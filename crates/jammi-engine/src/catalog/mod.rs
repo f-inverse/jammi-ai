@@ -1,5 +1,6 @@
 pub mod migrations;
 pub mod schema;
+pub mod source_repo;
 
 use std::path::Path;
 

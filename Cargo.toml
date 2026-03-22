@@ -70,4 +70,6 @@ backon = "1"
 hf-hub = "0.5"
 thiserror = "2"
 directories = "6"
+url = "2"
+async-trait = "0.1"
 

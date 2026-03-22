@@ -31,7 +31,9 @@ tracing-subscriber.workspace = true
 thiserror.workspace = true
 directories.workspace = true
 tokio.workspace = true
+url.workspace = true
+async-trait.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-tracing-subscriber.workspace = true
+tokio.workspace = true

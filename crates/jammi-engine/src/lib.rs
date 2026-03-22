@@ -1,6 +1,8 @@
 pub mod catalog;
 pub mod config;
 pub mod error;
+pub mod session;
+pub mod source;
 
 use config::LoggingConfig;
 

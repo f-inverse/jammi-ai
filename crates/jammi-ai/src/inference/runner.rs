@@ -270,8 +270,18 @@ impl InferenceRunner {
         let row_status = vec![false; row_count];
         let row_errors = vec![error_message.to_string(); row_count];
 
+        // Extract embedding dim from the output schema (FixedSizeList field)
+        let dim = output_schema
+            .fields()
+            .iter()
+            .find_map(|f| match f.data_type() {
+                arrow::datatypes::DataType::FixedSizeList(_, n) => Some(*n as usize),
+                _ => None,
+            })
+            .unwrap_or(0);
+
         // Create a dummy BackendOutput with all-error rows
-        let adapter = create_adapter_for_error(self.task, row_count);
+        let adapter = create_adapter_for_error(self.task, row_count, dim);
         let dummy_output = BackendOutput {
             float_outputs: adapter.0,
             string_outputs: adapter.1,
@@ -280,7 +290,7 @@ impl InferenceRunner {
             shapes: vec![(row_count, 0)],
         };
 
-        let task_adapter = super::adapter::create_adapter_for_schema(self.task);
+        let task_adapter = super::adapter::create_adapter_for_schema(self.task, Some(dim));
         let task_columns = task_adapter.adapt(&dummy_output, row_count)?;
 
         let prefix = build_prefix_columns(
@@ -305,12 +315,12 @@ impl InferenceRunner {
 fn create_adapter_for_error(
     task: ModelTask,
     row_count: usize,
+    embedding_dim: usize,
 ) -> (Vec<Vec<f32>>, Vec<Vec<String>>) {
     match task {
         ModelTask::Embedding => {
             // EmbeddingAdapter expects float_outputs[0] with row_count * dim values
-            // For errors, we just need enough zeros. Adapter nulls failed rows anyway.
-            (vec![vec![0.0; row_count]], vec![])
+            (vec![vec![0.0; row_count * embedding_dim]], vec![])
         }
         ModelTask::Classification => (
             vec![vec![0.0; row_count]],

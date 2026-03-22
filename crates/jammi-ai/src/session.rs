@@ -117,6 +117,12 @@ impl InferenceSession {
             .await
             .map_err(|e| JammiError::Inference(format!("Failed to create scan plan: {e}")))?;
 
+        // Pre-load the model to get embedding dimensions for schema construction.
+        // This also warms the cache so execute() hits a cache hit.
+        let guard = self.model_cache.get_or_load(model_id, task, None).await?;
+        let embedding_dim = guard.model.embedding_dim();
+        drop(guard);
+
         // Wrap with InferenceExec
         let inference_exec = InferenceExec::new(
             input_plan,
@@ -129,6 +135,7 @@ impl InferenceSession {
             self.inner.config().inference.batch_size,
             Arc::clone(&self.model_cache),
             self.observer.clone(),
+            embedding_dim,
         )?;
 
         // Execute and collect results

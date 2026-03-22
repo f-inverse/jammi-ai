@@ -51,9 +51,13 @@ pub fn create_adapter(task: ModelTask, model: &LoadedModel) -> Result<Box<dyn Ou
 }
 
 /// Create an adapter for schema construction only (no model needed).
-pub fn create_adapter_for_schema(task: ModelTask) -> Box<dyn OutputAdapter> {
+/// For embedding, pass the model's hidden_size as `embedding_dim`.
+pub fn create_adapter_for_schema(
+    task: ModelTask,
+    embedding_dim: Option<usize>,
+) -> Box<dyn OutputAdapter> {
     match task {
-        ModelTask::Embedding => Box::new(EmbeddingAdapter::new(0)),
+        ModelTask::Embedding => Box::new(EmbeddingAdapter::new(embedding_dim.unwrap_or(0))),
         ModelTask::Classification => Box::new(ClassificationAdapter),
         ModelTask::Summarization => Box::new(summarization::SummarizationAdapter),
         ModelTask::ObjectDetection => Box::new(object_detection::ObjectDetectionAdapter),

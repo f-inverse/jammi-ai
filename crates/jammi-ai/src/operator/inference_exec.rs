@@ -30,6 +30,7 @@ pub struct InferenceExec {
     batch_size: usize,
     model_cache: Arc<ModelCache>,
     observer: Option<Arc<dyn InferenceObserver>>,
+    embedding_dim: Option<usize>,
     properties: PlanProperties,
 }
 
@@ -56,8 +57,10 @@ impl InferenceExec {
         batch_size: usize,
         model_cache: Arc<ModelCache>,
         observer: Option<Arc<dyn InferenceObserver>>,
+        embedding_dim: Option<usize>,
     ) -> jammi_engine::error::Result<Self> {
-        let output_schema = build_output_schema(&task, &input.schema(), &key_column)?;
+        let output_schema =
+            build_output_schema(&task, &input.schema(), &key_column, embedding_dim)?;
         let properties = Self::compute_properties(output_schema);
         Ok(Self {
             input,
@@ -70,6 +73,7 @@ impl InferenceExec {
             batch_size,
             model_cache,
             observer,
+            embedding_dim,
             properties,
         })
     }
@@ -127,6 +131,7 @@ impl ExecutionPlan for InferenceExec {
                 self.batch_size,
                 Arc::clone(&self.model_cache),
                 self.observer.clone(),
+                self.embedding_dim,
             )
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
         ))

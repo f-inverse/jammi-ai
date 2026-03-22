@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float32Array, StringArray};
+use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use jammi_engine::error::Result;
 
@@ -20,13 +21,15 @@ pub fn common_prefix_fields() -> Vec<Field> {
 }
 
 /// Build the full output schema: prefix + task-specific.
+/// For embedding tasks, `embedding_dim` must be the model's actual hidden size.
 pub fn build_output_schema(
     task: &ModelTask,
     _input_schema: &SchemaRef,
     _key_column: &str,
+    embedding_dim: Option<usize>,
 ) -> Result<SchemaRef> {
     let mut fields = common_prefix_fields();
-    let task_adapter = adapter::create_adapter_for_schema(*task);
+    let task_adapter = adapter::create_adapter_for_schema(*task, embedding_dim);
     fields.extend(task_adapter.output_schema());
     Ok(Arc::new(Schema::new(fields)))
 }
@@ -59,8 +62,15 @@ pub fn build_prefix_columns(
         })
         .collect();
 
+    // Cast keys to Utf8 if needed (key column may be Int64, etc.)
+    let row_ids: ArrayRef = if keys.data_type() == &DataType::Utf8 {
+        Arc::clone(keys)
+    } else {
+        compute::cast(keys, &DataType::Utf8).unwrap_or_else(|_| Arc::clone(keys))
+    };
+
     vec![
-        Arc::clone(keys),                                                      // _row_id
+        row_ids,                                                               // _row_id
         Arc::new(StringArray::from(vec![source_id; row_count])) as ArrayRef,   // _source
         Arc::new(StringArray::from(vec![model_id; row_count])) as ArrayRef,    // _model
         Arc::new(status) as ArrayRef,                                          // _status

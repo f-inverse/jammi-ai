@@ -59,7 +59,8 @@ fn build_output_schema_embedding_has_prefix_plus_vector() {
         Field::new("abstract", DataType::Utf8, false),
     ]));
 
-    let schema = build_output_schema(&ModelTask::Embedding, &input_schema, "id").unwrap();
+    let schema =
+        build_output_schema(&ModelTask::Embedding, &input_schema, "id", Some(384)).unwrap();
 
     let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert!(field_names.contains(&"_row_id"));
@@ -74,7 +75,8 @@ fn build_output_schema_classification_has_prefix_plus_task_cols() {
         Field::new("abstract", DataType::Utf8, false),
     ]));
 
-    let schema = build_output_schema(&ModelTask::Classification, &input_schema, "id").unwrap();
+    let schema =
+        build_output_schema(&ModelTask::Classification, &input_schema, "id", None).unwrap();
 
     let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert!(field_names.contains(&"_row_id"));
@@ -299,6 +301,7 @@ mod live {
             &ModelTask::Classification,
             &input_schema,
             "id",
+            None,
         )
         .unwrap();
 

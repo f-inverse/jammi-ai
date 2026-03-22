@@ -3,10 +3,11 @@ pub mod observer;
 pub mod runner;
 pub mod schema;
 
-use arrow::array::{Array, ArrayRef, StringArray};
+use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray, StringViewArray};
+use arrow::datatypes::DataType;
 use jammi_engine::error::{JammiError, Result};
 
-/// Extract text from Arrow StringArray columns.
+/// Extract text from Arrow string columns (handles Utf8, LargeUtf8, and Utf8View).
 /// If multiple columns, concatenate with " " separator.
 /// Null values produce empty strings (caller handles null tracking).
 pub fn arrow_to_texts(columns: &[ArrayRef]) -> Result<Vec<String>> {
@@ -19,19 +20,33 @@ pub fn arrow_to_texts(columns: &[ArrayRef]) -> Result<Vec<String>> {
     for i in 0..row_count {
         let parts: Vec<&str> = columns
             .iter()
-            .filter_map(|col| {
-                col.as_any().downcast_ref::<StringArray>().and_then(|arr| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i))
-                    }
-                })
-            })
+            .filter_map(|col| get_string_value(col, i))
             .collect();
         texts.push(parts.join(" "));
     }
     Ok(texts)
+}
+
+/// Extract a string value from any Arrow string-like array type at index `i`.
+fn get_string_value(col: &ArrayRef, i: usize) -> Option<&str> {
+    if col.is_null(i) {
+        return None;
+    }
+    match col.data_type() {
+        DataType::Utf8 => col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|a| a.value(i)),
+        DataType::LargeUtf8 => col
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .map(|a| a.value(i)),
+        DataType::Utf8View => col
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .map(|a| a.value(i)),
+        _ => None,
+    }
 }
 
 /// Extract named columns from a RecordBatch as ArrayRefs.

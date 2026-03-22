@@ -7,7 +7,9 @@ use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result;
 
-/// Provides tables for a single registered source.
+/// DataFusion [`SchemaProvider`] that holds the table providers for a single data source.
+///
+/// Tables are added at registration time and looked up by name during query planning.
 pub struct JammiSchemaProvider {
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
 }
@@ -29,10 +31,12 @@ impl Default for JammiSchemaProvider {
 }
 
 impl JammiSchemaProvider {
+    /// Create an empty schema provider.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Register a table provider under the given name.
     pub fn add_table(&self, name: String, table: Arc<dyn TableProvider>) {
         self.tables.write().unwrap().insert(name, table);
     }

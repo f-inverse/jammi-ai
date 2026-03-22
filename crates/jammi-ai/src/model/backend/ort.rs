@@ -10,6 +10,7 @@ pub struct OrtBackend;
 /// An ORT-loaded model ready for inference.
 /// Extended with `ort::Session` in Phase 12a when the ORT dependency is resolved.
 pub struct OrtModel {
+    /// Architecture dimensions for memory estimation and output sizing.
     pub dimensions: ModelDimensions,
 }
 

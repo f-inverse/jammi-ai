@@ -10,8 +10,10 @@ use crate::source::registry::SourceCatalog;
 use crate::source::schema_provider::JammiSchemaProvider;
 use crate::source::{local, table_name_from_url, SourceConnection, SourceType};
 
-/// The main entry point. Wraps a DataFusion SessionContext with Jammi's
-/// source registry, catalog, and configuration.
+/// Primary entry point for the Jammi query engine.
+///
+/// Wraps a DataFusion `SessionContext` with source registration,
+/// an artifact catalog, and platform configuration.
 pub struct JammiSession {
     ctx: SessionContext,
     catalog: Arc<Catalog>,
@@ -19,7 +21,7 @@ pub struct JammiSession {
 }
 
 impl JammiSession {
-    /// Create a new session.
+    /// Create a new session, opening the catalog and configuring DataFusion.
     pub async fn new(config: JammiConfig) -> Result<Self> {
         let config = Arc::new(config);
         let catalog = Arc::new(Catalog::open(&config.artifact_dir)?);
@@ -36,7 +38,7 @@ impl JammiSession {
         })
     }
 
-    /// Register a data source.
+    /// Register a data source, persisting it to the catalog and exposing it to SQL queries.
     pub async fn add_source(
         &self,
         source_id: &str,
@@ -94,28 +96,28 @@ impl JammiSession {
         Ok(())
     }
 
-    /// Execute a SQL query, return results as RecordBatches.
+    /// Execute a SQL query and collect results as Arrow `RecordBatch`es.
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
         let df = self.ctx.sql(query).await?;
         Ok(df.collect().await?)
     }
 
-    /// Access the underlying DataFusion SessionContext.
+    /// Return a reference to the underlying DataFusion `SessionContext`.
     pub fn context(&self) -> &SessionContext {
         &self.ctx
     }
 
-    /// Access the catalog.
+    /// Return a reference to the artifact catalog.
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }
 
-    /// Access the catalog as an Arc (for components that need shared ownership).
+    /// Return a shared handle to the catalog for components that need ownership.
     pub fn catalog_arc(&self) -> Arc<Catalog> {
         Arc::clone(&self.catalog)
     }
 
-    /// Access the config.
+    /// Return a reference to the active configuration.
     pub fn config(&self) -> &JammiConfig {
         &self.config
     }

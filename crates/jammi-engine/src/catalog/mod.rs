@@ -10,11 +10,16 @@ use r2d2_sqlite::SqliteConnectionManager;
 
 use crate::error::{JammiError, Result};
 
+/// SQLite-backed artifact catalog for models, sources, and experiment metadata.
+///
+/// Provides connection-pooled access to a WAL-mode SQLite database stored
+/// inside the configured artifact directory.
 pub struct Catalog {
     pool: Pool<SqliteConnectionManager>,
 }
 
 impl Catalog {
+    /// Open (or create) the catalog database in `artifact_dir`, running any pending migrations.
     pub fn open(artifact_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(artifact_dir)?;
         let db_path = artifact_dir.join("catalog.db");
@@ -34,6 +39,7 @@ impl Catalog {
         Ok(Self { pool })
     }
 
+    /// Acquire a pooled SQLite connection.
     pub fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
         self.pool.get().map_err(JammiError::Pool)
     }

@@ -28,9 +28,13 @@ impl std::fmt::Display for ModelId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendType {
+    /// Candle — native Rust inference via safetensors weights.
     Candle,
+    /// ONNX Runtime — cross-platform inference via ONNX models.
     Ort,
+    /// vLLM — high-throughput serving for large language models.
     Vllm,
+    /// HTTP — remote model endpoint (REST/gRPC).
     Http,
 }
 
@@ -38,33 +42,52 @@ pub enum BackendType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelTask {
+    /// Produce dense vector representations of input text.
     Embedding,
+    /// Assign a label and confidence score to input text.
     Classification,
+    /// Generate a condensed summary of input text.
     Summarization,
+    /// Detect and localize objects in images.
     ObjectDetection,
+    /// Extract named entities (person, org, location, etc.) from text.
     Ner,
+    /// Generate continuation text from a prompt.
     TextGeneration,
 }
 
 /// A resolved model — files located, backend determined, NOT yet loaded.
 pub struct ResolvedModel {
+    /// HuggingFace or local identifier for this model.
     pub model_id: ModelId,
+    /// Selected inference backend.
     pub backend: BackendType,
+    /// ML task this model performs.
     pub task: ModelTask,
+    /// Path to the model's `config.json`.
     pub config_path: std::path::PathBuf,
+    /// Paths to weight files (safetensors shards or ONNX).
     pub weights_paths: Vec<std::path::PathBuf>,
+    /// Path to `tokenizer.json`, if present.
     pub tokenizer_path: Option<std::path::PathBuf>,
+    /// Parsed contents of `config.json`.
     pub model_config: serde_json::Value,
+    /// Parent model ID for fine-tuned variants.
     pub base_model_id: Option<ModelId>,
+    /// Estimated GPU memory in bytes (sum of weight file sizes).
     pub estimated_memory: usize,
 }
 
-/// Model configuration for memory estimation.
+/// Model architecture dimensions used for memory estimation and output sizing.
 #[derive(Debug, Clone)]
 pub struct ModelDimensions {
+    /// Size of the hidden representation (embedding dimension).
     pub hidden_size: usize,
+    /// Number of transformer layers.
     pub num_layers: usize,
+    /// Number of attention heads per layer.
     pub num_attention_heads: usize,
+    /// Feed-forward intermediate layer size.
     pub intermediate_size: usize,
 }
 
@@ -101,11 +124,14 @@ impl ModelDimensions {
 
 /// A model loaded into memory, ready for inference.
 pub enum LoadedModel {
+    /// Loaded via the Candle backend (safetensors weights).
     Candle(Box<CandleModel>),
+    /// Loaded via the ORT backend (ONNX weights).
     Ort(OrtModel),
 }
 
 impl LoadedModel {
+    /// Estimate GPU memory for one inference batch.
     pub fn estimate_batch_memory(&self, batch_size: usize, seq_len: usize) -> usize {
         match self {
             LoadedModel::Candle(m) => m.dimensions.estimate_activation_memory(batch_size, seq_len),
@@ -113,6 +139,7 @@ impl LoadedModel {
         }
     }
 
+    /// Return the embedding dimension (hidden size), if known.
     pub fn embedding_dim(&self) -> Option<usize> {
         match self {
             LoadedModel::Candle(m) => Some(m.dimensions.hidden_size),
@@ -133,6 +160,7 @@ impl LoadedModel {
 
 /// RAII guard that decrements ref count on drop.
 pub struct ModelGuard {
+    /// Shared handle to the loaded model.
     pub model: Arc<LoadedModel>,
     ref_count: Arc<AtomicUsize>,
 }

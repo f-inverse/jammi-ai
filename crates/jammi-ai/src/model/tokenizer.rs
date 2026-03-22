@@ -10,6 +10,7 @@ pub struct TokenizerWrapper {
 }
 
 impl TokenizerWrapper {
+    /// Load a tokenizer from a `tokenizer.json` file with batch-longest padding.
     pub fn from_file(path: &Path) -> Result<Self> {
         let mut tokenizer =
             tokenizers::Tokenizer::from_file(path).map_err(|e| JammiError::Model {
@@ -59,9 +60,14 @@ impl TokenizerWrapper {
     }
 }
 
+/// Tokenized batch output with padding applied.
 pub struct BatchEncoding {
+    /// Token IDs for each input text, padded to equal length.
     pub input_ids: Vec<Vec<u32>>,
+    /// Attention masks (1 = real token, 0 = padding).
     pub attention_masks: Vec<Vec<u32>>,
+    /// Token type IDs for segment disambiguation.
     pub type_ids: Vec<Vec<u32>>,
+    /// Padded sequence length (columns in the batch).
     pub seq_len: usize,
 }

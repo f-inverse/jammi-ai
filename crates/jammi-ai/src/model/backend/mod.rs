@@ -16,11 +16,14 @@ pub trait ModelBackend: Send + Sync {
 
 /// Device configuration derived from JammiConfig.
 pub struct DeviceConfig {
+    /// GPU device ordinal (-1 for CPU-only).
     pub gpu_device: i32,
+    /// Fraction of GPU memory available for model loading.
     pub memory_fraction: f64,
 }
 
 impl DeviceConfig {
+    /// Derive device configuration from the application config.
     pub fn from_config(config: &jammi_engine::config::JammiConfig) -> Self {
         Self {
             gpu_device: config.gpu.device,

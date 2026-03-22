@@ -30,6 +30,7 @@ pub struct InferenceRunner {
 }
 
 impl InferenceRunner {
+    /// Create a runner for the given model, task, and column configuration.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         model_cache: Arc<ModelCache>,
@@ -55,6 +56,7 @@ impl InferenceRunner {
         }
     }
 
+    /// Consume the input stream, run inference in sub-batches, and send results to `tx`.
     pub async fn run(
         &self,
         mut input: SendableRecordBatchStream,

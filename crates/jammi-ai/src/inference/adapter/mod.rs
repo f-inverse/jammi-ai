@@ -14,12 +14,17 @@ pub use embedding::EmbeddingAdapter;
 
 use crate::model::{LoadedModel, ModelTask};
 
-/// Raw output from a model backend.
+/// Raw output from a model backend, before task-specific adaptation.
 pub struct BackendOutput {
+    /// Numeric output tensors flattened to 1-D (one vec per output head).
     pub float_outputs: Vec<Vec<f32>>,
+    /// String output tensors (one vec per output head).
     pub string_outputs: Vec<Vec<String>>,
+    /// Per-row success flag (`true` = inference succeeded).
     pub row_status: Vec<bool>,
+    /// Per-row error message (empty string when status is `true`).
     pub row_errors: Vec<String>,
+    /// Shape metadata for each float output as `(rows, cols)`.
     pub shapes: Vec<(usize, usize)>,
 }
 

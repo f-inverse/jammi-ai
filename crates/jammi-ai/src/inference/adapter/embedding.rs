@@ -7,11 +7,13 @@ use jammi_engine::error::Result;
 
 use super::{BackendOutput, OutputAdapter};
 
+/// Adapt raw float embeddings into a `FixedSizeList<Float32>` Arrow column.
 pub struct EmbeddingAdapter {
     dimensions: usize,
 }
 
 impl EmbeddingAdapter {
+    /// Create an adapter for embeddings of the given dimensionality.
     pub fn new(dimensions: usize) -> Self {
         Self { dimensions }
     }

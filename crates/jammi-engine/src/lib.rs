@@ -1,3 +1,9 @@
+//! Jammi Engine — query engine, configuration, catalog, and source management.
+//!
+//! This crate provides the foundational infrastructure for the Jammi AI platform:
+//! data source registration, SQL query execution via DataFusion, SQLite-backed
+//! artifact catalog, and configuration management.
+
 pub mod catalog;
 pub mod config;
 pub mod error;
@@ -6,6 +12,7 @@ pub mod source;
 
 use config::LoggingConfig;
 
+/// Initialize the tracing subscriber using the provided logging configuration.
 pub fn init_tracing(config: &LoggingConfig) {
     use tracing_subscriber::{fmt, EnvFilter};
 

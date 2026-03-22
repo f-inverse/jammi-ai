@@ -6,6 +6,7 @@ use jammi_engine::error::Result;
 
 use super::{BackendOutput, OutputAdapter};
 
+/// Adapt classification output into `label`, `confidence`, and `all_scores_json` columns.
 pub struct ClassificationAdapter;
 
 impl OutputAdapter for ClassificationAdapter {

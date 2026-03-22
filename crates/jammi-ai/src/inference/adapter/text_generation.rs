@@ -6,6 +6,7 @@ use jammi_engine::error::Result;
 
 use super::{BackendOutput, OutputAdapter};
 
+/// Adapt text generation output into `generated_text` and `finish_reason` columns.
 pub struct TextGenerationAdapter;
 
 impl OutputAdapter for TextGenerationAdapter {

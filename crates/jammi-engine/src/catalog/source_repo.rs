@@ -3,15 +3,22 @@ use crate::source::{SourceConnection, SourceType};
 
 use super::Catalog;
 
-/// A row from the `sources` table.
+/// Materialized row from the `sources` catalog table.
 #[derive(Debug, Clone)]
 pub struct SourceRecord {
+    /// Unique identifier for this data source.
     pub source_id: String,
+    /// Backend type (e.g., `Local`, `Postgres`, `S3`).
     pub source_type: SourceType,
+    /// Deserialized connection parameters.
     pub connection: SourceConnection,
+    /// Cached schema JSON (populated after first introspection).
     pub schema_json: Option<String>,
+    /// Lifecycle status (e.g., `"active"`).
     pub status: String,
+    /// ISO-8601 timestamp of initial registration.
     pub created_at: String,
+    /// ISO-8601 timestamp of last update.
     pub updated_at: String,
 }
 

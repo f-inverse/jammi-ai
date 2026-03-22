@@ -14,9 +14,13 @@ pub struct CandleBackend;
 
 /// A candle-loaded model ready for inference.
 pub struct CandleModel {
+    /// Architecture dimensions for memory estimation and output sizing.
     pub dimensions: ModelDimensions,
+    /// Loaded BERT model weights and computation graph.
     pub bert: BertModel,
+    /// Tokenizer for text-to-token conversion, if available.
     pub tokenizer: Option<TokenizerWrapper>,
+    /// Device the model weights reside on (CPU, CUDA, or Metal).
     pub device: Device,
 }
 

@@ -45,6 +45,7 @@ impl std::fmt::Debug for InferenceExec {
 }
 
 impl InferenceExec {
+    /// Create a new inference operator wrapping the given input plan.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         input: Arc<dyn ExecutionPlan>,

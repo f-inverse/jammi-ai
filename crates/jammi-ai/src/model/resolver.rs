@@ -14,6 +14,7 @@ pub struct ModelResolver {
 }
 
 impl ModelResolver {
+    /// Create a resolver backed by the given catalog and HuggingFace Hub API.
     pub fn new(catalog: Arc<Catalog>) -> Result<Self> {
         let hf_api = hf_hub::api::sync::Api::new()
             .map_err(|e| JammiError::Config(format!("HF Hub init failed: {e}")))?;
@@ -25,6 +26,7 @@ impl ModelResolver {
         &self.catalog
     }
 
+    /// Resolve a model ID to file paths and backend selection.
     pub fn resolve(
         &self,
         model_id: &str,

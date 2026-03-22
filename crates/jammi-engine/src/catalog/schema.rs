@@ -1,3 +1,4 @@
+/// SQL DDL for the initial catalog schema: sources, models, embeddings, fine-tune jobs, evals.
 pub const MIGRATION_001_CORE_TABLES: &str = r#"
 CREATE TABLE sources (
     source_id   TEXT PRIMARY KEY,

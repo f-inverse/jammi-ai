@@ -6,6 +6,7 @@ use jammi_engine::error::Result;
 
 use super::{BackendOutput, OutputAdapter};
 
+/// Adapt summarization output into a `summary` LargeUtf8 column.
 pub struct SummarizationAdapter;
 
 impl OutputAdapter for SummarizationAdapter {

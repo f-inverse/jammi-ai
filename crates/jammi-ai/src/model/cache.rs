@@ -13,10 +13,14 @@ use super::resolver::ModelResolver;
 use super::{BackendType, LoadedModel, ModelGuard, ModelId, ModelTask};
 use crate::concurrency::{GpuPermit, GpuScheduler};
 
+/// Where a cached model currently resides.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelResidency {
+    /// Weights are loaded on GPU memory.
     Gpu,
+    /// Weights are loaded in CPU memory.
     Cpu,
+    /// Model has been evicted and is no longer in memory.
     Unloaded,
 }
 
@@ -39,6 +43,7 @@ struct Backends {
     ort: OrtBackend,
 }
 
+/// LRU cache of loaded models with GPU memory tracking and single-flight loading.
 pub struct ModelCache {
     inner: Arc<RwLock<CacheInner>>,
     resolver: ModelResolver,
@@ -48,6 +53,7 @@ pub struct ModelCache {
 }
 
 impl ModelCache {
+    /// Create a cache backed by the given resolver, device config, and GPU scheduler.
     pub fn new(
         resolver: ModelResolver,
         device_config: DeviceConfig,

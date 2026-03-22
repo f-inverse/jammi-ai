@@ -1,0 +1,12 @@
+[book]
+title = "Jammi AI Guide"
+authors = ["F-Inverse"]
+language = "en"
+multilingual = false
+src = "src"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/f-inverse/jammi-ai"
+edit-url-template = "https://github.com/f-inverse/jammi-ai/edit/main/docs/guide/{path}"

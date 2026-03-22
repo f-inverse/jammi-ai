@@ -2,31 +2,49 @@ use crate::error::Result;
 
 use super::Catalog;
 
-/// A row from the `models` table.
+/// Materialized row from the `models` catalog table.
 #[derive(Debug, Clone)]
 pub struct ModelRecord {
+    /// Unique model name (e.g., `"sentence-transformers/all-MiniLM-L6-v2"`).
     pub model_id: String,
+    /// Monotonically increasing version number for this model name.
     pub version: i32,
+    /// Model category (e.g., `"embedding"`, `"llm"`, `"lora"`).
     pub model_type: String,
+    /// Parent model this was derived from (fine-tuned or adapted).
     pub base_model_id: Option<String>,
+    /// Inference backend (e.g., `"candle"`, `"vllm"`, `"http"`).
     pub backend: String,
+    /// Task this model performs (e.g., `"text-generation"`, `"embedding"`).
     pub task: String,
+    /// Filesystem path to model weights or adapter files.
     pub artifact_path: Option<String>,
+    /// Serialized JSON blob with backend-specific configuration.
     pub config_json: Option<String>,
+    /// Lifecycle status (e.g., `"registered"`, `"loaded"`, `"failed"`).
     pub status: String,
+    /// ISO-8601 timestamp of initial registration.
     pub created_at: String,
 }
 
-/// Parameters for registering a model.
+/// Input parameters for [`Catalog::register_model`].
 #[derive(Debug, Default)]
 pub struct RegisterModelParams<'a> {
+    /// Unique model name.
     pub model_id: &'a str,
+    /// Version number for this registration.
     pub version: i32,
+    /// Model category (e.g., `"embedding"`, `"llm"`).
     pub model_type: &'a str,
+    /// Inference backend identifier.
     pub backend: &'a str,
+    /// Task this model performs.
     pub task: &'a str,
+    /// Optional parent model ID (for fine-tuned variants).
     pub base_model_id: Option<&'a str>,
+    /// Optional filesystem path to model weights.
     pub artifact_path: Option<&'a str>,
+    /// Optional JSON blob with backend-specific settings.
     pub config_json: Option<&'a str>,
 }
 

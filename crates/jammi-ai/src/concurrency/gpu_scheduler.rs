@@ -42,6 +42,7 @@ impl GpuScheduler {
         }
     }
 
+    /// Attempt to reserve `bytes` of GPU memory. Return `None` if insufficient.
     pub fn try_acquire(self: &Arc<Self>, bytes: usize) -> Option<GpuPermit> {
         if self.unlimited {
             return Some(GpuPermit {
@@ -53,6 +54,7 @@ impl GpuScheduler {
         todo!()
     }
 
+    /// Return the number of unreserved GPU bytes.
     pub fn available(&self) -> usize {
         if self.unlimited {
             return usize::MAX;

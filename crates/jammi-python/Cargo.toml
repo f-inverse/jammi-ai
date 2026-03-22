@@ -1,0 +1,13 @@
+[package]
+name = "jammi-python"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "jammi_python"
+crate-type = ["cdylib"]
+
+[dependencies]
+jammi-engine.workspace = true
+jammi-ai.workspace = true
+pyo3.workspace = true

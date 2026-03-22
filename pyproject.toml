@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "jammi-ai"
+requires-python = ">=3.8"
+dynamic = ["version"]
+
+[tool.maturin]
+manifest-path = "crates/jammi-python/Cargo.toml"
+module-name = "jammi._native"
+python-source = "python"
+features = []

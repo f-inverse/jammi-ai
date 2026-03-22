@@ -1,0 +1,14 @@
+artifact_dir = "/tmp/jammi-test-artifacts"
+
+[engine]
+execution_threads = 2
+batch_size = 4096
+
+[gpu]
+device = -1
+
+[inference]
+batch_size = 8
+
+[logging]
+level = "debug"

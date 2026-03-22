@@ -1,0 +1,8 @@
+[package]
+name = "jammi-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+jammi-engine.workspace = true
+jammi-ai.workspace = true

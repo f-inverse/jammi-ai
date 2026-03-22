@@ -1,0 +1,16 @@
+query_id,query_text,relevant_id
+q1,quantum computing applications,1
+q1,quantum computing applications,4
+q1,quantum computing applications,7
+q1,quantum computing applications,11
+q2,machine learning for science,2
+q2,machine learning for science,5
+q2,machine learning for science,12
+q3,gene therapy and editing,3
+q3,gene therapy and editing,9
+q3,gene therapy and editing,18
+q4,renewable energy technology,10
+q4,renewable energy technology,14
+q5,chemical synthesis methods,6
+q5,chemical synthesis methods,15
+q5,chemical synthesis methods,19

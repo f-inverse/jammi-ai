@@ -1,0 +1,73 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/jammi-engine",
+    "crates/jammi-ai",
+    "crates/jammi-server",
+    "crates/jammi-python",
+    "crates/jammi-cli",
+]
+# jammi-python is a PyO3 cdylib — build via maturin, not cargo build --workspace
+default-members = [
+    "crates/jammi-engine",
+    "crates/jammi-ai",
+    "crates/jammi-server",
+    "crates/jammi-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88.0"
+license = "Apache-2.0"
+repository = "https://github.com/f-inverse/jammi-ai"
+
+[workspace.dependencies]
+# Internal crates
+jammi-engine = { path = "crates/jammi-engine" }
+jammi-ai = { path = "crates/jammi-ai" }
+
+# Query engine
+datafusion = "52.3"
+datafusion-federation = "0.5"
+arrow = "57"
+arrow-flight = { version = "57", features = ["flight-sql"] }
+arrow-schema = "57"
+arrow-array = "57"
+
+# Storage
+lancedb = "0.27"
+rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite_migration = "2.4"
+r2d2 = "0.8"
+r2d2_sqlite = "0.33"
+
+# ML inference
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+ort = { version = "2.0.0-rc.12", default-features = false }
+
+# Python bindings
+pyo3 = { version = "0.28", features = ["abi3-py38", "extension-module"] }
+pyo3-arrow = "0.16"
+
+# HTTP / server
+axum = "0.8"
+reqwest = { version = "0.12", features = ["json"] }
+tonic = "0.14"
+tokio = { version = "1.44", features = ["full"] }
+
+# Utilities
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+backon = "1"
+hf-hub = "0.5"
+thiserror = "2"
+directories = "6"
+

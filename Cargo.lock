@@ -2851,9 +2851,13 @@ name = "jammi-ai"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-array",
+ "arrow-schema",
  "candle-core",
  "candle-nn",
  "candle-transformers",
+ "datafusion",
+ "futures",
  "hf-hub",
  "jammi-engine",
  "serde",

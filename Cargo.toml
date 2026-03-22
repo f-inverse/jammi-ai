@@ -73,4 +73,5 @@ thiserror = "2"
 directories = "6"
 url = "2"
 async-trait = "0.1"
+futures = "0.3"
 

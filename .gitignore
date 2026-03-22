@@ -27,3 +27,9 @@ dist/
 
 # HuggingFace cache (large, downloaded at runtime)
 .cache/
+
+# Claude
+.claude
+CLAUDE.md
+docs/plans/
+docs/IMPLEMENTATION.md

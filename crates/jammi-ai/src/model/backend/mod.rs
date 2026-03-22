@@ -19,3 +19,12 @@ pub struct DeviceConfig {
     pub gpu_device: i32,
     pub memory_fraction: f64,
 }
+
+impl DeviceConfig {
+    pub fn from_config(config: &jammi_engine::config::JammiConfig) -> Self {
+        Self {
+            gpu_device: config.gpu.device,
+            memory_fraction: config.gpu.memory_fraction,
+        }
+    }
+}

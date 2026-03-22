@@ -20,6 +20,11 @@ impl ModelResolver {
         Ok(Self { catalog, hf_api })
     }
 
+    /// Access the catalog (for model registration after loading).
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
     pub fn resolve(
         &self,
         model_id: &str,
@@ -209,7 +214,8 @@ impl ModelResolver {
 
     fn select_backend_hf(&self, repo: &hf_hub::api::sync::ApiRepo) -> BackendType {
         if let Ok(info) = repo.info() {
-            if info.siblings.iter().any(|s| s.rfilename.ends_with(".onnx")) {
+            // Only check for root-level model.onnx (not subdirectory ONNX files)
+            if info.siblings.iter().any(|s| s.rfilename == "model.onnx") {
                 return BackendType::Ort;
             }
         }

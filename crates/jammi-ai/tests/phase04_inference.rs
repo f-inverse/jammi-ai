@@ -1,75 +1,16 @@
 mod common;
 
-#[allow(unused_imports)]
-use jammi_ai::{
-    inference::{
-        adapter::{BackendOutput, ClassificationAdapter, EmbeddingAdapter, OutputAdapter},
-        observer::InferenceObserver,
-        schema::{build_output_schema, common_prefix_fields},
-    },
-    model::{
-        backend::DeviceConfig, cache::ModelCache, resolver::ModelResolver, BackendType, ModelTask,
-    },
-    operator::inference_exec::InferenceExec,
+use jammi_ai::inference::{
+    adapter::{BackendOutput, ClassificationAdapter, EmbeddingAdapter, OutputAdapter},
+    schema::{build_output_schema, common_prefix_fields},
 };
-#[allow(unused_imports)]
-use jammi_engine::{
-    config::JammiConfig,
-    session::JammiSession,
-    source::{FileFormat, SourceConnection, SourceType},
-};
+use jammi_ai::model::ModelTask;
 
-use arrow::array::{Array, FixedSizeListArray, Float32Array, StringArray};
+use arrow::array::{Array, FixedSizeListArray};
 use arrow::datatypes::{DataType, Field};
 use std::sync::Arc;
-#[allow(unused_imports)]
-use tempfile::tempdir;
 
-// --- Embedding output schema ---
-
-#[cfg(feature = "live-hub-tests")]
-#[tokio::test]
-async fn inference_exec_embedding_produces_fixed_size_list_384() {
-    let dir = tempdir().unwrap();
-    let config = common::test_config(dir.path());
-    let session = JammiSession::new(config).await.unwrap();
-
-    session
-        .add_source(
-            "patents",
-            SourceType::Local,
-            SourceConnection {
-                url: Some(common::fixture_url("patents.parquet")),
-                format: Some(FileFormat::Parquet),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-    let results = session
-        .infer(
-            "patents",
-            "sentence-transformers/all-MiniLM-L6-v2",
-            ModelTask::Embedding,
-            &["abstract".to_string()],
-            "id",
-        )
-        .await
-        .unwrap();
-
-    assert!(!results.is_empty(), "Should produce at least one batch");
-    let batch = &results[0];
-    let vector_col = batch
-        .column_by_name("vector")
-        .expect("vector column should exist");
-    match vector_col.data_type() {
-        DataType::FixedSizeList(inner, 384) => {
-            assert_eq!(inner.data_type(), &DataType::Float32);
-        }
-        other => panic!("Expected FixedSizeList(Float32, 384), got {other:?}"),
-    }
-}
+// ─── Hermetic tests (no network, no live models) ───────────────────────────
 
 // --- Output adapter schemas match spec ---
 
@@ -255,64 +196,519 @@ fn contract_adapters_null_failed_rows() {
     assert!(vector_col.is_null(1), "Failed row should have null vector");
 }
 
-// --- Live tests (behind feature gate) ---
+// ─── Live tests (behind feature gate, require HF Hub downloads) ────────────
 
 #[cfg(feature = "live-hub-tests")]
-#[tokio::test]
-async fn inference_exec_classification_produces_label_and_confidence() {
-    todo!("Requires live model loading")
-}
+mod live {
+    use super::*;
+    use arrow::array::{Float32Array, StringArray};
+    use jammi_ai::inference::observer::InferenceObserver;
+    use jammi_ai::session::InferenceSession;
+    use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tempfile::tempdir;
 
-#[cfg(feature = "live-hub-tests")]
-#[tokio::test]
-async fn null_text_row_produces_error_status() {
-    todo!("Requires live model loading")
-}
+    async fn setup_session() -> InferenceSession {
+        let dir = tempdir().unwrap();
+        let config = common::test_config(dir.path());
+        InferenceSession::new(config).await.unwrap()
+    }
 
-#[cfg(feature = "live-hub-tests")]
-#[tokio::test]
-async fn error_rows_have_null_vector_and_populated_error_message() {
-    todo!("Requires live model loading")
-}
+    async fn setup_with_patents() -> InferenceSession {
+        let session = setup_session().await;
+        session
+            .add_source(
+                "patents",
+                SourceType::Local,
+                SourceConnection {
+                    url: Some(common::fixture_url("patents.parquet")),
+                    format: Some(FileFormat::Parquet),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        session
+    }
 
-#[cfg(feature = "live-hub-tests")]
-#[tokio::test]
-async fn inference_output_contains_all_prefix_columns() {
-    todo!("Requires live model loading")
-}
+    #[tokio::test]
+    async fn inference_exec_embedding_produces_fixed_size_list_384() {
+        let session = setup_with_patents().await;
 
-#[cfg(feature = "live-hub-tests")]
-#[tokio::test]
-async fn process_large_input_without_oom() {
-    todo!("Requires live model loading")
-}
+        let results = session
+            .infer(
+                "patents",
+                "sentence-transformers/all-MiniLM-L6-v2",
+                ModelTask::Embedding,
+                &["abstract".to_string()],
+                "id",
+            )
+            .await
+            .unwrap();
 
-#[cfg(feature = "live-hub-tests")]
-#[tokio::test]
-async fn observer_receives_batch_notifications() {
-    todo!("Requires live model loading")
-}
+        assert!(!results.is_empty(), "Should produce at least one batch");
+        let batch = &results[0];
 
-#[cfg(feature = "live-hub-tests")]
-#[tokio::test]
-async fn no_observer_runs_without_error() {
-    todo!("Requires live model loading")
-}
+        // Check that "vector" column exists and is FixedSizeList(384)
+        let vector_col = batch
+            .column_by_name("vector")
+            .expect("vector column should exist");
+        match vector_col.data_type() {
+            DataType::FixedSizeList(inner, 384) => {
+                assert_eq!(inner.data_type(), &DataType::Float32);
+            }
+            other => panic!("Expected FixedSizeList(Float32, 384), got {other:?}"),
+        }
 
-#[cfg(feature = "live-hub-tests")]
-#[tokio::test]
-async fn inference_with_nonexistent_model_returns_error() {
-    todo!("Requires live model loading")
-}
+        // Every OK row should have a 384-dim vector
+        let fsl = vector_col
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        let status = batch
+            .column_by_name("_status")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..fsl.len() {
+            if status.value(i) == "ok" {
+                assert!(!fsl.is_null(i), "OK row {i} should have a vector");
+            }
+        }
+    }
 
-#[cfg(feature = "live-hub-tests")]
-#[tokio::test]
-async fn inference_with_nonexistent_source_returns_error() {
-    todo!("Requires live model loading")
-}
+    #[tokio::test]
+    async fn inference_exec_classification_adapter_schema_verified() {
+        // Classification output is thoroughly verified at the schema/contract level:
+        //   - classification_adapter_schema_has_label_confidence_scores (hermetic)
+        //   - contract_classification_adapter_schema_matches_adapt_output (hermetic)
+        //   - build_output_schema_classification_has_prefix_plus_task_cols (hermetic)
+        //
+        // Live end-to-end classification requires a classification model (e.g. facebook/bart-large-mnli)
+        // which is BART, not BERT. The Candle backend supports BERT-family models in CP2.
+        // Full classification live testing lands when additional model architectures are added.
+        //
+        // Verify the classification schema construction works at runtime:
+        let input_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Utf8, false),
+            arrow::datatypes::Field::new("text", DataType::Utf8, false),
+        ]));
+        let schema = jammi_ai::inference::schema::build_output_schema(
+            &ModelTask::Classification,
+            &input_schema,
+            "id",
+        )
+        .unwrap();
 
-#[cfg(feature = "live-hub-tests")]
-#[tokio::test]
-async fn inference_with_nonexistent_column_returns_error() {
-    todo!("Requires live model loading")
+        assert!(schema.field_with_name("label").is_ok());
+        assert!(schema.field_with_name("confidence").is_ok());
+        assert!(schema.field_with_name("all_scores_json").is_ok());
+        assert!(schema.field_with_name("_row_id").is_ok());
+        assert!(schema.field_with_name("_status").is_ok());
+    }
+
+    #[tokio::test]
+    async fn model_registered_in_catalog_after_inference() {
+        let session = setup_with_patents().await;
+
+        let results = session
+            .infer(
+                "patents",
+                "sentence-transformers/all-MiniLM-L6-v2",
+                ModelTask::Embedding,
+                &["abstract".to_string()],
+                "id",
+            )
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
+
+        // Verify the model was registered in the catalog
+        let models = session.catalog().list_models().unwrap();
+        assert!(
+            models
+                .iter()
+                .any(|m| m.model_id.contains("all-MiniLM-L6-v2")),
+            "Model should be registered in catalog after inference"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_dimensions_retained_after_loading() {
+        use jammi_ai::concurrency::GpuScheduler;
+        use jammi_ai::model::backend::DeviceConfig;
+        use jammi_ai::model::cache::ModelCache;
+        use jammi_ai::model::resolver::ModelResolver;
+
+        let dir = tempdir().unwrap();
+        let catalog = Arc::new(jammi_engine::catalog::Catalog::open(dir.path()).unwrap());
+        let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
+        let device_config = DeviceConfig {
+            gpu_device: -1,
+            memory_fraction: 1.0,
+        };
+        let scheduler = Arc::new(GpuScheduler::new_unlimited());
+        let cache = ModelCache::new(resolver, device_config, scheduler);
+
+        let guard = cache
+            .get_or_load(
+                "sentence-transformers/all-MiniLM-L6-v2",
+                ModelTask::Embedding,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // MiniLM-L6-v2: hidden=384, heads=12, intermediate=1536
+        let batch_mem = guard.model.estimate_batch_memory(32, 128);
+        assert!(batch_mem > 0, "Batch memory estimate should be positive");
+        // attention: 32*12*128*128*4 = 25,165,824
+        // ffn: 32*128*1536*4 = 25,165,824
+        assert!(
+            batch_mem > 20_000_000 && batch_mem < 30_000_000,
+            "Expected ~25MB for batch(32,128), got {batch_mem}"
+        );
+    }
+
+    #[tokio::test]
+    async fn null_text_row_produces_error_status() {
+        let session = setup_session().await;
+        session
+            .add_source(
+                "patents_nulls",
+                SourceType::Local,
+                SourceConnection {
+                    url: Some(common::fixture_url("patents_with_nulls.parquet")),
+                    format: Some(FileFormat::Parquet),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let results = session
+            .infer(
+                "patents_nulls",
+                "sentence-transformers/all-MiniLM-L6-v2",
+                ModelTask::Embedding,
+                &["abstract".to_string()],
+                "id",
+            )
+            .await
+            .unwrap();
+
+        let mut ok_count = 0;
+        let mut error_count = 0;
+
+        for batch in &results {
+            let status = batch
+                .column_by_name("_status")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..status.len() {
+                match status.value(i) {
+                    "ok" => ok_count += 1,
+                    "error" => error_count += 1,
+                    other => panic!("Unexpected _status value: {other}"),
+                }
+            }
+        }
+
+        // patents_with_nulls.parquet has rows with null abstract
+        assert!(
+            error_count > 0,
+            "Rows with null abstract should have _status='error'"
+        );
+        assert!(
+            ok_count > 0,
+            "Rows with valid abstract should have _status='ok'"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_rows_have_null_vector_and_populated_error_message() {
+        let session = setup_session().await;
+        session
+            .add_source(
+                "patents_nulls",
+                SourceType::Local,
+                SourceConnection {
+                    url: Some(common::fixture_url("patents_with_nulls.parquet")),
+                    format: Some(FileFormat::Parquet),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let results = session
+            .infer(
+                "patents_nulls",
+                "sentence-transformers/all-MiniLM-L6-v2",
+                ModelTask::Embedding,
+                &["abstract".to_string()],
+                "id",
+            )
+            .await
+            .unwrap();
+
+        for batch in &results {
+            let status = batch
+                .column_by_name("_status")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let error_col = batch
+                .column_by_name("_error")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let vector_col = batch
+                .column_by_name("vector")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .unwrap();
+
+            for i in 0..status.len() {
+                if status.value(i) == "error" {
+                    assert!(
+                        vector_col.is_null(i),
+                        "Error row {i} should have null vector"
+                    );
+                    assert!(
+                        !error_col.is_null(i),
+                        "Error row {i} should have an error message"
+                    );
+                    assert!(
+                        !error_col.value(i).is_empty(),
+                        "Error message should not be empty"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn inference_output_contains_all_prefix_columns() {
+        let session = setup_with_patents().await;
+
+        let results = session
+            .infer(
+                "patents",
+                "sentence-transformers/all-MiniLM-L6-v2",
+                ModelTask::Embedding,
+                &["abstract".to_string()],
+                "id",
+            )
+            .await
+            .unwrap();
+
+        let batch = &results[0];
+        let schema = batch.schema();
+
+        for prefix_field in &[
+            "_row_id",
+            "_source",
+            "_model",
+            "_status",
+            "_error",
+            "_latency_ms",
+        ] {
+            assert!(
+                schema.field_with_name(prefix_field).is_ok(),
+                "Output should contain prefix column '{prefix_field}'"
+            );
+        }
+
+        // _source should be the source_id
+        let source_col = batch
+            .column_by_name("_source")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(source_col.value(0), "patents");
+
+        // _latency_ms should be positive
+        let latency_col = batch
+            .column_by_name("_latency_ms")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert!(latency_col.value(0) > 0.0, "Latency should be positive");
+    }
+
+    #[tokio::test]
+    async fn process_large_input_without_oom() {
+        let session = setup_with_patents().await;
+
+        let results = session
+            .infer(
+                "patents",
+                "sentence-transformers/all-MiniLM-L6-v2",
+                ModelTask::Embedding,
+                &["abstract".to_string()],
+                "id",
+            )
+            .await
+            .unwrap();
+
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert!(total_rows > 0, "Should process at least some rows");
+
+        // Verify every row has a valid _status (no dropped rows)
+        for batch in &results {
+            let status = batch
+                .column_by_name("_status")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..status.len() {
+                let s = status.value(i);
+                assert!(
+                    s == "ok" || s == "error",
+                    "Every row should have a valid _status, got '{s}'"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn observer_receives_batch_notifications() {
+        struct CountingObserver {
+            batch_count: AtomicUsize,
+        }
+
+        impl InferenceObserver for CountingObserver {
+            fn on_batch(
+                &self,
+                _batch: &arrow::record_batch::RecordBatch,
+                _model_id: &str,
+                _latency: Duration,
+            ) {
+                self.batch_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let config = common::test_config(dir.path());
+        let observer = Arc::new(CountingObserver {
+            batch_count: AtomicUsize::new(0),
+        });
+        let session = InferenceSession::with_observer(
+            config,
+            Some(observer.clone() as Arc<dyn InferenceObserver>),
+        )
+        .await
+        .unwrap();
+
+        session
+            .add_source(
+                "patents",
+                SourceType::Local,
+                SourceConnection {
+                    url: Some(common::fixture_url("patents.parquet")),
+                    format: Some(FileFormat::Parquet),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let results = session
+            .infer(
+                "patents",
+                "sentence-transformers/all-MiniLM-L6-v2",
+                ModelTask::Embedding,
+                &["abstract".to_string()],
+                "id",
+            )
+            .await
+            .unwrap();
+
+        assert!(!results.is_empty());
+        assert!(
+            observer.batch_count.load(Ordering::Relaxed) > 0,
+            "Observer should have been called at least once"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_observer_runs_without_error() {
+        let session = setup_with_patents().await;
+
+        // No observer attached — should work fine
+        let results = session
+            .infer(
+                "patents",
+                "sentence-transformers/all-MiniLM-L6-v2",
+                ModelTask::Embedding,
+                &["abstract".to_string()],
+                "id",
+            )
+            .await
+            .unwrap();
+
+        assert!(!results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inference_with_nonexistent_model_returns_error() {
+        let session = setup_with_patents().await;
+
+        let result = session
+            .infer(
+                "patents",
+                "nonexistent-org/nonexistent-model-xyz",
+                ModelTask::Embedding,
+                &["abstract".to_string()],
+                "id",
+            )
+            .await;
+
+        assert!(result.is_err(), "Nonexistent model should fail inference");
+    }
+
+    #[tokio::test]
+    async fn inference_with_nonexistent_source_returns_error() {
+        let session = setup_session().await;
+
+        let result = session
+            .infer(
+                "no_such_source",
+                "sentence-transformers/all-MiniLM-L6-v2",
+                ModelTask::Embedding,
+                &["abstract".to_string()],
+                "id",
+            )
+            .await;
+
+        assert!(result.is_err(), "Nonexistent source should fail inference");
+    }
+
+    #[tokio::test]
+    async fn inference_with_nonexistent_column_returns_error() {
+        let session = setup_with_patents().await;
+
+        let result = session
+            .infer(
+                "patents",
+                "sentence-transformers/all-MiniLM-L6-v2",
+                ModelTask::Embedding,
+                &["nonexistent_column".to_string()],
+                "id",
+            )
+            .await;
+
+        assert!(result.is_err(), "Nonexistent content column should fail");
+    }
 }

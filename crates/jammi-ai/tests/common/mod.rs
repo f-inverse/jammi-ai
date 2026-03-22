@@ -19,3 +19,30 @@ pub fn fixtures_dir() -> PathBuf {
 pub fn fixture(name: &str) -> PathBuf {
     fixtures_dir().join(name)
 }
+
+/// URL for a fixture file suitable for DataFusion's ListingTable.
+#[allow(dead_code)]
+pub fn fixture_url(name: &str) -> String {
+    format!("file://{}", fixture(name).display())
+}
+
+/// Create a JammiConfig pointing at a temporary artifact directory.
+#[allow(dead_code)]
+pub fn test_config(artifact_dir: &Path) -> jammi_engine::config::JammiConfig {
+    jammi_engine::config::JammiConfig {
+        artifact_dir: artifact_dir.to_path_buf(),
+        gpu: jammi_engine::config::GpuConfig {
+            device: -1,
+            ..Default::default()
+        },
+        inference: jammi_engine::config::InferenceConfig {
+            batch_size: 8,
+            ..Default::default()
+        },
+        logging: jammi_engine::config::LoggingConfig {
+            level: "debug".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}

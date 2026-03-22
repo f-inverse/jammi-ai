@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use jammi_engine::catalog::model_repo::RegisterModelParams;
 use jammi_engine::error::{JammiError, Result};
 use tokio::sync::RwLock;
 
@@ -158,6 +159,20 @@ impl ModelCache {
         };
 
         let loaded = backend.load(&resolved, &self.device_config)?;
+
+        // Register model in catalog (idempotent — ignores if already registered)
+        let backend_str = format!("{:?}", resolved.backend).to_lowercase();
+        let task_str = format!("{task:?}").to_lowercase();
+        let _ = self.resolver.catalog().register_model(RegisterModelParams {
+            model_id,
+            version: 1,
+            model_type: "huggingface",
+            backend: &backend_str,
+            task: &task_str,
+            artifact_path: resolved.weights_paths.first().and_then(|p| p.to_str()),
+            config_json: None,
+            ..Default::default()
+        });
 
         let mut cache = self.inner.write().await;
         let ref_count = Arc::new(AtomicUsize::new(1));

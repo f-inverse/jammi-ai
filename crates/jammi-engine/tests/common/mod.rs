@@ -1,7 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use jammi_engine::config::JammiConfig;
-
 /// Workspace root — two levels up from any crate in `crates/<name>/`.
 pub fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -23,13 +21,15 @@ pub fn fixture(name: &str) -> PathBuf {
 }
 
 /// URL for a fixture file suitable for DataFusion's ListingTable.
+#[allow(dead_code)]
 pub fn fixture_url(name: &str) -> String {
     format!("file://{}", fixture(name).display())
 }
 
 /// Create a JammiConfig pointing at a temporary artifact directory.
-pub fn test_config(artifact_dir: &Path) -> JammiConfig {
-    JammiConfig {
+#[allow(dead_code)]
+pub fn test_config(artifact_dir: &Path) -> jammi_engine::config::JammiConfig {
+    jammi_engine::config::JammiConfig {
         artifact_dir: artifact_dir.to_path_buf(),
         gpu: jammi_engine::config::GpuConfig {
             device: -1,

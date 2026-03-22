@@ -6,9 +6,13 @@ pub mod tokenizer;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use arrow::array::ArrayRef;
 use backend::candle::CandleModel;
 use backend::ort::OrtModel;
+use jammi_engine::error::{JammiError, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::inference::adapter::BackendOutput;
 
 /// Unique identifier for a loaded model.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -97,7 +101,7 @@ impl ModelDimensions {
 
 /// A model loaded into memory, ready for inference.
 pub enum LoadedModel {
-    Candle(CandleModel),
+    Candle(Box<CandleModel>),
     Ort(OrtModel),
 }
 
@@ -113,6 +117,16 @@ impl LoadedModel {
         match self {
             LoadedModel::Candle(m) => Some(m.dimensions.hidden_size),
             LoadedModel::Ort(m) => Some(m.dimensions.hidden_size),
+        }
+    }
+
+    /// Run forward pass on Arrow content columns. Returns raw output.
+    pub fn forward(&self, content: &[ArrayRef], task: ModelTask) -> Result<BackendOutput> {
+        match self {
+            LoadedModel::Candle(m) => m.forward(content, task),
+            LoadedModel::Ort(_) => Err(JammiError::Inference(
+                "ORT forward pass not available in this build".into(),
+            )),
         }
     }
 }

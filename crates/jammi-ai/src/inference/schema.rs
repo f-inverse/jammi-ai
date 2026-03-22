@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use arrow::array::{ArrayRef, Float32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use jammi_engine::error::Result;
 
@@ -28,4 +29,42 @@ pub fn build_output_schema(
     let task_adapter = adapter::create_adapter_for_schema(*task);
     fields.extend(task_adapter.output_schema());
     Ok(Arc::new(Schema::new(fields)))
+}
+
+/// Build common prefix arrays for an output batch.
+pub fn build_prefix_columns(
+    keys: &ArrayRef,
+    source_id: &str,
+    model_id: &str,
+    row_status: &[bool],
+    row_errors: &[String],
+    latency_ms: f32,
+    row_count: usize,
+) -> Vec<ArrayRef> {
+    let status_strs: Vec<&str> = row_status
+        .iter()
+        .map(|&ok| if ok { "ok" } else { "error" })
+        .collect();
+    let status = StringArray::from(status_strs);
+
+    let errors: StringArray = row_errors
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            if row_status[i] {
+                None
+            } else {
+                Some(e.as_str())
+            }
+        })
+        .collect();
+
+    vec![
+        Arc::clone(keys),                                                      // _row_id
+        Arc::new(StringArray::from(vec![source_id; row_count])) as ArrayRef,   // _source
+        Arc::new(StringArray::from(vec![model_id; row_count])) as ArrayRef,    // _model
+        Arc::new(status) as ArrayRef,                                          // _status
+        Arc::new(errors) as ArrayRef,                                          // _error
+        Arc::new(Float32Array::from(vec![latency_ms; row_count])) as ArrayRef, // _latency_ms
+    ]
 }

@@ -1,14 +1,12 @@
 mod common;
 
 use jammi_ai::concurrency::GpuScheduler;
+#[allow(unused_imports)]
 use jammi_ai::model::{
-    backend::DeviceConfig, cache::ModelCache, resolver::ModelResolver, tokenizer::BatchEncoding,
-    tokenizer::TokenizerWrapper, BackendType, ModelId, ModelTask,
+    backend::DeviceConfig, cache::ModelCache, resolver::ModelResolver, tokenizer::TokenizerWrapper,
+    BackendType, ModelId, ModelTask,
 };
-use jammi_engine::catalog::{
-    model_repo::{ModelRecord, RegisterModelParams},
-    Catalog,
-};
+use jammi_engine::catalog::{model_repo::RegisterModelParams, Catalog};
 use std::sync::Arc;
 use tempfile::tempdir;
 

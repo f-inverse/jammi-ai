@@ -6,9 +6,12 @@ use arrow::datatypes::SchemaRef;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    stream::RecordBatchReceiverStreamBuilder, DisplayAs, DisplayFormatType, ExecutionPlan,
+    Partitioning, PlanProperties,
 };
 
+use crate::inference::observer::InferenceObserver;
+use crate::inference::runner::InferenceRunner;
 use crate::inference::schema::build_output_schema;
 use crate::model::cache::ModelCache;
 use crate::model::{BackendType, ModelTask};
@@ -26,6 +29,7 @@ pub struct InferenceExec {
     backend: Option<BackendType>,
     batch_size: usize,
     model_cache: Arc<ModelCache>,
+    observer: Option<Arc<dyn InferenceObserver>>,
     properties: PlanProperties,
 }
 
@@ -51,6 +55,7 @@ impl InferenceExec {
         backend: Option<BackendType>,
         batch_size: usize,
         model_cache: Arc<ModelCache>,
+        observer: Option<Arc<dyn InferenceObserver>>,
     ) -> jammi_engine::error::Result<Self> {
         let output_schema = build_output_schema(&task, &input.schema(), &key_column)?;
         let properties = Self::compute_properties(output_schema);
@@ -64,6 +69,7 @@ impl InferenceExec {
             backend,
             batch_size,
             model_cache,
+            observer,
             properties,
         })
     }
@@ -120,6 +126,7 @@ impl ExecutionPlan for InferenceExec {
                 self.backend,
                 self.batch_size,
                 Arc::clone(&self.model_cache),
+                self.observer.clone(),
             )
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
         ))
@@ -127,9 +134,31 @@ impl ExecutionPlan for InferenceExec {
 
     fn execute(
         &self,
-        _partition: usize,
-        _context: Arc<TaskContext>,
+        partition: usize,
+        context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
-        todo!("InferenceExec::execute — requires live model loading")
+        let input_stream = self.input.execute(partition, context)?;
+        let output_schema = self.schema();
+
+        // Bounded channel for backpressure (capacity = 2 batches)
+        let mut builder = RecordBatchReceiverStreamBuilder::new(output_schema.clone(), 2);
+        let tx = builder.tx();
+
+        // Build the runner with everything it needs
+        let runner = InferenceRunner::new(
+            Arc::clone(&self.model_cache),
+            self.model_id.clone(),
+            self.task,
+            self.content_columns.clone(),
+            self.key_column.clone(),
+            self.source_id.clone(),
+            self.backend,
+            self.batch_size,
+            self.observer.clone(),
+        );
+
+        builder.spawn(async move { runner.run(input_stream, tx, output_schema).await });
+
+        Ok(builder.build())
     }
 }

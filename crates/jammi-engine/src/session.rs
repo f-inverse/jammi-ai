@@ -110,6 +110,11 @@ impl JammiSession {
         &self.catalog
     }
 
+    /// Access the catalog as an Arc (for components that need shared ownership).
+    pub fn catalog_arc(&self) -> Arc<Catalog> {
+        Arc::clone(&self.catalog)
+    }
+
     /// Access the config.
     pub fn config(&self) -> &JammiConfig {
         &self.config

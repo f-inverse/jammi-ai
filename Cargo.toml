@@ -46,7 +46,8 @@ r2d2_sqlite = "0.33"
 candle-core = "0.9"
 candle-nn = "0.9"
 candle-transformers = "0.9"
-ort = { version = "2.0.0-rc.12", default-features = false }
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["download-binaries"] }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 
 # Python bindings
 pyo3 = { version = "0.28", features = ["abi3-py38", "extension-module"] }

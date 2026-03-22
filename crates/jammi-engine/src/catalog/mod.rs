@@ -1,4 +1,5 @@
 pub mod migrations;
+pub mod model_repo;
 pub mod schema;
 pub mod source_repo;
 

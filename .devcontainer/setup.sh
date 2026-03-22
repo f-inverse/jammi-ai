@@ -7,6 +7,7 @@ sudo apt-get install -y --no-install-recommends \
     protobuf-compiler \
     libprotobuf-dev \
     libonig-dev \
+    liblzma-dev \
     pkg-config
 
 # --- Rust toolchain (from rust-toolchain.toml) ---
@@ -19,6 +20,9 @@ pip install \
     pyarrow \
     pytest \
     pre-commit
+
+# --- Rust tools ---
+cargo install mdbook --locked
 
 # --- Pre-commit hooks ---
 pre-commit install

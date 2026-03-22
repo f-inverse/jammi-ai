@@ -5,7 +5,8 @@
   "features": {
     "ghcr.io/devcontainers/features/python:1": {
       "version": "3.12"
-    }
+    },
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1": {}
   },
 
   "postCreateCommand": "bash .devcontainer/setup.sh",
@@ -15,7 +16,7 @@
       "extensions": [
         "rust-lang.rust-analyzer",
         "tamasfe.even-better-toml",
-        "serayuzgur.crates",
+        "fill-labs.dependi",
         "vadimcn.vscode-lldb",
         "ms-python.python",
         "ms-python.vscode-pylance",

@@ -30,6 +30,9 @@ pub struct RegisterModelParams<'a> {
     pub config_json: Option<&'a str>,
 }
 
+const SELECT_COLS: &str =
+    "model_id, name, model_type, task, backend, version, status, metadata, created_at";
+
 impl Catalog {
     /// Register a model in the catalog.
     pub fn register_model(&self, params: RegisterModelParams<'_>) -> Result<()> {
@@ -43,7 +46,7 @@ impl Catalog {
         .to_string();
 
         conn.execute(
-            "INSERT INTO models (model_id, name, model_type, source, backend, dimensions, status, metadata)
+            "INSERT INTO models (model_id, name, model_type, task, backend, version, status, metadata)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'registered', ?7)",
             rusqlite::params![
                 pk,
@@ -61,20 +64,18 @@ impl Catalog {
     /// Get the latest version of a model by name.
     pub fn get_model(&self, model_id: &str) -> Result<Option<ModelRecord>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT model_id, name, model_type, source, backend, dimensions, status, metadata, created_at
-             FROM models WHERE name = ?1 ORDER BY dimensions DESC LIMIT 1",
-        )?;
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM models WHERE name = ?1 ORDER BY version DESC LIMIT 1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         Self::query_one_model(&mut stmt, rusqlite::params![model_id])
     }
 
     /// Get a specific version of a model.
     pub fn get_model_version(&self, model_id: &str, version: i32) -> Result<Option<ModelRecord>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT model_id, name, model_type, source, backend, dimensions, status, metadata, created_at
-             FROM models WHERE name = ?1 AND dimensions = ?2",
-        )?;
+        let sql = format!("SELECT {SELECT_COLS} FROM models WHERE name = ?1 AND version = ?2");
+        let mut stmt = conn.prepare(&sql)?;
         Self::query_one_model(&mut stmt, rusqlite::params![model_id, version])
     }
 
@@ -92,10 +93,8 @@ impl Catalog {
     /// List all registered models.
     pub fn list_models(&self) -> Result<Vec<ModelRecord>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT model_id, name, model_type, source, backend, dimensions, status, metadata, created_at
-             FROM models ORDER BY created_at",
-        )?;
+        let sql = format!("SELECT {SELECT_COLS} FROM models ORDER BY created_at");
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |row| Ok(parse_model_row(row)))?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
@@ -113,6 +112,7 @@ impl Catalog {
     }
 }
 
+/// Parse: model_id, name, model_type, task, backend, version, status, metadata, created_at
 fn parse_model_row(row: &rusqlite::Row<'_>) -> ModelRecord {
     let _pk: String = row.get(0).unwrap_or_default();
     let name: String = row.get(1).unwrap_or_default();

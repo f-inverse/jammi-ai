@@ -30,8 +30,10 @@ CREATE TABLE models (
     model_id    TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
     model_type  TEXT NOT NULL,
-    source      TEXT NOT NULL,
+    task        TEXT NOT NULL,
     backend     TEXT,
+    version     INTEGER NOT NULL DEFAULT 1,
+    source      TEXT,
     dimensions  INTEGER,
     status      TEXT NOT NULL DEFAULT 'available',
     metadata    TEXT,
@@ -39,6 +41,7 @@ CREATE TABLE models (
     updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 CREATE INDEX idx_models_type ON models(model_type);
+CREATE INDEX idx_models_task ON models(task);
 
 CREATE TABLE fine_tune_jobs (
     job_id          TEXT PRIMARY KEY,

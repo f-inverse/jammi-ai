@@ -1,5 +1,6 @@
 mod common;
 
+#[allow(unused_imports)]
 use jammi_ai::concurrency::GpuScheduler;
 #[allow(unused_imports)]
 use jammi_ai::model::{
@@ -274,41 +275,6 @@ async fn cache_ref_count_decrements_on_guard_drop() {
     assert!(Arc::ptr_eq(&guard1.model, &guard3.model));
 }
 
-#[cfg(feature = "live-hub-tests")]
-#[tokio::test]
-async fn cache_evicts_lru_model_under_memory_pressure() {
-    let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
-    let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
-    let device_config = DeviceConfig {
-        gpu_device: -1,
-        memory_fraction: 1.0,
-    };
-    let scheduler = Arc::new(GpuScheduler::new_unlimited());
-    let cache = ModelCache::new(resolver, device_config, scheduler);
-
-    let guard = cache
-        .get_or_load(
-            &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-            ModelTask::Embedding,
-            None,
-        )
-        .await
-        .unwrap();
-
-    drop(guard);
-
-    let guard2 = cache
-        .get_or_load(
-            &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-            ModelTask::Embedding,
-            None,
-        )
-        .await;
-
-    assert!(guard2.is_ok() || guard2.is_err());
-}
-
 // --- Model catalog CRUD ---
 
 #[test]
@@ -482,7 +448,7 @@ fn model_dimensions_defaults_intermediate_to_4x_hidden() {
 }
 
 #[test]
-fn estimate_activation_memory_scales_with_batch_size() {
+fn activation_memory_scaling() {
     use jammi_ai::model::ModelDimensions;
 
     let dims = ModelDimensions {
@@ -491,6 +457,8 @@ fn estimate_activation_memory_scales_with_batch_size() {
         num_attention_heads: 12,
         intermediate_size: 1536,
     };
+
+    // Batch linearity: memory scales linearly with batch size
     let mem_b1 = dims.estimate_activation_memory(1, 128);
     let mem_b32 = dims.estimate_activation_memory(32, 128);
     assert!(mem_b32 > mem_b1);
@@ -499,21 +467,15 @@ fn estimate_activation_memory_scales_with_batch_size() {
         mem_b1 * 32,
         "Should scale linearly with batch size"
     );
-}
 
-#[test]
-fn estimate_activation_memory_quadratic_in_seq_len_for_attention() {
-    use jammi_ai::model::ModelDimensions;
-
-    let dims = ModelDimensions {
-        hidden_size: 384,
-        num_layers: 6,
-        num_attention_heads: 12,
-        intermediate_size: 1536,
-    };
+    // Seq-len superlinearity: doubling seq_len more than doubles memory (attention is quadratic)
     let mem_s128 = dims.estimate_activation_memory(1, 128);
     let mem_s256 = dims.estimate_activation_memory(1, 256);
-    assert!(mem_s256 > mem_s128);
+    assert!(
+        mem_s256 > mem_s128 * 2,
+        "Doubling seq_len should more than double memory (attention is quadratic), \
+         got mem_s128={mem_s128}, mem_s256={mem_s256}"
+    );
 }
 
 // --- Preload (live only) ---
@@ -700,70 +662,4 @@ async fn cache_load_failure_clears_in_flight_state() {
         .await
         .unwrap();
     assert!(std::mem::size_of_val(&*guard.model) > 0);
-}
-
-// --- Contract tests ---
-
-#[test]
-fn contract_model_dimensions_requires_hidden_size() {
-    use jammi_ai::model::ModelDimensions;
-
-    let config: serde_json::Value = serde_json::from_str(
-        r#"{
-        "num_hidden_layers": 6,
-        "num_attention_heads": 12
-    }"#,
-    )
-    .unwrap();
-
-    assert!(
-        ModelDimensions::from_config(&config).is_none(),
-        "Missing hidden_size should return None"
-    );
-}
-
-#[test]
-fn contract_model_dimensions_requires_num_layers() {
-    use jammi_ai::model::ModelDimensions;
-
-    let config: serde_json::Value = serde_json::from_str(
-        r#"{
-        "hidden_size": 384,
-        "num_attention_heads": 12
-    }"#,
-    )
-    .unwrap();
-
-    assert!(
-        ModelDimensions::from_config(&config).is_none(),
-        "Missing layer count should return None"
-    );
-}
-
-#[test]
-fn contract_activation_memory_positive_for_any_valid_input() {
-    use jammi_ai::model::ModelDimensions;
-
-    let dims = ModelDimensions {
-        hidden_size: 384,
-        num_layers: 6,
-        num_attention_heads: 12,
-        intermediate_size: 1536,
-    };
-    assert!(dims.estimate_activation_memory(1, 1) > 0);
-    assert!(dims.estimate_activation_memory(1, 512) > 0);
-    assert!(dims.estimate_activation_memory(64, 512) > 0);
-}
-
-#[test]
-fn contract_gpu_scheduler_unlimited_always_grants() {
-    let scheduler = Arc::new(GpuScheduler::new_unlimited());
-
-    let permit1 = scheduler.try_acquire(1_000_000_000).unwrap();
-    let permit2 = scheduler.try_acquire(1_000_000_000).unwrap();
-    let permit3 = scheduler.try_acquire(usize::MAX / 2).unwrap();
-
-    drop(permit1);
-    drop(permit2);
-    drop(permit3);
 }

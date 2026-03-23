@@ -6,14 +6,13 @@ use jammi_engine::{
 };
 use tempfile::tempdir;
 
-// --- Source registration and querying ---
-
 #[tokio::test]
-async fn register_parquet_source_and_query() {
+async fn register_and_query_multiple_formats() {
     let dir = tempdir().unwrap();
     let config = common::test_config(dir.path());
     let session = JammiSession::new(config).await.unwrap();
 
+    // Parquet
     session
         .add_source(
             "patents",
@@ -35,14 +34,8 @@ async fn register_parquet_source_and_query() {
     assert!(results[0].num_rows() <= 5);
     assert!(results[0].schema().field_with_name("id").is_ok());
     assert!(results[0].schema().field_with_name("title").is_ok());
-}
 
-#[tokio::test]
-async fn register_csv_source_and_query() {
-    let dir = tempdir().unwrap();
-    let config = common::test_config(dir.path());
-    let session = JammiSession::new(config).await.unwrap();
-
+    // CSV
     session
         .add_source(
             "scores",
@@ -60,7 +53,7 @@ async fn register_csv_source_and_query() {
         .sql("SELECT name, score FROM scores.public.scores WHERE score > 0.6")
         .await
         .unwrap();
-    assert_eq!(results[0].num_rows(), 2); // alpha (0.9), beta (0.7)
+    assert_eq!(results[0].num_rows(), 2);
 }
 
 #[tokio::test]
@@ -89,27 +82,25 @@ async fn query_with_filter_and_order() {
 
     let batch = &results[0];
     assert!(batch.num_rows() >= 1);
-    let years = batch.column_by_name("year").unwrap();
-    let year_arr = years
+    let years = batch
+        .column_by_name("year")
+        .unwrap()
         .as_any()
         .downcast_ref::<arrow::array::Int64Array>()
         .unwrap();
-    for i in 1..year_arr.len() {
+    for i in 1..years.len() {
         assert!(
-            year_arr.value(i - 1) >= year_arr.value(i),
+            years.value(i - 1) >= years.value(i),
             "Should be DESC ordered"
         );
     }
 }
-
-// --- Source persistence ---
 
 #[tokio::test]
 async fn source_persists_across_sessions() {
     let dir = tempdir().unwrap();
     let config = common::test_config(dir.path());
 
-    // Session 1: register
     {
         let session = JammiSession::new(config.clone()).await.unwrap();
         session
@@ -126,7 +117,6 @@ async fn source_persists_across_sessions() {
             .unwrap();
     }
 
-    // Session 2: verify
     {
         let session = JammiSession::new(config).await.unwrap();
         let sources = session.catalog().list_sources().unwrap();
@@ -134,10 +124,8 @@ async fn source_persists_across_sessions() {
     }
 }
 
-// --- Source CRUD ---
-
 #[tokio::test]
-async fn source_list_returns_registered_sources() {
+async fn source_crud_list_and_remove() {
     let dir = tempdir().unwrap();
     let config = common::test_config(dir.path());
     let session = JammiSession::new(config).await.unwrap();
@@ -172,33 +160,12 @@ async fn source_list_returns_registered_sources() {
     let ids: Vec<&str> = sources.iter().map(|s| s.source_id.as_str()).collect();
     assert!(ids.contains(&"src_a"));
     assert!(ids.contains(&"src_b"));
-}
 
-#[tokio::test]
-async fn source_removal() {
-    let dir = tempdir().unwrap();
-    let config = common::test_config(dir.path());
-    let session = JammiSession::new(config).await.unwrap();
-
-    session
-        .add_source(
-            "to_remove",
-            SourceType::Local,
-            SourceConnection {
-                url: Some(common::fixture_url("patents.parquet")),
-                format: Some(FileFormat::Parquet),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-    session.catalog().remove_source("to_remove").unwrap();
+    session.catalog().remove_source("src_a").unwrap();
     let sources = session.catalog().list_sources().unwrap();
-    assert!(!sources.iter().any(|s| s.source_id == "to_remove"));
+    assert!(!sources.iter().any(|s| s.source_id == "src_a"));
+    assert!(sources.iter().any(|s| s.source_id == "src_b"));
 }
-
-// --- Config integration ---
 
 #[tokio::test]
 async fn session_respects_config_batch_size() {
@@ -227,8 +194,6 @@ async fn session_respects_config_batch_size() {
     let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 20);
 }
-
-// --- Error cases ---
 
 #[tokio::test]
 async fn query_nonexistent_source_fails() {

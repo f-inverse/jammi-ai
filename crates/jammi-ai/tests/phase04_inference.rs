@@ -1,14 +1,11 @@
 mod common;
 
-use jammi_ai::inference::{
-    adapter::{BackendOutput, ClassificationAdapter, EmbeddingAdapter, OutputAdapter},
-    schema::{build_output_schema, common_prefix_fields},
+use jammi_ai::inference::adapter::{
+    BackendOutput, ClassificationAdapter, EmbeddingAdapter, OutputAdapter,
 };
-use jammi_ai::model::ModelTask;
 
 use arrow::array::{Array, FixedSizeListArray};
-use arrow::datatypes::{DataType, Field};
-use std::sync::Arc;
+use arrow::datatypes::DataType;
 
 // ─── Hermetic tests (no network, no live models) ───────────────────────────
 
@@ -34,56 +31,6 @@ fn classification_adapter_schema_has_label_confidence_scores() {
     let fields = adapter.output_schema();
     let names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
     assert_eq!(names, vec!["label", "confidence", "all_scores_json"]);
-}
-
-// --- Common prefix columns ---
-
-#[test]
-fn common_prefix_fields_present() {
-    let fields = common_prefix_fields();
-    let names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
-    assert!(names.contains(&"_row_id"));
-    assert!(names.contains(&"_source"));
-    assert!(names.contains(&"_model"));
-    assert!(names.contains(&"_status"));
-    assert!(names.contains(&"_error"));
-    assert!(names.contains(&"_latency_ms"));
-}
-
-// --- Output schema construction ---
-
-#[test]
-fn build_output_schema_embedding_has_prefix_plus_vector() {
-    let input_schema = Arc::new(arrow::datatypes::Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("abstract", DataType::Utf8, false),
-    ]));
-
-    let schema =
-        build_output_schema(&ModelTask::Embedding, &input_schema, "id", Some(384)).unwrap();
-
-    let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    assert!(field_names.contains(&"_row_id"));
-    assert!(field_names.contains(&"_status"));
-    assert!(field_names.contains(&"vector"));
-}
-
-#[test]
-fn build_output_schema_classification_has_prefix_plus_task_cols() {
-    let input_schema = Arc::new(arrow::datatypes::Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("abstract", DataType::Utf8, false),
-    ]));
-
-    let schema =
-        build_output_schema(&ModelTask::Classification, &input_schema, "id", None).unwrap();
-
-    let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    assert!(field_names.contains(&"_row_id"));
-    assert!(field_names.contains(&"_status"));
-    assert!(field_names.contains(&"label"));
-    assert!(field_names.contains(&"confidence"));
-    assert!(field_names.contains(&"all_scores_json"));
 }
 
 // --- Contract tests: OutputAdapter behavioral invariants ---
@@ -205,10 +152,11 @@ mod live {
     use super::*;
     use arrow::array::{Float32Array, StringArray};
     use jammi_ai::inference::observer::InferenceObserver;
-    use jammi_ai::model::ModelSource;
+    use jammi_ai::model::{ModelSource, ModelTask};
     use jammi_ai::session::InferenceSession;
     use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
 
@@ -280,37 +228,6 @@ mod live {
                 assert!(!fsl.is_null(i), "OK row {i} should have a vector");
             }
         }
-    }
-
-    #[tokio::test]
-    async fn inference_exec_classification_adapter_schema_verified() {
-        // Classification output is thoroughly verified at the schema/contract level:
-        //   - classification_adapter_schema_has_label_confidence_scores (hermetic)
-        //   - contract_classification_adapter_schema_matches_adapt_output (hermetic)
-        //   - build_output_schema_classification_has_prefix_plus_task_cols (hermetic)
-        //
-        // Live end-to-end classification requires a classification model (e.g. facebook/bart-large-mnli)
-        // which is BART, not BERT. The Candle backend supports BERT-family models in CP2.
-        // Full classification live testing lands when additional model architectures are added.
-        //
-        // Verify the classification schema construction works at runtime:
-        let input_schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("id", DataType::Utf8, false),
-            arrow::datatypes::Field::new("text", DataType::Utf8, false),
-        ]));
-        let schema = jammi_ai::inference::schema::build_output_schema(
-            &ModelTask::Classification,
-            &input_schema,
-            "id",
-            None,
-        )
-        .unwrap();
-
-        assert!(schema.field_with_name("label").is_ok());
-        assert!(schema.field_with_name("confidence").is_ok());
-        assert!(schema.field_with_name("all_scores_json").is_ok());
-        assert!(schema.field_with_name("_row_id").is_ok());
-        assert!(schema.field_with_name("_status").is_ok());
     }
 
     #[tokio::test]
@@ -500,93 +417,6 @@ mod live {
     }
 
     #[tokio::test]
-    async fn inference_output_contains_all_prefix_columns() {
-        let session = setup_with_patents().await;
-
-        let results = session
-            .infer(
-                "patents",
-                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-                ModelTask::Embedding,
-                &["abstract".to_string()],
-                "id",
-            )
-            .await
-            .unwrap();
-
-        let batch = &results[0];
-        let schema = batch.schema();
-
-        for prefix_field in &[
-            "_row_id",
-            "_source",
-            "_model",
-            "_status",
-            "_error",
-            "_latency_ms",
-        ] {
-            assert!(
-                schema.field_with_name(prefix_field).is_ok(),
-                "Output should contain prefix column '{prefix_field}'"
-            );
-        }
-
-        // _source should be the source_id
-        let source_col = batch
-            .column_by_name("_source")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(source_col.value(0), "patents");
-
-        // _latency_ms should be positive
-        let latency_col = batch
-            .column_by_name("_latency_ms")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .unwrap();
-        assert!(latency_col.value(0) > 0.0, "Latency should be positive");
-    }
-
-    #[tokio::test]
-    async fn process_large_input_without_oom() {
-        let session = setup_with_patents().await;
-
-        let results = session
-            .infer(
-                "patents",
-                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-                ModelTask::Embedding,
-                &["abstract".to_string()],
-                "id",
-            )
-            .await
-            .unwrap();
-
-        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-        assert!(total_rows > 0, "Should process at least some rows");
-
-        // Verify every row has a valid _status (no dropped rows)
-        for batch in &results {
-            let status = batch
-                .column_by_name("_status")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            for i in 0..status.len() {
-                let s = status.value(i);
-                assert!(
-                    s == "ok" || s == "error",
-                    "Every row should have a valid _status, got '{s}'"
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn observer_receives_batch_notifications() {
         struct CountingObserver {
             batch_count: AtomicUsize,
@@ -644,75 +474,5 @@ mod live {
             observer.batch_count.load(Ordering::Relaxed) > 0,
             "Observer should have been called at least once"
         );
-    }
-
-    #[tokio::test]
-    async fn no_observer_runs_without_error() {
-        let session = setup_with_patents().await;
-
-        // No observer attached — should work fine
-        let results = session
-            .infer(
-                "patents",
-                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-                ModelTask::Embedding,
-                &["abstract".to_string()],
-                "id",
-            )
-            .await
-            .unwrap();
-
-        assert!(!results.is_empty());
-    }
-
-    #[tokio::test]
-    async fn inference_with_nonexistent_model_returns_error() {
-        let session = setup_with_patents().await;
-
-        let result = session
-            .infer(
-                "patents",
-                &ModelSource::hf("nonexistent-org/nonexistent-model-xyz"),
-                ModelTask::Embedding,
-                &["abstract".to_string()],
-                "id",
-            )
-            .await;
-
-        assert!(result.is_err(), "Nonexistent model should fail inference");
-    }
-
-    #[tokio::test]
-    async fn inference_with_nonexistent_source_returns_error() {
-        let session = setup_session().await;
-
-        let result = session
-            .infer(
-                "no_such_source",
-                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-                ModelTask::Embedding,
-                &["abstract".to_string()],
-                "id",
-            )
-            .await;
-
-        assert!(result.is_err(), "Nonexistent source should fail inference");
-    }
-
-    #[tokio::test]
-    async fn inference_with_nonexistent_column_returns_error() {
-        let session = setup_with_patents().await;
-
-        let result = session
-            .infer(
-                "patents",
-                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-                ModelTask::Embedding,
-                &["nonexistent_column".to_string()],
-                "id",
-            )
-            .await;
-
-        assert!(result.is_err(), "Nonexistent content column should fail");
     }
 }

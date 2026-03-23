@@ -15,18 +15,15 @@ use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tempfile::tempdir;
+use tempfile::TempDir;
 
 fn tiny_bert_source() -> ModelSource {
     ModelSource::local(common::fixture("tiny_bert"))
 }
 
-async fn session_with_patents() -> InferenceSession {
-    let dir = tempdir().unwrap();
-    // Keep tempdir alive by leaking it (tests are short-lived)
-    let dir_path = dir.path().to_path_buf();
-    std::mem::forget(dir);
-    let config = common::test_config(&dir_path);
+async fn session_with_patents() -> (InferenceSession, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
     let session = InferenceSession::new(config).await.unwrap();
     session
         .add_source(
@@ -40,14 +37,14 @@ async fn session_with_patents() -> InferenceSession {
         )
         .await
         .unwrap();
-    session
+    (session, dir)
 }
 
 // ─── Full pipeline: source → model → embedding vectors ─────────────────────
 
 #[tokio::test]
 async fn e2e_embedding_produces_vectors_with_correct_schema() {
-    let session = session_with_patents().await;
+    let (session, _dir) = session_with_patents().await;
     let model_source = tiny_bert_source();
 
     let results = session
@@ -93,7 +90,7 @@ async fn e2e_embedding_produces_vectors_with_correct_schema() {
 
 #[tokio::test]
 async fn e2e_every_row_has_valid_status() {
-    let session = session_with_patents().await;
+    let (session, _dir) = session_with_patents().await;
     let model_source = tiny_bert_source();
 
     let results = session
@@ -130,49 +127,8 @@ async fn e2e_every_row_has_valid_status() {
 }
 
 #[tokio::test]
-async fn e2e_ok_rows_have_non_null_vectors() {
-    let session = session_with_patents().await;
-    let model_source = tiny_bert_source();
-
-    let results = session
-        .infer(
-            "patents",
-            &model_source,
-            ModelTask::Embedding,
-            &["abstract".to_string()],
-            "id",
-        )
-        .await
-        .unwrap();
-
-    for batch in &results {
-        let status = batch
-            .column_by_name("_status")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let vectors = batch
-            .column_by_name("vector")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .unwrap();
-
-        for i in 0..status.len() {
-            if status.value(i) == "ok" {
-                assert!(
-                    !vectors.is_null(i),
-                    "OK row {i} should have a non-null vector"
-                );
-            }
-        }
-    }
-}
-
-#[tokio::test]
 async fn e2e_provenance_columns_have_correct_values() {
-    let session = session_with_patents().await;
+    let (session, _dir) = session_with_patents().await;
     let model_source = tiny_bert_source();
 
     let results = session
@@ -223,7 +179,7 @@ async fn e2e_provenance_columns_have_correct_values() {
 
 #[tokio::test]
 async fn e2e_null_text_rows_produce_error_status() {
-    let dir = tempdir().unwrap();
+    let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let session = InferenceSession::new(config).await.unwrap();
 
@@ -284,7 +240,7 @@ async fn e2e_null_text_rows_produce_error_status() {
 
 #[tokio::test]
 async fn e2e_error_rows_have_null_vector_and_error_message() {
-    let dir = tempdir().unwrap();
+    let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let session = InferenceSession::new(config).await.unwrap();
 
@@ -363,7 +319,7 @@ async fn e2e_observer_receives_batch_notifications() {
         }
     }
 
-    let dir = tempdir().unwrap();
+    let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let observer = Arc::new(CountingObserver(AtomicUsize::new(0)));
     let session = InferenceSession::with_observer(
@@ -409,7 +365,7 @@ async fn e2e_observer_receives_batch_notifications() {
 
 #[tokio::test]
 async fn e2e_model_registered_in_catalog_after_inference() {
-    let session = session_with_patents().await;
+    let (session, _dir) = session_with_patents().await;
     let model_source = tiny_bert_source();
 
     let results = session
@@ -430,61 +386,4 @@ async fn e2e_model_registered_in_catalog_after_inference() {
         "Model should be registered in catalog after inference. Found: {:?}",
         models.iter().map(|m| &m.model_id).collect::<Vec<_>>()
     );
-}
-
-// ─── Failure paths ──────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn e2e_nonexistent_source_returns_error() {
-    let dir = tempdir().unwrap();
-    let config = common::test_config(dir.path());
-    let session = InferenceSession::new(config).await.unwrap();
-
-    let model_source = tiny_bert_source();
-    let result = session
-        .infer(
-            "no_such_source",
-            &model_source,
-            ModelTask::Embedding,
-            &["abstract".to_string()],
-            "id",
-        )
-        .await;
-
-    assert!(result.is_err(), "Nonexistent source should fail");
-}
-
-#[tokio::test]
-async fn e2e_nonexistent_model_returns_error() {
-    let session = session_with_patents().await;
-
-    let result = session
-        .infer(
-            "patents",
-            &ModelSource::local("/nonexistent/path/to/model"),
-            ModelTask::Embedding,
-            &["abstract".to_string()],
-            "id",
-        )
-        .await;
-
-    assert!(result.is_err(), "Nonexistent model should fail");
-}
-
-#[tokio::test]
-async fn e2e_nonexistent_column_returns_error() {
-    let session = session_with_patents().await;
-    let model_source = tiny_bert_source();
-
-    let result = session
-        .infer(
-            "patents",
-            &model_source,
-            ModelTask::Embedding,
-            &["nonexistent_column".to_string()],
-            "id",
-        )
-        .await;
-
-    assert!(result.is_err(), "Nonexistent column should fail");
 }

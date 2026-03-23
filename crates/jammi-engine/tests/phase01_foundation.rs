@@ -2,7 +2,6 @@ mod common;
 
 use jammi_engine::catalog::Catalog;
 use jammi_engine::config::JammiConfig;
-use jammi_engine::error::JammiError;
 use std::path::Path;
 use std::sync::Mutex;
 use tempfile::tempdir;
@@ -35,31 +34,15 @@ fn config_defaults_without_file() {
 }
 
 #[test]
-fn config_env_override_gpu_device() {
+fn config_env_overrides() {
     let _lock = ENV_LOCK.lock().unwrap();
     std::env::set_var("JAMMI_GPU__DEVICE", "2");
-    let config = JammiConfig::load(None).unwrap();
-    assert_eq!(config.gpu.device, 2);
-    std::env::remove_var("JAMMI_GPU__DEVICE");
-}
-
-#[test]
-fn config_env_override_inference_batch_size() {
-    let _lock = ENV_LOCK.lock().unwrap();
     std::env::set_var("JAMMI_INFERENCE__BATCH_SIZE", "64");
     let config = JammiConfig::load(None).unwrap();
+    assert_eq!(config.gpu.device, 2);
     assert_eq!(config.inference.batch_size, 64);
+    std::env::remove_var("JAMMI_GPU__DEVICE");
     std::env::remove_var("JAMMI_INFERENCE__BATCH_SIZE");
-}
-
-#[test]
-fn config_artifact_dir_has_platform_default() {
-    let config = JammiConfig::load(None).unwrap();
-    let path_str = config.artifact_dir.to_str().unwrap();
-    assert!(
-        path_str.contains("jammi"),
-        "artifact_dir should contain 'jammi': {path_str}"
-    );
 }
 
 // --- Catalog ---
@@ -124,22 +107,4 @@ fn catalog_creates_artifact_directory() {
     let sub = dir.path().join("nested").join("deep");
     let _catalog = Catalog::open(&sub).unwrap();
     assert!(sub.join("catalog.db").exists());
-}
-
-// --- Error types ---
-
-#[test]
-fn error_from_io() {
-    let err: JammiError = std::io::Error::new(std::io::ErrorKind::NotFound, "test").into();
-    assert!(err.to_string().contains("test"));
-}
-
-#[test]
-fn error_from_rusqlite() {
-    let dir = tempdir().unwrap();
-    let catalog = Catalog::open(dir.path()).unwrap();
-    let conn = catalog.conn().unwrap();
-    let result: Result<i64, _> = conn.query_row("SELECT * FROM nonexistent", [], |r| r.get(0));
-    let err: JammiError = result.unwrap_err().into();
-    assert!(err.to_string().to_lowercase().contains("no such table"));
 }

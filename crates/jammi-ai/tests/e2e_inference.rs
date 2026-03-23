@@ -9,7 +9,7 @@ mod common;
 use arrow::array::{Array, FixedSizeListArray, Float32Array, StringArray};
 use arrow::datatypes::DataType;
 use jammi_ai::inference::observer::InferenceObserver;
-use jammi_ai::model::ModelTask;
+use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
 
-fn tiny_bert_path() -> String {
-    common::fixture("tiny_bert").to_str().unwrap().to_string()
+fn tiny_bert_source() -> ModelSource {
+    ModelSource::local(common::fixture("tiny_bert"))
 }
 
 async fn session_with_patents() -> InferenceSession {
@@ -48,12 +48,12 @@ async fn session_with_patents() -> InferenceSession {
 #[tokio::test]
 async fn e2e_embedding_produces_vectors_with_correct_schema() {
     let session = session_with_patents().await;
-    let model_path = tiny_bert_path();
+    let model_source = tiny_bert_source();
 
     let results = session
         .infer(
             "patents",
-            &model_path,
+            &model_source,
             ModelTask::Embedding,
             &["abstract".to_string()],
             "id",
@@ -94,12 +94,12 @@ async fn e2e_embedding_produces_vectors_with_correct_schema() {
 #[tokio::test]
 async fn e2e_every_row_has_valid_status() {
     let session = session_with_patents().await;
-    let model_path = tiny_bert_path();
+    let model_source = tiny_bert_source();
 
     let results = session
         .infer(
             "patents",
-            &model_path,
+            &model_source,
             ModelTask::Embedding,
             &["abstract".to_string()],
             "id",
@@ -132,12 +132,12 @@ async fn e2e_every_row_has_valid_status() {
 #[tokio::test]
 async fn e2e_ok_rows_have_non_null_vectors() {
     let session = session_with_patents().await;
-    let model_path = tiny_bert_path();
+    let model_source = tiny_bert_source();
 
     let results = session
         .infer(
             "patents",
-            &model_path,
+            &model_source,
             ModelTask::Embedding,
             &["abstract".to_string()],
             "id",
@@ -173,12 +173,12 @@ async fn e2e_ok_rows_have_non_null_vectors() {
 #[tokio::test]
 async fn e2e_provenance_columns_have_correct_values() {
     let session = session_with_patents().await;
-    let model_path = tiny_bert_path();
+    let model_source = tiny_bert_source();
 
     let results = session
         .infer(
             "patents",
-            &model_path,
+            &model_source,
             ModelTask::Embedding,
             &["abstract".to_string()],
             "id",
@@ -240,11 +240,11 @@ async fn e2e_null_text_rows_produce_error_status() {
         .await
         .unwrap();
 
-    let model_path = tiny_bert_path();
+    let model_source = tiny_bert_source();
     let results = session
         .infer(
             "patents_nulls",
-            &model_path,
+            &model_source,
             ModelTask::Embedding,
             &["abstract".to_string()],
             "id",
@@ -301,11 +301,11 @@ async fn e2e_error_rows_have_null_vector_and_error_message() {
         .await
         .unwrap();
 
-    let model_path = tiny_bert_path();
+    let model_source = tiny_bert_source();
     let results = session
         .infer(
             "patents_nulls",
-            &model_path,
+            &model_source,
             ModelTask::Embedding,
             &["abstract".to_string()],
             "id",
@@ -386,11 +386,11 @@ async fn e2e_observer_receives_batch_notifications() {
         .await
         .unwrap();
 
-    let model_path = tiny_bert_path();
+    let model_source = tiny_bert_source();
     let results = session
         .infer(
             "patents",
-            &model_path,
+            &model_source,
             ModelTask::Embedding,
             &["abstract".to_string()],
             "id",
@@ -410,12 +410,12 @@ async fn e2e_observer_receives_batch_notifications() {
 #[tokio::test]
 async fn e2e_model_registered_in_catalog_after_inference() {
     let session = session_with_patents().await;
-    let model_path = tiny_bert_path();
+    let model_source = tiny_bert_source();
 
     let results = session
         .infer(
             "patents",
-            &model_path,
+            &model_source,
             ModelTask::Embedding,
             &["abstract".to_string()],
             "id",
@@ -440,11 +440,11 @@ async fn e2e_nonexistent_source_returns_error() {
     let config = common::test_config(dir.path());
     let session = InferenceSession::new(config).await.unwrap();
 
-    let model_path = tiny_bert_path();
+    let model_source = tiny_bert_source();
     let result = session
         .infer(
             "no_such_source",
-            &model_path,
+            &model_source,
             ModelTask::Embedding,
             &["abstract".to_string()],
             "id",
@@ -461,7 +461,7 @@ async fn e2e_nonexistent_model_returns_error() {
     let result = session
         .infer(
             "patents",
-            "/nonexistent/path/to/model",
+            &ModelSource::local("/nonexistent/path/to/model"),
             ModelTask::Embedding,
             &["abstract".to_string()],
             "id",
@@ -474,12 +474,12 @@ async fn e2e_nonexistent_model_returns_error() {
 #[tokio::test]
 async fn e2e_nonexistent_column_returns_error() {
     let session = session_with_patents().await;
-    let model_path = tiny_bert_path();
+    let model_source = tiny_bert_source();
 
     let result = session
         .infer(
             "patents",
-            &model_path,
+            &model_source,
             ModelTask::Embedding,
             &["nonexistent_column".to_string()],
             "id",

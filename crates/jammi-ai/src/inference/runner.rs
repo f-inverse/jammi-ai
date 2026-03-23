@@ -13,13 +13,13 @@ use super::observer::InferenceObserver;
 use super::schema::build_prefix_columns;
 use super::{extract_column, extract_columns, slice_columns};
 use crate::model::cache::ModelCache;
-use crate::model::{BackendType, LoadedModel, ModelTask};
+use crate::model::{BackendType, LoadedModel, ModelSource, ModelTask};
 
 /// Processes input RecordBatches through a model, handling batching,
 /// error recovery, and dynamic batch sizing.
 pub struct InferenceRunner {
     model_cache: Arc<ModelCache>,
-    model_id: String,
+    source: ModelSource,
     task: ModelTask,
     content_columns: Vec<String>,
     key_column: String,
@@ -34,7 +34,7 @@ impl InferenceRunner {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         model_cache: Arc<ModelCache>,
-        model_id: String,
+        source: ModelSource,
         task: ModelTask,
         content_columns: Vec<String>,
         key_column: String,
@@ -45,7 +45,7 @@ impl InferenceRunner {
     ) -> Self {
         Self {
             model_cache,
-            model_id,
+            source,
             task,
             content_columns,
             key_column,
@@ -83,7 +83,7 @@ impl InferenceRunner {
         // Load model (or get from cache)
         let guard = self
             .model_cache
-            .get_or_load(&self.model_id, self.task, self.backend)
+            .get_or_load(&self.source, self.task, self.backend)
             .await?;
 
         // Create output adapter for this task
@@ -122,7 +122,7 @@ impl InferenceRunner {
 
                 // Notify observer
                 if let Some(obs) = &self.observer {
-                    obs.on_batch(&output_batch, &self.model_id, elapsed);
+                    obs.on_batch(&output_batch, &self.source.to_string(), elapsed);
                 }
 
                 if tx.send(Ok(output_batch)).await.is_err() {
@@ -246,7 +246,7 @@ impl InferenceRunner {
         let prefix = build_prefix_columns(
             keys,
             &self.source_id,
-            &self.model_id,
+            &self.source.to_string(),
             &raw_output.row_status,
             &raw_output.row_errors,
             latency_ms,
@@ -298,7 +298,7 @@ impl InferenceRunner {
         let prefix = build_prefix_columns(
             keys,
             &self.source_id,
-            &self.model_id,
+            &self.source.to_string(),
             &row_status,
             &row_errors,
             0.0,

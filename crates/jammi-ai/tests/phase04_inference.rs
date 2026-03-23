@@ -205,6 +205,7 @@ mod live {
     use super::*;
     use arrow::array::{Float32Array, StringArray};
     use jammi_ai::inference::observer::InferenceObserver;
+    use jammi_ai::model::ModelSource;
     use jammi_ai::session::InferenceSession;
     use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -241,7 +242,7 @@ mod live {
         let results = session
             .infer(
                 "patents",
-                "sentence-transformers/all-MiniLM-L6-v2",
+                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
                 ModelTask::Embedding,
                 &["abstract".to_string()],
                 "id",
@@ -319,7 +320,7 @@ mod live {
         let results = session
             .infer(
                 "patents",
-                "sentence-transformers/all-MiniLM-L6-v2",
+                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
                 ModelTask::Embedding,
                 &["abstract".to_string()],
                 "id",
@@ -357,7 +358,7 @@ mod live {
 
         let guard = cache
             .get_or_load(
-                "sentence-transformers/all-MiniLM-L6-v2",
+                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
                 ModelTask::Embedding,
                 None,
             )
@@ -394,7 +395,7 @@ mod live {
         let results = session
             .infer(
                 "patents_nulls",
-                "sentence-transformers/all-MiniLM-L6-v2",
+                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
                 ModelTask::Embedding,
                 &["abstract".to_string()],
                 "id",
@@ -451,7 +452,7 @@ mod live {
         let results = session
             .infer(
                 "patents_nulls",
-                "sentence-transformers/all-MiniLM-L6-v2",
+                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
                 ModelTask::Embedding,
                 &["abstract".to_string()],
                 "id",
@@ -505,7 +506,7 @@ mod live {
         let results = session
             .infer(
                 "patents",
-                "sentence-transformers/all-MiniLM-L6-v2",
+                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
                 ModelTask::Embedding,
                 &["abstract".to_string()],
                 "id",
@@ -556,7 +557,7 @@ mod live {
         let results = session
             .infer(
                 "patents",
-                "sentence-transformers/all-MiniLM-L6-v2",
+                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
                 ModelTask::Embedding,
                 &["abstract".to_string()],
                 "id",
@@ -630,7 +631,7 @@ mod live {
         let results = session
             .infer(
                 "patents",
-                "sentence-transformers/all-MiniLM-L6-v2",
+                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
                 ModelTask::Embedding,
                 &["abstract".to_string()],
                 "id",
@@ -653,7 +654,7 @@ mod live {
         let results = session
             .infer(
                 "patents",
-                "sentence-transformers/all-MiniLM-L6-v2",
+                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
                 ModelTask::Embedding,
                 &["abstract".to_string()],
                 "id",
@@ -671,7 +672,7 @@ mod live {
         let result = session
             .infer(
                 "patents",
-                "nonexistent-org/nonexistent-model-xyz",
+                &ModelSource::hf("nonexistent-org/nonexistent-model-xyz"),
                 ModelTask::Embedding,
                 &["abstract".to_string()],
                 "id",
@@ -688,7 +689,7 @@ mod live {
         let result = session
             .infer(
                 "no_such_source",
-                "sentence-transformers/all-MiniLM-L6-v2",
+                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
                 ModelTask::Embedding,
                 &["abstract".to_string()],
                 "id",
@@ -705,7 +706,7 @@ mod live {
         let result = session
             .infer(
                 "patents",
-                "sentence-transformers/all-MiniLM-L6-v2",
+                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
                 ModelTask::Embedding,
                 &["nonexistent_column".to_string()],
                 "id",

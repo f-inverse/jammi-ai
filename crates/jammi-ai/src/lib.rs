@@ -1,7 +1,7 @@
 //! Jammi AI — model loading, inference execution, and output adapters.
 //!
 //! This crate provides the intelligence layer of the Jammi platform:
-//! HuggingFace model resolution, Candle/ORT backends, batch inference
+//! explicit model source resolution, Candle/ORT backends, batch inference
 //! with backpressure, and typed output adapters for embedding,
 //! classification, summarization, and other ML tasks.
 

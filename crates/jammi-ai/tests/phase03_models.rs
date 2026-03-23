@@ -4,7 +4,7 @@ use jammi_ai::concurrency::GpuScheduler;
 #[allow(unused_imports)]
 use jammi_ai::model::{
     backend::DeviceConfig, cache::ModelCache, resolver::ModelResolver, tokenizer::TokenizerWrapper,
-    BackendType, ModelId, ModelTask,
+    BackendType, ModelId, ModelSource, ModelTask,
 };
 use jammi_engine::catalog::{model_repo::RegisterModelParams, Catalog};
 use std::sync::Arc;
@@ -19,12 +19,9 @@ async fn resolve_hf_hub_sentence_transformer() {
     let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
     let resolver = ModelResolver::new(catalog).unwrap();
 
+    let source = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");
     let resolved = resolver
-        .resolve(
-            "sentence-transformers/all-MiniLM-L6-v2",
-            ModelTask::Embedding,
-            None,
-        )
+        .resolve(&source, ModelTask::Embedding, None)
         .unwrap();
 
     assert_eq!(
@@ -54,12 +51,9 @@ async fn resolve_hf_hub_selects_candle_for_safetensors_model() {
     let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
     let resolver = ModelResolver::new(catalog).unwrap();
 
+    let source = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");
     let resolved = resolver
-        .resolve(
-            "sentence-transformers/all-MiniLM-L6-v2",
-            ModelTask::Embedding,
-            None,
-        )
+        .resolve(&source, ModelTask::Embedding, None)
         .unwrap();
 
     assert_eq!(resolved.backend, BackendType::Candle);
@@ -80,9 +74,9 @@ async fn resolve_local_path_with_safetensors() {
     let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
     let resolver = ModelResolver::new(catalog).unwrap();
 
-    let path_str = model_dir.to_str().unwrap();
+    let source = ModelSource::local(&model_dir);
     let resolved = resolver
-        .resolve(path_str, ModelTask::Embedding, None)
+        .resolve(&source, ModelTask::Embedding, None)
         .unwrap();
 
     assert_eq!(resolved.backend, BackendType::Candle);
@@ -104,9 +98,9 @@ async fn resolve_local_path_with_onnx() {
     let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
     let resolver = ModelResolver::new(catalog).unwrap();
 
-    let path_str = model_dir.to_str().unwrap();
+    let source = ModelSource::local(&model_dir);
     let resolved = resolver
-        .resolve(path_str, ModelTask::Embedding, None)
+        .resolve(&source, ModelTask::Embedding, None)
         .unwrap();
 
     assert_eq!(resolved.backend, BackendType::Ort);
@@ -131,9 +125,9 @@ async fn backend_hint_overrides_heuristic() {
     let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
     let resolver = ModelResolver::new(catalog).unwrap();
 
-    let path_str = model_dir.to_str().unwrap();
+    let source = ModelSource::local(&model_dir);
     let resolved = resolver
-        .resolve(path_str, ModelTask::Embedding, Some(BackendType::Candle))
+        .resolve(&source, ModelTask::Embedding, Some(BackendType::Candle))
         .unwrap();
 
     assert_eq!(
@@ -214,7 +208,7 @@ async fn cache_get_or_load_returns_guard_with_ref_count() {
 
     let guard = cache
         .get_or_load(
-            "sentence-transformers/all-MiniLM-L6-v2",
+            &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::Embedding,
             None,
         )
@@ -225,7 +219,7 @@ async fn cache_get_or_load_returns_guard_with_ref_count() {
 
     let guard2 = cache
         .get_or_load(
-            "sentence-transformers/all-MiniLM-L6-v2",
+            &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::Embedding,
             None,
         )
@@ -250,7 +244,7 @@ async fn cache_ref_count_decrements_on_guard_drop() {
 
     let guard1 = cache
         .get_or_load(
-            "sentence-transformers/all-MiniLM-L6-v2",
+            &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::Embedding,
             None,
         )
@@ -259,7 +253,7 @@ async fn cache_ref_count_decrements_on_guard_drop() {
 
     let guard2 = cache
         .get_or_load(
-            "sentence-transformers/all-MiniLM-L6-v2",
+            &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::Embedding,
             None,
         )
@@ -270,7 +264,7 @@ async fn cache_ref_count_decrements_on_guard_drop() {
 
     let guard3 = cache
         .get_or_load(
-            "sentence-transformers/all-MiniLM-L6-v2",
+            &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::Embedding,
             None,
         )
@@ -295,7 +289,7 @@ async fn cache_evicts_lru_model_under_memory_pressure() {
 
     let guard = cache
         .get_or_load(
-            "sentence-transformers/all-MiniLM-L6-v2",
+            &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::Embedding,
             None,
         )
@@ -306,7 +300,7 @@ async fn cache_evicts_lru_model_under_memory_pressure() {
 
     let guard2 = cache
         .get_or_load(
-            "sentence-transformers/all-MiniLM-L6-v2",
+            &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::Embedding,
             None,
         )
@@ -539,7 +533,7 @@ async fn preload_loads_model_into_cache_without_returning_guard() {
 
     cache
         .preload(
-            "sentence-transformers/all-MiniLM-L6-v2",
+            &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::Embedding,
             None,
         )
@@ -548,7 +542,7 @@ async fn preload_loads_model_into_cache_without_returning_guard() {
 
     let guard = cache
         .get_or_load(
-            "sentence-transformers/all-MiniLM-L6-v2",
+            &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::Embedding,
             None,
         )
@@ -619,7 +613,7 @@ async fn eviction_skips_model_with_active_guard() {
 
     let guard = cache
         .get_or_load(
-            "sentence-transformers/all-MiniLM-L6-v2",
+            &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::Embedding,
             None,
         )
@@ -642,8 +636,8 @@ fn resolve_local_missing_config_returns_error() {
     let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
     let resolver = ModelResolver::new(catalog).unwrap();
 
-    let path_str = model_dir.to_str().unwrap();
-    let result = resolver.resolve(path_str, ModelTask::Embedding, None);
+    let source = ModelSource::local(&model_dir);
+    let result = resolver.resolve(&source, ModelTask::Embedding, None);
     assert!(
         result.is_err(),
         "Missing config.json should fail resolution"
@@ -659,8 +653,8 @@ fn resolve_local_empty_directory_returns_error() {
     let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
     let resolver = ModelResolver::new(catalog).unwrap();
 
-    let path_str = model_dir.to_str().unwrap();
-    let result = resolver.resolve(path_str, ModelTask::Embedding, None);
+    let source = ModelSource::local(&model_dir);
+    let result = resolver.resolve(&source, ModelTask::Embedding, None);
     assert!(result.is_err(), "Empty directory should fail resolution");
 }
 
@@ -670,7 +664,8 @@ fn resolve_nonexistent_local_path_returns_error() {
     let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
     let resolver = ModelResolver::new(catalog).unwrap();
 
-    let result = resolver.resolve("/nonexistent/path/to/model", ModelTask::Embedding, None);
+    let source = ModelSource::local("/nonexistent/path/to/model");
+    let result = resolver.resolve(&source, ModelTask::Embedding, None);
     assert!(result.is_err(), "Nonexistent path should fail resolution");
 }
 
@@ -689,7 +684,7 @@ async fn cache_load_failure_clears_in_flight_state() {
 
     let result = cache
         .get_or_load(
-            "nonexistent-org/nonexistent-model-xyz",
+            &ModelSource::hf("nonexistent-org/nonexistent-model-xyz"),
             ModelTask::Embedding,
             None,
         )
@@ -698,7 +693,7 @@ async fn cache_load_failure_clears_in_flight_state() {
 
     let guard = cache
         .get_or_load(
-            "sentence-transformers/all-MiniLM-L6-v2",
+            &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::Embedding,
             None,
         )

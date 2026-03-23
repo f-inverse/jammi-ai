@@ -4,7 +4,11 @@ use jammi_engine::catalog::Catalog;
 use jammi_engine::config::JammiConfig;
 use jammi_engine::error::JammiError;
 use std::path::Path;
+use std::sync::Mutex;
 use tempfile::tempdir;
+
+// Env-var-mutating config tests must not run in parallel.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 // --- Configuration ---
 
@@ -20,6 +24,9 @@ fn config_loads_from_toml_file() {
 
 #[test]
 fn config_defaults_without_file() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    std::env::remove_var("JAMMI_GPU__DEVICE");
+    std::env::remove_var("JAMMI_INFERENCE__BATCH_SIZE");
     let config = JammiConfig::load(None).unwrap();
     assert_eq!(config.engine.batch_size, 8192);
     assert_eq!(config.gpu.device, 0);
@@ -29,6 +36,7 @@ fn config_defaults_without_file() {
 
 #[test]
 fn config_env_override_gpu_device() {
+    let _lock = ENV_LOCK.lock().unwrap();
     std::env::set_var("JAMMI_GPU__DEVICE", "2");
     let config = JammiConfig::load(None).unwrap();
     assert_eq!(config.gpu.device, 2);
@@ -37,6 +45,7 @@ fn config_env_override_gpu_device() {
 
 #[test]
 fn config_env_override_inference_batch_size() {
+    let _lock = ENV_LOCK.lock().unwrap();
     std::env::set_var("JAMMI_INFERENCE__BATCH_SIZE", "64");
     let config = JammiConfig::load(None).unwrap();
     assert_eq!(config.inference.batch_size, 64);

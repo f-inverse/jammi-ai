@@ -14,14 +14,14 @@ use crate::inference::observer::InferenceObserver;
 use crate::inference::runner::InferenceRunner;
 use crate::inference::schema::build_output_schema;
 use crate::model::cache::ModelCache;
-use crate::model::{BackendType, ModelTask};
+use crate::model::{BackendType, ModelSource, ModelTask};
 
 /// InferenceExec — the core intelligence operator.
 /// Reads input RecordBatches, runs model inference, and outputs
 /// RecordBatches with common prefix + task-specific columns.
 pub struct InferenceExec {
     input: Arc<dyn ExecutionPlan>,
-    model_id: String,
+    source: ModelSource,
     task: ModelTask,
     content_columns: Vec<String>,
     key_column: String,
@@ -37,7 +37,7 @@ pub struct InferenceExec {
 impl std::fmt::Debug for InferenceExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("InferenceExec")
-            .field("model_id", &self.model_id)
+            .field("source", &self.source)
             .field("task", &self.task)
             .field("content_columns", &self.content_columns)
             .finish()
@@ -49,7 +49,7 @@ impl InferenceExec {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
-        model_id: String,
+        source: ModelSource,
         task: ModelTask,
         content_columns: Vec<String>,
         key_column: String,
@@ -65,7 +65,7 @@ impl InferenceExec {
         let properties = Self::compute_properties(output_schema);
         Ok(Self {
             input,
-            model_id,
+            source,
             task,
             content_columns,
             key_column,
@@ -94,7 +94,7 @@ impl DisplayAs for InferenceExec {
         write!(
             f,
             "InferenceExec: model={}, task={:?}, columns={:?}",
-            self.model_id, self.task, self.content_columns
+            self.source, self.task, self.content_columns
         )
     }
 }
@@ -123,7 +123,7 @@ impl ExecutionPlan for InferenceExec {
         Ok(Arc::new(
             Self::new(
                 Arc::clone(&children[0]),
-                self.model_id.clone(),
+                self.source.clone(),
                 self.task,
                 self.content_columns.clone(),
                 self.key_column.clone(),
@@ -153,7 +153,7 @@ impl ExecutionPlan for InferenceExec {
         // Build the runner with everything it needs
         let runner = InferenceRunner::new(
             Arc::clone(&self.model_cache),
-            self.model_id.clone(),
+            self.source.clone(),
             self.task,
             self.content_columns.clone(),
             self.key_column.clone(),

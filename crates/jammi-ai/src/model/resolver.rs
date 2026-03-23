@@ -1,13 +1,12 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use jammi_engine::catalog::Catalog;
 use jammi_engine::error::{JammiError, Result};
 
-use super::{BackendType, ModelId, ModelTask, ResolvedModel};
+use super::{BackendType, ModelId, ModelSource, ModelTask, ResolvedModel};
 
-/// Resolves a model ID to file paths and backend selection.
-/// Resolution chain: catalog → fine-tuned → local path → HTTP → HF Hub.
+/// Resolves a `ModelSource` to file paths and backend selection.
 pub struct ModelResolver {
     catalog: Arc<Catalog>,
     hf_api: hf_hub::api::sync::Api,
@@ -26,76 +25,51 @@ impl ModelResolver {
         &self.catalog
     }
 
-    /// Resolve a model ID to file paths and backend selection.
+    /// Resolve a model source to file paths and backend selection.
     pub fn resolve(
         &self,
-        model_id: &str,
+        source: &ModelSource,
         task: ModelTask,
         backend_hint: Option<BackendType>,
     ) -> Result<ResolvedModel> {
-        // 1. Catalog lookup
-        if let Some(_record) = self.catalog.get_model(model_id)? {
-            return Err(JammiError::Model {
-                model_id: model_id.into(),
-                message: "Catalog model loading not yet implemented".into(),
-            });
+        match source {
+            ModelSource::Local(path) => self.resolve_local(path, source, task, backend_hint),
+            ModelSource::HuggingFace(repo_id) => {
+                self.resolve_hf_hub(repo_id, source, task, backend_hint)
+            }
         }
-
-        // 2. Jammi fine-tuned model
-        if model_id.starts_with("jammi:fine-tuned:") {
-            return Err(JammiError::Model {
-                model_id: model_id.into(),
-                message: "Fine-tuned model loading not yet implemented".into(),
-            });
-        }
-
-        // 3. Local path
-        if model_id.starts_with('/') || model_id.starts_with("./") {
-            return self.resolve_local(model_id, task, backend_hint);
-        }
-
-        // 4. HTTP endpoint
-        if model_id.starts_with("http://") || model_id.starts_with("https://") {
-            return Err(JammiError::Model {
-                model_id: model_id.into(),
-                message: "HTTP endpoint loading not yet implemented".into(),
-            });
-        }
-
-        // 5. HuggingFace Hub
-        self.resolve_hf_hub(model_id, task, backend_hint)
     }
 
     fn resolve_local(
         &self,
-        path: &str,
+        path: &Path,
+        source: &ModelSource,
         task: ModelTask,
         backend_hint: Option<BackendType>,
     ) -> Result<ResolvedModel> {
-        let model_dir = PathBuf::from(path);
-        if !model_dir.exists() {
+        if !path.exists() {
             return Err(JammiError::Model {
-                model_id: path.into(),
-                message: format!("Model directory does not exist: {path}"),
+                model_id: source.to_string(),
+                message: format!("Model directory does not exist: {}", path.display()),
             });
         }
 
-        let config_path = model_dir.join("config.json");
+        let config_path = path.join("config.json");
         if !config_path.exists() {
             return Err(JammiError::Model {
-                model_id: path.into(),
+                model_id: source.to_string(),
                 message: "Missing config.json in model directory".into(),
             });
         }
         let config: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(&config_path)?)?;
 
-        let has_safetensors = model_dir.join("model.safetensors").exists();
-        let has_onnx = model_dir.join("model.onnx").exists();
+        let has_safetensors = path.join("model.safetensors").exists();
+        let has_onnx = path.join("model.onnx").exists();
 
         if !has_safetensors && !has_onnx {
             return Err(JammiError::Model {
-                model_id: path.into(),
+                model_id: source.to_string(),
                 message: "No model weights found (need model.safetensors or model.onnx)".into(),
             });
         }
@@ -108,37 +82,37 @@ impl ModelResolver {
 
         let weights_paths = match backend {
             BackendType::Candle => {
-                let p = model_dir.join("model.safetensors");
+                let p = path.join("model.safetensors");
                 if p.exists() {
                     vec![p]
                 } else {
                     return Err(JammiError::Model {
-                        model_id: path.into(),
+                        model_id: source.to_string(),
                         message: "No safetensors weights found for Candle backend".into(),
                     });
                 }
             }
             BackendType::Ort => {
-                let p = model_dir.join("model.onnx");
+                let p = path.join("model.onnx");
                 if p.exists() {
                     vec![p]
                 } else {
                     return Err(JammiError::Model {
-                        model_id: path.into(),
+                        model_id: source.to_string(),
                         message: "No ONNX weights found for ORT backend".into(),
                     });
                 }
             }
             other => {
                 return Err(JammiError::Model {
-                    model_id: path.into(),
+                    model_id: source.to_string(),
                     message: format!("Backend {other:?} not supported for local resolution"),
                 })
             }
         };
 
         let tokenizer_path = {
-            let p = model_dir.join("tokenizer.json");
+            let p = path.join("tokenizer.json");
             if p.exists() {
                 Some(p)
             } else {
@@ -153,7 +127,7 @@ impl ModelResolver {
             .sum();
 
         Ok(ResolvedModel {
-            model_id: ModelId(path.to_string()),
+            model_id: ModelId::from(source),
             backend,
             task,
             config_path,
@@ -167,14 +141,15 @@ impl ModelResolver {
 
     fn resolve_hf_hub(
         &self,
-        model_id: &str,
+        repo_id: &str,
+        source: &ModelSource,
         task: ModelTask,
         backend_hint: Option<BackendType>,
     ) -> Result<ResolvedModel> {
-        let repo = self.hf_api.model(model_id.to_string());
+        let repo = self.hf_api.model(repo_id.to_string());
 
         let config_path = repo.get("config.json").map_err(|e| JammiError::Model {
-            model_id: model_id.into(),
+            model_id: source.to_string(),
             message: format!("Failed to download config.json: {e}"),
         })?;
         let config: serde_json::Value =
@@ -183,11 +158,11 @@ impl ModelResolver {
         let backend = backend_hint.unwrap_or_else(|| self.select_backend_hf(&repo));
 
         let weights_paths = match backend {
-            BackendType::Candle => self.download_safetensors(&repo, model_id)?,
-            BackendType::Ort => self.download_onnx(&repo, model_id)?,
+            BackendType::Candle => self.download_safetensors(&repo, source)?,
+            BackendType::Ort => self.download_onnx(&repo, source)?,
             other => {
                 return Err(JammiError::Model {
-                    model_id: model_id.into(),
+                    model_id: source.to_string(),
                     message: format!("Backend {other:?} not supported in resolve"),
                 })
             }
@@ -202,7 +177,7 @@ impl ModelResolver {
             .sum();
 
         Ok(ResolvedModel {
-            model_id: ModelId(model_id.to_string()),
+            model_id: ModelId::from(source),
             backend,
             task,
             config_path,
@@ -216,7 +191,6 @@ impl ModelResolver {
 
     fn select_backend_hf(&self, repo: &hf_hub::api::sync::ApiRepo) -> BackendType {
         if let Ok(info) = repo.info() {
-            // Only check for root-level model.onnx (not subdirectory ONNX files)
             if info.siblings.iter().any(|s| s.rfilename == "model.onnx") {
                 return BackendType::Ort;
             }
@@ -227,7 +201,7 @@ impl ModelResolver {
     fn download_safetensors(
         &self,
         repo: &hf_hub::api::sync::ApiRepo,
-        model_id: &str,
+        source: &ModelSource,
     ) -> Result<Vec<PathBuf>> {
         if let Ok(path) = repo.get("model.safetensors") {
             return Ok(vec![path]);
@@ -244,7 +218,7 @@ impl ModelResolver {
             }
         }
         Err(JammiError::Model {
-            model_id: model_id.into(),
+            model_id: source.to_string(),
             message: "No safetensors weights found".into(),
         })
     }
@@ -252,12 +226,12 @@ impl ModelResolver {
     fn download_onnx(
         &self,
         repo: &hf_hub::api::sync::ApiRepo,
-        model_id: &str,
+        source: &ModelSource,
     ) -> Result<Vec<PathBuf>> {
         repo.get("model.onnx")
             .map(|p| vec![p])
             .map_err(|e| JammiError::Model {
-                model_id: model_id.into(),
+                model_id: source.to_string(),
                 message: format!("No ONNX model found: {e}"),
             })
     }

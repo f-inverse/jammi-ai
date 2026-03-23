@@ -12,7 +12,7 @@ use crate::inference::observer::InferenceObserver;
 use crate::model::backend::DeviceConfig;
 use crate::model::cache::ModelCache;
 use crate::model::resolver::ModelResolver;
-use crate::model::ModelTask;
+use crate::model::{ModelSource, ModelTask};
 use crate::operator::inference_exec::InferenceExec;
 
 /// An inference-capable session that wraps `JammiSession` with model loading
@@ -82,7 +82,7 @@ impl InferenceSession {
     pub async fn infer(
         &self,
         source_id: &str,
-        model_id: &str,
+        source: &ModelSource,
         task: ModelTask,
         content_columns: &[String],
         key_column: &str,
@@ -119,14 +119,14 @@ impl InferenceSession {
 
         // Pre-load the model to get embedding dimensions for schema construction.
         // This also warms the cache so execute() hits a cache hit.
-        let guard = self.model_cache.get_or_load(model_id, task, None).await?;
+        let guard = self.model_cache.get_or_load(source, task, None).await?;
         let embedding_dim = guard.model.embedding_dim();
         drop(guard);
 
         // Wrap with InferenceExec
         let inference_exec = InferenceExec::new(
             input_plan,
-            model_id.to_string(),
+            source.clone(),
             task,
             content_columns.to_vec(),
             key_column.to_string(),

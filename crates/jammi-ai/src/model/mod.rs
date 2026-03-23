@@ -3,6 +3,7 @@ pub mod cache;
 pub mod resolver;
 pub mod tokenizer;
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -14,13 +15,49 @@ use serde::{Deserialize, Serialize};
 
 use crate::inference::adapter::BackendOutput;
 
-/// Unique identifier for a loaded model.
+/// Unique identifier for a loaded model, used as cache key.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct ModelId(pub String);
 
 impl std::fmt::Display for ModelId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+/// Explicit model source — the user declares where to load from, no fallback.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ModelSource {
+    /// A HuggingFace Hub repository (e.g. `"sentence-transformers/all-MiniLM-L6-v2"`).
+    HuggingFace(String),
+    /// A local directory containing model files (config.json + weights).
+    Local(PathBuf),
+}
+
+impl ModelSource {
+    /// Create a HuggingFace Hub source.
+    pub fn hf(repo_id: impl Into<String>) -> Self {
+        Self::HuggingFace(repo_id.into())
+    }
+
+    /// Create a local filesystem source.
+    pub fn local(path: impl Into<PathBuf>) -> Self {
+        Self::Local(path.into())
+    }
+}
+
+impl std::fmt::Display for ModelSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HuggingFace(repo_id) => write!(f, "{repo_id}"),
+            Self::Local(path) => write!(f, "{}", path.display()),
+        }
+    }
+}
+
+impl From<&ModelSource> for ModelId {
+    fn from(source: &ModelSource) -> Self {
+        ModelId(source.to_string())
     }
 }
 

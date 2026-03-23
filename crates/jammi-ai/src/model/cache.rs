@@ -10,7 +10,7 @@ use super::backend::candle::CandleBackend;
 use super::backend::ort::OrtBackend;
 use super::backend::{DeviceConfig, ModelBackend};
 use super::resolver::ModelResolver;
-use super::{BackendType, LoadedModel, ModelGuard, ModelId, ModelTask};
+use super::{BackendType, LoadedModel, ModelGuard, ModelId, ModelSource, ModelTask};
 use crate::concurrency::{GpuPermit, GpuScheduler};
 
 /// Where a cached model currently resides.
@@ -78,11 +78,11 @@ impl ModelCache {
     /// Get or load a model. Returns a guard that keeps the model alive.
     pub async fn get_or_load(
         &self,
-        model_id: &str,
+        source: &ModelSource,
         task: ModelTask,
         backend_hint: Option<BackendType>,
     ) -> Result<ModelGuard> {
-        let id = ModelId(model_id.to_string());
+        let id = ModelId::from(source);
 
         loop {
             let mut cache = self.inner.write().await;
@@ -111,7 +111,7 @@ impl ModelCache {
             cache.in_flight.insert(id.clone(), Arc::clone(&notify));
             drop(cache);
 
-            let result = self.do_load(&id, model_id, task, backend_hint).await;
+            let result = self.do_load(&id, source, task, backend_hint).await;
 
             let mut cache = self.inner.write().await;
             cache.in_flight.remove(&id);
@@ -134,17 +134,18 @@ impl ModelCache {
     async fn do_load(
         &self,
         id: &ModelId,
-        model_id: &str,
+        source: &ModelSource,
         task: ModelTask,
         backend_hint: Option<BackendType>,
     ) -> Result<ModelGuard> {
-        let resolved = self.resolver.resolve(model_id, task, backend_hint)?;
+        let resolved = self.resolver.resolve(source, task, backend_hint)?;
+        let source_str = source.to_string();
         let backend: &dyn ModelBackend = match resolved.backend {
             BackendType::Candle => &self.backends.candle,
             BackendType::Ort => &self.backends.ort,
             other => {
                 return Err(JammiError::Model {
-                    model_id: model_id.into(),
+                    model_id: source_str,
                     message: format!("Backend {other:?} not available"),
                 })
             }
@@ -158,7 +159,7 @@ impl ModelCache {
             let mut cache = self.inner.write().await;
             if !cache.evict_one() {
                 return Err(JammiError::Model {
-                    model_id: model_id.into(),
+                    model_id: source_str,
                     message: "Cannot acquire GPU memory: nothing to evict".into(),
                 });
             }
@@ -169,10 +170,14 @@ impl ModelCache {
         // Register model in catalog (idempotent — ignores if already registered)
         let backend_str = format!("{:?}", resolved.backend).to_lowercase();
         let task_str = format!("{task:?}").to_lowercase();
+        let model_type = match source {
+            ModelSource::HuggingFace(_) => "huggingface",
+            ModelSource::Local(_) => "local",
+        };
         let _ = self.resolver.catalog().register_model(RegisterModelParams {
-            model_id,
+            model_id: &source_str,
             version: 1,
-            model_type: "huggingface",
+            model_type,
             backend: &backend_str,
             task: &task_str,
             artifact_path: resolved.weights_paths.first().and_then(|p| p.to_str()),
@@ -201,11 +206,11 @@ impl ModelCache {
     /// Preload a model without running inference.
     pub async fn preload(
         &self,
-        model_id: &str,
+        source: &ModelSource,
         task: ModelTask,
         backend_hint: Option<BackendType>,
     ) -> Result<()> {
-        let guard = self.get_or_load(model_id, task, backend_hint).await?;
+        let guard = self.get_or_load(source, task, backend_hint).await?;
         drop(guard);
         Ok(())
     }

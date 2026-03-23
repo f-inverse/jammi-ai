@@ -1,0 +1,25 @@
+name: CI (live tests)
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"  # Weekly on Monday at 06:00 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test-live:
+    name: Test (live)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run live tests
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: cargo test --workspace --features live-hub-tests

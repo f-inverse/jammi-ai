@@ -35,22 +35,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Compile-check live tests
+        run: cargo test --workspace --features live-hub-tests --no-run
+
       - name: Run tests
         run: cargo test --workspace
-
-  test-live:
-    name: Test (live)
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/f-inverse/jammi-ai-ci:latest
-    needs: check
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run live tests
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: cargo test --workspace --features live-hub-tests
 
   docs:
     name: Documentation

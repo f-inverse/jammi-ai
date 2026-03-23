@@ -1,8 +1,10 @@
 name: CI (live tests)
 
 on:
-  schedule:
-    - cron: "0 6 * * 1"  # Weekly on Monday at 06:00 UTC
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 env:
@@ -16,8 +18,17 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: target
+          key: cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-test-
 
       - name: Run live tests
         env:

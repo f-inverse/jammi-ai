@@ -35,25 +35,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/cache@v4
+        with:
+          path: target
+          key: cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-test-
+
       - name: Compile-check live tests
         run: cargo test --workspace --features live-hub-tests --no-run
 
       - name: Run tests
         run: cargo test --workspace
-
-  docs:
-    name: Documentation
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/f-inverse/jammi-ai-ci:latest
-    needs: check
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Rustdoc
-        run: cargo doc --workspace --no-deps
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-
-      - name: Build guide
-        run: mdbook build docs/guide

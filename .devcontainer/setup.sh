@@ -1,19 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# --- System dependencies ---
-sudo apt-get update
-sudo apt-get install -y --no-install-recommends \
-    protobuf-compiler \
-    libprotobuf-dev \
-    libonig-dev \
-    liblzma-dev \
-    pkg-config
-
-# --- Rust toolchain (from rust-toolchain.toml) ---
-rustup show  # triggers automatic install of pinned toolchain
-
-# --- Python packages ---
+# --- Python packages (dev-only) ---
 pip install --upgrade pip
 pip install \
     maturin \
@@ -21,10 +9,10 @@ pip install \
     pytest \
     pre-commit
 
-# --- Rust tools ---
-cargo install mdbook --locked
+# --- Claude Code (native installer) ---
+curl -fsSL https://claude.ai/install.sh | bash
 
 # --- Pre-commit hooks ---
 pre-commit install
 
-echo "✓ Development environment ready"
+echo "Development environment ready"

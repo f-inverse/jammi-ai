@@ -1,13 +1,10 @@
 {
   "name": "jammi-ai",
-  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
-
-  "features": {
-    "ghcr.io/devcontainers/features/python:1": {
-      "version": "3.12"
-    },
-    "ghcr.io/anthropics/devcontainer-features/claude-code:1": {}
+  "build": {
+    "dockerfile": "Dockerfile"
   },
+
+  "remoteUser": "vscode",
 
   "postCreateCommand": "bash .devcontainer/setup.sh",
 

@@ -150,7 +150,7 @@ fn contract_adapters_null_failed_rows() {
 #[cfg(feature = "live-hub-tests")]
 mod live {
     use super::*;
-    use arrow::array::{Float32Array, StringArray};
+    use arrow::array::StringArray;
     use jammi_ai::inference::observer::InferenceObserver;
     use jammi_ai::model::{ModelSource, ModelTask};
     use jammi_ai::session::InferenceSession;

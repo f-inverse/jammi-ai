@@ -28,6 +28,9 @@ dist/
 # HuggingFace cache (large, downloaded at runtime)
 .cache/
 
+# mdbook build output
+docs/guide/book/
+
 # Claude
 .claude
 CLAUDE.md

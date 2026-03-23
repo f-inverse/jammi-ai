@@ -15,15 +15,10 @@ jobs:
   check:
     name: Format & Lint
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.88.0"
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -34,25 +29,11 @@ jobs:
   test:
     name: Test (hermetic)
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
     needs: check
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.88.0"
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            protobuf-compiler \
-            libprotobuf-dev \
-            libonig-dev \
-            liblzma-dev \
-            pkg-config
 
       - name: Run tests
         run: cargo test --workspace
@@ -60,25 +41,11 @@ jobs:
   test-live:
     name: Test (live)
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
     needs: check
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.88.0"
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            protobuf-compiler \
-            libprotobuf-dev \
-            libonig-dev \
-            liblzma-dev \
-            pkg-config
 
       - name: Run live tests
         env:
@@ -88,33 +55,16 @@ jobs:
   docs:
     name: Documentation
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
     needs: check
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.88.0"
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            protobuf-compiler \
-            libprotobuf-dev \
-            libonig-dev \
-            liblzma-dev \
-            pkg-config
 
       - name: Rustdoc
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
-
-      - name: Install mdbook
-        run: cargo install mdbook --locked
 
       - name: Build guide
         run: mdbook build docs/guide

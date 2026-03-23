@@ -536,7 +536,7 @@ async fn single_flight_concurrent_loads_coalesce() {
         tokio::spawn(async move {
             cache1
                 .get_or_load(
-                    "sentence-transformers/all-MiniLM-L6-v2",
+                    &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
                     ModelTask::Embedding,
                     None,
                 )
@@ -545,7 +545,7 @@ async fn single_flight_concurrent_loads_coalesce() {
         tokio::spawn(async move {
             cache2
                 .get_or_load(
-                    "sentence-transformers/all-MiniLM-L6-v2",
+                    &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
                     ModelTask::Embedding,
                     None,
                 )

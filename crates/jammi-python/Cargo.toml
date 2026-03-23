@@ -2,6 +2,7 @@
 name = "jammi-python"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [lib]
 name = "jammi_python"

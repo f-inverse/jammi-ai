@@ -50,3 +50,25 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+  test-live:
+    name: Test (live)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: target
+          key: cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-test-
+
+      - name: Run live tests
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: cargo test --workspace --features live-hub-tests

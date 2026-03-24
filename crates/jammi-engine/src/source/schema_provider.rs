@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::TableProvider;
-use datafusion::error::Result;
+use datafusion::error::{DataFusionError, Result};
 
 /// DataFusion [`SchemaProvider`] that holds the table providers for a single data source.
 ///
@@ -37,8 +37,12 @@ impl JammiSchemaProvider {
     }
 
     /// Register a table provider under the given name.
-    pub fn add_table(&self, name: String, table: Arc<dyn TableProvider>) {
-        self.tables.write().unwrap().insert(name, table);
+    pub fn add_table(&self, name: String, table: Arc<dyn TableProvider>) -> Result<()> {
+        self.tables
+            .write()
+            .map_err(|e| DataFusionError::Internal(format!("Lock poisoned: {e}")))?
+            .insert(name, table);
+        Ok(())
     }
 }
 
@@ -49,14 +53,21 @@ impl SchemaProvider for JammiSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        self.tables.read().unwrap().keys().cloned().collect()
+        self.tables
+            .read()
+            .map(|t| t.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        Ok(self.tables.read().unwrap().get(name).cloned())
+        let guard = self
+            .tables
+            .read()
+            .map_err(|e| DataFusionError::Internal(format!("Lock poisoned: {e}")))?;
+        Ok(guard.get(name).cloned())
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.tables.read().unwrap().contains_key(name)
+        self.tables.read().is_ok_and(|t| t.contains_key(name))
     }
 }

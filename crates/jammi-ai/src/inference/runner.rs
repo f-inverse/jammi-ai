@@ -8,7 +8,9 @@ use futures::StreamExt;
 use jammi_engine::error::{JammiError, Result};
 use tokio::sync::mpsc::Sender;
 
-use super::adapter::{create_adapter, BackendOutput, OutputAdapter};
+use super::adapter::{
+    create_adapter, create_adapter_for_schema, create_error_output, BackendOutput, OutputAdapter,
+};
 use super::observer::InferenceObserver;
 use super::schema::build_prefix_columns;
 use super::{extract_column, extract_columns, slice_columns};
@@ -283,16 +285,11 @@ impl InferenceRunner {
             .unwrap_or(0);
 
         // Create a dummy BackendOutput with all-error rows
-        let adapter = create_adapter_for_error(self.task, row_count, dim);
-        let dummy_output = BackendOutput {
-            float_outputs: adapter.0,
-            string_outputs: adapter.1,
-            row_status: row_status.clone(),
-            row_errors: row_errors.clone(),
-            shapes: vec![(row_count, 0)],
-        };
+        let mut dummy_output = create_error_output(self.task, row_count, dim);
+        dummy_output.row_status = row_status.clone();
+        dummy_output.row_errors = row_errors.clone();
 
-        let task_adapter = super::adapter::create_adapter_for_schema(self.task, Some(dim));
+        let task_adapter = create_adapter_for_schema(self.task, Some(dim));
         let task_columns = task_adapter.adapt(&dummy_output, row_count)?;
 
         let prefix = build_prefix_columns(
@@ -310,36 +307,5 @@ impl InferenceRunner {
 
         RecordBatch::try_new(Arc::clone(output_schema), all_columns)
             .map_err(|e| JammiError::Inference(format!("Failed to build error batch: {e}")))
-    }
-}
-
-/// Create dummy float/string outputs for an error batch of a given task.
-fn create_adapter_for_error(
-    task: ModelTask,
-    row_count: usize,
-    embedding_dim: usize,
-) -> (Vec<Vec<f32>>, Vec<Vec<String>>) {
-    match task {
-        ModelTask::Embedding => {
-            // EmbeddingAdapter expects float_outputs[0] with row_count * dim values
-            (vec![vec![0.0; row_count * embedding_dim]], vec![])
-        }
-        ModelTask::Classification => (
-            vec![vec![0.0; row_count]],
-            vec![
-                vec![String::new(); row_count],
-                vec![String::new(); row_count],
-            ],
-        ),
-        ModelTask::Summarization => (vec![], vec![vec![String::new(); row_count]]),
-        ModelTask::TextGeneration => (
-            vec![],
-            vec![
-                vec![String::new(); row_count],
-                vec![String::new(); row_count],
-            ],
-        ),
-        ModelTask::Ner => (vec![], vec![vec![String::new(); row_count]]),
-        ModelTask::ObjectDetection => (vec![], vec![vec![String::new(); row_count]]),
     }
 }

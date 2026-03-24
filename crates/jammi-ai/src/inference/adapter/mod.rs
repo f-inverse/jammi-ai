@@ -5,7 +5,7 @@ pub mod object_detection;
 pub mod summarization;
 pub mod text_generation;
 
-use arrow::array::ArrayRef;
+use arrow::array::{ArrayRef, Float32Array, LargeStringArray, StringArray};
 use arrow::datatypes::Field;
 use jammi_engine::error::Result;
 
@@ -57,7 +57,7 @@ pub fn create_adapter(task: ModelTask, model: &LoadedModel) -> Result<Box<dyn Ou
 
 /// Create an adapter for schema construction only (no model needed).
 /// For embedding, pass the model's hidden_size as `embedding_dim`.
-pub fn create_adapter_for_schema(
+pub(crate) fn create_adapter_for_schema(
     task: ModelTask,
     embedding_dim: Option<usize>,
 ) -> Box<dyn OutputAdapter> {
@@ -68,5 +68,108 @@ pub fn create_adapter_for_schema(
         ModelTask::ObjectDetection => Box::new(object_detection::ObjectDetectionAdapter),
         ModelTask::Ner => Box::new(ner::NerAdapter),
         ModelTask::TextGeneration => Box::new(text_generation::TextGenerationAdapter),
+    }
+}
+
+// ─── Shared null-handling helpers ────────────────────────────────────────────
+
+/// Build a nullable StringArray: rows where `row_status[i]` is false become null.
+pub(crate) fn nullify_strings(
+    values: Option<&Vec<String>>,
+    row_status: &[bool],
+    row_count: usize,
+) -> StringArray {
+    match values {
+        Some(v) => v
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                if row_status.get(i).copied().unwrap_or(false) {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        None => vec![None::<&str>; row_count].into_iter().collect(),
+    }
+}
+
+/// Build a nullable LargeStringArray: rows where `row_status[i]` is false become null.
+pub(crate) fn nullify_large_strings(
+    values: Option<&Vec<String>>,
+    row_status: &[bool],
+    row_count: usize,
+) -> LargeStringArray {
+    match values {
+        Some(v) => v
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                if row_status.get(i).copied().unwrap_or(false) {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        None => vec![None::<&str>; row_count].into_iter().collect(),
+    }
+}
+
+/// Build a nullable Float32Array: rows where `row_status[i]` is false become null.
+pub(crate) fn nullify_floats(
+    values: Option<&Vec<f32>>,
+    row_status: &[bool],
+    row_count: usize,
+) -> Float32Array {
+    match values {
+        Some(v) => v
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| {
+                if row_status.get(i).copied().unwrap_or(false) {
+                    Some(c)
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        None => vec![None::<f32>; row_count].into_iter().collect(),
+    }
+}
+
+/// Create dummy BackendOutput for an all-error batch of a given task.
+pub(crate) fn create_error_output(
+    task: ModelTask,
+    row_count: usize,
+    embedding_dim: usize,
+) -> BackendOutput {
+    let (float_outputs, string_outputs) = match task {
+        ModelTask::Embedding => (vec![vec![0.0; row_count * embedding_dim]], vec![]),
+        ModelTask::Classification => (
+            vec![vec![0.0; row_count]],
+            vec![
+                vec![String::new(); row_count],
+                vec![String::new(); row_count],
+            ],
+        ),
+        ModelTask::Summarization => (vec![], vec![vec![String::new(); row_count]]),
+        ModelTask::TextGeneration => (
+            vec![],
+            vec![
+                vec![String::new(); row_count],
+                vec![String::new(); row_count],
+            ],
+        ),
+        ModelTask::Ner => (vec![], vec![vec![String::new(); row_count]]),
+        ModelTask::ObjectDetection => (vec![], vec![vec![String::new(); row_count]]),
+    };
+    BackendOutput {
+        float_outputs,
+        string_outputs,
+        row_status: vec![false; row_count],
+        row_errors: vec![String::new(); row_count],
+        shapes: vec![(row_count, 0)],
     }
 }

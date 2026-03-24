@@ -35,7 +35,7 @@ impl InferenceSession {
         observer: Option<Arc<dyn InferenceObserver>>,
     ) -> Result<Self> {
         let inner = JammiSession::new(config).await?;
-        let catalog = inner.catalog_arc();
+        let catalog = Arc::clone(inner.catalog());
         let resolver = ModelResolver::new(catalog)?;
         let device_config = DeviceConfig::from_config(inner.config());
         let scheduler = Arc::new(GpuScheduler::new_unlimited());

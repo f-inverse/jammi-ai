@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, StringArray};
+use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field};
 use jammi_engine::error::Result;
 
-use super::{BackendOutput, OutputAdapter};
+use super::{nullify_strings, BackendOutput, OutputAdapter};
 
 /// Object detection adapter — serializes detections as JSON per row.
 /// Full structured output (List<Struct{label, confidence, bbox: FixedSizeList(4)}>)
@@ -17,22 +17,10 @@ impl OutputAdapter for ObjectDetectionAdapter {
     }
 
     fn adapt(&self, output: &BackendOutput, row_count: usize) -> Result<Vec<ArrayRef>> {
-        let detections: StringArray = output
-            .string_outputs
-            .first()
-            .map(|v| {
-                v.iter()
-                    .enumerate()
-                    .map(|(i, s)| {
-                        if output.row_status.get(i).copied().unwrap_or(false) {
-                            Some(s.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![None::<&str>; row_count].into_iter().collect());
-        Ok(vec![Arc::new(detections)])
+        Ok(vec![Arc::new(nullify_strings(
+            output.string_outputs.first(),
+            &output.row_status,
+            row_count,
+        ))])
     }
 }

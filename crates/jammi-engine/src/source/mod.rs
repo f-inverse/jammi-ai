@@ -70,7 +70,7 @@ pub struct SourceConnection {
 }
 
 /// Derive a DataFusion table name from a URL by extracting the file stem.
-pub fn table_name_from_url(url: &str) -> String {
+pub(crate) fn table_name_from_url(url: &str) -> String {
     let path = url.rsplit('/').next().unwrap_or(url);
     path.split('.').next().unwrap_or(path).to_string()
 }

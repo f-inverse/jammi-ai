@@ -9,7 +9,7 @@ use super::schema_provider::JammiSchemaProvider;
 ///
 /// Each registered data source gets its own `SourceCatalog` instance,
 /// making tables addressable as `<source_id>.public.<table_name>`.
-pub struct SourceCatalog {
+pub(crate) struct SourceCatalog {
     schema: Arc<JammiSchemaProvider>,
 }
 
@@ -23,7 +23,7 @@ impl std::fmt::Debug for SourceCatalog {
 
 impl SourceCatalog {
     /// Wrap a schema provider as a catalog with a single `"public"` schema.
-    pub fn new(schema: Arc<JammiSchemaProvider>) -> Self {
+    pub(crate) fn new(schema: Arc<JammiSchemaProvider>) -> Self {
         Self { schema }
     }
 }

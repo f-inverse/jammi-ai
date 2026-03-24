@@ -12,12 +12,17 @@ use crate::model::{LoadedModel, ModelDimensions, ModelTask, ResolvedModel};
 /// Candle backend — loads safetensors models via candle.
 pub struct CandleBackend;
 
+/// Discriminated model architecture for forward-pass dispatch.
+enum CandleModelInner {
+    Bert(BertModel),
+}
+
 /// A candle-loaded model ready for inference.
 pub struct CandleModel {
     /// Architecture dimensions for memory estimation and output sizing.
     pub dimensions: ModelDimensions,
-    /// Loaded BERT model weights and computation graph.
-    pub bert: BertModel,
+    /// Loaded model weights and computation graph.
+    inner: CandleModelInner,
     /// Tokenizer for text-to-token conversion, if available.
     pub tokenizer: Option<TokenizerWrapper>,
     /// Device the model weights reside on (CPU, CUDA, or Metal).
@@ -26,9 +31,7 @@ pub struct CandleModel {
 
 impl CandleModel {
     /// Mean-pool the last hidden state using the attention mask.
-    pub fn mean_pool(&self, hidden: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
-        // hidden: [batch, seq_len, hidden_size]
-        // attention_mask: [batch, seq_len]
+    pub(crate) fn mean_pool(&self, hidden: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         let mask = attention_mask
             .unsqueeze(2)
             .map_err(|e| JammiError::Inference(e.to_string()))?
@@ -48,7 +51,7 @@ impl CandleModel {
     }
 
     /// L2-normalize each vector in a [batch, hidden_size] tensor.
-    pub fn l2_normalize(&self, tensor: &Tensor) -> Result<Tensor> {
+    pub(crate) fn l2_normalize(&self, tensor: &Tensor) -> Result<Tensor> {
         let norm = tensor
             .sqr()
             .map_err(|e| JammiError::Inference(e.to_string()))?
@@ -64,7 +67,7 @@ impl CandleModel {
     }
 
     /// Convert token ID vectors into a candle Tensor on this model's device.
-    pub fn tokens_to_tensor(&self, vecs: &[Vec<u32>]) -> Result<Tensor> {
+    pub(crate) fn tokens_to_tensor(&self, vecs: &[Vec<u32>]) -> Result<Tensor> {
         let rows = vecs.len();
         let cols = vecs.first().map_or(0, |v| v.len());
         let flat: Vec<u32> = vecs.iter().flatten().copied().collect();
@@ -132,10 +135,11 @@ impl CandleModel {
             let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
             let token_type_ids = self.tokens_to_tensor(&encoding.type_ids)?;
 
-            let output = self
-                .bert
-                .forward(&input_ids, &token_type_ids, Some(&attention_mask))
-                .map_err(|e| JammiError::Inference(format!("BERT forward pass failed: {e}")))?;
+            let output = match &self.inner {
+                CandleModelInner::Bert(bert) => bert
+                    .forward(&input_ids, &token_type_ids, Some(&attention_mask))
+                    .map_err(|e| JammiError::Inference(format!("BERT forward pass failed: {e}")))?,
+            };
 
             let pooled = self.mean_pool(&output, &attention_mask)?;
             let normalized = self.l2_normalize(&pooled)?;
@@ -165,11 +169,11 @@ impl ModelBackend for CandleBackend {
     fn load(&self, resolved: &ResolvedModel, device_config: &DeviceConfig) -> Result<LoadedModel> {
         let device = select_device(device_config);
 
-        let bert_config: BertConfig = serde_json::from_value(resolved.model_config.clone())
-            .map_err(|e| JammiError::Model {
-                model_id: resolved.model_id.0.clone(),
-                message: format!("Failed to parse BERT config: {e}"),
-            })?;
+        let model_type = resolved
+            .model_config
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("bert");
 
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&resolved.weights_paths, DType::F32, &device)
@@ -179,10 +183,29 @@ impl ModelBackend for CandleBackend {
                 })?
         };
 
-        let bert = BertModel::load(vb, &bert_config).map_err(|e| JammiError::Model {
-            model_id: resolved.model_id.0.clone(),
-            message: format!("Failed to construct BERT model: {e}"),
-        })?;
+        let inner = match model_type {
+            "bert" | "roberta" | "distilbert" | "camembert" | "xlm-roberta" => {
+                let bert_config: BertConfig = serde_json::from_value(resolved.model_config.clone())
+                    .map_err(|e| JammiError::Model {
+                        model_id: resolved.model_id.0.clone(),
+                        message: format!("Failed to parse BERT config: {e}"),
+                    })?;
+                let bert = BertModel::load(vb, &bert_config).map_err(|e| JammiError::Model {
+                    model_id: resolved.model_id.0.clone(),
+                    message: format!("Failed to construct BERT model: {e}"),
+                })?;
+                CandleModelInner::Bert(bert)
+            }
+            unsupported => {
+                return Err(JammiError::Model {
+                    model_id: resolved.model_id.0.clone(),
+                    message: format!(
+                        "Unsupported model architecture '{unsupported}'. \
+                         Supported: bert, roberta, distilbert, camembert, xlm-roberta"
+                    ),
+                });
+            }
+        };
 
         let tokenizer = resolved
             .tokenizer_path
@@ -199,7 +222,7 @@ impl ModelBackend for CandleBackend {
 
         Ok(LoadedModel::Candle(Box::new(CandleModel {
             dimensions,
-            bert,
+            inner,
             tokenizer,
             device,
         })))

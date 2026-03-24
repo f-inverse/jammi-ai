@@ -108,7 +108,12 @@ impl JammiSession {
         // Derive table name from URL and build schema provider.
         let table_name = table_name_from_url(connection.url.as_deref().unwrap_or("data"));
         let schema_provider = Arc::new(JammiSchemaProvider::new());
-        schema_provider.add_table(table_name, table);
+        schema_provider
+            .add_table(table_name, table)
+            .map_err(|e| JammiError::Source {
+                source_id: source_id.into(),
+                message: format!("Failed to register table: {e}"),
+            })?;
 
         // Register as a named catalog so queries use `source_id.public.table_name`.
         let source_catalog = Arc::new(SourceCatalog::new(schema_provider));
@@ -129,13 +134,8 @@ impl JammiSession {
     }
 
     /// Return a reference to the artifact catalog.
-    pub fn catalog(&self) -> &Catalog {
+    pub fn catalog(&self) -> &Arc<Catalog> {
         &self.catalog
-    }
-
-    /// Return a shared handle to the catalog for components that need ownership.
-    pub fn catalog_arc(&self) -> Arc<Catalog> {
-        Arc::clone(&self.catalog)
     }
 
     /// Return a reference to the active configuration.

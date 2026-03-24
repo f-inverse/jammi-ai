@@ -32,12 +32,110 @@ impl ModelResolver {
         task: ModelTask,
         backend_hint: Option<BackendType>,
     ) -> Result<ResolvedModel> {
+        // Check catalog first — if this model was previously resolved and
+        // registered, reuse the stored metadata instead of re-downloading.
+        if let Some(resolved) = self.try_catalog_lookup(source, task, backend_hint)? {
+            return Ok(resolved);
+        }
+
         match source {
             ModelSource::Local(path) => self.resolve_local(path, source, task, backend_hint),
             ModelSource::HuggingFace(repo_id) => {
                 self.resolve_hf_hub(repo_id, source, task, backend_hint)
             }
         }
+    }
+
+    /// Check the catalog for an existing model record matching this source.
+    /// Returns `Some(ResolvedModel)` if found and files still exist on disk.
+    fn try_catalog_lookup(
+        &self,
+        source: &ModelSource,
+        task: ModelTask,
+        backend_hint: Option<BackendType>,
+    ) -> Result<Option<ResolvedModel>> {
+        let model_id = ModelId::from(source);
+        let record = match self.catalog.get_model(&model_id.0)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        // Only use the catalog hit if artifact_path is set and still exists
+        let artifact_dir = match &record.artifact_path {
+            Some(p) => {
+                let path = PathBuf::from(p);
+                if path.exists() {
+                    path
+                } else {
+                    return Ok(None);
+                }
+            }
+            None => return Ok(None),
+        };
+
+        let config_path = artifact_dir.join("config.json");
+        if !config_path.exists() {
+            return Ok(None);
+        }
+
+        // Use stored config_json if available, otherwise re-read from disk
+        let model_config: serde_json::Value = match &record.config_json {
+            Some(json_str) => serde_json::from_str(json_str)?,
+            None => serde_json::from_reader(std::fs::File::open(&config_path)?)?,
+        };
+
+        let backend = backend_hint.unwrap_or_else(|| {
+            serde_json::from_str::<BackendType>(&format!("\"{}\"", record.backend))
+                .unwrap_or(BackendType::Candle)
+        });
+
+        // Reconstruct weights paths from the artifact directory
+        let weights_paths: Vec<PathBuf> = match backend {
+            BackendType::Candle => {
+                let p = artifact_dir.join("model.safetensors");
+                if p.exists() {
+                    vec![p]
+                } else {
+                    return Ok(None);
+                }
+            }
+            BackendType::Ort => {
+                let p = artifact_dir.join("model.onnx");
+                if p.exists() {
+                    vec![p]
+                } else {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
+        };
+
+        let tokenizer_path = {
+            let p = artifact_dir.join("tokenizer.json");
+            if p.exists() {
+                Some(p)
+            } else {
+                None
+            }
+        };
+
+        let estimated_memory: usize = weights_paths
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len() as usize)
+            .sum();
+
+        Ok(Some(ResolvedModel {
+            model_id,
+            backend,
+            task,
+            config_path,
+            weights_paths,
+            tokenizer_path,
+            model_config,
+            base_model_id: record.base_model_id.map(ModelId),
+            estimated_memory,
+        }))
     }
 
     fn resolve_local(

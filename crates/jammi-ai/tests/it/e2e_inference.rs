@@ -1,10 +1,10 @@
-//! End-to-end hermetic tests for the inference pipeline.
-//!
-//! These tests exercise the full path: InferenceSession → add_source → infer()
-//! → RecordBatch with vectors. They use a tiny BERT fixture (32-dim, 1 layer)
-//! checked into tests/fixtures/tiny_bert/ — no network access required.
+// End-to-end hermetic tests for the inference pipeline.
+//
+// These tests exercise the full path: InferenceSession → add_source → infer()
+// → RecordBatch with vectors. They use a tiny BERT fixture (32-dim, 1 layer)
+// checked into tests/fixtures/tiny_bert/ — no network access required.
 
-mod common;
+use crate::common;
 
 use arrow::array::{Array, FixedSizeListArray, Float32Array, StringArray};
 use arrow::datatypes::DataType;

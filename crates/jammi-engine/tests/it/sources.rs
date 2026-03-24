@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 
 use jammi_engine::{
     session::JammiSession,

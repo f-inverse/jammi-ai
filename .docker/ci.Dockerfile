@@ -8,6 +8,7 @@ RUN apt-get update \
         libonig-dev \
         liblzma-dev \
         pkg-config \
+        mold \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

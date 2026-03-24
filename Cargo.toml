@@ -75,3 +75,6 @@ url = "2"
 async-trait = "0.1"
 futures = "0.3"
 
+[profile.dev]
+debug = "line-tables-only"
+

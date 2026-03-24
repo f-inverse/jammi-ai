@@ -1,4 +1,5 @@
-mod common;
+#[cfg(feature = "live-hub-tests")]
+use crate::common;
 
 use jammi_ai::inference::adapter::{
     BackendOutput, ClassificationAdapter, EmbeddingAdapter, OutputAdapter,

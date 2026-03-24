@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_federation::{FederatedQueryPlanner, FederationOptimizerRule};
 
 use crate::catalog::Catalog;
 use crate::config::JammiConfig;
@@ -29,7 +31,26 @@ impl JammiSession {
         let session_config = SessionConfig::new()
             .with_target_partitions(config.engine.execution_threads)
             .with_batch_size(config.engine.batch_size);
-        let ctx = SessionContext::new_with_config(session_config);
+
+        // Build a base context to get the default state, then layer in
+        // federation support (optimizer rule + query planner).
+        let base_ctx = SessionContext::new_with_config(session_config);
+        let base_state = base_ctx.state();
+
+        let mut rules = base_state.optimizer().rules.clone();
+        let insert_pos = rules
+            .iter()
+            .position(|r| r.name() == "scalar_subquery_to_join")
+            .map(|pos| pos + 1)
+            .unwrap_or(rules.len());
+        rules.insert(insert_pos, Arc::new(FederationOptimizerRule::new()));
+
+        let federated_state = SessionStateBuilder::new_from_existing(base_state)
+            .with_optimizer_rules(rules)
+            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .build();
+
+        let ctx = SessionContext::new_with_state(federated_state);
 
         Ok(Self {
             ctx,

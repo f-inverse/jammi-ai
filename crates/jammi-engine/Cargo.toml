@@ -6,8 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-# Query engine (not used in Phase 01, but declared)
+# Query engine
 datafusion.workspace = true
+datafusion-federation.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
 arrow-array.workspace = true

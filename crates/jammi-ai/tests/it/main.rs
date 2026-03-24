@@ -4,3 +4,4 @@ mod inference;
 mod models;
 mod pipeline;
 mod search;
+mod smoke;

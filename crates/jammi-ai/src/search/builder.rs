@@ -1,6 +1,10 @@
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use datafusion::common::{JoinType, NullEquality};
+use datafusion::physical_expr::expressions::col;
+use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::physical_plan::joins::PartitionMode;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
 
@@ -9,6 +13,7 @@ use jammi_engine::store::ResultStore;
 
 use crate::evidence::provenance::add_provenance;
 use crate::operator::ann_search_exec::AnnSearchExec;
+use crate::operator::inference_exec::InferenceExecBuilder;
 use crate::session::InferenceSession;
 
 /// Fluent API for constructing search queries.
@@ -102,6 +107,108 @@ impl SearchBuilder {
         let limit = datafusion::physical_plan::limit::GlobalLimitExec::new(self.plan, 0, Some(n));
         self.plan = Arc::new(limit);
         self
+    }
+
+    /// Join search results with another registered source.
+    ///
+    /// `on` is `"left_col=right_col"`. `how` is `"inner"` or `"left"` (default).
+    pub async fn join(mut self, source: &str, on: &str, how: Option<&str>) -> Result<Self> {
+        let (left_col_name, right_col_name) = on
+            .split_once('=')
+            .ok_or_else(|| JammiError::Other(format!("Join: 'on' must contain '=', got '{on}'")))?;
+
+        let join_type = match how {
+            Some("inner") => JoinType::Inner,
+            _ => JoinType::Left,
+        };
+
+        // Scan the join source table
+        let table_name = self.session.find_table_name(source)?;
+        let sql = format!("SELECT * FROM {source}.public.{table_name}");
+        let df = self
+            .session
+            .context()
+            .sql(&sql)
+            .await
+            .map_err(|e| JammiError::Other(format!("Join: {e}")))?;
+        let right_plan = df
+            .create_physical_plan()
+            .await
+            .map_err(|e| JammiError::Other(format!("Join: {e}")))?;
+
+        // Build column expressions for the join keys
+        let left_col = col(left_col_name, self.plan.schema().as_ref())
+            .map_err(|e| JammiError::Other(format!("Join: {e}")))?;
+        let right_col = col(right_col_name, right_plan.schema().as_ref())
+            .map_err(|e| JammiError::Other(format!("Join: {e}")))?;
+
+        let join = HashJoinExec::try_new(
+            self.plan,
+            right_plan,
+            vec![(left_col, right_col)],
+            None,
+            &join_type,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+        )
+        .map_err(|e| JammiError::Other(format!("Join: {e}")))?;
+
+        self.plan = Arc::new(join);
+        Ok(self)
+    }
+
+    /// Annotate search results by running model inference over selected columns.
+    ///
+    /// This inserts an `InferenceExec` node into the execution plan so that
+    /// each result row is enriched with model outputs (e.g. embeddings,
+    /// classifications) before final collection.
+    pub async fn annotate(mut self, model: &str, task: &str, columns: &[String]) -> Result<Self> {
+        // Parse model source from the model string
+        let model_source = if let Some(path) = model.strip_prefix("local:") {
+            crate::model::ModelSource::local(std::path::PathBuf::from(path))
+        } else {
+            crate::model::ModelSource::hf(model)
+        };
+
+        // Parse the task string to ModelTask enum
+        let model_task = match task.to_lowercase().as_str() {
+            "embedding" => crate::model::ModelTask::Embedding,
+            "classification" => crate::model::ModelTask::Classification,
+            "summarization" => crate::model::ModelTask::Summarization,
+            "ner" => crate::model::ModelTask::Ner,
+            "text_generation" => crate::model::ModelTask::TextGeneration,
+            other => return Err(JammiError::Other(format!("Unknown task: {other}"))),
+        };
+
+        // Pre-load model to get embedding dimensions
+        let guard = self
+            .session
+            .model_cache()
+            .get_or_load(&model_source, model_task, None)
+            .await?;
+        let embedding_dim = guard.model.embedding_dim();
+        drop(guard);
+
+        // Build InferenceExec using the builder
+        let inference = InferenceExecBuilder::new(
+            self.plan,
+            model_source,
+            model_task,
+            columns.to_vec(),
+            "_row_id".to_string(),
+            String::new(), // source_id not needed for annotation
+            std::sync::Arc::clone(self.session.model_cache()),
+        )
+        .batch_size(self.session.inner_config().inference.batch_size)
+        .observer(self.session.observer().clone())
+        .embedding_dim(embedding_dim)
+        .build()?;
+
+        self.plan = Arc::new(inference);
+        self.channels.push("inference".into());
+        self.annotated = true;
+        Ok(self)
     }
 
     /// Execute the plan and return results with evidence provenance.

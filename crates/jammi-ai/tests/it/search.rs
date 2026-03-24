@@ -184,6 +184,113 @@ async fn search_fails_without_embedding_table() {
     );
 }
 
+// ─── Join adds columns from right source ─────────────────────────────────────
+
+#[tokio::test]
+async fn search_with_join_adds_columns_from_right_source() {
+    let (session, _dir) = session_with_embeddings().await;
+
+    session
+        .add_source(
+            "assignees",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(common::fixture_url("assignees.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let query = vec![0.5_f32; 32];
+    // Left join: right columns appear even if no rows match
+    let results = session
+        .search("patents", query, 5)
+        .await
+        .unwrap()
+        .join("assignees", "_source_id=country", None)
+        .await
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+
+    assert!(!results.is_empty());
+    let batch = &results[0];
+    assert!(
+        batch.schema().field_with_name("company_name").is_ok(),
+        "Join should add company_name from assignees"
+    );
+    assert!(
+        batch.schema().field_with_name("id").is_ok(),
+        "Join should add id from assignees"
+    );
+}
+
+// ─── Annotate tracks provenance correctly ─────────────────────────────────────
+
+#[tokio::test]
+async fn search_with_annotate_tracks_provenance() {
+    let (session, _dir) = session_with_embeddings().await;
+
+    let query = vec![0.5_f32; 32];
+    let results = session
+        .search("patents", query, 3)
+        .await
+        .unwrap()
+        .annotate(&tiny_bert_model(), "embedding", &["_row_id".to_string()])
+        .await
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+
+    assert!(
+        !results.is_empty(),
+        "Annotated search should return results"
+    );
+    let batch = &results[0];
+
+    // annotated_by should contain "inference"
+    let annotated_by = batch
+        .column_by_name("annotated_by")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    for i in 0..annotated_by.len() {
+        let values = annotated_by.value(i);
+        let str_arr = values.as_any().downcast_ref::<StringArray>().unwrap();
+        let channels: Vec<&str> = (0..str_arr.len()).map(|j| str_arr.value(j)).collect();
+        assert!(
+            channels.contains(&"inference"),
+            "annotated_by should contain 'inference', got {channels:?}"
+        );
+    }
+
+    // retrieved_by should contain "vector" and NOT "inference"
+    let retrieved_by = batch
+        .column_by_name("retrieved_by")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    for i in 0..retrieved_by.len() {
+        let values = retrieved_by.value(i);
+        let str_arr = values.as_any().downcast_ref::<StringArray>().unwrap();
+        let channels: Vec<&str> = (0..str_arr.len()).map(|j| str_arr.value(j)).collect();
+        assert!(
+            channels.contains(&"vector"),
+            "retrieved_by should contain 'vector', got {channels:?}"
+        );
+        assert!(
+            !channels.contains(&"inference"),
+            "retrieved_by should NOT contain 'inference', got {channels:?}"
+        );
+    }
+}
+
 // ─── encode_query returns a vector ───────────────────────────────────────────
 
 #[tokio::test]

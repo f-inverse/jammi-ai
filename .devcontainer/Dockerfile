@@ -21,6 +21,12 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# Node.js (required by Claude Code)
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
 # Non-root user for devcontainer
 RUN useradd -m -s /bin/bash vscode \
     && mkdir -p /home/vscode/.cargo /home/vscode/.rustup \

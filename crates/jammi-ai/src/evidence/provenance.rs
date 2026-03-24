@@ -4,7 +4,7 @@ use arrow::array::{ArrayRef, ListArray, RecordBatch, StringArray};
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema};
 
-use jammi_engine::error::Result;
+use jammi_engine::error::{JammiError, Result};
 
 /// Add `retrieved_by` and `annotated_by` List<Utf8> columns to result batches.
 pub fn add_provenance(
@@ -23,13 +23,13 @@ pub fn add_provenance(
                 .filter(|c| c.as_str() != "inference" || !has_annotation)
                 .map(|c| c.as_str())
                 .collect();
-            let retrieved_by = build_list_column(row_count, &retrieval_channels);
+            let retrieved_by = build_list_column(row_count, &retrieval_channels)?;
 
             // annotated_by: channels that added evidence post-retrieval
             let annotated_by = if has_annotation {
-                build_list_column(row_count, &["inference"])
+                build_list_column(row_count, &["inference"])?
             } else {
-                build_list_column(row_count, &[])
+                build_list_column(row_count, &[])?
             };
 
             // Append provenance columns to the batch
@@ -54,23 +54,21 @@ pub fn add_provenance(
 }
 
 /// Build a List<Utf8> column where every row has the same list of values.
-fn build_list_column(row_count: usize, values: &[&str]) -> ArrayRef {
-    // Flat values array: repeat the channel names for each row
+fn build_list_column(row_count: usize, values: &[&str]) -> Result<ArrayRef> {
     let flat_values: Vec<&str> = (0..row_count)
         .flat_map(|_| values.iter().copied())
         .collect();
     let values_array = Arc::new(StringArray::from(flat_values));
 
-    // Offsets: each row has `values.len()` elements
     let offsets: Vec<i32> = (0..=row_count).map(|i| (i * values.len()) as i32).collect();
 
-    Arc::new(
-        ListArray::try_new(
-            Arc::new(Field::new("item", DataType::Utf8, true)),
-            OffsetBuffer::new(offsets.into()),
-            values_array,
-            None,
-        )
-        .expect("list construction should not fail"),
+    let list = ListArray::try_new(
+        Arc::new(Field::new("item", DataType::Utf8, true)),
+        OffsetBuffer::new(offsets.into()),
+        values_array,
+        None,
     )
+    .map_err(|e| JammiError::Other(format!("List construction: {e}")))?;
+
+    Ok(Arc::new(list))
 }

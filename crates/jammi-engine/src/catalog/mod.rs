@@ -53,4 +53,28 @@ impl Catalog {
         let rows = stmt.query_map([], |row| row.get(0))?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
+
+    /// Fetch an evidence channel by name.
+    pub fn get_evidence_channel(&self, name: &str) -> Result<EvidenceChannelRecord> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT channel_name, schema_json, priority FROM evidence_channels WHERE channel_name = ?1",
+        )?;
+        stmt.query_row(rusqlite::params![name], |row| {
+            Ok(EvidenceChannelRecord {
+                channel_name: row.get(0)?,
+                schema_json: row.get(1)?,
+                priority: row.get(2)?,
+            })
+        })
+        .map_err(|e| JammiError::Catalog(format!("Evidence channel '{name}': {e}")))
+    }
+}
+
+/// A row from the `evidence_channels` catalog table.
+#[derive(Debug, Clone)]
+pub struct EvidenceChannelRecord {
+    pub channel_name: String,
+    pub schema_json: String,
+    pub priority: i32,
 }

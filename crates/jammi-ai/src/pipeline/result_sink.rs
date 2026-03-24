@@ -146,17 +146,25 @@ pub fn filter_ok_and_extract_vectors(
 
     let embedding_schema = jammi_engine::store::schema::embedding_table_schema(dims);
 
-    // Build the output RecordBatch with renamed columns (_source → _source_id, _model → _model_id)
-    let ok_batch = RecordBatch::try_new(
-        embedding_schema,
-        vec![
-            filtered_row_ids.clone(),
-            filtered_source,
-            filtered_model,
-            filtered_vector,
-        ],
-    )
-    .map_err(|e| JammiError::Other(format!("RecordBatch build: {e}")))?;
+    // Build the output RecordBatch. Column mapping is positional:
+    //   inference _row_id  → embedding _row_id     (same name)
+    //   inference _source  → embedding _source_id   (renamed)
+    //   inference _model   → embedding _model_id    (renamed)
+    //   inference vector   → embedding vector       (same name)
+    // The embedding schema (embedding_table_schema) defines the canonical names.
+    let columns = vec![
+        filtered_row_ids.clone(),
+        filtered_source,
+        filtered_model,
+        filtered_vector,
+    ];
+    debug_assert_eq!(
+        embedding_schema.fields().len(),
+        columns.len(),
+        "Column count must match embedding schema field count"
+    );
+    let ok_batch = RecordBatch::try_new(embedding_schema, columns)
+        .map_err(|e| JammiError::Other(format!("RecordBatch build: {e}")))?;
 
     // Extract row_ids and vectors for the sidecar index
     let row_ids: Vec<String> = filtered_row_ids

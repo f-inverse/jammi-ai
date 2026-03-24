@@ -48,10 +48,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 CSV works the same way — use `FileFormat::Csv` instead.
 
-## Generate embeddings
+## Generate embeddings and search
 
 ```rust
-use jammi_ai::model::ModelTask;
+use std::sync::Arc;
 use jammi_ai::session::InferenceSession;
 use jammi_engine::config::JammiConfig;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
@@ -59,7 +59,7 @@ use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = JammiConfig::load(None)?;
-    let session = InferenceSession::new(config).await?;
+    let session = Arc::new(InferenceSession::new(config).await?);
 
     session.add_source("patents", SourceType::Local, SourceConnection {
         url: Some("file:///path/to/patents.parquet".into()),
@@ -67,22 +67,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     }).await?;
 
-    // Run embedding inference on the "abstract" text column
-    let results = session.infer(
-        "patents",                                    // source id
-        "sentence-transformers/all-MiniLM-L6-v2",    // HF Hub model
-        ModelTask::Embedding,                         // task
-        &["abstract".to_string()],                    // text column(s)
-        "id",                                         // key column
+    // Generate embeddings — persists to Parquet with sidecar ANN index
+    let record = session.generate_embeddings(
+        "patents",
+        "sentence-transformers/all-MiniLM-L6-v2",
+        &["abstract".to_string()],
+        "id",
+    ).await?;
+    println!("Embedded {} rows, dimensions={:?}", record.row_count, record.dimensions);
+
+    // Encode a query and search
+    let query_vec = session.encode_query(
+        "sentence-transformers/all-MiniLM-L6-v2",
+        "quantum computing applications",
     ).await?;
 
-    // Each RecordBatch has:
-    //   _row_id, _source, _model, _status, _error, _latency_ms, vector
+    let results = session.search("patents", query_vec, 5).await?
+        .sort("similarity", true)?
+        .run().await?;
+
     for batch in &results {
-        println!("Rows: {}, Columns: {:?}",
-            batch.num_rows(),
-            batch.schema().fields().iter().map(|f| f.name()).collect::<Vec<_>>()
-        );
+        println!("{batch:?}");
     }
     Ok(())
 }
@@ -90,26 +95,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 The first run downloads the model from HuggingFace Hub (~90MB). Subsequent runs load from cache.
 
-## Output schema
+## Run raw inference
 
-Every inference output includes these prefix columns:
+For inference without persistence (returns `Vec<RecordBatch>` directly):
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `_row_id` | Utf8 | Key column value (cast to string) |
-| `_source` | Utf8 | Source ID |
-| `_model` | Utf8 | Model ID |
-| `_status` | Utf8 | `"ok"` or `"error"` |
-| `_error` | Utf8 (nullable) | Error message if status is error |
-| `_latency_ms` | Float32 | Inference latency for this batch |
+```rust
+use jammi_ai::model::{ModelSource, ModelTask};
 
-For embedding tasks, the output also includes:
+let model = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");
+let results = session.infer(
+    "patents",
+    &model,
+    ModelTask::Embedding,
+    &["abstract".to_string()],
+    "id",
+).await?;
+```
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `vector` | FixedSizeList(Float32, N) | L2-normalized embedding vector |
-
-Rows with null or empty text get `_status = "error"` with a message in `_error`. The `vector` column is null for error rows.
+Each `RecordBatch` has prefix columns (`_row_id`, `_source`, `_model`, `_status`, `_error`, `_latency_ms`) plus task-specific columns (e.g., `vector` for embeddings).
 
 ## Supported models
 
@@ -120,10 +123,10 @@ Any BERT-family model on HuggingFace Hub with safetensors weights:
 - `BAAI/bge-small-en-v1.5`, `BAAI/bge-base-en-v1.5`
 - Any local directory with `config.json` + `model.safetensors` + `tokenizer.json`
 
-Use a local model by passing its absolute path as the model ID:
+Use a local model:
 
 ```rust
-session.infer("source", "/path/to/my-model", ModelTask::Embedding, &["text".into()], "id").await?;
+let model = ModelSource::local("/path/to/my-model");
 ```
 
 ## Observe inference batches

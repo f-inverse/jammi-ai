@@ -8,6 +8,8 @@
 - [Configuration](./configuration.md)
 - [Data Sources](./data-sources.md)
 - [Embedding Inference](./embedding-inference.md)
+- [Embedding Generation](./embedding-generation.md)
+- [Vector Search](./vector-search.md)
 
 # Architecture
 

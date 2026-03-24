@@ -5,14 +5,19 @@ Jammi generates embeddings by running BERT-family models over text columns from 
 ## Basic usage
 
 ```rust
+use jammi_ai::model::{ModelSource, ModelTask};
+
+let model = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");
 let results = session.infer(
-    "patents",                                    // source id
-    "sentence-transformers/all-MiniLM-L6-v2",    // model (HF Hub or local path)
-    ModelTask::Embedding,                         // task type
-    &["abstract".to_string()],                    // text column(s) to embed
-    "id",                                         // key column for _row_id
+    "patents",                     // source id
+    &model,                        // ModelSource (HF Hub or local path)
+    ModelTask::Embedding,          // task type
+    &["abstract".to_string()],    // text column(s) to embed
+    "id",                          // key column for _row_id
 ).await?;
 ```
+
+> **Note:** For embedding generation with persistence (Parquet + ANN index), use `generate_embeddings()` instead — see [Embedding Generation](./embedding-generation.md).
 
 ## Pipeline architecture
 
@@ -55,9 +60,10 @@ The batch continues processing even when individual rows fail. Every row in the 
 Pass multiple column names to concatenate them (space-separated) before embedding:
 
 ```rust
+let model = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");
 let results = session.infer(
     "papers",
-    "sentence-transformers/all-MiniLM-L6-v2",
+    &model,
     ModelTask::Embedding,
     &["title".to_string(), "abstract".to_string()],  // concatenated
     "doi",

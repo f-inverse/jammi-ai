@@ -11,8 +11,8 @@ use jammi_engine::error::{JammiError, Result};
 /// Base fields (always present):
 /// - `_row_id` (Utf8)
 /// - `_source_id` (Utf8)
-/// - `retrieved_by` (List<Utf8>)
-/// - `annotated_by` (List<Utf8>)
+/// - `retrieved_by` (`List<Utf8>`)
+/// - `annotated_by` (`List<Utf8>`)
 ///
 /// Channel fields (added per channel):
 /// - vector: `similarity` (Float32)

@@ -32,7 +32,7 @@ pub struct RowProvenance {
 /// A result row with structured evidence from multiple operators.
 ///
 /// This is the stable type that downstream phases (Evaluation, Caching)
-/// depend on. The dynamic List<Utf8> columns in RecordBatch output map
+/// depend on. The dynamic `List<Utf8>` columns in RecordBatch output map
 /// directly to these fields.
 #[derive(Debug)]
 pub struct EvidenceRow {

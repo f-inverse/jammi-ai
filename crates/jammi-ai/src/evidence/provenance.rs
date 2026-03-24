@@ -6,7 +6,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 
 use jammi_engine::error::{JammiError, Result};
 
-/// Add `retrieved_by` and `annotated_by` List<Utf8> columns to result batches.
+/// Add `retrieved_by` and `annotated_by` `List<Utf8>` columns to result batches.
 pub fn add_provenance(
     batches: &[RecordBatch],
     channels: &[String],
@@ -53,7 +53,7 @@ pub fn add_provenance(
         .collect()
 }
 
-/// Build a List<Utf8> column where every row has the same list of values.
+/// Build a `List<Utf8>` column where every row has the same list of values.
 fn build_list_column(row_count: usize, values: &[&str]) -> Result<ArrayRef> {
     let flat_values: Vec<&str> = (0..row_count)
         .flat_map(|_| values.iter().copied())

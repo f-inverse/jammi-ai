@@ -15,6 +15,10 @@ RUN apt-get update \
 # Rust components (no rust-src — that's dev-only for rust-analyzer)
 RUN rustup component add rustfmt clippy
 
+# sccache for compilation caching
+RUN cargo install sccache --locked \
+    && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
+
 # mdbook for documentation builds (pinned to match local dev)
 RUN cargo install mdbook --locked --version 0.5.2 \
     && rm -rf /usr/local/cargo/registry /usr/local/cargo/git

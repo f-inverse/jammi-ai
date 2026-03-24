@@ -14,6 +14,8 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   RUSTFLAGS: "-D warnings"
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
 
 jobs:
   check:
@@ -23,6 +25,9 @@ jobs:
       image: ghcr.io/f-inverse/jammi-ai-ci:latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -38,6 +43,9 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v4
+
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - uses: actions/cache@v4
         with:
@@ -61,6 +69,9 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - uses: actions/cache@v4
         with:

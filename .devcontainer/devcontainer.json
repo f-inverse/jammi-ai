@@ -6,6 +6,11 @@
 
   "remoteUser": "vscode",
 
+  "mounts": [
+    "source=jammi-cargo-target,target=${containerWorkspaceFolder}/target,type=volume",
+    "source=jammi-sccache,target=/home/vscode/.cache/sccache,type=volume"
+  ],
+
   "postCreateCommand": "bash .devcontainer/setup.sh",
 
   "customizations": {
@@ -22,6 +27,7 @@
       "settings": {
         "rust-analyzer.check.command": "clippy",
         "rust-analyzer.check.extraArgs": ["--workspace"],
+        "rust-analyzer.check.allTargets": false,
         "editor.formatOnSave": true,
         "[rust]": {
           "editor.defaultFormatter": "rust-lang.rust-analyzer"

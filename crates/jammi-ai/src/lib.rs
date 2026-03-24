@@ -6,8 +6,10 @@
 //! classification, summarization, and other ML tasks.
 
 pub mod concurrency;
+pub mod evidence;
 pub mod inference;
 pub mod model;
 pub mod operator;
 pub mod pipeline;
+pub mod search;
 pub mod session;

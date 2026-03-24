@@ -17,6 +17,7 @@ use crate::model::resolver::ModelResolver;
 use crate::model::{ModelSource, ModelTask};
 use crate::operator::inference_exec::InferenceExecBuilder;
 use crate::pipeline::embedding::EmbeddingPipeline;
+use crate::search::SearchBuilder;
 
 /// An inference-capable session that wraps `JammiSession` with model loading
 /// and inference execution. This is the primary entry point for CP2+.
@@ -101,6 +102,45 @@ impl InferenceSession {
     /// Access the inference observer.
     pub(crate) fn observer(&self) -> &Option<Arc<dyn InferenceObserver>> {
         &self.observer
+    }
+
+    /// Start a vector search query over an embedding table.
+    pub async fn search(
+        self: &Arc<Self>,
+        source_id: &str,
+        query: Vec<f32>,
+        k: usize,
+    ) -> Result<SearchBuilder> {
+        SearchBuilder::new(Arc::clone(self), source_id, query, k, None).await
+    }
+
+    /// Encode a single text query into a vector using the given model.
+    pub async fn encode_query(&self, model_id: &str, text: &str) -> Result<Vec<f32>> {
+        let model_source = if let Some(path) = model_id.strip_prefix("local:") {
+            ModelSource::local(std::path::PathBuf::from(path))
+        } else {
+            ModelSource::hf(model_id)
+        };
+
+        let guard = self
+            .model_cache
+            .get_or_load(&model_source, ModelTask::Embedding, None)
+            .await?;
+
+        // Build a single-row input with the text
+        let text_array = Arc::new(arrow::array::StringArray::from(vec![text.to_string()]))
+            as arrow::array::ArrayRef;
+        let output = guard
+            .model
+            .forward(&[text_array], ModelTask::Embedding)
+            .map_err(|e| JammiError::Inference(format!("encode_query forward: {e}")))?;
+
+        // Extract the first (and only) vector from the output
+        let dim = output.shapes.first().map(|(_, c)| *c).unwrap_or(0);
+        if output.float_outputs.is_empty() || output.float_outputs[0].is_empty() {
+            return Err(JammiError::Inference("No embedding output".into()));
+        }
+        Ok(output.float_outputs[0][..dim].to_vec())
     }
 
     /// Generate embeddings for a source and persist to Jammi DB.

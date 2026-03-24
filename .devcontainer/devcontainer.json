@@ -1,7 +1,8 @@
 {
   "name": "jammi-ai",
   "build": {
-    "dockerfile": "Dockerfile"
+    "dockerfile": "Dockerfile",
+    "options": ["--pull"]
   },
 
   "remoteUser": "vscode",

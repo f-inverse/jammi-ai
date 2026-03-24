@@ -24,7 +24,7 @@ use crate::search::SearchBuilder;
 pub struct InferenceSession {
     inner: JammiSession,
     model_cache: Arc<ModelCache>,
-    result_store: ResultStore,
+    result_store: Arc<ResultStore>,
     observer: Option<Arc<dyn InferenceObserver>>,
 }
 
@@ -45,7 +45,10 @@ impl InferenceSession {
         let device_config = DeviceConfig::from_config(inner.config());
         let scheduler = Arc::new(GpuScheduler::new_unlimited());
         let model_cache = Arc::new(ModelCache::new(resolver, device_config, scheduler));
-        let result_store = ResultStore::new(inner.config().artifact_dir.as_path(), catalog)?;
+        let result_store = Arc::new(ResultStore::new(
+            inner.config().artifact_dir.as_path(),
+            catalog,
+        )?);
         result_store.recover().await?;
         result_store.load_existing_tables(inner.context()).await?;
 
@@ -85,8 +88,8 @@ impl InferenceSession {
     }
 
     /// Access the result store.
-    pub fn result_store(&self) -> &ResultStore {
-        &self.result_store
+    pub fn result_store(&self) -> Arc<ResultStore> {
+        Arc::clone(&self.result_store)
     }
 
     /// Access the DataFusion session context.

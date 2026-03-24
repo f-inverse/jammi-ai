@@ -3,13 +3,15 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use datafusion::common::{JoinType, NullEquality};
 use datafusion::physical_expr::expressions::col;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::joins::PartitionMode;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
 
 use jammi_engine::error::{JammiError, Result};
-use jammi_engine::store::ResultStore;
 
 use crate::evidence::provenance::add_provenance;
 use crate::operator::ann_search_exec::AnnSearchExec;
@@ -21,12 +23,10 @@ use crate::session::InferenceSession;
 /// Each method adds a node to a DataFusion execution plan.
 /// `.run()` executes the plan and adds evidence provenance columns.
 ///
-/// ```text
-/// session.search("patents", query_vec, 10).await?
-///     .sort("similarity", true)?
-///     .limit(5)
-///     .run().await?
-/// ```
+/// After the initial ANN search, results are automatically hydrated by
+/// joining back to the source table — so all original columns (e.g.
+/// `title`, `abstract`, `assignee_id`) are available for downstream
+/// operations like `.join()`, `.annotate()`, `.filter()`, `.select()`.
 pub struct SearchBuilder {
     session: Arc<InferenceSession>,
     plan: Arc<dyn ExecutionPlan>,
@@ -36,29 +36,101 @@ pub struct SearchBuilder {
 
 impl SearchBuilder {
     /// Start a search over an embedding table.
+    ///
+    /// Creates an ANN search plan, then automatically hydrates results
+    /// by joining back to the source table to include all original columns.
     pub(crate) async fn new(
         session: Arc<InferenceSession>,
         source_id: &str,
         query_vec: Vec<f32>,
         k: usize,
-        _embedding_table: Option<&str>,
+        embedding_table: Option<&str>,
     ) -> Result<Self> {
         let table = session
             .catalog()
-            .resolve_embedding_table(source_id, _embedding_table)?;
+            .resolve_embedding_table(source_id, embedding_table)?;
 
-        let result_store = Arc::new(ResultStore::new(
-            session.inner_config().artifact_dir.as_path(),
-            Arc::new(jammi_engine::catalog::Catalog::open(
-                &session.inner_config().artifact_dir,
-            )?),
-        )?);
+        let result_store = session.result_store();
 
-        let ann = AnnSearchExec::new(table, query_vec, k, result_store, session.context().clone())?;
+        let ann = AnnSearchExec::new(
+            table.clone(),
+            query_vec,
+            k,
+            result_store,
+            session.context().clone(),
+        )?;
+
+        let mut plan: Arc<dyn ExecutionPlan> = Arc::new(ann);
+
+        // Hydration: join ANN results back to the source to get original columns.
+        // ANN output is (_row_id Utf8, _source_id Utf8, similarity Float32).
+        // The source key column may be a different type, so we cast it to Utf8.
+        // We also cast all string columns to VARCHAR to avoid Utf8View/Utf8 mismatches
+        // from the Parquet reader.
+        if let Some(ref key_col) = table.key_column {
+            let source_table_name = session.find_table_name(&table.source_id)?;
+            // Build column list that casts string columns to VARCHAR for compatibility
+            let source_cols = build_hydration_select(
+                session.context(),
+                &format!("{}.public.{source_table_name}", table.source_id),
+                key_col,
+            )
+            .await?;
+            let sql = format!(
+                "SELECT {source_cols} FROM {}.public.{source_table_name}",
+                table.source_id
+            );
+            let df = session
+                .context()
+                .sql(&sql)
+                .await
+                .map_err(|e| JammiError::Other(format!("Hydration scan: {e}")))?;
+            let source_plan: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(
+                df.create_physical_plan()
+                    .await
+                    .map_err(|e| JammiError::Other(format!("Hydration plan: {e}")))?,
+            ));
+
+            let left_col = col("_row_id", plan.schema().as_ref())
+                .map_err(|e| JammiError::Other(format!("Hydration join: {e}")))?;
+            let right_col = col("_join_key", source_plan.schema().as_ref())
+                .map_err(|e| JammiError::Other(format!("Hydration join: {e}")))?;
+
+            let join = HashJoinExec::try_new(
+                plan,
+                source_plan,
+                vec![(left_col, right_col)],
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+            )
+            .map_err(|e| JammiError::Other(format!("Hydration join: {e}")))?;
+
+            // Drop the _join_key column (redundant with _row_id)
+            plan = drop_column(Arc::new(join), "_join_key")?;
+
+            // Re-sort by similarity descending (join doesn't preserve order)
+            let sim_col = col("similarity", plan.schema().as_ref())
+                .map_err(|e| JammiError::Other(format!("Hydration sort: {e}")))?;
+            let sort_expr = datafusion::physical_expr::PhysicalSortExpr {
+                expr: sim_col,
+                options: arrow::compute::SortOptions {
+                    descending: true,
+                    nulls_first: false,
+                },
+            };
+            if let Some(ordering) = datafusion::physical_expr::LexOrdering::new(vec![sort_expr]) {
+                plan = Arc::new(datafusion::physical_plan::sorts::sort::SortExec::new(
+                    ordering, plan,
+                ));
+            }
+        }
 
         Ok(Self {
             session,
-            plan: Arc::new(ann),
+            plan,
             channels: vec!["vector".into()],
             annotated: false,
         })
@@ -109,6 +181,23 @@ impl SearchBuilder {
         self
     }
 
+    /// Select specific columns from the results.
+    pub fn select(mut self, columns: &[String]) -> Result<Self> {
+        let schema = self.plan.schema();
+        let exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = columns
+            .iter()
+            .map(|name| {
+                let expr = col(name, schema.as_ref())
+                    .map_err(|e| JammiError::Other(format!("Select column '{name}': {e}")))?;
+                Ok((expr as Arc<dyn PhysicalExpr>, name.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let projection = ProjectionExec::try_new(exprs, self.plan)
+            .map_err(|e| JammiError::Other(format!("ProjectionExec: {e}")))?;
+        self.plan = Arc::new(projection);
+        Ok(self)
+    }
+
     /// Join search results with another registered source.
     ///
     /// `on` is `"left_col=right_col"`. `how` is `"inner"` or `"left"` (default).
@@ -122,7 +211,6 @@ impl SearchBuilder {
             _ => JoinType::Left,
         };
 
-        // Scan the join source table
         let table_name = self.session.find_table_name(source)?;
         let sql = format!("SELECT * FROM {source}.public.{table_name}");
         let df = self
@@ -131,12 +219,12 @@ impl SearchBuilder {
             .sql(&sql)
             .await
             .map_err(|e| JammiError::Other(format!("Join: {e}")))?;
-        let right_plan = df
-            .create_physical_plan()
-            .await
-            .map_err(|e| JammiError::Other(format!("Join: {e}")))?;
+        let right_plan: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(
+            df.create_physical_plan()
+                .await
+                .map_err(|e| JammiError::Other(format!("Join: {e}")))?,
+        ));
 
-        // Build column expressions for the join keys
         let left_col = col(left_col_name, self.plan.schema().as_ref())
             .map_err(|e| JammiError::Other(format!("Join: {e}")))?;
         let right_col = col(right_col_name, right_plan.schema().as_ref())
@@ -159,19 +247,13 @@ impl SearchBuilder {
     }
 
     /// Annotate search results by running model inference over selected columns.
-    ///
-    /// This inserts an `InferenceExec` node into the execution plan so that
-    /// each result row is enriched with model outputs (e.g. embeddings,
-    /// classifications) before final collection.
     pub async fn annotate(mut self, model: &str, task: &str, columns: &[String]) -> Result<Self> {
-        // Parse model source from the model string
         let model_source = if let Some(path) = model.strip_prefix("local:") {
             crate::model::ModelSource::local(std::path::PathBuf::from(path))
         } else {
             crate::model::ModelSource::hf(model)
         };
 
-        // Parse the task string to ModelTask enum
         let model_task = match task.to_lowercase().as_str() {
             "embedding" => crate::model::ModelTask::Embedding,
             "classification" => crate::model::ModelTask::Classification,
@@ -181,7 +263,6 @@ impl SearchBuilder {
             other => return Err(JammiError::Other(format!("Unknown task: {other}"))),
         };
 
-        // Pre-load model to get embedding dimensions
         let guard = self
             .session
             .model_cache()
@@ -190,14 +271,13 @@ impl SearchBuilder {
         let embedding_dim = guard.model.embedding_dim();
         drop(guard);
 
-        // Build InferenceExec using the builder
         let inference = InferenceExecBuilder::new(
             self.plan,
             model_source,
             model_task,
             columns.to_vec(),
             "_row_id".to_string(),
-            String::new(), // source_id not needed for annotation
+            String::new(),
             std::sync::Arc::clone(self.session.model_cache()),
         )
         .batch_size(self.session.inner_config().inference.batch_size)
@@ -225,4 +305,54 @@ impl SearchBuilder {
 
         add_provenance(&batches, &self.channels, self.annotated)
     }
+}
+
+/// Build a SELECT column list for hydration that casts Utf8View columns to VARCHAR
+/// and adds a `_join_key` column from the key column cast to VARCHAR.
+async fn build_hydration_select(
+    ctx: &datafusion::prelude::SessionContext,
+    table_ref: &str,
+    key_col: &str,
+) -> Result<String> {
+    let df = ctx
+        .sql(&format!("SELECT * FROM {table_ref} LIMIT 0"))
+        .await
+        .map_err(|e| JammiError::Other(format!("Schema introspection: {e}")))?;
+    let schema = df.schema();
+
+    let mut cols = Vec::new();
+    for field in schema.fields() {
+        let name = field.name();
+        let cast = match field.data_type() {
+            arrow::datatypes::DataType::Utf8View | arrow::datatypes::DataType::LargeUtf8 => {
+                format!("arrow_cast(\"{name}\", 'Utf8') AS \"{name}\"")
+            }
+            _ => format!("\"{name}\""),
+        };
+        cols.push(cast);
+    }
+    cols.push(format!("arrow_cast(\"{key_col}\", 'Utf8') AS _join_key"));
+    Ok(cols.join(", "))
+}
+
+/// Drop a single column from a plan via ProjectionExec.
+fn drop_column(
+    plan: Arc<dyn ExecutionPlan>,
+    column_to_drop: &str,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let schema = plan.schema();
+    let exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.name() != column_to_drop)
+        .map(|(_, f)| {
+            let expr = col(f.name(), schema.as_ref())
+                .map_err(|e| JammiError::Other(format!("drop_column: {e}")))?;
+            Ok((expr as Arc<dyn PhysicalExpr>, f.name().to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let projection = ProjectionExec::try_new(exprs, plan)
+        .map_err(|e| JammiError::Other(format!("drop_column projection: {e}")))?;
+    Ok(Arc::new(projection))
 }

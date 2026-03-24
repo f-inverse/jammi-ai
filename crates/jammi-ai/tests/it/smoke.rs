@@ -78,6 +78,10 @@ async fn smoke_cp3_full_pipeline() {
         assert!(channels.contains(&"vector"));
     }
 
+    // Hydrated source columns present
+    assert!(batch.schema().field_with_name("abstract").is_ok());
+    assert!(batch.schema().field_with_name("title").is_ok());
+
     // Similarity descending
     let sim = batch
         .column_by_name("similarity")

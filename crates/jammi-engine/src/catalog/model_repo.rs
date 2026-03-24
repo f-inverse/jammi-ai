@@ -113,7 +113,7 @@ impl Catalog {
         let conn = self.conn()?;
         let sql = format!("SELECT {SELECT_COLS} FROM models ORDER BY created_at");
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| Ok(parse_model_row(row)))?;
+        let rows = stmt.query_map([], parse_model_row)?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
@@ -121,7 +121,7 @@ impl Catalog {
         stmt: &mut rusqlite::Statement<'_>,
         params: &[&dyn rusqlite::types::ToSql],
     ) -> Result<Option<ModelRecord>> {
-        let mut rows = stmt.query_map(params, |row| Ok(parse_model_row(row)))?;
+        let mut rows = stmt.query_map(params, parse_model_row)?;
         match rows.next() {
             Some(Ok(record)) => Ok(Some(record)),
             Some(Err(e)) => Err(e.into()),
@@ -131,16 +131,16 @@ impl Catalog {
 }
 
 /// Parse: model_id, name, model_type, task, backend, version, status, metadata, created_at
-fn parse_model_row(row: &rusqlite::Row<'_>) -> ModelRecord {
-    let _pk: String = row.get(0).unwrap_or_default();
-    let name: String = row.get(1).unwrap_or_default();
-    let model_type: String = row.get(2).unwrap_or_default();
-    let task: String = row.get(3).unwrap_or_default();
-    let backend: String = row.get(4).unwrap_or_default();
-    let version: i32 = row.get(5).unwrap_or(1);
-    let status: String = row.get(6).unwrap_or_default();
-    let metadata: Option<String> = row.get(7).unwrap_or(None);
-    let created_at: String = row.get(8).unwrap_or_default();
+fn parse_model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRecord> {
+    let _pk: String = row.get(0)?;
+    let name: String = row.get(1)?;
+    let model_type: String = row.get(2)?;
+    let task: String = row.get(3)?;
+    let backend: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
+    let version: i32 = row.get::<_, Option<i32>>(5)?.unwrap_or(1);
+    let status: String = row.get::<_, Option<String>>(6)?.unwrap_or_default();
+    let metadata: Option<String> = row.get(7)?;
+    let created_at: String = row.get::<_, Option<String>>(8)?.unwrap_or_default();
 
     let (base_model_id, artifact_path, config_json) = metadata
         .as_deref()
@@ -154,7 +154,7 @@ fn parse_model_row(row: &rusqlite::Row<'_>) -> ModelRecord {
         })
         .unwrap_or((None, None, None));
 
-    ModelRecord {
+    Ok(ModelRecord {
         model_id: name,
         version,
         model_type,
@@ -165,5 +165,5 @@ fn parse_model_row(row: &rusqlite::Row<'_>) -> ModelRecord {
         config_json,
         status,
         created_at,
-    }
+    })
 }

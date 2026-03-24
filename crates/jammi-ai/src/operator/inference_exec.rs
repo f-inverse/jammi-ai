@@ -44,9 +44,22 @@ impl std::fmt::Debug for InferenceExec {
     }
 }
 
-impl InferenceExec {
-    /// Create a new inference operator wrapping the given input plan.
-    #[allow(clippy::too_many_arguments)]
+/// Builder for constructing an `InferenceExec` operator.
+pub struct InferenceExecBuilder {
+    input: Arc<dyn ExecutionPlan>,
+    source: ModelSource,
+    task: ModelTask,
+    content_columns: Vec<String>,
+    key_column: String,
+    source_id: String,
+    model_cache: Arc<ModelCache>,
+    backend: Option<BackendType>,
+    batch_size: usize,
+    observer: Option<Arc<dyn InferenceObserver>>,
+    embedding_dim: Option<usize>,
+}
+
+impl InferenceExecBuilder {
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         source: ModelSource,
@@ -54,31 +67,64 @@ impl InferenceExec {
         content_columns: Vec<String>,
         key_column: String,
         source_id: String,
-        backend: Option<BackendType>,
-        batch_size: usize,
         model_cache: Arc<ModelCache>,
-        observer: Option<Arc<dyn InferenceObserver>>,
-        embedding_dim: Option<usize>,
-    ) -> jammi_engine::error::Result<Self> {
-        let output_schema =
-            build_output_schema(&task, &input.schema(), &key_column, embedding_dim)?;
-        let properties = Self::compute_properties(output_schema);
-        Ok(Self {
+    ) -> Self {
+        Self {
             input,
             source,
             task,
             content_columns,
             key_column,
             source_id,
-            backend,
-            batch_size,
             model_cache,
-            observer,
-            embedding_dim,
+            backend: None,
+            batch_size: 32,
+            observer: None,
+            embedding_dim: None,
+        }
+    }
+
+    pub fn batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size;
+        self
+    }
+
+    pub fn observer(mut self, observer: Option<Arc<dyn InferenceObserver>>) -> Self {
+        self.observer = observer;
+        self
+    }
+
+    pub fn embedding_dim(mut self, dim: Option<usize>) -> Self {
+        self.embedding_dim = dim;
+        self
+    }
+
+    pub fn build(self) -> jammi_engine::error::Result<InferenceExec> {
+        let output_schema = build_output_schema(
+            &self.task,
+            &self.input.schema(),
+            &self.key_column,
+            self.embedding_dim,
+        )?;
+        let properties = InferenceExec::compute_properties(output_schema);
+        Ok(InferenceExec {
+            input: self.input,
+            source: self.source,
+            task: self.task,
+            content_columns: self.content_columns,
+            key_column: self.key_column,
+            source_id: self.source_id,
+            backend: self.backend,
+            batch_size: self.batch_size,
+            model_cache: self.model_cache,
+            observer: self.observer,
+            embedding_dim: self.embedding_dim,
             properties,
         })
     }
+}
 
+impl InferenceExec {
     fn compute_properties(schema: SchemaRef) -> PlanProperties {
         PlanProperties::new(
             EquivalenceProperties::new(schema),
@@ -121,19 +167,19 @@ impl ExecutionPlan for InferenceExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(
-            Self::new(
+            InferenceExecBuilder::new(
                 Arc::clone(&children[0]),
                 self.source.clone(),
                 self.task,
                 self.content_columns.clone(),
                 self.key_column.clone(),
                 self.source_id.clone(),
-                self.backend,
-                self.batch_size,
                 Arc::clone(&self.model_cache),
-                self.observer.clone(),
-                self.embedding_dim,
             )
+            .batch_size(self.batch_size)
+            .observer(self.observer.clone())
+            .embedding_dim(self.embedding_dim)
+            .build()
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
         ))
     }

@@ -1,5 +1,5 @@
 /// SQL DDL for the initial catalog schema: sources, models, embeddings, fine-tune jobs, evals.
-pub const MIGRATION_001_CORE_TABLES: &str = r#"
+pub(super) const MIGRATION_001_CORE_TABLES: &str = r#"
 CREATE TABLE sources (
     source_id   TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
@@ -80,4 +80,28 @@ CREATE TABLE evidence_channels (
 INSERT INTO evidence_channels VALUES
     ('vector',    '{"similarity": "Float32"}', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     ('inference', '{"inference_model": "Utf8", "inference_task": "Utf8", "inference_confidence": "Float32"}', 2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+"#;
+
+/// Result tables: Parquet-backed embedding and inference outputs with sidecar ANN indexes.
+pub(super) const MIGRATION_002_RESULT_TABLES: &str = r#"
+CREATE TABLE result_tables (
+    table_name      TEXT PRIMARY KEY,
+    source_id       TEXT NOT NULL,
+    model_id        TEXT NOT NULL,
+    task            TEXT NOT NULL,
+    parquet_path    TEXT NOT NULL,
+    index_path      TEXT,
+    dimensions      INTEGER,
+    distance_metric TEXT DEFAULT 'cosine',
+    row_count       INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'building',
+    key_column      TEXT,
+    text_columns    TEXT,
+    checkpoint      INTEGER,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    completed_at    TEXT
+);
+CREATE INDEX idx_result_tables_source ON result_tables(source_id);
+CREATE INDEX idx_result_tables_task ON result_tables(task);
+CREATE INDEX idx_result_tables_status ON result_tables(status);
 "#;

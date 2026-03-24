@@ -1,5 +1,6 @@
 pub mod migrations;
 pub mod model_repo;
+pub mod result_repo;
 pub mod schema;
 pub mod source_repo;
 
@@ -40,7 +41,16 @@ impl Catalog {
     }
 
     /// Acquire a pooled SQLite connection.
-    pub fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
+    pub(crate) fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
         self.pool.get().map_err(JammiError::Pool)
+    }
+
+    /// List registered evidence channel names, ordered by priority.
+    pub fn evidence_channel_names(&self) -> Result<Vec<String>> {
+        let conn = self.conn()?;
+        let mut stmt =
+            conn.prepare("SELECT channel_name FROM evidence_channels ORDER BY priority")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
     }
 }

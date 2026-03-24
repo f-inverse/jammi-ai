@@ -152,23 +152,16 @@ fn contract_adapters_null_failed_rows() {
 mod live {
     use super::*;
     use arrow::array::StringArray;
-    use jammi_ai::inference::observer::InferenceObserver;
     use jammi_ai::model::{ModelSource, ModelTask};
     use jammi_ai::session::InferenceSession;
     use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::Duration;
     use tempfile::tempdir;
 
-    async fn setup_session() -> InferenceSession {
+    async fn setup_with_patents() -> (InferenceSession, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let config = common::test_config(dir.path());
-        InferenceSession::new(config).await.unwrap()
-    }
-
-    async fn setup_with_patents() -> InferenceSession {
-        let session = setup_session().await;
+        let session = InferenceSession::new(config).await.unwrap();
         session
             .add_source(
                 "patents",
@@ -181,12 +174,13 @@ mod live {
             )
             .await
             .unwrap();
-        session
+        (session, dir)
     }
 
+    // Tests 384-dim real model — tiny_bert is only 32-dim, can't cover this.
     #[tokio::test]
-    async fn inference_exec_embedding_produces_fixed_size_list_384() {
-        let session = setup_with_patents().await;
+    async fn real_model_produces_384_dim_embeddings() {
+        let (session, _dir) = setup_with_patents().await;
 
         let results = session
             .infer(
@@ -199,13 +193,10 @@ mod live {
             .await
             .unwrap();
 
-        assert!(!results.is_empty(), "Should produce at least one batch");
+        assert!(!results.is_empty());
         let batch = &results[0];
 
-        // Check that "vector" column exists and is FixedSizeList(384)
-        let vector_col = batch
-            .column_by_name("vector")
-            .expect("vector column should exist");
+        let vector_col = batch.column_by_name("vector").expect("vector column");
         match vector_col.data_type() {
             DataType::FixedSizeList(inner, 384) => {
                 assert_eq!(inner.data_type(), &DataType::Float32);
@@ -213,7 +204,6 @@ mod live {
             other => panic!("Expected FixedSizeList(Float32, 384), got {other:?}"),
         }
 
-        // Every OK row should have a 384-dim vector
         let fsl = vector_col
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
@@ -231,34 +221,9 @@ mod live {
         }
     }
 
+    // Tests batch memory estimation with real model config — tiny_bert doesn't have realistic dimensions.
     #[tokio::test]
-    async fn model_registered_in_catalog_after_inference() {
-        let session = setup_with_patents().await;
-
-        let results = session
-            .infer(
-                "patents",
-                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-                ModelTask::Embedding,
-                &["abstract".to_string()],
-                "id",
-            )
-            .await
-            .unwrap();
-        assert!(!results.is_empty());
-
-        // Verify the model was registered in the catalog
-        let models = session.catalog().list_models().unwrap();
-        assert!(
-            models
-                .iter()
-                .any(|m| m.model_id.contains("all-MiniLM-L6-v2")),
-            "Model should be registered in catalog after inference"
-        );
-    }
-
-    #[tokio::test]
-    async fn model_dimensions_retained_after_loading() {
+    async fn real_model_batch_memory_estimation() {
         use jammi_ai::concurrency::GpuScheduler;
         use jammi_ai::model::backend::DeviceConfig;
         use jammi_ai::model::cache::ModelCache;
@@ -283,197 +248,11 @@ mod live {
             .await
             .unwrap();
 
-        // MiniLM-L6-v2: hidden=384, heads=12, intermediate=1536
         let batch_mem = guard.model.estimate_batch_memory(32, 128);
         assert!(batch_mem > 0, "Batch memory estimate should be positive");
-        // attention: 32*12*128*128*4 = 25,165,824
-        // ffn: 32*128*1536*4 = 25,165,824
         assert!(
             batch_mem > 20_000_000 && batch_mem < 30_000_000,
             "Expected ~25MB for batch(32,128), got {batch_mem}"
-        );
-    }
-
-    #[tokio::test]
-    async fn null_text_row_produces_error_status() {
-        let session = setup_session().await;
-        session
-            .add_source(
-                "patents_nulls",
-                SourceType::Local,
-                SourceConnection {
-                    url: Some(common::fixture_url("patents_with_nulls.parquet")),
-                    format: Some(FileFormat::Parquet),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        let results = session
-            .infer(
-                "patents_nulls",
-                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-                ModelTask::Embedding,
-                &["abstract".to_string()],
-                "id",
-            )
-            .await
-            .unwrap();
-
-        let mut ok_count = 0;
-        let mut error_count = 0;
-
-        for batch in &results {
-            let status = batch
-                .column_by_name("_status")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            for i in 0..status.len() {
-                match status.value(i) {
-                    "ok" => ok_count += 1,
-                    "error" => error_count += 1,
-                    other => panic!("Unexpected _status value: {other}"),
-                }
-            }
-        }
-
-        // patents_with_nulls.parquet has rows with null abstract
-        assert!(
-            error_count > 0,
-            "Rows with null abstract should have _status='error'"
-        );
-        assert!(
-            ok_count > 0,
-            "Rows with valid abstract should have _status='ok'"
-        );
-    }
-
-    #[tokio::test]
-    async fn error_rows_have_null_vector_and_populated_error_message() {
-        let session = setup_session().await;
-        session
-            .add_source(
-                "patents_nulls",
-                SourceType::Local,
-                SourceConnection {
-                    url: Some(common::fixture_url("patents_with_nulls.parquet")),
-                    format: Some(FileFormat::Parquet),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        let results = session
-            .infer(
-                "patents_nulls",
-                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-                ModelTask::Embedding,
-                &["abstract".to_string()],
-                "id",
-            )
-            .await
-            .unwrap();
-
-        for batch in &results {
-            let status = batch
-                .column_by_name("_status")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let error_col = batch
-                .column_by_name("_error")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let vector_col = batch
-                .column_by_name("vector")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<FixedSizeListArray>()
-                .unwrap();
-
-            for i in 0..status.len() {
-                if status.value(i) == "error" {
-                    assert!(
-                        vector_col.is_null(i),
-                        "Error row {i} should have null vector"
-                    );
-                    assert!(
-                        !error_col.is_null(i),
-                        "Error row {i} should have an error message"
-                    );
-                    assert!(
-                        !error_col.value(i).is_empty(),
-                        "Error message should not be empty"
-                    );
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn observer_receives_batch_notifications() {
-        struct CountingObserver {
-            batch_count: AtomicUsize,
-        }
-
-        impl InferenceObserver for CountingObserver {
-            fn on_batch(
-                &self,
-                _batch: &arrow::record_batch::RecordBatch,
-                _model_id: &str,
-                _latency: Duration,
-            ) {
-                self.batch_count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        let dir = tempdir().unwrap();
-        let config = common::test_config(dir.path());
-        let observer = Arc::new(CountingObserver {
-            batch_count: AtomicUsize::new(0),
-        });
-        let session = InferenceSession::with_observer(
-            config,
-            Some(observer.clone() as Arc<dyn InferenceObserver>),
-        )
-        .await
-        .unwrap();
-
-        session
-            .add_source(
-                "patents",
-                SourceType::Local,
-                SourceConnection {
-                    url: Some(common::fixture_url("patents.parquet")),
-                    format: Some(FileFormat::Parquet),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        let results = session
-            .infer(
-                "patents",
-                &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-                ModelTask::Embedding,
-                &["abstract".to_string()],
-                "id",
-            )
-            .await
-            .unwrap();
-
-        assert!(!results.is_empty());
-        assert!(
-            observer.batch_count.load(Ordering::Relaxed) > 0,
-            "Observer should have been called at least once"
         );
     }
 }

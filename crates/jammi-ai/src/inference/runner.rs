@@ -67,11 +67,15 @@ impl InferenceRunner {
     ) -> std::result::Result<(), datafusion::error::DataFusionError> {
         let result = self.run_inner(&mut input, &tx, &output_schema).await;
         if let Err(e) = result {
-            let _ = tx
+            if tx
                 .send(Err(datafusion::error::DataFusionError::External(Box::new(
                     e,
                 ))))
-                .await;
+                .await
+                .is_err()
+            {
+                tracing::warn!("Failed to send inference error to receiver (query cancelled)");
+            }
         }
         Ok(())
     }

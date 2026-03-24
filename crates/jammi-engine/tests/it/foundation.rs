@@ -51,44 +51,23 @@ fn config_env_overrides() {
 fn catalog_opens_and_creates_tables() {
     let dir = tempdir().unwrap();
     let catalog = Catalog::open(dir.path()).unwrap();
-    let conn = catalog.conn().unwrap();
 
-    let tables = [
-        "sources",
-        "embedding_sets",
-        "models",
-        "fine_tune_jobs",
-        "eval_runs",
-        "evidence_channels",
-    ];
-    for table in tables {
-        let count: i64 = conn
-            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
-            .unwrap_or_else(|e| panic!("Table {table} should exist: {e}"));
-        assert!(count >= 0, "Table {table} should be queryable");
-    }
+    // Exercise public APIs that transitively verify each table exists
+    assert!(catalog.list_sources().unwrap().is_empty());
+    assert!(catalog.list_models().unwrap().is_empty());
+    assert!(catalog
+        .list_result_tables_by_status("ready")
+        .unwrap()
+        .is_empty());
+    assert!(!catalog.evidence_channel_names().unwrap().is_empty());
 }
 
 #[test]
 fn catalog_seeds_evidence_channels() {
     let dir = tempdir().unwrap();
     let catalog = Catalog::open(dir.path()).unwrap();
-    let conn = catalog.conn().unwrap();
 
-    let count: i64 = conn
-        .query_row("SELECT count(*) FROM evidence_channels", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(count, 2, "Should have vector and inference channels");
-
-    let names: Vec<String> = {
-        let mut stmt = conn
-            .prepare("SELECT channel_name FROM evidence_channels ORDER BY priority")
-            .unwrap();
-        stmt.query_map([], |r| r.get(0))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect()
-    };
+    let names = catalog.evidence_channel_names().unwrap();
     assert_eq!(names, vec!["vector", "inference"]);
 }
 

@@ -1,3 +1,7 @@
+// NOTE: This module is duplicated in crates/jammi-{engine,ai}/tests/it/common/mod.rs.
+// A shared jammi-test-utils crate isn't worth it for 5 helpers.
+// If this grows beyond ~50 lines, extract to a shared crate.
+
 use std::path::{Path, PathBuf};
 
 /// Workspace root — two levels up from any crate in `crates/<name>/`.

@@ -26,6 +26,7 @@ thiserror.workspace = true
 [dev-dependencies]
 tempfile = "3"
 tokio.workspace = true
+parquet.workspace = true
 
 [features]
 live-hub-tests = []

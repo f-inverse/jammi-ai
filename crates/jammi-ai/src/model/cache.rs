@@ -174,7 +174,7 @@ impl ModelCache {
             ModelSource::HuggingFace(_) => "huggingface",
             ModelSource::Local(_) => "local",
         };
-        let _ = self.resolver.catalog().register_model(RegisterModelParams {
+        if let Err(e) = self.resolver.catalog().register_model(RegisterModelParams {
             model_id: &source_str,
             version: 1,
             model_type,
@@ -183,7 +183,9 @@ impl ModelCache {
             artifact_path: resolved.weights_paths.first().and_then(|p| p.to_str()),
             config_json: None,
             ..Default::default()
-        });
+        }) {
+            tracing::warn!(model_id = %source_str, "Failed to register model in catalog: {e}");
+        }
 
         let mut cache = self.inner.write().await;
         let ref_count = Arc::new(AtomicUsize::new(1));

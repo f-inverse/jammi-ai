@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use datafusion::physical_plan::ExecutionPlan;
+use jammi_engine::catalog::result_repo::ResultTableRecord;
 use jammi_engine::config::JammiConfig;
 use jammi_engine::error::{JammiError, Result};
 use jammi_engine::session::JammiSession;
 use jammi_engine::source::{SourceConnection, SourceType};
+use jammi_engine::store::ResultStore;
 
 use crate::concurrency::GpuScheduler;
 use crate::inference::observer::InferenceObserver;
@@ -13,13 +15,15 @@ use crate::model::backend::DeviceConfig;
 use crate::model::cache::ModelCache;
 use crate::model::resolver::ModelResolver;
 use crate::model::{ModelSource, ModelTask};
-use crate::operator::inference_exec::InferenceExec;
+use crate::operator::inference_exec::InferenceExecBuilder;
+use crate::pipeline::embedding::EmbeddingPipeline;
 
 /// An inference-capable session that wraps `JammiSession` with model loading
 /// and inference execution. This is the primary entry point for CP2+.
 pub struct InferenceSession {
     inner: JammiSession,
     model_cache: Arc<ModelCache>,
+    result_store: ResultStore,
     observer: Option<Arc<dyn InferenceObserver>>,
 }
 
@@ -36,14 +40,18 @@ impl InferenceSession {
     ) -> Result<Self> {
         let inner = JammiSession::new(config).await?;
         let catalog = Arc::clone(inner.catalog());
-        let resolver = ModelResolver::new(catalog)?;
+        let resolver = ModelResolver::new(catalog.clone())?;
         let device_config = DeviceConfig::from_config(inner.config());
         let scheduler = Arc::new(GpuScheduler::new_unlimited());
         let model_cache = Arc::new(ModelCache::new(resolver, device_config, scheduler));
+        let result_store = ResultStore::new(inner.config().artifact_dir.as_path(), catalog)?;
+        result_store.recover().await?;
+        result_store.load_existing_tables(inner.context()).await?;
 
         Ok(Self {
             inner,
             model_cache,
+            result_store,
             observer,
         })
     }
@@ -75,6 +83,39 @@ impl InferenceSession {
         &self.model_cache
     }
 
+    /// Access the result store.
+    pub fn result_store(&self) -> &ResultStore {
+        &self.result_store
+    }
+
+    /// Access the DataFusion session context.
+    pub fn context(&self) -> &datafusion::prelude::SessionContext {
+        self.inner.context()
+    }
+
+    /// Access the engine configuration.
+    pub fn inner_config(&self) -> &jammi_engine::config::JammiConfig {
+        self.inner.config()
+    }
+
+    /// Access the inference observer.
+    pub(crate) fn observer(&self) -> &Option<Arc<dyn InferenceObserver>> {
+        &self.observer
+    }
+
+    /// Generate embeddings for a source and persist to Jammi DB.
+    pub async fn generate_embeddings(
+        &self,
+        source_id: &str,
+        model_id: &str,
+        columns: &[String],
+        key_column: &str,
+    ) -> Result<ResultTableRecord> {
+        EmbeddingPipeline::new(self, &self.result_store)
+            .run(source_id, model_id, columns, key_column)
+            .await
+    }
+
     /// Run inference on a registered source using a model.
     ///
     /// Scans the source, feeds `content_columns` through the model,
@@ -94,19 +135,8 @@ impl InferenceSession {
             ));
         }
 
-        // Build a scan plan over the source by querying for the needed columns
-        let all_columns: Vec<&str> = std::iter::once(key_column)
-            .chain(content_columns.iter().map(|s| s.as_str()))
-            .collect();
-        let select_list = all_columns
-            .iter()
-            .map(|c| format!("\"{c}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        // Find the table in the source's catalog
         let table_name = self.find_table_name(source_id)?;
-        let query = format!("SELECT {select_list} FROM {source_id}.public.{table_name}");
+        let query = self.build_source_query(source_id, &table_name, key_column, content_columns);
 
         let df = self.inner.context().sql(&query).await.map_err(|e| {
             JammiError::Inference(format!("Failed to scan source '{source_id}': {e}"))
@@ -124,19 +154,19 @@ impl InferenceSession {
         drop(guard);
 
         // Wrap with InferenceExec
-        let inference_exec = InferenceExec::new(
+        let inference_exec = InferenceExecBuilder::new(
             input_plan,
             source.clone(),
             task,
             content_columns.to_vec(),
             key_column.to_string(),
             source_id.to_string(),
-            None,
-            self.inner.config().inference.batch_size,
             Arc::clone(&self.model_cache),
-            self.observer.clone(),
-            embedding_dim,
-        )?;
+        )
+        .batch_size(self.inner.config().inference.batch_size)
+        .observer(self.observer.clone())
+        .embedding_dim(embedding_dim)
+        .build()?;
 
         // Execute and collect results
         let task_ctx = self.inner.context().task_ctx();
@@ -144,13 +174,64 @@ impl InferenceSession {
             .execute(0, task_ctx)
             .map_err(|e| JammiError::Inference(format!("InferenceExec failed: {e}")))?;
 
-        datafusion::physical_plan::common::collect(stream)
+        let batches = datafusion::physical_plan::common::collect(stream)
             .await
-            .map_err(|e| JammiError::Inference(format!("Failed to collect results: {e}")))
+            .map_err(|e| JammiError::Inference(format!("Failed to collect results: {e}")))?;
+
+        // Persist results to Parquet
+        if !batches.is_empty() {
+            let task_str = format!("{task:?}").to_lowercase();
+            let table_info = self.result_store.create_table(
+                source_id,
+                &task_str,
+                &source.to_string(),
+                None,
+                None,
+                None,
+            )?;
+            let schema = batches[0].schema();
+            let mut writer = jammi_engine::store::writer::ParquetResultWriter::new(
+                &table_info.parquet_path,
+                schema,
+            )?;
+            for batch in &batches {
+                writer.write_batch(batch)?;
+            }
+            let row_count = writer.close()?;
+            self.result_store
+                .finalize(
+                    self.inner.context(),
+                    &table_info.table_name,
+                    &table_info.parquet_path,
+                    row_count,
+                )
+                .await?;
+        }
+
+        Ok(batches)
+    }
+
+    /// Build a SELECT query for the key + content columns from a source table.
+    pub(crate) fn build_source_query(
+        &self,
+        source_id: &str,
+        table_name: &str,
+        key_column: &str,
+        content_columns: &[String],
+    ) -> String {
+        let all_columns: Vec<&str> = std::iter::once(key_column)
+            .chain(content_columns.iter().map(|s| s.as_str()))
+            .collect();
+        let select_list = all_columns
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("SELECT {select_list} FROM {source_id}.public.{table_name}")
     }
 
     /// Find the first table name registered under a source catalog.
-    fn find_table_name(&self, source_id: &str) -> Result<String> {
+    pub(crate) fn find_table_name(&self, source_id: &str) -> Result<String> {
         let ctx = self.inner.context();
         let catalog = ctx
             .catalog(source_id)

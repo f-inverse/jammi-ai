@@ -7,8 +7,10 @@
 pub mod catalog;
 pub mod config;
 pub mod error;
+pub mod index;
 pub mod session;
 pub mod source;
+pub mod store;
 
 use config::LoggingConfig;
 

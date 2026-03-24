@@ -3000,6 +3000,7 @@ dependencies = [
  "futures",
  "hf-hub",
  "jammi-engine",
+ "parquet",
  "serde",
  "serde_json",
  "tempfile",

@@ -5,10 +5,14 @@ edition.workspace = true
 publish = false
 
 [lib]
-name = "jammi_python"
+name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]
 jammi-engine.workspace = true
 jammi-ai.workspace = true
 pyo3.workspace = true
+arrow.workspace = true
+arrow-array.workspace = true
+tokio.workspace = true
+serde_json.workspace = true

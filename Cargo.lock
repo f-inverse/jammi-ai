@@ -3634,9 +3634,13 @@ dependencies = [
 name = "jammi-python"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "arrow-array",
  "jammi-ai",
  "jammi-engine",
  "pyo3",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

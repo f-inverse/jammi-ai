@@ -1,8 +1,11 @@
+pub mod eval_repo;
+pub mod fine_tune_repo;
 pub mod migrations;
 pub mod model_repo;
 pub mod result_repo;
 pub mod schema;
 pub mod source_repo;
+pub mod status;
 
 use std::path::Path;
 

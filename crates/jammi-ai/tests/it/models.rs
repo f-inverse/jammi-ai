@@ -5,7 +5,7 @@ use jammi_ai::model::{
     backend::DeviceConfig, cache::ModelCache, resolver::ModelResolver, tokenizer::TokenizerWrapper,
     BackendType, ModelId, ModelSource, ModelTask,
 };
-use jammi_engine::catalog::{model_repo::RegisterModelParams, Catalog};
+use jammi_engine::catalog::{model_repo::RegisterModelParams, status::ModelStatus, Catalog};
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -353,7 +353,7 @@ fn catalog_update_model_status() {
         .unwrap();
 
     catalog
-        .update_model_status("status-model", "loaded")
+        .update_model_status("status-model", ModelStatus::Loaded)
         .unwrap();
 
     let record = catalog.get_model("status-model").unwrap().unwrap();

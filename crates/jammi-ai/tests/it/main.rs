@@ -1,5 +1,7 @@
 mod common;
 mod e2e_inference;
+mod evaluation;
+mod fine_tune;
 mod inference;
 mod models;
 mod pipeline;

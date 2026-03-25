@@ -10,6 +10,7 @@ use datafusion::prelude::SessionContext;
 use tracing::warn;
 
 use crate::catalog::result_repo::{CreateResultTableParams, ResultTableRecord};
+use crate::catalog::status::ResultTableStatus;
 use crate::catalog::Catalog;
 use crate::error::{JammiError, Result};
 use crate::index::sidecar::SidecarIndex;
@@ -118,13 +119,15 @@ impl ResultStore {
     ) -> Result<()> {
         self.register_table(ctx, name, path).await?;
         self.catalog
-            .update_result_table_status(name, "ready", rows)?;
+            .update_result_table_status(name, ResultTableStatus::Ready, rows)?;
         Ok(())
     }
 
     /// Recover tables stuck in 'building' status after a crash.
     pub async fn recover(&self) -> Result<()> {
-        let building = self.catalog.list_result_tables_by_status("building")?;
+        let building = self
+            .catalog
+            .list_result_tables_by_status(ResultTableStatus::Building)?;
         for table in building {
             let parquet_exists = Path::new(&table.parquet_path).exists();
             let parquet_valid = parquet_exists && reader::is_valid_parquet(&table.parquet_path);
@@ -134,8 +137,11 @@ impl ResultStore {
                     table = table.table_name,
                     "Recovery: Parquet missing, marking failed"
                 );
-                self.catalog
-                    .update_result_table_status(&table.table_name, "failed", 0)?;
+                self.catalog.update_result_table_status(
+                    &table.table_name,
+                    ResultTableStatus::Failed,
+                    0,
+                )?;
             } else if !parquet_valid {
                 warn!(
                     table = table.table_name,
@@ -148,8 +154,11 @@ impl ResultStore {
                     std::fs::remove_file(base.with_extension("rowmap")).ok();
                     std::fs::remove_file(base.with_extension("manifest.json")).ok();
                 }
-                self.catalog
-                    .update_result_table_status(&table.table_name, "failed", 0)?;
+                self.catalog.update_result_table_status(
+                    &table.table_name,
+                    ResultTableStatus::Failed,
+                    0,
+                )?;
             } else {
                 let row_count = reader::count_parquet_rows(&table.parquet_path)?;
                 // Rebuild ANN index if this is an embedding table
@@ -168,8 +177,11 @@ impl ResultStore {
                         }
                     }
                 }
-                self.catalog
-                    .update_result_table_status(&table.table_name, "ready", row_count)?;
+                self.catalog.update_result_table_status(
+                    &table.table_name,
+                    ResultTableStatus::Ready,
+                    row_count,
+                )?;
             }
         }
         Ok(())
@@ -177,7 +189,9 @@ impl ResultStore {
 
     /// Load all 'ready' result tables into DataFusion.
     pub async fn load_existing_tables(&self, ctx: &SessionContext) -> Result<()> {
-        let ready = self.catalog.list_result_tables_by_status("ready")?;
+        let ready = self
+            .catalog
+            .list_result_tables_by_status(ResultTableStatus::Ready)?;
         for table in ready {
             let path = Path::new(&table.parquet_path);
             if path.exists() {
@@ -191,6 +205,24 @@ impl ResultStore {
             }
         }
         Ok(())
+    }
+
+    /// Search an embedding table for the nearest neighbors of a query vector.
+    /// Uses SidecarIndex (ANN) when available, falls back to exact brute-force search.
+    pub async fn search_vectors(
+        &self,
+        ctx: &SessionContext,
+        table: &ResultTableRecord,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<(String, f32)>> {
+        let index = self.resolve_search_mode(table)?;
+        match index {
+            Some(idx) => idx.search(query, k),
+            None => {
+                crate::index::exact::exact_vector_search(ctx, &table.table_name, query, k).await
+            }
+        }
     }
 
     /// Resolve whether to use ANN (sidecar index) or exact search for a table.

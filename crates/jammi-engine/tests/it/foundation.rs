@@ -1,5 +1,6 @@
 use crate::common;
 
+use jammi_engine::catalog::status::ResultTableStatus;
 use jammi_engine::catalog::Catalog;
 use jammi_engine::config::JammiConfig;
 use std::path::Path;
@@ -56,7 +57,7 @@ fn catalog_opens_and_creates_tables() {
     assert!(catalog.list_sources().unwrap().is_empty());
     assert!(catalog.list_models().unwrap().is_empty());
     assert!(catalog
-        .list_result_tables_by_status("ready")
+        .list_result_tables_by_status(ResultTableStatus::Ready)
         .unwrap()
         .is_empty());
     assert!(!catalog.evidence_channel_names().unwrap().is_empty());

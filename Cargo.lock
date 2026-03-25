@@ -2996,6 +2996,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "candle-transformers",
+ "chrono",
  "datafusion",
  "futures",
  "hf-hub",
@@ -3008,6 +3009,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

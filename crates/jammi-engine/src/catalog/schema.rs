@@ -105,3 +105,16 @@ CREATE INDEX idx_result_tables_source ON result_tables(source_id);
 CREATE INDEX idx_result_tables_task ON result_tables(task);
 CREATE INDEX idx_result_tables_status ON result_tables(status);
 "#;
+
+/// Phase 08: add golden_source, k, and status columns to eval_runs.
+pub(super) const MIGRATION_003_EVAL_COLUMNS: &str = r#"
+ALTER TABLE eval_runs ADD COLUMN golden_source TEXT;
+ALTER TABLE eval_runs ADD COLUMN k INTEGER;
+ALTER TABLE eval_runs ADD COLUMN status TEXT NOT NULL DEFAULT 'completed';
+"#;
+
+/// Drop unused embedding_sets table. Defined in MIGRATION_001 but never
+/// referenced by any Rust code — no repo, no types, no callers.
+pub(super) const MIGRATION_004_DROP_EMBEDDING_SETS: &str = r#"
+DROP TABLE IF EXISTS embedding_sets;
+"#;

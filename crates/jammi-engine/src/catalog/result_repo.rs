@@ -80,10 +80,18 @@ impl Catalog {
     }
 
     /// Update a result table's status and row count. Sets `completed_at` when
-    /// transitioning to a terminal state (ready/failed).
-    pub fn update_result_table_status(&self, name: &str, status: &str, rows: usize) -> Result<()> {
+    /// transitioning to a terminal state (Ready/Failed).
+    pub fn update_result_table_status(
+        &self,
+        name: &str,
+        status: super::status::ResultTableStatus,
+        rows: usize,
+    ) -> Result<()> {
         let conn = self.conn()?;
-        let completed_at = if status == "ready" || status == "failed" {
+        let completed_at = if matches!(
+            status,
+            super::status::ResultTableStatus::Ready | super::status::ResultTableStatus::Failed
+        ) {
             Some(
                 chrono::Utc::now()
                     .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -92,10 +100,11 @@ impl Catalog {
         } else {
             None
         };
+        let status_str = status.to_string();
         conn.execute(
             "UPDATE result_tables SET status = ?1, row_count = ?2, completed_at = ?3
              WHERE table_name = ?4",
-            params![status, rows as i64, completed_at, name],
+            params![status_str, rows as i64, completed_at, name],
         )?;
         Ok(())
     }
@@ -113,11 +122,15 @@ impl Catalog {
     }
 
     /// List all result tables with a given status.
-    pub fn list_result_tables_by_status(&self, status: &str) -> Result<Vec<ResultTableRecord>> {
+    pub fn list_result_tables_by_status(
+        &self,
+        status: super::status::ResultTableStatus,
+    ) -> Result<Vec<ResultTableRecord>> {
         let conn = self.conn()?;
+        let status_str = status.to_string();
         let mut stmt =
             conn.prepare("SELECT * FROM result_tables WHERE status = ?1 ORDER BY created_at")?;
-        let rows = stmt.query_map(params![status], parse_row)?;
+        let rows = stmt.query_map(params![status_str], parse_row)?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 

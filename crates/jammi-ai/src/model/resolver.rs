@@ -60,6 +60,29 @@ impl ModelResolver {
             None => return Ok(None),
         };
 
+        // For fine-tuned models: resolve via the base model, set adapter_path.
+        // The artifact_path for fine-tuned models points to the adapter directory,
+        // not a full model directory — skip the config.json/weights checks.
+        if record.model_type == "fine-tuned" {
+            if let Some(ref base_id) = record.base_model_id {
+                let base_source = ModelSource::parse(base_id);
+                let base_resolved = self.resolve(&base_source, task, backend_hint)?;
+
+                return Ok(Some(ResolvedModel {
+                    model_id,
+                    backend: base_resolved.backend,
+                    task,
+                    config_path: base_resolved.config_path,
+                    weights_paths: base_resolved.weights_paths,
+                    tokenizer_path: base_resolved.tokenizer_path,
+                    model_config: base_resolved.model_config,
+                    base_model_id: Some(ModelId(base_id.clone())),
+                    adapter_path: record.artifact_path.map(PathBuf::from),
+                    estimated_memory: base_resolved.estimated_memory,
+                }));
+            }
+        }
+
         // Only use the catalog hit if artifact_path is set and still exists
         let artifact_dir = match &record.artifact_path {
             Some(p) => {
@@ -134,6 +157,7 @@ impl ModelResolver {
             tokenizer_path,
             model_config,
             base_model_id: record.base_model_id.map(ModelId),
+            adapter_path: None,
             estimated_memory,
         }))
     }
@@ -233,6 +257,7 @@ impl ModelResolver {
             tokenizer_path,
             model_config: config,
             base_model_id: None,
+            adapter_path: None,
             estimated_memory,
         })
     }
@@ -283,6 +308,7 @@ impl ModelResolver {
             tokenizer_path,
             model_config: config,
             base_model_id: None,
+            adapter_path: None,
             estimated_memory,
         })
     }

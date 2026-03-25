@@ -6,6 +6,8 @@ use crate::error::Result;
 static MIGRATIONS: &[M<'static>] = &[
     M::up(schema::MIGRATION_001_CORE_TABLES),
     M::up(schema::MIGRATION_002_RESULT_TABLES),
+    M::up(schema::MIGRATION_003_EVAL_COLUMNS),
+    M::up(schema::MIGRATION_004_DROP_EMBEDDING_SETS),
 ];
 
 /// Build the full migration set for the catalog database.

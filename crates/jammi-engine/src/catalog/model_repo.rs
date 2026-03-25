@@ -97,13 +97,18 @@ impl Catalog {
         Self::query_one_model(&mut stmt, rusqlite::params![model_id, version])
     }
 
-    /// Update model status (e.g., "registered" → "loaded").
-    pub fn update_model_status(&self, model_id: &str, status: &str) -> Result<()> {
+    /// Update model status (e.g., Registered → Loaded).
+    pub fn update_model_status(
+        &self,
+        model_id: &str,
+        status: super::status::ModelStatus,
+    ) -> Result<()> {
         let conn = self.conn()?;
+        let status_str = status.to_string();
         conn.execute(
             "UPDATE models SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE name = ?2",
-            rusqlite::params![status, model_id],
+            rusqlite::params![status_str, model_id],
         )?;
         Ok(())
     }

@@ -27,6 +27,8 @@ pub struct CandleModel {
     pub tokenizer: Option<TokenizerWrapper>,
     /// Device the model weights reside on (CPU, CUDA, or Metal).
     pub device: Device,
+    /// Optional LoRA projection applied after pooling (for fine-tuned models).
+    pub lora_projection: Option<crate::fine_tune::lora::LoraLinear>,
 }
 
 impl CandleModel {
@@ -144,7 +146,15 @@ impl CandleModel {
             let pooled = self.mean_pool(&output, &attention_mask)?;
             let normalized = self.l2_normalize(&pooled)?;
 
-            let embeddings = normalized
+            // Apply LoRA projection if this is a fine-tuned model
+            let final_output = if let Some(ref lora) = self.lora_projection {
+                lora.forward(&normalized)
+                    .map_err(|e| JammiError::Inference(format!("LoRA projection: {e}")))?
+            } else {
+                normalized
+            };
+
+            let embeddings = final_output
                 .to_vec2::<f32>()
                 .map_err(|e| JammiError::Inference(format!("Tensor to vec failed: {e}")))?;
 
@@ -220,11 +230,60 @@ impl ModelBackend for CandleBackend {
             }
         })?;
 
+        // Load LoRA adapter if present (fine-tuned models)
+        let lora_projection =
+            if let Some(ref adapter_path) = resolved.adapter_path {
+                let adapter_file = adapter_path.join("adapter.safetensors");
+                if adapter_file.exists() {
+                    let adapter_weights =
+                        crate::fine_tune::lora::load_lora_weights(&adapter_file, &device).map_err(
+                            |e| JammiError::Model {
+                                model_id: resolved.model_id.0.clone(),
+                                message: format!("Load adapter: {e}"),
+                            },
+                        )?;
+
+                    let hidden_size = dimensions.hidden_size;
+                    let identity = Tensor::eye(hidden_size, DType::F32, &device).map_err(|e| {
+                        JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("Identity weight: {e}"),
+                        }
+                    })?;
+                    let base_linear = candle_nn::Linear::new(identity, None);
+
+                    let lora_a = adapter_weights.get("projection.lora_a").ok_or_else(|| {
+                        JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: "Adapter missing projection.lora_a".into(),
+                        }
+                    })?;
+                    let lora_b = adapter_weights.get("projection.lora_b").ok_or_else(|| {
+                        JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: "Adapter missing projection.lora_b".into(),
+                        }
+                    })?;
+
+                    Some(crate::fine_tune::lora::LoraLinear::from_loaded(
+                        base_linear,
+                        lora_a.clone(),
+                        lora_b.clone(),
+                        16.0, // default alpha — matches FineTuneConfig::default()
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         Ok(LoadedModel::Candle(Box::new(CandleModel {
             dimensions,
             inner,
             tokenizer,
             device,
+            lora_projection,
         })))
     }
 

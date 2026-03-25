@@ -4,6 +4,7 @@ use arrow::array::{ArrayRef, Float32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use jammi_engine::catalog::result_repo::CreateResultTableParams;
+use jammi_engine::catalog::status::ResultTableStatus;
 use jammi_engine::catalog::Catalog;
 use jammi_engine::store::reader::{count_parquet_rows, is_valid_parquet};
 use jammi_engine::store::writer::ParquetResultWriter;
@@ -93,7 +94,7 @@ fn result_table_crud_lifecycle() {
 
     // Transition to ready
     catalog
-        .update_result_table_status("t1", "ready", 42)
+        .update_result_table_status("t1", ResultTableStatus::Ready, 42)
         .unwrap();
     let record = catalog.get_result_table("t1").unwrap().unwrap();
     assert_eq!(record.status, "ready");
@@ -115,11 +116,15 @@ fn result_table_crud_lifecycle() {
         })
         .unwrap();
 
-    let building = catalog.list_result_tables_by_status("building").unwrap();
+    let building = catalog
+        .list_result_tables_by_status(ResultTableStatus::Building)
+        .unwrap();
     assert_eq!(building.len(), 1);
     assert_eq!(building[0].table_name, "t2");
 
-    let ready = catalog.list_result_tables_by_status("ready").unwrap();
+    let ready = catalog
+        .list_result_tables_by_status(ResultTableStatus::Ready)
+        .unwrap();
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].table_name, "t1");
 }
@@ -187,7 +192,7 @@ fn resolve_embedding_table_latest_explicit_and_missing() {
             })
             .unwrap();
         catalog
-            .update_result_table_status(name, "ready", 10)
+            .update_result_table_status(name, ResultTableStatus::Ready, 10)
             .unwrap();
     }
 

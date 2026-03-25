@@ -248,11 +248,7 @@ impl SearchBuilder {
 
     /// Annotate search results by running model inference over selected columns.
     pub async fn annotate(mut self, model: &str, task: &str, columns: &[String]) -> Result<Self> {
-        let model_source = if let Some(path) = model.strip_prefix("local:") {
-            crate::model::ModelSource::local(std::path::PathBuf::from(path))
-        } else {
-            crate::model::ModelSource::hf(model)
-        };
+        let model_source = crate::model::ModelSource::parse(model);
 
         let model_task = match task.to_lowercase().as_str() {
             "embedding" => crate::model::ModelTask::Embedding,

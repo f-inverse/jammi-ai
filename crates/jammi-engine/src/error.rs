@@ -33,6 +33,14 @@ pub enum JammiError {
     #[error("Inference error: {0}")]
     Inference(String),
 
+    /// Fine-tuning error.
+    #[error("Fine-tune error: {0}")]
+    FineTune(String),
+
+    /// Evaluation error.
+    #[error("Eval error: {0}")]
+    Eval(String),
+
     /// Filesystem I/O error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

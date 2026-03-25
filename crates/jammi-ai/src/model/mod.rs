@@ -44,6 +44,27 @@ impl ModelSource {
     pub fn local(path: impl Into<PathBuf>) -> Self {
         Self::Local(path.into())
     }
+
+    /// Parse a user-provided model ID string into a ModelSource.
+    /// `"local:/path/to/model"` → `Local(path)`, anything else → `HuggingFace(id)`.
+    pub fn parse(id: &str) -> Self {
+        if let Some(path) = id.strip_prefix("local:") {
+            Self::Local(std::path::PathBuf::from(path))
+        } else {
+            Self::HuggingFace(id.to_string())
+        }
+    }
+
+    /// Reconstruct a ModelSource from a canonical name (as stored in result_tables).
+    /// Absolute paths that exist on disk → Local, everything else → HuggingFace.
+    pub fn from_canonical(canonical_name: &str) -> Self {
+        let path = std::path::Path::new(canonical_name);
+        if path.is_absolute() && path.exists() {
+            Self::Local(path.to_path_buf())
+        } else {
+            Self::HuggingFace(canonical_name.to_string())
+        }
+    }
 }
 
 impl std::fmt::Display for ModelSource {
@@ -53,6 +74,12 @@ impl std::fmt::Display for ModelSource {
             Self::Local(path) => write!(f, "{}", path.display()),
         }
     }
+}
+
+/// Construct the catalog PK for a model: `"{canonical_name}::{version}"`.
+/// The canonical name is `ModelSource::to_string()` output.
+pub fn to_catalog_pk(canonical_name: &str, version: i32) -> String {
+    format!("{canonical_name}::{version}")
 }
 
 impl From<&ModelSource> for ModelId {
@@ -111,6 +138,8 @@ pub struct ResolvedModel {
     pub model_config: serde_json::Value,
     /// Parent model ID for fine-tuned variants.
     pub base_model_id: Option<ModelId>,
+    /// Path to LoRA adapter directory (for fine-tuned models).
+    pub adapter_path: Option<std::path::PathBuf>,
     /// Estimated GPU memory in bytes (sum of weight file sizes).
     pub estimated_memory: usize,
 }

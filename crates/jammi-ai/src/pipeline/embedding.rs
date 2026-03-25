@@ -36,11 +36,7 @@ impl<'a> EmbeddingPipeline<'a> {
         key_column: &str,
     ) -> Result<ResultTableRecord> {
         // Parse model source from model_id string
-        let model_source = if let Some(path) = model_id.strip_prefix("local:") {
-            ModelSource::local(std::path::PathBuf::from(path))
-        } else {
-            ModelSource::hf(model_id)
-        };
+        let model_source = ModelSource::parse(model_id);
 
         // Pre-load model to get embedding dimensions
         let guard = self
@@ -54,12 +50,16 @@ impl<'a> EmbeddingPipeline<'a> {
             .ok_or_else(|| JammiError::Inference("Model does not support embeddings".into()))?;
         drop(guard);
 
-        // Create result table in catalog
+        // Create result table in catalog.
+        // Store the canonical model name (ModelSource::to_string()), not the raw
+        // user string. This matches the models table registration format and
+        // avoids downstream code needing to strip "local:" prefixes.
+        let canonical_model_id = model_source.to_string();
         let text_cols = columns.join(",");
         let table_info = self.result_store.create_table(
             source_id,
             "embedding",
-            model_id,
+            &canonical_model_id,
             Some(embedding_dim as i32),
             Some(key_column),
             Some(&text_cols),

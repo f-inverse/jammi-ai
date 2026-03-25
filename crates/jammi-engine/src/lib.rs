@@ -4,6 +4,7 @@
 //! data source registration, SQL query execution via DataFusion, SQLite-backed
 //! artifact catalog, and configuration management.
 
+pub mod cache;
 pub mod catalog;
 pub mod config;
 pub mod error;

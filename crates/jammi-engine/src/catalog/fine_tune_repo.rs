@@ -123,6 +123,22 @@ impl Catalog {
         Ok(())
     }
 
+    /// Transition all fine-tune jobs with status Running to Failed.
+    /// Called during startup recovery — a Running job at startup means
+    /// the process crashed mid-training.
+    pub fn cleanup_stale_fine_tune_jobs(&self) -> Result<usize> {
+        let conn = self.conn()?;
+        let running = super::status::FineTuneJobStatus::Running.to_string();
+        let failed = super::status::FineTuneJobStatus::Failed.to_string();
+        let count = conn.execute(
+            "UPDATE fine_tune_jobs SET status = ?1, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE status = ?2",
+            params![failed, running],
+        )?;
+        Ok(count)
+    }
+
     /// List all fine-tune jobs, most recent first.
     pub fn list_fine_tune_jobs(&self) -> Result<Vec<FineTuneJobRecord>> {
         let conn = self.conn()?;

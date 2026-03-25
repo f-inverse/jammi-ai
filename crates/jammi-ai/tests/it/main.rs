@@ -5,5 +5,6 @@ mod fine_tune;
 mod inference;
 mod models;
 mod pipeline;
+mod scheduling;
 mod search;
 mod smoke;

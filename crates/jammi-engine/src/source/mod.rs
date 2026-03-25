@@ -1,5 +1,6 @@
 pub mod local;
 pub mod registry;
+pub mod retry;
 pub mod schema_provider;
 
 use serde::{Deserialize, Serialize};
@@ -67,6 +68,17 @@ pub struct SourceConnection {
     /// Arbitrary key-value options passed to the source driver.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub options: HashMap<String, String>,
+}
+
+impl SourceConnection {
+    /// Create a connection from a local filesystem path and file format.
+    pub fn from_path(path: &str, format: FileFormat) -> Self {
+        Self {
+            url: Some(format!("file://{path}")),
+            format: Some(format),
+            ..Default::default()
+        }
+    }
 }
 
 /// Derive a DataFusion table name from a URL by extracting the file stem.

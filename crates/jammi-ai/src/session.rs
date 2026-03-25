@@ -50,9 +50,10 @@ impl InferenceSession {
         let model_cache = Arc::new(ModelCache::new(resolver, device_config, scheduler));
         let result_store = Arc::new(ResultStore::new(
             inner.config().artifact_dir.as_path(),
-            catalog,
+            Arc::clone(&catalog),
         )?);
         result_store.recover().await?;
+        catalog.cleanup_stale_fine_tune_jobs()?;
         result_store.load_existing_tables(inner.context()).await?;
 
         Ok(Self {

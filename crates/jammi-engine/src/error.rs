@@ -41,6 +41,14 @@ pub enum JammiError {
     #[error("Eval error: {0}")]
     Eval(String),
 
+    /// GPU scheduling or detection error.
+    #[error("GPU error: {0}")]
+    Gpu(String),
+
+    /// Remote backend error (vLLM, HTTP).
+    #[error("Backend error: {0}")]
+    Backend(String),
+
     /// Filesystem I/O error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

@@ -26,6 +26,15 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 
+# Caching
+moka.workspace = true
+seahash.workspace = true
+bytemuck.workspace = true
+
+# Retry
+backon.workspace = true
+futures.workspace = true
+
 # Utilities
 uuid.workspace = true
 chrono.workspace = true

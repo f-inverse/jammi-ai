@@ -103,7 +103,7 @@ pub enum BackendType {
 }
 
 /// What task this model performs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelTask {
     /// Produce dense vector representations of input text.

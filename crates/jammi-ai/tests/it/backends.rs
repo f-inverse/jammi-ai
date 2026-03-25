@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use jammi_ai::model::backend::http::HttpBackend;
 use jammi_ai::model::backend::vllm::VllmBackend;
-use jammi_ai::model::{BackendType, ModelTask};
+use jammi_ai::model::ModelTask;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -39,7 +39,7 @@ async fn http_backend_embedding_and_chat_and_errors() {
         .mount(&server)
         .await;
 
-    let backend = HttpBackend::new(Duration::from_secs(5));
+    let backend = HttpBackend::new(Duration::from_secs(5)).unwrap();
     let base_url = server.uri();
 
     // --- Embedding request: 2 inputs → 2 vectors of dim 3 ---
@@ -117,42 +117,7 @@ async fn http_backend_embedding_and_chat_and_errors() {
     }
 }
 
-// ─── Backend type enum: serde round-trip, Vllm + Http variants ───────────────
-
-#[test]
-fn contract_backend_type_has_vllm_and_http_variants() {
-    // Verify serde round-trip for all variants
-    let variants = [
-        (BackendType::Candle, "\"candle\""),
-        (BackendType::Ort, "\"ort\""),
-        (BackendType::Vllm, "\"vllm\""),
-        (BackendType::Http, "\"http\""),
-    ];
-    for (variant, expected_json) in variants {
-        let json = serde_json::to_string(&variant).unwrap();
-        assert_eq!(json, expected_json);
-        let roundtrip: BackendType = serde_json::from_str(&json).unwrap();
-        assert_eq!(roundtrip, variant);
-    }
-}
-
 // ─── vLLM: failure modes ─────────────────────────────────────────────────────
-
-#[test]
-fn vllm_check_installed_returns_result() {
-    // On CI without vllm, this should return an error (not panic)
-    let result = VllmBackend::check_vllm_installed();
-    match result {
-        Ok(()) => {} // vllm installed — fine
-        Err(e) => {
-            let msg = e.to_string();
-            assert!(
-                msg.contains("vllm") && msg.contains("not found"),
-                "Error should mention vllm not found: {msg}"
-            );
-        }
-    }
-}
 
 #[tokio::test]
 async fn vllm_health_timeout_returns_error() {

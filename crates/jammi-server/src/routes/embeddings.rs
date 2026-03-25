@@ -21,7 +21,7 @@ pub async fn generate_embeddings(
     Json(req): Json<GenerateEmbeddingsRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let result = state
-        .session
+        .session()
         .generate_embeddings(&req.source_id, &req.model_id, &req.columns, &req.key_column)
         .await?;
     Ok(Json(serde_json::json!({

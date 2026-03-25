@@ -72,7 +72,7 @@ impl FromStr for FineTuneJobStatus {
     type Err = JammiError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "queued" | "pending" => Ok(Self::Queued),
+            "queued" => Ok(Self::Queued),
             "running" => Ok(Self::Running),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
@@ -132,7 +132,7 @@ impl FromStr for ModelStatus {
     type Err = JammiError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "registered" | "available" => Ok(Self::Registered),
+            "registered" => Ok(Self::Registered),
             "loaded" => Ok(Self::Loaded),
             other => Err(JammiError::Catalog(format!(
                 "Unknown model status: '{other}'"

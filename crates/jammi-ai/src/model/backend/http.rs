@@ -20,12 +20,12 @@ pub struct HttpBackend {
 
 impl HttpBackend {
     /// Create a new HTTP backend with the given request timeout.
-    pub fn new(timeout: Duration) -> Self {
+    pub fn new(timeout: Duration) -> Result<Self> {
         let client = Client::builder()
             .timeout(timeout)
             .build()
-            .expect("Failed to build HTTP client");
-        Self { client }
+            .map_err(|e| JammiError::Backend(format!("Failed to build HTTP client: {e}")))?;
+        Ok(Self { client })
     }
 
     /// Forward inference to the remote endpoint.

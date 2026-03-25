@@ -12,7 +12,7 @@ use jammi_engine::store::ResultStore;
 use crate::concurrency::GpuScheduler;
 use crate::eval::runner::EvalRunner;
 use crate::fine_tune::job::FineTuneJob;
-use crate::fine_tune::FineTuneConfig;
+use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
 use crate::inference::observer::InferenceObserver;
 use crate::model::backend::DeviceConfig;
 use crate::model::cache::ModelCache;
@@ -80,6 +80,14 @@ impl InferenceSession {
         self.inner
             .add_source(source_id, source_type, connection)
             .await
+    }
+
+    /// Remove a source and all associated state (result tables, disk files,
+    /// ANN cache, DataFusion registration). Eval runs are preserved.
+    pub fn remove_source(&self, source_id: &str) -> Result<()> {
+        self.inner.remove_source(source_id)?;
+        self.ann_cache.invalidate_source(source_id)?;
+        Ok(())
     }
 
     /// Execute a SQL query.
@@ -169,7 +177,7 @@ impl InferenceSession {
         let result = EmbeddingPipeline::new(self, &self.result_store)
             .run(source_id, model_id, columns, key_column)
             .await?;
-        self.ann_cache.invalidate_source(source_id);
+        self.ann_cache.invalidate_source(source_id)?;
         Ok(result)
     }
 
@@ -316,21 +324,10 @@ impl InferenceSession {
         source: &str,
         base_model: &str,
         columns: &[String],
-        method: &str,
+        _method: FineTuneMethod,
         _task: &str,
         config: Option<FineTuneConfig>,
     ) -> Result<FineTuneJob> {
-        if method == "qlora" {
-            return Err(JammiError::FineTune(
-                "QLoRA is not supported. Use method='lora'.".into(),
-            ));
-        }
-        if method != "lora" {
-            return Err(JammiError::FineTune(format!(
-                "Unknown fine-tuning method '{method}'. Supported: lora"
-            )));
-        }
-
         let config = config.unwrap_or_default();
         config.validate()?;
         let job_id = uuid::Uuid::new_v4().to_string();

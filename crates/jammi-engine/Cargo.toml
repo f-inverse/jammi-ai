@@ -57,3 +57,4 @@ async-trait.workspace = true
 [dev-dependencies]
 tempfile = "3"
 tokio.workspace = true
+jammi-test-utils.workspace = true

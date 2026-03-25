@@ -1,3 +1,9 @@
+use std::sync::Arc;
+
+use arrow::array::{Int64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use parquet::arrow::ArrowWriter;
+
 use crate::common;
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
@@ -287,4 +293,156 @@ async fn existing_tables_loaded_on_new_session() {
             .unwrap();
         assert!(!results.is_empty());
     }
+}
+
+// ─── Concurrent embedding generation on same source ──────────────────────────
+
+#[tokio::test]
+async fn concurrent_embedding_generation_on_same_source() {
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    session
+        .add_source(
+            "patents",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let model = tiny_bert_model();
+
+    let session_a = Arc::clone(&session);
+    let model_a = model.clone();
+    let task_a = tokio::spawn(async move {
+        session_a
+            .generate_embeddings("patents", &model_a, &["title".to_string()], "id")
+            .await
+    });
+
+    let session_b = Arc::clone(&session);
+    let model_b = model.clone();
+    let task_b = tokio::spawn(async move {
+        session_b
+            .generate_embeddings("patents", &model_b, &["abstract".to_string()], "id")
+            .await
+    });
+
+    let (result_a, result_b) = tokio::try_join!(task_a, task_b).unwrap();
+    let record_a = result_a.unwrap();
+    let record_b = result_b.unwrap();
+
+    // Both completed successfully with status "ready"
+    assert_eq!(record_a.status, "ready");
+    assert_eq!(record_b.status, "ready");
+
+    // Both have the expected row count (patents.parquet has 20 rows)
+    assert_eq!(record_a.row_count, 20);
+    assert_eq!(record_b.row_count, 20);
+
+    // Table names are distinct
+    assert_ne!(record_a.table_name, record_b.table_name);
+
+    // Both exist in catalog with status "ready"
+    let cat_a = session
+        .catalog()
+        .get_result_table(&record_a.table_name)
+        .unwrap()
+        .unwrap();
+    let cat_b = session
+        .catalog()
+        .get_result_table(&record_b.table_name)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cat_a.status, "ready");
+    assert_eq!(cat_b.status, "ready");
+}
+
+// ─── Large batch embedding completes without OOM ─────────────────────────────
+
+#[tokio::test]
+async fn large_batch_embedding_completes_without_oom() {
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = InferenceSession::new(config).await.unwrap();
+
+    // Generate a 5000-row Parquet file
+    let texts = [
+        "Quantum computing advances in error correction",
+        "Gene editing breakthroughs using CRISPR technology",
+        "Renewable energy storage with solid-state batteries",
+        "Autonomous vehicle navigation in urban environments",
+        "Natural language processing for medical records",
+        "Blockchain consensus mechanisms for scalability",
+        "Protein folding prediction with deep learning",
+        "Satellite internet constellation deployment strategies",
+        "Robotic surgery systems with haptic feedback",
+        "Carbon capture and sequestration techniques",
+        "Superconducting materials at higher temperatures",
+        "Brain-computer interface signal processing",
+        "Fusion reactor plasma containment methods",
+        "Biodegradable polymer synthesis for packaging",
+        "Federated learning for privacy-preserving analytics",
+        "Lidar-based terrain mapping for exploration",
+        "Microbiome engineering for crop resilience",
+        "Photonic computing architectures for inference",
+        "Desalination membranes using graphene oxide",
+        "Swarm intelligence algorithms for logistics",
+    ];
+
+    let row_count = 5000;
+    let ids: Vec<i64> = (0..row_count as i64).collect();
+    let text_values: Vec<&str> = (0..row_count).map(|i| texts[i % texts.len()]).collect();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+
+    let batch = arrow::array::RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(text_values)),
+        ],
+    )
+    .unwrap();
+
+    let parquet_path = dir.path().join("large_batch.parquet");
+    let file = std::fs::File::create(&parquet_path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let parquet_url = format!("file://{}", parquet_path.display());
+    session
+        .add_source(
+            "large_batch",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(parquet_url),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let record = session
+        .generate_embeddings(
+            "large_batch",
+            &tiny_bert_model(),
+            &["text".to_string()],
+            "id",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(record.row_count, 5000);
+    assert_eq!(record.status, "ready");
 }

@@ -250,14 +250,7 @@ impl SearchBuilder {
     pub async fn annotate(mut self, model: &str, task: &str, columns: &[String]) -> Result<Self> {
         let model_source = crate::model::ModelSource::parse(model);
 
-        let model_task = match task.to_lowercase().as_str() {
-            "embedding" => crate::model::ModelTask::Embedding,
-            "classification" => crate::model::ModelTask::Classification,
-            "summarization" => crate::model::ModelTask::Summarization,
-            "ner" => crate::model::ModelTask::Ner,
-            "text_generation" => crate::model::ModelTask::TextGeneration,
-            other => return Err(JammiError::Other(format!("Unknown task: {other}"))),
-        };
+        let model_task: crate::model::ModelTask = task.parse()?;
 
         let guard = self
             .session

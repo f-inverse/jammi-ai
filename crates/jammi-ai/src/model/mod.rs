@@ -120,6 +120,37 @@ pub enum ModelTask {
     TextGeneration,
 }
 
+impl std::fmt::Display for ModelTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Embedding => write!(f, "embedding"),
+            Self::Classification => write!(f, "classification"),
+            Self::Summarization => write!(f, "summarization"),
+            Self::ObjectDetection => write!(f, "object_detection"),
+            Self::Ner => write!(f, "ner"),
+            Self::TextGeneration => write!(f, "text_generation"),
+        }
+    }
+}
+
+impl std::str::FromStr for ModelTask {
+    type Err = jammi_engine::error::JammiError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "embedding" => Ok(Self::Embedding),
+            "classification" => Ok(Self::Classification),
+            "summarization" => Ok(Self::Summarization),
+            "object_detection" => Ok(Self::ObjectDetection),
+            "ner" => Ok(Self::Ner),
+            "text_generation" => Ok(Self::TextGeneration),
+            other => Err(jammi_engine::error::JammiError::Other(format!(
+                "Unknown model task '{other}'. Expected: embedding, classification, \
+                 summarization, object_detection, ner, text_generation"
+            ))),
+        }
+    }
+}
+
 /// A resolved model — files located, backend determined, NOT yet loaded.
 pub struct ResolvedModel {
     /// HuggingFace or local identifier for this model.

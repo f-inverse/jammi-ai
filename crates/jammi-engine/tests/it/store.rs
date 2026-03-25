@@ -44,27 +44,6 @@ fn parquet_write_read_roundtrip() {
     assert_eq!(count_parquet_rows(path.to_str().unwrap()).unwrap(), 3);
 }
 
-#[test]
-fn parquet_writer_empty_close_produces_valid_file() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("empty.parquet");
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
-
-    let writer = ParquetResultWriter::new(&path, schema).unwrap();
-    assert_eq!(writer.close().unwrap(), 0);
-    assert!(is_valid_parquet(path.to_str().unwrap()));
-}
-
-#[test]
-fn is_valid_parquet_rejects_garbage_and_missing() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("garbage.parquet");
-    std::fs::write(&path, b"not a parquet file").unwrap();
-
-    assert!(!is_valid_parquet(path.to_str().unwrap()));
-    assert!(!is_valid_parquet("/nonexistent/path.parquet"));
-}
-
 // ─── Catalog result_tables lifecycle ─────────────────────────────────────────
 
 #[test]

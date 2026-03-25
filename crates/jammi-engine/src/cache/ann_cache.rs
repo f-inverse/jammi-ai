@@ -63,11 +63,14 @@ impl AnnCache {
     }
 
     /// Invalidate all entries for a source. Called when new embeddings are generated.
-    pub fn invalidate_source(&self, source_id: &str) {
+    pub fn invalidate_source(&self, source_id: &str) -> crate::error::Result<()> {
         let sid = source_id.to_string();
         self.entries
             .invalidate_entries_if(move |k, _v| k.source_id == sid)
-            .expect("invalidate_entries_if should not fail");
+            .map_err(|e| {
+                crate::error::JammiError::Other(format!("Cache invalidation failed: {e}"))
+            })?;
+        Ok(())
     }
 
     /// Force moka to process pending invalidation predicates.

@@ -44,6 +44,16 @@ impl JammiSchemaProvider {
             .insert(name, table);
         Ok(())
     }
+
+    /// Remove all tables. Used during source removal so DataFusion queries
+    /// return "table not found" instead of serving stale data.
+    pub fn clear(&self) -> Result<()> {
+        self.tables
+            .write()
+            .map_err(|e| DataFusionError::Internal(format!("Lock poisoned: {e}")))?
+            .clear();
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -56,7 +66,10 @@ impl SchemaProvider for JammiSchemaProvider {
         self.tables
             .read()
             .map(|t| t.keys().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                tracing::error!("Lock poisoned in table_names: {e}");
+                Vec::new()
+            })
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
@@ -68,6 +81,12 @@ impl SchemaProvider for JammiSchemaProvider {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.tables.read().is_ok_and(|t| t.contains_key(name))
+        self.tables
+            .read()
+            .map(|t| t.contains_key(name))
+            .unwrap_or_else(|e| {
+                tracing::error!("Lock poisoned in table_exist: {e}");
+                false
+            })
     }
 }

@@ -11,6 +11,7 @@ use arrow::datatypes::DataType;
 use jammi_ai::inference::observer::InferenceObserver;
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
+use jammi_engine::index::cosine_distance;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -385,5 +386,97 @@ async fn e2e_model_registered_in_catalog_after_inference() {
         models.iter().any(|m| m.model_id.contains("tiny_bert")),
         "Model should be registered in catalog after inference. Found: {:?}",
         models.iter().map(|m| &m.model_id).collect::<Vec<_>>()
+    );
+}
+
+// ─── Embedding semantic correctness and reproducibility ─────────────────────
+
+#[tokio::test]
+async fn embedding_vectors_are_semantically_meaningful_and_reproducible() {
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = InferenceSession::new(config).await.unwrap();
+
+    let model = "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap();
+
+    // Encode four queries: two physics, one biology, and a repeat of the first
+    let vec_physics_1 = session
+        .encode_query(&model, "quantum computing in superconducting systems")
+        .await
+        .unwrap();
+
+    let vec_physics_2 = session
+        .encode_query(&model, "topological quantum error correction")
+        .await
+        .unwrap();
+
+    let vec_biology = session
+        .encode_query(&model, "CRISPR gene editing for disease treatment")
+        .await
+        .unwrap();
+
+    let vec_physics_1_repeat = session
+        .encode_query(&model, "quantum computing in superconducting systems")
+        .await
+        .unwrap();
+
+    // Reproducibility: identical input must produce identical output
+    assert_eq!(
+        vec_physics_1, vec_physics_1_repeat,
+        "Encoding the same text twice must produce identical vectors"
+    );
+
+    // Dimension: tiny_bert has hidden_size=32
+    assert_eq!(
+        vec_physics_1.len(),
+        32,
+        "Physics vector 1 should have 32 dimensions"
+    );
+    assert_eq!(
+        vec_physics_2.len(),
+        32,
+        "Physics vector 2 should have 32 dimensions"
+    );
+    assert_eq!(
+        vec_biology.len(),
+        32,
+        "Biology vector should have 32 dimensions"
+    );
+    assert_eq!(
+        vec_physics_1_repeat.len(),
+        32,
+        "Repeat vector should have 32 dimensions"
+    );
+
+    // Non-trivial: vectors should not be all zeros
+    assert!(
+        vec_physics_1.iter().any(|&v| v != 0.0),
+        "Physics vector 1 should have at least one non-zero element"
+    );
+    assert!(
+        vec_physics_2.iter().any(|&v| v != 0.0),
+        "Physics vector 2 should have at least one non-zero element"
+    );
+    assert!(
+        vec_biology.iter().any(|&v| v != 0.0),
+        "Biology vector should have at least one non-zero element"
+    );
+    assert!(
+        vec_physics_1_repeat.iter().any(|&v| v != 0.0),
+        "Repeat vector should have at least one non-zero element"
+    );
+
+    // Semantic coherence: within-category distance should be small
+    let dist_physics = cosine_distance(&vec_physics_1, &vec_physics_2);
+    assert!(
+        dist_physics < 0.5,
+        "Within-category (physics-to-physics) cosine distance should be < 0.5, got {dist_physics}"
+    );
+
+    // Cross-category distance should be larger than within-category distance
+    let dist_cross = cosine_distance(&vec_physics_1, &vec_biology);
+    assert!(
+        dist_cross > dist_physics,
+        "Cross-category distance ({dist_cross}) should exceed within-category distance ({dist_physics})"
     );
 }

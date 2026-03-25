@@ -6,6 +6,7 @@ members = [
     "crates/jammi-server",
     "crates/jammi-python",
     "crates/jammi-cli",
+    "crates/jammi-test-utils",
 ]
 # jammi-python is a PyO3 cdylib — build via maturin, not cargo build --workspace
 default-members = [
@@ -26,6 +27,7 @@ repository = "https://github.com/f-inverse/jammi-ai"
 # Internal crates
 jammi-engine = { path = "crates/jammi-engine" }
 jammi-ai = { path = "crates/jammi-ai" }
+jammi-test-utils = { path = "crates/jammi-test-utils" }
 
 # Query engine
 datafusion = "52.3"
@@ -51,8 +53,8 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 usearch = "2.24"
 
 # Python bindings
-pyo3 = { version = "0.28", features = ["abi3-py38", "extension-module"] }
-pyo3-arrow = "0.16"
+pyo3 = { version = "0.28", features = ["abi3-py39", "extension-module"] }
+pyo3-arrow = { version = "0.16", default-features = false }
 
 # HTTP / server
 axum = "0.8"

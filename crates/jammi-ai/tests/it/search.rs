@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::array::{Array, Float32Array, ListArray, StringArray};
+use arrow::array::{Array, Float32Array, Int64Array, ListArray, StringArray};
 use jammi_ai::session::InferenceSession;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
@@ -302,4 +302,161 @@ async fn encode_query_returns_vector_of_correct_dimension() {
         vector.iter().any(|&v| v != 0.0),
         "Vector should not be all zeros"
     );
+}
+
+// ─── CP3 UAT 10: multiple tables → search resolves to latest ────────────────
+
+#[tokio::test]
+async fn search_resolves_to_latest_embedding_table() {
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+
+    session
+        .add_source(
+            "patents",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let model = tiny_bert_model();
+
+    // Generate first embedding table (columns=["title"]).
+    let r1 = session
+        .generate_embeddings("patents", &model, &["title".to_string()], "id")
+        .await
+        .unwrap();
+
+    // Generate second embedding table (columns=["abstract"]), created later.
+    let r2 = session
+        .generate_embeddings("patents", &model, &["abstract".to_string()], "id")
+        .await
+        .unwrap();
+
+    assert_ne!(
+        r1.table_name, r2.table_name,
+        "Should produce distinct tables"
+    );
+
+    // Both tables should exist in the catalog.
+    let tables = session
+        .catalog()
+        .find_result_tables("patents", Some("embedding"), None)
+        .unwrap();
+    assert_eq!(tables.len(), 2);
+
+    // Resolve without explicit table name should pick the latest (r2).
+    let resolved = session
+        .catalog()
+        .resolve_embedding_table("patents", None)
+        .unwrap();
+    assert_eq!(
+        resolved.table_name, r2.table_name,
+        "Should resolve to the latest embedding table"
+    );
+
+    // Search should work using the resolved (latest) table.
+    let query = vec![0.5_f32; 32];
+    let results = session
+        .search("patents", query, 5)
+        .await
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+    assert!(!results.is_empty(), "Search should succeed on latest table");
+}
+
+// ─── Semantic relevance: encode_query → search returns meaningful results ─────
+
+#[tokio::test]
+async fn search_returns_semantically_relevant_results() {
+    let (session, _dir) = session_with_embeddings().await;
+
+    // Encode a real query about quantum computing
+    let query_vec = session
+        .encode_query(&tiny_bert_model(), "quantum computing")
+        .await
+        .unwrap();
+
+    // k=20 is deliberately >= the number of patents to verify we never return
+    // more rows than exist.
+    let results = session
+        .search("patents", query_vec, 20)
+        .await
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+
+    // 1. Results are non-empty
+    assert!(
+        !results.is_empty(),
+        "Search should return at least one batch"
+    );
+
+    // Flatten all batches into parallel id / similarity vecs
+    let mut all_ids: Vec<i64> = Vec::new();
+    let mut all_similarities: Vec<f32> = Vec::new();
+
+    for batch in &results {
+        let ids = batch
+            .column_by_name("id")
+            .expect("results should contain 'id' column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("'id' column should be Int64Array");
+
+        let sims = batch
+            .column_by_name("similarity")
+            .expect("results should contain 'similarity' column")
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("'similarity' column should be Float32Array");
+
+        for i in 0..batch.num_rows() {
+            all_ids.push(ids.value(i));
+            all_similarities.push(sims.value(i));
+        }
+    }
+
+    let total_rows = all_ids.len();
+
+    // 2. Total row count <= 20 (can't return more rows than exist)
+    assert!(
+        total_rows <= 20,
+        "Should not return more rows than exist, got {total_rows}"
+    );
+
+    // 3. At least one of the quantum-related patents {1, 4, 7} appears in the top 5
+    let quantum_patent_ids: &[i64] = &[1, 4, 7];
+    let top_n = total_rows.min(5);
+    let top_ids = &all_ids[..top_n];
+    let has_quantum_in_top5 = top_ids.iter().any(|id| quantum_patent_ids.contains(id));
+    assert!(
+        has_quantum_in_top5,
+        "At least one of patents {{1, 4, 7}} should appear in top 5 results, \
+         but top 5 IDs were: {top_ids:?}"
+    );
+
+    // 4. First result's similarity > 0.0 (query is not orthogonal to all documents)
+    assert!(
+        all_similarities[0] > 0.0,
+        "First result similarity should be > 0.0, got {}",
+        all_similarities[0]
+    );
+
+    // 5. All similarity values are in (0.0, 1.0] — not inverted or garbage
+    for (i, &sim) in all_similarities.iter().enumerate() {
+        assert!(
+            sim > 0.0 && sim <= 1.0,
+            "Similarity at row {i} should be in (0.0, 1.0], got {sim}"
+        );
+    }
 }

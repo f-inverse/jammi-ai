@@ -18,30 +18,12 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceType {
+    /// Local filesystem path.
+    Local,
     /// PostgreSQL database.
     Postgres,
     /// MySQL / MariaDB database.
     Mysql,
-    /// SQLite database file.
-    Sqlite,
-    /// Snowflake data warehouse.
-    Snowflake,
-    /// Google BigQuery.
-    BigQuery,
-    /// MongoDB document store.
-    MongoDB,
-    /// Amazon S3 object store.
-    S3,
-    /// Google Cloud Storage.
-    Gcs,
-    /// Azure Blob Storage.
-    Azure,
-    /// Local filesystem path.
-    Local,
-    /// Qdrant vector database.
-    Qdrant,
-    /// User-defined source with custom connection logic.
-    Custom,
 }
 
 /// File format for local and object-store sources.
@@ -56,6 +38,32 @@ pub enum FileFormat {
     Json,
     /// Apache Avro binary format.
     Avro,
+}
+
+impl std::fmt::Display for FileFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parquet => write!(f, "parquet"),
+            Self::Csv => write!(f, "csv"),
+            Self::Json => write!(f, "json"),
+            Self::Avro => write!(f, "avro"),
+        }
+    }
+}
+
+impl std::str::FromStr for FileFormat {
+    type Err = crate::error::JammiError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "parquet" => Ok(Self::Parquet),
+            "csv" => Ok(Self::Csv),
+            "json" => Ok(Self::Json),
+            "avro" => Ok(Self::Avro),
+            other => Err(crate::error::JammiError::Other(format!(
+                "Unknown file format '{other}'. Expected: parquet, csv, json, avro"
+            ))),
+        }
+    }
 }
 
 /// Connection parameters for a data source.

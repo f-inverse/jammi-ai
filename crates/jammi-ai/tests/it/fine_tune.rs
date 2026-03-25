@@ -5,7 +5,8 @@ use candle_nn::{Linear, Module, VarBuilder, VarMap};
 use tempfile::TempDir;
 
 use jammi_ai::fine_tune::{
-    data::TrainingDataLoader, lora::LoraLinear, trainer::compute_lr, FineTuneConfig, LrSchedule,
+    data::TrainingDataLoader, lora::LoraLinear, trainer::compute_lr, FineTuneConfig,
+    FineTuneMethod, LrSchedule,
 };
 use jammi_ai::session::InferenceSession;
 use jammi_engine::catalog::status::FineTuneJobStatus;
@@ -258,7 +259,7 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
                 "text_b".to_string(),
                 "score".to_string(),
             ],
-            "lora",
+            FineTuneMethod::Lora,
             "embedding",
             Some(FineTuneConfig {
                 epochs: 2,
@@ -362,34 +363,8 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
     );
 }
 
-// ─── UAT 6: QLoRA returns clear error ───────────────────────────────────────
-
-#[tokio::test]
-async fn qlora_returns_unsupported_error() {
-    let (session, _dir) = session_with_training_data().await;
-
-    let result = session
-        .fine_tune(
-            "training",
-            "test-base-model",
-            &[
-                "text_a".to_string(),
-                "text_b".to_string(),
-                "score".to_string(),
-            ],
-            "qlora",
-            "embedding",
-            None,
-        )
-        .await;
-
-    assert!(result.is_err(), "QLoRA should return an error");
-    let msg = result.unwrap_err().to_string();
-    assert!(
-        msg.to_lowercase().contains("qlora") || msg.to_lowercase().contains("not supported"),
-        "Error should mention QLoRA, got: {msg}"
-    );
-}
+// UAT 6 (QLoRA): Invalid methods are now unrepresentable at the type level
+// via `FineTuneMethod` enum. No runtime test needed.
 
 // ─── Fine-tune catalog CRUD ─────────────────────────────────────────────────
 
@@ -705,6 +680,133 @@ fn training_early_stopping_triggers() {
     // Job should be completed (not failed)
     let job = catalog.get_fine_tune_job("es-job").unwrap();
     assert_eq!(job.status, "completed");
+}
+
+// ─── Fine-tuned model produces measurably different search quality ───────────
+//
+// End-to-end: fine-tune with LoRA, generate embeddings with both base and
+// fine-tuned models, run eval_embeddings on both, assert that retrieval
+// metrics differ. Proves the adapter actually alters search behavior.
+
+#[tokio::test]
+async fn fine_tuned_model_produces_measurably_different_search_quality() {
+    let (session, _dir) = session_with_training_data().await;
+    let model = tiny_bert_model();
+
+    // Register patents source for embedding generation and eval
+    session
+        .add_source(
+            "patents",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Register golden relevance dataset for evaluation
+    session
+        .add_source(
+            "golden_rel",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(common::fixture_url("golden_relevance.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Generate base embeddings
+    let base_rec = session
+        .generate_embeddings("patents", &model, &["abstract".to_string()], "id")
+        .await
+        .unwrap();
+
+    // Fine-tune with LoRA (minimal config for speed)
+    let columns = vec![
+        "text_a".to_string(),
+        "text_b".to_string(),
+        "score".to_string(),
+    ];
+    let job = session
+        .fine_tune(
+            "training",
+            &model,
+            &columns,
+            FineTuneMethod::Lora,
+            "embedding",
+            Some(FineTuneConfig {
+                epochs: 2,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    job.wait().await.unwrap();
+
+    // Generate embeddings with the fine-tuned model
+    let ft_rec = session
+        .generate_embeddings("patents", job.model_id(), &["abstract".to_string()], "id")
+        .await
+        .unwrap();
+
+    // Eval base embeddings against golden relevance
+    let base_metrics = session
+        .eval_embeddings(
+            "patents",
+            Some(&base_rec.table_name),
+            "golden_rel.public.golden_relevance",
+            10,
+        )
+        .await
+        .unwrap();
+
+    // Eval fine-tuned embeddings against golden relevance
+    let ft_metrics = session
+        .eval_embeddings(
+            "patents",
+            Some(&ft_rec.table_name),
+            "golden_rel.public.golden_relevance",
+            10,
+        )
+        .await
+        .unwrap();
+
+    // Both evals return valid JSON with all four metric keys in [0, 1]
+    let metric_keys = ["recall_at_k", "precision_at_k", "mrr", "ndcg"];
+    for (label, metrics) in [("base", &base_metrics), ("fine-tuned", &ft_metrics)] {
+        for key in &metric_keys {
+            let val = metrics[key]
+                .as_f64()
+                .unwrap_or_else(|| panic!("{label} missing metric: {key}"));
+            assert!(
+                (0.0..=1.0).contains(&val),
+                "{label} {key} = {val} outside [0, 1]"
+            );
+        }
+    }
+
+    // At least one metric must differ between base and fine-tuned (proves the
+    // adapter actually changes retrieval behavior, not a no-op)
+    let any_different = metric_keys.iter().any(|key| {
+        let base_val = base_metrics[key].as_f64().unwrap();
+        let ft_val = ft_metrics[key].as_f64().unwrap();
+        (base_val - ft_val).abs() > 1e-6
+    });
+    assert!(
+        any_different,
+        "Fine-tuned model should produce at least one different retrieval metric.\n\
+         base:       {base_metrics}\n\
+         fine-tuned: {ft_metrics}"
+    );
 }
 
 // ─── FineTuneConfig validation ──────────────────────────────────────────────

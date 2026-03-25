@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 
+use jammi_ai::fine_tune::FineTuneMethod;
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
@@ -106,10 +107,14 @@ impl PyDatabase {
     ) -> PyResult<PyFineTuneJob> {
         let job = self
             .runtime
-            .block_on(
-                self.session
-                    .fine_tune(source, base_model, &columns, method, task, None),
-            )
+            .block_on(self.session.fine_tune(
+                source,
+                base_model,
+                &columns,
+                method.parse::<FineTuneMethod>().map_err(to_pyerr)?,
+                task,
+                None,
+            ))
             .map_err(to_pyerr)?;
         Ok(PyFineTuneJob::new(job, Arc::clone(&self.runtime)))
     }
@@ -204,36 +209,13 @@ impl PyDatabase {
 }
 
 fn parse_file_format(s: &str) -> PyResult<FileFormat> {
-    match s.to_lowercase().as_str() {
-        "parquet" => Ok(FileFormat::Parquet),
-        "csv" => Ok(FileFormat::Csv),
-        "json" => Ok(FileFormat::Json),
-        "avro" => Ok(FileFormat::Avro),
-        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown file format '{other}'. Expected: parquet, csv, json, avro"
-        ))),
-    }
+    s.parse().map_err(to_pyerr)
 }
 
 fn parse_model_task(s: &str) -> PyResult<ModelTask> {
-    match s.to_lowercase().as_str() {
-        "embedding" => Ok(ModelTask::Embedding),
-        "classification" => Ok(ModelTask::Classification),
-        "summarization" => Ok(ModelTask::Summarization),
-        "ner" => Ok(ModelTask::Ner),
-        "text_generation" => Ok(ModelTask::TextGeneration),
-        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown model task '{other}'. Expected: embedding, classification, summarization, ner, text_generation"
-        ))),
-    }
+    s.parse().map_err(to_pyerr)
 }
 
 fn parse_eval_task(s: &str) -> PyResult<jammi_ai::eval::EvalTask> {
-    match s.to_lowercase().as_str() {
-        "classification" => Ok(jammi_ai::eval::EvalTask::Classification),
-        "summarization" => Ok(jammi_ai::eval::EvalTask::Summarization),
-        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown eval task '{other}'. Expected: classification, summarization"
-        ))),
-    }
+    s.parse().map_err(to_pyerr)
 }

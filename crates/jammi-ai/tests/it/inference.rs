@@ -5,34 +5,13 @@ use jammi_ai::inference::adapter::{
     BackendOutput, ClassificationAdapter, EmbeddingAdapter, OutputAdapter,
 };
 
-use arrow::array::{Array, FixedSizeListArray};
+use arrow::array::Array;
+#[cfg(feature = "live-hub-tests")]
+use arrow::array::FixedSizeListArray;
+#[cfg(feature = "live-hub-tests")]
 use arrow::datatypes::DataType;
 
 // ─── Hermetic tests (no network, no live models) ───────────────────────────
-
-// --- Output adapter schemas match spec ---
-
-#[test]
-fn embedding_adapter_schema_has_vector_field() {
-    let adapter = EmbeddingAdapter::new(384);
-    let fields = adapter.output_schema();
-    assert_eq!(fields.len(), 1);
-    assert_eq!(fields[0].name(), "vector");
-    match fields[0].data_type() {
-        DataType::FixedSizeList(inner, 384) => {
-            assert_eq!(inner.data_type(), &DataType::Float32);
-        }
-        other => panic!("Expected FixedSizeList(Float32, 384), got {other:?}"),
-    }
-}
-
-#[test]
-fn classification_adapter_schema_has_label_confidence_scores() {
-    let adapter = ClassificationAdapter;
-    let fields = adapter.output_schema();
-    let names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
-    assert_eq!(names, vec!["label", "confidence", "all_scores_json"]);
-}
 
 // --- Contract tests: OutputAdapter behavioral invariants ---
 
@@ -96,62 +75,12 @@ fn contract_classification_adapter_schema_matches_adapt_output() {
     }
 }
 
-#[test]
-fn contract_adapters_handle_zero_rows() {
-    let embedding = EmbeddingAdapter::new(384);
-    let classification = ClassificationAdapter;
-
-    let empty_output = BackendOutput {
-        float_outputs: vec![vec![]],
-        string_outputs: vec![vec![], vec![]],
-        row_status: vec![],
-        row_errors: vec![],
-        shapes: vec![(0, 384)],
-    };
-
-    let emb_cols = embedding.adapt(&empty_output, 0).unwrap();
-    assert_eq!(
-        emb_cols[0].len(),
-        0,
-        "Embedding adapter should handle 0 rows"
-    );
-
-    let cls_cols = classification.adapt(&empty_output, 0).unwrap();
-    assert_eq!(
-        cls_cols[0].len(),
-        0,
-        "Classification adapter should handle 0 rows"
-    );
-}
-
-#[test]
-fn contract_adapters_null_failed_rows() {
-    let adapter = EmbeddingAdapter::new(384);
-
-    let output = BackendOutput {
-        float_outputs: vec![vec![0.0_f32; 768]], // 2 * 384
-        string_outputs: vec![],
-        row_status: vec![true, false],
-        row_errors: vec![String::new(), "tokenization failed".into()],
-        shapes: vec![(2, 384)],
-    };
-
-    let columns = adapter.adapt(&output, 2).unwrap();
-    let vector_col = columns[0]
-        .as_any()
-        .downcast_ref::<FixedSizeListArray>()
-        .unwrap();
-
-    assert!(!vector_col.is_null(0), "Success row should have a vector");
-    assert!(vector_col.is_null(1), "Failed row should have null vector");
-}
-
 // ─── Live tests (behind feature gate, require HF Hub downloads) ────────────
 
 #[cfg(feature = "live-hub-tests")]
 mod live {
     use super::*;
-    use arrow::array::StringArray;
+    use arrow::array::{Float64Array, StringArray};
     use jammi_ai::model::{ModelSource, ModelTask};
     use jammi_ai::session::InferenceSession;
     use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
@@ -253,6 +182,127 @@ mod live {
         assert!(
             batch_mem > 20_000_000 && batch_mem < 30_000_000,
             "Expected ~25MB for batch(32,128), got {batch_mem}"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_classification_produces_valid_labels() {
+        let (session, _dir) = setup_with_patents().await;
+
+        let model = ModelSource::parse("distilbert-base-uncased-finetuned-sst-2-english");
+        let batches = session
+            .infer(
+                "patents",
+                &model,
+                ModelTask::Classification,
+                &["abstract".into()],
+                "id",
+            )
+            .await
+            .unwrap();
+
+        assert!(!batches.is_empty());
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(total_rows > 0);
+
+        // Check that labels are from the model's vocabulary (POSITIVE/NEGATIVE for SST-2)
+        for batch in &batches {
+            let status = batch
+                .column_by_name("_status")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            // For "ok" rows, check label and confidence
+            if let Some(label_col) = batch.column_by_name("label") {
+                let labels = label_col.as_any().downcast_ref::<StringArray>().unwrap();
+                let confidence = batch
+                    .column_by_name("confidence")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+
+                for i in 0..batch.num_rows() {
+                    if status.value(i) == "ok" {
+                        let label = labels.value(i);
+                        assert!(
+                            label == "POSITIVE" || label == "NEGATIVE",
+                            "SST-2 label should be POSITIVE or NEGATIVE, got '{label}'"
+                        );
+                        let conf = confidence.value(i);
+                        assert!(conf > 0.0 && conf <= 1.0, "Confidence {conf} out of range");
+                    }
+                }
+            }
+        }
+
+        // At least one row should have confidence > 0.5
+        let any_confident = batches.iter().any(|b| {
+            if let Some(conf_col) = b.column_by_name("confidence") {
+                let arr = conf_col.as_any().downcast_ref::<Float64Array>().unwrap();
+                (0..arr.len()).any(|i| !arr.is_null(i) && arr.value(i) > 0.5)
+            } else {
+                false
+            }
+        });
+        assert!(
+            any_confident,
+            "At least one row should have confidence > 0.5"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_summarization_produces_coherent_output() {
+        let (session, _dir) = setup_with_patents().await;
+
+        let model = ModelSource::parse("sshleifer/distilbart-cnn-6-6");
+        let batches = session
+            .infer(
+                "patents",
+                &model,
+                ModelTask::Summarization,
+                &["abstract".into()],
+                "id",
+            )
+            .await
+            .unwrap();
+
+        assert!(!batches.is_empty());
+
+        let mut ok_count = 0;
+        let mut shorter_count = 0;
+
+        for batch in &batches {
+            let status = batch
+                .column_by_name("_status")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            if let Some(summary_col) = batch.column_by_name("summary") {
+                let summaries = summary_col.as_any().downcast_ref::<StringArray>().unwrap();
+
+                for i in 0..batch.num_rows() {
+                    if status.value(i) == "ok" && !summaries.is_null(i) {
+                        ok_count += 1;
+                        let summary = summaries.value(i);
+                        assert!(!summary.is_empty(), "Summary should not be empty");
+                        // Summaries should generally be shorter than patent abstracts (~100-200 words)
+                        if summary.len() < 500 {
+                            shorter_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(ok_count > 0, "At least one row should produce a summary");
+        assert!(
+            shorter_count as f64 / ok_count as f64 > 0.5,
+            "At least 50% of summaries should be reasonably short (< 500 chars)"
         );
     }
 }

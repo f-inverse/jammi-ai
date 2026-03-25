@@ -1,7 +1,142 @@
-use serde::Deserialize;
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
-use crate::error::Result;
+use serde::Deserialize;
+
+use crate::error::{JammiError, Result};
+
+// ─── Config-layer enums ─────────────────────────────────────────────────────
+
+/// Backend selection strategy for model inference.
+///
+/// `Auto` defers to the model resolver; concrete variants force a specific backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendSelection {
+    Auto,
+    Candle,
+    Ort,
+    Vllm,
+    Http,
+}
+
+impl fmt::Display for BackendSelection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Candle => write!(f, "candle"),
+            Self::Ort => write!(f, "ort"),
+            Self::Vllm => write!(f, "vllm"),
+            Self::Http => write!(f, "http"),
+        }
+    }
+}
+
+impl FromStr for BackendSelection {
+    type Err = JammiError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "candle" => Ok(Self::Candle),
+            "ort" => Ok(Self::Ort),
+            "vllm" => Ok(Self::Vllm),
+            "http" => Ok(Self::Http),
+            other => Err(JammiError::Config(format!(
+                "Unknown backend '{other}'. Expected: auto, candle, ort, vllm, http"
+            ))),
+        }
+    }
+}
+
+/// Distance metric for ANN indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistanceMetric {
+    Cosine,
+    L2,
+}
+
+impl fmt::Display for DistanceMetric {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cosine => write!(f, "cosine"),
+            Self::L2 => write!(f, "l2"),
+        }
+    }
+}
+
+impl FromStr for DistanceMetric {
+    type Err = JammiError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "cosine" => Ok(Self::Cosine),
+            "l2" => Ok(Self::L2),
+            other => Err(JammiError::Config(format!(
+                "Unknown distance metric '{other}'. Expected: cosine, l2"
+            ))),
+        }
+    }
+}
+
+/// ANN index type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexType {
+    IvfHnswSq,
+}
+
+impl fmt::Display for IndexType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IvfHnswSq => write!(f, "ivf_hnsw_sq"),
+        }
+    }
+}
+
+impl FromStr for IndexType {
+    type Err = JammiError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "ivf_hnsw_sq" => Ok(Self::IvfHnswSq),
+            other => Err(JammiError::Config(format!(
+                "Unknown index type '{other}'. Expected: ivf_hnsw_sq"
+            ))),
+        }
+    }
+}
+
+/// Log output format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    Text,
+    Json,
+}
+
+impl fmt::Display for LogFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text => write!(f, "text"),
+            Self::Json => write!(f, "json"),
+        }
+    }
+}
+
+impl FromStr for LogFormat {
+    type Err = JammiError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            other => Err(JammiError::Config(format!(
+                "Unknown log format '{other}'. Expected: text, json"
+            ))),
+        }
+    }
+}
+
+// ─── Config structs ─────────────────────────────────────────────────────────
 
 /// Top-level configuration for the Jammi AI platform.
 ///
@@ -58,8 +193,8 @@ pub struct GpuConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct InferenceConfig {
-    /// Backend selection strategy (e.g., `"auto"`, `"candle"`, `"vllm"`). Default: `"auto"`.
-    pub default_backend: String,
+    /// Backend selection strategy. Default: `Auto`.
+    pub default_backend: BackendSelection,
     /// Maximum requests per inference batch. Default: 32.
     pub batch_size: usize,
     /// Seconds to wait before flushing an incomplete batch. Default: 300.
@@ -98,10 +233,10 @@ pub struct HttpConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct EmbeddingConfig {
-    /// Distance metric for ANN indices (e.g., `"cosine"`, `"l2"`). Default: `"cosine"`.
-    pub default_distance_metric: String,
-    /// ANN index type (e.g., `"ivf_hnsw_sq"`). Default: `"ivf_hnsw_sq"`.
-    pub default_index_type: String,
+    /// Distance metric for ANN indices. Default: `Cosine`.
+    pub default_distance_metric: DistanceMetric,
+    /// ANN index type. Default: `IvfHnswSq`.
+    pub default_index_type: IndexType,
     /// Rows between index checkpoint writes. Default: 1000.
     pub checkpoint_interval: usize,
 }
@@ -180,8 +315,8 @@ impl ServerConfig {
 pub struct LoggingConfig {
     /// Log level filter (e.g., `"info"`, `"debug"`, `"warn"`). Default: `"info"`.
     pub level: String,
-    /// Output format: `"text"` or `"json"`. Default: `"text"`.
-    pub format: String,
+    /// Output format. Default: `Text`.
+    pub format: LogFormat,
 }
 
 // --- Defaults ---
@@ -231,7 +366,7 @@ impl Default for GpuConfig {
 impl Default for InferenceConfig {
     fn default() -> Self {
         Self {
-            default_backend: "auto".into(),
+            default_backend: BackendSelection::Auto,
             batch_size: 32,
             batch_timeout_secs: 300,
             max_loaded_models: 0,
@@ -253,8 +388,8 @@ impl Default for HttpConfig {
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
-            default_distance_metric: "cosine".into(),
-            default_index_type: "ivf_hnsw_sq".into(),
+            default_distance_metric: DistanceMetric::Cosine,
+            default_index_type: IndexType::IvfHnswSq,
             checkpoint_interval: 1000,
         }
     }
@@ -297,7 +432,7 @@ impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             level: "info".into(),
-            format: "text".into(),
+            format: LogFormat::Text,
         }
     }
 }
@@ -393,7 +528,10 @@ impl JammiConfig {
 
         // Inference
         if let Ok(v) = std::env::var("JAMMI_INFERENCE__DEFAULT_BACKEND") {
-            self.inference.default_backend = v;
+            match v.parse() {
+                Ok(b) => self.inference.default_backend = b,
+                Err(e) => tracing::warn!("Ignoring invalid JAMMI_INFERENCE__DEFAULT_BACKEND: {e}"),
+            }
         }
         if let Ok(v) = std::env::var("JAMMI_INFERENCE__BATCH_SIZE") {
             if let Ok(n) = v.parse() {
@@ -416,7 +554,10 @@ impl JammiConfig {
             self.logging.level = v;
         }
         if let Ok(v) = std::env::var("JAMMI_LOGGING__FORMAT") {
-            self.logging.format = v;
+            match v.parse() {
+                Ok(f) => self.logging.format = f,
+                Err(e) => tracing::warn!("Ignoring invalid JAMMI_LOGGING__FORMAT: {e}"),
+            }
         }
 
         // Server

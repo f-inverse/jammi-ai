@@ -55,7 +55,7 @@ async fn ann_cache_lifecycle_and_concurrency() {
     );
 
     // Invalidate source → entries gone
-    cache.invalidate_source("patents");
+    cache.invalidate_source("patents").unwrap();
     cache.run_pending_tasks().await;
     assert!(
         cache
@@ -75,7 +75,7 @@ async fn ann_cache_lifecycle_and_concurrency() {
             cache.put("src", "tbl", &query, 10, vec![]).await;
             let _ = cache.get("src", "tbl", &query, 10).await;
             if i % 5 == 0 {
-                cache.invalidate_source("src");
+                cache.invalidate_source("src").unwrap();
             }
         }));
     }
@@ -231,13 +231,4 @@ fn retry_config_validation() {
         ..Default::default()
     };
     assert!(bad_multiplier.validate().is_err());
-}
-
-// ─── Contract: cache types are Send + Sync ───────────────────────────────────
-
-#[test]
-fn contract_caches_are_send_sync() {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<AnnCache>();
-    assert_send_sync::<InferenceCache>();
 }

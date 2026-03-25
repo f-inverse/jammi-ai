@@ -48,7 +48,7 @@ pub async fn create_postgres_tables(
     let pool = Arc::new(pool);
     let factory = PostgresTableFactory::new(pool);
 
-    let table_names = discover_table_names(source_id, connection).await?;
+    let table_names = discover_table_names(source_id, url).await?;
     let mut tables = Vec::new();
     for name in table_names {
         let table_ref = TableReference::bare(&name);
@@ -66,12 +66,7 @@ pub async fn create_postgres_tables(
 }
 
 /// Discover table names from information_schema via a lightweight query.
-async fn discover_table_names(
-    source_id: &str,
-    connection: &SourceConnection,
-) -> Result<Vec<String>> {
-    let url = connection.url.as_deref().unwrap_or_default();
-
+async fn discover_table_names(source_id: &str, url: &str) -> Result<Vec<String>> {
     let (client, conn) = tokio_postgres::connect(url, tokio_postgres::NoTls)
         .await
         .map_err(|e| JammiError::Source {

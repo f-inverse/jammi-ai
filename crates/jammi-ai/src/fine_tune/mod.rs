@@ -11,6 +11,34 @@ pub mod trainer;
 
 use serde::{Deserialize, Serialize};
 
+/// Supported fine-tuning methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FineTuneMethod {
+    /// Low-Rank Adaptation — trains small adapter matrices alongside frozen base weights.
+    Lora,
+}
+
+impl std::fmt::Display for FineTuneMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lora => write!(f, "lora"),
+        }
+    }
+}
+
+impl std::str::FromStr for FineTuneMethod {
+    type Err = jammi_engine::error::JammiError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "lora" => Ok(Self::Lora),
+            other => Err(jammi_engine::error::JammiError::FineTune(format!(
+                "Unknown fine-tuning method '{other}'. Supported: lora"
+            ))),
+        }
+    }
+}
+
 /// Loss function for embedding fine-tuning.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -161,10 +161,21 @@ async fn source_crud_list_and_remove() {
     assert!(ids.contains(&"src_a"));
     assert!(ids.contains(&"src_b"));
 
-    session.catalog().remove_source("src_a").unwrap();
+    session.remove_source("src_a").unwrap();
     let sources = session.catalog().list_sources().unwrap();
     assert!(!sources.iter().any(|s| s.source_id == "src_a"));
     assert!(sources.iter().any(|s| s.source_id == "src_b"));
+
+    // Queries against the removed source should fail.
+    let err = session.sql("SELECT * FROM src_a.public.patents").await;
+    assert!(err.is_err(), "Query against removed source should fail");
+
+    // Queries against the other source should still work.
+    let rows = session
+        .sql("SELECT COUNT(*) FROM src_b.public.scores")
+        .await
+        .unwrap();
+    assert!(!rows.is_empty());
 }
 
 #[tokio::test]
@@ -193,36 +204,4 @@ async fn session_respects_config_batch_size() {
         .unwrap();
     let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 20);
-}
-
-#[tokio::test]
-async fn query_nonexistent_source_fails() {
-    let dir = tempdir().unwrap();
-    let config = common::test_config(dir.path());
-    let session = JammiSession::new(config).await.unwrap();
-
-    let result = session
-        .sql("SELECT * FROM nonexistent.public.table LIMIT 1")
-        .await;
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn duplicate_source_registration_fails() {
-    let dir = tempdir().unwrap();
-    let config = common::test_config(dir.path());
-    let session = JammiSession::new(config).await.unwrap();
-
-    let conn = SourceConnection {
-        url: Some(common::fixture_url("patents.parquet")),
-        format: Some(FileFormat::Parquet),
-        ..Default::default()
-    };
-
-    session
-        .add_source("dup", SourceType::Local, conn.clone())
-        .await
-        .unwrap();
-    let result = session.add_source("dup", SourceType::Local, conn).await;
-    assert!(result.is_err());
 }

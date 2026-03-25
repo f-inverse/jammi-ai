@@ -21,12 +21,11 @@ session.add_source("my_data", SourceType::Local, SourceConnection {
 
 ### Source types
 
-| Type | Description | Status |
-|------|-------------|--------|
-| `SourceType::Local` | Local filesystem (file:// URLs) | Available |
-| `SourceType::S3` | Amazon S3 / MinIO | Phase 12a |
-| `SourceType::Gcs` | Google Cloud Storage | Phase 12a |
-| `SourceType::Http` | Remote HTTP endpoints | Phase 12a |
+| Type | Description | Feature flag |
+|------|-------------|--------------|
+| `SourceType::Local` | Local filesystem (file:// URLs) | (always available) |
+| `SourceType::Postgres` | PostgreSQL database | `postgres` |
+| `SourceType::Mysql` | MySQL / MariaDB database | `mysql` |
 
 ## Querying sources
 

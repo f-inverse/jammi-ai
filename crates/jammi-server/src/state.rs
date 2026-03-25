@@ -4,5 +4,15 @@ use jammi_ai::session::InferenceSession;
 
 /// Shared application state for all HTTP handlers.
 pub struct AppState {
-    pub session: Arc<InferenceSession>,
+    session: Arc<InferenceSession>,
+}
+
+impl AppState {
+    pub fn new(session: Arc<InferenceSession>) -> Self {
+        Self { session }
+    }
+
+    pub fn session(&self) -> &InferenceSession {
+        &self.session
+    }
 }

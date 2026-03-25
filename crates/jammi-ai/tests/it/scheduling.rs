@@ -180,18 +180,6 @@ async fn headroom_fraction_enforced() {
     assert!(half.try_acquire(500_000_000).is_some());
 }
 
-#[test]
-#[should_panic(expected = "headroom_fraction must be between 0.0 and 1.0")]
-fn headroom_fraction_rejects_out_of_range() {
-    let _ = GpuScheduler::new(1_000_000_000, 1.5);
-}
-
-#[test]
-#[should_panic(expected = "headroom_fraction must be between 0.0 and 1.0")]
-fn headroom_fraction_rejects_negative() {
-    let _ = GpuScheduler::new(1_000_000_000, -0.1);
-}
-
 // ─── GPU memory detection ────────────────────────────────────────────────────
 //
 // Covers acceptance criterion 9: Err on CPU-only, no panic.

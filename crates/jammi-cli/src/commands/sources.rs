@@ -45,12 +45,9 @@ pub async fn run(
             }
         }
         SourceAction::Add { name, path, format } => {
-            let file_format = match format.to_lowercase().as_str() {
-                "parquet" => FileFormat::Parquet,
-                "csv" => FileFormat::Csv,
-                "json" => FileFormat::Json,
-                other => return Err(format!("Unknown format: {other}").into()),
-            };
+            let file_format: FileFormat = format
+                .parse()
+                .map_err(|e: jammi_engine::error::JammiError| e.to_string())?;
             let connection = SourceConnection::from_path(&path, file_format);
             let session = InferenceSession::new(config).await?;
             session

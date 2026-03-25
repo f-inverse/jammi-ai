@@ -46,6 +46,18 @@ impl RetryConfig {
     }
 }
 
+fn build_backoff(config: &RetryConfig) -> ExponentialBuilder {
+    let mut backoff = ExponentialBuilder::default()
+        .with_min_delay(config.initial_backoff)
+        .with_max_delay(config.max_backoff)
+        .with_factor(config.backoff_multiplier)
+        .with_max_times(config.max_attempts.saturating_sub(1));
+    if config.jitter {
+        backoff = backoff.with_jitter();
+    }
+    backoff
+}
+
 /// Retry a fallible async operation with exponential backoff.
 /// Error messages include the source name for debuggability.
 pub async fn retry_with_backoff<F, Fut, T>(
@@ -58,17 +70,7 @@ where
     Fut: Future<Output = Result<T>>,
 {
     config.validate()?;
-
-    let mut backoff = ExponentialBuilder::default()
-        .with_min_delay(config.initial_backoff)
-        .with_max_delay(config.max_backoff)
-        .with_factor(config.backoff_multiplier)
-        .with_max_times(config.max_attempts.saturating_sub(1));
-
-    if config.jitter {
-        backoff = backoff.with_jitter();
-    }
-
+    let backoff = build_backoff(config);
     let source_name = source_name.to_string();
     let max_attempts = config.max_attempts;
 
@@ -111,17 +113,7 @@ where
     Fut: Future<Output = Result<T>>,
 {
     config.validate()?;
-
-    let mut backoff = ExponentialBuilder::default()
-        .with_min_delay(config.initial_backoff)
-        .with_max_delay(config.max_backoff)
-        .with_factor(config.backoff_multiplier)
-        .with_max_times(config.max_attempts.saturating_sub(1));
-
-    if config.jitter {
-        backoff = backoff.with_jitter();
-    }
-
+    let backoff = build_backoff(config);
     let source_name = source_name.to_string();
     let max_attempts = config.max_attempts;
 

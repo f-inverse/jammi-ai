@@ -100,15 +100,21 @@ impl JammiSession {
                 SourceType::Postgres => {
                     crate::source::postgres::create_postgres_tables(source_id, &connection).await?
                 }
+                #[cfg(not(feature = "postgres"))]
+                SourceType::Postgres => {
+                    return Err(JammiError::Config(
+                        "Postgres support requires the 'postgres' feature flag".into(),
+                    ));
+                }
                 #[cfg(feature = "mysql")]
                 SourceType::Mysql => {
                     crate::source::mysql::create_mysql_tables(source_id, &connection).await?
                 }
-                other => {
-                    return Err(JammiError::Config(format!(
-                        "Source type {other:?} not yet supported. \
-                         Enable the corresponding feature flag (postgres, mysql, sqlite-external)."
-                    )));
+                #[cfg(not(feature = "mysql"))]
+                SourceType::Mysql => {
+                    return Err(JammiError::Config(
+                        "MySQL support requires the 'mysql' feature flag".into(),
+                    ));
                 }
             };
 
@@ -130,6 +136,50 @@ impl JammiSession {
         // Register as a named catalog so queries use `source_id.public.table_name`.
         let source_catalog = Arc::new(SourceCatalog::new(schema_provider));
         self.ctx.register_catalog(source_id, source_catalog);
+
+        Ok(())
+    }
+
+    /// Remove a source and all associated state: catalog entries, result tables,
+    /// disk files (Parquet + index), ANN cache, and DataFusion registration.
+    ///
+    /// Eval runs are preserved as immutable historical records.
+    pub fn remove_source(&self, source_id: &str) -> Result<()> {
+        // 1. Fetch result tables so we know which files to delete.
+        let result_tables = self.catalog.delete_result_tables_for_source(source_id)?;
+
+        // 2. Delete Parquet and index files from disk (best-effort).
+        for rt in &result_tables {
+            if let Err(e) = std::fs::remove_file(&rt.parquet_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!("Failed to delete parquet file '{}': {e}", rt.parquet_path);
+                }
+            }
+            if let Some(idx) = &rt.index_path {
+                for ext in ["", ".rowmap", ".manifest"] {
+                    let path = format!("{idx}{ext}");
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            tracing::warn!("Failed to delete index file '{path}': {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Delete the source row from the catalog.
+        self.catalog.remove_source(source_id)?;
+
+        // 4. Clear the DataFusion schema provider so queries return "not found".
+        if let Some(catalog) = self.ctx.catalog(source_id) {
+            if let Some(schema) = catalog.schema("public") {
+                if let Some(provider) = schema.as_any().downcast_ref::<JammiSchemaProvider>() {
+                    if let Err(e) = provider.clear() {
+                        tracing::warn!("Failed to clear schema provider for '{source_id}': {e}");
+                    }
+                }
+            }
+        }
 
         Ok(())
     }

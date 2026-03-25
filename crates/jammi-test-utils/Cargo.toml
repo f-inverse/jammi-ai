@@ -1,0 +1,8 @@
+[package]
+name = "jammi-test-utils"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+jammi-engine.workspace = true

@@ -25,7 +25,7 @@ pub async fn add_source(
     Json(req): Json<AddSourceRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     state
-        .session
+        .session()
         .add_source(&req.source_id, req.source_type, req.connection)
         .await?;
     Ok((
@@ -38,7 +38,7 @@ pub async fn add_source(
 pub async fn list_sources(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let sources = state.session.catalog().list_sources()?;
+    let sources = state.session().catalog().list_sources()?;
     Ok(Json(serde_json::json!({ "sources": sources })))
 }
 
@@ -47,6 +47,6 @@ pub async fn remove_source(
     State(state): State<Arc<AppState>>,
     Path(source_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    state.session.catalog().remove_source(&source_id)?;
+    state.session().remove_source(&source_id)?;
     Ok(StatusCode::NO_CONTENT)
 }

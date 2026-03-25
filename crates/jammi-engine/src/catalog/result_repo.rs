@@ -163,6 +163,21 @@ impl Catalog {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    /// Delete all result tables for a source. Returns the deleted records
+    /// so callers can clean up associated disk files.
+    pub fn delete_result_tables_for_source(
+        &self,
+        source_id: &str,
+    ) -> Result<Vec<ResultTableRecord>> {
+        let records = self.find_result_tables(source_id, None, None)?;
+        let conn = self.conn()?;
+        conn.execute(
+            "DELETE FROM result_tables WHERE source_id = ?1",
+            params![source_id],
+        )?;
+        Ok(records)
+    }
+
     /// Resolve which embedding table to use for a source.
     ///
     /// - Explicit name → return that table.

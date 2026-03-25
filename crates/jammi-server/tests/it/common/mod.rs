@@ -24,5 +24,5 @@ pub async fn test_app_state(artifact_dir: &Path) -> Arc<AppState> {
         ..Default::default()
     };
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
-    Arc::new(AppState { session })
+    Arc::new(AppState::new(session))
 }

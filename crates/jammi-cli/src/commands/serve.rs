@@ -10,7 +10,7 @@ pub async fn run(config: JammiConfig) -> Result<(), Box<dyn std::error::Error>> 
 
     let session = Arc::new(InferenceSession::new(config).await?);
     let ctx = session.context().clone();
-    let state = Arc::new(AppState { session });
+    let state = Arc::new(AppState::new(session));
 
     tokio::try_join!(
         async {

@@ -14,5 +14,6 @@ jammi-ai.workspace = true
 pyo3.workspace = true
 arrow.workspace = true
 arrow-array.workspace = true
+pyo3-arrow.workspace = true
 tokio.workspace = true
 serde_json.workspace = true

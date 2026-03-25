@@ -27,3 +27,16 @@ impl std::fmt::Display for EvalTask {
         }
     }
 }
+
+impl std::str::FromStr for EvalTask {
+    type Err = jammi_engine::error::JammiError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "classification" => Ok(Self::Classification),
+            "summarization" => Ok(Self::Summarization),
+            other => Err(jammi_engine::error::JammiError::Other(format!(
+                "Unknown eval task '{other}'. Expected: classification, summarization"
+            ))),
+        }
+    }
+}

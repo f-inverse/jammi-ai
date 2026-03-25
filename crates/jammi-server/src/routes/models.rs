@@ -13,7 +13,7 @@ use crate::state::AppState;
 pub async fn list_models(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let models = state.session.catalog().list_models()?;
+    let models = state.session().catalog().list_models()?;
     Ok(Json(serde_json::json!({ "models": models })))
 }
 
@@ -21,11 +21,11 @@ pub async fn list_models(
 pub struct PreloadRequest {
     pub model_id: String,
     #[serde(default = "default_task")]
-    pub task: String,
+    pub task: ModelTask,
 }
 
-fn default_task() -> String {
-    "embedding".into()
+fn default_task() -> ModelTask {
+    ModelTask::Embedding
 }
 
 /// POST /models/preload — preload a model into the cache.
@@ -34,24 +34,11 @@ pub async fn preload_model(
     Json(req): Json<PreloadRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let source = ModelSource::parse(&req.model_id);
-    let task = match req.task.as_str() {
-        "embedding" => ModelTask::Embedding,
-        "classification" => ModelTask::Classification,
-        "summarization" => ModelTask::Summarization,
-        "text_generation" => ModelTask::TextGeneration,
-        other => {
-            return Err(AppError {
-                status: axum::http::StatusCode::BAD_REQUEST,
-                error: format!("Unknown task: {other}"),
-                code: "invalid_task".into(),
-            });
-        }
-    };
 
     state
-        .session
+        .session()
         .model_cache()
-        .preload(&source, task, None)
+        .preload(&source, req.task, None)
         .await?;
     Ok(Json(
         serde_json::json!({ "model_id": req.model_id, "status": "loaded" }),

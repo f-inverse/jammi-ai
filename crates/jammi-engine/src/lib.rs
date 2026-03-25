@@ -13,7 +13,7 @@ pub mod session;
 pub mod source;
 pub mod store;
 
-use config::LoggingConfig;
+use config::{LogFormat, LoggingConfig};
 
 /// Initialize the tracing subscriber using the provided logging configuration.
 pub fn init_tracing(config: &LoggingConfig) {
@@ -22,11 +22,11 @@ pub fn init_tracing(config: &LoggingConfig) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.level));
 
-    match config.format.as_str() {
-        "json" => {
+    match config.format {
+        LogFormat::Json => {
             fmt().with_env_filter(filter).json().init();
         }
-        _ => {
+        LogFormat::Text => {
             fmt().with_env_filter(filter).init();
         }
     }

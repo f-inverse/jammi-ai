@@ -93,8 +93,8 @@ embedding_cache_enabled = true
 embedding_cache_size = "1GB"
 
 [server]
-# REST API listen address. Default: "0.0.0.0:8080".
-listen = "0.0.0.0:8080"
+# Health probe listen address. Default: "0.0.0.0:8080".
+health_listen = "0.0.0.0:8080"
 # Arrow Flight SQL listen address. Default: "0.0.0.0:8081".
 flight_listen = "0.0.0.0:8081"
 # Models to preload on server start. Default: [].

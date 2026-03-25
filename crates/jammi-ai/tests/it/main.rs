@@ -1,5 +1,6 @@
 mod backends;
 mod common;
+mod cookbook;
 mod e2e_inference;
 mod evaluation;
 mod fine_tune;

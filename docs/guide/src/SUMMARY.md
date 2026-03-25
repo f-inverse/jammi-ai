@@ -2,17 +2,26 @@
 
 [Introduction](./introduction.md)
 
-# User Guide
+# Getting Started
 
-- [Getting Started](./getting-started.md)
+- [Installation](./installation.md)
+- [Quickstart: Rust](./quickstart-rust.md)
+- [Quickstart: Python](./quickstart-python.md)
+- [Quickstart: CLI](./quickstart-cli.md)
+
+# Cookbook
+
+- [Query Your Data with SQL](./query-data.md)
+- [Generate Embeddings](./generate-embeddings.md)
+- [Semantic Search](./semantic-search.md)
+- [Enrich Results with Joins and Annotations](./enrich-results.md)
+- [Fine-Tune for Your Domain](./fine-tuning.md)
+- [Evaluate and Compare Models](./evaluation.md)
+- [Connect to PostgreSQL / MySQL](./external-sources.md)
+- [Deploy as a Server](./deploy-server.md)
+- [Monitor Inference](./monitor-inference.md)
+
+# Reference
+
 - [Configuration](./configuration.md)
-- [Data Sources](./data-sources.md)
-- [Embedding Inference](./embedding-inference.md)
-- [Embedding Generation](./embedding-generation.md)
-- [Vector Search](./vector-search.md)
-- [Fine-Tuning](./fine-tuning.md)
-- [Evaluation](./evaluation.md)
-
-# Architecture
-
-- [Crate Structure](./architecture.md)
+- [Architecture](./architecture.md)

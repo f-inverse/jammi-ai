@@ -1,54 +1,80 @@
-# Fine-Tuning
+# Fine-Tune for Your Domain
 
-`fine_tune()` trains LoRA adapters on your data to improve embedding quality for your domain. The base model stays frozen — only a small projection layer is trained and saved.
+Train LoRA adapters on your data to improve embedding quality for your domain. The base model stays frozen — only a small projection layer is trained and saved.
 
-## Training data
+## Prepare training data
 
-Prepare contrastive pairs (CSV, Parquet, or any registered source):
+Create contrastive pairs with a similarity score:
 
-```
+```csv
 text_a,text_b,score
 "quantum error correction","superconducting qubit stabilization",0.88
 "quantum error correction","medieval poetry analysis",0.08
 ```
 
-High scores mean similar; low scores mean dissimilar. Triplet format (`anchor, positive, negative`) is also supported.
+High scores mean similar; low scores mean dissimilar.
 
 Register the training data as a source:
 
+### Rust
+
 ```rust
 session.add_source("training", SourceType::Local, SourceConnection {
-    url: Some("file:///path/to/training_pairs.csv".into()),
+    url: Some("file:///data/training_pairs.csv".into()),
     format: Some(FileFormat::Csv),
     ..Default::default()
 }).await?;
 ```
 
+### Python
+
+```python
+db.add_source("training", path="/data/training_pairs.csv", format="csv")
+```
+
 ## Start a fine-tuning job
+
+### Rust
+
+```rust
+use jammi_ai::fine_tune::FineTuneMethod;
+
+let job = session.fine_tune(
+    "training",
+    "sentence-transformers/all-MiniLM-L6-v2",
+    &["text_a".into(), "text_b".into(), "score".into()],
+    FineTuneMethod::Lora,
+    "embedding",
+    None,  // default config
+).await?;
+
+println!("Job: {}", job.job_id);
+job.wait().await?;
+println!("Model: {}", job.model_id());
+```
+
+### Python
+
+```python
+job = db.fine_tune(
+    source="training",
+    base_model="sentence-transformers/all-MiniLM-L6-v2",
+    columns=["text_a", "text_b", "score"],
+    method="lora",
+    task="embedding",
+)
+
+job.wait()
+print(f"Model: {job.model_id}")
+```
+
+## Custom configuration
+
+### Rust
 
 ```rust
 use jammi_ai::fine_tune::FineTuneConfig;
 
-let job = session.fine_tune(
-    "training",                                          // source
-    "sentence-transformers/all-MiniLM-L6-v2",           // base model
-    &["text_a".into(), "text_b".into(), "score".into()], // columns
-    "lora",                                              // method
-    "embedding",                                         // task
-    None,                                                // default config
-).await?;
-
-println!("Job: {}", job.job_id);
-println!("Model: {}", job.model_id());  // jammi:fine-tuned:{uuid}
-
-job.wait().await?;
-```
-
-The job runs asynchronously. `wait()` blocks until completion.
-
-## Custom configuration
-
-```rust
 let config = FineTuneConfig {
     lora_rank: 4,
     learning_rate: 5e-4,
@@ -58,16 +84,14 @@ let config = FineTuneConfig {
     lr_schedule: LrSchedule::CosineDecay,
     early_stopping_patience: 2,
     validation_fraction: 0.2,
-    gradient_accumulation_steps: 4,  // effective batch = 4 × 4 = 16
+    gradient_accumulation_steps: 4,  // effective batch = 4 x 4 = 16
     ..Default::default()
 };
 
 let job = session.fine_tune(
-    "training", model, &columns, "lora", "embedding", Some(config),
+    "training", model, &columns, FineTuneMethod::Lora, "embedding", Some(config),
 ).await?;
 ```
-
-All config fields are validated before training starts. Invalid values (e.g., `batch_size: 0`, `validation_fraction: 1.5`) produce clear errors.
 
 ## Configuration reference
 
@@ -91,36 +115,38 @@ All config fields are validated before training starts. Invalid values (e.g., `b
 
 The fine-tuned model is automatically registered and can be used anywhere a model ID is accepted:
 
+### Rust
+
 ```rust
-let model_id = job.model_id();  // "jammi:fine-tuned:{uuid}"
+let model_id = job.model_id();
 
-// Encode a query with the fine-tuned model
 let embedding = session.encode_query(model_id, "quantum computing").await?;
-
-// Generate embeddings for a whole source
 session.generate_embeddings("patents", model_id, &["abstract".into()], "id").await?;
 ```
 
-The fine-tuned model loads the original base model plus the saved LoRA adapter. Embeddings differ from the base model because the LoRA projection has been trained on your domain data.
+### Python
+
+```python
+model_id = job.model_id
+
+query_vec = db.encode_query(model_id, "quantum computing")
+db.generate_embeddings(source="patents", model=model_id, columns=["abstract"], key="id")
+```
 
 ## How it works
 
 ```
-text → BertModel (frozen) → base embedding → LoRA projection (trained) → output
+text -> BertModel (frozen) -> base embedding -> LoRA projection (trained) -> output
 ```
 
-1. The base model (e.g., MiniLM) is loaded from safetensors and frozen
+1. The base model is loaded and frozen
 2. A LoRA projection layer (identity + low-rank A/B matrices) is added after pooling
-3. For each batch: text is encoded through the base model, projected through LoRA, and loss is computed
-4. Only the A/B matrices receive gradients — the base model weights never change
-5. The adapter (A/B matrices) is saved as `adapter.safetensors` in the artifact directory
+3. For each batch: text is encoded, projected through LoRA, and loss is computed
+4. Only the A/B matrices receive gradients
+5. The adapter is saved as `adapter.safetensors` in the artifact directory
 
 ## Training safety
 
 - **Divergence detection:** if loss is NaN or >100 for 3 consecutive batches, the job fails with a clear error
-- **Early stopping:** training stops when validation loss doesn't improve for `patience` epochs, and the best checkpoint weights are restored
+- **Early stopping:** training stops when validation loss doesn't improve for `patience` epochs, best checkpoint weights are restored
 - **Checkpoints:** saved at ~10% intervals for crash recovery
-
-## QLoRA
-
-Not supported. `method="qlora"` returns a clear error.

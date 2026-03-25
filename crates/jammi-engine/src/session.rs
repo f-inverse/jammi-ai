@@ -52,11 +52,33 @@ impl JammiSession {
 
         let ctx = SessionContext::new_with_state(federated_state);
 
-        Ok(Self {
+        let session = Self {
             ctx,
             catalog,
             config,
-        })
+        };
+        session.reload_sources().await?;
+        Ok(session)
+    }
+
+    /// Re-register all sources persisted in the catalog into DataFusion.
+    ///
+    /// Called on startup so that sources added by previous sessions (e.g. a
+    /// prior CLI invocation) are available for queries immediately.
+    async fn reload_sources(&self) -> Result<()> {
+        let sources = self.catalog.list_sources()?;
+        for record in sources {
+            if let Err(e) = self
+                .register_source_tables(&record.source_id, &record.source_type, &record.connection)
+                .await
+            {
+                tracing::warn!(
+                    source_id = %record.source_id,
+                    "Failed to reload source: {e}"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Register a data source, persisting it to the catalog and exposing it to SQL queries.
@@ -74,55 +96,67 @@ impl JammiSession {
             });
         }
 
-        // Create (table_name, TableProvider) pairs depending on source type.
-        let tables: Vec<(String, Arc<dyn datafusion::catalog::TableProvider>)> =
-            match &source_type {
-                SourceType::Local => {
-                    let format = connection.format.as_ref().ok_or_else(|| {
-                        JammiError::Config("Local source requires a format".into())
-                    })?;
-                    let url = connection
-                        .url
-                        .as_deref()
-                        .ok_or_else(|| JammiError::Config("Local source requires a URL".into()))?;
-                    let state = self.ctx.state();
-                    let table = local::create_listing_table(
-                        url,
-                        format,
-                        connection.file_extension.as_deref(),
-                        &state,
-                    )
-                    .await?;
-                    let name = table_name_from_url(url);
-                    vec![(name, table)]
-                }
-                #[cfg(feature = "postgres")]
-                SourceType::Postgres => {
-                    crate::source::postgres::create_postgres_tables(source_id, &connection).await?
-                }
-                #[cfg(not(feature = "postgres"))]
-                SourceType::Postgres => {
-                    return Err(JammiError::Config(
-                        "Postgres support requires the 'postgres' feature flag".into(),
-                    ));
-                }
-                #[cfg(feature = "mysql")]
-                SourceType::Mysql => {
-                    crate::source::mysql::create_mysql_tables(source_id, &connection).await?
-                }
-                #[cfg(not(feature = "mysql"))]
-                SourceType::Mysql => {
-                    return Err(JammiError::Config(
-                        "MySQL support requires the 'mysql' feature flag".into(),
-                    ));
-                }
-            };
+        // Register tables in DataFusion.
+        self.register_source_tables(source_id, &source_type, &connection)
+            .await?;
 
         // Persist to catalog.
         self.catalog
             .register_source(source_id, source_type, &connection)?;
 
-        // Register all discovered tables under one schema provider.
+        Ok(())
+    }
+
+    /// Create DataFusion table providers for a source and register them.
+    async fn register_source_tables(
+        &self,
+        source_id: &str,
+        source_type: &SourceType,
+        connection: &SourceConnection,
+    ) -> Result<()> {
+        let tables: Vec<(String, Arc<dyn datafusion::catalog::TableProvider>)> = match source_type {
+            SourceType::Local => {
+                let format = connection
+                    .format
+                    .as_ref()
+                    .ok_or_else(|| JammiError::Config("Local source requires a format".into()))?;
+                let url = connection
+                    .url
+                    .as_deref()
+                    .ok_or_else(|| JammiError::Config("Local source requires a URL".into()))?;
+                let state = self.ctx.state();
+                let table = local::create_listing_table(
+                    url,
+                    format,
+                    connection.file_extension.as_deref(),
+                    &state,
+                )
+                .await?;
+                let name = table_name_from_url(url);
+                vec![(name, table)]
+            }
+            #[cfg(feature = "postgres")]
+            SourceType::Postgres => {
+                crate::source::postgres::create_postgres_tables(source_id, connection).await?
+            }
+            #[cfg(not(feature = "postgres"))]
+            SourceType::Postgres => {
+                return Err(JammiError::Config(
+                    "Postgres support requires the 'postgres' feature flag".into(),
+                ));
+            }
+            #[cfg(feature = "mysql")]
+            SourceType::Mysql => {
+                crate::source::mysql::create_mysql_tables(source_id, connection).await?
+            }
+            #[cfg(not(feature = "mysql"))]
+            SourceType::Mysql => {
+                return Err(JammiError::Config(
+                    "MySQL support requires the 'mysql' feature flag".into(),
+                ));
+            }
+        };
+
         let schema_provider = Arc::new(JammiSchemaProvider::new());
         for (table_name, table) in tables {
             schema_provider
@@ -133,7 +167,6 @@ impl JammiSession {
                 })?;
         }
 
-        // Register as a named catalog so queries use `source_id.public.table_name`.
         let source_catalog = Arc::new(SourceCatalog::new(schema_provider));
         self.ctx.register_catalog(source_id, source_catalog);
 

@@ -271,12 +271,12 @@ pub struct CacheConfig {
     pub embedding_cache_size: String,
 }
 
-/// HTTP and Arrow Flight server bind addresses.
+/// Arrow Flight SQL and health-probe server bind addresses.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
-    /// HTTP API listen address. Default: `"0.0.0.0:8080"`.
-    pub listen: String,
+    /// Health probe listen address. Default: `"0.0.0.0:8080"`.
+    pub health_listen: String,
     /// Arrow Flight listen address. Default: `"0.0.0.0:8081"`.
     pub flight_listen: String,
     /// Model IDs to preload into memory at server startup.
@@ -288,10 +288,10 @@ impl ServerConfig {
     pub fn validate(&self) -> Result<()> {
         use std::net::SocketAddr;
 
-        let _: SocketAddr = self.listen.parse().map_err(|e| {
+        let _: SocketAddr = self.health_listen.parse().map_err(|e| {
             crate::error::JammiError::Config(format!(
-                "Invalid listen address '{}': {e}",
-                self.listen
+                "Invalid health_listen address '{}': {e}",
+                self.health_listen
             ))
         })?;
         let _: SocketAddr = self.flight_listen.parse().map_err(|e| {
@@ -300,9 +300,9 @@ impl ServerConfig {
                 self.flight_listen
             ))
         })?;
-        if self.listen == self.flight_listen {
+        if self.health_listen == self.flight_listen {
             return Err(crate::error::JammiError::Config(
-                "listen and flight_listen must be different addresses".into(),
+                "health_listen and flight_listen must be different addresses".into(),
             ));
         }
         Ok(())
@@ -421,7 +421,7 @@ impl Default for CacheConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            listen: "0.0.0.0:8080".into(),
+            health_listen: "0.0.0.0:8080".into(),
             flight_listen: "0.0.0.0:8081".into(),
             preload_models: Vec::new(),
         }
@@ -561,8 +561,8 @@ impl JammiConfig {
         }
 
         // Server
-        if let Ok(v) = std::env::var("JAMMI_SERVER__LISTEN") {
-            self.server.listen = v;
+        if let Ok(v) = std::env::var("JAMMI_SERVER__HEALTH_LISTEN") {
+            self.server.health_listen = v;
         }
         if let Ok(v) = std::env::var("JAMMI_SERVER__FLIGHT_LISTEN") {
             self.server.flight_listen = v;

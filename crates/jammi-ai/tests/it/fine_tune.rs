@@ -781,15 +781,10 @@ fn config_validation_rejects_invalid_values() {
 
     for (config, field) in &cases {
         let result = config.validate();
-        assert!(
-            result.is_err(),
-            "Should reject invalid {field}: {:?}",
-            config
-        );
+        assert!(result.is_err(), "Should reject invalid {field}: {config:?}");
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.to_lowercase()
-                .contains(&field.to_lowercase().replace('_', "_")),
+            msg.to_lowercase().contains(&field.to_lowercase()),
             "Error for {field} should name the field, got: {msg}"
         );
     }

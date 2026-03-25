@@ -21,6 +21,7 @@ use crate::model::{ModelSource, ModelTask};
 use crate::operator::inference_exec::InferenceExecBuilder;
 use crate::pipeline::embedding::EmbeddingPipeline;
 use crate::search::SearchBuilder;
+use jammi_engine::cache::ann_cache::AnnCache;
 
 /// An inference-capable session that wraps `JammiSession` with model loading
 /// and inference execution. This is the primary entry point for CP2+.
@@ -29,6 +30,7 @@ pub struct InferenceSession {
     model_cache: Arc<ModelCache>,
     result_store: Arc<ResultStore>,
     observer: Option<Arc<dyn InferenceObserver>>,
+    ann_cache: Arc<AnnCache>,
 }
 
 impl InferenceSession {
@@ -56,11 +58,15 @@ impl InferenceSession {
         catalog.cleanup_stale_fine_tune_jobs()?;
         result_store.load_existing_tables(inner.context()).await?;
 
+        let ann_cache_size = inner.config().cache.ann_cache_max_entries as u64;
+        let ann_cache = Arc::new(AnnCache::new(ann_cache_size));
+
         Ok(Self {
             inner,
             model_cache,
             result_store,
             observer,
+            ann_cache,
         })
     }
 
@@ -106,6 +112,11 @@ impl InferenceSession {
         self.inner.config()
     }
 
+    /// Access the ANN cache.
+    pub fn ann_cache(&self) -> &Arc<AnnCache> {
+        &self.ann_cache
+    }
+
     /// Access the inference observer.
     pub(crate) fn observer(&self) -> &Option<Arc<dyn InferenceObserver>> {
         &self.observer
@@ -147,6 +158,7 @@ impl InferenceSession {
     }
 
     /// Generate embeddings for a source and persist to Jammi DB.
+    /// Invalidates the ANN cache for this source after completion.
     pub async fn generate_embeddings(
         &self,
         source_id: &str,
@@ -154,9 +166,11 @@ impl InferenceSession {
         columns: &[String],
         key_column: &str,
     ) -> Result<ResultTableRecord> {
-        EmbeddingPipeline::new(self, &self.result_store)
+        let result = EmbeddingPipeline::new(self, &self.result_store)
             .run(source_id, model_id, columns, key_column)
-            .await
+            .await?;
+        self.ann_cache.invalidate_source(source_id);
+        Ok(result)
     }
 
     /// Run inference on a registered source using a model.

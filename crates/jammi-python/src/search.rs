@@ -27,6 +27,31 @@ impl PySearchBuilder {
 
 #[pymethods]
 impl PySearchBuilder {
+    /// Join with another registered source.
+    /// `on` is `"left_col=right_col"`. `how` is `"inner"` or `"left"` (default).
+    #[pyo3(signature = (source, *, on, how=None))]
+    fn join(&mut self, source: &str, on: &str, how: Option<&str>) -> PyResult<()> {
+        let builder = self.take_inner()?;
+        self.inner = Some(
+            self.runtime
+                .block_on(builder.join(source, on, how))
+                .map_err(to_pyerr)?,
+        );
+        Ok(())
+    }
+
+    /// Annotate results with model inference.
+    #[pyo3(signature = (*, model, task, columns))]
+    fn annotate(&mut self, model: &str, task: &str, columns: Vec<String>) -> PyResult<()> {
+        let builder = self.take_inner()?;
+        self.inner = Some(
+            self.runtime
+                .block_on(builder.annotate(model, task, &columns))
+                .map_err(to_pyerr)?,
+        );
+        Ok(())
+    }
+
     /// Filter results with a SQL WHERE clause predicate.
     fn filter(&mut self, predicate: &str) -> PyResult<()> {
         let builder = self.take_inner()?;

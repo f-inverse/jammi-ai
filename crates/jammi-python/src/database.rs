@@ -182,6 +182,13 @@ impl PyDatabase {
         json_to_pydict(py, &json)
     }
 
+    /// Encode a text query into an embedding vector using the given model.
+    fn encode_query(&self, model_id: &str, text: &str) -> PyResult<Vec<f32>> {
+        self.runtime
+            .block_on(self.session.encode_query(model_id, text))
+            .map_err(to_pyerr)
+    }
+
     /// Preload a model into the cache without running inference.
     fn preload_model(&self, model_id: &str) -> PyResult<()> {
         let source = ModelSource::parse(model_id);

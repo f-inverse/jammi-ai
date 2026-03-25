@@ -14,8 +14,8 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   RUSTFLAGS: "-D warnings"
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
+  RUSTC_WRAPPER: ""
+  CARGO_INCREMENTAL: 1
 
 jobs:
   check:
@@ -26,8 +26,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: actions/cache@v4
+        with:
+          path: target
+          key: cargo-check-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-check-
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -43,9 +46,6 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v4
-
-      - name: Configure sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - uses: actions/cache@v4
         with:
@@ -69,9 +69,6 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-
-      - name: Configure sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
 
       - uses: actions/cache@v4
         with:

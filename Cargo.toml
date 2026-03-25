@@ -25,8 +25,9 @@ repository = "https://github.com/f-inverse/jammi-ai"
 
 [workspace.dependencies]
 # Internal crates
-jammi-engine = { path = "crates/jammi-engine" }
-jammi-ai = { path = "crates/jammi-ai" }
+jammi-engine = { version = "0.1.0", path = "crates/jammi-engine" }
+jammi-ai = { version = "0.1.0", path = "crates/jammi-ai" }
+jammi-server = { version = "0.1.0", path = "crates/jammi-server" }
 jammi-test-utils = { path = "crates/jammi-test-utils" }
 
 # Query engine

@@ -10,7 +10,7 @@ repository.workspace = true
 [dependencies]
 jammi-engine.workspace = true
 jammi-ai.workspace = true
-jammi-server = { path = "../jammi-server" }
+jammi-server.workspace = true
 arrow.workspace = true
 clap.workspace = true
 tokio.workspace = true

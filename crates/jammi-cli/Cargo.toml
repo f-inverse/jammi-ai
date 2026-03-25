@@ -1,7 +1,11 @@
 [package]
 name = "jammi-cli"
+description = "Command-line interface for Jammi AI"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 jammi-engine.workspace = true

@@ -29,8 +29,6 @@ jobs:
           manylinux: auto
         env:
           RUSTC_WRAPPER: ""
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ""
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ""
 
       - uses: actions/upload-artifact@v4
         with:

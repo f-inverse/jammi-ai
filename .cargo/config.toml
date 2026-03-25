@@ -1,12 +1,4 @@
-# Local development: use sccache if available, fall back gracefully.
+# Local development: use sccache if available.
 # CI overrides RUSTC_WRAPPER="" to use incremental compilation instead.
 [build]
 rustc-wrapper = "sccache"
-
-# Use mold linker on Linux for faster local linking.
-# CI and PyPI builds override this via CARGO_TARGET_*_RUSTFLAGS="".
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
-
-[target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]

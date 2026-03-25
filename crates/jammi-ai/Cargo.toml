@@ -25,10 +25,14 @@ thiserror.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 
+# HTTP backend
+reqwest.workspace = true
+
 [dev-dependencies]
 tempfile = "3"
 tokio.workspace = true
 parquet.workspace = true
+wiremock = "0.6"
 
 [features]
 live-hub-tests = []

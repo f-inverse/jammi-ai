@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+postgres = ["datafusion-table-providers/postgres-federation"]
+mysql = ["datafusion-table-providers/mysql-federation"]
+
 [dependencies]
 # Query engine
 datafusion.workspace = true
@@ -12,6 +17,9 @@ datafusion-federation.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
 arrow-array.workspace = true
+
+# External sources (feature-gated — not a workspace dep to avoid sqlite3 links conflict)
+datafusion-table-providers = { version = "0.10.1", default-features = false, optional = true }
 
 # Storage
 parquet.workspace = true

@@ -1,3 +1,4 @@
+mod backends;
 mod common;
 mod e2e_inference;
 mod evaluation;

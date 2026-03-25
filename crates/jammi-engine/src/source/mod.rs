@@ -1,7 +1,15 @@
 pub mod local;
+#[cfg(feature = "mysql")]
+pub mod mysql;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod registry;
 pub mod retry;
 pub mod schema_provider;
+// Note: SQLite external source via datafusion-table-providers is not supported
+// because DTP's rusqlite version conflicts with our catalog's rusqlite (different
+// libsqlite3-sys links versions). Users can query SQLite files via Local source
+// after exporting to Parquet/CSV.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

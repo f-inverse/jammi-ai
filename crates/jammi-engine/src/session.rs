@@ -74,46 +74,58 @@ impl JammiSession {
             });
         }
 
-        // Create the table provider for local sources.
-        let table = match &source_type {
-            SourceType::Local => {
-                let format = connection
-                    .format
-                    .as_ref()
-                    .ok_or_else(|| JammiError::Config("Local source requires a format".into()))?;
-                let url = connection
-                    .url
-                    .as_deref()
-                    .ok_or_else(|| JammiError::Config("Local source requires a URL".into()))?;
-                let state = self.ctx.state();
-                local::create_listing_table(
-                    url,
-                    format,
-                    connection.file_extension.as_deref(),
-                    &state,
-                )
-                .await?
-            }
-            other => {
-                return Err(JammiError::Config(format!(
-                    "Source type {other:?} not yet supported"
-                )));
-            }
-        };
+        // Create (table_name, TableProvider) pairs depending on source type.
+        let tables: Vec<(String, Arc<dyn datafusion::catalog::TableProvider>)> =
+            match &source_type {
+                SourceType::Local => {
+                    let format = connection.format.as_ref().ok_or_else(|| {
+                        JammiError::Config("Local source requires a format".into())
+                    })?;
+                    let url = connection
+                        .url
+                        .as_deref()
+                        .ok_or_else(|| JammiError::Config("Local source requires a URL".into()))?;
+                    let state = self.ctx.state();
+                    let table = local::create_listing_table(
+                        url,
+                        format,
+                        connection.file_extension.as_deref(),
+                        &state,
+                    )
+                    .await?;
+                    let name = table_name_from_url(url);
+                    vec![(name, table)]
+                }
+                #[cfg(feature = "postgres")]
+                SourceType::Postgres => {
+                    crate::source::postgres::create_postgres_tables(source_id, &connection).await?
+                }
+                #[cfg(feature = "mysql")]
+                SourceType::Mysql => {
+                    crate::source::mysql::create_mysql_tables(source_id, &connection).await?
+                }
+                other => {
+                    return Err(JammiError::Config(format!(
+                        "Source type {other:?} not yet supported. \
+                         Enable the corresponding feature flag (postgres, mysql, sqlite-external)."
+                    )));
+                }
+            };
 
         // Persist to catalog.
         self.catalog
             .register_source(source_id, source_type, &connection)?;
 
-        // Derive table name from URL and build schema provider.
-        let table_name = table_name_from_url(connection.url.as_deref().unwrap_or("data"));
+        // Register all discovered tables under one schema provider.
         let schema_provider = Arc::new(JammiSchemaProvider::new());
-        schema_provider
-            .add_table(table_name, table)
-            .map_err(|e| JammiError::Source {
-                source_id: source_id.into(),
-                message: format!("Failed to register table: {e}"),
-            })?;
+        for (table_name, table) in tables {
+            schema_provider
+                .add_table(table_name, table)
+                .map_err(|e| JammiError::Source {
+                    source_id: source_id.into(),
+                    message: format!("Failed to register table: {e}"),
+                })?;
+        }
 
         // Register as a named catalog so queries use `source_id.public.table_name`.
         let source_catalog = Arc::new(SourceCatalog::new(schema_provider));

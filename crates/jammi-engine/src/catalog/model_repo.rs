@@ -3,7 +3,7 @@ use crate::error::Result;
 use super::Catalog;
 
 /// Materialized row from the `models` catalog table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelRecord {
     /// Unique model name (e.g., `"sentence-transformers/all-MiniLM-L6-v2"`).
     pub model_id: String,

@@ -4,7 +4,7 @@ use crate::source::{SourceConnection, SourceType};
 use super::Catalog;
 
 /// Materialized row from the `sources` catalog table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SourceRecord {
     /// Unique identifier for this data source.
     pub source_id: String,

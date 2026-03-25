@@ -148,6 +148,32 @@ pub struct ServerConfig {
     pub preload_models: Vec<String>,
 }
 
+impl ServerConfig {
+    /// Validate server configuration.
+    pub fn validate(&self) -> Result<()> {
+        use std::net::SocketAddr;
+
+        let _: SocketAddr = self.listen.parse().map_err(|e| {
+            crate::error::JammiError::Config(format!(
+                "Invalid listen address '{}': {e}",
+                self.listen
+            ))
+        })?;
+        let _: SocketAddr = self.flight_listen.parse().map_err(|e| {
+            crate::error::JammiError::Config(format!(
+                "Invalid flight_listen address '{}': {e}",
+                self.flight_listen
+            ))
+        })?;
+        if self.listen == self.flight_listen {
+            return Err(crate::error::JammiError::Config(
+                "listen and flight_listen must be different addresses".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Tracing/logging configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]

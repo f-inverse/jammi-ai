@@ -17,6 +17,9 @@ pip install \
 curl -fsSL https://claude.ai/install.sh | bash
 
 # --- Pre-commit hooks ---
+# Claude Code installer sets core.hooksPath; unset it so pre-commit can
+# manage hooks in the standard .git/hooks directory.
+git config --unset-all core.hooksPath 2>/dev/null || true
 pre-commit install
 
 echo "Development environment ready"

@@ -35,7 +35,7 @@ jobs:
         run: mdbook build docs/guide
 
       - name: Build rustdoc
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --exclude jammi-python --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
 

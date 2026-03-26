@@ -727,7 +727,10 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
         .await
         .unwrap();
 
-    // Fine-tune with LoRA (minimal config for speed)
+    // Fine-tune with LoRA. The tiny 32-dim model needs enough total
+    // gradient to shift LoRA's zero-initialized B matrix away from the
+    // identity projection: 10 epochs × ~4 batches = 40 steps at 1e-3
+    // with constant schedule (no decay wasting steps near zero LR).
     let columns = vec![
         "text_a".to_string(),
         "text_b".to_string(),
@@ -741,10 +744,12 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
             FineTuneMethod::Lora,
             "embedding",
             Some(FineTuneConfig {
-                epochs: 2,
+                epochs: 10,
                 batch_size: 8,
+                learning_rate: 1e-3,
                 lora_rank: 4,
                 warmup_steps: 0,
+                lr_schedule: LrSchedule::Constant,
                 ..Default::default()
             }),
         )

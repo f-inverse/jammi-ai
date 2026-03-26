@@ -96,8 +96,6 @@ pub enum BackendType {
     Candle,
     /// ONNX Runtime — cross-platform inference via ONNX models.
     Ort,
-    /// vLLM — high-throughput serving for large language models.
-    Vllm,
     /// HTTP — remote model endpoint (REST/gRPC).
     Http,
 }
@@ -110,14 +108,8 @@ pub enum ModelTask {
     Embedding,
     /// Assign a label and confidence score to input text.
     Classification,
-    /// Generate a condensed summary of input text.
-    Summarization,
-    /// Detect and localize objects in images.
-    ObjectDetection,
     /// Extract named entities (person, org, location, etc.) from text.
     Ner,
-    /// Generate continuation text from a prompt.
-    TextGeneration,
 }
 
 impl std::fmt::Display for ModelTask {
@@ -125,10 +117,7 @@ impl std::fmt::Display for ModelTask {
         match self {
             Self::Embedding => write!(f, "embedding"),
             Self::Classification => write!(f, "classification"),
-            Self::Summarization => write!(f, "summarization"),
-            Self::ObjectDetection => write!(f, "object_detection"),
             Self::Ner => write!(f, "ner"),
-            Self::TextGeneration => write!(f, "text_generation"),
         }
     }
 }
@@ -139,13 +128,9 @@ impl std::str::FromStr for ModelTask {
         match s {
             "embedding" => Ok(Self::Embedding),
             "classification" => Ok(Self::Classification),
-            "summarization" => Ok(Self::Summarization),
-            "object_detection" => Ok(Self::ObjectDetection),
             "ner" => Ok(Self::Ner),
-            "text_generation" => Ok(Self::TextGeneration),
             other => Err(jammi_engine::error::JammiError::Other(format!(
-                "Unknown model task '{other}'. Expected: embedding, classification, \
-                 summarization, object_detection, ner, text_generation"
+                "Unknown model task '{other}'. Expected: embedding, classification, ner"
             ))),
         }
     }

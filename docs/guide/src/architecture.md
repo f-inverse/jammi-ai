@@ -56,7 +56,7 @@ jammi-cli
 | `ModelResolver` | Resolves model ID to file paths + backend. Chain: catalog -> local -> HF Hub |
 | `ModelCache` | LRU cache with single-flight loading, ref-counted guards |
 | `CandleBackend` / `OrtBackend` | Model backends: Candle (safetensors), ONNX Runtime |
-| `VllmBackend` / `HttpBackend` | Remote backends: vLLM server, generic HTTP |
+| `HttpBackend` | Remote backend: HTTP endpoint for embeddings |
 | `InferenceExec` | DataFusion `ExecutionPlan` operator for inference with backpressure |
 | `AnnSearchExec` | DataFusion `ExecutionPlan` leaf node for ANN vector search |
 | `EmbeddingPipeline` | Orchestrates generate_embeddings: model -> InferenceExec -> ResultSink -> index |
@@ -66,7 +66,7 @@ jammi-cli
 | `OutputAdapter` | Trait that converts raw model output to Arrow arrays per task |
 | `GpuScheduler` | GPU memory permit system with budget-based admission control |
 | `FineTuneJob` | LoRA fine-tuning with contrastive loss, checkpointing, early stopping |
-| `EvalRunner` | Retrieval, classification, and summarization evaluation |
+| `EvalRunner` | Retrieval and classification evaluation |
 
 ### Server layer (`jammi-server`)
 
@@ -148,7 +148,7 @@ crates/jammi-ai/src/
 |-- evidence/           # Provenance types and columns
 |-- search/             # SearchBuilder
 |-- fine_tune/          # LoRA training, config, jobs
-|-- eval/               # Retrieval, classification, summarization eval
+|-- eval/               # Retrieval and classification eval
 '-- concurrency/        # GpuScheduler, permits
 
 crates/jammi-server/src/

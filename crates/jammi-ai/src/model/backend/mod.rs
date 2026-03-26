@@ -1,7 +1,6 @@
 pub mod candle;
 pub mod http;
 pub mod ort;
-pub mod vllm;
 
 use jammi_engine::error::Result;
 

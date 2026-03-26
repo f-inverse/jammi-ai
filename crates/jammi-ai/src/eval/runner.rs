@@ -11,13 +11,11 @@ use crate::session::InferenceSession;
 
 use super::golden::{
     ensure_column, load_classification_golden_from_batches, load_retrieval_golden_from_batches,
-    load_summarization_golden_from_batches,
 };
 use super::metrics::classification::ClassificationMetrics;
 use super::metrics::retrieval::RetrievalMetrics;
-use super::metrics::summarization::SummarizationMetrics;
 
-/// Orchestrates evaluation pipelines — retrieval, classification, summarization.
+/// Orchestrates evaluation pipelines — retrieval and classification.
 pub struct EvalRunner<'a> {
     pub(crate) session: &'a InferenceSession,
 }
@@ -162,44 +160,6 @@ impl<'a> EvalRunner<'a> {
 
                 let result = ClassificationMetrics::compute(&aligned_predicted, &aligned_actual);
                 serde_json::to_value(&result)?
-            }
-            EvalTask::Summarization => {
-                let golden_schema = self.source_schema(golden_source).await?;
-                ensure_column(&golden_schema, "id", DataType::Utf8)?;
-                ensure_column(&golden_schema, "reference", DataType::Utf8)?;
-
-                let batches = self
-                    .session
-                    .sql(&format!(
-                        "SELECT \"id\", \"reference\" FROM {golden_source}"
-                    ))
-                    .await?;
-                let golden = load_summarization_golden_from_batches(&batches)?;
-
-                let results = self
-                    .session
-                    .infer(
-                        source_id,
-                        &model_source,
-                        crate::model::ModelTask::Summarization,
-                        columns,
-                        "id",
-                    )
-                    .await?;
-
-                let mut scores = Vec::new();
-                for batch in &results {
-                    let ids = super::golden::extract_string_column(batch, "_row_id")?;
-                    let generated = super::golden::extract_string_column(batch, "summary")?;
-                    for (id, gen) in ids.iter().zip(&generated) {
-                        if let Some(reference) = golden.references.get(id) {
-                            scores.push(SummarizationMetrics::rouge_l(gen, reference));
-                        }
-                    }
-                }
-
-                let agg = SummarizationMetrics::aggregate(&scores);
-                serde_json::to_value(&agg)?
             }
         };
 

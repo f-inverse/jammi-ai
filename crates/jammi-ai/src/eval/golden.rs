@@ -30,11 +30,6 @@ pub struct ClassificationGolden {
     pub labels: HashMap<String, String>,
 }
 
-/// A loaded summarization golden dataset: id → reference.
-pub struct SummarizationGolden {
-    pub references: HashMap<String, String>,
-}
-
 /// Returns true if `actual` is compatible with `expected` for golden schema validation.
 ///
 /// When Utf8 is expected, we accept any string-like type (Utf8View, LargeUtf8) and
@@ -150,24 +145,6 @@ pub fn load_classification_golden_from_batches(
     }
 
     Ok(ClassificationGolden { labels })
-}
-
-/// Load a summarization golden dataset from DataFusion query results.
-pub fn load_summarization_golden_from_batches(
-    batches: &[arrow::array::RecordBatch],
-) -> Result<SummarizationGolden> {
-    let mut references = HashMap::new();
-
-    for batch in batches {
-        let ids = extract_string_column(batch, "id")?;
-        let refs = extract_string_column(batch, "reference")?;
-
-        for (id, reference) in ids.into_iter().zip(refs) {
-            references.insert(id, reference);
-        }
-    }
-
-    Ok(SummarizationGolden { references })
 }
 
 /// Extract a column as strings, handling Utf8, Utf8View, LargeUtf8, and numeric types.

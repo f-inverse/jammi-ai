@@ -1,11 +1,8 @@
 pub mod classification;
 pub mod embedding;
 pub mod ner;
-pub mod object_detection;
-pub mod summarization;
-pub mod text_generation;
 
-use arrow::array::{ArrayRef, Float32Array, LargeStringArray, StringArray};
+use arrow::array::{ArrayRef, Float32Array, StringArray};
 use arrow::datatypes::Field;
 use jammi_engine::error::Result;
 
@@ -48,10 +45,7 @@ pub fn create_adapter(task: ModelTask, model: &LoadedModel) -> Result<Box<dyn Ou
             Ok(Box::new(EmbeddingAdapter::new(dim)))
         }
         ModelTask::Classification => Ok(Box::new(ClassificationAdapter)),
-        ModelTask::Summarization => Ok(Box::new(summarization::SummarizationAdapter)),
-        ModelTask::ObjectDetection => Ok(Box::new(object_detection::ObjectDetectionAdapter)),
         ModelTask::Ner => Ok(Box::new(ner::NerAdapter)),
-        ModelTask::TextGeneration => Ok(Box::new(text_generation::TextGenerationAdapter)),
     }
 }
 
@@ -64,10 +58,7 @@ pub(crate) fn create_adapter_for_schema(
     match task {
         ModelTask::Embedding => Box::new(EmbeddingAdapter::new(embedding_dim.unwrap_or(0))),
         ModelTask::Classification => Box::new(ClassificationAdapter),
-        ModelTask::Summarization => Box::new(summarization::SummarizationAdapter),
-        ModelTask::ObjectDetection => Box::new(object_detection::ObjectDetectionAdapter),
         ModelTask::Ner => Box::new(ner::NerAdapter),
-        ModelTask::TextGeneration => Box::new(text_generation::TextGenerationAdapter),
     }
 }
 
@@ -79,28 +70,6 @@ pub(crate) fn nullify_strings(
     row_status: &[bool],
     row_count: usize,
 ) -> StringArray {
-    match values {
-        Some(v) => v
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                if row_status.get(i).copied().unwrap_or(false) {
-                    Some(s.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect(),
-        None => vec![None::<&str>; row_count].into_iter().collect(),
-    }
-}
-
-/// Build a nullable LargeStringArray: rows where `row_status[i]` is false become null.
-pub(crate) fn nullify_large_strings(
-    values: Option<&Vec<String>>,
-    row_status: &[bool],
-    row_count: usize,
-) -> LargeStringArray {
     match values {
         Some(v) => v
             .iter()
@@ -154,16 +123,7 @@ pub(crate) fn create_error_output(
                 vec![String::new(); row_count],
             ],
         ),
-        ModelTask::Summarization => (vec![], vec![vec![String::new(); row_count]]),
-        ModelTask::TextGeneration => (
-            vec![],
-            vec![
-                vec![String::new(); row_count],
-                vec![String::new(); row_count],
-            ],
-        ),
         ModelTask::Ner => (vec![], vec![vec![String::new(); row_count]]),
-        ModelTask::ObjectDetection => (vec![], vec![vec![String::new(); row_count]]),
     };
     BackendOutput {
         float_outputs,

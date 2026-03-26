@@ -11,7 +11,7 @@ Jammi is an embeddable AI engine that brings model inference into your data pipe
 - **Search builder** — fluent API for `.join()`, `.annotate()`, `.filter()`, `.sort()`, `.limit()`, `.select()`, `.run()`
 - **Evidence provenance** — `retrieved_by` and `annotated_by` tracking on every search result
 - **Fine-tuning** — LoRA adapters with contrastive loss to improve embeddings for your domain
-- **Evaluation** — retrieval metrics (recall@k, precision@k, MRR, nDCG), classification (accuracy, F1), summarization (ROUGE-L), and A/B model comparison
+- **Evaluation** — retrieval metrics (recall@k, precision@k, MRR, nDCG), classification (accuracy, F1), and A/B model comparison
 - **Per-row error handling** — null or invalid text produces error status per row, not a batch failure
 - **Model caching** — LRU eviction, ref-counted guards, single-flight loading
 - **GPU scheduling** — memory-budget admission control with RAII permits

@@ -2,10 +2,7 @@ use std::sync::Arc;
 
 use jammi_ai::eval::{
     golden::{ensure_column, RelevanceJudgment},
-    metrics::{
-        classification::ClassificationMetrics, retrieval::RetrievalMetrics,
-        summarization::SummarizationMetrics,
-    },
+    metrics::{classification::ClassificationMetrics, retrieval::RetrievalMetrics},
 };
 use jammi_ai::session::InferenceSession;
 use jammi_engine::catalog::eval_repo::EvalRunRecord;
@@ -170,43 +167,6 @@ fn classification_metrics_known_inputs() {
 
 // ─── ROUGE-L ────────────────────────────────────────────────────────────────
 //
-// The two non-trivial cases: subsequence matching (LCS, not substring) and
-// text normalization. These guard the LCS DP implementation and the normalize() step.
-
-#[test]
-fn rouge_l_known_inputs() {
-    // Subsequence (not substring): "A C E" matches "A B C D E" with LCS=3
-    // P = 3/3 = 1.0, R = 3/5 = 0.6 — guards LCS implementation
-    let subseq = SummarizationMetrics::rouge_l("A C E", "A B C D E");
-    assert!(
-        (subseq.precision - 1.0).abs() < 1e-6,
-        "LCS precision: 3/3=1.0, got {}",
-        subseq.precision
-    );
-    assert!(
-        (subseq.recall - 3.0 / 5.0).abs() < 1e-6,
-        "LCS recall: 3/5=0.6, got {}",
-        subseq.recall
-    );
-
-    // Partial overlap with asymmetric lengths: guards P vs R distinction
-    let partial = SummarizationMetrics::rouge_l("the cat sat", "the cat sat on the mat");
-    assert!((partial.precision - 1.0).abs() < 1e-6, "P = 3/3");
-    assert!((partial.recall - 0.5).abs() < 1e-6, "R = 3/6");
-    assert!((partial.f1 - 2.0 / 3.0).abs() < 1e-6, "F1 = 2/3");
-
-    // Normalization: case + punctuation stripped — guards normalize() step
-    let normalized = SummarizationMetrics::rouge_l("Hello, World!", "hello world");
-    assert!(
-        (normalized.f1 - 1.0).abs() < 1e-6,
-        "After normalization should match"
-    );
-
-    // Empty inputs: guards divide-by-zero paths
-    assert!(SummarizationMetrics::rouge_l("", "some text").f1.abs() < 1e-6);
-    assert!(SummarizationMetrics::rouge_l("some text", "").f1.abs() < 1e-6);
-}
-
 // ─── Golden dataset schema validation ────────────────────────────────────────
 //
 // Guards that user-facing error messages name the offending column and type.
@@ -287,14 +247,6 @@ fn contract_metrics_in_valid_ranges() {
     );
     assert!(c.accuracy >= 0.0 && c.accuracy <= 1.0);
     assert!(c.f1 >= 0.0 && c.f1 <= 1.0);
-
-    let s = SummarizationMetrics::rouge_l(
-        "the quick brown fox jumps",
-        "the slow brown dog sits on the mat",
-    );
-    assert!(s.precision >= 0.0 && s.precision <= 1.0);
-    assert!(s.recall >= 0.0 && s.recall <= 1.0);
-    assert!(s.f1 >= 0.0 && s.f1 <= 1.0);
 }
 
 // ─── Catalog eval_runs: CRUD + latest_eval_run ordering ─────────────────────

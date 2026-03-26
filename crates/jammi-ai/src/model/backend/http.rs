@@ -1,8 +1,6 @@
-//! HTTP backend for OpenAI-compatible inference endpoints.
+//! HTTP backend for OpenAI-compatible embedding endpoints.
 //!
-//! Routes embedding tasks to `POST /v1/embeddings` and text generation
-//! tasks (summarization, classification, text generation) to
-//! `POST /v1/chat/completions`.
+//! Routes embedding tasks to `POST /v1/embeddings`.
 
 use std::time::Duration;
 
@@ -30,8 +28,7 @@ impl HttpBackend {
 
     /// Forward inference to the remote endpoint.
     ///
-    /// - Embedding tasks → `POST {base_url}/v1/embeddings`
-    /// - Other tasks → `POST {base_url}/v1/chat/completions`
+    /// Only embedding tasks are supported via `POST {base_url}/v1/embeddings`.
     pub async fn forward(
         &self,
         base_url: &str,
@@ -41,7 +38,9 @@ impl HttpBackend {
     ) -> Result<BackendOutput> {
         match task {
             ModelTask::Embedding => self.forward_embeddings(base_url, inputs, model_id).await,
-            _ => self.forward_chat(base_url, inputs, model_id, task).await,
+            other => Err(JammiError::Backend(format!(
+                "HTTP backend only supports embedding task, got {other:?}"
+            ))),
         }
     }
 
@@ -94,75 +93,6 @@ impl HttpBackend {
             shapes: vec![(n, dim)],
         })
     }
-
-    async fn forward_chat(
-        &self,
-        base_url: &str,
-        inputs: &[String],
-        model_id: &str,
-        _task: ModelTask,
-    ) -> Result<BackendOutput> {
-        let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-        let mut string_outputs = Vec::new();
-        let mut row_status = Vec::new();
-        let mut row_errors = Vec::new();
-
-        for input in inputs {
-            let body = ChatCompletionRequest {
-                model: model_id.to_string(),
-                messages: vec![ChatMessage {
-                    role: "user".to_string(),
-                    content: input.clone(),
-                }],
-                max_tokens: Some(256),
-            };
-
-            match self.client.post(&url).json(&body).send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if !status.is_success() {
-                        let body = resp.text().await.unwrap_or_default();
-                        row_status.push(false);
-                        row_errors.push(format!("{status}: {body}"));
-                        string_outputs.push(String::new());
-                        continue;
-                    }
-                    match resp.json::<ChatCompletionResponse>().await {
-                        Ok(chat_resp) => {
-                            let text = chat_resp
-                                .choices
-                                .into_iter()
-                                .next()
-                                .map(|c| c.message.content)
-                                .unwrap_or_default();
-                            string_outputs.push(text);
-                            row_status.push(true);
-                            row_errors.push(String::new());
-                        }
-                        Err(e) => {
-                            row_status.push(false);
-                            row_errors.push(format!("Parse error: {e}"));
-                            string_outputs.push(String::new());
-                        }
-                    }
-                }
-                Err(e) => {
-                    row_status.push(false);
-                    row_errors.push(format!("Request error: {e}"));
-                    string_outputs.push(String::new());
-                }
-            }
-        }
-
-        let n = string_outputs.len();
-        Ok(BackendOutput {
-            float_outputs: Vec::new(),
-            string_outputs: vec![string_outputs],
-            row_status,
-            row_errors,
-            shapes: vec![(n, 0)],
-        })
-    }
 }
 
 // ─── Request/Response types (OpenAI-compatible) ──────────────────────────────
@@ -181,28 +111,4 @@ struct EmbeddingResponse {
 #[derive(Deserialize)]
 struct EmbeddingData {
     embedding: Vec<f32>,
-}
-
-#[derive(Serialize)]
-struct ChatCompletionRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct ChatCompletionResponse {
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(Deserialize)]
-struct ChatChoice {
-    message: ChatMessage,
 }

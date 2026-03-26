@@ -1,6 +1,6 @@
 # Evaluate and Compare Models
 
-Measure embedding quality, classification accuracy, and summarization quality against golden datasets. Results are recorded in the catalog for tracking over time.
+Measure embedding quality and classification accuracy against golden datasets. Results are recorded in the catalog for tracking over time.
 
 ## Prepare a golden dataset
 
@@ -144,25 +144,6 @@ metrics = db.eval_inference(
 print(f"Accuracy: {metrics['accuracy']:.3f}")
 print(f"Macro F1: {metrics['f1']:.3f}")
 ```
-
-## Evaluate summarization
-
-### Rust
-
-```rust
-let metrics = session.eval_inference(
-    "facebook/bart-large-cnn",
-    "articles",
-    &["text".into()],
-    EvalTask::Summarization,
-    "golden.public.summaries",
-    "reference",
-).await?;
-
-println!("ROUGE-L F1: {}", metrics["f1"]);
-```
-
-ROUGE-L uses longest common subsequence (LCS) after normalization (lowercase, strip punctuation).
 
 ## Eval runs in the catalog
 

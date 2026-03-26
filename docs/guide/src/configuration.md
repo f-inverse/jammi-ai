@@ -47,14 +47,6 @@ batch_timeout_secs = 300
 # Maximum models kept loaded simultaneously. 0 = unlimited. Default: 0.
 max_loaded_models = 0
 
-[inference.vllm]
-# vLLM server host. Optional.
-host = "localhost"
-# vLLM server port. Optional.
-port = 8000
-# Extra CLI args passed to vLLM. Default: [].
-extra_args = []
-
 [inference.http]
 # HTTP request timeout (seconds). Default: 60.
 timeout_secs = 60

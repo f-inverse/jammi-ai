@@ -17,7 +17,6 @@ pub enum BackendSelection {
     Auto,
     Candle,
     Ort,
-    Vllm,
     Http,
 }
 
@@ -27,7 +26,6 @@ impl fmt::Display for BackendSelection {
             Self::Auto => write!(f, "auto"),
             Self::Candle => write!(f, "candle"),
             Self::Ort => write!(f, "ort"),
-            Self::Vllm => write!(f, "vllm"),
             Self::Http => write!(f, "http"),
         }
     }
@@ -40,10 +38,9 @@ impl FromStr for BackendSelection {
             "auto" => Ok(Self::Auto),
             "candle" => Ok(Self::Candle),
             "ort" => Ok(Self::Ort),
-            "vllm" => Ok(Self::Vllm),
             "http" => Ok(Self::Http),
             other => Err(JammiError::Config(format!(
-                "Unknown backend '{other}'. Expected: auto, candle, ort, vllm, http"
+                "Unknown backend '{other}'. Expected: auto, candle, ort, http"
             ))),
         }
     }
@@ -201,22 +198,8 @@ pub struct InferenceConfig {
     pub batch_timeout_secs: u64,
     /// Maximum number of models held in memory simultaneously. 0 means unlimited. Default: 0.
     pub max_loaded_models: usize,
-    /// vLLM-specific backend configuration.
-    pub vllm: VllmConfig,
     /// HTTP backend configuration (for remote inference endpoints).
     pub http: HttpConfig,
-}
-
-/// vLLM backend connection settings.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct VllmConfig {
-    /// vLLM server hostname. Default: None (auto-detect).
-    pub host: Option<String>,
-    /// vLLM server port. Default: None (auto-detect).
-    pub port: Option<u16>,
-    /// Additional CLI arguments passed to the vLLM server process.
-    pub extra_args: Vec<String>,
 }
 
 /// HTTP backend configuration for remote inference endpoints.
@@ -370,7 +353,6 @@ impl Default for InferenceConfig {
             batch_size: 32,
             batch_timeout_secs: 300,
             max_loaded_models: 0,
-            vllm: VllmConfig::default(),
             http: HttpConfig::default(),
         }
     }

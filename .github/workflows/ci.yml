@@ -13,9 +13,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  RUSTFLAGS: "-D warnings"
-  RUSTC_WRAPPER: ""
-  CARGO_INCREMENTAL: 1
+  RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=mold"
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   check:
@@ -25,12 +24,6 @@ jobs:
       image: ghcr.io/f-inverse/jammi-ai-ci:latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/cache@v4
-        with:
-          path: target
-          key: cargo-check-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-check-
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -46,12 +39,6 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/cache@v4
-        with:
-          path: target
-          key: cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-test-
 
       - name: Compile-check live tests
         run: cargo test --workspace --features live-hub-tests --no-run
@@ -69,12 +56,6 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/cache@v4
-        with:
-          path: target
-          key: cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-test-
 
       - name: Run live tests
         env:

@@ -1,4 +1,12 @@
-# Local development: use sccache if available.
-# CI overrides RUSTC_WRAPPER="" to use incremental compilation instead.
+# sccache: local disk in dev, GHA cache backend in CI (SCCACHE_GHA_ENABLED).
 [build]
 rustc-wrapper = "sccache"
+
+# mold linker on Linux — available in the unified manylinux_2_28 CI/dev image.
+# In CI, RUSTFLAGS env var includes both -D warnings and -C link-arg=-fuse-ld=mold,
+# which overrides these config values. These apply to local dev only.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

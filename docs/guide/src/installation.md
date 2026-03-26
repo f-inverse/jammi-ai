@@ -19,13 +19,17 @@ cargo install jammi-cli
 
 ### Build dependencies (Linux)
 
-If building from source, you need:
+If building from source, you need a C compiler and `protoc`:
 
 ```bash
-apt-get install protobuf-compiler libonig-dev liblzma-dev pkg-config mold
+# Debian/Ubuntu
+apt-get install protobuf-compiler gcc g++ pkg-config
+
+# RHEL/AlmaLinux
+yum install protobuf-compiler gcc gcc-c++ pkg-config
 ```
 
-These are pre-installed in the devcontainer and CI images.
+All other native libraries (lzma, zstd, zlib, sqlite) are vendored and compiled from source automatically. These tools are pre-installed in the devcontainer and CI images.
 
 ## Python
 

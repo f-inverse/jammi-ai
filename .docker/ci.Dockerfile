@@ -1,24 +1,34 @@
-FROM rust:1.88.0-bookworm
+FROM quay.io/pypa/manylinux_2_28_x86_64
 
-# System dependencies for building jammi-ai crates
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        protobuf-compiler \
-        libprotobuf-dev \
-        libonig-dev \
-        liblzma-dev \
-        pkg-config \
-        mold \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+# protoc: prost-build (via substrait) invokes protoc at build time.
+# Not in AlmaLinux 8 repos — install from GitHub release.
+ARG PROTOC_VERSION=28.3
+RUN curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" \
+        -o /tmp/protoc.zip \
+    && unzip /tmp/protoc.zip -d /usr/local bin/protoc 'include/*' \
+    && rm /tmp/protoc.zip
 
-# Rust components (no rust-src — that's dev-only for rust-analyzer)
-RUN rustup component add rustfmt clippy
+# mold linker for faster linking
+ARG MOLD_VERSION=2.35.1
+RUN curl -fsSL "https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/mold-${MOLD_VERSION}-x86_64-linux.tar.gz" \
+    | tar -xz --strip-components=1 -C /usr/local
 
-# sccache for compilation caching
+# Rust toolchain (manylinux ships no Rust)
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH="/usr/local/cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain 1.88.0 --profile minimal \
+    && rustup component add rustfmt clippy
+
+# sccache — compilation caching (local disk or GHA cache backend in CI)
 RUN cargo install sccache --locked \
     && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
 
-# mdbook for documentation builds (pinned to match local dev)
+# mdbook — documentation builds
 RUN cargo install mdbook --locked --version 0.5.2 \
+    && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
+
+# maturin — PyO3 wheel builds
+RUN cargo install maturin --locked \
     && rm -rf /usr/local/cargo/registry /usr/local/cargo/git

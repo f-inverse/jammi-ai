@@ -3,22 +3,19 @@ FROM ghcr.io/f-inverse/jammi-ai-ci:latest
 # Dev-only: rust-src for rust-analyzer
 RUN rustup component add rust-src
 
-# Dev-only system packages
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
-        python3 \
-        python3-venv \
+# Python: use manylinux's bundled CPython 3.12
+RUN ln -s /opt/python/cp312-cp312/bin/python3 /usr/local/bin/python3
+
+# Dev-only system packages (AlmaLinux 8 / yum)
+RUN yum install -y 'dnf-command(config-manager)' \
+    && yum config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo \
+    && yum install -y \
         gh \
         sudo \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    && yum clean all
 
 RUN useradd -m -s /bin/bash vscode \
-    && usermod -aG sudo vscode \
+    && usermod -aG wheel vscode \
     && echo "vscode ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/vscode \
     && mkdir -p /home/vscode/.cargo /home/vscode/.rustup \
     && cp -r /usr/local/cargo/. /home/vscode/.cargo/ \
@@ -26,7 +23,7 @@ RUN useradd -m -s /bin/bash vscode \
     && chown -R vscode:vscode /home/vscode
 
 # Create Python venv owned by vscode
-RUN python3 -m venv /home/vscode/.venv \
+RUN /usr/local/bin/python3 -m venv /home/vscode/.venv \
     && chown -R vscode:vscode /home/vscode/.venv
 
 USER vscode

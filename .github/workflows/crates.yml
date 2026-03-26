@@ -48,13 +48,20 @@ jobs:
     container:
       image: ghcr.io/f-inverse/jammi-ai-ci:latest
     environment: crates-io
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
+
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
 
       - name: Publish jammi-engine
         run: cargo publish -p jammi-engine
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Wait for crates.io index
         run: sleep 30
@@ -62,7 +69,7 @@ jobs:
       - name: Publish jammi-ai
         run: cargo publish -p jammi-ai
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Wait for crates.io index
         run: sleep 30
@@ -70,12 +77,12 @@ jobs:
       - name: Publish jammi-server
         run: cargo publish -p jammi-server
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Publish jammi-cli
         run: cargo publish -p jammi-cli
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   github-release:
     name: GitHub Release

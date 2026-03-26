@@ -15,10 +15,10 @@ jobs:
     container:
       image: ghcr.io/f-inverse/jammi-ai-ci:latest
     env:
-      SCCACHE_GHA_ENABLED: "true"
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Build wheel
         run: maturin build --release --out dist

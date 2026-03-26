@@ -21,12 +21,12 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain 1.88.0 --profile minimal \
     && rustup component add rustfmt clippy
 
-# OpenSSL headers — needed by sccache (native-tls) at compile time
-RUN yum install -y openssl-devel && yum clean all
-
-# sccache — compilation caching (local disk or GHA cache backend in CI)
-RUN cargo install sccache --locked \
-    && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
+# sccache — pre-built static binary (avoids openssl-devel in the image,
+# which could cause manylinux-incompatible linkage in wheel builds)
+ARG SCCACHE_VERSION=0.14.0
+RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    | tar -xz --strip-components=1 -C /usr/local/cargo/bin \
+        "sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache"
 
 # mdbook — documentation builds
 RUN cargo install mdbook --locked --version 0.5.2 \

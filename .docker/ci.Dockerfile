@@ -21,6 +21,9 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain 1.88.0 --profile minimal \
     && rustup component add rustfmt clippy
 
+# OpenSSL headers — needed by sccache (native-tls) at compile time
+RUN yum install -y openssl-devel && yum clean all
+
 # sccache — compilation caching (local disk or GHA cache backend in CI)
 RUN cargo install sccache --locked \
     && rm -rf /usr/local/cargo/registry /usr/local/cargo/git

@@ -206,8 +206,7 @@ impl ModelDimensions {
             let embed_dim = model_cfg.get("embed_dim").and_then(|v| v.as_u64())? as usize;
             let width = vision_cfg.get("width").and_then(|v| v.as_u64())? as usize;
             let num_layers = vision_cfg.get("layers").and_then(|v| v.as_u64())? as usize;
-            let num_attention_heads =
-                vision_cfg.get("heads").and_then(|v| v.as_u64())? as usize;
+            let num_attention_heads = vision_cfg.get("heads").and_then(|v| v.as_u64())? as usize;
             let mlp_ratio = vision_cfg
                 .get("mlp_ratio")
                 .and_then(|v| v.as_f64())

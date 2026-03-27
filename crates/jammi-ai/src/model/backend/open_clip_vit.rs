@@ -4,7 +4,9 @@
 //! Supports global average pooling (used by PatentCLIP) instead of CLS token pooling.
 
 use candle_core::{IndexOp, Module, Result as CandleResult, Tensor, D};
-use candle_nn::{conv2d_no_bias, layer_norm, linear, Conv2d, Conv2dConfig, LayerNorm, Linear, VarBuilder};
+use candle_nn::{
+    conv2d_no_bias, layer_norm, linear, Conv2d, Conv2dConfig, LayerNorm, Linear, VarBuilder,
+};
 use jammi_engine::error::{JammiError, Result};
 
 /// Configuration for an OpenCLIP vision transformer.
@@ -31,18 +33,16 @@ pub struct OpenClipVisionConfig {
 impl OpenClipVisionConfig {
     /// Parse from an OpenCLIP config JSON (`open_clip_config.json`).
     pub fn from_open_clip_config(config: &serde_json::Value) -> Result<Self> {
-        let model_cfg = config.get("model_cfg").ok_or_else(|| {
-            JammiError::Model {
-                model_id: String::new(),
-                message: "OpenCLIP config missing 'model_cfg'".into(),
-            }
+        let model_cfg = config.get("model_cfg").ok_or_else(|| JammiError::Model {
+            model_id: String::new(),
+            message: "OpenCLIP config missing 'model_cfg'".into(),
         })?;
-        let vision_cfg = model_cfg.get("vision_cfg").ok_or_else(|| {
-            JammiError::Model {
+        let vision_cfg = model_cfg
+            .get("vision_cfg")
+            .ok_or_else(|| JammiError::Model {
                 model_id: String::new(),
                 message: "OpenCLIP config missing 'model_cfg.vision_cfg'".into(),
-            }
-        })?;
+            })?;
 
         let embed_dim = model_cfg
             .get("embed_dim")
@@ -131,9 +131,11 @@ impl MultiHeadAttention {
         let attn_output = attn_weights.matmul(&v)?;
 
         // Reshape back: (batch, heads, seq, head_dim) -> (batch, seq, width)
-        let attn_output = attn_output
-            .permute((0, 2, 1, 3))?
-            .reshape((batch, seq_len, self.num_heads * self.head_dim))?;
+        let attn_output = attn_output.permute((0, 2, 1, 3))?.reshape((
+            batch,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ))?;
 
         self.out_proj.forward(&attn_output)
     }
@@ -219,7 +221,13 @@ impl OpenClipVisionTransformer {
             stride: config.patch_size,
             ..Default::default()
         };
-        let conv1 = conv2d_no_bias(3, config.width, config.patch_size, conv_config, vb.pp("conv1"))?;
+        let conv1 = conv2d_no_bias(
+            3,
+            config.width,
+            config.patch_size,
+            conv_config,
+            vb.pp("conv1"),
+        )?;
 
         let class_embedding = vb.get(&[config.width], "class_embedding")?;
         let grid_size = config.image_size / config.patch_size;
@@ -269,11 +277,11 @@ impl OpenClipVisionTransformer {
         let x = x.flatten_from(2)?.permute((0, 2, 1))?;
 
         // Prepend CLS token: (batch, grid*grid+1, width)
-        let cls = self
-            .class_embedding
-            .unsqueeze(0)?
-            .unsqueeze(0)?
-            .expand((batch_size, 1, self.config.width))?;
+        let cls = self.class_embedding.unsqueeze(0)?.unsqueeze(0)?.expand((
+            batch_size,
+            1,
+            self.config.width,
+        ))?;
         let x = Tensor::cat(&[&cls, &x], 1)?;
 
         // Add positional embedding

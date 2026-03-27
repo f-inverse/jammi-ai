@@ -6,8 +6,7 @@ pub mod runner;
 pub mod schema;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray,
-    StringViewArray,
+    Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
 };
 use arrow::datatypes::DataType;
 use image::DynamicImage;
@@ -95,9 +94,7 @@ pub fn extract_column(
 /// Null values produce `None` (caller tracks via `row_status`).
 pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<DynamicImage>>> {
     if columns.is_empty() {
-        return Err(JammiError::Inference(
-            "No image columns provided".into(),
-        ));
+        return Err(JammiError::Inference("No image columns provided".into()));
     }
     // Use the first column only (image embedding expects a single column).
     let col = &columns[0];

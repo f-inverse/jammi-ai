@@ -245,9 +245,12 @@ impl CandleModel {
             let input_ids = self.tokens_to_tensor(&encoding.input_ids)?;
             let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
 
-            let output =
-                self.text_forward()?
-                    .forward_hidden(&input_ids, &attention_mask, &encoding, &self.device)?;
+            let output = self.text_forward()?.forward_hidden(
+                &input_ids,
+                &attention_mask,
+                &encoding,
+                &self.device,
+            )?;
 
             let pooled = self.mean_pool(&output, &attention_mask)?;
             let normalized = self.l2_normalize(&pooled)?;
@@ -280,10 +283,7 @@ impl CandleModel {
         })
     }
 
-    fn forward_image_embedding(
-        &self,
-        content: &[arrow::array::ArrayRef],
-    ) -> Result<BackendOutput> {
+    fn forward_image_embedding(&self, content: &[arrow::array::ArrayRef]) -> Result<BackendOutput> {
         let vision = self.vision.as_ref().ok_or_else(|| {
             JammiError::Inference("No vision model loaded for image embedding".into())
         })?;
@@ -327,9 +327,9 @@ impl CandleModel {
             let pixel_values =
                 image_preprocess::preprocess_clip_batch(&valid_images, target_size, &self.device)?;
 
-            let output = vision.forward(&pixel_values).map_err(|e| {
-                JammiError::Inference(format!("Vision forward pass failed: {e}"))
-            })?;
+            let output = vision
+                .forward(&pixel_values)
+                .map_err(|e| JammiError::Inference(format!("Vision forward pass failed: {e}")))?;
 
             let normalized = self.l2_normalize(&output)?;
 
@@ -399,9 +399,12 @@ impl CandleModel {
             let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
 
             // Forward pass returns (batch, num_classes) with softmax applied
-            let logits =
-                self.text_forward()?
-                    .forward_hidden(&input_ids, &attention_mask, &encoding, &self.device)?;
+            let logits = self.text_forward()?.forward_hidden(
+                &input_ids,
+                &attention_mask,
+                &encoding,
+                &self.device,
+            )?;
 
             let probs = logits
                 .to_vec2::<f32>()
@@ -496,9 +499,12 @@ impl CandleModel {
             let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
 
             // Encoder returns (batch, seq_len, hidden)
-            let hidden_states =
-                self.text_forward()?
-                    .forward_hidden(&input_ids, &attention_mask, &encoding, &self.device)?;
+            let hidden_states = self.text_forward()?.forward_hidden(
+                &input_ids,
+                &attention_mask,
+                &encoding,
+                &self.device,
+            )?;
 
             // Apply token classifier: (batch, seq_len, hidden) → (batch, seq_len, num_labels)
             let logits = hidden_states.apply(ner_classifier).map_err(|e| {
@@ -575,21 +581,26 @@ impl ModelBackend for CandleBackend {
         let is_open_clip = resolved.model_config.get("model_cfg").is_some();
 
         // Branch: vision model (OpenCLIP) vs text model (BERT family)
-        let (inner, vision): (Option<Box<dyn CandleForward>>, Option<OpenClipVisionTransformer>) =
-            if is_open_clip {
-                let clip_config = OpenClipVisionConfig::from_open_clip_config(&resolved.model_config)
-                    .map_err(|e| JammiError::Model {
-                        model_id: resolved.model_id.0.clone(),
-                        message: format!("Failed to parse OpenCLIP config: {e}"),
-                    })?;
-                let model = OpenClipVisionTransformer::load(vb.pp("visual"), &clip_config)
-                    .map_err(|e| JammiError::Model {
+        let (inner, vision): (
+            Option<Box<dyn CandleForward>>,
+            Option<OpenClipVisionTransformer>,
+        ) = if is_open_clip {
+            let clip_config = OpenClipVisionConfig::from_open_clip_config(&resolved.model_config)
+                .map_err(|e| JammiError::Model {
+                model_id: resolved.model_id.0.clone(),
+                message: format!("Failed to parse OpenCLIP config: {e}"),
+            })?;
+            let model =
+                OpenClipVisionTransformer::load(vb.pp("visual"), &clip_config).map_err(|e| {
+                    JammiError::Model {
                         model_id: resolved.model_id.0.clone(),
                         message: format!("Failed to construct OpenCLIP ViT: {e}"),
-                    })?;
-                (None, Some(model))
-            } else {
-                let text_inner: Box<dyn CandleForward> = match model_type {
+                    }
+                })?;
+            (None, Some(model))
+        } else {
+            let text_inner: Box<dyn CandleForward> =
+                match model_type {
                     "bert" | "roberta" | "distilbert" | "camembert" | "xlm-roberta"
                         if is_classification =>
                     {
@@ -642,9 +653,7 @@ impl ModelBackend for CandleBackend {
                         let model = ModernBertForSequenceClassification::load(vb, &mb_config)
                             .map_err(|e| JammiError::Model {
                                 model_id: resolved.model_id.0.clone(),
-                                message: format!(
-                                    "Failed to construct ModernBERT classifier: {e}"
-                                ),
+                                message: format!("Failed to construct ModernBERT classifier: {e}"),
                             })?;
                         Box::new(ModernBertClassificationForward(model))
                     }
@@ -673,8 +682,8 @@ impl ModelBackend for CandleBackend {
                         });
                     }
                 };
-                (Some(text_inner), None)
-            };
+            (Some(text_inner), None)
+        };
 
         let tokenizer = resolved
             .tokenizer_path

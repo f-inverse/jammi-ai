@@ -192,20 +192,15 @@ impl InferenceSession {
         key_column: &str,
         strategy: EmbeddingStrategy,
     ) -> Result<ResultTableRecord> {
-        let result =
-            ImageEmbeddingPipeline::new(self, &self.result_store, strategy)
-                .run(source_id, model_id, image_column, key_column)
-                .await?;
+        let result = ImageEmbeddingPipeline::new(self, &self.result_store, strategy)
+            .run(source_id, model_id, image_column, key_column)
+            .await?;
         self.ann_cache.invalidate_source(source_id)?;
         Ok(result)
     }
 
     /// Encode a single image into a vector using the given vision model.
-    pub async fn encode_image_query(
-        &self,
-        model_id: &str,
-        image_bytes: &[u8],
-    ) -> Result<Vec<f32>> {
+    pub async fn encode_image_query(&self, model_id: &str, image_bytes: &[u8]) -> Result<Vec<f32>> {
         let model_source = ModelSource::parse(model_id);
 
         let guard = self
@@ -213,8 +208,8 @@ impl InferenceSession {
             .get_or_load(&model_source, ModelTask::ImageEmbedding, None)
             .await?;
 
-        let binary_array = Arc::new(arrow::array::BinaryArray::from(vec![image_bytes]))
-            as arrow::array::ArrayRef;
+        let binary_array =
+            Arc::new(arrow::array::BinaryArray::from(vec![image_bytes])) as arrow::array::ArrayRef;
         let output = guard
             .model
             .forward(&[binary_array], ModelTask::ImageEmbedding)

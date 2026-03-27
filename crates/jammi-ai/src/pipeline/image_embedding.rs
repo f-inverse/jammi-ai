@@ -227,13 +227,8 @@ impl<'a> ImageEmbeddingPipeline<'a> {
         let image_arrays = self.images_to_binary_array(images)?;
         let output = model.forward(&[image_arrays], ModelTask::ImageEmbedding)?;
 
-        let result_batch = self.build_result_batch(
-            &row_ids,
-            source_id,
-            model_id,
-            &output,
-            embedding_dim,
-        )?;
+        let result_batch =
+            self.build_result_batch(&row_ids, source_id, model_id, &output, embedding_dim)?;
         sink.write_batch(&result_batch)
     }
 
@@ -266,13 +261,8 @@ impl<'a> ImageEmbeddingPipeline<'a> {
             let image_arrays = self.images_to_binary_array(&rotated_images)?;
             let output = model.forward(&[image_arrays], ModelTask::ImageEmbedding)?;
 
-            let result_batch = self.build_result_batch(
-                &row_ids,
-                source_id,
-                model_id,
-                &output,
-                embedding_dim,
-            )?;
+            let result_batch =
+                self.build_result_batch(&row_ids, source_id, model_id, &output, embedding_dim)?;
             sink.write_batch(&result_batch)?;
         }
         Ok(())
@@ -280,22 +270,16 @@ impl<'a> ImageEmbeddingPipeline<'a> {
 
     /// Convert a slice of optional images to an Arrow BinaryArray.
     /// Valid images are PNG-encoded; None values become null.
-    fn images_to_binary_array(
-        &self,
-        images: &[Option<image::DynamicImage>],
-    ) -> Result<ArrayRef> {
+    fn images_to_binary_array(&self, images: &[Option<image::DynamicImage>]) -> Result<ArrayRef> {
         let mut builder = arrow::array::BinaryBuilder::new();
         for img in images {
             match img {
                 Some(im) => {
                     let mut buf = Vec::new();
-                    im.write_to(
-                        &mut std::io::Cursor::new(&mut buf),
-                        image::ImageFormat::Png,
-                    )
-                    .map_err(|e| {
-                        JammiError::Inference(format!("Failed to encode image to PNG: {e}"))
-                    })?;
+                    im.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                        .map_err(|e| {
+                            JammiError::Inference(format!("Failed to encode image to PNG: {e}"))
+                        })?;
                     builder.append_value(&buf);
                 }
                 None => builder.append_null(),
@@ -316,8 +300,7 @@ impl<'a> ImageEmbeddingPipeline<'a> {
         use crate::inference::schema::build_prefix_columns;
 
         let row_count = row_ids.len();
-        let keys_array =
-            Arc::new(StringArray::from(row_ids.to_vec())) as ArrayRef;
+        let keys_array = Arc::new(StringArray::from(row_ids.to_vec())) as ArrayRef;
 
         let prefix = build_prefix_columns(
             &keys_array,

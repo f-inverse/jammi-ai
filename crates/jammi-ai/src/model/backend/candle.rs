@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
+use candle_transformers::models::distilbert::{Config as DistilBertConfig, DistilBertModel};
 use candle_transformers::models::modernbert::{
     Config as ModernBertConfig, ModernBert, ModernBertForSequenceClassification,
 };
@@ -61,6 +62,62 @@ impl CandleForward for ModernBertForward {
         self.0
             .forward(input_ids, attention_mask)
             .map_err(|e| JammiError::Inference(format!("ModernBERT forward pass failed: {e}")))
+    }
+}
+
+/// DistilBERT forward pass (no token_type_ids, different architecture from BERT).
+struct DistilBertForward(DistilBertModel);
+
+impl CandleForward for DistilBertForward {
+    fn forward_hidden(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+        _encoding: &BatchEncoding,
+        _device: &Device,
+    ) -> Result<Tensor> {
+        self.0
+            .forward(input_ids, attention_mask)
+            .map_err(|e| JammiError::Inference(format!("DistilBERT forward pass failed: {e}")))
+    }
+}
+
+/// DistilBERT sequence classification: encoder → CLS → pre_classifier → ReLU → classifier → softmax.
+struct DistilBertClassificationForward {
+    distilbert: DistilBertModel,
+    pre_classifier: candle_nn::Linear,
+    classifier: candle_nn::Linear,
+}
+
+impl CandleForward for DistilBertClassificationForward {
+    fn forward_hidden(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+        _encoding: &BatchEncoding,
+        _device: &Device,
+    ) -> Result<Tensor> {
+        let hidden = self
+            .distilbert
+            .forward(input_ids, attention_mask)
+            .map_err(|e| {
+                JammiError::Inference(format!("DistilBERT classification forward failed: {e}"))
+            })?;
+        let cls = hidden
+            .i((.., 0, ..))
+            .map_err(|e| JammiError::Inference(format!("CLS pooling failed: {e}")))?
+            .contiguous()
+            .map_err(|e| JammiError::Inference(format!("CLS contiguous failed: {e}")))?;
+        let pre = cls
+            .apply(&self.pre_classifier)
+            .map_err(|e| JammiError::Inference(format!("Pre-classifier failed: {e}")))?
+            .relu()
+            .map_err(|e| JammiError::Inference(format!("ReLU failed: {e}")))?;
+        let logits = pre
+            .apply(&self.classifier)
+            .map_err(|e| JammiError::Inference(format!("Classifier forward failed: {e}")))?;
+        candle_nn::ops::softmax(&logits, candle_core::D::Minus1)
+            .map_err(|e| JammiError::Inference(format!("Softmax failed: {e}")))
     }
 }
 
@@ -580,6 +637,15 @@ impl ModelBackend for CandleBackend {
         let is_ner = resolved.task == ModelTask::Ner && id2label.is_some();
         let is_open_clip = resolved.model_config.get("model_cfg").is_some();
 
+        // Normalize DistilBERT config fields to standard BERT names.
+        // DistilBERT uses dim/n_heads/n_layers/hidden_dim instead of
+        // hidden_size/num_attention_heads/num_hidden_layers/intermediate_size.
+        let model_config = if model_type == "distilbert" {
+            normalize_distilbert_config(&resolved.model_config)
+        } else {
+            resolved.model_config.clone()
+        };
+
         // Branch: vision model (OpenCLIP) vs text model (BERT family)
         let (inner, vision): (
             Option<Box<dyn CandleForward>>,
@@ -599,89 +665,128 @@ impl ModelBackend for CandleBackend {
                 })?;
             (None, Some(model))
         } else {
-            let text_inner: Box<dyn CandleForward> =
-                match model_type {
-                    "bert" | "roberta" | "distilbert" | "camembert" | "xlm-roberta"
-                        if is_classification =>
-                    {
-                        let bert_config: BertConfig =
-                            serde_json::from_value(resolved.model_config.clone()).map_err(|e| {
-                                JammiError::Model {
-                                    model_id: resolved.model_id.0.clone(),
-                                    message: format!("Failed to parse BERT config: {e}"),
-                                }
-                            })?;
-                        let bert = BertModel::load(vb.clone(), &bert_config).map_err(|e| {
+            let text_inner: Box<dyn CandleForward> = match model_type {
+                "distilbert" if is_classification => {
+                    let db_config: DistilBertConfig = serde_json::from_value(model_config.clone())
+                        .map_err(|e| JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("Failed to parse DistilBERT config: {e}"),
+                        })?;
+                    let distilbert =
+                        DistilBertModel::load(vb.clone(), &db_config).map_err(|e| {
                             JammiError::Model {
                                 model_id: resolved.model_id.0.clone(),
-                                message: format!("Failed to construct BERT model: {e}"),
+                                message: format!("Failed to construct DistilBERT model: {e}"),
                             }
                         })?;
-                        let num_classes = id2label.as_ref().map_or(2, |m| m.len());
-                        let hidden_size = bert_config.hidden_size;
-                        let classifier =
-                            candle_nn::linear(hidden_size, num_classes, vb.pp("classifier"))
-                                .map_err(|e| JammiError::Model {
-                                    model_id: resolved.model_id.0.clone(),
-                                    message: format!("Failed to load BERT classifier head: {e}"),
-                                })?;
-                        Box::new(BertClassificationForward { bert, classifier })
-                    }
-                    "bert" | "roberta" | "distilbert" | "camembert" | "xlm-roberta" => {
-                        let bert_config: BertConfig =
-                            serde_json::from_value(resolved.model_config.clone()).map_err(|e| {
-                                JammiError::Model {
-                                    model_id: resolved.model_id.0.clone(),
-                                    message: format!("Failed to parse BERT config: {e}"),
-                                }
-                            })?;
-                        let bert =
-                            BertModel::load(vb, &bert_config).map_err(|e| JammiError::Model {
-                                model_id: resolved.model_id.0.clone(),
-                                message: format!("Failed to construct BERT model: {e}"),
-                            })?;
-                        Box::new(BertForward(bert))
-                    }
-                    "modernbert" if is_classification => {
-                        let mb_config: ModernBertConfig =
-                            serde_json::from_value(resolved.model_config.clone()).map_err(|e| {
-                                JammiError::Model {
-                                    model_id: resolved.model_id.0.clone(),
-                                    message: format!("Failed to parse ModernBERT config: {e}"),
-                                }
-                            })?;
-                        let model = ModernBertForSequenceClassification::load(vb, &mb_config)
+                    let num_classes = id2label.as_ref().map_or(2, |m| m.len());
+                    let hidden_size = db_config.dim;
+                    let pre_classifier =
+                        candle_nn::linear(hidden_size, hidden_size, vb.pp("pre_classifier"))
                             .map_err(|e| JammiError::Model {
                                 model_id: resolved.model_id.0.clone(),
-                                message: format!("Failed to construct ModernBERT classifier: {e}"),
+                                message: format!("Failed to load DistilBERT pre_classifier: {e}"),
                             })?;
-                        Box::new(ModernBertClassificationForward(model))
-                    }
-                    "modernbert" => {
-                        let mb_config: ModernBertConfig =
-                            serde_json::from_value(resolved.model_config.clone()).map_err(|e| {
-                                JammiError::Model {
-                                    model_id: resolved.model_id.0.clone(),
-                                    message: format!("Failed to parse ModernBERT config: {e}"),
-                                }
-                            })?;
-                        let model =
-                            ModernBert::load(vb, &mb_config).map_err(|e| JammiError::Model {
+                    let classifier =
+                        candle_nn::linear(hidden_size, num_classes, vb.pp("classifier")).map_err(
+                            |e| JammiError::Model {
                                 model_id: resolved.model_id.0.clone(),
-                                message: format!("Failed to construct ModernBERT model: {e}"),
-                            })?;
-                        Box::new(ModernBertForward(model))
-                    }
-                    unsupported => {
-                        return Err(JammiError::Model {
+                                message: format!("Failed to load DistilBERT classifier head: {e}"),
+                            },
+                        )?;
+                    Box::new(DistilBertClassificationForward {
+                        distilbert,
+                        pre_classifier,
+                        classifier,
+                    })
+                }
+                "distilbert" => {
+                    let db_config: DistilBertConfig = serde_json::from_value(model_config.clone())
+                        .map_err(|e| JammiError::Model {
                             model_id: resolved.model_id.0.clone(),
-                            message: format!(
-                                "Unsupported model architecture '{unsupported}'. Supported: \
+                            message: format!("Failed to parse DistilBERT config: {e}"),
+                        })?;
+                    let model =
+                        DistilBertModel::load(vb, &db_config).map_err(|e| JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("Failed to construct DistilBERT model: {e}"),
+                        })?;
+                    Box::new(DistilBertForward(model))
+                }
+                "bert" | "roberta" | "camembert" | "xlm-roberta" if is_classification => {
+                    let bert_config: BertConfig = serde_json::from_value(model_config.clone())
+                        .map_err(|e| JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("Failed to parse BERT config: {e}"),
+                        })?;
+                    let bert = BertModel::load(vb.clone(), &bert_config).map_err(|e| {
+                        JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("Failed to construct BERT model: {e}"),
+                        }
+                    })?;
+                    let num_classes = id2label.as_ref().map_or(2, |m| m.len());
+                    let hidden_size = bert_config.hidden_size;
+                    let classifier =
+                        candle_nn::linear(hidden_size, num_classes, vb.pp("classifier")).map_err(
+                            |e| JammiError::Model {
+                                model_id: resolved.model_id.0.clone(),
+                                message: format!("Failed to load BERT classifier head: {e}"),
+                            },
+                        )?;
+                    Box::new(BertClassificationForward { bert, classifier })
+                }
+                "bert" | "roberta" | "camembert" | "xlm-roberta" => {
+                    let bert_config: BertConfig = serde_json::from_value(model_config.clone())
+                        .map_err(|e| JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("Failed to parse BERT config: {e}"),
+                        })?;
+                    let bert =
+                        BertModel::load(vb, &bert_config).map_err(|e| JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("Failed to construct BERT model: {e}"),
+                        })?;
+                    Box::new(BertForward(bert))
+                }
+                "modernbert" if is_classification => {
+                    let mb_config: ModernBertConfig = serde_json::from_value(model_config.clone())
+                        .map_err(|e| JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("Failed to parse ModernBERT config: {e}"),
+                        })?;
+                    let model =
+                        ModernBertForSequenceClassification::load(vb, &mb_config).map_err(|e| {
+                            JammiError::Model {
+                                model_id: resolved.model_id.0.clone(),
+                                message: format!("Failed to construct ModernBERT classifier: {e}"),
+                            }
+                        })?;
+                    Box::new(ModernBertClassificationForward(model))
+                }
+                "modernbert" => {
+                    let mb_config: ModernBertConfig = serde_json::from_value(model_config.clone())
+                        .map_err(|e| JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("Failed to parse ModernBERT config: {e}"),
+                        })?;
+                    let model =
+                        ModernBert::load(vb, &mb_config).map_err(|e| JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("Failed to construct ModernBERT model: {e}"),
+                        })?;
+                    Box::new(ModernBertForward(model))
+                }
+                unsupported => {
+                    return Err(JammiError::Model {
+                        model_id: resolved.model_id.0.clone(),
+                        message: format!(
+                            "Unsupported model architecture '{unsupported}'. Supported: \
                                  bert, roberta, distilbert, camembert, xlm-roberta, modernbert"
-                            ),
-                        });
-                    }
-                };
+                        ),
+                    });
+                }
+            };
             (Some(text_inner), None)
         };
 
@@ -691,12 +796,11 @@ impl ModelBackend for CandleBackend {
             .map(|p| TokenizerWrapper::from_file(p))
             .transpose()?;
 
-        let dimensions = ModelDimensions::from_config(&resolved.model_config).ok_or_else(|| {
-            JammiError::Model {
+        let dimensions =
+            ModelDimensions::from_config(&model_config).ok_or_else(|| JammiError::Model {
                 model_id: resolved.model_id.0.clone(),
                 message: "Could not parse model dimensions from config".into(),
-            }
-        })?;
+            })?;
 
         // Load LoRA adapter if present (fine-tuned models)
         let lora_projection =
@@ -798,6 +902,40 @@ fn tokens_to_tensor(vecs: &[Vec<u32>], device: &Device) -> Result<Tensor> {
     let cols = vecs.first().map_or(0, |v| v.len());
     let flat: Vec<u32> = vecs.iter().flatten().copied().collect();
     Tensor::from_vec(flat, (rows, cols), device).map_err(|e| JammiError::Inference(e.to_string()))
+}
+
+/// Normalize DistilBERT config fields to standard BERT names.
+///
+/// DistilBERT uses different field names and omits some fields that
+/// candle's `BertConfig` requires. This maps them to BERT equivalents.
+fn normalize_distilbert_config(config: &serde_json::Value) -> serde_json::Value {
+    let mut normalized = config.clone();
+    if let Some(obj) = normalized.as_object_mut() {
+        // Field renames: DistilBERT → BERT
+        let mappings: &[(&str, &str)] = &[
+            ("dim", "hidden_size"),
+            ("n_heads", "num_attention_heads"),
+            ("n_layers", "num_hidden_layers"),
+            ("hidden_dim", "intermediate_size"),
+            ("dropout", "hidden_dropout_prob"),
+            ("attention_dropout", "attention_probs_dropout_prob"),
+        ];
+        for &(src, dst) in mappings {
+            if let Some(val) = obj.get(src).cloned() {
+                obj.entry(dst).or_insert(val);
+            }
+        }
+        // activation → hidden_act (string value)
+        if let Some(val) = obj.get("activation").cloned() {
+            obj.entry("hidden_act").or_insert(val);
+        }
+        // Defaults for fields DistilBERT doesn't have but BertConfig requires
+        obj.entry("type_vocab_size")
+            .or_insert(serde_json::Value::from(2));
+        obj.entry("layer_norm_eps")
+            .or_insert(serde_json::json!(1e-12));
+    }
+    normalized
 }
 
 fn select_device(config: &DeviceConfig) -> Device {

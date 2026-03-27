@@ -185,16 +185,15 @@ mod live {
         );
     }
 
-    // TODO: DistilBERT SST-2 model lacks tokenizer.json (only has slow tokenizer),
-    // and RoBERTa classification models use a two-layer classifier head
-    // (classifier.dense + classifier.out_proj) that the current code doesn't support.
-    // Re-enable once either slow tokenizer support or RoBERTa classification heads are added.
     #[tokio::test]
-    #[ignore = "no compatible classification model with tokenizer.json + single classifier head"]
     async fn live_classification_produces_valid_labels() {
         let (session, _dir) = setup_with_patents().await;
 
-        let model = ModelSource::parse("distilbert-base-uncased-finetuned-sst-2-english");
+        // Emotion classifier: BERT-based, 6 labels, has tokenizer.json + model.safetensors,
+        // single-layer classifier head (classifier.weight + classifier.bias).
+        let model = ModelSource::parse("bhadresh-savani/bert-base-uncased-emotion");
+        let valid_labels = ["sadness", "joy", "love", "anger", "fear", "surprise"];
+
         let batches = session
             .infer(
                 "patents",
@@ -218,41 +217,41 @@ mod live {
                 .downcast_ref::<StringArray>()
                 .unwrap();
 
-            if let Some(label_col) = batch.column_by_name("label") {
-                let labels = label_col.as_any().downcast_ref::<StringArray>().unwrap();
-                let confidence = batch
-                    .column_by_name("confidence")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .unwrap();
+            let labels = batch
+                .column_by_name("label")
+                .expect("label column")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let confidence = batch
+                .column_by_name("confidence")
+                .expect("confidence column")
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap();
 
-                for i in 0..batch.num_rows() {
-                    if status.value(i) == "ok" {
-                        let label = labels.value(i);
-                        assert!(
-                            label == "POSITIVE" || label == "NEGATIVE",
-                            "SST-2 label should be POSITIVE or NEGATIVE, got '{label}'"
-                        );
-                        let conf = confidence.value(i);
-                        assert!(conf > 0.0 && conf <= 1.0, "Confidence {conf} out of range");
-                    }
+            for i in 0..batch.num_rows() {
+                if status.value(i) == "ok" {
+                    let label = labels.value(i);
+                    assert!(
+                        valid_labels.contains(&label),
+                        "Label should be one of {valid_labels:?}, got '{label}'"
+                    );
+                    let conf = confidence.value(i);
+                    assert!(conf > 0.0 && conf <= 1.0, "Confidence {conf} out of range");
                 }
             }
         }
 
-        // At least one row should have confidence > 0.5
+        // At least one row should have confidence > 0.2 (6-class → random baseline ~0.17)
         let any_confident = batches.iter().any(|b| {
-            if let Some(conf_col) = b.column_by_name("confidence") {
-                let arr = conf_col.as_any().downcast_ref::<Float32Array>().unwrap();
-                (0..arr.len()).any(|i| !arr.is_null(i) && arr.value(i) > 0.5)
-            } else {
-                false
-            }
+            let conf_col = b.column_by_name("confidence").unwrap();
+            let arr = conf_col.as_any().downcast_ref::<Float32Array>().unwrap();
+            (0..arr.len()).any(|i| !arr.is_null(i) && arr.value(i) > 0.2)
         });
         assert!(
             any_confident,
-            "At least one row should have confidence > 0.5"
+            "At least one row should have confidence > 0.2"
         );
     }
 

@@ -17,7 +17,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 rust-version = "1.88.0"
 license = "Apache-2.0"
@@ -25,9 +25,9 @@ repository = "https://github.com/f-inverse/jammi-ai"
 
 [workspace.dependencies]
 # Internal crates
-jammi-engine = { version = "0.1.4", path = "crates/jammi-engine" }
-jammi-ai = { version = "0.1.4", path = "crates/jammi-ai" }
-jammi-server = { version = "0.1.4", path = "crates/jammi-server" }
+jammi-engine = { version = "0.1.5", path = "crates/jammi-engine" }
+jammi-ai = { version = "0.1.5", path = "crates/jammi-ai" }
+jammi-server = { version = "0.1.5", path = "crates/jammi-server" }
 jammi-test-utils = { path = "crates/jammi-test-utils" }
 
 # Query engine

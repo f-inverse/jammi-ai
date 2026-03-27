@@ -4,10 +4,6 @@ on:
   push:
     tags: ["py-v*"]
 
-concurrency:
-  group: release-python
-  cancel-in-progress: false
-
 jobs:
   build-linux:
     name: Build wheel (Linux)
@@ -38,7 +34,7 @@ jobs:
           - runner: macos-latest
             target: aarch64-apple-darwin
             artifact: wheels-macos-arm64
-          - runner: macos-13
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
             artifact: wheels-macos-x86_64
     steps:

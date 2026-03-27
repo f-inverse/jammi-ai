@@ -52,19 +52,22 @@ impl OpenClipVisionConfig {
                 message: "OpenCLIP config missing 'model_cfg.embed_dim'".into(),
             })? as usize;
 
+        let width = vision_cfg
+            .get("width")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(768) as usize;
+
         Ok(Self {
-            width: vision_cfg
-                .get("width")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(768) as usize,
+            width,
             layers: vision_cfg
                 .get("layers")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(12) as usize,
+            // Default to width/64 (ViT convention: head_dim=64)
             heads: vision_cfg
                 .get("heads")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(12) as usize,
+                .unwrap_or((width / 64) as u64) as usize,
             mlp_ratio: vision_cfg
                 .get("mlp_ratio")
                 .and_then(|v| v.as_f64())
@@ -102,7 +105,10 @@ struct MultiHeadAttention {
 impl MultiHeadAttention {
     fn load(vb: VarBuilder, width: usize, num_heads: usize) -> CandleResult<Self> {
         let head_dim = width / num_heads;
-        let in_proj = linear(width, width * 3, vb.pp("in_proj"))?;
+        // OpenCLIP uses `in_proj_weight` / `in_proj_bias` (underscore, not dot-separated).
+        let in_proj_weight = vb.get((width * 3, width), "in_proj_weight")?;
+        let in_proj_bias = vb.get(width * 3, "in_proj_bias")?;
+        let in_proj = Linear::new(in_proj_weight, Some(in_proj_bias));
         let out_proj = linear(width, width, vb.pp("out_proj"))?;
         Ok(Self {
             in_proj,

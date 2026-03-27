@@ -252,4 +252,111 @@ mod live {
             "At least one row should have confidence > 0.5"
         );
     }
+
+    #[tokio::test]
+    async fn live_patentclip_produces_512_dim_image_embeddings() {
+        use jammi_ai::model::backend::DeviceConfig;
+        use jammi_ai::model::cache::ModelCache;
+        use jammi_ai::model::resolver::ModelResolver;
+
+        let dir = tempdir().unwrap();
+        let catalog = Arc::new(jammi_engine::catalog::Catalog::open(dir.path()).unwrap());
+        let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
+        let device_config = DeviceConfig {
+            gpu_device: -1,
+            memory_fraction: 1.0,
+        };
+        let scheduler = Arc::new(jammi_ai::concurrency::GpuScheduler::new_unlimited());
+        let cache = ModelCache::new(resolver, device_config, scheduler);
+
+        // Load PatentCLIP
+        let source = ModelSource::hf("patentclip/PatentCLIP_Vit_B");
+        let guard = cache
+            .get_or_load(&source, ModelTask::ImageEmbedding, None)
+            .await
+            .unwrap();
+
+        // Verify embedding dimension
+        let dim = guard.model.embedding_dim().unwrap();
+        assert_eq!(dim, 512, "PatentCLIP should produce 512-dim embeddings");
+
+        // Create a synthetic test image (white 100x150 with a black rectangle)
+        let mut img = image::RgbImage::from_pixel(100, 150, image::Rgb([255, 255, 255]));
+        for y in 30..80 {
+            for x in 20..70 {
+                img.put_pixel(x, y, image::Rgb([0, 0, 0]));
+            }
+        }
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+
+        // Embed via forward pass
+        let binary_array = Arc::new(arrow::array::BinaryArray::from(vec![png_bytes.as_slice()]))
+            as arrow::array::ArrayRef;
+        let output = guard
+            .model
+            .forward(&[binary_array], ModelTask::ImageEmbedding)
+            .unwrap();
+
+        // Verify output shape
+        assert_eq!(output.shapes, vec![(1, 512)]);
+        assert_eq!(output.float_outputs[0].len(), 512);
+        assert!(output.row_status[0], "Row should be marked as OK");
+
+        // Verify L2-normalized (norm ≈ 1.0)
+        let norm: f32 = output.float_outputs[0]
+            .iter()
+            .map(|v| v * v)
+            .sum::<f32>()
+            .sqrt();
+        assert!(
+            (norm - 1.0).abs() < 0.01,
+            "Embedding should be L2-normalized, got norm={norm}"
+        );
+
+        // Verify non-trivial (not all zeros)
+        let max_val = output.float_outputs[0]
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_val > 0.01,
+            "Embedding should not be all zeros, max={max_val}"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_patentclip_encode_image_query() {
+        let dir = tempdir().unwrap();
+        let config = common::test_config(dir.path());
+        let session = InferenceSession::new(config).await.unwrap();
+
+        // Create a small test image
+        let img = image::RgbImage::from_pixel(64, 64, image::Rgb([128, 128, 128]));
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+
+        let vector = session
+            .encode_image_query("patentclip/PatentCLIP_Vit_B", &png_bytes)
+            .await
+            .unwrap();
+
+        assert_eq!(vector.len(), 512);
+
+        let norm: f32 = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 0.01,
+            "Should be L2-normalized, got norm={norm}"
+        );
+    }
 }

@@ -206,7 +206,11 @@ impl ModelDimensions {
             let embed_dim = model_cfg.get("embed_dim").and_then(|v| v.as_u64())? as usize;
             let width = vision_cfg.get("width").and_then(|v| v.as_u64())? as usize;
             let num_layers = vision_cfg.get("layers").and_then(|v| v.as_u64())? as usize;
-            let num_attention_heads = vision_cfg.get("heads").and_then(|v| v.as_u64())? as usize;
+            // heads may be absent in OpenCLIP configs — default to width/64 (ViT convention)
+            let num_attention_heads = vision_cfg
+                .get("heads")
+                .and_then(|v| v.as_u64())
+                .unwrap_or((width / 64) as u64) as usize;
             let mlp_ratio = vision_cfg
                 .get("mlp_ratio")
                 .and_then(|v| v.as_f64())

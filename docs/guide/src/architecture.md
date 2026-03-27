@@ -55,7 +55,7 @@ jammi-cli
 | `InferenceSession` | Wraps `JammiSession` + `ModelCache` + `ResultStore`. Entry point for all operations |
 | `ModelResolver` | Resolves model ID to file paths + backend. Chain: catalog -> local -> HF Hub |
 | `ModelCache` | LRU cache with single-flight loading, ref-counted guards |
-| `CandleBackend` / `OrtBackend` | Model backends: Candle (safetensors), ONNX Runtime |
+| `CandleBackend` / `OrtBackend` | Model backends: Candle (safetensors, BERT + ModernBERT), ONNX Runtime |
 | `HttpBackend` | Remote backend: HTTP endpoint for embeddings |
 | `InferenceExec` | DataFusion `ExecutionPlan` operator for inference with backpressure |
 | `AnnSearchExec` | DataFusion `ExecutionPlan` leaf node for ANN vector search |

@@ -22,6 +22,10 @@ fn tiny_bert_source() -> ModelSource {
     ModelSource::local(common::fixture("tiny_bert"))
 }
 
+fn tiny_modernbert_source() -> ModelSource {
+    ModelSource::local(common::fixture("tiny_modernbert"))
+}
+
 async fn session_with_patents() -> (InferenceSession, TempDir) {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
@@ -478,5 +482,76 @@ async fn embedding_vectors_are_semantically_meaningful_and_reproducible() {
     assert!(
         dist_cross > dist_physics,
         "Cross-category distance ({dist_cross}) should exceed within-category distance ({dist_physics})"
+    );
+}
+
+// ─── ModernBERT backend ──────────────────────────────────��──────────────────
+
+#[tokio::test]
+async fn e2e_modernbert_embedding_produces_vectors_with_correct_schema() {
+    let (session, _dir) = session_with_patents().await;
+    let model_source = tiny_modernbert_source();
+
+    let results = session
+        .infer(
+            "patents",
+            &model_source,
+            ModelTask::Embedding,
+            &["abstract".to_string()],
+            "id",
+        )
+        .await
+        .unwrap();
+
+    assert!(!results.is_empty(), "Should produce at least one batch");
+    let batch = &results[0];
+
+    // Verify vector column is FixedSizeList(Float32, 32) — tiny_modernbert has hidden_size=32
+    let vector_col = batch
+        .column_by_name("vector")
+        .expect("vector column should exist");
+    match vector_col.data_type() {
+        DataType::FixedSizeList(inner, 32) => {
+            assert_eq!(inner.data_type(), &DataType::Float32);
+        }
+        other => panic!("Expected FixedSizeList(Float32, 32), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn e2e_modernbert_embedding_vectors_are_nonzero_and_reproducible() {
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = InferenceSession::new(config).await.unwrap();
+
+    let model = "local:".to_string() + common::fixture("tiny_modernbert").to_str().unwrap();
+
+    let vec_a = session
+        .encode_query(&model, "quantum computing in superconducting systems")
+        .await
+        .unwrap();
+
+    let vec_b = session
+        .encode_query(&model, "quantum computing in superconducting systems")
+        .await
+        .unwrap();
+
+    // Reproducibility: identical input must produce identical output
+    assert_eq!(
+        vec_a, vec_b,
+        "Encoding the same text twice must produce identical vectors"
+    );
+
+    // Correct dimension
+    assert_eq!(
+        vec_a.len(),
+        32,
+        "ModernBERT vector should have 32 dimensions"
+    );
+
+    // Non-trivial: vectors should not be all zeros
+    assert!(
+        vec_a.iter().any(|&v| v != 0.0),
+        "Vector should have at least one non-zero element"
     );
 }

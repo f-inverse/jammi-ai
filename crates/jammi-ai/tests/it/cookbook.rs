@@ -18,6 +18,10 @@ fn tiny_bert_id() -> String {
     "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()
 }
 
+fn tiny_modernbert_id() -> String {
+    "local:".to_string() + common::fixture("tiny_modernbert").to_str().unwrap()
+}
+
 async fn cookbook_session(dir: &TempDir) -> Arc<InferenceSession> {
     let config = common::test_config(dir.path());
     Arc::new(InferenceSession::new(config).await.unwrap())
@@ -508,4 +512,174 @@ async fn recipe_evaluation() {
 
     assert!(comparison.get("baseline").is_some());
     assert!(comparison.get("delta").is_some());
+}
+
+// ─── Recipe: ModernBERT Embeddings ───────────────────────────────────────────
+
+#[tokio::test]
+async fn recipe_modernbert_embeddings() {
+    let dir = TempDir::new().unwrap();
+    let session = cookbook_session(&dir).await;
+    let model_id = tiny_modernbert_id();
+
+    session
+        .add_source(
+            "patents",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // generate_embeddings — same API as BERT, different model
+    let record = session
+        .generate_embeddings("patents", &model_id, &["abstract".to_string()], "id")
+        .await
+        .unwrap();
+
+    assert_eq!(record.status, "ready");
+    assert!(record.row_count > 0);
+    assert!(record.dimensions.is_some());
+
+    // encode_query with ModernBERT
+    let query = session
+        .encode_query(&model_id, "quantum computing applications")
+        .await
+        .unwrap();
+    assert_eq!(query.len(), 32, "tiny_modernbert has hidden_size=32");
+
+    // search over ModernBERT-generated embeddings
+    let results = session
+        .search("patents", query, 10)
+        .await
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+    assert!(!results.is_empty());
+    assert!(results[0].schema().field_with_name("similarity").is_ok());
+}
+
+// ─── Recipe: Source Lifecycle ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn recipe_source_lifecycle() {
+    let dir = TempDir::new().unwrap();
+    let session = cookbook_session(&dir).await;
+
+    // Register two sources
+    session
+        .add_source(
+            "alpha",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    session
+        .add_source(
+            "beta",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(common::fixture_url("assignees.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // List sources
+    let sources = session.catalog().list_sources().unwrap();
+    assert_eq!(sources.len(), 2);
+    let ids: Vec<&str> = sources.iter().map(|s| s.source_id.as_str()).collect();
+    assert!(ids.contains(&"alpha"));
+    assert!(ids.contains(&"beta"));
+
+    // Inspect a source
+    let alpha = session
+        .catalog()
+        .get_source("alpha")
+        .unwrap()
+        .expect("alpha should exist");
+    assert_eq!(alpha.source_type, SourceType::Local);
+
+    // Remove a source
+    session.remove_source("alpha").unwrap();
+
+    // Verify removal
+    let sources = session.catalog().list_sources().unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].source_id, "beta");
+    assert!(session.catalog().get_source("alpha").unwrap().is_none());
+}
+
+// ─── Recipe: Model Management ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn recipe_model_management() {
+    let dir = TempDir::new().unwrap();
+    let session = cookbook_session(&dir).await;
+
+    session
+        .add_source(
+            "patents",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // No models registered initially
+    let models = session.catalog().list_models().unwrap();
+    assert!(models.is_empty(), "No models before first inference");
+
+    // Generate embeddings — auto-registers the model
+    session
+        .generate_embeddings("patents", &tiny_bert_id(), &["abstract".to_string()], "id")
+        .await
+        .unwrap();
+
+    // Model now visible in catalog
+    let models = session.catalog().list_models().unwrap();
+    assert_eq!(models.len(), 1);
+    let model = &models[0];
+    assert!(model.model_id.contains("tiny_bert"));
+    assert_eq!(model.backend, "candle");
+    assert_eq!(model.task, "embedding");
+
+    // Inspect specific model
+    let found = session
+        .catalog()
+        .get_model(&model.model_id)
+        .unwrap()
+        .expect("model should exist");
+    assert_eq!(found.model_id, model.model_id);
+
+    // Second model (ModernBERT) on the same source
+    session
+        .generate_embeddings(
+            "patents",
+            &tiny_modernbert_id(),
+            &["abstract".to_string()],
+            "id",
+        )
+        .await
+        .unwrap();
+
+    let models = session.catalog().list_models().unwrap();
+    assert_eq!(models.len(), 2, "Both models should be registered");
 }

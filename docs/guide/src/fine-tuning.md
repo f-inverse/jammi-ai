@@ -136,10 +136,10 @@ db.generate_embeddings(source="patents", model=model_id, columns=["abstract"], k
 ## How it works
 
 ```
-text -> BertModel (frozen) -> base embedding -> LoRA projection (trained) -> output
+text -> encoder (frozen) -> base embedding -> LoRA projection (trained) -> output
 ```
 
-1. The base model is loaded and frozen
+1. The base encoder model (BERT, ModernBERT, etc.) is loaded and frozen
 2. A LoRA projection layer (identity + low-rank A/B matrices) is added after pooling
 3. For each batch: text is encoded, projected through LoRA, and loss is computed
 4. Only the A/B matrices receive gradients

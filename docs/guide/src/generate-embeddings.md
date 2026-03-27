@@ -97,12 +97,20 @@ When searching, the latest ready embedding table is used by default.
 
 ## Supported models
 
-Any BERT-family model on HuggingFace Hub with safetensors weights:
+Any encoder model on HuggingFace Hub with safetensors weights. Supported architectures:
+
+**BERT family** — BERT, RoBERTa, DistilBERT, CamemBERT, XLM-RoBERTa:
 
 - `sentence-transformers/all-MiniLM-L6-v2` (384-dim, fast)
 - `sentence-transformers/all-mpnet-base-v2` (768-dim, higher quality)
 - `BAAI/bge-small-en-v1.5`, `BAAI/bge-base-en-v1.5`
-- Any local directory with `config.json` + `model.safetensors` + `tokenizer.json`
+
+**ModernBERT** — modernized encoder with rotary embeddings, 8192-token context, GeGLU:
+
+- `answerdotai/ModernBERT-base` (768-dim)
+- `answerdotai/ModernBERT-large` (1024-dim)
+
+Or any local directory with `config.json` + `model.safetensors` + `tokenizer.json`. The architecture is detected automatically from `model_type` in config.json.
 
 Use a local model:
 

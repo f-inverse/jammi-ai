@@ -1,28 +1,70 @@
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
+use candle_transformers::models::modernbert::{Config as ModernBertConfig, ModernBert};
 use jammi_engine::error::{JammiError, Result};
 
 use super::{DeviceConfig, ModelBackend};
 use crate::inference::adapter::BackendOutput;
 use crate::inference::arrow_to_texts;
-use crate::model::tokenizer::TokenizerWrapper;
+use crate::model::tokenizer::{BatchEncoding, TokenizerWrapper};
 use crate::model::{LoadedModel, ModelDimensions, ModelTask, ResolvedModel};
 
 /// Candle backend — loads safetensors models via candle.
 pub struct CandleBackend;
 
-/// Discriminated model architecture for forward-pass dispatch.
-enum CandleModelInner {
-    Bert(BertModel),
+/// Each architecture implements this to produce hidden states from tokenized input.
+trait CandleForward: Send + Sync {
+    fn forward_hidden(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+        encoding: &BatchEncoding,
+        device: &Device,
+    ) -> Result<Tensor>;
+}
+
+/// BERT-family forward pass (bert, roberta, distilbert, camembert, xlm-roberta).
+struct BertForward(BertModel);
+
+impl CandleForward for BertForward {
+    fn forward_hidden(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+        encoding: &BatchEncoding,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let token_type_ids = tokens_to_tensor(&encoding.type_ids, device)?;
+        self.0
+            .forward(input_ids, &token_type_ids, Some(attention_mask))
+            .map_err(|e| JammiError::Inference(format!("BERT forward pass failed: {e}")))
+    }
+}
+
+/// ModernBERT forward pass (rotary embeddings, GeGLU, no token_type_ids).
+struct ModernBertForward(ModernBert);
+
+impl CandleForward for ModernBertForward {
+    fn forward_hidden(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+        _encoding: &BatchEncoding,
+        _device: &Device,
+    ) -> Result<Tensor> {
+        self.0
+            .forward(input_ids, attention_mask)
+            .map_err(|e| JammiError::Inference(format!("ModernBERT forward pass failed: {e}")))
+    }
 }
 
 /// A candle-loaded model ready for inference.
 pub struct CandleModel {
     /// Architecture dimensions for memory estimation and output sizing.
     pub dimensions: ModelDimensions,
-    /// Loaded model weights and computation graph.
-    inner: CandleModelInner,
+    /// Architecture-specific forward pass.
+    inner: Box<dyn CandleForward>,
     /// Tokenizer for text-to-token conversion, if available.
     pub tokenizer: Option<TokenizerWrapper>,
     /// Device the model weights reside on (CPU, CUDA, or Metal).
@@ -70,11 +112,7 @@ impl CandleModel {
 
     /// Convert token ID vectors into a candle Tensor on this model's device.
     pub(crate) fn tokens_to_tensor(&self, vecs: &[Vec<u32>]) -> Result<Tensor> {
-        let rows = vecs.len();
-        let cols = vecs.first().map_or(0, |v| v.len());
-        let flat: Vec<u32> = vecs.iter().flatten().copied().collect();
-        Tensor::from_vec(flat, (rows, cols), &self.device)
-            .map_err(|e| JammiError::Inference(e.to_string()))
+        tokens_to_tensor(vecs, &self.device)
     }
 
     /// Run forward pass dispatching by task.
@@ -135,13 +173,10 @@ impl CandleModel {
 
             let input_ids = self.tokens_to_tensor(&encoding.input_ids)?;
             let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
-            let token_type_ids = self.tokens_to_tensor(&encoding.type_ids)?;
 
-            let output = match &self.inner {
-                CandleModelInner::Bert(bert) => bert
-                    .forward(&input_ids, &token_type_ids, Some(&attention_mask))
-                    .map_err(|e| JammiError::Inference(format!("BERT forward pass failed: {e}")))?,
-            };
+            let output =
+                self.inner
+                    .forward_hidden(&input_ids, &attention_mask, &encoding, &self.device)?;
 
             let pooled = self.mean_pool(&output, &attention_mask)?;
             let normalized = self.l2_normalize(&pooled)?;
@@ -193,7 +228,7 @@ impl ModelBackend for CandleBackend {
                 })?
         };
 
-        let inner = match model_type {
+        let inner: Box<dyn CandleForward> = match model_type {
             "bert" | "roberta" | "distilbert" | "camembert" | "xlm-roberta" => {
                 let bert_config: BertConfig = serde_json::from_value(resolved.model_config.clone())
                     .map_err(|e| JammiError::Model {
@@ -204,14 +239,28 @@ impl ModelBackend for CandleBackend {
                     model_id: resolved.model_id.0.clone(),
                     message: format!("Failed to construct BERT model: {e}"),
                 })?;
-                CandleModelInner::Bert(bert)
+                Box::new(BertForward(bert))
+            }
+            "modernbert" => {
+                let mb_config: ModernBertConfig =
+                    serde_json::from_value(resolved.model_config.clone()).map_err(|e| {
+                        JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("Failed to parse ModernBERT config: {e}"),
+                        }
+                    })?;
+                let model = ModernBert::load(vb, &mb_config).map_err(|e| JammiError::Model {
+                    model_id: resolved.model_id.0.clone(),
+                    message: format!("Failed to construct ModernBERT model: {e}"),
+                })?;
+                Box::new(ModernBertForward(model))
             }
             unsupported => {
                 return Err(JammiError::Model {
                     model_id: resolved.model_id.0.clone(),
                     message: format!(
                         "Unsupported model architecture '{unsupported}'. \
-                         Supported: bert, roberta, distilbert, camembert, xlm-roberta"
+                         Supported: bert, roberta, distilbert, camembert, xlm-roberta, modernbert"
                     ),
                 });
             }
@@ -295,6 +344,14 @@ impl ModelBackend for CandleBackend {
             .map(|m| m.len() as usize)
             .sum()
     }
+}
+
+/// Convert token ID vectors into a candle Tensor on the given device.
+fn tokens_to_tensor(vecs: &[Vec<u32>], device: &Device) -> Result<Tensor> {
+    let rows = vecs.len();
+    let cols = vecs.first().map_or(0, |v| v.len());
+    let flat: Vec<u32> = vecs.iter().flatten().copied().collect();
+    Tensor::from_vec(flat, (rows, cols), device).map_err(|e| JammiError::Inference(e.to_string()))
 }
 
 fn select_device(config: &DeviceConfig) -> Device {

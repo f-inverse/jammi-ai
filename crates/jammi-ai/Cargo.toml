@@ -28,6 +28,9 @@ thiserror.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 
+# Image processing
+image.workspace = true
+
 # HTTP backend
 reqwest.workspace = true
 

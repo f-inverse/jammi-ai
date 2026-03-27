@@ -106,6 +106,8 @@ pub enum BackendType {
 pub enum ModelTask {
     /// Produce dense vector representations of input text.
     Embedding,
+    /// Produce dense vector representations of input images.
+    ImageEmbedding,
     /// Assign a label and confidence score to input text.
     Classification,
     /// Extract named entities (person, org, location, etc.) from text.
@@ -116,6 +118,7 @@ impl std::fmt::Display for ModelTask {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Embedding => write!(f, "embedding"),
+            Self::ImageEmbedding => write!(f, "image_embedding"),
             Self::Classification => write!(f, "classification"),
             Self::Ner => write!(f, "ner"),
         }
@@ -127,10 +130,11 @@ impl std::str::FromStr for ModelTask {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "embedding" => Ok(Self::Embedding),
+            "image_embedding" => Ok(Self::ImageEmbedding),
             "classification" => Ok(Self::Classification),
             "ner" => Ok(Self::Ner),
             other => Err(jammi_engine::error::JammiError::Other(format!(
-                "Unknown model task '{other}'. Expected: embedding, classification, ner"
+                "Unknown model task '{other}'. Expected: embedding, image_embedding, classification, ner"
             ))),
         }
     }
@@ -174,24 +178,50 @@ pub struct ModelDimensions {
 }
 
 impl ModelDimensions {
-    /// Parse from HuggingFace config.json.
+    /// Parse from HuggingFace config.json or OpenCLIP open_clip_config.json.
     pub fn from_config(config: &serde_json::Value) -> Option<Self> {
-        let hidden_size = config["hidden_size"].as_u64()? as usize;
-        let num_layers = config
-            .get("num_hidden_layers")
-            .or(config.get("num_layers"))?
-            .as_u64()? as usize;
-        let num_attention_heads = config["num_attention_heads"].as_u64()? as usize;
-        let intermediate_size = config
-            .get("intermediate_size")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(hidden_size as u64 * 4) as usize;
-        Some(Self {
-            hidden_size,
-            num_layers,
-            num_attention_heads,
-            intermediate_size,
-        })
+        // Standard text model format (BERT, ModernBERT, etc.)
+        if let Some(hidden_size) = config.get("hidden_size").and_then(|v| v.as_u64()) {
+            let hidden_size = hidden_size as usize;
+            let num_layers = config
+                .get("num_hidden_layers")
+                .or(config.get("num_layers"))?
+                .as_u64()? as usize;
+            let num_attention_heads = config["num_attention_heads"].as_u64()? as usize;
+            let intermediate_size = config
+                .get("intermediate_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(hidden_size as u64 * 4) as usize;
+            return Some(Self {
+                hidden_size,
+                num_layers,
+                num_attention_heads,
+                intermediate_size,
+            });
+        }
+
+        // OpenCLIP format: model_cfg.vision_cfg with embed_dim at top level
+        if let Some(model_cfg) = config.get("model_cfg") {
+            let vision_cfg = model_cfg.get("vision_cfg")?;
+            let embed_dim = model_cfg.get("embed_dim").and_then(|v| v.as_u64())? as usize;
+            let width = vision_cfg.get("width").and_then(|v| v.as_u64())? as usize;
+            let num_layers = vision_cfg.get("layers").and_then(|v| v.as_u64())? as usize;
+            let num_attention_heads =
+                vision_cfg.get("heads").and_then(|v| v.as_u64())? as usize;
+            let mlp_ratio = vision_cfg
+                .get("mlp_ratio")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(4.0);
+            let intermediate_size = (width as f64 * mlp_ratio) as usize;
+            return Some(Self {
+                hidden_size: embed_dim,
+                num_layers,
+                num_attention_heads,
+                intermediate_size,
+            });
+        }
+
+        None
     }
 
     /// Peak activation memory for one inference batch (encoder-only, no gradients).

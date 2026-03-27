@@ -96,10 +96,18 @@ impl ModelResolver {
             None => return Ok(None),
         };
 
-        let config_path = artifact_dir.join("config.json");
-        if !config_path.exists() {
-            return Ok(None);
-        }
+        // Try standard config.json first, then OpenCLIP open_clip_config.json
+        let config_path = {
+            let standard = artifact_dir.join("config.json");
+            let open_clip = artifact_dir.join("open_clip_config.json");
+            if standard.exists() {
+                standard
+            } else if open_clip.exists() {
+                open_clip
+            } else {
+                return Ok(None);
+            }
+        };
 
         // Use stored config_json if available, otherwise re-read from disk
         let model_config: serde_json::Value = match &record.config_json {
@@ -115,9 +123,12 @@ impl ModelResolver {
         // Reconstruct weights paths from the artifact directory
         let weights_paths: Vec<PathBuf> = match backend {
             BackendType::Candle => {
-                let p = artifact_dir.join("model.safetensors");
-                if p.exists() {
-                    vec![p]
+                let standard = artifact_dir.join("model.safetensors");
+                let open_clip = artifact_dir.join("open_clip_model.safetensors");
+                if standard.exists() {
+                    vec![standard]
+                } else if open_clip.exists() {
+                    vec![open_clip]
                 } else {
                     return Ok(None);
                 }
@@ -176,23 +187,35 @@ impl ModelResolver {
             });
         }
 
-        let config_path = path.join("config.json");
-        if !config_path.exists() {
-            return Err(JammiError::Model {
-                model_id: source.to_string(),
-                message: "Missing config.json in model directory".into(),
-            });
-        }
+        // Try standard config.json first, then OpenCLIP open_clip_config.json
+        let config_path = {
+            let standard = path.join("config.json");
+            let open_clip = path.join("open_clip_config.json");
+            if standard.exists() {
+                standard
+            } else if open_clip.exists() {
+                open_clip
+            } else {
+                return Err(JammiError::Model {
+                    model_id: source.to_string(),
+                    message: "Missing config.json or open_clip_config.json in model directory"
+                        .into(),
+                });
+            }
+        };
         let config: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(&config_path)?)?;
 
-        let has_safetensors = path.join("model.safetensors").exists();
+        let has_safetensors = path.join("model.safetensors").exists()
+            || path.join("open_clip_model.safetensors").exists();
         let has_onnx = path.join("model.onnx").exists();
 
         if !has_safetensors && !has_onnx {
             return Err(JammiError::Model {
                 model_id: source.to_string(),
-                message: "No model weights found (need model.safetensors or model.onnx)".into(),
+                message: "No model weights found (need model.safetensors, \
+                          open_clip_model.safetensors, or model.onnx)"
+                    .into(),
             });
         }
 
@@ -204,9 +227,12 @@ impl ModelResolver {
 
         let weights_paths = match backend {
             BackendType::Candle => {
-                let p = path.join("model.safetensors");
-                if p.exists() {
-                    vec![p]
+                let standard = path.join("model.safetensors");
+                let open_clip = path.join("open_clip_model.safetensors");
+                if standard.exists() {
+                    vec![standard]
+                } else if open_clip.exists() {
+                    vec![open_clip]
                 } else {
                     return Err(JammiError::Model {
                         model_id: source.to_string(),
@@ -271,10 +297,14 @@ impl ModelResolver {
     ) -> Result<ResolvedModel> {
         let repo = self.hf_api.model(repo_id.to_string());
 
-        let config_path = repo.get("config.json").map_err(|e| JammiError::Model {
-            model_id: source.to_string(),
-            message: format!("Failed to download config.json: {e}"),
-        })?;
+        // Try standard config.json first, then OpenCLIP open_clip_config.json
+        let config_path = repo
+            .get("config.json")
+            .or_else(|_| repo.get("open_clip_config.json"))
+            .map_err(|e| JammiError::Model {
+                model_id: source.to_string(),
+                message: format!("Failed to download config: {e}"),
+            })?;
         let config: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(&config_path)?)?;
 
@@ -327,7 +357,11 @@ impl ModelResolver {
         repo: &hf_hub::api::sync::ApiRepo,
         source: &ModelSource,
     ) -> Result<Vec<PathBuf>> {
+        // Try standard naming first, then OpenCLIP naming
         if let Ok(path) = repo.get("model.safetensors") {
+            return Ok(vec![path]);
+        }
+        if let Ok(path) = repo.get("open_clip_model.safetensors") {
             return Ok(vec![path]);
         }
         if let Ok(info) = repo.info() {

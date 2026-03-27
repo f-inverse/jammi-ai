@@ -39,7 +39,7 @@ impl HttpBackend {
         match task {
             ModelTask::Embedding => self.forward_embeddings(base_url, inputs, model_id).await,
             other => Err(JammiError::Backend(format!(
-                "HTTP backend only supports embedding task, got {other:?}"
+                "HTTP backend only supports embedding task, got {other}"
             ))),
         }
     }

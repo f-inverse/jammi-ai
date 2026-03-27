@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 
 use jammi_ai::fine_tune::FineTuneMethod;
 use jammi_ai::model::{ModelSource, ModelTask};
+use jammi_ai::pipeline::image_embedding::EmbeddingStrategy;
 use jammi_ai::session::InferenceSession;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 
@@ -205,6 +206,42 @@ impl PyDatabase {
             )
             .map_err(to_pyerr)?;
         Ok(())
+    }
+
+    /// Generate image embeddings for a registered source.
+    ///
+    /// If `rotation_angles` is provided (e.g., `[0, 90, 180, 270]`),
+    /// each image produces one embedding per angle for rotation invariance.
+    #[pyo3(signature = (*, source, model, image_column, key, rotation_angles=None))]
+    fn generate_image_embeddings(
+        &self,
+        source: &str,
+        model: &str,
+        image_column: &str,
+        key: &str,
+        rotation_angles: Option<Vec<u16>>,
+    ) -> PyResult<()> {
+        let strategy = match rotation_angles {
+            Some(angles) => EmbeddingStrategy::RotationInvariant { angles },
+            None => EmbeddingStrategy::Single,
+        };
+        self.runtime
+            .block_on(self.session.generate_image_embeddings(
+                source,
+                model,
+                image_column,
+                key,
+                strategy,
+            ))
+            .map_err(to_pyerr)?;
+        Ok(())
+    }
+
+    /// Encode an image into an embedding vector using the given vision model.
+    fn encode_image_query(&self, model_id: &str, image_bytes: &[u8]) -> PyResult<Vec<f32>> {
+        self.runtime
+            .block_on(self.session.encode_image_query(model_id, image_bytes))
+            .map_err(to_pyerr)
     }
 }
 

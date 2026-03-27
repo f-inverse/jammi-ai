@@ -20,6 +20,7 @@ use crate::model::resolver::ModelResolver;
 use crate::model::{ModelSource, ModelTask};
 use crate::operator::inference_exec::InferenceExecBuilder;
 use crate::pipeline::embedding::EmbeddingPipeline;
+use crate::pipeline::image_embedding::{EmbeddingStrategy, ImageEmbeddingPipeline};
 use crate::search::SearchBuilder;
 use jammi_engine::cache::ann_cache::AnnCache;
 
@@ -179,6 +180,51 @@ impl InferenceSession {
             .await?;
         self.ann_cache.invalidate_source(source_id)?;
         Ok(result)
+    }
+
+    /// Generate image embeddings for a source and persist to Jammi DB.
+    /// Supports optional rotation-invariant strategy for patent drawings.
+    pub async fn generate_image_embeddings(
+        &self,
+        source_id: &str,
+        model_id: &str,
+        image_column: &str,
+        key_column: &str,
+        strategy: EmbeddingStrategy,
+    ) -> Result<ResultTableRecord> {
+        let result =
+            ImageEmbeddingPipeline::new(self, &self.result_store, strategy)
+                .run(source_id, model_id, image_column, key_column)
+                .await?;
+        self.ann_cache.invalidate_source(source_id)?;
+        Ok(result)
+    }
+
+    /// Encode a single image into a vector using the given vision model.
+    pub async fn encode_image_query(
+        &self,
+        model_id: &str,
+        image_bytes: &[u8],
+    ) -> Result<Vec<f32>> {
+        let model_source = ModelSource::parse(model_id);
+
+        let guard = self
+            .model_cache
+            .get_or_load(&model_source, ModelTask::ImageEmbedding, None)
+            .await?;
+
+        let binary_array = Arc::new(arrow::array::BinaryArray::from(vec![image_bytes]))
+            as arrow::array::ArrayRef;
+        let output = guard
+            .model
+            .forward(&[binary_array], ModelTask::ImageEmbedding)
+            .map_err(|e| JammiError::Inference(format!("encode_image_query forward: {e}")))?;
+
+        let dim = output.shapes.first().map(|(_, c)| *c).unwrap_or(0);
+        if output.float_outputs.is_empty() || output.float_outputs[0].is_empty() {
+            return Err(JammiError::Inference("No embedding output".into()));
+        }
+        Ok(output.float_outputs[0][..dim].to_vec())
     }
 
     /// Run inference on a registered source using a model.

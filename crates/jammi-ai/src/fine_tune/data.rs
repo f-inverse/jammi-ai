@@ -25,6 +25,11 @@ pub enum TrainingBatch {
         positive: Tensor,
         negative: Tensor,
     },
+    /// Classification: embeddings + integer class labels.
+    Classification {
+        embeddings: Tensor,
+        labels: Tensor, // shape (batch_size,) u32
+    },
 }
 
 /// Format of training data, detected from column names.
@@ -34,6 +39,8 @@ pub enum TrainingFormat {
     Contrastive,
     /// `anchor, positive, negative` — triplet format.
     Triplet,
+    /// Classification with label-to-index mapping.
+    Classification { num_classes: usize },
 }
 
 /// A chunk of text data for one training batch. The training loop encodes
@@ -48,6 +55,10 @@ pub enum TextChunk {
         anchors: Vec<String>,
         positives: Vec<String>,
         negatives: Vec<String>,
+    },
+    Classification {
+        texts: Vec<String>,
+        labels: Vec<u32>,
     },
 }
 
@@ -82,6 +93,10 @@ enum TrainingRow {
         positive: String,
         negative: String,
     },
+    Classification {
+        text: String,
+        label: u32,
+    },
 }
 
 impl TrainingDataLoader {
@@ -96,6 +111,18 @@ impl TrainingDataLoader {
                         text_b: b,
                         score: s,
                     })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Create a loader from classification rows (text + integer label).
+    pub fn from_classification(rows: Vec<(String, u32)>, num_classes: usize) -> Self {
+        Self {
+            format: TrainingFormat::Classification { num_classes },
+            data: LoaderData::TextRows(
+                rows.into_iter()
+                    .map(|(text, label)| TrainingRow::Classification { text, label })
                     .collect(),
             ),
         }
@@ -276,6 +303,22 @@ impl TrainingDataLoader {
                             .map(|r| match r {
                                 TrainingRow::Triplet { negative, .. } => negative.clone(),
                                 _ => String::new(),
+                            })
+                            .collect(),
+                    },
+                    TrainingFormat::Classification { .. } => TextChunk::Classification {
+                        texts: chunk
+                            .iter()
+                            .map(|r| match r {
+                                TrainingRow::Classification { text, .. } => text.clone(),
+                                _ => String::new(),
+                            })
+                            .collect(),
+                        labels: chunk
+                            .iter()
+                            .map(|r| match r {
+                                TrainingRow::Classification { label, .. } => *label,
+                                _ => 0,
                             })
                             .collect(),
                     },

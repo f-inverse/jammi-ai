@@ -13,6 +13,7 @@
 
 - [Query Your Data with SQL](./query-data.md)
 - [Generate Embeddings](./generate-embeddings.md)
+- [Classify Text](./classify-text.md)
 - [Semantic Search](./semantic-search.md)
 - [Enrich Results with Joins and Annotations](./enrich-results.md)
 - [Fine-Tune for Your Domain](./fine-tuning.md)

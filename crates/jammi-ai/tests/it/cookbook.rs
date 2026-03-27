@@ -22,6 +22,10 @@ fn tiny_modernbert_id() -> String {
     "local:".to_string() + common::fixture("tiny_modernbert").to_str().unwrap()
 }
 
+fn tiny_modernbert_classifier_id() -> String {
+    "local:".to_string() + common::fixture("tiny_modernbert_classifier").to_str().unwrap()
+}
+
 async fn cookbook_session(dir: &TempDir) -> Arc<InferenceSession> {
     let config = common::test_config(dir.path());
     Arc::new(InferenceSession::new(config).await.unwrap())
@@ -682,4 +686,91 @@ async fn recipe_model_management() {
 
     let models = session.catalog().list_models().unwrap();
     assert_eq!(models.len(), 2, "Both models should be registered");
+}
+
+// ─── Recipe: Classification Inference ────────────────────────────────────────
+
+#[tokio::test]
+async fn recipe_classification_inference() {
+    let dir = TempDir::new().unwrap();
+    let session = cookbook_session(&dir).await;
+    let model_id = tiny_modernbert_classifier_id();
+
+    session
+        .add_source(
+            "patents",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Raw classification inference
+    let model_source = ModelSource::parse(&model_id);
+    let results = session
+        .infer(
+            "patents",
+            &model_source,
+            ModelTask::Classification,
+            &["abstract".to_string()],
+            "id",
+        )
+        .await
+        .unwrap();
+
+    assert!(!results.is_empty());
+    let batch = &results[0];
+
+    // Verify classification columns
+    let label_col = batch
+        .column_by_name("label")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let confidence_col = batch
+        .column_by_name("confidence")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap();
+    let scores_col = batch
+        .column_by_name("all_scores_json")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    // At least one valid row
+    let status_col = batch
+        .column_by_name("_status")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let ok_count = (0..batch.num_rows())
+        .filter(|&i| status_col.value(i) == "ok")
+        .count();
+    assert!(ok_count > 0, "At least one row should succeed");
+
+    // Valid row has label, confidence, and JSON scores
+    let first_ok = (0..batch.num_rows())
+        .find(|&i| status_col.value(i) == "ok")
+        .unwrap();
+    assert!(
+        ["physics", "biology"].contains(&label_col.value(first_ok)),
+        "Label should be from id2label"
+    );
+    assert!(
+        confidence_col.value(first_ok) > 0.0,
+        "Confidence should be positive"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(scores_col.value(first_ok)).expect("all_scores_json should be valid JSON");
+    assert!(json.get("physics").is_some(), "Scores should contain 'physics'");
+    assert!(json.get("biology").is_some(), "Scores should contain 'biology'");
 }

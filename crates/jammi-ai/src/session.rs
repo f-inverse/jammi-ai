@@ -325,7 +325,7 @@ impl InferenceSession {
         base_model: &str,
         columns: &[String],
         _method: FineTuneMethod,
-        _task: &str,
+        task: &str,
         config: Option<FineTuneConfig>,
     ) -> Result<FineTuneJob> {
         let config = config.unwrap_or_default();
@@ -345,7 +345,7 @@ impl InferenceSession {
                     version: 1,
                     model_type: "embedding",
                     backend: "candle",
-                    task: "embedding",
+                    task,
                     ..Default::default()
                 },
             ) {
@@ -355,10 +355,17 @@ impl InferenceSession {
 
         // Persist job in catalog. FK references models.model_id PK = "{name}::{version}".
         let hyperparams = serde_json::to_string(&config)?;
-        let loss_type = config
-            .embedding_loss
-            .map(|l| format!("{l:?}"))
-            .unwrap_or_else(|| "auto".into());
+        let loss_type = if task == "classification" {
+            config
+                .classification_loss
+                .map(|l| format!("{l:?}"))
+                .unwrap_or_else(|| "CrossEntropy".into())
+        } else {
+            config
+                .embedding_loss
+                .map(|l| format!("{l:?}"))
+                .unwrap_or_else(|| "auto".into())
+        };
 
         let base_model_pk = crate::model::to_catalog_pk(&canonical_name, 1);
         self.inner.catalog().create_fine_tune_job(
@@ -401,6 +408,7 @@ impl InferenceSession {
         let job_id_clone = job_id.clone();
         let output_model_id_clone = output_model_id.clone();
         let base_model_str = base_model.to_string();
+        let task_str = task.to_string();
 
         tokio::task::spawn_blocking(move || {
             run_fine_tune_blocking(
@@ -409,6 +417,7 @@ impl InferenceSession {
                 job_id_clone,
                 output_model_id_clone,
                 base_model_str,
+                task_str,
                 config,
                 data_loader,
                 base_model_arc,
@@ -497,6 +506,7 @@ fn build_training_data_loader(
     let has_triplet = col_names.contains(&"anchor")
         && col_names.contains(&"positive")
         && col_names.contains(&"negative");
+    let has_classification = col_names.contains(&"text") && col_names.contains(&"label");
 
     if has_contrastive {
         let mut rows = Vec::new();
@@ -571,10 +581,46 @@ fn build_training_data_loader(
         Ok(crate::fine_tune::data::TrainingDataLoader::from_triplets(
             rows,
         ))
+    } else if has_classification {
+        let mut label_set = std::collections::BTreeSet::new();
+        let mut rows = Vec::new();
+        for batch in batches {
+            let text_col = batch
+                .column_by_name("text")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
+            let label_col = batch
+                .column_by_name("label")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
+            for i in 0..batch.num_rows() {
+                label_set.insert(label_col.value(i).to_string());
+                rows.push((text_col.value(i).to_string(), label_col.value(i).to_string()));
+            }
+        }
+        // Build label → index mapping
+        let label_to_idx: std::collections::HashMap<String, u32> = label_set
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (l.clone(), i as u32))
+            .collect();
+        let num_classes = label_to_idx.len();
+        let indexed_rows: Vec<(String, u32)> = rows
+            .into_iter()
+            .map(|(text, label)| {
+                let idx = label_to_idx[&label];
+                (text, idx)
+            })
+            .collect();
+        Ok(crate::fine_tune::data::TrainingDataLoader::from_classification(
+            indexed_rows,
+            num_classes,
+        ))
     } else {
         Err(JammiError::FineTune(format!(
             "Cannot detect training format from columns: {col_names:?}. \
-             Expected contrastive (text_a, text_b, score) or triplet (anchor, positive, negative)."
+             Expected contrastive (text_a, text_b, score), triplet (anchor, positive, negative), \
+             or classification (text, label)."
         )))
     }
 }
@@ -587,6 +633,7 @@ fn run_fine_tune_blocking(
     job_id: String,
     output_model_id: String,
     base_model: String,
+    task: String,
     config: FineTuneConfig,
     data_loader: crate::fine_tune::data::TrainingDataLoader,
     base_model_arc: Arc<crate::model::LoadedModel>,
@@ -599,7 +646,19 @@ fn run_fine_tune_blocking(
     let varmap = VarMap::new();
     let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
-    let model = crate::fine_tune::lora::build_lora_projection(hidden_size, &config, &vb)?;
+    let model = if task == "classification" {
+        let num_classes = match data_loader.format() {
+            crate::fine_tune::data::TrainingFormat::Classification { num_classes } => num_classes,
+            _ => {
+                return Err(JammiError::FineTune(
+                    "Classification task requires classification training data format".into(),
+                ))
+            }
+        };
+        crate::fine_tune::lora::build_lora_classification(hidden_size, num_classes, &config, &vb)?
+    } else {
+        crate::fine_tune::lora::build_lora_projection(hidden_size, &config, &vb)?
+    };
 
     let mut training_loop =
         crate::fine_tune::trainer::TrainingLoopBuilder::new(model, varmap, config)
@@ -622,7 +681,7 @@ fn run_fine_tune_blocking(
                     version: 1,
                     model_type: "fine-tuned",
                     backend: "candle",
-                    task: "embedding",
+                    task: &task,
                     base_model_id: Some(&base_model),
                     artifact_path: Some(adapter_dir.to_str().unwrap_or("")),
                     config_json: None,

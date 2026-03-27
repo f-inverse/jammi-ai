@@ -555,3 +555,96 @@ async fn e2e_modernbert_embedding_vectors_are_nonzero_and_reproducible() {
         "Vector should have at least one non-zero element"
     );
 }
+
+// ─── Classification backend ─────────────────────────────────────────────────
+
+fn tiny_modernbert_classifier_source() -> ModelSource {
+    ModelSource::local(common::fixture("tiny_modernbert_classifier"))
+}
+
+#[tokio::test]
+async fn e2e_classification_produces_correct_schema() {
+    let (session, _dir) = session_with_patents().await;
+    let model_source = tiny_modernbert_classifier_source();
+
+    let results = session
+        .infer(
+            "patents",
+            &model_source,
+            ModelTask::Classification,
+            &["abstract".to_string()],
+            "id",
+        )
+        .await
+        .unwrap();
+
+    assert!(!results.is_empty(), "Should produce at least one batch");
+    let batch = &results[0];
+
+    // Verify classification columns exist
+    assert!(
+        batch.schema().field_with_name("label").is_ok(),
+        "Missing label column"
+    );
+    assert!(
+        batch.schema().field_with_name("confidence").is_ok(),
+        "Missing confidence column"
+    );
+    assert!(
+        batch.schema().field_with_name("all_scores_json").is_ok(),
+        "Missing all_scores_json column"
+    );
+}
+
+#[tokio::test]
+async fn e2e_classification_labels_match_id2label() {
+    let (session, _dir) = session_with_patents().await;
+    let model_source = tiny_modernbert_classifier_source();
+
+    let results = session
+        .infer(
+            "patents",
+            &model_source,
+            ModelTask::Classification,
+            &["abstract".to_string()],
+            "id",
+        )
+        .await
+        .unwrap();
+
+    let batch = &results[0];
+    let label_col = batch
+        .column_by_name("label")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let confidence_col = batch
+        .column_by_name("confidence")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap();
+    let status_col = batch
+        .column_by_name("_status")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    let valid_labels = ["physics", "biology"];
+    for i in 0..batch.num_rows() {
+        if status_col.value(i) == "ok" {
+            assert!(
+                valid_labels.contains(&label_col.value(i)),
+                "Row {i}: label '{}' not in id2label",
+                label_col.value(i)
+            );
+            assert!(
+                confidence_col.value(i) > 0.0 && confidence_col.value(i) <= 1.0,
+                "Row {i}: confidence {} out of range (0, 1]",
+                confidence_col.value(i)
+            );
+        }
+    }
+}

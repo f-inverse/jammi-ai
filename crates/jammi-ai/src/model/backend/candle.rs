@@ -1,7 +1,11 @@
-use candle_core::{DType, Device, Tensor};
+use std::collections::HashMap;
+
+use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-use candle_transformers::models::modernbert::{Config as ModernBertConfig, ModernBert};
+use candle_transformers::models::modernbert::{
+    Config as ModernBertConfig, ModernBert, ModernBertForSequenceClassification,
+};
 use jammi_engine::error::{JammiError, Result};
 
 use super::{DeviceConfig, ModelBackend};
@@ -59,6 +63,60 @@ impl CandleForward for ModernBertForward {
     }
 }
 
+/// ModernBERT sequence classification forward pass.
+/// Returns softmaxed logits of shape (batch, num_classes).
+struct ModernBertClassificationForward(ModernBertForSequenceClassification);
+
+impl CandleForward for ModernBertClassificationForward {
+    fn forward_hidden(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+        _encoding: &BatchEncoding,
+        _device: &Device,
+    ) -> Result<Tensor> {
+        self.0.forward(input_ids, attention_mask).map_err(|e| {
+            JammiError::Inference(format!("ModernBERT classification forward failed: {e}"))
+        })
+    }
+}
+
+/// BERT-family sequence classification forward pass.
+/// Applies CLS pooling + linear classifier + softmax on top of BertModel.
+struct BertClassificationForward {
+    bert: BertModel,
+    classifier: candle_nn::Linear,
+}
+
+impl CandleForward for BertClassificationForward {
+    fn forward_hidden(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+        encoding: &BatchEncoding,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let token_type_ids = tokens_to_tensor(&encoding.type_ids, device)?;
+        let hidden = self
+            .bert
+            .forward(input_ids, &token_type_ids, Some(attention_mask))
+            .map_err(|e| {
+                JammiError::Inference(format!("BERT classification forward failed: {e}"))
+            })?;
+        // CLS pooling: take first token
+        let cls = hidden
+            .i((.., 0, ..))
+            .map_err(|e| JammiError::Inference(format!("CLS pooling failed: {e}")))?
+            .contiguous()
+            .map_err(|e| JammiError::Inference(format!("CLS contiguous failed: {e}")))?;
+        let logits = cls
+            .apply(&self.classifier)
+            .map_err(|e| JammiError::Inference(format!("Classifier forward failed: {e}")))?;
+        candle_nn::ops::softmax(&logits, candle_core::D::Minus1)
+            .map_err(|e| JammiError::Inference(format!("Softmax failed: {e}")))
+    }
+}
+
 /// A candle-loaded model ready for inference.
 pub struct CandleModel {
     /// Architecture dimensions for memory estimation and output sizing.
@@ -71,6 +129,8 @@ pub struct CandleModel {
     pub device: Device,
     /// Optional LoRA projection applied after pooling (for fine-tuned models).
     pub lora_projection: Option<crate::fine_tune::lora::LoraLinear>,
+    /// Label index → label string mapping for classification models.
+    id2label: Option<HashMap<u32, String>>,
 }
 
 impl CandleModel {
@@ -123,9 +183,9 @@ impl CandleModel {
     ) -> Result<BackendOutput> {
         match task {
             ModelTask::Embedding => self.forward_embedding(content),
+            ModelTask::Classification => self.forward_classification(content),
             other => Err(JammiError::Inference(format!(
-                "Candle forward pass not implemented for task {other:?}. \
-                 Only Embedding is supported in CP2."
+                "Candle forward pass not implemented for task {other:?}."
             ))),
         }
     }
@@ -208,6 +268,101 @@ impl CandleModel {
             shapes: vec![(num_rows, hidden_size)],
         })
     }
+
+    fn forward_classification(&self, content: &[arrow::array::ArrayRef]) -> Result<BackendOutput> {
+        let id2label = self.id2label.as_ref().ok_or_else(|| {
+            JammiError::Inference("No id2label mapping for classification model".into())
+        })?;
+
+        let texts = arrow_to_texts(content)?;
+        let num_rows = texts.len();
+
+        if num_rows == 0 {
+            return Ok(BackendOutput {
+                float_outputs: vec![vec![]],
+                string_outputs: vec![vec![], vec![]],
+                row_status: vec![],
+                row_errors: vec![],
+                shapes: vec![(0, 0)],
+            });
+        }
+
+        let mut row_status = vec![true; num_rows];
+        let mut row_errors = vec![String::new(); num_rows];
+        let mut valid_indices = Vec::new();
+        let mut valid_texts = Vec::new();
+        for (i, text) in texts.iter().enumerate() {
+            if text.is_empty() {
+                row_status[i] = false;
+                row_errors[i] = "Empty or null text input".into();
+            } else {
+                valid_indices.push(i);
+                valid_texts.push(text.as_str());
+            }
+        }
+
+        // Initialize outputs for all rows (failed rows stay empty/zero)
+        let mut all_confidences = vec![0.0_f32; num_rows];
+        let mut all_labels = vec![String::new(); num_rows];
+        let mut all_scores_json = vec![String::new(); num_rows];
+
+        if !valid_texts.is_empty() {
+            let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+                JammiError::Inference("No tokenizer loaded for classification model".into())
+            })?;
+            let encoding = tokenizer.encode_batch(&valid_texts, Some(512))?;
+
+            let input_ids = self.tokens_to_tensor(&encoding.input_ids)?;
+            let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
+
+            // Forward pass returns (batch, num_classes) with softmax applied
+            let logits =
+                self.inner
+                    .forward_hidden(&input_ids, &attention_mask, &encoding, &self.device)?;
+
+            let probs = logits
+                .to_vec2::<f32>()
+                .map_err(|e| JammiError::Inference(format!("Logits to vec failed: {e}")))?;
+
+            for (batch_idx, &orig_idx) in valid_indices.iter().enumerate() {
+                let row_probs = &probs[batch_idx];
+
+                // Argmax → label, max → confidence
+                let (max_idx, &max_val) = row_probs
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .unwrap_or((0, &0.0));
+
+                let label = id2label
+                    .get(&(max_idx as u32))
+                    .cloned()
+                    .unwrap_or_else(|| format!("LABEL_{max_idx}"));
+
+                // Build JSON of all scores
+                let scores_map: serde_json::Map<String, serde_json::Value> = id2label
+                    .iter()
+                    .map(|(&idx, name)| {
+                        let score = row_probs.get(idx as usize).copied().unwrap_or(0.0);
+                        (name.clone(), serde_json::Value::from(score))
+                    })
+                    .collect();
+                let scores_json = serde_json::Value::Object(scores_map).to_string();
+
+                all_confidences[orig_idx] = max_val;
+                all_labels[orig_idx] = label;
+                all_scores_json[orig_idx] = scores_json;
+            }
+        }
+
+        Ok(BackendOutput {
+            float_outputs: vec![all_confidences],
+            string_outputs: vec![all_labels, all_scores_json],
+            row_status,
+            row_errors,
+            shapes: vec![(num_rows, 0)],
+        })
+    }
 }
 
 impl ModelBackend for CandleBackend {
@@ -228,7 +383,46 @@ impl ModelBackend for CandleBackend {
                 })?
         };
 
+        // Parse id2label from config if present (classification models)
+        let id2label: Option<HashMap<u32, String>> = resolved
+            .model_config
+            .get("id2label")
+            .and_then(|v| v.as_object())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(k, v)| {
+                        let idx: u32 = k.parse().ok()?;
+                        let label = v.as_str()?.to_string();
+                        Some((idx, label))
+                    })
+                    .collect()
+            });
+
+        let is_classification = resolved.task == ModelTask::Classification && id2label.is_some();
+
         let inner: Box<dyn CandleForward> = match model_type {
+            "bert" | "roberta" | "distilbert" | "camembert" | "xlm-roberta"
+                if is_classification =>
+            {
+                let bert_config: BertConfig = serde_json::from_value(resolved.model_config.clone())
+                    .map_err(|e| JammiError::Model {
+                        model_id: resolved.model_id.0.clone(),
+                        message: format!("Failed to parse BERT config: {e}"),
+                    })?;
+                let bert =
+                    BertModel::load(vb.clone(), &bert_config).map_err(|e| JammiError::Model {
+                        model_id: resolved.model_id.0.clone(),
+                        message: format!("Failed to construct BERT model: {e}"),
+                    })?;
+                let num_classes = id2label.as_ref().map_or(2, |m| m.len());
+                let hidden_size = bert_config.hidden_size;
+                let classifier = candle_nn::linear(hidden_size, num_classes, vb.pp("classifier"))
+                    .map_err(|e| JammiError::Model {
+                    model_id: resolved.model_id.0.clone(),
+                    message: format!("Failed to load BERT classifier head: {e}"),
+                })?;
+                Box::new(BertClassificationForward { bert, classifier })
+            }
             "bert" | "roberta" | "distilbert" | "camembert" | "xlm-roberta" => {
                 let bert_config: BertConfig = serde_json::from_value(resolved.model_config.clone())
                     .map_err(|e| JammiError::Model {
@@ -240,6 +434,23 @@ impl ModelBackend for CandleBackend {
                     message: format!("Failed to construct BERT model: {e}"),
                 })?;
                 Box::new(BertForward(bert))
+            }
+            "modernbert" if is_classification => {
+                let mb_config: ModernBertConfig =
+                    serde_json::from_value(resolved.model_config.clone()).map_err(|e| {
+                        JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("Failed to parse ModernBERT config: {e}"),
+                        }
+                    })?;
+                let model =
+                    ModernBertForSequenceClassification::load(vb, &mb_config).map_err(|e| {
+                        JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("Failed to construct ModernBERT classifier: {e}"),
+                        }
+                    })?;
+                Box::new(ModernBertClassificationForward(model))
             }
             "modernbert" => {
                 let mb_config: ModernBertConfig =
@@ -333,6 +544,7 @@ impl ModelBackend for CandleBackend {
             tokenizer,
             device,
             lora_projection,
+            id2label,
         })))
     }
 

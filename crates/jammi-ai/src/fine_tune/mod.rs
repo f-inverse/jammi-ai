@@ -57,6 +57,20 @@ impl Default for EmbeddingLoss {
     }
 }
 
+/// Loss function for classification fine-tuning.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassificationLoss {
+    /// Standard cross-entropy loss.
+    CrossEntropy,
+}
+
+impl Default for ClassificationLoss {
+    fn default() -> Self {
+        Self::CrossEntropy
+    }
+}
+
 /// Learning rate schedule applied after warmup.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -92,8 +106,10 @@ pub struct FineTuneConfig {
     pub batch_size: usize,
     /// Maximum sequence length for tokenization. Default: 512.
     pub max_seq_length: usize,
-    /// Loss function. Auto-selected from data format if None.
+    /// Loss function for embedding fine-tuning. Auto-selected from data format if None.
     pub embedding_loss: Option<EmbeddingLoss>,
+    /// Loss function for classification fine-tuning. Auto-selected if None.
+    pub classification_loss: Option<ClassificationLoss>,
     /// Gradient accumulation steps. Effective batch = batch_size × this. Default: 1.
     pub gradient_accumulation_steps: usize,
     /// Fraction of data held out for validation. Default: 0.1.
@@ -117,6 +133,7 @@ impl Default for FineTuneConfig {
             batch_size: 8,
             max_seq_length: 512,
             embedding_loss: None,
+            classification_loss: None,
             gradient_accumulation_steps: 1,
             validation_fraction: 0.1,
             early_stopping_patience: 3,

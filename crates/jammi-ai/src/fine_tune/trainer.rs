@@ -368,6 +368,16 @@ impl TrainingLoop {
                     negative: proj_n,
                 })
             }
+            TextChunk::Classification { texts, labels } => {
+                let emb = self.encode_texts(texts)?;
+                let proj = self.project(&emb)?;
+                let labels_tensor = Tensor::from_vec(labels.clone(), (labels.len(),), &Device::Cpu)
+                    .map_err(|e| JammiError::FineTune(format!("Labels tensor: {e}")))?;
+                Ok(super::data::TrainingBatch::Classification {
+                    embeddings: proj,
+                    labels: labels_tensor,
+                })
+            }
         }
     }
 
@@ -467,6 +477,10 @@ impl TrainingLoop {
                 positive,
                 negative,
             } => self.triplet_loss(anchor, positive, negative),
+            super::data::TrainingBatch::Classification { embeddings, labels } => {
+                let logits = self.classify(embeddings)?;
+                self.cross_entropy_loss(&logits, labels)
+            }
         }
     }
 
@@ -488,6 +502,23 @@ impl TrainingLoop {
             .map_err(|e| JammiError::FineTune(format!("CoSENT mean: {e}")))?;
 
         Ok(loss)
+    }
+
+    /// Apply classification head to projected embeddings.
+    fn classify(&self, embeddings: &Tensor) -> Result<Tensor> {
+        if self.model.layers.len() > 1 {
+            self.model.layers[1].1.forward(embeddings)
+        } else {
+            Err(JammiError::FineTune(
+                "No classification head in LoRA model".into(),
+            ))
+        }
+    }
+
+    /// Cross-entropy loss for classification.
+    fn cross_entropy_loss(&self, logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
+        candle_nn::loss::cross_entropy(logits, labels)
+            .map_err(|e| JammiError::FineTune(format!("Cross-entropy loss: {e}")))
     }
 
     /// Triplet loss: `max(0, cos(anchor, negative) - cos(anchor, positive) + margin)`.

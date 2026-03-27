@@ -171,6 +171,46 @@ pub fn apply_loaded_weights(
     Ok(())
 }
 
+/// Build a LoRA model for classification: projection + classification head.
+///
+/// Layer 0: "projection" -- LoRA-adapted identity (hidden_size -> hidden_size)
+/// Layer 1: "classifier" -- LoRA-adapted zeros->random (hidden_size -> num_classes)
+pub fn build_lora_classification(
+    hidden_size: usize,
+    num_classes: usize,
+    config: &super::FineTuneConfig,
+    vb: &VarBuilder,
+) -> Result<LoraModel> {
+    // Layer 0: projection (identity base, same as embedding)
+    let proj_base = Tensor::eye(hidden_size, DType::F32, vb.device())
+        .map_err(|e| JammiError::FineTune(format!("Projection identity: {e}")))?;
+    let proj_linear = Linear::new(proj_base, None);
+    let projection = LoraLinear::new(
+        proj_linear,
+        config.lora_rank,
+        config.lora_alpha,
+        &vb.pp("projection"),
+    )?;
+
+    // Layer 1: classifier (zeros base, trained from scratch via LoRA)
+    let cls_base = Tensor::zeros((num_classes, hidden_size), DType::F32, vb.device())
+        .map_err(|e| JammiError::FineTune(format!("Classifier zeros: {e}")))?;
+    let cls_linear = Linear::new(cls_base, None);
+    let classifier = LoraLinear::new(
+        cls_linear,
+        config.lora_rank,
+        config.lora_alpha,
+        &vb.pp("classifier"),
+    )?;
+
+    Ok(LoraModel {
+        layers: vec![
+            ("projection".to_string(), projection),
+            ("classifier".to_string(), classifier),
+        ],
+    })
+}
+
 /// Build a LoRA projection layer for embedding fine-tuning.
 /// Creates an identity base weight (hidden_size x hidden_size) wrapped with LoRA.
 /// At init (B=0), the projection is identity — model starts producing the same embeddings.

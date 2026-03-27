@@ -30,6 +30,11 @@ pub enum TrainingBatch {
         embeddings: Tensor,
         labels: Tensor, // shape (batch_size,) u32
     },
+    /// NER: hidden states for all tokens + per-token labels.
+    Ner {
+        hidden_states: Tensor, // (batch, seq_len, hidden)
+        labels: Tensor,        // (batch, seq_len) as i64, -100 for ignored tokens
+    },
 }
 
 /// Format of training data, detected from column names.
@@ -41,6 +46,8 @@ pub enum TrainingFormat {
     Triplet,
     /// Classification with label-to-index mapping.
     Classification { num_classes: usize },
+    /// NER with BIO tag mapping.
+    Ner { num_labels: usize },
 }
 
 /// A chunk of text data for one training batch. The training loop encodes
@@ -59,6 +66,11 @@ pub enum TextChunk {
     Classification {
         texts: Vec<String>,
         labels: Vec<u32>,
+    },
+    Ner {
+        texts: Vec<String>,
+        /// Per-text entity spans as JSON strings (same format as inference output).
+        entities_json: Vec<String>,
     },
 }
 
@@ -97,6 +109,11 @@ enum TrainingRow {
         text: String,
         label: u32,
     },
+    Ner {
+        text: String,
+        /// JSON-serialized entity spans.
+        entities_json: String,
+    },
 }
 
 impl TrainingDataLoader {
@@ -123,6 +140,21 @@ impl TrainingDataLoader {
             data: LoaderData::TextRows(
                 rows.into_iter()
                     .map(|(text, label)| TrainingRow::Classification { text, label })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Create a loader from NER rows (text + JSON entity spans).
+    pub fn from_ner(rows: Vec<(String, String)>, num_labels: usize) -> Self {
+        Self {
+            format: TrainingFormat::Ner { num_labels },
+            data: LoaderData::TextRows(
+                rows.into_iter()
+                    .map(|(text, entities_json)| TrainingRow::Ner {
+                        text,
+                        entities_json,
+                    })
                     .collect(),
             ),
         }
@@ -319,6 +351,22 @@ impl TrainingDataLoader {
                             .map(|r| match r {
                                 TrainingRow::Classification { label, .. } => *label,
                                 _ => 0,
+                            })
+                            .collect(),
+                    },
+                    TrainingFormat::Ner { .. } => TextChunk::Ner {
+                        texts: chunk
+                            .iter()
+                            .map(|r| match r {
+                                TrainingRow::Ner { text, .. } => text.clone(),
+                                _ => String::new(),
+                            })
+                            .collect(),
+                        entities_json: chunk
+                            .iter()
+                            .map(|r| match r {
+                                TrainingRow::Ner { entities_json, .. } => entities_json.clone(),
+                                _ => String::new(),
                             })
                             .collect(),
                     },

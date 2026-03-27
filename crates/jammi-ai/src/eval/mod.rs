@@ -16,12 +16,14 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum EvalTask {
     Classification,
+    Ner,
 }
 
 impl std::fmt::Display for EvalTask {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Classification => write!(f, "classification"),
+            Self::Ner => write!(f, "ner"),
         }
     }
 }
@@ -31,8 +33,9 @@ impl std::str::FromStr for EvalTask {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "classification" => Ok(Self::Classification),
+            "ner" => Ok(Self::Ner),
             other => Err(jammi_engine::error::JammiError::Other(format!(
-                "Unknown eval task '{other}'. Expected: classification"
+                "Unknown eval task '{other}'. Expected: classification, ner"
             ))),
         }
     }

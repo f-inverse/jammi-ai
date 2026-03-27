@@ -23,7 +23,10 @@ fn tiny_modernbert_id() -> String {
 }
 
 fn tiny_modernbert_classifier_id() -> String {
-    "local:".to_string() + common::fixture("tiny_modernbert_classifier").to_str().unwrap()
+    "local:".to_string()
+        + common::fixture("tiny_modernbert_classifier")
+            .to_str()
+            .unwrap()
 }
 
 async fn cookbook_session(dir: &TempDir) -> Arc<InferenceSession> {
@@ -769,8 +772,84 @@ async fn recipe_classification_inference() {
         confidence_col.value(first_ok) > 0.0,
         "Confidence should be positive"
     );
-    let json: serde_json::Value =
-        serde_json::from_str(scores_col.value(first_ok)).expect("all_scores_json should be valid JSON");
-    assert!(json.get("physics").is_some(), "Scores should contain 'physics'");
-    assert!(json.get("biology").is_some(), "Scores should contain 'biology'");
+    let json: serde_json::Value = serde_json::from_str(scores_col.value(first_ok))
+        .expect("all_scores_json should be valid JSON");
+    assert!(
+        json.get("physics").is_some(),
+        "Scores should contain 'physics'"
+    );
+    assert!(
+        json.get("biology").is_some(),
+        "Scores should contain 'biology'"
+    );
+}
+
+// ─── Recipe: NER Inference ───────────────────────────────────────────────────
+
+fn tiny_modernbert_ner_id() -> String {
+    "local:".to_string() + common::fixture("tiny_modernbert_ner").to_str().unwrap()
+}
+
+#[tokio::test]
+async fn recipe_ner_inference() {
+    let dir = TempDir::new().unwrap();
+    let session = cookbook_session(&dir).await;
+    let model_id = tiny_modernbert_ner_id();
+
+    session
+        .add_source(
+            "patents",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Raw NER inference
+    let model_source = ModelSource::parse(&model_id);
+    let results = session
+        .infer(
+            "patents",
+            &model_source,
+            ModelTask::Ner,
+            &["abstract".to_string()],
+            "id",
+        )
+        .await
+        .unwrap();
+
+    assert!(!results.is_empty());
+    let batch = &results[0];
+
+    // Verify entities column with valid JSON
+    let entities_col = batch
+        .column_by_name("entities")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let status_col = batch
+        .column_by_name("_status")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    let ok_count = (0..batch.num_rows())
+        .filter(|&i| status_col.value(i) == "ok")
+        .count();
+    assert!(ok_count > 0, "At least one row should succeed");
+
+    // Valid rows have parseable JSON entity arrays
+    for i in 0..batch.num_rows() {
+        if status_col.value(i) == "ok" {
+            let json: serde_json::Value =
+                serde_json::from_str(entities_col.value(i)).expect("valid JSON");
+            assert!(json.is_array(), "entities should be a JSON array");
+        }
+    }
 }

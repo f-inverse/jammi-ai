@@ -161,6 +161,13 @@ impl<'a> EvalRunner<'a> {
                 let result = ClassificationMetrics::compute(&aligned_predicted, &aligned_actual);
                 serde_json::to_value(&result)?
             }
+            EvalTask::Ner => {
+                return Err(JammiError::Eval(
+                    "NER evaluation via eval_inference is not yet implemented. \
+                     Use eval::metrics::ner::NerMetrics::compute() directly."
+                        .into(),
+                ));
+            }
         };
 
         // Record in catalog

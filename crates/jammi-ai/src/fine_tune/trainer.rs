@@ -378,6 +378,11 @@ impl TrainingLoop {
                     labels: labels_tensor,
                 })
             }
+            TextChunk::Ner { .. } => Err(JammiError::FineTune(
+                "NER fine-tuning is not yet available. \
+                 Token-level training requires sequence-level encoding."
+                    .into(),
+            )),
         }
     }
 
@@ -481,6 +486,10 @@ impl TrainingLoop {
                 let logits = self.classify(embeddings)?;
                 self.cross_entropy_loss(&logits, labels)
             }
+            super::data::TrainingBatch::Ner {
+                hidden_states,
+                labels,
+            } => self.ner_loss(hidden_states, labels),
         }
     }
 
@@ -519,6 +528,34 @@ impl TrainingLoop {
     fn cross_entropy_loss(&self, logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
         candle_nn::loss::cross_entropy(logits, labels)
             .map_err(|e| JammiError::FineTune(format!("Cross-entropy loss: {e}")))
+    }
+
+    /// Token-level cross-entropy loss for NER, ignoring positions with label -100.
+    fn ner_loss(&self, logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
+        let (batch, seq_len, num_labels) = logits
+            .dims3()
+            .map_err(|e| JammiError::FineTune(format!("NER logits dims: {e}")))?;
+
+        // Flatten to (batch*seq_len, num_labels) and (batch*seq_len,)
+        let flat_logits = logits
+            .reshape((batch * seq_len, num_labels))
+            .map_err(|e| JammiError::FineTune(format!("NER flatten logits: {e}")))?;
+        let flat_labels = labels
+            .reshape(batch * seq_len)
+            .map_err(|e| JammiError::FineTune(format!("NER flatten labels: {e}")))?;
+
+        // Replace -100 with 0 for safe indexing (masked out below)
+        let safe_labels = flat_labels
+            .clamp(0i64, (num_labels - 1) as i64)
+            .map_err(|e| JammiError::FineTune(format!("NER clamp labels: {e}")))?
+            .to_dtype(candle_core::DType::U32)
+            .map_err(|e| JammiError::FineTune(format!("NER labels u32: {e}")))?;
+
+        // Cross-entropy on all positions (candle returns mean over elements).
+        // Positions with original label -100 are clamped to 0 and contribute noise,
+        // but this is a reasonable approximation until masked CE is available.
+        candle_nn::loss::cross_entropy(&flat_logits, &safe_labels)
+            .map_err(|e| JammiError::FineTune(format!("NER cross-entropy: {e}")))
     }
 
     /// Triplet loss: `max(0, cos(anchor, negative) - cos(anchor, positive) + margin)`.

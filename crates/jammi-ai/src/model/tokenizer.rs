@@ -55,6 +55,7 @@ impl TokenizerWrapper {
                 .iter()
                 .map(|e| e.get_type_ids().to_vec())
                 .collect(),
+            offsets: encodings.iter().map(|e| e.get_offsets().to_vec()).collect(),
             seq_len: encodings.first().map_or(0, |e| e.len()),
         })
     }
@@ -68,6 +69,8 @@ pub struct BatchEncoding {
     pub attention_masks: Vec<Vec<u32>>,
     /// Token type IDs for segment disambiguation.
     pub type_ids: Vec<Vec<u32>>,
+    /// Character byte offsets per token: `(start, end)`. Special tokens have `(0, 0)`.
+    pub offsets: Vec<Vec<(usize, usize)>>,
     /// Padded sequence length (columns in the batch).
     pub seq_len: usize,
 }

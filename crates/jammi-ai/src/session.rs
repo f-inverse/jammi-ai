@@ -595,7 +595,10 @@ fn build_training_data_loader(
                 .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
             for i in 0..batch.num_rows() {
                 label_set.insert(label_col.value(i).to_string());
-                rows.push((text_col.value(i).to_string(), label_col.value(i).to_string()));
+                rows.push((
+                    text_col.value(i).to_string(),
+                    label_col.value(i).to_string(),
+                ));
             }
         }
         // Build label → index mapping
@@ -612,10 +615,12 @@ fn build_training_data_loader(
                 (text, idx)
             })
             .collect();
-        Ok(crate::fine_tune::data::TrainingDataLoader::from_classification(
-            indexed_rows,
-            num_classes,
-        ))
+        Ok(
+            crate::fine_tune::data::TrainingDataLoader::from_classification(
+                indexed_rows,
+                num_classes,
+            ),
+        )
     } else {
         Err(JammiError::FineTune(format!(
             "Cannot detect training format from columns: {col_names:?}. \

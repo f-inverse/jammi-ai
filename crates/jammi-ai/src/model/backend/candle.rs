@@ -129,8 +129,10 @@ pub struct CandleModel {
     pub device: Device,
     /// Optional LoRA projection applied after pooling (for fine-tuned models).
     pub lora_projection: Option<crate::fine_tune::lora::LoraLinear>,
-    /// Label index → label string mapping for classification models.
+    /// Label index → label string mapping for classification/NER models.
     id2label: Option<HashMap<u32, String>>,
+    /// Token-level classifier for NER models (applied per token, no pooling).
+    ner_classifier: Option<candle_nn::Linear>,
 }
 
 impl CandleModel {
@@ -184,9 +186,7 @@ impl CandleModel {
         match task {
             ModelTask::Embedding => self.forward_embedding(content),
             ModelTask::Classification => self.forward_classification(content),
-            other => Err(JammiError::Inference(format!(
-                "Candle forward pass not implemented for task {other:?}."
-            ))),
+            ModelTask::Ner => self.forward_ner(content),
         }
     }
 
@@ -363,6 +363,95 @@ impl CandleModel {
             shapes: vec![(num_rows, 0)],
         })
     }
+
+    fn forward_ner(&self, content: &[arrow::array::ArrayRef]) -> Result<BackendOutput> {
+        let id2label = self
+            .id2label
+            .as_ref()
+            .ok_or_else(|| JammiError::Inference("No id2label mapping for NER model".into()))?;
+        let ner_classifier = self.ner_classifier.as_ref().ok_or_else(|| {
+            JammiError::Inference("No token classifier loaded for NER model".into())
+        })?;
+
+        let texts = arrow_to_texts(content)?;
+        let num_rows = texts.len();
+
+        if num_rows == 0 {
+            return Ok(BackendOutput {
+                float_outputs: vec![],
+                string_outputs: vec![vec![]],
+                row_status: vec![],
+                row_errors: vec![],
+                shapes: vec![(0, 0)],
+            });
+        }
+
+        let mut row_status = vec![true; num_rows];
+        let mut row_errors = vec![String::new(); num_rows];
+        let mut valid_indices = Vec::new();
+        let mut valid_texts = Vec::new();
+        for (i, text) in texts.iter().enumerate() {
+            if text.is_empty() {
+                row_status[i] = false;
+                row_errors[i] = "Empty or null text input".into();
+            } else {
+                valid_indices.push(i);
+                valid_texts.push(text.as_str());
+            }
+        }
+
+        let mut all_entities_json = vec![String::new(); num_rows];
+
+        if !valid_texts.is_empty() {
+            let tokenizer = self
+                .tokenizer
+                .as_ref()
+                .ok_or_else(|| JammiError::Inference("No tokenizer loaded for NER model".into()))?;
+            let encoding = tokenizer.encode_batch(&valid_texts, Some(512))?;
+
+            let input_ids = self.tokens_to_tensor(&encoding.input_ids)?;
+            let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
+
+            // Encoder returns (batch, seq_len, hidden)
+            let hidden_states =
+                self.inner
+                    .forward_hidden(&input_ids, &attention_mask, &encoding, &self.device)?;
+
+            // Apply token classifier: (batch, seq_len, hidden) → (batch, seq_len, num_labels)
+            let logits = hidden_states.apply(ner_classifier).map_err(|e| {
+                JammiError::Inference(format!("NER classifier forward failed: {e}"))
+            })?;
+
+            let logits_vec = logits
+                .to_vec3::<f32>()
+                .map_err(|e| JammiError::Inference(format!("NER logits to vec failed: {e}")))?;
+
+            for (batch_idx, &orig_idx) in valid_indices.iter().enumerate() {
+                let token_logits = &logits_vec[batch_idx];
+                let offsets = &encoding.offsets[batch_idx];
+                let mask = &encoding.attention_masks[batch_idx];
+
+                let entities = crate::inference::ner_decode::decode_bio_spans(
+                    token_logits,
+                    offsets,
+                    mask,
+                    id2label,
+                    &texts[orig_idx],
+                );
+
+                all_entities_json[orig_idx] =
+                    serde_json::to_string(&entities).unwrap_or_else(|_| "[]".to_string());
+            }
+        }
+
+        Ok(BackendOutput {
+            float_outputs: vec![],
+            string_outputs: vec![all_entities_json],
+            row_status,
+            row_errors,
+            shapes: vec![(num_rows, 0)],
+        })
+    }
 }
 
 impl ModelBackend for CandleBackend {
@@ -399,6 +488,7 @@ impl ModelBackend for CandleBackend {
             });
 
         let is_classification = resolved.task == ModelTask::Classification && id2label.is_some();
+        let is_ner = resolved.task == ModelTask::Ner && id2label.is_some();
 
         let inner: Box<dyn CandleForward> = match model_type {
             "bert" | "roberta" | "distilbert" | "camembert" | "xlm-roberta"
@@ -538,6 +628,30 @@ impl ModelBackend for CandleBackend {
                 None
             };
 
+        // Load NER token classifier if this is a NER model
+        let ner_classifier = if is_ner {
+            let num_labels = id2label.as_ref().map_or(3, |m| m.len());
+            let hidden_size = dimensions.hidden_size;
+            // NER models use a VarBuilder scoped to the same safetensors
+            let ner_vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(&resolved.weights_paths, DType::F32, &device)
+                    .map_err(|e| JammiError::Model {
+                        model_id: resolved.model_id.0.clone(),
+                        message: format!("Failed to reload safetensors for NER classifier: {e}"),
+                    })?
+            };
+            Some(
+                candle_nn::linear(hidden_size, num_labels, ner_vb.pp("classifier")).map_err(
+                    |e| JammiError::Model {
+                        model_id: resolved.model_id.0.clone(),
+                        message: format!("Failed to load NER classifier head: {e}"),
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+
         Ok(LoadedModel::Candle(Box::new(CandleModel {
             dimensions,
             inner,
@@ -545,6 +659,7 @@ impl ModelBackend for CandleBackend {
             device,
             lora_projection,
             id2label,
+            ner_classifier,
         })))
     }
 

@@ -648,3 +648,108 @@ async fn e2e_classification_labels_match_id2label() {
         }
     }
 }
+
+// ─── NER backend ─────────────────────────────────────────────────────────────
+
+fn tiny_modernbert_ner_source() -> ModelSource {
+    ModelSource::local(common::fixture("tiny_modernbert_ner"))
+}
+
+#[tokio::test]
+async fn e2e_ner_produces_entities_json() {
+    let (session, _dir) = session_with_patents().await;
+    let model_source = tiny_modernbert_ner_source();
+
+    let results = session
+        .infer(
+            "patents",
+            &model_source,
+            ModelTask::Ner,
+            &["abstract".to_string()],
+            "id",
+        )
+        .await
+        .unwrap();
+
+    assert!(!results.is_empty(), "Should produce at least one batch");
+    let batch = &results[0];
+
+    // Verify entities column exists with valid JSON
+    let entities_col = batch
+        .column_by_name("entities")
+        .expect("entities column should exist")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let status_col = batch
+        .column_by_name("_status")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    for i in 0..batch.num_rows() {
+        if status_col.value(i) == "ok" {
+            let json: serde_json::Value =
+                serde_json::from_str(entities_col.value(i)).expect("entities should be valid JSON");
+            assert!(json.is_array(), "entities should be a JSON array");
+        }
+    }
+}
+
+#[tokio::test]
+async fn e2e_ner_entities_have_valid_spans() {
+    let (session, _dir) = session_with_patents().await;
+    let model_source = tiny_modernbert_ner_source();
+
+    let results = session
+        .infer(
+            "patents",
+            &model_source,
+            ModelTask::Ner,
+            &["abstract".to_string()],
+            "id",
+        )
+        .await
+        .unwrap();
+
+    let batch = &results[0];
+    let entities_col = batch
+        .column_by_name("entities")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let status_col = batch
+        .column_by_name("_status")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    let valid_labels = ["PER", "ORG"];
+    for i in 0..batch.num_rows() {
+        if status_col.value(i) == "ok" {
+            let entities: Vec<serde_json::Value> =
+                serde_json::from_str(entities_col.value(i)).unwrap();
+            for entity in &entities {
+                let label = entity["label"].as_str().unwrap();
+                assert!(
+                    valid_labels.contains(&label),
+                    "Entity label '{label}' not in valid set"
+                );
+                let start = entity["start"].as_u64().unwrap();
+                let end = entity["end"].as_u64().unwrap();
+                assert!(end > start, "Entity end must be > start");
+                assert!(
+                    entity["confidence"].as_f64().unwrap() > 0.0,
+                    "Entity confidence must be positive"
+                );
+                assert!(
+                    !entity["text"].as_str().unwrap().is_empty(),
+                    "Entity text must not be empty"
+                );
+            }
+        }
+    }
+}

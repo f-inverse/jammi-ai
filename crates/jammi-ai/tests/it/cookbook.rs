@@ -8,6 +8,7 @@ use std::sync::Arc;
 use arrow::array::{Array, Float32Array, ListArray, StringArray};
 use jammi_ai::fine_tune::FineTuneMethod;
 use jammi_ai::model::{ModelSource, ModelTask};
+use jammi_ai::pipeline::image_embedding::EmbeddingStrategy;
 use jammi_ai::session::InferenceSession;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
@@ -16,6 +17,10 @@ use crate::common;
 
 fn tiny_bert_id() -> String {
     "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()
+}
+
+fn tiny_open_clip_id() -> String {
+    "local:".to_string() + common::fixture("tiny_open_clip").to_str().unwrap()
 }
 
 fn tiny_modernbert_id() -> String {
@@ -852,4 +857,138 @@ async fn recipe_ner_inference() {
             assert!(json.is_array(), "entities should be a JSON array");
         }
     }
+}
+
+// ─── Recipe: Generate Image Embeddings ──────────────────────────────────────
+
+#[tokio::test]
+async fn recipe_generate_image_embeddings() {
+    let dir = TempDir::new().unwrap();
+    let session = cookbook_session(&dir).await;
+    let model_id = tiny_open_clip_id();
+
+    // Register a source with inline image data (Binary column)
+    session
+        .add_source(
+            "figures",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(common::fixture_url("figures.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Rotation-invariant strategy (cookbook recipe: patent drawings)
+    let rotated = session
+        .generate_image_embeddings(
+            "figures",
+            &model_id,
+            "image",
+            "figure_id",
+            EmbeddingStrategy::RotationInvariant {
+                angles: vec![0, 90, 180, 270],
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(rotated.status, "ready");
+    // 4 rotations × 5 images = 20 rows
+    assert_eq!(rotated.row_count, 20);
+
+    // Verify rotation-encoded row IDs
+    let sql_rotated = session
+        .sql(&format!(
+            "SELECT _row_id FROM \"jammi.{}\" ORDER BY _row_id LIMIT 4",
+            rotated.table_name
+        ))
+        .await
+        .unwrap();
+    let row_id_col = sql_rotated[0].column_by_name("_row_id").unwrap();
+    let first_id = arrow::compute::cast(row_id_col, &arrow::datatypes::DataType::Utf8)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0)
+        .to_string();
+    assert!(
+        first_id.contains("_r"),
+        "Rotation row IDs should contain '_r' suffix, got '{first_id}'"
+    );
+
+    // Basic image embedding (cookbook recipe: single strategy)
+    // Generated after rotation table so search resolves to this one (1:1 row IDs)
+    let record = session
+        .generate_image_embeddings(
+            "figures",
+            &model_id,
+            "image",
+            "figure_id",
+            EmbeddingStrategy::Single,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(record.status, "ready");
+    assert_eq!(record.row_count, 5);
+    assert!(record.dimensions.is_some());
+
+    // Parquet file exists
+    assert!(std::path::Path::new(&record.parquet_path).exists());
+
+    // Sidecar index files exist
+    let base = std::path::Path::new(record.index_path.as_ref().unwrap());
+    assert!(base.with_extension("usearch").exists());
+    assert!(base.with_extension("rowmap").exists());
+    assert!(base.with_extension("manifest.json").exists());
+
+    // Result table queryable via SQL
+    let sql_results = session
+        .sql(&format!(
+            "SELECT _row_id, _source_id FROM \"jammi.{}\" LIMIT 5",
+            record.table_name
+        ))
+        .await
+        .unwrap();
+    assert!(!sql_results.is_empty());
+    assert!(sql_results[0].num_rows() > 0);
+
+    // Encode a single image query (cookbook recipe: encode_image_query)
+    let test_image = {
+        let img = image::RgbImage::from_pixel(10, 10, image::Rgb([128, 128, 128]));
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    };
+
+    let query_vec = session
+        .encode_image_query(&model_id, &test_image)
+        .await
+        .unwrap();
+    assert_eq!(query_vec.len(), 16); // tiny model embed_dim=16
+
+    // L2-normalized
+    let norm: f32 = query_vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+    assert!(
+        (norm - 1.0).abs() < 0.01,
+        "Query vector should be L2-normalized, got norm={norm}"
+    );
+
+    // Search with the query vector (cookbook recipe: semantic search over images)
+    let results = session
+        .search("figures", query_vec, 3)
+        .await
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert!(total_rows > 0, "Search should return results");
+    assert!(results[0].schema().field_with_name("similarity").is_ok());
 }

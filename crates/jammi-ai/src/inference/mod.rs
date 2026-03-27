@@ -6,7 +6,8 @@ pub mod runner;
 pub mod schema;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, LargeBinaryArray, LargeStringArray, StringArray,
+    StringViewArray,
 };
 use arrow::datatypes::DataType;
 use image::DynamicImage;
@@ -147,6 +148,18 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<DynamicImage>>
                 let bytes = col
                     .as_any()
                     .downcast_ref::<LargeBinaryArray>()
+                    .map(|a| a.value(i))
+                    .ok_or_else(|| {
+                        JammiError::Inference(format!("Failed to read bytes at row {i}"))
+                    })?;
+                image::load_from_memory(bytes).map_err(|e| {
+                    JammiError::Inference(format!("Failed to decode image at row {i}: {e}"))
+                })?
+            }
+            DataType::BinaryView => {
+                let bytes = col
+                    .as_any()
+                    .downcast_ref::<BinaryViewArray>()
                     .map(|a| a.value(i))
                     .ok_or_else(|| {
                         JammiError::Inference(format!("Failed to read bytes at row {i}"))

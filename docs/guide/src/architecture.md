@@ -55,11 +55,12 @@ jammi-cli
 | `InferenceSession` | Wraps `JammiSession` + `ModelCache` + `ResultStore`. Entry point for all operations |
 | `ModelResolver` | Resolves model ID to file paths + backend. Chain: catalog -> local -> HF Hub |
 | `ModelCache` | LRU cache with single-flight loading, ref-counted guards |
-| `CandleBackend` / `OrtBackend` | Model backends: Candle (safetensors, BERT + ModernBERT), ONNX Runtime |
+| `CandleBackend` / `OrtBackend` | Model backends: Candle (safetensors, BERT + ModernBERT + DistilBERT + OpenCLIP ViT), ONNX Runtime |
 | `HttpBackend` | Remote backend: HTTP endpoint for embeddings |
 | `InferenceExec` | DataFusion `ExecutionPlan` operator for inference with backpressure |
 | `AnnSearchExec` | DataFusion `ExecutionPlan` leaf node for ANN vector search |
 | `EmbeddingPipeline` | Orchestrates generate_embeddings: model -> InferenceExec -> ResultSink -> index |
+| `ImageEmbeddingPipeline` | Orchestrates generate_image_embeddings: image preprocessing -> vision model -> ResultSink -> index. Supports rotation-invariant strategy |
 | `ResultSink` | Streams inference output to Parquet + sidecar index, filters failed rows |
 | `SearchBuilder` | Fluent API: join, annotate, filter, sort, limit, select, run |
 | `EvidenceRow` / `RowProvenance` | Evidence model types for provenance tracking |
@@ -115,6 +116,24 @@ InferenceSession::generate_embeddings(source, model, columns, key)
     -> Return ResultTableRecord
 ```
 
+### Image embedding generation path
+
+```
+InferenceSession::generate_image_embeddings(source, model, image_column, key, strategy)
+    -> ImageEmbeddingPipeline::run()
+    -> Register result_table (status = "building")
+    -> Scan source for key + image column
+    -> For each batch:
+    |   |-- arrow_to_images(): decode Binary/BinaryView/Utf8 column
+    |   |-- Apply strategy (Single or RotationInvariant)
+    |   |-- preprocess_clip_batch(): pad-to-square, resize, normalize
+    |   |-- OpenClipVisionTransformer::forward() -> L2 normalize
+    |   '-- Write through ResultSink -> Parquet + SidecarIndex
+    -> Close writer, save sidecar bundle
+    -> Register as DataFusion table, update catalog to "ready"
+    -> Return ResultTableRecord
+```
+
 ### Vector search path
 
 ```
@@ -143,8 +162,8 @@ crates/jammi-ai/src/
 |-- session.rs          # InferenceSession
 |-- model/              # ModelResolver, ModelCache, backends
 |-- operator/           # InferenceExec, AnnSearchExec
-|-- inference/          # Runner, observer, output adapters
-|-- pipeline/           # EmbeddingPipeline, ResultSink
+|-- inference/          # Runner, observer, output adapters, image preprocessing
+|-- pipeline/           # EmbeddingPipeline, ImageEmbeddingPipeline, ResultSink
 |-- evidence/           # Provenance types and columns
 |-- search/             # SearchBuilder
 |-- fine_tune/          # LoRA training, config, jobs

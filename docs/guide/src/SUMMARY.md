@@ -13,6 +13,7 @@
 
 - [Query Your Data with SQL](./query-data.md)
 - [Generate Embeddings](./generate-embeddings.md)
+- [Generate Image Embeddings](./generate-image-embeddings.md)
 - [Classify Text](./classify-text.md)
 - [Extract Entities (NER)](./extract-entities.md)
 - [Semantic Search](./semantic-search.md)

@@ -6,10 +6,18 @@ use arrow::array::{Array, StringArray};
 use arrow::datatypes::{DataType, Schema};
 use jammi_engine::error::{JammiError, Result};
 
+/// The input for a retrieval query — either text or image bytes.
+pub enum QueryInput {
+    /// Text query to encode via `encode_query()`.
+    Text(String),
+    /// Image bytes (PNG/JPEG) to encode via `encode_image_query()`.
+    Image(Vec<u8>),
+}
+
 /// A retrieval query with relevance judgments.
 pub struct RetrievalQuery {
     pub query_id: String,
-    pub query_text: String,
+    pub input: QueryInput,
     pub judgments: Vec<RelevanceJudgment>,
 }
 
@@ -85,15 +93,19 @@ pub fn ensure_column(schema: &Schema, name: &str, expected: DataType) -> Result<
 }
 
 /// Load a retrieval golden dataset from DataFusion query results.
+///
+/// Supports two modes:
+/// - Text queries: golden source has `query_text` (Utf8) column
+/// - Image queries: golden source has `query_image` (Binary) column
 pub fn load_retrieval_golden_from_batches(
     batches: &[arrow::array::RecordBatch],
     has_grades: bool,
+    is_image: bool,
 ) -> Result<RetrievalGolden> {
-    let mut query_map: HashMap<String, (String, Vec<RelevanceJudgment>)> = HashMap::new();
+    let mut query_map: HashMap<String, (QueryInput, Vec<RelevanceJudgment>)> = HashMap::new();
 
     for batch in batches {
         let query_ids = extract_string_column(batch, "query_id")?;
-        let query_texts = extract_string_column(batch, "query_text")?;
         let relevant_ids = extract_string_column(batch, "relevant_id")?;
 
         let grades: Vec<i32> = if has_grades {
@@ -106,27 +118,63 @@ pub fn load_retrieval_golden_from_batches(
             vec![1; batch.num_rows()]
         };
 
-        for i in 0..batch.num_rows() {
-            let entry = query_map
-                .entry(query_ids[i].clone())
-                .or_insert_with(|| (query_texts[i].clone(), Vec::new()));
-            entry.1.push(RelevanceJudgment {
-                doc_id: relevant_ids[i].clone(),
-                grade: grades[i],
-            });
+        if is_image {
+            let image_col = batch.column_by_name("query_image").ok_or_else(|| {
+                JammiError::Eval("Column 'query_image' not found in batch".into())
+            })?;
+            let image_bytes = extract_binary_column(image_col)?;
+            for i in 0..batch.num_rows() {
+                let entry = query_map
+                    .entry(query_ids[i].clone())
+                    .or_insert_with(|| (QueryInput::Image(image_bytes[i].clone()), Vec::new()));
+                entry.1.push(RelevanceJudgment {
+                    doc_id: relevant_ids[i].clone(),
+                    grade: grades[i],
+                });
+            }
+        } else {
+            let query_texts = extract_string_column(batch, "query_text")?;
+            for i in 0..batch.num_rows() {
+                let entry = query_map
+                    .entry(query_ids[i].clone())
+                    .or_insert_with(|| (QueryInput::Text(query_texts[i].clone()), Vec::new()));
+                entry.1.push(RelevanceJudgment {
+                    doc_id: relevant_ids[i].clone(),
+                    grade: grades[i],
+                });
+            }
         }
     }
 
     let queries = query_map
         .into_iter()
-        .map(|(query_id, (query_text, judgments))| RetrievalQuery {
+        .map(|(query_id, (input, judgments))| RetrievalQuery {
             query_id,
-            query_text,
+            input,
             judgments,
         })
         .collect();
 
     Ok(RetrievalGolden { queries })
+}
+
+/// Extract binary data from an Arrow column (handles Binary, LargeBinary, BinaryView).
+fn extract_binary_column(col: &dyn Array) -> Result<Vec<Vec<u8>>> {
+    use arrow::array::{BinaryArray, BinaryViewArray, LargeBinaryArray};
+
+    if let Some(arr) = col.as_any().downcast_ref::<BinaryArray>() {
+        return Ok((0..arr.len()).map(|i| arr.value(i).to_vec()).collect());
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<LargeBinaryArray>() {
+        return Ok((0..arr.len()).map(|i| arr.value(i).to_vec()).collect());
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<BinaryViewArray>() {
+        return Ok((0..arr.len()).map(|i| arr.value(i).to_vec()).collect());
+    }
+    Err(JammiError::Eval(format!(
+        "Column has type {:?}, expected Binary",
+        col.data_type()
+    )))
 }
 
 /// Load a classification golden dataset from DataFusion query results.

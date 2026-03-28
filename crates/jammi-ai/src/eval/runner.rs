@@ -42,13 +42,22 @@ impl<'a> EvalRunner<'a> {
 
         let result_store = self.session.result_store();
 
-        // 2. Load golden dataset
+        // 2. Load golden dataset — detect text vs image queries
         let golden_schema = self.source_schema(golden_source).await?;
         ensure_column(&golden_schema, "query_id", DataType::Utf8)?;
-        ensure_column(&golden_schema, "query_text", DataType::Utf8)?;
         ensure_column(&golden_schema, "relevant_id", DataType::Utf8)?;
         let has_grades = golden_schema.field_with_name("relevance_grade").is_ok();
 
+        let is_image = golden_schema.field_with_name("query_image").is_ok();
+        if !is_image {
+            ensure_column(&golden_schema, "query_text", DataType::Utf8)?;
+        }
+
+        let query_col = if is_image {
+            "\"query_image\""
+        } else {
+            "\"query_text\""
+        };
         let grade_select = if has_grades {
             ", \"relevance_grade\""
         } else {
@@ -57,22 +66,25 @@ impl<'a> EvalRunner<'a> {
         let batches = self
             .session
             .sql(&format!(
-                "SELECT \"query_id\", \"query_text\", \"relevant_id\"{grade_select} FROM {golden_source}"
+                "SELECT \"query_id\", {query_col}, \"relevant_id\"{grade_select} FROM {golden_source}"
             ))
             .await?;
 
-        let golden = load_retrieval_golden_from_batches(&batches, has_grades)?;
+        let golden = load_retrieval_golden_from_batches(&batches, has_grades, is_image)?;
 
         // 4. For each query: encode → search → compute metrics.
-        // encode_query needs a model source; reconstruct from canonical name.
         let model_source = ModelSource::from_canonical(canonical_model);
         let encode_id = model_source.to_string();
         let mut query_metrics = Vec::new();
         for query in &golden.queries {
-            let query_vec = self
-                .session
-                .encode_query(&encode_id, &query.query_text)
-                .await?;
+            let query_vec = match &query.input {
+                super::golden::QueryInput::Text(text) => {
+                    self.session.encode_query(&encode_id, text).await?
+                }
+                super::golden::QueryInput::Image(bytes) => {
+                    self.session.encode_image_query(&encode_id, bytes).await?
+                }
+            };
 
             let search_results = result_store
                 .search_vectors(self.session.context(), &table, &query_vec, k)

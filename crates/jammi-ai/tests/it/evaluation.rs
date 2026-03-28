@@ -579,3 +579,81 @@ async fn eval_compare_distinct_tables_has_nonzero_deltas() {
         "Different text columns should produce at least one non-zero delta"
     );
 }
+
+// ─── Image eval: query_image column instead of query_text ─────────────────
+
+#[tokio::test]
+async fn eval_image_embeddings_end_to_end() {
+    let dir = tempdir().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+
+    let tiny_open_clip = format!(
+        "local:{}",
+        common::fixture("tiny_open_clip").to_str().unwrap()
+    );
+
+    // Register source with inline images
+    session
+        .add_source(
+            "figures",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(common::fixture_url("figures.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Generate image embeddings (single strategy, no rotation for simplicity)
+    use jammi_ai::pipeline::image_embedding::EmbeddingStrategy;
+    let record = session
+        .generate_image_embeddings(
+            "figures",
+            &tiny_open_clip,
+            "image",
+            "figure_id",
+            EmbeddingStrategy::Single,
+        )
+        .await
+        .unwrap();
+    let table_name = record.table_name.clone();
+
+    // Register golden image relevance dataset
+    session
+        .add_source(
+            "golden_img",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(common::fixture_url("golden_image_relevance.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Run image-aware eval
+    let metrics = session
+        .eval_embeddings(
+            "figures",
+            Some(&table_name),
+            "golden_img.public.golden_image_relevance",
+            5,
+        )
+        .await
+        .unwrap();
+
+    // All four metric keys present and in valid range
+    for key in ["recall_at_k", "precision_at_k", "mrr", "ndcg"] {
+        let val = metrics[key]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{key} missing or not a number"));
+        assert!(
+            (0.0..=1.0).contains(&val),
+            "{key} = {val} out of [0, 1] range"
+        );
+    }
+}

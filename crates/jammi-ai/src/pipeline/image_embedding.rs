@@ -80,12 +80,11 @@ pub async fn expand_with_rotations(
         }
     }
 
-    // Write expanded Parquet
+    // Write expanded Parquet (absolute path required for DataFusion registration)
     let expanded_name = format!("{source_id}__rotated");
-    let parquet_path = session
-        .inner_config()
-        .artifact_dir
-        .join(format!("{expanded_name}.parquet"));
+    let artifact_dir = std::fs::canonicalize(&session.inner_config().artifact_dir)
+        .unwrap_or_else(|_| session.inner_config().artifact_dir.clone());
+    let parquet_path = artifact_dir.join(format!("{expanded_name}.parquet"));
 
     write_expanded_parquet(
         &parquet_path,

@@ -52,10 +52,10 @@ def test_generate_embeddings():
         db.add_source("patents", path=os.path.join(FIXTURES, "patents.parquet"), format="parquet")
 
         # Basic generate_embeddings
-        db.generate_embeddings(source="patents", model=TINY_BERT, columns=["abstract"], key="id")
+        db.generate_text_embeddings(source="patents", model=TINY_BERT, columns=["abstract"], key="id")
 
         # Raw inference (no persistence)
-        result = db.infer(source="patents", model=TINY_BERT, columns=["abstract"], task="embedding", key="id")
+        result = db.infer(source="patents", model=TINY_BERT, columns=["abstract"], task="text_embedding", key="id")
         assert result.num_rows > 0
         assert "_status" in result.column_names
         assert "vector" in result.column_names
@@ -68,10 +68,10 @@ def test_semantic_search():
     with tempfile.TemporaryDirectory() as tmpdir:
         db = make_db(tmpdir)
         db.add_source("patents", path=os.path.join(FIXTURES, "patents.parquet"), format="parquet")
-        db.generate_embeddings(source="patents", model=TINY_BERT, columns=["abstract"], key="id")
+        db.generate_text_embeddings(source="patents", model=TINY_BERT, columns=["abstract"], key="id")
 
         # encode_query
-        query_vec = db.encode_query(TINY_BERT, "quantum computing applications")
+        query_vec = db.encode_text_query(TINY_BERT, "quantum computing applications")
         assert len(query_vec) > 0
 
         # Basic search
@@ -105,7 +105,7 @@ def test_enrich_results():
         db = make_db(tmpdir)
         db.add_source("patents", path=os.path.join(FIXTURES, "patents.parquet"), format="parquet")
         db.add_source("companies", path=os.path.join(FIXTURES, "assignees.csv"), format="csv")
-        db.generate_embeddings(source="patents", model=TINY_BERT, columns=["abstract"], key="id")
+        db.generate_text_embeddings(source="patents", model=TINY_BERT, columns=["abstract"], key="id")
 
         query_vec = [0.5] * 32  # tiny_bert is 32-dim
 
@@ -118,7 +118,7 @@ def test_enrich_results():
 
         # Annotate
         search = db.search("patents", query=query_vec, k=10)
-        search.annotate(model=TINY_BERT, task="embedding", columns=["abstract"])
+        search.annotate(model=TINY_BERT, task="text_embedding", columns=["abstract"])
         annotated = search.run()
         assert annotated.num_rows > 0
         assert "annotated_by" in annotated.column_names
@@ -149,7 +149,7 @@ def test_fine_tune():
             base_model=TINY_BERT,
             columns=["text_a", "text_b", "score"],
             method="lora",
-            task="embedding",
+            task="text_embedding",
         )
         assert job.job_id
 
@@ -161,7 +161,7 @@ def test_fine_tune():
         assert ft_model_id.startswith("jammi:fine-tuned:")
 
         # encode_query with fine-tuned model
-        query_vec = db.encode_query(ft_model_id, "quantum computing")
+        query_vec = db.encode_text_query(ft_model_id, "quantum computing")
         assert len(query_vec) > 0
 
     print("  PASS fine-tune")
@@ -173,7 +173,7 @@ def test_evaluation():
         db = make_db(tmpdir)
         db.add_source("patents", path=os.path.join(FIXTURES, "patents.parquet"), format="parquet")
         db.add_source("golden", path=os.path.join(FIXTURES, "golden_relevance.csv"), format="csv")
-        db.generate_embeddings(source="patents", model=TINY_BERT, columns=["abstract"], key="id")
+        db.generate_text_embeddings(source="patents", model=TINY_BERT, columns=["abstract"], key="id")
 
         # eval_embeddings
         metrics = db.eval_embeddings(

@@ -1,22 +1,19 @@
-//! Image embedding pipeline with optional rotation-invariant strategy.
+//! Rotation expansion for image embedding.
 //!
-//! Generates image embeddings using a vision model (e.g., PatentCLIP),
-//! optionally expanding each image into multiple rotation variants.
+//! Rotation is data preparation — it transforms a source by creating
+//! multiple rotated copies of each image before embedding. The actual
+//! embedding generation flows through the standard `EmbeddingPipeline`.
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Schema};
-use jammi_engine::catalog::result_repo::ResultTableRecord;
+use arrow::array::{
+    Array, BinaryArray, BinaryViewArray, LargeBinaryArray, StringArray, StringViewArray,
+};
+use arrow::datatypes::DataType;
 use jammi_engine::error::{JammiError, Result};
-use jammi_engine::index::sidecar::SidecarIndex;
-use jammi_engine::store::writer::ParquetResultWriter;
-use jammi_engine::store::ResultStore;
+use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 
 use crate::inference::image_preprocess::rotate_image;
-use crate::inference::{adapter::BackendOutput, arrow_to_images};
-use crate::model::{ModelSource, ModelTask};
-use crate::pipeline::result_sink::ResultSink;
 use crate::session::InferenceSession;
 
 /// Strategy for generating embeddings from images.
@@ -34,328 +31,177 @@ impl Default for EmbeddingStrategy {
     }
 }
 
-/// Orchestrates image embedding generation with optional rotation expansion.
-pub struct ImageEmbeddingPipeline<'a> {
-    session: &'a InferenceSession,
-    result_store: &'a ResultStore,
-    strategy: EmbeddingStrategy,
+/// Expand a source by rotating each image at multiple angles.
+///
+/// Creates a new Parquet source where each original row produces N rows
+/// (one per angle). Row IDs are suffixed with `_r{angle}`. The new source
+/// is registered and its name is returned.
+pub async fn expand_with_rotations(
+    session: &InferenceSession,
+    source_id: &str,
+    image_column: &str,
+    key_column: &str,
+    angles: &[u16],
+) -> Result<String> {
+    // Scan the original source
+    let table_name = session.find_table_name(source_id)?;
+    let query = session.build_source_query(
+        source_id,
+        &table_name,
+        key_column,
+        &[image_column.to_string()],
+    );
+    let batches = session.sql(&query).await?;
+
+    // Expand: for each row × each angle, rotate and collect
+    let mut expanded_keys: Vec<String> = Vec::new();
+    let mut expanded_images: Vec<Vec<u8>> = Vec::new();
+
+    for batch in &batches {
+        let keys = extract_keys(batch, key_column)?;
+        let images = extract_image_bytes(batch, image_column)?;
+
+        for (key, image_bytes) in keys.iter().zip(&images) {
+            let img = image::load_from_memory(image_bytes).map_err(|e| {
+                JammiError::Inference(format!("Failed to decode image for key '{key}': {e}"))
+            })?;
+
+            for &angle in angles {
+                let rotated = rotate_image(&img, angle);
+                let mut buf = Vec::new();
+                rotated
+                    .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                    .map_err(|e| {
+                        JammiError::Inference(format!("Failed to encode rotated image: {e}"))
+                    })?;
+                expanded_keys.push(format!("{key}_r{angle}"));
+                expanded_images.push(buf);
+            }
+        }
+    }
+
+    // Write expanded Parquet
+    let expanded_name = format!("{source_id}__rotated");
+    let parquet_path = session
+        .inner_config()
+        .artifact_dir
+        .join(format!("{expanded_name}.parquet"));
+
+    write_expanded_parquet(
+        &parquet_path,
+        key_column,
+        image_column,
+        &expanded_keys,
+        &expanded_images,
+    )?;
+
+    // Register as a new source
+    session
+        .add_source(
+            &expanded_name,
+            SourceType::Local,
+            SourceConnection {
+                url: Some(format!("file://{}", parquet_path.display())),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+    Ok(expanded_name)
 }
 
-impl<'a> ImageEmbeddingPipeline<'a> {
-    pub fn new(
-        session: &'a InferenceSession,
-        result_store: &'a ResultStore,
-        strategy: EmbeddingStrategy,
-    ) -> Self {
-        Self {
-            session,
-            result_store,
-            strategy,
-        }
+/// Write the expanded key + image data to a Parquet file.
+fn write_expanded_parquet(
+    path: &std::path::Path,
+    key_column: &str,
+    image_column: &str,
+    keys: &[String],
+    images: &[Vec<u8>],
+) -> Result<()> {
+    use arrow::array::ArrayRef;
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(key_column, DataType::Utf8, false),
+        Field::new(image_column, DataType::Binary, false),
+    ]));
+
+    let key_array = Arc::new(StringArray::from(keys.to_vec())) as ArrayRef;
+    let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
+    let image_array = Arc::new(BinaryArray::from(image_refs)) as ArrayRef;
+
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![key_array, image_array])
+        .map_err(|e| JammiError::Inference(format!("Failed to create expanded batch: {e}")))?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    let file = std::fs::File::create(path)?;
+    let props = WriterProperties::builder().build();
+    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), Some(props))
+        .map_err(|e| JammiError::Inference(format!("Failed to create Parquet writer: {e}")))?;
+    writer
+        .write(&batch)
+        .map_err(|e| JammiError::Inference(format!("Failed to write expanded batch: {e}")))?;
+    writer
+        .close()
+        .map_err(|e| JammiError::Inference(format!("Failed to close Parquet writer: {e}")))?;
 
-    /// Run the full image embedding pipeline for a source.
-    pub async fn run(
-        &self,
-        source_id: &str,
-        model_id: &str,
-        image_column: &str,
-        key_column: &str,
-    ) -> Result<ResultTableRecord> {
-        let model_source = ModelSource::parse(model_id);
+    Ok(())
+}
 
-        // Pre-load model to get embedding dimensions
-        let guard = self
-            .session
-            .model_cache()
-            .get_or_load(&model_source, ModelTask::ImageEmbedding, None)
-            .await?;
-        let embedding_dim = guard
-            .model
-            .embedding_dim()
-            .ok_or_else(|| JammiError::Inference("Model does not support embeddings".into()))?;
-        drop(guard);
+/// Extract string keys from a RecordBatch column (handles Utf8, Utf8View).
+fn extract_keys(batch: &arrow::record_batch::RecordBatch, column: &str) -> Result<Vec<String>> {
+    let col = batch
+        .column_by_name(column)
+        .ok_or_else(|| JammiError::Inference(format!("Column '{column}' not found")))?;
 
-        // Create result table in catalog
-        let canonical_model_id = model_source.to_string();
-        let table_info = self.result_store.create_table(
-            source_id,
-            "embedding",
-            &canonical_model_id,
-            Some(embedding_dim as i32),
-            Some(key_column),
-            Some(image_column),
-        )?;
-
-        // Scan source for key + image column
-        let table_name = self.session.find_table_name(source_id)?;
-        let query = self.session.build_source_query(
-            source_id,
-            &table_name,
-            key_column,
-            &[image_column.to_string()],
-        );
-
-        let df = self
-            .session
-            .context()
-            .sql(&query)
-            .await
-            .map_err(|e| JammiError::Inference(format!("Failed to scan source: {e}")))?;
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| JammiError::Inference(format!("Failed to collect source: {e}")))?;
-
-        // Set up result sink
-        let embedding_schema = jammi_engine::store::schema::embedding_table_schema(embedding_dim);
-        let writer = ParquetResultWriter::new(&table_info.parquet_path, embedding_schema)?;
-        let sidecar = SidecarIndex::new(embedding_dim)?;
-        let checkpoint_interval = self.session.inner_config().embedding.checkpoint_interval;
-        let mut sink = ResultSink::for_embeddings(
-            writer,
-            sidecar,
-            self.session.catalog(),
-            table_info.table_name.clone(),
-            checkpoint_interval,
-        );
-
-        // Load model for inference
-        let guard = self
-            .session
-            .model_cache()
-            .get_or_load(&model_source, ModelTask::ImageEmbedding, None)
-            .await?;
-
-        let batch_size = self.session.inner_config().inference.batch_size.min(16);
-
-        for batch in &batches {
-            let keys = batch.column_by_name(key_column).ok_or_else(|| {
-                JammiError::Inference(format!("Key column '{key_column}' not found"))
-            })?;
-            let image_col = batch.column_by_name(image_column).ok_or_else(|| {
-                JammiError::Inference(format!("Image column '{image_column}' not found"))
-            })?;
-
-            let images = arrow_to_images(&[Arc::clone(image_col)])?;
-            let num_rows = images.len();
-
-            // Process in sub-batches
-            for chunk_start in (0..num_rows).step_by(batch_size) {
-                let chunk_end = (chunk_start + batch_size).min(num_rows);
-
-                match &self.strategy {
-                    EmbeddingStrategy::Single => {
-                        self.process_chunk_single(
-                            &guard.model,
-                            keys,
-                            &images[chunk_start..chunk_end],
-                            chunk_start,
-                            embedding_dim,
-                            source_id,
-                            &canonical_model_id,
-                            &mut sink,
-                        )?;
-                    }
-                    EmbeddingStrategy::RotationInvariant { angles } => {
-                        self.process_chunk_rotated(
-                            &guard.model,
-                            keys,
-                            &images[chunk_start..chunk_end],
-                            chunk_start,
-                            angles,
-                            embedding_dim,
-                            source_id,
-                            &canonical_model_id,
-                            &mut sink,
-                        )?;
-                    }
-                }
-            }
+    match col.data_type() {
+        DataType::Utf8 => {
+            let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+            Ok((0..arr.len()).map(|i| arr.value(i).to_string()).collect())
         }
-
-        drop(guard);
-
-        let (row_count, index) = sink.finalize()?;
-
-        if let Some(ref idx) = index {
-            if let Some(ref idx_path) = table_info.index_path {
-                idx.save(idx_path)?;
-            }
+        DataType::Utf8View => {
+            let arr = col.as_any().downcast_ref::<StringViewArray>().unwrap();
+            Ok((0..arr.len()).map(|i| arr.value(i).to_string()).collect())
         }
-
-        self.result_store
-            .finalize(
-                self.session.context(),
-                &table_info.table_name,
-                &table_info.parquet_path,
-                row_count,
-            )
-            .await?;
-
-        self.session
-            .catalog()
-            .get_result_table(&table_info.table_name)?
-            .ok_or_else(|| {
-                JammiError::Catalog(format!(
-                    "Result table '{}' not found after finalization",
-                    table_info.table_name
-                ))
-            })
-    }
-
-    /// Process a chunk of images without rotation (1:1 mapping).
-    #[allow(clippy::too_many_arguments)]
-    fn process_chunk_single(
-        &self,
-        model: &crate::model::LoadedModel,
-        keys: &ArrayRef,
-        images: &[Option<image::DynamicImage>],
-        offset: usize,
-        embedding_dim: usize,
-        source_id: &str,
-        model_id: &str,
-        sink: &mut ResultSink<'_>,
-    ) -> Result<()> {
-        // Build a binary array from the valid images
-        let mut row_ids = Vec::with_capacity(images.len());
-        for i in 0..images.len() {
-            let key = get_key_string(keys, offset + i)?;
-            row_ids.push(key);
+        _ => {
+            let casted = arrow::compute::cast(col, &DataType::Utf8)
+                .map_err(|e| JammiError::Inference(format!("Failed to cast key column: {e}")))?;
+            let arr = casted.as_any().downcast_ref::<StringArray>().unwrap();
+            Ok((0..arr.len()).map(|i| arr.value(i).to_string()).collect())
         }
-
-        let image_arrays = self.images_to_binary_array(images)?;
-        let output = model.forward(&[image_arrays], ModelTask::ImageEmbedding)?;
-
-        let result_batch =
-            self.build_result_batch(&row_ids, source_id, model_id, &output, embedding_dim)?;
-        sink.write_batch(&result_batch)
-    }
-
-    /// Process a chunk with rotation expansion (N:1 per image).
-    #[allow(clippy::too_many_arguments)]
-    fn process_chunk_rotated(
-        &self,
-        model: &crate::model::LoadedModel,
-        keys: &ArrayRef,
-        images: &[Option<image::DynamicImage>],
-        offset: usize,
-        angles: &[u16],
-        embedding_dim: usize,
-        source_id: &str,
-        model_id: &str,
-        sink: &mut ResultSink<'_>,
-    ) -> Result<()> {
-        // For each angle, rotate all images and embed as a batch
-        for &angle in angles {
-            let mut row_ids = Vec::with_capacity(images.len());
-            let mut rotated_images: Vec<Option<image::DynamicImage>> =
-                Vec::with_capacity(images.len());
-
-            for (i, img) in images.iter().enumerate() {
-                let key = get_key_string(keys, offset + i)?;
-                row_ids.push(format!("{key}_r{angle}"));
-                rotated_images.push(img.as_ref().map(|im| rotate_image(im, angle)));
-            }
-
-            let image_arrays = self.images_to_binary_array(&rotated_images)?;
-            let output = model.forward(&[image_arrays], ModelTask::ImageEmbedding)?;
-
-            let result_batch =
-                self.build_result_batch(&row_ids, source_id, model_id, &output, embedding_dim)?;
-            sink.write_batch(&result_batch)?;
-        }
-        Ok(())
-    }
-
-    /// Convert a slice of optional images to an Arrow BinaryArray.
-    /// Valid images are PNG-encoded; None values become null.
-    fn images_to_binary_array(&self, images: &[Option<image::DynamicImage>]) -> Result<ArrayRef> {
-        let mut builder = arrow::array::BinaryBuilder::new();
-        for img in images {
-            match img {
-                Some(im) => {
-                    let mut buf = Vec::new();
-                    im.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
-                        .map_err(|e| {
-                            JammiError::Inference(format!("Failed to encode image to PNG: {e}"))
-                        })?;
-                    builder.append_value(&buf);
-                }
-                None => builder.append_null(),
-            }
-        }
-        Ok(Arc::new(builder.finish()) as ArrayRef)
-    }
-
-    /// Build a result RecordBatch in the embedding output schema.
-    fn build_result_batch(
-        &self,
-        row_ids: &[String],
-        source_id: &str,
-        model_id: &str,
-        output: &BackendOutput,
-        embedding_dim: usize,
-    ) -> Result<RecordBatch> {
-        use crate::inference::schema::build_prefix_columns;
-
-        let row_count = row_ids.len();
-        let keys_array = Arc::new(StringArray::from(row_ids.to_vec())) as ArrayRef;
-
-        let prefix = build_prefix_columns(
-            &keys_array,
-            source_id,
-            model_id,
-            &output.row_status,
-            &output.row_errors,
-            0.0, // latency tracked elsewhere
-            row_count,
-        );
-
-        let adapter = crate::inference::adapter::EmbeddingAdapter::new(embedding_dim);
-        let task_columns =
-            crate::inference::adapter::OutputAdapter::adapt(&adapter, output, row_count)?;
-
-        let mut all_columns = prefix;
-        all_columns.extend(task_columns);
-
-        let schema = crate::inference::schema::build_output_schema(
-            &ModelTask::ImageEmbedding,
-            &Arc::new(Schema::empty()),
-            "",
-            Some(embedding_dim),
-        )?;
-
-        RecordBatch::try_new(schema, all_columns)
-            .map_err(|e| JammiError::Inference(format!("Failed to build result batch: {e}")))
     }
 }
 
-/// Extract a string key from an Arrow array at the given index.
-fn get_key_string(keys: &ArrayRef, i: usize) -> Result<String> {
-    use arrow::array::Array;
-    if keys.is_null(i) {
-        return Ok(String::new());
-    }
-    match keys.data_type() {
-        DataType::Utf8 => Ok(keys
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .map(|a| a.value(i).to_string())
-            .unwrap_or_default()),
-        DataType::Int64 => Ok(keys
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .map(|a| a.value(i).to_string())
-            .unwrap_or_default()),
-        _ => Ok(arrow::compute::cast(keys, &DataType::Utf8)
-            .ok()
-            .and_then(|casted| {
-                casted
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .map(|a| a.value(i).to_string())
-            })
-            .unwrap_or_else(|| format!("row_{i}"))),
+/// Extract raw image bytes from a RecordBatch column (handles Binary, BinaryView, LargeBinary).
+fn extract_image_bytes(
+    batch: &arrow::record_batch::RecordBatch,
+    column: &str,
+) -> Result<Vec<Vec<u8>>> {
+    let col = batch
+        .column_by_name(column)
+        .ok_or_else(|| JammiError::Inference(format!("Column '{column}' not found")))?;
+
+    match col.data_type() {
+        DataType::Binary => {
+            let arr = col.as_any().downcast_ref::<BinaryArray>().unwrap();
+            Ok((0..arr.len()).map(|i| arr.value(i).to_vec()).collect())
+        }
+        DataType::BinaryView => {
+            let arr = col.as_any().downcast_ref::<BinaryViewArray>().unwrap();
+            Ok((0..arr.len()).map(|i| arr.value(i).to_vec()).collect())
+        }
+        DataType::LargeBinary => {
+            let arr = col.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            Ok((0..arr.len()).map(|i| arr.value(i).to_vec()).collect())
+        }
+        dt => Err(JammiError::Inference(format!(
+            "Column '{column}' has type {dt}, expected Binary"
+        ))),
     }
 }

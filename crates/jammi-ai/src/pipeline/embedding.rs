@@ -13,17 +13,26 @@ use crate::operator::inference_exec::InferenceExecBuilder;
 use crate::pipeline::result_sink::ResultSink;
 use crate::session::InferenceSession;
 
-/// Orchestrates `generate_embeddings()`: model → InferenceExec → ResultSink → index.
+/// Orchestrates embedding generation: source scan → InferenceExec → ResultSink → index.
+///
+/// Modality-agnostic — works for both text (`ModelTask::Embedding`) and
+/// image (`ModelTask::ImageEmbedding`) by dispatching through InferenceExec.
 pub struct EmbeddingPipeline<'a> {
     session: &'a InferenceSession,
     result_store: &'a ResultStore,
+    task: ModelTask,
 }
 
 impl<'a> EmbeddingPipeline<'a> {
-    pub fn new(session: &'a InferenceSession, result_store: &'a ResultStore) -> Self {
+    pub fn new(
+        session: &'a InferenceSession,
+        result_store: &'a ResultStore,
+        task: ModelTask,
+    ) -> Self {
         Self {
             session,
             result_store,
+            task,
         }
     }
 
@@ -42,7 +51,7 @@ impl<'a> EmbeddingPipeline<'a> {
         let guard = self
             .session
             .model_cache()
-            .get_or_load(&model_source, ModelTask::Embedding, None)
+            .get_or_load(&model_source, self.task, None)
             .await?;
         let embedding_dim = guard
             .model
@@ -86,7 +95,7 @@ impl<'a> EmbeddingPipeline<'a> {
         let inference_exec = InferenceExecBuilder::new(
             input_plan,
             model_source,
-            ModelTask::Embedding,
+            self.task,
             columns.to_vec(),
             key_column.to_string(),
             source_id.to_string(),

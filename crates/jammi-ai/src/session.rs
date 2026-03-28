@@ -20,7 +20,7 @@ use crate::model::resolver::ModelResolver;
 use crate::model::{ModelSource, ModelTask};
 use crate::operator::inference_exec::InferenceExecBuilder;
 use crate::pipeline::embedding::EmbeddingPipeline;
-use crate::pipeline::image_embedding::{EmbeddingStrategy, ImageEmbeddingPipeline};
+use crate::pipeline::image_embedding::{self, EmbeddingStrategy};
 use crate::search::SearchBuilder;
 use jammi_engine::cache::ann_cache::AnnCache;
 
@@ -175,7 +175,7 @@ impl InferenceSession {
         columns: &[String],
         key_column: &str,
     ) -> Result<ResultTableRecord> {
-        let result = EmbeddingPipeline::new(self, &self.result_store)
+        let result = EmbeddingPipeline::new(self, &self.result_store, ModelTask::Embedding)
             .run(source_id, model_id, columns, key_column)
             .await?;
         self.ann_cache.invalidate_source(source_id)?;
@@ -192,8 +192,31 @@ impl InferenceSession {
         key_column: &str,
         strategy: EmbeddingStrategy,
     ) -> Result<ResultTableRecord> {
-        let result = ImageEmbeddingPipeline::new(self, &self.result_store, strategy)
-            .run(source_id, model_id, image_column, key_column)
+        let (effective_source, effective_key, effective_col) = match &strategy {
+            EmbeddingStrategy::Single => (
+                source_id.to_string(),
+                key_column.to_string(),
+                image_column.to_string(),
+            ),
+            EmbeddingStrategy::RotationInvariant { angles } => {
+                let expanded = image_embedding::expand_with_rotations(
+                    self,
+                    source_id,
+                    image_column,
+                    key_column,
+                    angles,
+                )
+                .await?;
+                (expanded, key_column.to_string(), image_column.to_string())
+            }
+        };
+        let result = EmbeddingPipeline::new(self, &self.result_store, ModelTask::ImageEmbedding)
+            .run(
+                &effective_source,
+                model_id,
+                &[effective_col],
+                &effective_key,
+            )
             .await?;
         self.ann_cache.invalidate_source(source_id)?;
         Ok(result)

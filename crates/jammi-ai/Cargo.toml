@@ -31,6 +31,9 @@ chrono.workspace = true
 # Image processing
 image.workspace = true
 
+# Parquet (for rotation expansion)
+parquet.workspace = true
+
 # HTTP backend
 reqwest.workspace = true
 

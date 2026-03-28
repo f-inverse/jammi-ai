@@ -57,7 +57,7 @@ fn result_table_crud_lifecycle() {
             table_name: "t1",
             source_id: "patents",
             model_id: "sentence-transformers/all-MiniLM-L6-v2",
-            task: "embedding",
+            task: "text_embedding",
             parquet_path: "/tmp/test.parquet",
             index_path: Some("/tmp/test"),
             dimensions: Some(384),
@@ -114,9 +114,9 @@ fn find_result_tables_filters_by_source_and_task() {
     let catalog = Catalog::open(dir.path()).unwrap();
 
     for (name, source, task) in [
-        ("t1", "patents", "embedding"),
+        ("t1", "patents", "text_embedding"),
         ("t2", "patents", "classification"),
-        ("t3", "scores", "embedding"),
+        ("t3", "scores", "text_embedding"),
     ] {
         catalog
             .create_result_table(CreateResultTableParams {
@@ -141,7 +141,7 @@ fn find_result_tables_filters_by_source_and_task() {
         2
     );
     let emb = catalog
-        .find_result_tables("patents", Some("embedding"), None)
+        .find_result_tables("patents", Some("text_embedding"), None)
         .unwrap();
     assert_eq!(emb.len(), 1);
     assert_eq!(emb[0].table_name, "t1");
@@ -162,7 +162,7 @@ fn resolve_embedding_table_latest_explicit_and_missing() {
                 table_name: name,
                 source_id: "patents",
                 model_id: "model",
-                task: "embedding",
+                task: "text_embedding",
                 parquet_path: &format!("/tmp/{name}.parquet"),
                 index_path: None,
                 dimensions: Some(384),
@@ -196,7 +196,7 @@ async fn result_store_create_table_generates_correct_paths() {
     let info = store
         .create_table(
             "patents",
-            "embedding",
+            "text_embedding",
             "sentence-transformers/all-MiniLM-L6-v2",
             None,
             None,
@@ -206,7 +206,7 @@ async fn result_store_create_table_generates_correct_paths() {
 
     assert!(info
         .table_name
-        .starts_with("patents__embedding__sentence-transformers_all-MiniLM-L6-v2__"));
+        .starts_with("patents__text_embedding__sentence-transformers_all-MiniLM-L6-v2__"));
     assert!(info.parquet_path.parent().unwrap().exists());
     assert!(
         info.index_path.is_some(),
@@ -226,7 +226,7 @@ async fn recovery_marks_missing_parquet_as_failed() {
             table_name: "orphan",
             source_id: "src",
             model_id: "model",
-            task: "embedding",
+            task: "text_embedding",
             parquet_path: dir.path().join("nonexistent.parquet").to_str().unwrap(),
             index_path: None,
             dimensions: None,
@@ -259,7 +259,7 @@ async fn recovery_deletes_invalid_parquet_and_marks_failed() {
             table_name: "corrupt",
             source_id: "src",
             model_id: "model",
-            task: "embedding",
+            task: "text_embedding",
             parquet_path: bad_path.to_str().unwrap(),
             index_path: None,
             dimensions: None,

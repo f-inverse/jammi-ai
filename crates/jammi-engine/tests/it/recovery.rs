@@ -20,7 +20,7 @@ async fn crash_recovery_cleans_up_stale_result_tables_and_fine_tune_jobs() {
             version: 1,
             model_type: "embedding",
             backend: "candle",
-            task: "embedding",
+            task: "text_embedding",
             ..Default::default()
         })
         .unwrap();
@@ -28,7 +28,7 @@ async fn crash_recovery_cleans_up_stale_result_tables_and_fine_tune_jobs() {
     // Create a result table (status = Building via default, no Parquet file on disk)
     let result_store = ResultStore::new(dir.path(), Arc::clone(&catalog)).unwrap();
     let table_info = result_store
-        .create_table("src1", "embedding", "test-model", None, None, None)
+        .create_table("src1", "text_embedding", "test-model", None, None, None)
         .unwrap();
 
     // Create a fine-tune job and transition to Running (simulates crashed training)

@@ -37,7 +37,7 @@ impl HttpBackend {
         task: ModelTask,
     ) -> Result<BackendOutput> {
         match task {
-            ModelTask::Embedding => self.forward_embeddings(base_url, inputs, model_id).await,
+            ModelTask::TextEmbedding => self.forward_embeddings(base_url, inputs, model_id).await,
             other => Err(JammiError::Backend(format!(
                 "HTTP backend only supports embedding task, got {other}"
             ))),

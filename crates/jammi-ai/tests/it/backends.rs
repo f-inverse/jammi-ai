@@ -32,7 +32,7 @@ async fn http_backend_embedding_and_errors() {
             &base_url,
             &["hello".into(), "world".into()],
             "test-model",
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
         )
         .await
         .unwrap();
@@ -86,7 +86,7 @@ async fn http_backend_embedding_and_errors() {
             &error_server.uri(),
             &["test".into()],
             "test-model",
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
         )
         .await;
     match result {

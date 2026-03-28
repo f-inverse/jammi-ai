@@ -20,14 +20,14 @@ async fn resolve_hf_hub_sentence_transformer() {
 
     let source = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");
     let resolved = resolver
-        .resolve(&source, ModelTask::Embedding, None)
+        .resolve(&source, ModelTask::TextEmbedding, None)
         .unwrap();
 
     assert_eq!(
         resolved.model_id,
         ModelId("sentence-transformers/all-MiniLM-L6-v2".into())
     );
-    assert_eq!(resolved.task, ModelTask::Embedding);
+    assert_eq!(resolved.task, ModelTask::TextEmbedding);
     assert!(
         !resolved.weights_paths.is_empty(),
         "Should have at least one weights file"
@@ -52,7 +52,7 @@ async fn resolve_hf_hub_selects_candle_for_safetensors_model() {
 
     let source = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");
     let resolved = resolver
-        .resolve(&source, ModelTask::Embedding, None)
+        .resolve(&source, ModelTask::TextEmbedding, None)
         .unwrap();
 
     assert_eq!(resolved.backend, BackendType::Candle);
@@ -75,7 +75,7 @@ async fn resolve_local_path_with_safetensors() {
 
     let source = ModelSource::local(&model_dir);
     let resolved = resolver
-        .resolve(&source, ModelTask::Embedding, None)
+        .resolve(&source, ModelTask::TextEmbedding, None)
         .unwrap();
 
     assert_eq!(resolved.backend, BackendType::Candle);
@@ -99,7 +99,7 @@ async fn resolve_local_path_with_onnx() {
 
     let source = ModelSource::local(&model_dir);
     let resolved = resolver
-        .resolve(&source, ModelTask::Embedding, None)
+        .resolve(&source, ModelTask::TextEmbedding, None)
         .unwrap();
 
     assert_eq!(resolved.backend, BackendType::Ort);
@@ -126,7 +126,7 @@ async fn backend_hint_overrides_heuristic() {
 
     let source = ModelSource::local(&model_dir);
     let resolved = resolver
-        .resolve(&source, ModelTask::Embedding, Some(BackendType::Candle))
+        .resolve(&source, ModelTask::TextEmbedding, Some(BackendType::Candle))
         .unwrap();
 
     assert_eq!(
@@ -208,7 +208,7 @@ async fn cache_get_or_load_returns_guard_with_ref_count() {
     let guard = cache
         .get_or_load(
             &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             None,
         )
         .await
@@ -219,7 +219,7 @@ async fn cache_get_or_load_returns_guard_with_ref_count() {
     let guard2 = cache
         .get_or_load(
             &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             None,
         )
         .await
@@ -244,7 +244,7 @@ async fn cache_ref_count_decrements_on_guard_drop() {
     let guard1 = cache
         .get_or_load(
             &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             None,
         )
         .await
@@ -253,7 +253,7 @@ async fn cache_ref_count_decrements_on_guard_drop() {
     let guard2 = cache
         .get_or_load(
             &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             None,
         )
         .await
@@ -264,7 +264,7 @@ async fn cache_ref_count_decrements_on_guard_drop() {
     let guard3 = cache
         .get_or_load(
             &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             None,
         )
         .await
@@ -322,7 +322,7 @@ async fn preload_loads_model_into_cache_without_returning_guard() {
     cache
         .preload(
             &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             None,
         )
         .await
@@ -331,7 +331,7 @@ async fn preload_loads_model_into_cache_without_returning_guard() {
     let guard = cache
         .get_or_load(
             &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             None,
         )
         .await
@@ -363,7 +363,7 @@ async fn single_flight_concurrent_loads_coalesce() {
             cache1
                 .get_or_load(
                     &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-                    ModelTask::Embedding,
+                    ModelTask::TextEmbedding,
                     None,
                 )
                 .await
@@ -372,7 +372,7 @@ async fn single_flight_concurrent_loads_coalesce() {
             cache2
                 .get_or_load(
                     &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-                    ModelTask::Embedding,
+                    ModelTask::TextEmbedding,
                     None,
                 )
                 .await
@@ -402,7 +402,7 @@ async fn eviction_skips_model_with_active_guard() {
     let guard = cache
         .get_or_load(
             &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             None,
         )
         .await
@@ -425,7 +425,7 @@ fn resolve_local_missing_config_returns_error() {
     let resolver = ModelResolver::new(catalog).unwrap();
 
     let source = ModelSource::local(&model_dir);
-    let result = resolver.resolve(&source, ModelTask::Embedding, None);
+    let result = resolver.resolve(&source, ModelTask::TextEmbedding, None);
     assert!(
         result.is_err(),
         "Missing config.json should fail resolution"
@@ -442,7 +442,7 @@ fn resolve_local_empty_directory_returns_error() {
     let resolver = ModelResolver::new(catalog).unwrap();
 
     let source = ModelSource::local(&model_dir);
-    let result = resolver.resolve(&source, ModelTask::Embedding, None);
+    let result = resolver.resolve(&source, ModelTask::TextEmbedding, None);
     assert!(result.is_err(), "Empty directory should fail resolution");
 }
 
@@ -453,7 +453,7 @@ fn resolve_nonexistent_local_path_returns_error() {
     let resolver = ModelResolver::new(catalog).unwrap();
 
     let source = ModelSource::local("/nonexistent/path/to/model");
-    let result = resolver.resolve(&source, ModelTask::Embedding, None);
+    let result = resolver.resolve(&source, ModelTask::TextEmbedding, None);
     assert!(result.is_err(), "Nonexistent path should fail resolution");
 }
 
@@ -473,7 +473,7 @@ async fn cache_load_failure_clears_in_flight_state() {
     let result = cache
         .get_or_load(
             &ModelSource::hf("nonexistent-org/nonexistent-model-xyz"),
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             None,
         )
         .await;
@@ -482,7 +482,7 @@ async fn cache_load_failure_clears_in_flight_state() {
     let guard = cache
         .get_or_load(
             &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             None,
         )
         .await

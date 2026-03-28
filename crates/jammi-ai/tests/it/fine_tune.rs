@@ -260,7 +260,7 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
                 "score".to_string(),
             ],
             FineTuneMethod::Lora,
-            "embedding",
+            "text_embedding",
             Some(FineTuneConfig {
                 epochs: 2,
                 batch_size: 8,
@@ -336,11 +336,11 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
     // needs the name part. Extract the name (everything before ::).
     let ft_name = ft_model_id.split("::").next().unwrap();
     let base_embedding = session
-        .encode_query(&model, "quantum computing")
+        .encode_text_query(&model, "quantum computing")
         .await
         .unwrap();
     let ft_embedding = session
-        .encode_query(ft_name, "quantum computing")
+        .encode_text_query(ft_name, "quantum computing")
         .await
         .unwrap();
 
@@ -380,7 +380,7 @@ fn fine_tune_job_catalog_crud() {
             version: 1,
             model_type: "embedding",
             backend: "candle",
-            task: "embedding",
+            task: "text_embedding",
             ..Default::default()
         })
         .unwrap();
@@ -539,7 +539,7 @@ fn training_divergence_detection() {
             version: 1,
             model_type: "embedding",
             backend: "candle",
-            task: "embedding",
+            task: "text_embedding",
             ..Default::default()
         })
         .unwrap();
@@ -640,7 +640,7 @@ fn training_early_stopping_triggers() {
             version: 1,
             model_type: "embedding",
             backend: "candle",
-            task: "embedding",
+            task: "text_embedding",
             ..Default::default()
         })
         .unwrap();
@@ -723,7 +723,7 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
 
     // Generate base embeddings
     let base_rec = session
-        .generate_embeddings("patents", &model, &["abstract".to_string()], "id")
+        .generate_text_embeddings("patents", &model, &["abstract".to_string()], "id")
         .await
         .unwrap();
 
@@ -742,7 +742,7 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
             &model,
             &columns,
             FineTuneMethod::Lora,
-            "embedding",
+            "text_embedding",
             Some(FineTuneConfig {
                 epochs: 10,
                 batch_size: 8,
@@ -759,7 +759,7 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
 
     // Generate embeddings with the fine-tuned model
     let ft_rec = session
-        .generate_embeddings("patents", job.model_id(), &["abstract".to_string()], "id")
+        .generate_text_embeddings("patents", job.model_id(), &["abstract".to_string()], "id")
         .await
         .unwrap();
 

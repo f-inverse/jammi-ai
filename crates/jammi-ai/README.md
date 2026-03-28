@@ -22,12 +22,12 @@ session.add_source("patents", SourceType::Local, SourceConnection {
     ..Default::default()
 }).await?;
 
-session.generate_embeddings(
+session.generate_text_embeddings(
     "patents", "sentence-transformers/all-MiniLM-L6-v2", &["abstract".into()], "id",
 ).await?;
 
 // Semantic search
-let query = session.encode_query("sentence-transformers/all-MiniLM-L6-v2", "quantum computing").await?;
+let query = session.encode_text_query("sentence-transformers/all-MiniLM-L6-v2", "quantum computing").await?;
 let results = session.search("patents", query, 10).await?
     .sort("similarity", true)?
     .limit(5)

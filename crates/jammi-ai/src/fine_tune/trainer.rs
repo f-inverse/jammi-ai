@@ -316,7 +316,7 @@ impl TrainingLoop {
         let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         let arr = Arc::new(StringArray::from(text_refs)) as ArrayRef;
         let output = base
-            .forward(&[arr], ModelTask::Embedding)
+            .forward(&[arr], ModelTask::TextEmbedding)
             .map_err(|e| JammiError::FineTune(format!("Encode: {e}")))?;
 
         let n = output.shapes[0].0;

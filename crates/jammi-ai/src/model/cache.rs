@@ -169,7 +169,7 @@ impl ModelCache {
 
         // Register model in catalog (idempotent — ignores if already registered)
         let backend_str = format!("{:?}", resolved.backend).to_lowercase();
-        let task_str = format!("{task:?}").to_lowercase();
+        let task_str = task.to_string();
         let model_type = match source {
             ModelSource::HuggingFace(_) => "huggingface",
             ModelSource::Local(_) => "local",

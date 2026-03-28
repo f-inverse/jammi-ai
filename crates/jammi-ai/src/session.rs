@@ -142,12 +142,12 @@ impl InferenceSession {
     }
 
     /// Encode a single text query into a vector using the given model.
-    pub async fn encode_query(&self, model_id: &str, text: &str) -> Result<Vec<f32>> {
+    pub async fn encode_text_query(&self, model_id: &str, text: &str) -> Result<Vec<f32>> {
         let model_source = ModelSource::parse(model_id);
 
         let guard = self
             .model_cache
-            .get_or_load(&model_source, ModelTask::Embedding, None)
+            .get_or_load(&model_source, ModelTask::TextEmbedding, None)
             .await?;
 
         // Build a single-row input with the text
@@ -155,7 +155,7 @@ impl InferenceSession {
             as arrow::array::ArrayRef;
         let output = guard
             .model
-            .forward(&[text_array], ModelTask::Embedding)
+            .forward(&[text_array], ModelTask::TextEmbedding)
             .map_err(|e| JammiError::Inference(format!("encode_query forward: {e}")))?;
 
         // Extract the first (and only) vector from the output
@@ -168,14 +168,14 @@ impl InferenceSession {
 
     /// Generate embeddings for a source and persist to Jammi DB.
     /// Invalidates the ANN cache for this source after completion.
-    pub async fn generate_embeddings(
+    pub async fn generate_text_embeddings(
         &self,
         source_id: &str,
         model_id: &str,
         columns: &[String],
         key_column: &str,
     ) -> Result<ResultTableRecord> {
-        let result = EmbeddingPipeline::new(self, &self.result_store, ModelTask::Embedding)
+        let result = EmbeddingPipeline::new(self, &self.result_store, ModelTask::TextEmbedding)
             .run(source_id, model_id, columns, key_column)
             .await?;
         self.ann_cache.invalidate_source(source_id)?;
@@ -310,7 +310,7 @@ impl InferenceSession {
 
         // Persist results to Parquet
         if !batches.is_empty() {
-            let task_str = format!("{task:?}").to_lowercase();
+            let task_str = task.to_string();
             let table_info = self.result_store.create_table(
                 source_id,
                 &task_str,
@@ -458,7 +458,7 @@ impl InferenceSession {
         // Load base model to get hidden_size and pass to training loop
         let guard = self
             .model_cache
-            .get_or_load(&model_source, ModelTask::Embedding, None)
+            .get_or_load(&model_source, ModelTask::TextEmbedding, None)
             .await?;
         let base_model_arc = Arc::clone(&guard.model);
         let hidden_size = guard

@@ -43,7 +43,7 @@ async fn generate_embeddings_produces_complete_result() {
     let (session, _dir) = session_with_patents().await;
 
     let record = session
-        .generate_embeddings(
+        .generate_text_embeddings(
             "patents",
             &tiny_bert_model(),
             &["abstract".to_string()],
@@ -75,7 +75,7 @@ async fn generate_embeddings_produces_complete_result() {
 
     // Metadata tracked
     assert_eq!(record.source_id, "patents");
-    assert_eq!(record.task, "embedding");
+    assert_eq!(record.task, "text_embedding");
     assert!(record.key_column.as_deref() == Some("id"));
     assert!(record.text_columns.as_deref() == Some("abstract"));
 
@@ -130,7 +130,7 @@ async fn multiple_tables_and_sidecar_fallback() {
     let (session, _dir) = session_with_patents().await;
 
     let r1 = session
-        .generate_embeddings(
+        .generate_text_embeddings(
             "patents",
             &tiny_bert_model(),
             &["abstract".to_string()],
@@ -140,7 +140,7 @@ async fn multiple_tables_and_sidecar_fallback() {
         .unwrap();
 
     let r2 = session
-        .generate_embeddings("patents", &tiny_bert_model(), &["title".to_string()], "id")
+        .generate_text_embeddings("patents", &tiny_bert_model(), &["title".to_string()], "id")
         .await
         .unwrap();
 
@@ -148,7 +148,7 @@ async fn multiple_tables_and_sidecar_fallback() {
     assert_ne!(r1.table_name, r2.table_name);
     let tables = session
         .catalog()
-        .find_result_tables("patents", Some("embedding"), None)
+        .find_result_tables("patents", Some("text_embedding"), None)
         .unwrap();
     assert!(tables.len() >= 2);
 
@@ -194,7 +194,7 @@ async fn failed_rows_skipped_in_embedding_output() {
         .unwrap();
 
     let record = session
-        .generate_embeddings(
+        .generate_text_embeddings(
             "patents_nulls",
             &tiny_bert_model(),
             &["abstract".to_string()],
@@ -223,7 +223,7 @@ async fn infer_persists_results_to_parquet() {
         .infer(
             "patents",
             &model_source,
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
         )
@@ -234,7 +234,7 @@ async fn infer_persists_results_to_parquet() {
 
     let tables = session
         .catalog()
-        .find_result_tables("patents", Some("embedding"), None)
+        .find_result_tables("patents", Some("text_embedding"), None)
         .unwrap();
     assert!(!tables.is_empty(), "Should have created a result table");
     assert_eq!(tables[0].status, "ready");
@@ -264,7 +264,7 @@ async fn existing_tables_loaded_on_new_session() {
             .unwrap();
 
         session
-            .generate_embeddings(
+            .generate_text_embeddings(
                 "patents",
                 &tiny_bert_model(),
                 &["abstract".to_string()],
@@ -279,7 +279,7 @@ async fn existing_tables_loaded_on_new_session() {
         let session = InferenceSession::new(config).await.unwrap();
         let tables = session
             .catalog()
-            .find_result_tables("patents", Some("embedding"), None)
+            .find_result_tables("patents", Some("text_embedding"), None)
             .unwrap();
         assert!(!tables.is_empty());
 
@@ -321,7 +321,7 @@ async fn concurrent_embedding_generation_on_same_source() {
     let model_a = model.clone();
     let task_a = tokio::spawn(async move {
         session_a
-            .generate_embeddings("patents", &model_a, &["title".to_string()], "id")
+            .generate_text_embeddings("patents", &model_a, &["title".to_string()], "id")
             .await
     });
 
@@ -329,7 +329,7 @@ async fn concurrent_embedding_generation_on_same_source() {
     let model_b = model.clone();
     let task_b = tokio::spawn(async move {
         session_b
-            .generate_embeddings("patents", &model_b, &["abstract".to_string()], "id")
+            .generate_text_embeddings("patents", &model_b, &["abstract".to_string()], "id")
             .await
     });
 
@@ -434,7 +434,7 @@ async fn large_batch_embedding_completes_without_oom() {
         .unwrap();
 
     let record = session
-        .generate_embeddings(
+        .generate_text_embeddings(
             "large_batch",
             &tiny_bert_model(),
             &["text".to_string()],

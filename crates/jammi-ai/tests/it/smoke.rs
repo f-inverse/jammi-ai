@@ -32,7 +32,7 @@ async fn smoke_cp3_full_pipeline() {
     // Generate embeddings
     let tiny_bert = "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap();
     let record = session
-        .generate_embeddings("patents", &tiny_bert, &["abstract".to_string()], "id")
+        .generate_text_embeddings("patents", &tiny_bert, &["abstract".to_string()], "id")
         .await
         .unwrap();
 

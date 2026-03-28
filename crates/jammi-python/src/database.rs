@@ -41,9 +41,9 @@ impl PyDatabase {
         batches_to_pyarrow(py, &batches)
     }
 
-    /// Generate embeddings for a registered source.
+    /// Generate text embeddings for a registered source.
     #[pyo3(signature = (*, source, model, columns, key))]
-    fn generate_embeddings(
+    fn generate_text_embeddings(
         &self,
         source: &str,
         model: &str,
@@ -53,7 +53,7 @@ impl PyDatabase {
         self.runtime
             .block_on(
                 self.session
-                    .generate_embeddings(source, model, &columns, key),
+                    .generate_text_embeddings(source, model, &columns, key),
             )
             .map_err(to_pyerr)?;
         Ok(())
@@ -189,9 +189,9 @@ impl PyDatabase {
     }
 
     /// Encode a text query into an embedding vector using the given model.
-    fn encode_query(&self, model_id: &str, text: &str) -> PyResult<Vec<f32>> {
+    fn encode_text_query(&self, model_id: &str, text: &str) -> PyResult<Vec<f32>> {
         self.runtime
-            .block_on(self.session.encode_query(model_id, text))
+            .block_on(self.session.encode_text_query(model_id, text))
             .map_err(to_pyerr)
     }
 
@@ -199,11 +199,11 @@ impl PyDatabase {
     fn preload_model(&self, model_id: &str) -> PyResult<()> {
         let source = ModelSource::parse(model_id);
         self.runtime
-            .block_on(
-                self.session
-                    .model_cache()
-                    .get_or_load(&source, ModelTask::Embedding, None),
-            )
+            .block_on(self.session.model_cache().get_or_load(
+                &source,
+                ModelTask::TextEmbedding,
+                None,
+            ))
             .map_err(to_pyerr)?;
         Ok(())
     }

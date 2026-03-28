@@ -15,7 +15,7 @@ use crate::session::InferenceSession;
 
 /// Orchestrates embedding generation: source scan → InferenceExec → ResultSink → index.
 ///
-/// Modality-agnostic — works for both text (`ModelTask::Embedding`) and
+/// Modality-agnostic — works for both text (`ModelTask::TextEmbedding`) and
 /// image (`ModelTask::ImageEmbedding`) by dispatching through InferenceExec.
 pub struct EmbeddingPipeline<'a> {
     session: &'a InferenceSession,
@@ -80,9 +80,10 @@ impl<'a> EmbeddingPipeline<'a> {
         // Create result table in catalog under the original source_id
         let canonical_model_id = model_source.to_string();
         let text_cols = columns.join(",");
+        let task_str = self.task.to_string();
         let table_info = self.result_store.create_table(
             source_id,
-            "embedding",
+            &task_str,
             &canonical_model_id,
             Some(embedding_dim as i32),
             Some(key_column),

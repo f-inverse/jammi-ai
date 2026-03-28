@@ -129,7 +129,7 @@ async fn recipe_generate_embeddings() {
 
     // Basic generate_embeddings (cookbook recipe)
     let record = session
-        .generate_embeddings("patents", &model_id, &["abstract".to_string()], "id")
+        .generate_text_embeddings("patents", &model_id, &["abstract".to_string()], "id")
         .await
         .unwrap();
 
@@ -163,7 +163,7 @@ async fn recipe_generate_embeddings() {
         .infer(
             "patents",
             &model_source,
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
         )
@@ -175,7 +175,7 @@ async fn recipe_generate_embeddings() {
 
     // Multiple text columns (cookbook recipe)
     let multi = session
-        .generate_embeddings(
+        .generate_text_embeddings(
             "patents",
             &model_id,
             &["title".to_string(), "abstract".to_string()],
@@ -209,13 +209,13 @@ async fn recipe_semantic_search() {
         .unwrap();
 
     session
-        .generate_embeddings("patents", &model_id, &["abstract".to_string()], "id")
+        .generate_text_embeddings("patents", &model_id, &["abstract".to_string()], "id")
         .await
         .unwrap();
 
     // encode_query (cookbook recipe)
     let query = session
-        .encode_query(&model_id, "quantum computing applications")
+        .encode_text_query(&model_id, "quantum computing applications")
         .await
         .unwrap();
     assert!(!query.is_empty());
@@ -305,7 +305,7 @@ async fn recipe_enrich_results() {
         .unwrap();
 
     session
-        .generate_embeddings("patents", &model_id, &["abstract".to_string()], "id")
+        .generate_text_embeddings("patents", &model_id, &["abstract".to_string()], "id")
         .await
         .unwrap();
 
@@ -330,7 +330,7 @@ async fn recipe_enrich_results() {
         .search("patents", query.clone(), 10)
         .await
         .unwrap()
-        .annotate(&model_id, "embedding", &["abstract".to_string()])
+        .annotate(&model_id, "text_embedding", &["abstract".to_string()])
         .await
         .unwrap()
         .run()
@@ -403,7 +403,7 @@ async fn recipe_fine_tune() {
             &model_id,
             &["text_a".into(), "text_b".into(), "score".into()],
             FineTuneMethod::Lora,
-            "embedding",
+            "text_embedding",
             None,
         )
         .await
@@ -433,7 +433,7 @@ async fn recipe_fine_tune() {
         .unwrap();
 
     let record = session
-        .generate_embeddings("patents", ft_model_id, &["abstract".into()], "id")
+        .generate_text_embeddings("patents", ft_model_id, &["abstract".into()], "id")
         .await
         .unwrap();
     assert_eq!(record.status, "ready");
@@ -441,7 +441,7 @@ async fn recipe_fine_tune() {
 
     // encode_query with fine-tuned model (cookbook recipe)
     let query = session
-        .encode_query(ft_model_id, "quantum computing")
+        .encode_text_query(ft_model_id, "quantum computing")
         .await
         .unwrap();
     assert!(!query.is_empty());
@@ -484,7 +484,7 @@ async fn recipe_evaluation() {
 
     // Generate embeddings first
     let record = session
-        .generate_embeddings("patents", &model_id, &["abstract".to_string()], "id")
+        .generate_text_embeddings("patents", &model_id, &["abstract".to_string()], "id")
         .await
         .unwrap();
 
@@ -508,7 +508,7 @@ async fn recipe_evaluation() {
 
     // eval_compare with two embedding tables (cookbook recipe)
     let record2 = session
-        .generate_embeddings("patents", &model_id, &["title".to_string()], "id")
+        .generate_text_embeddings("patents", &model_id, &["title".to_string()], "id")
         .await
         .unwrap();
 
@@ -549,7 +549,7 @@ async fn recipe_modernbert_embeddings() {
 
     // generate_embeddings — same API as BERT, different model
     let record = session
-        .generate_embeddings("patents", &model_id, &["abstract".to_string()], "id")
+        .generate_text_embeddings("patents", &model_id, &["abstract".to_string()], "id")
         .await
         .unwrap();
 
@@ -559,7 +559,7 @@ async fn recipe_modernbert_embeddings() {
 
     // encode_query with ModernBERT
     let query = session
-        .encode_query(&model_id, "quantum computing applications")
+        .encode_text_query(&model_id, "quantum computing applications")
         .await
         .unwrap();
     assert_eq!(query.len(), 32, "tiny_modernbert has hidden_size=32");
@@ -661,7 +661,7 @@ async fn recipe_model_management() {
 
     // Generate embeddings — auto-registers the model
     session
-        .generate_embeddings("patents", &tiny_bert_id(), &["abstract".to_string()], "id")
+        .generate_text_embeddings("patents", &tiny_bert_id(), &["abstract".to_string()], "id")
         .await
         .unwrap();
 
@@ -671,7 +671,7 @@ async fn recipe_model_management() {
     let model = &models[0];
     assert!(model.model_id.contains("tiny_bert"));
     assert_eq!(model.backend, "candle");
-    assert_eq!(model.task, "embedding");
+    assert_eq!(model.task, "text_embedding");
 
     // Inspect specific model
     let found = session
@@ -683,7 +683,7 @@ async fn recipe_model_management() {
 
     // Second model (ModernBERT) on the same source
     session
-        .generate_embeddings(
+        .generate_text_embeddings(
             "patents",
             &tiny_modernbert_id(),
             &["abstract".to_string()],

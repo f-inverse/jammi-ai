@@ -197,7 +197,7 @@ impl Catalog {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT * FROM result_tables
-             WHERE source_id = ?1 AND task = 'embedding' AND status = 'ready'
+             WHERE source_id = ?1 AND task IN ('text_embedding', 'image_embedding') AND status = 'ready'
              ORDER BY created_at DESC, rowid DESC LIMIT 1",
         )?;
         let mut rows = stmt.query_map(params![source_id], parse_row)?;

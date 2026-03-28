@@ -105,7 +105,7 @@ pub enum BackendType {
 #[serde(rename_all = "snake_case")]
 pub enum ModelTask {
     /// Produce dense vector representations of input text.
-    Embedding,
+    TextEmbedding,
     /// Produce dense vector representations of input images.
     ImageEmbedding,
     /// Assign a label and confidence score to input text.
@@ -117,7 +117,7 @@ pub enum ModelTask {
 impl std::fmt::Display for ModelTask {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Embedding => write!(f, "embedding"),
+            Self::TextEmbedding => write!(f, "text_embedding"),
             Self::ImageEmbedding => write!(f, "image_embedding"),
             Self::Classification => write!(f, "classification"),
             Self::Ner => write!(f, "ner"),
@@ -129,12 +129,12 @@ impl std::str::FromStr for ModelTask {
     type Err = jammi_engine::error::JammiError;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
-            "embedding" => Ok(Self::Embedding),
+            "text_embedding" => Ok(Self::TextEmbedding),
             "image_embedding" => Ok(Self::ImageEmbedding),
             "classification" => Ok(Self::Classification),
             "ner" => Ok(Self::Ner),
             other => Err(jammi_engine::error::JammiError::Other(format!(
-                "Unknown model task '{other}'. Expected: embedding, image_embedding, classification, ner"
+                "Unknown model task '{other}'. Expected: text_embedding, image_embedding, classification, ner"
             ))),
         }
     }

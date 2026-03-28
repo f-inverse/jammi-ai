@@ -251,7 +251,7 @@ impl CandleModel {
         task: ModelTask,
     ) -> Result<BackendOutput> {
         match task {
-            ModelTask::Embedding => self.forward_embedding(content),
+            ModelTask::TextEmbedding => self.forward_embedding(content),
             ModelTask::ImageEmbedding => self.forward_image_embedding(content),
             ModelTask::Classification => self.forward_classification(content),
             ModelTask::Ner => self.forward_ner(content),

@@ -29,7 +29,7 @@ async fn session_with_embeddings() -> (Arc<InferenceSession>, TempDir) {
         .unwrap();
 
     session
-        .generate_embeddings(
+        .generate_text_embeddings(
             "patents",
             &tiny_bert_model(),
             &["abstract".to_string()],
@@ -244,7 +244,11 @@ async fn search_with_annotate_on_real_column() {
         .search("patents", query, 3)
         .await
         .unwrap()
-        .annotate(&tiny_bert_model(), "embedding", &["abstract".to_string()])
+        .annotate(
+            &tiny_bert_model(),
+            "text_embedding",
+            &["abstract".to_string()],
+        )
         .await
         .unwrap()
         .run()
@@ -293,7 +297,7 @@ async fn encode_query_returns_vector_of_correct_dimension() {
     let session = InferenceSession::new(config).await.unwrap();
 
     let vector = session
-        .encode_query(&tiny_bert_model(), "quantum computing")
+        .encode_text_query(&tiny_bert_model(), "quantum computing")
         .await
         .unwrap();
 
@@ -329,13 +333,13 @@ async fn search_resolves_to_latest_embedding_table() {
 
     // Generate first embedding table (columns=["title"]).
     let r1 = session
-        .generate_embeddings("patents", &model, &["title".to_string()], "id")
+        .generate_text_embeddings("patents", &model, &["title".to_string()], "id")
         .await
         .unwrap();
 
     // Generate second embedding table (columns=["abstract"]), created later.
     let r2 = session
-        .generate_embeddings("patents", &model, &["abstract".to_string()], "id")
+        .generate_text_embeddings("patents", &model, &["abstract".to_string()], "id")
         .await
         .unwrap();
 
@@ -347,7 +351,7 @@ async fn search_resolves_to_latest_embedding_table() {
     // Both tables should exist in the catalog.
     let tables = session
         .catalog()
-        .find_result_tables("patents", Some("embedding"), None)
+        .find_result_tables("patents", Some("text_embedding"), None)
         .unwrap();
     assert_eq!(tables.len(), 2);
 
@@ -381,7 +385,7 @@ async fn search_returns_semantically_relevant_results() {
 
     // Encode a real query about quantum computing
     let query_vec = session
-        .encode_query(&tiny_bert_model(), "quantum computing")
+        .encode_text_query(&tiny_bert_model(), "quantum computing")
         .await
         .unwrap();
 

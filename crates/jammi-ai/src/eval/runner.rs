@@ -79,7 +79,7 @@ impl<'a> EvalRunner<'a> {
         for query in &golden.queries {
             let query_vec = match &query.input {
                 super::golden::QueryInput::Text(text) => {
-                    self.session.encode_query(&encode_id, text).await?
+                    self.session.encode_text_query(&encode_id, text).await?
                 }
                 super::golden::QueryInput::Image(bytes) => {
                     self.session.encode_image_query(&encode_id, bytes).await?

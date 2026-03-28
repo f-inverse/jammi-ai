@@ -272,7 +272,7 @@ fn catalog_eval_run_crud_and_latest() {
             version: 1,
             model_type: "embedding",
             backend: "candle",
-            task: "embedding",
+            task: "text_embedding",
             ..Default::default()
         })
         .unwrap();
@@ -346,7 +346,7 @@ async fn session_with_embeddings_and_golden() -> (Arc<InferenceSession>, String,
 
     // Generate embeddings with tiny_bert
     let record = session
-        .generate_embeddings(
+        .generate_text_embeddings(
             "patents",
             &tiny_bert_model(),
             &["abstract".to_string()],
@@ -539,11 +539,11 @@ async fn eval_compare_distinct_tables_has_nonzero_deltas() {
 
     // Generate embeddings from two different text columns → different metrics
     let rec1 = session
-        .generate_embeddings("patents", &model, &["abstract".to_string()], "id")
+        .generate_text_embeddings("patents", &model, &["abstract".to_string()], "id")
         .await
         .unwrap();
     let rec2 = session
-        .generate_embeddings("patents", &model, &["title".to_string()], "id")
+        .generate_text_embeddings("patents", &model, &["title".to_string()], "id")
         .await
         .unwrap();
 

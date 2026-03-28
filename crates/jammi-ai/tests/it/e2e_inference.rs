@@ -56,7 +56,7 @@ async fn e2e_embedding_produces_vectors_with_correct_schema() {
         .infer(
             "patents",
             &model_source,
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
         )
@@ -102,7 +102,7 @@ async fn e2e_every_row_has_valid_status() {
         .infer(
             "patents",
             &model_source,
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
         )
@@ -140,7 +140,7 @@ async fn e2e_provenance_columns_have_correct_values() {
         .infer(
             "patents",
             &model_source,
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
         )
@@ -206,7 +206,7 @@ async fn e2e_null_text_rows_produce_error_status() {
         .infer(
             "patents_nulls",
             &model_source,
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
         )
@@ -267,7 +267,7 @@ async fn e2e_error_rows_have_null_vector_and_error_message() {
         .infer(
             "patents_nulls",
             &model_source,
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
         )
@@ -352,7 +352,7 @@ async fn e2e_observer_receives_batch_notifications() {
         .infer(
             "patents",
             &model_source,
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
         )
@@ -377,7 +377,7 @@ async fn e2e_model_registered_in_catalog_after_inference() {
         .infer(
             "patents",
             &model_source,
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
         )
@@ -405,22 +405,22 @@ async fn embedding_vectors_are_semantically_meaningful_and_reproducible() {
 
     // Encode four queries: two physics, one biology, and a repeat of the first
     let vec_physics_1 = session
-        .encode_query(&model, "quantum computing in superconducting systems")
+        .encode_text_query(&model, "quantum computing in superconducting systems")
         .await
         .unwrap();
 
     let vec_physics_2 = session
-        .encode_query(&model, "topological quantum error correction")
+        .encode_text_query(&model, "topological quantum error correction")
         .await
         .unwrap();
 
     let vec_biology = session
-        .encode_query(&model, "CRISPR gene editing for disease treatment")
+        .encode_text_query(&model, "CRISPR gene editing for disease treatment")
         .await
         .unwrap();
 
     let vec_physics_1_repeat = session
-        .encode_query(&model, "quantum computing in superconducting systems")
+        .encode_text_query(&model, "quantum computing in superconducting systems")
         .await
         .unwrap();
 
@@ -496,7 +496,7 @@ async fn e2e_modernbert_embedding_produces_vectors_with_correct_schema() {
         .infer(
             "patents",
             &model_source,
-            ModelTask::Embedding,
+            ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
         )
@@ -527,12 +527,12 @@ async fn e2e_modernbert_embedding_vectors_are_nonzero_and_reproducible() {
     let model = "local:".to_string() + common::fixture("tiny_modernbert").to_str().unwrap();
 
     let vec_a = session
-        .encode_query(&model, "quantum computing in superconducting systems")
+        .encode_text_query(&model, "quantum computing in superconducting systems")
         .await
         .unwrap();
 
     let vec_b = session
-        .encode_query(&model, "quantum computing in superconducting systems")
+        .encode_text_query(&model, "quantum computing in superconducting systems")
         .await
         .unwrap();
 

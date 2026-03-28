@@ -115,7 +115,7 @@ mod live {
             .infer(
                 "patents",
                 &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-                ModelTask::Embedding,
+                ModelTask::TextEmbedding,
                 &["abstract".to_string()],
                 "id",
             )
@@ -171,7 +171,7 @@ mod live {
         let guard = cache
             .get_or_load(
                 &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
-                ModelTask::Embedding,
+                ModelTask::TextEmbedding,
                 None,
             )
             .await

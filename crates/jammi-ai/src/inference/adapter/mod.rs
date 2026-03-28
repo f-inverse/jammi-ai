@@ -38,7 +38,7 @@ pub trait OutputAdapter: Send + Sync {
 pub fn create_adapter(task: ModelTask, model: &LoadedModel) -> Result<Box<dyn OutputAdapter>> {
     use jammi_engine::error::JammiError;
     match task {
-        ModelTask::Embedding | ModelTask::ImageEmbedding => {
+        ModelTask::TextEmbedding | ModelTask::ImageEmbedding => {
             let dim = model.embedding_dim().ok_or_else(|| {
                 JammiError::Inference("Model does not report embedding dim".into())
             })?;
@@ -56,7 +56,7 @@ pub(crate) fn create_adapter_for_schema(
     embedding_dim: Option<usize>,
 ) -> Box<dyn OutputAdapter> {
     match task {
-        ModelTask::Embedding | ModelTask::ImageEmbedding => {
+        ModelTask::TextEmbedding | ModelTask::ImageEmbedding => {
             Box::new(EmbeddingAdapter::new(embedding_dim.unwrap_or(0)))
         }
         ModelTask::Classification => Box::new(ClassificationAdapter),
@@ -117,7 +117,7 @@ pub(crate) fn create_error_output(
     embedding_dim: usize,
 ) -> BackendOutput {
     let (float_outputs, string_outputs) = match task {
-        ModelTask::Embedding | ModelTask::ImageEmbedding => {
+        ModelTask::TextEmbedding | ModelTask::ImageEmbedding => {
             (vec![vec![0.0; row_count * embedding_dim]], vec![])
         }
         ModelTask::Classification => (

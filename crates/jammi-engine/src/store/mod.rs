@@ -73,7 +73,7 @@ impl ResultStore {
         let table_name = format!("{source_id}__{task}__{sanitized}__{timestamp}");
 
         let parquet_path = self.jammi_db_dir.join(format!("{table_name}.parquet"));
-        let index_path = if task == "embedding" {
+        let index_path = if task == "text_embedding" || task == "image_embedding" {
             Some(self.jammi_db_dir.join(&table_name))
         } else {
             None

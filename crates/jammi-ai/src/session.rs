@@ -211,7 +211,8 @@ impl InferenceSession {
             }
         };
         let result = EmbeddingPipeline::new(self, &self.result_store, ModelTask::ImageEmbedding)
-            .run(
+            .run_with_scan_source(
+                source_id,
                 &effective_source,
                 model_id,
                 &[effective_col],

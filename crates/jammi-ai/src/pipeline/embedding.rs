@@ -37,9 +37,27 @@ impl<'a> EmbeddingPipeline<'a> {
     }
 
     /// Run the full embedding generation pipeline for a source.
+    /// Run the embedding pipeline.
+    ///
+    /// `source_id` is used for catalog registration (determines which source
+    /// the embedding table belongs to). `scan_source` is the DataFusion source
+    /// to read data from — usually the same as `source_id`, but may differ for
+    /// rotation-expanded sources.
     pub async fn run(
         &self,
         source_id: &str,
+        model_id: &str,
+        columns: &[String],
+        key_column: &str,
+    ) -> Result<ResultTableRecord> {
+        self.run_with_scan_source(source_id, source_id, model_id, columns, key_column)
+            .await
+    }
+
+    pub async fn run_with_scan_source(
+        &self,
+        source_id: &str,
+        scan_source: &str,
         model_id: &str,
         columns: &[String],
         key_column: &str,
@@ -59,10 +77,7 @@ impl<'a> EmbeddingPipeline<'a> {
             .ok_or_else(|| JammiError::Inference("Model does not support embeddings".into()))?;
         drop(guard);
 
-        // Create result table in catalog.
-        // Store the canonical model name (ModelSource::to_string()), not the raw
-        // user string. This matches the models table registration format and
-        // avoids downstream code needing to strip "local:" prefixes.
+        // Create result table in catalog under the original source_id
         let canonical_model_id = model_source.to_string();
         let text_cols = columns.join(",");
         let table_info = self.result_store.create_table(
@@ -75,11 +90,11 @@ impl<'a> EmbeddingPipeline<'a> {
         )?;
         tracing::debug!("create_table OK: {}", table_info.table_name);
 
-        // Build scan plan over source
-        let table_name = self.session.find_table_name(source_id)?;
+        // Build scan plan over the scan source (may differ from catalog source_id)
+        let table_name = self.session.find_table_name(scan_source)?;
         let query = self
             .session
-            .build_source_query(source_id, &table_name, key_column, columns);
+            .build_source_query(scan_source, &table_name, key_column, columns);
         tracing::debug!("source query: {}", query);
 
         let df = self

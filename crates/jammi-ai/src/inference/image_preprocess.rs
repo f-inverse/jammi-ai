@@ -77,7 +77,9 @@ fn pad_to_square(img: &DynamicImage) -> DynamicImage {
 mod tests {
     use super::*;
 
+    #[allow(clippy::excessive_precision)]
     const TEST_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
+    #[allow(clippy::excessive_precision)]
     const TEST_STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
 
     fn test_image(w: u32, h: u32) -> DynamicImage {

@@ -19,8 +19,8 @@ use crate::model::{LoadedModel, ModelDimensions, ModelTask, ResolvedModel};
 /// Candle backend — loads safetensors models via candle.
 pub struct CandleBackend;
 
-/// Each architecture implements this to produce hidden states from tokenized input.
-trait CandleForward: Send + Sync {
+/// Text architectures produce hidden states from tokenized input.
+trait CandleTextForward: Send + Sync {
     fn forward_hidden(
         &self,
         input_ids: &Tensor,
@@ -30,10 +30,35 @@ trait CandleForward: Send + Sync {
     ) -> Result<Tensor>;
 }
 
+/// Vision architectures produce embeddings from pixel tensors.
+/// Preprocessing config (mean, std, image_size) is model-driven.
+pub(crate) trait CandleVisionForward: Send + Sync {
+    fn forward_image(&self, pixel_values: &Tensor) -> Result<Tensor>;
+    fn image_size(&self) -> usize;
+    fn preprocess_mean(&self) -> [f32; 3];
+    fn preprocess_std(&self) -> [f32; 3];
+}
+
+impl CandleVisionForward for OpenClipVisionTransformer {
+    fn forward_image(&self, pixel_values: &Tensor) -> Result<Tensor> {
+        self.forward(pixel_values)
+            .map_err(|e| JammiError::Inference(format!("Vision forward pass failed: {e}")))
+    }
+    fn image_size(&self) -> usize {
+        self.image_size()
+    }
+    fn preprocess_mean(&self) -> [f32; 3] {
+        self.preprocess_mean()
+    }
+    fn preprocess_std(&self) -> [f32; 3] {
+        self.preprocess_std()
+    }
+}
+
 /// BERT-family forward pass (bert, roberta, distilbert, camembert, xlm-roberta).
 struct BertForward(BertModel);
 
-impl CandleForward for BertForward {
+impl CandleTextForward for BertForward {
     fn forward_hidden(
         &self,
         input_ids: &Tensor,
@@ -51,7 +76,7 @@ impl CandleForward for BertForward {
 /// ModernBERT forward pass (rotary embeddings, GeGLU, no token_type_ids).
 struct ModernBertForward(ModernBert);
 
-impl CandleForward for ModernBertForward {
+impl CandleTextForward for ModernBertForward {
     fn forward_hidden(
         &self,
         input_ids: &Tensor,
@@ -68,7 +93,7 @@ impl CandleForward for ModernBertForward {
 /// DistilBERT forward pass (no token_type_ids, different architecture from BERT).
 struct DistilBertForward(DistilBertModel);
 
-impl CandleForward for DistilBertForward {
+impl CandleTextForward for DistilBertForward {
     fn forward_hidden(
         &self,
         input_ids: &Tensor,
@@ -89,7 +114,7 @@ struct DistilBertClassificationForward {
     classifier: candle_nn::Linear,
 }
 
-impl CandleForward for DistilBertClassificationForward {
+impl CandleTextForward for DistilBertClassificationForward {
     fn forward_hidden(
         &self,
         input_ids: &Tensor,
@@ -125,7 +150,7 @@ impl CandleForward for DistilBertClassificationForward {
 /// Returns softmaxed logits of shape (batch, num_classes).
 struct ModernBertClassificationForward(ModernBertForSequenceClassification);
 
-impl CandleForward for ModernBertClassificationForward {
+impl CandleTextForward for ModernBertClassificationForward {
     fn forward_hidden(
         &self,
         input_ids: &Tensor,
@@ -146,7 +171,7 @@ struct BertClassificationForward {
     classifier: candle_nn::Linear,
 }
 
-impl CandleForward for BertClassificationForward {
+impl CandleTextForward for BertClassificationForward {
     fn forward_hidden(
         &self,
         input_ids: &Tensor,
@@ -179,10 +204,10 @@ impl CandleForward for BertClassificationForward {
 pub struct CandleModel {
     /// Architecture dimensions for memory estimation and output sizing.
     pub dimensions: ModelDimensions,
-    /// Text architecture forward pass (BERT, ModernBERT, etc.).
-    inner: Option<Box<dyn CandleForward>>,
-    /// Vision architecture forward pass (OpenCLIP ViT, etc.).
-    vision: Option<OpenClipVisionTransformer>,
+    /// Text architecture forward pass (BERT, ModernBERT, DistilBERT).
+    text: Option<Box<dyn CandleTextForward>>,
+    /// Vision architecture forward pass (OpenCLIP ViT).
+    vision: Option<Box<dyn CandleVisionForward>>,
     /// Tokenizer for text-to-token conversion, if available.
     pub tokenizer: Option<TokenizerWrapper>,
     /// Device the model weights reside on (CPU, CUDA, or Metal).
@@ -238,8 +263,8 @@ impl CandleModel {
     }
 
     /// Access the text forward pass, returning an error if this is a vision-only model.
-    fn text_forward(&self) -> Result<&dyn CandleForward> {
-        self.inner.as_deref().ok_or_else(|| {
+    fn text_forward(&self) -> Result<&dyn CandleTextForward> {
+        self.text.as_deref().ok_or_else(|| {
             JammiError::Inference("Cannot run text task on a vision-only model".into())
         })
     }
@@ -341,7 +366,7 @@ impl CandleModel {
     }
 
     fn forward_image_embedding(&self, content: &[arrow::array::ArrayRef]) -> Result<BackendOutput> {
-        let vision = self.vision.as_ref().ok_or_else(|| {
+        let vision = self.vision.as_deref().ok_or_else(|| {
             JammiError::Inference("No vision model loaded for image embedding".into())
         })?;
 
@@ -381,12 +406,17 @@ impl CandleModel {
 
         if !valid_images.is_empty() {
             let target_size = vision.image_size() as u32;
-            let pixel_values =
-                image_preprocess::preprocess_clip_batch(&valid_images, target_size, &self.device)?;
+            let mean = vision.preprocess_mean();
+            let std = vision.preprocess_std();
+            let pixel_values = image_preprocess::preprocess_image_batch(
+                &valid_images,
+                target_size,
+                &mean,
+                &std,
+                &self.device,
+            )?;
 
-            let output = vision
-                .forward(&pixel_values)
-                .map_err(|e| JammiError::Inference(format!("Vision forward pass failed: {e}")))?;
+            let output = vision.forward_image(&pixel_values)?;
 
             let normalized = self.l2_normalize(&output)?;
 
@@ -647,9 +677,10 @@ impl ModelBackend for CandleBackend {
         };
 
         // Branch: vision model (OpenCLIP) vs text model (BERT family)
-        let (inner, vision): (
-            Option<Box<dyn CandleForward>>,
-            Option<OpenClipVisionTransformer>,
+        #[allow(clippy::type_complexity)]
+        let (text, vision): (
+            Option<Box<dyn CandleTextForward>>,
+            Option<Box<dyn CandleVisionForward>>,
         ) = if is_open_clip {
             let clip_config = OpenClipVisionConfig::from_open_clip_config(&resolved.model_config)
                 .map_err(|e| JammiError::Model {
@@ -663,9 +694,9 @@ impl ModelBackend for CandleBackend {
                         message: format!("Failed to construct OpenCLIP ViT: {e}"),
                     }
                 })?;
-            (None, Some(model))
+            (None, Some(Box::new(model) as Box<dyn CandleVisionForward>))
         } else {
-            let text_inner: Box<dyn CandleForward> = match model_type {
+            let text_inner: Box<dyn CandleTextForward> = match model_type {
                 "distilbert" if is_classification => {
                     let db_config: DistilBertConfig = serde_json::from_value(model_config.clone())
                         .map_err(|e| JammiError::Model {
@@ -876,7 +907,7 @@ impl ModelBackend for CandleBackend {
 
         Ok(LoadedModel::Candle(Box::new(CandleModel {
             dimensions,
-            inner,
+            text,
             vision,
             tokenizer,
             device,

@@ -36,13 +36,7 @@ impl<'a> EmbeddingPipeline<'a> {
         }
     }
 
-    /// Run the full embedding generation pipeline for a source.
-    /// Run the embedding pipeline.
-    ///
-    /// `source_id` is used for catalog registration (determines which source
-    /// the embedding table belongs to). `scan_source` is the DataFusion source
-    /// to read data from — usually the same as `source_id`, but may differ for
-    /// rotation-expanded sources.
+    /// Run the embedding pipeline: scan source → run inference → persist to Parquet + index.
     pub async fn run(
         &self,
         source_id: &str,
@@ -50,19 +44,6 @@ impl<'a> EmbeddingPipeline<'a> {
         columns: &[String],
         key_column: &str,
     ) -> Result<ResultTableRecord> {
-        self.run_with_scan_source(source_id, source_id, model_id, columns, key_column)
-            .await
-    }
-
-    pub async fn run_with_scan_source(
-        &self,
-        source_id: &str,
-        scan_source: &str,
-        model_id: &str,
-        columns: &[String],
-        key_column: &str,
-    ) -> Result<ResultTableRecord> {
-        // Parse model source from model_id string
         let model_source = ModelSource::parse(model_id);
 
         // Pre-load model to get embedding dimensions
@@ -77,9 +58,9 @@ impl<'a> EmbeddingPipeline<'a> {
             .ok_or_else(|| JammiError::Inference("Model does not support embeddings".into()))?;
         drop(guard);
 
-        // Create result table in catalog under the original source_id
+        // Create result table in catalog
         let canonical_model_id = model_source.to_string();
-        let text_cols = columns.join(",");
+        let col_list = columns.join(",");
         let task_str = self.task.to_string();
         let table_info = self.result_store.create_table(
             source_id,
@@ -87,16 +68,14 @@ impl<'a> EmbeddingPipeline<'a> {
             &canonical_model_id,
             Some(embedding_dim as i32),
             Some(key_column),
-            Some(&text_cols),
+            Some(&col_list),
         )?;
-        tracing::debug!("create_table OK: {}", table_info.table_name);
 
-        // Build scan plan over the scan source (may differ from catalog source_id)
-        let table_name = self.session.find_table_name(scan_source)?;
+        // Build scan plan over source
+        let table_name = self.session.find_table_name(source_id)?;
         let query = self
             .session
-            .build_source_query(scan_source, &table_name, key_column, columns);
-        tracing::debug!("source query: {}", query);
+            .build_source_query(source_id, &table_name, key_column, columns);
 
         let df = self
             .session
@@ -104,12 +83,10 @@ impl<'a> EmbeddingPipeline<'a> {
             .sql(&query)
             .await
             .map_err(|e| JammiError::Inference(format!("Failed to scan source: {e}")))?;
-        tracing::debug!("sql OK");
         let input_plan = df
             .create_physical_plan()
             .await
             .map_err(|e| JammiError::Inference(format!("Failed to create scan plan: {e}")))?;
-        tracing::debug!("physical plan OK");
 
         // Create InferenceExec
         let inference_exec = InferenceExecBuilder::new(
@@ -140,25 +117,20 @@ impl<'a> EmbeddingPipeline<'a> {
         );
 
         // Execute and stream results through sink
-        tracing::debug!("InferenceExec built, executing...");
         let task_ctx = self.session.context().task_ctx();
         let stream = inference_exec
             .execute(0, task_ctx)
             .map_err(|e| JammiError::Inference(format!("InferenceExec failed: {e}")))?;
-        tracing::debug!("execute OK, collecting...");
 
         let batches = datafusion::physical_plan::common::collect(stream)
             .await
             .map_err(|e| JammiError::Inference(format!("Failed to collect results: {e}")))?;
-        tracing::debug!("collect OK: {} batches", batches.len());
 
         for batch in &batches {
             sink.write_batch(batch)?;
         }
-        tracing::debug!("write_batch OK");
 
         let (row_count, index) = sink.finalize()?;
-        tracing::debug!("finalize OK: {} rows", row_count);
 
         // Save sidecar index
         if let Some(ref idx) = index {
@@ -166,13 +138,8 @@ impl<'a> EmbeddingPipeline<'a> {
                 idx.save(idx_path)?;
             }
         }
-        tracing::debug!("sidecar saved");
 
         // Finalize: register in DataFusion and update catalog to 'ready'
-        tracing::debug!(
-            "registering in DataFusion as jammi.{}",
-            table_info.table_name
-        );
         self.result_store
             .finalize(
                 self.session.context(),

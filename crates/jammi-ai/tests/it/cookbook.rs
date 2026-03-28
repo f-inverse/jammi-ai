@@ -8,7 +8,6 @@ use std::sync::Arc;
 use arrow::array::{Array, Float32Array, ListArray, StringArray};
 use jammi_ai::fine_tune::FineTuneMethod;
 use jammi_ai::model::{ModelSource, ModelTask};
-use jammi_ai::pipeline::image_embedding::EmbeddingStrategy;
 use jammi_ai::session::InferenceSession;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
@@ -881,55 +880,9 @@ async fn recipe_generate_image_embeddings() {
         .await
         .unwrap();
 
-    // Rotation-invariant strategy (cookbook recipe: patent drawings)
-    let rotated = session
-        .generate_image_embeddings(
-            "figures",
-            &model_id,
-            "image",
-            "figure_id",
-            EmbeddingStrategy::RotationInvariant {
-                angles: vec![0, 90, 180, 270],
-            },
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(rotated.status, "ready");
-    // 4 rotations × 5 images = 20 rows
-    assert_eq!(rotated.row_count, 20);
-
-    // Verify rotation-encoded row IDs
-    let sql_rotated = session
-        .sql(&format!(
-            "SELECT _row_id FROM \"jammi.{}\" ORDER BY _row_id LIMIT 4",
-            rotated.table_name
-        ))
-        .await
-        .unwrap();
-    let row_id_col = sql_rotated[0].column_by_name("_row_id").unwrap();
-    let first_id = arrow::compute::cast(row_id_col, &arrow::datatypes::DataType::Utf8)
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap()
-        .value(0)
-        .to_string();
-    assert!(
-        first_id.contains("_r"),
-        "Rotation row IDs should contain '_r' suffix, got '{first_id}'"
-    );
-
-    // Basic image embedding (cookbook recipe: single strategy)
-    // Generated after rotation table so search resolves to this one (1:1 row IDs)
+    // Generate image embeddings
     let record = session
-        .generate_image_embeddings(
-            "figures",
-            &model_id,
-            "image",
-            "figure_id",
-            EmbeddingStrategy::Single,
-        )
+        .generate_image_embeddings("figures", &model_id, "image", "figure_id")
         .await
         .unwrap();
 

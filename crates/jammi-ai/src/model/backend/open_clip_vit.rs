@@ -10,6 +10,12 @@ use candle_nn::{
 use jammi_engine::error::{JammiError, Result};
 
 /// Configuration for an OpenCLIP vision transformer.
+/// Default CLIP normalization constants (used when preprocess_cfg is absent).
+#[allow(clippy::excessive_precision)]
+const DEFAULT_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
+#[allow(clippy::excessive_precision)]
+const DEFAULT_STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
+
 #[derive(Debug, Clone)]
 pub struct OpenClipVisionConfig {
     /// Width of the transformer (hidden dimension).
@@ -28,6 +34,10 @@ pub struct OpenClipVisionConfig {
     pub embed_dim: usize,
     /// Whether to use global average pooling (true) or CLS token pooling (false).
     pub global_average_pool: bool,
+    /// Per-channel normalization mean (from preprocess_cfg).
+    pub preprocess_mean: [f32; 3],
+    /// Per-channel normalization std (from preprocess_cfg).
+    pub preprocess_std: [f32; 3],
 }
 
 impl OpenClipVisionConfig {
@@ -85,8 +95,28 @@ impl OpenClipVisionConfig {
                 .get("global_average_pool")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            preprocess_mean: parse_f32_array(config.pointer("/preprocess_cfg/mean"), DEFAULT_MEAN),
+            preprocess_std: parse_f32_array(config.pointer("/preprocess_cfg/std"), DEFAULT_STD),
         })
     }
+}
+
+/// Parse a 3-element f32 array from JSON, falling back to a default.
+fn parse_f32_array(value: Option<&serde_json::Value>, default: [f32; 3]) -> [f32; 3] {
+    value
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            if arr.len() >= 3 {
+                Some([
+                    arr[0].as_f64()? as f32,
+                    arr[1].as_f64()? as f32,
+                    arr[2].as_f64()? as f32,
+                ])
+            } else {
+                None
+            }
+        })
+        .unwrap_or(default)
 }
 
 /// QuickGelu activation: x * sigmoid(1.702 * x).
@@ -328,6 +358,16 @@ impl OpenClipVisionTransformer {
     pub fn image_size(&self) -> usize {
         self.config.image_size
     }
+
+    /// Return the preprocessing normalization mean.
+    pub fn preprocess_mean(&self) -> [f32; 3] {
+        self.config.preprocess_mean
+    }
+
+    /// Return the preprocessing normalization std.
+    pub fn preprocess_std(&self) -> [f32; 3] {
+        self.config.preprocess_std
+    }
 }
 
 #[cfg(test)]
@@ -346,6 +386,8 @@ mod tests {
             patch_size: 4,
             embed_dim: 16,
             global_average_pool: true,
+            preprocess_mean: DEFAULT_MEAN,
+            preprocess_std: DEFAULT_STD,
         }
     }
 

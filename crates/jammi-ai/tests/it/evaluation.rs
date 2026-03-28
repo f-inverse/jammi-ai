@@ -608,15 +608,8 @@ async fn eval_image_embeddings_end_to_end() {
         .unwrap();
 
     // Generate image embeddings (single strategy, no rotation for simplicity)
-    use jammi_ai::pipeline::image_embedding::EmbeddingStrategy;
     let record = session
-        .generate_image_embeddings(
-            "figures",
-            &tiny_open_clip,
-            "image",
-            "figure_id",
-            EmbeddingStrategy::Single,
-        )
+        .generate_image_embeddings("figures", &tiny_open_clip, "image", "figure_id")
         .await
         .unwrap();
     let table_name = record.table_name.clone();

@@ -4,7 +4,6 @@ use pyo3::prelude::*;
 
 use jammi_ai::fine_tune::FineTuneMethod;
 use jammi_ai::model::{ModelSource, ModelTask};
-use jammi_ai::pipeline::image_embedding::EmbeddingStrategy;
 use jammi_ai::session::InferenceSession;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 
@@ -209,30 +208,19 @@ impl PyDatabase {
     }
 
     /// Generate image embeddings for a registered source.
-    ///
-    /// If `rotation_angles` is provided (e.g., `[0, 90, 180, 270]`),
-    /// each image produces one embedding per angle for rotation invariance.
-    #[pyo3(signature = (*, source, model, image_column, key, rotation_angles=None))]
+    #[pyo3(signature = (*, source, model, image_column, key))]
     fn generate_image_embeddings(
         &self,
         source: &str,
         model: &str,
         image_column: &str,
         key: &str,
-        rotation_angles: Option<Vec<u16>>,
     ) -> PyResult<()> {
-        let strategy = match rotation_angles {
-            Some(angles) => EmbeddingStrategy::RotationInvariant { angles },
-            None => EmbeddingStrategy::Single,
-        };
         self.runtime
-            .block_on(self.session.generate_image_embeddings(
-                source,
-                model,
-                image_column,
-                key,
-                strategy,
-            ))
+            .block_on(
+                self.session
+                    .generate_image_embeddings(source, model, image_column, key),
+            )
             .map_err(to_pyerr)?;
         Ok(())
     }

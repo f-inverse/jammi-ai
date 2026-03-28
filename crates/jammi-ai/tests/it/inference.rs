@@ -364,8 +364,6 @@ mod live {
 
     #[tokio::test]
     async fn live_patentclip_generate_image_embeddings_pipeline() {
-        use jammi_ai::pipeline::image_embedding::EmbeddingStrategy;
-
         let dir = tempdir().unwrap();
         let config = common::test_config(dir.path());
         let session = InferenceSession::new(config).await.unwrap();
@@ -418,13 +416,7 @@ mod live {
 
         // This is the exact path that previously failed with PatentCLIP
         let record = session
-            .generate_image_embeddings(
-                "test_imgs",
-                "patentclip/PatentCLIP_Vit_B",
-                "img",
-                "fid",
-                EmbeddingStrategy::Single,
-            )
+            .generate_image_embeddings("test_imgs", "patentclip/PatentCLIP_Vit_B", "img", "fid")
             .await
             .unwrap();
 

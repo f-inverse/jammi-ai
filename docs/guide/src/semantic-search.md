@@ -12,7 +12,7 @@ use std::sync::Arc;
 let session = Arc::new(InferenceSession::new(config).await?);
 
 // Encode a query
-let query = session.encode_query(
+let query = session.encode_text_query(
     "sentence-transformers/all-MiniLM-L6-v2",
     "quantum computing applications",
 ).await?;
@@ -25,7 +25,7 @@ let results = session.search("patents", query, 10).await?
 ### Python
 
 ```python
-query_vec = db.encode_query("sentence-transformers/all-MiniLM-L6-v2", "quantum computing applications")
+query_vec = db.encode_text_query("sentence-transformers/all-MiniLM-L6-v2", "quantum computing applications")
 
 search = db.search("patents", query=query_vec, k=10)
 results = search.run()

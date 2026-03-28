@@ -49,7 +49,7 @@ External databases work as sources for embedding generation:
 db.add_source("pg_articles", path="postgresql://user:pass@localhost/mydb", format="parquet")
 # Note: for external databases, use the Rust API to register with the appropriate source_type
 
-db.generate_embeddings(
+db.generate_text_embeddings(
     source="pg_articles",
     model="sentence-transformers/all-MiniLM-L6-v2",
     columns=["title", "abstract"],

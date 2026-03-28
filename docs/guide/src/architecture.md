@@ -59,8 +59,7 @@ jammi-cli
 | `HttpBackend` | Remote backend: HTTP endpoint for embeddings |
 | `InferenceExec` | DataFusion `ExecutionPlan` operator for inference with backpressure |
 | `AnnSearchExec` | DataFusion `ExecutionPlan` leaf node for ANN vector search |
-| `EmbeddingPipeline` | Orchestrates generate_embeddings: model -> InferenceExec -> ResultSink -> index |
-| `ImageEmbeddingPipeline` | Orchestrates generate_image_embeddings: image preprocessing -> vision model -> ResultSink -> index. Supports rotation-invariant strategy |
+| `EmbeddingPipeline` | Orchestrates embedding generation (text or image): model -> InferenceExec -> ResultSink -> index. Parameterized by ModelTask |
 | `ResultSink` | Streams inference output to Parquet + sidecar index, filters failed rows |
 | `SearchBuilder` | Fluent API: join, annotate, filter, sort, limit, select, run |
 | `EvidenceRow` / `RowProvenance` | Evidence model types for provenance tracking |
@@ -99,37 +98,23 @@ JammiSession::sql("SELECT ...")
     -> Returns Vec<RecordBatch>
 ```
 
-### Embedding generation path
+### Embedding generation path (text and image)
 
 ```
-InferenceSession::generate_embeddings(source, model, columns, key)
-    -> EmbeddingPipeline::run()
+InferenceSession::generate_text_embeddings(source, model, columns, key)
+InferenceSession::generate_image_embeddings(source, model, image_column, key)
+    -> EmbeddingPipeline::run(task = TextEmbedding | ImageEmbedding)
     -> Register result_table (status = "building")
-    -> Build plan: SourceScan -> InferenceExec(embedding)
-    -> Execute, stream batches through ResultSink
+    -> Build plan: SourceScan -> InferenceExec(task)
+    -> InferenceExec dispatches to CandleModel::forward(content, task):
+    |   TextEmbedding:  arrow_to_texts -> tokenize -> BERT/ModernBERT -> mean_pool -> L2_normalize
+    |   ImageEmbedding: arrow_to_images -> preprocess (model-driven) -> ViT forward -> L2_normalize
+    -> Stream batches through ResultSink
     |   |-- Filter _status = "ok"
     |   |-- Transform to embedding schema
     |   |-- Write to Parquet via ParquetResultWriter
     |   '-- Feed vectors to SidecarIndex::add()
     -> Close writer, build ANN index, save sidecar bundle
-    -> Register as DataFusion table, update catalog to "ready"
-    -> Return ResultTableRecord
-```
-
-### Image embedding generation path
-
-```
-InferenceSession::generate_image_embeddings(source, model, image_column, key, strategy)
-    -> ImageEmbeddingPipeline::run()
-    -> Register result_table (status = "building")
-    -> Scan source for key + image column
-    -> For each batch:
-    |   |-- arrow_to_images(): decode Binary/BinaryView/Utf8 column
-    |   |-- Apply strategy (Single or RotationInvariant)
-    |   |-- preprocess_clip_batch(): pad-to-square, resize, normalize
-    |   |-- OpenClipVisionTransformer::forward() -> L2 normalize
-    |   '-- Write through ResultSink -> Parquet + SidecarIndex
-    -> Close writer, save sidecar bundle
     -> Register as DataFusion table, update catalog to "ready"
     -> Return ResultTableRecord
 ```
@@ -163,7 +148,7 @@ crates/jammi-ai/src/
 |-- model/              # ModelResolver, ModelCache, backends
 |-- operator/           # InferenceExec, AnnSearchExec
 |-- inference/          # Runner, observer, output adapters, image preprocessing
-|-- pipeline/           # EmbeddingPipeline, ImageEmbeddingPipeline, ResultSink
+|-- pipeline/           # EmbeddingPipeline, ResultSink
 |-- evidence/           # Provenance types and columns
 |-- search/             # SearchBuilder
 |-- fine_tune/          # LoRA training, config, jobs

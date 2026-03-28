@@ -7,7 +7,7 @@ Generate vector embeddings by running a model over text columns from a registere
 ### Rust
 
 ```rust
-let record = session.generate_embeddings(
+let record = session.generate_text_embeddings(
     "patents",
     "sentence-transformers/all-MiniLM-L6-v2",
     &["abstract".to_string()],
@@ -20,7 +20,7 @@ println!("Embedded {} rows, {} dimensions", record.row_count, record.dimensions.
 ### Python
 
 ```python
-db.generate_embeddings(
+db.generate_text_embeddings(
     source="patents",
     model="sentence-transformers/all-MiniLM-L6-v2",
     columns=["abstract"],
@@ -65,7 +65,7 @@ Pass multiple column names to concatenate them (space-separated) before embeddin
 ### Rust
 
 ```rust
-session.generate_embeddings(
+session.generate_text_embeddings(
     "papers",
     "sentence-transformers/all-MiniLM-L6-v2",
     &["title".to_string(), "abstract".to_string()],
@@ -76,7 +76,7 @@ session.generate_embeddings(
 ### Python
 
 ```python
-db.generate_embeddings(
+db.generate_text_embeddings(
     source="papers",
     model="sentence-transformers/all-MiniLM-L6-v2",
     columns=["title", "abstract"],
@@ -89,8 +89,8 @@ db.generate_embeddings(
 Each call creates a new table. Multiple tables can coexist for the same source (different models, different columns):
 
 ```rust
-session.generate_embeddings("patents", "all-MiniLM-L6-v2", &["abstract".into()], "id").await?;
-session.generate_embeddings("patents", "bge-small-en-v1.5", &["title".into()], "id").await?;
+session.generate_text_embeddings("patents", "all-MiniLM-L6-v2", &["abstract".into()], "id").await?;
+session.generate_text_embeddings("patents", "bge-small-en-v1.5", &["title".into()], "id").await?;
 ```
 
 When searching, the latest ready embedding table is used by default.

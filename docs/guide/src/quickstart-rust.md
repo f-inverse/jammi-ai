@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 3. Generate embeddings
-    let record = session.generate_embeddings(
+    let record = session.generate_text_embeddings(
         "patents",
         "sentence-transformers/all-MiniLM-L6-v2",
         &["title".to_string()],
@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Embedded {} rows", record.row_count);
 
     // 4. Semantic search
-    let query = session.encode_query(
+    let query = session.encode_text_query(
         "sentence-transformers/all-MiniLM-L6-v2",
         "quantum computing applications",
     ).await?;
@@ -65,8 +65,8 @@ The first run downloads the model from HuggingFace Hub (~90MB). Subsequent runs 
 2. **`InferenceSession`** wraps the query engine with model loading, caching, and GPU scheduling
 3. **`add_source`** registers a file in the catalog — it survives session restarts
 4. **`sql`** runs any SQL query via DataFusion, returns `Vec<RecordBatch>`
-5. **`generate_embeddings`** runs the model over every row, persists vectors to Parquet with a sidecar ANN index
-6. **`encode_query`** encodes a text string into the same vector space
+5. **`generate_text_embeddings`** runs the model over every row, persists vectors to Parquet with a sidecar ANN index
+6. **`encode_text_query`** encodes a text string into the same vector space
 7. **`search`** finds the nearest neighbors, hydrates all source columns, and returns results with similarity scores
 
 ## Next steps

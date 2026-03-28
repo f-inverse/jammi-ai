@@ -18,7 +18,7 @@ table = db.sql("SELECT id, title, year FROM patents.public.patents WHERE year > 
 print(table.to_pandas())
 
 # 4. Generate embeddings
-db.generate_embeddings(
+db.generate_text_embeddings(
     source="patents",
     model="sentence-transformers/all-MiniLM-L6-v2",
     columns=["title"],
@@ -26,7 +26,7 @@ db.generate_embeddings(
 )
 
 # 5. Semantic search
-query_vec = db.encode_query("sentence-transformers/all-MiniLM-L6-v2", "quantum computing applications")
+query_vec = db.encode_text_query("sentence-transformers/all-MiniLM-L6-v2", "quantum computing applications")
 
 search = db.search("patents", query=query_vec, k=5)
 search.sort("similarity", descending=True)
@@ -40,8 +40,8 @@ print(results.to_pandas())
 1. **`jammi.connect()`** creates a `Database` backed by an `InferenceSession` with a shared tokio runtime
 2. **`add_source`** registers a local file — Parquet, CSV, and JSON are supported
 3. **`sql`** returns a `pyarrow.Table` (zero-copy from Rust via pyo3-arrow)
-4. **`generate_embeddings`** runs the model and persists vectors to Parquet with an ANN index
-5. **`encode_query`** encodes text into the same vector space, returns `list[float]`
+4. **`generate_text_embeddings`** runs the model and persists vectors to Parquet with an ANN index
+5. **`encode_text_query`** encodes text into the same vector space, returns `list[float]`
 6. **`search`** returns a `SearchBuilder` — call methods to filter, sort, join, then `.run()` to execute
 
 ## SearchBuilder

@@ -120,8 +120,8 @@ The fine-tuned model is automatically registered and can be used anywhere a mode
 ```rust
 let model_id = job.model_id();
 
-let embedding = session.encode_query(model_id, "quantum computing").await?;
-session.generate_embeddings("patents", model_id, &["abstract".into()], "id").await?;
+let embedding = session.encode_text_query(model_id, "quantum computing").await?;
+session.generate_text_embeddings("patents", model_id, &["abstract".into()], "id").await?;
 ```
 
 ### Python
@@ -129,8 +129,8 @@ session.generate_embeddings("patents", model_id, &["abstract".into()], "id").awa
 ```python
 model_id = job.model_id
 
-query_vec = db.encode_query(model_id, "quantum computing")
-db.generate_embeddings(source="patents", model=model_id, columns=["abstract"], key="id")
+query_vec = db.encode_text_query(model_id, "quantum computing")
+db.generate_text_embeddings(source="patents", model=model_id, columns=["abstract"], key="id")
 ```
 
 ## How it works

@@ -73,12 +73,14 @@ impl<'a> EmbeddingPipeline<'a> {
             Some(key_column),
             Some(&text_cols),
         )?;
+        tracing::debug!("create_table OK: {}", table_info.table_name);
 
         // Build scan plan over source
         let table_name = self.session.find_table_name(source_id)?;
         let query = self
             .session
             .build_source_query(source_id, &table_name, key_column, columns);
+        tracing::debug!("source query: {}", query);
 
         let df = self
             .session
@@ -86,10 +88,12 @@ impl<'a> EmbeddingPipeline<'a> {
             .sql(&query)
             .await
             .map_err(|e| JammiError::Inference(format!("Failed to scan source: {e}")))?;
+        tracing::debug!("sql OK");
         let input_plan = df
             .create_physical_plan()
             .await
             .map_err(|e| JammiError::Inference(format!("Failed to create scan plan: {e}")))?;
+        tracing::debug!("physical plan OK");
 
         // Create InferenceExec
         let inference_exec = InferenceExecBuilder::new(
@@ -120,20 +124,25 @@ impl<'a> EmbeddingPipeline<'a> {
         );
 
         // Execute and stream results through sink
+        tracing::debug!("InferenceExec built, executing...");
         let task_ctx = self.session.context().task_ctx();
         let stream = inference_exec
             .execute(0, task_ctx)
             .map_err(|e| JammiError::Inference(format!("InferenceExec failed: {e}")))?;
+        tracing::debug!("execute OK, collecting...");
 
         let batches = datafusion::physical_plan::common::collect(stream)
             .await
             .map_err(|e| JammiError::Inference(format!("Failed to collect results: {e}")))?;
+        tracing::debug!("collect OK: {} batches", batches.len());
 
         for batch in &batches {
             sink.write_batch(batch)?;
         }
+        tracing::debug!("write_batch OK");
 
         let (row_count, index) = sink.finalize()?;
+        tracing::debug!("finalize OK: {} rows", row_count);
 
         // Save sidecar index
         if let Some(ref idx) = index {
@@ -141,8 +150,13 @@ impl<'a> EmbeddingPipeline<'a> {
                 idx.save(idx_path)?;
             }
         }
+        tracing::debug!("sidecar saved");
 
         // Finalize: register in DataFusion and update catalog to 'ready'
+        tracing::debug!(
+            "registering in DataFusion as jammi.{}",
+            table_info.table_name
+        );
         self.result_store
             .finalize(
                 self.session.context(),

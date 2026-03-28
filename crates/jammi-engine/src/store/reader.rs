@@ -1,5 +1,7 @@
 use std::path::Path;
+use std::sync::Arc;
 
+use datafusion::catalog::MemorySchemaProvider;
 use datafusion::datasource::file_format::options::ParquetReadOptions;
 use datafusion::prelude::SessionContext;
 
@@ -22,7 +24,19 @@ pub fn count_parquet_rows(path: &str) -> Result<usize> {
 }
 
 /// Register a Parquet file as a DataFusion table under the name `jammi.{name}`.
+///
+/// Ensures the `jammi` schema exists in the default catalog before registration.
 pub async fn register_parquet_table(ctx: &SessionContext, name: &str, path: &Path) -> Result<()> {
+    // Ensure the "jammi" schema exists in the default catalog.
+    // DataFusion does not auto-create schemas for register_parquet.
+    let default_catalog_name = ctx.state().config_options().catalog.default_catalog.clone();
+    let default_catalog = ctx
+        .catalog(&default_catalog_name)
+        .ok_or_else(|| JammiError::Other("Default catalog not found".into()))?;
+    if default_catalog.schema("jammi").is_none() {
+        let _ = default_catalog.register_schema("jammi", Arc::new(MemorySchemaProvider::new()));
+    }
+
     let table_ref = format!("jammi.{name}");
     let path_str = path
         .to_str()

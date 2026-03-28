@@ -361,4 +361,75 @@ mod live {
             "Should be L2-normalized, got norm={norm}"
         );
     }
+
+    #[tokio::test]
+    async fn live_patentclip_generate_image_embeddings_pipeline() {
+        use jammi_ai::pipeline::image_embedding::EmbeddingStrategy;
+
+        let dir = tempdir().unwrap();
+        let config = common::test_config(dir.path());
+        let session = InferenceSession::new(config).await.unwrap();
+
+        // Create a source with 2 small test images
+        let mut images = Vec::new();
+        for i in 0..2u8 {
+            let img = image::RgbImage::from_pixel(20, 20, image::Rgb([i * 100, 100, 200]));
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .unwrap();
+            images.push(buf);
+        }
+
+        let parquet_path = dir.path().join("test_images.parquet");
+        {
+            use arrow::array::{ArrayRef, BinaryArray, StringArray};
+            use arrow::datatypes::{DataType, Field, Schema};
+            use arrow::record_batch::RecordBatch;
+            use parquet::arrow::ArrowWriter;
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("fid", DataType::Utf8, false),
+                Field::new("img", DataType::Binary, false),
+            ]));
+            let keys = Arc::new(StringArray::from(vec!["img_0", "img_1"])) as ArrayRef;
+            let imgs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
+            let img_array = Arc::new(BinaryArray::from(imgs)) as ArrayRef;
+            let batch = RecordBatch::try_new(schema.clone(), vec![keys, img_array]).unwrap();
+
+            let file = std::fs::File::create(&parquet_path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        session
+            .add_source(
+                "test_imgs",
+                SourceType::Local,
+                SourceConnection {
+                    url: Some(format!("file://{}", parquet_path.display())),
+                    format: Some(FileFormat::Parquet),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // This is the exact path that previously failed with PatentCLIP
+        let record = session
+            .generate_image_embeddings(
+                "test_imgs",
+                "patentclip/PatentCLIP_Vit_B",
+                "img",
+                "fid",
+                EmbeddingStrategy::Single,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(record.status, "ready");
+        assert_eq!(record.row_count, 2);
+        assert_eq!(record.dimensions, Some(512));
+    }
 }

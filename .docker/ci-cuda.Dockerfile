@@ -12,4 +12,5 @@ RUN dnf install -y 'dnf-command(config-manager)' \
 
 ENV PATH="/usr/local/cuda-12.6/bin:${PATH}" \
     LD_LIBRARY_PATH="/usr/local/cuda-12.6/lib64:${LD_LIBRARY_PATH}" \
-    CUDA_COMPUTE_CAP=86
+    CUDA_COMPUTE_CAP=86 \
+    NVCC_PREPEND_FLAGS="--allow-unsupported-compiler"

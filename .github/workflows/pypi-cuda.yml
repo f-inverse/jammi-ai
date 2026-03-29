@@ -32,7 +32,7 @@ jobs:
     name: Publish to PyPI
     needs: [build-linux-cuda]
     runs-on: ubuntu-latest
-    environment: pypi
+    environment: pypi-cuda
     permissions:
       id-token: write
     steps:

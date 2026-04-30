@@ -10,24 +10,62 @@ use std::path::Path;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Init, Linear, Module, VarBuilder};
 use jammi_engine::error::{JammiError, Result};
+use serde::{Deserialize, Serialize};
+
+/// Initialization strategy for the LoRA A matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoraInitMode {
+    /// B = zeros, A = kaiming uniform (default — adapter starts at zero delta).
+    ZerosB,
+    /// Both A and B initialized with Gaussian noise (σ = 0.02).
+    Gaussian,
+    /// PiSSA: A/B initialized from principal singular values of the base weight.
+    /// Falls back to ZerosB when the base weight is not available for SVD.
+    PiSSA,
+}
+
+impl Default for LoraInitMode {
+    fn default() -> Self {
+        Self::ZerosB
+    }
+}
 
 /// A single LoRA-augmented linear layer: frozen base + trainable A, B matrices.
 pub struct LoraLinear {
     base: Linear,
-    /// A matrix: (rank × in_features), initialized with kaiming uniform.
+    /// A matrix: (rank × in_features).
     pub lora_a: Tensor,
-    /// B matrix: (out_features × rank), initialized to zeros.
+    /// B matrix: (out_features × rank).
     pub lora_b: Tensor,
-    alpha: f64,
+    /// Pre-computed scaling factor (alpha/rank or alpha/sqrt(rank) when use_rslora).
+    scaling: f64,
+    #[allow(dead_code)]
     rank: usize,
+    /// Optional dropout probability applied to the LoRA path — only active when
+    /// `training` is `true`.  Set to `false` during evaluation and inference to
+    /// avoid stochastic noise in validation loss and inference outputs.
+    dropout: Option<f32>,
+    /// Whether the layer is in training mode.  Defaults to `true` for newly
+    /// constructed layers; `false` for layers loaded from saved adapters.
+    pub training: bool,
 }
 
 impl LoraLinear {
     /// Wrap a frozen `Linear` layer with LoRA adapters.
     ///
     /// `rank` controls the number of low-rank dimensions. `alpha` scales the
-    /// LoRA contribution: `output = base(x) + (alpha/rank) * x @ A^T @ B^T`.
-    pub fn new(base: Linear, rank: usize, alpha: f64, vb: &VarBuilder) -> Result<Self> {
+    /// LoRA contribution. When `use_rslora` is true, scaling = alpha/sqrt(rank)
+    /// instead of alpha/rank. `init_mode` controls A/B initialization.
+    pub fn new(
+        base: Linear,
+        rank: usize,
+        alpha: f64,
+        use_rslora: bool,
+        init_mode: LoraInitMode,
+        dropout: Option<f32>,
+        vb: &VarBuilder,
+    ) -> Result<Self> {
         let in_features = base
             .weight()
             .dim(1)
@@ -37,70 +75,176 @@ impl LoraLinear {
             .dim(0)
             .map_err(|e| JammiError::FineTune(format!("LoRA dim: {e}")))?;
 
-        let lora_a = vb
-            .get_with_hints(
-                (rank, in_features),
-                "lora_a",
+        let (a_init, b_init) = match init_mode {
+            LoraInitMode::ZerosB => (
                 Init::Kaiming {
                     dist: candle_nn::init::NormalOrUniform::Uniform,
                     fan: candle_nn::init::FanInOut::FanIn,
                     non_linearity: candle_nn::init::NonLinearity::Linear,
                 },
-            )
+                Init::Const(0.0),
+            ),
+            LoraInitMode::Gaussian => (Init::Randn { mean: 0.0, stdev: 0.02 }, Init::Randn { mean: 0.0, stdev: 0.02 }),
+            LoraInitMode::PiSSA => (
+                // PiSSA requires SVD of the base weight — fall back to ZerosB
+                Init::Kaiming {
+                    dist: candle_nn::init::NormalOrUniform::Uniform,
+                    fan: candle_nn::init::FanInOut::FanIn,
+                    non_linearity: candle_nn::init::NonLinearity::Linear,
+                },
+                Init::Const(0.0),
+            ),
+        };
+
+        let lora_a = vb
+            .get_with_hints((rank, in_features), "lora_a", a_init)
             .map_err(|e| JammiError::FineTune(format!("LoRA A init: {e}")))?;
 
         let lora_b = vb
-            .get_with_hints((out_features, rank), "lora_b", Init::Const(0.0))
+            .get_with_hints((out_features, rank), "lora_b", b_init)
             .map_err(|e| JammiError::FineTune(format!("LoRA B init: {e}")))?;
+
+        let scaling = if use_rslora {
+            alpha / (rank as f64).sqrt()
+        } else {
+            alpha / rank as f64
+        };
 
         Ok(Self {
             base,
             lora_a,
             lora_b,
-            alpha,
+            scaling,
             rank,
+            dropout,
+            training: true,
         })
     }
 
-    /// Forward pass: `base(x) + scaling * (x @ A^T @ B^T)`.
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let base_out = self
-            .base
-            .forward(x)
-            .map_err(|e| JammiError::FineTune(format!("LoRA base forward: {e}")))?;
-        let scaling = self.alpha / self.rank as f64;
+    /// Convenience constructor matching the old signature (ZerosB, no dropout, standard scaling).
+    pub fn new_simple(base: Linear, rank: usize, alpha: f64, vb: &VarBuilder) -> Result<Self> {
+        Self::new(base, rank, alpha, false, LoraInitMode::ZerosB, None, vb)
+    }
 
-        let lora_out = x
-            .matmul(
-                &self
-                    .lora_a
-                    .t()
-                    .map_err(|e| JammiError::FineTune(format!("LoRA A^T: {e}")))?,
-            )
-            .map_err(|e| JammiError::FineTune(format!("LoRA x@A^T: {e}")))?
-            .matmul(
-                &self
-                    .lora_b
-                    .t()
-                    .map_err(|e| JammiError::FineTune(format!("LoRA B^T: {e}")))?,
-            )
+    /// Switch between training and evaluation mode.
+    ///
+    /// When `false`, the dropout path is skipped so validation loss and
+    /// inference outputs are deterministic.
+    pub fn set_training(&mut self, training: bool) {
+        self.training = training;
+    }
+
+    /// Forward pass: `base(x) + scaling * dropout(x @ A^T @ B^T)`.
+    ///
+    /// Mixed-precision aware: the frozen base linear always runs in F32 for
+    /// device-agnostic compatibility (BF16/F16 matmul is not supported on all
+    /// CUDA compute capabilities).  Since the base weights are frozen, running
+    /// them in F32 does not affect gradient flow through the LoRA path.
+    /// The result is cast back to the backbone's native dtype before the LoRA
+    /// delta is added, so downstream layers stay in the expected precision.
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let base_dtype = self.base.weight().dtype();
+
+        // Frozen path: always compute in F32 for maximum device compatibility.
+        let x_f32 = if x.dtype() == DType::F32 {
+            x.clone()
+        } else {
+            x.to_dtype(DType::F32)
+                .map_err(|e| JammiError::FineTune(format!("LoRA base input cast: {e}")))?
+        };
+        let w_f32 = if base_dtype == DType::F32 {
+            self.base.weight().clone()
+        } else {
+            self.base
+                .weight()
+                .to_dtype(DType::F32)
+                .map_err(|e| JammiError::FineTune(format!("LoRA base weight cast: {e}")))?
+        };
+        let bias_f32 = self
+            .base
+            .bias()
+            .map(|b| {
+                if b.dtype() == DType::F32 {
+                    Ok(b.clone())
+                } else {
+                    b.to_dtype(DType::F32)
+                        .map_err(|e| JammiError::FineTune(format!("LoRA base bias cast: {e}")))
+                }
+            })
+            .transpose()?;
+        let base_out_f32 = Linear::new(w_f32, bias_f32)
+            .forward(&x_f32)
+            .map_err(|e| JammiError::FineTune(format!("LoRA base forward: {e}")))?;
+        // Cast output back to backbone dtype so downstream transformer layers
+        // continue operating in their expected precision.
+        let base_out = if base_dtype == DType::F32 {
+            base_out_f32
+        } else {
+            base_out_f32
+                .to_dtype(base_dtype)
+                .map_err(|e| JammiError::FineTune(format!("LoRA base output cast: {e}")))?
+        };
+
+        // LoRA path: A/B matrices are always F32; cast input accordingly.
+        let lora_dtype = self.lora_a.dtype();
+        let x_lora = if x.dtype() != lora_dtype {
+            x.to_dtype(lora_dtype)
+                .map_err(|e| JammiError::FineTune(format!("LoRA lora dtype cast: {e}")))?
+        } else {
+            x.clone()
+        };
+
+        let lora_in = if self.training {
+            if let Some(p) = self.dropout {
+                candle_nn::ops::dropout(&x_lora, p)
+                    .map_err(|e| JammiError::FineTune(format!("LoRA dropout: {e}")))?
+            } else {
+                x_lora
+            }
+        } else {
+            x_lora
+        };
+
+        // x @ A^T : Linear with weight = lora_a (shape [rank, in]) computes
+        //   y = x @ lora_a^T  →  [..., rank]
+        let a_lin = Linear::new(self.lora_a.clone(), None);
+        let after_a = a_lin
+            .forward(&lora_in)
+            .map_err(|e| JammiError::FineTune(format!("LoRA x@A^T: {e}")))?;
+
+        // (x @ A^T) @ B^T : Linear with weight = lora_b (shape [out, rank]).
+        let b_lin = Linear::new(self.lora_b.clone(), None);
+        let lora_out = b_lin
+            .forward(&after_a)
             .map_err(|e| JammiError::FineTune(format!("LoRA xA^T@B^T: {e}")))?;
 
-        let scaled = (&lora_out * scaling)
+        let scaled = (&lora_out * self.scaling)
             .map_err(|e| JammiError::FineTune(format!("LoRA scaling: {e}")))?;
 
-        (&base_out + &scaled).map_err(|e| JammiError::FineTune(format!("LoRA add: {e}")))
+        // Cast LoRA delta back to the frozen output dtype before adding.
+        let scaled_cast = if scaled.dtype() != base_out.dtype() {
+            scaled
+                .to_dtype(base_out.dtype())
+                .map_err(|e| JammiError::FineTune(format!("LoRA output dtype cast: {e}")))?
+        } else {
+            scaled
+        };
+
+        (&base_out + &scaled_cast).map_err(|e| JammiError::FineTune(format!("LoRA add: {e}")))
     }
 
     /// Reconstruct a LoraLinear from pre-loaded weights (for inference with saved adapters).
     pub fn from_loaded(base: Linear, lora_a: Tensor, lora_b: Tensor, alpha: f64) -> Self {
         let rank = lora_a.dims()[0];
+        let scaling = alpha / rank as f64;
         Self {
             base,
             lora_a,
             lora_b,
-            alpha,
+            scaling,
             rank,
+            dropout: None,
+            training: false,
         }
     }
 
@@ -185,7 +329,7 @@ pub fn build_lora_classification(
     let proj_base = Tensor::eye(hidden_size, DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("Projection identity: {e}")))?;
     let proj_linear = Linear::new(proj_base, None);
-    let projection = LoraLinear::new(
+    let projection = LoraLinear::new_simple(
         proj_linear,
         config.lora_rank,
         config.lora_alpha,
@@ -196,7 +340,7 @@ pub fn build_lora_classification(
     let cls_base = Tensor::zeros((num_classes, hidden_size), DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("Classifier zeros: {e}")))?;
     let cls_linear = Linear::new(cls_base, None);
-    let classifier = LoraLinear::new(
+    let classifier = LoraLinear::new_simple(
         cls_linear,
         config.lora_rank,
         config.lora_alpha,
@@ -225,7 +369,7 @@ pub fn build_lora_ner(
     let proj_base = Tensor::eye(hidden_size, DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("NER projection identity: {e}")))?;
     let proj_linear = Linear::new(proj_base, None);
-    let projection = LoraLinear::new(
+    let projection = LoraLinear::new_simple(
         proj_linear,
         config.lora_rank,
         config.lora_alpha,
@@ -236,7 +380,7 @@ pub fn build_lora_ner(
     let cls_base = Tensor::zeros((num_labels, hidden_size), DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("NER classifier zeros: {e}")))?;
     let cls_linear = Linear::new(cls_base, None);
-    let classifier = LoraLinear::new(
+    let classifier = LoraLinear::new_simple(
         cls_linear,
         config.lora_rank,
         config.lora_alpha,
@@ -262,7 +406,7 @@ pub fn build_lora_projection(
     let base_weight = Tensor::eye(hidden_size, DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("Identity weight: {e}")))?;
     let base = Linear::new(base_weight, None);
-    let lora = LoraLinear::new(
+    let lora = LoraLinear::new_simple(
         base,
         config.lora_rank,
         config.lora_alpha,

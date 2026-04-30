@@ -17,7 +17,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.88.0"
 license = "Apache-2.0"
@@ -25,9 +25,9 @@ repository = "https://github.com/f-inverse/jammi-ai"
 
 [workspace.dependencies]
 # Internal crates
-jammi-engine = { version = "0.2.0", path = "crates/jammi-engine" }
-jammi-ai = { version = "0.2.0", path = "crates/jammi-ai" }
-jammi-server = { version = "0.2.0", path = "crates/jammi-server" }
+jammi-engine = { version = "0.3.0", path = "crates/jammi-engine" }
+jammi-ai = { version = "0.3.0", path = "crates/jammi-ai" }
+jammi-server = { version = "0.3.0", path = "crates/jammi-server" }
 jammi-test-utils = { path = "crates/jammi-test-utils" }
 
 # Query engine
@@ -51,7 +51,7 @@ candle-nn = "0.9"
 candle-transformers = "0.9"
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["download-binaries"] }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
-usearch = "2.24"
+usearch = "2.25"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
 
 # Python bindings
@@ -87,6 +87,11 @@ directories = "6"
 url = "2"
 async-trait = "0.1"
 futures = "0.3"
+
+[patch.crates-io]
+# Local patch so the MoE CUDA kernels are compiled with /MD (dynamic CRT)
+# instead of the nvcc default /MT, avoiding LNK2038 mismatch with the Rust toolchain.
+candle-kernels = { path = "vendor/candle-kernels" }
 
 [profile.dev]
 debug = "line-tables-only"

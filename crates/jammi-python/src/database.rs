@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 
-use jammi_ai::fine_tune::FineTuneMethod;
+use jammi_ai::fine_tune::{BackboneDtype, EarlyStoppingMetric, FineTuneConfig, FineTuneMethod};
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
@@ -96,7 +96,47 @@ impl PyDatabase {
     }
 
     /// Start a fine-tuning job. Returns a `FineTuneJob` handle.
-    #[pyo3(signature = (*, source, base_model, columns, method, task="embedding"))]
+    ///
+    /// All config kwargs are optional — omitting them uses the Jammi defaults:
+    ///   lora_rank=8, lora_alpha=16.0, lora_dropout=0.05,
+    ///   learning_rate=2e-4, epochs=3, batch_size=8, max_seq_length=512,
+    ///   validation_fraction=0.10, early_stopping_patience=3,
+    ///   warmup_steps=100, gradient_accumulation_steps=1,
+    ///   triplet_margin=0.5 (embedding_loss="triplet" must be set for custom margin),
+    ///   target_modules=[] (projection-only LoRA; pass e.g. ["Wqkv","Wo"] for deep LoRA).
+    ///   early_stopping_metric="val_loss" | "train_loss".
+    ///     "train_loss" replicates train_embedding_model.py without --val-file:
+    ///     set validation_fraction=0.0 and the full dataset trains without a held-out split.
+    ///   backbone_dtype="f32" | "bf16" | "f16" — dtype for frozen backbone weights.
+    ///     "bf16" cuts backbone VRAM by ~half; LoRA A/B always stay in f32.
+    ///   weight_decay — AdamW L2 regularization. Default: 0.01 (matches train_embedding_model.py).
+    ///   max_grad_norm — global gradient clipping norm. Default: 1.0. Pass 0.0 to disable.
+    #[pyo3(signature = (
+        *,
+        source,
+        base_model,
+        columns,
+        method,
+        task = "embedding",
+        lora_rank = None,
+        lora_alpha = None,
+        lora_dropout = None,
+        learning_rate = None,
+        epochs = None,
+        batch_size = None,
+        max_seq_length = None,
+        validation_fraction = None,
+        early_stopping_patience = None,
+        warmup_steps = None,
+        gradient_accumulation_steps = None,
+        triplet_margin = None,
+        target_modules = None,
+        early_stopping_metric = None,
+        backbone_dtype = None,
+        weight_decay = None,
+        max_grad_norm = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn fine_tune(
         &self,
         source: &str,
@@ -104,7 +144,62 @@ impl PyDatabase {
         columns: Vec<String>,
         method: &str,
         task: &str,
+        lora_rank: Option<usize>,
+        lora_alpha: Option<f64>,
+        lora_dropout: Option<f64>,
+        learning_rate: Option<f64>,
+        epochs: Option<usize>,
+        batch_size: Option<usize>,
+        max_seq_length: Option<usize>,
+        validation_fraction: Option<f64>,
+        early_stopping_patience: Option<usize>,
+        warmup_steps: Option<usize>,
+        gradient_accumulation_steps: Option<usize>,
+        triplet_margin: Option<f64>,
+        target_modules: Option<Vec<String>>,
+        early_stopping_metric: Option<&str>,
+        backbone_dtype: Option<&str>,
+        weight_decay: Option<f64>,
+        max_grad_norm: Option<f64>,
     ) -> PyResult<PyFineTuneJob> {
+        let mut cfg = FineTuneConfig::default();
+        if let Some(v) = lora_rank                  { cfg.lora_rank = v; }
+        if let Some(v) = lora_alpha                 { cfg.lora_alpha = v; }
+        if let Some(v) = lora_dropout               { cfg.lora_dropout = v; }
+        if let Some(v) = learning_rate              { cfg.learning_rate = v; }
+        if let Some(v) = epochs                     { cfg.epochs = v; }
+        if let Some(v) = batch_size                 { cfg.batch_size = v; }
+        if let Some(v) = max_seq_length             { cfg.max_seq_length = v; }
+        if let Some(v) = validation_fraction        { cfg.validation_fraction = v; }
+        if let Some(v) = early_stopping_patience    { cfg.early_stopping_patience = v; }
+        if let Some(v) = warmup_steps               { cfg.warmup_steps = v; }
+        if let Some(v) = gradient_accumulation_steps { cfg.gradient_accumulation_steps = v; }
+        if let Some(m) = triplet_margin {
+            cfg.embedding_loss = Some(jammi_ai::fine_tune::EmbeddingLoss::Triplet { margin: m });
+        }
+        if let Some(v) = target_modules             { cfg.target_modules = v; }
+        if let Some(metric) = early_stopping_metric {
+            cfg.early_stopping_metric = match metric {
+                "train_loss" => EarlyStoppingMetric::TrainLoss,
+                "val_loss"   => EarlyStoppingMetric::ValLoss,
+                other => return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown early_stopping_metric '{other}'. Use 'val_loss' or 'train_loss'."
+                ))),
+            };
+        }
+        if let Some(dtype_str) = backbone_dtype {
+            cfg.backbone_dtype = match dtype_str {
+                "f32"  => BackboneDtype::F32,
+                "bf16" => BackboneDtype::BF16,
+                "f16"  => BackboneDtype::F16,
+                other  => return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown backbone_dtype '{other}'. Use 'f32', 'bf16', or 'f16'."
+                ))),
+            };
+        }
+        if let Some(v) = weight_decay               { cfg.weight_decay = v; }
+        if let Some(v) = max_grad_norm              { cfg.max_grad_norm = v; }
+
         let job = self
             .runtime
             .block_on(self.session.fine_tune(
@@ -113,7 +208,7 @@ impl PyDatabase {
                 &columns,
                 method.parse::<FineTuneMethod>().map_err(to_pyerr)?,
                 task,
-                None,
+                Some(cfg),
             ))
             .map_err(to_pyerr)?;
         Ok(PyFineTuneJob::new(job, Arc::clone(&self.runtime)))

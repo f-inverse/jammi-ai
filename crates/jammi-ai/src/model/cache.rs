@@ -167,20 +167,28 @@ impl ModelCache {
 
         let loaded = backend.load(&resolved, &self.device_config)?;
 
-        // Register model in catalog (idempotent — ignores if already registered)
+        // Register model in catalog (idempotent — ignores if already registered).
+        // Store the parent directory of the first weights file so that
+        // build_deep_lora_model can locate config.json and tokenizer.json.
         let backend_str = format!("{:?}", resolved.backend).to_lowercase();
         let task_str = task.to_string();
         let model_type = match source {
             ModelSource::HuggingFace(_) => "huggingface",
             ModelSource::Local(_) => "local",
         };
+        let artifact_dir_str: Option<String> = resolved
+            .weights_paths
+            .first()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.to_str())
+            .map(|s| s.to_owned());
         if let Err(e) = self.resolver.catalog().register_model(RegisterModelParams {
             model_id: &source_str,
             version: 1,
             model_type,
             backend: &backend_str,
             task: &task_str,
-            artifact_path: resolved.weights_paths.first().and_then(|p| p.to_str()),
+            artifact_path: artifact_dir_str.as_deref(),
             config_json: None,
             ..Default::default()
         }) {

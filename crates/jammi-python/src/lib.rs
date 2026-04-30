@@ -7,6 +7,7 @@ mod search;
 use std::sync::Arc;
 
 use pyo3::prelude::*;
+use tracing_subscriber::EnvFilter;
 
 use jammi_ai::session::InferenceSession;
 use jammi_engine::config::JammiConfig;
@@ -38,6 +39,16 @@ fn connect(
     gpu_device: Option<i32>,
     inference_batch_size: Option<usize>,
 ) -> PyResult<PyDatabase> {
+    // Install a stderr tracing subscriber the first time connect() is called.
+    // Reads RUST_LOG; falls back to showing INFO from jammi crates only.
+    // try_init() is a no-op if a subscriber was already installed.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("jammi_ai=info,jammi_engine=info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Tokio init: {e}")))?;
     let rt = Arc::new(runtime);

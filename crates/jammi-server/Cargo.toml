@@ -9,6 +9,7 @@ repository.workspace = true
 readme = "README.md"
 
 [dependencies]
+jammi-ai = { workspace = true, optional = true }
 axum.workspace = true
 datafusion.workspace = true
 datafusion-flight-sql-server.workspace = true
@@ -17,6 +18,10 @@ tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+
+[features]
+cuda  = ["dep:jammi-ai", "jammi-ai/cuda"]
+metal = ["dep:jammi-ai", "jammi-ai/metal"]
 
 [dev-dependencies]
 jammi-engine.workspace = true

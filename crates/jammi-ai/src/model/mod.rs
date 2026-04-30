@@ -46,10 +46,15 @@ impl ModelSource {
     }
 
     /// Parse a user-provided model ID string into a ModelSource.
-    /// `"local:/path/to/model"` → `Local(path)`, anything else → `HuggingFace(id)`.
+    ///
+    /// - `"local:/path/to/model"` → `Local(path)`
+    /// - `"hf://owner/repo"` → `HuggingFace("owner/repo")` (strips `hf://`)
+    /// - `"owner/repo"` → `HuggingFace("owner/repo")`
     pub fn parse(id: &str) -> Self {
         if let Some(path) = id.strip_prefix("local:") {
             Self::Local(std::path::PathBuf::from(path))
+        } else if let Some(repo_id) = id.strip_prefix("hf://") {
+            Self::HuggingFace(repo_id.to_string())
         } else {
             Self::HuggingFace(id.to_string())
         }

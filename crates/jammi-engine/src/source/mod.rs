@@ -104,6 +104,6 @@ impl SourceConnection {
 /// rather than the full `C:\...\triplets_train` (which contains a colon that
 /// breaks DataFusion's SQL parser).
 pub(crate) fn table_name_from_url(url: &str) -> String {
-    let path = url.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(url);
+    let path = url.rsplit(['/', '\\']).next().unwrap_or(url);
     path.split('.').next().unwrap_or(path).to_string()
 }

@@ -439,9 +439,9 @@ impl CandleModel {
             let normalized_f32 = if normalized.dtype() == DType::F32 {
                 normalized
             } else {
-                normalized
-                    .to_dtype(DType::F32)
-                    .map_err(|e| JammiError::Inference(format!("Image embedding dtype cast: {e}")))?
+                normalized.to_dtype(DType::F32).map_err(|e| {
+                    JammiError::Inference(format!("Image embedding dtype cast: {e}"))
+                })?
             };
             let embeddings = normalized_f32
                 .to_vec2::<f32>()
@@ -886,11 +886,8 @@ impl ModelBackend for CandleBackend {
                         // Rebuild the deep LoRA encoder for inference.
                         // Pass adapter_file so LoRA A/B are loaded from the saved weights.
                         let dummy_varmap = candle_nn::VarMap::new();
-                        let weights_paths_ref: Vec<&std::path::Path> = resolved
-                            .weights_paths
-                            .iter()
-                            .map(|p| p.as_path())
-                            .collect();
+                        let weights_paths_ref: Vec<&std::path::Path> =
+                            resolved.weights_paths.iter().map(|p| p.as_path()).collect();
 
                         let mut encoder: Box<dyn crate::fine_tune::deep_lora::DeepLoraEncoder> =
                             match adapter_cfg.model_type.as_str() {
@@ -911,9 +908,11 @@ impl ModelBackend for CandleBackend {
                                         Some(adapter_file.as_path()),
                                         adapter_cfg.backbone_dtype.into(),
                                     )
-                                    .map_err(|e| JammiError::Model {
-                                        model_id: resolved.model_id.0.clone(),
-                                        message: format!("Deep LoRA DistilBERT: {e}"),
+                                    .map_err(|e| {
+                                        JammiError::Model {
+                                            model_id: resolved.model_id.0.clone(),
+                                            message: format!("Deep LoRA DistilBERT: {e}"),
+                                        }
                                     })?,
                                 ),
                                 "modernbert" => Box::new(
@@ -933,9 +932,11 @@ impl ModelBackend for CandleBackend {
                                         Some(adapter_file.as_path()),
                                         adapter_cfg.backbone_dtype.into(),
                                     )
-                                    .map_err(|e| JammiError::Model {
-                                        model_id: resolved.model_id.0.clone(),
-                                        message: format!("Deep LoRA ModernBERT: {e}"),
+                                    .map_err(|e| {
+                                        JammiError::Model {
+                                            model_id: resolved.model_id.0.clone(),
+                                            message: format!("Deep LoRA ModernBERT: {e}"),
+                                        }
                                     })?,
                                 ),
                                 _ => Box::new(
@@ -955,9 +956,11 @@ impl ModelBackend for CandleBackend {
                                         Some(adapter_file.as_path()),
                                         adapter_cfg.backbone_dtype.into(),
                                     )
-                                    .map_err(|e| JammiError::Model {
-                                        model_id: resolved.model_id.0.clone(),
-                                        message: format!("Deep LoRA BERT: {e}"),
+                                    .map_err(|e| {
+                                        JammiError::Model {
+                                            model_id: resolved.model_id.0.clone(),
+                                            message: format!("Deep LoRA BERT: {e}"),
+                                        }
                                     })?,
                                 ),
                             };
@@ -966,11 +969,27 @@ impl ModelBackend for CandleBackend {
                         (None, Some(encoder))
                     } else {
                         // Legacy projection-only adapter
-                        (load_projection_adapter(&adapter_file, &device, &dimensions, &resolved.model_id.0)?, None)
+                        (
+                            load_projection_adapter(
+                                &adapter_file,
+                                &device,
+                                &dimensions,
+                                &resolved.model_id.0,
+                            )?,
+                            None,
+                        )
                     }
                 } else if adapter_file.exists() {
                     // Legacy projection-only (no adapter_config.json)
-                    (load_projection_adapter(&adapter_file, &device, &dimensions, &resolved.model_id.0)?, None)
+                    (
+                        load_projection_adapter(
+                            &adapter_file,
+                            &device,
+                            &dimensions,
+                            &resolved.model_id.0,
+                        )?,
+                        None,
+                    )
                 } else {
                     (None, None)
                 }

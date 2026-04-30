@@ -70,9 +70,13 @@ impl LayerNorm {
                     .map_err(|e| JammiError::FineTune(format!("LN sqrt: {e}")))?,
             )
             .map_err(|e| JammiError::FineTune(format!("LN div: {e}")))?;
-        let weight_f32 = self.weight.to_dtype(DType::F32)
+        let weight_f32 = self
+            .weight
+            .to_dtype(DType::F32)
             .map_err(|e| JammiError::FineTune(format!("LN weight dtype: {e}")))?;
-        let bias_f32 = self.bias.to_dtype(DType::F32)
+        let bias_f32 = self
+            .bias
+            .to_dtype(DType::F32)
             .map_err(|e| JammiError::FineTune(format!("LN bias dtype: {e}")))?;
         norm.broadcast_mul(&weight_f32)
             .map_err(|e| JammiError::FineTune(format!("LN scale: {e}")))?
@@ -171,9 +175,9 @@ struct BertAttention {
 
 impl BertAttention {
     fn forward(&self, hidden: &Tensor, mask: &Tensor) -> Result<Tensor> {
-        let (batch, seq, _hidden) = hidden.dims3().map_err(|e| {
-            JammiError::FineTune(format!("BertAttention dims: {e}"))
-        })?;
+        let (batch, seq, _hidden) = hidden
+            .dims3()
+            .map_err(|e| JammiError::FineTune(format!("BertAttention dims: {e}")))?;
         let h = self.num_heads;
         let d = self.head_dim;
 
@@ -208,8 +212,8 @@ impl BertAttention {
                     .map_err(|e| JammiError::FineTune(format!("K^T: {e}")))?,
             )
             .map_err(|e| JammiError::FineTune(format!("QK^T: {e}")))?;
-        let scores = (scores / scale)
-            .map_err(|e| JammiError::FineTune(format!("QK scale: {e}")))?;
+        let scores =
+            (scores / scale).map_err(|e| JammiError::FineTune(format!("QK scale: {e}")))?;
 
         // Causal / padding mask: mask shape [batch, seq], expand to [batch, 1, 1, seq]
         let mask_f = mask
@@ -239,8 +243,8 @@ impl BertAttention {
             .map_err(|e| JammiError::FineTune(format!("ctx reshape: {e}")))?;
 
         let out = self.output_dense.forward(&ctx)?;
-        let residual = (out + hidden)
-            .map_err(|e| JammiError::FineTune(format!("attn residual: {e}")))?;
+        let residual =
+            (out + hidden).map_err(|e| JammiError::FineTune(format!("attn residual: {e}")))?;
         self.output_ln.forward(&residual)
     }
 }
@@ -258,8 +262,7 @@ impl BertFfn {
             .gelu_erf()
             .map_err(|e| JammiError::FineTune(format!("GELU: {e}")))?;
         let out = self.output.forward(&act)?;
-        let residual = (out + x)
-            .map_err(|e| JammiError::FineTune(format!("FFN residual: {e}")))?;
+        let residual = (out + x).map_err(|e| JammiError::FineTune(format!("FFN residual: {e}")))?;
         self.output_ln.forward(&residual)
     }
 }
@@ -290,7 +293,11 @@ struct BertEmbeddings {
 impl BertEmbeddings {
     fn load(vb: &VarBuilder) -> Result<Self> {
         let word = vb
-            .get_with_hints(0, "word_embeddings.weight", candle_nn::init::Init::Const(0.0))
+            .get_with_hints(
+                0,
+                "word_embeddings.weight",
+                candle_nn::init::Init::Const(0.0),
+            )
             .map_err(|e| JammiError::FineTune(format!("word embeddings: {e}")))?;
         let position = vb
             .get_with_hints(
@@ -344,10 +351,9 @@ impl BertEmbeddings {
             .embedding(&type_ids)
             .map_err(|e| JammiError::FineTune(format!("type embed: {e}")))?;
 
-        let emb = (word_emb + pos_emb)
-            .map_err(|e| JammiError::FineTune(format!("emb sum1: {e}")))?;
-        let emb = (emb + type_emb)
-            .map_err(|e| JammiError::FineTune(format!("emb sum2: {e}")))?;
+        let emb =
+            (word_emb + pos_emb).map_err(|e| JammiError::FineTune(format!("emb sum1: {e}")))?;
+        let emb = (emb + type_emb).map_err(|e| JammiError::FineTune(format!("emb sum2: {e}")))?;
         self.ln.forward(&emb)
     }
 }
@@ -420,8 +426,7 @@ impl BertLoraEncoder {
             let value = maybe_lora!("value", "attention.self.value");
             let output_dense = maybe_lora!("dense", "attention.output.dense");
 
-            let output_ln =
-                LayerNorm::load(&layer_vb.pp("attention.output.LayerNorm"), 1e-12)?;
+            let output_ln = LayerNorm::load(&layer_vb.pp("attention.output.LayerNorm"), 1e-12)?;
 
             let intermediate = maybe_lora!("intermediate_dense", "intermediate.dense");
             let ffn_output = maybe_lora!("output_dense", "output.dense");
@@ -518,9 +523,24 @@ impl DeepLoraEncoder for BertLoraEncoder {
     fn named_trainable_weights(&self) -> Result<HashMap<String, Tensor>> {
         let mut out = HashMap::new();
         for (n, layer) in self.layers.iter().enumerate() {
-            out.extend(layer.attention.query.named_weights(&format!("layer.{n}.query"))?);
-            out.extend(layer.attention.key.named_weights(&format!("layer.{n}.key"))?);
-            out.extend(layer.attention.value.named_weights(&format!("layer.{n}.value"))?);
+            out.extend(
+                layer
+                    .attention
+                    .query
+                    .named_weights(&format!("layer.{n}.query"))?,
+            );
+            out.extend(
+                layer
+                    .attention
+                    .key
+                    .named_weights(&format!("layer.{n}.key"))?,
+            );
+            out.extend(
+                layer
+                    .attention
+                    .value
+                    .named_weights(&format!("layer.{n}.value"))?,
+            );
             out.extend(
                 layer
                     .attention
@@ -556,12 +576,30 @@ impl DeepLoraEncoder for BertLoraEncoder {
 
     fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<()> {
         for (n, layer) in self.layers.iter_mut().enumerate() {
-            layer.attention.query.load_weights(weights, &format!("layer.{n}.query"));
-            layer.attention.key.load_weights(weights, &format!("layer.{n}.key"));
-            layer.attention.value.load_weights(weights, &format!("layer.{n}.value"));
-            layer.attention.output_dense.load_weights(weights, &format!("layer.{n}.dense"));
-            layer.ffn.intermediate.load_weights(weights, &format!("layer.{n}.intermediate_dense"));
-            layer.ffn.output.load_weights(weights, &format!("layer.{n}.output_dense"));
+            layer
+                .attention
+                .query
+                .load_weights(weights, &format!("layer.{n}.query"));
+            layer
+                .attention
+                .key
+                .load_weights(weights, &format!("layer.{n}.key"));
+            layer
+                .attention
+                .value
+                .load_weights(weights, &format!("layer.{n}.value"));
+            layer
+                .attention
+                .output_dense
+                .load_weights(weights, &format!("layer.{n}.dense"));
+            layer
+                .ffn
+                .intermediate
+                .load_weights(weights, &format!("layer.{n}.intermediate_dense"));
+            layer
+                .ffn
+                .output
+                .load_weights(weights, &format!("layer.{n}.output_dense"));
         }
         Ok(())
     }

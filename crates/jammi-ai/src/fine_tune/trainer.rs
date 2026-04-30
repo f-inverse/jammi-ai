@@ -62,11 +62,7 @@ pub fn compute_lr(config: &FineTuneConfig, step: usize, total_steps: usize) -> f
 /// Computes `total_norm = sqrt(sum ||g||² for all g)`.  If `total_norm > max_norm`,
 /// every gradient is scaled by `max_norm / total_norm`.  Pass `max_norm = 0.0` to
 /// disable clipping entirely.
-fn clip_gradients(
-    trainable_vars: &[Var],
-    grads: &mut GradStore,
-    max_norm: f64,
-) -> Result<()> {
+fn clip_gradients(trainable_vars: &[Var], grads: &mut GradStore, max_norm: f64) -> Result<()> {
     if max_norm <= 0.0 {
         return Ok(());
     }
@@ -377,7 +373,7 @@ impl TrainingLoop {
             // Decide which loss to monitor for early stopping.
             let (monitor_loss, monitor_label) = match self.config.early_stopping_metric {
                 EarlyStoppingMetric::TrainLoss => (avg_train_loss, "train"),
-                EarlyStoppingMetric::ValLoss   => (avg_val_loss,   "val"),
+                EarlyStoppingMetric::ValLoss => (avg_val_loss, "val"),
             };
 
             let lr = compute_lr(&self.config, global_step, total_steps);
@@ -433,7 +429,7 @@ impl TrainingLoop {
         let completed_at = chrono::Utc::now().to_rfc3339();
         let early_stopping_metric_label = match self.config.early_stopping_metric {
             EarlyStoppingMetric::TrainLoss => "train_loss",
-            EarlyStoppingMetric::ValLoss   => "val_loss",
+            EarlyStoppingMetric::ValLoss => "val_loss",
         };
         let metrics = serde_json::json!({
             "final_loss": best_val_loss,
@@ -490,14 +486,22 @@ impl TrainingLoop {
         let cols = encoding.input_ids.first().map_or(0, |v| v.len());
 
         let input_ids = Tensor::from_vec(
-            encoding.input_ids.into_iter().flatten().collect::<Vec<u32>>(),
+            encoding
+                .input_ids
+                .into_iter()
+                .flatten()
+                .collect::<Vec<u32>>(),
             (rows, cols),
             &self.device,
         )
         .map_err(|e| JammiError::FineTune(format!("input_ids tensor: {e}")))?;
 
         let attention_mask = Tensor::from_vec(
-            encoding.attention_masks.into_iter().flatten().collect::<Vec<u32>>(),
+            encoding
+                .attention_masks
+                .into_iter()
+                .flatten()
+                .collect::<Vec<u32>>(),
             (rows, cols),
             &self.device,
         )
@@ -582,9 +586,8 @@ impl TrainingLoop {
             }
             TextChunk::Classification { texts, labels } => {
                 let proj = encode(texts)?;
-                let labels_tensor =
-                    Tensor::from_vec(labels.clone(), (labels.len(),), &self.device)
-                        .map_err(|e| JammiError::FineTune(format!("Labels tensor: {e}")))?;
+                let labels_tensor = Tensor::from_vec(labels.clone(), (labels.len(),), &self.device)
+                    .map_err(|e| JammiError::FineTune(format!("Labels tensor: {e}")))?;
                 Ok(super::data::TrainingBatch::Classification {
                     embeddings: proj,
                     labels: labels_tensor,
@@ -608,18 +611,41 @@ impl TrainingLoop {
         epoch_neg_sim: &mut f64,
         triplet_count: &mut usize,
     ) {
-        if let super::data::TrainingBatch::Triplet { anchor, positive, negative } = batch {
+        if let super::data::TrainingBatch::Triplet {
+            anchor,
+            positive,
+            negative,
+        } = batch
+        {
             let ps = cosine_similarity(anchor, positive)
-                .and_then(|t| t.mean_all().map_err(|e| JammiError::FineTune(format!("{e}"))))
                 .and_then(|t| {
-                    let t = if t.dtype() == DType::F32 { t } else { t.to_dtype(DType::F32).map_err(|e| JammiError::FineTune(format!("{e}")))? };
-                    t.to_scalar::<f32>().map_err(|e| JammiError::FineTune(format!("{e}")))
+                    t.mean_all()
+                        .map_err(|e| JammiError::FineTune(format!("{e}")))
+                })
+                .and_then(|t| {
+                    let t = if t.dtype() == DType::F32 {
+                        t
+                    } else {
+                        t.to_dtype(DType::F32)
+                            .map_err(|e| JammiError::FineTune(format!("{e}")))?
+                    };
+                    t.to_scalar::<f32>()
+                        .map_err(|e| JammiError::FineTune(format!("{e}")))
                 });
             let ns = cosine_similarity(anchor, negative)
-                .and_then(|t| t.mean_all().map_err(|e| JammiError::FineTune(format!("{e}"))))
                 .and_then(|t| {
-                    let t = if t.dtype() == DType::F32 { t } else { t.to_dtype(DType::F32).map_err(|e| JammiError::FineTune(format!("{e}")))? };
-                    t.to_scalar::<f32>().map_err(|e| JammiError::FineTune(format!("{e}")))
+                    t.mean_all()
+                        .map_err(|e| JammiError::FineTune(format!("{e}")))
+                })
+                .and_then(|t| {
+                    let t = if t.dtype() == DType::F32 {
+                        t
+                    } else {
+                        t.to_dtype(DType::F32)
+                            .map_err(|e| JammiError::FineTune(format!("{e}")))?
+                    };
+                    t.to_scalar::<f32>()
+                        .map_err(|e| JammiError::FineTune(format!("{e}")))
                 });
             if let (Ok(ps_val), Ok(ns_val)) = (ps, ns) {
                 *epoch_pos_sim += ps_val as f64;
@@ -658,10 +684,10 @@ impl TrainingLoop {
             loss.to_dtype(DType::F32)
                 .map_err(|e| JammiError::FineTune(format!("Loss dtype cast: {e}")))?
         };
-        let loss_val =
-            loss_f32
-                .to_scalar::<f32>()
-                .map_err(|e| JammiError::FineTune(format!("Loss scalar: {e}")))? as f64;
+        let loss_val = loss_f32
+            .to_scalar::<f32>()
+            .map_err(|e| JammiError::FineTune(format!("Loss scalar: {e}")))?
+            as f64;
 
         // Divergence detection
         if loss_val.is_nan() || loss_val > 100.0 {
@@ -693,8 +719,8 @@ impl TrainingLoop {
         // graph so that `gradient_accumulation_steps > 1` doesn't grow memory
         // proportionally to the number of micro-batches.
         let scale = self.config.gradient_accumulation_steps.max(1) as f64;
-        let scaled_loss = (&loss / scale)
-            .map_err(|e| JammiError::FineTune(format!("Loss scale: {e}")))?;
+        let scaled_loss =
+            (&loss / scale).map_err(|e| JammiError::FineTune(format!("Loss scale: {e}")))?;
         let new_grads = scaled_loss
             .backward()
             .map_err(|e| JammiError::FineTune(format!("Backward: {e}")))?;
@@ -882,7 +908,12 @@ impl TrainingLoop {
             for chunk in &text_chunks {
                 let batch = self.encode_chunk(chunk)?;
                 let loss = self.compute_loss(&batch)?;
-                let loss = if loss.dtype() == DType::F32 { loss } else { loss.to_dtype(DType::F32).map_err(|e| JammiError::FineTune(format!("Val loss dtype cast: {e}")))? };
+                let loss = if loss.dtype() == DType::F32 {
+                    loss
+                } else {
+                    loss.to_dtype(DType::F32)
+                        .map_err(|e| JammiError::FineTune(format!("Val loss dtype cast: {e}")))?
+                };
                 total_loss += loss
                     .to_scalar::<f32>()
                     .map_err(|e| JammiError::FineTune(format!("Val loss scalar: {e}")))?
@@ -894,7 +925,12 @@ impl TrainingLoop {
             for batch in batches {
                 let batch = batch?;
                 let loss = self.compute_loss(&batch)?;
-                let loss = if loss.dtype() == DType::F32 { loss } else { loss.to_dtype(DType::F32).map_err(|e| JammiError::FineTune(format!("Val loss dtype cast: {e}")))? };
+                let loss = if loss.dtype() == DType::F32 {
+                    loss
+                } else {
+                    loss.to_dtype(DType::F32)
+                        .map_err(|e| JammiError::FineTune(format!("Val loss dtype cast: {e}")))?
+                };
                 total_loss += loss
                     .to_scalar::<f32>()
                     .map_err(|e| JammiError::FineTune(format!("Val loss scalar: {e}")))?
@@ -934,8 +970,9 @@ impl TrainingLoop {
         if let Some(ref deep) = self.deep_lora_model {
             let path = dir.join(format!("checkpoint_{tag}_deep.safetensors"));
             let weights = deep.encoder.named_trainable_weights()?;
-            candle_core::safetensors::save(&weights, &path)
-                .map_err(|e| JammiError::FineTune(format!("Save deep LoRA checkpoint {tag}: {e}")))?;
+            candle_core::safetensors::save(&weights, &path).map_err(|e| {
+                JammiError::FineTune(format!("Save deep LoRA checkpoint {tag}: {e}"))
+            })?;
         } else {
             let path = dir.join(format!("checkpoint_{tag}.safetensors"));
             save_lora_weights(&self.model, &path)?;

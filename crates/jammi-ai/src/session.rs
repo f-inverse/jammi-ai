@@ -629,21 +629,30 @@ fn build_training_data_loader(
             let anchor_vals = batch
                 .column_by_name("anchor")
                 .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| JammiError::FineTune(format!(
-                    "Missing/invalid 'anchor' column. Batch schema: [{}]", schema_info()
-                )))?;
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "Missing/invalid 'anchor' column. Batch schema: [{}]",
+                        schema_info()
+                    ))
+                })?;
             let pos_vals = batch
                 .column_by_name("positive")
                 .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| JammiError::FineTune(format!(
-                    "Missing/invalid 'positive' column. Batch schema: [{}]", schema_info()
-                )))?;
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "Missing/invalid 'positive' column. Batch schema: [{}]",
+                        schema_info()
+                    ))
+                })?;
             let neg_vals = batch
                 .column_by_name("negative")
                 .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| JammiError::FineTune(format!(
-                    "Missing/invalid 'negative' column. Batch schema: [{}]", schema_info()
-                )))?;
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "Missing/invalid 'negative' column. Batch schema: [{}]",
+                        schema_info()
+                    ))
+                })?;
 
             for i in 0..batch.num_rows() {
                 rows.push((
@@ -757,13 +766,12 @@ fn run_fine_tune_blocking(
         None
     };
 
-    let mut builder =
-        crate::fine_tune::trainer::TrainingLoopBuilder::new(model, varmap, config)
-            .job_id(job_id.clone())
-            .catalog(Arc::clone(&catalog))
-            .artifact_dir(artifact_dir.clone())
-            .base_model(base_model_arc)
-            .device(device.clone());
+    let mut builder = crate::fine_tune::trainer::TrainingLoopBuilder::new(model, varmap, config)
+        .job_id(job_id.clone())
+        .catalog(Arc::clone(&catalog))
+        .artifact_dir(artifact_dir.clone())
+        .base_model(base_model_arc)
+        .device(device.clone());
 
     if let Some(dlm) = deep_lora {
         builder = builder.deep_lora_model(dlm);
@@ -823,9 +831,9 @@ fn build_deep_lora_model(
     // The catalog entry may have artifact_path = NULL (set before the model was
     // downloaded for FK-constraint purposes) or may point to a weights file
     // rather than a directory (older behavior in do_load).  Handle all cases.
-    let model_record = catalog
-        .get_model(catalog_model_id)?
-        .ok_or_else(|| JammiError::FineTune(format!("Base model '{base_model_id}' not in catalog")))?;
+    let model_record = catalog.get_model(catalog_model_id)?.ok_or_else(|| {
+        JammiError::FineTune(format!("Base model '{base_model_id}' not in catalog"))
+    })?;
 
     let artifact_dir: std::path::PathBuf = match model_record.artifact_path.as_deref() {
         Some(p) if !p.is_empty() => {
@@ -835,9 +843,11 @@ fn build_deep_lora_model(
                 path
             } else {
                 path.parent()
-                    .ok_or_else(|| JammiError::FineTune(
-                        format!("Cannot determine model dir from artifact_path '{p}'")
-                    ))?
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
+                            "Cannot determine model dir from artifact_path '{p}'"
+                        ))
+                    })?
                     .to_path_buf()
             }
         }
@@ -846,22 +856,25 @@ fn build_deep_lora_model(
         // HF hub local cache, which does not re-download if files are present.
         _ => {
             let is_hf = base_model_id.starts_with("hf://")
-                || (!base_model_id.starts_with('/') && !std::path::Path::new(base_model_id).exists());
+                || (!base_model_id.starts_with('/')
+                    && !std::path::Path::new(base_model_id).exists());
             if is_hf {
                 let api = hf_hub::api::sync::Api::new()
                     .map_err(|e| JammiError::FineTune(format!("HF hub init: {e}")))?;
                 let repo = api.model(catalog_model_id.to_string());
                 // repo.get() returns the cached path without re-downloading.
-                let weights = repo
-                    .get("model.safetensors")
-                    .map_err(|e| JammiError::FineTune(format!(
+                let weights = repo.get("model.safetensors").map_err(|e| {
+                    JammiError::FineTune(format!(
                         "Cannot locate '{catalog_model_id}' in HF hub cache: {e}"
-                    )))?;
+                    ))
+                })?;
                 weights
                     .parent()
-                    .ok_or_else(|| JammiError::FineTune(
-                        "Cannot determine model dir from HF hub cache path".into()
-                    ))?
+                    .ok_or_else(|| {
+                        JammiError::FineTune(
+                            "Cannot determine model dir from HF hub cache path".into(),
+                        )
+                    })?
                     .to_path_buf()
             } else {
                 return Err(JammiError::FineTune(format!(
@@ -964,5 +977,8 @@ fn build_deep_lora_model(
         config.backbone_dtype,
     );
 
-    Ok(crate::fine_tune::deep_lora::DeepLoraModel::new(encoder, adapter_cfg))
+    Ok(crate::fine_tune::deep_lora::DeepLoraModel::new(
+        encoder,
+        adapter_cfg,
+    ))
 }

@@ -78,6 +78,7 @@ pub struct DeepLoraAdapterConfig {
 }
 
 impl DeepLoraAdapterConfig {
+    #[allow(clippy::too_many_arguments)]
     pub fn new_deep_lora(
         model_type: &str,
         lora_rank: usize,
@@ -153,7 +154,7 @@ impl DeepLoraModel {
         std::fs::create_dir_all(dir)?;
 
         let weights = self.encoder.named_trainable_weights()?;
-        candle_core::safetensors::save(&weights, &dir.join("adapter.safetensors"))
+        candle_core::safetensors::save(&weights, dir.join("adapter.safetensors"))
             .map_err(|e| JammiError::FineTune(format!("Save deep_lora safetensors: {e}")))?;
 
         let cfg_json = serde_json::to_string_pretty(&self.config)

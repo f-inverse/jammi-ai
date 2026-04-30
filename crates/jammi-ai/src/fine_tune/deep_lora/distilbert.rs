@@ -63,9 +63,13 @@ impl LayerNorm {
                     .map_err(|e| JammiError::FineTune(format!("LN sqrt: {e}")))?,
             )
             .map_err(|e| JammiError::FineTune(format!("LN div: {e}")))?;
-        let weight_f32 = self.weight.to_dtype(DType::F32)
+        let weight_f32 = self
+            .weight
+            .to_dtype(DType::F32)
             .map_err(|e| JammiError::FineTune(format!("LN weight dtype: {e}")))?;
-        let bias_f32 = self.bias.to_dtype(DType::F32)
+        let bias_f32 = self
+            .bias
+            .to_dtype(DType::F32)
             .map_err(|e| JammiError::FineTune(format!("LN bias dtype: {e}")))?;
         norm.broadcast_mul(&weight_f32)
             .map_err(|e| JammiError::FineTune(format!("LN scale: {e}")))?
@@ -204,8 +208,7 @@ impl DistilAttention {
                     .map_err(|e| JammiError::FineTune(format!("K^T: {e}")))?,
             )
             .map_err(|e| JammiError::FineTune(format!("QK: {e}")))?;
-        let scores = (scores / scale)
-            .map_err(|e| JammiError::FineTune(format!("scale: {e}")))?;
+        let scores = (scores / scale).map_err(|e| JammiError::FineTune(format!("scale: {e}")))?;
 
         let mask_f = mask
             .to_dtype(DType::F32)
@@ -222,9 +225,8 @@ impl DistilAttention {
             .broadcast_add(&additive)
             .map_err(|e| JammiError::FineTune(format!("mask add: {e}")))?;
 
-        let attn =
-            candle_nn::ops::softmax(&scores, candle_core::D::Minus1)
-                .map_err(|e| JammiError::FineTune(format!("softmax: {e}")))?;
+        let attn = candle_nn::ops::softmax(&scores, candle_core::D::Minus1)
+            .map_err(|e| JammiError::FineTune(format!("softmax: {e}")))?;
 
         let ctx = attn
             .matmul(&v)
@@ -235,8 +237,8 @@ impl DistilAttention {
             .map_err(|e| JammiError::FineTune(format!("ctx reshape: {e}")))?;
 
         let out = self.out_lin.forward(&ctx)?;
-        let residual = (out + hidden)
-            .map_err(|e| JammiError::FineTune(format!("residual: {e}")))?;
+        let residual =
+            (out + hidden).map_err(|e| JammiError::FineTune(format!("residual: {e}")))?;
         self.sa_layer_norm.forward(&residual)
     }
 }
@@ -255,8 +257,7 @@ impl DistilFfn {
             .gelu_erf()
             .map_err(|e| JammiError::FineTune(format!("ffn gelu: {e}")))?;
         let out = self.lin2.forward(&mid)?;
-        let residual = (out + x)
-            .map_err(|e| JammiError::FineTune(format!("ffn residual: {e}")))?;
+        let residual = (out + x).map_err(|e| JammiError::FineTune(format!("ffn residual: {e}")))?;
         self.output_layer_norm.forward(&residual)
     }
 }
@@ -286,7 +287,11 @@ struct DistilEmbeddings {
 impl DistilEmbeddings {
     fn load(vb: &VarBuilder) -> Result<Self> {
         let word = vb
-            .get_with_hints(0, "word_embeddings.weight", candle_nn::init::Init::Const(0.0))
+            .get_with_hints(
+                0,
+                "word_embeddings.weight",
+                candle_nn::init::Init::Const(0.0),
+            )
             .map_err(|e| JammiError::FineTune(format!("word emb: {e}")))?;
         let position = vb
             .get_with_hints(
@@ -321,8 +326,8 @@ impl DistilEmbeddings {
             .embedding(&pos_ids)
             .map_err(|e| JammiError::FineTune(format!("pos embed: {e}")))?;
 
-        let emb = (word_emb + pos_emb)
-            .map_err(|e| JammiError::FineTune(format!("emb sum: {e}")))?;
+        let emb =
+            (word_emb + pos_emb).map_err(|e| JammiError::FineTune(format!("emb sum: {e}")))?;
         self.ln.forward(&emb)
     }
 }
@@ -393,8 +398,7 @@ impl DistilBertLoraEncoder {
 
             let lin1 = maybe_lora!("lin1", "ffn.lin1");
             let lin2 = maybe_lora!("lin2", "ffn.lin2");
-            let output_layer_norm =
-                LayerNorm::load(&layer_vb.pp("output_layer_norm"), 1e-12)?;
+            let output_layer_norm = LayerNorm::load(&layer_vb.pp("output_layer_norm"), 1e-12)?;
 
             layers.push(DistilLayer {
                 attention: DistilAttention {
@@ -476,9 +480,24 @@ impl DeepLoraEncoder for DistilBertLoraEncoder {
     fn named_trainable_weights(&self) -> Result<HashMap<String, Tensor>> {
         let mut out = HashMap::new();
         for (n, layer) in self.layers.iter().enumerate() {
-            out.extend(layer.attention.q_lin.named_weights(&format!("layer.{n}.q_lin"))?);
-            out.extend(layer.attention.k_lin.named_weights(&format!("layer.{n}.k_lin"))?);
-            out.extend(layer.attention.v_lin.named_weights(&format!("layer.{n}.v_lin"))?);
+            out.extend(
+                layer
+                    .attention
+                    .q_lin
+                    .named_weights(&format!("layer.{n}.q_lin"))?,
+            );
+            out.extend(
+                layer
+                    .attention
+                    .k_lin
+                    .named_weights(&format!("layer.{n}.k_lin"))?,
+            );
+            out.extend(
+                layer
+                    .attention
+                    .v_lin
+                    .named_weights(&format!("layer.{n}.v_lin"))?,
+            );
             out.extend(
                 layer
                     .attention
@@ -504,12 +523,30 @@ impl DeepLoraEncoder for DistilBertLoraEncoder {
 
     fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<()> {
         for (n, layer) in self.layers.iter_mut().enumerate() {
-            layer.attention.q_lin.load_weights(weights, &format!("layer.{n}.q_lin"));
-            layer.attention.k_lin.load_weights(weights, &format!("layer.{n}.k_lin"));
-            layer.attention.v_lin.load_weights(weights, &format!("layer.{n}.v_lin"));
-            layer.attention.out_lin.load_weights(weights, &format!("layer.{n}.out_lin"));
-            layer.ffn.lin1.load_weights(weights, &format!("layer.{n}.lin1"));
-            layer.ffn.lin2.load_weights(weights, &format!("layer.{n}.lin2"));
+            layer
+                .attention
+                .q_lin
+                .load_weights(weights, &format!("layer.{n}.q_lin"));
+            layer
+                .attention
+                .k_lin
+                .load_weights(weights, &format!("layer.{n}.k_lin"));
+            layer
+                .attention
+                .v_lin
+                .load_weights(weights, &format!("layer.{n}.v_lin"));
+            layer
+                .attention
+                .out_lin
+                .load_weights(weights, &format!("layer.{n}.out_lin"));
+            layer
+                .ffn
+                .lin1
+                .load_weights(weights, &format!("layer.{n}.lin1"));
+            layer
+                .ffn
+                .lin2
+                .load_weights(weights, &format!("layer.{n}.lin2"));
         }
         Ok(())
     }

@@ -163,42 +163,74 @@ impl PyDatabase {
         max_grad_norm: Option<f64>,
     ) -> PyResult<PyFineTuneJob> {
         let mut cfg = FineTuneConfig::default();
-        if let Some(v) = lora_rank                  { cfg.lora_rank = v; }
-        if let Some(v) = lora_alpha                 { cfg.lora_alpha = v; }
-        if let Some(v) = lora_dropout               { cfg.lora_dropout = v; }
-        if let Some(v) = learning_rate              { cfg.learning_rate = v; }
-        if let Some(v) = epochs                     { cfg.epochs = v; }
-        if let Some(v) = batch_size                 { cfg.batch_size = v; }
-        if let Some(v) = max_seq_length             { cfg.max_seq_length = v; }
-        if let Some(v) = validation_fraction        { cfg.validation_fraction = v; }
-        if let Some(v) = early_stopping_patience    { cfg.early_stopping_patience = v; }
-        if let Some(v) = warmup_steps               { cfg.warmup_steps = v; }
-        if let Some(v) = gradient_accumulation_steps { cfg.gradient_accumulation_steps = v; }
+        if let Some(v) = lora_rank {
+            cfg.lora_rank = v;
+        }
+        if let Some(v) = lora_alpha {
+            cfg.lora_alpha = v;
+        }
+        if let Some(v) = lora_dropout {
+            cfg.lora_dropout = v;
+        }
+        if let Some(v) = learning_rate {
+            cfg.learning_rate = v;
+        }
+        if let Some(v) = epochs {
+            cfg.epochs = v;
+        }
+        if let Some(v) = batch_size {
+            cfg.batch_size = v;
+        }
+        if let Some(v) = max_seq_length {
+            cfg.max_seq_length = v;
+        }
+        if let Some(v) = validation_fraction {
+            cfg.validation_fraction = v;
+        }
+        if let Some(v) = early_stopping_patience {
+            cfg.early_stopping_patience = v;
+        }
+        if let Some(v) = warmup_steps {
+            cfg.warmup_steps = v;
+        }
+        if let Some(v) = gradient_accumulation_steps {
+            cfg.gradient_accumulation_steps = v;
+        }
         if let Some(m) = triplet_margin {
             cfg.embedding_loss = Some(jammi_ai::fine_tune::EmbeddingLoss::Triplet { margin: m });
         }
-        if let Some(v) = target_modules             { cfg.target_modules = v; }
+        if let Some(v) = target_modules {
+            cfg.target_modules = v;
+        }
         if let Some(metric) = early_stopping_metric {
             cfg.early_stopping_metric = match metric {
                 "train_loss" => EarlyStoppingMetric::TrainLoss,
-                "val_loss"   => EarlyStoppingMetric::ValLoss,
-                other => return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Unknown early_stopping_metric '{other}'. Use 'val_loss' or 'train_loss'."
-                ))),
+                "val_loss" => EarlyStoppingMetric::ValLoss,
+                other => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Unknown early_stopping_metric '{other}'. Use 'val_loss' or 'train_loss'."
+                    )))
+                }
             };
         }
         if let Some(dtype_str) = backbone_dtype {
             cfg.backbone_dtype = match dtype_str {
-                "f32"  => BackboneDtype::F32,
+                "f32" => BackboneDtype::F32,
                 "bf16" => BackboneDtype::BF16,
-                "f16"  => BackboneDtype::F16,
-                other  => return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Unknown backbone_dtype '{other}'. Use 'f32', 'bf16', or 'f16'."
-                ))),
+                "f16" => BackboneDtype::F16,
+                other => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Unknown backbone_dtype '{other}'. Use 'f32', 'bf16', or 'f16'."
+                    )))
+                }
             };
         }
-        if let Some(v) = weight_decay               { cfg.weight_decay = v; }
-        if let Some(v) = max_grad_norm              { cfg.max_grad_norm = v; }
+        if let Some(v) = weight_decay {
+            cfg.weight_decay = v;
+        }
+        if let Some(v) = max_grad_norm {
+            cfg.max_grad_norm = v;
+        }
 
         let job = self
             .runtime

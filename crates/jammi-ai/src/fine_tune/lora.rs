@@ -84,7 +84,16 @@ impl LoraLinear {
                 },
                 Init::Const(0.0),
             ),
-            LoraInitMode::Gaussian => (Init::Randn { mean: 0.0, stdev: 0.02 }, Init::Randn { mean: 0.0, stdev: 0.02 }),
+            LoraInitMode::Gaussian => (
+                Init::Randn {
+                    mean: 0.0,
+                    stdev: 0.02,
+                },
+                Init::Randn {
+                    mean: 0.0,
+                    stdev: 0.02,
+                },
+            ),
             LoraInitMode::PiSSA => (
                 // PiSSA requires SVD of the base weight — fall back to ZerosB
                 Init::Kaiming {

@@ -125,7 +125,7 @@ impl Default for LrSchedule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BackboneDtype {
-    /// Full precision (default; maximally compatible). 
+    /// Full precision (default; maximally compatible).
     F32,
     /// BFloat16 — recommended for CUDA/Metal; cuts backbone VRAM by ~half.
     BF16,
@@ -234,8 +234,12 @@ pub struct FineTuneConfig {
     pub max_grad_norm: f64,
 }
 
-fn default_weight_decay() -> f64 { 0.01 }
-fn default_max_grad_norm() -> f64 { 1.0 }
+fn default_weight_decay() -> f64 {
+    0.01
+}
+fn default_max_grad_norm() -> f64 {
+    1.0
+}
 
 impl Default for FineTuneConfig {
     fn default() -> Self {

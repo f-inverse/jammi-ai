@@ -77,11 +77,7 @@ impl RmsNorm {
     }
 }
 
-fn load_linear_no_bias(
-    vb: &VarBuilder,
-    out_features: usize,
-    in_features: usize,
-) -> Result<Linear> {
+fn load_linear_no_bias(vb: &VarBuilder, out_features: usize, in_features: usize) -> Result<Linear> {
     let weight = vb
         .get_with_hints(
             (out_features, in_features),
@@ -179,12 +175,7 @@ struct RotaryEmbedding {
 }
 
 impl RotaryEmbedding {
-    fn new(
-        head_dim: usize,
-        max_seq_len: usize,
-        rope_base: f64,
-        device: &Device,
-    ) -> Result<Self> {
+    fn new(head_dim: usize, max_seq_len: usize, rope_base: f64, device: &Device) -> Result<Self> {
         // Standard HF-style RoPE table. Build cos/sin at full `head_dim`
         // by duplicating the `half` frequencies; this matches the
         // `rotate_half` formulation `(q*cos) + (rotate_half(q)*sin)` where
@@ -197,15 +188,13 @@ impl RotaryEmbedding {
         for pos in 0..max_seq_len {
             // First half: cos(pos·θ_i), sin(pos·θ_i) for i in 0..half.
             for i in 0..half {
-                let theta = (pos as f64)
-                    * (rope_base.powf(-2.0 * i as f64 / head_dim as f64));
+                let theta = (pos as f64) * (rope_base.powf(-2.0 * i as f64 / head_dim as f64));
                 cos_vec.push(theta.cos() as f32);
                 sin_vec.push(theta.sin() as f32);
             }
             // Second half: same values duplicated (HF `cat([freqs, freqs])`).
             for i in 0..half {
-                let theta = (pos as f64)
-                    * (rope_base.powf(-2.0 * i as f64 / head_dim as f64));
+                let theta = (pos as f64) * (rope_base.powf(-2.0 * i as f64 / head_dim as f64));
                 cos_vec.push(theta.cos() as f32);
                 sin_vec.push(theta.sin() as f32);
             }
@@ -216,14 +205,18 @@ impl RotaryEmbedding {
         let sin = Tensor::from_vec(sin_vec, (max_seq_len, head_dim), device)
             .map_err(|e| JammiError::FineTune(format!("RoPE sin: {e}")))?;
 
-        Ok(Self { cos, sin, rotary_dim })
+        Ok(Self {
+            cos,
+            sin,
+            rotary_dim,
+        })
     }
 
     /// Apply RoPE to a [batch, num_heads, seq, head_dim] tensor.
     fn apply(&self, x: &Tensor) -> Result<Tensor> {
-        let (_batch, _heads, seq, head_dim) = x.dims4().map_err(|e| {
-            JammiError::FineTune(format!("RoPE apply dims: {e}"))
-        })?;
+        let (_batch, _heads, seq, head_dim) = x
+            .dims4()
+            .map_err(|e| JammiError::FineTune(format!("RoPE apply dims: {e}")))?;
         let half = head_dim / 2;
         let x_dtype = x.dtype();
 
@@ -259,8 +252,8 @@ impl RotaryEmbedding {
             .map_err(|e| JammiError::FineTune(format!("RoPE x2: {e}")))?;
 
         // rotate_half: [-x2, x1]
-        let neg_x2 = (x2 * -1.0f64)
-            .map_err(|e| JammiError::FineTune(format!("RoPE neg_x2: {e}")))?;
+        let neg_x2 =
+            (x2 * -1.0f64).map_err(|e| JammiError::FineTune(format!("RoPE neg_x2: {e}")))?;
         let rot_half = Tensor::cat(&[&neg_x2, &x1], candle_core::D::Minus1)
             .map_err(|e| JammiError::FineTune(format!("RoPE cat: {e}")))?;
 
@@ -363,8 +356,7 @@ impl ModernBertAttention {
                     .map_err(|e| JammiError::FineTune(format!("K^T: {e}")))?,
             )
             .map_err(|e| JammiError::FineTune(format!("QK: {e}")))?;
-        let scores = (scores / scale)
-            .map_err(|e| JammiError::FineTune(format!("scale: {e}")))?;
+        let scores = (scores / scale).map_err(|e| JammiError::FineTune(format!("scale: {e}")))?;
 
         // Additive attention mask in F32: 0 → -1e9 for padding positions.
         let mask_f = mask
@@ -422,9 +414,10 @@ impl ModernBertMlp {
 
         // Wi: [batch, seq, 2*intermediate] → split gate and up
         let up_gate = self.wi.forward(&normed)?;
-        let intermediate = up_gate.dim(candle_core::D::Minus1).map_err(|e| {
-            JammiError::FineTune(format!("Wi dim: {e}"))
-        })? / 2;
+        let intermediate = up_gate
+            .dim(candle_core::D::Minus1)
+            .map_err(|e| JammiError::FineTune(format!("Wi dim: {e}")))?
+            / 2;
 
         let gate = up_gate
             .narrow(candle_core::D::Minus1, 0, intermediate)
@@ -433,9 +426,10 @@ impl ModernBertMlp {
             .narrow(candle_core::D::Minus1, intermediate, intermediate)
             .map_err(|e| JammiError::FineTune(format!("up narrow: {e}")))?;
 
-        let act = (gate.gelu_erf().map_err(|e| {
-            JammiError::FineTune(format!("GELU: {e}"))
-        })? * up)
+        let act = (gate
+            .gelu_erf()
+            .map_err(|e| JammiError::FineTune(format!("GELU: {e}")))?
+            * up)
             .map_err(|e| JammiError::FineTune(format!("gate*up: {e}")))?;
 
         let out = self.wo.forward(&act)?;
@@ -501,11 +495,7 @@ impl ModernBertLoraEncoderInner {
             )
             .map_err(|e| JammiError::FineTune(format!("ModernBERT tok_embeddings: {e}")))?;
 
-        let emb_norm = RmsNorm::load(
-            &frozen_vb.pp("model.embeddings.norm"),
-            1e-5,
-            hidden_size,
-        )?;
+        let emb_norm = RmsNorm::load(&frozen_vb.pp("model.embeddings.norm"), 1e-5, hidden_size)?;
 
         let mut layers = Vec::with_capacity(num_layers);
 
@@ -515,8 +505,7 @@ impl ModernBertLoraEncoderInner {
 
             macro_rules! maybe_lora {
                 ($name:expr, $sub:expr, $out:expr, $in:expr) => {{
-                    let frozen_lin =
-                        load_linear_no_bias(&layer_vb.pp($sub), $out, $in)?;
+                    let frozen_lin = load_linear_no_bias(&layer_vb.pp($sub), $out, $in)?;
                     if should_apply_lora($name, target_modules, n, layers_to_transform) {
                         let rank = effective_rank($name, lora_rank, rank_pattern);
                         let l = LoraLinear::new(
@@ -538,18 +527,14 @@ impl ModernBertLoraEncoderInner {
             // attn.Wqkv: fused QKV → out=3*hidden, in=hidden
             let wqkv = maybe_lora!("Wqkv", "attn.Wqkv", 3 * hidden_size, hidden_size);
             // attn.Wo:  hidden × hidden
-            let wo   = maybe_lora!("Wo",   "attn.Wo",   hidden_size,     hidden_size);
+            let wo = maybe_lora!("Wo", "attn.Wo", hidden_size, hidden_size);
 
             // ModernBERT replaces layer 0's `attn_norm` with `nn.Identity()`
             // because the embedding RMSNorm already pre-normalises the input.
             let attn_norm = if n == 0 {
                 None
             } else {
-                Some(RmsNorm::load(
-                    &layer_vb.pp("attn_norm"),
-                    1e-5,
-                    hidden_size,
-                )?)
+                Some(RmsNorm::load(&layer_vb.pp("attn_norm"), 1e-5, hidden_size)?)
             };
 
             let rope = RotaryEmbedding::new(head_dim, max_seq_len, rope_base, device)?;
@@ -558,11 +543,9 @@ impl ModernBertLoraEncoderInner {
             // the target-module string "Wo" via ends_with() but has a unique VarMap
             // key that does not collide with the attention "Wo".
             // GeGLU: Wi packs gate+up → out=2*intermediate, in=hidden
-            let wi     = maybe_lora!("Wi",     "mlp.Wi",
-                                     2 * intermediate_size, hidden_size);
+            let wi = maybe_lora!("Wi", "mlp.Wi", 2 * intermediate_size, hidden_size);
             // mlp.Wo: hidden × intermediate
-            let mlp_wo = maybe_lora!("mlp.Wo", "mlp.Wo",
-                                     hidden_size,           intermediate_size);
+            let mlp_wo = maybe_lora!("mlp.Wo", "mlp.Wo", hidden_size, intermediate_size);
             let mlp_norm = RmsNorm::load(&layer_vb.pp("mlp_norm"), 1e-5, hidden_size)?;
 
             layers.push(ModernBertLayer {
@@ -665,7 +648,12 @@ impl DeepLoraEncoder for ModernBertLoraEncoderInner {
     fn named_trainable_weights(&self) -> Result<HashMap<String, Tensor>> {
         let mut out = HashMap::new();
         for (n, layer) in self.layers.iter().enumerate() {
-            out.extend(layer.attention.wqkv.named_weights(&format!("layer.{n}.Wqkv"))?);
+            out.extend(
+                layer
+                    .attention
+                    .wqkv
+                    .named_weights(&format!("layer.{n}.Wqkv"))?,
+            );
             out.extend(layer.attention.wo.named_weights(&format!("layer.{n}.Wo"))?);
             out.extend(layer.mlp.wi.named_weights(&format!("layer.{n}.Wi"))?);
             out.extend(layer.mlp.wo.named_weights(&format!("layer.{n}.mlp.Wo"))?);
@@ -684,10 +672,19 @@ impl DeepLoraEncoder for ModernBertLoraEncoderInner {
 
     fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<()> {
         for (n, layer) in self.layers.iter_mut().enumerate() {
-            layer.attention.wqkv.load_weights(weights, &format!("layer.{n}.Wqkv"));
-            layer.attention.wo.load_weights(weights, &format!("layer.{n}.Wo"));
+            layer
+                .attention
+                .wqkv
+                .load_weights(weights, &format!("layer.{n}.Wqkv"));
+            layer
+                .attention
+                .wo
+                .load_weights(weights, &format!("layer.{n}.Wo"));
             layer.mlp.wi.load_weights(weights, &format!("layer.{n}.Wi"));
-            layer.mlp.wo.load_weights(weights, &format!("layer.{n}.mlp.Wo"));
+            layer
+                .mlp
+                .wo
+                .load_weights(weights, &format!("layer.{n}.mlp.Wo"));
         }
         Ok(())
     }

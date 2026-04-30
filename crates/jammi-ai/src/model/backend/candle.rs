@@ -218,6 +218,9 @@ pub struct CandleModel {
     id2label: Option<HashMap<u32, String>>,
     /// Token-level classifier for NER models (applied per token, no pooling).
     ner_classifier: Option<candle_nn::Linear>,
+    /// Optional deep LoRA encoder. When set, overrides the standard text forward
+    /// + mean-pool + L2-norm + optional projection path for text embedding tasks.
+    deep_lora_inference: Option<Box<dyn crate::fine_tune::deep_lora::DeepLoraEncoder>>,
 }
 
 impl CandleModel {
@@ -327,25 +330,38 @@ impl CandleModel {
             let input_ids = self.tokens_to_tensor(&encoding.input_ids)?;
             let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
 
-            let output = self.text_forward()?.forward_hidden(
-                &input_ids,
-                &attention_mask,
-                &encoding,
-                &self.device,
-            )?;
-
-            let pooled = self.mean_pool(&output, &attention_mask)?;
-            let normalized = self.l2_normalize(&pooled)?;
-
-            // Apply LoRA projection if this is a fine-tuned model
-            let final_output = if let Some(ref lora) = self.lora_projection {
-                lora.forward(&normalized)
-                    .map_err(|e| JammiError::Inference(format!("LoRA projection: {e}")))?
+            let final_output = if let Some(ref deep) = self.deep_lora_inference {
+                // Deep LoRA path: encoder handles pooling + L2 norm internally.
+                deep.forward(&input_ids, &attention_mask)
+                    .map_err(|e| JammiError::Inference(format!("Deep LoRA forward: {e}")))?
             } else {
-                normalized
+                let output = self.text_forward()?.forward_hidden(
+                    &input_ids,
+                    &attention_mask,
+                    &encoding,
+                    &self.device,
+                )?;
+
+                let pooled = self.mean_pool(&output, &attention_mask)?;
+                let normalized = self.l2_normalize(&pooled)?;
+
+                // Apply projection-only LoRA if present
+                if let Some(ref lora) = self.lora_projection {
+                    lora.forward(&normalized)
+                        .map_err(|e| JammiError::Inference(format!("LoRA projection: {e}")))?
+                } else {
+                    normalized
+                }
             };
 
-            let embeddings = final_output
+            let final_output_f32 = if final_output.dtype() == DType::F32 {
+                final_output
+            } else {
+                final_output
+                    .to_dtype(DType::F32)
+                    .map_err(|e| JammiError::Inference(format!("Embedding dtype cast: {e}")))?
+            };
+            let embeddings = final_output_f32
                 .to_vec2::<f32>()
                 .map_err(|e| JammiError::Inference(format!("Tensor to vec failed: {e}")))?;
 
@@ -420,7 +436,14 @@ impl CandleModel {
 
             let normalized = self.l2_normalize(&output)?;
 
-            let embeddings = normalized
+            let normalized_f32 = if normalized.dtype() == DType::F32 {
+                normalized
+            } else {
+                normalized
+                    .to_dtype(DType::F32)
+                    .map_err(|e| JammiError::Inference(format!("Image embedding dtype cast: {e}")))?
+            };
+            let embeddings = normalized_f32
                 .to_vec2::<f32>()
                 .map_err(|e| JammiError::Inference(format!("Tensor to vec failed: {e}")))?;
 
@@ -834,51 +857,125 @@ impl ModelBackend for CandleBackend {
             })?;
 
         // Load LoRA adapter if present (fine-tuned models)
-        let lora_projection =
+        //
+        // Two paths:
+        //   1. deep_lora — adapter_config.json has "adapter_type": "deep_lora"
+        //      → rebuild the encoder with frozen base weights + loaded LoRA A/B.
+        //   2. projection-only (legacy) — adapter.safetensors holds only the
+        //      external projection layer's A/B matrices.
+        let (lora_projection, deep_lora_inference) =
             if let Some(ref adapter_path) = resolved.adapter_path {
+                let adapter_config_file = adapter_path.join("adapter_config.json");
                 let adapter_file = adapter_path.join("adapter.safetensors");
-                if adapter_file.exists() {
-                    let adapter_weights =
-                        crate::fine_tune::lora::load_lora_weights(&adapter_file, &device).map_err(
-                            |e| JammiError::Model {
-                                model_id: resolved.model_id.0.clone(),
-                                message: format!("Load adapter: {e}"),
-                            },
-                        )?;
 
-                    let hidden_size = dimensions.hidden_size;
-                    let identity = Tensor::eye(hidden_size, DType::F32, &device).map_err(|e| {
+                if adapter_config_file.exists() && adapter_file.exists() {
+                    // Read and parse adapter_config.json
+                    let cfg_str = std::fs::read_to_string(&adapter_config_file).map_err(|e| {
                         JammiError::Model {
                             model_id: resolved.model_id.0.clone(),
-                            message: format!("Identity weight: {e}"),
+                            message: format!("Read adapter_config.json: {e}"),
                         }
                     })?;
-                    let base_linear = candle_nn::Linear::new(identity, None);
-
-                    let lora_a = adapter_weights.get("projection.lora_a").ok_or_else(|| {
-                        JammiError::Model {
+                    let adapter_cfg: crate::fine_tune::deep_lora::DeepLoraAdapterConfig =
+                        serde_json::from_str(&cfg_str).map_err(|e| JammiError::Model {
                             model_id: resolved.model_id.0.clone(),
-                            message: "Adapter missing projection.lora_a".into(),
-                        }
-                    })?;
-                    let lora_b = adapter_weights.get("projection.lora_b").ok_or_else(|| {
-                        JammiError::Model {
-                            model_id: resolved.model_id.0.clone(),
-                            message: "Adapter missing projection.lora_b".into(),
-                        }
-                    })?;
+                            message: format!("Parse adapter_config.json: {e}"),
+                        })?;
 
-                    Some(crate::fine_tune::lora::LoraLinear::from_loaded(
-                        base_linear,
-                        lora_a.clone(),
-                        lora_b.clone(),
-                        16.0, // default alpha — matches FineTuneConfig::default()
-                    ))
+                    if adapter_cfg.adapter_type == "deep_lora" {
+                        // Rebuild the deep LoRA encoder for inference.
+                        // Pass adapter_file so LoRA A/B are loaded from the saved weights.
+                        let dummy_varmap = candle_nn::VarMap::new();
+                        let weights_paths_ref: Vec<&std::path::Path> = resolved
+                            .weights_paths
+                            .iter()
+                            .map(|p| p.as_path())
+                            .collect();
+
+                        let mut encoder: Box<dyn crate::fine_tune::deep_lora::DeepLoraEncoder> =
+                            match adapter_cfg.model_type.as_str() {
+                                "distilbert" => Box::new(
+                                    crate::fine_tune::deep_lora::distilbert::build(
+                                        &weights_paths_ref,
+                                        &model_config,
+                                        &adapter_cfg.target_modules,
+                                        &adapter_cfg.layers_to_transform,
+                                        adapter_cfg.lora_rank,
+                                        adapter_cfg.lora_alpha,
+                                        adapter_cfg.use_rslora,
+                                        None,
+                                        &adapter_cfg.rank_pattern,
+                                        crate::fine_tune::lora::LoraInitMode::ZerosB,
+                                        &device,
+                                        &dummy_varmap,
+                                        Some(adapter_file.as_path()),
+                                        adapter_cfg.backbone_dtype.into(),
+                                    )
+                                    .map_err(|e| JammiError::Model {
+                                        model_id: resolved.model_id.0.clone(),
+                                        message: format!("Deep LoRA DistilBERT: {e}"),
+                                    })?,
+                                ),
+                                "modernbert" => Box::new(
+                                    crate::fine_tune::deep_lora::modernbert::build(
+                                        &weights_paths_ref,
+                                        &model_config,
+                                        &adapter_cfg.target_modules,
+                                        &adapter_cfg.layers_to_transform,
+                                        adapter_cfg.lora_rank,
+                                        adapter_cfg.lora_alpha,
+                                        adapter_cfg.use_rslora,
+                                        None,
+                                        &adapter_cfg.rank_pattern,
+                                        crate::fine_tune::lora::LoraInitMode::ZerosB,
+                                        &device,
+                                        &dummy_varmap,
+                                        Some(adapter_file.as_path()),
+                                        adapter_cfg.backbone_dtype.into(),
+                                    )
+                                    .map_err(|e| JammiError::Model {
+                                        model_id: resolved.model_id.0.clone(),
+                                        message: format!("Deep LoRA ModernBERT: {e}"),
+                                    })?,
+                                ),
+                                _ => Box::new(
+                                    crate::fine_tune::deep_lora::bert::build(
+                                        &weights_paths_ref,
+                                        &model_config,
+                                        &adapter_cfg.target_modules,
+                                        &adapter_cfg.layers_to_transform,
+                                        adapter_cfg.lora_rank,
+                                        adapter_cfg.lora_alpha,
+                                        adapter_cfg.use_rslora,
+                                        None,
+                                        &adapter_cfg.rank_pattern,
+                                        crate::fine_tune::lora::LoraInitMode::ZerosB,
+                                        &device,
+                                        &dummy_varmap,
+                                        Some(adapter_file.as_path()),
+                                        adapter_cfg.backbone_dtype.into(),
+                                    )
+                                    .map_err(|e| JammiError::Model {
+                                        model_id: resolved.model_id.0.clone(),
+                                        message: format!("Deep LoRA BERT: {e}"),
+                                    })?,
+                                ),
+                            };
+                        // Loaded for inference: disable dropout in all LoRA layers.
+                        encoder.set_training(false);
+                        (None, Some(encoder))
+                    } else {
+                        // Legacy projection-only adapter
+                        (load_projection_adapter(&adapter_file, &device, &dimensions, &resolved.model_id.0)?, None)
+                    }
+                } else if adapter_file.exists() {
+                    // Legacy projection-only (no adapter_config.json)
+                    (load_projection_adapter(&adapter_file, &device, &dimensions, &resolved.model_id.0)?, None)
                 } else {
-                    None
+                    (None, None)
                 }
             } else {
-                None
+                (None, None)
             };
 
         // Load NER token classifier if this is a NER model
@@ -914,6 +1011,7 @@ impl ModelBackend for CandleBackend {
             lora_projection,
             id2label,
             ner_classifier,
+            deep_lora_inference,
         })))
     }
 
@@ -933,6 +1031,48 @@ fn tokens_to_tensor(vecs: &[Vec<u32>], device: &Device) -> Result<Tensor> {
     let cols = vecs.first().map_or(0, |v| v.len());
     let flat: Vec<u32> = vecs.iter().flatten().copied().collect();
     Tensor::from_vec(flat, (rows, cols), device).map_err(|e| JammiError::Inference(e.to_string()))
+}
+
+/// Load a legacy projection-only LoRA adapter from a safetensors file.
+///
+/// Returns the single `projection` LoraLinear, or `None` if the file cannot
+/// be read or the expected keys are missing.
+fn load_projection_adapter(
+    adapter_file: &std::path::Path,
+    device: &Device,
+    dimensions: &crate::model::ModelDimensions,
+    model_id: &str,
+) -> jammi_engine::error::Result<Option<crate::fine_tune::lora::LoraLinear>> {
+    let adapter_weights =
+        crate::fine_tune::lora::load_lora_weights(adapter_file, device).map_err(|e| {
+            JammiError::Model {
+                model_id: model_id.to_string(),
+                message: format!("Load adapter: {e}"),
+            }
+        })?;
+
+    let hidden_size = dimensions.hidden_size;
+    let identity = Tensor::eye(hidden_size, DType::F32, device).map_err(|e| JammiError::Model {
+        model_id: model_id.to_string(),
+        message: format!("Identity weight: {e}"),
+    })?;
+    let base_linear = candle_nn::Linear::new(identity, None);
+
+    let lora_a = match adapter_weights.get("projection.lora_a") {
+        Some(t) => t.clone(),
+        None => return Ok(None),
+    };
+    let lora_b = match adapter_weights.get("projection.lora_b") {
+        Some(t) => t.clone(),
+        None => return Ok(None),
+    };
+
+    Ok(Some(crate::fine_tune::lora::LoraLinear::from_loaded(
+        base_linear,
+        lora_a,
+        lora_b,
+        16.0, // default alpha — matches FineTuneConfig::default()
+    )))
 }
 
 /// Normalize DistilBERT config fields to standard BERT names.
@@ -969,7 +1109,7 @@ fn normalize_distilbert_config(config: &serde_json::Value) -> serde_json::Value 
     normalized
 }
 
-fn select_device(config: &DeviceConfig) -> Device {
+pub(crate) fn select_device(config: &DeviceConfig) -> Device {
     if config.gpu_device < 0 {
         return Device::Cpu;
     }

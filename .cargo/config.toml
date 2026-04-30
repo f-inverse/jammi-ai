@@ -1,6 +1,6 @@
-# sccache: local disk in dev, GHA cache backend in CI (SCCACHE_GHA_ENABLED).
-[build]
-rustc-wrapper = "sccache"
+# sccache is used in CI via SCCACHE_GHA_ENABLED env var — not needed for local dev.
+# [build]
+# rustc-wrapper = "sccache"
 
 # mold linker on Linux — available in the unified manylinux_2_28 CI/dev image.
 # In CI, RUSTFLAGS env var includes both -D warnings and -C link-arg=-fuse-ld=mold,
@@ -10,3 +10,11 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# Point the build to CUDA 12.4 (overrides any older 11.x installation on PATH).
+# NVCC_FLAGS: pass /MD so CUDA host-compiled objects use the dynamic CRT,
+# matching the /MD that the Rust toolchain and other C++ libs use. Without
+# this the linker raises LNK2038 (MT_StaticRelease vs MD_DynamicRelease).
+[env]
+CUDA_PATH = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.4"
+CUDA_HOME = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.4"

@@ -31,6 +31,7 @@ pub struct InferenceSession {
     result_store: Arc<ResultStore>,
     observer: Option<Arc<dyn InferenceObserver>>,
     ann_cache: Arc<AnnCache>,
+    device_config: DeviceConfig,
 }
 
 impl InferenceSession {
@@ -49,7 +50,7 @@ impl InferenceSession {
         let resolver = ModelResolver::new(catalog.clone())?;
         let device_config = DeviceConfig::from_config(inner.config());
         let scheduler = Arc::new(GpuScheduler::new_unlimited());
-        let model_cache = Arc::new(ModelCache::new(resolver, device_config, scheduler));
+        let model_cache = Arc::new(ModelCache::new(resolver, device_config.clone(), scheduler));
         let result_store = Arc::new(ResultStore::new(
             inner.config().artifact_dir.as_path(),
             Arc::clone(&catalog),
@@ -67,6 +68,7 @@ impl InferenceSession {
             result_store,
             observer,
             ann_cache,
+            device_config,
         })
     }
 
@@ -330,7 +332,7 @@ impl InferenceSession {
             .map(|c| format!("\"{c}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("SELECT {select_list} FROM {source_id}.public.{table_name}")
+        format!("SELECT {select_list} FROM {source_id}.public.\"{table_name}\"")
     }
 
     /// Find the first table name registered under a source catalog.
@@ -417,7 +419,7 @@ impl InferenceSession {
         // Load training data from the source
         let table_name = self.find_table_name(source)?;
         let query = format!(
-            "SELECT {} FROM {source}.public.{table_name}",
+            "SELECT {} FROM {source}.public.\"{table_name}\"",
             columns
                 .iter()
                 .map(|c| format!("\"{c}\""))
@@ -447,6 +449,7 @@ impl InferenceSession {
         let output_model_id_clone = output_model_id.clone();
         let base_model_str = base_model.to_string();
         let task_str = task.to_string();
+        let device_config = self.device_config.clone();
 
         tokio::task::spawn_blocking(move || {
             run_fine_tune_blocking(
@@ -460,6 +463,7 @@ impl InferenceSession {
                 data_loader,
                 base_model_arc,
                 hidden_size,
+                device_config,
             )
         });
 
@@ -528,13 +532,39 @@ impl InferenceSession {
 // Fine-tuning helpers (outside impl block)
 // =========================================================================
 
+/// Extract all string values from an Arrow column.
+///
+/// DataFusion 52+ returns Parquet string columns as `Utf8View` by default;
+/// older versions returned `Utf8` or `LargeUtf8`. Dictionary-encoded variants
+/// are also possible. Fast paths cover the three common types; the `cast`
+/// fallback handles everything else.
+fn extract_string_column(col: &dyn arrow::array::Array) -> Option<Vec<String>> {
+    use arrow::array::{Array, LargeStringArray, StringArray, StringViewArray};
+    use arrow::datatypes::DataType;
+
+    // Fast path: Utf8View — DataFusion 52+ default for Parquet string columns
+    if let Some(a) = col.as_any().downcast_ref::<StringViewArray>() {
+        return Some((0..a.len()).map(|i| a.value(i).to_string()).collect());
+    }
+    // Fast path: Utf8
+    if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+        return Some((0..a.len()).map(|i| a.value(i).to_string()).collect());
+    }
+    // Fast path: LargeUtf8
+    if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
+        return Some((0..a.len()).map(|i| a.value(i).to_string()).collect());
+    }
+    // General fallback: cast to Utf8 (handles Dictionary variants, etc.)
+    let casted = arrow::compute::cast(col, &DataType::Utf8).ok()?;
+    let a = casted.as_any().downcast_ref::<StringArray>()?;
+    Some((0..a.len()).map(|i| a.value(i).to_string()).collect())
+}
+
 /// Build a TrainingDataLoader from query result batches.
 fn build_training_data_loader(
     batches: &[RecordBatch],
     columns: &[String],
 ) -> Result<crate::fine_tune::data::TrainingDataLoader> {
-    use arrow::array::StringArray;
-
     // Detect format from column names
     let col_names: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
 
@@ -559,13 +589,9 @@ fn build_training_data_loader(
                 .column_by_name("score")
                 .ok_or_else(|| JammiError::FineTune("Missing column 'score'".into()))?;
 
-            let a_arr = a_col
-                .as_any()
-                .downcast_ref::<StringArray>()
+            let a_vals = extract_string_column(a_col.as_ref())
                 .ok_or_else(|| JammiError::FineTune("'text_a' is not a string column".into()))?;
-            let b_arr = b_col
-                .as_any()
-                .downcast_ref::<StringArray>()
+            let b_vals = extract_string_column(b_col.as_ref())
                 .ok_or_else(|| JammiError::FineTune("'text_b' is not a string column".into()))?;
             let s_arr = s_col
                 .as_any()
@@ -584,35 +610,46 @@ fn build_training_data_loader(
                 .ok_or_else(|| JammiError::FineTune("'score' is not a float column".into()))?;
 
             for (i, &score) in s_arr.iter().enumerate().take(batch.num_rows()) {
-                rows.push((
-                    a_arr.value(i).to_string(),
-                    b_arr.value(i).to_string(),
-                    score,
-                ));
+                rows.push((a_vals[i].clone(), b_vals[i].clone(), score));
             }
         }
         Ok(crate::fine_tune::data::TrainingDataLoader::from_contrastive(rows))
     } else if has_triplet {
         let mut rows = Vec::new();
         for batch in batches {
-            let anchor = batch
+            let schema_info = || {
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| format!("{}:{}", f.name(), f.data_type()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let anchor_vals = batch
                 .column_by_name("anchor")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'anchor' column".into()))?;
-            let pos = batch
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| JammiError::FineTune(format!(
+                    "Missing/invalid 'anchor' column. Batch schema: [{}]", schema_info()
+                )))?;
+            let pos_vals = batch
                 .column_by_name("positive")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'positive' column".into()))?;
-            let neg = batch
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| JammiError::FineTune(format!(
+                    "Missing/invalid 'positive' column. Batch schema: [{}]", schema_info()
+                )))?;
+            let neg_vals = batch
                 .column_by_name("negative")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'negative' column".into()))?;
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| JammiError::FineTune(format!(
+                    "Missing/invalid 'negative' column. Batch schema: [{}]", schema_info()
+                )))?;
 
             for i in 0..batch.num_rows() {
                 rows.push((
-                    anchor.value(i).to_string(),
-                    pos.value(i).to_string(),
-                    neg.value(i).to_string(),
+                    anchor_vals[i].clone(),
+                    pos_vals[i].clone(),
+                    neg_vals[i].clone(),
                 ));
             }
         }
@@ -623,20 +660,17 @@ fn build_training_data_loader(
         let mut label_set = std::collections::BTreeSet::new();
         let mut rows = Vec::new();
         for batch in batches {
-            let text_col = batch
+            let text_vals = batch
                 .column_by_name("text")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .and_then(|c| extract_string_column(c.as_ref()))
                 .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
-            let label_col = batch
+            let label_vals = batch
                 .column_by_name("label")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .and_then(|c| extract_string_column(c.as_ref()))
                 .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
             for i in 0..batch.num_rows() {
-                label_set.insert(label_col.value(i).to_string());
-                rows.push((
-                    text_col.value(i).to_string(),
-                    label_col.value(i).to_string(),
-                ));
+                label_set.insert(label_vals[i].clone());
+                rows.push((text_vals[i].clone(), label_vals[i].clone()));
             }
         }
         // Build label → index mapping
@@ -681,11 +715,12 @@ fn run_fine_tune_blocking(
     data_loader: crate::fine_tune::data::TrainingDataLoader,
     base_model_arc: Arc<crate::model::LoadedModel>,
     hidden_size: usize,
+    device_config: DeviceConfig,
 ) -> Result<()> {
-    use candle_core::{DType, Device};
+    use candle_core::DType;
     use candle_nn::VarMap;
 
-    let device = Device::Cpu;
+    let device = crate::model::backend::candle::select_device(&device_config);
     let varmap = VarMap::new();
     let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
@@ -703,13 +738,38 @@ fn run_fine_tune_blocking(
         crate::fine_tune::lora::build_lora_projection(hidden_size, &config, &vb)?
     };
 
-    let mut training_loop =
+    // ── Deep LoRA path ────────────────────────────────────────────────────────
+    // When `target_modules` is non-empty, build a DeepLoraEncoder that wraps
+    // LoRA adapters inside the encoder stack rather than after it.
+    let deep_lora = if !config.target_modules.is_empty() {
+        build_deep_lora_model(
+            &base_model,
+            &catalog,
+            &config,
+            &varmap,
+            &device,
+        )
+        .map_err(|e| {
+            tracing::error!(error = %e, "Deep LoRA init failed; falling back to projection-only");
+        })
+        .ok()
+    } else {
+        None
+    };
+
+    let mut builder =
         crate::fine_tune::trainer::TrainingLoopBuilder::new(model, varmap, config)
             .job_id(job_id.clone())
             .catalog(Arc::clone(&catalog))
             .artifact_dir(artifact_dir.clone())
             .base_model(base_model_arc)
-            .build()?;
+            .device(device.clone());
+
+    if let Some(dlm) = deep_lora {
+        builder = builder.deep_lora_model(dlm);
+    }
+
+    let mut training_loop = builder.build()?;
 
     match training_loop.run(&data_loader) {
         Ok(_result) => {
@@ -739,4 +799,170 @@ fn run_fine_tune_blocking(
     }
 
     Ok(())
+}
+
+/// Construct a [`DeepLoraModel`] for the given base model by loading its frozen
+/// weights from the catalog artifact path and wrapping target modules with LoRA.
+fn build_deep_lora_model(
+    base_model_id: &str,
+    catalog: &Arc<jammi_engine::catalog::Catalog>,
+    config: &FineTuneConfig,
+    varmap: &candle_nn::VarMap,
+    device: &candle_core::Device,
+) -> Result<crate::fine_tune::deep_lora::DeepLoraModel> {
+    use std::path::Path;
+
+    // Strip URI scheme prefixes (e.g. "hf://", "local:") so the catalog
+    // lookup uses the bare model ID that was stored at download time.
+    let catalog_model_id = base_model_id
+        .strip_prefix("hf://")
+        .or_else(|| base_model_id.strip_prefix("local:"))
+        .unwrap_or(base_model_id);
+
+    // Resolve the artifact directory from the catalog.
+    // The catalog entry may have artifact_path = NULL (set before the model was
+    // downloaded for FK-constraint purposes) or may point to a weights file
+    // rather than a directory (older behavior in do_load).  Handle all cases.
+    let model_record = catalog
+        .get_model(catalog_model_id)?
+        .ok_or_else(|| JammiError::FineTune(format!("Base model '{base_model_id}' not in catalog")))?;
+
+    let artifact_dir: std::path::PathBuf = match model_record.artifact_path.as_deref() {
+        Some(p) if !p.is_empty() => {
+            let path = std::path::PathBuf::from(p);
+            // Stored path may be a file (old do_load behavior); use its parent as dir.
+            if path.is_dir() {
+                path
+            } else {
+                path.parent()
+                    .ok_or_else(|| JammiError::FineTune(
+                        format!("Cannot determine model dir from artifact_path '{p}'")
+                    ))?
+                    .to_path_buf()
+            }
+        }
+        // artifact_path is NULL — the model was pre-registered for the FK
+        // constraint before the weights were downloaded.  Fall back to the
+        // HF hub local cache, which does not re-download if files are present.
+        _ => {
+            let is_hf = base_model_id.starts_with("hf://")
+                || (!base_model_id.starts_with('/') && !std::path::Path::new(base_model_id).exists());
+            if is_hf {
+                let api = hf_hub::api::sync::Api::new()
+                    .map_err(|e| JammiError::FineTune(format!("HF hub init: {e}")))?;
+                let repo = api.model(catalog_model_id.to_string());
+                // repo.get() returns the cached path without re-downloading.
+                let weights = repo
+                    .get("model.safetensors")
+                    .map_err(|e| JammiError::FineTune(format!(
+                        "Cannot locate '{catalog_model_id}' in HF hub cache: {e}"
+                    )))?;
+                weights
+                    .parent()
+                    .ok_or_else(|| JammiError::FineTune(
+                        "Cannot determine model dir from HF hub cache path".into()
+                    ))?
+                    .to_path_buf()
+            } else {
+                return Err(JammiError::FineTune(format!(
+                    "Base model '{base_model_id}' has no artifact_path in catalog"
+                )));
+            }
+        }
+    };
+
+    // Read config.json
+    let config_path = artifact_dir.join("config.json");
+    let model_config: serde_json::Value = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .ok_or_else(|| {
+            JammiError::FineTune(format!(
+                "Cannot read config.json for base model at {config_path:?}"
+            ))
+        })?;
+
+    let model_type = model_config
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("bert");
+
+    // Collect weights paths (standard single-shard safetensors)
+    let weights_path = artifact_dir.join("model.safetensors");
+    if !weights_path.exists() {
+        return Err(JammiError::FineTune(format!(
+            "model.safetensors not found at {weights_path:?}"
+        )));
+    }
+    let weights_paths: Vec<&Path> = vec![weights_path.as_path()];
+
+    let dropout = if config.lora_dropout > 0.0 {
+        Some(config.lora_dropout as f32)
+    } else {
+        None
+    };
+
+    let encoder: Box<dyn crate::fine_tune::deep_lora::DeepLoraEncoder> = match model_type {
+        "distilbert" => Box::new(crate::fine_tune::deep_lora::distilbert::build(
+            &weights_paths,
+            &model_config,
+            &config.target_modules,
+            &config.layers_to_transform,
+            config.lora_rank,
+            config.lora_alpha,
+            config.use_rslora,
+            dropout,
+            &config.rank_pattern,
+            config.init_lora_weights,
+            device,
+            varmap,
+            None,
+            config.backbone_dtype.into(),
+        )?),
+        "modernbert" => Box::new(crate::fine_tune::deep_lora::modernbert::build(
+            &weights_paths,
+            &model_config,
+            &config.target_modules,
+            &config.layers_to_transform,
+            config.lora_rank,
+            config.lora_alpha,
+            config.use_rslora,
+            dropout,
+            &config.rank_pattern,
+            config.init_lora_weights,
+            device,
+            varmap,
+            None,
+            config.backbone_dtype.into(),
+        )?),
+        _ => Box::new(crate::fine_tune::deep_lora::bert::build(
+            &weights_paths,
+            &model_config,
+            &config.target_modules,
+            &config.layers_to_transform,
+            config.lora_rank,
+            config.lora_alpha,
+            config.use_rslora,
+            dropout,
+            &config.rank_pattern,
+            config.init_lora_weights,
+            device,
+            varmap,
+            None,
+            config.backbone_dtype.into(),
+        )?),
+    };
+
+    let adapter_cfg = crate::fine_tune::deep_lora::DeepLoraAdapterConfig::new_deep_lora(
+        model_type,
+        config.lora_rank,
+        config.lora_alpha,
+        config.use_rslora,
+        config.target_modules.clone(),
+        config.layers_to_transform.clone(),
+        config.rank_pattern.clone(),
+        config.backbone_dtype,
+    );
+
+    Ok(crate::fine_tune::deep_lora::DeepLoraModel::new(encoder, adapter_cfg))
 }

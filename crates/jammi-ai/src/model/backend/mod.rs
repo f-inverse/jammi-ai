@@ -17,6 +17,7 @@ pub trait ModelBackend: Send + Sync {
 }
 
 /// Device configuration derived from JammiConfig.
+#[derive(Clone)]
 pub struct DeviceConfig {
     /// GPU device ordinal (-1 for CPU-only).
     pub gpu_device: i32,

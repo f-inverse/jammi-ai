@@ -22,9 +22,18 @@ __pycache__/
 dist/
 .venv/
 *.so
+*.pyd
 
 # Test artifacts
 /tmp/jammi-test-*/
+rustup-init.exe
+
+# HCC test database (model weights, embeddings, generated data)
+hcc_data/jammi_test_db/
+hcc_data/triplets_train.parquet
+hcc_data/triplets_val.parquet
+hcc_data/triplets_train.jsonl
+hcc_data/triplets_val.jsonl
 
 # HuggingFace cache (large, downloaded at runtime)
 .cache/

@@ -4,15 +4,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, StringArray};
-use candle_core::{Device, Tensor};
+use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarMap};
 use jammi_engine::catalog::status::FineTuneJobStatus;
 use jammi_engine::catalog::Catalog;
 use jammi_engine::error::{JammiError, Result};
 
 use super::data::{TextChunk, TrainingDataLoader};
+use super::deep_lora::DeepLoraModel;
 use super::lora::{save_lora_weights, LoraModel};
-use super::{FineTuneConfig, LrSchedule};
+use super::{EarlyStoppingMetric, FineTuneConfig, LrSchedule};
 use crate::model::{LoadedModel, ModelTask};
 
 /// Result of a completed training run.
@@ -55,6 +56,57 @@ pub fn compute_lr(config: &FineTuneConfig, step: usize, total_steps: usize) -> f
     }
 }
 
+/// Clip gradients by global L2 norm in-place, matching
+/// `torch.nn.utils.clip_grad_norm_(params, max_norm)`.
+///
+/// Computes `total_norm = sqrt(sum ||g||² for all g)`.  If `total_norm > max_norm`,
+/// every gradient is scaled by `max_norm / total_norm`.  Pass `max_norm = 0.0` to
+/// disable clipping entirely.
+fn clip_gradients(trainable_vars: &[Var], grads: &mut GradStore, max_norm: f64) -> Result<()> {
+    if max_norm <= 0.0 {
+        return Ok(());
+    }
+
+    // Compute the global L2 norm.
+    let mut total_sq = 0.0f64;
+    for var in trainable_vars {
+        let t: &Tensor = var;
+        if let Some(g) = grads.get(t) {
+            let g_f32 = if g.dtype() == DType::F32 {
+                g.clone()
+            } else {
+                g.to_dtype(DType::F32)
+                    .map_err(|e| JammiError::FineTune(format!("GradClip dtype: {e}")))?
+            };
+            let sq: f32 = g_f32
+                .sqr()
+                .map_err(|e| JammiError::FineTune(format!("GradClip sqr: {e}")))?
+                .sum_all()
+                .map_err(|e| JammiError::FineTune(format!("GradClip sum: {e}")))?
+                .to_scalar::<f32>()
+                .map_err(|e| JammiError::FineTune(format!("GradClip scalar: {e}")))?;
+            total_sq += sq as f64;
+        }
+    }
+
+    let total_norm = total_sq.sqrt();
+    if total_norm <= max_norm {
+        return Ok(());
+    }
+
+    let clip_coef = max_norm / total_norm;
+    for var in trainable_vars {
+        let t: &Tensor = var;
+        if let Some(g) = grads.remove(t) {
+            let scaled = (&g * clip_coef)
+                .map_err(|e| JammiError::FineTune(format!("GradClip scale: {e}")))?;
+            grads.insert(t, scaled);
+        }
+    }
+
+    Ok(())
+}
+
 /// The training loop: runs LoRA fine-tuning with gradient accumulation,
 /// early stopping, LR scheduling, and checkpointing.
 pub struct TrainingLoop {
@@ -66,6 +118,10 @@ pub struct TrainingLoop {
     artifact_dir: PathBuf,
     divergence_count: usize,
     base_model: Option<Arc<LoadedModel>>,
+    device: Device,
+    /// When set, `encode_chunk` runs the deep LoRA encoder instead of the
+    /// frozen base model + external LoRA projection.
+    deep_lora_model: Option<DeepLoraModel>,
 }
 
 /// Builder for [`TrainingLoop`]. Core ML params (model, varmap, config) are
@@ -78,6 +134,8 @@ pub struct TrainingLoopBuilder {
     catalog: Option<Arc<Catalog>>,
     artifact_dir: Option<PathBuf>,
     base_model: Option<Arc<LoadedModel>>,
+    device: Device,
+    deep_lora_model: Option<DeepLoraModel>,
 }
 
 impl TrainingLoopBuilder {
@@ -91,7 +149,22 @@ impl TrainingLoopBuilder {
             catalog: None,
             artifact_dir: None,
             base_model: None,
+            device: Device::Cpu,
+            deep_lora_model: None,
         }
+    }
+
+    /// Set the device all training tensors should live on.
+    pub fn device(mut self, device: Device) -> Self {
+        self.device = device;
+        self
+    }
+
+    /// Set an optional deep LoRA encoder. When provided, `encode_chunk` will
+    /// call this encoder directly instead of the frozen base model.
+    pub fn deep_lora_model(mut self, model: DeepLoraModel) -> Self {
+        self.deep_lora_model = Some(model);
+        self
     }
 
     /// Set the job ID for catalog tracking.
@@ -138,6 +211,8 @@ impl TrainingLoopBuilder {
             artifact_dir,
             divergence_count: 0,
             base_model: self.base_model,
+            device: self.device,
+            deep_lora_model: self.deep_lora_model,
         })
     }
 }
@@ -167,11 +242,13 @@ impl TrainingLoop {
             / self.config.gradient_accumulation_steps.max(1);
         let checkpoint_interval = (total_steps as f64 * 0.1).ceil() as usize;
 
-        // Create optimizer from VarMap's trainable variables
+        // Create optimizer from VarMap's trainable variables.
+        // weight_decay matches train_embedding_model.py: AdamW(weight_decay=0.01).
         let mut optimizer = AdamW::new(
             self.varmap.all_vars(),
             ParamsAdamW {
                 lr: self.config.learning_rate,
+                weight_decay: self.config.weight_decay,
                 ..Default::default()
             },
         )
@@ -183,10 +260,18 @@ impl TrainingLoop {
         let checkpoint_dir = self.artifact_dir.join("models").join(&self.job_id);
         std::fs::create_dir_all(&checkpoint_dir)?;
 
+        // Collect trainable vars once; their TensorIds are stable for the run.
+        let trainable_vars = self.varmap.all_vars();
+
         for epoch in 0..self.config.epochs {
             let mut epoch_loss = 0.0;
             let mut batch_count = 0;
-            let mut accumulated_loss: Option<Tensor> = None;
+            // Accumulated gradients across micro-batches. Seeded from the first
+            // backward call (avoids needing a private GradStore::new()).
+            let mut accumulated_grads: Option<GradStore> = None;
+            let mut epoch_pos_sim = 0.0f64;
+            let mut epoch_neg_sim = 0.0f64;
+            let mut triplet_batch_count = 0usize;
 
             if self.base_model.is_some() {
                 // Real training: encode text through base model, project through LoRA
@@ -194,11 +279,18 @@ impl TrainingLoop {
                 for chunk in &text_chunks {
                     let batch = self.encode_chunk(chunk)?;
                     let loss = self.compute_loss(&batch)?;
+                    self.accumulate_sim_stats(
+                        &batch,
+                        &mut epoch_pos_sim,
+                        &mut epoch_neg_sim,
+                        &mut triplet_batch_count,
+                    );
                     self.process_batch_loss(
                         loss,
                         &mut batch_count,
                         &mut epoch_loss,
-                        &mut accumulated_loss,
+                        &mut accumulated_grads,
+                        &trainable_vars,
                         &mut global_step,
                         total_steps,
                         &mut optimizer,
@@ -213,11 +305,18 @@ impl TrainingLoop {
                 for batch in train_batches {
                     let batch = batch?;
                     let loss = self.compute_loss(&batch)?;
+                    self.accumulate_sim_stats(
+                        &batch,
+                        &mut epoch_pos_sim,
+                        &mut epoch_neg_sim,
+                        &mut triplet_batch_count,
+                    );
                     self.process_batch_loss(
                         loss,
                         &mut batch_count,
                         &mut epoch_loss,
-                        &mut accumulated_loss,
+                        &mut accumulated_grads,
+                        &trainable_vars,
                         &mut global_step,
                         total_steps,
                         &mut optimizer,
@@ -228,35 +327,72 @@ impl TrainingLoop {
                 }
             }
 
-            // Flush remaining accumulated gradients
-            if accumulated_loss.is_some() {
+            // Flush any remaining micro-batch gradients that didn't fill a full
+            // accumulation window (last partial window of the epoch).
+            if let Some(mut acc) = accumulated_grads.take() {
                 let lr = compute_lr(&self.config, global_step, total_steps);
                 optimizer.set_learning_rate(lr);
-                if let Some(acc) = accumulated_loss.take() {
-                    optimizer
-                        .backward_step(&acc)
-                        .map_err(|e| JammiError::FineTune(format!("Backward flush: {e}")))?;
-                }
+                clip_gradients(&trainable_vars, &mut acc, self.config.max_grad_norm)?;
+                optimizer
+                    .step(&acc)
+                    .map_err(|e| JammiError::FineTune(format!("Backward flush: {e}")))?;
                 global_step += 1;
             }
 
             let avg_train_loss = epoch_loss / batch_count.max(1) as f64;
+            let avg_pos_sim = if triplet_batch_count > 0 {
+                epoch_pos_sim / triplet_batch_count as f64
+            } else {
+                0.0
+            };
+            let avg_neg_sim = if triplet_batch_count > 0 {
+                epoch_neg_sim / triplet_batch_count as f64
+            } else {
+                0.0
+            };
 
-            // Validation
-            let avg_val_loss = self.evaluate(&val_loader)?;
+            // Validation — skip entirely when monitoring train loss to avoid wasting time.
+            let avg_val_loss = match self.config.early_stopping_metric {
+                EarlyStoppingMetric::TrainLoss => {
+                    // No validation pass needed; report 0.0 as a sentinel.
+                    0.0
+                }
+                EarlyStoppingMetric::ValLoss => {
+                    // Disable dropout for the validation pass.
+                    if let Some(ref mut deep) = self.deep_lora_model {
+                        deep.set_training(false);
+                    }
+                    let val_loss = self.evaluate(&val_loader)?;
+                    if let Some(ref mut deep) = self.deep_lora_model {
+                        deep.set_training(true);
+                    }
+                    val_loss
+                }
+            };
 
+            // Decide which loss to monitor for early stopping.
+            let (monitor_loss, monitor_label) = match self.config.early_stopping_metric {
+                EarlyStoppingMetric::TrainLoss => (avg_train_loss, "train"),
+                EarlyStoppingMetric::ValLoss => (avg_val_loss, "val"),
+            };
+
+            let lr = compute_lr(&self.config, global_step, total_steps);
             tracing::info!(
                 epoch,
                 avg_train_loss,
                 avg_val_loss,
+                avg_pos_sim,
+                avg_neg_sim,
+                monitor_loss,
+                monitor_label,
                 global_step,
-                lr = compute_lr(&self.config, global_step, total_steps),
+                lr,
                 "Epoch complete"
             );
 
-            // Early stopping
-            if avg_val_loss < best_val_loss {
-                best_val_loss = avg_val_loss;
+            // Early stopping on the chosen metric.
+            if monitor_loss < best_val_loss {
+                best_val_loss = monitor_loss;
                 patience_counter = 0;
                 self.save_checkpoint_tagged(&checkpoint_dir, "best")?;
             } else {
@@ -265,7 +401,8 @@ impl TrainingLoop {
                     tracing::info!(
                         epoch,
                         patience_counter,
-                        best_val_loss,
+                        best_loss = best_val_loss,
+                        monitor_label,
                         "Early stopping: no improvement for {} epochs",
                         patience_counter
                     );
@@ -280,14 +417,23 @@ impl TrainingLoop {
             self.load_checkpoint(&best_path)?;
         }
 
-        // Save final adapter
-        let adapter_path = checkpoint_dir.join("adapter.safetensors");
-        save_lora_weights(&self.model, &adapter_path)?;
+        // Save final adapter (deep LoRA or projection-only)
+        if let Some(ref deep) = self.deep_lora_model {
+            deep.save(&checkpoint_dir)?;
+        } else {
+            let adapter_path = checkpoint_dir.join("adapter.safetensors");
+            save_lora_weights(&self.model, &adapter_path)?;
+        }
 
         // Update job status
         let completed_at = chrono::Utc::now().to_rfc3339();
+        let early_stopping_metric_label = match self.config.early_stopping_metric {
+            EarlyStoppingMetric::TrainLoss => "train_loss",
+            EarlyStoppingMetric::ValLoss => "val_loss",
+        };
         let metrics = serde_json::json!({
             "final_loss": best_val_loss,
+            "early_stopping_metric": early_stopping_metric_label,
             "total_steps": global_step,
             "started_at": started_at,
             "completed_at": completed_at,
@@ -306,6 +452,64 @@ impl TrainingLoop {
         })
     }
 
+    /// Tokenize texts and run through the deep LoRA encoder.
+    ///
+    /// The encoder produces mean-pooled, L2-normalised embeddings directly;
+    /// no external projection is needed.
+    fn encode_texts_deep(&self, texts: &[String]) -> Result<Tensor> {
+        let deep = self
+            .deep_lora_model
+            .as_ref()
+            .ok_or_else(|| JammiError::FineTune("No deep LoRA model".into()))?;
+
+        let base = self
+            .base_model
+            .as_ref()
+            .ok_or_else(|| JammiError::FineTune("No base model for tokenization".into()))?;
+
+        let tokenizer = match base.as_ref() {
+            crate::model::LoadedModel::Candle(m) => m
+                .tokenizer
+                .as_ref()
+                .ok_or_else(|| JammiError::FineTune("No tokenizer in base model".into()))?,
+            _ => {
+                return Err(JammiError::FineTune(
+                    "Deep LoRA requires a Candle base model with a tokenizer".into(),
+                ))
+            }
+        };
+
+        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let encoding = tokenizer.encode_batch(&text_refs, Some(self.config.max_seq_length))?;
+
+        let rows = encoding.input_ids.len();
+        let cols = encoding.input_ids.first().map_or(0, |v| v.len());
+
+        let input_ids = Tensor::from_vec(
+            encoding
+                .input_ids
+                .into_iter()
+                .flatten()
+                .collect::<Vec<u32>>(),
+            (rows, cols),
+            &self.device,
+        )
+        .map_err(|e| JammiError::FineTune(format!("input_ids tensor: {e}")))?;
+
+        let attention_mask = Tensor::from_vec(
+            encoding
+                .attention_masks
+                .into_iter()
+                .flatten()
+                .collect::<Vec<u32>>(),
+            (rows, cols),
+            &self.device,
+        )
+        .map_err(|e| JammiError::FineTune(format!("attention_mask tensor: {e}")))?;
+
+        deep.forward(&input_ids, &attention_mask)
+    }
+
     /// Encode texts through the frozen base model. Returns (batch_size, hidden_size) Tensor.
     fn encode_texts(&self, texts: &[String]) -> Result<Tensor> {
         let base = self
@@ -321,7 +525,7 @@ impl TrainingLoop {
 
         let n = output.shapes[0].0;
         let dim = output.shapes[0].1;
-        Tensor::from_vec(output.float_outputs[0].clone(), (n, dim), &Device::Cpu)
+        Tensor::from_vec(output.float_outputs[0].clone(), (n, dim), &self.device)
             .map_err(|e| JammiError::FineTune(format!("Encode tensor: {e}")))
     }
 
@@ -332,18 +536,33 @@ impl TrainingLoop {
 
     /// Encode a text chunk through the base model and project through LoRA,
     /// producing a TrainingBatch ready for loss computation.
+    ///
+    /// When `deep_lora_model` is set, texts are tokenized and fed through the
+    /// deep LoRA encoder (gradients flow through A/B matrices inside the
+    /// encoder). Otherwise, the frozen base model produces embeddings that are
+    /// then projected through the external LoRA head.
     fn encode_chunk(&self, chunk: &TextChunk) -> Result<super::data::TrainingBatch> {
+        let use_deep = self.deep_lora_model.is_some();
+
+        // Helper: encode a text slice returning the final embedding tensor.
+        let encode = |texts: &Vec<String>| -> Result<Tensor> {
+            if use_deep {
+                self.encode_texts_deep(texts)
+            } else {
+                let emb = self.encode_texts(texts)?;
+                self.project(&emb)
+            }
+        };
+
         match chunk {
             TextChunk::Contrastive {
                 texts_a,
                 texts_b,
                 scores,
             } => {
-                let emb_a = self.encode_texts(texts_a)?;
-                let proj_a = self.project(&emb_a)?;
-                let emb_b = self.encode_texts(texts_b)?;
-                let proj_b = self.project(&emb_b)?;
-                let scores_tensor = Tensor::from_vec(scores.clone(), (scores.len(),), &Device::Cpu)
+                let proj_a = encode(texts_a)?;
+                let proj_b = encode(texts_b)?;
+                let scores_tensor = Tensor::from_vec(scores.clone(), (scores.len(),), &self.device)
                     .map_err(|e| JammiError::FineTune(format!("Scores tensor: {e}")))?;
                 Ok(super::data::TrainingBatch::Contrastive {
                     embeddings_a: proj_a,
@@ -356,12 +575,9 @@ impl TrainingLoop {
                 positives,
                 negatives,
             } => {
-                let emb_a = self.encode_texts(anchors)?;
-                let proj_a = self.project(&emb_a)?;
-                let emb_p = self.encode_texts(positives)?;
-                let proj_p = self.project(&emb_p)?;
-                let emb_n = self.encode_texts(negatives)?;
-                let proj_n = self.project(&emb_n)?;
+                let proj_a = encode(anchors)?;
+                let proj_p = encode(positives)?;
+                let proj_n = encode(negatives)?;
                 Ok(super::data::TrainingBatch::Triplet {
                     anchor: proj_a,
                     positive: proj_p,
@@ -369,9 +585,8 @@ impl TrainingLoop {
                 })
             }
             TextChunk::Classification { texts, labels } => {
-                let emb = self.encode_texts(texts)?;
-                let proj = self.project(&emb)?;
-                let labels_tensor = Tensor::from_vec(labels.clone(), (labels.len(),), &Device::Cpu)
+                let proj = encode(texts)?;
+                let labels_tensor = Tensor::from_vec(labels.clone(), (labels.len(),), &self.device)
                     .map_err(|e| JammiError::FineTune(format!("Labels tensor: {e}")))?;
                 Ok(super::data::TrainingBatch::Classification {
                     embeddings: proj,
@@ -386,15 +601,76 @@ impl TrainingLoop {
         }
     }
 
-    /// Process a single batch loss: divergence detection, gradient accumulation,
-    /// optimizer step, and checkpointing. Shared by both real and precomputed paths.
+    /// Accumulate cosine similarity stats from a triplet batch for epoch-level logging.
+    /// Non-triplet batches are silently ignored. Errors in stat computation are swallowed
+    /// so a GPU issue never aborts training just because of a logging metric.
+    fn accumulate_sim_stats(
+        &self,
+        batch: &super::data::TrainingBatch,
+        epoch_pos_sim: &mut f64,
+        epoch_neg_sim: &mut f64,
+        triplet_count: &mut usize,
+    ) {
+        if let super::data::TrainingBatch::Triplet {
+            anchor,
+            positive,
+            negative,
+        } = batch
+        {
+            let ps = cosine_similarity(anchor, positive)
+                .and_then(|t| {
+                    t.mean_all()
+                        .map_err(|e| JammiError::FineTune(format!("{e}")))
+                })
+                .and_then(|t| {
+                    let t = if t.dtype() == DType::F32 {
+                        t
+                    } else {
+                        t.to_dtype(DType::F32)
+                            .map_err(|e| JammiError::FineTune(format!("{e}")))?
+                    };
+                    t.to_scalar::<f32>()
+                        .map_err(|e| JammiError::FineTune(format!("{e}")))
+                });
+            let ns = cosine_similarity(anchor, negative)
+                .and_then(|t| {
+                    t.mean_all()
+                        .map_err(|e| JammiError::FineTune(format!("{e}")))
+                })
+                .and_then(|t| {
+                    let t = if t.dtype() == DType::F32 {
+                        t
+                    } else {
+                        t.to_dtype(DType::F32)
+                            .map_err(|e| JammiError::FineTune(format!("{e}")))?
+                    };
+                    t.to_scalar::<f32>()
+                        .map_err(|e| JammiError::FineTune(format!("{e}")))
+                });
+            if let (Ok(ps_val), Ok(ns_val)) = (ps, ns) {
+                *epoch_pos_sim += ps_val as f64;
+                *epoch_neg_sim += ns_val as f64;
+                *triplet_count += 1;
+            }
+        }
+    }
+
+    /// Process a single batch loss: divergence detection, gradient accumulation
+    /// via immediate backward, and optimizer step every N micro-batches.
+    ///
+    /// Each call computes `loss.backward()` immediately so the activation graph
+    /// is freed at the end of every micro-batch. Gradients are accumulated in an
+    /// `Option<GradStore>` (seeded from the first micro-batch's backward result,
+    /// which avoids needing the private `GradStore::new()`) and an optimizer step
+    /// is taken once every `gradient_accumulation_steps` micro-batches.
     #[allow(clippy::too_many_arguments)]
     fn process_batch_loss(
         &mut self,
         loss: Tensor,
         batch_count: &mut usize,
         epoch_loss: &mut f64,
-        accumulated_loss: &mut Option<Tensor>,
+        accumulated_grads: &mut Option<GradStore>,
+        trainable_vars: &[Var],
         global_step: &mut usize,
         total_steps: usize,
         optimizer: &mut AdamW,
@@ -402,9 +678,16 @@ impl TrainingLoop {
         checkpoint_interval: usize,
         started_at: &str,
     ) -> Result<()> {
-        let loss_val =
-            loss.to_scalar::<f32>()
-                .map_err(|e| JammiError::FineTune(format!("Loss scalar: {e}")))? as f64;
+        let loss_f32 = if loss.dtype() == DType::F32 {
+            loss.clone()
+        } else {
+            loss.to_dtype(DType::F32)
+                .map_err(|e| JammiError::FineTune(format!("Loss dtype cast: {e}")))?
+        };
+        let loss_val = loss_f32
+            .to_scalar::<f32>()
+            .map_err(|e| JammiError::FineTune(format!("Loss scalar: {e}")))?
+            as f64;
 
         // Divergence detection
         if loss_val.is_nan() || loss_val > 100.0 {
@@ -429,34 +712,54 @@ impl TrainingLoop {
         }
         self.divergence_count = 0;
 
-        // Gradient accumulation: scale loss
-        let scaled_loss = if self.config.gradient_accumulation_steps > 1 {
-            (&loss / self.config.gradient_accumulation_steps as f64)
-                .map_err(|e| JammiError::FineTune(format!("Loss scale: {e}")))?
-        } else {
-            loss
-        };
-
-        *accumulated_loss = Some(match accumulated_loss.take() {
-            Some(acc) => {
-                (&acc + &scaled_loss).map_err(|e| JammiError::FineTune(format!("Loss acc: {e}")))?
-            }
-            None => scaled_loss,
-        });
-
         *epoch_loss += loss_val;
         *batch_count += 1;
 
-        // Step optimizer every N micro-batches
+        // Scale the loss and immediately run backward, releasing the activation
+        // graph so that `gradient_accumulation_steps > 1` doesn't grow memory
+        // proportionally to the number of micro-batches.
+        let scale = self.config.gradient_accumulation_steps.max(1) as f64;
+        let scaled_loss =
+            (&loss / scale).map_err(|e| JammiError::FineTune(format!("Loss scale: {e}")))?;
+        let new_grads = scaled_loss
+            .backward()
+            .map_err(|e| JammiError::FineTune(format!("Backward: {e}")))?;
+
+        // Merge new_grads into the running accumulator.
+        // The accumulator is seeded from the first backward call to avoid
+        // needing the private GradStore::new().
+        match accumulated_grads {
+            None => {
+                *accumulated_grads = Some(new_grads);
+            }
+            Some(ref mut acc) => {
+                for var in trainable_vars.iter() {
+                    let t: &Tensor = var;
+                    if let Some(g_new) = new_grads.get(t) {
+                        if let Some(g_acc) = acc.remove(t) {
+                            let summed = (&g_acc + g_new)
+                                .map_err(|e| JammiError::FineTune(format!("Grad acc: {e}")))?;
+                            acc.insert(t, summed);
+                        } else {
+                            acc.insert(t, g_new.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Optimizer step every N micro-batches.
         if *batch_count % self.config.gradient_accumulation_steps == 0 {
             let lr = compute_lr(&self.config, *global_step, total_steps);
             optimizer.set_learning_rate(lr);
 
-            if let Some(acc) = accumulated_loss.take() {
+            if let Some(mut acc) = accumulated_grads.take() {
+                clip_gradients(trainable_vars, &mut acc, self.config.max_grad_norm)?;
                 optimizer
-                    .backward_step(&acc)
-                    .map_err(|e| JammiError::FineTune(format!("Backward: {e}")))?;
+                    .step(&acc)
+                    .map_err(|e| JammiError::FineTune(format!("Optimizer step: {e}")))?;
             }
+
             *global_step += 1;
 
             // Checkpoint
@@ -567,7 +870,7 @@ impl TrainingLoop {
     ) -> Result<Tensor> {
         let margin = match self.config.embedding_loss {
             Some(super::EmbeddingLoss::Triplet { margin }) => margin,
-            _ => 0.5,
+            _ => 0.3,
         };
 
         let pos_sim = cosine_similarity(anchor, positive)?;
@@ -605,6 +908,12 @@ impl TrainingLoop {
             for chunk in &text_chunks {
                 let batch = self.encode_chunk(chunk)?;
                 let loss = self.compute_loss(&batch)?;
+                let loss = if loss.dtype() == DType::F32 {
+                    loss
+                } else {
+                    loss.to_dtype(DType::F32)
+                        .map_err(|e| JammiError::FineTune(format!("Val loss dtype cast: {e}")))?
+                };
                 total_loss += loss
                     .to_scalar::<f32>()
                     .map_err(|e| JammiError::FineTune(format!("Val loss scalar: {e}")))?
@@ -616,6 +925,12 @@ impl TrainingLoop {
             for batch in batches {
                 let batch = batch?;
                 let loss = self.compute_loss(&batch)?;
+                let loss = if loss.dtype() == DType::F32 {
+                    loss
+                } else {
+                    loss.to_dtype(DType::F32)
+                        .map_err(|e| JammiError::FineTune(format!("Val loss dtype cast: {e}")))?
+                };
                 total_loss += loss
                     .to_scalar::<f32>()
                     .map_err(|e| JammiError::FineTune(format!("Val loss scalar: {e}")))?
@@ -632,27 +947,65 @@ impl TrainingLoop {
     }
 
     /// Save a numbered checkpoint.
+    ///
+    /// For deep LoRA training, the checkpoint contains the encoder's LoRA A/B
+    /// matrices (named with a `_deep` suffix so they don't collide with
+    /// projection-only checkpoints).  For legacy projection-only training, the
+    /// external `LoraModel` weights are saved as before.
     fn save_checkpoint(&self, dir: &Path, step: usize) -> Result<()> {
-        let path = dir.join(format!("checkpoint_{step}.safetensors"));
-        save_lora_weights(&self.model, &path)
+        if let Some(ref deep) = self.deep_lora_model {
+            let path = dir.join(format!("checkpoint_{step}_deep.safetensors"));
+            let weights = deep.encoder.named_trainable_weights()?;
+            candle_core::safetensors::save(&weights, &path)
+                .map_err(|e| JammiError::FineTune(format!("Save deep LoRA checkpoint: {e}")))?;
+        } else {
+            let path = dir.join(format!("checkpoint_{step}.safetensors"));
+            save_lora_weights(&self.model, &path)?;
+        }
+        Ok(())
     }
 
     /// Save a named checkpoint (e.g. "best").
     fn save_checkpoint_tagged(&self, dir: &Path, tag: &str) -> Result<()> {
-        let path = dir.join(format!("checkpoint_{tag}.safetensors"));
-        save_lora_weights(&self.model, &path)
+        if let Some(ref deep) = self.deep_lora_model {
+            let path = dir.join(format!("checkpoint_{tag}_deep.safetensors"));
+            let weights = deep.encoder.named_trainable_weights()?;
+            candle_core::safetensors::save(&weights, &path).map_err(|e| {
+                JammiError::FineTune(format!("Save deep LoRA checkpoint {tag}: {e}"))
+            })?;
+        } else {
+            let path = dir.join(format!("checkpoint_{tag}.safetensors"));
+            save_lora_weights(&self.model, &path)?;
+        }
+        Ok(())
     }
 
-    /// Load a checkpoint, updating the model's LoRA weights.
+    /// Load a checkpoint, restoring LoRA weights in place.
+    ///
+    /// For deep LoRA, looks for the `_deep`-suffixed file that matches the
+    /// supplied path (e.g. `checkpoint_best.safetensors` →
+    /// `checkpoint_best_deep.safetensors`).
     fn load_checkpoint(&mut self, path: &Path) -> Result<()> {
-        let device = self
-            .model
-            .layers
-            .first()
-            .map(|(_, l)| l.lora_a.device().clone())
-            .unwrap_or(candle_core::Device::Cpu);
-        let weights = super::lora::load_lora_weights(path, &device)?;
-        super::lora::apply_loaded_weights(&mut self.model, &weights)
+        if let Some(ref mut deep) = self.deep_lora_model {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("checkpoint_best");
+            let deep_path = path.with_file_name(format!("{stem}_deep.safetensors"));
+            if deep_path.exists() {
+                deep.load_from_checkpoint(&deep_path, &self.device)?;
+            }
+        } else {
+            let device = self
+                .model
+                .layers
+                .first()
+                .map(|(_, l)| l.lora_a.device().clone())
+                .unwrap_or(candle_core::Device::Cpu);
+            let weights = super::lora::load_lora_weights(path, &device)?;
+            super::lora::apply_loaded_weights(&mut self.model, &weights)?;
+        }
+        Ok(())
     }
 }
 

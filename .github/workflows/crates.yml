@@ -96,6 +96,9 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
+      - name: Wait for crates.io index
+        run: sleep 30
+
       - name: Publish jammi-cli
         run: cargo publish -p jammi-cli
         env:

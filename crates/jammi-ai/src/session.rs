@@ -792,14 +792,14 @@ fn run_fine_tune_blocking(
                     ))
                 }
             };
-            crate::fine_tune::lora::build_lora_classification(
+            crate::fine_tune::lora::build_classification_head(
                 hidden_size,
                 num_classes,
                 &config,
                 &vb,
             )?
         } else {
-            crate::fine_tune::lora::build_lora_projection(hidden_size, &config, &vb)?
+            crate::fine_tune::lora::build_projection_head(hidden_size, &config, &vb)?
         };
         crate::fine_tune::target::TrainingTarget::ProjectionHead { head }
     } else {

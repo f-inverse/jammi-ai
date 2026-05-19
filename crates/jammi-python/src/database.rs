@@ -104,7 +104,9 @@ impl PyDatabase {
     ///   validation_fraction=0.10, early_stopping_patience=3,
     ///   warmup_steps=100, gradient_accumulation_steps=1,
     ///   triplet_margin=0.5 (embedding_loss="triplet" must be set for custom margin),
-    ///   target_modules=[] (projection-only LoRA; pass e.g. ["Wqkv","Wo"] for deep LoRA).
+    ///   target_modules=[] trains a projection head over the frozen base model;
+    ///     a non-empty list (e.g. ["Wqkv","Wo"]) injects LoRA into the encoder's
+    ///     internal attention/FFN linears at the listed sites instead.
     ///   early_stopping_metric="val_loss" | "train_loss".
     ///     "train_loss" replicates train_embedding_model.py without --val-file:
     ///     set validation_fraction=0.0 and the full dataset trains without a held-out split.

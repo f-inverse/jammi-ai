@@ -1,23 +1,21 @@
-//! LoRA model assembly and adapter persistence helpers built on top of
-//! [`jammi_lora`].
-//!
-//! The single-layer LoRA primitive (`LoraLinear`), the init-mode enum, and the
-//! `MaybeLoraLinear` wrapper now live in `jammi-lora`. This module provides the
-//! jammi-ai-specific projection-head assemblies (embedding projection +
-//! optional classifier/NER head) used by
-//! [`crate::fine_tune::target::TrainingTarget::ProjectionHead`].
+//! Projection-head assemblies for
+//! [`crate::fine_tune::target::TrainingTarget::ProjectionHead`]: a single
+//! projection layer for embedding fine-tunes, or a projection plus a
+//! classifier head for classification / NER. All three builders return a
+//! [`LoraModel`] — a flat sequence of named [`jammi_lora::LoraLinear`]
+//! layers that the trainer consumes uniformly.
 
-use std::collections::HashMap;
-use std::path::Path;
-
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Tensor};
 use candle_nn::{Linear, VarBuilder};
 use jammi_engine::error::{JammiError, Result};
 use jammi_lora::LoraLinear;
 
-/// A collection of LoRA layers applied to a model.
+/// A sequence of named LoRA layers — the trainable state of a
+/// [`TrainingTarget::ProjectionHead`] target.
+///
+/// [`TrainingTarget::ProjectionHead`]: crate::fine_tune::target::TrainingTarget::ProjectionHead
 pub struct LoraModel {
-    /// LoRA layers keyed by their path in the model (e.g. "encoder.layer.0.attention.query").
+    /// LoRA layers keyed by their name (e.g. `"projection"`, `"classifier"`).
     pub layers: Vec<(String, LoraLinear)>,
 }
 
@@ -31,56 +29,11 @@ impl LoraModel {
     }
 }
 
-/// Save LoRA adapter weights (only A and B matrices) as safetensors.
-pub fn save_lora_weights(model: &LoraModel, path: &Path) -> Result<()> {
-    let mut tensors = HashMap::new();
-    for (name, layer) in &model.layers {
-        tensors.insert(
-            format!("{name}.lora_a"),
-            layer
-                .lora_a
-                .to_device(&Device::Cpu)
-                .map_err(|e| JammiError::FineTune(format!("Save A: {e}")))?,
-        );
-        tensors.insert(
-            format!("{name}.lora_b"),
-            layer
-                .lora_b
-                .to_device(&Device::Cpu)
-                .map_err(|e| JammiError::FineTune(format!("Save B: {e}")))?,
-        );
-    }
-    candle_core::safetensors::save(&tensors, path)
-        .map_err(|e| JammiError::FineTune(format!("Save safetensors: {e}")))
-}
-
-/// Load LoRA adapter weights from a safetensors file.
-pub fn load_lora_weights(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
-    candle_core::safetensors::load(path, device)
-        .map_err(|e| JammiError::FineTune(format!("Load safetensors: {e}")))
-}
-
-/// Apply loaded adapter weights to an existing LoRA model.
-pub fn apply_loaded_weights(
-    model: &mut LoraModel,
-    weights: &HashMap<String, Tensor>,
-) -> Result<()> {
-    for (name, layer) in &mut model.layers {
-        if let Some(a) = weights.get(&format!("{name}.lora_a")) {
-            layer.lora_a = a.clone();
-        }
-        if let Some(b) = weights.get(&format!("{name}.lora_b")) {
-            layer.lora_b = b.clone();
-        }
-    }
-    Ok(())
-}
-
-/// Build a LoRA model for classification: projection + classification head.
+/// Build a projection-plus-classifier head for classification fine-tunes.
 ///
-/// Layer 0: "projection" -- LoRA-adapted identity (hidden_size -> hidden_size)
-/// Layer 1: "classifier" -- LoRA-adapted zeros->random (hidden_size -> num_classes)
-pub fn build_lora_classification(
+/// Layer 0 (`projection`): LoRA-wrapped identity, `hidden → hidden`.
+/// Layer 1 (`classifier`): LoRA-wrapped zeros, `hidden → num_classes`.
+pub fn build_classification_head(
     hidden_size: usize,
     num_classes: usize,
     config: &super::FineTuneConfig,
@@ -118,11 +71,11 @@ pub fn build_lora_classification(
     })
 }
 
-/// Build a LoRA model for NER: projection + token classifier.
+/// Build a projection-plus-token-classifier head for NER fine-tunes.
 ///
-/// Layer 0: "projection" -- LoRA-adapted identity (hidden_size -> hidden_size), applied per token
-/// Layer 1: "token_classifier" -- LoRA-adapted zeros->random (hidden_size -> num_labels), per token
-pub fn build_lora_ner(
+/// Layer 0 (`projection`): LoRA-wrapped identity, `hidden → hidden`, per token.
+/// Layer 1 (`token_classifier`): LoRA-wrapped zeros, `hidden → num_labels`, per token.
+pub fn build_ner_head(
     hidden_size: usize,
     num_labels: usize,
     config: &super::FineTuneConfig,
@@ -160,10 +113,13 @@ pub fn build_lora_ner(
     })
 }
 
-/// Build a LoRA projection layer for embedding fine-tuning.
-/// Creates an identity base weight (hidden_size x hidden_size) wrapped with LoRA.
-/// At init (B=0), the projection is identity — model starts producing the same embeddings.
-pub fn build_lora_projection(
+/// Build a single-layer head for embedding fine-tunes.
+///
+/// One `projection` LoRA layer wrapping an identity weight
+/// (`hidden → hidden`). At init, `B = 0` and the layer acts as identity,
+/// so the fine-tuned model starts producing the same embeddings as the
+/// frozen base.
+pub fn build_projection_head(
     hidden_size: usize,
     config: &super::FineTuneConfig,
     vb: &VarBuilder,

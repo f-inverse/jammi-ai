@@ -509,7 +509,7 @@ fn training_divergence_detection() {
     use candle_nn::VarMap;
     use jammi_ai::fine_tune::{
         data::{TrainingBatch, TrainingDataLoader},
-        lora::build_lora_projection,
+        lora::build_projection_head,
         trainer::TrainingLoopBuilder,
     };
     use std::sync::Arc;
@@ -517,7 +517,7 @@ fn training_divergence_detection() {
     let device = Device::Cpu;
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    let model = build_lora_projection(32, &FineTuneConfig::default(), &vb).unwrap();
+    let model = build_projection_head(32, &FineTuneConfig::default(), &vb).unwrap();
 
     // Create batches where scores are NaN → cosent_loss produces NaN
     let nan_batch = TrainingBatch::Contrastive {
@@ -591,7 +591,7 @@ fn training_early_stopping_triggers() {
     use candle_nn::VarMap;
     use jammi_ai::fine_tune::{
         data::{TrainingBatch, TrainingDataLoader},
-        lora::build_lora_projection,
+        lora::build_projection_head,
         trainer::TrainingLoopBuilder,
     };
     use std::sync::Arc;
@@ -599,7 +599,7 @@ fn training_early_stopping_triggers() {
     let device = Device::Cpu;
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    let model = build_lora_projection(32, &FineTuneConfig::default(), &vb).unwrap();
+    let model = build_projection_head(32, &FineTuneConfig::default(), &vb).unwrap();
 
     // Training batches: similar embeddings with score=1.0 → low contrastive loss
     let make_train_batch = || {

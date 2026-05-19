@@ -145,11 +145,11 @@ text -> encoder (frozen) -> base embedding -> LoRA projection (trained) -> outpu
 4. Only the A/B matrices receive gradients
 5. The adapter is saved as `adapter.safetensors` in the artifact directory
 
-## Deep LoRA (PEFT-style adapter injection)
+## Encoder-adapters fine-tuning (PEFT-style adapter injection)
 
-The default flow above (shallow LoRA) trains a single low-rank projection sitting *outside* the frozen encoder. For higher capacity at the same parameter budget, Jammi also supports **deep LoRA** — adapters injected into named linear layers *inside* the encoder stack, matching the PEFT convention.
+The default flow above trains a single low-rank **projection head** sitting *outside* the frozen encoder. For higher capacity at the same parameter budget, Jammi also supports **encoder adapters** — LoRA injected into named linear layers *inside* the encoder stack, matching the PEFT convention.
 
-Trigger deep LoRA by populating `target_modules` on `FineTuneConfig`:
+Switch to encoder adapters by populating `target_modules` on `FineTuneConfig`:
 
 ```rust
 let config = FineTuneConfig {
@@ -208,11 +208,15 @@ let config = FineTuneConfig {
 
 ### On-disk artifact
 
-Deep-LoRA adapters save `adapter.safetensors` plus an `adapter_config.json` carrying the build-time settings:
+Every fine-tuned model writes `adapter.safetensors` plus an
+`adapter_config.json` whose `adapter_type` tag discriminates between the two
+adapter shapes Jammi produces.
+
+Encoder-adapters example:
 
 ```json
 {
-  "adapter_type": "deep_lora",
+  "adapter_type": "encoder_adapters",
   "model_type": "bert",
   "lora_rank": 8,
   "lora_alpha": 16.0,
@@ -224,12 +228,33 @@ Deep-LoRA adapters save `adapter.safetensors` plus an `adapter_config.json` carr
 }
 ```
 
-The Candle inference backend reads `adapter_config.json` on model load. If `adapter_type` is `"deep_lora"`, it rebuilds the encoder with frozen backbone weights plus the LoRA A/B from `adapter.safetensors`. Shallow-LoRA adapters (no `adapter_config.json`, or `adapter_type` set to anything else) continue using the external-projection inference path.
+Projection-head example:
 
-### When to choose deep vs shallow
+```json
+{
+  "adapter_type": "projection_head",
+  "lora_rank": 8,
+  "lora_alpha": 16.0,
+  "head_layers": ["projection"]
+}
+```
 
-- **Shallow** — fastest training, smallest artifact, lowest memory. The default when `target_modules` is empty. Best for adapting embedding direction without per-token attention reshape.
-- **Deep** — higher representational ceiling per adapter parameter; required if the task needs to reshape attention behaviour (e.g., a domain where the base attention pattern mismatches the query distribution). Costs a slightly slower forward pass since LoRA paths run per layer.
+The Candle inference backend reads `adapter_config.json` on model load and
+dispatches on `adapter_type`: `encoder_adapters` rebuilds the encoder with
+frozen backbone weights plus the LoRA A/B from `adapter.safetensors`;
+`projection_head` loads the saved projection weights as a `LoraLinear`
+applied after pooling.
+
+### When to use each
+
+- **Projection head** — fastest training, smallest artifact, lowest memory.
+  The default when `target_modules` is empty. Best for adapting embedding
+  direction without changing per-token attention behaviour.
+- **Encoder adapters** — higher representational ceiling per adapter
+  parameter; required if the task needs to reshape attention behaviour
+  (e.g. a domain where the base attention pattern mismatches the query
+  distribution). Costs a slightly slower forward pass since the LoRA path
+  runs per layer.
 
 ## Training safety
 

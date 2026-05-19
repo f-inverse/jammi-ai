@@ -380,4 +380,11 @@ impl TrainingDataLoader {
     pub fn format(&self) -> TrainingFormat {
         self.format
     }
+
+    /// Whether this loader was constructed from pre-built tensor batches
+    /// (typically a test fixture) rather than text rows that must be
+    /// encoded through a model.
+    pub fn is_precomputed(&self) -> bool {
+        matches!(self.data, LoaderData::Precomputed(_))
+    }
 }

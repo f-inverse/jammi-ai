@@ -34,15 +34,15 @@ impl From<BackboneDtype> for DType {
     }
 }
 
-/// Adapter metadata persisted alongside the safetensors weights.
+/// Metadata describing a LoRA adapter injected into an encoder's internal
+/// attention/FFN linears.
 ///
-/// On-disk filename is `adapter_config.json` and lives next to
-/// `adapter.safetensors` inside the adapter directory.
+/// Persisted as JSON alongside `adapter.safetensors`. Discrimination between
+/// different *kinds* of adapters (e.g. an external projection head vs. these
+/// internal adapters) is a concern for the caller; this struct describes the
+/// internal-adapter case only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdapterConfig {
-    /// Discriminator field — currently always `"deep_lora"`, reserved for
-    /// future adapter formats.
-    pub adapter_type: String,
     /// Backbone model family: e.g. `"bert"`, `"distilbert"`, `"modernbert"`.
     pub model_type: String,
     /// Default LoRA rank used at training time.
@@ -76,7 +76,6 @@ impl AdapterConfig {
         backbone_dtype: BackboneDtype,
     ) -> Self {
         Self {
-            adapter_type: "deep_lora".into(),
             model_type: model_type.into(),
             lora_rank: lora.lora_rank,
             lora_alpha: lora.lora_alpha,

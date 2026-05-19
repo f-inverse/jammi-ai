@@ -548,7 +548,7 @@ fn training_divergence_detection() {
         .unwrap();
 
     let mut training_loop = TrainingLoopBuilder::new(
-        model,
+        jammi_ai::fine_tune::target::TrainingTarget::ProjectionHead { head: model },
         varmap,
         FineTuneConfig {
             epochs: 5,
@@ -649,7 +649,7 @@ fn training_early_stopping_triggers() {
         .unwrap();
 
     let mut training_loop = TrainingLoopBuilder::new(
-        model,
+        jammi_ai::fine_tune::target::TrainingTarget::ProjectionHead { head: model },
         varmap,
         FineTuneConfig {
             epochs: 100, // high — should stop well before this

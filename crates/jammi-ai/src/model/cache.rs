@@ -169,7 +169,7 @@ impl ModelCache {
 
         // Register model in catalog (idempotent — ignores if already registered).
         // Store the parent directory of the first weights file so that
-        // build_deep_lora_model can locate config.json and tokenizer.json.
+        // `build_encoder_adapters` can locate config.json and tokenizer.json.
         let backend_str = format!("{:?}", resolved.backend).to_lowercase();
         let task_str = task.to_string();
         let model_type = match source {

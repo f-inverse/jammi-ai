@@ -8,6 +8,7 @@ pub mod classifier;
 pub mod data;
 pub mod job;
 pub mod lora;
+pub mod target;
 pub mod trainer;
 
 use std::collections::HashMap;
@@ -153,10 +154,12 @@ pub struct FineTuneConfig {
     #[serde(default)]
     pub early_stopping_metric: EarlyStoppingMetric,
 
-    // ── PEFT-style deep LoRA fields ────────────────────────────────────────
+    // ── Encoder-adapters fields (LoRA injected inside the encoder) ─────────
     /// Layer name suffixes that receive LoRA adapters (PEFT `target_modules`).
     ///
-    /// Empty = projection-only (current default behaviour).
+    /// Empty = train a projection head on top of the frozen base model.
+    /// Non-empty = inject LoRA into the encoder's internal linears at the
+    /// listed sites and train those.
     /// `["all-linear"]` = every linear layer.
     /// Model-specific examples: `["query", "value"]` for BERT/RoBERTa;
     /// `["q_lin", "v_lin"]` for DistilBERT; `["Wqkv"]` for ModernBERT.

@@ -182,12 +182,11 @@ impl MaybeLoraLinear {
 // RoPE helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Precomputed RoPE cos/sin tables: [max_seq_len, rotary_dim].
+/// Precomputed RoPE cos/sin tables: `[max_seq_len, head_dim]`.
+/// (The "rotary dim" equals `head_dim` in HF ModernBERT — no separate field needed.)
 struct RotaryEmbedding {
     cos: Tensor,
     sin: Tensor,
-    #[allow(dead_code)]
-    rotary_dim: usize,
 }
 
 impl RotaryEmbedding {
@@ -221,11 +220,7 @@ impl RotaryEmbedding {
         let sin = Tensor::from_vec(sin_vec, (max_seq_len, head_dim), device)
             .map_err(|e| JammiError::FineTune(format!("RoPE sin: {e}")))?;
 
-        Ok(Self {
-            cos,
-            sin,
-            rotary_dim,
-        })
+        Ok(Self { cos, sin })
     }
 
     /// Apply RoPE to a [batch, num_heads, seq, head_dim] tensor.

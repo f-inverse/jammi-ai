@@ -145,6 +145,92 @@ text -> encoder (frozen) -> base embedding -> LoRA projection (trained) -> outpu
 4. Only the A/B matrices receive gradients
 5. The adapter is saved as `adapter.safetensors` in the artifact directory
 
+## Deep LoRA (PEFT-style adapter injection)
+
+The default flow above (shallow LoRA) trains a single low-rank projection sitting *outside* the frozen encoder. For higher capacity at the same parameter budget, Jammi also supports **deep LoRA** — adapters injected into named linear layers *inside* the encoder stack, matching the PEFT convention.
+
+Trigger deep LoRA by populating `target_modules` on `FineTuneConfig`:
+
+```rust
+let config = FineTuneConfig {
+    lora_rank: 8,
+    lora_alpha: 16.0,
+    // Inject LoRA into BERT's attention query and value projections.
+    target_modules: vec!["query".to_string(), "value".to_string()],
+    ..Default::default()
+};
+```
+
+```python
+job = db.fine_tune(
+    source="training",
+    base_model="sentence-transformers/all-MiniLM-L6-v2",
+    columns=["text_a", "text_b", "score"],
+    method="lora",
+    task="embedding",
+    target_modules=["query", "value"],
+)
+```
+
+### Target-module conventions
+
+Pick `target_modules` per the architecture you're fine-tuning:
+
+| Architecture | Common target_modules |
+|---|---|
+| BERT / RoBERTa / CamemBERT / XLM-RoBERTa | `["query", "value"]` (recommended) or `["query", "key", "value", "dense"]` |
+| DistilBERT | `["q_lin", "v_lin"]` or `["q_lin", "k_lin", "v_lin", "out_lin"]` |
+| ModernBERT | `["Wqkv", "Wo"]` (fused QKV + output) |
+| Any encoder | `["all-linear"]` — every linear layer gets an adapter (largest capacity) |
+
+Names match the trailing module-name segment in the HuggingFace weight layout. Suffix matching is the rule, so `"query"` matches `"attention.self.query"`.
+
+### Layer ranges and per-module ranks
+
+Two optional refinements:
+
+- **`layers_to_transform`** — restrict injection to specific 0-based layer indices. `None` (default) applies to every layer.
+- **`rank_pattern`** — override `lora_rank` for individual modules. Keys are substring matches against the module name; values are the override rank.
+
+```rust
+let mut rank_pattern = std::collections::HashMap::new();
+rank_pattern.insert("query".to_string(), 16);  // higher capacity on Q
+rank_pattern.insert("value".to_string(), 4);   // lower on V
+
+let config = FineTuneConfig {
+    lora_rank: 8,                                     // default rank
+    target_modules: vec!["query".into(), "value".into()],
+    layers_to_transform: Some(vec![6, 7, 8, 9, 10, 11]), // top half only
+    rank_pattern,
+    ..Default::default()
+};
+```
+
+### On-disk artifact
+
+Deep-LoRA adapters save `adapter.safetensors` plus an `adapter_config.json` carrying the build-time settings:
+
+```json
+{
+  "adapter_type": "deep_lora",
+  "model_type": "bert",
+  "lora_rank": 8,
+  "lora_alpha": 16.0,
+  "use_rslora": false,
+  "target_modules": ["query", "value"],
+  "layers_to_transform": [6, 7, 8, 9, 10, 11],
+  "rank_pattern": {"query": 16, "value": 4},
+  "backbone_dtype": "f32"
+}
+```
+
+The Candle inference backend reads `adapter_config.json` on model load. If `adapter_type` is `"deep_lora"`, it rebuilds the encoder with frozen backbone weights plus the LoRA A/B from `adapter.safetensors`. Shallow-LoRA adapters (no `adapter_config.json`, or `adapter_type` set to anything else) continue using the external-projection inference path.
+
+### When to choose deep vs shallow
+
+- **Shallow** — fastest training, smallest artifact, lowest memory. The default when `target_modules` is empty. Best for adapting embedding direction without per-token attention reshape.
+- **Deep** — higher representational ceiling per adapter parameter; required if the task needs to reshape attention behaviour (e.g., a domain where the base attention pattern mismatches the query distribution). Costs a slightly slower forward pass since LoRA paths run per layer.
+
 ## Training safety
 
 - **Divergence detection:** if loss is NaN or >100 for 3 consecutive batches, the job fails with a clear error

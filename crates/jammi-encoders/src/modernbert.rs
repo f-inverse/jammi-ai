@@ -30,12 +30,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
-use candle_nn::{
-    embedding, layer_norm_no_bias, linear_no_bias, Embedding, LayerNorm, VarBuilder, VarMap,
-};
+use candle_nn::{embedding, linear_no_bias, Embedding, VarBuilder, VarMap};
 use jammi_lora::{effective_rank, should_apply_lora, LoraBuildConfig, LoraLinear, MaybeLoraLinear};
 
 use crate::error::EncoderError;
+use crate::layer_norm::LayerNorm;
 use crate::mask::extended_attention_mask;
 use crate::pooling::{pool_and_normalize, Pooling};
 
@@ -338,7 +337,7 @@ impl ModernBert {
             hidden = layer.forward(&hidden, &extended)?;
         }
 
-        Ok(self.final_norm.forward(&hidden)?)
+        self.final_norm.forward(&hidden)
     }
 
     /// Borrowed references to every trainable LoRA tensor in the encoder.
@@ -371,14 +370,23 @@ impl ModernBert {
         Ok(out)
     }
 
-    /// Toggle training mode on every LoRA-augmented linear.
+    /// Toggle training mode on every LoRA-augmented linear and every LayerNorm.
+    /// ModernBERT's LayerNorms use the bias-free variant whose forward stays
+    /// on the slow primitive-op path in both modes, but propagating the flag
+    /// keeps the surface consistent with [`Bert`] and [`DistilBert`].
     pub fn set_training(&mut self, training: bool) {
+        self.emb_norm.set_training(training);
         for layer in &mut self.layers {
             layer.attention.wqkv.set_training(training);
             layer.attention.wo.set_training(training);
+            if let Some(attn_norm) = layer.attention.attn_norm.as_mut() {
+                attn_norm.set_training(training);
+            }
             layer.mlp.wi.set_training(training);
             layer.mlp.wo.set_training(training);
+            layer.mlp.mlp_norm.set_training(training);
         }
+        self.final_norm.set_training(training);
     }
 
     /// Restore LoRA `A`/`B` tensors from a `named_trainable_weights`-shaped map.
@@ -477,9 +485,10 @@ impl<'a> ModernBertBuilder<'a> {
             config.hidden_size,
             frozen_vb.pp("model.embeddings.tok_embeddings"),
         )?;
-        let emb_norm = layer_norm_no_bias(
+        let emb_norm = LayerNorm::new(
             config.hidden_size,
             config.layer_norm_eps,
+            false,
             frozen_vb.pp("model.embeddings.norm"),
         )?;
 
@@ -505,9 +514,10 @@ impl<'a> ModernBertBuilder<'a> {
             let attn_norm = if n == 0 {
                 None
             } else {
-                Some(layer_norm_no_bias(
+                Some(LayerNorm::new(
                     config.hidden_size,
                     config.layer_norm_eps,
+                    false,
                     layer_vb.pp("attn_norm"),
                 )?)
             };
@@ -531,9 +541,10 @@ impl<'a> ModernBertBuilder<'a> {
                 config.intermediate_size,
                 config.hidden_size,
             )?;
-            let mlp_norm = layer_norm_no_bias(
+            let mlp_norm = LayerNorm::new(
                 config.hidden_size,
                 config.layer_norm_eps,
+                false,
                 layer_vb.pp("mlp_norm"),
             )?;
 
@@ -554,9 +565,10 @@ impl<'a> ModernBertBuilder<'a> {
             });
         }
 
-        let final_norm = layer_norm_no_bias(
+        let final_norm = LayerNorm::new(
             config.hidden_size,
             config.layer_norm_eps,
+            false,
             frozen_vb.pp("model.final_norm"),
         )?;
 

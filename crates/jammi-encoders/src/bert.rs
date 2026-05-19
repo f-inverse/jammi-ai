@@ -19,12 +19,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use candle_core::{DType, Device, Tensor, D};
-use candle_nn::{
-    embedding, layer_norm, linear, Embedding, LayerNorm, Linear, Module, VarBuilder, VarMap,
-};
+use candle_nn::{embedding, linear, Embedding, Linear, Module, VarBuilder, VarMap};
 use jammi_lora::{effective_rank, should_apply_lora, LoraBuildConfig, LoraLinear, MaybeLoraLinear};
 
 use crate::error::EncoderError;
+use crate::layer_norm::LayerNorm;
 use crate::mask::extended_attention_mask;
 use crate::pooling::{pool_and_normalize, Pooling};
 
@@ -86,9 +85,10 @@ impl BertEmbeddings {
             config.hidden_size,
             vb.pp("token_type_embeddings"),
         )?;
-        let layer_norm = layer_norm(
+        let layer_norm = LayerNorm::new(
             config.hidden_size,
             config.layer_norm_eps,
+            true,
             vb.pp("LayerNorm"),
         )?;
         Ok(Self {
@@ -107,7 +107,7 @@ impl BertEmbeddings {
         let position_ids = Tensor::arange(0u32, seq as u32, input_ids.device())?;
         let position_emb = self.position_embeddings.forward(&position_ids)?;
         let embeddings = embeddings.broadcast_add(&position_emb)?;
-        Ok(self.layer_norm.forward(&embeddings)?)
+        self.layer_norm.forward(&embeddings)
     }
 }
 
@@ -159,7 +159,7 @@ struct BertSelfOutput {
 impl BertSelfOutput {
     fn forward(&self, hidden: &Tensor, input_tensor: &Tensor) -> Result<Tensor, EncoderError> {
         let hidden = self.dense.forward(hidden)?;
-        Ok(self.layer_norm.forward(&(hidden + input_tensor)?)?)
+        self.layer_norm.forward(&(hidden + input_tensor)?)
     }
 }
 
@@ -194,7 +194,7 @@ struct BertOutput {
 impl BertOutput {
     fn forward(&self, hidden: &Tensor, input_tensor: &Tensor) -> Result<Tensor, EncoderError> {
         let hidden = self.dense.forward(hidden)?;
-        Ok(self.layer_norm.forward(&(hidden + input_tensor)?)?)
+        self.layer_norm.forward(&(hidden + input_tensor)?)
     }
 }
 
@@ -341,16 +341,25 @@ impl Bert {
         Ok(out)
     }
 
-    /// Switch every LoRA-wrapped linear into / out of training mode (gates
-    /// dropout on the adapter path).
+    /// Switch every LoRA-wrapped linear and LayerNorm into / out of training
+    /// mode. LoRA layers gate dropout; LayerNorms switch between the fused
+    /// no-bwd eval kernel and the primitive-op composition whose backward is
+    /// well-defined.
     pub fn set_training(&mut self, training: bool) {
+        self.embeddings.layer_norm.set_training(training);
         for layer in &mut self.layers {
             layer.attention.self_attention.query.set_training(training);
             layer.attention.self_attention.key.set_training(training);
             layer.attention.self_attention.value.set_training(training);
             layer.attention.self_output.dense.set_training(training);
+            layer
+                .attention
+                .self_output
+                .layer_norm
+                .set_training(training);
             layer.intermediate.dense.set_training(training);
             layer.output.dense.set_training(training);
+            layer.output.layer_norm.set_training(training);
         }
     }
 
@@ -481,17 +490,19 @@ impl<'a> BertBuilder<'a> {
             let key = site.build("attention.self.key", "key", h, h)?;
             let value = site.build("attention.self.value", "value", h, h)?;
             let attn_output_dense = site.build("attention.output.dense", "dense", h, h)?;
-            let attn_output_ln = layer_norm(
+            let attn_output_ln = LayerNorm::new(
                 config.hidden_size,
                 config.layer_norm_eps,
+                true,
                 layer_vb.pp("attention.output.LayerNorm"),
             )?;
             let intermediate_dense =
                 site.build("intermediate.dense", "intermediate_dense", h, i)?;
             let output_dense = site.build("output.dense", "output_dense", i, h)?;
-            let output_ln = layer_norm(
+            let output_ln = LayerNorm::new(
                 config.hidden_size,
                 config.layer_norm_eps,
+                true,
                 layer_vb.pp("output.LayerNorm"),
             )?;
 

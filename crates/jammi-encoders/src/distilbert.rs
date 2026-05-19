@@ -16,10 +16,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use candle_core::{DType, Device, Module, Tensor, D};
-use candle_nn::{Embedding, LayerNorm, VarBuilder, VarMap};
+use candle_nn::{Embedding, VarBuilder, VarMap};
 use jammi_lora::{effective_rank, should_apply_lora, LoraBuildConfig, LoraLinear, MaybeLoraLinear};
 
 use crate::error::EncoderError;
+use crate::layer_norm::LayerNorm;
 use crate::pooling::{pool_and_normalize, Pooling};
 
 /// DistilBERT architecture configuration.
@@ -72,7 +73,7 @@ impl DistilBertEmbeddings {
         let position_ids = Tensor::arange(0u32, seq as u32, input_ids.device())?;
         let position_emb = self.position_embeddings.forward(&position_ids)?;
         let embeddings = word_emb.broadcast_add(&position_emb)?;
-        Ok(self.layer_norm.forward(&embeddings)?)
+        self.layer_norm.forward(&embeddings)
     }
 }
 
@@ -152,7 +153,7 @@ impl DistilBertLayer {
         // Post-LN FFN: residual then LayerNorm.
         let ffn_out = self.ffn.forward(&attn_normed)?;
         let ffn_residual = (ffn_out + &attn_normed)?;
-        Ok(self.output_layer_norm.forward(&ffn_residual)?)
+        self.output_layer_norm.forward(&ffn_residual)
     }
 }
 
@@ -271,16 +272,21 @@ impl DistilBert {
         Ok(out)
     }
 
-    /// Toggle training mode on every LoRA-augmented linear. Affects dropout
-    /// inside [`LoraLinear`]; frozen linears are unaffected.
+    /// Toggle training mode on every LoRA-augmented linear and every LayerNorm.
+    /// LoRA layers gate dropout; LayerNorms switch between the fused no-bwd
+    /// eval kernel and the primitive-op composition whose backward is well-
+    /// defined.
     pub fn set_training(&mut self, training: bool) {
+        self.embeddings.layer_norm.set_training(training);
         for layer in &mut self.layers {
             layer.attention.q_lin.set_training(training);
             layer.attention.k_lin.set_training(training);
             layer.attention.v_lin.set_training(training);
             layer.attention.out_lin.set_training(training);
+            layer.sa_layer_norm.set_training(training);
             layer.ffn.lin1.set_training(training);
             layer.ffn.lin2.set_training(training);
+            layer.output_layer_norm.set_training(training);
         }
     }
 
@@ -395,9 +401,10 @@ impl<'a> DistilBertBuilder<'a> {
             config.hidden_size,
             emb_vb.pp("position_embeddings"),
         )?;
-        let emb_layer_norm = candle_nn::layer_norm(
+        let emb_layer_norm = LayerNorm::new(
             config.hidden_size,
             config.layer_norm_eps,
+            true,
             emb_vb.pp("LayerNorm"),
         )?;
         let embeddings = DistilBertEmbeddings {
@@ -446,9 +453,10 @@ impl<'a> DistilBertBuilder<'a> {
                 config.hidden_size,
             )?;
 
-            let sa_layer_norm = candle_nn::layer_norm(
+            let sa_layer_norm = LayerNorm::new(
                 config.hidden_size,
                 config.layer_norm_eps,
+                true,
                 layer_vb.pp("sa_layer_norm"),
             )?;
 
@@ -473,9 +481,10 @@ impl<'a> DistilBertBuilder<'a> {
                 config.hidden_size,
             )?;
 
-            let output_layer_norm = candle_nn::layer_norm(
+            let output_layer_norm = LayerNorm::new(
                 config.hidden_size,
                 config.layer_norm_eps,
+                true,
                 layer_vb.pp("output_layer_norm"),
             )?;
 

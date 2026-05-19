@@ -3719,6 +3719,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "jammi-encoders"
+version = "0.3.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "jammi-lora",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "jammi-engine"
 version = "0.3.0"
 dependencies = [

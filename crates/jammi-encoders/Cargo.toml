@@ -1,0 +1,37 @@
+[package]
+name = "jammi-encoders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Candle-native BERT-family encoders for sentence embeddings, with built-in PEFT support via jammi-lora."
+keywords = ["bert", "sentence-embeddings", "lora", "candle", "transformer"]
+categories = ["science"]
+readme = "README.md"
+
+[dependencies]
+candle-core.workspace = true
+candle-nn.workspace = true
+jammi-lora.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+candle-transformers.workspace = true
+tempfile = "3"
+
+[features]
+default = []
+# Enables tests/parity.rs which depends on candle-transformers as a numerical
+# oracle for the Bert frozen forward pass.
+parity-test = []
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
+[[test]]
+name = "parity"
+path = "tests/parity.rs"

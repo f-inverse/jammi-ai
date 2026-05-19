@@ -915,65 +915,51 @@ fn build_deep_lora_model(
         None
     };
 
+    let lora = crate::fine_tune::deep_lora::LoraBuildConfig {
+        target_modules: &config.target_modules,
+        layers_to_transform: &config.layers_to_transform,
+        lora_rank: config.lora_rank,
+        lora_alpha: config.lora_alpha,
+        use_rslora: config.use_rslora,
+        lora_dropout: dropout,
+        rank_pattern: &config.rank_pattern,
+        init_mode: config.init_lora_weights,
+    };
+    let backbone_dtype = config.backbone_dtype.into();
+
     let encoder: Box<dyn crate::fine_tune::deep_lora::DeepLoraEncoder> = match model_type {
         "distilbert" => Box::new(crate::fine_tune::deep_lora::distilbert::build(
             &weights_paths,
             &model_config,
-            &config.target_modules,
-            &config.layers_to_transform,
-            config.lora_rank,
-            config.lora_alpha,
-            config.use_rslora,
-            dropout,
-            &config.rank_pattern,
-            config.init_lora_weights,
+            lora,
+            backbone_dtype,
             device,
             varmap,
             None,
-            config.backbone_dtype.into(),
         )?),
         "modernbert" => Box::new(crate::fine_tune::deep_lora::modernbert::build(
             &weights_paths,
             &model_config,
-            &config.target_modules,
-            &config.layers_to_transform,
-            config.lora_rank,
-            config.lora_alpha,
-            config.use_rslora,
-            dropout,
-            &config.rank_pattern,
-            config.init_lora_weights,
+            lora,
+            backbone_dtype,
             device,
             varmap,
             None,
-            config.backbone_dtype.into(),
         )?),
         _ => Box::new(crate::fine_tune::deep_lora::bert::build(
             &weights_paths,
             &model_config,
-            &config.target_modules,
-            &config.layers_to_transform,
-            config.lora_rank,
-            config.lora_alpha,
-            config.use_rslora,
-            dropout,
-            &config.rank_pattern,
-            config.init_lora_weights,
+            lora,
+            backbone_dtype,
             device,
             varmap,
             None,
-            config.backbone_dtype.into(),
         )?),
     };
 
-    let adapter_cfg = crate::fine_tune::deep_lora::DeepLoraAdapterConfig::new_deep_lora(
+    let adapter_cfg = crate::fine_tune::deep_lora::DeepLoraAdapterConfig::from_build(
         model_type,
-        config.lora_rank,
-        config.lora_alpha,
-        config.use_rslora,
-        config.target_modules.clone(),
-        config.layers_to_transform.clone(),
-        config.rank_pattern.clone(),
+        &lora,
         config.backbone_dtype,
     );
 

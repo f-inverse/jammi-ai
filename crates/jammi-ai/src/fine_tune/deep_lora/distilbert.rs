@@ -14,9 +14,21 @@ use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{Linear, VarBuilder, VarMap};
 use jammi_engine::error::{JammiError, Result};
 
-use crate::fine_tune::lora::{LoraInitMode, LoraLinear};
+use crate::fine_tune::lora::LoraLinear;
 
-use super::{effective_rank, should_apply_lora, DeepLoraEncoder};
+use super::{effective_rank, should_apply_lora, DeepLoraEncoder, LoraBuildConfig};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Architecture dimensions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// DistilBERT architecture dimensions read from the model's `config.json`.
+#[derive(Debug, Clone, Copy)]
+pub struct DistilBertDims {
+    pub num_layers: usize,
+    pub num_heads: usize,
+    pub hidden_size: usize,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers (re-used from bert — inline copies to avoid cross-module coupling)
@@ -343,22 +355,17 @@ pub struct DistilBertLoraEncoder {
 }
 
 impl DistilBertLoraEncoder {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         frozen_vb: &VarBuilder,
         lora_vb: &VarBuilder,
-        num_layers: usize,
-        num_heads: usize,
-        hidden_size: usize,
-        target_modules: &[String],
-        layers_to_transform: &Option<Vec<usize>>,
-        lora_rank: usize,
-        lora_alpha: f64,
-        use_rslora: bool,
-        lora_dropout: Option<f32>,
-        rank_pattern: &HashMap<String, usize>,
-        init_mode: LoraInitMode,
+        dims: DistilBertDims,
+        lora: LoraBuildConfig<'_>,
     ) -> Result<Self> {
+        let DistilBertDims {
+            num_layers,
+            num_heads,
+            hidden_size,
+        } = dims;
         let head_dim = hidden_size / num_heads;
         let base_vb = frozen_vb.pp("distilbert");
 
@@ -372,15 +379,15 @@ impl DistilBertLoraEncoder {
             macro_rules! maybe_lora {
                 ($name:expr, $sub:expr) => {{
                     let frozen_lin = load_linear(&layer_vb.pp($sub))?;
-                    if should_apply_lora($name, target_modules, n, layers_to_transform) {
-                        let rank = effective_rank($name, lora_rank, rank_pattern);
+                    if should_apply_lora($name, lora.target_modules, n, lora.layers_to_transform) {
+                        let rank = effective_rank($name, lora.lora_rank, lora.rank_pattern);
                         let l = LoraLinear::new(
                             frozen_lin,
                             rank,
-                            lora_alpha,
-                            use_rslora,
-                            init_mode,
-                            lora_dropout,
+                            lora.lora_alpha,
+                            lora.use_rslora,
+                            lora.init_mode,
+                            lora.lora_dropout,
                             &lora_layer_vb.pp($name),
                         )?;
                         MaybeLoraLinear::Lora(l)
@@ -556,22 +563,14 @@ impl DeepLoraEncoder for DistilBertLoraEncoder {
 // Public builder
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 pub fn build(
     weights_paths: &[&Path],
     model_config: &serde_json::Value,
-    target_modules: &[String],
-    layers_to_transform: &Option<Vec<usize>>,
-    lora_rank: usize,
-    lora_alpha: f64,
-    use_rslora: bool,
-    lora_dropout: Option<f32>,
-    rank_pattern: &HashMap<String, usize>,
-    init_mode: LoraInitMode,
+    lora: LoraBuildConfig<'_>,
+    backbone_dtype: DType,
     device: &Device,
     varmap: &VarMap,
     adapter_file: Option<&Path>,
-    backbone_dtype: DType,
 ) -> Result<DistilBertLoraEncoder> {
     let frozen_vb = unsafe {
         VarBuilder::from_mmaped_safetensors(weights_paths, backbone_dtype, device)
@@ -586,32 +585,20 @@ pub fn build(
         VarBuilder::from_varmap(varmap, DType::F32, device)
     };
 
-    let hidden_size = model_config
-        .get("dim")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(768) as usize;
-    let num_heads = model_config
-        .get("n_heads")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(12) as usize;
-    let num_layers = model_config
-        .get("n_layers")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(6) as usize;
+    let dims = DistilBertDims {
+        hidden_size: model_config
+            .get("dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(768) as usize,
+        num_heads: model_config
+            .get("n_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(12) as usize,
+        num_layers: model_config
+            .get("n_layers")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(6) as usize,
+    };
 
-    DistilBertLoraEncoder::new(
-        &frozen_vb,
-        &lora_vb,
-        num_layers,
-        num_heads,
-        hidden_size,
-        target_modules,
-        layers_to_transform,
-        lora_rank,
-        lora_alpha,
-        use_rslora,
-        lora_dropout,
-        rank_pattern,
-        init_mode,
-    )
+    DistilBertLoraEncoder::new(&frozen_vb, &lora_vb, dims, lora)
 }

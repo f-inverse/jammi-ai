@@ -21,9 +21,23 @@ use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{Linear, VarBuilder, VarMap};
 use jammi_engine::error::{JammiError, Result};
 
-use crate::fine_tune::lora::{LoraInitMode, LoraLinear};
+use crate::fine_tune::lora::LoraLinear;
 
-use super::{effective_rank, should_apply_lora, DeepLoraEncoder};
+use super::{effective_rank, should_apply_lora, DeepLoraEncoder, LoraBuildConfig};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Architecture dimensions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// BERT-family architecture dimensions read from the model's `config.json`.
+#[derive(Debug, Clone, Copy)]
+pub struct BertDims<'a> {
+    pub num_layers: usize,
+    pub num_heads: usize,
+    pub hidden_size: usize,
+    /// Weight-key prefix (`"bert"`, `"roberta"`, `"camembert"`, `"xlm_roberta"`).
+    pub prefix: &'a str,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Layer-norm helper
@@ -373,23 +387,18 @@ impl BertLoraEncoder {
     ///
     /// Frozen linear layers are loaded from `frozen_vb` (backed by mmaped safetensors).
     /// LoRA A/B matrices are registered in `lora_vb` (backed by a `VarMap`).
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         frozen_vb: &VarBuilder,
         lora_vb: &VarBuilder,
-        num_layers: usize,
-        num_heads: usize,
-        hidden_size: usize,
-        target_modules: &[String],
-        layers_to_transform: &Option<Vec<usize>>,
-        lora_rank: usize,
-        lora_alpha: f64,
-        use_rslora: bool,
-        lora_dropout: Option<f32>,
-        rank_pattern: &HashMap<String, usize>,
-        init_mode: LoraInitMode,
-        prefix: &str,
+        dims: BertDims<'_>,
+        lora: LoraBuildConfig<'_>,
     ) -> Result<Self> {
+        let BertDims {
+            num_layers,
+            num_heads,
+            hidden_size,
+            prefix,
+        } = dims;
         let head_dim = hidden_size / num_heads;
         let base_vb = frozen_vb.pp(prefix);
 
@@ -403,15 +412,15 @@ impl BertLoraEncoder {
             macro_rules! maybe_lora {
                 ($name:expr, $sub:expr) => {{
                     let frozen_lin = load_linear(&layer_vb.pp($sub))?;
-                    if should_apply_lora($name, target_modules, n, layers_to_transform) {
-                        let rank = effective_rank($name, lora_rank, rank_pattern);
+                    if should_apply_lora($name, lora.target_modules, n, lora.layers_to_transform) {
+                        let rank = effective_rank($name, lora.lora_rank, lora.rank_pattern);
                         let l = LoraLinear::new(
                             frozen_lin,
                             rank,
-                            lora_alpha,
-                            use_rslora,
-                            init_mode,
-                            lora_dropout,
+                            lora.lora_alpha,
+                            lora.use_rslora,
+                            lora.init_mode,
+                            lora.lora_dropout,
                             &lora_layer_vb.pp($name),
                         )?;
                         MaybeLoraLinear::Lora(l)
@@ -625,22 +634,14 @@ pub fn bert_weight_prefix(model_type: &str) -> &'static str {
 /// `adapter_file` — when `Some`, load LoRA A/B tensors from that safetensors
 ///   file (inference mode).  When `None`, allocate fresh tensors in `varmap`
 ///   using the chosen `init_mode` (training mode).
-#[allow(clippy::too_many_arguments)]
 pub fn build(
     weights_paths: &[&Path],
     model_config: &serde_json::Value,
-    target_modules: &[String],
-    layers_to_transform: &Option<Vec<usize>>,
-    lora_rank: usize,
-    lora_alpha: f64,
-    use_rslora: bool,
-    lora_dropout: Option<f32>,
-    rank_pattern: &HashMap<String, usize>,
-    init_mode: LoraInitMode,
+    lora: LoraBuildConfig<'_>,
+    backbone_dtype: DType,
     device: &Device,
     varmap: &VarMap,
     adapter_file: Option<&Path>,
-    backbone_dtype: DType,
 ) -> Result<BertLoraEncoder> {
     let frozen_vb = unsafe {
         VarBuilder::from_mmaped_safetensors(weights_paths, backbone_dtype, device)
@@ -659,35 +660,21 @@ pub fn build(
         .get("model_type")
         .and_then(|v| v.as_str())
         .unwrap_or("bert");
-    let prefix = bert_weight_prefix(model_type);
+    let dims = BertDims {
+        prefix: bert_weight_prefix(model_type),
+        hidden_size: model_config
+            .get("hidden_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(768) as usize,
+        num_heads: model_config
+            .get("num_attention_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(12) as usize,
+        num_layers: model_config
+            .get("num_hidden_layers")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(12) as usize,
+    };
 
-    let hidden_size = model_config
-        .get("hidden_size")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(768) as usize;
-    let num_heads = model_config
-        .get("num_attention_heads")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(12) as usize;
-    let num_layers = model_config
-        .get("num_hidden_layers")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(12) as usize;
-
-    BertLoraEncoder::new(
-        &frozen_vb,
-        &lora_vb,
-        num_layers,
-        num_heads,
-        hidden_size,
-        target_modules,
-        layers_to_transform,
-        lora_rank,
-        lora_alpha,
-        use_rslora,
-        lora_dropout,
-        rank_pattern,
-        init_mode,
-        prefix,
-    )
+    BertLoraEncoder::new(&frozen_vb, &lora_vb, dims, lora)
 }

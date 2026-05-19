@@ -889,24 +889,29 @@ impl ModelBackend for CandleBackend {
                         let weights_paths_ref: Vec<&std::path::Path> =
                             resolved.weights_paths.iter().map(|p| p.as_path()).collect();
 
+                        let lora = crate::fine_tune::deep_lora::LoraBuildConfig {
+                            target_modules: &adapter_cfg.target_modules,
+                            layers_to_transform: &adapter_cfg.layers_to_transform,
+                            lora_rank: adapter_cfg.lora_rank,
+                            lora_alpha: adapter_cfg.lora_alpha,
+                            use_rslora: adapter_cfg.use_rslora,
+                            lora_dropout: None,
+                            rank_pattern: &adapter_cfg.rank_pattern,
+                            init_mode: crate::fine_tune::lora::LoraInitMode::ZerosB,
+                        };
+                        let backbone_dtype = adapter_cfg.backbone_dtype.into();
+
                         let mut encoder: Box<dyn crate::fine_tune::deep_lora::DeepLoraEncoder> =
                             match adapter_cfg.model_type.as_str() {
                                 "distilbert" => Box::new(
                                     crate::fine_tune::deep_lora::distilbert::build(
                                         &weights_paths_ref,
                                         &model_config,
-                                        &adapter_cfg.target_modules,
-                                        &adapter_cfg.layers_to_transform,
-                                        adapter_cfg.lora_rank,
-                                        adapter_cfg.lora_alpha,
-                                        adapter_cfg.use_rslora,
-                                        None,
-                                        &adapter_cfg.rank_pattern,
-                                        crate::fine_tune::lora::LoraInitMode::ZerosB,
+                                        lora,
+                                        backbone_dtype,
                                         &device,
                                         &dummy_varmap,
                                         Some(adapter_file.as_path()),
-                                        adapter_cfg.backbone_dtype.into(),
                                     )
                                     .map_err(|e| {
                                         JammiError::Model {
@@ -919,18 +924,11 @@ impl ModelBackend for CandleBackend {
                                     crate::fine_tune::deep_lora::modernbert::build(
                                         &weights_paths_ref,
                                         &model_config,
-                                        &adapter_cfg.target_modules,
-                                        &adapter_cfg.layers_to_transform,
-                                        adapter_cfg.lora_rank,
-                                        adapter_cfg.lora_alpha,
-                                        adapter_cfg.use_rslora,
-                                        None,
-                                        &adapter_cfg.rank_pattern,
-                                        crate::fine_tune::lora::LoraInitMode::ZerosB,
+                                        lora,
+                                        backbone_dtype,
                                         &device,
                                         &dummy_varmap,
                                         Some(adapter_file.as_path()),
-                                        adapter_cfg.backbone_dtype.into(),
                                     )
                                     .map_err(|e| {
                                         JammiError::Model {
@@ -943,18 +941,11 @@ impl ModelBackend for CandleBackend {
                                     crate::fine_tune::deep_lora::bert::build(
                                         &weights_paths_ref,
                                         &model_config,
-                                        &adapter_cfg.target_modules,
-                                        &adapter_cfg.layers_to_transform,
-                                        adapter_cfg.lora_rank,
-                                        adapter_cfg.lora_alpha,
-                                        adapter_cfg.use_rslora,
-                                        None,
-                                        &adapter_cfg.rank_pattern,
-                                        crate::fine_tune::lora::LoraInitMode::ZerosB,
+                                        lora,
+                                        backbone_dtype,
                                         &device,
                                         &dummy_varmap,
                                         Some(adapter_file.as_path()),
-                                        adapter_cfg.backbone_dtype.into(),
                                     )
                                     .map_err(|e| {
                                         JammiError::Model {

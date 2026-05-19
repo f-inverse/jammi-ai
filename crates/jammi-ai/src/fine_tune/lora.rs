@@ -39,9 +39,10 @@ pub struct LoraLinear {
     /// B matrix: (out_features × rank).
     pub lora_b: Tensor,
     /// Pre-computed scaling factor (alpha/rank or alpha/sqrt(rank) when use_rslora).
+    /// Once computed at construction the rank is no longer needed at runtime — the
+    /// dimensions are recoverable from `lora_a.dim(0)` / `lora_b.dim(1)` if a caller
+    /// needs them.
     scaling: f64,
-    #[allow(dead_code)]
-    rank: usize,
     /// Optional dropout probability applied to the LoRA path — only active when
     /// `training` is `true`.  Set to `false` during evaluation and inference to
     /// avoid stochastic noise in validation loss and inference outputs.
@@ -124,7 +125,6 @@ impl LoraLinear {
             lora_a,
             lora_b,
             scaling,
-            rank,
             dropout,
             training: true,
         })
@@ -251,7 +251,6 @@ impl LoraLinear {
             lora_a,
             lora_b,
             scaling,
-            rank,
             dropout: None,
             training: false,
         }

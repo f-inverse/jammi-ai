@@ -88,11 +88,6 @@ url = "2"
 async-trait = "0.1"
 futures = "0.3"
 
-[patch.crates-io]
-# Local patch so the MoE CUDA kernels are compiled with /MD (dynamic CRT)
-# instead of the nvcc default /MT, avoiding LNK2038 mismatch with the Rust toolchain.
-candle-kernels = { path = "vendor/candle-kernels" }
-
 [profile.dev]
 debug = "line-tables-only"
 

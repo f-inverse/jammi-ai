@@ -22,11 +22,9 @@ __pycache__/
 dist/
 .venv/
 *.so
-*.pyd
 
 # Test artifacts
 /tmp/jammi-test-*/
-rustup-init.exe
 
 # HuggingFace cache (large, downloaded at runtime)
 .cache/

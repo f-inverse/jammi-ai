@@ -170,14 +170,6 @@ async fn encoder_adapters_modernbert_writes_adapter_marker() {
     );
 }
 
-// Backward does not propagate gradient through the encoder-adapters target
-// to the LoRA `lora_a` / `lora_b` tensors on the BERT path: after training,
-// the saved adapter holds `B = 0` and `A` at exactly the Kaiming init value,
-// so the fine-tuned model's embedding equals the base embedding (max |Δ| = 0).
-// The autograd chain breaks somewhere across `Bert::forward_hidden` →
-// `pool_and_normalize`; diagnosing it requires candle-internals work that
-// belongs in a separate change.
-#[ignore = "encoder-adapters backward produces no gradient on lora_a/lora_b (autograd chain issue)"]
 #[tokio::test]
 async fn encoder_adapters_changes_embeddings_versus_base() {
     let (session, _dir) = session_with_training_data().await;

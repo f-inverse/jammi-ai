@@ -12,6 +12,7 @@ pub mod modernbert;
 
 mod any;
 mod error;
+mod layer_norm;
 mod mask;
 mod pooling;
 

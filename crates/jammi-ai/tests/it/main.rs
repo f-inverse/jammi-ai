@@ -1,8 +1,8 @@
 mod backends;
 mod common;
 mod cookbook;
-mod deep_lora;
 mod e2e_inference;
+mod encoder_adapters;
 mod evaluation;
 mod fine_tune;
 mod inference;

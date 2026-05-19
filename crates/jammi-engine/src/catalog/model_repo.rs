@@ -52,7 +52,16 @@ const SELECT_COLS: &str =
     "model_id, name, model_type, task, backend, version, status, metadata, created_at";
 
 impl Catalog {
-    /// Register a model in the catalog.
+    /// Register or refresh a model in the catalog.
+    ///
+    /// UPSERT semantics on the `model_id` PK: a later call with the same
+    /// `(model_id, version)` overwrites the metadata, backend, and task
+    /// columns. `created_at` is preserved; `updated_at` advances.
+    ///
+    /// This handles the common race where a caller pre-registers a model with
+    /// minimal metadata to satisfy a foreign-key constraint and a later caller
+    /// re-registers the same model with the full `artifact_path` known after
+    /// the weights are actually loaded.
     pub fn register_model(&self, params: RegisterModelParams<'_>) -> Result<()> {
         let conn = self.conn()?;
         let pk = format!("{}::{}", params.model_id, params.version);
@@ -65,7 +74,13 @@ impl Catalog {
 
         conn.execute(
             "INSERT INTO models (model_id, name, model_type, task, backend, version, status, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'registered', ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'registered', ?7)
+             ON CONFLICT(model_id) DO UPDATE SET
+                 metadata = excluded.metadata,
+                 backend = excluded.backend,
+                 task = excluded.task,
+                 model_type = excluded.model_type,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
             rusqlite::params![
                 pk,
                 params.model_id,

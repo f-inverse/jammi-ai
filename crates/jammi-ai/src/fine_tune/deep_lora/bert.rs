@@ -51,11 +51,14 @@ struct LayerNorm {
 
 impl LayerNorm {
     fn load(vb: &VarBuilder, eps: f64) -> Result<Self> {
+        // Shape is read from the safetensors header — passing `0` as a hint
+        // would be interpreted as the literal shape `[0]` (zero-length 1-D)
+        // and would mismatch every real layer-norm weight.
         let weight = vb
-            .get_with_hints(0, "weight", candle_nn::init::Init::Const(1.0))
+            .get_unchecked("weight")
             .map_err(|e| JammiError::FineTune(format!("LayerNorm weight: {e}")))?;
         let bias = vb
-            .get_with_hints(0, "bias", candle_nn::init::Init::Const(0.0))
+            .get_unchecked("bias")
             .map_err(|e| JammiError::FineTune(format!("LayerNorm bias: {e}")))?;
         Ok(Self { weight, bias, eps })
     }
@@ -307,25 +310,13 @@ struct BertEmbeddings {
 impl BertEmbeddings {
     fn load(vb: &VarBuilder) -> Result<Self> {
         let word = vb
-            .get_with_hints(
-                0,
-                "word_embeddings.weight",
-                candle_nn::init::Init::Const(0.0),
-            )
+            .get_unchecked("word_embeddings.weight")
             .map_err(|e| JammiError::FineTune(format!("word embeddings: {e}")))?;
         let position = vb
-            .get_with_hints(
-                0,
-                "position_embeddings.weight",
-                candle_nn::init::Init::Const(0.0),
-            )
+            .get_unchecked("position_embeddings.weight")
             .map_err(|e| JammiError::FineTune(format!("position embeddings: {e}")))?;
         let token_type = vb
-            .get_with_hints(
-                0,
-                "token_type_embeddings.weight",
-                candle_nn::init::Init::Const(0.0),
-            )
+            .get_unchecked("token_type_embeddings.weight")
             .map_err(|e| JammiError::FineTune(format!("token_type embeddings: {e}")))?;
         let ln = LayerNorm::load(&vb.pp("LayerNorm"), 1e-12)?;
         Ok(Self {
@@ -400,7 +391,15 @@ impl BertLoraEncoder {
             prefix,
         } = dims;
         let head_dim = hidden_size / num_heads;
-        let base_vb = frozen_vb.pp(prefix);
+        // An empty prefix means weights are stored at the root of the safetensors
+        // (raw `BertModel` checkpoints); a non-empty prefix wraps them (e.g.,
+        // `BertForMaskedLM` → keys under `"bert."`).  `pp("")` would emit a
+        // spurious leading dot, so branch.
+        let base_vb = if prefix.is_empty() {
+            frozen_vb.clone()
+        } else {
+            frozen_vb.pp(prefix)
+        };
 
         let embeddings = BertEmbeddings::load(&base_vb.pp("embeddings"))?;
 
@@ -466,11 +465,9 @@ impl BertLoraEncoder {
 /// Load a `Linear` layer from `vb` — weight required, bias optional.
 fn load_linear(vb: &VarBuilder) -> Result<Linear> {
     let weight = vb
-        .get_with_hints(0, "weight", candle_nn::init::Init::Const(0.0))
+        .get_unchecked("weight")
         .map_err(|e| JammiError::FineTune(format!("linear weight: {e}")))?;
-    let bias = vb
-        .get_with_hints(0, "bias", candle_nn::init::Init::Const(0.0))
-        .ok();
+    let bias = vb.get_unchecked("bias").ok();
     Ok(Linear::new(weight, bias))
 }
 
@@ -660,8 +657,32 @@ pub fn build(
         .get("model_type")
         .and_then(|v| v.as_str())
         .unwrap_or("bert");
+
+    // Two checkpoint layouts in the wild:
+    //   1. Raw `BertModel` saved with no wrapper → keys at root
+    //      (e.g. `embeddings.word_embeddings.weight`).
+    //   2. `BertForX` head wrapping a `BertModel` → keys under a prefix
+    //      (e.g. `bert.embeddings.word_embeddings.weight`).
+    // Detect by probing for the embeddings tensor at the prefix derived from
+    // `model_type`; if missing, fall back to no prefix.  Either layout works.
+    let default_prefix = bert_weight_prefix(model_type);
+    let prefix = if frozen_vb
+        .pp(default_prefix)
+        .contains_tensor("embeddings.word_embeddings.weight")
+    {
+        default_prefix
+    } else if frozen_vb.contains_tensor("embeddings.word_embeddings.weight") {
+        ""
+    } else {
+        // Neither layout matched.  Keep the model-type-derived prefix so the
+        // loader produces a clear "missing tensor" error naming what it
+        // expected, rather than silently falling back to a layout that also
+        // won't work.
+        default_prefix
+    };
+
     let dims = BertDims {
-        prefix: bert_weight_prefix(model_type),
+        prefix,
         hidden_size: model_config
             .get("hidden_size")
             .and_then(|v| v.as_u64())

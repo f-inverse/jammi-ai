@@ -54,6 +54,8 @@ r2d2_sqlite = "0.33"
 # ML inference
 candle-core = "0.9"
 candle-nn = "0.9"
+# candle-transformers is consumed only by jammi-encoders dev-dependencies
+# (parity-test feature) — it is no longer in any production dep tree.
 candle-transformers = "0.9"
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["download-binaries"] }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }

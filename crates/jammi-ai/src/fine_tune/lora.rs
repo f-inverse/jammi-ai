@@ -1,266 +1,19 @@
-//! LoRA (Low-Rank Adaptation) layer implementation.
+//! LoRA model assembly and adapter persistence helpers built on top of
+//! [`jammi_lora`].
 //!
-//! Replaces `W·x` with `(W + B·A)·x` where A is `rank×in_features` and B is
-//! `out_features×rank`. At initialization B is zeros, so the LoRA layer starts
-//! as an identity transform over the base weight.
+//! The single-layer LoRA primitive (`LoraLinear`), the init-mode enum, and the
+//! `MaybeLoraLinear` wrapper now live in `jammi-lora`. This module provides the
+//! jammi-ai-specific assemblies — projection-only / classification / NER
+//! adapter stacks — and the safetensors save/load helpers keyed by the per-job
+//! layer names jammi-ai uses.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{Init, Linear, Module, VarBuilder};
+use candle_nn::{Linear, VarBuilder};
 use jammi_engine::error::{JammiError, Result};
-use serde::{Deserialize, Serialize};
-
-/// Initialization strategy for the LoRA A matrix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LoraInitMode {
-    /// B = zeros, A = kaiming uniform (default — adapter starts at zero delta).
-    ZerosB,
-    /// Both A and B initialized with Gaussian noise (σ = 0.02).
-    Gaussian,
-    /// PiSSA: A/B initialized from principal singular values of the base weight.
-    /// Falls back to ZerosB when the base weight is not available for SVD.
-    PiSSA,
-}
-
-impl Default for LoraInitMode {
-    fn default() -> Self {
-        Self::ZerosB
-    }
-}
-
-/// A single LoRA-augmented linear layer: frozen base + trainable A, B matrices.
-pub struct LoraLinear {
-    base: Linear,
-    /// A matrix: (rank × in_features).
-    pub lora_a: Tensor,
-    /// B matrix: (out_features × rank).
-    pub lora_b: Tensor,
-    /// Pre-computed scaling factor (alpha/rank or alpha/sqrt(rank) when use_rslora).
-    /// Once computed at construction the rank is no longer needed at runtime — the
-    /// dimensions are recoverable from `lora_a.dim(0)` / `lora_b.dim(1)` if a caller
-    /// needs them.
-    scaling: f64,
-    /// Optional dropout probability applied to the LoRA path — only active when
-    /// `training` is `true`.  Set to `false` during evaluation and inference to
-    /// avoid stochastic noise in validation loss and inference outputs.
-    dropout: Option<f32>,
-    /// Whether the layer is in training mode.  Defaults to `true` for newly
-    /// constructed layers; `false` for layers loaded from saved adapters.
-    pub training: bool,
-}
-
-impl LoraLinear {
-    /// Wrap a frozen `Linear` layer with LoRA adapters.
-    ///
-    /// `rank` controls the number of low-rank dimensions. `alpha` scales the
-    /// LoRA contribution. When `use_rslora` is true, scaling = alpha/sqrt(rank)
-    /// instead of alpha/rank. `init_mode` controls A/B initialization.
-    pub fn new(
-        base: Linear,
-        rank: usize,
-        alpha: f64,
-        use_rslora: bool,
-        init_mode: LoraInitMode,
-        dropout: Option<f32>,
-        vb: &VarBuilder,
-    ) -> Result<Self> {
-        let in_features = base
-            .weight()
-            .dim(1)
-            .map_err(|e| JammiError::FineTune(format!("LoRA dim: {e}")))?;
-        let out_features = base
-            .weight()
-            .dim(0)
-            .map_err(|e| JammiError::FineTune(format!("LoRA dim: {e}")))?;
-
-        let (a_init, b_init) = match init_mode {
-            LoraInitMode::ZerosB => (
-                Init::Kaiming {
-                    dist: candle_nn::init::NormalOrUniform::Uniform,
-                    fan: candle_nn::init::FanInOut::FanIn,
-                    non_linearity: candle_nn::init::NonLinearity::Linear,
-                },
-                Init::Const(0.0),
-            ),
-            LoraInitMode::Gaussian => (
-                Init::Randn {
-                    mean: 0.0,
-                    stdev: 0.02,
-                },
-                Init::Randn {
-                    mean: 0.0,
-                    stdev: 0.02,
-                },
-            ),
-            LoraInitMode::PiSSA => (
-                // PiSSA requires SVD of the base weight — fall back to ZerosB
-                Init::Kaiming {
-                    dist: candle_nn::init::NormalOrUniform::Uniform,
-                    fan: candle_nn::init::FanInOut::FanIn,
-                    non_linearity: candle_nn::init::NonLinearity::Linear,
-                },
-                Init::Const(0.0),
-            ),
-        };
-
-        let lora_a = vb
-            .get_with_hints((rank, in_features), "lora_a", a_init)
-            .map_err(|e| JammiError::FineTune(format!("LoRA A init: {e}")))?;
-
-        let lora_b = vb
-            .get_with_hints((out_features, rank), "lora_b", b_init)
-            .map_err(|e| JammiError::FineTune(format!("LoRA B init: {e}")))?;
-
-        let scaling = if use_rslora {
-            alpha / (rank as f64).sqrt()
-        } else {
-            alpha / rank as f64
-        };
-
-        Ok(Self {
-            base,
-            lora_a,
-            lora_b,
-            scaling,
-            dropout,
-            training: true,
-        })
-    }
-
-    /// Convenience constructor matching the old signature (ZerosB, no dropout, standard scaling).
-    pub fn new_simple(base: Linear, rank: usize, alpha: f64, vb: &VarBuilder) -> Result<Self> {
-        Self::new(base, rank, alpha, false, LoraInitMode::ZerosB, None, vb)
-    }
-
-    /// Switch between training and evaluation mode.
-    ///
-    /// When `false`, the dropout path is skipped so validation loss and
-    /// inference outputs are deterministic.
-    pub fn set_training(&mut self, training: bool) {
-        self.training = training;
-    }
-
-    /// Forward pass: `base(x) + scaling * dropout(x @ A^T @ B^T)`.
-    ///
-    /// Mixed-precision aware: the frozen base linear always runs in F32 for
-    /// device-agnostic compatibility (BF16/F16 matmul is not supported on all
-    /// CUDA compute capabilities).  Since the base weights are frozen, running
-    /// them in F32 does not affect gradient flow through the LoRA path.
-    /// The result is cast back to the backbone's native dtype before the LoRA
-    /// delta is added, so downstream layers stay in the expected precision.
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let base_dtype = self.base.weight().dtype();
-
-        // Frozen path: always compute in F32 for maximum device compatibility.
-        let x_f32 = if x.dtype() == DType::F32 {
-            x.clone()
-        } else {
-            x.to_dtype(DType::F32)
-                .map_err(|e| JammiError::FineTune(format!("LoRA base input cast: {e}")))?
-        };
-        let w_f32 = if base_dtype == DType::F32 {
-            self.base.weight().clone()
-        } else {
-            self.base
-                .weight()
-                .to_dtype(DType::F32)
-                .map_err(|e| JammiError::FineTune(format!("LoRA base weight cast: {e}")))?
-        };
-        let bias_f32 = self
-            .base
-            .bias()
-            .map(|b| {
-                if b.dtype() == DType::F32 {
-                    Ok(b.clone())
-                } else {
-                    b.to_dtype(DType::F32)
-                        .map_err(|e| JammiError::FineTune(format!("LoRA base bias cast: {e}")))
-                }
-            })
-            .transpose()?;
-        let base_out_f32 = Linear::new(w_f32, bias_f32)
-            .forward(&x_f32)
-            .map_err(|e| JammiError::FineTune(format!("LoRA base forward: {e}")))?;
-        // Cast output back to backbone dtype so downstream transformer layers
-        // continue operating in their expected precision.
-        let base_out = if base_dtype == DType::F32 {
-            base_out_f32
-        } else {
-            base_out_f32
-                .to_dtype(base_dtype)
-                .map_err(|e| JammiError::FineTune(format!("LoRA base output cast: {e}")))?
-        };
-
-        // LoRA path: A/B matrices are always F32; cast input accordingly.
-        let lora_dtype = self.lora_a.dtype();
-        let x_lora = if x.dtype() != lora_dtype {
-            x.to_dtype(lora_dtype)
-                .map_err(|e| JammiError::FineTune(format!("LoRA lora dtype cast: {e}")))?
-        } else {
-            x.clone()
-        };
-
-        let lora_in = if self.training {
-            if let Some(p) = self.dropout {
-                candle_nn::ops::dropout(&x_lora, p)
-                    .map_err(|e| JammiError::FineTune(format!("LoRA dropout: {e}")))?
-            } else {
-                x_lora
-            }
-        } else {
-            x_lora
-        };
-
-        // x @ A^T : Linear with weight = lora_a (shape [rank, in]) computes
-        //   y = x @ lora_a^T  →  [..., rank]
-        let a_lin = Linear::new(self.lora_a.clone(), None);
-        let after_a = a_lin
-            .forward(&lora_in)
-            .map_err(|e| JammiError::FineTune(format!("LoRA x@A^T: {e}")))?;
-
-        // (x @ A^T) @ B^T : Linear with weight = lora_b (shape [out, rank]).
-        let b_lin = Linear::new(self.lora_b.clone(), None);
-        let lora_out = b_lin
-            .forward(&after_a)
-            .map_err(|e| JammiError::FineTune(format!("LoRA xA^T@B^T: {e}")))?;
-
-        let scaled = (&lora_out * self.scaling)
-            .map_err(|e| JammiError::FineTune(format!("LoRA scaling: {e}")))?;
-
-        // Cast LoRA delta back to the frozen output dtype before adding.
-        let scaled_cast = if scaled.dtype() != base_out.dtype() {
-            scaled
-                .to_dtype(base_out.dtype())
-                .map_err(|e| JammiError::FineTune(format!("LoRA output dtype cast: {e}")))?
-        } else {
-            scaled
-        };
-
-        (&base_out + &scaled_cast).map_err(|e| JammiError::FineTune(format!("LoRA add: {e}")))
-    }
-
-    /// Reconstruct a LoraLinear from pre-loaded weights (for inference with saved adapters).
-    pub fn from_loaded(base: Linear, lora_a: Tensor, lora_b: Tensor, alpha: f64) -> Self {
-        let rank = lora_a.dims()[0];
-        let scaling = alpha / rank as f64;
-        Self {
-            base,
-            lora_a,
-            lora_b,
-            scaling,
-            dropout: None,
-            training: false,
-        }
-    }
-
-    /// Return references to the two trainable parameter tensors (A and B).
-    pub fn trainable_params(&self) -> Vec<&Tensor> {
-        vec![&self.lora_a, &self.lora_b]
-    }
-}
+use jammi_lora::LoraLinear;
 
 /// A collection of LoRA layers applied to a model.
 pub struct LoraModel {
@@ -342,7 +95,8 @@ pub fn build_lora_classification(
         config.lora_rank,
         config.lora_alpha,
         &vb.pp("projection"),
-    )?;
+    )
+    .map_err(|e| JammiError::FineTune(format!("Projection LoRA: {e}")))?;
 
     // Layer 1: classifier (zeros base, trained from scratch via LoRA)
     let cls_base = Tensor::zeros((num_classes, hidden_size), DType::F32, vb.device())
@@ -353,7 +107,8 @@ pub fn build_lora_classification(
         config.lora_rank,
         config.lora_alpha,
         &vb.pp("classifier"),
-    )?;
+    )
+    .map_err(|e| JammiError::FineTune(format!("Classifier LoRA: {e}")))?;
 
     Ok(LoraModel {
         layers: vec![
@@ -382,7 +137,8 @@ pub fn build_lora_ner(
         config.lora_rank,
         config.lora_alpha,
         &vb.pp("projection"),
-    )?;
+    )
+    .map_err(|e| JammiError::FineTune(format!("NER projection LoRA: {e}")))?;
 
     // Layer 1: token classifier (zeros base, trained from scratch via LoRA)
     let cls_base = Tensor::zeros((num_labels, hidden_size), DType::F32, vb.device())
@@ -393,7 +149,8 @@ pub fn build_lora_ner(
         config.lora_rank,
         config.lora_alpha,
         &vb.pp("token_classifier"),
-    )?;
+    )
+    .map_err(|e| JammiError::FineTune(format!("NER classifier LoRA: {e}")))?;
 
     Ok(LoraModel {
         layers: vec![
@@ -419,7 +176,8 @@ pub fn build_lora_projection(
         config.lora_rank,
         config.lora_alpha,
         &vb.pp("projection"),
-    )?;
+    )
+    .map_err(|e| JammiError::FineTune(format!("Projection LoRA: {e}")))?;
     Ok(LoraModel {
         layers: vec![("projection".into(), lora)],
     })

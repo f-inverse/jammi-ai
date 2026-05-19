@@ -1,16 +1,15 @@
 use std::collections::HashMap;
 
 use candle_core::{DType, Device, IndexOp, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-use candle_transformers::models::distilbert::{Config as DistilBertConfig, DistilBertModel};
-use candle_transformers::models::modernbert::{
-    Config as ModernBertConfig, ModernBert, ModernBertForSequenceClassification,
+use candle_nn::{VarBuilder, VarMap};
+use jammi_encoders::{
+    Bert, BertConfig, DistilBert, DistilBertConfig, ModernBert, ModernBertConfig, Pooling,
 };
 use jammi_engine::error::{JammiError, Result};
 
 use super::open_clip_vit::{OpenClipVisionConfig, OpenClipVisionTransformer};
 use super::{DeviceConfig, ModelBackend};
+use crate::fine_tune::classifier::SeqClassifier;
 use crate::inference::adapter::BackendOutput;
 use crate::inference::{arrow_to_images, arrow_to_texts, image_preprocess};
 use crate::model::tokenizer::{BatchEncoding, TokenizerWrapper};
@@ -55,20 +54,19 @@ impl CandleVisionForward for OpenClipVisionTransformer {
     }
 }
 
-/// BERT-family forward pass (bert, roberta, distilbert, camembert, xlm-roberta).
-struct BertForward(BertModel);
+/// BERT-family forward pass (bert, roberta, camembert, xlm-roberta).
+struct BertForward(Bert);
 
 impl CandleTextForward for BertForward {
     fn forward_hidden(
         &self,
         input_ids: &Tensor,
         attention_mask: &Tensor,
-        encoding: &BatchEncoding,
-        device: &Device,
+        _encoding: &BatchEncoding,
+        _device: &Device,
     ) -> Result<Tensor> {
-        let token_type_ids = tokens_to_tensor(&encoding.type_ids, device)?;
         self.0
-            .forward(input_ids, &token_type_ids, Some(attention_mask))
+            .forward_hidden(input_ids, attention_mask)
             .map_err(|e| JammiError::Inference(format!("BERT forward pass failed: {e}")))
     }
 }
@@ -85,13 +83,13 @@ impl CandleTextForward for ModernBertForward {
         _device: &Device,
     ) -> Result<Tensor> {
         self.0
-            .forward(input_ids, attention_mask)
+            .forward_hidden(input_ids, attention_mask)
             .map_err(|e| JammiError::Inference(format!("ModernBERT forward pass failed: {e}")))
     }
 }
 
 /// DistilBERT forward pass (no token_type_ids, different architecture from BERT).
-struct DistilBertForward(DistilBertModel);
+struct DistilBertForward(DistilBert);
 
 impl CandleTextForward for DistilBertForward {
     fn forward_hidden(
@@ -102,14 +100,14 @@ impl CandleTextForward for DistilBertForward {
         _device: &Device,
     ) -> Result<Tensor> {
         self.0
-            .forward(input_ids, attention_mask)
+            .forward_hidden(input_ids, attention_mask)
             .map_err(|e| JammiError::Inference(format!("DistilBERT forward pass failed: {e}")))
     }
 }
 
 /// DistilBERT sequence classification: encoder → CLS → pre_classifier → ReLU → classifier → softmax.
 struct DistilBertClassificationForward {
-    distilbert: DistilBertModel,
+    distilbert: DistilBert,
     pre_classifier: candle_nn::Linear,
     classifier: candle_nn::Linear,
 }
@@ -124,7 +122,7 @@ impl CandleTextForward for DistilBertClassificationForward {
     ) -> Result<Tensor> {
         let hidden = self
             .distilbert
-            .forward(input_ids, attention_mask)
+            .forward_hidden(input_ids, attention_mask)
             .map_err(|e| {
                 JammiError::Inference(format!("DistilBERT classification forward failed: {e}"))
             })?;
@@ -148,7 +146,7 @@ impl CandleTextForward for DistilBertClassificationForward {
 
 /// ModernBERT sequence classification forward pass.
 /// Returns softmaxed logits of shape (batch, num_classes).
-struct ModernBertClassificationForward(ModernBertForSequenceClassification);
+struct ModernBertClassificationForward(SeqClassifier);
 
 impl CandleTextForward for ModernBertClassificationForward {
     fn forward_hidden(
@@ -158,16 +156,18 @@ impl CandleTextForward for ModernBertClassificationForward {
         _encoding: &BatchEncoding,
         _device: &Device,
     ) -> Result<Tensor> {
-        self.0.forward(input_ids, attention_mask).map_err(|e| {
+        let logits = self.0.forward(input_ids, attention_mask).map_err(|e| {
             JammiError::Inference(format!("ModernBERT classification forward failed: {e}"))
-        })
+        })?;
+        candle_nn::ops::softmax(&logits, candle_core::D::Minus1)
+            .map_err(|e| JammiError::Inference(format!("Softmax failed: {e}")))
     }
 }
 
 /// BERT-family sequence classification forward pass.
-/// Applies CLS pooling + linear classifier + softmax on top of BertModel.
+/// Applies CLS pooling + linear classifier + softmax on top of Bert.
 struct BertClassificationForward {
-    bert: BertModel,
+    bert: Bert,
     classifier: candle_nn::Linear,
 }
 
@@ -176,13 +176,12 @@ impl CandleTextForward for BertClassificationForward {
         &self,
         input_ids: &Tensor,
         attention_mask: &Tensor,
-        encoding: &BatchEncoding,
-        device: &Device,
+        _encoding: &BatchEncoding,
+        _device: &Device,
     ) -> Result<Tensor> {
-        let token_type_ids = tokens_to_tensor(&encoding.type_ids, device)?;
         let hidden = self
             .bert
-            .forward(input_ids, &token_type_ids, Some(attention_mask))
+            .forward_hidden(input_ids, attention_mask)
             .map_err(|e| {
                 JammiError::Inference(format!("BERT classification forward failed: {e}"))
             })?;
@@ -213,14 +212,11 @@ pub struct CandleModel {
     /// Device the model weights reside on (CPU, CUDA, or Metal).
     pub device: Device,
     /// Optional LoRA projection applied after pooling (for fine-tuned models).
-    pub lora_projection: Option<crate::fine_tune::lora::LoraLinear>,
+    pub lora_projection: Option<jammi_lora::LoraLinear>,
     /// Label index → label string mapping for classification/NER models.
     id2label: Option<HashMap<u32, String>>,
     /// Token-level classifier for NER models (applied per token, no pooling).
     ner_classifier: Option<candle_nn::Linear>,
-    /// Optional deep LoRA encoder. When set, overrides the standard text forward
-    /// + mean-pool + L2-norm + optional projection path for text embedding tasks.
-    deep_lora_inference: Option<Box<dyn crate::fine_tune::deep_lora::DeepLoraEncoder>>,
 }
 
 impl CandleModel {
@@ -330,28 +326,22 @@ impl CandleModel {
             let input_ids = self.tokens_to_tensor(&encoding.input_ids)?;
             let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
 
-            let final_output = if let Some(ref deep) = self.deep_lora_inference {
-                // Deep LoRA path: encoder handles pooling + L2 norm internally.
-                deep.forward(&input_ids, &attention_mask)
-                    .map_err(|e| JammiError::Inference(format!("Deep LoRA forward: {e}")))?
+            let output = self.text_forward()?.forward_hidden(
+                &input_ids,
+                &attention_mask,
+                &encoding,
+                &self.device,
+            )?;
+
+            let pooled = self.mean_pool(&output, &attention_mask)?;
+            let normalized = self.l2_normalize(&pooled)?;
+
+            // Apply projection-only LoRA if present
+            let final_output = if let Some(ref lora) = self.lora_projection {
+                lora.forward(&normalized)
+                    .map_err(|e| JammiError::Inference(format!("LoRA projection: {e}")))?
             } else {
-                let output = self.text_forward()?.forward_hidden(
-                    &input_ids,
-                    &attention_mask,
-                    &encoding,
-                    &self.device,
-                )?;
-
-                let pooled = self.mean_pool(&output, &attention_mask)?;
-                let normalized = self.l2_normalize(&pooled)?;
-
-                // Apply projection-only LoRA if present
-                if let Some(ref lora) = self.lora_projection {
-                    lora.forward(&normalized)
-                        .map_err(|e| JammiError::Inference(format!("LoRA projection: {e}")))?
-                } else {
-                    normalized
-                }
+                normalized
             };
 
             let final_output_f32 = if final_output.dtype() == DType::F32 {
@@ -699,6 +689,51 @@ impl ModelBackend for CandleBackend {
             resolved.model_config.clone()
         };
 
+        // Detect a deep-LoRA adapter ahead of building the encoder so we can
+        // pass the LoRA injection config into the builder once and avoid a
+        // second pass that rebuilds the encoder for inference.
+        let deep_lora_adapter: Option<(jammi_lora::AdapterConfig, std::path::PathBuf)> =
+            resolved.adapter_path.as_ref().and_then(|p| {
+                let cfg_path = p.join("adapter_config.json");
+                let weights_path = p.join("adapter.safetensors");
+                if !cfg_path.exists() || !weights_path.exists() {
+                    return None;
+                }
+                let cfg_str = std::fs::read_to_string(&cfg_path).ok()?;
+                let cfg: jammi_lora::AdapterConfig = serde_json::from_str(&cfg_str).ok()?;
+                (cfg.adapter_type == "deep_lora").then_some((cfg, weights_path))
+            });
+        let lora_owned = deep_lora_adapter.as_ref().map(|(cfg, _)| {
+            (
+                cfg.target_modules.clone(),
+                cfg.layers_to_transform.clone(),
+                cfg.rank_pattern.clone(),
+            )
+        });
+        let lora_build = match (&deep_lora_adapter, &lora_owned) {
+            (Some((cfg, _)), Some((targets, layers, pattern))) => jammi_lora::LoraBuildConfig {
+                target_modules: targets,
+                layers_to_transform: layers,
+                lora_rank: cfg.lora_rank,
+                lora_alpha: cfg.lora_alpha,
+                use_rslora: cfg.use_rslora,
+                lora_dropout: None,
+                rank_pattern: pattern,
+                init_mode: jammi_lora::LoraInitMode::ZerosB,
+            },
+            _ => jammi_lora::LoraBuildConfig::frozen(),
+        };
+        let encoder_adapter_file: Option<&std::path::Path> = deep_lora_adapter
+            .as_ref()
+            .map(|(_, weights)| weights.as_path());
+        let encoder_backbone_dtype = deep_lora_adapter
+            .as_ref()
+            .map(|(cfg, _)| candle_core::DType::from(cfg.backbone_dtype))
+            .unwrap_or(DType::F32);
+        let weights_paths_ref: Vec<&std::path::Path> =
+            resolved.weights_paths.iter().map(|p| p.as_path()).collect();
+        let dummy_varmap = VarMap::new();
+
         // Branch: vision model (OpenCLIP) vs text model (BERT family)
         #[allow(clippy::type_complexity)]
         let (text, vision): (
@@ -726,15 +761,18 @@ impl ModelBackend for CandleBackend {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to parse DistilBERT config: {e}"),
                         })?;
-                    let distilbert =
-                        DistilBertModel::load(vb.clone(), &db_config).map_err(|e| {
-                            JammiError::Model {
-                                model_id: resolved.model_id.0.clone(),
-                                message: format!("Failed to construct DistilBERT model: {e}"),
-                            }
+                    let distilbert = DistilBert::builder()
+                        .pooling(Pooling::Mean)
+                        .lora(lora_build)
+                        .backbone_dtype(encoder_backbone_dtype)
+                        .adapter(encoder_adapter_file)
+                        .build(&weights_paths_ref, &db_config, &device, &dummy_varmap)
+                        .map_err(|e| JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("Failed to construct DistilBERT model: {e}"),
                         })?;
                     let num_classes = id2label.as_ref().map_or(2, |m| m.len());
-                    let hidden_size = db_config.dim;
+                    let hidden_size = db_config.hidden_size;
                     let pre_classifier =
                         candle_nn::linear(hidden_size, hidden_size, vb.pp("pre_classifier"))
                             .map_err(|e| JammiError::Model {
@@ -760,8 +798,13 @@ impl ModelBackend for CandleBackend {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to parse DistilBERT config: {e}"),
                         })?;
-                    let model =
-                        DistilBertModel::load(vb, &db_config).map_err(|e| JammiError::Model {
+                    let model = DistilBert::builder()
+                        .pooling(Pooling::Mean)
+                        .lora(lora_build)
+                        .backbone_dtype(encoder_backbone_dtype)
+                        .adapter(encoder_adapter_file)
+                        .build(&weights_paths_ref, &db_config, &device, &dummy_varmap)
+                        .map_err(|e| JammiError::Model {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to construct DistilBERT model: {e}"),
                         })?;
@@ -773,12 +816,16 @@ impl ModelBackend for CandleBackend {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to parse BERT config: {e}"),
                         })?;
-                    let bert = BertModel::load(vb.clone(), &bert_config).map_err(|e| {
-                        JammiError::Model {
+                    let bert = Bert::builder()
+                        .pooling(Pooling::Mean)
+                        .lora(lora_build)
+                        .backbone_dtype(encoder_backbone_dtype)
+                        .adapter(encoder_adapter_file)
+                        .build(&weights_paths_ref, &bert_config, &device, &dummy_varmap)
+                        .map_err(|e| JammiError::Model {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to construct BERT model: {e}"),
-                        }
-                    })?;
+                        })?;
                     let num_classes = id2label.as_ref().map_or(2, |m| m.len());
                     let hidden_size = bert_config.hidden_size;
                     let classifier =
@@ -796,8 +843,13 @@ impl ModelBackend for CandleBackend {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to parse BERT config: {e}"),
                         })?;
-                    let bert =
-                        BertModel::load(vb, &bert_config).map_err(|e| JammiError::Model {
+                    let bert = Bert::builder()
+                        .pooling(Pooling::Mean)
+                        .lora(lora_build)
+                        .backbone_dtype(encoder_backbone_dtype)
+                        .adapter(encoder_adapter_file)
+                        .build(&weights_paths_ref, &bert_config, &device, &dummy_varmap)
+                        .map_err(|e| JammiError::Model {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to construct BERT model: {e}"),
                         })?;
@@ -809,14 +861,23 @@ impl ModelBackend for CandleBackend {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to parse ModernBERT config: {e}"),
                         })?;
-                    let model =
-                        ModernBertForSequenceClassification::load(vb, &mb_config).map_err(|e| {
-                            JammiError::Model {
-                                model_id: resolved.model_id.0.clone(),
-                                message: format!("Failed to construct ModernBERT classifier: {e}"),
-                            }
+                    let backbone = ModernBert::builder()
+                        .pooling(Pooling::Mean)
+                        .lora(lora_build)
+                        .backbone_dtype(encoder_backbone_dtype)
+                        .adapter(encoder_adapter_file)
+                        .build(&weights_paths_ref, &mb_config, &device, &dummy_varmap)
+                        .map_err(|e| JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("Failed to construct ModernBERT model: {e}"),
                         })?;
-                    Box::new(ModernBertClassificationForward(model))
+                    let num_classes = id2label.as_ref().map_or(2, |m| m.len());
+                    let classifier = SeqClassifier::new(backbone, num_classes, vb.clone())
+                        .map_err(|e| JammiError::Model {
+                            model_id: resolved.model_id.0.clone(),
+                            message: format!("Failed to load ModernBERT classifier head: {e}"),
+                        })?;
+                    Box::new(ModernBertClassificationForward(classifier))
                 }
                 "modernbert" => {
                     let mb_config: ModernBertConfig = serde_json::from_value(model_config.clone())
@@ -824,8 +885,13 @@ impl ModelBackend for CandleBackend {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to parse ModernBERT config: {e}"),
                         })?;
-                    let model =
-                        ModernBert::load(vb, &mb_config).map_err(|e| JammiError::Model {
+                    let model = ModernBert::builder()
+                        .pooling(Pooling::Mean)
+                        .lora(lora_build)
+                        .backbone_dtype(encoder_backbone_dtype)
+                        .adapter(encoder_adapter_file)
+                        .build(&weights_paths_ref, &mb_config, &device, &dummy_varmap)
+                        .map_err(|e| JammiError::Model {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to construct ModernBERT model: {e}"),
                         })?;
@@ -856,137 +922,25 @@ impl ModelBackend for CandleBackend {
                 message: "Could not parse model dimensions from config".into(),
             })?;
 
-        // Load LoRA adapter if present (fine-tuned models)
+        // Load LoRA adapter if present (fine-tuned models).
         //
-        // Two paths:
-        //   1. deep_lora — adapter_config.json has "adapter_type": "deep_lora"
-        //      → rebuild the encoder with frozen base weights + loaded LoRA A/B.
-        //   2. projection-only (legacy) — adapter.safetensors holds only the
-        //      external projection layer's A/B matrices.
-        let (lora_projection, deep_lora_inference) =
-            if let Some(ref adapter_path) = resolved.adapter_path {
-                let adapter_config_file = adapter_path.join("adapter_config.json");
-                let adapter_file = adapter_path.join("adapter.safetensors");
-
-                if adapter_config_file.exists() && adapter_file.exists() {
-                    // Read and parse adapter_config.json
-                    let cfg_str = std::fs::read_to_string(&adapter_config_file).map_err(|e| {
-                        JammiError::Model {
-                            model_id: resolved.model_id.0.clone(),
-                            message: format!("Read adapter_config.json: {e}"),
-                        }
-                    })?;
-                    let adapter_cfg: crate::fine_tune::deep_lora::DeepLoraAdapterConfig =
-                        serde_json::from_str(&cfg_str).map_err(|e| JammiError::Model {
-                            model_id: resolved.model_id.0.clone(),
-                            message: format!("Parse adapter_config.json: {e}"),
-                        })?;
-
-                    if adapter_cfg.adapter_type == "deep_lora" {
-                        // Rebuild the deep LoRA encoder for inference.
-                        // Pass adapter_file so LoRA A/B are loaded from the saved weights.
-                        let dummy_varmap = candle_nn::VarMap::new();
-                        let weights_paths_ref: Vec<&std::path::Path> =
-                            resolved.weights_paths.iter().map(|p| p.as_path()).collect();
-
-                        let lora = crate::fine_tune::deep_lora::LoraBuildConfig {
-                            target_modules: &adapter_cfg.target_modules,
-                            layers_to_transform: &adapter_cfg.layers_to_transform,
-                            lora_rank: adapter_cfg.lora_rank,
-                            lora_alpha: adapter_cfg.lora_alpha,
-                            use_rslora: adapter_cfg.use_rslora,
-                            lora_dropout: None,
-                            rank_pattern: &adapter_cfg.rank_pattern,
-                            init_mode: crate::fine_tune::lora::LoraInitMode::ZerosB,
-                        };
-                        let backbone_dtype = adapter_cfg.backbone_dtype.into();
-
-                        let mut encoder: Box<dyn crate::fine_tune::deep_lora::DeepLoraEncoder> =
-                            match adapter_cfg.model_type.as_str() {
-                                "distilbert" => Box::new(
-                                    crate::fine_tune::deep_lora::distilbert::build(
-                                        &weights_paths_ref,
-                                        &model_config,
-                                        lora,
-                                        backbone_dtype,
-                                        &device,
-                                        &dummy_varmap,
-                                        Some(adapter_file.as_path()),
-                                    )
-                                    .map_err(|e| {
-                                        JammiError::Model {
-                                            model_id: resolved.model_id.0.clone(),
-                                            message: format!("Deep LoRA DistilBERT: {e}"),
-                                        }
-                                    })?,
-                                ),
-                                "modernbert" => Box::new(
-                                    crate::fine_tune::deep_lora::modernbert::build(
-                                        &weights_paths_ref,
-                                        &model_config,
-                                        lora,
-                                        backbone_dtype,
-                                        &device,
-                                        &dummy_varmap,
-                                        Some(adapter_file.as_path()),
-                                    )
-                                    .map_err(|e| {
-                                        JammiError::Model {
-                                            model_id: resolved.model_id.0.clone(),
-                                            message: format!("Deep LoRA ModernBERT: {e}"),
-                                        }
-                                    })?,
-                                ),
-                                _ => Box::new(
-                                    crate::fine_tune::deep_lora::bert::build(
-                                        &weights_paths_ref,
-                                        &model_config,
-                                        lora,
-                                        backbone_dtype,
-                                        &device,
-                                        &dummy_varmap,
-                                        Some(adapter_file.as_path()),
-                                    )
-                                    .map_err(|e| {
-                                        JammiError::Model {
-                                            model_id: resolved.model_id.0.clone(),
-                                            message: format!("Deep LoRA BERT: {e}"),
-                                        }
-                                    })?,
-                                ),
-                            };
-                        // Loaded for inference: disable dropout in all LoRA layers.
-                        encoder.set_training(false);
-                        (None, Some(encoder))
-                    } else {
-                        // Legacy projection-only adapter
-                        (
-                            load_projection_adapter(
-                                &adapter_file,
-                                &device,
-                                &dimensions,
-                                &resolved.model_id.0,
-                            )?,
-                            None,
-                        )
-                    }
-                } else if adapter_file.exists() {
-                    // Legacy projection-only (no adapter_config.json)
-                    (
-                        load_projection_adapter(
-                            &adapter_file,
-                            &device,
-                            &dimensions,
-                            &resolved.model_id.0,
-                        )?,
-                        None,
-                    )
-                } else {
-                    (None, None)
-                }
+        // Deep-LoRA adapters are already installed into `text` above via the
+        // encoder builder's `.lora(...)` + `.adapter(Some(...))` calls.
+        // What remains here is the legacy projection-only adapter format
+        // (adapter.safetensors with no adapter_config.json, or adapter_type
+        // ≠ "deep_lora") — that path keeps the in-tree projection layer.
+        let lora_projection = if deep_lora_adapter.is_some() {
+            None
+        } else if let Some(ref adapter_path) = resolved.adapter_path {
+            let adapter_file = adapter_path.join("adapter.safetensors");
+            if adapter_file.exists() {
+                load_projection_adapter(&adapter_file, &device, &dimensions, &resolved.model_id.0)?
             } else {
-                (None, None)
-            };
+                None
+            }
+        } else {
+            None
+        };
 
         // Load NER token classifier if this is a NER model
         let ner_classifier = if is_ner {
@@ -1021,7 +975,6 @@ impl ModelBackend for CandleBackend {
             lora_projection,
             id2label,
             ner_classifier,
-            deep_lora_inference,
         })))
     }
 
@@ -1052,7 +1005,7 @@ fn load_projection_adapter(
     device: &Device,
     dimensions: &crate::model::ModelDimensions,
     model_id: &str,
-) -> jammi_engine::error::Result<Option<crate::fine_tune::lora::LoraLinear>> {
+) -> jammi_engine::error::Result<Option<jammi_lora::LoraLinear>> {
     let adapter_weights =
         crate::fine_tune::lora::load_lora_weights(adapter_file, device).map_err(|e| {
             JammiError::Model {
@@ -1077,7 +1030,7 @@ fn load_projection_adapter(
         None => return Ok(None),
     };
 
-    Ok(Some(crate::fine_tune::lora::LoraLinear::from_loaded(
+    Ok(Some(jammi_lora::LoraLinear::from_loaded(
         base_linear,
         lora_a,
         lora_b,

@@ -451,8 +451,10 @@ impl InferenceSession {
         let task_str = task.to_string();
         let device_config = self.device_config.clone();
 
+        let catalog_for_err = Arc::clone(&catalog);
+        let job_id_for_err = job_id_clone.clone();
         tokio::task::spawn_blocking(move || {
-            run_fine_tune_blocking(
+            if let Err(e) = run_fine_tune_blocking(
                 catalog,
                 artifact_dir,
                 job_id_clone,
@@ -464,7 +466,19 @@ impl InferenceSession {
                 base_model_arc,
                 hidden_size,
                 device_config,
-            )
+            ) {
+                // Surface the failure to the catalog so that `FineTuneJob::wait()`
+                // observes a terminal state instead of polling forever.
+                tracing::error!(job_id = %job_id_for_err, error = %e, "Fine-tune blocking task failed");
+                let metrics = serde_json::json!({ "error_message": e.to_string() }).to_string();
+                if let Err(e2) = catalog_for_err.update_fine_tune_status(
+                    &job_id_for_err,
+                    jammi_engine::catalog::status::FineTuneJobStatus::Failed,
+                    Some(&metrics),
+                ) {
+                    tracing::error!(job_id = %job_id_for_err, error = %e2, "Failed to record terminal status");
+                }
+            }
         });
 
         Ok(FineTuneJob::new(
@@ -749,19 +763,18 @@ fn run_fine_tune_blocking(
 
     // ── Deep LoRA path ────────────────────────────────────────────────────────
     // When `target_modules` is non-empty, build a DeepLoraEncoder that wraps
-    // LoRA adapters inside the encoder stack rather than after it.
+    // LoRA adapters inside the encoder stack rather than after it.  A build
+    // failure here is fatal: the caller asked for deep LoRA, silently falling
+    // back to shallow would produce an adapter that doesn't match what they
+    // requested.  Loud failure beats a wrong-shape adapter.
     let deep_lora = if !config.target_modules.is_empty() {
-        build_deep_lora_model(
+        Some(build_deep_lora_model(
             &base_model,
             &catalog,
             &config,
             &varmap,
             &device,
-        )
-        .map_err(|e| {
-            tracing::error!(error = %e, "Deep LoRA init failed; falling back to projection-only");
-        })
-        .ok()
+        )?)
     } else {
         None
     };

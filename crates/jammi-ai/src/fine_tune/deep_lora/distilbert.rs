@@ -42,11 +42,14 @@ struct LayerNorm {
 
 impl LayerNorm {
     fn load(vb: &VarBuilder, eps: f64) -> Result<Self> {
+        // Shape is read from the safetensors header; passing `0` would be
+        // interpreted as the literal shape `[0]` and reject every real LN
+        // weight.
         let weight = vb
-            .get_with_hints(0, "weight", candle_nn::init::Init::Const(1.0))
+            .get_unchecked("weight")
             .map_err(|e| JammiError::FineTune(format!("LN weight: {e}")))?;
         let bias = vb
-            .get_with_hints(0, "bias", candle_nn::init::Init::Const(0.0))
+            .get_unchecked("bias")
             .map_err(|e| JammiError::FineTune(format!("LN bias: {e}")))?;
         Ok(Self { weight, bias, eps })
     }
@@ -94,11 +97,9 @@ impl LayerNorm {
 
 fn load_linear(vb: &VarBuilder) -> Result<Linear> {
     let weight = vb
-        .get_with_hints(0, "weight", candle_nn::init::Init::Const(0.0))
+        .get_unchecked("weight")
         .map_err(|e| JammiError::FineTune(format!("linear weight: {e}")))?;
-    let bias = vb
-        .get_with_hints(0, "bias", candle_nn::init::Init::Const(0.0))
-        .ok();
+    let bias = vb.get_unchecked("bias").ok();
     Ok(Linear::new(weight, bias))
 }
 
@@ -299,18 +300,10 @@ struct DistilEmbeddings {
 impl DistilEmbeddings {
     fn load(vb: &VarBuilder) -> Result<Self> {
         let word = vb
-            .get_with_hints(
-                0,
-                "word_embeddings.weight",
-                candle_nn::init::Init::Const(0.0),
-            )
+            .get_unchecked("word_embeddings.weight")
             .map_err(|e| JammiError::FineTune(format!("word emb: {e}")))?;
         let position = vb
-            .get_with_hints(
-                0,
-                "position_embeddings.weight",
-                candle_nn::init::Init::Const(0.0),
-            )
+            .get_unchecked("position_embeddings.weight")
             .map_err(|e| JammiError::FineTune(format!("pos emb: {e}")))?;
         let ln = LayerNorm::load(&vb.pp("LayerNorm"), 1e-12)?;
         Ok(Self { word, position, ln })

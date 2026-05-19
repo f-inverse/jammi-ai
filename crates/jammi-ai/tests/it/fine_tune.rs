@@ -27,7 +27,7 @@ fn lora_layer_mechanics() {
 
     let base_weight = Tensor::randn(0.0f32, 1.0, (4, 8), &device).unwrap();
     let base_linear = Linear::new(base_weight, None);
-    let mut lora = LoraLinear::new(base_linear.clone(), 2, 4.0, &vb).unwrap();
+    let mut lora = LoraLinear::new_simple(base_linear.clone(), 2, 4.0, &vb).unwrap();
 
     // B initialized to zeros — critical: ensures LoRA starts as identity
     let b_vals = lora.lora_b.to_vec2::<f32>().unwrap();
@@ -448,7 +448,7 @@ fn lora_backward_step_changes_weights() {
 
     let base_weight = Tensor::randn(0.0f32, 1.0, (4, 8), &device).unwrap();
     let base = Linear::new(base_weight, None);
-    let lora = LoraLinear::new(base, 2, 4.0, &vb.pp("test")).unwrap();
+    let lora = LoraLinear::new_simple(base, 2, 4.0, &vb.pp("test")).unwrap();
 
     // Capture B weights before training — should be zeros
     let b_before = lora.lora_b.to_vec2::<f32>().unwrap();

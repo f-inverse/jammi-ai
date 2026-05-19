@@ -32,8 +32,8 @@ use super::lora::LoraModel;
 pub enum TrainingTarget {
     /// LoRA wraps a projection head sitting on top of a frozen base model's
     /// pooled output. The head is one or two [`jammi_lora::LoraLinear`]
-    /// layers (projection-only for embeddings; projection + classifier for
-    /// classification / NER).
+    /// layers: a single `projection` layer for embedding fine-tunes, or a
+    /// `projection` + `classifier` pair for classification / NER.
     ProjectionHead { head: LoraModel },
     /// LoRA is injected into the encoder's internal attention/FFN linears.
     EncoderAdapters(Box<EncoderAdaptersTarget>),
@@ -140,11 +140,8 @@ impl TrainingTarget {
 }
 
 /// Persisted metadata serialised into `adapter_config.json` for both adapter
-/// flavours jammi-ai produces.
-///
-/// The `adapter_type` JSON field discriminates which variant a saved adapter
-/// is, replacing the implicit "presence/absence of config.json" discriminator
-/// the previous projection-only format relied on.
+/// flavours jammi-ai produces. The `adapter_type` JSON field tags which
+/// variant a saved adapter is.
 ///
 /// `EncoderAdapters` boxes its payload because [`AdapterConfig`] is
 /// substantially larger than [`ProjectionHeadConfig`] (multiple `Vec`s,

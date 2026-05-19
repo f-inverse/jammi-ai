@@ -211,8 +211,11 @@ pub struct CandleModel {
     pub tokenizer: Option<TokenizerWrapper>,
     /// Device the model weights reside on (CPU, CUDA, or Metal).
     pub device: Device,
-    /// Optional LoRA projection applied after pooling (for fine-tuned models).
-    pub lora_projection: Option<jammi_lora::LoraLinear>,
+    /// Projection head applied after pooling on models fine-tuned via the
+    /// `ProjectionHead` training target. `None` for base models and for
+    /// models fine-tuned via the `EncoderAdapters` target (those carry
+    /// their LoRA inside the encoder, not on top of it).
+    pub projection_head: Option<jammi_lora::LoraLinear>,
     /// Label index → label string mapping for classification/NER models.
     id2label: Option<HashMap<u32, String>>,
     /// Token-level classifier for NER models (applied per token, no pooling).
@@ -337,9 +340,9 @@ impl CandleModel {
             let normalized = self.l2_normalize(&pooled)?;
 
             // Apply the trained projection head if one was loaded.
-            let final_output = if let Some(ref lora) = self.lora_projection {
-                lora.forward(&normalized)
-                    .map_err(|e| JammiError::Inference(format!("LoRA projection: {e}")))?
+            let final_output = if let Some(ref head) = self.projection_head {
+                head.forward(&normalized)
+                    .map_err(|e| JammiError::Inference(format!("Projection head: {e}")))?
             } else {
                 normalized
             };
@@ -934,11 +937,11 @@ impl ModelBackend for CandleBackend {
             })?;
 
         // Load the post-pool projection head, if the saved adapter is one.
-        // Encoder-adapters were already installed into `text` above via the
-        // encoder builder's `.lora(...)` + `.adapter(Some(...))` calls.
-        let lora_projection = match saved_adapter.as_ref() {
+        // Encoder-adapters are installed inside `text` above via the encoder
+        // builder's `.lora(...)` + `.adapter(Some(...))` calls.
+        let projection_head = match saved_adapter.as_ref() {
             Some((crate::fine_tune::target::SavedAdapter::ProjectionHead(cfg), weights_path)) => {
-                load_projection_adapter(
+                load_projection_head(
                     weights_path,
                     cfg.lora_alpha,
                     &device,
@@ -979,7 +982,7 @@ impl ModelBackend for CandleBackend {
             vision,
             tokenizer,
             device,
-            lora_projection,
+            projection_head,
             id2label,
             ner_classifier,
         })))
@@ -1003,12 +1006,12 @@ fn tokens_to_tensor(vecs: &[Vec<u32>], device: &Device) -> Result<Tensor> {
     Tensor::from_vec(flat, (rows, cols), device).map_err(|e| JammiError::Inference(e.to_string()))
 }
 
-/// Load the projection-head LoRA adapter from `adapter_file` using the alpha
-/// recorded in the adapter's saved config. Returns `Some(LoraLinear)` keyed
-/// at `projection.lora_a` / `projection.lora_b`, or `None` if the projection
+/// Load the projection head from `adapter_file` using the alpha recorded in
+/// the adapter's saved config. Returns `Some(LoraLinear)` keyed at
+/// `projection.lora_a` / `projection.lora_b`, or `None` if the projection
 /// keys are absent (the adapter was a classifier/NER head with no embedding
 /// projection — that case does not produce a post-pool projection).
-fn load_projection_adapter(
+fn load_projection_head(
     adapter_file: &std::path::Path,
     lora_alpha: f64,
     device: &Device,

@@ -24,9 +24,25 @@ use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_nn::{Linear, VarBuilder, VarMap};
 use jammi_engine::error::{JammiError, Result};
 
-use crate::fine_tune::lora::{LoraInitMode, LoraLinear};
+use crate::fine_tune::lora::LoraLinear;
 
-use super::{effective_rank, should_apply_lora, DeepLoraEncoder};
+use super::{effective_rank, should_apply_lora, DeepLoraEncoder, LoraBuildConfig};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Architecture dimensions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// ModernBERT architecture dimensions read from the model's `config.json`.
+#[derive(Debug, Clone, Copy)]
+pub struct ModernBertDims {
+    pub num_layers: usize,
+    pub num_heads: usize,
+    pub hidden_size: usize,
+    pub vocab_size: usize,
+    pub intermediate_size: usize,
+    pub max_seq_len: usize,
+    pub rope_base: f64,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LayerNorm without bias (ModernBERT style)
@@ -462,27 +478,22 @@ pub struct ModernBertLoraEncoderInner {
 }
 
 impl ModernBertLoraEncoderInner {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         frozen_vb: &VarBuilder,
         lora_vb: &VarBuilder,
-        num_layers: usize,
-        num_heads: usize,
-        hidden_size: usize,
-        vocab_size: usize,
-        intermediate_size: usize,
-        max_seq_len: usize,
-        rope_base: f64,
-        target_modules: &[String],
-        layers_to_transform: &Option<Vec<usize>>,
-        lora_rank: usize,
-        lora_alpha: f64,
-        use_rslora: bool,
-        lora_dropout: Option<f32>,
-        rank_pattern: &HashMap<String, usize>,
-        init_mode: LoraInitMode,
+        dims: ModernBertDims,
+        lora: LoraBuildConfig<'_>,
         device: &Device,
     ) -> Result<Self> {
+        let ModernBertDims {
+            num_layers,
+            num_heads,
+            hidden_size,
+            vocab_size,
+            intermediate_size,
+            max_seq_len,
+            rope_base,
+        } = dims;
         let head_dim = hidden_size / num_heads;
 
         // Embedding matrix is [vocab_size, hidden_size]; pass the full 2-D shape so
@@ -506,15 +517,15 @@ impl ModernBertLoraEncoderInner {
             macro_rules! maybe_lora {
                 ($name:expr, $sub:expr, $out:expr, $in:expr) => {{
                     let frozen_lin = load_linear_no_bias(&layer_vb.pp($sub), $out, $in)?;
-                    if should_apply_lora($name, target_modules, n, layers_to_transform) {
-                        let rank = effective_rank($name, lora_rank, rank_pattern);
+                    if should_apply_lora($name, lora.target_modules, n, lora.layers_to_transform) {
+                        let rank = effective_rank($name, lora.lora_rank, lora.rank_pattern);
                         let l = LoraLinear::new(
                             frozen_lin,
                             rank,
-                            lora_alpha,
-                            use_rslora,
-                            init_mode,
-                            lora_dropout,
+                            lora.lora_alpha,
+                            lora.use_rslora,
+                            lora.init_mode,
+                            lora.lora_dropout,
                             &lora_layer_vb.pp($name),
                         )?;
                         MaybeLoraLinear::Lora(l)
@@ -694,22 +705,14 @@ impl DeepLoraEncoder for ModernBertLoraEncoderInner {
 // Public builder
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 pub fn build(
     weights_paths: &[&Path],
     model_config: &serde_json::Value,
-    target_modules: &[String],
-    layers_to_transform: &Option<Vec<usize>>,
-    lora_rank: usize,
-    lora_alpha: f64,
-    use_rslora: bool,
-    lora_dropout: Option<f32>,
-    rank_pattern: &HashMap<String, usize>,
-    init_mode: LoraInitMode,
+    lora: LoraBuildConfig<'_>,
+    backbone_dtype: DType,
     device: &Device,
     varmap: &VarMap,
     adapter_file: Option<&Path>,
-    backbone_dtype: DType,
 ) -> Result<ModernBertLoraEncoderInner> {
     let frozen_vb = unsafe {
         VarBuilder::from_mmaped_safetensors(weights_paths, backbone_dtype, device)
@@ -724,53 +727,36 @@ pub fn build(
         VarBuilder::from_varmap(varmap, DType::F32, device)
     };
 
-    let hidden_size = model_config
-        .get("hidden_size")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(768) as usize;
-    let vocab_size = model_config
-        .get("vocab_size")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(50368) as usize;
-    let num_heads = model_config
-        .get("num_attention_heads")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(12) as usize;
-    let num_layers = model_config
-        .get("num_hidden_layers")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(22) as usize;
-    let intermediate_size = model_config
-        .get("intermediate_size")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1152) as usize;
-    let max_seq_len = model_config
-        .get("max_position_embeddings")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(8192) as usize;
-    let rope_base = model_config
-        .get("rope_theta")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(10_000.0);
+    let dims = ModernBertDims {
+        hidden_size: model_config
+            .get("hidden_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(768) as usize,
+        vocab_size: model_config
+            .get("vocab_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50368) as usize,
+        num_heads: model_config
+            .get("num_attention_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(12) as usize,
+        num_layers: model_config
+            .get("num_hidden_layers")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(22) as usize,
+        intermediate_size: model_config
+            .get("intermediate_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1152) as usize,
+        max_seq_len: model_config
+            .get("max_position_embeddings")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(8192) as usize,
+        rope_base: model_config
+            .get("rope_theta")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(10_000.0),
+    };
 
-    ModernBertLoraEncoderInner::new(
-        &frozen_vb,
-        &lora_vb,
-        num_layers,
-        num_heads,
-        hidden_size,
-        vocab_size,
-        intermediate_size,
-        max_seq_len,
-        rope_base,
-        target_modules,
-        layers_to_transform,
-        lora_rank,
-        lora_alpha,
-        use_rslora,
-        lora_dropout,
-        rank_pattern,
-        init_mode,
-        device,
-    )
+    ModernBertLoraEncoderInner::new(&frozen_vb, &lora_vb, dims, lora, device)
 }

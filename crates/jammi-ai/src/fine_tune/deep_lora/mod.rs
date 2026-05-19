@@ -22,6 +22,37 @@ use candle_core::Tensor;
 use jammi_engine::error::{JammiError, Result};
 use serde::{Deserialize, Serialize};
 
+use super::lora::LoraInitMode;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared LoRA build configuration
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// LoRA injection parameters shared by every deep-LoRA encoder builder.
+///
+/// Holds borrowed references so that callers can pass an instance built from
+/// their own owned config without forcing a clone.  Construct fresh per call
+/// site; the struct is `Copy` over the primitive fields and cheap to build.
+#[derive(Debug, Clone, Copy)]
+pub struct LoraBuildConfig<'a> {
+    /// Target module-name suffixes that receive a LoRA adapter.
+    pub target_modules: &'a [String],
+    /// Optional restriction of LoRA injection to specific layer indices.
+    pub layers_to_transform: &'a Option<Vec<usize>>,
+    /// Default LoRA rank (overridden per module via `rank_pattern`).
+    pub lora_rank: usize,
+    /// LoRA scaling factor.
+    pub lora_alpha: f64,
+    /// Whether to use RSLoRA-style scaling (`alpha / sqrt(rank)`).
+    pub use_rslora: bool,
+    /// Dropout probability applied to the LoRA path during training.
+    pub lora_dropout: Option<f32>,
+    /// Per-module rank overrides keyed by module-name substring.
+    pub rank_pattern: &'a HashMap<String, usize>,
+    /// How the LoRA A/B matrices are initialised.
+    pub init_mode: LoraInitMode,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Core trait
 // ─────────────────────────────────────────────────────────────────────────────
@@ -78,26 +109,22 @@ pub struct DeepLoraAdapterConfig {
 }
 
 impl DeepLoraAdapterConfig {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_deep_lora(
+    /// Build a serializable adapter config from the build-time `LoraBuildConfig`.
+    /// The run-time-only `lora_dropout` and `init_mode` fields are not persisted.
+    pub fn from_build(
         model_type: &str,
-        lora_rank: usize,
-        lora_alpha: f64,
-        use_rslora: bool,
-        target_modules: Vec<String>,
-        layers_to_transform: Option<Vec<usize>>,
-        rank_pattern: HashMap<String, usize>,
+        lora: &LoraBuildConfig<'_>,
         backbone_dtype: super::BackboneDtype,
     ) -> Self {
         Self {
             adapter_type: "deep_lora".into(),
             model_type: model_type.into(),
-            lora_rank,
-            lora_alpha,
-            use_rslora,
-            target_modules,
-            layers_to_transform,
-            rank_pattern,
+            lora_rank: lora.lora_rank,
+            lora_alpha: lora.lora_alpha,
+            use_rslora: lora.use_rslora,
+            target_modules: lora.target_modules.to_vec(),
+            layers_to_transform: lora.layers_to_transform.clone(),
+            rank_pattern: lora.rank_pattern.clone(),
             backbone_dtype,
         }
     }

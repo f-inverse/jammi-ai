@@ -107,6 +107,30 @@ fn clip_gradients(trainable_vars: &[Var], grads: &mut GradStore, max_norm: f64) 
     Ok(())
 }
 
+/// Mutable per-epoch state passed into [`TrainingLoop::process_batch_loss`].
+///
+/// All four fields are borrowed mutably so the function can update batch
+/// counts, loss accumulators, and the gradient store in place.
+struct EpochState<'a> {
+    batch_count: &'a mut usize,
+    epoch_loss: &'a mut f64,
+    accumulated_grads: &'a mut Option<GradStore>,
+    global_step: &'a mut usize,
+}
+
+/// Immutable per-step context (except for the optimizer, which mutates on
+/// every step). Constructed fresh for each call to
+/// [`TrainingLoop::process_batch_loss`] and dropped at function return so the
+/// caller can keep using `optimizer` directly between iterations.
+struct StepContext<'a> {
+    trainable_vars: &'a [Var],
+    optimizer: &'a mut AdamW,
+    checkpoint_dir: &'a Path,
+    checkpoint_interval: usize,
+    total_steps: usize,
+    started_at: &'a str,
+}
+
 /// The training loop: runs LoRA fine-tuning with gradient accumulation,
 /// early stopping, LR scheduling, and checkpointing.
 pub struct TrainingLoop {
@@ -287,16 +311,20 @@ impl TrainingLoop {
                     );
                     self.process_batch_loss(
                         loss,
-                        &mut batch_count,
-                        &mut epoch_loss,
-                        &mut accumulated_grads,
-                        &trainable_vars,
-                        &mut global_step,
-                        total_steps,
-                        &mut optimizer,
-                        &checkpoint_dir,
-                        checkpoint_interval,
-                        &started_at,
+                        EpochState {
+                            batch_count: &mut batch_count,
+                            epoch_loss: &mut epoch_loss,
+                            accumulated_grads: &mut accumulated_grads,
+                            global_step: &mut global_step,
+                        },
+                        StepContext {
+                            trainable_vars: &trainable_vars,
+                            optimizer: &mut optimizer,
+                            checkpoint_dir: &checkpoint_dir,
+                            checkpoint_interval,
+                            total_steps,
+                            started_at: &started_at,
+                        },
                     )?;
                 }
             } else {
@@ -313,16 +341,20 @@ impl TrainingLoop {
                     );
                     self.process_batch_loss(
                         loss,
-                        &mut batch_count,
-                        &mut epoch_loss,
-                        &mut accumulated_grads,
-                        &trainable_vars,
-                        &mut global_step,
-                        total_steps,
-                        &mut optimizer,
-                        &checkpoint_dir,
-                        checkpoint_interval,
-                        &started_at,
+                        EpochState {
+                            batch_count: &mut batch_count,
+                            epoch_loss: &mut epoch_loss,
+                            accumulated_grads: &mut accumulated_grads,
+                            global_step: &mut global_step,
+                        },
+                        StepContext {
+                            trainable_vars: &trainable_vars,
+                            optimizer: &mut optimizer,
+                            checkpoint_dir: &checkpoint_dir,
+                            checkpoint_interval,
+                            total_steps,
+                            started_at: &started_at,
+                        },
                     )?;
                 }
             }
@@ -663,20 +695,11 @@ impl TrainingLoop {
     /// `Option<GradStore>` (seeded from the first micro-batch's backward result,
     /// which avoids needing the private `GradStore::new()`) and an optimizer step
     /// is taken once every `gradient_accumulation_steps` micro-batches.
-    #[allow(clippy::too_many_arguments)]
     fn process_batch_loss(
         &mut self,
         loss: Tensor,
-        batch_count: &mut usize,
-        epoch_loss: &mut f64,
-        accumulated_grads: &mut Option<GradStore>,
-        trainable_vars: &[Var],
-        global_step: &mut usize,
-        total_steps: usize,
-        optimizer: &mut AdamW,
-        checkpoint_dir: &Path,
-        checkpoint_interval: usize,
-        started_at: &str,
+        epoch: EpochState<'_>,
+        ctx: StepContext<'_>,
     ) -> Result<()> {
         let loss_f32 = if loss.dtype() == DType::F32 {
             loss.clone()
@@ -696,7 +719,7 @@ impl TrainingLoop {
                 let err_msg = "Training diverged: loss was NaN or >100 for 3 consecutive batches";
                 let metrics = serde_json::json!({
                     "error_message": err_msg,
-                    "started_at": started_at,
+                    "started_at": ctx.started_at,
                 })
                 .to_string();
                 if let Err(e) = self.catalog.update_fine_tune_status(
@@ -712,8 +735,8 @@ impl TrainingLoop {
         }
         self.divergence_count = 0;
 
-        *epoch_loss += loss_val;
-        *batch_count += 1;
+        *epoch.epoch_loss += loss_val;
+        *epoch.batch_count += 1;
 
         // Scale the loss and immediately run backward, releasing the activation
         // graph so that `gradient_accumulation_steps > 1` doesn't grow memory
@@ -728,12 +751,12 @@ impl TrainingLoop {
         // Merge new_grads into the running accumulator.
         // The accumulator is seeded from the first backward call to avoid
         // needing the private GradStore::new().
-        match accumulated_grads {
+        match epoch.accumulated_grads {
             None => {
-                *accumulated_grads = Some(new_grads);
+                *epoch.accumulated_grads = Some(new_grads);
             }
             Some(ref mut acc) => {
-                for var in trainable_vars.iter() {
+                for var in ctx.trainable_vars.iter() {
                     let t: &Tensor = var;
                     if let Some(g_new) = new_grads.get(t) {
                         if let Some(g_acc) = acc.remove(t) {
@@ -749,22 +772,22 @@ impl TrainingLoop {
         }
 
         // Optimizer step every N micro-batches.
-        if *batch_count % self.config.gradient_accumulation_steps == 0 {
-            let lr = compute_lr(&self.config, *global_step, total_steps);
-            optimizer.set_learning_rate(lr);
+        if *epoch.batch_count % self.config.gradient_accumulation_steps == 0 {
+            let lr = compute_lr(&self.config, *epoch.global_step, ctx.total_steps);
+            ctx.optimizer.set_learning_rate(lr);
 
-            if let Some(mut acc) = accumulated_grads.take() {
-                clip_gradients(trainable_vars, &mut acc, self.config.max_grad_norm)?;
-                optimizer
+            if let Some(mut acc) = epoch.accumulated_grads.take() {
+                clip_gradients(ctx.trainable_vars, &mut acc, self.config.max_grad_norm)?;
+                ctx.optimizer
                     .step(&acc)
                     .map_err(|e| JammiError::FineTune(format!("Optimizer step: {e}")))?;
             }
 
-            *global_step += 1;
+            *epoch.global_step += 1;
 
             // Checkpoint
-            if checkpoint_interval > 0 && *global_step % checkpoint_interval == 0 {
-                self.save_checkpoint(checkpoint_dir, *global_step)?;
+            if ctx.checkpoint_interval > 0 && *epoch.global_step % ctx.checkpoint_interval == 0 {
+                self.save_checkpoint(ctx.checkpoint_dir, *epoch.global_step)?;
             }
         }
 

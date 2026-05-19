@@ -123,7 +123,6 @@ fn adapter_config_from_build_copies_lora_fields() {
     let cfg = AdapterConfig::from_build("bert", &lora, BackboneDtype::F32);
 
     // Persisted fields copied verbatim.
-    assert_eq!(cfg.adapter_type, "deep_lora");
     assert_eq!(cfg.model_type, "bert");
     assert_eq!(cfg.lora_rank, 8);
     assert_eq!(cfg.lora_alpha, 16.0);
@@ -141,7 +140,6 @@ fn adapter_config_json_roundtrip_preserves_every_field() {
     rank_pattern.insert("Wqkv".to_string(), 16);
 
     let cfg = AdapterConfig {
-        adapter_type: "deep_lora".into(),
         model_type: "modernbert".into(),
         lora_rank: 8,
         lora_alpha: 32.0,
@@ -155,7 +153,6 @@ fn adapter_config_json_roundtrip_preserves_every_field() {
     let json = serde_json::to_string_pretty(&cfg).unwrap();
     let parsed: AdapterConfig = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(parsed.adapter_type, cfg.adapter_type);
     assert_eq!(parsed.model_type, cfg.model_type);
     assert_eq!(parsed.lora_rank, cfg.lora_rank);
     assert_eq!(parsed.lora_alpha, cfg.lora_alpha);
@@ -171,7 +168,6 @@ fn adapter_config_json_accepts_missing_optional_fields() {
     // A pre-`layers_to_transform` config (or any partial config) should still
     // deserialize — the serde `#[serde(default)]` attributes guarantee this.
     let minimal = r#"{
-        "adapter_type": "deep_lora",
         "model_type": "bert",
         "lora_rank": 4,
         "lora_alpha": 8.0,
@@ -262,17 +258,21 @@ async fn deep_lora_bert_fine_tune_writes_deep_adapter_marker() {
         .unwrap();
     job.wait().await.unwrap();
 
-    // Walk back through the saved adapter and confirm the deep marker.
+    // Walk back through the saved adapter and confirm the encoder-adapters
+    // discriminator + the persisted target modules / rank.
     let adapter_dir = adapter_dir_for_model(&session, job.model_id());
     let cfg_path = adapter_dir.join("adapter_config.json");
     assert!(
         cfg_path.exists(),
-        "deep-LoRA adapter_config.json should exist at {cfg_path:?}"
+        "adapter_config.json should exist at {cfg_path:?}"
     );
     let cfg_str = std::fs::read_to_string(&cfg_path).unwrap();
-    let cfg: AdapterConfig = serde_json::from_str(&cfg_str).unwrap();
+    let saved: jammi_ai::fine_tune::target::SavedAdapter = serde_json::from_str(&cfg_str).unwrap();
+    let cfg = match saved {
+        jammi_ai::fine_tune::target::SavedAdapter::EncoderAdapters(cfg) => *cfg,
+        other => panic!("expected EncoderAdapters variant, got {other:?}"),
+    };
 
-    assert_eq!(cfg.adapter_type, "deep_lora");
     assert_eq!(cfg.model_type, "bert");
     assert_eq!(
         cfg.target_modules,
@@ -315,12 +315,15 @@ async fn deep_lora_modernbert_fine_tune_writes_modernbert_marker() {
     job.wait().await.unwrap();
 
     let adapter_dir = adapter_dir_for_model(&session, job.model_id());
-    let cfg: AdapterConfig = serde_json::from_str(
+    let saved: jammi_ai::fine_tune::target::SavedAdapter = serde_json::from_str(
         &std::fs::read_to_string(adapter_dir.join("adapter_config.json")).unwrap(),
     )
     .unwrap();
+    let cfg = match saved {
+        jammi_ai::fine_tune::target::SavedAdapter::EncoderAdapters(cfg) => *cfg,
+        other => panic!("expected EncoderAdapters variant, got {other:?}"),
+    };
 
-    assert_eq!(cfg.adapter_type, "deep_lora");
     assert_eq!(cfg.model_type, "modernbert");
     assert_eq!(
         cfg.target_modules,

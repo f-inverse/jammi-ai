@@ -776,50 +776,51 @@ fn run_fine_tune_blocking(
     let varmap = VarMap::new();
     let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
-    let model = if task == "classification" {
-        let num_classes = match data_loader.format() {
-            crate::fine_tune::data::TrainingFormat::Classification { num_classes } => num_classes,
-            _ => {
-                return Err(JammiError::FineTune(
-                    "Classification task requires classification training data format".into(),
-                ))
-            }
+    // Choose between the two LoRA training shapes exactly once, based on
+    // whether the caller requested LoRA inside the encoder (non-empty
+    // `target_modules`) or a projection head over a frozen base model.
+    // No half-built state — only the chosen variant is materialised.
+    let target = if config.target_modules.is_empty() {
+        let head = if task == "classification" {
+            let num_classes = match data_loader.format() {
+                crate::fine_tune::data::TrainingFormat::Classification { num_classes } => {
+                    num_classes
+                }
+                _ => {
+                    return Err(JammiError::FineTune(
+                        "Classification task requires classification training data format".into(),
+                    ))
+                }
+            };
+            crate::fine_tune::lora::build_lora_classification(
+                hidden_size,
+                num_classes,
+                &config,
+                &vb,
+            )?
+        } else {
+            crate::fine_tune::lora::build_lora_projection(hidden_size, &config, &vb)?
         };
-        crate::fine_tune::lora::build_lora_classification(hidden_size, num_classes, &config, &vb)?
+        crate::fine_tune::target::TrainingTarget::ProjectionHead { head }
     } else {
-        crate::fine_tune::lora::build_lora_projection(hidden_size, &config, &vb)?
+        let (encoder, adapter_cfg) =
+            build_encoder_adapters(&base_model, &catalog, &config, &varmap, &device)?;
+        crate::fine_tune::target::TrainingTarget::EncoderAdapters(Box::new(
+            crate::fine_tune::target::EncoderAdaptersTarget {
+                encoder,
+                adapter_cfg,
+            },
+        ))
     };
 
-    // ── Deep LoRA path ────────────────────────────────────────────────────────
-    // When `target_modules` is non-empty, build a DeepLoraEncoder that wraps
-    // LoRA adapters inside the encoder stack rather than after it.  A build
-    // failure here is fatal: the caller asked for deep LoRA, silently falling
-    // back to shallow would produce an adapter that doesn't match what they
-    // requested.  Loud failure beats a wrong-shape adapter.
-    let deep_lora = if !config.target_modules.is_empty() {
-        Some(build_deep_lora_model(
-            &base_model,
-            &catalog,
-            &config,
-            &varmap,
-            &device,
-        )?)
-    } else {
-        None
-    };
-
-    let mut builder = crate::fine_tune::trainer::TrainingLoopBuilder::new(model, varmap, config)
-        .job_id(job_id.clone())
-        .catalog(Arc::clone(&catalog))
-        .artifact_dir(artifact_dir.clone())
-        .base_model(base_model_arc)
-        .device(device.clone());
-
-    if let Some((encoder, adapter_cfg)) = deep_lora {
-        builder = builder.deep_lora_model(encoder, adapter_cfg);
-    }
-
-    let mut training_loop = builder.build()?;
+    let mut training_loop =
+        crate::fine_tune::trainer::TrainingLoopBuilder::new(target, varmap, config)
+            .base_model(base_model_arc)
+            .job_id(job_id.clone())
+            .catalog(Arc::clone(&catalog))
+            .artifact_dir(artifact_dir.clone())
+            .device(device.clone())
+            .build()?;
 
     match training_loop.run(&data_loader) {
         Ok(_result) => {
@@ -851,10 +852,11 @@ fn run_fine_tune_blocking(
     Ok(())
 }
 
-/// Construct a deep-LoRA encoder and its persisted adapter config for the given
-/// base model by loading frozen weights from the catalog artifact path and
-/// wrapping target modules with LoRA.
-fn build_deep_lora_model(
+/// Construct an encoder-adapters target: load the frozen backbone weights
+/// from the catalog artifact path, wrap the configured target modules with
+/// LoRA, and return both the resulting encoder and the persisted adapter
+/// metadata that pairs with the trained tensors on disk.
+fn build_encoder_adapters(
     base_model_id: &str,
     catalog: &Arc<jammi_engine::catalog::Catalog>,
     config: &FineTuneConfig,

@@ -10,11 +10,8 @@ use jammi_engine::catalog::status::FineTuneJobStatus;
 use jammi_engine::catalog::Catalog;
 use jammi_engine::error::{JammiError, Result};
 
-use jammi_encoders::AnyEncoder;
-use jammi_lora::AdapterConfig;
-
 use super::data::{TextChunk, TrainingDataLoader};
-use super::lora::{save_lora_weights, LoraModel};
+use super::target::TrainingTarget;
 use super::{EarlyStoppingMetric, FineTuneConfig, LrSchedule};
 use crate::model::{LoadedModel, ModelTask};
 
@@ -136,51 +133,49 @@ struct StepContext<'a> {
 /// The training loop: runs LoRA fine-tuning with gradient accumulation,
 /// early stopping, LR scheduling, and checkpointing.
 pub struct TrainingLoop {
-    model: LoraModel,
+    target: TrainingTarget,
+    /// Provides the tokenizer for both target variants, plus the frozen
+    /// forward path consumed by [`TrainingTarget::ProjectionHead`]. `None`
+    /// is only valid when the data loader yields pre-built tensor batches
+    /// (`is_precomputed()` is `true`) — used by trainer-internals tests.
+    base_model: Option<Arc<LoadedModel>>,
     varmap: VarMap,
     config: FineTuneConfig,
     job_id: String,
     catalog: Arc<Catalog>,
     artifact_dir: PathBuf,
     divergence_count: usize,
-    base_model: Option<Arc<LoadedModel>>,
     device: Device,
-    /// When set, `encode_chunk` runs the deep LoRA encoder instead of the
-    /// frozen base model + external LoRA projection.
-    deep_lora_model: Option<AnyEncoder>,
-    /// Adapter metadata persisted alongside the deep-LoRA weights.
-    deep_lora_adapter_cfg: Option<AdapterConfig>,
 }
 
-/// Builder for [`TrainingLoop`]. Core ML params (model, varmap, config) are
-/// required at construction; infrastructure params are set via builder methods.
+/// Builder for [`TrainingLoop`].
 pub struct TrainingLoopBuilder {
-    model: LoraModel,
+    target: TrainingTarget,
+    base_model: Option<Arc<LoadedModel>>,
     varmap: VarMap,
     config: FineTuneConfig,
     job_id: Option<String>,
     catalog: Option<Arc<Catalog>>,
     artifact_dir: Option<PathBuf>,
-    base_model: Option<Arc<LoadedModel>>,
     device: Device,
-    deep_lora_model: Option<AnyEncoder>,
-    deep_lora_adapter_cfg: Option<AdapterConfig>,
 }
 
 impl TrainingLoopBuilder {
-    /// Start building a training loop with the core ML parameters.
-    pub fn new(model: LoraModel, varmap: VarMap, config: FineTuneConfig) -> Self {
+    /// Start building a training loop with the chosen [`TrainingTarget`].
+    /// Call [`Self::base_model`] before [`Self::build`] for the production
+    /// path; omit it only when supplying a precomputed-batches data loader
+    /// to the trainer (test affordance — the loader yields tensors directly
+    /// instead of texts that need to be encoded).
+    pub fn new(target: TrainingTarget, varmap: VarMap, config: FineTuneConfig) -> Self {
         Self {
-            model,
+            target,
+            base_model: None,
             varmap,
             config,
             job_id: None,
             catalog: None,
             artifact_dir: None,
-            base_model: None,
             device: Device::Cpu,
-            deep_lora_model: None,
-            deep_lora_adapter_cfg: None,
         }
     }
 
@@ -190,12 +185,11 @@ impl TrainingLoopBuilder {
         self
     }
 
-    /// Set an optional deep LoRA encoder + the adapter metadata persisted
-    /// alongside its weights. When provided, `encode_chunk` calls this encoder
-    /// directly instead of the frozen base model.
-    pub fn deep_lora_model(mut self, encoder: AnyEncoder, adapter_cfg: AdapterConfig) -> Self {
-        self.deep_lora_model = Some(encoder);
-        self.deep_lora_adapter_cfg = Some(adapter_cfg);
+    /// Set the base model. Required for text-data training (supplies the
+    /// tokenizer and, for `ProjectionHead` targets, the frozen forward
+    /// pass).
+    pub fn base_model(mut self, model: Arc<LoadedModel>) -> Self {
+        self.base_model = Some(model);
         self
     }
 
@@ -217,12 +211,6 @@ impl TrainingLoopBuilder {
         self
     }
 
-    /// Set the frozen base model for model-in-loop training.
-    pub fn base_model(mut self, model: Arc<LoadedModel>) -> Self {
-        self.base_model = Some(model);
-        self
-    }
-
     /// Build the training loop. All infrastructure params must be set.
     pub fn build(self) -> Result<TrainingLoop> {
         let job_id = self
@@ -235,17 +223,15 @@ impl TrainingLoopBuilder {
             JammiError::FineTune("TrainingLoopBuilder: artifact_dir required".into())
         })?;
         Ok(TrainingLoop {
-            model: self.model,
+            target: self.target,
+            base_model: self.base_model,
             varmap: self.varmap,
             config: self.config,
             job_id,
             catalog,
             artifact_dir,
             divergence_count: 0,
-            base_model: self.base_model,
             device: self.device,
-            deep_lora_model: self.deep_lora_model,
-            deep_lora_adapter_cfg: self.deep_lora_adapter_cfg,
         })
     }
 }
@@ -306,18 +292,18 @@ impl TrainingLoop {
             let mut epoch_neg_sim = 0.0f64;
             let mut triplet_batch_count = 0usize;
 
-            if self.base_model.is_some() {
-                // Real training: encode text through base model, project through LoRA
-                let text_chunks = train_loader.text_chunks(self.config.batch_size);
-                for chunk in &text_chunks {
-                    let batch = self.encode_chunk(chunk)?;
-                    let loss = self.compute_loss(&batch)?;
+            if train_loader.is_precomputed() {
+                // Test path: direct tensor batches, no encoding.
+                let train_batches = train_loader.batches(self.config.batch_size)?;
+                for batch in train_batches {
+                    let batch = batch?;
                     self.accumulate_sim_stats(
                         &batch,
                         &mut epoch_pos_sim,
                         &mut epoch_neg_sim,
                         &mut triplet_batch_count,
                     );
+                    let loss = self.compute_loss(&batch)?;
                     self.process_batch_loss(
                         loss,
                         EpochState {
@@ -337,10 +323,10 @@ impl TrainingLoop {
                     )?;
                 }
             } else {
-                // Precomputed path: direct tensor batches (for testing)
-                let train_batches = train_loader.batches(self.config.batch_size)?;
-                for batch in train_batches {
-                    let batch = batch?;
+                // Production path: encode text through the target, then compute loss.
+                let text_chunks = train_loader.text_chunks(self.config.batch_size);
+                for chunk in &text_chunks {
+                    let batch = self.encode_chunk(chunk)?;
                     let loss = self.compute_loss(&batch)?;
                     self.accumulate_sim_stats(
                         &batch,
@@ -400,13 +386,9 @@ impl TrainingLoop {
                 }
                 EarlyStoppingMetric::ValLoss => {
                     // Disable dropout for the validation pass.
-                    if let Some(ref mut deep) = self.deep_lora_model {
-                        deep.set_training(false);
-                    }
+                    self.target.set_training(false);
                     let val_loss = self.evaluate(&val_loader)?;
-                    if let Some(ref mut deep) = self.deep_lora_model {
-                        deep.set_training(true);
-                    }
+                    self.target.set_training(true);
                     val_loss
                 }
             };
@@ -458,20 +440,12 @@ impl TrainingLoop {
             self.load_checkpoint(&best_path)?;
         }
 
-        // Save final adapter (deep LoRA or projection-only)
-        if let Some(ref deep) = self.deep_lora_model {
-            let weights = deep
-                .named_trainable_weights()
-                .map_err(|e| JammiError::FineTune(format!("Collect deep LoRA weights: {e}")))?;
-            let cfg = self.deep_lora_adapter_cfg.as_ref().ok_or_else(|| {
-                JammiError::FineTune("deep LoRA encoder set without an adapter config".into())
-            })?;
-            jammi_lora::save_adapter(&checkpoint_dir, &weights, cfg)
-                .map_err(|e| JammiError::FineTune(format!("Save deep LoRA adapter: {e}")))?;
-        } else {
-            let adapter_path = checkpoint_dir.join("adapter.safetensors");
-            save_lora_weights(&self.model, &adapter_path)?;
-        }
+        // Save the final adapter — both target variants persist their
+        // trainable weights alongside a `SavedAdapter` metadata JSON.
+        let final_weights = self.target.named_trainable_weights()?;
+        let saved = self.target.saved_adapter(&self.config);
+        jammi_lora::save_adapter(&checkpoint_dir, &final_weights, &saved)
+            .map_err(|e| JammiError::FineTune(format!("Save adapter: {e}")))?;
 
         // Update job status
         let completed_at = chrono::Utc::now().to_rfc3339();
@@ -500,112 +474,88 @@ impl TrainingLoop {
         })
     }
 
-    /// Tokenize texts and run through the deep LoRA encoder.
+    /// Encode a slice of texts into a `[batch, hidden]` embedding tensor,
+    /// dispatched on the active [`TrainingTarget`]:
     ///
-    /// The encoder produces mean-pooled, L2-normalised embeddings directly;
-    /// no external projection is needed.
-    fn encode_texts_deep(&self, texts: &[String]) -> Result<Tensor> {
-        let deep = self
-            .deep_lora_model
-            .as_ref()
-            .ok_or_else(|| JammiError::FineTune("No deep LoRA model".into()))?;
-
-        let base = self
-            .base_model
-            .as_ref()
-            .ok_or_else(|| JammiError::FineTune("No base model for tokenization".into()))?;
-
-        let tokenizer = match base.as_ref() {
-            crate::model::LoadedModel::Candle(m) => m
-                .tokenizer
-                .as_ref()
-                .ok_or_else(|| JammiError::FineTune("No tokenizer in base model".into()))?,
-            _ => {
-                return Err(JammiError::FineTune(
-                    "Deep LoRA requires a Candle base model with a tokenizer".into(),
-                ))
-            }
-        };
-
-        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-        let effective_max = self.config.max_seq_length.min(deep.max_seq_length());
-        let encoding = tokenizer.encode_batch(&text_refs, Some(effective_max))?;
-
-        let rows = encoding.input_ids.len();
-        let cols = encoding.input_ids.first().map_or(0, |v| v.len());
-
-        let input_ids = Tensor::from_vec(
-            encoding
-                .input_ids
-                .into_iter()
-                .flatten()
-                .collect::<Vec<u32>>(),
-            (rows, cols),
-            &self.device,
-        )
-        .map_err(|e| JammiError::FineTune(format!("input_ids tensor: {e}")))?;
-
-        let attention_mask = Tensor::from_vec(
-            encoding
-                .attention_masks
-                .into_iter()
-                .flatten()
-                .collect::<Vec<u32>>(),
-            (rows, cols),
-            &self.device,
-        )
-        .map_err(|e| JammiError::FineTune(format!("attention_mask tensor: {e}")))?;
-
-        deep.forward(&input_ids, &attention_mask)
-            .map_err(|e| JammiError::FineTune(format!("Deep LoRA forward: {e}")))
-    }
-
-    /// Encode texts through the frozen base model. Returns (batch_size, hidden_size) Tensor.
+    /// - `ProjectionHead`: run the texts through the frozen base model to
+    ///   produce pooled embeddings, then project through the head's first
+    ///   LoRA layer.
+    /// - `EncoderAdapters`: tokenize the texts via the base model's tokenizer,
+    ///   then forward through the LoRA-injected encoder directly (the encoder
+    ///   does its own pooling and normalisation).
     fn encode_texts(&self, texts: &[String]) -> Result<Tensor> {
         let base = self
             .base_model
             .as_ref()
-            .ok_or_else(|| JammiError::FineTune("No base model for encoding".into()))?;
-
-        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-        let arr = Arc::new(StringArray::from(text_refs)) as ArrayRef;
-        let output = base
-            .forward(&[arr], ModelTask::TextEmbedding)
-            .map_err(|e| JammiError::FineTune(format!("Encode: {e}")))?;
-
-        let n = output.shapes[0].0;
-        let dim = output.shapes[0].1;
-        Tensor::from_vec(output.float_outputs[0].clone(), (n, dim), &self.device)
-            .map_err(|e| JammiError::FineTune(format!("Encode tensor: {e}")))
-    }
-
-    /// Apply LoRA projection to base embeddings.
-    fn project(&self, embeddings: &Tensor) -> Result<Tensor> {
-        self.model.layers[0]
-            .1
-            .forward(embeddings)
-            .map_err(|e| JammiError::FineTune(format!("LoRA projection: {e}")))
-    }
-
-    /// Encode a text chunk through the base model and project through LoRA,
-    /// producing a TrainingBatch ready for loss computation.
-    ///
-    /// When `deep_lora_model` is set, texts are tokenized and fed through the
-    /// deep LoRA encoder (gradients flow through A/B matrices inside the
-    /// encoder). Otherwise, the frozen base model produces embeddings that are
-    /// then projected through the external LoRA head.
-    fn encode_chunk(&self, chunk: &TextChunk) -> Result<super::data::TrainingBatch> {
-        let use_deep = self.deep_lora_model.is_some();
-
-        // Helper: encode a text slice returning the final embedding tensor.
-        let encode = |texts: &Vec<String>| -> Result<Tensor> {
-            if use_deep {
-                self.encode_texts_deep(texts)
-            } else {
-                let emb = self.encode_texts(texts)?;
-                self.project(&emb)
+            .ok_or_else(|| JammiError::FineTune("encode_texts requires a base model".into()))?;
+        match &self.target {
+            TrainingTarget::ProjectionHead { head } => {
+                let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+                let arr = Arc::new(StringArray::from(text_refs)) as ArrayRef;
+                let output = base
+                    .forward(&[arr], ModelTask::TextEmbedding)
+                    .map_err(|e| JammiError::FineTune(format!("Encode: {e}")))?;
+                let n = output.shapes[0].0;
+                let dim = output.shapes[0].1;
+                let raw = Tensor::from_vec(output.float_outputs[0].clone(), (n, dim), &self.device)
+                    .map_err(|e| JammiError::FineTune(format!("Encode tensor: {e}")))?;
+                head.layers[0]
+                    .1
+                    .forward(&raw)
+                    .map_err(|e| JammiError::FineTune(format!("LoRA projection: {e}")))
             }
-        };
+            TrainingTarget::EncoderAdapters(state) => {
+                let encoder = &state.encoder;
+                let tokenizer = match base.as_ref() {
+                    crate::model::LoadedModel::Candle(m) => m
+                        .tokenizer
+                        .as_ref()
+                        .ok_or_else(|| JammiError::FineTune("No tokenizer in base model".into()))?,
+                    _ => return Err(JammiError::FineTune(
+                        "Encoder-adapters training requires a Candle base model with a tokenizer"
+                            .into(),
+                    )),
+                };
+
+                let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+                let effective_max = self.config.max_seq_length.min(encoder.max_seq_length());
+                let encoding = tokenizer.encode_batch(&text_refs, Some(effective_max))?;
+
+                let rows = encoding.input_ids.len();
+                let cols = encoding.input_ids.first().map_or(0, |v| v.len());
+
+                let input_ids = Tensor::from_vec(
+                    encoding
+                        .input_ids
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<u32>>(),
+                    (rows, cols),
+                    &self.device,
+                )
+                .map_err(|e| JammiError::FineTune(format!("input_ids tensor: {e}")))?;
+
+                let attention_mask = Tensor::from_vec(
+                    encoding
+                        .attention_masks
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<u32>>(),
+                    (rows, cols),
+                    &self.device,
+                )
+                .map_err(|e| JammiError::FineTune(format!("attention_mask tensor: {e}")))?;
+
+                encoder
+                    .forward(&input_ids, &attention_mask)
+                    .map_err(|e| JammiError::FineTune(format!("Encoder forward: {e}")))
+            }
+        }
+    }
+
+    /// Encode a text chunk into a `TrainingBatch` ready for loss computation.
+    fn encode_chunk(&self, chunk: &TextChunk) -> Result<super::data::TrainingBatch> {
+        let encode = |texts: &Vec<String>| -> Result<Tensor> { self.encode_texts(texts) };
 
         match chunk {
             TextChunk::Contrastive {
@@ -860,17 +810,23 @@ impl TrainingLoop {
         Ok(loss)
     }
 
-    /// Apply classification head to projected embeddings.
+    /// Apply the classification head to projected embeddings.
+    ///
+    /// Only the `ProjectionHead` target supports classification training,
+    /// and only when the head was built with both a projection and a
+    /// classifier layer (i.e. `head.layers.len() > 1`).
     fn classify(&self, embeddings: &Tensor) -> Result<Tensor> {
-        if self.model.layers.len() > 1 {
-            self.model.layers[1]
+        match &self.target {
+            TrainingTarget::ProjectionHead { head } if head.layers.len() > 1 => head.layers[1]
                 .1
                 .forward(embeddings)
-                .map_err(|e| JammiError::FineTune(format!("LoRA classifier: {e}")))
-        } else {
-            Err(JammiError::FineTune(
-                "No classification head in LoRA model".into(),
-            ))
+                .map_err(|e| JammiError::FineTune(format!("LoRA classifier: {e}"))),
+            TrainingTarget::ProjectionHead { .. } => Err(JammiError::FineTune(
+                "No classification head in projection target".into(),
+            )),
+            TrainingTarget::EncoderAdapters(_) => Err(JammiError::FineTune(
+                "Classification with encoder adapters is not supported".into(),
+            )),
         }
     }
 
@@ -941,7 +897,6 @@ impl TrainingLoop {
     }
 
     /// Run forward pass over validation set without gradient updates.
-    /// Dual-path: with base_model encodes text chunks, without it uses precomputed batches.
     fn evaluate(&self, val_loader: &TrainingDataLoader) -> Result<f64> {
         if val_loader.is_empty() {
             return Ok(0.0);
@@ -950,39 +905,31 @@ impl TrainingLoop {
         let mut total_loss = 0.0;
         let mut count = 0;
 
-        if self.base_model.is_some() {
+        let accumulate = |batch, total: &mut f64, count: &mut usize| -> Result<()> {
+            let loss = self.compute_loss(&batch)?;
+            let loss = if loss.dtype() == DType::F32 {
+                loss
+            } else {
+                loss.to_dtype(DType::F32)
+                    .map_err(|e| JammiError::FineTune(format!("Val loss dtype cast: {e}")))?
+            };
+            *total += loss
+                .to_scalar::<f32>()
+                .map_err(|e| JammiError::FineTune(format!("Val loss scalar: {e}")))?
+                as f64;
+            *count += 1;
+            Ok(())
+        };
+
+        if val_loader.is_precomputed() {
+            for batch in val_loader.batches(self.config.batch_size)? {
+                accumulate(batch?, &mut total_loss, &mut count)?;
+            }
+        } else {
             let text_chunks = val_loader.text_chunks(self.config.batch_size);
             for chunk in &text_chunks {
                 let batch = self.encode_chunk(chunk)?;
-                let loss = self.compute_loss(&batch)?;
-                let loss = if loss.dtype() == DType::F32 {
-                    loss
-                } else {
-                    loss.to_dtype(DType::F32)
-                        .map_err(|e| JammiError::FineTune(format!("Val loss dtype cast: {e}")))?
-                };
-                total_loss += loss
-                    .to_scalar::<f32>()
-                    .map_err(|e| JammiError::FineTune(format!("Val loss scalar: {e}")))?
-                    as f64;
-                count += 1;
-            }
-        } else {
-            let batches = val_loader.batches(self.config.batch_size)?;
-            for batch in batches {
-                let batch = batch?;
-                let loss = self.compute_loss(&batch)?;
-                let loss = if loss.dtype() == DType::F32 {
-                    loss
-                } else {
-                    loss.to_dtype(DType::F32)
-                        .map_err(|e| JammiError::FineTune(format!("Val loss dtype cast: {e}")))?
-                };
-                total_loss += loss
-                    .to_scalar::<f32>()
-                    .map_err(|e| JammiError::FineTune(format!("Val loss scalar: {e}")))?
-                    as f64;
-                count += 1;
+                accumulate(batch, &mut total_loss, &mut count)?;
             }
         }
 
@@ -993,74 +940,33 @@ impl TrainingLoop {
         })
     }
 
-    /// Save a numbered checkpoint.
-    ///
-    /// For deep LoRA training, the checkpoint contains the encoder's LoRA A/B
-    /// matrices (named with a `_deep` suffix so they don't collide with
-    /// projection-only checkpoints).  For legacy projection-only training, the
-    /// external `LoraModel` weights are saved as before.
+    /// Save a numbered intra-epoch checkpoint. Weights only — the metadata
+    /// JSON is written once when the final adapter lands.
     fn save_checkpoint(&self, dir: &Path, step: usize) -> Result<()> {
-        if let Some(ref deep) = self.deep_lora_model {
-            let path = dir.join(format!("checkpoint_{step}_deep.safetensors"));
-            let weights = deep
-                .named_trainable_weights()
-                .map_err(|e| JammiError::FineTune(format!("Collect deep LoRA weights: {e}")))?;
-            candle_core::safetensors::save(&weights, &path)
-                .map_err(|e| JammiError::FineTune(format!("Save deep LoRA checkpoint: {e}")))?;
-        } else {
-            let path = dir.join(format!("checkpoint_{step}.safetensors"));
-            save_lora_weights(&self.model, &path)?;
-        }
-        Ok(())
+        let path = dir.join(format!("checkpoint_{step}.safetensors"));
+        self.save_checkpoint_weights(&path)
     }
 
-    /// Save a named checkpoint (e.g. "best").
+    /// Save a named checkpoint (e.g. "best"). Weights only.
     fn save_checkpoint_tagged(&self, dir: &Path, tag: &str) -> Result<()> {
-        if let Some(ref deep) = self.deep_lora_model {
-            let path = dir.join(format!("checkpoint_{tag}_deep.safetensors"));
-            let weights = deep
-                .named_trainable_weights()
-                .map_err(|e| JammiError::FineTune(format!("Collect deep LoRA weights: {e}")))?;
-            candle_core::safetensors::save(&weights, &path).map_err(|e| {
-                JammiError::FineTune(format!("Save deep LoRA checkpoint {tag}: {e}"))
-            })?;
-        } else {
-            let path = dir.join(format!("checkpoint_{tag}.safetensors"));
-            save_lora_weights(&self.model, &path)?;
-        }
-        Ok(())
+        let path = dir.join(format!("checkpoint_{tag}.safetensors"));
+        self.save_checkpoint_weights(&path)
+    }
+
+    fn save_checkpoint_weights(&self, path: &Path) -> Result<()> {
+        let weights = self.target.named_trainable_weights()?;
+        candle_core::safetensors::save(&weights, path)
+            .map_err(|e| JammiError::FineTune(format!("Save checkpoint: {e}")))
     }
 
     /// Load a checkpoint, restoring LoRA weights in place.
-    ///
-    /// For deep LoRA, looks for the `_deep`-suffixed file that matches the
-    /// supplied path (e.g. `checkpoint_best.safetensors` →
-    /// `checkpoint_best_deep.safetensors`).
     fn load_checkpoint(&mut self, path: &Path) -> Result<()> {
-        if let Some(ref mut deep) = self.deep_lora_model {
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("checkpoint_best");
-            let deep_path = path.with_file_name(format!("{stem}_deep.safetensors"));
-            if deep_path.exists() {
-                let weights = candle_core::safetensors::load(&deep_path, &self.device)
-                    .map_err(|e| JammiError::FineTune(format!("Load deep LoRA checkpoint: {e}")))?;
-                deep.load_weights(&weights).map_err(|e| {
-                    JammiError::FineTune(format!("Apply deep LoRA checkpoint: {e}"))
-                })?;
-            }
-        } else {
-            let device = self
-                .model
-                .layers
-                .first()
-                .map(|(_, l)| l.lora_a.device().clone())
-                .unwrap_or(candle_core::Device::Cpu);
-            let weights = super::lora::load_lora_weights(path, &device)?;
-            super::lora::apply_loaded_weights(&mut self.model, &weights)?;
+        if !path.exists() {
+            return Ok(());
         }
-        Ok(())
+        let weights = candle_core::safetensors::load(path, &self.device)
+            .map_err(|e| JammiError::FineTune(format!("Load checkpoint: {e}")))?;
+        self.target.load_weights(&weights)
     }
 }
 

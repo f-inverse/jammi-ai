@@ -3,9 +3,9 @@
 //!
 //! The single-layer LoRA primitive (`LoraLinear`), the init-mode enum, and the
 //! `MaybeLoraLinear` wrapper now live in `jammi-lora`. This module provides the
-//! jammi-ai-specific assemblies — projection-only / classification / NER
-//! adapter stacks — and the safetensors save/load helpers keyed by the per-job
-//! layer names jammi-ai uses.
+//! jammi-ai-specific projection-head assemblies (embedding projection +
+//! optional classifier/NER head) used by
+//! [`crate::fine_tune::target::TrainingTarget::ProjectionHead`].
 
 use std::collections::HashMap;
 use std::path::Path;

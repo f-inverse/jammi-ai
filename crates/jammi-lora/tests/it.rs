@@ -241,7 +241,6 @@ fn adapter_config_json_roundtrip() {
     let mut rank_pattern = HashMap::new();
     rank_pattern.insert("query".to_string(), 16);
     let cfg = AdapterConfig {
-        adapter_type: "deep_lora".into(),
         model_type: "bert".into(),
         lora_rank: 8,
         lora_alpha: 16.0,
@@ -254,7 +253,6 @@ fn adapter_config_json_roundtrip() {
 
     let json = serde_json::to_string(&cfg).unwrap();
     let decoded: AdapterConfig = serde_json::from_str(&json).unwrap();
-    assert_eq!(decoded.adapter_type, cfg.adapter_type);
     assert_eq!(decoded.model_type, cfg.model_type);
     assert_eq!(decoded.lora_rank, cfg.lora_rank);
     assert_eq!(decoded.lora_alpha, cfg.lora_alpha);
@@ -268,7 +266,6 @@ fn adapter_config_json_roundtrip() {
 #[test]
 fn adapter_config_default_optional_fields() {
     let json = r#"{
-        "adapter_type": "deep_lora",
         "model_type": "bert",
         "lora_rank": 8,
         "lora_alpha": 16.0,
@@ -294,7 +291,6 @@ fn save_load_adapter_roundtrip() {
     tensors.insert("layer.0.query.lora_b".to_string(), b.clone());
 
     let cfg = AdapterConfig {
-        adapter_type: "deep_lora".into(),
         model_type: "bert".into(),
         lora_rank: 2,
         lora_alpha: 4.0,
@@ -306,7 +302,7 @@ fn save_load_adapter_roundtrip() {
     };
 
     save_adapter(dir.path(), &tensors, &cfg).unwrap();
-    let (cfg_back, tensors_back) = load_adapter(dir.path(), &device).unwrap();
+    let (cfg_back, tensors_back): (AdapterConfig, _) = load_adapter(dir.path(), &device).unwrap();
 
     assert_eq!(cfg_back.lora_rank, cfg.lora_rank);
     assert_eq!(cfg_back.target_modules, cfg.target_modules);

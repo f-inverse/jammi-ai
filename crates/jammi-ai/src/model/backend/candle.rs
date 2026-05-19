@@ -336,7 +336,7 @@ impl CandleModel {
             let pooled = self.mean_pool(&output, &attention_mask)?;
             let normalized = self.l2_normalize(&pooled)?;
 
-            // Apply projection-only LoRA if present
+            // Apply the trained projection head if one was loaded.
             let final_output = if let Some(ref lora) = self.lora_projection {
                 lora.forward(&normalized)
                     .map_err(|e| JammiError::Inference(format!("LoRA projection: {e}")))?
@@ -689,10 +689,13 @@ impl ModelBackend for CandleBackend {
             resolved.model_config.clone()
         };
 
-        // Detect a deep-LoRA adapter ahead of building the encoder so we can
-        // pass the LoRA injection config into the builder once and avoid a
-        // second pass that rebuilds the encoder for inference.
-        let deep_lora_adapter: Option<(jammi_lora::AdapterConfig, std::path::PathBuf)> =
+        // Read the saved adapter, if any. Both flavours of `SavedAdapter`
+        // share the same on-disk layout (`adapter.safetensors` plus
+        // `adapter_config.json` with the `adapter_type` discriminator); the
+        // variant is the type-level switch that decides whether to wire
+        // LoRA inside the encoder or leave it as an external projection
+        // head applied post-pool.
+        let saved_adapter: Option<(crate::fine_tune::target::SavedAdapter, std::path::PathBuf)> =
             resolved.adapter_path.as_ref().and_then(|p| {
                 let cfg_path = p.join("adapter_config.json");
                 let weights_path = p.join("adapter.safetensors");
@@ -700,17 +703,26 @@ impl ModelBackend for CandleBackend {
                     return None;
                 }
                 let cfg_str = std::fs::read_to_string(&cfg_path).ok()?;
-                let cfg: jammi_lora::AdapterConfig = serde_json::from_str(&cfg_str).ok()?;
-                (cfg.adapter_type == "deep_lora").then_some((cfg, weights_path))
+                let saved: crate::fine_tune::target::SavedAdapter =
+                    serde_json::from_str(&cfg_str).ok()?;
+                Some((saved, weights_path))
             });
-        let lora_owned = deep_lora_adapter.as_ref().map(|(cfg, _)| {
+
+        let encoder_adapter = saved_adapter.as_ref().and_then(|(saved, weights)| {
+            if let crate::fine_tune::target::SavedAdapter::EncoderAdapters(cfg) = saved {
+                Some(((**cfg).clone(), weights.as_path()))
+            } else {
+                None
+            }
+        });
+        let encoder_owned = encoder_adapter.as_ref().map(|(cfg, _)| {
             (
                 cfg.target_modules.clone(),
                 cfg.layers_to_transform.clone(),
                 cfg.rank_pattern.clone(),
             )
         });
-        let lora_build = match (&deep_lora_adapter, &lora_owned) {
+        let lora_build = match (&encoder_adapter, &encoder_owned) {
             (Some((cfg, _)), Some((targets, layers, pattern))) => jammi_lora::LoraBuildConfig {
                 target_modules: targets,
                 layers_to_transform: layers,
@@ -723,10 +735,9 @@ impl ModelBackend for CandleBackend {
             },
             _ => jammi_lora::LoraBuildConfig::frozen(),
         };
-        let encoder_adapter_file: Option<&std::path::Path> = deep_lora_adapter
-            .as_ref()
-            .map(|(_, weights)| weights.as_path());
-        let encoder_backbone_dtype = deep_lora_adapter
+        let encoder_adapter_file: Option<&std::path::Path> =
+            encoder_adapter.as_ref().map(|(_, p)| *p);
+        let encoder_backbone_dtype = encoder_adapter
             .as_ref()
             .map(|(cfg, _)| candle_core::DType::from(cfg.backbone_dtype))
             .unwrap_or(DType::F32);
@@ -922,24 +933,20 @@ impl ModelBackend for CandleBackend {
                 message: "Could not parse model dimensions from config".into(),
             })?;
 
-        // Load LoRA adapter if present (fine-tuned models).
-        //
-        // Deep-LoRA adapters are already installed into `text` above via the
+        // Load the post-pool projection head, if the saved adapter is one.
+        // Encoder-adapters were already installed into `text` above via the
         // encoder builder's `.lora(...)` + `.adapter(Some(...))` calls.
-        // What remains here is the legacy projection-only adapter format
-        // (adapter.safetensors with no adapter_config.json, or adapter_type
-        // ≠ "deep_lora") — that path keeps the in-tree projection layer.
-        let lora_projection = if deep_lora_adapter.is_some() {
-            None
-        } else if let Some(ref adapter_path) = resolved.adapter_path {
-            let adapter_file = adapter_path.join("adapter.safetensors");
-            if adapter_file.exists() {
-                load_projection_adapter(&adapter_file, &device, &dimensions, &resolved.model_id.0)?
-            } else {
-                None
+        let lora_projection = match saved_adapter.as_ref() {
+            Some((crate::fine_tune::target::SavedAdapter::ProjectionHead(cfg), weights_path)) => {
+                load_projection_adapter(
+                    weights_path,
+                    cfg.lora_alpha,
+                    &device,
+                    &dimensions,
+                    &resolved.model_id.0,
+                )?
             }
-        } else {
-            None
+            _ => None,
         };
 
         // Load NER token classifier if this is a NER model
@@ -996,22 +1003,22 @@ fn tokens_to_tensor(vecs: &[Vec<u32>], device: &Device) -> Result<Tensor> {
     Tensor::from_vec(flat, (rows, cols), device).map_err(|e| JammiError::Inference(e.to_string()))
 }
 
-/// Load a legacy projection-only LoRA adapter from a safetensors file.
-///
-/// Returns the single `projection` LoraLinear, or `None` if the file cannot
-/// be read or the expected keys are missing.
+/// Load the projection-head LoRA adapter from `adapter_file` using the alpha
+/// recorded in the adapter's saved config. Returns `Some(LoraLinear)` keyed
+/// at `projection.lora_a` / `projection.lora_b`, or `None` if the projection
+/// keys are absent (the adapter was a classifier/NER head with no embedding
+/// projection — that case does not produce a post-pool projection).
 fn load_projection_adapter(
     adapter_file: &std::path::Path,
+    lora_alpha: f64,
     device: &Device,
     dimensions: &crate::model::ModelDimensions,
     model_id: &str,
 ) -> jammi_engine::error::Result<Option<jammi_lora::LoraLinear>> {
     let adapter_weights =
-        crate::fine_tune::lora::load_lora_weights(adapter_file, device).map_err(|e| {
-            JammiError::Model {
-                model_id: model_id.to_string(),
-                message: format!("Load adapter: {e}"),
-            }
+        candle_core::safetensors::load(adapter_file, device).map_err(|e| JammiError::Model {
+            model_id: model_id.to_string(),
+            message: format!("Load adapter: {e}"),
         })?;
 
     let hidden_size = dimensions.hidden_size;
@@ -1034,7 +1041,7 @@ fn load_projection_adapter(
         base_linear,
         lora_a,
         lora_b,
-        16.0, // default alpha — matches FineTuneConfig::default()
+        lora_alpha,
     )))
 }
 

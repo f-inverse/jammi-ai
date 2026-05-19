@@ -4,7 +4,7 @@
 //!
 //! 1. **Pure-function helpers** — `should_apply_lora` and `effective_rank`
 //!    (module-name matching + per-module rank overrides). No fixtures.
-//! 2. **Config plumbing** — `LoraBuildConfig` → `DeepLoraAdapterConfig::from_build`
+//! 2. **Config plumbing** — `LoraBuildConfig` → `AdapterConfig::from_build`
 //!    and the on-disk JSON roundtrip. No fixtures.
 //! 3. **End-to-end** — fine-tune the local `tiny_bert` and `tiny_modernbert`
 //!    fixtures with `target_modules` populated, walk back through the saved
@@ -17,13 +17,12 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 
-use jammi_ai::fine_tune::deep_lora::{
-    effective_rank, should_apply_lora, DeepLoraAdapterConfig, LoraBuildConfig,
-};
-use jammi_ai::fine_tune::lora::LoraInitMode;
-use jammi_ai::fine_tune::{BackboneDtype, FineTuneConfig, FineTuneMethod, LrSchedule};
+use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod, LrSchedule};
 use jammi_ai::session::InferenceSession;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+use jammi_lora::{
+    effective_rank, should_apply_lora, AdapterConfig, BackboneDtype, LoraBuildConfig, LoraInitMode,
+};
 
 use crate::common;
 
@@ -99,7 +98,7 @@ fn effective_rank_substring_match_wins_over_default() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Layer 2 — LoraBuildConfig → DeepLoraAdapterConfig::from_build
+// Layer 2 — LoraBuildConfig → AdapterConfig::from_build
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -121,7 +120,7 @@ fn adapter_config_from_build_copies_lora_fields() {
         init_mode: LoraInitMode::ZerosB,
     };
 
-    let cfg = DeepLoraAdapterConfig::from_build("bert", &lora, BackboneDtype::F32);
+    let cfg = AdapterConfig::from_build("bert", &lora, BackboneDtype::F32);
 
     // Persisted fields copied verbatim.
     assert_eq!(cfg.adapter_type, "deep_lora");
@@ -141,7 +140,7 @@ fn adapter_config_json_roundtrip_preserves_every_field() {
     let mut rank_pattern = HashMap::new();
     rank_pattern.insert("Wqkv".to_string(), 16);
 
-    let cfg = DeepLoraAdapterConfig {
+    let cfg = AdapterConfig {
         adapter_type: "deep_lora".into(),
         model_type: "modernbert".into(),
         lora_rank: 8,
@@ -154,7 +153,7 @@ fn adapter_config_json_roundtrip_preserves_every_field() {
     };
 
     let json = serde_json::to_string_pretty(&cfg).unwrap();
-    let parsed: DeepLoraAdapterConfig = serde_json::from_str(&json).unwrap();
+    let parsed: AdapterConfig = serde_json::from_str(&json).unwrap();
 
     assert_eq!(parsed.adapter_type, cfg.adapter_type);
     assert_eq!(parsed.model_type, cfg.model_type);
@@ -179,7 +178,7 @@ fn adapter_config_json_accepts_missing_optional_fields() {
         "use_rslora": false,
         "target_modules": ["query"]
     }"#;
-    let cfg: DeepLoraAdapterConfig = serde_json::from_str(minimal).unwrap();
+    let cfg: AdapterConfig = serde_json::from_str(minimal).unwrap();
     assert_eq!(cfg.layers_to_transform, None);
     assert!(cfg.rank_pattern.is_empty());
     assert_eq!(cfg.backbone_dtype, BackboneDtype::F32);
@@ -237,16 +236,6 @@ fn adapter_dir_for_model(session: &InferenceSession, model_id: &str) -> std::pat
     std::path::PathBuf::from(record.artifact_path.expect("artifact_path"))
 }
 
-// Known-failing on the local `tiny_bert` fixture: the `deep_lora::bert` training
-// path hangs after a successful encoder build.  The ModernBERT path in the
-// neighbouring test works end-to-end on `tiny_modernbert`, so the issue is
-// BERT-specific (likely in the forward / backward shape handling for the raw
-// `BertModel` layout that `tiny_bert` ships, exposed by the prefix
-// auto-detection added in this commit).  Resolving it requires deeper rework
-// of `bert.rs`'s forward pass than belongs in a CLAUDE.md-alignment PR; track
-// as a follow-up.  When fixed, remove `#[ignore]` here and on the
-// `deep_lora_changes_embeddings_versus_base` test below.
-#[ignore = "deep_lora::bert forward path hangs on tiny_bert fixture; see test comment"]
 #[tokio::test]
 async fn deep_lora_bert_fine_tune_writes_deep_adapter_marker() {
     let (session, _dir) = session_with_training_data().await;
@@ -281,7 +270,7 @@ async fn deep_lora_bert_fine_tune_writes_deep_adapter_marker() {
         "deep-LoRA adapter_config.json should exist at {cfg_path:?}"
     );
     let cfg_str = std::fs::read_to_string(&cfg_path).unwrap();
-    let cfg: DeepLoraAdapterConfig = serde_json::from_str(&cfg_str).unwrap();
+    let cfg: AdapterConfig = serde_json::from_str(&cfg_str).unwrap();
 
     assert_eq!(cfg.adapter_type, "deep_lora");
     assert_eq!(cfg.model_type, "bert");
@@ -326,7 +315,7 @@ async fn deep_lora_modernbert_fine_tune_writes_modernbert_marker() {
     job.wait().await.unwrap();
 
     let adapter_dir = adapter_dir_for_model(&session, job.model_id());
-    let cfg: DeepLoraAdapterConfig = serde_json::from_str(
+    let cfg: AdapterConfig = serde_json::from_str(
         &std::fs::read_to_string(adapter_dir.join("adapter_config.json")).unwrap(),
     )
     .unwrap();
@@ -343,7 +332,15 @@ async fn deep_lora_modernbert_fine_tune_writes_modernbert_marker() {
 // `deep_lora::bert` hangs on the `tiny_bert` fixture's BertModel layout.
 // Once that lands, this test verifies the trainer EpochState/StepContext
 // refactor produces gradients that shift the embedding direction.
-#[ignore = "deep_lora::bert forward path hangs on tiny_bert fixture; see neighbouring test"]
+// Backward does not propagate gradient through the deep encoder to the LoRA
+// A/B tensors on the BERT path — after training, the saved adapter holds
+// `B = 0` and `A` at exactly the Kaiming init value, so the fine-tuned
+// embedding equals the base embedding (max |Δ| = 0). The hang fix from Spec 2
+// (`.contiguous()` + canonical mask) exposed this autograd-integration issue
+// that the previous hang had been masking. Diagnosing where the autograd
+// chain breaks across `Bert::forward_hidden` → `pool_and_normalize` requires
+// candle-internals work outside Spec 3's scope. Track separately.
+#[ignore = "deep-LoRA backward produces no gradient on lora_a/lora_b (autograd chain issue)"]
 #[tokio::test]
 async fn deep_lora_changes_embeddings_versus_base() {
     // Proves the deep-LoRA training loop produced gradients that updated the

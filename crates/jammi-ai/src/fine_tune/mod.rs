@@ -4,15 +4,14 @@
 //! models. Training data is read through DataFusion, so any registered source
 //! (Parquet, CSV, Postgres) works as long as it has the right schema.
 
+pub mod classifier;
 pub mod data;
-pub mod deep_lora;
 pub mod job;
 pub mod lora;
 pub mod trainer;
 
 use std::collections::HashMap;
 
-use candle_core::DType;
 use serde::{Deserialize, Serialize};
 
 /// Supported fine-tuning methods.
@@ -116,39 +115,6 @@ impl Default for LrSchedule {
     }
 }
 
-/// Dtype for the frozen backbone weights loaded during deep LoRA fine-tuning.
-///
-/// `BF16` halves backbone memory (~450 MB → ~225 MB for base, multi-GB for
-/// large) with negligible impact on training dynamics because the frozen
-/// backbone weights are never updated.  The trainable LoRA A/B matrices always
-/// remain in F32 regardless of this setting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BackboneDtype {
-    /// Full precision (default; maximally compatible).
-    F32,
-    /// BFloat16 — recommended for CUDA/Metal; cuts backbone VRAM by ~half.
-    BF16,
-    /// Half-precision float — compatible with most CUDA devices.
-    F16,
-}
-
-impl Default for BackboneDtype {
-    fn default() -> Self {
-        Self::F32
-    }
-}
-
-impl From<BackboneDtype> for DType {
-    fn from(d: BackboneDtype) -> Self {
-        match d {
-            BackboneDtype::F32 => DType::F32,
-            BackboneDtype::BF16 => DType::BF16,
-            BackboneDtype::F16 => DType::F16,
-        }
-    }
-}
-
 /// Configuration for a fine-tuning job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FineTuneConfig {
@@ -214,13 +180,13 @@ pub struct FineTuneConfig {
 
     /// Initialization strategy for the LoRA A (and optionally B) matrix.
     #[serde(default)]
-    pub init_lora_weights: lora::LoraInitMode,
+    pub init_lora_weights: jammi_lora::LoraInitMode,
 
     /// Dtype for the frozen backbone weights. `BF16` cuts backbone VRAM by ~half.
     /// LoRA A/B matrices are always kept in F32 for numerical stability.
     /// Default: `F32` for backward compatibility.
     #[serde(default)]
-    pub backbone_dtype: BackboneDtype,
+    pub backbone_dtype: jammi_lora::BackboneDtype,
 
     /// AdamW weight decay (L2 regularization coefficient). Default: 0.01.
     /// Matches `train_embedding_model.py` which uses `AdamW(weight_decay=0.01)`.
@@ -263,8 +229,8 @@ impl Default for FineTuneConfig {
             layers_to_transform: None,
             use_rslora: false,
             rank_pattern: HashMap::new(),
-            init_lora_weights: lora::LoraInitMode::ZerosB,
-            backbone_dtype: BackboneDtype::F32,
+            init_lora_weights: jammi_lora::LoraInitMode::ZerosB,
+            backbone_dtype: jammi_lora::BackboneDtype::F32,
             weight_decay: 0.01,
             max_grad_norm: 1.0,
         }

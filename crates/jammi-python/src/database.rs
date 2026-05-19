@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 
-use jammi_ai::fine_tune::{BackboneDtype, EarlyStoppingMetric, FineTuneConfig, FineTuneMethod};
+use jammi_ai::fine_tune::{EarlyStoppingMetric, FineTuneConfig, FineTuneMethod};
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+use jammi_lora::BackboneDtype;
 
 use crate::convert::{batches_to_pyarrow, json_to_pydict};
 use crate::error::to_pyerr;

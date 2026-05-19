@@ -5,12 +5,12 @@ use candle_nn::{Linear, Module, VarBuilder, VarMap};
 use tempfile::TempDir;
 
 use jammi_ai::fine_tune::{
-    data::TrainingDataLoader, lora::LoraLinear, trainer::compute_lr, FineTuneConfig,
-    FineTuneMethod, LrSchedule,
+    data::TrainingDataLoader, trainer::compute_lr, FineTuneConfig, FineTuneMethod, LrSchedule,
 };
 use jammi_ai::session::InferenceSession;
 use jammi_engine::catalog::status::FineTuneJobStatus;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+use jammi_lora::LoraLinear;
 
 use crate::common;
 

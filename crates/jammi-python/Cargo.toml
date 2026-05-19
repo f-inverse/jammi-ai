@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 [dependencies]
 jammi-engine.workspace = true
 jammi-ai.workspace = true
+jammi-lora.workspace = true
 pyo3.workspace = true
 arrow.workspace = true
 arrow-array.workspace = true

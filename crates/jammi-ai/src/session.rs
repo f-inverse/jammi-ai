@@ -454,29 +454,33 @@ impl InferenceSession {
         let catalog_for_err = Arc::clone(&catalog);
         let job_id_for_err = job_id_clone.clone();
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = run_fine_tune_blocking(
-                catalog,
-                artifact_dir,
-                job_id_clone,
-                output_model_id_clone,
-                base_model_str,
-                task_str,
-                config,
-                data_loader,
-                base_model_arc,
-                hidden_size,
-                device_config,
-            ) {
-                // Surface the failure to the catalog so that `FineTuneJob::wait()`
-                // observes a terminal state instead of polling forever.
-                tracing::error!(job_id = %job_id_for_err, error = %e, "Fine-tune blocking task failed");
-                let metrics = serde_json::json!({ "error_message": e.to_string() }).to_string();
-                if let Err(e2) = catalog_for_err.update_fine_tune_status(
-                    &job_id_for_err,
-                    jammi_engine::catalog::status::FineTuneJobStatus::Failed,
-                    Some(&metrics),
-                ) {
-                    tracing::error!(job_id = %job_id_for_err, error = %e2, "Failed to record terminal status");
+            // Catch panics inside the training loop so a terminal status is
+            // always recorded — otherwise `FineTuneJob::wait()` polls forever.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_fine_tune_blocking(
+                    catalog,
+                    artifact_dir,
+                    job_id_clone,
+                    output_model_id_clone,
+                    base_model_str,
+                    task_str,
+                    config,
+                    data_loader,
+                    base_model_arc,
+                    hidden_size,
+                    device_config,
+                )
+            }));
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::error!(job_id = %job_id_for_err, error = %e, "Fine-tune blocking task failed");
+                    record_failed(&catalog_for_err, &job_id_for_err, e.to_string());
+                }
+                Err(payload) => {
+                    let msg = panic_message(payload.as_ref());
+                    tracing::error!(job_id = %job_id_for_err, panic = %msg, "Fine-tune blocking task panicked");
+                    record_failed(&catalog_for_err, &job_id_for_err, format!("Panic: {msg}"));
                 }
             }
         });
@@ -725,6 +729,31 @@ fn build_training_data_loader(
     }
 }
 
+/// Extract a human-readable message from a panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<unknown panic payload>".into()
+    }
+}
+
+/// Record a terminal `Failed` status for a fine-tune job, surfacing the cause
+/// via the catalog metrics blob so callers polling `FineTuneJob::wait()` see
+/// the failure instead of an indefinite `Running` state.
+fn record_failed(catalog: &Arc<jammi_engine::catalog::Catalog>, job_id: &str, msg: String) {
+    let metrics = serde_json::json!({ "error_message": msg }).to_string();
+    if let Err(e) = catalog.update_fine_tune_status(
+        job_id,
+        jammi_engine::catalog::status::FineTuneJobStatus::Failed,
+        Some(&metrics),
+    ) {
+        tracing::error!(job_id = %job_id, error = %e, "Failed to record terminal status");
+    }
+}
+
 /// Run fine-tuning in a blocking context.
 #[allow(clippy::too_many_arguments)]
 fn run_fine_tune_blocking(
@@ -786,8 +815,8 @@ fn run_fine_tune_blocking(
         .base_model(base_model_arc)
         .device(device.clone());
 
-    if let Some(dlm) = deep_lora {
-        builder = builder.deep_lora_model(dlm);
+    if let Some((encoder, adapter_cfg)) = deep_lora {
+        builder = builder.deep_lora_model(encoder, adapter_cfg);
     }
 
     let mut training_loop = builder.build()?;
@@ -822,15 +851,16 @@ fn run_fine_tune_blocking(
     Ok(())
 }
 
-/// Construct a [`DeepLoraModel`] for the given base model by loading its frozen
-/// weights from the catalog artifact path and wrapping target modules with LoRA.
+/// Construct a deep-LoRA encoder and its persisted adapter config for the given
+/// base model by loading frozen weights from the catalog artifact path and
+/// wrapping target modules with LoRA.
 fn build_deep_lora_model(
     base_model_id: &str,
     catalog: &Arc<jammi_engine::catalog::Catalog>,
     config: &FineTuneConfig,
     varmap: &candle_nn::VarMap,
     device: &candle_core::Device,
-) -> Result<crate::fine_tune::deep_lora::DeepLoraModel> {
+) -> Result<(jammi_encoders::AnyEncoder, jammi_lora::AdapterConfig)> {
     use std::path::Path;
 
     // Strip URI scheme prefixes (e.g. "hf://", "local:") so the catalog
@@ -920,64 +950,70 @@ fn build_deep_lora_model(
             "model.safetensors not found at {weights_path:?}"
         )));
     }
-    let weights_paths: Vec<&Path> = vec![weights_path.as_path()];
 
-    let dropout = if config.lora_dropout > 0.0 {
+    let lora_dropout = if config.lora_dropout > 0.0 {
         Some(config.lora_dropout as f32)
     } else {
         None
     };
 
-    let lora = crate::fine_tune::deep_lora::LoraBuildConfig {
+    let lora = jammi_lora::LoraBuildConfig {
         target_modules: &config.target_modules,
         layers_to_transform: &config.layers_to_transform,
         lora_rank: config.lora_rank,
         lora_alpha: config.lora_alpha,
         use_rslora: config.use_rslora,
-        lora_dropout: dropout,
+        lora_dropout,
         rank_pattern: &config.rank_pattern,
         init_mode: config.init_lora_weights,
     };
-    let backbone_dtype = config.backbone_dtype.into();
 
-    let encoder: Box<dyn crate::fine_tune::deep_lora::DeepLoraEncoder> = match model_type {
-        "distilbert" => Box::new(crate::fine_tune::deep_lora::distilbert::build(
-            &weights_paths,
-            &model_config,
-            lora,
-            backbone_dtype,
-            device,
-            varmap,
-            None,
-        )?),
-        "modernbert" => Box::new(crate::fine_tune::deep_lora::modernbert::build(
-            &weights_paths,
-            &model_config,
-            lora,
-            backbone_dtype,
-            device,
-            varmap,
-            None,
-        )?),
-        _ => Box::new(crate::fine_tune::deep_lora::bert::build(
-            &weights_paths,
-            &model_config,
-            lora,
-            backbone_dtype,
-            device,
-            varmap,
-            None,
-        )?),
+    let backbone_dtype: candle_core::DType = config.backbone_dtype.into();
+    let adapter_cfg =
+        jammi_lora::AdapterConfig::from_build(model_type, &lora, config.backbone_dtype);
+
+    let weights_paths: Vec<&Path> = vec![weights_path.as_path()];
+
+    let encoder = match model_type {
+        "distilbert" => {
+            let distilbert_config: jammi_encoders::DistilBertConfig =
+                serde_json::from_value(model_config.clone()).map_err(|e| {
+                    JammiError::FineTune(format!("Parse DistilBert config.json: {e}"))
+                })?;
+            jammi_encoders::AnyEncoder::DistilBert(
+                jammi_encoders::DistilBert::builder()
+                    .lora(lora)
+                    .backbone_dtype(backbone_dtype)
+                    .build(&weights_paths, &distilbert_config, device, varmap)
+                    .map_err(|e| JammiError::FineTune(format!("Build DistilBert encoder: {e}")))?,
+            )
+        }
+        "modernbert" => {
+            let modernbert_config: jammi_encoders::ModernBertConfig =
+                serde_json::from_value(model_config.clone()).map_err(|e| {
+                    JammiError::FineTune(format!("Parse ModernBert config.json: {e}"))
+                })?;
+            jammi_encoders::AnyEncoder::ModernBert(
+                jammi_encoders::ModernBert::builder()
+                    .lora(lora)
+                    .backbone_dtype(backbone_dtype)
+                    .build(&weights_paths, &modernbert_config, device, varmap)
+                    .map_err(|e| JammiError::FineTune(format!("Build ModernBert encoder: {e}")))?,
+            )
+        }
+        _ => {
+            let bert_config: jammi_encoders::BertConfig =
+                serde_json::from_value(model_config.clone())
+                    .map_err(|e| JammiError::FineTune(format!("Parse Bert config.json: {e}")))?;
+            jammi_encoders::AnyEncoder::Bert(
+                jammi_encoders::Bert::builder()
+                    .lora(lora)
+                    .backbone_dtype(backbone_dtype)
+                    .build(&weights_paths, &bert_config, device, varmap)
+                    .map_err(|e| JammiError::FineTune(format!("Build Bert encoder: {e}")))?,
+            )
+        }
     };
 
-    let adapter_cfg = crate::fine_tune::deep_lora::DeepLoraAdapterConfig::from_build(
-        model_type,
-        &lora,
-        config.backbone_dtype,
-    );
-
-    Ok(crate::fine_tune::deep_lora::DeepLoraModel::new(
-        encoder,
-        adapter_cfg,
-    ))
+    Ok((encoder, adapter_cfg))
 }

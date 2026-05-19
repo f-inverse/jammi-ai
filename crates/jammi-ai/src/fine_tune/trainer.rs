@@ -10,8 +10,10 @@ use jammi_engine::catalog::status::FineTuneJobStatus;
 use jammi_engine::catalog::Catalog;
 use jammi_engine::error::{JammiError, Result};
 
+use jammi_encoders::AnyEncoder;
+use jammi_lora::AdapterConfig;
+
 use super::data::{TextChunk, TrainingDataLoader};
-use super::deep_lora::DeepLoraModel;
 use super::lora::{save_lora_weights, LoraModel};
 use super::{EarlyStoppingMetric, FineTuneConfig, LrSchedule};
 use crate::model::{LoadedModel, ModelTask};
@@ -145,7 +147,9 @@ pub struct TrainingLoop {
     device: Device,
     /// When set, `encode_chunk` runs the deep LoRA encoder instead of the
     /// frozen base model + external LoRA projection.
-    deep_lora_model: Option<DeepLoraModel>,
+    deep_lora_model: Option<AnyEncoder>,
+    /// Adapter metadata persisted alongside the deep-LoRA weights.
+    deep_lora_adapter_cfg: Option<AdapterConfig>,
 }
 
 /// Builder for [`TrainingLoop`]. Core ML params (model, varmap, config) are
@@ -159,7 +163,8 @@ pub struct TrainingLoopBuilder {
     artifact_dir: Option<PathBuf>,
     base_model: Option<Arc<LoadedModel>>,
     device: Device,
-    deep_lora_model: Option<DeepLoraModel>,
+    deep_lora_model: Option<AnyEncoder>,
+    deep_lora_adapter_cfg: Option<AdapterConfig>,
 }
 
 impl TrainingLoopBuilder {
@@ -175,6 +180,7 @@ impl TrainingLoopBuilder {
             base_model: None,
             device: Device::Cpu,
             deep_lora_model: None,
+            deep_lora_adapter_cfg: None,
         }
     }
 
@@ -184,10 +190,12 @@ impl TrainingLoopBuilder {
         self
     }
 
-    /// Set an optional deep LoRA encoder. When provided, `encode_chunk` will
-    /// call this encoder directly instead of the frozen base model.
-    pub fn deep_lora_model(mut self, model: DeepLoraModel) -> Self {
-        self.deep_lora_model = Some(model);
+    /// Set an optional deep LoRA encoder + the adapter metadata persisted
+    /// alongside its weights. When provided, `encode_chunk` calls this encoder
+    /// directly instead of the frozen base model.
+    pub fn deep_lora_model(mut self, encoder: AnyEncoder, adapter_cfg: AdapterConfig) -> Self {
+        self.deep_lora_model = Some(encoder);
+        self.deep_lora_adapter_cfg = Some(adapter_cfg);
         self
     }
 
@@ -237,6 +245,7 @@ impl TrainingLoopBuilder {
             base_model: self.base_model,
             device: self.device,
             deep_lora_model: self.deep_lora_model,
+            deep_lora_adapter_cfg: self.deep_lora_adapter_cfg,
         })
     }
 }
@@ -451,7 +460,14 @@ impl TrainingLoop {
 
         // Save final adapter (deep LoRA or projection-only)
         if let Some(ref deep) = self.deep_lora_model {
-            deep.save(&checkpoint_dir)?;
+            let weights = deep
+                .named_trainable_weights()
+                .map_err(|e| JammiError::FineTune(format!("Collect deep LoRA weights: {e}")))?;
+            let cfg = self.deep_lora_adapter_cfg.as_ref().ok_or_else(|| {
+                JammiError::FineTune("deep LoRA encoder set without an adapter config".into())
+            })?;
+            jammi_lora::save_adapter(&checkpoint_dir, &weights, cfg)
+                .map_err(|e| JammiError::FineTune(format!("Save deep LoRA adapter: {e}")))?;
         } else {
             let adapter_path = checkpoint_dir.join("adapter.safetensors");
             save_lora_weights(&self.model, &adapter_path)?;
@@ -512,7 +528,8 @@ impl TrainingLoop {
         };
 
         let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-        let encoding = tokenizer.encode_batch(&text_refs, Some(self.config.max_seq_length))?;
+        let effective_max = self.config.max_seq_length.min(deep.max_seq_length());
+        let encoding = tokenizer.encode_batch(&text_refs, Some(effective_max))?;
 
         let rows = encoding.input_ids.len();
         let cols = encoding.input_ids.first().map_or(0, |v| v.len());
@@ -540,6 +557,7 @@ impl TrainingLoop {
         .map_err(|e| JammiError::FineTune(format!("attention_mask tensor: {e}")))?;
 
         deep.forward(&input_ids, &attention_mask)
+            .map_err(|e| JammiError::FineTune(format!("Deep LoRA forward: {e}")))
     }
 
     /// Encode texts through the frozen base model. Returns (batch_size, hidden_size) Tensor.
@@ -563,7 +581,10 @@ impl TrainingLoop {
 
     /// Apply LoRA projection to base embeddings.
     fn project(&self, embeddings: &Tensor) -> Result<Tensor> {
-        self.model.layers[0].1.forward(embeddings)
+        self.model.layers[0]
+            .1
+            .forward(embeddings)
+            .map_err(|e| JammiError::FineTune(format!("LoRA projection: {e}")))
     }
 
     /// Encode a text chunk through the base model and project through LoRA,
@@ -842,7 +863,10 @@ impl TrainingLoop {
     /// Apply classification head to projected embeddings.
     fn classify(&self, embeddings: &Tensor) -> Result<Tensor> {
         if self.model.layers.len() > 1 {
-            self.model.layers[1].1.forward(embeddings)
+            self.model.layers[1]
+                .1
+                .forward(embeddings)
+                .map_err(|e| JammiError::FineTune(format!("LoRA classifier: {e}")))
         } else {
             Err(JammiError::FineTune(
                 "No classification head in LoRA model".into(),
@@ -978,7 +1002,9 @@ impl TrainingLoop {
     fn save_checkpoint(&self, dir: &Path, step: usize) -> Result<()> {
         if let Some(ref deep) = self.deep_lora_model {
             let path = dir.join(format!("checkpoint_{step}_deep.safetensors"));
-            let weights = deep.encoder.named_trainable_weights()?;
+            let weights = deep
+                .named_trainable_weights()
+                .map_err(|e| JammiError::FineTune(format!("Collect deep LoRA weights: {e}")))?;
             candle_core::safetensors::save(&weights, &path)
                 .map_err(|e| JammiError::FineTune(format!("Save deep LoRA checkpoint: {e}")))?;
         } else {
@@ -992,7 +1018,9 @@ impl TrainingLoop {
     fn save_checkpoint_tagged(&self, dir: &Path, tag: &str) -> Result<()> {
         if let Some(ref deep) = self.deep_lora_model {
             let path = dir.join(format!("checkpoint_{tag}_deep.safetensors"));
-            let weights = deep.encoder.named_trainable_weights()?;
+            let weights = deep
+                .named_trainable_weights()
+                .map_err(|e| JammiError::FineTune(format!("Collect deep LoRA weights: {e}")))?;
             candle_core::safetensors::save(&weights, &path).map_err(|e| {
                 JammiError::FineTune(format!("Save deep LoRA checkpoint {tag}: {e}"))
             })?;
@@ -1016,7 +1044,11 @@ impl TrainingLoop {
                 .unwrap_or("checkpoint_best");
             let deep_path = path.with_file_name(format!("{stem}_deep.safetensors"));
             if deep_path.exists() {
-                deep.load_from_checkpoint(&deep_path, &self.device)?;
+                let weights = candle_core::safetensors::load(&deep_path, &self.device)
+                    .map_err(|e| JammiError::FineTune(format!("Load deep LoRA checkpoint: {e}")))?;
+                deep.load_weights(&weights).map_err(|e| {
+                    JammiError::FineTune(format!("Apply deep LoRA checkpoint: {e}"))
+                })?;
             }
         } else {
             let device = self

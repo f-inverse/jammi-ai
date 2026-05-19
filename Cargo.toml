@@ -6,6 +6,7 @@ members = [
     "crates/jammi-server",
     "crates/jammi-python",
     "crates/jammi-cli",
+    "crates/jammi-lora",
     "crates/jammi-test-utils",
 ]
 # jammi-python is a PyO3 cdylib — build via maturin, not cargo build --workspace
@@ -14,6 +15,7 @@ default-members = [
     "crates/jammi-ai",
     "crates/jammi-server",
     "crates/jammi-cli",
+    "crates/jammi-lora",
 ]
 
 [workspace.package]
@@ -28,6 +30,7 @@ repository = "https://github.com/f-inverse/jammi-ai"
 jammi-engine = { version = "0.3.0", path = "crates/jammi-engine" }
 jammi-ai = { version = "0.3.0", path = "crates/jammi-ai" }
 jammi-server = { version = "0.3.0", path = "crates/jammi-server" }
+jammi-lora = { version = "0.3.0", path = "crates/jammi-lora" }
 jammi-test-utils = { path = "crates/jammi-test-utils" }
 
 # Query engine

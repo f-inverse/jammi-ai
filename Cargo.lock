@@ -3756,6 +3756,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "jammi-lora"
+version = "0.3.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "jammi-python"
 version = "0.3.0"
 dependencies = [

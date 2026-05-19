@@ -1,0 +1,21 @@
+[package]
+name = "jammi-lora"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Static-dispatch PEFT-style LoRA primitives for candle. Closed-enum dispatch, immutable construction, candle-0.9.x-native."
+keywords = ["lora", "peft", "fine-tuning", "candle", "transformer"]
+categories = ["science"]
+readme = "README.md"
+
+[dependencies]
+candle-core.workspace = true
+candle-nn.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

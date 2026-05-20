@@ -1,6 +1,6 @@
 //! BERT-family encoder (BERT, RoBERTa, CamemBERT, XLM-RoBERTa).
 //!
-//! Mirrors candle-transformers' [`BertModel`] architecture so the parity test
+//! Mirrors candle-transformers' `BertModel` architecture so the parity test
 //! can numerically verify the frozen forward pass against the upstream
 //! implementation. The six attention/FFN linears per layer (`query`, `key`,
 //! `value`, `attention.output.dense`, `intermediate.dense`, `output.dense`)

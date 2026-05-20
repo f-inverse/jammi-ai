@@ -49,6 +49,29 @@ not include them.
 
 ## Register the topic
 
+The simplest path is the SQL surface — `session.sql("CREATE TOPIC …")`
+parses the same statement Flight SQL clients send across the wire:
+
+```rust,no_run
+# use jammi_engine::session::JammiSession;
+# async fn ex(session: &JammiSession) -> jammi_engine::error::Result<()> {
+session
+    .sql(
+        "CREATE TOPIC cdc.orders (\
+             op TEXT NOT NULL, ts_ms BIGINT NOT NULL, \
+             key TEXT NOT NULL, after TEXT) \
+         WITH (retention_seconds = '604800')",
+    )
+    .await?;
+# Ok(())
+# }
+```
+
+The CLI exposes the same shape via `jammi trigger register --name … --schema …`.
+
+For callers that build the topic programmatically (rather than via SQL),
+the Rust API surface is equivalent:
+
 ```rust,no_run
 # use std::collections::BTreeMap;
 # use std::sync::Arc;

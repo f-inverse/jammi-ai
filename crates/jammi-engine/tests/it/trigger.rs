@@ -410,6 +410,60 @@ async fn empty_predicate_matches_every_batch() {
 }
 
 #[tokio::test]
+async fn session_create_topic_ddl_round_trip() {
+    use jammi_engine::config::JammiConfig;
+    use jammi_engine::session::JammiSession;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = JammiConfig {
+        artifact_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let session = JammiSession::new(cfg).await.unwrap();
+
+    // CREATE TOPIC inserts a topics row + provisions the backing table.
+    session
+        .sql(
+            "CREATE TOPIC orders.changes (op TEXT NOT NULL, ts_ms BIGINT NOT NULL, payload TEXT) \
+             WITH (retention_seconds = '3600')",
+        )
+        .await
+        .unwrap();
+
+    let topics = session.topic_repo().list_topics(None).await.unwrap();
+    assert_eq!(topics.len(), 1);
+    assert_eq!(topics[0].name, "orders.changes");
+    assert_eq!(topics[0].schema.fields().len(), 3);
+    assert_eq!(
+        topics[0].broker_metadata.get("retention_seconds"),
+        Some(&"3600".to_string())
+    );
+
+    // DROP TOPIC removes it; DROP TOPIC IF EXISTS on a missing name is a no-op.
+    session.sql("DROP TOPIC orders.changes").await.unwrap();
+    let topics = session.topic_repo().list_topics(None).await.unwrap();
+    assert!(topics.is_empty());
+
+    session
+        .sql("DROP TOPIC IF EXISTS orders.changes")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn session_drop_topic_missing_errors_without_if_exists() {
+    use jammi_engine::config::JammiConfig;
+    use jammi_engine::session::JammiSession;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = JammiConfig {
+        artifact_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let session = JammiSession::new(cfg).await.unwrap();
+    let err = session.sql("DROP TOPIC missing.topic").await.unwrap_err();
+    assert!(err.to_string().contains("not found"));
+}
+
+#[tokio::test]
 async fn predicate_rejects_unsupported_constructs() {
     // SPEC-04 §8.2 — subqueries, aggregates, and other forms are rejected
     // at parse time with `PredicateUnsupported`.

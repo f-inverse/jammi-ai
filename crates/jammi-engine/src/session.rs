@@ -7,6 +7,7 @@ use datafusion_federation::{FederatedQueryPlanner, FederationOptimizerRule};
 
 use std::sync::RwLock;
 
+use crate::catalog::topic_repo::TopicRepo;
 use crate::catalog::Catalog;
 use crate::config::JammiConfig;
 use crate::error::{JammiError, Result};
@@ -14,11 +15,15 @@ use crate::source::mutable::MutableTableRegistry;
 use crate::source::registry::SourceCatalog;
 use crate::source::schema_provider::JammiSchemaProvider;
 use crate::source::{local, table_name_from_url, SourceConnection, SourceType};
+use crate::sql::topic_ddl::{self, TopicDdl};
 use crate::store::mutable::definition::{MutableTableDefinition, MutableTableId};
 use crate::store::mutable::sqlite::SqliteMutableBackend;
 use crate::store::mutable::MutableBackend;
 use crate::tenant::{TenantContext, TenantId};
 use crate::tenant_scope::{SourceTenantColumns, TenantBinding, TenantScopeAnalyzerRule};
+use crate::trigger::{
+    InMemoryBroker, Publisher, Subscriber, TopicDefinition, TopicId, TriggerBroker,
+};
 
 /// Primary entry point for the Jammi query engine.
 ///
@@ -35,6 +40,13 @@ pub struct JammiSession {
     source_tenant_columns: Arc<SourceTenantColumns>,
     mutable: Arc<MutableTableRegistry>,
     mutable_schema: Arc<JammiSchemaProvider>,
+    /// Default broker used by the in-process trigger surface — replaced at
+    /// deployment time by callers that wire a clustered broker (e.g.
+    /// JetStream) into the session via `with_trigger_broker`.
+    trigger_broker: Arc<dyn TriggerBroker>,
+    topic_repo: Arc<TopicRepo>,
+    publisher: Arc<Publisher>,
+    subscriber: Arc<Subscriber>,
 }
 
 impl JammiSession {
@@ -113,6 +125,18 @@ impl JammiSession {
         let mutable_catalog = Arc::new(SourceCatalog::new(Arc::clone(&mutable_schema)));
         ctx.register_catalog("mutable", mutable_catalog);
 
+        let trigger_broker: Arc<dyn TriggerBroker> = Arc::new(InMemoryBroker::new());
+        let topic_repo = Arc::new(TopicRepo::new(Arc::clone(&catalog), Arc::clone(&mutable)));
+        let publisher = Arc::new(Publisher::new(
+            Arc::clone(&trigger_broker),
+            catalog.backend_arc(),
+            Arc::clone(&mutable),
+        ));
+        let subscriber = Arc::new(Subscriber::new(
+            Arc::clone(&trigger_broker),
+            Arc::clone(&mutable),
+        ));
+
         let session = Self {
             ctx,
             catalog,
@@ -121,6 +145,10 @@ impl JammiSession {
             source_tenant_columns,
             mutable,
             mutable_schema,
+            trigger_broker,
+            topic_repo,
+            publisher,
+            subscriber,
         };
         session.reload_sources().await?;
         session.reload_mutable_tables().await?;
@@ -334,9 +362,88 @@ impl JammiSession {
     }
 
     /// Execute a SQL query and collect results as Arrow `RecordBatch`es.
+    ///
+    /// Inspects the input for trigger-stream DDL (`CREATE TOPIC` /
+    /// `DROP TOPIC`) before handing it to DataFusion: those statements are
+    /// routed to the engine's [`TopicRepo`] and return an empty result set.
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
-        let df = self.ctx.sql(query).await?;
-        Ok(df.collect().await?)
+        match topic_ddl::maybe_parse(query).map_err(|e| JammiError::Catalog(e.to_string()))? {
+            Some(TopicDdl::Create(create)) => {
+                self.exec_create_topic(create).await?;
+                Ok(Vec::new())
+            }
+            Some(TopicDdl::Drop(drop_)) => {
+                self.exec_drop_topic(drop_).await?;
+                Ok(Vec::new())
+            }
+            None => {
+                let df = self.ctx.sql(query).await?;
+                Ok(df.collect().await?)
+            }
+        }
+    }
+
+    async fn exec_create_topic(&self, create: crate::sql::topic_ddl::CreateTopic) -> Result<()> {
+        let topic = TopicDefinition {
+            id: TopicId::new(),
+            name: create.name,
+            schema: Arc::new(create.schema),
+            tenant: self.tenant(),
+            broker_metadata: create.broker_metadata,
+        };
+        self.trigger_broker
+            .register_topic(&topic)
+            .await
+            .map_err(|e| JammiError::Catalog(e.to_string()))?;
+        self.topic_repo
+            .register_topic(&topic)
+            .await
+            .map_err(|e| JammiError::Catalog(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn exec_drop_topic(&self, drop_: crate::sql::topic_ddl::DropTopic) -> Result<()> {
+        let tenant = self.tenant();
+        let topic = self
+            .topic_repo
+            .lookup_by_name(&drop_.name, tenant)
+            .await
+            .map_err(|e| JammiError::Catalog(e.to_string()))?;
+        match topic {
+            Some(t) => {
+                self.topic_repo
+                    .drop_topic(t.id, tenant)
+                    .await
+                    .map_err(|e| JammiError::Catalog(e.to_string()))?;
+                let _ = self.trigger_broker.drop_topic(t.id).await;
+                Ok(())
+            }
+            None if drop_.if_exists => Ok(()),
+            None => Err(JammiError::Catalog(format!(
+                "topic '{}' not found",
+                drop_.name
+            ))),
+        }
+    }
+
+    /// Shared handle to the trigger broker the session was constructed with.
+    pub fn trigger_broker(&self) -> Arc<dyn TriggerBroker> {
+        Arc::clone(&self.trigger_broker)
+    }
+
+    /// Shared handle to the topic-catalog repo.
+    pub fn topic_repo(&self) -> Arc<TopicRepo> {
+        Arc::clone(&self.topic_repo)
+    }
+
+    /// Shared handle to the trigger-stream publisher.
+    pub fn publisher(&self) -> Arc<Publisher> {
+        Arc::clone(&self.publisher)
+    }
+
+    /// Shared handle to the trigger-stream subscriber.
+    pub fn subscriber(&self) -> Arc<Subscriber> {
+        Arc::clone(&self.subscriber)
     }
 
     /// Register a mutable companion table. After this returns, the table is

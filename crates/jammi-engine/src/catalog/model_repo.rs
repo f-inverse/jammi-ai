@@ -83,7 +83,7 @@ impl Catalog {
                              backend = excluded.backend, \
                              task = excluded.task, \
                              model_type = excluded.model_type, \
-                             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                             updated_at = CAST(CURRENT_TIMESTAMP AS TEXT)",
                         &[
                             SqlValue::TextOwned(pk),
                             SqlValue::TextOwned(model_id),
@@ -189,7 +189,7 @@ impl Catalog {
                 Box::pin(async move {
                     tx.set_tenant(tenant);
                     tx.execute(
-                        "UPDATE models SET status = $1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                        "UPDATE models SET status = $1, updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
                          WHERE name = $2 AND (tenant_id = $3 OR tenant_id IS NULL)",
                         &[
                             SqlValue::TextOwned(status_str),

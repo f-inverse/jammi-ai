@@ -64,3 +64,37 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: cargo test --workspace --features live-hub-tests
+
+  test-pg:
+    name: Test (Postgres)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    needs: check
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: jammi
+          POSTGRES_PASSWORD: jammi
+          POSTGRES_DB: jammi_test
+        options: >-
+          --health-cmd "pg_isready -U jammi -d jammi_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Run Postgres-gated tests
+        env:
+          # Service container is reachable at `postgres` from the job container
+          # (same Docker network); the catalog connects via sqlx::PgPool.
+          JAMMI_TEST_PG_URL: postgres://jammi:jammi@postgres:5432/jammi_test
+        # Tests share one catalog DB and serialise migrate() ledger writes.
+        # `--test-threads=1` keeps that contract; the suite is small.
+        run: |
+          cargo test -p jammi-engine --features live-postgres-tests --test it -- --test-threads=1

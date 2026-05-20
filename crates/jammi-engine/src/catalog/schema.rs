@@ -7,8 +7,8 @@ CREATE TABLE sources (
     uri         TEXT NOT NULL,
     schema_json TEXT,
     options     TEXT,
-    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at  TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT)),
+    updated_at  TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT))
 );
 
 CREATE TABLE embedding_sets (
@@ -20,8 +20,8 @@ CREATE TABLE embedding_sets (
     status      TEXT NOT NULL DEFAULT 'pending',
     num_rows    INTEGER,
     dimensions  INTEGER,
-    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at  TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT)),
+    updated_at  TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT))
 );
 CREATE INDEX idx_embedding_sets_source ON embedding_sets(source_id);
 CREATE INDEX idx_embedding_sets_model  ON embedding_sets(model_id);
@@ -38,8 +38,8 @@ CREATE TABLE models (
     dimensions  INTEGER,
     status      TEXT NOT NULL DEFAULT 'available',
     metadata    TEXT,
-    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at  TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT)),
+    updated_at  TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT))
 );
 CREATE INDEX idx_models_type ON models(model_type);
 CREATE INDEX idx_models_task ON models(task);
@@ -53,8 +53,8 @@ CREATE TABLE fine_tune_jobs (
     hyperparams     TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'pending',
     metrics         TEXT,
-    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at      TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT)),
+    updated_at      TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT))
 );
 CREATE INDEX idx_fine_tune_jobs_status ON fine_tune_jobs(status);
 
@@ -65,7 +65,7 @@ CREATE TABLE eval_runs (
     source_id   TEXT,
     metrics     TEXT NOT NULL,
     config      TEXT,
-    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at  TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT))
 );
 CREATE INDEX idx_eval_runs_model   ON eval_runs(model_id);
 CREATE INDEX idx_eval_runs_type    ON eval_runs(eval_type);
@@ -75,11 +75,11 @@ CREATE TABLE evidence_channels (
     channel_name    TEXT PRIMARY KEY,
     schema_json     TEXT NOT NULL,
     priority        INTEGER NOT NULL,
-    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at      TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT))
 );
-INSERT INTO evidence_channels VALUES
-    ('vector',    '{"similarity": "Float32"}', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    ('inference', '{"inference_model": "Utf8", "inference_task": "Utf8", "inference_confidence": "Float32"}', 2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+INSERT INTO evidence_channels (channel_name, schema_json, priority) VALUES
+    ('vector',    '{"similarity": "Float32"}', 1),
+    ('inference', '{"inference_model": "Utf8", "inference_task": "Utf8", "inference_confidence": "Float32"}', 2);
 "#;
 
 /// Result tables: Parquet-backed embedding and inference outputs with sidecar ANN indexes.
@@ -98,7 +98,7 @@ CREATE TABLE result_tables (
     key_column      TEXT,
     text_columns    TEXT,
     checkpoint      INTEGER,
-    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    created_at      TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT)),
     completed_at    TEXT
 );
 CREATE INDEX idx_result_tables_source ON result_tables(source_id);
@@ -150,7 +150,7 @@ CREATE TABLE evidence_channel_columns (
     column_name     TEXT NOT NULL,
     column_type     TEXT NOT NULL,
     ordinal         INTEGER NOT NULL,
-    declared_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    declared_at     TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT)),
     PRIMARY KEY (channel_name, column_name)
 );
 CREATE UNIQUE INDEX idx_channel_cols_ordinal
@@ -184,8 +184,8 @@ CREATE TABLE mutable_tables (
     tenant_id       TEXT,
     user_metadata   TEXT NOT NULL DEFAULT '{}',
     backend_kind    TEXT NOT NULL,
-    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at      TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT)),
+    updated_at      TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT))
 );
 
 CREATE INDEX idx_mutable_tables_tenant ON mutable_tables(tenant_id);

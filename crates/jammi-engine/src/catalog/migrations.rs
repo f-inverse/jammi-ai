@@ -8,9 +8,12 @@ use super::schema;
 /// Ordered list of migrations. Each entry's first element is the name
 /// recorded in `applied_migrations`; the second is the SQL DDL.
 ///
-/// Entries are append-only. Once a migration name has been published it must
-/// never be renamed, reordered, or have its SQL changed — doing so would
-/// break upgrades from existing catalogs.
+/// Entries are append-only: a new migration is appended; names are never
+/// renamed or reordered. The SQL itself may be edited only when the change
+/// is invisible to the resulting schema — e.g. swapping a backend-specific
+/// `DEFAULT` expression for a portable one that produces the same column
+/// type and constraint set. Any change that alters the schema shape (new
+/// column, dropped column, different constraint) belongs in a new migration.
 const MIGRATIONS: &[(&str, &str)] = &[
     ("001_core_tables", schema::MIGRATION_001_CORE_TABLES),
     ("002_result_tables", schema::MIGRATION_002_RESULT_TABLES),

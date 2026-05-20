@@ -153,7 +153,7 @@ impl Catalog {
                     tx.set_tenant(tenant);
                     tx.execute(
                         "UPDATE fine_tune_jobs SET status = $1, metrics = $2, \
-                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                         updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
                          WHERE job_id = $3 AND (tenant_id = $4 OR tenant_id IS NULL)",
                         &[
                             SqlValue::TextOwned(status_str),
@@ -185,7 +185,7 @@ impl Catalog {
                     tx.set_tenant(tenant);
                     tx.execute(
                         "UPDATE fine_tune_jobs SET output_model_id = $1, \
-                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                         updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
                          WHERE job_id = $2 AND (tenant_id = $3 OR tenant_id IS NULL)",
                         &[
                             SqlValue::TextOwned(output_model_id),
@@ -215,7 +215,7 @@ impl Catalog {
                     tx.set_tenant(tenant);
                     tx.execute(
                         "UPDATE fine_tune_jobs SET status = $1, \
-                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                         updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
                          WHERE status = $2 AND (tenant_id = $3 OR tenant_id IS NULL)",
                         &[
                             SqlValue::TextOwned(failed),

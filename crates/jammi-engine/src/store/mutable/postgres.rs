@@ -35,7 +35,9 @@ impl MutableBackend for PostgresMutableBackend {
                 )
             })
             .collect();
-        cols.push("tenant_id UUID".to_string());
+        // Stored as TEXT to match migration 005's catalog convention; the
+        // sink and tenant-predicate paths emit stringified UUIDs.
+        cols.push("tenant_id TEXT".to_string());
 
         let pk = def
             .primary_key

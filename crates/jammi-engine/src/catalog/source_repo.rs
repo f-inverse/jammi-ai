@@ -24,7 +24,10 @@ pub struct SourceRecord {
 }
 
 impl Catalog {
-    /// Persist a new source to the catalog.
+    /// Persist a new source to the catalog. The session's bound tenant is
+    /// written to `tenant_id` and asserted via
+    /// [`crate::catalog::backend::Transaction::assert_tenant_matches`] before
+    /// the INSERT (SPEC-03 §7 defence-in-depth).
     pub async fn register_source(
         &self,
         source_id: &str,
@@ -37,19 +40,23 @@ impl Catalog {
         let options =
             serde_json::to_string(connection).map_err(|e| JammiError::Catalog(e.to_string()))?;
         let sid = source_id.to_string();
+        let tenant = self.current_tenant();
 
         self.backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
+                    tx.set_tenant(tenant);
+                    tx.assert_tenant_matches(tenant, "sources")?;
                     tx.execute(
-                        "INSERT INTO sources (source_id, name, source_type, uri, options) \
-                         VALUES ($1, $2, $3, $4, $5)",
+                        "INSERT INTO sources (source_id, name, source_type, uri, options, tenant_id) \
+                         VALUES ($1, $2, $3, $4, $5, $6)",
                         &[
                             SqlValue::TextOwned(sid.clone()),
                             SqlValue::TextOwned(sid),
                             SqlValue::TextOwned(type_str),
                             SqlValue::TextOwned(uri),
                             SqlValue::TextOwned(options),
+                            SqlValue::from(tenant.map(|t| t.to_string())),
                         ],
                     )
                     .await?;
@@ -60,9 +67,11 @@ impl Catalog {
         Ok(())
     }
 
-    /// Look up a source by ID.
+    /// Look up a source by ID. Filtered to the session's tenant (own rows
+    /// plus globally-scoped `tenant_id IS NULL` rows).
     pub async fn get_source(&self, source_id: &str) -> Result<Option<SourceRecord>> {
         let sid = source_id.to_string();
+        let tenant = self.current_tenant();
         let raw = self
             .backend()
             .transaction(
@@ -75,8 +84,12 @@ impl Catalog {
                         tx.query_opt(
                             "SELECT source_id, source_type, options, schema_json, \
                                 'active' AS status, created_at, updated_at \
-                         FROM sources WHERE source_id = $1",
-                            &[SqlValue::TextOwned(sid)],
+                             FROM sources WHERE source_id = $1 \
+                               AND (tenant_id = $2 OR tenant_id IS NULL)",
+                            &[
+                                SqlValue::TextOwned(sid),
+                                SqlValue::from(tenant.map(|t| t.to_string())),
+                            ],
                             read_source_row,
                         )
                         .await
@@ -87,8 +100,9 @@ impl Catalog {
         raw.map(parse_source_row).transpose()
     }
 
-    /// List all registered sources.
+    /// List sources visible to the session's tenant.
     pub async fn list_sources(&self) -> Result<Vec<SourceRecord>> {
+        let tenant = self.current_tenant();
         let raws = self
             .backend()
             .transaction(
@@ -101,8 +115,10 @@ impl Catalog {
                         tx.query(
                             "SELECT source_id, source_type, options, schema_json, \
                                 'active' AS status, created_at, updated_at \
-                         FROM sources ORDER BY created_at",
-                            &[],
+                             FROM sources \
+                             WHERE tenant_id = $1 OR tenant_id IS NULL \
+                             ORDER BY created_at",
+                            &[SqlValue::from(tenant.map(|t| t.to_string()))],
                             read_source_row,
                         )
                         .await
@@ -113,15 +129,22 @@ impl Catalog {
         raws.into_iter().map(parse_source_row).collect()
     }
 
-    /// Remove a source from the catalog.
+    /// Remove a source from the catalog. Scoped to the session's tenant —
+    /// a tenant cannot delete another tenant's source.
     pub async fn remove_source(&self, source_id: &str) -> Result<()> {
         let sid = source_id.to_string();
+        let tenant = self.current_tenant();
         self.backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
+                    tx.set_tenant(tenant);
                     tx.execute(
-                        "DELETE FROM sources WHERE source_id = $1",
-                        &[SqlValue::TextOwned(sid)],
+                        "DELETE FROM sources WHERE source_id = $1 \
+                           AND (tenant_id = $2 OR tenant_id IS NULL)",
+                        &[
+                            SqlValue::TextOwned(sid),
+                            SqlValue::from(tenant.map(|t| t.to_string())),
+                        ],
                     )
                     .await?;
                     Ok(())

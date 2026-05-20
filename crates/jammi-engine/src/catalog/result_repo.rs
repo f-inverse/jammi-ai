@@ -56,7 +56,8 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendErr
 }
 
 impl Catalog {
-    /// Insert a new result table record with status = 'building'.
+    /// Insert a new result table record with status = 'building'. Binds
+    /// the session's tenant to the row (SPEC-03 §7).
     pub async fn create_result_table(&self, p: CreateResultTableParams<'_>) -> Result<()> {
         let table_name = p.table_name.to_string();
         let source_id = p.source_id.to_string();
@@ -67,14 +68,17 @@ impl Catalog {
         let dimensions = p.dimensions;
         let key_column = p.key_column.map(str::to_string);
         let text_columns = p.text_columns.map(str::to_string);
+        let tenant = self.current_tenant();
 
         self.backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
+                    tx.set_tenant(tenant);
+                    tx.assert_tenant_matches(tenant, "result_tables")?;
                     tx.execute(
                         "INSERT INTO result_tables (table_name, source_id, model_id, task, parquet_path, \
-                         index_path, dimensions, key_column, text_columns) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                         index_path, dimensions, key_column, text_columns, tenant_id) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                         &[
                             SqlValue::TextOwned(table_name),
                             SqlValue::TextOwned(source_id),
@@ -85,6 +89,7 @@ impl Catalog {
                             SqlValue::from(dimensions.map(|d| d as i64)),
                             SqlValue::from(key_column),
                             SqlValue::from(text_columns),
+                            SqlValue::from(tenant.map(|t| t.to_string())),
                         ],
                     )
                     .await?;
@@ -118,18 +123,21 @@ impl Catalog {
         let status_str = status.to_string();
         let name = name.to_string();
         let rows_i64 = rows as i64;
+        let tenant = self.current_tenant();
 
         self.backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
+                    tx.set_tenant(tenant);
                     tx.execute(
                         "UPDATE result_tables SET status = $1, row_count = $2, completed_at = $3 \
-                         WHERE table_name = $4",
+                         WHERE table_name = $4 AND (tenant_id = $5 OR tenant_id IS NULL)",
                         &[
                             SqlValue::TextOwned(status_str),
                             SqlValue::Int(rows_i64),
                             SqlValue::from(completed_at),
                             SqlValue::TextOwned(name),
+                            SqlValue::from(tenant.map(|t| t.to_string())),
                         ],
                     )
                     .await?;
@@ -140,9 +148,10 @@ impl Catalog {
         Ok(())
     }
 
-    /// Fetch a single result table by name.
+    /// Fetch a single result table by name. Tenant-filtered.
     pub async fn get_result_table(&self, name: &str) -> Result<Option<ResultTableRecord>> {
         let name = name.to_string();
+        let tenant = self.current_tenant();
         Ok(self
             .backend()
             .transaction(
@@ -153,8 +162,12 @@ impl Catalog {
                 |tx| {
                     Box::pin(async move {
                         tx.query_opt(
-                            "SELECT * FROM result_tables WHERE table_name = $1",
-                            &[SqlValue::TextOwned(name)],
+                            "SELECT * FROM result_tables WHERE table_name = $1 \
+                               AND (tenant_id = $2 OR tenant_id IS NULL)",
+                            &[
+                                SqlValue::TextOwned(name),
+                                SqlValue::from(tenant.map(|t| t.to_string())),
+                            ],
                             parse_row,
                         )
                         .await
@@ -164,12 +177,13 @@ impl Catalog {
             .await?)
     }
 
-    /// List all result tables with a given status.
+    /// List result tables with a given status, scoped to the session tenant.
     pub async fn list_result_tables_by_status(
         &self,
         status: super::status::ResultTableStatus,
     ) -> Result<Vec<ResultTableRecord>> {
         let status_str = status.to_string();
+        let tenant = self.current_tenant();
         Ok(self
             .backend()
             .transaction(
@@ -180,8 +194,13 @@ impl Catalog {
                 |tx| {
                     Box::pin(async move {
                         tx.query(
-                            "SELECT * FROM result_tables WHERE status = $1 ORDER BY created_at",
-                            &[SqlValue::TextOwned(status_str)],
+                            "SELECT * FROM result_tables WHERE status = $1 \
+                               AND (tenant_id = $2 OR tenant_id IS NULL) \
+                             ORDER BY created_at",
+                            &[
+                                SqlValue::TextOwned(status_str),
+                                SqlValue::from(tenant.map(|t| t.to_string())),
+                            ],
                             parse_row,
                         )
                         .await
@@ -191,7 +210,8 @@ impl Catalog {
             .await?)
     }
 
-    /// Find result tables matching source, optional task, optional model.
+    /// Find result tables matching source, optional task, optional model;
+    /// scoped to the session tenant.
     pub async fn find_result_tables(
         &self,
         source_id: &str,
@@ -209,6 +229,12 @@ impl Catalog {
             sql.push_str(&format!(" AND model_id = ${}", params.len() + 1));
             params.push(SqlValue::TextOwned(m.to_string()));
         }
+        let tenant = self.current_tenant();
+        sql.push_str(&format!(
+            " AND (tenant_id = ${} OR tenant_id IS NULL)",
+            params.len() + 1
+        ));
+        params.push(SqlValue::from(tenant.map(|t| t.to_string())));
         sql.push_str(" ORDER BY created_at");
 
         Ok(self
@@ -224,27 +250,31 @@ impl Catalog {
     }
 
     /// Delete all result tables for a source. Returns the deleted records
-    /// so callers can clean up associated disk files.
+    /// so callers can clean up associated disk files. Scoped to tenant.
     pub async fn delete_result_tables_for_source(
         &self,
         source_id: &str,
     ) -> Result<Vec<ResultTableRecord>> {
         let sid = source_id.to_string();
-        // Use a single transaction so the listing and delete are atomic.
+        let tenant = self.current_tenant();
         Ok(self
             .backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
+                    tx.set_tenant(tenant);
+                    let tenant_param = SqlValue::from(tenant.map(|t| t.to_string()));
                     let records = tx
                         .query(
-                            "SELECT * FROM result_tables WHERE source_id = $1",
-                            &[SqlValue::TextOwned(sid.clone())],
+                            "SELECT * FROM result_tables WHERE source_id = $1 \
+                               AND (tenant_id = $2 OR tenant_id IS NULL)",
+                            &[SqlValue::TextOwned(sid.clone()), tenant_param.clone()],
                             parse_row,
                         )
                         .await?;
                     tx.execute(
-                        "DELETE FROM result_tables WHERE source_id = $1",
-                        &[SqlValue::TextOwned(sid)],
+                        "DELETE FROM result_tables WHERE source_id = $1 \
+                           AND (tenant_id = $2 OR tenant_id IS NULL)",
+                        &[SqlValue::TextOwned(sid), tenant_param],
                     )
                     .await?;
                     Ok(records)
@@ -253,11 +283,7 @@ impl Catalog {
             .await?)
     }
 
-    /// Resolve which embedding table to use for a source.
-    ///
-    /// - Explicit name → return that table.
-    /// - None → find ready embedding tables for source, return latest by `created_at`.
-    ///   Zero → error. One or more → latest.
+    /// Resolve which embedding table to use for a source. Tenant-filtered.
     pub async fn resolve_embedding_table(
         &self,
         source_id: &str,
@@ -271,6 +297,7 @@ impl Catalog {
         }
 
         let sid = source_id.to_string();
+        let tenant = self.current_tenant();
         let found = self
             .backend()
             .transaction(
@@ -282,10 +309,14 @@ impl Catalog {
                     Box::pin(async move {
                         tx.query_opt(
                             "SELECT * FROM result_tables \
-                         WHERE source_id = $1 AND task IN ('text_embedding', 'image_embedding') \
-                           AND status = 'ready' \
-                         ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                            &[SqlValue::TextOwned(sid)],
+                             WHERE source_id = $1 AND task IN ('text_embedding', 'image_embedding') \
+                               AND status = 'ready' \
+                               AND (tenant_id = $2 OR tenant_id IS NULL) \
+                             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                            &[
+                                SqlValue::TextOwned(sid),
+                                SqlValue::from(tenant.map(|t| t.to_string())),
+                            ],
                             parse_row,
                         )
                         .await
@@ -302,12 +333,19 @@ impl Catalog {
     pub async fn set_checkpoint(&self, name: &str, batch: usize) -> Result<()> {
         let name = name.to_string();
         let batch_i64 = batch as i64;
+        let tenant = self.current_tenant();
         self.backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
+                    tx.set_tenant(tenant);
                     tx.execute(
-                        "UPDATE result_tables SET checkpoint = $1 WHERE table_name = $2",
-                        &[SqlValue::Int(batch_i64), SqlValue::TextOwned(name)],
+                        "UPDATE result_tables SET checkpoint = $1 WHERE table_name = $2 \
+                           AND (tenant_id = $3 OR tenant_id IS NULL)",
+                        &[
+                            SqlValue::Int(batch_i64),
+                            SqlValue::TextOwned(name),
+                            SqlValue::from(tenant.map(|t| t.to_string())),
+                        ],
                     )
                     .await?;
                     Ok(())
@@ -320,6 +358,7 @@ impl Catalog {
     /// Retrieve the last checkpoint for a result table.
     pub async fn get_checkpoint(&self, name: &str) -> Result<Option<usize>> {
         let name = name.to_string();
+        let tenant = self.current_tenant();
         let found: Option<Option<i64>> = self
             .backend()
             .transaction(
@@ -330,8 +369,12 @@ impl Catalog {
                 |tx| {
                     Box::pin(async move {
                         tx.query_opt(
-                            "SELECT checkpoint FROM result_tables WHERE table_name = $1",
-                            &[SqlValue::TextOwned(name)],
+                            "SELECT checkpoint FROM result_tables WHERE table_name = $1 \
+                               AND (tenant_id = $2 OR tenant_id IS NULL)",
+                            &[
+                                SqlValue::TextOwned(name),
+                                SqlValue::from(tenant.map(|t| t.to_string())),
+                            ],
                             |row| row.try_get::<i64>("checkpoint"),
                         )
                         .await

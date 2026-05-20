@@ -102,6 +102,22 @@ impl InferenceSession {
         self.inner.catalog()
     }
 
+    /// Bind a tenant scope to this session. Subsequent reads/writes filter
+    /// to `tenant_id = t OR tenant_id IS NULL`; writes record `tenant_id = t`.
+    pub fn bind_tenant(&self, t: jammi_engine::TenantId) {
+        self.inner.bind_tenant(t);
+    }
+
+    /// Clear the bound tenant.
+    pub fn unbind_tenant(&self) {
+        self.inner.unbind_tenant();
+    }
+
+    /// Return the tenant currently bound, if any.
+    pub fn tenant(&self) -> Option<jammi_engine::TenantId> {
+        self.inner.tenant()
+    }
+
     /// Access the model cache.
     pub fn model_cache(&self) -> &Arc<ModelCache> {
         &self.model_cache

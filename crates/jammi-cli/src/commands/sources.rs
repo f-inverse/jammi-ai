@@ -1,6 +1,5 @@
 use clap::Subcommand;
 use jammi_ai::session::InferenceSession;
-use jammi_engine::catalog::Catalog;
 use jammi_engine::config::JammiConfig;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 
@@ -23,12 +22,16 @@ pub enum SourceAction {
 
 pub async fn run(
     config: JammiConfig,
+    tenant: Option<jammi_engine::TenantId>,
     action: SourceAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {
         SourceAction::List => {
-            let catalog = Catalog::open(&config.artifact_dir).await?;
-            let sources = catalog.list_sources().await?;
+            let session = InferenceSession::new(config).await?;
+            if let Some(t) = tenant {
+                session.bind_tenant(t);
+            }
+            let sources = session.catalog().list_sources().await?;
             if sources.is_empty() {
                 println!("No sources registered.");
             } else {
@@ -50,6 +53,9 @@ pub async fn run(
                 .map_err(|e: jammi_engine::error::JammiError| e.to_string())?;
             let connection = SourceConnection::from_path(&path, file_format);
             let session = InferenceSession::new(config).await?;
+            if let Some(t) = tenant {
+                session.bind_tenant(t);
+            }
             session
                 .add_source(&name, SourceType::Local, connection)
                 .await?;

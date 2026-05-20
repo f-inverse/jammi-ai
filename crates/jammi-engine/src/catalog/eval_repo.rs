@@ -36,16 +36,19 @@ fn parse_eval_row(row: &Row<'_>) -> std::result::Result<EvalRunRecord, BackendEr
 }
 
 impl Catalog {
-    /// Insert a new eval run record.
+    /// Insert a new eval run record. Tenant bound + asserted (SPEC-03 §7).
     pub async fn record_eval_run(&self, record: &EvalRunRecord) -> Result<()> {
         let r = record.clone();
+        let tenant = self.current_tenant();
         self.backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
+                    tx.set_tenant(tenant);
+                    tx.assert_tenant_matches(tenant, "eval_runs")?;
                     tx.execute(
                         "INSERT INTO eval_runs \
-                         (run_id, eval_type, model_id, source_id, golden_source, k, metrics, status, created_at) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                         (run_id, eval_type, model_id, source_id, golden_source, k, metrics, status, created_at, tenant_id) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                         &[
                             SqlValue::TextOwned(r.eval_run_id),
                             SqlValue::TextOwned(r.eval_type),
@@ -56,6 +59,7 @@ impl Catalog {
                             SqlValue::TextOwned(r.metrics_json),
                             SqlValue::TextOwned(r.status),
                             SqlValue::TextOwned(r.created_at),
+                            SqlValue::from(tenant.map(|t| t.to_string())),
                         ],
                     )
                     .await?;
@@ -66,55 +70,14 @@ impl Catalog {
         Ok(())
     }
 
-    /// Get a single eval run by ID.
+    /// Get a single eval run by ID. Tenant-filtered.
     pub async fn get_eval_run(&self, eval_run_id: &str) -> Result<Option<EvalRunRecord>> {
-        let sql = format!("SELECT {SELECT_COLS} FROM eval_runs WHERE run_id = $1");
-        let id = eval_run_id.to_string();
-        Ok(self
-            .backend()
-            .transaction(
-                TxOptions {
-                    read_only: true,
-                    ..Default::default()
-                },
-                |tx| {
-                    Box::pin(async move {
-                        tx.query_opt(&sql, &[SqlValue::TextOwned(id)], parse_eval_row)
-                            .await
-                    })
-                },
-            )
-            .await?)
-    }
-
-    /// List all eval runs, most recent first.
-    pub async fn list_eval_runs(&self) -> Result<Vec<EvalRunRecord>> {
-        let sql = format!("SELECT {SELECT_COLS} FROM eval_runs ORDER BY created_at DESC");
-        Ok(self
-            .backend()
-            .transaction(
-                TxOptions {
-                    read_only: true,
-                    ..Default::default()
-                },
-                |tx| Box::pin(async move { tx.query(&sql, &[], parse_eval_row).await }),
-            )
-            .await?)
-    }
-
-    /// Most recent eval run for a given model + eval type.
-    pub async fn latest_eval_run(
-        &self,
-        model_id: &str,
-        eval_type: &str,
-    ) -> Result<Option<EvalRunRecord>> {
         let sql = format!(
-            "SELECT {SELECT_COLS} FROM eval_runs \
-             WHERE model_id = $1 AND eval_type = $2 \
-             ORDER BY created_at DESC LIMIT 1"
+            "SELECT {SELECT_COLS} FROM eval_runs WHERE run_id = $1 \
+               AND (tenant_id = $2 OR tenant_id IS NULL)"
         );
-        let mid = model_id.to_string();
-        let et = eval_type.to_string();
+        let id = eval_run_id.to_string();
+        let tenant = self.current_tenant();
         Ok(self
             .backend()
             .transaction(
@@ -126,7 +89,79 @@ impl Catalog {
                     Box::pin(async move {
                         tx.query_opt(
                             &sql,
-                            &[SqlValue::TextOwned(mid), SqlValue::TextOwned(et)],
+                            &[
+                                SqlValue::TextOwned(id),
+                                SqlValue::from(tenant.map(|t| t.to_string())),
+                            ],
+                            parse_eval_row,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?)
+    }
+
+    /// List eval runs visible to the session tenant, most recent first.
+    pub async fn list_eval_runs(&self) -> Result<Vec<EvalRunRecord>> {
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM eval_runs \
+             WHERE tenant_id = $1 OR tenant_id IS NULL \
+             ORDER BY created_at DESC"
+        );
+        let tenant = self.current_tenant();
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query(
+                            &sql,
+                            &[SqlValue::from(tenant.map(|t| t.to_string()))],
+                            parse_eval_row,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?)
+    }
+
+    /// Most recent eval run for a given model + eval type. Tenant-filtered.
+    pub async fn latest_eval_run(
+        &self,
+        model_id: &str,
+        eval_type: &str,
+    ) -> Result<Option<EvalRunRecord>> {
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM eval_runs \
+             WHERE model_id = $1 AND eval_type = $2 \
+               AND (tenant_id = $3 OR tenant_id IS NULL) \
+             ORDER BY created_at DESC LIMIT 1"
+        );
+        let mid = model_id.to_string();
+        let et = eval_type.to_string();
+        let tenant = self.current_tenant();
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query_opt(
+                            &sql,
+                            &[
+                                SqlValue::TextOwned(mid),
+                                SqlValue::TextOwned(et),
+                                SqlValue::from(tenant.map(|t| t.to_string())),
+                            ],
                             parse_eval_row,
                         )
                         .await

@@ -1,8 +1,15 @@
 use jammi_ai::session::InferenceSession;
 use jammi_engine::config::JammiConfig;
 
-pub async fn run(config: JammiConfig, sql: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    config: JammiConfig,
+    tenant: Option<jammi_engine::TenantId>,
+    sql: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let session = InferenceSession::new(config).await?;
+    if let Some(t) = tenant {
+        session.bind_tenant(t);
+    }
     let batches = session.sql(sql).await?;
 
     for batch in &batches {
@@ -17,8 +24,15 @@ pub async fn run(config: JammiConfig, sql: &str) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-pub async fn explain(config: JammiConfig, sql: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn explain(
+    config: JammiConfig,
+    tenant: Option<jammi_engine::TenantId>,
+    sql: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let session = InferenceSession::new(config).await?;
+    if let Some(t) = tenant {
+        session.bind_tenant(t);
+    }
     let explain_sql = format!("EXPLAIN {sql}");
     let batches = session.sql(&explain_sql).await?;
 

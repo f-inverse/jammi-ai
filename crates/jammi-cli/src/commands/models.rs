@@ -1,5 +1,5 @@
 use clap::Subcommand;
-use jammi_engine::catalog::Catalog;
+use jammi_ai::session::InferenceSession;
 use jammi_engine::config::JammiConfig;
 
 #[derive(Subcommand)]
@@ -10,13 +10,17 @@ pub enum ModelAction {
 
 pub async fn run(
     config: JammiConfig,
+    tenant: Option<jammi_engine::TenantId>,
     action: ModelAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let catalog = Catalog::open(&config.artifact_dir).await?;
+    let session = InferenceSession::new(config).await?;
+    if let Some(t) = tenant {
+        session.bind_tenant(t);
+    }
 
     match action {
         ModelAction::List => {
-            let models = catalog.list_models().await?;
+            let models = session.catalog().list_models().await?;
             if models.is_empty() {
                 println!("No models registered.");
             } else {

@@ -22,6 +22,7 @@
 - [Fine-Tune for Your Domain](./fine-tuning.md)
 - [Evaluate and Compare Models](./evaluation.md)
 - [Connect to PostgreSQL / MySQL](./external-sources.md)
+- [Scope a Session to a Tenant](./multi-tenant.md)
 - [Deploy as a Server](./deploy-server.md)
 - [Monitor Inference](./monitor-inference.md)
 

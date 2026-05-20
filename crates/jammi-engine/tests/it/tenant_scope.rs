@@ -228,6 +228,113 @@ async fn with_tenant_returns_same_session_id() {
     assert_eq!(session.tenant(), Some(tenant_a()));
 }
 
+/// Two scoped sessions writing through the same `Catalog::register_source`
+/// path see disjoint `list_sources` results — the tenant filter on read +
+/// the tenant binding on write together enforce isolation.
+#[tokio::test]
+async fn catalog_sources_isolated_by_tenant() {
+    use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+
+    let dir = tempdir().unwrap();
+    let cfg = common::test_config(dir.path());
+
+    let session_a = JammiSession::new(cfg.clone())
+        .await
+        .unwrap()
+        .with_tenant(tenant_a());
+    session_a
+        .add_source(
+            "src_a",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let session_b = JammiSession::new(cfg)
+        .await
+        .unwrap()
+        .with_tenant(tenant_b());
+    session_b
+        .add_source(
+            "src_b",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let sources_a = session_a.catalog().list_sources().await.unwrap();
+    let ids_a: Vec<&str> = sources_a.iter().map(|s| s.source_id.as_str()).collect();
+    assert_eq!(ids_a, vec!["src_a"]);
+
+    let sources_b = session_b.catalog().list_sources().await.unwrap();
+    let ids_b: Vec<&str> = sources_b.iter().map(|s| s.source_id.as_str()).collect();
+    assert_eq!(ids_b, vec!["src_b"]);
+}
+
+/// An unscoped session sees globally-scoped (NULL) rows; a scoped session
+/// sees its own rows plus the NULL rows (consistent with the read-side
+/// predicate-injection rule).
+#[tokio::test]
+async fn catalog_unscoped_session_sees_global_only_after_scoped_writes() {
+    use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+
+    let dir = tempdir().unwrap();
+    let cfg = common::test_config(dir.path());
+
+    let unscoped = JammiSession::new(cfg.clone()).await.unwrap();
+    unscoped
+        .add_source(
+            "global_src",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let scoped = JammiSession::new(cfg.clone())
+        .await
+        .unwrap()
+        .with_tenant(tenant_a());
+    scoped
+        .add_source(
+            "tenant_a_src",
+            SourceType::Local,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // A fresh unscoped session sees only the global row.
+    let fresh_unscoped = JammiSession::new(cfg).await.unwrap();
+    let ids: Vec<String> = fresh_unscoped
+        .catalog()
+        .list_sources()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.source_id)
+        .collect();
+    assert_eq!(ids, vec!["global_src".to_string()]);
+}
+
 /// `Transaction::assert_tenant_matches` is the defence-in-depth write-side
 /// guard. The sink calls it once per write_all; verify it rejects mismatches.
 #[tokio::test]

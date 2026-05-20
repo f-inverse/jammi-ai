@@ -41,7 +41,15 @@ impl JammiSession {
     /// Create a new session, opening the catalog and configuring DataFusion.
     pub async fn new(config: JammiConfig) -> Result<Self> {
         let config = Arc::new(config);
-        let catalog = Arc::new(Catalog::open(&config.artifact_dir).await?);
+
+        // Construct the shared tenant binding first so the catalog can be
+        // opened with it; downstream writes / reads in the catalog repos
+        // consult the binding to bind / filter `tenant_id` on every row.
+        let tenant_binding: TenantBinding = Arc::new(RwLock::new(TenantContext::Unscoped));
+        let catalog = Arc::new(
+            Catalog::open_with_tenant(&config.artifact_dir, Some(Arc::clone(&tenant_binding)))
+                .await?,
+        );
 
         let session_config = SessionConfig::new()
             .with_target_partitions(config.engine.execution_threads)
@@ -62,9 +70,8 @@ impl JammiSession {
 
         // Tenant-scope analyzer rule injected before existing analyzer rules
         // so the predicate is applied before federation, projection pruning,
-        // etc. Bound to a shared RwLock<TenantContext> that `with_tenant`
-        // mutates; the rule reads it on every analyze() invocation.
-        let tenant_binding: TenantBinding = Arc::new(RwLock::new(TenantContext::Unscoped));
+        // etc. Shares the binding with the catalog and the mutable-table
+        // registry so every read/write surface observes the same value.
         let source_tenant_columns = Arc::new(SourceTenantColumns::new());
         let analyzer_rule = Arc::new(TenantScopeAnalyzerRule::new(
             Arc::clone(&tenant_binding),
@@ -142,6 +149,20 @@ impl JammiSession {
             .read()
             .expect("tenant binding lock poisoned")
             .tenant()
+    }
+
+    /// Mutate the bound tenant in place. Equivalent to `with_tenant` but does
+    /// not consume `self` — needed for callers that hold the session behind a
+    /// shared reference (`Arc<JammiSession>` in PyO3 / CLI wrappers, the
+    /// per-request gRPC handler reading `SessionTenant` from the request
+    /// interceptor).
+    pub fn bind_tenant(&self, t: TenantId) {
+        *self.tenant.write().expect("tenant binding lock poisoned") = TenantContext::Scoped(t);
+    }
+
+    /// Clear the bound tenant in place.
+    pub fn unbind_tenant(&self) {
+        *self.tenant.write().expect("tenant binding lock poisoned") = TenantContext::Unscoped;
     }
 
     /// Register a tenant-discriminator column for a federated source. The

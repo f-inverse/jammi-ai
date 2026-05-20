@@ -53,7 +53,8 @@ const SELECT_COLS: &str =
     "model_id, name, model_type, task, backend, version, status, metadata, created_at";
 
 impl Catalog {
-    /// Register or refresh a model in the catalog.
+    /// Register or refresh a model in the catalog. The session's bound
+    /// tenant is written to `tenant_id` and asserted before INSERT.
     pub async fn register_model(&self, params: RegisterModelParams<'_>) -> Result<()> {
         let pk = format!("{}::{}", params.model_id, params.version);
         let metadata = serde_json::json!({
@@ -67,13 +68,16 @@ impl Catalog {
         let task = params.task.to_string();
         let backend = params.backend.to_string();
         let version = params.version as i64;
+        let tenant = self.current_tenant();
 
         self.backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
+                    tx.set_tenant(tenant);
+                    tx.assert_tenant_matches(tenant, "models")?;
                     tx.execute(
-                        "INSERT INTO models (model_id, name, model_type, task, backend, version, status, metadata) \
-                         VALUES ($1, $2, $3, $4, $5, $6, 'registered', $7) \
+                        "INSERT INTO models (model_id, name, model_type, task, backend, version, status, metadata, tenant_id) \
+                         VALUES ($1, $2, $3, $4, $5, $6, 'registered', $7, $8) \
                          ON CONFLICT(model_id) DO UPDATE SET \
                              metadata = excluded.metadata, \
                              backend = excluded.backend, \
@@ -88,6 +92,7 @@ impl Catalog {
                             SqlValue::TextOwned(backend),
                             SqlValue::Int(version),
                             SqlValue::TextOwned(metadata),
+                            SqlValue::from(tenant.map(|t| t.to_string())),
                         ],
                     )
                     .await?;
@@ -98,12 +103,15 @@ impl Catalog {
         Ok(())
     }
 
-    /// Get the latest version of a model by name.
+    /// Get the latest version of a model by name. Tenant-filtered.
     pub async fn get_model(&self, model_id: &str) -> Result<Option<ModelRecord>> {
         let sql = format!(
-            "SELECT {SELECT_COLS} FROM models WHERE name = $1 ORDER BY version DESC LIMIT 1"
+            "SELECT {SELECT_COLS} FROM models \
+             WHERE name = $1 AND (tenant_id = $2 OR tenant_id IS NULL) \
+             ORDER BY version DESC LIMIT 1"
         );
         let mid = model_id.to_string();
+        let tenant = self.current_tenant();
         Ok(self
             .backend()
             .transaction(
@@ -113,8 +121,15 @@ impl Catalog {
                 },
                 |tx| {
                     Box::pin(async move {
-                        tx.query_opt(&sql, &[SqlValue::TextOwned(mid)], parse_model_row)
-                            .await
+                        tx.query_opt(
+                            &sql,
+                            &[
+                                SqlValue::TextOwned(mid),
+                                SqlValue::from(tenant.map(|t| t.to_string())),
+                            ],
+                            parse_model_row,
+                        )
+                        .await
                     })
                 },
             )
@@ -127,9 +142,14 @@ impl Catalog {
         model_id: &str,
         version: i32,
     ) -> Result<Option<ModelRecord>> {
-        let sql = format!("SELECT {SELECT_COLS} FROM models WHERE name = $1 AND version = $2");
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM models \
+             WHERE name = $1 AND version = $2 \
+               AND (tenant_id = $3 OR tenant_id IS NULL)"
+        );
         let mid = model_id.to_string();
         let v = version as i64;
+        let tenant = self.current_tenant();
         Ok(self
             .backend()
             .transaction(
@@ -141,7 +161,11 @@ impl Catalog {
                     Box::pin(async move {
                         tx.query_opt(
                             &sql,
-                            &[SqlValue::TextOwned(mid), SqlValue::Int(v)],
+                            &[
+                                SqlValue::TextOwned(mid),
+                                SqlValue::Int(v),
+                                SqlValue::from(tenant.map(|t| t.to_string())),
+                            ],
                             parse_model_row,
                         )
                         .await
@@ -151,7 +175,7 @@ impl Catalog {
             .await?)
     }
 
-    /// Update model status (e.g., Registered → Loaded).
+    /// Update model status. Scoped to the session's tenant.
     pub async fn update_model_status(
         &self,
         model_id: &str,
@@ -159,13 +183,19 @@ impl Catalog {
     ) -> Result<()> {
         let status_str = status.to_string();
         let mid = model_id.to_string();
+        let tenant = self.current_tenant();
         self.backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
+                    tx.set_tenant(tenant);
                     tx.execute(
                         "UPDATE models SET status = $1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-                         WHERE name = $2",
-                        &[SqlValue::TextOwned(status_str), SqlValue::TextOwned(mid)],
+                         WHERE name = $2 AND (tenant_id = $3 OR tenant_id IS NULL)",
+                        &[
+                            SqlValue::TextOwned(status_str),
+                            SqlValue::TextOwned(mid),
+                            SqlValue::from(tenant.map(|t| t.to_string())),
+                        ],
                     )
                     .await?;
                     Ok(())
@@ -175,9 +205,14 @@ impl Catalog {
         Ok(())
     }
 
-    /// List all registered models.
+    /// List models visible to the session's tenant.
     pub async fn list_models(&self) -> Result<Vec<ModelRecord>> {
-        let sql = format!("SELECT {SELECT_COLS} FROM models ORDER BY created_at");
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM models \
+             WHERE tenant_id = $1 OR tenant_id IS NULL \
+             ORDER BY created_at"
+        );
+        let tenant = self.current_tenant();
         Ok(self
             .backend()
             .transaction(
@@ -185,7 +220,16 @@ impl Catalog {
                     read_only: true,
                     ..Default::default()
                 },
-                |tx| Box::pin(async move { tx.query(&sql, &[], parse_model_row).await }),
+                |tx| {
+                    Box::pin(async move {
+                        tx.query(
+                            &sql,
+                            &[SqlValue::from(tenant.map(|t| t.to_string()))],
+                            parse_model_row,
+                        )
+                        .await
+                    })
+                },
             )
             .await?)
     }

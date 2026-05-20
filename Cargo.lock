@@ -3875,6 +3875,7 @@ dependencies = [
 name = "jammi-server"
 version = "0.5.0"
 dependencies = [
+ "arrow-flight",
  "async-trait",
  "axum",
  "datafusion",

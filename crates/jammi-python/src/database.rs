@@ -1,3 +1,4 @@
+use std::str::FromStr;
 use std::sync::Arc;
 
 use pyo3::prelude::*;
@@ -22,6 +23,26 @@ pub struct PyDatabase {
 
 #[pymethods]
 impl PyDatabase {
+    /// Bind a tenant scope to this connection.
+    ///
+    /// Subsequent reads return rows whose `tenant_id` matches `tenant_id`
+    /// plus globally-scoped (`tenant_id IS NULL`) rows; writes carry the
+    /// bound tenant on every row. Pass an empty string to clear.
+    fn with_tenant(&self, tenant_id: &str) -> PyResult<()> {
+        if tenant_id.is_empty() {
+            self.session.unbind_tenant();
+            return Ok(());
+        }
+        let t = jammi_engine::TenantId::from_str(tenant_id).map_err(to_pyerr)?;
+        self.session.bind_tenant(t);
+        Ok(())
+    }
+
+    /// The tenant currently bound to this connection, or `None`.
+    fn tenant(&self) -> Option<String> {
+        self.session.tenant().map(|t| t.to_string())
+    }
+
     /// Register a local file as a data source.
     #[pyo3(signature = (name, *, path, format))]
     fn add_source(&self, name: &str, path: &str, format: &str) -> PyResult<()> {

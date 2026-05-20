@@ -12,6 +12,7 @@ readme = "README.md"
 jammi-ai = { workspace = true, optional = true }
 jammi-engine.workspace = true
 axum.workspace = true
+arrow-flight.workspace = true
 datafusion.workspace = true
 datafusion-flight-sql-server.workspace = true
 tonic.workspace = true

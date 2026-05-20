@@ -101,6 +101,7 @@ async-trait = "0.1"
 futures = "0.3"
 async-stream = "0.3"
 parking_lot = "0.12"
+async-nats = "0.41"
 
 [profile.dev]
 debug = "line-tables-only"

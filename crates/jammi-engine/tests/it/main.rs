@@ -12,3 +12,5 @@ mod sources;
 mod store;
 mod tenant_scope;
 mod trigger;
+#[cfg(feature = "live-broker-tests")]
+mod trigger_jetstream;

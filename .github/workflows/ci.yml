@@ -65,6 +65,32 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: cargo test --workspace --features live-hub-tests
 
+  test-broker:
+    name: Test (NATS JetStream)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    needs: check
+    services:
+      nats:
+        image: nats:2.10
+        # `--js` enables JetStream — required by the broker driver.
+        options: --health-cmd "wget -q -O - http://localhost:8222/healthz || exit 1" --health-interval 5s --health-retries 12
+        ports:
+          - 4222:4222
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Run JetStream broker tests
+        env:
+          JAMMI_TEST_NATS_URL: nats://nats:4222
+        # JetStream streams are global; serialise so concurrent tests do not
+        # collide on freshly minted topic ids while one of them is still
+        # tearing down.
+        run: |
+          cargo test -p jammi-engine --features live-broker-tests --test it -- --test-threads=1
+
   test-pg:
     name: Test (Postgres)
     runs-on: ubuntu-latest

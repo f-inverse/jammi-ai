@@ -57,6 +57,10 @@ pub enum JammiError {
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    /// Invalid tenant identifier (e.g., nil UUID, malformed string).
+    #[error("Tenant error: {0}")]
+    Tenant(String),
+
     /// TOML configuration parse error.
     #[error("TOML parse error: {0}")]
     Toml(#[from] toml::de::Error),

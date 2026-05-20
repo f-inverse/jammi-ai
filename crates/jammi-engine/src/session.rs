@@ -11,6 +11,7 @@ use crate::error::{JammiError, Result};
 use crate::source::registry::SourceCatalog;
 use crate::source::schema_provider::JammiSchemaProvider;
 use crate::source::{local, table_name_from_url, SourceConnection, SourceType};
+use crate::tenant::TenantId;
 
 /// Primary entry point for the Jammi query engine.
 ///
@@ -20,6 +21,7 @@ pub struct JammiSession {
     ctx: SessionContext,
     catalog: Arc<Catalog>,
     config: Arc<JammiConfig>,
+    tenant: Option<TenantId>,
 }
 
 impl JammiSession {
@@ -56,9 +58,25 @@ impl JammiSession {
             ctx,
             catalog,
             config,
+            tenant: None,
         };
         session.reload_sources().await?;
         Ok(session)
+    }
+
+    /// Bind a tenant scope to this session.
+    ///
+    /// The engine stores the identifier; auth/identity systems above the
+    /// engine are responsible for verifying the caller is permitted to use
+    /// `t`. The engine never mints a `TenantId` itself.
+    pub fn with_tenant(mut self, t: TenantId) -> Self {
+        self.tenant = Some(t);
+        self
+    }
+
+    /// Return the tenant scope bound to this session, if any.
+    pub fn tenant(&self) -> Option<TenantId> {
+        self.tenant
     }
 
     /// Re-register all sources persisted in the catalog into DataFusion.

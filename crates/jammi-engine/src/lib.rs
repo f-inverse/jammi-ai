@@ -12,8 +12,11 @@ pub mod index;
 pub mod session;
 pub mod source;
 pub mod store;
+pub mod tenant;
 
 use config::{LogFormat, LoggingConfig};
+
+pub use tenant::TenantId;
 
 /// Initialize the tracing subscriber using the provided logging configuration.
 pub fn init_tracing(config: &LoggingConfig) {

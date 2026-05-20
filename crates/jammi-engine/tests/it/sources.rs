@@ -205,3 +205,21 @@ async fn session_respects_config_batch_size() {
     let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 20);
 }
+
+#[tokio::test]
+async fn session_tenant_defaults_to_none_and_with_tenant_sets_it() {
+    use jammi_engine::TenantId;
+    use std::str::FromStr;
+
+    let dir = tempdir().unwrap();
+    let config = common::test_config(dir.path());
+    let session = JammiSession::new(config).await.unwrap();
+    assert!(
+        session.tenant().is_none(),
+        "fresh session has no tenant scope"
+    );
+
+    let t = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
+    let session = session.with_tenant(t);
+    assert_eq!(session.tenant(), Some(t));
+}

@@ -118,3 +118,23 @@ ALTER TABLE eval_runs ADD COLUMN status TEXT NOT NULL DEFAULT 'completed';
 pub(super) const MIGRATION_004_DROP_EMBEDDING_SETS: &str = r#"
 DROP TABLE IF EXISTS embedding_sets;
 "#;
+
+/// Add a nullable `tenant_id` column to every catalog table, plus a B-tree
+/// index per table. The column stores the canonical hyphenated lowercase
+/// `Uuid::Display` form (SQLite has no native UUID type; `TEXT` is the
+/// convention). Existing rows back-fill to NULL.
+pub(super) const MIGRATION_005_TENANT_SCOPE: &str = r#"
+ALTER TABLE sources           ADD COLUMN tenant_id TEXT;
+ALTER TABLE models            ADD COLUMN tenant_id TEXT;
+ALTER TABLE fine_tune_jobs    ADD COLUMN tenant_id TEXT;
+ALTER TABLE eval_runs         ADD COLUMN tenant_id TEXT;
+ALTER TABLE result_tables     ADD COLUMN tenant_id TEXT;
+ALTER TABLE evidence_channels ADD COLUMN tenant_id TEXT;
+
+CREATE INDEX idx_sources_tenant           ON sources(tenant_id);
+CREATE INDEX idx_models_tenant            ON models(tenant_id);
+CREATE INDEX idx_fine_tune_jobs_tenant    ON fine_tune_jobs(tenant_id);
+CREATE INDEX idx_eval_runs_tenant         ON eval_runs(tenant_id);
+CREATE INDEX idx_result_tables_tenant     ON result_tables(tenant_id);
+CREATE INDEX idx_evidence_channels_tenant ON evidence_channels(tenant_id);
+"#;

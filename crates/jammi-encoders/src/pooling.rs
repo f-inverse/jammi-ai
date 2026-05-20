@@ -11,7 +11,7 @@ pub enum Pooling {
     /// Mean over real (non-padding) tokens. Sentence-transformers default.
     #[default]
     Mean,
-    /// First token's hidden state ([CLS] for BERT-family backbones).
+    /// First token's hidden state (\[CLS\] for BERT-family backbones).
     Cls,
     /// Element-wise max over real tokens (padding positions are excluded by
     /// substituting `-inf` before the reduce).

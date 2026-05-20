@@ -373,7 +373,7 @@ impl ModernBert {
     /// Toggle training mode on every LoRA-augmented linear and every LayerNorm.
     /// ModernBERT's LayerNorms use the bias-free variant whose forward stays
     /// on the slow primitive-op path in both modes, but propagating the flag
-    /// keeps the surface consistent with [`Bert`] and [`DistilBert`].
+    /// keeps the surface consistent with [`crate::Bert`] and [`crate::DistilBert`].
     pub fn set_training(&mut self, training: bool) {
         self.emb_norm.set_training(training);
         for layer in &mut self.layers {

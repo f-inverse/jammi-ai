@@ -27,7 +27,7 @@ use super::lora::LoraModel;
 ///
 /// The `EncoderAdapters` variant payload is boxed because [`AnyEncoder`] is
 /// substantially larger than a [`LoraModel`] — keeping the variants on a
-/// similar size footprint is what [`clippy::large_enum_variant`] is asking
+/// similar size footprint is what `clippy::large_enum_variant` is asking
 /// for and is the right thing here, not a band-aid.
 pub enum TrainingTarget {
     /// LoRA wraps a projection head sitting on top of a frozen base model's

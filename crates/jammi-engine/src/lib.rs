@@ -14,6 +14,7 @@ pub mod session;
 pub mod source;
 pub mod store;
 pub mod tenant;
+pub mod tenant_scope;
 
 use config::{LogFormat, LoggingConfig};
 

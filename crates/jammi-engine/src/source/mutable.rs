@@ -12,17 +12,27 @@ use crate::store::mutable::definition::{
 use crate::store::mutable::provider::MutableTableProvider;
 use crate::store::mutable::MutableBackend;
 use crate::tenant::TenantId;
+use crate::tenant_scope::TenantBinding;
 
 /// Owns the lifecycle of mutable companion tables: catalog row + storage
 /// table + DataFusion `TableProvider` construction.
 pub struct MutableTableRegistry {
     catalog: Arc<Catalog>,
     backend: Arc<dyn MutableBackend>,
+    tenant: TenantBinding,
 }
 
 impl MutableTableRegistry {
-    pub fn new(catalog: Arc<Catalog>, backend: Arc<dyn MutableBackend>) -> Self {
-        Self { catalog, backend }
+    pub fn new(
+        catalog: Arc<Catalog>,
+        backend: Arc<dyn MutableBackend>,
+        tenant: TenantBinding,
+    ) -> Self {
+        Self {
+            catalog,
+            backend,
+            tenant,
+        }
     }
 
     /// Register a mutable table. Atomically: catalog row + storage table +
@@ -59,6 +69,7 @@ impl MutableTableRegistry {
         Ok(Arc::new(MutableTableProvider::new(
             def,
             Arc::clone(&self.backend),
+            Arc::clone(&self.tenant),
         )))
     }
 
@@ -107,6 +118,7 @@ impl MutableTableRegistry {
         Arc::new(MutableTableProvider::new(
             Arc::new(def),
             Arc::clone(&self.backend),
+            Arc::clone(&self.tenant),
         ))
     }
 }

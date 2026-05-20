@@ -3,11 +3,10 @@
 //! Per DataFusion: *"This method will be called exactly once during each DML
 //! statement. Thus prior to return, the sink should do any commit or rollback
 //! required."* We wrap the entire write in one
-//! [`CatalogBackend::transaction`](crate::catalog::backend::CatalogBackend::transaction)
-//! closure. Each [`RecordBatch`] is translated into a multi-row
+//! [`crate::catalog::backend::CatalogBackend::transaction`] closure. Each
+//! [`RecordBatch`] is translated into a multi-row
 //! `INSERT … VALUES (…), (…), …` statement built from the backend's
-//! [`MutableBackend::insert_dml`](crate::store::mutable::MutableBackend::insert_dml)
-//! renderer.
+//! [`crate::store::mutable::MutableBackend::insert_dml`] renderer.
 
 use std::any::Any;
 use std::fmt;
@@ -35,11 +34,20 @@ use super::MutableBackend;
 pub struct MutableTableSink {
     def: Arc<MutableTableDefinition>,
     backend: Arc<dyn MutableBackend>,
+    tenant: crate::tenant_scope::TenantBinding,
 }
 
 impl MutableTableSink {
-    pub fn new(def: Arc<MutableTableDefinition>, backend: Arc<dyn MutableBackend>) -> Self {
-        Self { def, backend }
+    pub fn new(
+        def: Arc<MutableTableDefinition>,
+        backend: Arc<dyn MutableBackend>,
+        tenant: crate::tenant_scope::TenantBinding,
+    ) -> Self {
+        Self {
+            def,
+            backend,
+            tenant,
+        }
     }
 }
 
@@ -81,12 +89,27 @@ impl DataSink for MutableTableSink {
 
         let def = Arc::clone(&self.def);
         let backend_for_closure = Arc::clone(&self.backend);
+        // Snapshot the tenant binding once per write_all call (not per row).
+        // The DataSink contract is "exactly one write_all per DML statement"
+        // so this is the natural unit of consistency.
+        let session_tenant = self
+            .tenant
+            .read()
+            .expect("tenant binding lock poisoned")
+            .tenant();
+        let table_name = def.id.as_str().to_string();
         let written = self
             .backend
             .catalog_backend()
             .transaction(TxOptions::default(), move |tx| {
                 let backend = backend_for_closure;
                 Box::pin(async move {
+                    tx.set_tenant(session_tenant);
+                    // Defence-in-depth: confirm the transaction sees the same
+                    // tenant we're about to bind to every row. A future change
+                    // that mutates the binding mid-flight would fail here
+                    // instead of silently re-tenanting the rows.
+                    tx.assert_tenant_matches(session_tenant, &table_name)?;
                     let mut total: u64 = 0;
                     for batch in batches {
                         if batch.num_rows() == 0 {
@@ -97,7 +120,7 @@ impl DataSink for MutableTableSink {
                             schema.fields().iter().map(|f| f.name().clone()).collect();
                         let cols: Vec<&str> = col_names.iter().map(String::as_str).collect();
                         let dml = backend.insert_dml(&def, &cols, batch.num_rows());
-                        let params = batch_to_params(&batch).map_err(|e| {
+                        let params = batch_to_params(&batch, session_tenant).map_err(|e| {
                             crate::catalog::backend::BackendError::Execution(e.to_string())
                         })?;
                         let rows = tx.execute(&dml, &params).await?;
@@ -114,19 +137,27 @@ impl DataSink for MutableTableSink {
 }
 
 /// Translate every cell of a `RecordBatch` into the engine's [`SqlValue`]
-/// taxonomy, in row-major order. The implicit `tenant_id` slot is appended
-/// per row as `NULL` (Phase 3 binds the session's tenant here).
-fn batch_to_params(batch: &RecordBatch) -> Result<Vec<SqlValue<'static>>, &'static str> {
+/// taxonomy, in row-major order. The implicit `tenant_id` slot is bound to
+/// the session-bound tenant: when `Some(t)`, every row carries the same
+/// tenant string; when `None`, every row carries `NULL` (a globally-scoped
+/// write, as in a single-tenant deployment).
+fn batch_to_params(
+    batch: &RecordBatch,
+    tenant: Option<crate::tenant::TenantId>,
+) -> Result<Vec<SqlValue<'static>>, &'static str> {
     let n_rows = batch.num_rows();
     let arrays: Vec<&dyn Array> = batch.columns().iter().map(|c| c.as_ref()).collect();
+    let tenant_value = match tenant {
+        Some(t) => SqlValue::TextOwned(t.to_string()),
+        None => SqlValue::Null,
+    };
     let mut out = Vec::with_capacity(n_rows * (arrays.len() + 1));
     for r in 0..n_rows {
         for (col_idx, arr) in arrays.iter().enumerate() {
             let value = extract_value(*arr, r, batch.schema().field(col_idx).data_type())?;
             out.push(value);
         }
-        // Implicit tenant_id placeholder for Phase 3.
-        out.push(SqlValue::Null);
+        out.push(tenant_value.clone());
     }
     Ok(out)
 }

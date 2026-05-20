@@ -15,12 +15,13 @@ use tempfile::tempdir;
 #[tokio::test]
 async fn resolve_hf_hub_sentence_transformer() {
     let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let resolver = ModelResolver::new(catalog).unwrap();
 
     let source = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");
     let resolved = resolver
         .resolve(&source, ModelTask::TextEmbedding, None)
+        .await
         .unwrap();
 
     assert_eq!(
@@ -47,12 +48,13 @@ async fn resolve_hf_hub_sentence_transformer() {
 #[tokio::test]
 async fn resolve_hf_hub_selects_candle_for_safetensors_model() {
     let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let resolver = ModelResolver::new(catalog).unwrap();
 
     let source = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");
     let resolved = resolver
         .resolve(&source, ModelTask::TextEmbedding, None)
+        .await
         .unwrap();
 
     assert_eq!(resolved.backend, BackendType::Candle);
@@ -199,7 +201,7 @@ async fn tokenizer_encode_batch_with_truncation() {
 #[tokio::test]
 async fn cache_get_or_load_returns_guard_with_ref_count() {
     let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
@@ -235,7 +237,7 @@ async fn cache_get_or_load_returns_guard_with_ref_count() {
 #[tokio::test]
 async fn cache_ref_count_decrements_on_guard_drop() {
     let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
@@ -313,7 +315,7 @@ fn activation_memory_scaling() {
 #[tokio::test]
 async fn preload_loads_model_into_cache_without_returning_guard() {
     let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
@@ -349,7 +351,7 @@ async fn preload_loads_model_into_cache_without_returning_guard() {
 #[tokio::test]
 async fn single_flight_concurrent_loads_coalesce() {
     let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
@@ -393,7 +395,7 @@ async fn single_flight_concurrent_loads_coalesce() {
 #[tokio::test]
 async fn eviction_skips_model_with_active_guard() {
     let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
@@ -470,7 +472,7 @@ async fn resolve_nonexistent_local_path_returns_error() {
 #[tokio::test]
 async fn cache_load_failure_clears_in_flight_state() {
     let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,

@@ -170,7 +170,11 @@ mod live {
         use jammi_ai::model::resolver::ModelResolver;
 
         let dir = tempdir().unwrap();
-        let catalog = Arc::new(jammi_engine::catalog::Catalog::open(dir.path()).unwrap());
+        let catalog = Arc::new(
+            jammi_engine::catalog::Catalog::open(dir.path())
+                .await
+                .unwrap(),
+        );
         let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
         let device_config = DeviceConfig {
             gpu_device: -1,
@@ -274,7 +278,11 @@ mod live {
         use jammi_ai::model::resolver::ModelResolver;
 
         let dir = tempdir().unwrap();
-        let catalog = Arc::new(jammi_engine::catalog::Catalog::open(dir.path()).unwrap());
+        let catalog = Arc::new(
+            jammi_engine::catalog::Catalog::open(dir.path())
+                .await
+                .unwrap(),
+        );
         let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
         let device_config = DeviceConfig {
             gpu_device: -1,

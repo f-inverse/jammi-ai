@@ -5,6 +5,8 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_federation::{FederatedQueryPlanner, FederationOptimizerRule};
 
+use std::sync::RwLock;
+
 use crate::catalog::Catalog;
 use crate::config::JammiConfig;
 use crate::error::{JammiError, Result};
@@ -15,7 +17,8 @@ use crate::source::{local, table_name_from_url, SourceConnection, SourceType};
 use crate::store::mutable::definition::{MutableTableDefinition, MutableTableId};
 use crate::store::mutable::sqlite::SqliteMutableBackend;
 use crate::store::mutable::MutableBackend;
-use crate::tenant::TenantId;
+use crate::tenant::{TenantContext, TenantId};
+use crate::tenant_scope::{SourceTenantColumns, TenantBinding, TenantScopeAnalyzerRule};
 
 /// Primary entry point for the Jammi query engine.
 ///
@@ -25,7 +28,11 @@ pub struct JammiSession {
     ctx: SessionContext,
     catalog: Arc<Catalog>,
     config: Arc<JammiConfig>,
-    tenant: Option<TenantId>,
+    tenant: TenantBinding,
+    /// Shared with the `TenantScopeAnalyzerRule` so callers can register
+    /// per-source tenant columns at `add_source` time (for federated sources
+    /// whose tenant discriminator has a non-`tenant_id` name).
+    source_tenant_columns: Arc<SourceTenantColumns>,
     mutable: Arc<MutableTableRegistry>,
     mutable_schema: Arc<JammiSchemaProvider>,
 }
@@ -53,8 +60,23 @@ impl JammiSession {
             .unwrap_or(rules.len());
         rules.insert(insert_pos, Arc::new(FederationOptimizerRule::new()));
 
+        // Tenant-scope analyzer rule injected before existing analyzer rules
+        // so the predicate is applied before federation, projection pruning,
+        // etc. Bound to a shared RwLock<TenantContext> that `with_tenant`
+        // mutates; the rule reads it on every analyze() invocation.
+        let tenant_binding: TenantBinding = Arc::new(RwLock::new(TenantContext::Unscoped));
+        let source_tenant_columns = Arc::new(SourceTenantColumns::new());
+        let analyzer_rule = Arc::new(TenantScopeAnalyzerRule::new(
+            Arc::clone(&tenant_binding),
+            Arc::clone(&source_tenant_columns),
+        ));
+
+        let mut analyzer_rules = base_state.analyzer().rules.clone();
+        analyzer_rules.push(analyzer_rule);
+
         let federated_state = SessionStateBuilder::new_from_existing(base_state)
             .with_optimizer_rules(rules)
+            .with_analyzer_rules(analyzer_rules)
             .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
             .build();
 
@@ -74,6 +96,7 @@ impl JammiSession {
         let mutable = Arc::new(MutableTableRegistry::new(
             Arc::clone(&catalog),
             mutable_backend,
+            Arc::clone(&tenant_binding),
         ));
 
         // The "mutable" catalog hosts every registered mutable companion
@@ -87,7 +110,8 @@ impl JammiSession {
             ctx,
             catalog,
             config,
-            tenant: None,
+            tenant: tenant_binding,
+            source_tenant_columns,
             mutable,
             mutable_schema,
         };
@@ -101,14 +125,31 @@ impl JammiSession {
     /// The engine stores the identifier; auth/identity systems above the
     /// engine are responsible for verifying the caller is permitted to use
     /// `t`. The engine never mints a `TenantId` itself.
-    pub fn with_tenant(mut self, t: TenantId) -> Self {
-        self.tenant = Some(t);
+    ///
+    /// After this returns, every subsequent SQL query, mutable-table read,
+    /// and write through this session observes tenant-scoped data: rows
+    /// whose `tenant_id = t` plus globally-scoped rows whose `tenant_id IS
+    /// NULL`. Writes that target a different tenant are rejected by the
+    /// write-side guard in [`crate::store::mutable::sink::MutableTableSink`].
+    pub fn with_tenant(self, t: TenantId) -> Self {
+        *self.tenant.write().expect("tenant binding lock poisoned") = TenantContext::Scoped(t);
         self
     }
 
     /// Return the tenant scope bound to this session, if any.
     pub fn tenant(&self) -> Option<TenantId> {
         self.tenant
+            .read()
+            .expect("tenant binding lock poisoned")
+            .tenant()
+    }
+
+    /// Register a tenant-discriminator column for a federated source. The
+    /// `TenantScopeAnalyzerRule` consults this lookup when a `TableScan`'s
+    /// schema does *not* itself declare a `tenant_id` column — i.e., when
+    /// the user's source carries the discriminator under a different name.
+    pub fn set_source_tenant_column(&self, source: &str, column: Option<String>) {
+        self.source_tenant_columns.set(source, column);
     }
 
     /// Re-register all sources persisted in the catalog into DataFusion.
@@ -306,11 +347,12 @@ impl JammiSession {
     }
 
     /// Re-register mutable tables persisted in the catalog from a previous
-    /// process. Called on startup.
+    /// process. Called on startup. Lists tables visible to the current
+    /// tenant binding (initially `Unscoped`).
     async fn reload_mutable_tables(&self) -> Result<()> {
         let defs = self
             .mutable
-            .list(self.tenant)
+            .list(self.tenant())
             .await
             .map_err(|e| JammiError::Catalog(e.to_string()))?;
         for def in defs {

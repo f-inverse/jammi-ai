@@ -8,3 +8,4 @@ mod mutable_tables;
 mod recovery;
 mod sources;
 mod store;
+mod tenant_scope;

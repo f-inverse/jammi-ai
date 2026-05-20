@@ -29,8 +29,8 @@ use crate::tenant::TenantId;
 /// method is not `dyn`-compatible (Rust object-safety rules disallow generic
 /// methods in trait objects), so the engine stores backends behind the
 /// concrete [`BackendImpl`] enum, not `Arc<dyn CatalogBackend>`. The trait
-/// still serves as the contract for generic helpers (e.g.
-/// [`super::migrations::run`]) and for backend implementations to honor.
+/// still serves as the contract for generic helpers (e.g. the catalog's
+/// migration runner) and for backend implementations to honor.
 pub trait CatalogBackend: Send + Sync {
     /// Run `f` inside one backend transaction. Commits on `Ok(_)`, rolls back
     /// on `Err(_)`. The `&mut Transaction<'_>` cannot escape `f`.
@@ -248,14 +248,36 @@ impl<'tx> Transaction<'tx> {
         Ok(rows.pop())
     }
 
-    /// Bookkeeping: bind a tenant for this transaction. Phase 3 wires the
-    /// predicate-injection layer; this PR only stores/retrieves the value.
+    /// Bind a tenant for this transaction. Read by [`Self::assert_tenant_matches`]
+    /// to enforce the write-side guard described in SPEC-03 §7.
     pub fn set_tenant(&mut self, tenant: Option<TenantId>) {
         self.tenant = tenant;
     }
 
     pub fn tenant(&self) -> Option<TenantId> {
         self.tenant
+    }
+
+    /// Assert that `row_tenant` matches the transaction's bound tenant.
+    /// Returns [`BackendError::TenantMismatch`] otherwise. This is the
+    /// defence-in-depth write-side guard: every code path that emits a
+    /// tenant-aware row should call this before issuing the `INSERT` /
+    /// `UPDATE` so the engine never persists a row whose tenant disagrees
+    /// with the session that produced it.
+    pub fn assert_tenant_matches(
+        &self,
+        row_tenant: Option<TenantId>,
+        table: &str,
+    ) -> Result<(), BackendError> {
+        if row_tenant == self.tenant {
+            Ok(())
+        } else {
+            Err(BackendError::TenantMismatch {
+                table: table.to_string(),
+                expected: self.tenant,
+                got: row_tenant,
+            })
+        }
     }
 }
 
@@ -541,6 +563,12 @@ pub enum BackendError {
     Migration(String),
     #[error("type conversion failure on column {column}: {detail}")]
     TypeConversion { column: String, detail: String },
+    #[error("tenant mismatch writing {table}: session={expected:?}, row={got:?}")]
+    TenantMismatch {
+        table: String,
+        expected: Option<TenantId>,
+        got: Option<TenantId>,
+    },
     #[error("sqlx backend error: {0}")]
     Sqlx(#[from] sqlx::Error),
 }

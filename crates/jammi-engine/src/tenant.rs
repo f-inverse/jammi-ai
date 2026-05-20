@@ -71,6 +71,45 @@ impl From<TenantId> for String {
     }
 }
 
+/// Session-scoped tenant binding propagated through DataFusion's
+/// `SessionConfig` extension store.
+///
+/// Read by [`crate::tenant_scope::TenantScopeAnalyzerRule`] during plan
+/// analysis to inject `tenant_id = $current OR tenant_id IS NULL` predicates
+/// on every scanned table whose schema declares the column; read by
+/// [`crate::catalog::backend::Transaction::set_tenant`] to bind a tenant for
+/// the duration of one transaction (used by the mutable-table sink to enforce
+/// the write-side guard).
+///
+/// `Scoped(t)` filters to tenant `t` and also surfaces engine-default rows
+/// (`tenant_id IS NULL`). `Unscoped` shows only `tenant_id IS NULL` rows —
+/// the no-op identity on a pre-Phase-3 population.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TenantContext {
+    /// No tenant binding; reads see only globally-scoped rows.
+    Unscoped,
+    /// Tenant binding active; reads see `tenant_id = t` ∪ `tenant_id IS NULL`.
+    Scoped(TenantId),
+}
+
+impl TenantContext {
+    /// Convert an optional tenant to the matching context value.
+    pub fn from_option(t: Option<TenantId>) -> Self {
+        match t {
+            Some(t) => TenantContext::Scoped(t),
+            None => TenantContext::Unscoped,
+        }
+    }
+
+    /// The tenant id this context binds, if any.
+    pub fn tenant(&self) -> Option<TenantId> {
+        match self {
+            TenantContext::Scoped(t) => Some(*t),
+            TenantContext::Unscoped => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

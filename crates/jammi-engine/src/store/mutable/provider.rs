@@ -33,6 +33,7 @@ use super::MutableBackend;
 pub struct MutableTableProvider {
     pub(crate) def: Arc<MutableTableDefinition>,
     pub(crate) backend: Arc<dyn MutableBackend>,
+    pub(crate) tenant: crate::tenant_scope::TenantBinding,
 }
 
 impl fmt::Debug for MutableTableProvider {
@@ -44,40 +45,49 @@ impl fmt::Debug for MutableTableProvider {
 }
 
 impl MutableTableProvider {
-    pub fn new(def: Arc<MutableTableDefinition>, backend: Arc<dyn MutableBackend>) -> Self {
-        Self { def, backend }
+    pub fn new(
+        def: Arc<MutableTableDefinition>,
+        backend: Arc<dyn MutableBackend>,
+        tenant: crate::tenant_scope::TenantBinding,
+    ) -> Self {
+        Self {
+            def,
+            backend,
+            tenant,
+        }
     }
 
     /// Read all rows from the backend table into a single in-memory partition.
-    /// This is the unsophisticated scan path — predicates, projection, and
-    /// limit are pushed down to SQL when supplied; the result fits in memory
-    /// for the catalog-sized tables Phase 2 targets.
-    async fn read_to_batch(
-        &self,
-        projection: Option<&Vec<usize>>,
-        limit: Option<usize>,
-    ) -> Result<RecordBatch, DataFusionError> {
-        let projected_cols: Vec<&str> = match projection {
-            Some(indices) => indices
-                .iter()
-                .map(|&i| self.def.schema.field(i).name().as_str())
-                .collect(),
-            None => self
-                .def
-                .schema
-                .fields()
-                .iter()
-                .map(|f| f.name().as_str())
-                .collect(),
-        };
-        let projected_schema: SchemaRef = match projection {
-            Some(indices) => Arc::new(self.def.schema.project(indices)?),
-            None => Arc::clone(&self.def.schema),
-        };
+    /// This is the unsophisticated scan path — the entire table is read with
+    /// the tenant-scope predicate pushed down to backend SQL, then DataFusion
+    /// applies projection / additional filters above the scan node.
+    async fn read_to_batch(&self, limit: Option<usize>) -> Result<RecordBatch, DataFusionError> {
+        // Always read the full schema; let DataFusion apply column projection.
+        let projected_cols: Vec<&str> = self
+            .def
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        let projected_schema: SchemaRef = Arc::clone(&self.def.schema);
 
+        // Inject the tenant-scope predicate at the backend SQL layer so we
+        // ship the correct row set off the SQLite/Postgres side, not just
+        // the union (which DataFusion's AnalyzerRule would also filter, but
+        // at the cost of materializing the full table first).
+        let tenant_pred = match self
+            .tenant
+            .read()
+            .expect("tenant binding lock poisoned")
+            .tenant()
+        {
+            Some(t) => Some(format!("(\"tenant_id\" = '{t}' OR \"tenant_id\" IS NULL)")),
+            None => Some("\"tenant_id\" IS NULL".to_string()),
+        };
         let sql = self
             .backend
-            .scan_dml(&self.def, &projected_cols, None, limit);
+            .scan_dml(&self.def, &projected_cols, tenant_pred.as_deref(), limit);
 
         // Build an owned copy of the SQL and column descriptors so the closure
         // can capture them with `'static` lifetimes.
@@ -146,10 +156,10 @@ impl TableProvider for MutableTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let batch = self.read_to_batch(projection, limit).await?;
+        let batch = self.read_to_batch(limit).await?;
         let schema = batch.schema();
         let mem = MemTable::try_new(schema, vec![vec![batch]])?;
-        mem.scan(state, None, filters, limit).await
+        mem.scan(state, projection, filters, limit).await
     }
 
     async fn insert_into(
@@ -167,6 +177,7 @@ impl TableProvider for MutableTableProvider {
         let sink = Arc::new(MutableTableSink::new(
             Arc::clone(&self.def),
             Arc::clone(&self.backend),
+            Arc::clone(&self.tenant),
         ));
         Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }

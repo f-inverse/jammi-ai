@@ -3876,8 +3876,12 @@ name = "jammi-cli"
 version = "0.5.0"
 dependencies = [
  "arrow",
+ "arrow-schema",
  "assert_cmd",
+ "chrono",
  "clap",
+ "datafusion",
+ "futures",
  "jammi-ai",
  "jammi-engine",
  "jammi-server",

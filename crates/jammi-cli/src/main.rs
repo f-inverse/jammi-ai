@@ -43,6 +43,11 @@ enum Commands {
         /// SQL query string
         sql: String,
     },
+    /// Manage trigger-stream topics
+    Trigger {
+        #[command(subcommand)]
+        action: commands::trigger::TriggerAction,
+    },
 }
 
 #[tokio::main]
@@ -77,6 +82,7 @@ async fn run(
         Some(Commands::Models { action }) => commands::models::run(config, tenant, action).await,
         Some(Commands::Query { sql }) => commands::query::run(config, tenant, &sql).await,
         Some(Commands::Explain { sql }) => commands::query::explain(config, tenant, &sql).await,
+        Some(Commands::Trigger { action }) => commands::trigger::run(config, tenant, action).await,
         None => {
             // No subcommand — print help
             use clap::CommandFactory;

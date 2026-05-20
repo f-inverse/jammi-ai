@@ -71,20 +71,34 @@ jobs:
     container:
       image: ghcr.io/f-inverse/jammi-ai-ci:latest
     needs: check
-    services:
-      nats:
-        image: nats:2.10
-        # `--js` enables JetStream — required by the broker driver.
-        options: --health-cmd "wget -q -O - http://localhost:8222/healthz || exit 1" --health-interval 5s --health-retries 12
-        ports:
-          - 4222:4222
     steps:
       - uses: actions/checkout@v4
       - uses: mozilla-actions/sccache-action@v0.0.9
 
+      - name: Install and start nats-server (with JetStream)
+        # GHA `services:` cannot override the upstream image's CMD to pass
+        # `-js`, so the broker driver's JetStream API isn't available with
+        # the default `nats:2.10` entrypoint. Running the official tarball
+        # release directly lets the job pass `-js -m 8222` and own the
+        # process lifetime explicitly.
+        run: |
+          NATS_VERSION=v2.10.21
+          NATS_TGZ="nats-server-${NATS_VERSION}-linux-amd64.tar.gz"
+          curl -fsSL "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/${NATS_TGZ}" -o /tmp/nats.tar.gz
+          tar -xzf /tmp/nats.tar.gz -C /tmp
+          /tmp/nats-server-${NATS_VERSION}-linux-amd64/nats-server -js -m 8222 -p 4222 >/tmp/nats.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8222/healthz >/dev/null 2>&1; then
+              echo "nats-server ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://localhost:8222/healthz
+
       - name: Run JetStream broker tests
         env:
-          JAMMI_TEST_NATS_URL: nats://nats:4222
+          JAMMI_TEST_NATS_URL: nats://127.0.0.1:4222
         # JetStream streams are global; serialise so concurrent tests do not
         # collide on freshly minted topic ids while one of them is still
         # tearing down.

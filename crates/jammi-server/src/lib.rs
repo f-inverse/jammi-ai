@@ -5,14 +5,29 @@ pub mod routes;
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::routing::get;
 use axum::Router;
 use tokio::net::TcpListener;
 use tokio::signal;
 
+use jammi_engine::catalog::topic_repo::TopicRepo;
+use jammi_engine::trigger::{Publisher, Subscriber};
+
 use crate::error::fallback_handler;
 use crate::routes::health;
+
+/// Trigger-stream handles attached to the gRPC server. The caller
+/// constructs these once per deployment (sharing one broker, publisher,
+/// subscriber, and topic catalog repo across every connection) and passes
+/// them to `serve_grpc_with_shutdown`. Omit by passing `None` to keep the
+/// trigger surface unmounted.
+pub struct TriggerHandles {
+    pub topic_repo: Arc<TopicRepo>,
+    pub publisher: Arc<Publisher>,
+    pub subscriber: Arc<Subscriber>,
+}
 
 /// Build the axum router with the health endpoint.
 pub fn build_router() -> Router {
@@ -50,20 +65,31 @@ pub async fn serve_with_shutdown(
 pub async fn serve_grpc_with_shutdown(
     addr: SocketAddr,
     store: grpc::session::SessionStore,
+    trigger: Option<TriggerHandles>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
     use grpc::proto::session::session_service_server::SessionServiceServer;
+    use grpc::proto::trigger::trigger_service_server::TriggerServiceServer;
     use grpc::session::{SessionServer, TenantInterceptor};
+    use grpc::trigger::TriggerServer;
 
     let interceptor = TenantInterceptor::new(store.clone());
     let session_svc =
-        SessionServiceServer::with_interceptor(SessionServer::new(store), interceptor);
+        SessionServiceServer::with_interceptor(SessionServer::new(store), interceptor.clone());
 
-    tracing::info!("gRPC server (SessionService) listening on {addr}");
-    tonic::transport::Server::builder()
-        .add_service(session_svc)
-        .serve_with_shutdown(addr, shutdown)
-        .await
+    let mut builder = tonic::transport::Server::builder().add_service(session_svc);
+    if let Some(handles) = trigger {
+        let trigger_svc = TriggerServiceServer::with_interceptor(
+            TriggerServer::new(handles.topic_repo, handles.publisher, handles.subscriber),
+            interceptor,
+        );
+        builder = builder.add_service(trigger_svc);
+        tracing::info!("gRPC server (SessionService + TriggerService) listening on {addr}");
+    } else {
+        tracing::info!("gRPC server (SessionService) listening on {addr}");
+    }
+
+    builder.serve_with_shutdown(addr, shutdown).await
 }
 
 async fn shutdown_signal() {

@@ -3877,11 +3877,16 @@ dependencies = [
 name = "jammi-server"
 version = "0.5.0"
 dependencies = [
+ "arrow",
  "arrow-flight",
+ "arrow-ipc",
+ "arrow-schema",
  "async-trait",
  "axum",
+ "chrono",
  "datafusion",
  "datafusion-flight-sql-server",
+ "futures",
  "jammi-ai",
  "jammi-engine",
  "prost",
@@ -3890,6 +3895,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-build",
  "tonic-prost",
@@ -7145,6 +7151,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

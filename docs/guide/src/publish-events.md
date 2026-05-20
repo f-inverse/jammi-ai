@@ -69,6 +69,22 @@ session
 
 The CLI exposes the same shape via `jammi trigger register --name … --schema …`.
 
+```python
+import jammi
+
+db = jammi.connect(artifact_dir="/var/lib/jammi")
+db.sql(
+    """
+    CREATE TOPIC cdc.orders (
+        op    TEXT NOT NULL,
+        ts_ms BIGINT NOT NULL,
+        key   TEXT NOT NULL,
+        after TEXT
+    ) WITH (retention_seconds = '604800')
+    """
+)
+```
+
 For callers that build the topic programmatically (rather than via SQL),
 the Rust API surface is equivalent:
 
@@ -141,6 +157,22 @@ let offset = publisher.publish(topic, batch).await?;
 println!("published offset = {}", offset.value());
 # Ok(())
 # }
+```
+
+Python equivalent — `publish_topic` accepts a `pyarrow.Table` via the
+Arrow C Stream Interface so the conversion is zero-copy:
+
+```python
+import pyarrow as pa
+
+table = pa.table({
+    "op":    ["c", "u", "d"],
+    "ts_ms": [1700_000_000_000, 1700_000_000_100, 1700_000_000_200],
+    "key":   ["order-1", "order-2", "order-3"],
+    "after": ["{...}", "{...}", None],
+})
+offset = db.publish_topic("cdc.orders", batch=table)
+print(f"published offset = {offset}")
 ```
 
 `publish()` validates the batch schema against the topic schema before

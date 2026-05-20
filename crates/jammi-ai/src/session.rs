@@ -102,6 +102,27 @@ impl InferenceSession {
         self.inner.catalog()
     }
 
+    /// Access the topic-catalog repo (used by trigger-stream callers that
+    /// do not want to go through Flight SQL DDL).
+    pub fn topic_repo(&self) -> Arc<jammi_engine::catalog::topic_repo::TopicRepo> {
+        self.inner.topic_repo()
+    }
+
+    /// Access the trigger-stream publisher.
+    pub fn publisher(&self) -> Arc<jammi_engine::trigger::Publisher> {
+        self.inner.publisher()
+    }
+
+    /// Access the trigger-stream subscriber.
+    pub fn subscriber(&self) -> Arc<jammi_engine::trigger::Subscriber> {
+        self.inner.subscriber()
+    }
+
+    /// Access the trigger broker the session was constructed with.
+    pub fn trigger_broker(&self) -> Arc<dyn jammi_engine::trigger::TriggerBroker> {
+        self.inner.trigger_broker()
+    }
+
     /// Bind a tenant scope to this session. Subsequent reads/writes filter
     /// to `tenant_id = t OR tenant_id IS NULL`; writes record `tenant_id = t`.
     pub fn bind_tenant(&self, t: jammi_engine::TenantId) {

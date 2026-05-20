@@ -1,12 +1,17 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use arrow::record_batch::RecordBatch;
+use datafusion::execution::context::SessionContext;
+use futures::StreamExt;
 use pyo3::prelude::*;
+use pyo3_arrow::PyTable;
 
 use jammi_ai::fine_tune::{EarlyStoppingMetric, FineTuneConfig, FineTuneMethod};
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+use jammi_engine::trigger::{Offset, Predicate};
 use jammi_lora::BackboneDtype;
 
 use crate::convert::{batches_to_pyarrow, json_to_pydict};
@@ -101,6 +106,107 @@ impl PyDatabase {
             )
             .map_err(to_pyerr)?;
         batches_to_pyarrow(py, &batches)
+    }
+
+    /// List registered topic names visible to the current tenant binding.
+    fn list_topics(&self) -> PyResult<Vec<String>> {
+        let topic_repo = self.session.topic_repo();
+        let tenant = self.session.tenant();
+        let topics = self
+            .runtime
+            .block_on(topic_repo.list_topics(tenant))
+            .map_err(|e| to_pyerr(jammi_engine::error::JammiError::Catalog(e.to_string())))?;
+        Ok(topics.into_iter().map(|t| t.name).collect())
+    }
+
+    /// Publish one batch of rows to a topic. `batch` is a `pyarrow.Table`
+    /// (zero-copy import via the Arrow C Stream Interface) whose schema
+    /// must match the topic's. Returns the engine-assigned offset.
+    #[pyo3(signature = (topic, *, batch))]
+    fn publish_topic(&self, topic: &str, batch: PyTable) -> PyResult<u64> {
+        let topic_repo = self.session.topic_repo();
+        let tenant = self.session.tenant();
+        let topic_def = self
+            .runtime
+            .block_on(topic_repo.lookup_by_name(topic, tenant))
+            .map_err(|e| to_pyerr(jammi_engine::error::JammiError::Catalog(e.to_string())))?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!("topic '{topic}' not found"))
+            })?;
+        let (batches, _schema) = batch.into_inner();
+        // The publisher accepts one RecordBatch per call; concatenate the
+        // streamed chunks so a multi-chunk pyarrow.Table publishes as one
+        // logical event.
+        let concatenated = if batches.len() == 1 {
+            batches.into_iter().next().unwrap()
+        } else {
+            let schema = batches[0].schema();
+            arrow::compute::concat_batches(&schema, batches.iter())
+                .map_err(|e| to_pyerr(jammi_engine::error::JammiError::Catalog(e.to_string())))?
+        };
+        let publisher = self.session.publisher();
+        let offset = self
+            .runtime
+            .block_on(publisher.publish(&topic_def, concatenated))
+            .map_err(|e| to_pyerr(jammi_engine::error::JammiError::Catalog(e.to_string())))?;
+        Ok(offset.value())
+    }
+
+    /// Open a subscription, collect up to `max_batches` matching batches
+    /// (replay + live tail joined), then close. Returns the concatenated
+    /// payload as a `pyarrow.Table`.
+    ///
+    /// Synchronous collect API: streaming iteration is left to the gRPC
+    /// `TriggerService.Subscribe` surface where back-pressure flows
+    /// through HTTP/2 naturally. This binding is the script-friendly
+    /// equivalent for one-shot Python workflows.
+    #[pyo3(signature = (topic, *, predicate=None, from_offset=None, max_batches=64))]
+    fn subscribe_collect(
+        &self,
+        py: Python<'_>,
+        topic: &str,
+        predicate: Option<&str>,
+        from_offset: Option<u64>,
+        max_batches: usize,
+    ) -> PyResult<Py<PyAny>> {
+        let topic_repo = self.session.topic_repo();
+        let tenant = self.session.tenant();
+        let topic_def = self
+            .runtime
+            .block_on(topic_repo.lookup_by_name(topic, tenant))
+            .map_err(|e| to_pyerr(jammi_engine::error::JammiError::Catalog(e.to_string())))?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!("topic '{topic}' not found"))
+            })?;
+        let predicate = Predicate::from_sql(
+            &SessionContext::new(),
+            Arc::clone(&topic_def.schema),
+            predicate.unwrap_or(""),
+        )
+        .map_err(|e| to_pyerr(jammi_engine::error::JammiError::Catalog(e.to_string())))?;
+        let from = from_offset.map(|v| Offset::new(v, chrono::Utc::now()));
+        let subscriber = self.session.subscriber();
+        let collected: Vec<RecordBatch> = self
+            .runtime
+            .block_on(async move {
+                let mut stream = subscriber
+                    .subscribe(&topic_def, predicate, from)
+                    .await
+                    .map_err(|e| jammi_engine::error::JammiError::Catalog(e.to_string()))?;
+                let mut out: Vec<RecordBatch> = Vec::new();
+                while out.len() < max_batches {
+                    match StreamExt::next(&mut stream).await {
+                        Some(Ok(d)) => out.push(d.batch),
+                        Some(Err(e)) => {
+                            return Err(jammi_engine::error::JammiError::Catalog(e.to_string()))
+                        }
+                        None => break,
+                    }
+                }
+                Ok::<_, jammi_engine::error::JammiError>(out)
+            })
+            .map_err(to_pyerr)?;
+        batches_to_pyarrow(py, &collected)
     }
 
     /// Start a vector search. Returns a `SearchBuilder` for fluent chaining.

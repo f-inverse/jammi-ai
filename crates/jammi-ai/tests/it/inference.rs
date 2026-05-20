@@ -84,8 +84,19 @@ mod live {
     use jammi_ai::model::{ModelSource, ModelTask};
     use jammi_ai::session::InferenceSession;
     use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+    use serial_test::serial;
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    // PatentCLIP tests share the hf-hub on-disk cache for
+    // `patentclip/PatentCLIP_Vit_B`. The per-`ModelCache` single-flight in
+    // `cache::ModelCache::get_or_load` deduplicates concurrent loads inside one
+    // cache, but each of these tests builds its own cache (and its own
+    // `hf_hub::api::sync::Api`). With cargo's default parallel test runner
+    // three threads race on the same on-disk weights file and hf-hub's sync
+    // API does not coordinate concurrent first-time downloads across `Api`
+    // instances. `#[serial]` forces them to run one at a time so the cache
+    // populates cleanly on the first attempt.
 
     async fn setup_with_patents() -> (InferenceSession, tempfile::TempDir) {
         let dir = tempdir().unwrap();
@@ -256,6 +267,7 @@ mod live {
     }
 
     #[tokio::test]
+    #[serial(patentclip)]
     async fn live_patentclip_produces_512_dim_image_embeddings() {
         use jammi_ai::model::backend::DeviceConfig;
         use jammi_ai::model::cache::ModelCache;
@@ -333,6 +345,7 @@ mod live {
     }
 
     #[tokio::test]
+    #[serial(patentclip)]
     async fn live_patentclip_encode_image_query() {
         let dir = tempdir().unwrap();
         let config = common::test_config(dir.path());
@@ -363,6 +376,7 @@ mod live {
     }
 
     #[tokio::test]
+    #[serial(patentclip)]
     async fn live_patentclip_generate_image_embeddings_pipeline() {
         let dir = tempdir().unwrap();
         let config = common::test_config(dir.path());

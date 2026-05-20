@@ -1,20 +1,18 @@
 //! Catalog-row operations for trigger-stream topics.
 //!
 //! `topic_repo` persists the [`TopicDefinition`] tuple — id, name, Arrow
-//! schema (serialised as IPC bytes), tenant scope, broker metadata, backing
+//! schema (serialised as JSON in a `TEXT` column to keep the DDL identical
+//! on SQLite and Postgres), tenant scope, broker metadata, backing
 //! mutable-table name — and the matching Phase-2 backing table inside one
-//! `CatalogBackend::transaction`. Schemas are IPC-encoded so the read path
-//! reconstructs the exact `arrow_schema::Schema` the publisher saw, including
-//! metadata that JSON encoders would drop.
+//! `CatalogBackend::transaction`. The encoding mirrors what `mutable_repo`
+//! does for `mutable_tables.schema_json` so the two catalog tables decode
+//! through the same lens.
 
 use std::collections::BTreeMap;
-use std::io::Cursor;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow_ipc::reader::StreamReader;
-use arrow_ipc::writer::StreamWriter;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Field, Schema};
 
 use crate::catalog::backend::{BackendError, Row, SqlValue, TxOptions};
 use crate::catalog::Catalog;
@@ -69,7 +67,7 @@ impl TopicRepo {
         // 2. Insert the topic catalog row referencing the backing table.
         let topic_id = topic.id.to_string();
         let name = topic.name.clone();
-        let schema_ipc = encode_schema_ipc(&topic.schema)?;
+        let schema_json = encode_schema_json(topic.schema.as_ref())?;
         let tenant_str = topic.tenant.map(|t| t.to_string());
         let broker_metadata = serde_json::to_string(&topic.broker_metadata)
             .map_err(|e| TriggerError::Catalog(format!("broker_metadata serialisation: {e}")))?;
@@ -80,19 +78,19 @@ impl TopicRepo {
             .transaction(TxOptions::default(), move |tx| {
                 let topic_id = topic_id.clone();
                 let name = name.clone();
-                let schema_ipc = schema_ipc.clone();
+                let schema_json = schema_json.clone();
                 let tenant_str = tenant_str.clone();
                 let broker_metadata = broker_metadata.clone();
                 let backing_table = backing_table.clone();
                 Box::pin(async move {
                     tx.execute(
                         "INSERT INTO topics \
-                         (topic_id, name, schema_arrow_ipc, tenant_id, broker_metadata, backing_table) \
+                         (topic_id, name, schema_json, tenant_id, broker_metadata, backing_table) \
                          VALUES ($1, $2, $3, $4, $5, $6)",
                         &[
                             SqlValue::TextOwned(topic_id),
                             SqlValue::TextOwned(name),
-                            SqlValue::BytesOwned(schema_ipc),
+                            SqlValue::TextOwned(schema_json),
                             SqlValue::from(tenant_str),
                             SqlValue::TextOwned(broker_metadata),
                             SqlValue::TextOwned(backing_table),
@@ -129,7 +127,7 @@ impl TopicRepo {
                     let tenant_str = tenant_str.clone();
                     Box::pin(async move {
                         tx.query_opt(
-                            "SELECT topic_id, name, schema_arrow_ipc, tenant_id, \
+                            "SELECT topic_id, name, schema_json, tenant_id, \
                                     broker_metadata, backing_table \
                              FROM topics \
                              WHERE name = $1 AND (tenant_id = $2 OR tenant_id IS NULL) \
@@ -166,7 +164,7 @@ impl TopicRepo {
                     let tenant_str = tenant_str.clone();
                     Box::pin(async move {
                         tx.query(
-                            "SELECT topic_id, name, schema_arrow_ipc, tenant_id, \
+                            "SELECT topic_id, name, schema_json, tenant_id, \
                                     broker_metadata, backing_table \
                              FROM topics \
                              WHERE (tenant_id = $1 OR tenant_id IS NULL) \
@@ -207,7 +205,7 @@ impl TopicRepo {
                     let tenant_str = tenant_str.clone();
                     Box::pin(async move {
                         tx.query_opt(
-                            "SELECT topic_id, name, schema_arrow_ipc, tenant_id, \
+                            "SELECT topic_id, name, schema_json, tenant_id, \
                                     broker_metadata, backing_table \
                              FROM topics \
                              WHERE topic_id = $1 AND (tenant_id = $2 OR tenant_id IS NULL)",
@@ -258,7 +256,7 @@ impl TopicRepo {
 struct RawTopicRow {
     topic_id: String,
     name: String,
-    schema_ipc: Vec<u8>,
+    schema_json: String,
     tenant_id: Option<String>,
     broker_metadata: String,
     backing_table: String,
@@ -268,7 +266,7 @@ fn parse_topic_row(row: &Row<'_>) -> Result<RawTopicRow, BackendError> {
     Ok(RawTopicRow {
         topic_id: row.get("topic_id")?,
         name: row.get("name")?,
-        schema_ipc: row.get("schema_arrow_ipc")?,
+        schema_json: row.get("schema_json")?,
         tenant_id: row.try_get("tenant_id")?,
         broker_metadata: row.get("broker_metadata")?,
         backing_table: row.get("backing_table")?,
@@ -278,7 +276,7 @@ fn parse_topic_row(row: &Row<'_>) -> Result<RawTopicRow, BackendError> {
 fn materialize_topic(raw: RawTopicRow) -> Result<TopicDefinition, TriggerError> {
     let id = TopicId::from_str(&raw.topic_id)
         .map_err(|e| TriggerError::Catalog(format!("topic_id parse: {e}")))?;
-    let schema = decode_schema_ipc(&raw.schema_ipc)?;
+    let schema = Arc::new(decode_schema_json(&raw.schema_json)?);
     let tenant = match raw.tenant_id {
         Some(s) => Some(
             TenantId::from_str(&s).map_err(|e| TriggerError::Catalog(format!("tenant: {e}")))?,
@@ -296,21 +294,85 @@ fn materialize_topic(raw: RawTopicRow) -> Result<TopicDefinition, TriggerError> 
     })
 }
 
-fn encode_schema_ipc(schema: &SchemaRef) -> Result<Vec<u8>, TriggerError> {
-    let mut buf: Vec<u8> = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut buf, schema.as_ref())
-            .map_err(|e| TriggerError::Catalog(format!("schema IPC encode: {e}")))?;
-        writer
-            .finish()
-            .map_err(|e| TriggerError::Catalog(format!("schema IPC finish: {e}")))?;
-    }
-    Ok(buf)
+/// Encode an Arrow schema as JSON — the same compact closed-type encoding
+/// `mutable_repo` uses for `mutable_tables.schema_json`. Keeping the format
+/// identical means the same backends decode both columns without a second
+/// parser.
+fn encode_schema_json(schema: &Schema) -> Result<String, TriggerError> {
+    let fields: Vec<serde_json::Value> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "name": f.name(),
+                "type": data_type_name(f.data_type()),
+                "nullable": f.is_nullable(),
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({ "fields": fields }).to_string())
 }
 
-fn decode_schema_ipc(bytes: &[u8]) -> Result<SchemaRef, TriggerError> {
-    let cursor = Cursor::new(bytes);
-    let reader = StreamReader::try_new(cursor, None)
-        .map_err(|e| TriggerError::Catalog(format!("schema IPC decode: {e}")))?;
-    Ok(reader.schema())
+fn decode_schema_json(json: &str) -> Result<Schema, TriggerError> {
+    #[derive(serde::Deserialize)]
+    struct Wire {
+        fields: Vec<WireField>,
+    }
+    #[derive(serde::Deserialize)]
+    struct WireField {
+        name: String,
+        #[serde(rename = "type")]
+        ty: String,
+        nullable: bool,
+    }
+    let wire: Wire = serde_json::from_str(json)
+        .map_err(|e| TriggerError::Catalog(format!("schema_json parse: {e}")))?;
+    let fields: Result<Vec<Field>, TriggerError> = wire
+        .fields
+        .into_iter()
+        .map(|w| Ok(Field::new(&w.name, data_type_from_name(&w.ty)?, w.nullable)))
+        .collect();
+    Ok(Schema::new(fields?))
+}
+
+fn data_type_name(ty: &DataType) -> &'static str {
+    match ty {
+        DataType::Boolean => "Boolean",
+        DataType::Int8 => "Int8",
+        DataType::Int16 => "Int16",
+        DataType::Int32 => "Int32",
+        DataType::Int64 => "Int64",
+        DataType::UInt8 => "UInt8",
+        DataType::UInt16 => "UInt16",
+        DataType::UInt32 => "UInt32",
+        DataType::UInt64 => "UInt64",
+        DataType::Float32 => "Float32",
+        DataType::Float64 => "Float64",
+        DataType::Utf8 => "Utf8",
+        DataType::Binary => "Binary",
+        _ => "Utf8",
+    }
+}
+
+fn data_type_from_name(name: &str) -> Result<DataType, TriggerError> {
+    Ok(match name {
+        "Boolean" => DataType::Boolean,
+        "Int8" => DataType::Int8,
+        "Int16" => DataType::Int16,
+        "Int32" => DataType::Int32,
+        "Int64" => DataType::Int64,
+        "UInt8" => DataType::UInt8,
+        "UInt16" => DataType::UInt16,
+        "UInt32" => DataType::UInt32,
+        "UInt64" => DataType::UInt64,
+        "Float32" => DataType::Float32,
+        "Float64" => DataType::Float64,
+        "Utf8" => DataType::Utf8,
+        "Binary" => DataType::Binary,
+        other => {
+            return Err(TriggerError::Catalog(format!(
+                "unsupported topic schema type: {other}"
+            )))
+        }
+    })
 }

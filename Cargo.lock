@@ -3815,7 +3815,6 @@ version = "0.5.0"
 dependencies = [
  "arrow",
  "arrow-array",
- "arrow-ipc",
  "arrow-schema",
  "async-stream",
  "async-trait",

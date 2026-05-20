@@ -22,7 +22,6 @@ datafusion-federation.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
 arrow-array.workspace = true
-arrow-ipc.workspace = true
 
 # External sources (feature-gated — not a workspace dep to avoid sqlite3 links conflict)
 datafusion-table-providers = { version = "0.10.1", default-features = false, optional = true }

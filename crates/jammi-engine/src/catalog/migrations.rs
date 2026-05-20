@@ -29,6 +29,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "008_mutable_order_column",
         schema::MIGRATION_008_MUTABLE_ORDER_COLUMN,
     ),
+    ("009_topics", schema::MIGRATION_009_TOPICS),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

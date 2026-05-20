@@ -110,6 +110,7 @@ pub struct MutableTableDefinitionBuilder {
     user_metadata: serde_json::Value,
     order_column: Option<String>,
     chunk_size: usize,
+    allow_internal_columns: bool,
 }
 
 impl MutableTableDefinitionBuilder {
@@ -123,7 +124,18 @@ impl MutableTableDefinitionBuilder {
             user_metadata: serde_json::Value::Object(serde_json::Map::new()),
             order_column: None,
             chunk_size: 8192,
+            allow_internal_columns: false,
         }
+    }
+
+    /// Permit schema columns whose names start with `_` (otherwise reserved
+    /// for engine-controlled metadata). Used by the trigger-stream backing
+    /// table where `_offset`, `_row_idx`, and `_produced_at` are part of the
+    /// designed-by-the-engine schema. User-facing mutable tables must not
+    /// call this.
+    pub fn allow_internal_columns(mut self) -> Self {
+        self.allow_internal_columns = true;
+        self
     }
 
     pub fn primary_key(mut self, columns: Vec<String>) -> Self {
@@ -180,7 +192,7 @@ impl MutableTableDefinitionBuilder {
             if f.name() == "tenant_id" {
                 return Err(MutableTableError::ReservedColumn(f.name().clone()));
             }
-            if f.name().starts_with('_') {
+            if !self.allow_internal_columns && f.name().starts_with('_') {
                 return Err(MutableTableError::ReservedColumn(f.name().clone()));
             }
         }

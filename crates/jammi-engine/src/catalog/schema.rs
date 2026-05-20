@@ -210,3 +210,25 @@ CREATE TABLE mutable_table_indexes (
 pub(super) const MIGRATION_008_MUTABLE_ORDER_COLUMN: &str = r#"
 ALTER TABLE mutable_tables ADD COLUMN order_column TEXT;
 "#;
+
+/// Migration 009 — trigger-stream `topics` catalog table.
+///
+/// One row per registered topic. The Arrow schema is serialised via IPC into
+/// `schema_arrow_ipc` so brokers and replay paths can reconstruct it without
+/// re-parsing user input. `backing_table` references the Phase-2 mutable
+/// table that persists the event log; `ON DELETE RESTRICT` keeps the topic
+/// and its backing table aligned. Tenant scope follows ADR-00 — nullable.
+pub(super) const MIGRATION_009_TOPICS: &str = r#"
+CREATE TABLE topics (
+    topic_id          TEXT PRIMARY KEY,
+    name              TEXT NOT NULL UNIQUE,
+    schema_arrow_ipc  BLOB NOT NULL,
+    tenant_id         TEXT,
+    broker_metadata   TEXT NOT NULL DEFAULT '{}',
+    backing_table     TEXT NOT NULL UNIQUE REFERENCES mutable_tables(id) ON DELETE RESTRICT,
+    created_at        TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT))
+);
+
+CREATE INDEX idx_topics_tenant ON topics(tenant_id);
+CREATE INDEX idx_topics_name ON topics(name);
+"#;

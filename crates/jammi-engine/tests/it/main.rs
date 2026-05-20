@@ -11,3 +11,4 @@ mod recovery;
 mod sources;
 mod store;
 mod tenant_scope;
+mod trigger;

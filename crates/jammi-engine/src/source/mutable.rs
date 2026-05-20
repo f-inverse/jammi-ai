@@ -252,7 +252,14 @@ async fn fetch_scan_after_batch(
         .iter()
         .map(|f| f.name().as_str())
         .collect();
-    let sql = backend.scan_dml(&def, &col_names, Some(predicate.as_str()), None);
+    let base_sql = backend.scan_dml(&def, &col_names, Some(predicate.as_str()), None);
+    // `scan_dml` does not emit ORDER BY; without it Postgres is free to return
+    // rows in any sequence. `scan_after`'s ascending-order contract requires
+    // the sort, so wrap the rendered statement here.
+    let sql = format!(
+        "{base_sql} ORDER BY \"{}\" ASC",
+        order_col.replace('"', "\"\"")
+    );
 
     let columns: Vec<(String, DataType)> = def
         .schema

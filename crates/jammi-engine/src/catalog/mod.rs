@@ -11,6 +11,7 @@ pub mod result_repo;
 pub mod schema;
 pub mod source_repo;
 pub mod status;
+pub mod topic_repo;
 
 use std::path::Path;
 use std::sync::Arc;

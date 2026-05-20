@@ -166,6 +166,7 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "004_drop_embedding_sets",
             "005_tenant_scope",
             "006_channel_columns",
+            "007_mutable_tables",
         ]
     );
 }

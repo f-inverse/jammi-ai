@@ -1,4 +1,5 @@
 pub mod local;
+pub mod mutable;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 #[cfg(feature = "postgres")]

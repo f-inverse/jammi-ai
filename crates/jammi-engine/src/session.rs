@@ -8,9 +8,13 @@ use datafusion_federation::{FederatedQueryPlanner, FederationOptimizerRule};
 use crate::catalog::Catalog;
 use crate::config::JammiConfig;
 use crate::error::{JammiError, Result};
+use crate::source::mutable::MutableTableRegistry;
 use crate::source::registry::SourceCatalog;
 use crate::source::schema_provider::JammiSchemaProvider;
 use crate::source::{local, table_name_from_url, SourceConnection, SourceType};
+use crate::store::mutable::definition::{MutableTableDefinition, MutableTableId};
+use crate::store::mutable::sqlite::SqliteMutableBackend;
+use crate::store::mutable::MutableBackend;
 use crate::tenant::TenantId;
 
 /// Primary entry point for the Jammi query engine.
@@ -22,6 +26,8 @@ pub struct JammiSession {
     catalog: Arc<Catalog>,
     config: Arc<JammiConfig>,
     tenant: Option<TenantId>,
+    mutable: Arc<MutableTableRegistry>,
+    mutable_schema: Arc<JammiSchemaProvider>,
 }
 
 impl JammiSession {
@@ -54,13 +60,39 @@ impl JammiSession {
 
         let ctx = SessionContext::new_with_state(federated_state);
 
+        // Construct the mutable-table registry backed by the same backend
+        // the catalog runs on. Phase 2 ships the SQLite renderer; a Postgres
+        // deployment would swap the renderer when `BackendKind::Postgres`.
+        let mutable_backend: Arc<dyn MutableBackend> = match catalog.backend_arc().backend_kind() {
+            crate::catalog::backend::BackendKind::Sqlite => {
+                Arc::new(SqliteMutableBackend::new(catalog.backend_arc()))
+            }
+            crate::catalog::backend::BackendKind::Postgres => Arc::new(
+                crate::store::mutable::postgres::PostgresMutableBackend::new(catalog.backend_arc()),
+            ),
+        };
+        let mutable = Arc::new(MutableTableRegistry::new(
+            Arc::clone(&catalog),
+            mutable_backend,
+        ));
+
+        // The "mutable" catalog hosts every registered mutable companion
+        // table under a single "public" schema. Register the empty catalog
+        // up-front so three-part names resolve before any table is added.
+        let mutable_schema = Arc::new(JammiSchemaProvider::new());
+        let mutable_catalog = Arc::new(SourceCatalog::new(Arc::clone(&mutable_schema)));
+        ctx.register_catalog("mutable", mutable_catalog);
+
         let session = Self {
             ctx,
             catalog,
             config,
             tenant: None,
+            mutable,
+            mutable_schema,
         };
         session.reload_sources().await?;
+        session.reload_mutable_tables().await?;
         Ok(session)
     }
 
@@ -243,6 +275,56 @@ impl JammiSession {
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
         let df = self.ctx.sql(query).await?;
         Ok(df.collect().await?)
+    }
+
+    /// Register a mutable companion table. After this returns, the table is
+    /// queryable as `mutable.public.<id>` in the same SQL surface that
+    /// federates Parquet result tables and external sources.
+    pub async fn create_mutable_table(
+        &self,
+        def: MutableTableDefinition,
+    ) -> Result<MutableTableId> {
+        let id = def.id.clone();
+        let provider = self
+            .mutable
+            .register(def)
+            .await
+            .map_err(|e| JammiError::Catalog(e.to_string()))?;
+        self.mutable_schema
+            .add_table(id.as_str().to_string(), provider)?;
+        Ok(id)
+    }
+
+    /// Drop a mutable companion table.
+    pub async fn drop_mutable_table(&self, id: &MutableTableId) -> Result<()> {
+        self.mutable
+            .drop_table(id)
+            .await
+            .map_err(|e| JammiError::Catalog(e.to_string()))?;
+        self.mutable_schema.remove_table(id.as_str())?;
+        Ok(())
+    }
+
+    /// Re-register mutable tables persisted in the catalog from a previous
+    /// process. Called on startup.
+    async fn reload_mutable_tables(&self) -> Result<()> {
+        let defs = self
+            .mutable
+            .list(self.tenant)
+            .await
+            .map_err(|e| JammiError::Catalog(e.to_string()))?;
+        for def in defs {
+            let id = def.id.clone();
+            let provider = self.mutable.provider_for(def);
+            self.mutable_schema
+                .add_table(id.as_str().to_string(), provider)?;
+        }
+        Ok(())
+    }
+
+    /// Reference to the mutable-table registry.
+    pub fn mutable_tables(&self) -> &MutableTableRegistry {
+        &self.mutable
     }
 
     /// Return a reference to the underlying DataFusion `SessionContext`.

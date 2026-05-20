@@ -54,6 +54,15 @@ impl JammiSchemaProvider {
             .clear();
         Ok(())
     }
+
+    /// Remove one table by name. Returns the dropped provider if present.
+    pub fn remove_table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+        Ok(self
+            .tables
+            .write()
+            .map_err(|e| DataFusionError::Internal(format!("Lock poisoned: {e}")))?
+            .remove(name))
+    }
 }
 
 #[async_trait]

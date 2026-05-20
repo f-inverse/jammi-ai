@@ -4,6 +4,7 @@ mod common;
 mod foundation;
 mod index;
 mod migrations;
+mod mutable_tables;
 mod recovery;
 mod sources;
 mod store;

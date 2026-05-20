@@ -6,6 +6,7 @@ pub mod eval_repo;
 pub mod fine_tune_repo;
 pub mod migrations;
 pub mod model_repo;
+pub mod mutable_repo;
 pub mod result_repo;
 pub mod schema;
 pub mod source_repo;
@@ -26,7 +27,7 @@ use channel_repo::ChannelRepo;
 /// embedded). Multi-process server deployments construct a Postgres backend
 /// via [`Catalog::from_backend`].
 pub struct Catalog {
-    backend: BackendImpl,
+    backend: std::sync::Arc<BackendImpl>,
 }
 
 impl Catalog {
@@ -38,7 +39,7 @@ impl Catalog {
         let db_path = artifact_dir.join("catalog.db");
         let backend = SqliteBackend::open(&db_path).await?;
         let cat = Self {
-            backend: BackendImpl::Sqlite(backend),
+            backend: std::sync::Arc::new(BackendImpl::Sqlite(backend)),
         };
         cat.backend.migrate().await?;
         Ok(cat)
@@ -47,7 +48,9 @@ impl Catalog {
     /// Open a catalog from a pre-built backend. Used by tests and by the
     /// server deployment shape that wires a Postgres backend.
     pub fn from_backend(backend: BackendImpl) -> Self {
-        Self { backend }
+        Self {
+            backend: std::sync::Arc::new(backend),
+        }
     }
 
     /// Repository view over the evidence-channel tables.
@@ -59,5 +62,12 @@ impl Catalog {
     /// implementations.
     pub(crate) fn backend(&self) -> &BackendImpl {
         &self.backend
+    }
+
+    /// Shared handle to the underlying backend. Used by the mutable-table
+    /// registry to issue DDL/DML on the same database the catalog rows live
+    /// in.
+    pub fn backend_arc(&self) -> std::sync::Arc<BackendImpl> {
+        std::sync::Arc::clone(&self.backend)
     }
 }

@@ -164,3 +164,37 @@ INSERT INTO evidence_channel_columns(channel_name, column_name, column_type, ord
 
 ALTER TABLE evidence_channels DROP COLUMN schema_json;
 "#;
+
+/// Migration 007 — mutable companion tables registry.
+///
+/// Adds two catalog tables that record user-declared mutable tables:
+///   * `mutable_tables` — one row per registered table, carrying the Arrow
+///     schema JSON, primary-key column list, optional tenant scope, free-form
+///     user metadata, and a backend identifier (`'sqlite'` | `'postgres'`).
+///   * `mutable_table_indexes` — secondary indexes per registered table.
+///
+/// The `tenant_id` column on `mutable_tables` is defined by migration 005;
+/// Phase 2 stores `NULL` for every row it writes. Phase 3 wires the
+/// session-attribute layer that populates it.
+pub(super) const MIGRATION_007_MUTABLE_TABLES: &str = r#"
+CREATE TABLE mutable_tables (
+    id              TEXT PRIMARY KEY,
+    schema_json     TEXT NOT NULL,
+    primary_key     TEXT NOT NULL,
+    tenant_id       TEXT,
+    user_metadata   TEXT NOT NULL DEFAULT '{}',
+    backend_kind    TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX idx_mutable_tables_tenant ON mutable_tables(tenant_id);
+
+CREATE TABLE mutable_table_indexes (
+    table_id        TEXT NOT NULL REFERENCES mutable_tables(id) ON DELETE CASCADE,
+    index_name      TEXT NOT NULL,
+    columns         TEXT NOT NULL,
+    is_unique       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (table_id, index_name)
+);
+"#;

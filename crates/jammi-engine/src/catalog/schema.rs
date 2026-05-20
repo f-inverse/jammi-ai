@@ -198,3 +198,15 @@ CREATE TABLE mutable_table_indexes (
     PRIMARY KEY (table_id, index_name)
 );
 "#;
+
+/// Migration 008 — `order_column` on `mutable_tables`.
+///
+/// `MutableTableDefinition` already carries an optional `order_column` field
+/// validated at build time, but Phase 2's `mutable_tables` catalog row did
+/// not persist it; every reload via `get_mutable_table` returned
+/// `order_column: None`. Phase 4's trigger-stream replay path consumes
+/// `order_column` via `MutableTableRegistry::scan_after`, so we round-trip
+/// it now.
+pub(super) const MIGRATION_008_MUTABLE_ORDER_COLUMN: &str = r#"
+ALTER TABLE mutable_tables ADD COLUMN order_column TEXT;
+"#;

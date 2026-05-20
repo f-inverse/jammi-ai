@@ -22,6 +22,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("005_tenant_scope", schema::MIGRATION_005_TENANT_SCOPE),
     ("006_channel_columns", schema::MIGRATION_006_CHANNEL_COLUMNS),
     ("007_mutable_tables", schema::MIGRATION_007_MUTABLE_TABLES),
+    (
+        "008_mutable_order_column",
+        schema::MIGRATION_008_MUTABLE_ORDER_COLUMN,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

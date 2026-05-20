@@ -141,7 +141,7 @@ impl DataSink for MutableTableSink {
 /// the session-bound tenant: when `Some(t)`, every row carries the same
 /// tenant string; when `None`, every row carries `NULL` (a globally-scoped
 /// write, as in a single-tenant deployment).
-fn batch_to_params(
+pub(crate) fn batch_to_params(
     batch: &RecordBatch,
     tenant: Option<crate::tenant::TenantId>,
 ) -> Result<Vec<SqlValue<'static>>, &'static str> {

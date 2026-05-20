@@ -22,6 +22,8 @@
 - [Fine-Tune for Your Domain](./fine-tuning.md)
 - [Evaluate and Compare Models](./evaluation.md)
 - [Connect to PostgreSQL / MySQL](./external-sources.md)
+- [Register a Mutable Companion Table](./register-mutable-table.md)
+- [Run Transactional Updates on a Mutable Table](./update-mutable-table.md)
 - [Scope a Session to a Tenant](./multi-tenant.md)
 - [Deploy as a Server](./deploy-server.md)
 - [Monitor Inference](./monitor-inference.md)

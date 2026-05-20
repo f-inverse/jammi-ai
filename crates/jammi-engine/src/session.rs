@@ -390,6 +390,13 @@ impl JammiSession {
         &self.mutable
     }
 
+    /// Shared handle to the mutable-table registry. Use when a caller needs
+    /// to move the registry into an `async move` closure (e.g. opening a
+    /// transaction and calling `insert_batch` inside it).
+    pub fn mutable_tables_arc(&self) -> Arc<MutableTableRegistry> {
+        Arc::clone(&self.mutable)
+    }
+
     /// Return a reference to the underlying DataFusion `SessionContext`.
     pub fn context(&self) -> &SessionContext {
         &self.ctx

@@ -6,8 +6,10 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use futures::StreamExt;
+use jammi_engine::catalog::backend::TxOptions;
 use jammi_engine::catalog::Catalog;
 use jammi_engine::session::JammiSession;
 use jammi_engine::store::mutable::definition::{
@@ -261,4 +263,193 @@ async fn catalog_create_get_delete_round_trip() {
 
     catalog.delete_mutable_table(&id).await.unwrap();
     assert!(catalog.get_mutable_table(&id).await.unwrap().is_none());
+}
+
+// ─── Phase 2.1 — insert_batch / scan_after / order_column round-trip ───────
+
+fn events_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("seq", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, true),
+    ]))
+}
+
+#[tokio::test]
+async fn order_column_persists_across_reload() {
+    let dir = tempdir().unwrap();
+    let cfg = common::test_config(dir.path());
+    let id = MutableTableId::new("events").unwrap();
+
+    {
+        let session = JammiSession::new(cfg.clone()).await.unwrap();
+        let def = MutableTableDefinitionBuilder::new(id.clone(), events_schema())
+            .primary_key(vec!["id".into()])
+            .order_column("seq")
+            .build()
+            .unwrap();
+        session.create_mutable_table(def).await.unwrap();
+    }
+
+    // Fresh process: order_column must round-trip through the catalog.
+    let session = JammiSession::new(cfg).await.unwrap();
+    let reloaded = session
+        .mutable_tables()
+        .get(&id)
+        .await
+        .unwrap()
+        .expect("table should exist after reload");
+    assert_eq!(reloaded.order_column.as_deref(), Some("seq"));
+}
+
+#[tokio::test]
+async fn insert_batch_appends_with_session_tenant() {
+    let dir = tempdir().unwrap();
+    let cfg = common::test_config(dir.path());
+    let session = JammiSession::new(cfg).await.unwrap();
+    let id = MutableTableId::new("events").unwrap();
+    let def = MutableTableDefinitionBuilder::new(id.clone(), events_schema())
+        .primary_key(vec!["id".into()])
+        .order_column("seq")
+        .build()
+        .unwrap();
+    session.create_mutable_table(def).await.unwrap();
+
+    // Build a 3-row batch.
+    let batch = RecordBatch::try_new(
+        events_schema(),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            Arc::new(Int64Array::from(vec![100_i64, 101, 102])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .unwrap();
+
+    // Use insert_batch via a caller-owned transaction.
+    let backend = session.catalog().backend_arc();
+    let registry = session.mutable_tables_arc();
+    let id_clone = id.clone();
+    let written = backend
+        .transaction(TxOptions::default(), move |tx| {
+            let id = id_clone.clone();
+            let batch = batch.clone();
+            let registry = Arc::clone(&registry);
+            Box::pin(async move {
+                let n = registry
+                    .insert_batch(tx, &id, &batch)
+                    .await
+                    .map_err(|e| jammi_engine::BackendError::Execution(e.to_string()))?;
+                Ok::<u64, jammi_engine::BackendError>(n)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(written, 3);
+}
+
+#[tokio::test]
+async fn scan_after_streams_rows_strictly_greater_in_order() {
+    let dir = tempdir().unwrap();
+    let cfg = common::test_config(dir.path());
+    let session = JammiSession::new(cfg).await.unwrap();
+    let id = MutableTableId::new("events").unwrap();
+    let def = MutableTableDefinitionBuilder::new(id.clone(), events_schema())
+        .primary_key(vec!["id".into()])
+        .order_column("seq")
+        .build()
+        .unwrap();
+    session.create_mutable_table(def).await.unwrap();
+
+    // Insert via SQL (simpler than the direct-access path for setup).
+    session
+        .sql(
+            "INSERT INTO mutable.public.events (id, seq, payload) VALUES \
+             (1, 100, 'old'), (2, 200, 'mid'), (3, 300, 'new')",
+        )
+        .await
+        .unwrap();
+
+    let mut stream = session.mutable_tables().scan_after(&id, 150).await.unwrap();
+    let mut all_rows = Vec::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch.unwrap();
+        let seqs = batch
+            .column_by_name("seq")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..seqs.len() {
+            all_rows.push(seqs.value(i));
+        }
+    }
+    assert_eq!(all_rows, vec![200, 300]);
+}
+
+#[tokio::test]
+async fn scan_after_errors_when_order_column_missing() {
+    use jammi_engine::store::mutable::definition::MutableTableError;
+
+    let dir = tempdir().unwrap();
+    let cfg = common::test_config(dir.path());
+    let session = JammiSession::new(cfg).await.unwrap();
+    let id = MutableTableId::new("noorder").unwrap();
+    let def = MutableTableDefinitionBuilder::new(id.clone(), events_schema())
+        .primary_key(vec!["id".into()])
+        .build()
+        .unwrap();
+    session.create_mutable_table(def).await.unwrap();
+
+    let result = session.mutable_tables().scan_after(&id, 0).await;
+    match result {
+        Ok(_) => panic!("scan_after should reject table without order_column"),
+        Err(MutableTableError::NoOrderColumn) => {}
+        Err(other) => panic!("expected NoOrderColumn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn insert_batch_rejects_schema_mismatch() {
+    use jammi_engine::store::mutable::definition::MutableTableError;
+
+    let dir = tempdir().unwrap();
+    let cfg = common::test_config(dir.path());
+    let session = JammiSession::new(cfg).await.unwrap();
+    let id = MutableTableId::new("events").unwrap();
+    let def = MutableTableDefinitionBuilder::new(id.clone(), events_schema())
+        .primary_key(vec!["id".into()])
+        .build()
+        .unwrap();
+    session.create_mutable_table(def).await.unwrap();
+
+    // Wrong schema — only one column.
+    let wrong_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch =
+        RecordBatch::try_new(wrong_schema, vec![Arc::new(Int64Array::from(vec![1_i64]))]).unwrap();
+
+    let backend = session.catalog().backend_arc();
+    let registry = session.mutable_tables_arc();
+    let err = backend
+        .transaction(TxOptions::default(), move |tx| {
+            let id = id.clone();
+            let batch = batch.clone();
+            let registry = Arc::clone(&registry);
+            Box::pin(async move {
+                match registry.insert_batch(tx, &id, &batch).await {
+                    Ok(_) => Ok::<(), jammi_engine::BackendError>(()),
+                    Err(MutableTableError::Schema(msg)) => Err(
+                        jammi_engine::BackendError::Execution(format!("SCHEMA_MISMATCH:{msg}")),
+                    ),
+                    Err(other) => Err(jammi_engine::BackendError::Execution(other.to_string())),
+                }
+            })
+        })
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("SCHEMA_MISMATCH"),
+        "expected schema mismatch error, got: {msg}"
+    );
 }

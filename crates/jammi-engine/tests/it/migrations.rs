@@ -167,6 +167,7 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "005_tenant_scope",
             "006_channel_columns",
             "007_mutable_tables",
+            "008_mutable_order_column",
         ]
     );
 }

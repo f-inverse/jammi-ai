@@ -18,6 +18,22 @@ use crate::tenant::TenantId;
 
 use super::Catalog;
 
+/// Raw `mutable_tables` row tuple — `(schema_json, primary_key_json,
+/// tenant_id, user_metadata, order_column)`. Aliased so the repo's
+/// internal closures stay readable.
+type MutableRowTuple = (String, String, Option<String>, String, Option<String>);
+
+/// Raw `mutable_tables` listing tuple — `(id, schema_json,
+/// primary_key_json, tenant_id, user_metadata, order_column)`.
+type MutableListingTuple = (
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
 impl Catalog {
     /// Insert the registration row + index rows for `def` atomically.
     pub async fn create_mutable_table(
@@ -31,6 +47,7 @@ impl Catalog {
         let user_metadata = def.user_metadata.to_string();
         let backend_kind = format!("{:?}", self.backend().backend_kind()).to_lowercase();
         let tenant_str = def.tenant.map(|t| t.to_string());
+        let order_column = def.order_column.clone();
         let indexes = def.indexes.clone();
 
         self.backend()
@@ -38,8 +55,8 @@ impl Catalog {
                 Box::pin(async move {
                     tx.execute(
                         "INSERT INTO mutable_tables \
-                         (id, schema_json, primary_key, tenant_id, user_metadata, backend_kind) \
-                         VALUES ($1, $2, $3, $4, $5, $6)",
+                         (id, schema_json, primary_key, tenant_id, user_metadata, backend_kind, order_column) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7)",
                         &[
                             SqlValue::TextOwned(id_str.clone()),
                             SqlValue::TextOwned(schema_json),
@@ -47,6 +64,7 @@ impl Catalog {
                             SqlValue::from(tenant_str),
                             SqlValue::TextOwned(user_metadata),
                             SqlValue::TextOwned(backend_kind),
+                            SqlValue::from(order_column),
                         ],
                     )
                     .await?;
@@ -92,7 +110,7 @@ impl Catalog {
                     let id_str = id_str.clone();
                     Box::pin(async move {
                         tx.query_opt(
-                            "SELECT schema_json, primary_key, tenant_id, user_metadata \
+                            "SELECT schema_json, primary_key, tenant_id, user_metadata, order_column \
                              FROM mutable_tables WHERE id = $1",
                             &[SqlValue::TextOwned(id_str)],
                             read_mutable_row,
@@ -103,7 +121,7 @@ impl Catalog {
             )
             .await?;
 
-        let Some((schema_json, pk_json, tenant_str, metadata_json)) = row else {
+        let Some((schema_json, pk_json, tenant_str, metadata_json, order_column)) = row else {
             return Ok(None);
         };
 
@@ -114,6 +132,7 @@ impl Catalog {
             pk_json,
             tenant_str,
             metadata_json,
+            order_column,
             indexes,
         )?))
     }
@@ -126,7 +145,7 @@ impl Catalog {
         tenant: Option<TenantId>,
     ) -> Result<Vec<MutableTableDefinition>, MutableTableError> {
         let tenant_str = tenant.map(|t| t.to_string());
-        let entries: Vec<(String, String, String, Option<String>, String)> = self
+        let entries: Vec<MutableListingTuple> = self
             .backend()
             .transaction(
                 TxOptions {
@@ -138,7 +157,7 @@ impl Catalog {
                     Box::pin(async move {
                         if let Some(ts) = tenant_str {
                             tx.query(
-                                "SELECT id, schema_json, primary_key, tenant_id, user_metadata \
+                                "SELECT id, schema_json, primary_key, tenant_id, user_metadata, order_column \
                                  FROM mutable_tables WHERE tenant_id = $1 ORDER BY id",
                                 &[SqlValue::TextOwned(ts)],
                                 read_listed_row,
@@ -146,7 +165,7 @@ impl Catalog {
                             .await
                         } else {
                             tx.query(
-                                "SELECT id, schema_json, primary_key, tenant_id, user_metadata \
+                                "SELECT id, schema_json, primary_key, tenant_id, user_metadata, order_column \
                                  FROM mutable_tables WHERE tenant_id IS NULL ORDER BY id",
                                 &[],
                                 read_listed_row,
@@ -159,7 +178,7 @@ impl Catalog {
             .await?;
 
         let mut defs = Vec::with_capacity(entries.len());
-        for (id_str, schema_json, pk_json, tenant_str, metadata_json) in entries {
+        for (id_str, schema_json, pk_json, tenant_str, metadata_json, order_column) in entries {
             let id = MutableTableId::new(id_str)?;
             let indexes = self.list_mutable_table_indexes(&id).await?;
             defs.push(materialize(
@@ -168,6 +187,7 @@ impl Catalog {
                 pk_json,
                 tenant_str,
                 metadata_json,
+                order_column,
                 indexes,
             )?);
         }
@@ -248,35 +268,35 @@ impl Catalog {
     }
 }
 
-fn read_mutable_row(
-    row: &Row<'_>,
-) -> Result<(String, String, Option<String>, String), BackendError> {
+fn read_mutable_row(row: &Row<'_>) -> Result<MutableRowTuple, BackendError> {
     Ok((
         row.get::<String>("schema_json")?,
         row.get::<String>("primary_key")?,
         row.try_get::<String>("tenant_id")?,
         row.get::<String>("user_metadata")?,
+        row.try_get::<String>("order_column")?,
     ))
 }
 
-fn read_listed_row(
-    row: &Row<'_>,
-) -> Result<(String, String, String, Option<String>, String), BackendError> {
+fn read_listed_row(row: &Row<'_>) -> Result<MutableListingTuple, BackendError> {
     Ok((
         row.get::<String>("id")?,
         row.get::<String>("schema_json")?,
         row.get::<String>("primary_key")?,
         row.try_get::<String>("tenant_id")?,
         row.get::<String>("user_metadata")?,
+        row.try_get::<String>("order_column")?,
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn materialize(
     id: MutableTableId,
     schema_json: String,
     pk_json: String,
     tenant_str: Option<String>,
     metadata_json: String,
+    order_column: Option<String>,
     indexes: Vec<MutableIndexDef>,
 ) -> Result<MutableTableDefinition, MutableTableError> {
     let schema = decode_schema(&schema_json)
@@ -297,7 +317,7 @@ fn materialize(
         tenant,
         indexes,
         user_metadata,
-        order_column: None,
+        order_column,
         chunk_size: 8192,
     })
 }

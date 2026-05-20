@@ -9,6 +9,7 @@ static MIGRATIONS: &[M<'static>] = &[
     M::up(schema::MIGRATION_003_EVAL_COLUMNS),
     M::up(schema::MIGRATION_004_DROP_EMBEDDING_SETS),
     M::up(schema::MIGRATION_005_TENANT_SCOPE),
+    M::up(schema::MIGRATION_006_CHANNEL_COLUMNS),
 ];
 
 /// Build the full migration set for the catalog database.

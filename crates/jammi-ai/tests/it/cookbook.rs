@@ -945,3 +945,143 @@ async fn recipe_generate_image_embeddings() {
     assert!(total_rows > 0, "Search should return results");
     assert!(results[0].schema().field_with_name("similarity").is_ok());
 }
+
+// ─── Recipe: Declare a Custom Provenance Channel ──────────────────────────────
+
+#[tokio::test]
+async fn cookbook_declare_provenance_channel_recipe_runs_end_to_end() {
+    use arrow::array::ArrayRef;
+    use jammi_ai::evidence::{merge_channels, ChannelContribution};
+    use jammi_engine::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
+    use jammi_engine::ChannelId;
+
+    let dir = TempDir::new().unwrap();
+    let session = cookbook_session(&dir).await;
+
+    // Step 1 (Declare the channel): register `scored_by` with the two
+    // columns the recipe documents.
+    session
+        .catalog()
+        .channels()
+        .register(&ChannelSpec {
+            id: ChannelId::new("scored_by").unwrap(),
+            priority: 3,
+            columns: vec![
+                ChannelColumn {
+                    name: "ranker".into(),
+                    data_type: ChannelColumnType::Utf8,
+                },
+                ChannelColumn {
+                    name: "rank_score".into(),
+                    data_type: ChannelColumnType::Float32,
+                },
+            ],
+        })
+        .unwrap();
+
+    // Step 2 (Use the channel): merge a synthetic contribution onto a
+    // realistic 2-row source batch.
+    use arrow::array::{Float32Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_row_id", DataType::Utf8, false),
+        Field::new("_source_id", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["r0", "r1"])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["src", "src"])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let scored_by = ChannelId::new("scored_by").unwrap();
+    let ranker: ArrayRef = Arc::new(StringArray::from(vec!["bm25"; 2]));
+    let rank_score: ArrayRef = Arc::new(Float32Array::from(vec![1.0_f32, 0.5]));
+    let contrib = ChannelContribution {
+        channel: scored_by.clone(),
+        columns: vec![ranker, rank_score],
+    };
+
+    let merged = merge_channels(
+        session.catalog(),
+        &[batch],
+        &[scored_by.clone()],
+        &[scored_by],
+        &[],
+        &[vec![contrib]],
+    )
+    .unwrap();
+
+    // Step 3 (Verify): the declared columns are present.
+    let m = &merged[0];
+    assert!(m.schema().field_with_name("ranker").is_ok());
+    assert!(m.schema().field_with_name("rank_score").is_ok());
+}
+
+#[tokio::test]
+async fn cookbook_declare_provenance_channel_append_only_callout_matches_runtime() {
+    use jammi_engine::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
+    use jammi_engine::error::JammiError;
+    use jammi_engine::ChannelId;
+
+    let dir = TempDir::new().unwrap();
+    let session = cookbook_session(&dir).await;
+    let id = ChannelId::new("scored_by").unwrap();
+
+    session
+        .catalog()
+        .channels()
+        .register(&ChannelSpec {
+            id: id.clone(),
+            priority: 3,
+            columns: vec![ChannelColumn {
+                name: "ranker".into(),
+                data_type: ChannelColumnType::Utf8,
+            }],
+        })
+        .unwrap();
+
+    // The recipe's "What you cannot do" section promises this exact
+    // error wording for a retype. Lock the contract so the recipe
+    // cannot silently drift from the runtime.
+    let err = session
+        .catalog()
+        .channels()
+        .add_columns(
+            &id,
+            &[ChannelColumn {
+                name: "ranker".into(),
+                data_type: ChannelColumnType::Int32,
+            }],
+        )
+        .unwrap_err();
+    match err {
+        JammiError::EvidenceChannel(m) => {
+            assert!(m.contains("cannot redeclare"));
+            assert!(m.contains("Utf8"));
+            assert!(m.contains("Int32"));
+        }
+        other => panic!("expected EvidenceChannel(cannot redeclare), got {other:?}"),
+    }
+
+    // Same column, same dtype → "already declared".
+    let err = session
+        .catalog()
+        .channels()
+        .add_columns(
+            &id,
+            &[ChannelColumn {
+                name: "ranker".into(),
+                data_type: ChannelColumnType::Utf8,
+            }],
+        )
+        .unwrap_err();
+    match err {
+        JammiError::EvidenceChannel(m) => assert!(m.contains("already declared")),
+        other => panic!("expected EvidenceChannel(already declared), got {other:?}"),
+    }
+}

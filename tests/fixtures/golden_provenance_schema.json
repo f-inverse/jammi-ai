@@ -1,0 +1,42 @@
+[
+  {
+    "dtype": "Utf8",
+    "name": "_row_id",
+    "nullable": false
+  },
+  {
+    "dtype": "Utf8",
+    "name": "_source_id",
+    "nullable": false
+  },
+  {
+    "dtype": "List(Field { data_type: Utf8, nullable: true })",
+    "name": "retrieved_by",
+    "nullable": false
+  },
+  {
+    "dtype": "List(Field { data_type: Utf8, nullable: true })",
+    "name": "annotated_by",
+    "nullable": false
+  },
+  {
+    "dtype": "Float32",
+    "name": "similarity",
+    "nullable": true
+  },
+  {
+    "dtype": "Utf8",
+    "name": "inference_model",
+    "nullable": true
+  },
+  {
+    "dtype": "Utf8",
+    "name": "inference_task",
+    "nullable": true
+  },
+  {
+    "dtype": "Float32",
+    "name": "inference_confidence",
+    "nullable": true
+  }
+]

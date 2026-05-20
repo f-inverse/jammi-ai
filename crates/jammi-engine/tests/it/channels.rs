@@ -1,0 +1,127 @@
+use arrow::datatypes::DataType;
+use jammi_engine::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
+use jammi_engine::catalog::Catalog;
+use jammi_engine::ChannelId;
+use tempfile::tempdir;
+
+fn open_catalog() -> (tempfile::TempDir, Catalog) {
+    let dir = tempdir().unwrap();
+    let catalog = Catalog::open(dir.path()).unwrap();
+    (dir, catalog)
+}
+
+#[test]
+fn migration_006_seeds_vector_and_inference_with_exact_columns() {
+    let (_dir, catalog) = open_catalog();
+    let channels = catalog.channels().list().unwrap();
+
+    let vector = channels
+        .iter()
+        .find(|c| c.id.as_str() == "vector")
+        .expect("vector channel must be seeded");
+    assert_eq!(vector.priority, 1);
+    assert_eq!(vector.columns.len(), 1);
+    assert_eq!(vector.columns[0].name, "similarity");
+    assert_eq!(vector.columns[0].data_type, ChannelColumnType::Float32);
+
+    let inference = channels
+        .iter()
+        .find(|c| c.id.as_str() == "inference")
+        .expect("inference channel must be seeded");
+    assert_eq!(inference.priority, 2);
+    assert_eq!(inference.columns.len(), 3);
+    let names: Vec<&str> = inference.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["inference_model", "inference_task", "inference_confidence"]
+    );
+}
+
+#[test]
+fn declared_columns_appear_in_merged_schema() {
+    let (_dir, catalog) = open_catalog();
+    let scored_by = ChannelId::new("scored_by").unwrap();
+    catalog
+        .channels()
+        .register(&ChannelSpec {
+            id: scored_by.clone(),
+            priority: 3,
+            columns: vec![
+                ChannelColumn {
+                    name: "ranker".into(),
+                    data_type: ChannelColumnType::Utf8,
+                },
+                ChannelColumn {
+                    name: "rank_score".into(),
+                    data_type: ChannelColumnType::Float32,
+                },
+            ],
+        })
+        .unwrap();
+
+    let schema = catalog
+        .channels()
+        .merged_schema(&[ChannelId::new("vector").unwrap(), scored_by])
+        .unwrap();
+
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(names, vec!["similarity", "ranker", "rank_score"]);
+    assert_eq!(schema.field(0).data_type(), &DataType::Float32);
+    assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+    assert_eq!(schema.field(2).data_type(), &DataType::Float32);
+    for field in schema.fields() {
+        assert!(
+            field.is_nullable(),
+            "declared columns are nullable by contract"
+        );
+    }
+}
+
+#[test]
+fn channel_column_order_is_stable_across_catalog_reads() {
+    let (_dir, catalog) = open_catalog();
+    let first = catalog
+        .channels()
+        .get(&ChannelId::new("inference").unwrap())
+        .unwrap()
+        .unwrap();
+    let second = catalog
+        .channels()
+        .get(&ChannelId::new("inference").unwrap())
+        .unwrap()
+        .unwrap();
+    let first_names: Vec<&str> = first.columns.iter().map(|c| c.name.as_str()).collect();
+    let second_names: Vec<&str> = second.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(first_names, second_names);
+}
+
+#[test]
+fn add_columns_then_merged_schema_includes_new_column() {
+    let (_dir, catalog) = open_catalog();
+    let id = ChannelId::new("scored_by").unwrap();
+    catalog
+        .channels()
+        .register(&ChannelSpec {
+            id: id.clone(),
+            priority: 3,
+            columns: vec![ChannelColumn {
+                name: "ranker".into(),
+                data_type: ChannelColumnType::Utf8,
+            }],
+        })
+        .unwrap();
+    catalog
+        .channels()
+        .add_columns(
+            &id,
+            &[ChannelColumn {
+                name: "rank_score".into(),
+                data_type: ChannelColumnType::Float32,
+            }],
+        )
+        .unwrap();
+
+    let schema = catalog.channels().merged_schema(&[id]).unwrap();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(names, vec!["ranker", "rank_score"]);
+}

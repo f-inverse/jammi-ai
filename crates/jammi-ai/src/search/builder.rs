@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
+use arrow::array::{ArrayRef, RecordBatch};
+use arrow::datatypes::{Field, Schema};
 use datafusion::common::{JoinType, NullEquality};
 use datafusion::physical_expr::expressions::col;
 use datafusion::physical_expr::PhysicalExpr;
@@ -11,9 +13,11 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
 
+use jammi_engine::catalog::Catalog;
 use jammi_engine::error::{JammiError, Result};
+use jammi_engine::ChannelId;
 
-use crate::evidence::provenance::add_provenance;
+use crate::evidence::{merge_channels, ChannelContribution};
 use crate::operator::ann_search_exec::AnnSearchExec;
 use crate::operator::inference_exec::InferenceExecBuilder;
 use crate::session::InferenceSession;
@@ -30,7 +34,7 @@ use crate::session::InferenceSession;
 pub struct SearchBuilder {
     session: Arc<InferenceSession>,
     plan: Arc<dyn ExecutionPlan>,
-    channels: Vec<String>,
+    channels: Vec<ChannelId>,
     annotated: bool,
 }
 
@@ -131,7 +135,7 @@ impl SearchBuilder {
         Ok(Self {
             session,
             plan,
-            channels: vec!["vector".into()],
+            channels: vec![ChannelId::new("vector")?],
             annotated: false,
         })
     }
@@ -275,12 +279,16 @@ impl SearchBuilder {
         .build()?;
 
         self.plan = Arc::new(inference);
-        self.channels.push("inference".into());
+        self.channels.push(ChannelId::new("inference")?);
         self.annotated = true;
         Ok(self)
     }
 
     /// Execute the plan and return results with evidence provenance.
+    ///
+    /// Output columns = source columns - (declared channel columns
+    /// extracted from the source) + `retrieved_by` + `annotated_by` +
+    /// per-channel declared columns in `(priority, ordinal)` order.
     pub async fn run(self) -> Result<Vec<RecordBatch>> {
         let task_ctx = self.session.context().task_ctx();
         let stream = self
@@ -292,8 +300,108 @@ impl SearchBuilder {
             .await
             .map_err(|e| JammiError::Other(format!("Search collect: {e}")))?;
 
-        add_provenance(&batches, &self.channels, self.annotated)
+        let inference = ChannelId::new("inference")?;
+        let retrieved: Vec<ChannelId> = self
+            .channels
+            .iter()
+            .filter(|c| !(self.annotated && *c == &inference))
+            .cloned()
+            .collect();
+        let annotated: Vec<ChannelId> = if self.annotated {
+            vec![inference]
+        } else {
+            Vec::new()
+        };
+
+        // Pull declared channel columns out of each batch before
+        // appending them via `merge_channels`. This avoids duplicating a
+        // column (`similarity`) that would otherwise appear in both the
+        // source and the suffix.
+        let catalog = self.session.catalog();
+        let mut per_batch_contribs: Vec<Vec<ChannelContribution>> =
+            Vec::with_capacity(batches.len());
+        let mut stripped: Vec<RecordBatch> = Vec::with_capacity(batches.len());
+        for batch in &batches {
+            let (rest, contribs) = extract_channel_contributions(batch, &self.channels, catalog)?;
+            per_batch_contribs.push(contribs);
+            stripped.push(rest);
+        }
+
+        merge_channels(
+            catalog,
+            &stripped,
+            &self.channels,
+            &retrieved,
+            &annotated,
+            &per_batch_contribs,
+        )
     }
+}
+
+/// Slice the channel-declared columns out of `batch` and return them as
+/// per-channel contributions, alongside the batch with those columns
+/// removed.
+///
+/// A channel contributes only if **all** of its declared columns are
+/// present in the source batch under their declared names. If any are
+/// missing, the channel produces no contribution and its declared
+/// columns become all-null in the merged output. Dtype mismatches are
+/// not coerced here; `merge_channels`'s validator surfaces them as a
+/// typed `EvidenceChannel` error so callers see the real mismatch.
+fn extract_channel_contributions(
+    batch: &RecordBatch,
+    participating: &[ChannelId],
+    catalog: &Catalog,
+) -> Result<(RecordBatch, Vec<ChannelContribution>)> {
+    let mut contributions: Vec<ChannelContribution> = Vec::new();
+    let mut to_remove: HashSet<usize> = HashSet::new();
+
+    for id in participating {
+        let spec = catalog.channels().get(id)?.ok_or_else(|| {
+            JammiError::EvidenceChannel(format!("channel '{id}': not registered"))
+        })?;
+        let positions: Option<Vec<usize>> = spec
+            .columns
+            .iter()
+            .map(|c| batch.schema().index_of(&c.name).ok())
+            .collect();
+        if let Some(positions) = positions {
+            let columns: Vec<ArrayRef> = positions
+                .iter()
+                .map(|&i| Arc::clone(batch.column(i)))
+                .collect();
+            for i in positions {
+                to_remove.insert(i);
+            }
+            contributions.push(ChannelContribution {
+                channel: id.clone(),
+                columns,
+            });
+        }
+    }
+
+    let new_fields: Vec<Arc<Field>> = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !to_remove.contains(i))
+        .map(|(_, f)| Arc::clone(f))
+        .collect();
+    let new_columns: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !to_remove.contains(i))
+        .map(|(_, c)| Arc::clone(c))
+        .collect();
+    let new_schema = Arc::new(Schema::new(
+        new_fields.iter().map(|f| (**f).clone()).collect::<Vec<_>>(),
+    ));
+    let stripped = RecordBatch::try_new(new_schema, new_columns)
+        .map_err(|e| JammiError::EvidenceChannel(format!("extract_channel_contributions: {e}")))?;
+
+    Ok((stripped, contributions))
 }
 
 /// Build a SELECT column list for hydration that casts Utf8View columns to VARCHAR

@@ -14,7 +14,7 @@ fn catalog_opens_and_creates_tables() {
         .list_result_tables_by_status(ResultTableStatus::Ready)
         .unwrap()
         .is_empty());
-    assert!(!catalog.evidence_channel_names().unwrap().is_empty());
+    assert!(!catalog.channels().list().unwrap().is_empty());
 }
 
 #[test]

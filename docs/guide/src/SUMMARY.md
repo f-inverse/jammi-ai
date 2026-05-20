@@ -18,6 +18,7 @@
 - [Extract Entities (NER)](./extract-entities.md)
 - [Semantic Search](./semantic-search.md)
 - [Enrich Results with Joins and Annotations](./enrich-results.md)
+- [Declare a Custom Provenance Channel](./declare-provenance-channel.md)
 - [Fine-Tune for Your Domain](./fine-tuning.md)
 - [Evaluate and Compare Models](./evaluation.md)
 - [Connect to PostgreSQL / MySQL](./external-sources.md)

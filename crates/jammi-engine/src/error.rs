@@ -81,6 +81,10 @@ pub enum JammiError {
     #[error("Migration error: {0}")]
     Migration(#[from] rusqlite_migration::Error),
 
+    /// Evidence channel validation or registration error.
+    #[error("Evidence channel error: {0}")]
+    EvidenceChannel(String),
+
     /// Catch-all for errors that don't fit another variant.
     #[error("{0}")]
     Other(String),

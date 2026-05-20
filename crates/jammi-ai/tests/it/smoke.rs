@@ -92,4 +92,32 @@ async fn smoke_cp3_full_pipeline() {
     for i in 1..sim.len() {
         assert!(sim.value(i - 1) >= sim.value(i));
     }
+
+    // The list-of-strings provenance columns themselves are non-null
+    // (their *items* are nullable, but the list slot per row always
+    // exists). Verifies the merger respects nullability of the suffix
+    // fields it adds.
+    let schema = batch.schema();
+    let retrieved_by_field = schema.field_with_name("retrieved_by").unwrap();
+    assert!(
+        !retrieved_by_field.is_nullable(),
+        "retrieved_by list column is non-null per the merger output contract"
+    );
+
+    // The merged-result `similarity` column comes from the vector
+    // channel's catalog declaration, not from a hardcoded path.
+    let declared = session
+        .catalog()
+        .channels()
+        .get(&jammi_engine::ChannelId::new("vector").unwrap())
+        .unwrap()
+        .expect("vector channel must be seeded by migration 006");
+    assert_eq!(declared.columns[0].name, "similarity");
+    assert!(
+        batch
+            .schema()
+            .column_with_name(&declared.columns[0].name)
+            .is_some(),
+        "smoke: column declared by vector channel is present in result"
+    );
 }

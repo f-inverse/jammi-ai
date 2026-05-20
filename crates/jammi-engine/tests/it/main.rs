@@ -1,4 +1,5 @@
 mod caching;
+mod channels;
 mod common;
 mod foundation;
 mod index;

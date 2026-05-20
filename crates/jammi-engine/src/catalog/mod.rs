@@ -1,3 +1,4 @@
+pub mod channel_repo;
 pub mod eval_repo;
 pub mod fine_tune_repo;
 pub mod migrations;
@@ -13,6 +14,8 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 
 use crate::error::{JammiError, Result};
+
+use channel_repo::ChannelRepo;
 
 /// SQLite-backed artifact catalog for models, sources, and experiment metadata.
 ///
@@ -48,36 +51,8 @@ impl Catalog {
         self.pool.get().map_err(JammiError::Pool)
     }
 
-    /// List registered evidence channel names, ordered by priority.
-    pub fn evidence_channel_names(&self) -> Result<Vec<String>> {
-        let conn = self.conn()?;
-        let mut stmt =
-            conn.prepare("SELECT channel_name FROM evidence_channels ORDER BY priority")?;
-        let rows = stmt.query_map([], |row| row.get(0))?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+    /// Repository view over the evidence-channel tables.
+    pub fn channels(&self) -> ChannelRepo<'_> {
+        ChannelRepo::new(self)
     }
-
-    /// Fetch an evidence channel by name.
-    pub fn get_evidence_channel(&self, name: &str) -> Result<EvidenceChannelRecord> {
-        let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT channel_name, schema_json, priority FROM evidence_channels WHERE channel_name = ?1",
-        )?;
-        stmt.query_row(rusqlite::params![name], |row| {
-            Ok(EvidenceChannelRecord {
-                channel_name: row.get(0)?,
-                schema_json: row.get(1)?,
-                priority: row.get(2)?,
-            })
-        })
-        .map_err(|e| JammiError::Catalog(format!("Evidence channel '{name}': {e}")))
-    }
-}
-
-/// A row from the `evidence_channels` catalog table.
-#[derive(Debug, Clone)]
-pub struct EvidenceChannelRecord {
-    pub channel_name: String,
-    pub schema_json: String,
-    pub priority: i32,
 }

@@ -1,4 +1,5 @@
 mod backends;
+mod channel_contract;
 mod common;
 mod cookbook;
 mod e2e_inference;
@@ -6,8 +7,10 @@ mod encoder_adapters;
 mod evaluation;
 mod fine_tune;
 mod inference;
+mod merger;
 mod models;
 mod pipeline;
 mod scheduling;
 mod search;
+mod search_attribution;
 mod smoke;

@@ -8,6 +8,7 @@ pub mod cache;
 pub mod catalog;
 pub mod config;
 pub mod error;
+pub mod evidence_channel;
 pub mod index;
 pub mod session;
 pub mod source;
@@ -16,6 +17,7 @@ pub mod tenant;
 
 use config::{LogFormat, LoggingConfig};
 
+pub use evidence_channel::ChannelId;
 pub use tenant::TenantId;
 
 /// Initialize the tracing subscriber using the provided logging configuration.

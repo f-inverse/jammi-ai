@@ -138,3 +138,29 @@ CREATE INDEX idx_eval_runs_tenant         ON eval_runs(tenant_id);
 CREATE INDEX idx_result_tables_tenant     ON result_tables(tenant_id);
 CREATE INDEX idx_evidence_channels_tenant ON evidence_channels(tenant_id);
 "#;
+
+/// Normalise the JSON-blob `evidence_channels.schema_json` column into a
+/// child `evidence_channel_columns` table. After this migration each
+/// declared column is a row keyed by `(channel_name, column_name)`,
+/// making the append-only invariant a database constraint rather than
+/// a parser check.
+pub(super) const MIGRATION_006_CHANNEL_COLUMNS: &str = r#"
+CREATE TABLE evidence_channel_columns (
+    channel_name    TEXT NOT NULL REFERENCES evidence_channels(channel_name),
+    column_name     TEXT NOT NULL,
+    column_type     TEXT NOT NULL,
+    ordinal         INTEGER NOT NULL,
+    declared_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (channel_name, column_name)
+);
+CREATE UNIQUE INDEX idx_channel_cols_ordinal
+    ON evidence_channel_columns(channel_name, ordinal);
+
+INSERT INTO evidence_channel_columns(channel_name, column_name, column_type, ordinal) VALUES
+    ('vector',    'similarity',            'Float32', 0),
+    ('inference', 'inference_model',       'Utf8',    0),
+    ('inference', 'inference_task',        'Utf8',    1),
+    ('inference', 'inference_confidence',  'Float32', 2);
+
+ALTER TABLE evidence_channels DROP COLUMN schema_json;
+"#;

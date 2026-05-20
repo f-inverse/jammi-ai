@@ -31,7 +31,7 @@ use super::channel::ChannelContribution;
 ///   declared column count.
 /// - A contributed array length disagrees with the batch's row count.
 /// - A contributed array's dtype disagrees with the catalog declaration.
-pub fn merge_channels(
+pub async fn merge_channels(
     catalog: &Catalog,
     batches: &[RecordBatch],
     participating: &[ChannelId],
@@ -51,7 +51,7 @@ pub fn merge_channels(
     // in `participating` isn't registered.
     let mut specs: Vec<ChannelSpec> = Vec::with_capacity(participating.len());
     for id in participating {
-        let spec = catalog.channels().get(id)?.ok_or_else(|| {
+        let spec = catalog.channels().get(id).await?.ok_or_else(|| {
             JammiError::EvidenceChannel(format!("channel '{id}': not registered"))
         })?;
         specs.push(spec);
@@ -219,9 +219,9 @@ mod tests {
     use jammi_engine::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
     use tempfile::tempdir;
 
-    fn open_catalog() -> (tempfile::TempDir, Catalog) {
+    async fn open_catalog() -> (tempfile::TempDir, Catalog) {
         let dir = tempdir().unwrap();
-        let catalog = Catalog::open(dir.path()).unwrap();
+        let catalog = Catalog::open(dir.path()).await.unwrap();
         (dir, catalog)
     }
 
@@ -237,7 +237,7 @@ mod tests {
         RecordBatch::try_new(schema, vec![row_id, src]).unwrap()
     }
 
-    fn register_scored_by(catalog: &Catalog) -> ChannelId {
+    async fn register_scored_by(catalog: &Catalog) -> ChannelId {
         let id = ChannelId::new("scored_by").unwrap();
         catalog
             .channels()
@@ -255,15 +255,16 @@ mod tests {
                     },
                 ],
             })
+            .await
             .unwrap();
         id
     }
 
-    #[test]
-    fn merge_adds_declared_columns_in_priority_order() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn merge_adds_declared_columns_in_priority_order() {
+        let (_dir, catalog) = open_catalog().await;
         let vector = ChannelId::new("vector").unwrap();
-        let scored_by = register_scored_by(&catalog);
+        let scored_by = register_scored_by(&catalog).await;
         let batch = source_batch(2);
 
         let vector_contrib = ChannelContribution::single(
@@ -286,6 +287,7 @@ mod tests {
             &[],
             &[vec![vector_contrib, scored_contrib]],
         )
+        .await
         .unwrap();
 
         assert_eq!(merged.len(), 1);
@@ -306,9 +308,9 @@ mod tests {
         assert_eq!(merged[0].num_rows(), 2);
     }
 
-    #[test]
-    fn unsupplied_channel_columns_become_null() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn unsupplied_channel_columns_become_null() {
+        let (_dir, catalog) = open_catalog().await;
         let vector = ChannelId::new("vector").unwrap();
         let inference = ChannelId::new("inference").unwrap();
         let batch = source_batch(3);
@@ -326,6 +328,7 @@ mod tests {
             &[inference.clone()],
             &[vec![vector_contrib]],
         )
+        .await
         .unwrap();
 
         // inference's three columns must be all-null.
@@ -344,9 +347,9 @@ mod tests {
         assert_eq!(inf_conf.null_count(), 3);
     }
 
-    #[test]
-    fn rejects_length_mismatch_between_contribution_and_batch() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn rejects_length_mismatch_between_contribution_and_batch() {
+        let (_dir, catalog) = open_catalog().await;
         let vector = ChannelId::new("vector").unwrap();
         let batch = source_batch(3);
         let bad = ChannelContribution::single(
@@ -361,6 +364,7 @@ mod tests {
             &[],
             &[vec![bad]],
         )
+        .await
         .unwrap_err();
         match err {
             JammiError::EvidenceChannel(m) => {
@@ -372,9 +376,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rejects_wrong_arrow_dtype() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn rejects_wrong_arrow_dtype() {
+        let (_dir, catalog) = open_catalog().await;
         let vector = ChannelId::new("vector").unwrap();
         let batch = source_batch(2);
         let bad = ChannelContribution::single(
@@ -389,6 +393,7 @@ mod tests {
             &[],
             &[vec![bad]],
         )
+        .await
         .unwrap_err();
         match err {
             JammiError::EvidenceChannel(m) => assert!(m.contains("dtype")),
@@ -396,9 +401,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rejects_contribution_for_non_participating_channel() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn rejects_contribution_for_non_participating_channel() {
+        let (_dir, catalog) = open_catalog().await;
         let vector = ChannelId::new("vector").unwrap();
         let inference = ChannelId::new("inference").unwrap();
         let batch = source_batch(1);
@@ -414,6 +419,7 @@ mod tests {
             &[],
             &[vec![stranger]],
         )
+        .await
         .unwrap_err();
         match err {
             JammiError::EvidenceChannel(m) => assert!(m.contains("not in the participating set")),
@@ -421,9 +427,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rejects_unregistered_channel() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn rejects_unregistered_channel() {
+        let (_dir, catalog) = open_catalog().await;
         let batch = source_batch(1);
         let err = merge_channels(
             &catalog,
@@ -433,6 +439,7 @@ mod tests {
             &[],
             &[vec![]],
         )
+        .await
         .unwrap_err();
         match err {
             JammiError::EvidenceChannel(m) => assert!(m.contains("not registered")),
@@ -440,9 +447,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn batches_and_contributions_must_have_equal_length() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn batches_and_contributions_must_have_equal_length() {
+        let (_dir, catalog) = open_catalog().await;
         let vector = ChannelId::new("vector").unwrap();
         let batches = vec![source_batch(1), source_batch(2)];
         let contribs: Vec<Vec<ChannelContribution>> = vec![vec![]]; // only one
@@ -454,6 +461,7 @@ mod tests {
             &[],
             &contribs,
         )
+        .await
         .unwrap_err();
         match err {
             JammiError::EvidenceChannel(m) => {
@@ -464,9 +472,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn preserves_source_columns_intact() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn preserves_source_columns_intact() {
+        let (_dir, catalog) = open_catalog().await;
         let vector = ChannelId::new("vector").unwrap();
         let batch = source_batch(2);
         let contrib = ChannelContribution::single(
@@ -481,6 +489,7 @@ mod tests {
             &[],
             &[vec![contrib]],
         )
+        .await
         .unwrap();
         // Source column data matches the input.
         let m = &merged[0];
@@ -489,9 +498,9 @@ mod tests {
         assert_eq!(row_id.value(1), "r1");
     }
 
-    #[test]
-    fn rejects_duplicate_contribution_for_same_channel_on_one_batch() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn rejects_duplicate_contribution_for_same_channel_on_one_batch() {
+        let (_dir, catalog) = open_catalog().await;
         let vector = ChannelId::new("vector").unwrap();
         let batch = source_batch(2);
         let dup_a = ChannelContribution::single(
@@ -510,6 +519,7 @@ mod tests {
             &[],
             &[vec![dup_a, dup_b]],
         )
+        .await
         .unwrap_err();
         match err {
             JammiError::EvidenceChannel(m) => {
@@ -520,9 +530,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn channel_columns_are_nullable_in_output_schema() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn channel_columns_are_nullable_in_output_schema() {
+        let (_dir, catalog) = open_catalog().await;
         let vector = ChannelId::new("vector").unwrap();
         let batch = source_batch(1);
         let contrib = ChannelContribution::single(
@@ -537,6 +547,7 @@ mod tests {
             &[],
             &[vec![contrib]],
         )
+        .await
         .unwrap();
         let schema = merged[0].schema();
         let similarity = schema.field(schema.index_of("similarity").unwrap());

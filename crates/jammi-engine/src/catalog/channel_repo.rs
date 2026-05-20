@@ -8,12 +8,10 @@ use serde::{Deserialize, Serialize};
 use crate::error::{JammiError, Result};
 use crate::evidence_channel::ChannelId;
 
+use super::backend::{BackendError, Row, SqlValue, TxOptions};
 use super::Catalog;
 
 /// The closed set of Arrow types a channel column may declare.
-///
-/// New variants are added only when a third-tenant use case requires
-/// them, never speculatively — see [`CLAUDE.md` — *Type-driven design*].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum ChannelColumnType {
@@ -26,7 +24,6 @@ pub enum ChannelColumnType {
 }
 
 impl ChannelColumnType {
-    /// Project to the corresponding Arrow `DataType`.
     pub fn to_arrow(self) -> DataType {
         match self {
             Self::Float32 => DataType::Float32,
@@ -38,8 +35,6 @@ impl ChannelColumnType {
         }
     }
 
-    /// Project an Arrow `DataType` back to the closed enum, rejecting any
-    /// type a channel is not allowed to declare.
     pub fn from_arrow(dt: &DataType) -> Result<Self> {
         match dt {
             DataType::Float32 => Ok(Self::Float32),
@@ -54,7 +49,6 @@ impl ChannelColumnType {
         }
     }
 
-    /// SQL-stored token (matches `evidence_channel_columns.column_type`).
     fn as_str(self) -> &'static str {
         match self {
             Self::Float32 => "Float32",
@@ -103,219 +97,301 @@ pub struct ChannelRepo<'a> {
     catalog: &'a Catalog,
 }
 
+fn map_constraint(e: BackendError, channel: &str) -> JammiError {
+    match e {
+        BackendError::Constraint { .. } => {
+            JammiError::EvidenceChannel(format!("channel '{channel}': already exists"))
+        }
+        other => JammiError::BackendDriver(other),
+    }
+}
+
+fn read_column_row(row: &Row<'_>) -> std::result::Result<(String, String), BackendError> {
+    Ok((row.get("column_name")?, row.get("column_type")?))
+}
+
+/// `(channel_name, priority, columns)` row as returned by `list()`'s catalog
+/// query. Aliased to keep the inner closure's local type readable.
+type ChannelListing = (String, i64, Vec<(String, String)>);
+
 impl<'a> ChannelRepo<'a> {
     pub(super) fn new(catalog: &'a Catalog) -> Self {
         Self { catalog }
     }
 
     /// Register a new channel and its columns atomically.
-    ///
-    /// Errors if the channel id is already registered (the SQL
-    /// `PRIMARY KEY` on `evidence_channels.channel_name` enforces this).
-    pub fn register(&self, spec: &ChannelSpec) -> Result<()> {
-        let mut conn = self.catalog.conn()?;
-        let tx = conn.transaction()?;
+    pub async fn register(&self, spec: &ChannelSpec) -> Result<()> {
+        let channel = spec.id.as_str().to_string();
+        let channel_for_err = channel.clone();
+        let priority = spec.priority as i64;
+        let columns: Vec<(String, &'static str, i64)> = spec
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.name.clone(), c.data_type.as_str(), i as i64))
+            .collect();
 
-        tx.execute(
-            "INSERT INTO evidence_channels (channel_name, priority) VALUES (?1, ?2)",
-            rusqlite::params![spec.id.as_str(), spec.priority],
-        )
-        .map_err(|e| match e {
-            rusqlite::Error::SqliteFailure(_, Some(ref m))
-                if m.contains("UNIQUE constraint failed") =>
-            {
-                JammiError::EvidenceChannel(format!("channel '{}': already exists", spec.id))
-            }
-            other => JammiError::Sqlite(other),
-        })?;
+        let res = self
+            .catalog
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO evidence_channels (channel_name, priority) VALUES ($1, $2)",
+                        &[
+                            SqlValue::TextOwned(channel.clone()),
+                            SqlValue::Int(priority),
+                        ],
+                    )
+                    .await?;
 
-        for (ordinal, col) in spec.columns.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO evidence_channel_columns \
-                 (channel_name, column_name, column_type, ordinal) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![
-                    spec.id.as_str(),
-                    col.name,
-                    col.data_type.as_str(),
-                    ordinal as i64,
-                ],
-            )?;
-        }
+                    for (name, ty, ord) in columns {
+                        tx.execute(
+                            "INSERT INTO evidence_channel_columns \
+                             (channel_name, column_name, column_type, ordinal) \
+                             VALUES ($1, $2, $3, $4)",
+                            &[
+                                SqlValue::TextOwned(channel.clone()),
+                                SqlValue::TextOwned(name),
+                                SqlValue::Text(ty),
+                                SqlValue::Int(ord),
+                            ],
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await;
 
-        tx.commit()?;
+        res.map_err(|e| map_constraint(e, &channel_for_err))?;
         Ok(())
     }
 
-    /// Append new columns to an already-registered channel.
-    ///
-    /// Append-only: any attempt to redeclare an existing column name —
-    /// whether with the same or a different dtype — is rejected with a
-    /// typed `EvidenceChannel` error.
-    pub fn add_columns(&self, channel: &ChannelId, new_columns: &[ChannelColumn]) -> Result<()> {
-        let mut conn = self.catalog.conn()?;
-        let tx = conn.transaction()?;
+    /// Append new columns to an already-registered channel. Append-only.
+    pub async fn add_columns(
+        &self,
+        channel: &ChannelId,
+        new_columns: &[ChannelColumn],
+    ) -> Result<()> {
+        let channel_name = channel.as_str().to_string();
+        let channel_for_err = channel_name.clone();
+        let cols: Vec<(String, ChannelColumnType)> = new_columns
+            .iter()
+            .map(|c| (c.name.clone(), c.data_type))
+            .collect();
 
-        // Existence check on the parent row.
-        let parent_exists: bool = tx
-            .query_row(
-                "SELECT 1 FROM evidence_channels WHERE channel_name = ?1",
-                rusqlite::params![channel.as_str()],
-                |_| Ok(true),
-            )
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(false),
-                other => Err(JammiError::Sqlite(other)),
+        self.catalog
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    // Existence check on the parent row.
+                    let parent_exists = tx
+                        .query_opt(
+                            "SELECT 1 AS one FROM evidence_channels WHERE channel_name = $1",
+                            &[SqlValue::TextOwned(channel_name.clone())],
+                            |row| row.get::<i64>("one"),
+                        )
+                        .await?
+                        .is_some();
+                    if !parent_exists {
+                        return Err(BackendError::Execution(format!(
+                            "channel '{channel_for_err}': not registered"
+                        )));
+                    }
+
+                    let max_ord = tx
+                        .query_opt(
+                            "SELECT MAX(ordinal) AS m FROM evidence_channel_columns WHERE channel_name = $1",
+                            &[SqlValue::TextOwned(channel_name.clone())],
+                            |row| row.try_get::<i64>("m"),
+                        )
+                        .await?
+                        .flatten();
+                    let mut next = max_ord.unwrap_or(-1) + 1;
+
+                    for (name, ty) in cols {
+                        let existing = tx
+                            .query_opt(
+                                "SELECT column_type FROM evidence_channel_columns \
+                                 WHERE channel_name = $1 AND column_name = $2",
+                                &[
+                                    SqlValue::TextOwned(channel_name.clone()),
+                                    SqlValue::TextOwned(name.clone()),
+                                ],
+                                |row| row.get::<String>("column_type"),
+                            )
+                            .await?;
+                        if let Some(existing_type) = existing {
+                            let existing = ChannelColumnType::from_sql_str(&existing_type)
+                                .map_err(|e| BackendError::Execution(e.to_string()))?;
+                            if existing == ty {
+                                return Err(BackendError::Execution(format!(
+                                    "channel '{channel_for_err}': column '{name}' already declared"
+                                )));
+                            } else {
+                                return Err(BackendError::Execution(format!(
+                                    "channel '{channel_for_err}': column '{name}' was declared {}, \
+                                     cannot redeclare as {}",
+                                    existing.as_str(),
+                                    ty.as_str(),
+                                )));
+                            }
+                        }
+
+                        tx.execute(
+                            "INSERT INTO evidence_channel_columns \
+                             (channel_name, column_name, column_type, ordinal) \
+                             VALUES ($1, $2, $3, $4)",
+                            &[
+                                SqlValue::TextOwned(channel_name.clone()),
+                                SqlValue::TextOwned(name),
+                                SqlValue::Text(ty.as_str()),
+                                SqlValue::Int(next),
+                            ],
+                        )
+                        .await?;
+                        next += 1;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(|e| match e {
+                BackendError::Execution(m) => JammiError::EvidenceChannel(m),
+                other => JammiError::BackendDriver(other),
             })?;
-        if !parent_exists {
-            return Err(JammiError::EvidenceChannel(format!(
-                "channel '{channel}': not registered"
-            )));
-        }
-
-        // Look up the current max ordinal so the append produces a
-        // contiguous sequence even after multiple add_columns calls.
-        let max_ordinal: Option<i64> = tx.query_row(
-            "SELECT MAX(ordinal) FROM evidence_channel_columns WHERE channel_name = ?1",
-            rusqlite::params![channel.as_str()],
-            |row| row.get::<_, Option<i64>>(0),
-        )?;
-        let mut next = max_ordinal.unwrap_or(-1) + 1;
-
-        for col in new_columns {
-            // Distinguish "already declared" from "different dtype" so
-            // the caller gets a precise error.
-            let existing: Option<String> = tx
-                .query_row(
-                    "SELECT column_type FROM evidence_channel_columns \
-                     WHERE channel_name = ?1 AND column_name = ?2",
-                    rusqlite::params![channel.as_str(), col.name],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok();
-            if let Some(existing_type) = existing {
-                let existing = ChannelColumnType::from_sql_str(&existing_type)?;
-                if existing == col.data_type {
-                    return Err(JammiError::EvidenceChannel(format!(
-                        "channel '{channel}': column '{}' already declared",
-                        col.name
-                    )));
-                } else {
-                    return Err(JammiError::EvidenceChannel(format!(
-                        "channel '{channel}': column '{}' was declared {}, \
-                         cannot redeclare as {}",
-                        col.name,
-                        existing.as_str(),
-                        col.data_type.as_str(),
-                    )));
-                }
-            }
-
-            tx.execute(
-                "INSERT INTO evidence_channel_columns \
-                 (channel_name, column_name, column_type, ordinal) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![channel.as_str(), col.name, col.data_type.as_str(), next],
-            )?;
-            next += 1;
-        }
-
-        tx.commit()?;
         Ok(())
     }
 
     /// Look up one channel's full spec.
-    pub fn get(&self, channel: &ChannelId) -> Result<Option<ChannelSpec>> {
-        let conn = self.catalog.conn()?;
-
-        let priority: Option<i32> = conn
-            .query_row(
-                "SELECT priority FROM evidence_channels WHERE channel_name = ?1",
-                rusqlite::params![channel.as_str()],
-                |row| row.get(0),
+    pub async fn get(&self, channel: &ChannelId) -> Result<Option<ChannelSpec>> {
+        let channel_name = channel.as_str().to_string();
+        let id = channel.clone();
+        let found = self
+            .catalog
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    let channel_name = channel_name.clone();
+                    Box::pin(async move {
+                        let priority = tx
+                            .query_opt(
+                                "SELECT priority FROM evidence_channels WHERE channel_name = $1",
+                                &[SqlValue::TextOwned(channel_name.clone())],
+                                |row| row.get::<i64>("priority"),
+                            )
+                            .await?;
+                        let Some(priority) = priority else {
+                            return Ok(None);
+                        };
+                        let cols = tx
+                            .query(
+                                "SELECT column_name, column_type FROM evidence_channel_columns \
+                             WHERE channel_name = $1 ORDER BY ordinal",
+                                &[SqlValue::TextOwned(channel_name)],
+                                read_column_row,
+                            )
+                            .await?;
+                        Ok(Some((priority, cols)))
+                    })
+                },
             )
-            .ok();
-        let Some(priority) = priority else {
+            .await?;
+
+        let Some((priority, raw_cols)) = found else {
             return Ok(None);
         };
-
-        let mut stmt = conn.prepare(
-            "SELECT column_name, column_type FROM evidence_channel_columns \
-             WHERE channel_name = ?1 ORDER BY ordinal",
-        )?;
-        let columns: Vec<ChannelColumn> = stmt
-            .query_map(rusqlite::params![channel.as_str()], |row| {
-                let name: String = row.get(0)?;
-                let type_str: String = row.get(1)?;
-                Ok((name, type_str))
-            })?
-            .map(|r| {
-                let (name, type_str) = r?;
+        let columns: Result<Vec<ChannelColumn>> = raw_cols
+            .into_iter()
+            .map(|(name, ty)| {
                 Ok(ChannelColumn {
                     name,
-                    data_type: ChannelColumnType::from_sql_str(&type_str)?,
+                    data_type: ChannelColumnType::from_sql_str(&ty)?,
                 })
             })
-            .collect::<Result<_>>()?;
-
+            .collect();
         Ok(Some(ChannelSpec {
-            id: channel.clone(),
-            priority,
-            columns,
+            id,
+            priority: priority as i32,
+            columns: columns?,
         }))
     }
 
-    /// List every registered channel, ordered by `(priority, ordinal)`.
-    pub fn list(&self) -> Result<Vec<ChannelSpec>> {
-        let conn = self.catalog.conn()?;
+    /// List every registered channel, ordered by `(priority, channel_name)`.
+    pub async fn list(&self) -> Result<Vec<ChannelSpec>> {
+        let entries = self
+            .catalog
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        let parents: Vec<(String, i64)> = tx
+                            .query(
+                                "SELECT channel_name, priority FROM evidence_channels \
+                             ORDER BY priority, channel_name",
+                                &[],
+                                |row| {
+                                    Ok((
+                                        row.get::<String>("channel_name")?,
+                                        row.get::<i64>("priority")?,
+                                    ))
+                                },
+                            )
+                            .await?;
+                        let mut out: Vec<ChannelListing> = Vec::with_capacity(parents.len());
+                        for (name, priority) in parents {
+                            let cols = tx
+                            .query(
+                                "SELECT column_name, column_type FROM evidence_channel_columns \
+                                 WHERE channel_name = $1 ORDER BY ordinal",
+                                &[SqlValue::TextOwned(name.clone())],
+                                read_column_row,
+                            )
+                            .await?;
+                            out.push((name, priority, cols));
+                        }
+                        Ok(out)
+                    })
+                },
+            )
+            .await?;
 
-        let mut stmt = conn.prepare(
-            "SELECT channel_name, priority FROM evidence_channels ORDER BY priority, channel_name",
-        )?;
-        let parents: Vec<(String, i32)> = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-
-        let mut specs = Vec::with_capacity(parents.len());
-        for (name, priority) in parents {
-            let id = ChannelId::new(name.clone())?;
-            let mut col_stmt = conn.prepare(
-                "SELECT column_name, column_type FROM evidence_channel_columns \
-                 WHERE channel_name = ?1 ORDER BY ordinal",
-            )?;
-            let columns: Vec<ChannelColumn> = col_stmt
-                .query_map(rusqlite::params![name], |row| {
-                    let cname: String = row.get(0)?;
-                    let ctype: String = row.get(1)?;
-                    Ok((cname, ctype))
-                })?
-                .map(|r| {
-                    let (cname, ctype) = r?;
+        let mut specs = Vec::with_capacity(entries.len());
+        for (name, priority, raw_cols) in entries {
+            let id = ChannelId::new(name)?;
+            let columns: Result<Vec<ChannelColumn>> = raw_cols
+                .into_iter()
+                .map(|(cname, ctype)| {
                     Ok(ChannelColumn {
                         name: cname,
                         data_type: ChannelColumnType::from_sql_str(&ctype)?,
                     })
                 })
-                .collect::<Result<_>>()?;
+                .collect();
             specs.push(ChannelSpec {
                 id,
-                priority,
-                columns,
+                priority: priority as i32,
+                columns: columns?,
             });
         }
-
         Ok(specs)
     }
 
     /// Build the Arrow schema produced by merging the given channels'
-    /// declared columns in `(priority, ordinal)` order. Unregistered
-    /// ids produce an error.
-    pub fn merged_schema(&self, participating: &[ChannelId]) -> Result<SchemaRef> {
+    /// declared columns in `(priority, ordinal)` order.
+    pub async fn merged_schema(&self, participating: &[ChannelId]) -> Result<SchemaRef> {
         let mut specs: Vec<ChannelSpec> = Vec::with_capacity(participating.len());
         for id in participating {
-            let spec = self.get(id)?.ok_or_else(|| {
+            let spec = self.get(id).await?.ok_or_else(|| {
                 JammiError::EvidenceChannel(format!("channel '{id}': not registered"))
             })?;
             specs.push(spec);
@@ -337,9 +413,9 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn open_catalog() -> (tempfile::TempDir, Catalog) {
+    async fn open_catalog() -> (tempfile::TempDir, Catalog) {
         let dir = tempdir().unwrap();
-        let catalog = Catalog::open(dir.path()).unwrap();
+        let catalog = Catalog::open(dir.path()).await.unwrap();
         (dir, catalog)
     }
 
@@ -383,21 +459,22 @@ mod tests {
         assert!(r.is_err());
     }
 
-    #[test]
-    fn seed_channels_visible_via_list() {
-        let (_dir, catalog) = open_catalog();
-        let channels = catalog.channels().list().unwrap();
+    #[tokio::test]
+    async fn seed_channels_visible_via_list() {
+        let (_dir, catalog) = open_catalog().await;
+        let channels = catalog.channels().list().await.unwrap();
         let names: Vec<&str> = channels.iter().map(|c| c.id.as_str()).collect();
         assert!(names.contains(&"vector"));
         assert!(names.contains(&"inference"));
     }
 
-    #[test]
-    fn vector_channel_has_similarity_column() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn vector_channel_has_similarity_column() {
+        let (_dir, catalog) = open_catalog().await;
         let vector = catalog
             .channels()
             .get(&ChannelId::new("vector").unwrap())
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(vector.columns.len(), 1);
@@ -405,12 +482,13 @@ mod tests {
         assert_eq!(vector.columns[0].data_type, ChannelColumnType::Float32);
     }
 
-    #[test]
-    fn inference_channel_columns_ordered_by_ordinal() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn inference_channel_columns_ordered_by_ordinal() {
+        let (_dir, catalog) = open_catalog().await;
         let inference = catalog
             .channels()
             .get(&ChannelId::new("inference").unwrap())
+            .await
             .unwrap()
             .unwrap();
         let names: Vec<&str> = inference.columns.iter().map(|c| c.name.as_str()).collect();
@@ -420,9 +498,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn register_then_get_round_trip() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn register_then_get_round_trip() {
+        let (_dir, catalog) = open_catalog().await;
         let id = ChannelId::new("scored_by").unwrap();
         let spec = ChannelSpec {
             id: id.clone(),
@@ -438,18 +516,18 @@ mod tests {
                 },
             ],
         };
-        catalog.channels().register(&spec).unwrap();
+        catalog.channels().register(&spec).await.unwrap();
 
-        let got = catalog.channels().get(&id).unwrap().unwrap();
+        let got = catalog.channels().get(&id).await.unwrap().unwrap();
         assert_eq!(got.priority, 3);
         assert_eq!(got.columns.len(), 2);
         assert_eq!(got.columns[0].name, "ranker");
         assert_eq!(got.columns[1].name, "rank_score");
     }
 
-    #[test]
-    fn register_rejects_duplicate_channel() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn register_rejects_duplicate_channel() {
+        let (_dir, catalog) = open_catalog().await;
         let id = ChannelId::new("scored_by").unwrap();
         let spec = ChannelSpec {
             id: id.clone(),
@@ -459,17 +537,17 @@ mod tests {
                 data_type: ChannelColumnType::Utf8,
             }],
         };
-        catalog.channels().register(&spec).unwrap();
-        let err = catalog.channels().register(&spec).unwrap_err();
+        catalog.channels().register(&spec).await.unwrap();
+        let err = catalog.channels().register(&spec).await.unwrap_err();
         match err {
             JammiError::EvidenceChannel(m) => assert!(m.contains("already exists")),
             other => panic!("expected EvidenceChannel(already exists), got {other:?}"),
         }
     }
 
-    #[test]
-    fn add_columns_appends_with_continuous_ordinal() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn add_columns_appends_with_continuous_ordinal() {
+        let (_dir, catalog) = open_catalog().await;
         let id = ChannelId::new("scored_by").unwrap();
         let spec = ChannelSpec {
             id: id.clone(),
@@ -479,7 +557,7 @@ mod tests {
                 data_type: ChannelColumnType::Utf8,
             }],
         };
-        catalog.channels().register(&spec).unwrap();
+        catalog.channels().register(&spec).await.unwrap();
 
         catalog
             .channels()
@@ -490,17 +568,18 @@ mod tests {
                     data_type: ChannelColumnType::Float32,
                 }],
             )
+            .await
             .unwrap();
 
-        let got = catalog.channels().get(&id).unwrap().unwrap();
+        let got = catalog.channels().get(&id).await.unwrap().unwrap();
         assert_eq!(got.columns.len(), 2);
         assert_eq!(got.columns[0].name, "ranker");
         assert_eq!(got.columns[1].name, "rank_score");
     }
 
-    #[test]
-    fn add_columns_rejects_redeclaration_with_same_type() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn add_columns_rejects_redeclaration_with_same_type() {
+        let (_dir, catalog) = open_catalog().await;
         let id = ChannelId::new("scored_by").unwrap();
         catalog
             .channels()
@@ -512,6 +591,7 @@ mod tests {
                     data_type: ChannelColumnType::Utf8,
                 }],
             })
+            .await
             .unwrap();
 
         let err = catalog
@@ -523,6 +603,7 @@ mod tests {
                     data_type: ChannelColumnType::Utf8,
                 }],
             )
+            .await
             .unwrap_err();
         match err {
             JammiError::EvidenceChannel(m) => assert!(m.contains("already declared")),
@@ -530,9 +611,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn add_columns_rejects_redeclaration_with_different_type() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn add_columns_rejects_redeclaration_with_different_type() {
+        let (_dir, catalog) = open_catalog().await;
         let id = ChannelId::new("scored_by").unwrap();
         catalog
             .channels()
@@ -544,6 +625,7 @@ mod tests {
                     data_type: ChannelColumnType::Utf8,
                 }],
             })
+            .await
             .unwrap();
 
         let err = catalog
@@ -555,6 +637,7 @@ mod tests {
                     data_type: ChannelColumnType::Int32,
                 }],
             )
+            .await
             .unwrap_err();
         match err {
             JammiError::EvidenceChannel(m) => {
@@ -566,17 +649,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn merged_schema_orders_by_priority_then_ordinal() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn merged_schema_orders_by_priority_then_ordinal() {
+        let (_dir, catalog) = open_catalog().await;
         let vector = ChannelId::new("vector").unwrap();
         let inference = ChannelId::new("inference").unwrap();
         let schema = catalog
             .channels()
             .merged_schema(&[inference.clone(), vector.clone()])
+            .await
             .unwrap();
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        // vector (priority 1) → "similarity" first; inference (priority 2) → three columns next.
         assert_eq!(
             names,
             vec![
@@ -588,12 +671,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn merged_schema_errors_on_unregistered_channel() {
-        let (_dir, catalog) = open_catalog();
+    #[tokio::test]
+    async fn merged_schema_errors_on_unregistered_channel() {
+        let (_dir, catalog) = open_catalog().await;
         let err = catalog
             .channels()
             .merged_schema(&[ChannelId::new("nonexistent").unwrap()])
+            .await
             .unwrap_err();
         match err {
             JammiError::EvidenceChannel(m) => assert!(m.contains("not registered")),

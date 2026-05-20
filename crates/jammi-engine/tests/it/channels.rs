@@ -4,16 +4,16 @@ use jammi_engine::catalog::Catalog;
 use jammi_engine::ChannelId;
 use tempfile::tempdir;
 
-fn open_catalog() -> (tempfile::TempDir, Catalog) {
+async fn open_catalog() -> (tempfile::TempDir, Catalog) {
     let dir = tempdir().unwrap();
-    let catalog = Catalog::open(dir.path()).unwrap();
+    let catalog = Catalog::open(dir.path()).await.unwrap();
     (dir, catalog)
 }
 
-#[test]
-fn migration_006_seeds_vector_and_inference_with_exact_columns() {
-    let (_dir, catalog) = open_catalog();
-    let channels = catalog.channels().list().unwrap();
+#[tokio::test]
+async fn migration_006_seeds_vector_and_inference_with_exact_columns() {
+    let (_dir, catalog) = open_catalog().await;
+    let channels = catalog.channels().list().await.unwrap();
 
     let vector = channels
         .iter()
@@ -37,9 +37,9 @@ fn migration_006_seeds_vector_and_inference_with_exact_columns() {
     );
 }
 
-#[test]
-fn declared_columns_appear_in_merged_schema() {
-    let (_dir, catalog) = open_catalog();
+#[tokio::test]
+async fn declared_columns_appear_in_merged_schema() {
+    let (_dir, catalog) = open_catalog().await;
     let scored_by = ChannelId::new("scored_by").unwrap();
     catalog
         .channels()
@@ -57,11 +57,13 @@ fn declared_columns_appear_in_merged_schema() {
                 },
             ],
         })
+        .await
         .unwrap();
 
     let schema = catalog
         .channels()
         .merged_schema(&[ChannelId::new("vector").unwrap(), scored_by])
+        .await
         .unwrap();
 
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
@@ -77,17 +79,19 @@ fn declared_columns_appear_in_merged_schema() {
     }
 }
 
-#[test]
-fn channel_column_order_is_stable_across_catalog_reads() {
-    let (_dir, catalog) = open_catalog();
+#[tokio::test]
+async fn channel_column_order_is_stable_across_catalog_reads() {
+    let (_dir, catalog) = open_catalog().await;
     let first = catalog
         .channels()
         .get(&ChannelId::new("inference").unwrap())
+        .await
         .unwrap()
         .unwrap();
     let second = catalog
         .channels()
         .get(&ChannelId::new("inference").unwrap())
+        .await
         .unwrap()
         .unwrap();
     let first_names: Vec<&str> = first.columns.iter().map(|c| c.name.as_str()).collect();
@@ -95,9 +99,9 @@ fn channel_column_order_is_stable_across_catalog_reads() {
     assert_eq!(first_names, second_names);
 }
 
-#[test]
-fn add_columns_then_merged_schema_includes_new_column() {
-    let (_dir, catalog) = open_catalog();
+#[tokio::test]
+async fn add_columns_then_merged_schema_includes_new_column() {
+    let (_dir, catalog) = open_catalog().await;
     let id = ChannelId::new("scored_by").unwrap();
     catalog
         .channels()
@@ -109,6 +113,7 @@ fn add_columns_then_merged_schema_includes_new_column() {
                 data_type: ChannelColumnType::Utf8,
             }],
         })
+        .await
         .unwrap();
     catalog
         .channels()
@@ -119,9 +124,10 @@ fn add_columns_then_merged_schema_includes_new_column() {
                 data_type: ChannelColumnType::Float32,
             }],
         )
+        .await
         .unwrap();
 
-    let schema = catalog.channels().merged_schema(&[id]).unwrap();
+    let schema = catalog.channels().merged_schema(&[id]).await.unwrap();
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(names, vec!["ranker", "rank_score"]);
 }

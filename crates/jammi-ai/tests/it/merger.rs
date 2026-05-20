@@ -16,9 +16,9 @@ use jammi_engine::catalog::Catalog;
 use jammi_engine::ChannelId;
 use tempfile::tempdir;
 
-fn open_catalog() -> (tempfile::TempDir, Catalog) {
+async fn open_catalog() -> (tempfile::TempDir, Catalog) {
     let dir = tempdir().unwrap();
-    let catalog = Catalog::open(dir.path()).unwrap();
+    let catalog = Catalog::open(dir.path()).await.unwrap();
     (dir, catalog)
 }
 
@@ -39,7 +39,7 @@ fn source_batch(n: usize) -> RecordBatch {
 /// every row. This proves the null/non-null bits propagate end-to-end.
 #[tokio::test]
 async fn merged_channel_nullability_round_trips_through_datafusion() {
-    let (_dir, catalog) = open_catalog();
+    let (_dir, catalog) = open_catalog().await;
     let vector = ChannelId::new("vector").unwrap();
     let inference = ChannelId::new("inference").unwrap();
 
@@ -58,6 +58,7 @@ async fn merged_channel_nullability_round_trips_through_datafusion() {
         &[inference],
         &[vec![vector_contrib]],
     )
+    .await
     .unwrap();
     assert_eq!(merged.len(), 1);
 

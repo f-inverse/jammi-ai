@@ -46,12 +46,11 @@ fn parquet_write_read_roundtrip() {
 
 // ─── Catalog result_tables lifecycle ─────────────────────────────────────────
 
-#[test]
-fn result_table_crud_lifecycle() {
+#[tokio::test]
+async fn result_table_crud_lifecycle() {
     let dir = tempdir().unwrap();
-    let catalog = Catalog::open(dir.path()).unwrap();
+    let catalog = Catalog::open(dir.path()).await.unwrap();
 
-    // Create with all fields
     catalog
         .create_result_table(CreateResultTableParams {
             table_name: "t1",
@@ -64,23 +63,23 @@ fn result_table_crud_lifecycle() {
             key_column: Some("id"),
             text_columns: Some("abstract"),
         })
+        .await
         .unwrap();
 
-    let record = catalog.get_result_table("t1").unwrap().unwrap();
+    let record = catalog.get_result_table("t1").await.unwrap().unwrap();
     assert_eq!(record.status, "building");
     assert_eq!(record.dimensions, Some(384));
     assert_eq!(record.row_count, 0);
 
-    // Transition to ready
     catalog
         .update_result_table_status("t1", ResultTableStatus::Ready, 42)
+        .await
         .unwrap();
-    let record = catalog.get_result_table("t1").unwrap().unwrap();
+    let record = catalog.get_result_table("t1").await.unwrap().unwrap();
     assert_eq!(record.status, "ready");
     assert_eq!(record.row_count, 42);
     assert!(record.completed_at.is_some());
 
-    // List by status — create more tables to filter
     catalog
         .create_result_table(CreateResultTableParams {
             table_name: "t2",
@@ -93,25 +92,28 @@ fn result_table_crud_lifecycle() {
             key_column: None,
             text_columns: None,
         })
+        .await
         .unwrap();
 
     let building = catalog
         .list_result_tables_by_status(ResultTableStatus::Building)
+        .await
         .unwrap();
     assert_eq!(building.len(), 1);
     assert_eq!(building[0].table_name, "t2");
 
     let ready = catalog
         .list_result_tables_by_status(ResultTableStatus::Ready)
+        .await
         .unwrap();
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].table_name, "t1");
 }
 
-#[test]
-fn find_result_tables_filters_by_source_and_task() {
+#[tokio::test]
+async fn find_result_tables_filters_by_source_and_task() {
     let dir = tempdir().unwrap();
-    let catalog = Catalog::open(dir.path()).unwrap();
+    let catalog = Catalog::open(dir.path()).await.unwrap();
 
     for (name, source, task) in [
         ("t1", "patents", "text_embedding"),
@@ -130,32 +132,36 @@ fn find_result_tables_filters_by_source_and_task() {
                 key_column: None,
                 text_columns: None,
             })
+            .await
             .unwrap();
     }
 
     assert_eq!(
         catalog
             .find_result_tables("patents", None, None)
+            .await
             .unwrap()
             .len(),
         2
     );
     let emb = catalog
         .find_result_tables("patents", Some("text_embedding"), None)
+        .await
         .unwrap();
     assert_eq!(emb.len(), 1);
     assert_eq!(emb[0].table_name, "t1");
 }
 
-#[test]
-fn resolve_embedding_table_latest_explicit_and_missing() {
+#[tokio::test]
+async fn resolve_embedding_table_latest_explicit_and_missing() {
     let dir = tempdir().unwrap();
-    let catalog = Catalog::open(dir.path()).unwrap();
+    let catalog = Catalog::open(dir.path()).await.unwrap();
 
-    // No tables → error
-    assert!(catalog.resolve_embedding_table("patents", None).is_err());
+    assert!(catalog
+        .resolve_embedding_table("patents", None)
+        .await
+        .is_err());
 
-    // Create two ready tables — should resolve to latest
     for name in ["old", "new"] {
         catalog
             .create_result_table(CreateResultTableParams {
@@ -169,18 +175,23 @@ fn resolve_embedding_table_latest_explicit_and_missing() {
                 key_column: None,
                 text_columns: None,
             })
+            .await
             .unwrap();
         catalog
             .update_result_table_status(name, ResultTableStatus::Ready, 10)
+            .await
             .unwrap();
     }
 
-    let resolved = catalog.resolve_embedding_table("patents", None).unwrap();
+    let resolved = catalog
+        .resolve_embedding_table("patents", None)
+        .await
+        .unwrap();
     assert_eq!(resolved.table_name, "new", "Should resolve to latest");
 
-    // Explicit name bypasses latest logic
     let explicit = catalog
         .resolve_embedding_table("patents", Some("old"))
+        .await
         .unwrap();
     assert_eq!(explicit.table_name, "old");
 }
@@ -190,7 +201,7 @@ fn resolve_embedding_table_latest_explicit_and_missing() {
 #[tokio::test]
 async fn result_store_create_table_generates_correct_paths() {
     let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store = ResultStore::new(dir.path(), catalog).unwrap();
 
     let info = store
@@ -202,6 +213,7 @@ async fn result_store_create_table_generates_correct_paths() {
             None,
             None,
         )
+        .await
         .unwrap();
 
     assert!(info
@@ -219,7 +231,7 @@ async fn result_store_create_table_generates_correct_paths() {
 #[tokio::test]
 async fn recovery_marks_missing_parquet_as_failed() {
     let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
 
     catalog
         .create_result_table(CreateResultTableParams {
@@ -233,13 +245,19 @@ async fn recovery_marks_missing_parquet_as_failed() {
             key_column: None,
             text_columns: None,
         })
+        .await
         .unwrap();
 
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog)).unwrap();
     store.recover().await.unwrap();
 
     assert_eq!(
-        catalog.get_result_table("orphan").unwrap().unwrap().status,
+        catalog
+            .get_result_table("orphan")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         "failed"
     );
 }
@@ -247,7 +265,7 @@ async fn recovery_marks_missing_parquet_as_failed() {
 #[tokio::test]
 async fn recovery_deletes_invalid_parquet_and_marks_failed() {
     let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let db_dir = dir.path().join("jammi_db");
     std::fs::create_dir_all(&db_dir).unwrap();
 
@@ -266,13 +284,19 @@ async fn recovery_deletes_invalid_parquet_and_marks_failed() {
             key_column: None,
             text_columns: None,
         })
+        .await
         .unwrap();
 
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog)).unwrap();
     store.recover().await.unwrap();
 
     assert_eq!(
-        catalog.get_result_table("corrupt").unwrap().unwrap().status,
+        catalog
+            .get_result_table("corrupt")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         "failed"
     );
     assert!(!bad_path.exists(), "Invalid Parquet should be deleted");
@@ -281,7 +305,7 @@ async fn recovery_deletes_invalid_parquet_and_marks_failed() {
 #[tokio::test]
 async fn recovery_promotes_valid_parquet_to_ready() {
     let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let db_dir = dir.path().join("jammi_db");
     std::fs::create_dir_all(&db_dir).unwrap();
 
@@ -312,12 +336,13 @@ async fn recovery_promotes_valid_parquet_to_ready() {
             key_column: None,
             text_columns: None,
         })
+        .await
         .unwrap();
 
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog)).unwrap();
     store.recover().await.unwrap();
 
-    let record = catalog.get_result_table("stuck").unwrap().unwrap();
+    let record = catalog.get_result_table("stuck").await.unwrap().unwrap();
     assert_eq!(record.status, "ready");
     assert_eq!(record.row_count, 3);
 }

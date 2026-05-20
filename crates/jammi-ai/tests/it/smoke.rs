@@ -110,6 +110,7 @@ async fn smoke_cp3_full_pipeline() {
         .catalog()
         .channels()
         .get(&jammi_engine::ChannelId::new("vector").unwrap())
+        .await
         .unwrap()
         .expect("vector channel must be seeded by migration 006");
     assert_eq!(declared.columns[0].name, "similarity");

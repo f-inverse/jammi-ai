@@ -1,3 +1,4 @@
+use crate::catalog::backend::{BackendError, Row, SqlValue, TxOptions};
 use crate::error::Result;
 
 use super::Catalog;
@@ -53,17 +54,7 @@ const SELECT_COLS: &str =
 
 impl Catalog {
     /// Register or refresh a model in the catalog.
-    ///
-    /// UPSERT semantics on the `model_id` PK: a later call with the same
-    /// `(model_id, version)` overwrites the metadata, backend, and task
-    /// columns. `created_at` is preserved; `updated_at` advances.
-    ///
-    /// This handles the common race where a caller pre-registers a model with
-    /// minimal metadata to satisfy a foreign-key constraint and a later caller
-    /// re-registers the same model with the full `artifact_path` known after
-    /// the weights are actually loaded.
-    pub fn register_model(&self, params: RegisterModelParams<'_>) -> Result<()> {
-        let conn = self.conn()?;
+    pub async fn register_model(&self, params: RegisterModelParams<'_>) -> Result<()> {
         let pk = format!("{}::{}", params.model_id, params.version);
         let metadata = serde_json::json!({
             "base_model_id": params.base_model_id,
@@ -71,96 +62,146 @@ impl Catalog {
             "config_json": params.config_json,
         })
         .to_string();
+        let model_id = params.model_id.to_string();
+        let model_type = params.model_type.to_string();
+        let task = params.task.to_string();
+        let backend = params.backend.to_string();
+        let version = params.version as i64;
 
-        conn.execute(
-            "INSERT INTO models (model_id, name, model_type, task, backend, version, status, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'registered', ?7)
-             ON CONFLICT(model_id) DO UPDATE SET
-                 metadata = excluded.metadata,
-                 backend = excluded.backend,
-                 task = excluded.task,
-                 model_type = excluded.model_type,
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-            rusqlite::params![
-                pk,
-                params.model_id,
-                params.model_type,
-                params.task,
-                params.backend,
-                params.version,
-                metadata
-            ],
-        )?;
+        self.backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO models (model_id, name, model_type, task, backend, version, status, metadata) \
+                         VALUES ($1, $2, $3, $4, $5, $6, 'registered', $7) \
+                         ON CONFLICT(model_id) DO UPDATE SET \
+                             metadata = excluded.metadata, \
+                             backend = excluded.backend, \
+                             task = excluded.task, \
+                             model_type = excluded.model_type, \
+                             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                        &[
+                            SqlValue::TextOwned(pk),
+                            SqlValue::TextOwned(model_id),
+                            SqlValue::TextOwned(model_type),
+                            SqlValue::TextOwned(task),
+                            SqlValue::TextOwned(backend),
+                            SqlValue::Int(version),
+                            SqlValue::TextOwned(metadata),
+                        ],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await?;
         Ok(())
     }
 
     /// Get the latest version of a model by name.
-    pub fn get_model(&self, model_id: &str) -> Result<Option<ModelRecord>> {
-        let conn = self.conn()?;
+    pub async fn get_model(&self, model_id: &str) -> Result<Option<ModelRecord>> {
         let sql = format!(
-            "SELECT {SELECT_COLS} FROM models WHERE name = ?1 ORDER BY version DESC LIMIT 1"
+            "SELECT {SELECT_COLS} FROM models WHERE name = $1 ORDER BY version DESC LIMIT 1"
         );
-        let mut stmt = conn.prepare(&sql)?;
-        Self::query_one_model(&mut stmt, rusqlite::params![model_id])
+        let mid = model_id.to_string();
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query_opt(&sql, &[SqlValue::TextOwned(mid)], parse_model_row)
+                            .await
+                    })
+                },
+            )
+            .await?)
     }
 
     /// Get a specific version of a model.
-    pub fn get_model_version(&self, model_id: &str, version: i32) -> Result<Option<ModelRecord>> {
-        let conn = self.conn()?;
-        let sql = format!("SELECT {SELECT_COLS} FROM models WHERE name = ?1 AND version = ?2");
-        let mut stmt = conn.prepare(&sql)?;
-        Self::query_one_model(&mut stmt, rusqlite::params![model_id, version])
+    pub async fn get_model_version(
+        &self,
+        model_id: &str,
+        version: i32,
+    ) -> Result<Option<ModelRecord>> {
+        let sql = format!("SELECT {SELECT_COLS} FROM models WHERE name = $1 AND version = $2");
+        let mid = model_id.to_string();
+        let v = version as i64;
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query_opt(
+                            &sql,
+                            &[SqlValue::TextOwned(mid), SqlValue::Int(v)],
+                            parse_model_row,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?)
     }
 
     /// Update model status (e.g., Registered → Loaded).
-    pub fn update_model_status(
+    pub async fn update_model_status(
         &self,
         model_id: &str,
         status: super::status::ModelStatus,
     ) -> Result<()> {
-        let conn = self.conn()?;
         let status_str = status.to_string();
-        conn.execute(
-            "UPDATE models SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE name = ?2",
-            rusqlite::params![status_str, model_id],
-        )?;
+        let mid = model_id.to_string();
+        self.backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE models SET status = $1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                         WHERE name = $2",
+                        &[SqlValue::TextOwned(status_str), SqlValue::TextOwned(mid)],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await?;
         Ok(())
     }
 
     /// List all registered models.
-    pub fn list_models(&self) -> Result<Vec<ModelRecord>> {
-        let conn = self.conn()?;
+    pub async fn list_models(&self) -> Result<Vec<ModelRecord>> {
         let sql = format!("SELECT {SELECT_COLS} FROM models ORDER BY created_at");
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], parse_model_row)?;
-        rows.map(|r| r.map_err(Into::into)).collect()
-    }
-
-    fn query_one_model(
-        stmt: &mut rusqlite::Statement<'_>,
-        params: &[&dyn rusqlite::types::ToSql],
-    ) -> Result<Option<ModelRecord>> {
-        let mut rows = stmt.query_map(params, parse_model_row)?;
-        match rows.next() {
-            Some(Ok(record)) => Ok(Some(record)),
-            Some(Err(e)) => Err(e.into()),
-            None => Ok(None),
-        }
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| Box::pin(async move { tx.query(&sql, &[], parse_model_row).await }),
+            )
+            .await?)
     }
 }
 
 /// Parse: model_id, name, model_type, task, backend, version, status, metadata, created_at
-fn parse_model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRecord> {
-    let _pk: String = row.get(0)?;
-    let name: String = row.get(1)?;
-    let model_type: String = row.get(2)?;
-    let task: String = row.get(3)?;
-    let backend: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
-    let version: i32 = row.get::<_, Option<i32>>(5)?.unwrap_or(1);
-    let status: String = row.get::<_, Option<String>>(6)?.unwrap_or_default();
-    let metadata: Option<String> = row.get(7)?;
-    let created_at: String = row.get::<_, Option<String>>(8)?.unwrap_or_default();
+fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendError> {
+    let _pk: String = row.get("model_id")?;
+    let name: String = row.get("name")?;
+    let model_type: String = row.get("model_type")?;
+    let task: String = row.get("task")?;
+    let backend: String = row.try_get("backend")?.unwrap_or_default();
+    let version: i64 = row.try_get("version")?.unwrap_or(1);
+    let status: String = row.try_get("status")?.unwrap_or_default();
+    let metadata: Option<String> = row.try_get("metadata")?;
+    let created_at: String = row.try_get("created_at")?.unwrap_or_default();
 
     let (base_model_id, artifact_path, config_json) = metadata
         .as_deref()
@@ -176,7 +217,7 @@ fn parse_model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRecord> {
 
     Ok(ModelRecord {
         model_id: name,
-        version,
+        version: version as i32,
         model_type,
         base_model_id,
         backend,

@@ -254,14 +254,17 @@ fn contract_metrics_in_valid_ranges() {
 // Integration test against real SQLite. Guards that latest_eval_run returns
 // most recent by created_at (ORDER BY DESC LIMIT 1), not first inserted.
 
-#[test]
-fn catalog_eval_run_crud_and_latest() {
+#[tokio::test]
+async fn catalog_eval_run_crud_and_latest() {
     let dir = tempdir().unwrap();
-    let catalog = jammi_engine::catalog::Catalog::open(dir.path()).unwrap();
+    let catalog = jammi_engine::catalog::Catalog::open(dir.path())
+        .await
+        .unwrap();
 
     // Missing model → None (not an error)
     assert!(catalog
         .latest_eval_run("nonexistent", "embedding")
+        .await
         .unwrap()
         .is_none());
 
@@ -275,6 +278,7 @@ fn catalog_eval_run_crud_and_latest() {
             task: "text_embedding",
             ..Default::default()
         })
+        .await
         .unwrap();
 
     // Insert two runs with different created_at
@@ -290,6 +294,7 @@ fn catalog_eval_run_crud_and_latest() {
             status: "completed".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
         })
+        .await
         .unwrap();
     catalog
         .record_eval_run(&EvalRunRecord {
@@ -303,11 +308,13 @@ fn catalog_eval_run_crud_and_latest() {
             status: "completed".into(),
             created_at: "2026-01-02T00:00:00Z".into(),
         })
+        .await
         .unwrap();
 
     // latest returns er-2 (most recent), not er-1 (first inserted)
     let latest = catalog
         .latest_eval_run("model-a::1", "embedding")
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(latest.eval_run_id, "er-2");
@@ -397,7 +404,7 @@ async fn eval_embeddings_end_to_end() {
     }
 
     // UAT 15: eval run recorded in catalog with golden_source and k
-    let runs = session.catalog().list_eval_runs().unwrap();
+    let runs = session.catalog().list_eval_runs().await.unwrap();
     assert!(!runs.is_empty(), "Eval run should be recorded");
     let run = &runs[0];
     assert_eq!(run.eval_type, "embedding");
@@ -410,6 +417,7 @@ async fn eval_embeddings_end_to_end() {
     let latest = session
         .catalog()
         .latest_eval_run(&run.model_id, "embedding")
+        .await
         .unwrap();
     assert!(latest.is_some());
     let latest = latest.unwrap();

@@ -53,9 +53,9 @@ pub enum JammiError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// SQLite driver error.
-    #[error("SQLite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    /// Catalog backend (SQLite / Postgres) error.
+    #[error("Backend error: {0}")]
+    BackendDriver(#[from] crate::catalog::backend::BackendError),
 
     /// Invalid tenant identifier (e.g., nil UUID, malformed string).
     #[error("Tenant error: {0}")]
@@ -72,14 +72,6 @@ pub enum JammiError {
     /// DataFusion query-engine error.
     #[error("DataFusion error: {0}")]
     DataFusion(#[from] datafusion::error::DataFusionError),
-
-    /// Connection pool error.
-    #[error("Pool error: {0}")]
-    Pool(#[from] r2d2::Error),
-
-    /// Schema migration error.
-    #[error("Migration error: {0}")]
-    Migration(#[from] rusqlite_migration::Error),
 
     /// Evidence channel validation or registration error.
     #[error("Evidence channel error: {0}")]

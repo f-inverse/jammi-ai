@@ -46,10 +46,7 @@ arrow-array = "57"
 
 # Storage
 parquet = "57"
-rusqlite = { version = "0.39", features = ["bundled"] }
-rusqlite_migration = "2.4"
-r2d2 = "0.8"
-r2d2_sqlite = "0.33"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres", "uuid", "chrono", "json", "macros"] }
 
 # ML inference
 candle-core = "0.9"

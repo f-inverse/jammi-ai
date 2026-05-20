@@ -62,10 +62,11 @@ fn training_columns() -> Vec<String> {
 /// Models registered via `fine_tune` carry their artifact path on the
 /// model record; the on-disk layout is `<artifact_path>/adapter.safetensors`
 /// alongside `adapter_config.json`.
-fn adapter_dir_for_model(session: &InferenceSession, model_id: &str) -> std::path::PathBuf {
+async fn adapter_dir_for_model(session: &InferenceSession, model_id: &str) -> std::path::PathBuf {
     let record = session
         .catalog()
         .get_model(model_id)
+        .await
         .expect("catalog lookup")
         .expect("fine-tuned model registered in catalog");
     std::path::PathBuf::from(record.artifact_path.expect("artifact_path"))
@@ -99,7 +100,7 @@ async fn encoder_adapters_bert_writes_adapter_marker() {
 
     // Walk back through the saved adapter and confirm the encoder-adapters
     // discriminator + the persisted target modules / rank.
-    let adapter_dir = adapter_dir_for_model(&session, job.model_id());
+    let adapter_dir = adapter_dir_for_model(&session, job.model_id()).await;
     let cfg_path = adapter_dir.join("adapter_config.json");
     assert!(
         cfg_path.exists(),
@@ -153,7 +154,7 @@ async fn encoder_adapters_modernbert_writes_adapter_marker() {
         .unwrap();
     job.wait().await.unwrap();
 
-    let adapter_dir = adapter_dir_for_model(&session, job.model_id());
+    let adapter_dir = adapter_dir_for_model(&session, job.model_id()).await;
     let saved: jammi_ai::fine_tune::target::SavedAdapter = serde_json::from_str(
         &std::fs::read_to_string(adapter_dir.join("adapter_config.json")).unwrap(),
     )

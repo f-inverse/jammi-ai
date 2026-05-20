@@ -1,6 +1,6 @@
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
+use super::backend::{BackendError, Row, SqlValue, TxOptions};
 use super::Catalog;
 use crate::error::{JammiError, Result};
 
@@ -24,9 +24,8 @@ pub struct FineTuneJobRecord {
 const SELECT_COLS: &str = "job_id, base_model_id, output_model_id, training_source, loss_type, \
      hyperparams, status, metrics, created_at";
 
-fn parse_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FineTuneJobRecord> {
-    let metrics_raw: Option<String> = row.get(7)?;
-    // Extract error_message from metrics JSON if present
+fn parse_row(row: &Row<'_>) -> std::result::Result<FineTuneJobRecord, BackendError> {
+    let metrics_raw: Option<String> = row.try_get("metrics")?;
     let error_message = metrics_raw.as_deref().and_then(|m| {
         serde_json::from_str::<serde_json::Value>(m)
             .ok()
@@ -44,16 +43,16 @@ fn parse_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FineTuneJobRecord> {
     });
 
     Ok(FineTuneJobRecord {
-        job_id: row.get(0)?,
-        base_model_id: row.get(1)?,
-        output_model_id: row.get(2)?,
-        training_source: row.get(3)?,
-        loss_type: row.get(4)?,
-        hyperparams: row.get(5)?,
-        status: row.get(6)?,
+        job_id: row.get("job_id")?,
+        base_model_id: row.get("base_model_id")?,
+        output_model_id: row.try_get("output_model_id")?,
+        training_source: row.get("training_source")?,
+        loss_type: row.get("loss_type")?,
+        hyperparams: row.get("hyperparams")?,
+        status: row.get("status")?,
         metrics: metrics_raw,
         error_message,
-        created_at: row.get(8)?,
+        created_at: row.get("created_at")?,
         started_at,
         completed_at,
     })
@@ -61,7 +60,7 @@ fn parse_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FineTuneJobRecord> {
 
 impl Catalog {
     /// Create a new fine-tune job record with status = 'queued'.
-    pub fn create_fine_tune_job(
+    pub async fn create_fine_tune_job(
         &self,
         job_id: &str,
         base_model_id: &str,
@@ -69,82 +68,152 @@ impl Catalog {
         loss_type: &str,
         hyperparams: &str,
     ) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            "INSERT INTO fine_tune_jobs \
-             (job_id, base_model_id, training_source, loss_type, hyperparams, status) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 'queued')",
-            params![
-                job_id,
-                base_model_id,
-                training_source,
-                loss_type,
-                hyperparams
-            ],
-        )?;
+        let job_id = job_id.to_string();
+        let base_model_id = base_model_id.to_string();
+        let training_source = training_source.to_string();
+        let loss_type = loss_type.to_string();
+        let hyperparams = hyperparams.to_string();
+
+        self.backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO fine_tune_jobs \
+                         (job_id, base_model_id, training_source, loss_type, hyperparams, status) \
+                         VALUES ($1, $2, $3, $4, $5, 'queued')",
+                        &[
+                            SqlValue::TextOwned(job_id),
+                            SqlValue::TextOwned(base_model_id),
+                            SqlValue::TextOwned(training_source),
+                            SqlValue::TextOwned(loss_type),
+                            SqlValue::TextOwned(hyperparams),
+                        ],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await?;
         Ok(())
     }
 
     /// Get a fine-tune job by ID.
-    pub fn get_fine_tune_job(&self, job_id: &str) -> Result<FineTuneJobRecord> {
-        let conn = self.conn()?;
-        let sql = format!("SELECT {SELECT_COLS} FROM fine_tune_jobs WHERE job_id = ?1");
-        conn.query_row(&sql, params![job_id], parse_row)
-            .map_err(|e| JammiError::Catalog(format!("Fine-tune job '{job_id}': {e}")))
+    pub async fn get_fine_tune_job(&self, job_id: &str) -> Result<FineTuneJobRecord> {
+        let sql = format!("SELECT {SELECT_COLS} FROM fine_tune_jobs WHERE job_id = $1");
+        let id = job_id.to_string();
+        let id_for_err = id.clone();
+        let found = self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query_opt(&sql, &[SqlValue::TextOwned(id)], parse_row)
+                            .await
+                    })
+                },
+            )
+            .await?;
+        found.ok_or_else(|| JammiError::Catalog(format!("Fine-tune job '{id_for_err}' not found")))
     }
 
     /// Update a fine-tune job's status and optional metrics JSON.
-    pub fn update_fine_tune_status(
+    pub async fn update_fine_tune_status(
         &self,
         job_id: &str,
         status: super::status::FineTuneJobStatus,
         metrics: Option<&str>,
     ) -> Result<()> {
-        let conn = self.conn()?;
         let status_str = status.to_string();
-        conn.execute(
-            "UPDATE fine_tune_jobs SET status = ?1, metrics = ?2, \
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-             WHERE job_id = ?3",
-            params![status_str, metrics, job_id],
-        )?;
+        let metrics = metrics.map(str::to_string);
+        let id = job_id.to_string();
+        self.backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE fine_tune_jobs SET status = $1, metrics = $2, \
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                         WHERE job_id = $3",
+                        &[
+                            SqlValue::TextOwned(status_str),
+                            SqlValue::from(metrics),
+                            SqlValue::TextOwned(id),
+                        ],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await?;
         Ok(())
     }
 
     /// Set the output model ID for a completed fine-tune job.
-    pub fn set_fine_tune_output_model(&self, job_id: &str, output_model_id: &str) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            "UPDATE fine_tune_jobs SET output_model_id = ?1, \
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-             WHERE job_id = ?2",
-            params![output_model_id, job_id],
-        )?;
+    pub async fn set_fine_tune_output_model(
+        &self,
+        job_id: &str,
+        output_model_id: &str,
+    ) -> Result<()> {
+        let output_model_id = output_model_id.to_string();
+        let id = job_id.to_string();
+        self.backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE fine_tune_jobs SET output_model_id = $1, \
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                         WHERE job_id = $2",
+                        &[
+                            SqlValue::TextOwned(output_model_id),
+                            SqlValue::TextOwned(id),
+                        ],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await?;
         Ok(())
     }
 
     /// Transition all fine-tune jobs with status Running to Failed.
-    /// Called during startup recovery — a Running job at startup means
-    /// the process crashed mid-training.
-    pub fn cleanup_stale_fine_tune_jobs(&self) -> Result<usize> {
-        let conn = self.conn()?;
+    /// Startup-recovery shim: a Running job at startup means the process
+    /// crashed mid-training.
+    pub async fn cleanup_stale_fine_tune_jobs(&self) -> Result<usize> {
         let running = super::status::FineTuneJobStatus::Running.to_string();
         let failed = super::status::FineTuneJobStatus::Failed.to_string();
-        let count = conn.execute(
-            "UPDATE fine_tune_jobs SET status = ?1, \
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-             WHERE status = ?2",
-            params![failed, running],
-        )?;
-        Ok(count)
+        let count = self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE fine_tune_jobs SET status = $1, \
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                         WHERE status = $2",
+                        &[SqlValue::TextOwned(failed), SqlValue::TextOwned(running)],
+                    )
+                    .await
+                })
+            })
+            .await?;
+        Ok(count as usize)
     }
 
     /// List all fine-tune jobs, most recent first.
-    pub fn list_fine_tune_jobs(&self) -> Result<Vec<FineTuneJobRecord>> {
-        let conn = self.conn()?;
+    pub async fn list_fine_tune_jobs(&self) -> Result<Vec<FineTuneJobRecord>> {
         let sql = format!("SELECT {SELECT_COLS} FROM fine_tune_jobs ORDER BY created_at DESC");
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], parse_row)?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| Box::pin(async move { tx.query(&sql, &[], parse_row).await }),
+            )
+            .await?)
     }
 }

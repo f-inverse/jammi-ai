@@ -50,7 +50,7 @@ pub fn test_config(artifact_dir: &Path) -> jammi_engine::config::JammiConfig {
 /// Register a custom evidence channel with the catalog. Used by tests
 /// that exercise the data-driven provenance machinery beyond the seeded
 /// `vector` and `inference` channels.
-pub fn register_test_channel(
+pub async fn register_test_channel(
     catalog: &jammi_engine::catalog::Catalog,
     id: &str,
     priority: i32,
@@ -69,5 +69,5 @@ pub fn register_test_channel(
             )
             .collect(),
     };
-    catalog.channels().register(&spec)
+    catalog.channels().register(&spec).await
 }

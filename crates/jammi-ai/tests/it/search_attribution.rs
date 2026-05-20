@@ -65,6 +65,7 @@ async fn third_party_scored_by_channel_columns_appear_in_search_results() {
             ("rank_score", ChannelColumnType::Float32),
         ],
     )
+    .await
     .unwrap();
 
     // Run a vector search; this produces batches with vector's `similarity`
@@ -106,6 +107,7 @@ async fn third_party_scored_by_channel_columns_appear_in_search_results() {
         &[],
         &contribs,
     )
+    .await
     .unwrap();
 
     // The catalog-declared third-tenant columns are present in the
@@ -153,6 +155,7 @@ async fn rows_not_touched_by_channel_have_null_in_that_channels_columns() {
             ("rank_score", ChannelColumnType::Float32),
         ],
     )
+    .await
     .unwrap();
 
     let query = vec![0.5_f32; 32];
@@ -179,6 +182,7 @@ async fn rows_not_touched_by_channel_have_null_in_that_channels_columns() {
         &[],
         &empty_contribs,
     )
+    .await
     .unwrap();
 
     let m = &merged[0];
@@ -208,6 +212,7 @@ async fn channel_contribution_arrow_dtypes_must_match_catalog_declaration() {
         3,
         &[("rank_score", ChannelColumnType::Float32)],
     )
+    .await
     .unwrap();
 
     let query = vec![0.5_f32; 32];
@@ -241,6 +246,7 @@ async fn channel_contribution_arrow_dtypes_must_match_catalog_declaration() {
         &[],
         &wrong,
     )
+    .await
     .unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("dtype"), "expected dtype mismatch, got: {msg}");

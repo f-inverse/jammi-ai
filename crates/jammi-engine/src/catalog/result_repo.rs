@@ -1,5 +1,4 @@
-use rusqlite::params;
-
+use crate::catalog::backend::{BackendError, Row, SqlValue, TxOptions};
 use crate::catalog::Catalog;
 use crate::error::{JammiError, Result};
 
@@ -37,57 +36,73 @@ pub struct ResultTableRecord {
     pub completed_at: Option<String>,
 }
 
-fn parse_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResultTableRecord> {
+fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendError> {
     Ok(ResultTableRecord {
         table_name: row.get("table_name")?,
         source_id: row.get("source_id")?,
         model_id: row.get("model_id")?,
         task: row.get("task")?,
         parquet_path: row.get("parquet_path")?,
-        index_path: row.get("index_path")?,
-        dimensions: row.get("dimensions")?,
+        index_path: row.try_get("index_path")?,
+        dimensions: row.try_get("dimensions")?,
         distance_metric: row.get("distance_metric")?,
-        row_count: row.get::<_, i64>("row_count")? as usize,
+        row_count: row.get::<i64>("row_count")? as usize,
         status: row.get("status")?,
-        key_column: row.get("key_column")?,
-        text_columns: row.get("text_columns")?,
+        key_column: row.try_get("key_column")?,
+        text_columns: row.try_get("text_columns")?,
         created_at: row.get("created_at")?,
-        completed_at: row.get("completed_at")?,
+        completed_at: row.try_get("completed_at")?,
     })
 }
 
 impl Catalog {
     /// Insert a new result table record with status = 'building'.
-    pub fn create_result_table(&self, p: CreateResultTableParams<'_>) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            "INSERT INTO result_tables (table_name, source_id, model_id, task, parquet_path,
-             index_path, dimensions, key_column, text_columns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                p.table_name,
-                p.source_id,
-                p.model_id,
-                p.task,
-                p.parquet_path,
-                p.index_path,
-                p.dimensions,
-                p.key_column,
-                p.text_columns,
-            ],
-        )?;
+    pub async fn create_result_table(&self, p: CreateResultTableParams<'_>) -> Result<()> {
+        let table_name = p.table_name.to_string();
+        let source_id = p.source_id.to_string();
+        let model_id = p.model_id.to_string();
+        let task = p.task.to_string();
+        let parquet_path = p.parquet_path.to_string();
+        let index_path = p.index_path.map(str::to_string);
+        let dimensions = p.dimensions;
+        let key_column = p.key_column.map(str::to_string);
+        let text_columns = p.text_columns.map(str::to_string);
+
+        self.backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO result_tables (table_name, source_id, model_id, task, parquet_path, \
+                         index_path, dimensions, key_column, text_columns) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                        &[
+                            SqlValue::TextOwned(table_name),
+                            SqlValue::TextOwned(source_id),
+                            SqlValue::TextOwned(model_id),
+                            SqlValue::TextOwned(task),
+                            SqlValue::TextOwned(parquet_path),
+                            SqlValue::from(index_path),
+                            SqlValue::from(dimensions.map(|d| d as i64)),
+                            SqlValue::from(key_column),
+                            SqlValue::from(text_columns),
+                        ],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await?;
         Ok(())
     }
 
     /// Update a result table's status and row count. Sets `completed_at` when
     /// transitioning to a terminal state (Ready/Failed).
-    pub fn update_result_table_status(
+    pub async fn update_result_table_status(
         &self,
         name: &str,
         status: super::status::ResultTableStatus,
         rows: usize,
     ) -> Result<()> {
-        let conn = self.conn()?;
         let completed_at = if matches!(
             status,
             super::status::ResultTableStatus::Ready | super::status::ResultTableStatus::Failed
@@ -101,81 +116,141 @@ impl Catalog {
             None
         };
         let status_str = status.to_string();
-        conn.execute(
-            "UPDATE result_tables SET status = ?1, row_count = ?2, completed_at = ?3
-             WHERE table_name = ?4",
-            params![status_str, rows as i64, completed_at, name],
-        )?;
+        let name = name.to_string();
+        let rows_i64 = rows as i64;
+
+        self.backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE result_tables SET status = $1, row_count = $2, completed_at = $3 \
+                         WHERE table_name = $4",
+                        &[
+                            SqlValue::TextOwned(status_str),
+                            SqlValue::Int(rows_i64),
+                            SqlValue::from(completed_at),
+                            SqlValue::TextOwned(name),
+                        ],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await?;
         Ok(())
     }
 
     /// Fetch a single result table by name.
-    pub fn get_result_table(&self, name: &str) -> Result<Option<ResultTableRecord>> {
-        let conn = self.conn()?;
-        let mut stmt = conn.prepare("SELECT * FROM result_tables WHERE table_name = ?1")?;
-        let mut rows = stmt.query_map(params![name], parse_row)?;
-        match rows.next() {
-            Some(Ok(record)) => Ok(Some(record)),
-            Some(Err(e)) => Err(e.into()),
-            None => Ok(None),
-        }
+    pub async fn get_result_table(&self, name: &str) -> Result<Option<ResultTableRecord>> {
+        let name = name.to_string();
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query_opt(
+                            "SELECT * FROM result_tables WHERE table_name = $1",
+                            &[SqlValue::TextOwned(name)],
+                            parse_row,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?)
     }
 
     /// List all result tables with a given status.
-    pub fn list_result_tables_by_status(
+    pub async fn list_result_tables_by_status(
         &self,
         status: super::status::ResultTableStatus,
     ) -> Result<Vec<ResultTableRecord>> {
-        let conn = self.conn()?;
         let status_str = status.to_string();
-        let mut stmt =
-            conn.prepare("SELECT * FROM result_tables WHERE status = ?1 ORDER BY created_at")?;
-        let rows = stmt.query_map(params![status_str], parse_row)?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query(
+                            "SELECT * FROM result_tables WHERE status = $1 ORDER BY created_at",
+                            &[SqlValue::TextOwned(status_str)],
+                            parse_row,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?)
     }
 
     /// Find result tables matching source, optional task, optional model.
-    pub fn find_result_tables(
+    pub async fn find_result_tables(
         &self,
         source_id: &str,
         task: Option<&str>,
         model_id: Option<&str>,
     ) -> Result<Vec<ResultTableRecord>> {
-        let conn = self.conn()?;
-        let mut sql = "SELECT * FROM result_tables WHERE source_id = ?1".to_string();
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(source_id.to_string())];
+        let mut sql = "SELECT * FROM result_tables WHERE source_id = $1".to_string();
+        let mut params: Vec<SqlValue<'static>> = vec![SqlValue::TextOwned(source_id.to_string())];
 
         if let Some(t) = task {
-            sql.push_str(&format!(" AND task = ?{}", param_values.len() + 1));
-            param_values.push(Box::new(t.to_string()));
+            sql.push_str(&format!(" AND task = ${}", params.len() + 1));
+            params.push(SqlValue::TextOwned(t.to_string()));
         }
         if let Some(m) = model_id {
-            sql.push_str(&format!(" AND model_id = ?{}", param_values.len() + 1));
-            param_values.push(Box::new(m.to_string()));
+            sql.push_str(&format!(" AND model_id = ${}", params.len() + 1));
+            params.push(SqlValue::TextOwned(m.to_string()));
         }
         sql.push_str(" ORDER BY created_at");
 
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_refs.as_slice(), parse_row)?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| Box::pin(async move { tx.query(&sql, &params, parse_row).await }),
+            )
+            .await?)
     }
 
     /// Delete all result tables for a source. Returns the deleted records
     /// so callers can clean up associated disk files.
-    pub fn delete_result_tables_for_source(
+    pub async fn delete_result_tables_for_source(
         &self,
         source_id: &str,
     ) -> Result<Vec<ResultTableRecord>> {
-        let records = self.find_result_tables(source_id, None, None)?;
-        let conn = self.conn()?;
-        conn.execute(
-            "DELETE FROM result_tables WHERE source_id = ?1",
-            params![source_id],
-        )?;
-        Ok(records)
+        let sid = source_id.to_string();
+        // Use a single transaction so the listing and delete are atomic.
+        Ok(self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    let records = tx
+                        .query(
+                            "SELECT * FROM result_tables WHERE source_id = $1",
+                            &[SqlValue::TextOwned(sid.clone())],
+                            parse_row,
+                        )
+                        .await?;
+                    tx.execute(
+                        "DELETE FROM result_tables WHERE source_id = $1",
+                        &[SqlValue::TextOwned(sid)],
+                    )
+                    .await?;
+                    Ok(records)
+                })
+            })
+            .await?)
     }
 
     /// Resolve which embedding table to use for a source.
@@ -183,49 +258,87 @@ impl Catalog {
     /// - Explicit name → return that table.
     /// - None → find ready embedding tables for source, return latest by `created_at`.
     ///   Zero → error. One or more → latest.
-    pub fn resolve_embedding_table(
+    pub async fn resolve_embedding_table(
         &self,
         source_id: &str,
         table_name: Option<&str>,
     ) -> Result<ResultTableRecord> {
         if let Some(name) = table_name {
             return self
-                .get_result_table(name)?
+                .get_result_table(name)
+                .await?
                 .ok_or_else(|| JammiError::Catalog(format!("Result table '{name}' not found")));
         }
 
-        let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT * FROM result_tables
-             WHERE source_id = ?1 AND task IN ('text_embedding', 'image_embedding') AND status = 'ready'
-             ORDER BY created_at DESC, rowid DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query_map(params![source_id], parse_row)?;
-        match rows.next() {
-            Some(Ok(record)) => Ok(record),
-            Some(Err(e)) => Err(e.into()),
-            None => Err(JammiError::Catalog(format!(
-                "No ready embedding table for source '{source_id}'"
-            ))),
-        }
+        let sid = source_id.to_string();
+        let found = self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query_opt(
+                            "SELECT * FROM result_tables \
+                         WHERE source_id = $1 AND task IN ('text_embedding', 'image_embedding') \
+                           AND status = 'ready' \
+                         ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                            &[SqlValue::TextOwned(sid)],
+                            parse_row,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?;
+        found.ok_or_else(|| {
+            JammiError::Catalog(format!("No ready embedding table for source '{source_id}'"))
+        })
     }
 
     /// Persist a checkpoint (batch number) for a result table.
-    pub fn set_checkpoint(&self, name: &str, batch: usize) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            "UPDATE result_tables SET checkpoint = ?1 WHERE table_name = ?2",
-            params![batch as i64, name],
-        )?;
+    pub async fn set_checkpoint(&self, name: &str, batch: usize) -> Result<()> {
+        let name = name.to_string();
+        let batch_i64 = batch as i64;
+        self.backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE result_tables SET checkpoint = $1 WHERE table_name = $2",
+                        &[SqlValue::Int(batch_i64), SqlValue::TextOwned(name)],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await?;
         Ok(())
     }
 
     /// Retrieve the last checkpoint for a result table.
-    pub fn get_checkpoint(&self, name: &str) -> Result<Option<usize>> {
-        let conn = self.conn()?;
-        let mut stmt =
-            conn.prepare("SELECT checkpoint FROM result_tables WHERE table_name = ?1")?;
-        let checkpoint: Option<i64> = stmt.query_row(params![name], |row| row.get(0))?;
-        Ok(checkpoint.map(|c| c as usize))
+    pub async fn get_checkpoint(&self, name: &str) -> Result<Option<usize>> {
+        let name = name.to_string();
+        let found: Option<Option<i64>> = self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query_opt(
+                            "SELECT checkpoint FROM result_tables WHERE table_name = $1",
+                            &[SqlValue::TextOwned(name)],
+                            |row| row.try_get::<i64>("checkpoint"),
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?;
+        Ok(found.flatten().map(|c| c as usize))
     }
 }

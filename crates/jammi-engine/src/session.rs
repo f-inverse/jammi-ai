@@ -28,7 +28,7 @@ impl JammiSession {
     /// Create a new session, opening the catalog and configuring DataFusion.
     pub async fn new(config: JammiConfig) -> Result<Self> {
         let config = Arc::new(config);
-        let catalog = Arc::new(Catalog::open(&config.artifact_dir)?);
+        let catalog = Arc::new(Catalog::open(&config.artifact_dir).await?);
 
         let session_config = SessionConfig::new()
             .with_target_partitions(config.engine.execution_threads)
@@ -84,7 +84,7 @@ impl JammiSession {
     /// Called on startup so that sources added by previous sessions (e.g. a
     /// prior CLI invocation) are available for queries immediately.
     async fn reload_sources(&self) -> Result<()> {
-        let sources = self.catalog.list_sources()?;
+        let sources = self.catalog.list_sources().await?;
         for record in sources {
             if let Err(e) = self
                 .register_source_tables(&record.source_id, &record.source_type, &record.connection)
@@ -107,7 +107,7 @@ impl JammiSession {
         connection: SourceConnection,
     ) -> Result<()> {
         // Check for duplicate registration.
-        if self.catalog.get_source(source_id)?.is_some() {
+        if self.catalog.get_source(source_id).await?.is_some() {
             return Err(JammiError::Source {
                 source_id: source_id.into(),
                 message: "Source already registered".into(),
@@ -120,7 +120,8 @@ impl JammiSession {
 
         // Persist to catalog.
         self.catalog
-            .register_source(source_id, source_type, &connection)?;
+            .register_source(source_id, source_type, &connection)
+            .await?;
 
         Ok(())
     }
@@ -195,9 +196,12 @@ impl JammiSession {
     /// disk files (Parquet + index), ANN cache, and DataFusion registration.
     ///
     /// Eval runs are preserved as immutable historical records.
-    pub fn remove_source(&self, source_id: &str) -> Result<()> {
+    pub async fn remove_source(&self, source_id: &str) -> Result<()> {
         // 1. Fetch result tables so we know which files to delete.
-        let result_tables = self.catalog.delete_result_tables_for_source(source_id)?;
+        let result_tables = self
+            .catalog
+            .delete_result_tables_for_source(source_id)
+            .await?;
 
         // 2. Delete Parquet and index files from disk (best-effort).
         for rt in &result_tables {
@@ -219,7 +223,7 @@ impl JammiSession {
         }
 
         // 3. Delete the source row from the catalog.
-        self.catalog.remove_source(source_id)?;
+        self.catalog.remove_source(source_id).await?;
 
         // 4. Clear the DataFusion schema provider so queries return "not found".
         if let Some(catalog) = self.ctx.catalog(source_id) {

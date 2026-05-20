@@ -56,7 +56,7 @@ impl InferenceSession {
             Arc::clone(&catalog),
         )?);
         result_store.recover().await?;
-        catalog.cleanup_stale_fine_tune_jobs()?;
+        catalog.cleanup_stale_fine_tune_jobs().await?;
         result_store.load_existing_tables(inner.context()).await?;
 
         let ann_cache_size = inner.config().cache.ann_cache_max_entries as u64;
@@ -86,8 +86,8 @@ impl InferenceSession {
 
     /// Remove a source and all associated state (result tables, disk files,
     /// ANN cache, DataFusion registration). Eval runs are preserved.
-    pub fn remove_source(&self, source_id: &str) -> Result<()> {
-        self.inner.remove_source(source_id)?;
+    pub async fn remove_source(&self, source_id: &str) -> Result<()> {
+        self.inner.remove_source(source_id).await?;
         self.ann_cache.invalidate_source(source_id)?;
         Ok(())
     }
@@ -286,14 +286,10 @@ impl InferenceSession {
         // Persist results to Parquet
         if !batches.is_empty() {
             let task_str = task.to_string();
-            let table_info = self.result_store.create_table(
-                source_id,
-                &task_str,
-                &source.to_string(),
-                None,
-                None,
-                None,
-            )?;
+            let table_info = self
+                .result_store
+                .create_table(source_id, &task_str, &source.to_string(), None, None, None)
+                .await?;
             let schema = batches[0].schema();
             let mut writer = jammi_engine::store::writer::ParquetResultWriter::new(
                 &table_info.parquet_path,
@@ -378,17 +374,19 @@ impl InferenceSession {
         let canonical_name = model_source.to_string();
 
         // Ensure base model is registered in catalog (FK constraint on fine_tune_jobs)
-        if self.catalog().get_model(&canonical_name)?.is_none() {
-            if let Err(e) = self.catalog().register_model(
-                jammi_engine::catalog::model_repo::RegisterModelParams {
+        if self.catalog().get_model(&canonical_name).await?.is_none() {
+            if let Err(e) = self
+                .catalog()
+                .register_model(jammi_engine::catalog::model_repo::RegisterModelParams {
                     model_id: &canonical_name,
                     version: 1,
                     model_type: "embedding",
                     backend: "candle",
                     task,
                     ..Default::default()
-                },
-            ) {
+                })
+                .await
+            {
                 tracing::error!(model_id = %canonical_name, error = %e, "Failed to register base model in catalog");
             }
         }
@@ -408,13 +406,10 @@ impl InferenceSession {
         };
 
         let base_model_pk = crate::model::to_catalog_pk(&canonical_name, 1);
-        self.inner.catalog().create_fine_tune_job(
-            &job_id,
-            &base_model_pk,
-            source,
-            &loss_type,
-            &hyperparams,
-        )?;
+        self.inner
+            .catalog()
+            .create_fine_tune_job(&job_id, &base_model_pk, source, &loss_type, &hyperparams)
+            .await?;
 
         // Load training data from the source
         let table_name = self.find_table_name(source)?;
@@ -745,11 +740,11 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// the failure instead of an indefinite `Running` state.
 fn record_failed(catalog: &Arc<jammi_engine::catalog::Catalog>, job_id: &str, msg: String) {
     let metrics = serde_json::json!({ "error_message": msg }).to_string();
-    if let Err(e) = catalog.update_fine_tune_status(
+    if let Err(e) = tokio::runtime::Handle::current().block_on(catalog.update_fine_tune_status(
         job_id,
         jammi_engine::catalog::status::FineTuneJobStatus::Failed,
         Some(&metrics),
-    ) {
+    )) {
         tracing::error!(job_id = %job_id, error = %e, "Failed to record terminal status");
     }
 }
@@ -824,13 +819,16 @@ fn run_fine_tune_blocking(
 
     match training_loop.run(&data_loader) {
         Ok(_result) => {
+            let handle = tokio::runtime::Handle::current();
             // Register the fine-tuned model in catalog
-            if let Err(e) = catalog.set_fine_tune_output_model(&job_id, &output_model_id) {
+            if let Err(e) =
+                handle.block_on(catalog.set_fine_tune_output_model(&job_id, &output_model_id))
+            {
                 tracing::error!(job_id = %job_id, error = %e, "Failed to set fine-tune output model in catalog");
             }
             let adapter_dir = artifact_dir.join("models").join(&job_id);
-            if let Err(e) =
-                catalog.register_model(jammi_engine::catalog::model_repo::RegisterModelParams {
+            if let Err(e) = handle.block_on(catalog.register_model(
+                jammi_engine::catalog::model_repo::RegisterModelParams {
                     model_id: &output_model_id,
                     version: 1,
                     model_type: "fine-tuned",
@@ -839,8 +837,8 @@ fn run_fine_tune_blocking(
                     base_model_id: Some(&base_model),
                     artifact_path: Some(adapter_dir.to_str().unwrap_or("")),
                     config_json: None,
-                })
-            {
+                },
+            )) {
                 tracing::error!(job_id = %job_id, error = %e, "Failed to register fine-tuned model in catalog");
             }
         }
@@ -876,9 +874,11 @@ fn build_encoder_adapters(
     // The catalog entry may have artifact_path = NULL (set before the model was
     // downloaded for FK-constraint purposes) or may point to a weights file
     // rather than a directory (older behavior in do_load).  Handle all cases.
-    let model_record = catalog.get_model(catalog_model_id)?.ok_or_else(|| {
-        JammiError::FineTune(format!("Base model '{base_model_id}' not in catalog"))
-    })?;
+    let model_record = tokio::runtime::Handle::current()
+        .block_on(catalog.get_model(catalog_model_id))?
+        .ok_or_else(|| {
+            JammiError::FineTune(format!("Base model '{base_model_id}' not in catalog"))
+        })?;
 
     let artifact_dir: std::path::PathBuf = match model_record.artifact_path.as_deref() {
         Some(p) if !p.is_empty() => {

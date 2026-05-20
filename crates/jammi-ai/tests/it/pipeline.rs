@@ -66,6 +66,7 @@ async fn generate_embeddings_produces_complete_result() {
     let from_catalog = session
         .catalog()
         .get_result_table(&record.table_name)
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(from_catalog.status, "ready");
@@ -149,6 +150,7 @@ async fn multiple_tables_and_sidecar_fallback() {
     let tables = session
         .catalog()
         .find_result_tables("patents", Some("text_embedding"), None)
+        .await
         .unwrap();
     assert!(tables.len() >= 2);
 
@@ -235,6 +237,7 @@ async fn infer_persists_results_to_parquet() {
     let tables = session
         .catalog()
         .find_result_tables("patents", Some("text_embedding"), None)
+        .await
         .unwrap();
     assert!(!tables.is_empty(), "Should have created a result table");
     assert_eq!(tables[0].status, "ready");
@@ -280,6 +283,7 @@ async fn existing_tables_loaded_on_new_session() {
         let tables = session
             .catalog()
             .find_result_tables("patents", Some("text_embedding"), None)
+            .await
             .unwrap();
         assert!(!tables.is_empty());
 
@@ -352,11 +356,13 @@ async fn concurrent_embedding_generation_on_same_source() {
     let cat_a = session
         .catalog()
         .get_result_table(&record_a.table_name)
+        .await
         .unwrap()
         .unwrap();
     let cat_b = session
         .catalog()
         .get_result_table(&record_b.table_name)
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(cat_a.status, "ready");

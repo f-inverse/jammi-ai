@@ -1,6 +1,7 @@
 use crate::error::{JammiError, Result};
 use crate::source::{SourceConnection, SourceType};
 
+use super::backend::{SqlValue, TxOptions};
 use super::Catalog;
 
 /// Materialized row from the `sources` catalog table.
@@ -24,88 +25,109 @@ pub struct SourceRecord {
 
 impl Catalog {
     /// Persist a new source to the catalog.
-    pub fn register_source(
+    pub async fn register_source(
         &self,
         source_id: &str,
         source_type: SourceType,
         connection: &SourceConnection,
     ) -> Result<()> {
-        let conn = self.conn()?;
         let type_str =
             serde_json::to_string(&source_type).map_err(|e| JammiError::Catalog(e.to_string()))?;
-        let uri = connection.url.as_deref().unwrap_or("");
+        let uri = connection.url.as_deref().unwrap_or("").to_string();
         let options =
             serde_json::to_string(connection).map_err(|e| JammiError::Catalog(e.to_string()))?;
+        let sid = source_id.to_string();
 
-        conn.execute(
-            "INSERT INTO sources (source_id, name, source_type, uri, options)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![source_id, source_id, type_str, uri, options],
-        )?;
+        self.backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO sources (source_id, name, source_type, uri, options) \
+                         VALUES ($1, $2, $3, $4, $5)",
+                        &[
+                            SqlValue::TextOwned(sid.clone()),
+                            SqlValue::TextOwned(sid),
+                            SqlValue::TextOwned(type_str),
+                            SqlValue::TextOwned(uri),
+                            SqlValue::TextOwned(options),
+                        ],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await?;
         Ok(())
     }
 
     /// Look up a source by ID.
-    pub fn get_source(&self, source_id: &str) -> Result<Option<SourceRecord>> {
-        let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT source_id, source_type, options, schema_json, 'active', created_at, updated_at
-             FROM sources WHERE source_id = ?1",
-        )?;
-
-        let mut rows = stmt.query_map(rusqlite::params![source_id], |row| {
-            Ok(RawSourceRow {
-                source_id: row.get(0)?,
-                source_type: row.get(1)?,
-                options: row.get(2)?,
-                schema_json: row.get(3)?,
-                status: row.get(4)?,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
-            })
-        })?;
-
-        match rows.next() {
-            Some(Ok(raw)) => Ok(Some(parse_source_row(raw)?)),
-            Some(Err(e)) => Err(e.into()),
-            None => Ok(None),
-        }
+    pub async fn get_source(&self, source_id: &str) -> Result<Option<SourceRecord>> {
+        let sid = source_id.to_string();
+        let raw = self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query_opt(
+                            "SELECT source_id, source_type, options, schema_json, \
+                                'active' AS status, created_at, updated_at \
+                         FROM sources WHERE source_id = $1",
+                            &[SqlValue::TextOwned(sid)],
+                            read_source_row,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?;
+        raw.map(parse_source_row).transpose()
     }
 
     /// List all registered sources.
-    pub fn list_sources(&self) -> Result<Vec<SourceRecord>> {
-        let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT source_id, source_type, options, schema_json, 'active', created_at, updated_at
-             FROM sources ORDER BY created_at",
-        )?;
-
-        let rows = stmt.query_map([], |row| {
-            Ok(RawSourceRow {
-                source_id: row.get(0)?,
-                source_type: row.get(1)?,
-                options: row.get(2)?,
-                schema_json: row.get(3)?,
-                status: row.get(4)?,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
-            })
-        })?;
-
-        rows.map(|r| {
-            let raw = r?;
-            parse_source_row(raw)
-        })
-        .collect()
+    pub async fn list_sources(&self) -> Result<Vec<SourceRecord>> {
+        let raws = self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query(
+                            "SELECT source_id, source_type, options, schema_json, \
+                                'active' AS status, created_at, updated_at \
+                         FROM sources ORDER BY created_at",
+                            &[],
+                            read_source_row,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?;
+        raws.into_iter().map(parse_source_row).collect()
     }
 
     /// Remove a source from the catalog.
-    pub fn remove_source(&self, source_id: &str) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            "DELETE FROM sources WHERE source_id = ?1",
-            rusqlite::params![source_id],
-        )?;
+    pub async fn remove_source(&self, source_id: &str) -> Result<()> {
+        let sid = source_id.to_string();
+        self.backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "DELETE FROM sources WHERE source_id = $1",
+                        &[SqlValue::TextOwned(sid)],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await?;
         Ok(())
     }
 }
@@ -118,6 +140,20 @@ struct RawSourceRow {
     status: String,
     created_at: String,
     updated_at: String,
+}
+
+fn read_source_row(
+    row: &super::backend::Row<'_>,
+) -> std::result::Result<RawSourceRow, super::backend::BackendError> {
+    Ok(RawSourceRow {
+        source_id: row.get("source_id")?,
+        source_type: row.get("source_type")?,
+        options: row.try_get("options")?,
+        schema_json: row.try_get("schema_json")?,
+        status: row.get("status")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
 }
 
 fn parse_source_row(raw: RawSourceRow) -> Result<SourceRecord> {

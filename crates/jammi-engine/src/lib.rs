@@ -17,6 +17,9 @@ pub mod tenant;
 
 use config::{LogFormat, LoggingConfig};
 
+pub use catalog::backend::{
+    BackendError, BackendImpl, BackendKind, CatalogBackend, IsolationLevel, Transaction, TxOptions,
+};
 pub use evidence_channel::ChannelId;
 pub use tenant::TenantId;
 

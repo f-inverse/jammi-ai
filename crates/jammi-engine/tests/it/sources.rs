@@ -119,7 +119,7 @@ async fn source_persists_across_sessions() {
 
     {
         let session = JammiSession::new(config).await.unwrap();
-        let sources = session.catalog().list_sources().unwrap();
+        let sources = session.catalog().list_sources().await.unwrap();
         assert!(sources.iter().any(|s| s.source_id == "persist"));
     }
 }
@@ -156,13 +156,13 @@ async fn source_crud_list_and_remove() {
         .await
         .unwrap();
 
-    let sources = session.catalog().list_sources().unwrap();
+    let sources = session.catalog().list_sources().await.unwrap();
     let ids: Vec<&str> = sources.iter().map(|s| s.source_id.as_str()).collect();
     assert!(ids.contains(&"src_a"));
     assert!(ids.contains(&"src_b"));
 
-    session.remove_source("src_a").unwrap();
-    let sources = session.catalog().list_sources().unwrap();
+    session.remove_source("src_a").await.unwrap();
+    let sources = session.catalog().list_sources().await.unwrap();
     assert!(!sources.iter().any(|s| s.source_id == "src_a"));
     assert!(sources.iter().any(|s| s.source_id == "src_b"));
 

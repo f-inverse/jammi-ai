@@ -12,11 +12,11 @@ pub async fn run(
     config: JammiConfig,
     action: ModelAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let catalog = Catalog::open(&config.artifact_dir)?;
+    let catalog = Catalog::open(&config.artifact_dir).await?;
 
     match action {
         ModelAction::List => {
-            let models = catalog.list_models()?;
+            let models = catalog.list_models().await?;
             if models.is_empty() {
                 println!("No models registered.");
             } else {

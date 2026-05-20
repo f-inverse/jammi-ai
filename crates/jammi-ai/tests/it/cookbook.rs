@@ -101,7 +101,7 @@ async fn recipe_query_data_with_sql() {
     assert!(joined[0].schema().field_with_name("company_name").is_ok());
 
     // Source lifecycle
-    let sources = session.catalog().list_sources().unwrap();
+    let sources = session.catalog().list_sources().await.unwrap();
     assert!(sources.len() >= 2);
 }
 
@@ -610,7 +610,7 @@ async fn recipe_source_lifecycle() {
         .unwrap();
 
     // List sources
-    let sources = session.catalog().list_sources().unwrap();
+    let sources = session.catalog().list_sources().await.unwrap();
     assert_eq!(sources.len(), 2);
     let ids: Vec<&str> = sources.iter().map(|s| s.source_id.as_str()).collect();
     assert!(ids.contains(&"alpha"));
@@ -620,18 +620,24 @@ async fn recipe_source_lifecycle() {
     let alpha = session
         .catalog()
         .get_source("alpha")
+        .await
         .unwrap()
         .expect("alpha should exist");
     assert_eq!(alpha.source_type, SourceType::Local);
 
     // Remove a source
-    session.remove_source("alpha").unwrap();
+    session.remove_source("alpha").await.unwrap();
 
     // Verify removal
-    let sources = session.catalog().list_sources().unwrap();
+    let sources = session.catalog().list_sources().await.unwrap();
     assert_eq!(sources.len(), 1);
     assert_eq!(sources[0].source_id, "beta");
-    assert!(session.catalog().get_source("alpha").unwrap().is_none());
+    assert!(session
+        .catalog()
+        .get_source("alpha")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 // ─── Recipe: Model Management ────────────────────────────────────────────────
@@ -655,7 +661,7 @@ async fn recipe_model_management() {
         .unwrap();
 
     // No models registered initially
-    let models = session.catalog().list_models().unwrap();
+    let models = session.catalog().list_models().await.unwrap();
     assert!(models.is_empty(), "No models before first inference");
 
     // Generate embeddings — auto-registers the model
@@ -665,7 +671,7 @@ async fn recipe_model_management() {
         .unwrap();
 
     // Model now visible in catalog
-    let models = session.catalog().list_models().unwrap();
+    let models = session.catalog().list_models().await.unwrap();
     assert_eq!(models.len(), 1);
     let model = &models[0];
     assert!(model.model_id.contains("tiny_bert"));
@@ -676,6 +682,7 @@ async fn recipe_model_management() {
     let found = session
         .catalog()
         .get_model(&model.model_id)
+        .await
         .unwrap()
         .expect("model should exist");
     assert_eq!(found.model_id, model.model_id);
@@ -691,7 +698,7 @@ async fn recipe_model_management() {
         .await
         .unwrap();
 
-    let models = session.catalog().list_models().unwrap();
+    let models = session.catalog().list_models().await.unwrap();
     assert_eq!(models.len(), 2, "Both models should be registered");
 }
 
@@ -977,6 +984,7 @@ async fn cookbook_declare_provenance_channel_recipe_runs_end_to_end() {
                 },
             ],
         })
+        .await
         .unwrap();
 
     // Step 2 (Use the channel): merge a synthetic contribution onto a
@@ -1014,6 +1022,7 @@ async fn cookbook_declare_provenance_channel_recipe_runs_end_to_end() {
         &[],
         &[vec![contrib]],
     )
+    .await
     .unwrap();
 
     // Step 3 (Verify): the declared columns are present.
@@ -1043,6 +1052,7 @@ async fn cookbook_declare_provenance_channel_append_only_callout_matches_runtime
                 data_type: ChannelColumnType::Utf8,
             }],
         })
+        .await
         .unwrap();
 
     // The recipe's "What you cannot do" section promises this exact
@@ -1058,6 +1068,7 @@ async fn cookbook_declare_provenance_channel_append_only_callout_matches_runtime
                 data_type: ChannelColumnType::Int32,
             }],
         )
+        .await
         .unwrap_err();
     match err {
         JammiError::EvidenceChannel(m) => {
@@ -1079,6 +1090,7 @@ async fn cookbook_declare_provenance_channel_append_only_callout_matches_runtime
                 data_type: ChannelColumnType::Utf8,
             }],
         )
+        .await
         .unwrap_err();
     match err {
         JammiError::EvidenceChannel(m) => assert!(m.contains("already declared")),

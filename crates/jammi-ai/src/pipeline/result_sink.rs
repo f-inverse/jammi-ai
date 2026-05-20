@@ -58,7 +58,7 @@ impl<'a> ResultSink<'a> {
     }
 
     /// Write a batch: filter OK rows (for embeddings), write to Parquet, feed index.
-    pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+    pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         self.batch_num += 1;
         if self.is_embedding {
             let (ok_batch, row_ids, vectors) = filter_ok_and_extract_vectors(batch)?;
@@ -75,7 +75,8 @@ impl<'a> ResultSink<'a> {
         }
         if self.checkpoint_interval > 0 && self.batch_num % self.checkpoint_interval == 0 {
             self.catalog
-                .set_checkpoint(&self.table_name, self.batch_num)?;
+                .set_checkpoint(&self.table_name, self.batch_num)
+                .await?;
         }
         Ok(())
     }

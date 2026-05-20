@@ -11,9 +11,8 @@ use tempfile::tempdir;
 #[tokio::test]
 async fn crash_recovery_cleans_up_stale_result_tables_and_fine_tune_jobs() {
     let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
 
-    // Register a model (FK constraint for both result_tables and fine_tune_jobs)
     catalog
         .register_model(RegisterModelParams {
             model_id: "test-model",
@@ -23,15 +22,15 @@ async fn crash_recovery_cleans_up_stale_result_tables_and_fine_tune_jobs() {
             task: "text_embedding",
             ..Default::default()
         })
+        .await
         .unwrap();
 
-    // Create a result table (status = Building via default, no Parquet file on disk)
     let result_store = ResultStore::new(dir.path(), Arc::clone(&catalog)).unwrap();
     let table_info = result_store
         .create_table("src1", "text_embedding", "test-model", None, None, None)
+        .await
         .unwrap();
 
-    // Create a fine-tune job and transition to Running (simulates crashed training)
     catalog
         .create_fine_tune_job(
             "ft-crash-1",
@@ -40,57 +39,39 @@ async fn crash_recovery_cleans_up_stale_result_tables_and_fine_tune_jobs() {
             "contrastive",
             "{}",
         )
+        .await
         .unwrap();
     catalog
         .update_fine_tune_status("ft-crash-1", FineTuneJobStatus::Running, None)
+        .await
         .unwrap();
 
-    // Verify stale state
     let building = catalog
         .list_result_tables_by_status(ResultTableStatus::Building)
+        .await
         .unwrap();
-    assert_eq!(
-        building.len(),
-        1,
-        "Should have one Building table before recovery"
-    );
+    assert_eq!(building.len(), 1);
 
-    let job = catalog.get_fine_tune_job("ft-crash-1").unwrap();
+    let job = catalog.get_fine_tune_job("ft-crash-1").await.unwrap();
     assert_eq!(job.status, FineTuneJobStatus::Running.to_string());
 
-    // Run recovery
     result_store.recover().await.unwrap();
-    let cleaned = catalog.cleanup_stale_fine_tune_jobs().unwrap();
-    assert_eq!(
-        cleaned, 1,
-        "Should have cleaned up one running fine-tune job"
-    );
+    let cleaned = catalog.cleanup_stale_fine_tune_jobs().await.unwrap();
+    assert_eq!(cleaned, 1);
 
-    // Verify: no more Building tables
     let building_after = catalog
         .list_result_tables_by_status(ResultTableStatus::Building)
+        .await
         .unwrap();
-    assert!(
-        building_after.is_empty(),
-        "No Building tables should remain"
-    );
+    assert!(building_after.is_empty());
 
-    // Verify: crashed table → Failed (no Parquet file existed)
     let table = catalog
         .get_result_table(&table_info.table_name)
+        .await
         .unwrap()
         .expect("table should still exist");
-    assert_eq!(
-        table.status,
-        ResultTableStatus::Failed.to_string(),
-        "Crashed table should be marked Failed"
-    );
+    assert_eq!(table.status, ResultTableStatus::Failed.to_string());
 
-    // Verify: crashed job → Failed
-    let job_after = catalog.get_fine_tune_job("ft-crash-1").unwrap();
-    assert_eq!(
-        job_after.status,
-        FineTuneJobStatus::Failed.to_string(),
-        "Crashed fine-tune job should be Failed"
-    );
+    let job_after = catalog.get_fine_tune_job("ft-crash-1").await.unwrap();
+    assert_eq!(job_after.status, FineTuneJobStatus::Failed.to_string());
 }

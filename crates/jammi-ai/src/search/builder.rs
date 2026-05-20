@@ -52,7 +52,8 @@ impl SearchBuilder {
     ) -> Result<Self> {
         let table = session
             .catalog()
-            .resolve_embedding_table(source_id, embedding_table)?;
+            .resolve_embedding_table(source_id, embedding_table)
+            .await?;
 
         let result_store = session.result_store();
 
@@ -322,7 +323,8 @@ impl SearchBuilder {
             Vec::with_capacity(batches.len());
         let mut stripped: Vec<RecordBatch> = Vec::with_capacity(batches.len());
         for batch in &batches {
-            let (rest, contribs) = extract_channel_contributions(batch, &self.channels, catalog)?;
+            let (rest, contribs) =
+                extract_channel_contributions(batch, &self.channels, catalog).await?;
             per_batch_contribs.push(contribs);
             stripped.push(rest);
         }
@@ -335,6 +337,7 @@ impl SearchBuilder {
             &annotated,
             &per_batch_contribs,
         )
+        .await
     }
 }
 
@@ -348,7 +351,7 @@ impl SearchBuilder {
 /// columns become all-null in the merged output. Dtype mismatches are
 /// not coerced here; `merge_channels`'s validator surfaces them as a
 /// typed `EvidenceChannel` error so callers see the real mismatch.
-fn extract_channel_contributions(
+async fn extract_channel_contributions(
     batch: &RecordBatch,
     participating: &[ChannelId],
     catalog: &Catalog,
@@ -357,7 +360,7 @@ fn extract_channel_contributions(
     let mut to_remove: HashSet<usize> = HashSet::new();
 
     for id in participating {
-        let spec = catalog.channels().get(id)?.ok_or_else(|| {
+        let spec = catalog.channels().get(id).await?.ok_or_else(|| {
             JammiError::EvidenceChannel(format!("channel '{id}': not registered"))
         })?;
         let positions: Option<Vec<usize>> = spec

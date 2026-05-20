@@ -286,7 +286,11 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
     job.wait().await.unwrap();
 
     // UAT 4: job status transitions queued → running → completed
-    let record = session.catalog().get_fine_tune_job(&job.job_id).unwrap();
+    let record = session
+        .catalog()
+        .get_fine_tune_job(&job.job_id)
+        .await
+        .unwrap();
     assert_eq!(record.status, "completed");
     assert!(record.started_at.is_some(), "started_at should be set");
     assert!(record.completed_at.is_some(), "completed_at should be set");
@@ -315,7 +319,7 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
     assert!(!checkpoints.is_empty(), "Should have checkpoint files");
 
     // UAT 3: fine-tuned model registered in catalog with artifact_path
-    let models = session.catalog().list_models().unwrap();
+    let models = session.catalog().list_models().await.unwrap();
     let ft_models: Vec<_> = models
         .iter()
         .filter(|m| m.model_id.starts_with("jammi:fine-tuned:"))
@@ -368,10 +372,12 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
 
 // ─── Fine-tune catalog CRUD ─────────────────────────────────────────────────
 
-#[test]
-fn fine_tune_job_catalog_crud() {
+#[tokio::test]
+async fn fine_tune_job_catalog_crud() {
     let dir = tempfile::tempdir().unwrap();
-    let catalog = jammi_engine::catalog::Catalog::open(dir.path()).unwrap();
+    let catalog = jammi_engine::catalog::Catalog::open(dir.path())
+        .await
+        .unwrap();
 
     // Register base model (FK constraint)
     catalog
@@ -383,6 +389,7 @@ fn fine_tune_job_catalog_crud() {
             task: "text_embedding",
             ..Default::default()
         })
+        .await
         .unwrap();
 
     // Create job
@@ -394,10 +401,11 @@ fn fine_tune_job_catalog_crud() {
             "cosent",
             r#"{"lora_rank": 8}"#,
         )
+        .await
         .unwrap();
 
     // Get job — status should be "queued"
-    let job = catalog.get_fine_tune_job("job-1").unwrap();
+    let job = catalog.get_fine_tune_job("job-1").await.unwrap();
     assert_eq!(job.status, "queued");
     assert_eq!(job.base_model_id, "base-model::1");
 
@@ -405,8 +413,9 @@ fn fine_tune_job_catalog_crud() {
     let metrics = r#"{"started_at": "2026-01-01T00:00:00Z"}"#;
     catalog
         .update_fine_tune_status("job-1", FineTuneJobStatus::Running, Some(metrics))
+        .await
         .unwrap();
-    let job2 = catalog.get_fine_tune_job("job-1").unwrap();
+    let job2 = catalog.get_fine_tune_job("job-1").await.unwrap();
     assert_eq!(job2.status, "running");
     assert!(job2.started_at.is_some());
 
@@ -417,11 +426,13 @@ fn fine_tune_job_catalog_crud() {
             FineTuneJobStatus::Completed,
             Some(r#"{"completed_at": "2026-01-01T01:00:00Z"}"#),
         )
+        .await
         .unwrap();
     catalog
         .set_fine_tune_output_model("job-1", "jammi:fine-tuned:job-1")
+        .await
         .unwrap();
-    let job3 = catalog.get_fine_tune_job("job-1").unwrap();
+    let job3 = catalog.get_fine_tune_job("job-1").await.unwrap();
     assert_eq!(job3.status, "completed");
     assert_eq!(
         job3.output_model_id.as_deref(),
@@ -429,7 +440,7 @@ fn fine_tune_job_catalog_crud() {
     );
 
     // List jobs
-    let jobs = catalog.list_fine_tune_jobs().unwrap();
+    let jobs = catalog.list_fine_tune_jobs().await.unwrap();
     assert_eq!(jobs.len(), 1);
 }
 
@@ -504,8 +515,8 @@ fn lora_backward_step_changes_weights() {
 // UAT 5. The training loop should fail with "diverged" after 3 consecutive
 // batches with NaN or >100 loss. Tests with precomputed NaN-score batches.
 
-#[test]
-fn training_divergence_detection() {
+#[tokio::test(flavor = "multi_thread")]
+async fn training_divergence_detection() {
     use candle_nn::VarMap;
     use jammi_ai::fine_tune::{
         data::{TrainingBatch, TrainingDataLoader},
@@ -530,7 +541,11 @@ fn training_divergence_detection() {
         TrainingDataLoader::from_precomputed(vec![nan_batch.clone(), nan_batch.clone(), nan_batch]);
 
     let dir = tempfile::tempdir().unwrap();
-    let catalog = Arc::new(jammi_engine::catalog::Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(
+        jammi_engine::catalog::Catalog::open(dir.path())
+            .await
+            .unwrap(),
+    );
 
     // Register a model for the FK
     catalog
@@ -542,9 +557,11 @@ fn training_divergence_detection() {
             task: "text_embedding",
             ..Default::default()
         })
+        .await
         .unwrap();
     catalog
         .create_fine_tune_job("div-job", "div-test-model::1", "src", "cosent", "{}")
+        .await
         .unwrap();
 
     let mut training_loop = TrainingLoopBuilder::new(
@@ -564,7 +581,9 @@ fn training_divergence_detection() {
     .build()
     .unwrap();
 
-    let result = training_loop.run(&loader);
+    let result = tokio::task::spawn_blocking(move || training_loop.run(&loader))
+        .await
+        .unwrap();
 
     assert!(result.is_err(), "Training should fail on NaN loss");
     let msg = result.unwrap_err().to_string();
@@ -574,7 +593,7 @@ fn training_divergence_detection() {
     );
 
     // Catalog should record failure
-    let job = catalog.get_fine_tune_job("div-job").unwrap();
+    let job = catalog.get_fine_tune_job("div-job").await.unwrap();
     assert_eq!(job.status, "failed", "Job status should be 'failed'");
 }
 
@@ -586,8 +605,8 @@ fn training_divergence_detection() {
 // - Validation batches: score=0.0 with identical embeddings → high loss
 // Validation loss stays constant, so patience exhausts after epoch 2.
 
-#[test]
-fn training_early_stopping_triggers() {
+#[tokio::test(flavor = "multi_thread")]
+async fn training_early_stopping_triggers() {
     use candle_nn::VarMap;
     use jammi_ai::fine_tune::{
         data::{TrainingBatch, TrainingDataLoader},
@@ -632,7 +651,11 @@ fn training_early_stopping_triggers() {
     let loader = TrainingDataLoader::from_precomputed(batches);
 
     let dir = tempfile::tempdir().unwrap();
-    let catalog = Arc::new(jammi_engine::catalog::Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(
+        jammi_engine::catalog::Catalog::open(dir.path())
+            .await
+            .unwrap(),
+    );
 
     catalog
         .register_model(jammi_engine::catalog::model_repo::RegisterModelParams {
@@ -643,9 +666,11 @@ fn training_early_stopping_triggers() {
             task: "text_embedding",
             ..Default::default()
         })
+        .await
         .unwrap();
     catalog
         .create_fine_tune_job("es-job", "es-test-model::1", "src", "cosent", "{}")
+        .await
         .unwrap();
 
     let mut training_loop = TrainingLoopBuilder::new(
@@ -667,7 +692,10 @@ fn training_early_stopping_triggers() {
     .build()
     .unwrap();
 
-    let result = training_loop.run(&loader).unwrap();
+    let result = tokio::task::spawn_blocking(move || training_loop.run(&loader))
+        .await
+        .unwrap()
+        .unwrap();
 
     // With patience=1 and constant validation loss, early stopping triggers
     // after epoch 2 (epoch 1 sets best, epoch 2 doesn't improve).
@@ -678,7 +706,7 @@ fn training_early_stopping_triggers() {
     );
 
     // Job should be completed (not failed)
-    let job = catalog.get_fine_tune_job("es-job").unwrap();
+    let job = catalog.get_fine_tune_job("es-job").await.unwrap();
     assert_eq!(job.status, "completed");
 }
 

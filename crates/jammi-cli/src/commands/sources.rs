@@ -27,8 +27,8 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {
         SourceAction::List => {
-            let catalog = Catalog::open(&config.artifact_dir)?;
-            let sources = catalog.list_sources()?;
+            let catalog = Catalog::open(&config.artifact_dir).await?;
+            let sources = catalog.list_sources().await?;
             if sources.is_empty() {
                 println!("No sources registered.");
             } else {

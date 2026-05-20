@@ -26,7 +26,7 @@ impl ModelResolver {
     }
 
     /// Resolve a model source to file paths and backend selection.
-    pub fn resolve(
+    pub async fn resolve(
         &self,
         source: &ModelSource,
         task: ModelTask,
@@ -34,7 +34,9 @@ impl ModelResolver {
     ) -> Result<ResolvedModel> {
         // Check catalog first — if this model was previously resolved and
         // registered, reuse the stored metadata instead of re-downloading.
-        if let Some(resolved) = self.try_catalog_lookup(source, task, backend_hint)? {
+        if let Some(resolved) =
+            Box::pin(self.try_catalog_lookup(source, task, backend_hint)).await?
+        {
             return Ok(resolved);
         }
 
@@ -48,14 +50,14 @@ impl ModelResolver {
 
     /// Check the catalog for an existing model record matching this source.
     /// Returns `Some(ResolvedModel)` if found and files still exist on disk.
-    fn try_catalog_lookup(
+    async fn try_catalog_lookup(
         &self,
         source: &ModelSource,
         task: ModelTask,
         backend_hint: Option<BackendType>,
     ) -> Result<Option<ResolvedModel>> {
         let model_id = ModelId::from(source);
-        let record = match self.catalog.get_model(&model_id.0)? {
+        let record = match self.catalog.get_model(&model_id.0).await? {
             Some(r) => r,
             None => return Ok(None),
         };
@@ -66,7 +68,8 @@ impl ModelResolver {
         if record.model_type == "fine-tuned" {
             if let Some(ref base_id) = record.base_model_id {
                 let base_source = ModelSource::parse(base_id);
-                let base_resolved = self.resolve(&base_source, task, backend_hint)?;
+                let base_resolved =
+                    Box::pin(self.resolve(&base_source, task, backend_hint)).await?;
 
                 return Ok(Some(ResolvedModel {
                     model_id,

@@ -62,14 +62,17 @@ impl<'a> EmbeddingPipeline<'a> {
         let canonical_model_id = model_source.to_string();
         let col_list = columns.join(",");
         let task_str = self.task.to_string();
-        let table_info = self.result_store.create_table(
-            source_id,
-            &task_str,
-            &canonical_model_id,
-            Some(embedding_dim as i32),
-            Some(key_column),
-            Some(&col_list),
-        )?;
+        let table_info = self
+            .result_store
+            .create_table(
+                source_id,
+                &task_str,
+                &canonical_model_id,
+                Some(embedding_dim as i32),
+                Some(key_column),
+                Some(&col_list),
+            )
+            .await?;
 
         // Build scan plan over source
         let table_name = self.session.find_table_name(source_id)?;
@@ -127,7 +130,7 @@ impl<'a> EmbeddingPipeline<'a> {
             .map_err(|e| JammiError::Inference(format!("Failed to collect results: {e}")))?;
 
         for batch in &batches {
-            sink.write_batch(batch)?;
+            sink.write_batch(batch).await?;
         }
 
         let (row_count, index) = sink.finalize()?;
@@ -152,7 +155,8 @@ impl<'a> EmbeddingPipeline<'a> {
         // Return the updated record
         self.session
             .catalog()
-            .get_result_table(&table_info.table_name)?
+            .get_result_table(&table_info.table_name)
+            .await?
             .ok_or_else(|| {
                 JammiError::Catalog(format!(
                     "Result table '{}' not found after finalization",

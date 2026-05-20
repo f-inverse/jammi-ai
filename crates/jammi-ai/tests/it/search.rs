@@ -352,6 +352,7 @@ async fn search_resolves_to_latest_embedding_table() {
     let tables = session
         .catalog()
         .find_result_tables("patents", Some("text_embedding"), None)
+        .await
         .unwrap();
     assert_eq!(tables.len(), 2);
 
@@ -359,6 +360,7 @@ async fn search_resolves_to_latest_embedding_table() {
     let resolved = session
         .catalog()
         .resolve_embedding_table("patents", None)
+        .await
         .unwrap();
     assert_eq!(
         resolved.table_name, r2.table_name,

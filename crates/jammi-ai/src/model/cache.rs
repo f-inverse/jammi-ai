@@ -138,7 +138,7 @@ impl ModelCache {
         task: ModelTask,
         backend_hint: Option<BackendType>,
     ) -> Result<ModelGuard> {
-        let resolved = self.resolver.resolve(source, task, backend_hint)?;
+        let resolved = self.resolver.resolve(source, task, backend_hint).await?;
         let source_str = source.to_string();
         let backend: &dyn ModelBackend = match resolved.backend {
             BackendType::Candle => &self.backends.candle,
@@ -182,16 +182,21 @@ impl ModelCache {
             .and_then(|p| p.parent())
             .and_then(|p| p.to_str())
             .map(|s| s.to_owned());
-        if let Err(e) = self.resolver.catalog().register_model(RegisterModelParams {
-            model_id: &source_str,
-            version: 1,
-            model_type,
-            backend: &backend_str,
-            task: &task_str,
-            artifact_path: artifact_dir_str.as_deref(),
-            config_json: None,
-            ..Default::default()
-        }) {
+        if let Err(e) = self
+            .resolver
+            .catalog()
+            .register_model(RegisterModelParams {
+                model_id: &source_str,
+                version: 1,
+                model_type,
+                backend: &backend_str,
+                task: &task_str,
+                artifact_path: artifact_dir_str.as_deref(),
+                config_json: None,
+                ..Default::default()
+            })
+            .await
+        {
             tracing::warn!(model_id = %source_str, "Failed to register model in catalog: {e}");
         }
 

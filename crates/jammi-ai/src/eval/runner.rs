@@ -37,7 +37,8 @@ impl<'a> EvalRunner<'a> {
         let table = self
             .session
             .catalog()
-            .resolve_embedding_table(source_id, embedding_table)?;
+            .resolve_embedding_table(source_id, embedding_table)
+            .await?;
         let canonical_model = &table.model_id;
 
         let result_store = self.session.result_store();
@@ -105,17 +106,20 @@ impl<'a> EvalRunner<'a> {
         let metrics_json = serde_json::to_value(&agg)?;
 
         // 6. Record in catalog
-        self.session.catalog().record_eval_run(&EvalRunRecord {
-            eval_run_id: uuid::Uuid::new_v4().to_string(),
-            eval_type: "embedding".into(),
-            model_id: crate::model::to_catalog_pk(canonical_model, 1),
-            source_id: source_id.into(),
-            golden_source: golden_source.into(),
-            k: Some(k as i32),
-            metrics_json: serde_json::to_string(&agg)?,
-            status: EvalRunStatus::Completed.to_string(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-        })?;
+        self.session
+            .catalog()
+            .record_eval_run(&EvalRunRecord {
+                eval_run_id: uuid::Uuid::new_v4().to_string(),
+                eval_type: "embedding".into(),
+                model_id: crate::model::to_catalog_pk(canonical_model, 1),
+                source_id: source_id.into(),
+                golden_source: golden_source.into(),
+                k: Some(k as i32),
+                metrics_json: serde_json::to_string(&agg)?,
+                status: EvalRunStatus::Completed.to_string(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await?;
 
         Ok(metrics_json)
     }
@@ -184,17 +188,20 @@ impl<'a> EvalRunner<'a> {
 
         // Record in catalog
         let canonical = model_source.to_string();
-        self.session.catalog().record_eval_run(&EvalRunRecord {
-            eval_run_id: uuid::Uuid::new_v4().to_string(),
-            eval_type: task.to_string(),
-            model_id: crate::model::to_catalog_pk(&canonical, 1),
-            source_id: source_id.into(),
-            golden_source: golden_source.into(),
-            k: None,
-            metrics_json: serde_json::to_string(&metrics_json)?,
-            status: EvalRunStatus::Completed.to_string(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-        })?;
+        self.session
+            .catalog()
+            .record_eval_run(&EvalRunRecord {
+                eval_run_id: uuid::Uuid::new_v4().to_string(),
+                eval_type: task.to_string(),
+                model_id: crate::model::to_catalog_pk(&canonical, 1),
+                source_id: source_id.into(),
+                golden_source: golden_source.into(),
+                k: None,
+                metrics_json: serde_json::to_string(&metrics_json)?,
+                status: EvalRunStatus::Completed.to_string(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await?;
 
         Ok(metrics_json)
     }

@@ -385,7 +385,7 @@ async fn e2e_model_registered_in_catalog_after_inference() {
         .unwrap();
     assert!(!results.is_empty());
 
-    let models = session.catalog().list_models().unwrap();
+    let models = session.catalog().list_models().await.unwrap();
     assert!(
         models.iter().any(|m| m.model_id.contains("tiny_bert")),
         "Model should be registered in catalog after inference. Found: {:?}",

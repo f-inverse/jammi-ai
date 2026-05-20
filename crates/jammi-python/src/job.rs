@@ -35,7 +35,7 @@ impl PyFineTuneJob {
 
     /// Current status from the catalog.
     fn status(&self) -> PyResult<String> {
-        self.inner.status().map_err(to_pyerr)
+        self.runtime.block_on(self.inner.status()).map_err(to_pyerr)
     }
 
     /// Block until the job reaches a terminal state (completed or failed).

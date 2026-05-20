@@ -247,11 +247,11 @@ impl TrainingLoop {
         // Update job status to running
         let started_at = chrono::Utc::now().to_rfc3339();
         let metrics_json = serde_json::json!({"started_at": started_at}).to_string();
-        self.catalog.update_fine_tune_status(
+        tokio::runtime::Handle::current().block_on(self.catalog.update_fine_tune_status(
             &self.job_id,
             FineTuneJobStatus::Running,
             Some(&metrics_json),
-        )?;
+        ))?;
 
         // Split training/validation
         let (train_loader, val_loader) = data_loader.split(self.config.validation_fraction)?;
@@ -461,11 +461,11 @@ impl TrainingLoop {
             "completed_at": completed_at,
         })
         .to_string();
-        self.catalog.update_fine_tune_status(
+        tokio::runtime::Handle::current().block_on(self.catalog.update_fine_tune_status(
             &self.job_id,
             FineTuneJobStatus::Completed,
             Some(&metrics),
-        )?;
+        ))?;
 
         Ok(TrainingResult {
             adapter_path: checkpoint_dir,
@@ -693,10 +693,12 @@ impl TrainingLoop {
                     "started_at": ctx.started_at,
                 })
                 .to_string();
-                if let Err(e) = self.catalog.update_fine_tune_status(
-                    &self.job_id,
-                    FineTuneJobStatus::Failed,
-                    Some(&metrics),
+                if let Err(e) = tokio::runtime::Handle::current().block_on(
+                    self.catalog.update_fine_tune_status(
+                        &self.job_id,
+                        FineTuneJobStatus::Failed,
+                        Some(&metrics),
+                    ),
                 ) {
                     tracing::error!(job_id = %self.job_id, error = %e, "Failed to record job status in catalog");
                 }

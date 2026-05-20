@@ -70,12 +70,13 @@ async fn resolve_local_path_with_safetensors() {
     std::fs::write(model_dir.join("model.safetensors"), b"fake-weights").unwrap();
     std::fs::write(model_dir.join("tokenizer.json"), r#"{"version":"1.0"}"#).unwrap();
 
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let resolver = ModelResolver::new(catalog).unwrap();
 
     let source = ModelSource::local(&model_dir);
     let resolved = resolver
         .resolve(&source, ModelTask::TextEmbedding, None)
+        .await
         .unwrap();
 
     assert_eq!(resolved.backend, BackendType::Candle);
@@ -94,12 +95,13 @@ async fn resolve_local_path_with_onnx() {
     std::fs::write(model_dir.join("config.json"), r#"{"model_type":"bert"}"#).unwrap();
     std::fs::write(model_dir.join("model.onnx"), b"fake-onnx").unwrap();
 
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let resolver = ModelResolver::new(catalog).unwrap();
 
     let source = ModelSource::local(&model_dir);
     let resolved = resolver
         .resolve(&source, ModelTask::TextEmbedding, None)
+        .await
         .unwrap();
 
     assert_eq!(resolved.backend, BackendType::Ort);
@@ -121,12 +123,13 @@ async fn backend_hint_overrides_heuristic() {
     std::fs::write(model_dir.join("model.safetensors"), b"fake-weights").unwrap();
     std::fs::write(model_dir.join("model.onnx"), b"fake-onnx").unwrap();
 
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let resolver = ModelResolver::new(catalog).unwrap();
 
     let source = ModelSource::local(&model_dir);
     let resolved = resolver
         .resolve(&source, ModelTask::TextEmbedding, Some(BackendType::Candle))
+        .await
         .unwrap();
 
     assert_eq!(
@@ -413,47 +416,53 @@ async fn eviction_skips_model_with_active_guard() {
 
 // --- Failure paths ---
 
-#[test]
-fn resolve_local_missing_config_returns_error() {
+#[tokio::test]
+async fn resolve_local_missing_config_returns_error() {
     let dir = tempdir().unwrap();
     let model_dir = dir.path().join("broken_model");
     std::fs::create_dir_all(&model_dir).unwrap();
 
     std::fs::write(model_dir.join("model.safetensors"), b"fake-weights").unwrap();
 
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let resolver = ModelResolver::new(catalog).unwrap();
 
     let source = ModelSource::local(&model_dir);
-    let result = resolver.resolve(&source, ModelTask::TextEmbedding, None);
+    let result = resolver
+        .resolve(&source, ModelTask::TextEmbedding, None)
+        .await;
     assert!(
         result.is_err(),
         "Missing config.json should fail resolution"
     );
 }
 
-#[test]
-fn resolve_local_empty_directory_returns_error() {
+#[tokio::test]
+async fn resolve_local_empty_directory_returns_error() {
     let dir = tempdir().unwrap();
     let model_dir = dir.path().join("empty_model");
     std::fs::create_dir_all(&model_dir).unwrap();
 
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let resolver = ModelResolver::new(catalog).unwrap();
 
     let source = ModelSource::local(&model_dir);
-    let result = resolver.resolve(&source, ModelTask::TextEmbedding, None);
+    let result = resolver
+        .resolve(&source, ModelTask::TextEmbedding, None)
+        .await;
     assert!(result.is_err(), "Empty directory should fail resolution");
 }
 
-#[test]
-fn resolve_nonexistent_local_path_returns_error() {
+#[tokio::test]
+async fn resolve_nonexistent_local_path_returns_error() {
     let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let resolver = ModelResolver::new(catalog).unwrap();
 
     let source = ModelSource::local("/nonexistent/path/to/model");
-    let result = resolver.resolve(&source, ModelTask::TextEmbedding, None);
+    let result = resolver
+        .resolve(&source, ModelTask::TextEmbedding, None)
+        .await;
     assert!(result.is_err(), "Nonexistent path should fail resolution");
 }
 

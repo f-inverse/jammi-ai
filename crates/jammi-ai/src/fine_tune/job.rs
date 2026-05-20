@@ -47,7 +47,7 @@ impl FineTuneJob {
     /// Block until the job reaches a terminal state (completed or failed).
     pub async fn wait(&self) -> Result<()> {
         loop {
-            let record = self.catalog.get_fine_tune_job(&self.job_id)?;
+            let record = self.catalog.get_fine_tune_job(&self.job_id).await?;
             let status: FineTuneJobStatus = record
                 .status
                 .parse()
@@ -64,8 +64,8 @@ impl FineTuneJob {
     }
 
     /// Get the current status from the catalog.
-    pub fn status(&self) -> Result<String> {
-        let record = self.catalog.get_fine_tune_job(&self.job_id)?;
+    pub async fn status(&self) -> Result<String> {
+        let record = self.catalog.get_fine_tune_job(&self.job_id).await?;
         Ok(record.status)
     }
 

@@ -59,7 +59,7 @@ impl ResultStore {
 
     /// Generate paths and register a new result table in the catalog with
     /// status = 'building'.
-    pub fn create_table(
+    pub async fn create_table(
         &self,
         source_id: &str,
         task: &str,
@@ -69,8 +69,12 @@ impl ResultStore {
         text_columns: Option<&str>,
     ) -> Result<ResultTableInfo> {
         let sanitized = sanitize_model_id(model_id);
-        let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%3f");
-        let table_name = format!("{source_id}__{task}__{sanitized}__{timestamp}");
+        let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%9f");
+        // Nanoseconds plus a short uuid suffix make table names unique even
+        // when two tokio tasks call create_table within the same nanosecond
+        // (concurrent embedding generation on the same source).
+        let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let table_name = format!("{source_id}__{task}__{sanitized}__{timestamp}_{suffix}");
 
         let parquet_path = self.jammi_db_dir.join(format!("{table_name}.parquet"));
         let index_path = if task == "text_embedding" || task == "image_embedding" {
@@ -79,17 +83,19 @@ impl ResultStore {
             None
         };
 
-        self.catalog.create_result_table(CreateResultTableParams {
-            table_name: &table_name,
-            source_id,
-            model_id,
-            task,
-            parquet_path: parquet_path.to_str().unwrap_or_default(),
-            index_path: index_path.as_ref().and_then(|p| p.to_str()),
-            dimensions,
-            key_column,
-            text_columns,
-        })?;
+        self.catalog
+            .create_result_table(CreateResultTableParams {
+                table_name: &table_name,
+                source_id,
+                model_id,
+                task,
+                parquet_path: parquet_path.to_str().unwrap_or_default(),
+                index_path: index_path.as_ref().and_then(|p| p.to_str()),
+                dimensions,
+                key_column,
+                text_columns,
+            })
+            .await?;
 
         Ok(ResultTableInfo {
             table_name,
@@ -119,7 +125,8 @@ impl ResultStore {
     ) -> Result<()> {
         self.register_table(ctx, name, path).await?;
         self.catalog
-            .update_result_table_status(name, ResultTableStatus::Ready, rows)?;
+            .update_result_table_status(name, ResultTableStatus::Ready, rows)
+            .await?;
         Ok(())
     }
 
@@ -127,7 +134,8 @@ impl ResultStore {
     pub async fn recover(&self) -> Result<()> {
         let building = self
             .catalog
-            .list_result_tables_by_status(ResultTableStatus::Building)?;
+            .list_result_tables_by_status(ResultTableStatus::Building)
+            .await?;
         for table in building {
             let parquet_exists = Path::new(&table.parquet_path).exists();
             let parquet_valid = parquet_exists && reader::is_valid_parquet(&table.parquet_path);
@@ -137,11 +145,9 @@ impl ResultStore {
                     table = table.table_name,
                     "Recovery: Parquet missing, marking failed"
                 );
-                self.catalog.update_result_table_status(
-                    &table.table_name,
-                    ResultTableStatus::Failed,
-                    0,
-                )?;
+                self.catalog
+                    .update_result_table_status(&table.table_name, ResultTableStatus::Failed, 0)
+                    .await?;
             } else if !parquet_valid {
                 warn!(
                     table = table.table_name,
@@ -154,11 +160,9 @@ impl ResultStore {
                     std::fs::remove_file(base.with_extension("rowmap")).ok();
                     std::fs::remove_file(base.with_extension("manifest.json")).ok();
                 }
-                self.catalog.update_result_table_status(
-                    &table.table_name,
-                    ResultTableStatus::Failed,
-                    0,
-                )?;
+                self.catalog
+                    .update_result_table_status(&table.table_name, ResultTableStatus::Failed, 0)
+                    .await?;
             } else {
                 let row_count = reader::count_parquet_rows(&table.parquet_path)?;
                 // Rebuild ANN index if this is an embedding table
@@ -177,11 +181,13 @@ impl ResultStore {
                         }
                     }
                 }
-                self.catalog.update_result_table_status(
-                    &table.table_name,
-                    ResultTableStatus::Ready,
-                    row_count,
-                )?;
+                self.catalog
+                    .update_result_table_status(
+                        &table.table_name,
+                        ResultTableStatus::Ready,
+                        row_count,
+                    )
+                    .await?;
             }
         }
         Ok(())
@@ -191,7 +197,8 @@ impl ResultStore {
     pub async fn load_existing_tables(&self, ctx: &SessionContext) -> Result<()> {
         let ready = self
             .catalog
-            .list_result_tables_by_status(ResultTableStatus::Ready)?;
+            .list_result_tables_by_status(ResultTableStatus::Ready)
+            .await?;
         for table in ready {
             let path = Path::new(&table.parquet_path);
             if path.exists() {

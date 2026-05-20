@@ -36,9 +36,9 @@ fn deterministic_batch(n: usize) -> RecordBatch {
     RecordBatch::try_new(schema, vec![row_id, src]).unwrap()
 }
 
-fn open_catalog() -> (tempfile::TempDir, Catalog) {
+async fn open_catalog() -> (tempfile::TempDir, Catalog) {
     let dir = tempdir().unwrap();
-    let catalog = Catalog::open(dir.path()).unwrap();
+    let catalog = Catalog::open(dir.path()).await.unwrap();
     (dir, catalog)
 }
 
@@ -48,9 +48,9 @@ fn open_catalog() -> (tempfile::TempDir, Catalog) {
 /// drift in field name, dtype, nullability, or ordering surfaces at test
 /// time. To regenerate the golden after an *intentional* shape change,
 /// set `JAMMI_REGENERATE_GOLDENS=1` and re-run this test.
-#[test]
-fn vector_and_inference_reexpressed_produce_byte_identical_recordbatch() {
-    let (_dir, catalog) = open_catalog();
+#[tokio::test]
+async fn vector_and_inference_reexpressed_produce_byte_identical_recordbatch() {
+    let (_dir, catalog) = open_catalog().await;
     let vector = ChannelId::new("vector").unwrap();
     let inference = ChannelId::new("inference").unwrap();
 
@@ -78,6 +78,7 @@ fn vector_and_inference_reexpressed_produce_byte_identical_recordbatch() {
         &[inference],
         &[vec![vector_contrib, inference_contrib]],
     )
+    .await
     .unwrap();
     assert_eq!(merged.len(), 1);
 
@@ -130,14 +131,15 @@ fn schema_to_canonical_json(schema: &Schema) -> String {
 /// matches what the merger appends to the batch (modulo the
 /// retrieved_by/annotated_by prefix that lives outside the channel
 /// schema by design).
-#[test]
-fn merged_schema_matches_merger_output_suffix() {
-    let (_dir, catalog) = open_catalog();
+#[tokio::test]
+async fn merged_schema_matches_merger_output_suffix() {
+    let (_dir, catalog) = open_catalog().await;
     let vector = ChannelId::new("vector").unwrap();
     let inference = ChannelId::new("inference").unwrap();
     let from_catalog = catalog
         .channels()
         .merged_schema(&[vector.clone(), inference.clone()])
+        .await
         .unwrap();
     let catalog_names: Vec<&str> = from_catalog
         .fields()

@@ -1,5 +1,6 @@
 pub mod error;
 pub mod flight;
+pub mod grpc;
 pub mod routes;
 
 use std::future::Future;
@@ -37,6 +38,31 @@ pub async fn serve_with_shutdown(
     tracing::info!("Health server listening on {addr}");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
+        .await
+}
+
+/// Start the gRPC server hosting [`grpc::session::SessionServer`] behind
+/// the [`grpc::session::TenantInterceptor`]. Returns when `shutdown` resolves.
+///
+/// Flight SQL queries running through `flight::serve` should share the same
+/// [`grpc::session::SessionStore`] so a tenant bound via `SessionService.SetTenant`
+/// applies to Flight SQL queries on the same `jammi-session-id`.
+pub async fn serve_grpc_with_shutdown(
+    addr: SocketAddr,
+    store: grpc::session::SessionStore,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), tonic::transport::Error> {
+    use grpc::proto::session::session_service_server::SessionServiceServer;
+    use grpc::session::{SessionServer, TenantInterceptor};
+
+    let interceptor = TenantInterceptor::new(store.clone());
+    let session_svc =
+        SessionServiceServer::with_interceptor(SessionServer::new(store), interceptor);
+
+    tracing::info!("gRPC server (SessionService) listening on {addr}");
+    tonic::transport::Server::builder()
+        .add_service(session_svc)
+        .serve_with_shutdown(addr, shutdown)
         .await
 }
 

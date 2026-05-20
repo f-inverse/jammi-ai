@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package jammi.v1.session;
+
+import "google/protobuf/empty.proto";
+
+// SessionService — primitive session-attribute surface for tenant binding
+// from remote clients. Verb vocabulary is closed: SetTenant, GetTenant,
+// ClearTenant. No domain-shaped verbs (per ADR-01 §3.2).
+//
+// The service is stateless w.r.t. the engine — calls update an in-process
+// session table that the Tonic TenantInterceptor reads on every downstream
+// gRPC / Flight SQL request and propagates to the engine via the request
+// extension (TenantId).
+service SessionService {
+  // Bind a tenant for the calling session. Idempotent — calling twice with
+  // the same tenant is a no-op. Replacing an existing binding is allowed
+  // (the auth layer above the engine validates the caller is permitted).
+  rpc SetTenant(SetTenantRequest) returns (google.protobuf.Empty);
+
+  // Return the tenant currently bound to the calling session, or an unset
+  // tenant if none is bound.
+  rpc GetTenant(google.protobuf.Empty) returns (GetTenantResponse);
+
+  // Clear the tenant binding for the calling session. After this returns,
+  // subsequent requests on the same session see an unscoped tenant.
+  rpc ClearTenant(google.protobuf.Empty) returns (google.protobuf.Empty);
+}
+
+// A tenant identifier carried over the wire. UUID v4 / v7 string per ADR-00;
+// the nil UUID is invalid and the engine rejects it at the TenantId newtype
+// boundary.
+message Tenant {
+  // UUID string. Empty string means "no tenant bound".
+  string id = 1;
+}
+
+message SetTenantRequest {
+  Tenant tenant = 1;
+}
+
+message GetTenantResponse {
+  Tenant tenant = 1;
+}

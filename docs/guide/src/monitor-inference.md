@@ -6,7 +6,14 @@ Attach an observer to inspect every output batch during inference. Use this for 
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate arrow;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# use jammi_engine::config::JammiConfig;
+# async fn ex(config: JammiConfig) -> jammi_engine::error::Result<()> {
 use jammi_ai::inference::observer::InferenceObserver;
 use std::sync::Arc;
 
@@ -30,6 +37,7 @@ let session = InferenceSession::with_observer(
     config,
     Some(Arc::new(MetricsCollector) as Arc<dyn InferenceObserver>),
 ).await?;
+# Ok(()) }
 ```
 
 The observer is called once per output batch. When no observer is attached, the overhead is a single `Option` branch — effectively zero.
@@ -38,7 +46,13 @@ The observer is called once per output batch. When no observer is attached, the 
 
 ### Progress logging
 
-```rust
+```rust,no_run
+# extern crate jammi_ai;
+# extern crate arrow;
+# use std::sync::atomic::{AtomicUsize, Ordering};
+# use std::time::Duration;
+# use arrow::record_batch::RecordBatch;
+# use jammi_ai::inference::observer::InferenceObserver;
 struct ProgressLogger { total: AtomicUsize }
 
 impl InferenceObserver for ProgressLogger {
@@ -51,7 +65,13 @@ impl InferenceObserver for ProgressLogger {
 
 ### Quality checks
 
-```rust
+```rust,no_run
+# extern crate jammi_ai;
+# extern crate arrow;
+# use std::time::Duration;
+# use arrow::array::StringArray;
+# use arrow::record_batch::RecordBatch;
+# use jammi_ai::inference::observer::InferenceObserver;
 struct QualityChecker;
 
 impl InferenceObserver for QualityChecker {
@@ -70,7 +90,12 @@ impl InferenceObserver for QualityChecker {
 
 ### Latency tracking
 
-```rust
+```rust,no_run
+# extern crate jammi_ai;
+# extern crate arrow;
+# use std::time::Duration;
+# use arrow::record_batch::RecordBatch;
+# use jammi_ai::inference::observer::InferenceObserver;
 struct LatencyTracker { slow_threshold: Duration }
 
 impl InferenceObserver for LatencyTracker {
@@ -88,7 +113,7 @@ impl InferenceObserver for LatencyTracker {
 
 ## Pipeline architecture
 
-```
+```text
 Source (Parquet/CSV/DB)
     |
     v  DataFusion scan

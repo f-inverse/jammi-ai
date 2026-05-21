@@ -24,7 +24,12 @@ Live integration tests live behind matching `live-s3-tests`, `live-gcs-tests`, `
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> Result<(), Box<dyn std::error::Error>> {
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 use jammi_engine::storage::{CloudConfig, S3Config, StorageUrl};
 
@@ -45,6 +50,7 @@ session.add_source("papers", SourceType::File, conn).await?;
 let rows = session
     .sql("SELECT id, title FROM papers.public.papers LIMIT 10")
     .await?;
+# Ok(()) }
 ```
 
 If the `cloud` field is `None` and the URL is a cloud scheme, the driver falls back to the SDK's ambient credential chain — env vars, instance profile, IRSA, ADC, Managed Identity.
@@ -73,7 +79,10 @@ jammi sources add papers \
 
 The pattern is identical — only the URL prefix and the `CloudConfig` variant change:
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# use jammi_engine::source::{FileFormat, SourceConnection};
+# fn make() -> SourceConnection {
 use jammi_engine::storage::{CloudConfig, GcsConfig};
 
 let conn = SourceConnection {
@@ -85,9 +94,13 @@ let conn = SourceConnection {
     })),
     ..Default::default()
 };
+# conn }
 ```
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# use jammi_engine::source::{FileFormat, SourceConnection};
+# fn make() -> Result<SourceConnection, Box<dyn std::error::Error>> {
 use jammi_engine::storage::{AzureConfig, CloudConfig};
 
 let conn = SourceConnection {
@@ -100,13 +113,18 @@ let conn = SourceConnection {
     })),
     ..Default::default()
 };
+# Ok(conn) }
 ```
 
 ## Persist result tables to the cloud
 
 `ResultStore` accepts a [`StorageUrl`] root, so embedding and inference outputs land in the same bucket as the source data:
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# use std::sync::Arc;
+# use jammi_engine::catalog::Catalog;
+# fn ex(catalog: Arc<Catalog>) -> jammi_engine::error::Result<()> {
 use jammi_engine::storage::{StorageRegistry, StorageUrl};
 use jammi_engine::store::ResultStore;
 use std::sync::Arc;
@@ -114,6 +132,7 @@ use std::sync::Arc;
 let root = StorageUrl::parse("s3://benchmarks/jammi_db")?;
 let registry = StorageRegistry::new();
 let result_store = Arc::new(ResultStore::with_root(root, registry, catalog)?);
+# Ok(()) }
 ```
 
 Every result table the session creates writes its Parquet and sidecar ANN index to that prefix; `delete_table_files` and the crash-recovery pass operate against the same backend.
@@ -122,7 +141,7 @@ Every result table the session creates writes its Parquet and sidecar ANN index 
 
 For a result table named `papers__text_embedding__bge-m3__20260520T120000Z_abc12345`, the engine writes three siblings:
 
-```
+```text
 s3://benchmarks/jammi_db/papers__text_embedding__bge-m3__….parquet
 s3://benchmarks/jammi_db/papers__text_embedding__bge-m3__….idx.usearch
 s3://benchmarks/jammi_db/papers__text_embedding__bge-m3__….idx.rowmap

@@ -4,7 +4,10 @@ This walkthrough registers a local data file, runs a SQL query, generates embedd
 
 ## Full example
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
 use std::sync::Arc;
 use jammi_ai::session::InferenceSession;
 use jammi_engine::config::JammiConfig;

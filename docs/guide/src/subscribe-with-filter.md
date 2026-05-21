@@ -25,6 +25,12 @@ Assumes the topic was registered (see
 ## Open the subscription
 
 ```rust,no_run
+# extern crate jammi_engine;
+# extern crate arrow;
+# extern crate arrow_schema;
+# extern crate datafusion;
+# extern crate futures;
+# extern crate tokio;
 # use std::sync::Arc;
 # use arrow_schema::SchemaRef;
 # use datafusion::execution::context::SessionContext;
@@ -82,6 +88,9 @@ If your consumer disconnects and reconnects, pass the last-seen
 offset as `from_offset` to resume without missing events:
 
 ```rust,no_run
+# extern crate jammi_engine;
+# extern crate chrono;
+# extern crate tokio;
 # use chrono::Utc;
 # use std::sync::Arc;
 # use jammi_engine::trigger::{Offset, Predicate, Subscriber, TopicDefinition};

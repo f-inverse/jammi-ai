@@ -8,7 +8,13 @@ This recipe walks through registering a third channel, `scored_by`, for a multi-
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate arrow;
+# extern crate tokio;
+# use jammi_engine::config::JammiConfig;
+# async fn ex(config: JammiConfig) -> jammi_engine::error::Result<()> {
 use std::sync::Arc;
 use arrow::array::{ArrayRef, Float32Array, StringArray};
 use jammi_ai::evidence::{merge_channels, ChannelContribution};
@@ -23,6 +29,7 @@ session.add_source("patents", SourceType::File, SourceConnection {
     format: Some(FileFormat::Parquet),
     ..Default::default()
 }).await?;
+# Ok(()) }
 ```
 
 ### Python
@@ -40,7 +47,15 @@ Channel declarations are catalog rows. Each declared column has a name, an Arrow
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use std::sync::Arc;
+# use jammi_ai::session::InferenceSession;
+# use jammi_engine::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
+# use jammi_engine::ChannelId;
+# async fn ex(session: &Arc<InferenceSession>) -> jammi_engine::error::Result<()> {
 session.catalog().channels().register(&ChannelSpec {
     id: ChannelId::new("scored_by")?,
     priority: 3,
@@ -54,7 +69,8 @@ session.catalog().channels().register(&ChannelSpec {
             data_type: ChannelColumnType::Float32,
         },
     ],
-})?;
+}).await?;
+# Ok(()) }
 ```
 
 ### Python
@@ -71,11 +87,20 @@ db.register_channel(
 
 To add more columns to an already-registered channel:
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use std::sync::Arc;
+# use jammi_ai::session::InferenceSession;
+# use jammi_engine::catalog::channel_repo::{ChannelColumn, ChannelColumnType};
+# use jammi_engine::ChannelId;
+# async fn ex(session: &Arc<InferenceSession>) -> jammi_engine::error::Result<()> {
 session.catalog().channels().add_columns(
     &ChannelId::new("scored_by")?,
     &[ChannelColumn { name: "scored_at".into(), data_type: ChannelColumnType::Utf8 }],
-)?;
+).await?;
+# Ok(()) }
 ```
 
 ```python
@@ -90,7 +115,18 @@ Build a `ChannelContribution` for each batch your reranker produces. The arrays 
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate arrow;
+# extern crate tokio;
+# use std::sync::Arc;
+# use arrow::array::{ArrayRef, Float32Array, RecordBatch, StringArray};
+# use jammi_ai::evidence::{merge_channels, ChannelContribution};
+# use jammi_ai::session::InferenceSession;
+# use jammi_engine::ChannelId;
+# fn rerank_scores(_batch: &RecordBatch) -> Vec<f32> { vec![] }
+# async fn ex(session: &Arc<InferenceSession>, batches: Vec<RecordBatch>) -> jammi_engine::error::Result<()> {
 let scored_by = ChannelId::new("scored_by")?;
 let vector = ChannelId::new("vector")?;
 
@@ -112,7 +148,8 @@ let merged = merge_channels(
     &[vector, scored_by],   // retrieved_by
     &[],                     // annotated_by
     &contributions,
-)?;
+).await?;
+# Ok(()) }
 ```
 
 ## Verify
@@ -121,7 +158,10 @@ The merged output schema includes the declared columns. Rows where the channel d
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate arrow;
+# use arrow::array::RecordBatch;
+# fn ex(merged: Vec<RecordBatch>) {
 let schema = merged[0].schema();
 assert!(schema.field_with_name("ranker").is_ok());
 assert!(schema.field_with_name("rank_score").is_ok());
@@ -130,6 +170,7 @@ for batch in &merged {
     let ranker = batch.column_by_name("ranker").unwrap();
     println!("first ranker: {:?}", ranker);
 }
+# }
 ```
 
 ### Python

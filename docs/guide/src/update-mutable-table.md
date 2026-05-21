@@ -112,9 +112,12 @@ Two lower-level methods bypass DataFusion's planner for high-throughput
 event paths:
 
 ```rust,no_run
+# extern crate jammi_engine;
+# extern crate arrow;
+# extern crate tokio;
 # async fn ex(
 #     session: &jammi_engine::session::JammiSession,
-#     batch: &arrow::array::RecordBatch,
+#     batch: arrow::array::RecordBatch,
 # ) -> jammi_engine::error::Result<()> {
 use jammi_engine::store::mutable::definition::MutableTableId;
 use jammi_engine::catalog::backend::TxOptions;
@@ -127,9 +130,11 @@ let backend = session.catalog().backend_arc();
 backend
     .transaction(TxOptions::default(), move |tx| {
         let registry = registry.clone();
+        let id = id.clone();
+        let batch = batch.clone();
         Box::pin(async move {
             registry
-                .insert_batch(tx, &id, batch)
+                .insert_batch(tx, &id, &batch)
                 .await
                 .map_err(|e| jammi_engine::BackendError::Execution(e.to_string()))?;
             Ok::<(), jammi_engine::BackendError>(())
@@ -141,6 +146,9 @@ backend
 ```
 
 ```rust,no_run
+# extern crate jammi_engine;
+# extern crate futures;
+# extern crate tokio;
 # use futures::StreamExt;
 # async fn ex(
 #     session: &jammi_engine::session::JammiSession,

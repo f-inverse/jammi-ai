@@ -6,7 +6,12 @@ Register data files as named sources, then query them with full SQL. Sources are
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 
 session.add_source("patents", SourceType::File, SourceConnection {
@@ -14,6 +19,7 @@ session.add_source("patents", SourceType::File, SourceConnection {
     format: Some(FileFormat::Parquet),
     ..Default::default()
 }).await?;
+# Ok(()) }
 ```
 
 ### Python
@@ -42,7 +48,12 @@ Sources are accessible via three-part SQL names: `<source_id>.public.<table_name
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
 let results = session.sql(
     "SELECT id, title, year FROM patents.public.patents WHERE year > 2020 ORDER BY year"
 ).await?;
@@ -50,6 +61,7 @@ let results = session.sql(
 for batch in &results {
     println!("{batch:?}");
 }
+# Ok(()) }
 ```
 
 ### Python
@@ -81,7 +93,13 @@ Register multiple sources and join them in a single query:
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
 session.add_source("companies", SourceType::File, SourceConnection {
     url: Some("file:///data/companies.csv".into()),
     format: Some(FileFormat::Csv),
@@ -93,6 +111,7 @@ let results = session.sql("
     FROM patents.public.patents p
     JOIN companies.public.companies c ON p.assignee_id = c.id
 ").await?;
+# Ok(()) }
 ```
 
 ### Python
@@ -111,12 +130,18 @@ table = db.sql("""
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
 // List registered sources
-let sources = session.catalog().list_sources()?;
+let sources = session.catalog().list_sources().await?;
 
 // Remove a source
-session.catalog().remove_source("patents")?;
+session.remove_source("patents").await?;
+# Ok(()) }
 ```
 
 ### CLI

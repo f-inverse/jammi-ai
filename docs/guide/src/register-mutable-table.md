@@ -29,7 +29,9 @@ configured artifact directory; nothing else is needed.
 
 Polaris keeps one row per `(item_id, valid_from, valid_to)` interval:
 
-```rust
+```rust,no_run
+# extern crate arrow_schema;
+# fn make() {
 use std::sync::Arc;
 use arrow_schema::{DataType, Field, Schema};
 
@@ -40,6 +42,7 @@ let schema = Arc::new(Schema::new(vec![
     Field::new("valid_from",   DataType::Int64,   false),  // epoch milliseconds
     Field::new("valid_to",     DataType::Int64,   true),   // epoch milliseconds; NULL = open
 ]));
+# }
 ```
 
 The catalog encoder accepts the closed primitive subset enforced by every
@@ -58,6 +61,8 @@ appends it implicitly.)
 `MutableTableDefinitionBuilder` chains the field validations:
 
 ```rust,no_run
+# extern crate jammi_engine;
+# extern crate arrow_schema;
 # use std::sync::Arc;
 # use arrow_schema::Schema;
 use jammi_engine::store::mutable::definition::{
@@ -93,6 +98,8 @@ secondary `CREATE INDEX` commit together. If any step fails, nothing lands.
 ### Rust
 
 ```rust,no_run
+# extern crate jammi_engine;
+# extern crate tokio;
 # use jammi_engine::store::mutable::definition::MutableTableDefinition;
 # use jammi_engine::session::JammiSession;
 # async fn ex(session: &JammiSession, def: MutableTableDefinition) -> jammi_engine::error::Result<()> {
@@ -125,6 +132,8 @@ Python APIs.
 ## Verify
 
 ```rust,no_run
+# extern crate jammi_engine;
+# extern crate tokio;
 # async fn ex(session: &jammi_engine::session::JammiSession) -> jammi_engine::error::Result<()> {
 let zero_rows = session
     .sql("SELECT * FROM mutable.public.item_dimensions LIMIT 0")

@@ -6,12 +6,17 @@ Jammi loads configuration from three sources, in priority order:
 2. **Environment variables** — `JAMMI_GPU__DEVICE=0`, `JAMMI_INFERENCE__BATCH_SIZE=64`
 3. **Defaults** — sensible defaults for all fields
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# use std::path::Path;
+# use jammi_engine::config::JammiConfig;
+# fn ex() -> jammi_engine::error::Result<()> {
 // Load with defaults
 let config = JammiConfig::load(None)?;
 
 // Load from a specific file
 let config = JammiConfig::load(Some(Path::new("/path/to/jammi.toml")))?;
+# Ok(()) }
 ```
 
 ## Full reference

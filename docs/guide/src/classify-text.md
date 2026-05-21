@@ -6,7 +6,12 @@ Run a classification model over text columns to assign labels and confidence sco
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
 use jammi_ai::model::{ModelSource, ModelTask};
 
 let model = ModelSource::hf("answerdotai/ModernBERT-base-classification");
@@ -17,6 +22,7 @@ let results = session.infer(
     &["abstract".to_string()],
     "id",
 ).await?;
+# Ok(()) }
 ```
 
 ### Python
@@ -73,7 +79,12 @@ text,label
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
 use jammi_ai::fine_tune::FineTuneMethod;
 
 let job = session.fine_tune(
@@ -86,6 +97,7 @@ let job = session.fine_tune(
 ).await?;
 
 job.wait().await?;
+# Ok(()) }
 ```
 
 ### Python

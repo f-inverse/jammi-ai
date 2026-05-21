@@ -35,6 +35,12 @@ jobs:
       - name: Build guide
         run: mdbook build docs/guide
 
+      - name: Build workspace (so mdbook test can resolve workspace crates)
+        run: cargo build --workspace --exclude jammi-python --quiet
+
+      - name: Test guide doctests
+        run: mdbook test docs/guide -L target/debug/deps
+
       - name: Build rustdoc
         run: cargo doc --workspace --exclude jammi-python --no-deps
         env:

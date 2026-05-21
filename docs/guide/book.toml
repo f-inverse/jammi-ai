@@ -4,6 +4,9 @@ authors = ["F-Inverse"]
 language = "en"
 src = "src"
 
+[rust]
+edition = "2021"
+
 [output.html]
 default-theme = "light"
 preferred-dark-theme = "ayu"

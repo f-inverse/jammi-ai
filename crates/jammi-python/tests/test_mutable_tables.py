@@ -102,34 +102,43 @@ def test_create_with_index_and_order_column(tmp_path):
 
 
 def test_create_inherits_session_tenant(tmp_path):
-    """A session bound to tenant A registers `notes_a`; a second session
-    bound to tenant B sees zero rows when the row carries the A tenant."""
-    db_a = jammi.connect(artifact_dir=str(tmp_path))
-    db_a.with_tenant(TENANT_A)
-    db_a.create_mutable_table(
+    """Tenant inheritance on create + analyzer-side row filtering on read.
+    Bound to tenant A: `create_mutable_table` stamps `tenant_id = A` on
+    the row. Re-bound to tenant B on the same session: the tenant-scope
+    analyzer injects `tenant_id = B OR IS NULL`, so the row authored
+    under A becomes invisible. Re-bound back to A: the row is visible
+    again."""
+    db = jammi.connect(artifact_dir=str(tmp_path))
+    db.with_tenant(TENANT_A)
+    db.create_mutable_table(
         "notes_a",
         schema=_notes_schema(),
         primary_key=["note_id"],
     )
-    db_a.sql(
-        "INSERT INTO mutable.public.notes_a (note_id, body) VALUES (1, 'a-row')"
-    )
+    db.sql("INSERT INTO mutable.public.notes_a (note_id, body) VALUES (1, 'a-row')")
 
     count_a = (
-        db_a.sql("SELECT COUNT(*) AS n FROM mutable.public.notes_a")
+        db.sql("SELECT COUNT(*) AS n FROM mutable.public.notes_a")
         .column("n")
         .to_pylist()[0]
     )
     assert count_a == 1
 
-    db_b = jammi.connect(artifact_dir=str(tmp_path))
-    db_b.with_tenant(TENANT_B)
+    db.with_tenant(TENANT_B)
     count_b = (
-        db_b.sql("SELECT COUNT(*) AS n FROM mutable.public.notes_a")
+        db.sql("SELECT COUNT(*) AS n FROM mutable.public.notes_a")
         .column("n")
         .to_pylist()[0]
     )
     assert count_b == 0
+
+    db.with_tenant(TENANT_A)
+    count_a_again = (
+        db.sql("SELECT COUNT(*) AS n FROM mutable.public.notes_a")
+        .column("n")
+        .to_pylist()[0]
+    )
+    assert count_a_again == 1
 
 
 def test_create_rejects_invalid_id(tmp_path):

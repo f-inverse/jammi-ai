@@ -77,20 +77,21 @@ def test_register_with_broker_metadata(tmp_path):
 
 
 def test_register_inherits_session_tenant(tmp_path):
-    """A session bound to tenant A registers `events.demo`; a second
-    session bound to tenant B's `list_topics` excludes the A-scoped
-    topic."""
-    db_a = jammi.connect(artifact_dir=str(tmp_path))
-    db_a.with_tenant(TENANT_A)
-    db_a.register_topic("events.demo", schema=_events_schema())
+    """Tenant inheritance on register + tenant-scoped listing on the same
+    session: bound to tenant A, `events.demo` appears in `list_topics`;
+    re-bound to tenant B, the same call excludes the A-scoped topic;
+    re-bound back to A, the topic is visible again."""
+    db = jammi.connect(artifact_dir=str(tmp_path))
+    db.with_tenant(TENANT_A)
+    db.register_topic("events.demo", schema=_events_schema())
 
-    topics_a = db_a.list_topics()
-    assert "events.demo" in topics_a
+    assert "events.demo" in db.list_topics()
 
-    db_b = jammi.connect(artifact_dir=str(tmp_path))
-    db_b.with_tenant(TENANT_B)
-    topics_b = db_b.list_topics()
-    assert "events.demo" not in topics_b
+    db.with_tenant(TENANT_B)
+    assert "events.demo" not in db.list_topics()
+
+    db.with_tenant(TENANT_A)
+    assert "events.demo" in db.list_topics()
 
 
 def test_drop_missing_without_if_exists_raises(tmp_path):

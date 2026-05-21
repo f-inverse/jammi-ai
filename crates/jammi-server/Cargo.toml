@@ -44,3 +44,6 @@ metal = ["dep:jammi-ai", "jammi-ai/metal"]
 tokio.workspace = true
 tower = { workspace = true, features = ["util"] }
 reqwest.workspace = true
+jammi-test-utils.workspace = true
+tempfile = "3"
+parquet.workspace = true

@@ -13,7 +13,13 @@ fn main() {
     println!("cargo:rerun-if-changed=proto");
 
     tonic_prost_build::configure()
-        .build_client(false)
+        // Client stubs are used by the integration-test harness
+        // (crates/jammi-server/tests/it/{flight_tenant,grpc_session}.rs)
+        // to drive `SessionService.SetTenant` and `TriggerService.ListTopics`
+        // against an in-process server. Other callers of the gRPC surface
+        // (jammi-cli, future SDK crates) build their own clients on top of
+        // these generated stubs.
+        .build_client(true)
         .build_server(true)
         .compile_protos(
             &proto_files

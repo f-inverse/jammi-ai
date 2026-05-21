@@ -6,7 +6,12 @@ Run a Named Entity Recognition model over text columns to extract person names, 
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
 use jammi_ai::model::{ModelSource, ModelTask};
 
 let model = ModelSource::hf("dslim/bert-base-NER");
@@ -17,6 +22,7 @@ let results = session.infer(
     &["abstract".to_string()],
     "id",
 ).await?;
+# Ok(()) }
 ```
 
 ### Python
@@ -77,7 +83,7 @@ NER models must have `id2label` with BIO-tagged labels (e.g., `B-PER`, `I-PER`, 
 
 ## How it works
 
-```
+```text
 text → tokenize (with character offsets)
      → encoder forward → hidden states [batch, seq_len, hidden]
      → Linear(hidden, num_labels) per token → logits

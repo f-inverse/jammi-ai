@@ -432,38 +432,36 @@ impl JammiSession {
             tenant: self.tenant(),
             broker_metadata: create.broker_metadata,
         };
-        self.trigger_broker
-            .register_topic(&topic)
-            .await
-            .map_err(|e| JammiError::Catalog(e.to_string()))?;
-        self.topic_repo
-            .register_topic(&topic)
-            .await
-            .map_err(|e| JammiError::Catalog(e.to_string()))?;
+        self.trigger_broker.register_topic(&topic).await?;
+        self.topic_repo.register_topic(&topic).await?;
         Ok(())
     }
 
     async fn exec_drop_topic(&self, drop_: crate::sql::topic_ddl::DropTopic) -> Result<()> {
         let tenant = self.tenant();
-        let topic = self
-            .topic_repo
-            .lookup_by_name(&drop_.name, tenant)
-            .await
-            .map_err(|e| JammiError::Catalog(e.to_string()))?;
+        let topic = self.topic_repo.lookup_by_name(&drop_.name, tenant).await?;
         match topic {
             Some(t) => {
-                self.topic_repo
-                    .drop_topic(t.id, tenant)
-                    .await
-                    .map_err(|e| JammiError::Catalog(e.to_string()))?;
-                let _ = self.trigger_broker.drop_topic(t.id).await;
+                self.topic_repo.drop_topic(t.id, tenant).await?;
+                // The broker driver's view of the topic is best-effort: an
+                // in-memory broker has no durable state, and the catalog row
+                // (the system of record) is already gone. A driver-side
+                // failure here would leak driver resources, not catalog
+                // state, so surface it via tracing rather than reverting
+                // the successful catalog drop.
+                if let Err(e) = self.trigger_broker.drop_topic(t.id).await {
+                    tracing::warn!(
+                        topic_id = %t.id,
+                        error = %e,
+                        "trigger broker driver failed to drop topic after catalog row removal",
+                    );
+                }
                 Ok(())
             }
             None if drop_.if_exists => Ok(()),
-            None => Err(JammiError::Catalog(format!(
-                "topic '{}' not found",
-                drop_.name
-            ))),
+            None => Err(JammiError::Trigger(
+                crate::trigger::TriggerError::TopicNotFound(drop_.name),
+            )),
         }
     }
 
@@ -495,11 +493,7 @@ impl JammiSession {
         def: MutableTableDefinition,
     ) -> Result<MutableTableId> {
         let id = def.id.clone();
-        let provider = self
-            .mutable
-            .register(def)
-            .await
-            .map_err(|e| JammiError::Catalog(e.to_string()))?;
+        let provider = self.mutable.register(def).await?;
         self.mutable_schema
             .add_table(id.as_str().to_string(), provider)?;
         Ok(id)
@@ -507,23 +501,20 @@ impl JammiSession {
 
     /// Drop a mutable companion table.
     pub async fn drop_mutable_table(&self, id: &MutableTableId) -> Result<()> {
-        self.mutable
-            .drop_table(id)
-            .await
-            .map_err(|e| JammiError::Catalog(e.to_string()))?;
+        self.mutable.drop_table(id).await?;
         self.mutable_schema.remove_table(id.as_str())?;
         Ok(())
     }
 
     /// Re-register mutable tables persisted in the catalog from a previous
-    /// process. Called on startup. Lists tables visible to the current
-    /// tenant binding (initially `Unscoped`).
+    /// process. Called on startup. Registers a `TableProvider` for every
+    /// table across every tenant — DataFusion name resolution does not
+    /// honour session scope, so the table must be discoverable in
+    /// `mutable.public.<id>` regardless of which tenant the session later
+    /// binds to. Per-row tenant filtering is applied by the analyzer at
+    /// query time.
     async fn reload_mutable_tables(&self) -> Result<()> {
-        let defs = self
-            .mutable
-            .list(self.tenant())
-            .await
-            .map_err(|e| JammiError::Catalog(e.to_string()))?;
+        let defs = self.mutable.list_all().await?;
         for def in defs {
             let id = def.id.clone();
             let provider = self.mutable.provider_for(def);

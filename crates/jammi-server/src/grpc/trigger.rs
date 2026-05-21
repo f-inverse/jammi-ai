@@ -300,6 +300,9 @@ fn map_trigger_error(err: TriggerError) -> Status {
         TriggerError::SchemaConflict { topic, detail } => {
             Status::failed_precondition(format!("schema conflict on {topic}: {detail}"))
         }
+        TriggerError::UnsupportedSchemaType { column, data_type } => Status::invalid_argument(
+            format!("unsupported topic schema type for '{column}': {data_type}"),
+        ),
         TriggerError::PredicateParse(detail) | TriggerError::PredicateUnsupported(detail) => {
             Status::invalid_argument(format!("predicate: {detail}"))
         }

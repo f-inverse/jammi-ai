@@ -116,6 +116,15 @@ impl MutableTableRegistry {
         self.catalog.list_mutable_tables(tenant).await
     }
 
+    /// List every registered table across all tenants. Used at session
+    /// startup to register a `TableProvider` for each persisted mutable
+    /// table so DataFusion can resolve `mutable.public.<id>` regardless of
+    /// which tenant the session later binds to; per-row tenant filtering
+    /// is then applied by the tenant-scope analyzer at query time.
+    pub async fn list_all(&self) -> Result<Vec<MutableTableDefinition>, MutableTableError> {
+        self.catalog.list_all_mutable_tables().await
+    }
+
     /// Build a `TableProvider` for an already-registered table (does not
     /// touch storage). Used by `JammiSession::reload_mutable_tables` at startup.
     pub fn provider_for(&self, def: MutableTableDefinition) -> Arc<dyn TableProvider> {

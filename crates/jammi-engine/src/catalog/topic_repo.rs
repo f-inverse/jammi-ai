@@ -303,13 +303,19 @@ fn encode_schema_json(schema: &Schema) -> Result<String, TriggerError> {
         .fields()
         .iter()
         .map(|f| {
-            serde_json::json!({
+            let type_name = data_type_name(f.data_type()).ok_or_else(|| {
+                TriggerError::UnsupportedSchemaType {
+                    column: f.name().clone(),
+                    data_type: format!("{:?}", f.data_type()),
+                }
+            })?;
+            Ok(serde_json::json!({
                 "name": f.name(),
-                "type": data_type_name(f.data_type()),
+                "type": type_name,
                 "nullable": f.is_nullable(),
-            })
+            }))
         })
-        .collect();
+        .collect::<Result<_, TriggerError>>()?;
     Ok(serde_json::json!({ "fields": fields }).to_string())
 }
 
@@ -335,8 +341,8 @@ fn decode_schema_json(json: &str) -> Result<Schema, TriggerError> {
     Ok(Schema::new(fields?))
 }
 
-fn data_type_name(ty: &DataType) -> &'static str {
-    match ty {
+fn data_type_name(ty: &DataType) -> Option<&'static str> {
+    Some(match ty {
         DataType::Boolean => "Boolean",
         DataType::Int8 => "Int8",
         DataType::Int16 => "Int16",
@@ -350,8 +356,8 @@ fn data_type_name(ty: &DataType) -> &'static str {
         DataType::Float64 => "Float64",
         DataType::Utf8 => "Utf8",
         DataType::Binary => "Binary",
-        _ => "Utf8",
-    }
+        _ => return None,
+    })
 }
 
 fn data_type_from_name(name: &str) -> Result<DataType, TriggerError> {

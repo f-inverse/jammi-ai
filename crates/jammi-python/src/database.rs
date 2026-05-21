@@ -1,17 +1,24 @@
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use futures::StreamExt;
+use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
-use pyo3_arrow::PyTable;
+use pyo3::types::PyDict;
+use pyo3_arrow::{PySchema, PyTable};
 
 use jammi_ai::fine_tune::{EarlyStoppingMetric, FineTuneConfig, FineTuneMethod};
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
+use jammi_engine::error::JammiError;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
-use jammi_engine::trigger::{Offset, Predicate};
+use jammi_engine::store::mutable::{
+    MutableIndexDef, MutableTableDefinitionBuilder, MutableTableError, MutableTableId,
+};
+use jammi_engine::trigger::{Offset, Predicate, TopicDefinition, TopicId};
 use jammi_lora::BackboneDtype;
 
 use crate::convert::{batches_to_pyarrow, json_to_pydict};
@@ -115,7 +122,7 @@ impl PyDatabase {
         let topics = self
             .runtime
             .block_on(topic_repo.list_topics(tenant))
-            .map_err(|e| to_pyerr(jammi_engine::error::JammiError::Catalog(e.to_string())))?;
+            .map_err(to_pyerr)?;
         Ok(topics.into_iter().map(|t| t.name).collect())
     }
 
@@ -129,7 +136,7 @@ impl PyDatabase {
         let topic_def = self
             .runtime
             .block_on(topic_repo.lookup_by_name(topic, tenant))
-            .map_err(|e| to_pyerr(jammi_engine::error::JammiError::Catalog(e.to_string())))?
+            .map_err(to_pyerr)?
             .ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err(format!("topic '{topic}' not found"))
             })?;
@@ -138,17 +145,20 @@ impl PyDatabase {
         // streamed chunks so a multi-chunk pyarrow.Table publishes as one
         // logical event.
         let concatenated = if batches.len() == 1 {
-            batches.into_iter().next().unwrap()
+            batches
+                .into_iter()
+                .next()
+                .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("publish batch was empty"))?
         } else {
             let schema = batches[0].schema();
             arrow::compute::concat_batches(&schema, batches.iter())
-                .map_err(|e| to_pyerr(jammi_engine::error::JammiError::Catalog(e.to_string())))?
+                .map_err(|e| to_pyerr(datafusion::error::DataFusionError::from(e)))?
         };
         let publisher = self.session.publisher();
         let offset = self
             .runtime
             .block_on(publisher.publish(&topic_def, concatenated))
-            .map_err(|e| to_pyerr(jammi_engine::error::JammiError::Catalog(e.to_string())))?;
+            .map_err(to_pyerr)?;
         Ok(offset.value())
     }
 
@@ -174,7 +184,7 @@ impl PyDatabase {
         let topic_def = self
             .runtime
             .block_on(topic_repo.lookup_by_name(topic, tenant))
-            .map_err(|e| to_pyerr(jammi_engine::error::JammiError::Catalog(e.to_string())))?
+            .map_err(to_pyerr)?
             .ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err(format!("topic '{topic}' not found"))
             })?;
@@ -183,27 +193,22 @@ impl PyDatabase {
             Arc::clone(&topic_def.schema),
             predicate.unwrap_or(""),
         )
-        .map_err(|e| to_pyerr(jammi_engine::error::JammiError::Catalog(e.to_string())))?;
+        .map_err(to_pyerr)?;
         let from = from_offset.map(|v| Offset::new(v, chrono::Utc::now()));
         let subscriber = self.session.subscriber();
         let collected: Vec<RecordBatch> = self
             .runtime
             .block_on(async move {
-                let mut stream = subscriber
-                    .subscribe(&topic_def, predicate, from)
-                    .await
-                    .map_err(|e| jammi_engine::error::JammiError::Catalog(e.to_string()))?;
+                let mut stream = subscriber.subscribe(&topic_def, predicate, from).await?;
                 let mut out: Vec<RecordBatch> = Vec::new();
                 while out.len() < max_batches {
                     match StreamExt::next(&mut stream).await {
                         Some(Ok(d)) => out.push(d.batch),
-                        Some(Err(e)) => {
-                            return Err(jammi_engine::error::JammiError::Catalog(e.to_string()))
-                        }
+                        Some(Err(e)) => return Err(e),
                         None => break,
                     }
                 }
-                Ok::<_, jammi_engine::error::JammiError>(out)
+                Ok::<_, jammi_engine::trigger::TriggerError>(out)
             })
             .map_err(to_pyerr)?;
         batches_to_pyarrow(py, &collected)
@@ -251,6 +256,130 @@ impl PyDatabase {
         self.runtime
             .block_on(self.session.catalog().channels().add_columns(&id, &cols))
             .map_err(to_pyerr)
+    }
+
+    /// Register a mutable companion table.
+    ///
+    /// Tenant scope is inherited from the session's currently bound tenant
+    /// (set via `with_tenant`). `schema` is any object implementing the
+    /// Arrow PyCapsule schema interface (e.g. `pyarrow.Schema`,
+    /// `arro3.Schema`). `primary_key` is a non-empty list of column names
+    /// drawn from `schema`. `indexes` is an optional list of dicts of shape
+    /// `{"name": str, "columns": [str, ...], "unique": bool=False}` — one
+    /// `CREATE INDEX` per entry. `order_column` is an optional `Int64` /
+    /// `UInt64` column that enables `MutableTableRegistry::scan_after`
+    /// streaming reads. `chunk_size` overrides the default scan chunk size
+    /// of 8192. Returns the catalog id of the registered table.
+    #[pyo3(signature = (name, *, schema, primary_key, indexes=None, order_column=None, chunk_size=None))]
+    fn create_mutable_table(
+        &self,
+        name: String,
+        schema: PySchema,
+        primary_key: Vec<String>,
+        indexes: Option<Vec<Bound<'_, PyDict>>>,
+        order_column: Option<String>,
+        chunk_size: Option<usize>,
+    ) -> PyResult<String> {
+        let id = MutableTableId::new(&name).map_err(to_pyerr)?;
+        let schema_ref = schema.into_inner();
+
+        let mut builder = MutableTableDefinitionBuilder::new(id.clone(), schema_ref)
+            .primary_key(primary_key)
+            .tenant(self.session.tenant());
+
+        if let Some(specs) = indexes {
+            for idx in parse_index_specs(&specs)? {
+                builder = builder.index(idx);
+            }
+        }
+        if let Some(col) = order_column {
+            builder = builder.order_column(col);
+        }
+        if let Some(size) = chunk_size {
+            builder = builder.chunk_size(size);
+        }
+
+        let def = builder.build().map_err(to_pyerr)?;
+        self.runtime
+            .block_on(self.session.create_mutable_table(def))
+            .map_err(to_pyerr)?;
+        Ok(id.as_str().to_string())
+    }
+
+    /// Drop a mutable companion table. If `if_exists` is true, dropping a
+    /// table that is not registered is a no-op; otherwise it raises with the
+    /// typed `MutableTableError::NotFound` variant.
+    #[pyo3(signature = (name, *, if_exists=false))]
+    fn drop_mutable_table(&self, name: String, if_exists: bool) -> PyResult<()> {
+        let id = MutableTableId::new(&name).map_err(to_pyerr)?;
+        match self.runtime.block_on(self.session.drop_mutable_table(&id)) {
+            Ok(()) => Ok(()),
+            Err(JammiError::MutableTable(MutableTableError::NotFound(_))) if if_exists => Ok(()),
+            Err(e) => Err(to_pyerr(e)),
+        }
+    }
+
+    /// Register a trigger-stream topic. The schema is the contract every
+    /// published batch must satisfy; the catalog encoder rejects DataTypes
+    /// outside the supported wire types with `TriggerError::UnsupportedSchemaType`.
+    /// `broker_metadata` is opaque driver-side configuration (retention,
+    /// replication, etc.). Returns the engine-minted topic id.
+    #[pyo3(signature = (name, *, schema, broker_metadata=None))]
+    fn register_topic(
+        &self,
+        name: String,
+        schema: PySchema,
+        broker_metadata: Option<BTreeMap<String, String>>,
+    ) -> PyResult<String> {
+        let topic = TopicDefinition {
+            id: TopicId::new(),
+            name,
+            schema: schema.into_inner(),
+            tenant: self.session.tenant(),
+            broker_metadata: broker_metadata.unwrap_or_default(),
+        };
+        self.runtime
+            .block_on(self.session.trigger_broker().register_topic(&topic))
+            .map_err(to_pyerr)?;
+        self.runtime
+            .block_on(self.session.topic_repo().register_topic(&topic))
+            .map_err(to_pyerr)?;
+        Ok(topic.id.to_string())
+    }
+
+    /// Drop a trigger-stream topic by name. Resolves the topic via the
+    /// tenant-scoped lookup, deletes the catalog row + backing table, and
+    /// then asks the broker driver to release any in-memory state. Broker
+    /// driver failure after the catalog row is gone is surfaced via tracing
+    /// — the system of record is already consistent.
+    #[pyo3(signature = (name, *, if_exists=false))]
+    fn drop_topic(&self, name: String, if_exists: bool) -> PyResult<()> {
+        let tenant = self.session.tenant();
+        let topic_repo = self.session.topic_repo();
+        let topic_opt = self
+            .runtime
+            .block_on(topic_repo.lookup_by_name(&name, tenant))
+            .map_err(to_pyerr)?;
+        match topic_opt {
+            Some(t) => {
+                self.runtime
+                    .block_on(topic_repo.drop_topic(t.id, tenant))
+                    .map_err(to_pyerr)?;
+                if let Err(e) = self
+                    .runtime
+                    .block_on(self.session.trigger_broker().drop_topic(t.id))
+                {
+                    tracing::warn!(
+                        topic_id = %t.id,
+                        error = %e,
+                        "trigger broker driver failed to drop topic after catalog row removal",
+                    );
+                }
+                Ok(())
+            }
+            None if if_exists => Ok(()),
+            None => Err(PyValueError::new_err(format!("topic '{name}' not found"))),
+        }
     }
 
     /// Start a vector search. Returns a `SearchBuilder` for fluent chaining.
@@ -561,4 +690,32 @@ fn parse_channel_columns(
             })
         })
         .collect()
+}
+
+/// Parse a Python list of `{"name": str, "columns": [str], "unique": bool}`
+/// dicts into typed `MutableIndexDef` values. Missing required keys raise
+/// `KeyError`; wrong value types raise the underlying pyo3 extraction error.
+/// `unique` defaults to `false` when the key is absent.
+fn parse_index_specs(specs: &[Bound<'_, PyDict>]) -> PyResult<Vec<MutableIndexDef>> {
+    specs.iter().map(parse_one_index_spec).collect()
+}
+
+fn parse_one_index_spec(spec: &Bound<'_, PyDict>) -> PyResult<MutableIndexDef> {
+    let name: String = spec
+        .get_item("name")?
+        .ok_or_else(|| PyKeyError::new_err("index spec missing required key 'name'"))?
+        .extract()?;
+    let columns: Vec<String> = spec
+        .get_item("columns")?
+        .ok_or_else(|| PyKeyError::new_err("index spec missing required key 'columns'"))?
+        .extract()?;
+    let unique: bool = match spec.get_item("unique")? {
+        Some(v) => v.extract()?,
+        None => false,
+    };
+    Ok(MutableIndexDef {
+        name,
+        columns,
+        unique,
+    })
 }

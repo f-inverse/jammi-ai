@@ -77,6 +77,14 @@ pub enum JammiError {
     #[error("Evidence channel error: {0}")]
     EvidenceChannel(String),
 
+    /// Mutable companion table error.
+    #[error("Mutable table error: {0}")]
+    MutableTable(#[from] crate::store::mutable::MutableTableError),
+
+    /// Trigger-stream error (topic registration, publish, subscribe).
+    #[error("Trigger error: {0}")]
+    Trigger(#[from] crate::trigger::TriggerError),
+
     /// Catch-all for errors that don't fit another variant.
     #[error("{0}")]
     Other(String),

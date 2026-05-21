@@ -3975,6 +3975,7 @@ dependencies = [
  "pyo3-arrow",
  "serde_json",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 

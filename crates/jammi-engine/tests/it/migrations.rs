@@ -169,6 +169,102 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "007_mutable_tables",
             "008_mutable_order_column",
             "009_topics",
+            "010_rename_source_type_local_to_file",
+        ]
+    );
+}
+
+/// Migration 010 rewrites pre-upgrade `source_type = '"local"'` rows to
+/// `'"file"'` so the deserialiser (which has no `#[serde(alias = "local")]`)
+/// can read them. The test inserts a legacy row, runs the migration SQL,
+/// and verifies the rewrite — exercising the exact statement the runner
+/// executes on a real upgrade.
+#[tokio::test]
+async fn migration_010_rewrites_legacy_local_rows_to_file() {
+    use jammi_engine::catalog::backend::SqlValue;
+
+    let dir = tempdir().unwrap();
+    let _catalog = Catalog::open(dir.path()).await.unwrap();
+    let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
+
+    // Insert two rows: one with the legacy "local" encoding (what the
+    // pre-rename catalog writes), one with the new "file" encoding (the
+    // post-rename canonical form). The migration must rewrite only the
+    // first; the second is left untouched so re-running is a no-op.
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO sources (source_id, name, source_type, uri, options) \
+                     VALUES ($1, $2, $3, $4, $5)",
+                    &[
+                        SqlValue::TextOwned("legacy".into()),
+                        SqlValue::TextOwned("legacy".into()),
+                        SqlValue::TextOwned("\"local\"".into()),
+                        SqlValue::TextOwned("file:///legacy.parquet".into()),
+                        SqlValue::TextOwned("{}".into()),
+                    ],
+                )
+                .await?;
+                tx.execute(
+                    "INSERT INTO sources (source_id, name, source_type, uri, options) \
+                     VALUES ($1, $2, $3, $4, $5)",
+                    &[
+                        SqlValue::TextOwned("modern".into()),
+                        SqlValue::TextOwned("modern".into()),
+                        SqlValue::TextOwned("\"file\"".into()),
+                        SqlValue::TextOwned("file:///modern.parquet".into()),
+                        SqlValue::TextOwned("{}".into()),
+                    ],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+    // Manually invoke the same SQL the migration runner executes for 010.
+    // We can't lean on Catalog::open here because the runner records 010
+    // as applied on the first open before any legacy row was inserted.
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE sources SET source_type = '\"file\"' WHERE source_type = '\"local\"'",
+                    &[],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+    let rows = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query::<_, (String, String)>(
+                        "SELECT source_id, source_type FROM sources ORDER BY source_id",
+                        &[],
+                        |row| Ok((row.get("source_id")?, row.get("source_type")?)),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("legacy".to_string(), "\"file\"".to_string()),
+            ("modern".to_string(), "\"file\"".to_string()),
         ]
     );
 }

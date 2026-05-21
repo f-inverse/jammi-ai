@@ -41,7 +41,7 @@ impl Catalog {
         def: &MutableTableDefinition,
     ) -> Result<(), MutableTableError> {
         let id_str = def.id.as_str().to_string();
-        let schema_json = encode_schema(def.schema.as_ref());
+        let schema_json = encode_schema(def.schema.as_ref())?;
         let primary_key_json = serde_json::to_string(&def.primary_key)
             .map_err(|e| MutableTableError::Schema(e.to_string()))?;
         let user_metadata = def.user_metadata.to_string();
@@ -328,19 +328,26 @@ fn materialize(
 /// feature set; this encoder captures the column subset Phase 2 supports
 /// (the closed set of primitive types accepted by the SQLite/Postgres
 /// `MutableBackend` impls).
-fn encode_schema(schema: &Schema) -> String {
+fn encode_schema(schema: &Schema) -> Result<String, MutableTableError> {
     let fields: Vec<serde_json::Value> = schema
         .fields()
         .iter()
         .map(|f| {
-            serde_json::json!({
+            let type_name = data_type_name(f.data_type()).ok_or_else(|| {
+                MutableTableError::Schema(format!(
+                    "unsupported mutable-table column type for '{}': {:?}",
+                    f.name(),
+                    f.data_type()
+                ))
+            })?;
+            Ok(serde_json::json!({
                 "name": f.name(),
-                "type": data_type_name(f.data_type()),
+                "type": type_name,
                 "nullable": f.is_nullable(),
-            })
+            }))
         })
-        .collect();
-    serde_json::json!({ "fields": fields }).to_string()
+        .collect::<Result<_, MutableTableError>>()?;
+    Ok(serde_json::json!({ "fields": fields }).to_string())
 }
 
 fn decode_schema(json: &str) -> Result<Schema, String> {
@@ -364,8 +371,8 @@ fn decode_schema(json: &str) -> Result<Schema, String> {
     Ok(Schema::new(fields?))
 }
 
-fn data_type_name(ty: &DataType) -> &'static str {
-    match ty {
+fn data_type_name(ty: &DataType) -> Option<&'static str> {
+    Some(match ty {
         DataType::Boolean => "Boolean",
         DataType::Int8 => "Int8",
         DataType::Int16 => "Int16",
@@ -379,8 +386,8 @@ fn data_type_name(ty: &DataType) -> &'static str {
         DataType::Float64 => "Float64",
         DataType::Utf8 => "Utf8",
         DataType::Binary => "Binary",
-        _ => "Utf8",
-    }
+        _ => return None,
+    })
 }
 
 fn data_type_from_name(name: &str) -> Result<DataType, String> {

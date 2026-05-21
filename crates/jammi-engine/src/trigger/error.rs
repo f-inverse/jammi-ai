@@ -13,6 +13,9 @@ pub enum TriggerError {
     #[error("topic schema conflict on {topic}: {detail}")]
     SchemaConflict { topic: String, detail: String },
 
+    #[error("unsupported topic schema type for column '{column}': {data_type}")]
+    UnsupportedSchemaType { column: String, data_type: String },
+
     #[error("batch schema does not match topic schema: {0}")]
     BatchSchemaMismatch(String),
 

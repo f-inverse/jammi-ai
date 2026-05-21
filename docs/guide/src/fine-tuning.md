@@ -18,12 +18,19 @@ Register the training data as a source:
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
 session.add_source("training", SourceType::File, SourceConnection {
     url: Some("file:///data/training_pairs.csv".into()),
     format: Some(FileFormat::Csv),
     ..Default::default()
 }).await?;
+# Ok(()) }
 ```
 
 ### Python
@@ -36,7 +43,12 @@ db.add_source("training", path="/data/training_pairs.csv", format="csv")
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
 use jammi_ai::fine_tune::FineTuneMethod;
 
 let job = session.fine_tune(
@@ -44,13 +56,14 @@ let job = session.fine_tune(
     "sentence-transformers/all-MiniLM-L6-v2",
     &["text_a".into(), "text_b".into(), "score".into()],
     FineTuneMethod::Lora,
-    "embedding",
+    "text_embedding",
     None,  // default config
 ).await?;
 
 println!("Job: {}", job.job_id);
 job.wait().await?;
 println!("Model: {}", job.model_id());
+# Ok(()) }
 ```
 
 ### Python
@@ -72,7 +85,13 @@ print(f"Model: {job.model_id}")
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# use jammi_ai::fine_tune::{FineTuneMethod, LrSchedule};
+# async fn ex(session: &InferenceSession, model: &str, columns: Vec<String>) -> jammi_engine::error::Result<()> {
 use jammi_ai::fine_tune::FineTuneConfig;
 
 let config = FineTuneConfig {
@@ -89,8 +108,9 @@ let config = FineTuneConfig {
 };
 
 let job = session.fine_tune(
-    "training", model, &columns, FineTuneMethod::Lora, "embedding", Some(config),
+    "training", model, &columns, FineTuneMethod::Lora, "text_embedding", Some(config),
 ).await?;
+# Ok(()) }
 ```
 
 ## Configuration reference
@@ -117,11 +137,18 @@ The fine-tuned model is automatically registered and can be used anywhere a mode
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# use jammi_ai::fine_tune::job::FineTuneJob;
+# async fn ex(session: &InferenceSession, job: &FineTuneJob) -> jammi_engine::error::Result<()> {
 let model_id = job.model_id();
 
 let embedding = session.encode_text_query(model_id, "quantum computing").await?;
 session.generate_text_embeddings("patents", model_id, &["abstract".into()], "id").await?;
+# Ok(()) }
 ```
 
 ### Python
@@ -135,7 +162,7 @@ db.generate_text_embeddings(source="patents", model=model_id, columns=["abstract
 
 ## How it works
 
-```
+```text
 text -> encoder (frozen) -> base embedding -> LoRA projection (trained) -> output
 ```
 
@@ -151,7 +178,10 @@ The default flow above trains a single low-rank **projection head** sitting *out
 
 Switch to encoder adapters by populating `target_modules` on `FineTuneConfig`:
 
-```rust
+```rust,no_run
+# extern crate jammi_ai;
+# use jammi_ai::fine_tune::FineTuneConfig;
+# fn make() -> FineTuneConfig {
 let config = FineTuneConfig {
     lora_rank: 8,
     lora_alpha: 16.0,
@@ -159,6 +189,7 @@ let config = FineTuneConfig {
     target_modules: vec!["query".to_string(), "value".to_string()],
     ..Default::default()
 };
+# config }
 ```
 
 ```python
@@ -167,7 +198,7 @@ job = db.fine_tune(
     base_model="sentence-transformers/all-MiniLM-L6-v2",
     columns=["text_a", "text_b", "score"],
     method="lora",
-    task="embedding",
+    task="text_embedding",
     target_modules=["query", "value"],
 )
 ```
@@ -192,7 +223,10 @@ Two optional refinements:
 - **`layers_to_transform`** — restrict injection to specific 0-based layer indices. `None` (default) applies to every layer.
 - **`rank_pattern`** — override `lora_rank` for individual modules. Keys are substring matches against the module name; values are the override rank.
 
-```rust
+```rust,no_run
+# extern crate jammi_ai;
+# use jammi_ai::fine_tune::FineTuneConfig;
+# fn make() -> FineTuneConfig {
 let mut rank_pattern = std::collections::HashMap::new();
 rank_pattern.insert("query".to_string(), 16);  // higher capacity on Q
 rank_pattern.insert("value".to_string(), 4);   // lower on V
@@ -204,6 +238,7 @@ let config = FineTuneConfig {
     rank_pattern,
     ..Default::default()
 };
+# config }
 ```
 
 ### On-disk artifact

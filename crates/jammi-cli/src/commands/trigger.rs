@@ -8,11 +8,12 @@
 //! recipes' Python / CLI tabs.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use clap::Subcommand;
+use clap::{ArgGroup, Subcommand};
 use datafusion::execution::context::SessionContext;
 use futures::StreamExt;
 use jammi_engine::catalog::backend::BackendImpl;
@@ -25,8 +26,8 @@ use jammi_engine::store::mutable::sqlite::SqliteMutableBackend;
 use jammi_engine::store::mutable::MutableBackend;
 use jammi_engine::tenant::TenantContext;
 use jammi_engine::trigger::{
-    InMemoryBroker, Offset, Predicate, Publisher, Subscriber, TopicDefinition, TopicId,
-    TriggerBroker,
+    DeliveredBatch, InMemoryBroker, Offset, Predicate, Publisher, Subscriber, TopicDefinition,
+    TopicId, TriggerBroker,
 };
 
 /// Subcommands under `jammi trigger`.
@@ -51,24 +52,37 @@ pub enum TriggerAction {
         broker_metadata: String,
     },
 
-    /// Publish one batch to a topic. Each `--row` argument is a JSON object
-    /// whose keys match the topic's column names; pass `--row` multiple
-    /// times to send multiple rows in one batch.
+    /// Publish one batch to a topic. Either pass one or more `--row` JSON
+    /// objects (one per row), or `--json-file` pointing at a JSON file
+    /// containing either an array of row objects or a single row object.
+    /// The two modes are mutually exclusive.
+    #[command(group(
+        ArgGroup::new("publish_input")
+            .args(["rows", "json_file"])
+            .required(true)
+            .multiple(false),
+    ))]
     Publish {
         /// Topic name to publish to.
         #[arg(long)]
-        name: String,
+        topic: String,
         /// One row per `--row` flag. JSON object syntax.
-        #[arg(long = "row", value_name = "JSON")]
+        #[arg(long = "row", value_name = "JSON", group = "publish_input")]
         rows: Vec<String>,
+        /// Path to a JSON file containing either an array of row objects or
+        /// a single row object. Mutually exclusive with `--row`.
+        #[arg(long, value_name = "PATH", group = "publish_input")]
+        json_file: Option<PathBuf>,
     },
 
     /// Subscribe and print every delivered batch as one JSON object per
-    /// row. Runs until interrupted with Ctrl-C.
+    /// row. With `--no-follow`, drains only the replay window from the
+    /// backing table and exits; otherwise runs until interrupted with
+    /// Ctrl-C.
     Subscribe {
         /// Topic name to subscribe to.
         #[arg(long)]
-        name: String,
+        topic: String,
         /// Optional SQL predicate; an empty string matches every row.
         #[arg(long, default_value = "")]
         predicate: String,
@@ -76,6 +90,10 @@ pub enum TriggerAction {
         /// retained event; omit to start at the live tail.
         #[arg(long)]
         from_offset: Option<u64>,
+        /// Drain only the replay window from the backing table and exit
+        /// instead of attaching to the live broker tail.
+        #[arg(long)]
+        no_follow: bool,
     },
 }
 
@@ -144,12 +162,17 @@ pub async fn run(
             schema,
             broker_metadata,
         } => register_topic(&handles, tenant, &name, &schema, &broker_metadata).await,
-        TriggerAction::Publish { name, rows } => publish_rows(&handles, tenant, &name, &rows).await,
+        TriggerAction::Publish {
+            topic,
+            rows,
+            json_file,
+        } => publish_rows(&handles, tenant, &topic, &rows, json_file.as_deref()).await,
         TriggerAction::Subscribe {
-            name,
+            topic,
             predicate,
             from_offset,
-        } => subscribe_topic(&handles, tenant, &name, &predicate, from_offset).await,
+            no_follow,
+        } => subscribe_topic(&handles, tenant, &topic, &predicate, from_offset, no_follow).await,
     }
 }
 
@@ -211,28 +234,29 @@ async fn publish_rows(
     tenant: Option<jammi_engine::TenantId>,
     name: &str,
     rows: &[String],
+    json_file: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if rows.is_empty() {
-        return Err("at least one --row argument is required".into());
-    }
     let topic = handles
         .topic_repo
         .lookup_by_name(name, tenant)
         .await?
         .ok_or_else(|| format!("topic '{name}' not found"))?;
     handles.broker.register_topic(&topic).await?;
-    let parsed_rows: Vec<serde_json::Map<String, serde_json::Value>> = rows
-        .iter()
-        .map(|s| -> Result<_, Box<dyn std::error::Error>> {
-            let value: serde_json::Value = serde_json::from_str(s)?;
-            value
-                .as_object()
-                .cloned()
-                .ok_or_else(|| "each --row must be a JSON object".into())
-        })
-        .collect::<Result<_, _>>()?;
 
-    let batch = build_batch(&topic.schema, &parsed_rows)?;
+    let batch = match json_file {
+        Some(path) => load_rows_from_file(path, &topic.schema)?,
+        None => {
+            // ArgGroup enforces that one of `rows` / `json_file` is set, so
+            // this branch always sees a non-empty rows vector. The empty
+            // check is a defensive belt-and-braces.
+            if rows.is_empty() {
+                return Err("at least one --row argument is required".into());
+            }
+            let parsed_rows = parse_row_strings(rows)?;
+            build_batch(&topic.schema, &parsed_rows)?
+        }
+    };
+
     let offset = handles.publisher.publish(&topic, batch).await?;
     println!("Published offset {}.", offset.value());
     Ok(())
@@ -244,6 +268,7 @@ async fn subscribe_topic(
     name: &str,
     predicate: &str,
     from_offset: Option<u64>,
+    no_follow: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let topic = handles
         .topic_repo
@@ -253,23 +278,93 @@ async fn subscribe_topic(
     handles.broker.register_topic(&topic).await?;
     let pred = Predicate::from_sql(&handles.session_ctx, Arc::clone(&topic.schema), predicate)?;
     let start = from_offset.map(|v| Offset::new(v, chrono::Utc::now()));
+
+    if no_follow {
+        let drained = handles.subscriber.replay_only(&topic, pred, start).await?;
+        for delivered in drained {
+            emit_delivered(&delivered)?;
+        }
+        return Ok(());
+    }
+
     let mut stream = handles.subscriber.subscribe(&topic, pred, start).await?;
     eprintln!("Listening on topic '{}'. Ctrl-C to exit.", topic.name);
     while let Some(item) = stream.next().await {
         let delivered = item?;
-        let rows = batch_to_json_rows(&delivered.batch)?;
-        for row in rows {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "offset": delivered.offset.value(),
-                    "produced_at_us": delivered.produced_at.timestamp_micros(),
-                    "row": row,
-                })
-            );
-        }
+        emit_delivered(&delivered)?;
     }
     Ok(())
+}
+
+/// Render one delivered batch as one JSON object per row to stdout.
+fn emit_delivered(delivered: &DeliveredBatch) -> Result<(), Box<dyn std::error::Error>> {
+    let rows = batch_to_json_rows(&delivered.batch)?;
+    for row in rows {
+        println!(
+            "{}",
+            serde_json::json!({
+                "offset": delivered.offset.value(),
+                "produced_at_us": delivered.produced_at.timestamp_micros(),
+                "row": row,
+            })
+        );
+    }
+    Ok(())
+}
+
+/// Parse each `--row` JSON string into a row object. Each entry must be a
+/// JSON object whose keys match the topic schema.
+fn parse_row_strings(
+    rows: &[String],
+) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, Box<dyn std::error::Error>> {
+    rows.iter()
+        .map(|s| -> Result<_, Box<dyn std::error::Error>> {
+            let value: serde_json::Value = serde_json::from_str(s)?;
+            value
+                .as_object()
+                .cloned()
+                .ok_or_else(|| "each --row must be a JSON object".into())
+        })
+        .collect()
+}
+
+/// Read a JSON file containing either an array of row objects or a single
+/// row object, validate every row is a JSON object, and build a
+/// `RecordBatch` matching `schema`.
+pub(crate) fn load_rows_from_file(
+    path: &Path,
+    schema: &SchemaRef,
+) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("read json file {}: {e}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("parse json file {}: {e}", path.display()))?;
+    let rows: Vec<serde_json::Map<String, serde_json::Value>> = match value {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .map(|v| -> Result<_, Box<dyn std::error::Error>> {
+                v.as_object().cloned().ok_or_else(|| {
+                    format!(
+                        "json file {} contains an array element that is not a JSON object",
+                        path.display()
+                    )
+                    .into()
+                })
+            })
+            .collect::<Result<_, _>>()?,
+        serde_json::Value::Object(obj) => vec![obj],
+        _ => {
+            return Err(format!(
+                "json file {} must be a JSON object or an array of JSON objects",
+                path.display()
+            )
+            .into());
+        }
+    };
+    if rows.is_empty() {
+        return Err(format!("json file {} contains zero rows", path.display()).into());
+    }
+    build_batch(schema, &rows)
 }
 
 fn parse_schema_spec(spec: &str) -> Result<Schema, Box<dyn std::error::Error>> {
@@ -393,5 +488,71 @@ fn simple_type_name(ty: &DataType) -> &'static str {
         DataType::Utf8 => "string",
         DataType::Boolean => "bool",
         _ => "?",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("op", DataType::Utf8, false),
+            Field::new("ts_ms", DataType::Int64, false),
+            Field::new("key", DataType::Utf8, false),
+        ]))
+    }
+
+    #[test]
+    fn load_rows_from_file_accepts_array() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("rows.json");
+        std::fs::write(
+            &path,
+            r#"[
+                {"op":"c","ts_ms":1,"key":"a"},
+                {"op":"u","ts_ms":2,"key":"a"}
+            ]"#,
+        )
+        .unwrap();
+        let batch = load_rows_from_file(&path, &schema()).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+    }
+
+    #[test]
+    fn load_rows_from_file_accepts_single_object() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("rows.json");
+        std::fs::write(&path, r#"{"op":"c","ts_ms":1,"key":"a"}"#).unwrap();
+        let batch = load_rows_from_file(&path, &schema()).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+    }
+
+    #[test]
+    fn load_rows_from_file_rejects_malformed_json() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("rows.json");
+        std::fs::write(&path, "not json").unwrap();
+        let err = load_rows_from_file(&path, &schema()).unwrap_err();
+        assert!(err.to_string().contains("parse json file"));
+    }
+
+    #[test]
+    fn load_rows_from_file_rejects_scalar() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("rows.json");
+        std::fs::write(&path, "42").unwrap();
+        let err = load_rows_from_file(&path, &schema()).unwrap_err();
+        assert!(err.to_string().contains("JSON object"));
+    }
+
+    #[test]
+    fn load_rows_from_file_rejects_empty_array() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("rows.json");
+        std::fs::write(&path, "[]").unwrap();
+        let err = load_rows_from_file(&path, &schema()).unwrap_err();
+        assert!(err.to_string().contains("zero rows"));
     }
 }

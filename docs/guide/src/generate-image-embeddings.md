@@ -6,7 +6,12 @@ Generate vector embeddings from images using a vision model. Results are persist
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
 let record = session.generate_image_embeddings(
     "figures",
     "patentclip/PatentCLIP_Vit_B",
@@ -15,6 +20,7 @@ let record = session.generate_image_embeddings(
 ).await?;
 
 println!("Embedded {} images, {} dimensions", record.row_count, record.dimensions.unwrap());
+# Ok(()) }
 ```
 
 ### Python
@@ -51,10 +57,16 @@ To embed one image without persistence (e.g., for a query):
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> Result<(), Box<dyn std::error::Error>> {
 let image_bytes = std::fs::read("query.png")?;
 let vector = session.encode_image_query("patentclip/PatentCLIP_Vit_B", &image_bytes).await?;
 // vector: Vec<f32>, 512 dimensions, L2-normalized
+# Ok(()) }
 ```
 
 ### Python

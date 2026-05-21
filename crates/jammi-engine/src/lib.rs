@@ -13,6 +13,7 @@ pub mod index;
 pub mod session;
 pub mod source;
 pub mod sql;
+pub mod storage;
 pub mod store;
 pub mod tenant;
 pub mod tenant_scope;

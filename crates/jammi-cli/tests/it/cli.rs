@@ -40,11 +40,9 @@ fn add_source(artifact_dir: &Path, tenant: Option<&str>, name: &str, fixture: &P
     if let Some(t) = tenant {
         cmd.args(["--tenant", t]);
     }
-    cmd.args([
-        "sources", "add", name, "--path", path, "--format", "parquet",
-    ])
-    .assert()
-    .success();
+    cmd.args(["sources", "add", name, "--url", path, "--format", "parquet"])
+        .assert()
+        .success();
 }
 
 /// SPEC-03 §12 #7 — every tenant binding receives a disjoint view of

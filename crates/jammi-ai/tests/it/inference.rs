@@ -105,7 +105,7 @@ mod live {
         session
             .add_source(
                 "patents",
-                SourceType::Local,
+                SourceType::File,
                 SourceConnection {
                     url: Some(common::fixture_url("patents.parquet")),
                     format: Some(FileFormat::Parquet),
@@ -426,7 +426,7 @@ mod live {
         session
             .add_source(
                 "test_imgs",
-                SourceType::Local,
+                SourceType::File,
                 SourceConnection {
                     url: Some(format!("file://{}", parquet_path.display())),
                     format: Some(FileFormat::Parquet),

@@ -21,7 +21,7 @@ async fn session_with_patents() -> (InferenceSession, TempDir) {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -55,7 +55,7 @@ async fn generate_embeddings_produces_complete_result() {
     // Parquet file exists with rows
     assert!(record.row_count > 0);
     assert!(
-        std::path::Path::new(&record.parquet_path).exists(),
+        common::url_to_path(&record.parquet_path).exists(),
         "Parquet file should exist at {}",
         record.parquet_path
     );
@@ -81,11 +81,11 @@ async fn generate_embeddings_produces_complete_result() {
     assert!(record.text_columns.as_deref() == Some("abstract"));
 
     // Sidecar index files exist
-    let base_path = record
+    let base_url = record
         .index_path
         .as_ref()
         .expect("Embedding table should have index_path");
-    let base = std::path::Path::new(base_path);
+    let base = common::url_to_path(base_url);
     assert!(
         base.with_extension("usearch").exists(),
         "USearch index missing"
@@ -110,7 +110,7 @@ async fn generate_embeddings_produces_complete_result() {
     assert!(results[0].schema().field_with_name("_source_id").is_ok());
 
     // Readable by external Parquet tools (no Jammi context)
-    let file = std::fs::File::open(&record.parquet_path).unwrap();
+    let file = std::fs::File::open(common::url_to_path(&record.parquet_path)).unwrap();
     let builder =
         parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
     let reader = builder.build().unwrap();
@@ -155,8 +155,8 @@ async fn multiple_tables_and_sidecar_fallback() {
     assert!(tables.len() >= 2);
 
     // Delete sidecar for r1 — Parquet still queryable
-    if let Some(ref base) = r1.index_path {
-        let base = std::path::Path::new(base);
+    if let Some(ref base_url) = r1.index_path {
+        let base = common::url_to_path(base_url);
         std::fs::remove_file(base.with_extension("usearch")).ok();
         std::fs::remove_file(base.with_extension("rowmap")).ok();
         std::fs::remove_file(base.with_extension("manifest.json")).ok();
@@ -185,7 +185,7 @@ async fn failed_rows_skipped_in_embedding_output() {
     session
         .add_source(
             "patents_nulls",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents_with_nulls.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -256,7 +256,7 @@ async fn existing_tables_loaded_on_new_session() {
         session
             .add_source(
                 "patents",
-                SourceType::Local,
+                SourceType::File,
                 SourceConnection {
                     url: Some(common::fixture_url("patents.parquet")),
                     format: Some(FileFormat::Parquet),
@@ -309,7 +309,7 @@ async fn concurrent_embedding_generation_on_same_source() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -429,7 +429,7 @@ async fn large_batch_embedding_completes_without_oom() {
     session
         .add_source(
             "large_batch",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(parquet_url),
                 format: Some(FileFormat::Parquet),

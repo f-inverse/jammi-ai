@@ -52,7 +52,7 @@ def test_with_tenant_filters_federated_source(tmp_path):
     # Register the source once with an unbound session. Both per-tenant
     # sessions reload it from the catalog on connect.
     registrar = jammi.connect(artifact_dir=str(artifact_dir))
-    registrar.add_source("notes", path=str(pq_path), format="parquet")
+    registrar.add_source("notes", url=str(pq_path), format="parquet")
     del registrar
 
     db_a = jammi.connect(artifact_dir=str(artifact_dir))

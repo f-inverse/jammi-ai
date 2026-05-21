@@ -233,7 +233,7 @@ async fn session_with_training_data() -> (Arc<InferenceSession>, TempDir) {
     session
         .add_source(
             "training",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("training_pairs.csv")),
                 format: Some(FileFormat::Csv),
@@ -725,7 +725,7 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -739,7 +739,7 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
     session
         .add_source(
             "golden_rel",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("golden_relevance.csv")),
                 format: Some(FileFormat::Csv),

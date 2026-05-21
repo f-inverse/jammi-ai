@@ -341,7 +341,7 @@ async fn session_with_embeddings_and_golden() -> (Arc<InferenceSession>, String,
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -367,7 +367,7 @@ async fn session_with_embeddings_and_golden() -> (Arc<InferenceSession>, String,
     session
         .add_source(
             "golden_rel",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("golden_relevance.csv")),
                 format: Some(FileFormat::Csv),
@@ -520,7 +520,7 @@ async fn eval_compare_distinct_tables_has_nonzero_deltas() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -533,7 +533,7 @@ async fn eval_compare_distinct_tables_has_nonzero_deltas() {
     session
         .add_source(
             "golden_rel",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("golden_relevance.csv")),
                 format: Some(FileFormat::Csv),
@@ -605,7 +605,7 @@ async fn eval_image_embeddings_end_to_end() {
     session
         .add_source(
             "figures",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("figures.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -626,7 +626,7 @@ async fn eval_image_embeddings_end_to_end() {
     session
         .add_source(
             "golden_img",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("golden_image_relevance.parquet")),
                 format: Some(FileFormat::Parquet),

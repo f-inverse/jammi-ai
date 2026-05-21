@@ -45,7 +45,7 @@ use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 session
     .add_source(
         "notes",
-        SourceType::Local,
+        SourceType::File,
         SourceConnection {
             url: Some("file:///data/notes.parquet".into()),
             format: Some(FileFormat::Parquet),

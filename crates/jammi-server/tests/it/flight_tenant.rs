@@ -81,7 +81,7 @@ async fn start_flight_test_server() -> (SocketAddr, TempDir, tokio::task::JoinHa
     session
         .add_source(
             "notes",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(format!("file://{}", pq_path.display())),
                 format: Some(FileFormat::Parquet),

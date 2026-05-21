@@ -14,8 +14,9 @@ use crate::error::{JammiError, Result};
 use crate::source::mutable::MutableTableRegistry;
 use crate::source::registry::SourceCatalog;
 use crate::source::schema_provider::JammiSchemaProvider;
-use crate::source::{local, table_name_from_url, SourceConnection, SourceType};
+use crate::source::{file_format, table_name_from_url, SourceConnection, SourceType};
 use crate::sql::topic_ddl::{self, TopicDdl};
+use crate::storage::{StorageRegistry, StorageUrl};
 use crate::store::mutable::definition::{MutableTableDefinition, MutableTableId};
 use crate::store::mutable::sqlite::SqliteMutableBackend;
 use crate::store::mutable::MutableBackend;
@@ -38,6 +39,10 @@ pub struct JammiSession {
     /// per-source tenant columns at `add_source` time (for federated sources
     /// whose tenant discriminator has a non-`tenant_id` name).
     source_tenant_columns: Arc<SourceTenantColumns>,
+    /// Process-wide cache of `object_store` drivers keyed by (scheme, bucket).
+    /// Used to register `s3://` / `gs://` / `azure://` URLs with both the
+    /// engine's own writers and DataFusion's `ListingTable` reader.
+    storage_registry: StorageRegistry,
     mutable: Arc<MutableTableRegistry>,
     mutable_schema: Arc<JammiSchemaProvider>,
     /// Default broker used by the in-process trigger surface — replaced at
@@ -175,6 +180,7 @@ impl JammiSession {
             config,
             tenant: tenant_binding,
             source_tenant_columns,
+            storage_registry: StorageRegistry::new(),
             mutable,
             mutable_schema,
             trigger_broker,
@@ -297,24 +303,28 @@ impl JammiSession {
         connection: &SourceConnection,
     ) -> Result<()> {
         let tables: Vec<(String, Arc<dyn datafusion::catalog::TableProvider>)> = match source_type {
-            SourceType::Local => {
+            SourceType::File => {
                 let format = connection
                     .format
                     .as_ref()
-                    .ok_or_else(|| JammiError::Config("Local source requires a format".into()))?;
-                let url = connection
+                    .ok_or_else(|| JammiError::Config("File source requires a format".into()))?;
+                let raw_url = connection
                     .url
                     .as_deref()
-                    .ok_or_else(|| JammiError::Config("Local source requires a URL".into()))?;
+                    .ok_or_else(|| JammiError::Config("File source requires a URL".into()))?;
+                let url = StorageUrl::parse(raw_url)?;
                 let state = self.ctx.state();
-                let table = local::create_listing_table(
-                    url,
+                let table = file_format::create_listing_table(
+                    &self.ctx,
+                    &self.storage_registry,
+                    &url,
                     format,
                     connection.file_extension.as_deref(),
+                    connection.cloud.as_ref(),
                     &state,
                 )
                 .await?;
-                let name = table_name_from_url(url);
+                let name = table_name_from_url(url.as_str());
                 vec![(name, table)]
             }
             #[cfg(feature = "postgres")]
@@ -366,21 +376,52 @@ impl JammiSession {
             .delete_result_tables_for_source(source_id)
             .await?;
 
-        // 2. Delete Parquet and index files from disk (best-effort).
+        // 2. Delete Parquet objects and sidecar bundles via the storage
+        //    layer. 404 is not an error — same best-effort semantics as
+        //    before, now portable across `file://` / `s3://` / `gs://`.
         for rt in &result_tables {
-            if let Err(e) = std::fs::remove_file(&rt.parquet_path) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!("Failed to delete parquet file '{}': {e}", rt.parquet_path);
+            let parquet_url = match StorageUrl::parse(&rt.parquet_path) {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %rt.parquet_path,
+                        error = %e,
+                        "Invalid parquet path on result-table row, skipping delete"
+                    );
+                    continue;
+                }
+            };
+            let driver = match self.storage_registry.driver_for(&parquet_url, None) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(path = %parquet_url, error = %e, "Driver init failed during cleanup");
+                    continue;
+                }
+            };
+            let handle = crate::storage::JammiObjectStore::new(driver, parquet_url.clone());
+            if let Ok(path) = handle.data_path() {
+                if let Err(e) = handle.delete_if_exists(&path).await {
+                    tracing::warn!(path = %parquet_url, error = %e, "Failed to delete parquet object");
                 }
             }
             if let Some(idx) = &rt.index_path {
-                for ext in ["", ".rowmap", ".manifest"] {
-                    let path = format!("{idx}{ext}");
-                    if let Err(e) = std::fs::remove_file(&path) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            tracing::warn!("Failed to delete index file '{path}': {e}");
-                        }
+                let idx_url = match StorageUrl::parse(idx) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        tracing::warn!(path = %idx, error = %e, "Invalid index path on result-table row, skipping delete");
+                        continue;
                     }
+                };
+                let idx_driver = match self.storage_registry.driver_for(&idx_url, None) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(path = %idx_url, error = %e, "Index driver init failed during cleanup");
+                        continue;
+                    }
+                };
+                let idx_handle = crate::storage::JammiObjectStore::new(idx_driver, idx_url.clone());
+                if let Err(e) = crate::storage::sidecar_layout::delete_sidecar(&idx_handle).await {
+                    tracing::warn!(path = %idx_url, error = %e, "Failed to delete sidecar bundle");
                 }
             }
         }
@@ -544,6 +585,14 @@ impl JammiSession {
     /// Return a reference to the artifact catalog.
     pub fn catalog(&self) -> &Arc<Catalog> {
         &self.catalog
+    }
+
+    /// Shared handle to the storage registry. Components that write
+    /// Jammi-owned artifacts (result Parquet, sidecar indexes) consult
+    /// this to resolve a [`crate::storage::JammiObjectStore`] for any
+    /// URL the session has already seen.
+    pub fn storage_registry(&self) -> StorageRegistry {
+        self.storage_registry.clone()
     }
 
     /// Return a reference to the active configuration.

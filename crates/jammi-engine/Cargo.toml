@@ -23,6 +23,18 @@ live-broker-tests = ["jetstream-broker"]
 # arms when env vars are set. Off by default; the
 # `mutable_crash_recovery.rs` integration test requires it.
 test-hooks = []
+# Object-store backends. The default build only ships `file://` and
+# `memory://`; cloud schemes are opt-in per provider so a tenant who
+# never publishes to S3 does not pull in the AWS SDK chain.
+storage-s3 = ["object_store/aws"]
+storage-gcs = ["object_store/gcp"]
+storage-azure = ["object_store/azure"]
+storage-cloud = ["storage-s3", "storage-gcs", "storage-azure"]
+# Live cloud tests: require credentials + JAMMI_TEST_*_BUCKET env vars.
+# Each implies the matching driver feature so the live test compiles.
+live-s3-tests = ["storage-s3"]
+live-gcs-tests = ["storage-gcs"]
+live-azure-tests = ["storage-azure"]
 
 [dependencies]
 # Query engine
@@ -40,6 +52,11 @@ datafusion-table-providers = { version = "0.10.1", default-features = false, opt
 parquet.workspace = true
 usearch.workspace = true
 sqlx.workspace = true
+object_store.workspace = true
+bytes = "1"
+# tempfile is needed by storage::sidecar_layout to bridge USearch's
+# path-based FFI into object_store's byte-stream API for cloud schemes.
+tempfile = "3"
 
 # Config
 serde.workspace = true

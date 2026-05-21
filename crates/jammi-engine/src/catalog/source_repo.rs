@@ -9,7 +9,7 @@ use super::Catalog;
 pub struct SourceRecord {
     /// Unique identifier for this data source.
     pub source_id: String,
-    /// Backend type (e.g., `Local`, `Postgres`, `S3`).
+    /// Backend type (e.g., `File`, `Postgres`, `Mysql`).
     pub source_type: SourceType,
     /// Deserialized connection parameters.
     pub connection: SourceConnection,

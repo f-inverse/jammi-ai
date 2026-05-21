@@ -16,7 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session = Arc::new(InferenceSession::new(config).await?);
 
     // 1. Register a data source
-    session.add_source("patents", SourceType::Local, SourceConnection {
+    session.add_source("patents", SourceType::File, SourceConnection {
         url: Some("file:///path/to/patents.parquet".into()),
         format: Some(FileFormat::Parquet),
         ..Default::default()

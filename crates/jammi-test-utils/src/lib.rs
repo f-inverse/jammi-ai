@@ -77,6 +77,15 @@ pub fn fixture_url(name: &str) -> String {
     format!("file://{}", fixture(name).display())
 }
 
+/// Convert a `file://...` URL back into a filesystem `PathBuf` for tests
+/// that need to exercise on-disk file existence checks (e.g. asserting a
+/// sidecar bundle was written, or peeking at the raw bytes a result-table
+/// row references). Returns the input unchanged when no `file://` prefix
+/// is present so the helper composes with callers that already strip it.
+pub fn url_to_path(url: &str) -> PathBuf {
+    PathBuf::from(url.strip_prefix("file://").unwrap_or(url))
+}
+
 /// Create a JammiConfig pointing at a temporary artifact directory.
 pub fn test_config(artifact_dir: &Path) -> jammi_engine::config::JammiConfig {
     jammi_engine::config::JammiConfig {

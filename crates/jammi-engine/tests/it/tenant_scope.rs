@@ -245,7 +245,7 @@ async fn catalog_sources_isolated_by_tenant() {
     session_a
         .add_source(
             "src_a",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -262,7 +262,7 @@ async fn catalog_sources_isolated_by_tenant() {
     session_b
         .add_source(
             "src_b",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -295,7 +295,7 @@ async fn catalog_unscoped_session_sees_global_only_after_scoped_writes() {
     unscoped
         .add_source(
             "global_src",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -312,7 +312,7 @@ async fn catalog_unscoped_session_sees_global_only_after_scoped_writes() {
     scoped
         .add_source(
             "tenant_a_src",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -395,7 +395,7 @@ async fn federated_source_tenant_column_filters_split_6_4() {
         registrar
             .add_source(
                 "notes",
-                SourceType::Local,
+                SourceType::File,
                 SourceConnection {
                     url: Some(url),
                     format: Some(FileFormat::Parquet),

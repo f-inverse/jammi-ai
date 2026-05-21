@@ -9,7 +9,7 @@ Join search results with a registered source to add context columns (e.g., compa
 ### Rust
 
 ```rust
-session.add_source("assignees", SourceType::Local, SourceConnection {
+session.add_source("assignees", SourceType::File, SourceConnection {
     url: Some("file:///data/assignees.csv".into()),
     format: Some(FileFormat::Csv),
     ..Default::default()

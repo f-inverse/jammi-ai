@@ -85,6 +85,11 @@ pub enum JammiError {
     #[error("Trigger error: {0}")]
     Trigger(#[from] crate::trigger::TriggerError),
 
+    /// Object-store / storage-layer failure (URL parse, driver init,
+    /// remote I/O, on-the-wire layout corruption).
+    #[error("Storage error: {0}")]
+    Storage(#[from] crate::storage::StorageError),
+
     /// Catch-all for errors that don't fit another variant.
     #[error("{0}")]
     Other(String),

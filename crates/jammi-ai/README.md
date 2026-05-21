@@ -16,7 +16,7 @@ let config = JammiConfig::load(None)?;
 let session = Arc::new(InferenceSession::new(config).await?);
 
 // Register data and generate embeddings
-session.add_source("patents", SourceType::Local, SourceConnection {
+session.add_source("patents", SourceType::File, SourceConnection {
     url: Some("file:///path/to/patents.parquet".into()),
     format: Some(FileFormat::Parquet),
     ..Default::default()

@@ -19,7 +19,7 @@ async fn smoke_cp3_full_pipeline() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -38,9 +38,9 @@ async fn smoke_cp3_full_pipeline() {
 
     assert_eq!(record.status, "ready");
     assert!(record.row_count > 0);
-    assert!(std::path::Path::new(&record.parquet_path).exists());
+    assert!(common::url_to_path(&record.parquet_path).exists());
 
-    let base = std::path::Path::new(record.index_path.as_ref().unwrap());
+    let base = common::url_to_path(record.index_path.as_ref().unwrap());
     assert!(base.with_extension("usearch").exists());
     assert!(base.with_extension("rowmap").exists());
     assert!(base.with_extension("manifest.json").exists());

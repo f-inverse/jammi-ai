@@ -38,7 +38,7 @@ async fn session_with_training_data() -> (Arc<InferenceSession>, TempDir) {
     session
         .add_source(
             "training",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("training_pairs.csv")),
                 format: Some(FileFormat::Csv),

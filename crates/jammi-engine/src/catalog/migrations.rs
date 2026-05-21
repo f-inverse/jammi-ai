@@ -30,6 +30,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         schema::MIGRATION_008_MUTABLE_ORDER_COLUMN,
     ),
     ("009_topics", schema::MIGRATION_009_TOPICS),
+    (
+        "010_rename_source_type_local_to_file",
+        schema::MIGRATION_010_RENAME_SOURCE_TYPE_LOCAL_TO_FILE,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

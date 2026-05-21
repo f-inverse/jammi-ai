@@ -46,8 +46,15 @@ arrow-array = "57"
 arrow-ipc = "57"
 
 # Storage
-parquet = "57"
+# The `object_store` feature pulls in `ParquetObjectWriter`, the async sink
+# Jammi uses for every result-table write. Without it the writer falls back
+# to a sync `File` path that can't target S3 / GCS / Azure.
+parquet = { version = "57", features = ["object_store"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres", "uuid", "chrono", "json", "macros"] }
+# Object-store pin matches the transitive version DataFusion 52.3 carries
+# (see Cargo.lock: object_store 0.12.5). Mismatching this would force
+# duplicate crates in the dep graph and break ListingTableUrl interop.
+object_store = { version = "0.12", default-features = false }
 
 # ML inference
 candle-core = "0.9"

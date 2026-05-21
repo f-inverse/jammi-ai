@@ -214,6 +214,23 @@ pub(super) const MIGRATION_008_MUTABLE_ORDER_COLUMN: &str = r#"
 ALTER TABLE mutable_tables ADD COLUMN order_column TEXT;
 "#;
 
+/// Migration 010 — rename `source_type = 'local'` to `'file'`.
+///
+/// The `SourceType` enum on the Rust side has its `Local` variant
+/// renamed `File` so the engine's file-shaped source driver can target
+/// any `StorageUrl` (local disk, S3, GCS, Azure). The serde rename is
+/// not back-compatible — there is no `#[serde(alias = "local")]` — so
+/// every existing row whose JSON-encoded `source_type` column reads
+/// `"local"` must be rewritten to `"file"` before the next catalog
+/// read.
+///
+/// The column stores the JSON-encoded enum tag rather than the bare
+/// snake-case string — `'"local"'` is what `serde_json::to_string` emits
+/// for `SourceType::Local`. The UPDATE matches that exact spelling.
+pub(super) const MIGRATION_010_RENAME_SOURCE_TYPE_LOCAL_TO_FILE: &str = r#"
+UPDATE sources SET source_type = '"file"' WHERE source_type = '"local"';
+"#;
+
 /// Migration 009 — trigger-stream `topics` catalog table.
 ///
 /// One row per registered topic. The Arrow schema is persisted as JSON

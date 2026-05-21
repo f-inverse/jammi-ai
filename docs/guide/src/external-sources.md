@@ -46,8 +46,9 @@ WHERE a.institution = 'MIT'
 External databases work as sources for embedding generation:
 
 ```python
-db.add_source("pg_articles", path="postgresql://user:pass@localhost/mydb", format="parquet")
-# Note: for external databases, use the Rust API to register with the appropriate source_type
+# Note: external databases must be registered through the Rust API,
+# which exposes the typed SourceType::Postgres / SourceType::Mysql variants.
+# The Python `add_source(url=…, format=…)` surface is for file-shaped sources.
 
 db.generate_text_embeddings(
     source="pg_articles",
@@ -72,7 +73,8 @@ These are enabled by default in published crates and pre-built binaries.
 
 | Type | Description | Status |
 |------|-------------|--------|
-| Local files | Parquet, CSV, JSON | Always available |
+| File (`file://`) | Parquet, CSV, JSON on local disk | Always available |
+| File (`s3://` / `gs://` / `azure://`) | Same formats over cloud object stores | Feature-gated — see [Cloud Storage](./cloud-storage.md) |
 | PostgreSQL | Any PostgreSQL-compatible database | Available |
 | MySQL | MySQL / MariaDB | Available |
 | SQLite | SQLite databases | Not supported (rusqlite version conflict) |

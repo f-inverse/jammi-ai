@@ -19,7 +19,7 @@ Register the training data as a source:
 ### Rust
 
 ```rust
-session.add_source("training", SourceType::Local, SourceConnection {
+session.add_source("training", SourceType::File, SourceConnection {
     url: Some("file:///data/training_pairs.csv".into()),
     format: Some(FileFormat::Csv),
     ..Default::default()

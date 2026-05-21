@@ -351,19 +351,19 @@ impl InferenceSession {
                 .create_table(source_id, &task_str, &source.to_string(), None, None, None)
                 .await?;
             let schema = batches[0].schema();
-            let mut writer = jammi_engine::store::writer::ParquetResultWriter::new(
-                &table_info.parquet_path,
-                schema,
-            )?;
+            let mut writer = self
+                .result_store
+                .open_writer(&table_info.parquet_url, schema)
+                .await?;
             for batch in &batches {
-                writer.write_batch(batch)?;
+                writer.write_batch(batch).await?;
             }
-            let row_count = writer.close()?;
+            let row_count = writer.close().await?;
             self.result_store
                 .finalize(
                     self.inner.context(),
                     &table_info.table_name,
-                    &table_info.parquet_path,
+                    &table_info.parquet_url,
                     row_count,
                 )
                 .await?;

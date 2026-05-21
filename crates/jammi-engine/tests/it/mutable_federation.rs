@@ -163,7 +163,7 @@ async fn mutable_thousand_row_insert_then_federation_join(backend: BackendKind) 
     session
         .add_source(
             "payloads",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(format!("file://{}", pq_path.display())),
                 format: Some(FileFormat::Parquet),
@@ -257,7 +257,7 @@ async fn mutable_join_parquet_returns_one_row_per_matching_id(backend: BackendKi
     session
         .add_source(
             "vectors",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(format!("file://{}", pq_path.display())),
                 format: Some(FileFormat::Parquet),

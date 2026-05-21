@@ -7,13 +7,16 @@ use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 pub enum SourceAction {
     /// List registered sources
     List,
-    /// Add a local file source
+    /// Add a file-shaped data source. `--url` accepts a local path
+    /// (parsed into `file://...`) or any storage URL the build was
+    /// compiled with: `s3://bucket/key`, `gs://bucket/key`,
+    /// `azure://container/blob`.
     Add {
         /// Source name
         name: String,
-        /// Path to the data file
+        /// Storage URL or local path
         #[arg(long)]
-        path: String,
+        url: String,
         /// File format (parquet, csv, json)
         #[arg(long)]
         format: String,
@@ -47,17 +50,17 @@ pub async fn run(
                 }
             }
         }
-        SourceAction::Add { name, path, format } => {
+        SourceAction::Add { name, url, format } => {
             let file_format: FileFormat = format
                 .parse()
                 .map_err(|e: jammi_engine::error::JammiError| e.to_string())?;
-            let connection = SourceConnection::from_path(&path, file_format);
+            let connection = SourceConnection::parse(&url, file_format)?;
             let session = InferenceSession::new(config).await?;
             if let Some(t) = tenant {
                 session.bind_tenant(t);
             }
             session
-                .add_source(&name, SourceType::Local, connection)
+                .add_source(&name, SourceType::File, connection)
                 .await?;
             println!("Source '{name}' added.");
         }

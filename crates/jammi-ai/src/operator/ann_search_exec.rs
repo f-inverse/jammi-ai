@@ -123,6 +123,7 @@ impl ExecutionPlan for AnnSearchExec {
         let result_stream = stream::once(async move {
             let search_results = match result_store
                 .resolve_search_mode(&table)
+                .await
                 .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
             {
                 Some(index) => index

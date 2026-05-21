@@ -33,7 +33,7 @@ async fn session_with_patents() -> (InferenceSession, TempDir) {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -191,7 +191,7 @@ async fn e2e_null_text_rows_produce_error_status() {
     session
         .add_source(
             "patents_nulls",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents_with_nulls.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -252,7 +252,7 @@ async fn e2e_error_rows_have_null_vector_and_error_message() {
     session
         .add_source(
             "patents_nulls",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents_with_nulls.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -337,7 +337,7 @@ async fn e2e_observer_receives_batch_notifications() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),

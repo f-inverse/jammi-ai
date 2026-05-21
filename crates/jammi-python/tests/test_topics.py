@@ -51,7 +51,9 @@ def test_register_publish_subscribe_round_trips(tmp_path):
         schema=_events_schema(),
     )
     offset = db.publish_topic("events.demo", batch=batch)
-    assert offset >= 1
+    # The broker assigns offsets sequentially per topic starting at 0,
+    # so the first publish on a fresh topic returns offset 0.
+    assert offset == 0
 
     collected = db.subscribe_collect("events.demo", max_batches=4)
     event_ids = collected.column("event_id").to_pylist()

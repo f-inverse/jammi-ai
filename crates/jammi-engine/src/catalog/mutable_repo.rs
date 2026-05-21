@@ -137,9 +137,53 @@ impl Catalog {
         )?))
     }
 
+    /// List every registered mutable table across all tenants. Used by
+    /// session startup to register a `TableProvider` for each persisted
+    /// row so DataFusion can resolve `mutable.public.<id>` regardless of
+    /// which tenant the session later binds to.
+    pub async fn list_all_mutable_tables(
+        &self,
+    ) -> Result<Vec<MutableTableDefinition>, MutableTableError> {
+        let entries: Vec<MutableListingTuple> = self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query(
+                            "SELECT id, schema_json, primary_key, tenant_id, user_metadata, order_column \
+                             FROM mutable_tables ORDER BY id",
+                            &[],
+                            read_listed_row,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?;
+
+        let mut defs = Vec::with_capacity(entries.len());
+        for (id_str, schema_json, pk_json, tenant_str, metadata_json, order_column) in entries {
+            let id = MutableTableId::new(id_str)?;
+            let indexes = self.list_mutable_table_indexes(&id).await?;
+            defs.push(materialize(
+                id,
+                schema_json,
+                pk_json,
+                tenant_str,
+                metadata_json,
+                order_column,
+                indexes,
+            )?);
+        }
+        Ok(defs)
+    }
+
     /// List mutable tables, optionally filtered by tenant. When `tenant`
-    /// is `None`, returns only rows whose `tenant_id` is `NULL` (Phase 3
-    /// will broaden this once the predicate-injection layer ships).
+    /// is `None`, returns only rows whose `tenant_id` is `NULL`.
     pub async fn list_mutable_tables(
         &self,
         tenant: Option<TenantId>,

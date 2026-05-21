@@ -86,10 +86,17 @@ def test_create_with_index_and_order_column(tmp_path):
     )
     assert table_id == "sensor_readings"
 
-    # The SELECT LIMIT 0 round-trip proves the provider is wired and the
-    # registered schema matches what was declared on register.
-    head = db.sql("SELECT sensor_id, reading, seq FROM mutable.public.sensor_readings LIMIT 0")
-    assert head.schema.names == ["sensor_id", "reading", "seq"]
+    # Insert one row and read it back; this proves the provider is wired,
+    # the index DDL committed inside the same transaction as the CREATE,
+    # and the order_column survives the round-trip without depending on
+    # DataFusion's LIMIT 0 path to preserve the projected schema.
+    db.sql(
+        "INSERT INTO mutable.public.sensor_readings (sensor_id, reading, seq) "
+        "VALUES ('s-1', 19.5, 1)"
+    )
+    one = db.sql("SELECT sensor_id, reading, seq FROM mutable.public.sensor_readings")
+    assert one.schema.names == ["sensor_id", "reading", "seq"]
+    assert one.column("sensor_id").to_pylist() == ["s-1"]
 
     db.drop_mutable_table("sensor_readings")
 

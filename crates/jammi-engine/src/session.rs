@@ -507,10 +507,14 @@ impl JammiSession {
     }
 
     /// Re-register mutable tables persisted in the catalog from a previous
-    /// process. Called on startup. Lists tables visible to the current
-    /// tenant binding (initially `Unscoped`).
+    /// process. Called on startup. Registers a `TableProvider` for every
+    /// table across every tenant — DataFusion name resolution does not
+    /// honour session scope, so the table must be discoverable in
+    /// `mutable.public.<id>` regardless of which tenant the session later
+    /// binds to. Per-row tenant filtering is applied by the analyzer at
+    /// query time.
     async fn reload_mutable_tables(&self) -> Result<()> {
-        let defs = self.mutable.list(self.tenant()).await?;
+        let defs = self.mutable.list_all().await?;
         for def in defs {
             let id = def.id.clone();
             let provider = self.mutable.provider_for(def);

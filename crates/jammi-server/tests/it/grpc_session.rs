@@ -6,36 +6,23 @@
 //! scoped topics; an invalid UUID is rejected with `InvalidArgument`.
 
 use std::net::SocketAddr;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use jammi_engine::session::JammiSession;
-use jammi_engine::TenantId;
 use jammi_server::grpc::proto::session::session_service_client::SessionServiceClient;
 use jammi_server::grpc::proto::session::{SetTenantRequest, Tenant};
 use jammi_server::grpc::proto::trigger::trigger_service_client::TriggerServiceClient;
 use jammi_server::grpc::proto::trigger::ListTopicsRequest;
-use jammi_server::grpc::session::{SessionStore, SESSION_HEADER};
+use jammi_server::grpc::session::SessionStore;
 use jammi_server::TriggerHandles;
 use jammi_test_utils::test_config;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
-use tonic::Request;
 
-const TENANT_A: &str = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a";
-const TENANT_B: &str = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b";
-
-fn tenant_a() -> TenantId {
-    TenantId::from_str(TENANT_A).unwrap()
-}
-
-fn tenant_b() -> TenantId {
-    TenantId::from_str(TENANT_B).unwrap()
-}
+use super::common::grpc::{channel, tenant_a, tenant_b, with_session, TENANT_A, TENANT_B};
 
 /// Spin up an in-process gRPC server hosting `SessionService` + `TriggerService`
 /// behind the shared interceptor. Pre-seeds two topics — one bound to
@@ -101,24 +88,6 @@ async fn start_grpc_test_server() -> (
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     (addr, store, shutdown_tx, dir, handle)
-}
-
-/// Build a gRPC channel + a request-extending interceptor that injects the
-/// `jammi-session-id` header on every outgoing request.
-async fn channel(addr: SocketAddr) -> Channel {
-    Channel::from_shared(format!("http://{addr}"))
-        .expect("channel uri")
-        .connect()
-        .await
-        .expect("channel connect")
-}
-
-fn with_session(session_id: &str) -> impl Fn(Request<()>) -> Result<Request<()>, tonic::Status> {
-    let id: MetadataValue<_> = session_id.parse().expect("session-id ascii");
-    move |mut req: Request<()>| {
-        req.metadata_mut().insert(SESSION_HEADER, id.clone());
-        Ok(req)
-    }
 }
 
 async fn set_tenant(

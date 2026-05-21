@@ -14,7 +14,6 @@
 //! file exists specifically to cover the Flight SQL surface.
 
 use std::net::SocketAddr;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,27 +22,14 @@ use arrow_flight::sql::client::FlightSqlServiceClient;
 use futures::TryStreamExt;
 use jammi_engine::session::JammiSession;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
-use jammi_engine::TenantId;
 use jammi_server::grpc::proto::session::session_service_client::SessionServiceClient;
 use jammi_server::grpc::proto::session::{SetTenantRequest, Tenant};
 use jammi_server::grpc::session::{SessionStore, SESSION_HEADER};
 use jammi_test_utils::test_config;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
-use tonic::metadata::MetadataValue;
-use tonic::transport::Channel;
-use tonic::Request;
 
-const TENANT_A: &str = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a";
-const TENANT_B: &str = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b";
-
-fn tenant_a() -> TenantId {
-    TenantId::from_str(TENANT_A).unwrap()
-}
-
-fn tenant_b() -> TenantId {
-    TenantId::from_str(TENANT_B).unwrap()
-}
+use super::common::grpc::{channel, tenant_a, tenant_b, with_session, TENANT_A, TENANT_B};
 
 /// Spin up the Flight SQL + SessionService server in-process. The fixture
 /// pre-seeds a Parquet local source with 10 rows split 6 (tenant A) + 4
@@ -124,22 +110,6 @@ async fn start_flight_test_server() -> (SocketAddr, TempDir, tokio::task::JoinHa
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     (addr, dir, handle)
-}
-
-fn with_session(session_id: &str) -> impl Fn(Request<()>) -> Result<Request<()>, tonic::Status> {
-    let id: MetadataValue<_> = session_id.parse().expect("session-id ascii");
-    move |mut req: Request<()>| {
-        req.metadata_mut().insert(SESSION_HEADER, id.clone());
-        Ok(req)
-    }
-}
-
-async fn channel(addr: SocketAddr) -> Channel {
-    Channel::from_shared(format!("http://{addr}"))
-        .expect("uri")
-        .connect()
-        .await
-        .expect("connect")
 }
 
 async fn bind_tenant_via_session_service(addr: SocketAddr, session_id: &str, tenant: &str) {

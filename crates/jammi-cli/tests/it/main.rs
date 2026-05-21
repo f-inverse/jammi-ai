@@ -1,1 +1,2 @@
+mod channels;
 mod cli;

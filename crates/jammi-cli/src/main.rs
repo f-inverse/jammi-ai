@@ -48,6 +48,11 @@ enum Commands {
         #[command(subcommand)]
         action: commands::trigger::TriggerAction,
     },
+    /// Manage evidence channels
+    Channels {
+        #[command(subcommand)]
+        action: commands::channels::ChannelAction,
+    },
 }
 
 #[tokio::main]
@@ -83,6 +88,9 @@ async fn run(
         Some(Commands::Query { sql }) => commands::query::run(config, tenant, &sql).await,
         Some(Commands::Explain { sql }) => commands::query::explain(config, tenant, &sql).await,
         Some(Commands::Trigger { action }) => commands::trigger::run(config, tenant, action).await,
+        Some(Commands::Channels { action }) => {
+            commands::channels::run(config, tenant, action).await
+        }
         None => {
             // No subcommand — print help
             use clap::CommandFactory;

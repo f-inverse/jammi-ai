@@ -92,11 +92,11 @@ def test_create_with_index_and_order_column(tmp_path):
     # DataFusion's LIMIT 0 path to preserve the projected schema.
     db.sql(
         "INSERT INTO mutable.public.sensor_readings (sensor_id, reading, seq) "
-        "VALUES ('s-1', 19.5, 1)"
+        "VALUES (1, 19.5, 100)"
     )
     one = db.sql("SELECT sensor_id, reading, seq FROM mutable.public.sensor_readings")
     assert one.schema.names == ["sensor_id", "reading", "seq"]
-    assert one.column("sensor_id").to_pylist() == ["s-1"]
+    assert one.column("sensor_id").to_pylist() == [1]
 
     db.drop_mutable_table("sensor_readings")
 

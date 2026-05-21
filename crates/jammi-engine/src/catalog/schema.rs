@@ -194,7 +194,10 @@ CREATE TABLE mutable_table_indexes (
     table_id        TEXT NOT NULL REFERENCES mutable_tables(id) ON DELETE CASCADE,
     index_name      TEXT NOT NULL,
     columns         TEXT NOT NULL,
-    is_unique       INTEGER NOT NULL DEFAULT 0,
+    -- BIGINT (8-byte) so the column decodes as `i64` on both SQLite (stores
+    -- INTEGER as variable-width up to 8 bytes) and Postgres (where `INTEGER`
+    -- is INT4 / i32, incompatible with the engine's i64 read shape).
+    is_unique       BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (table_id, index_name)
 );
 "#;

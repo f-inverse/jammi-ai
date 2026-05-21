@@ -67,7 +67,8 @@ impl JammiSession {
 
     /// Build a session around a caller-supplied catalog backend. Migrations
     /// are applied here so the caller hands in a connected-but-unmigrated
-    /// [`BackendImpl`]; the session takes it from there.
+    /// [`crate::catalog::backend::BackendImpl`]; the session takes it from
+    /// there.
     ///
     /// Used by:
     /// - tests that need to parameterize over backend (SQLite tempfile vs

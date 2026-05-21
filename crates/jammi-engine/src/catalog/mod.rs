@@ -77,8 +77,9 @@ impl Catalog {
     }
 
     /// Open a catalog from a pre-built backend with a tenant binding shared
-    /// across the surrounding session. Used by [`crate::JammiSession::with_backend`]
-    /// for tests and server deployments that compose their own backend.
+    /// across the surrounding session. Used by
+    /// [`crate::session::JammiSession::with_backend`] for tests and server
+    /// deployments that compose their own backend.
     pub fn from_backend_with_tenant(backend: BackendImpl, tenant: Option<TenantBinding>) -> Self {
         Self {
             backend: Arc::new(backend),

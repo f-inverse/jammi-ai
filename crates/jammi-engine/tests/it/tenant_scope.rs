@@ -335,6 +335,140 @@ async fn catalog_unscoped_session_sees_global_only_after_scoped_writes() {
     assert_eq!(ids, vec!["global_src".to_string()]);
 }
 
+/// SPEC-03 §12 #2 — one federated source carries a `tenant_id` column;
+/// the analyzer rule injects a per-session filter that yields 6 rows for
+/// tenant A and 4 rows for tenant B on the same on-disk Parquet table.
+/// Verifies the read-side predicate-injection path end-to-end against a
+/// local Parquet source, not just the engine-internal mutable table tested
+/// elsewhere in this file.
+#[tokio::test]
+async fn federated_source_tenant_column_filters_split_6_4() {
+    use arrow::array::{ArrayRef, RecordBatch};
+    use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let dir = tempdir().unwrap();
+    let pq_path = dir.path().join("notes.parquet");
+
+    // Build a 10-row batch: 6 for tenant A, 4 for tenant B.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("note_id", DataType::Int64, false),
+        Field::new("tenant_id", DataType::Utf8, true),
+    ]));
+    let note_ids = Int64Array::from((0..10_i64).collect::<Vec<_>>());
+    let a_str = tenant_a().to_string();
+    let b_str = tenant_b().to_string();
+    let tenant_col: Vec<&str> = (0..10)
+        .map(|i| {
+            if i < 6 {
+                a_str.as_str()
+            } else {
+                b_str.as_str()
+            }
+        })
+        .collect();
+    let tenant_col = StringArray::from(tenant_col);
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(note_ids) as ArrayRef,
+            Arc::new(tenant_col) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let file = std::fs::File::create(&pq_path).unwrap();
+    let props = WriterProperties::builder().build();
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let cfg = common::test_config(dir.path());
+    let url = format!("file://{}", pq_path.display());
+
+    // Register the source ONCE — unscoped (tenant_id NULL on the catalog
+    // row) — so both per-tenant sessions read it from the catalog on
+    // reload. SPEC-03 §12 #2 calls for "one source registration, one
+    // connection pool, no per-tenant table".
+    {
+        let registrar = JammiSession::new(cfg.clone()).await.unwrap();
+        registrar
+            .add_source(
+                "notes",
+                SourceType::Local,
+                SourceConnection {
+                    url: Some(url),
+                    format: Some(FileFormat::Parquet),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // Session A: bind tenant A and declare the federated source's tenant
+    // discriminator column. The source row in the catalog is `tenant_id
+    // NULL`, so both per-tenant sessions can see it via the read-side
+    // predicate (`tenant_id = $bound OR tenant_id IS NULL`).
+    let session_a = JammiSession::new(cfg.clone())
+        .await
+        .unwrap()
+        .with_tenant(tenant_a());
+    session_a.set_source_tenant_column("notes", Some("tenant_id".into()));
+
+    let session_b = JammiSession::new(cfg.clone())
+        .await
+        .unwrap()
+        .with_tenant(tenant_b());
+    session_b.set_source_tenant_column("notes", Some("tenant_id".into()));
+
+    async fn count_for(session: &JammiSession) -> i64 {
+        let rows = session
+            .sql("SELECT COUNT(*) AS n FROM notes.public.notes")
+            .await
+            .unwrap();
+        let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
+        batch
+            .column_by_name("n")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    }
+
+    let n_a = count_for(&session_a).await;
+    let n_b = count_for(&session_b).await;
+    assert_eq!(n_a, 6, "session A must see exactly its 6 rows");
+    assert_eq!(n_b, 4, "session B must see exactly its 4 rows");
+
+    async fn collect_ids(session: &JammiSession) -> Vec<i64> {
+        let rows = session
+            .sql("SELECT note_id FROM notes.public.notes ORDER BY note_id")
+            .await
+            .unwrap();
+        let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
+        let col = batch
+            .column_by_name("note_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        (0..col.len()).map(|i| col.value(i)).collect::<Vec<i64>>()
+    }
+    let ids_a = collect_ids(&session_a).await;
+    let ids_b = collect_ids(&session_b).await;
+    let intersection: Vec<i64> = ids_a
+        .iter()
+        .copied()
+        .filter(|id| ids_b.contains(id))
+        .collect();
+    assert!(
+        intersection.is_empty(),
+        "tenant A ids ({ids_a:?}) and B ids ({ids_b:?}) must be disjoint"
+    );
+}
+
 /// `Transaction::assert_tenant_matches` is the defence-in-depth write-side
 /// guard. The sink calls it once per write_all; verify it rejects mismatches.
 #[tokio::test]

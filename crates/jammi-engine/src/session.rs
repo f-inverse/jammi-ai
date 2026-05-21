@@ -211,6 +211,14 @@ impl JammiSession {
             .tenant()
     }
 
+    /// Shared handle to the underlying tenant binding. Used by server-side
+    /// composition (Flight SQL + gRPC) to plumb the per-session tenant value
+    /// from a [`crate::tenant_scope::TenantBoundProvider`] / interceptor into
+    /// the engine without re-creating the binding for every request.
+    pub fn tenant_binding_arc(&self) -> crate::tenant_scope::TenantBinding {
+        std::sync::Arc::clone(&self.tenant)
+    }
+
     /// Mutate the bound tenant in place. Equivalent to `with_tenant` but does
     /// not consume `self` — needed for callers that hold the session behind a
     /// shared reference (`Arc<JammiSession>` in PyO3 / CLI wrappers, the

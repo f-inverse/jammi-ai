@@ -31,16 +31,25 @@ Polaris keeps one row per `(item_id, valid_from, valid_to)` interval:
 
 ```rust
 use std::sync::Arc;
-use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use arrow_schema::{DataType, Field, Schema};
 
 let schema = Arc::new(Schema::new(vec![
-    Field::new("item_id",      DataType::Utf8,                                    false),
-    Field::new("price_tier",   DataType::Utf8,                                    false),
-    Field::new("availability", DataType::Utf8,                                    false),
-    Field::new("valid_from",   DataType::Timestamp(TimeUnit::Microsecond, None),  false),
-    Field::new("valid_to",     DataType::Timestamp(TimeUnit::Microsecond, None),  true),
+    Field::new("item_id",      DataType::Utf8,    false),
+    Field::new("price_tier",   DataType::Utf8,    false),
+    Field::new("availability", DataType::Utf8,    false),
+    Field::new("valid_from",   DataType::Int64,   false),
+    Field::new("valid_to",     DataType::Int64,   true),
 ]));
 ```
+
+The catalog's closed set of supported column types is `Boolean`, the
+integer family (`Int8`/`Int16`/`Int32`/`Int64`/`UInt8`/`UInt16`/`UInt32`/`UInt64`),
+`Float32`/`Float64`, `Utf8`, and `Binary`. Declare time-valued columns
+as `Int64` epoch microseconds — the same convention the
+[update recipe](./update-mutable-table.md) uses — and convert at the
+application boundary. Registering a column outside the closed set
+returns `MutableTableError::Schema` and the registration is rolled
+back atomically.
 
 The engine reserves `tenant_id` and any column whose name starts with `_`
 — the schema builder rejects them at build time per ADR-00. (The

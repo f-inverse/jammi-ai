@@ -1102,7 +1102,7 @@ async fn cookbook_declare_provenance_channel_append_only_callout_matches_runtime
 
 #[tokio::test]
 async fn cookbook_register_mutable_table_recipe_runs_end_to_end() {
-    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use arrow_schema::{DataType, Field, Schema};
     use jammi_engine::session::JammiSession;
     use jammi_engine::store::mutable::definition::{
         MutableIndexDef, MutableTableDefinitionBuilder, MutableTableId,
@@ -1113,21 +1113,16 @@ async fn cookbook_register_mutable_table_recipe_runs_end_to_end() {
         .await
         .unwrap();
 
-    // Recipe §"Define the schema": 5 fields including a Timestamp.
+    // Recipe §"Define the schema": 5 fields. The catalog's closed type
+    // set excludes Timestamp; time-valued columns are stored as Int64
+    // epoch microseconds and converted at the application boundary, per
+    // the recipe's own callout.
     let schema = Arc::new(Schema::new(vec![
         Field::new("item_id", DataType::Utf8, false),
         Field::new("price_tier", DataType::Utf8, false),
         Field::new("availability", DataType::Utf8, false),
-        Field::new(
-            "valid_from",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            false,
-        ),
-        Field::new(
-            "valid_to",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            true,
-        ),
+        Field::new("valid_from", DataType::Int64, false),
+        Field::new("valid_to", DataType::Int64, true),
     ]));
 
     // Recipe §"Build the definition": primary key + secondary index.

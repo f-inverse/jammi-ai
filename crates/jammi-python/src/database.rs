@@ -378,7 +378,7 @@ impl PyDatabase {
                 Ok(())
             }
             None if if_exists => Ok(()),
-            None => Err(PyValueError::new_err(format!("topic '{}' not found", name))),
+            None => Err(PyValueError::new_err(format!("topic '{name}' not found"))),
         }
     }
 

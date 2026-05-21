@@ -48,6 +48,10 @@ arrow-ipc = "57"
 # Storage
 parquet = "57"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres", "uuid", "chrono", "json", "macros"] }
+# Object-store pin matches the transitive version DataFusion 52.3 carries
+# (see Cargo.lock: object_store 0.12.5). Mismatching this would force
+# duplicate crates in the dep graph and break ListingTableUrl interop.
+object_store = { version = "0.12", default-features = false }
 
 # ML inference
 candle-core = "0.9"

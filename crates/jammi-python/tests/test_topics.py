@@ -55,7 +55,12 @@ def test_register_publish_subscribe_round_trips(tmp_path):
     # so the first publish on a fresh topic returns offset 0.
     assert offset == 0
 
-    collected = db.subscribe_collect("events.demo", max_batches=4)
+    # Replay the one published batch, then exit before the live tail blocks.
+    # `from_offset=0` triggers backing-table replay; `max_batches=1` matches
+    # the publish count exactly so the read does not race the live broker.
+    collected = db.subscribe_collect(
+        "events.demo", from_offset=0, max_batches=1
+    )
     event_ids = collected.column("event_id").to_pylist()
     payloads = collected.column("payload").to_pylist()
     assert event_ids == [1, 2, 3]

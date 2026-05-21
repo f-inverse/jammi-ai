@@ -505,9 +505,11 @@ jammi serve &
 SHAPE_B_PID=$!; sleep 1
 
 # Phase 1, 2, 4 over the server surface — exercised by the Rust harness
-# above. Python UAT scripts that drive every primitive over Flight SQL +
-# gRPC from a Python client are *Deferred — Wave 3*; the Wave-3 scripts
-# will live at tests/uat/shape_b_*.py.
+# above. Python UAT scripts at `tests/uat/shape_b_{channels,mutable,topics,trigger}.py`
+# drive every primitive via the embedded PyO3 surface from a standalone
+# Python process (`python3 tests/uat/shape_b_<primitive>.py`); CI's
+# `Test (Python)` lane runs them after pytest. An over-the-wire variant
+# that drives Flight SQL + gRPC from Python is the natural next step.
 
 kill $SHAPE_B_PID
 ```
@@ -523,9 +525,10 @@ TENANT_C1=$(uuidgen | tr 'A-Z' 'a-z'); TENANT_C2=$(uuidgen | tr 'A-Z' 'a-z')
 
 # The Phase-3 isolation guarantee at the server surface is exercised by
 # the Rust harness above and by crates/jammi-server/tests/it/flight_tenant.rs
-# and grpc_session.rs. A Python `shape_c_isolation.py` script that
-# combines Flight SQL + gRPC + Python + CLI in one process is *Deferred —
-# Wave 3*.
+# and grpc_session.rs. `tests/uat/shape_c_isolation.py` exercises the
+# same property at the PyO3-binding boundary: a single Python session
+# rebinds between two tenants and asserts the analyzer filters cross-
+# tenant rows correctly. CI runs it in the `Test (Python)` lane.
 
 kill $SHAPE_C_PID
 ```
@@ -542,7 +545,7 @@ The following surfaces are not part of this checkpoint and are explicitly out of
 - **CLI `jammi generate-embeddings`** — reachable through `db.generate_text_embeddings(...)` in Rust/Python; a CLI surface is queued for Wave 3.
 - **CLI `jammi models register --tenant`** — model registration today happens through the pipeline path or the Rust `Catalog::register_model` API; the explicit tenant-mismatch CLI flow is queued for Wave 3.
 - **CLI `jammi trigger list --filter <name> --output topic_id`** — resolving a backing-table name from a topic name through the CLI is queued for Wave 3.
-- **Python UAT scripts `tests/uat/shape_b_*.py` / `shape_c_isolation.py`** — multi-primitive Python clients driving Flight SQL + gRPC are queued for Wave 3. Item 1's PyO3 bindings (`PyDatabase.{create_mutable_table, drop_mutable_table, register_topic, drop_topic}`) ship in this branch, so the dependencies for the Wave-3 scripts are now satisfied.
+- **Python UAT scripts over Flight SQL + gRPC** — `tests/uat/shape_b_{channels,mutable,topics,trigger}.py` and `shape_c_isolation.py` ship in this branch driving every primitive via the PyO3 surface. An over-the-wire variant that talks to a running `jammi serve` via `pyarrow.flight` and python-generated gRPC stubs is the natural next iteration.
 - **Global `--artifacts <dir>` flag** — replaced by the `JAMMI_ARTIFACT_DIR` env var, which every shipped subcommand already honours; do not look for the flag.
 
 ---
@@ -592,8 +595,8 @@ The operator ticks every box; the PR is merge-blocked until all are checked.
 - [ ] Workflow B — feature-store SCD — `cargo test -p jammi-ai uat_workflow_b_feature_store_scd_isolates_two_tenants` passes with disjoint row counts (2 and 1) across two tenants on the same mutable-table name.
 - [ ] Workflow C — CDC pipeline — `cargo test -p jammi-ai uat_workflow_c_cdc_pipeline_isolates_tenants_and_predicates` passes with predicate-filtered subscribers receiving only their matches and zero cross-tenant leak.
 - [ ] Shape A (embedded) verified — every primitive exercised via the CLI against a SQLite catalog and in-memory broker; `cargo test -p jammi-server shape_a_*` passes.
-- [ ] Shape B (single-tenant server) verified — `cargo test -p jammi-server shape_b_*` passes; Python UAT scripts deferred (*Wave 3*).
-- [ ] Shape C (multi-tenant server) verified — `cargo test -p jammi-server shape_c_*` passes; Python UAT scripts deferred (*Wave 3*).
+- [ ] Shape B (single-tenant server) verified — `cargo test -p jammi-server shape_b_*` passes; `python3 tests/uat/shape_b_{channels,mutable,topics,trigger}.py` all exit 0.
+- [ ] Shape C (multi-tenant server) verified — `cargo test -p jammi-server shape_c_*` passes; `python3 tests/uat/shape_c_isolation.py` exits 0.
 - [ ] `cargo test --workspace` clean.
 - [ ] `cargo test --test smoke` clean.
 - [ ] `python3 tests/smoke_test.py` clean.

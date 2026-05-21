@@ -54,6 +54,9 @@ usearch.workspace = true
 sqlx.workspace = true
 object_store.workspace = true
 bytes = "1"
+# tempfile is needed by storage::sidecar_layout to bridge USearch's
+# path-based FFI into object_store's byte-stream API for cloud schemes.
+tempfile = "3"
 
 # Config
 serde.workspace = true

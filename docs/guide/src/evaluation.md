@@ -32,7 +32,12 @@ db.add_source("golden", path="/data/golden_relevance.csv", format="csv")
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
 let metrics = session.eval_embeddings(
     "patents",
     None,                              // use latest embedding table
@@ -44,6 +49,7 @@ println!("recall@10:    {}", metrics["recall_at_k"]);
 println!("precision@10: {}", metrics["precision_at_k"]);
 println!("MRR:          {}", metrics["mrr"]);
 println!("nDCG:         {}", metrics["ndcg"]);
+# Ok(()) }
 ```
 
 ### Python
@@ -78,7 +84,12 @@ Compare a base model against a fine-tuned model:
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession, base_table: String, finetuned_table: String) -> jammi_engine::error::Result<()> {
 let comparison = session.eval_compare(
     &[base_table.clone(), finetuned_table.clone()],
     "patents",
@@ -93,6 +104,7 @@ for (table, metrics) in deltas.as_object().unwrap() {
         metrics["recall_at_k"]["relative"].as_f64().unwrap() * 100.0,
     );
 }
+# Ok(()) }
 ```
 
 ### Python
@@ -113,7 +125,12 @@ The first table is the baseline. Deltas (absolute and relative) are computed for
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
 use jammi_ai::eval::EvalTask;
 
 let metrics = session.eval_inference(
@@ -127,6 +144,7 @@ let metrics = session.eval_inference(
 
 println!("Accuracy: {}", metrics["accuracy"]);
 println!("Macro F1: {}", metrics["f1"]);
+# Ok(()) }
 ```
 
 ### Python
@@ -149,18 +167,24 @@ print(f"Macro F1: {metrics['f1']:.3f}")
 
 Every evaluation is recorded automatically:
 
-```rust
-let runs = session.catalog().list_eval_runs()?;
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
+let runs = session.catalog().list_eval_runs().await?;
 for run in &runs {
     println!("{}: {} on {} (k={:?})", run.eval_run_id, run.eval_type, run.golden_source, run.k);
 }
+# Ok(()) }
 ```
 
 ## Schema validation
 
 Golden datasets are validated before evaluation starts. Missing or wrong-type columns produce clear errors:
 
-```
+```text
 Eval error: Golden dataset missing required column 'query_text'
 Eval error: Golden dataset column 'query_id' has type Boolean, expected Utf8
 ```

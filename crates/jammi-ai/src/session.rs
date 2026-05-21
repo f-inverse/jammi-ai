@@ -874,39 +874,21 @@ fn run_fine_tune_blocking(
             .job_id(job_id.clone())
             .catalog(Arc::clone(&catalog))
             .artifact_dir(artifact_dir.clone())
+            .output_model(crate::fine_tune::trainer::OutputModelHandle {
+                output_model_id,
+                base_model_id: base_model,
+                task,
+            })
             .device(device.clone())
             .build()?;
 
-    match training_loop.run(&data_loader) {
-        Ok(_result) => {
-            let handle = tokio::runtime::Handle::current();
-            // Register the fine-tuned model in catalog
-            if let Err(e) =
-                handle.block_on(catalog.set_fine_tune_output_model(&job_id, &output_model_id))
-            {
-                tracing::error!(job_id = %job_id, error = %e, "Failed to set fine-tune output model in catalog");
-            }
-            let adapter_dir = artifact_dir.join("models").join(&job_id);
-            if let Err(e) = handle.block_on(catalog.register_model(
-                jammi_engine::catalog::model_repo::RegisterModelParams {
-                    model_id: &output_model_id,
-                    version: 1,
-                    model_type: "fine-tuned",
-                    backend: "candle",
-                    task: &task,
-                    base_model_id: Some(&base_model),
-                    artifact_path: Some(adapter_dir.to_str().unwrap_or("")),
-                    config_json: None,
-                },
-            )) {
-                tracing::error!(job_id = %job_id, error = %e, "Failed to register fine-tuned model in catalog");
-            }
-        }
-        Err(e) => {
-            tracing::error!(job_id = %job_id, error = %e, "Fine-tune training failed");
-        }
-    }
-
+    // The trainer is responsible for registering the output model and
+    // flipping the job's status to `Completed` atomically with respect to
+    // the artifact write. Propagate any failure so the job lands in
+    // `Failed` (via the trainer's failure paths) and the caller's
+    // `wait()` observer sees a typed error rather than a wedged
+    // `Running` row.
+    training_loop.run(&data_loader)?;
     Ok(())
 }
 

@@ -130,6 +130,22 @@ struct StepContext<'a> {
     started_at: &'a str,
 }
 
+/// Catalog handles a successful training run must register before flipping
+/// the job's status to `Completed`. Bundled into one struct so the caller's
+/// `wait()` observer never sees a completed job whose output model row is
+/// still missing.
+pub struct OutputModelHandle {
+    /// Canonical id of the fine-tuned model (e.g. `"jammi:fine-tuned:<uuid>"`).
+    pub output_model_id: String,
+    /// Canonical id of the base model used for training (e.g. `"local:..."`
+    /// or `"sentence-transformers/all-MiniLM-L6-v2"`). Stored on the output
+    /// model row so the resolver can reach the base config from the
+    /// fine-tuned id alone.
+    pub base_model_id: String,
+    /// Task the fine-tuned model performs.
+    pub task: String,
+}
+
 /// The training loop: runs LoRA fine-tuning with gradient accumulation,
 /// early stopping, LR scheduling, and checkpointing.
 pub struct TrainingLoop {
@@ -144,6 +160,7 @@ pub struct TrainingLoop {
     job_id: String,
     catalog: Arc<Catalog>,
     artifact_dir: PathBuf,
+    output_model: Option<OutputModelHandle>,
     divergence_count: usize,
     device: Device,
 }
@@ -157,6 +174,7 @@ pub struct TrainingLoopBuilder {
     job_id: Option<String>,
     catalog: Option<Arc<Catalog>>,
     artifact_dir: Option<PathBuf>,
+    output_model: Option<OutputModelHandle>,
     device: Device,
 }
 
@@ -175,6 +193,7 @@ impl TrainingLoopBuilder {
             job_id: None,
             catalog: None,
             artifact_dir: None,
+            output_model: None,
             device: Device::Cpu,
         }
     }
@@ -211,6 +230,19 @@ impl TrainingLoopBuilder {
         self
     }
 
+    /// Set the output-model handle. Required when the loop is part of the
+    /// production fine-tune path: on successful completion the trainer
+    /// registers the output model in the catalog *before* flipping the
+    /// job to `Completed`, closing the wait/read race that would otherwise
+    /// let a caller observe a completed job with no model row.
+    ///
+    /// Omit only in trainer-internals tests that drive the loop directly
+    /// with precomputed batches and assert on the in-memory result alone.
+    pub fn output_model(mut self, handle: OutputModelHandle) -> Self {
+        self.output_model = Some(handle);
+        self
+    }
+
     /// Build the training loop. All infrastructure params must be set.
     pub fn build(self) -> Result<TrainingLoop> {
         let job_id = self
@@ -230,6 +262,7 @@ impl TrainingLoopBuilder {
             job_id,
             catalog,
             artifact_dir,
+            output_model: self.output_model,
             divergence_count: 0,
             device: self.device,
         })
@@ -447,7 +480,35 @@ impl TrainingLoop {
         jammi_lora::save_adapter(&checkpoint_dir, &final_weights, &saved)
             .map_err(|e| JammiError::FineTune(format!("Save adapter: {e}")))?;
 
-        // Update job status
+        // Register the output model in the catalog BEFORE flipping the
+        // job's status to `Completed`. `FineTuneJob::wait()` returns as
+        // soon as it sees `Completed`; if the model row landed after the
+        // flip, a caller doing `wait().await; encode_text_query(job.model_id())`
+        // would race and miss the row, falling through to the HF Hub
+        // resolver and hitting a 401 on a name that cannot exist there.
+        let handle = tokio::runtime::Handle::current();
+        if let Some(ref output) = self.output_model {
+            handle.block_on(
+                self.catalog
+                    .set_fine_tune_output_model(&self.job_id, &output.output_model_id),
+            )?;
+            handle.block_on(self.catalog.register_model(
+                jammi_engine::catalog::model_repo::RegisterModelParams {
+                    model_id: &output.output_model_id,
+                    version: 1,
+                    model_type: "fine-tuned",
+                    backend: "candle",
+                    task: &output.task,
+                    base_model_id: Some(&output.base_model_id),
+                    artifact_path: checkpoint_dir.to_str(),
+                    config_json: None,
+                },
+            ))?;
+        }
+
+        // Job status flips to Completed last — only after every artifact
+        // and catalog row is durable. `wait()` observers see a consistent
+        // post-state.
         let completed_at = chrono::Utc::now().to_rfc3339();
         let early_stopping_metric_label = match self.config.early_stopping_metric {
             EarlyStoppingMetric::TrainLoss => "train_loss",
@@ -461,7 +522,7 @@ impl TrainingLoop {
             "completed_at": completed_at,
         })
         .to_string();
-        tokio::runtime::Handle::current().block_on(self.catalog.update_fine_tune_status(
+        handle.block_on(self.catalog.update_fine_tune_status(
             &self.job_id,
             FineTuneJobStatus::Completed,
             Some(&metrics),

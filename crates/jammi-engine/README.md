@@ -14,7 +14,7 @@ use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 let config = JammiConfig::load(None)?;
 let session = JammiSession::new(config).await?;
 
-session.add_source("data", SourceType::Local, SourceConnection {
+session.add_source("data", SourceType::File, SourceConnection {
     url: Some("file:///path/to/data.parquet".into()),
     format: Some(FileFormat::Parquet),
     ..Default::default()

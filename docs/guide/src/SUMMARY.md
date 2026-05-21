@@ -22,6 +22,7 @@
 - [Fine-Tune for Your Domain](./fine-tuning.md)
 - [Evaluate and Compare Models](./evaluation.md)
 - [Connect to PostgreSQL / MySQL](./external-sources.md)
+- [Store Sources and Results in Cloud Object Storage](./cloud-storage.md)
 - [Register a Mutable Companion Table](./register-mutable-table.md)
 - [Run Transactional Updates on a Mutable Table](./update-mutable-table.md)
 - [Publish Events to a Topic](./publish-events.md)

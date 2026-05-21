@@ -110,8 +110,8 @@ fn build_gcs(
             reason: "GCS URL has no bucket".into(),
         })?;
 
-    let mut builder = object_store::gcp::GoogleCloudStorageBuilder::from_env()
-        .with_bucket_name(bucket);
+    let mut builder =
+        object_store::gcp::GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket);
 
     if let Some(CloudConfig::Gcs(gcs)) = config {
         if let Some(json) = &gcs.service_account_json {
@@ -134,7 +134,9 @@ fn build_gcs(
     _url: &StorageUrl,
     _config: Option<&CloudConfig>,
 ) -> Result<DynObjectStore, StorageError> {
-    Err(StorageError::SchemeNotEnabled { scheme: Scheme::Gcs })
+    Err(StorageError::SchemeNotEnabled {
+        scheme: Scheme::Gcs,
+    })
 }
 
 #[cfg(feature = "storage-azure")]
@@ -152,8 +154,8 @@ fn build_azure(
             reason: "Azure URL has no container".into(),
         })?;
 
-    let mut builder = object_store::azure::MicrosoftAzureBuilder::from_env()
-        .with_container_name(container);
+    let mut builder =
+        object_store::azure::MicrosoftAzureBuilder::from_env().with_container_name(container);
 
     if let Some(CloudConfig::Azure(azure)) = config {
         if let Some(name) = &azure.account_name {
@@ -176,7 +178,10 @@ fn build_azure(
             let pairs: Vec<(String, String)> = sas
                 .trim_start_matches('?')
                 .split('&')
-                .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+                .filter_map(|kv| {
+                    kv.split_once('=')
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                })
                 .collect();
             builder = builder.with_sas_authorization(pairs);
         }
@@ -225,9 +230,7 @@ mod tests {
         let err = build_object_store(&url, None).unwrap_err();
         assert!(matches!(
             err,
-            StorageError::SchemeNotEnabled {
-                scheme: Scheme::S3
-            }
+            StorageError::SchemeNotEnabled { scheme: Scheme::S3 }
         ));
     }
 }

@@ -244,13 +244,8 @@ async fn recovery_marks_missing_parquet_as_failed() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
 
-    let missing_url = StorageUrl::parse(
-        dir.path()
-            .join("nonexistent.parquet")
-            .to_str()
-            .unwrap(),
-    )
-    .unwrap();
+    let missing_url =
+        StorageUrl::parse(dir.path().join("nonexistent.parquet").to_str().unwrap()).unwrap();
     catalog
         .create_result_table(CreateResultTableParams {
             table_name: "orphan",

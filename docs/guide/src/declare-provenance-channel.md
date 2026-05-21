@@ -18,7 +18,7 @@ use jammi_engine::ChannelId;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 
 let session = Arc::new(InferenceSession::new(config).await?);
-session.add_source("patents", SourceType::Local, SourceConnection {
+session.add_source("patents", SourceType::File, SourceConnection {
     url: Some("file:///data/patents.parquet".into()),
     format: Some(FileFormat::Parquet),
     ..Default::default()

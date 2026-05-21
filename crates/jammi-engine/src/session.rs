@@ -419,11 +419,8 @@ impl JammiSession {
                         continue;
                     }
                 };
-                let idx_handle =
-                    crate::storage::JammiObjectStore::new(idx_driver, idx_url.clone());
-                if let Err(e) =
-                    crate::storage::sidecar_layout::delete_sidecar(&idx_handle).await
-                {
+                let idx_handle = crate::storage::JammiObjectStore::new(idx_driver, idx_url.clone());
+                if let Err(e) = crate::storage::sidecar_layout::delete_sidecar(&idx_handle).await {
                     tracing::warn!(path = %idx_url, error = %e, "Failed to delete sidecar bundle");
                 }
             }

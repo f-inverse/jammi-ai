@@ -56,7 +56,9 @@ pub async fn read_all_record_batches(
             StorageError::layout(path.to_string(), format!("Parquet reader builder: {e}"))
         })?
         .build()
-        .map_err(|e| StorageError::layout(path.to_string(), format!("Parquet stream build: {e}")))?;
+        .map_err(|e| {
+            StorageError::layout(path.to_string(), format!("Parquet stream build: {e}"))
+        })?;
     stream
         .try_collect()
         .await

@@ -32,10 +32,9 @@ impl ObjectParquetWriter {
             .set_max_row_group_size(65_536)
             .build();
         let inner = ParquetObjectWriter::new(handle.driver(), path.clone());
-        let writer =
-            AsyncArrowWriter::try_new(inner, schema, Some(props)).map_err(|e| {
-                StorageError::layout(path.to_string(), format!("Parquet writer init: {e}"))
-            })?;
+        let writer = AsyncArrowWriter::try_new(inner, schema, Some(props)).map_err(|e| {
+            StorageError::layout(path.to_string(), format!("Parquet writer init: {e}"))
+        })?;
         Ok(Self {
             writer,
             row_count: 0,
@@ -45,9 +44,10 @@ impl ObjectParquetWriter {
 
     /// Append a batch to the file.
     pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), StorageError> {
-        self.writer.write(batch).await.map_err(|e| {
-            StorageError::layout(self.path.clone(), format!("Parquet write: {e}"))
-        })?;
+        self.writer
+            .write(batch)
+            .await
+            .map_err(|e| StorageError::layout(self.path.clone(), format!("Parquet write: {e}")))?;
         self.row_count += batch.num_rows();
         Ok(())
     }
@@ -107,7 +107,10 @@ mod tests {
         assert_eq!(rows, 3);
 
         // Sanity: the bytes are now readable back through the same handle.
-        let bytes = handle.get_bytes(&handle.data_path().unwrap()).await.unwrap();
+        let bytes = handle
+            .get_bytes(&handle.data_path().unwrap())
+            .await
+            .unwrap();
         assert!(!bytes.is_empty());
     }
 }

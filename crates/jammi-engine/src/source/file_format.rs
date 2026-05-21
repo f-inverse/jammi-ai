@@ -86,9 +86,8 @@ fn register_driver_for_url(
         Scheme::File | Scheme::Memory => return Ok(()),
         _ => {}
     }
-    let parsed = ::url::Url::parse(url.as_str()).map_err(|e| {
-        JammiError::Config(format!("Storage URL '{}' did not re-parse: {e}", url))
-    })?;
+    let parsed = ::url::Url::parse(url.as_str())
+        .map_err(|e| JammiError::Config(format!("Storage URL '{url}' did not re-parse: {e}")))?;
     ctx.runtime_env().register_object_store(&parsed, driver);
     Ok(())
 }

@@ -235,7 +235,9 @@ impl ResultStore {
                 if let Some(ref idx) = table.index_path {
                     let idx_url = StorageUrl::parse(idx)?;
                     let idx_handle = self.open_index(&idx_url)?;
-                    storage::sidecar_layout::delete_sidecar(&idx_handle).await.ok();
+                    storage::sidecar_layout::delete_sidecar(&idx_handle)
+                        .await
+                        .ok();
                 }
                 self.catalog
                     .update_result_table_status(&table.table_name, ResultTableStatus::Failed, 0)
@@ -421,8 +423,7 @@ impl ResultStore {
                         .as_any()
                         .downcast_ref::<arrow::array::Float32Array>()
                         .ok_or_else(|| JammiError::Other("Vector not Float32".into()))?;
-                    let vec: Vec<f32> =
-                        (0..float_arr.len()).map(|j| float_arr.value(j)).collect();
+                    let vec: Vec<f32> = (0..float_arr.len()).map(|j| float_arr.value(j)).collect();
                     index.add(row_id, &vec)?;
                 }
             }
@@ -477,4 +478,3 @@ pub(crate) async fn register_parquet_table(
         .await?;
     Ok(())
 }
-

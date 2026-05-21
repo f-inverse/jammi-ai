@@ -9,7 +9,7 @@ Register data files as named sources, then query them with full SQL. Sources are
 ```rust
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 
-session.add_source("patents", SourceType::Local, SourceConnection {
+session.add_source("patents", SourceType::File, SourceConnection {
     url: Some("file:///data/patents.parquet".into()),
     format: Some(FileFormat::Parquet),
     ..Default::default()
@@ -82,7 +82,7 @@ Register multiple sources and join them in a single query:
 ### Rust
 
 ```rust
-session.add_source("companies", SourceType::Local, SourceConnection {
+session.add_source("companies", SourceType::File, SourceConnection {
     url: Some("file:///data/companies.csv".into()),
     format: Some(FileFormat::Csv),
     ..Default::default()

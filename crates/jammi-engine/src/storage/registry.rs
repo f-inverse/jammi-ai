@@ -25,12 +25,7 @@ impl DriverKey {
         let scheme = url.scheme();
         let root = match scheme {
             Scheme::File | Scheme::Memory => String::new(),
-            _ => url
-                .path()
-                .split('/')
-                .next()
-                .unwrap_or_default()
-                .to_string(),
+            _ => url.path().split('/').next().unwrap_or_default().to_string(),
         };
         Self { scheme, root }
     }

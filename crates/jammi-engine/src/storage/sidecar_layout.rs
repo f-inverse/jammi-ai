@@ -52,10 +52,7 @@ pub async fn load_sidecar(handle: &JammiObjectStore) -> Result<SidecarIndex> {
 pub async fn delete_sidecar(handle: &JammiObjectStore) -> Result<()> {
     for ext in SIDECAR_EXTENSIONS {
         let path = handle.sibling_path(ext).map_err(map_storage)?;
-        handle
-            .delete_if_exists(&path)
-            .await
-            .map_err(map_storage)?;
+        handle.delete_if_exists(&path).await.map_err(map_storage)?;
     }
     Ok(())
 }
@@ -72,9 +69,8 @@ fn load_sidecar_local(handle: &JammiObjectStore) -> Result<SidecarIndex> {
 }
 
 async fn save_sidecar_remote(handle: &JammiObjectStore, index: &SidecarIndex) -> Result<()> {
-    let tmp = tempfile::tempdir().map_err(|e| {
-        crate::error::JammiError::Other(format!("sidecar tempdir create: {e}"))
-    })?;
+    let tmp = tempfile::tempdir()
+        .map_err(|e| crate::error::JammiError::Other(format!("sidecar tempdir create: {e}")))?;
     let stem = tmp.path().join("sidecar");
     index.save(&stem)?;
 
@@ -94,9 +90,8 @@ async fn save_sidecar_remote(handle: &JammiObjectStore, index: &SidecarIndex) ->
 }
 
 async fn load_sidecar_remote(handle: &JammiObjectStore) -> Result<SidecarIndex> {
-    let tmp = tempfile::tempdir().map_err(|e| {
-        crate::error::JammiError::Other(format!("sidecar tempdir create: {e}"))
-    })?;
+    let tmp = tempfile::tempdir()
+        .map_err(|e| crate::error::JammiError::Other(format!("sidecar tempdir create: {e}")))?;
     let stem = tmp.path().join("sidecar");
 
     for ext in SIDECAR_EXTENSIONS {

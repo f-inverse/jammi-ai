@@ -10,6 +10,7 @@ mod mutable_federation;
 mod mutable_tables;
 mod recovery;
 mod sources;
+mod storage_cloud;
 mod store;
 mod tenant_scope;
 mod trigger;

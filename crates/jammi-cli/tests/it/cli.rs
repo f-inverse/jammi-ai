@@ -41,7 +41,7 @@ fn add_source(artifact_dir: &Path, tenant: Option<&str>, name: &str, fixture: &P
         cmd.args(["--tenant", t]);
     }
     cmd.args([
-        "sources", "add", name, "--path", path, "--format", "parquet",
+        "sources", "add", name, "--url", path, "--format", "parquet",
     ])
     .assert()
     .success();

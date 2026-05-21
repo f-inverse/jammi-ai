@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
 };
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -204,6 +206,32 @@ fn extract_value(
             .downcast_ref::<StringArray>()
             .map(|a| SqlValue::TextOwned(a.value(idx).to_string()))
             .ok_or("expected StringArray"),
+        // Timestamps map to their numeric tick (i64). The catalog backend
+        // stores them as INTEGER for SQLite portability; consumers that
+        // need wall-clock formatting do the conversion at read time. This
+        // honors SPEC-02 §"Define the schema" which explicitly lists
+        // `Timestamp(Microsecond, _)` as a supported column shape on the
+        // `register-mutable-table.md` recipe.
+        Timestamp(arrow_schema::TimeUnit::Second, _) => arr
+            .as_any()
+            .downcast_ref::<TimestampSecondArray>()
+            .map(|a| SqlValue::Int(a.value(idx)))
+            .ok_or("expected TimestampSecondArray"),
+        Timestamp(arrow_schema::TimeUnit::Millisecond, _) => arr
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .map(|a| SqlValue::Int(a.value(idx)))
+            .ok_or("expected TimestampMillisecondArray"),
+        Timestamp(arrow_schema::TimeUnit::Microsecond, _) => arr
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .map(|a| SqlValue::Int(a.value(idx)))
+            .ok_or("expected TimestampMicrosecondArray"),
+        Timestamp(arrow_schema::TimeUnit::Nanosecond, _) => arr
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .map(|a| SqlValue::Int(a.value(idx)))
+            .ok_or("expected TimestampNanosecondArray"),
         _ => Err("unsupported arrow type for mutable-table insert"),
     }
 }

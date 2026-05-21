@@ -6,7 +6,12 @@ Generate vector embeddings by running a model over text columns from a registere
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
 let record = session.generate_text_embeddings(
     "patents",
     "sentence-transformers/all-MiniLM-L6-v2",
@@ -15,6 +20,7 @@ let record = session.generate_text_embeddings(
 ).await?;
 
 println!("Embedded {} rows, {} dimensions", record.row_count, record.dimensions.unwrap());
+# Ok(()) }
 ```
 
 ### Python
@@ -32,7 +38,7 @@ db.generate_text_embeddings(
 
 Each call creates a timestamped Parquet file plus a sidecar ANN index bundle:
 
-```
+```text
 {artifact_dir}/jammi_db/
 ├── patents__embedding__all-MiniLM-L6-v2__20260325T120000.parquet
 ├── patents__embedding__all-MiniLM-L6-v2__20260325T120000.usearch
@@ -64,13 +70,19 @@ Pass multiple column names to concatenate them (space-separated) before embeddin
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
 session.generate_text_embeddings(
     "papers",
     "sentence-transformers/all-MiniLM-L6-v2",
     &["title".to_string(), "abstract".to_string()],
     "doi",
 ).await?;
+# Ok(()) }
 ```
 
 ### Python
@@ -88,9 +100,15 @@ db.generate_text_embeddings(
 
 Each call creates a new table. Multiple tables can coexist for the same source (different models, different columns):
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
 session.generate_text_embeddings("patents", "all-MiniLM-L6-v2", &["abstract".into()], "id").await?;
 session.generate_text_embeddings("patents", "bge-small-en-v1.5", &["title".into()], "id").await?;
+# Ok(()) }
 ```
 
 When searching, the latest ready embedding table is used by default.
@@ -114,7 +132,9 @@ Or any local directory with `config.json` + `model.safetensors` + `tokenizer.jso
 
 Use a local model:
 
-```rust
+```rust,no_run
+# extern crate jammi_ai;
+# use jammi_ai::model::ModelSource;
 let model = ModelSource::local("/path/to/my-model");
 ```
 
@@ -124,11 +144,17 @@ To get embeddings as `RecordBatch` without writing to disk:
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
 use jammi_ai::model::{ModelSource, ModelTask};
 
 let model = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");
-let results = session.infer("patents", &model, ModelTask::Embedding, &["abstract".into()], "id").await?;
+let results = session.infer("patents", &model, ModelTask::TextEmbedding, &["abstract".into()], "id").await?;
+# Ok(()) }
 ```
 
 ### Python
@@ -181,9 +207,16 @@ No data is lost if the Parquet file was fully written.
 
 Result tables are automatically registered in DataFusion and queryable via SQL:
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# use jammi_engine::catalog::result_repo::ResultTableRecord;
+# async fn ex(session: &InferenceSession, record: &ResultTableRecord) -> jammi_engine::error::Result<()> {
 let results = session.sql(&format!(
     "SELECT _row_id, _source_id FROM \"jammi.{}\" LIMIT 10",
     record.table_name
 )).await?;
+# Ok(()) }
 ```

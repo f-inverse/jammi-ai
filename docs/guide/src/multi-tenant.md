@@ -27,6 +27,8 @@ boundary.
 ## Rust
 
 ```rust,no_run
+# extern crate jammi_engine;
+# extern crate tokio;
 use std::str::FromStr;
 use jammi_engine::TenantId;
 use jammi_engine::session::JammiSession;

@@ -38,6 +38,8 @@ analyzer rule does a string comparison after coercing the column to
 ### Rust
 
 ```rust,no_run
+# extern crate jammi_engine;
+# extern crate tokio;
 use jammi_engine::session::JammiSession;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 
@@ -68,6 +70,7 @@ db.add_source("notes", path="/data/notes.parquet", format="parquet")
 ### Rust
 
 ```rust,no_run
+# extern crate jammi_engine;
 # use jammi_engine::session::JammiSession;
 # fn ex(session: &JammiSession) {
 session.set_source_tenant_column("notes", Some("customer_id".into()));
@@ -97,6 +100,8 @@ globally visible.
 ### Rust
 
 ```rust,no_run
+# extern crate jammi_engine;
+# extern crate tokio;
 # use std::str::FromStr;
 # use jammi_engine::TenantId;
 # use jammi_engine::session::JammiSession;

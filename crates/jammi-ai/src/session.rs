@@ -123,6 +123,29 @@ impl InferenceSession {
         self.inner.trigger_broker()
     }
 
+    /// Register a mutable companion table. After this returns the table is
+    /// queryable as `mutable.public.<id>` in the same SQL surface that
+    /// federates Parquet result tables and external sources.
+    pub async fn create_mutable_table(
+        &self,
+        def: jammi_engine::store::mutable::MutableTableDefinition,
+    ) -> Result<jammi_engine::store::mutable::MutableTableId> {
+        self.inner.create_mutable_table(def).await
+    }
+
+    /// Drop a mutable companion table.
+    pub async fn drop_mutable_table(
+        &self,
+        id: &jammi_engine::store::mutable::MutableTableId,
+    ) -> Result<()> {
+        self.inner.drop_mutable_table(id).await
+    }
+
+    /// Reference to the mutable-table registry.
+    pub fn mutable_tables(&self) -> &jammi_engine::source::mutable::MutableTableRegistry {
+        self.inner.mutable_tables()
+    }
+
     /// Bind a tenant scope to this session. Subsequent reads/writes filter
     /// to `tenant_id = t OR tenant_id IS NULL`; writes record `tenant_id = t`.
     pub fn bind_tenant(&self, t: jammi_engine::TenantId) {

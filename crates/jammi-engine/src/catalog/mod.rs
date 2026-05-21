@@ -73,9 +73,16 @@ impl Catalog {
     /// Open a catalog from a pre-built backend. Used by tests and by the
     /// server deployment shape that wires a Postgres backend.
     pub fn from_backend(backend: BackendImpl) -> Self {
+        Self::from_backend_with_tenant(backend, None)
+    }
+
+    /// Open a catalog from a pre-built backend with a tenant binding shared
+    /// across the surrounding session. Used by [`crate::JammiSession::with_backend`]
+    /// for tests and server deployments that compose their own backend.
+    pub fn from_backend_with_tenant(backend: BackendImpl, tenant: Option<TenantBinding>) -> Self {
         Self {
             backend: Arc::new(backend),
-            tenant: None,
+            tenant,
         }
     }
 

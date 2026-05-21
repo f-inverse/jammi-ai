@@ -125,6 +125,8 @@ impl DataSink for MutableTableSink {
                         })?;
                         let rows = tx.execute(&dml, &params).await?;
                         total += rows;
+                        #[cfg(feature = "test-hooks")]
+                        crate::store::mutable::test_hook::maybe_signal(total).await;
                     }
                     Ok(total)
                 })

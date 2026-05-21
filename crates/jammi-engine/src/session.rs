@@ -62,7 +62,38 @@ impl JammiSession {
             Catalog::open_with_tenant(&config.artifact_dir, Some(Arc::clone(&tenant_binding)))
                 .await?,
         );
+        Self::build(config, catalog, tenant_binding).await
+    }
 
+    /// Build a session around a caller-supplied catalog backend. Migrations
+    /// are applied here so the caller hands in a connected-but-unmigrated
+    /// [`BackendImpl`]; the session takes it from there.
+    ///
+    /// Used by:
+    /// - tests that need to parameterize over backend (SQLite tempfile vs
+    ///   live Postgres URL) without going through the path-based
+    ///   [`Catalog::open_with_tenant`] surface
+    /// - server deployments that compose their own backend (e.g. a shared
+    ///   Postgres pool across multiple `jammi-server` replicas)
+    pub async fn with_backend(
+        config: JammiConfig,
+        backend: crate::catalog::backend::BackendImpl,
+    ) -> Result<Self> {
+        let config = Arc::new(config);
+        let tenant_binding: TenantBinding = Arc::new(RwLock::new(TenantContext::Unscoped));
+        backend.migrate().await?;
+        let catalog = Arc::new(Catalog::from_backend_with_tenant(
+            backend,
+            Some(Arc::clone(&tenant_binding)),
+        ));
+        Self::build(config, catalog, tenant_binding).await
+    }
+
+    async fn build(
+        config: Arc<JammiConfig>,
+        catalog: Arc<Catalog>,
+        tenant_binding: TenantBinding,
+    ) -> Result<Self> {
         let session_config = SessionConfig::new()
             .with_target_partitions(config.engine.execution_threads)
             .with_batch_size(config.engine.batch_size);

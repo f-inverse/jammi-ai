@@ -2,6 +2,56 @@
 
 use std::path::{Path, PathBuf};
 
+use jammi_engine::catalog::backend::{BackendImpl, BackendKind};
+use jammi_engine::catalog::backend_postgres::PostgresBackend;
+use jammi_engine::session::JammiSession;
+
+/// Env var inspected by [`pg_url_for_tests`] and [`make_test_session`] to
+/// reach a live Postgres instance. CI sets this for the `test-pg` job; local
+/// runs can leave it unset.
+pub const PG_URL_ENV: &str = "JAMMI_TEST_PG_URL";
+
+/// Return the configured Postgres URL when both `JAMMI_TEST_PG_URL` is set
+/// and the value is non-empty. Tests that need a live Postgres backend call
+/// this to decide whether to skip (without `#[ignore]`, which CLAUDE.md
+/// forbids — instead they early-return with a `tracing::warn` so CI logs
+/// surface the skip).
+pub fn pg_url_for_tests() -> Option<String> {
+    std::env::var(PG_URL_ENV).ok().filter(|s| !s.is_empty())
+}
+
+/// Build a [`JammiSession`] backed by `kind` for parameterized integration
+/// tests. The caller passes an artifact dir (used by SQLite for the catalog
+/// file and by both backends for result-table parquet); the Postgres variant
+/// connects to `JAMMI_TEST_PG_URL` and runs migrations.
+///
+/// Returns `None` when `kind = Postgres` and the env var is unset, so tests
+/// can `let session = match make_test_session(kind, dir).await { Some(s) => s,
+/// None => return };` to skip Postgres parameterizations on the hermetic
+/// `cargo test` lane without per-test `#[cfg(feature = …)]` decoration.
+pub async fn make_test_session(kind: BackendKind, artifact_dir: &Path) -> Option<JammiSession> {
+    let config = test_config(artifact_dir);
+    match kind {
+        BackendKind::Sqlite => Some(
+            JammiSession::new(config)
+                .await
+                .expect("sqlite-backed session"),
+        ),
+        BackendKind::Postgres => {
+            let url = pg_url_for_tests()?;
+            let pg = PostgresBackend::open(&url)
+                .await
+                .expect("open postgres backend");
+            let backend = BackendImpl::Postgres(pg);
+            Some(
+                JammiSession::with_backend(config, backend)
+                    .await
+                    .expect("postgres-backed session"),
+            )
+        }
+    }
+}
+
 /// Workspace root — two levels up from any crate in `crates/<name>/`.
 pub fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

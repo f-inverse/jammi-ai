@@ -171,6 +171,8 @@ impl MutableTableRegistry {
         let params = batch_to_params(batch, session_tenant)
             .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.into())))?;
         let rows = tx.execute(&dml, &params).await?;
+        #[cfg(feature = "test-hooks")]
+        crate::store::mutable::test_hook::maybe_signal(rows).await;
         Ok(rows)
     }
 

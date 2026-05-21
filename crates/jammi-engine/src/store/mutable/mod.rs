@@ -13,6 +13,8 @@ pub mod postgres;
 pub mod provider;
 pub mod sink;
 pub mod sqlite;
+#[cfg(feature = "test-hooks")]
+pub mod test_hook;
 
 pub use definition::{
     MutableIndexDef, MutableTableDefinition, MutableTableDefinitionBuilder, MutableTableError,

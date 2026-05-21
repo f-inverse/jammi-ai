@@ -18,6 +18,11 @@ live-postgres-tests = []
 # require a NATS JetStream server reachable via JAMMI_TEST_NATS_URL.
 jetstream-broker = ["dep:async-nats", "dep:arrow-ipc"]
 live-broker-tests = ["jetstream-broker"]
+# Compiles the mutable-sink crash-recovery checkpoint hook. Pure test
+# infrastructure: the hook is a single `await` on a notifier that only
+# arms when env vars are set. Off by default; the
+# `mutable_crash_recovery.rs` integration test requires it.
+test-hooks = []
 
 [dependencies]
 # Query engine
@@ -68,3 +73,6 @@ async-trait.workspace = true
 tempfile = "3"
 tokio.workspace = true
 jammi-test-utils.workspace = true
+test-case = { workspace = true }
+libc = { workspace = true }
+parquet = { workspace = true }

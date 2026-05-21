@@ -103,6 +103,10 @@ async-stream = "0.3"
 parking_lot = "0.12"
 async-nats = "0.41"
 
+# Test utilities
+test-case = "3.3"
+libc = "0.2"
+
 [profile.dev]
 debug = "line-tables-only"
 

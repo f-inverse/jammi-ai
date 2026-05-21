@@ -30,21 +30,18 @@ def main() -> int:
         db.register_channel(
             "scored_by",
             priority=3,
-            columns=[
-                {"name": "ranker", "dtype": "Utf8"},
-                {"name": "rank_score", "dtype": "Float32"},
-            ],
+            columns=[("ranker", "Utf8"), ("rank_score", "Float32")],
         )
         db.add_channel_columns(
             "scored_by",
-            columns=[{"name": "model_version", "dtype": "Utf8"}],
+            columns=[("model_version", "Utf8")],
         )
 
         # Append-only invariant: retyping an existing column must fail.
         try:
             db.add_channel_columns(
                 "scored_by",
-                columns=[{"name": "ranker", "dtype": "Int32"}],
+                columns=[("ranker", "Int32")],
             )
         except (RuntimeError, ValueError) as exc:
             msg = str(exc).lower()
@@ -57,7 +54,7 @@ def main() -> int:
             db.register_channel(
                 "scored_by",
                 priority=4,
-                columns=[{"name": "ranker", "dtype": "Utf8"}],
+                columns=[("ranker", "Utf8")],
             )
         except (RuntimeError, ValueError) as exc:
             assert "scored_by" in str(exc), f"duplicate-register error lost id: {exc}"

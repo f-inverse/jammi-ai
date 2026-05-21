@@ -2,7 +2,7 @@
 
 ## Crate dependency graph
 
-```
+```text
 jammi-engine (foundation)
     |
     |-- Config, Catalog, Sources, SQL execution
@@ -89,7 +89,7 @@ jammi-cli
 
 ### SQL query path
 
-```
+```text
 JammiSession::sql("SELECT ...")
     -> DataFusion parses SQL
     -> Resolves table from SourceCatalog/JammiSchemaProvider
@@ -100,7 +100,7 @@ JammiSession::sql("SELECT ...")
 
 ### Embedding generation path (text and image)
 
-```
+```text
 InferenceSession::generate_text_embeddings(source, model, columns, key)
 InferenceSession::generate_image_embeddings(source, model, image_column, key)
     -> EmbeddingPipeline::run(task = TextEmbedding | ImageEmbedding)
@@ -121,7 +121,7 @@ InferenceSession::generate_image_embeddings(source, model, image_column, key)
 
 ### Vector search path
 
-```
+```text
 InferenceSession::search(source, query_vec, k)
     -> Resolve embedding table from catalog
     -> AnnSearchExec: SidecarIndex (ANN) or exact_vector_search (fallback)
@@ -133,7 +133,7 @@ InferenceSession::search(source, query_vec, k)
 
 ## Module layout
 
-```
+```text
 crates/jammi-engine/src/
 |-- config.rs           # Configuration loading
 |-- error.rs            # Unified error type

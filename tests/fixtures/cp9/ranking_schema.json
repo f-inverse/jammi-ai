@@ -1,0 +1,6 @@
+[
+  {"name": "paper_id", "type": "Int64", "nullable": false},
+  {"name": "round", "type": "Int32", "nullable": false},
+  {"name": "best_ranker", "type": "Utf8", "nullable": true},
+  {"name": "best_score", "type": "Float64", "nullable": true}
+]

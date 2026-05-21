@@ -1113,10 +1113,11 @@ async fn cookbook_register_mutable_table_recipe_runs_end_to_end() {
         .await
         .unwrap();
 
-    // Recipe §"Define the schema": 5 fields. The catalog's closed type
-    // set excludes Timestamp; time-valued columns are stored as Int64
-    // epoch microseconds and converted at the application boundary, per
-    // the recipe's own callout.
+    // Recipe §"Define the schema": 5 fields including time columns encoded
+    // as Int64 epoch milliseconds. The catalog encoder admits the closed
+    // primitive subset every `MutableBackend` impl supports; wider types
+    // like `Timestamp` round-trip via their natural numeric encoding so
+    // the schema stays narrow and the recipe's typed-error contract holds.
     let schema = Arc::new(Schema::new(vec![
         Field::new("item_id", DataType::Utf8, false),
         Field::new("price_tier", DataType::Utf8, false),

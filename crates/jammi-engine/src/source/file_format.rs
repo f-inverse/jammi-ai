@@ -1,12 +1,11 @@
 //! `File` source driver: file-shaped data (Parquet / CSV / JSON) read
 //! through any [`StorageUrl`]-addressable backend.
 //!
-//! Replaces the previous `local.rs` driver. The driver is scheme-agnostic
-//! because DataFusion's `ListingTable` accepts any URL the embedded
-//! `object_store` registry recognises — the engine registers the same
-//! drivers it built via [`crate::storage`] so cloud schemes work
-//! end-to-end without DataFusion having to know about Jammi's
-//! [`StorageRegistry`].
+//! The driver is scheme-agnostic because DataFusion's `ListingTable`
+//! accepts any URL the embedded `object_store` registry recognises — the
+//! engine registers the same drivers it built via [`crate::storage`] so
+//! cloud schemes work end-to-end without DataFusion having to know about
+//! Jammi's [`StorageRegistry`].
 
 use std::sync::Arc;
 

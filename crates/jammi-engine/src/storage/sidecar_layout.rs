@@ -17,7 +17,6 @@ use std::path::Path;
 use crate::error::Result;
 use crate::index::sidecar::SidecarIndex;
 
-use super::error::StorageError;
 use super::object_store_handle::JammiObjectStore;
 use super::url::Scheme;
 
@@ -51,8 +50,8 @@ pub async fn load_sidecar(handle: &JammiObjectStore) -> Result<SidecarIndex> {
 /// Best-effort cleanup: delete every sidecar sibling that exists.
 pub async fn delete_sidecar(handle: &JammiObjectStore) -> Result<()> {
     for ext in SIDECAR_EXTENSIONS {
-        let path = handle.sibling_path(ext).map_err(map_storage)?;
-        handle.delete_if_exists(&path).await.map_err(map_storage)?;
+        let path = handle.sibling_path(ext)?;
+        handle.delete_if_exists(&path).await?;
     }
     Ok(())
 }
@@ -69,8 +68,7 @@ fn load_sidecar_local(handle: &JammiObjectStore) -> Result<SidecarIndex> {
 }
 
 async fn save_sidecar_remote(handle: &JammiObjectStore, index: &SidecarIndex) -> Result<()> {
-    let tmp = tempfile::tempdir()
-        .map_err(|e| crate::error::JammiError::Other(format!("sidecar tempdir create: {e}")))?;
+    let tmp = tempfile::tempdir()?;
     let stem = tmp.path().join("sidecar");
     index.save(&stem)?;
 
@@ -80,26 +78,22 @@ async fn save_sidecar_remote(handle: &JammiObjectStore, index: &SidecarIndex) ->
             continue;
         }
         let bytes = std::fs::read(&local_path)?;
-        let remote = handle.sibling_path(ext).map_err(map_storage)?;
-        handle
-            .put_bytes(&remote, bytes.into())
-            .await
-            .map_err(map_storage)?;
+        let remote = handle.sibling_path(ext)?;
+        handle.put_bytes(&remote, bytes.into()).await?;
     }
     Ok(())
 }
 
 async fn load_sidecar_remote(handle: &JammiObjectStore) -> Result<SidecarIndex> {
-    let tmp = tempfile::tempdir()
-        .map_err(|e| crate::error::JammiError::Other(format!("sidecar tempdir create: {e}")))?;
+    let tmp = tempfile::tempdir()?;
     let stem = tmp.path().join("sidecar");
 
     for ext in SIDECAR_EXTENSIONS {
-        let remote = handle.sibling_path(ext).map_err(map_storage)?;
-        if !handle.exists(&remote).await.map_err(map_storage)? {
+        let remote = handle.sibling_path(ext)?;
+        if !handle.exists(&remote).await? {
             continue;
         }
-        let bytes = handle.get_bytes(&remote).await.map_err(map_storage)?;
+        let bytes = handle.get_bytes(&remote).await?;
         std::fs::write(stem.with_extension(ext), &bytes)?;
     }
 
@@ -113,10 +107,6 @@ fn local_base_path(handle: &JammiObjectStore) -> Result<std::path::PathBuf> {
     let raw = handle.url().path();
     let path = Path::new(raw);
     Ok(path.with_extension(""))
-}
-
-fn map_storage(e: StorageError) -> crate::error::JammiError {
-    crate::error::JammiError::Other(e.to_string())
 }
 
 #[cfg(test)]

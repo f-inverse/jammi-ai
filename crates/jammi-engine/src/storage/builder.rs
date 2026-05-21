@@ -24,6 +24,12 @@ pub fn build_object_store(
     url: &StorageUrl,
     config: Option<&CloudConfig>,
 ) -> Result<DynObjectStore, StorageError> {
+    // Reject partial credentials up front so the caller gets a typed
+    // [`StorageError::DriverInit`] at build time rather than a deep-in-the-
+    // request SDK error on the first GET.
+    if let Some(cfg) = config {
+        cfg.validate()?;
+    }
     match url.scheme() {
         Scheme::File => build_file(url),
         Scheme::Memory => Ok(Arc::new(object_store::memory::InMemory::new())),

@@ -105,6 +105,32 @@ jobs:
         run: |
           cargo test -p jammi-engine --features live-broker-tests --test it -- --test-threads=1
 
+  test-python:
+    name: Test (Python)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Build wheel with maturin develop
+        # The CI base image ships maturin + a python3 toolchain; use a
+        # venv to avoid polluting the system site-packages and to make
+        # `python` resolve to the venv's interpreter for pytest.
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install maturin pytest pyarrow
+          maturin develop --release
+
+      - name: Run pytest
+        run: |
+          . .venv/bin/activate
+          pytest crates/jammi-python/tests -v
+
   test-pg:
     name: Test (Postgres)
     runs-on: ubuntu-latest

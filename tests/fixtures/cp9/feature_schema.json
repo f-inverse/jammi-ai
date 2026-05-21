@@ -1,0 +1,6 @@
+[
+  {"name": "feature_id", "type": "Int64", "nullable": false},
+  {"name": "feature_value", "type": "Float64", "nullable": false},
+  {"name": "effective_from", "type": "Int64", "nullable": false},
+  {"name": "effective_to", "type": "Int64", "nullable": true}
+]

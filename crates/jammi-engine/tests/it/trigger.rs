@@ -488,3 +488,83 @@ async fn predicate_rejects_unsupported_constructs() {
         "expected PredicateParse, got {err:?}"
     );
 }
+
+#[tokio::test]
+async fn replay_only_drains_backing_table_without_live_tail() {
+    // `Subscriber::replay_only` is the CLI-shaped variant of `subscribe`
+    // that returns the replay prefix as a Vec and exits without attaching
+    // to the live broker tail. Publishing two batches and replaying from
+    // offset 0 must return exactly those two batches, in order.
+    let h = build_harness().await;
+    let topic = topic_def("events.replay_only", None);
+    h.broker.register_topic(&topic).await.unwrap();
+    h.topic_repo.register_topic(&topic).await.unwrap();
+
+    for i in 0..2i64 {
+        let batch = batch_of(&[i], &["X"], &[i as f64]);
+        h.publisher.publish(&topic, batch).await.unwrap();
+    }
+
+    let from = Offset::new(0, chrono::Utc::now());
+    let drained = h
+        .subscriber
+        .replay_only(&topic, Predicate::match_all(), Some(from))
+        .await
+        .unwrap();
+    assert_eq!(drained.len(), 2);
+    assert_eq!(drained[0].offset.value(), 0);
+    assert_eq!(drained[1].offset.value(), 1);
+}
+
+#[tokio::test]
+async fn replay_only_returns_empty_when_from_offset_none() {
+    // Without a `from_offset` the live-tail flow has nothing to replay,
+    // so the engine returns an empty Vec rather than blocking on the
+    // broker tail.
+    let h = build_harness().await;
+    let topic = topic_def("events.replay_only_empty", None);
+    h.broker.register_topic(&topic).await.unwrap();
+    h.topic_repo.register_topic(&topic).await.unwrap();
+
+    for i in 0..3i64 {
+        let batch = batch_of(&[i], &["X"], &[i as f64]);
+        h.publisher.publish(&topic, batch).await.unwrap();
+    }
+
+    let drained = h
+        .subscriber
+        .replay_only(&topic, Predicate::match_all(), None)
+        .await
+        .unwrap();
+    assert!(drained.is_empty());
+}
+
+#[tokio::test]
+async fn replay_only_applies_predicate_to_replay_window() {
+    // Predicate filter on the replay path: publish two batches with
+    // kind='X' / 'Y'; replay with `kind = 'X'` returns only the X batch.
+    let h = build_harness().await;
+    let topic = topic_def("events.replay_only_pred", None);
+    h.broker.register_topic(&topic).await.unwrap();
+    h.topic_repo.register_topic(&topic).await.unwrap();
+
+    h.publisher
+        .publish(&topic, batch_of(&[0], &["X"], &[0.0]))
+        .await
+        .unwrap();
+    h.publisher
+        .publish(&topic, batch_of(&[1], &["Y"], &[1.0]))
+        .await
+        .unwrap();
+
+    let predicate =
+        Predicate::from_sql(&h.session, Arc::clone(&topic.schema), "kind = 'X'").unwrap();
+    let from = Offset::new(0, chrono::Utc::now());
+    let drained = h
+        .subscriber
+        .replay_only(&topic, predicate, Some(from))
+        .await
+        .unwrap();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].offset.value(), 0);
+}

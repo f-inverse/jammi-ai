@@ -46,21 +46,72 @@ impl Subscriber {
         predicate: Predicate,
         from_offset: Option<Offset>,
     ) -> Result<Subscription, TriggerError> {
+        let replay_delivered = self.drain_replay(topic, &predicate, from_offset).await?;
+        let last_replayed = replay_delivered.iter().map(|d| d.offset.value()).max();
+
+        // Live tail starts strictly above the replayed prefix so the two
+        // halves do not deliver the same offset twice.
+        let live_from = match (from_offset, last_replayed) {
+            (_, Some(max)) => Some(Offset::new(max + 1, chrono::Utc::now())),
+            (Some(off), None) => Some(off),
+            (None, None) => None,
+        };
+        let mut live = self
+            .broker
+            .subscribe(topic.id, predicate, live_from)
+            .await?;
+
+        let stream = try_stream! {
+            for delivered in replay_delivered {
+                yield delivered;
+            }
+            while let Some(item) = live.next().await {
+                let delivered = item?;
+                yield delivered;
+            }
+        };
+        Ok(Subscription::new(SubscriptionId::new(), Box::pin(stream)))
+    }
+
+    /// Drain the backing-table replay window without attaching to the live
+    /// broker tail. Returns every event with offset `>= from_offset` that the
+    /// predicate accepts, in ascending `_offset` order.
+    ///
+    /// This is the engine-level primitive used by CLI-shaped callers (`jammi
+    /// trigger subscribe --no-follow`) that want a finite drain rather than
+    /// the infinite tail. Producing a `Vec<DeliveredBatch>` is acceptable
+    /// because the caller exits after consuming it; long-running subscribers
+    /// should keep using [`Subscriber::subscribe`].
+    pub async fn replay_only(
+        &self,
+        topic: &TopicDefinition,
+        predicate: Predicate,
+        from_offset: Option<Offset>,
+    ) -> Result<Vec<DeliveredBatch>, TriggerError> {
+        self.drain_replay(topic, &predicate, from_offset).await
+    }
+
+    /// Shared helper: collect the replay prefix matching `predicate` from the
+    /// backing table starting at `from_offset` (defaulting to the live tail
+    /// when `None`, in which case the replay is empty).
+    async fn drain_replay(
+        &self,
+        topic: &TopicDefinition,
+        predicate: &Predicate,
+        from_offset: Option<Offset>,
+    ) -> Result<Vec<DeliveredBatch>, TriggerError> {
         let backing_id = MutableTableId::new(topic.backing_table_name())
             .map_err(|e| TriggerError::Catalog(e.to_string()))?;
         let user_schema = Arc::clone(&topic.schema);
-        let predicate_for_replay = predicate.clone();
-        let mutable = Arc::clone(&self.mutable);
 
-        // Collect the replay prefix eagerly so the subscribe() future returns
-        // once the historical window is known.
         let replay_batches = match from_offset {
             Some(off) => {
                 // `scan_after` is strictly greater than, so subtract one to
                 // include `off` itself in the replay window. Using `i64`
                 // arithmetic so `Offset(0)` produces `-1` (return every row).
                 let scan_after_value = (off.value() as i64).saturating_sub(1);
-                let mut stream = mutable
+                let mut stream = self
+                    .mutable
                     .scan_after(&backing_id, scan_after_value)
                     .await
                     .map_err(TriggerError::BackingTable)?;
@@ -74,36 +125,17 @@ impl Subscriber {
         };
 
         let replay_events = group_replay_batches(&replay_batches, &user_schema)?;
-        let last_replayed = replay_events.iter().map(|e| e.offset.value()).max();
-
-        // Live tail starts strictly above the replayed prefix so the two
-        // halves do not deliver the same offset twice.
-        let live_from = match (from_offset, last_replayed) {
-            (_, Some(max)) => Some(Offset::new(max + 1, chrono::Utc::now())),
-            (Some(off), None) => Some(off),
-            (None, None) => None,
-        };
-        let mut live = self
-            .broker
-            .subscribe(topic.id, predicate.clone(), live_from)
-            .await?;
-
-        let stream = try_stream! {
-            for event in replay_events {
-                if let Some(filtered) = predicate_for_replay.evaluate(&event.batch)? {
-                    yield DeliveredBatch {
-                        offset: event.offset,
-                        produced_at: event.produced_at,
-                        batch: filtered,
-                    };
-                }
+        let mut delivered: Vec<DeliveredBatch> = Vec::with_capacity(replay_events.len());
+        for event in replay_events {
+            if let Some(filtered) = predicate.evaluate(&event.batch)? {
+                delivered.push(DeliveredBatch {
+                    offset: event.offset,
+                    produced_at: event.produced_at,
+                    batch: filtered,
+                });
             }
-            while let Some(item) = live.next().await {
-                let delivered = item?;
-                yield delivered;
-            }
-        };
-        Ok(Subscription::new(SubscriptionId::new(), Box::pin(stream)))
+        }
+        Ok(delivered)
     }
 }
 

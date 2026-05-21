@@ -25,6 +25,15 @@ session.add_source("patents", SourceType::Local, SourceConnection {
 }).await?;
 ```
 
+### Python
+
+```python
+import jammi
+
+db = jammi.connect(artifact_dir="/var/lib/jammi")
+db.add_source("patents", path="/data/patents.parquet", format="parquet")
+```
+
 ## Declare the channel
 
 Channel declarations are catalog rows. Each declared column has a name, an Arrow type, and an ordinal. The set is append-only — once `ranker: Utf8` is declared, the engine refuses to redeclare it as `Int32` or drop it.
@@ -48,6 +57,16 @@ session.catalog().channels().register(&ChannelSpec {
 })?;
 ```
 
+### Python
+
+```python
+db.register_channel(
+    "scored_by",
+    priority=3,
+    columns=[("ranker", "Utf8"), ("rank_score", "Float32")],
+)
+```
+
 `priority` controls the order columns appear in the merged output — `vector` (1) and `inference` (2) come first, then `scored_by` (3).
 
 To add more columns to an already-registered channel:
@@ -57,6 +76,10 @@ session.catalog().channels().add_columns(
     &ChannelId::new("scored_by")?,
     &[ChannelColumn { name: "scored_at".into(), data_type: ChannelColumnType::Utf8 }],
 )?;
+```
+
+```python
+db.add_channel_columns("scored_by", columns=[("scored_at", "Utf8")])
 ```
 
 `add_columns` is append-only by construction. Trying to redeclare `ranker` with the same or a different type returns `JammiError::EvidenceChannel(_)`.
@@ -109,11 +132,29 @@ for batch in &merged {
 }
 ```
 
+### Python
+
+From the SQL surface, the declared columns show up in any query that touches the result table — Python sees them as plain Arrow columns:
+
+```python
+table = db.sql(
+    "SELECT _row_id, similarity, ranker, rank_score FROM results LIMIT 3"
+)
+for row in table.to_pylist():
+    print(row["ranker"], row["rank_score"])
+```
+
 ## What you cannot do
 
 The channel declaration is append-only. Once `scored_by` ships with `ranker: Utf8`, you cannot:
 
-- Redeclare `ranker` as `Int32` — `add_columns` rejects with `JammiError::EvidenceChannel("channel 'scored_by': column 'ranker' was declared Utf8, cannot redeclare as Int32")`.
+- Redeclare `ranker` as `Int32` — `add_columns` rejects with `JammiError::EvidenceChannel("channel 'scored_by': column 'ranker' was declared Utf8, cannot redeclare as Int32")`. From Python, the same call raises `RuntimeError` carrying the identical message:
+
+  ```python
+  db.add_channel_columns("scored_by", columns=[("ranker", "Int32")])
+  # RuntimeError: channel 'scored_by': column 'ranker' was declared Utf8, cannot redeclare as Int32
+  ```
+
 - Add a second column with the same name — `add_columns` rejects with `JammiError::EvidenceChannel("channel 'scored_by': column 'ranker' already declared")`.
 - Drop `ranker` from the channel — there is no `drop_column` method by design.
 

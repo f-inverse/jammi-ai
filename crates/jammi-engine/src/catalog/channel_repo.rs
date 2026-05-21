@@ -60,7 +60,11 @@ impl ChannelColumnType {
         }
     }
 
-    fn from_sql_str(s: &str) -> Result<Self> {
+    /// Parse a PascalCase variant name (`"Float32"`, `"Utf8"`, …) into a
+    /// `ChannelColumnType`. The canonical string form is shared with the
+    /// catalog's stored representation and with public-API callers (e.g.
+    /// the Python binding's `register_channel(columns=[(name, dtype_str)])`).
+    pub fn from_sql_str(s: &str) -> Result<Self> {
         match s {
             "Float32" => Ok(Self::Float32),
             "Float64" => Ok(Self::Float64),

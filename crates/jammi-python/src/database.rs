@@ -209,6 +209,50 @@ impl PyDatabase {
         batches_to_pyarrow(py, &collected)
     }
 
+    /// Register a new evidence-provenance channel. `columns` is a list of
+    /// `(name, dtype)` tuples where `dtype` is one of `"Float32"`, `"Float64"`,
+    /// `"Int32"`, `"Int64"`, `"Utf8"`, `"Boolean"`. Priority orders the
+    /// channel against others on the same row when several contribute the
+    /// same column. The channel id is unique across the catalog: passing
+    /// one that already exists raises `RuntimeError` carrying
+    /// `EvidenceChannel("channel '<id>': already exists")`.
+    #[pyo3(signature = (channel_id, *, priority, columns))]
+    fn register_channel(
+        &self,
+        channel_id: &str,
+        priority: i32,
+        columns: Vec<(String, String)>,
+    ) -> PyResult<()> {
+        let id = jammi_engine::ChannelId::new(channel_id).map_err(to_pyerr)?;
+        let cols = parse_channel_columns(&columns)?;
+        let spec = jammi_engine::catalog::channel_repo::ChannelSpec {
+            id,
+            priority,
+            columns: cols,
+        };
+        self.runtime
+            .block_on(self.session.catalog().channels().register(&spec))
+            .map_err(to_pyerr)
+    }
+
+    /// Append columns to an already-registered channel. The append-only
+    /// invariant is enforced: redeclaring an existing column with a
+    /// different dtype raises `RuntimeError` carrying
+    /// `EvidenceChannel("channel '<id>': column '<name>' was declared <X>,
+    /// cannot redeclare as <Y>")`.
+    #[pyo3(signature = (channel_id, *, columns))]
+    fn add_channel_columns(
+        &self,
+        channel_id: &str,
+        columns: Vec<(String, String)>,
+    ) -> PyResult<()> {
+        let id = jammi_engine::ChannelId::new(channel_id).map_err(to_pyerr)?;
+        let cols = parse_channel_columns(&columns)?;
+        self.runtime
+            .block_on(self.session.catalog().channels().add_columns(&id, &cols))
+            .map_err(to_pyerr)
+    }
+
     /// Start a vector search. Returns a `SearchBuilder` for fluent chaining.
     #[pyo3(signature = (source, *, query, k))]
     fn search(&self, source: &str, query: Vec<f32>, k: usize) -> PyResult<PySearchBuilder> {
@@ -500,4 +544,21 @@ fn parse_model_task(s: &str) -> PyResult<ModelTask> {
 
 fn parse_eval_task(s: &str) -> PyResult<jammi_ai::eval::EvalTask> {
     s.parse().map_err(to_pyerr)
+}
+
+fn parse_channel_columns(
+    columns: &[(String, String)],
+) -> PyResult<Vec<jammi_engine::catalog::channel_repo::ChannelColumn>> {
+    columns
+        .iter()
+        .map(|(name, dtype)| {
+            let data_type =
+                jammi_engine::catalog::channel_repo::ChannelColumnType::from_sql_str(dtype)
+                    .map_err(to_pyerr)?;
+            Ok(jammi_engine::catalog::channel_repo::ChannelColumn {
+                name: name.clone(),
+                data_type,
+            })
+        })
+        .collect()
 }

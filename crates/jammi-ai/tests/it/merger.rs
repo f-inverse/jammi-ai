@@ -8,11 +8,12 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Float32Array, RecordBatch, StringArray};
+use arrow::array::{ArrayRef, Float32Array, Int32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
 use jammi_ai::evidence::{merge_channels, ChannelContribution};
 use jammi_engine::catalog::Catalog;
+use jammi_engine::error::JammiError;
 use jammi_engine::ChannelId;
 use tempfile::tempdir;
 
@@ -110,5 +111,78 @@ async fn merged_channel_nullability_round_trips_through_datafusion() {
             count, n as i64,
             "expected every row of '{col}' to be NULL when the channel supplied no contribution"
         );
+    }
+}
+
+/// SPEC-01 §9 — a contribution whose array length doesn't match the batch's
+/// row count must surface as a typed `EvidenceChannel` error naming both
+/// counts. SPEC-01 §3.7 phrases this as "has N rows, batch has M"; the
+/// production wording is "has N rows, expected M" (substring match against
+/// "has 2 rows" + "expected 3" + the column name pins both sides of the
+/// inequality without depending on the exact connective).
+#[tokio::test]
+async fn length_mismatched_contribution_returns_typed_error() {
+    let (_dir, catalog) = open_catalog().await;
+    let vector = ChannelId::new("vector").unwrap();
+    let batch = source_batch(3); // 3 rows
+
+    let bad = ChannelContribution::single(
+        vector.clone(),
+        Arc::new(Float32Array::from(vec![0.5_f32, 0.4])) as ArrayRef, // only 2 rows
+    );
+
+    let err = merge_channels(
+        &catalog,
+        &[batch],
+        &[vector.clone()],
+        &[vector],
+        &[],
+        &[vec![bad]],
+    )
+    .await
+    .unwrap_err();
+
+    match err {
+        JammiError::EvidenceChannel(msg) => assert!(
+            msg.contains("has 2 rows")
+                && msg.contains("expected 3")
+                && msg.contains("similarity"),
+            "expected length-mismatch error naming the column 'similarity' and row counts; got: {msg}"
+        ),
+        other => panic!("expected JammiError::EvidenceChannel, got {other:?}"),
+    }
+}
+
+/// SPEC-01 §9 — a contribution whose Arrow dtype doesn't match the
+/// catalog-declared `ChannelColumnType` must surface as a typed
+/// `EvidenceChannel` error naming the column and both types.
+#[tokio::test]
+async fn wrong_dtype_contribution_returns_typed_error() {
+    let (_dir, catalog) = open_catalog().await;
+    let vector = ChannelId::new("vector").unwrap(); // 'similarity' declared Float32
+    let batch = source_batch(2);
+
+    let bad = ChannelContribution::single(
+        vector.clone(),
+        Arc::new(Int32Array::from(vec![1_i32, 2])) as ArrayRef, // wrong: Int32
+    );
+
+    let err = merge_channels(
+        &catalog,
+        &[batch],
+        &[vector.clone()],
+        &[vector],
+        &[],
+        &[vec![bad]],
+    )
+    .await
+    .unwrap_err();
+
+    match err {
+        JammiError::EvidenceChannel(msg) => assert!(
+            msg.contains("Float32") && msg.contains("Int32") && msg.contains("similarity"),
+            "expected dtype-mismatch error naming 'similarity' + Int32 + Float32; got: {msg}"
+        ),
+        other => panic!("expected JammiError::EvidenceChannel, got {other:?}"),
     }
 }

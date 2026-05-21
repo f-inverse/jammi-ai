@@ -14,3 +14,4 @@ mod scheduling;
 mod search;
 mod search_attribution;
 mod smoke;
+mod uat_workflows;

@@ -53,6 +53,11 @@ enum Commands {
         #[command(subcommand)]
         action: commands::channels::ChannelAction,
     },
+    /// Manage mutable companion tables
+    Mutable {
+        #[command(subcommand)]
+        action: commands::mutable::MutableAction,
+    },
 }
 
 #[tokio::main]
@@ -91,6 +96,7 @@ async fn run(
         Some(Commands::Channels { action }) => {
             commands::channels::run(config, tenant, action).await
         }
+        Some(Commands::Mutable { action }) => commands::mutable::run(config, tenant, action).await,
         None => {
             // No subcommand — print help
             use clap::CommandFactory;

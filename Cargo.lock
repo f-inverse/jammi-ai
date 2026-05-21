@@ -3886,6 +3886,7 @@ dependencies = [
  "jammi-engine",
  "jammi-server",
  "predicates",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

@@ -43,7 +43,7 @@ export JAMMI_ARTIFACT_DIR=$(mktemp -d)
 alias jammi='cargo run --quiet -p jammi-cli --'
 ```
 
-The four migrations cp9 introduces apply automatically on first session open; the sequence `005_TENANT_SCOPE → 006_CHANNEL_COLUMNS → 007_MUTABLE_TABLES → 008_TOPICS` is verified in the sign-off checklist. Fixtures used below live at `tests/fixtures/patents.parquet` (a generic public-domain corpus), `tests/fixtures/cp9/feature_schema.json` (tenant-neutral SCD-2 schema), and `tests/fixtures/cp9/ranking_schema.json` (tenant-neutral ranking-state schema). The `two_tenant_session_pair` / `mint_tenant_id` helpers under `crates/jammi-test-utils/src/tenant_fixtures.rs` back the engine-level workflow tests.
+The cp9 migrations apply automatically on first session open; the sequence `005_tenant_scope → 006_channel_columns → 007_mutable_tables → 008_mutable_order_column → 009_topics` is verified in the sign-off checklist. Fixtures used below live at `tests/fixtures/patents.parquet` (a generic public-domain corpus), `tests/fixtures/cp9/feature_schema.json` (tenant-neutral SCD-2 schema), and `tests/fixtures/cp9/ranking_schema.json` (tenant-neutral ranking-state schema). The `two_tenant_session_pair` / `mint_tenant_id` helpers under `crates/jammi-test-utils/src/tenant_fixtures.rs` back the engine-level workflow tests.
 
 ---
 
@@ -465,7 +465,7 @@ jammi --tenant "$TENANT_OTHER" trigger publish \
   --topic cdc.orders --json-file tests/fixtures/cdc/poison.json
 ```
 
-The predicate-isolation and tenant-isolation properties — subscriber 1 receives exactly the `op = 'c'` envelopes; subscriber 2 receives all 10 envelopes from offset 0; subscriber 3 receives only `op IN ('u','d')` envelopes; Tenant OPS subscribers never see envelopes from `poison.json` — are regression-covered by `uat_workflow_c_cdc_pipeline_isolates_tenants_and_predicates` in `crates/jammi-ai/tests/it/uat_workflows.rs`.
+The `tests/fixtures/cdc/orders_run_1.json` and `tests/fixtures/cdc/poison.json` paths above are illustrative — the operator supplies their own envelope batches (or uses `--row '{...}'` repeated for small inline runs). The predicate-isolation and tenant-isolation properties — subscriber 1 receives exactly the `op = 'c'` envelopes; subscriber 2 receives all envelopes from offset 0; subscriber 3 receives only `op IN ('u','d')` envelopes; Tenant OPS subscribers never see Tenant OTHER's envelopes — are regression-covered by `uat_workflow_c_cdc_pipeline_isolates_tenants_and_predicates` in `crates/jammi-ai/tests/it/uat_workflows.rs`.
 
 Backing-table direct scan for ad-hoc analytics is exercised at the engine layer (the topic backing table is a regular mutable companion table named `__topic_<uuid7>` and is queryable through the same `MutableTableRegistry::scan_after` surface). A CLI flag for resolving the backing-table name from a topic name (`--output topic_id`) is deferred — *Wave 3*.
 
@@ -604,7 +604,7 @@ The operator ticks every box; the PR is merge-blocked until all are checked.
 - [ ] No new `#[allow(...)]` attributes anywhere in the four cp9 PRs: `git log --all --since="cp9 start" -p -- crates/ | grep -E '^\+.*#\[allow' | wc -l` returns 0.
 - [ ] No new `let _ = …` over a `Result`, no new `// TODO: later`, no new `#[ignore]` across the four PRs.
 - [ ] No tenant-coupled fixtures introduced — the operator scans `crates/`, `tests/`, and `docs/` cp9 diffs and confirms no tenant-domain names, no tenant-shaped CSV columns, and no tenant-specific scripts appear. Flagship tenant names are forbidden by name and by likeness.
-- [ ] Migration sequence applies cleanly from an empty catalog: `rm -rf $JAMMI_ARTIFACT_DIR && jammi sources list` succeeds, and the catalog reports migrations `001 → 002 → 003 → 004 → 005 → 006 → 007 → 008` applied in that order.
+- [ ] Migration sequence applies cleanly from an empty catalog: `rm -rf $JAMMI_ARTIFACT_DIR && jammi sources list` succeeds, and the catalog reports migrations `001 → 002 → 003 → 004 → 005 → 006 → 007 → 008 → 009` applied in that order.
 - [ ] Workspace `version = "0.3.0"` is the single version on every publishable crate (lockstep per *Atomic across the workspace*).
 
 ---

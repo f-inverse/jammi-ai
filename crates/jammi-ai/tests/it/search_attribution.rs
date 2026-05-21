@@ -28,7 +28,7 @@ async fn session_with_embeddings() -> (Arc<InferenceSession>, TempDir) {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),

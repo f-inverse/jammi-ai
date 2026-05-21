@@ -18,7 +18,7 @@ async fn session_with_embeddings() -> (Arc<InferenceSession>, TempDir) {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -158,7 +158,7 @@ async fn search_fails_without_embedding_table() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -184,7 +184,7 @@ async fn search_with_join_on_real_foreign_key() {
     session
         .add_source(
             "assignees",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("assignees.csv")),
                 format: Some(FileFormat::Csv),
@@ -319,7 +319,7 @@ async fn search_resolves_to_latest_embedding_table() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),

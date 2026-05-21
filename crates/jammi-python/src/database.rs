@@ -55,13 +55,16 @@ impl PyDatabase {
         self.session.tenant().map(|t| t.to_string())
     }
 
-    /// Register a local file as a data source.
-    #[pyo3(signature = (name, *, path, format))]
-    fn add_source(&self, name: &str, path: &str, format: &str) -> PyResult<()> {
+    /// Register a file-shaped data source. `url` accepts a local path
+    /// (parsed into `file://...`) or any storage URL the build was
+    /// compiled with: `s3://bucket/key`, `gs://bucket/key`,
+    /// `azure://container/blob`.
+    #[pyo3(signature = (name, *, url, format))]
+    fn add_source(&self, name: &str, url: &str, format: &str) -> PyResult<()> {
         let file_format = parse_file_format(format)?;
-        let connection = SourceConnection::from_path(path, file_format);
+        let connection = SourceConnection::parse(url, file_format).map_err(to_pyerr)?;
         self.runtime
-            .block_on(self.session.add_source(name, SourceType::Local, connection))
+            .block_on(self.session.add_source(name, SourceType::File, connection))
             .map_err(to_pyerr)
     }
 

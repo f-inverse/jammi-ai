@@ -49,7 +49,7 @@ async fn recipe_query_data_with_sql() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -83,7 +83,7 @@ async fn recipe_query_data_with_sql() {
     session
         .add_source(
             "companies",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("assignees.csv")),
                 format: Some(FileFormat::Csv),
@@ -116,7 +116,7 @@ async fn recipe_generate_embeddings() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -137,10 +137,10 @@ async fn recipe_generate_embeddings() {
     assert!(record.dimensions.is_some());
 
     // Parquet file exists
-    assert!(std::path::Path::new(&record.parquet_path).exists());
+    assert!(common::url_to_path(&record.parquet_path).exists());
 
     // Sidecar index files exist
-    let base = std::path::Path::new(record.index_path.as_ref().unwrap());
+    let base = common::url_to_path(record.index_path.as_ref().unwrap());
     assert!(base.with_extension("usearch").exists());
     assert!(base.with_extension("rowmap").exists());
     assert!(base.with_extension("manifest.json").exists());
@@ -197,7 +197,7 @@ async fn recipe_semantic_search() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -280,7 +280,7 @@ async fn recipe_enrich_results() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -293,7 +293,7 @@ async fn recipe_enrich_results() {
     session
         .add_source(
             "assignees",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("assignees.csv")),
                 format: Some(FileFormat::Csv),
@@ -385,7 +385,7 @@ async fn recipe_fine_tune() {
     session
         .add_source(
             "training",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("training_pairs.csv")),
                 format: Some(FileFormat::Csv),
@@ -421,7 +421,7 @@ async fn recipe_fine_tune() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -458,7 +458,7 @@ async fn recipe_evaluation() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -471,7 +471,7 @@ async fn recipe_evaluation() {
     session
         .add_source(
             "golden",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("golden_relevance.csv")),
                 format: Some(FileFormat::Csv),
@@ -536,7 +536,7 @@ async fn recipe_modernbert_embeddings() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -586,7 +586,7 @@ async fn recipe_source_lifecycle() {
     session
         .add_source(
             "alpha",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -599,7 +599,7 @@ async fn recipe_source_lifecycle() {
     session
         .add_source(
             "beta",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("assignees.csv")),
                 format: Some(FileFormat::Csv),
@@ -623,7 +623,7 @@ async fn recipe_source_lifecycle() {
         .await
         .unwrap()
         .expect("alpha should exist");
-    assert_eq!(alpha.source_type, SourceType::Local);
+    assert_eq!(alpha.source_type, SourceType::File);
 
     // Remove a source
     session.remove_source("alpha").await.unwrap();
@@ -650,7 +650,7 @@ async fn recipe_model_management() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -713,7 +713,7 @@ async fn recipe_classification_inference() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -810,7 +810,7 @@ async fn recipe_ner_inference() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -877,7 +877,7 @@ async fn recipe_generate_image_embeddings() {
     session
         .add_source(
             "figures",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("figures.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -898,10 +898,10 @@ async fn recipe_generate_image_embeddings() {
     assert!(record.dimensions.is_some());
 
     // Parquet file exists
-    assert!(std::path::Path::new(&record.parquet_path).exists());
+    assert!(common::url_to_path(&record.parquet_path).exists());
 
     // Sidecar index files exist
-    let base = std::path::Path::new(record.index_path.as_ref().unwrap());
+    let base = common::url_to_path(record.index_path.as_ref().unwrap());
     assert!(base.with_extension("usearch").exists());
     assert!(base.with_extension("rowmap").exists());
     assert!(base.with_extension("manifest.json").exists());
@@ -1359,7 +1359,7 @@ async fn cookbook_scope_source_by_tenant_recipe_runs_end_to_end() {
         registrar
             .add_source(
                 "notes",
-                SourceType::Local,
+                SourceType::File,
                 SourceConnection {
                     url: Some(url.clone()),
                     format: Some(FileFormat::Parquet),

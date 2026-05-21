@@ -5,7 +5,6 @@ use datafusion::physical_plan::ExecutionPlan;
 use jammi_engine::catalog::result_repo::ResultTableRecord;
 use jammi_engine::error::{JammiError, Result};
 use jammi_engine::index::sidecar::SidecarIndex;
-use jammi_engine::store::writer::ParquetResultWriter;
 use jammi_engine::store::ResultStore;
 
 use crate::model::{ModelSource, ModelTask};
@@ -108,7 +107,10 @@ impl<'a> EmbeddingPipeline<'a> {
 
         // Create ResultSink
         let embedding_schema = jammi_engine::store::schema::embedding_table_schema(embedding_dim);
-        let writer = ParquetResultWriter::new(&table_info.parquet_path, embedding_schema)?;
+        let writer = self
+            .result_store
+            .open_writer(&table_info.parquet_url, embedding_schema)
+            .await?;
         let sidecar = SidecarIndex::new(embedding_dim)?;
         let checkpoint_interval = self.session.inner_config().embedding.checkpoint_interval;
         let mut sink = ResultSink::for_embeddings(
@@ -133,12 +135,12 @@ impl<'a> EmbeddingPipeline<'a> {
             sink.write_batch(batch).await?;
         }
 
-        let (row_count, index) = sink.finalize()?;
+        let (row_count, index) = sink.finalize().await?;
 
         // Save sidecar index
         if let Some(ref idx) = index {
-            if let Some(ref idx_path) = table_info.index_path {
-                idx.save(idx_path)?;
+            if let Some(ref idx_url) = table_info.index_url {
+                self.result_store.save_sidecar(idx_url, idx).await?;
             }
         }
 
@@ -147,7 +149,7 @@ impl<'a> EmbeddingPipeline<'a> {
             .finalize(
                 self.session.context(),
                 &table_info.table_name,
-                &table_info.parquet_path,
+                &table_info.parquet_url,
                 row_count,
             )
             .await?;

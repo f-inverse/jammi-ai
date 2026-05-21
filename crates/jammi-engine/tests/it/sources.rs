@@ -16,7 +16,7 @@ async fn register_and_query_multiple_formats() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -39,7 +39,7 @@ async fn register_and_query_multiple_formats() {
     session
         .add_source(
             "scores",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("scores.csv")),
                 format: Some(FileFormat::Csv),
@@ -65,7 +65,7 @@ async fn query_with_filter_and_order() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -106,7 +106,7 @@ async fn source_persists_across_sessions() {
         session
             .add_source(
                 "persist",
-                SourceType::Local,
+                SourceType::File,
                 SourceConnection {
                     url: Some(common::fixture_url("patents.parquet")),
                     format: Some(FileFormat::Parquet),
@@ -133,7 +133,7 @@ async fn source_crud_list_and_remove() {
     session
         .add_source(
             "src_a",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),
@@ -146,7 +146,7 @@ async fn source_crud_list_and_remove() {
     session
         .add_source(
             "src_b",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("scores.csv")),
                 format: Some(FileFormat::Csv),
@@ -188,7 +188,7 @@ async fn session_respects_config_batch_size() {
     session
         .add_source(
             "patents",
-            SourceType::Local,
+            SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
                 format: Some(FileFormat::Parquet),

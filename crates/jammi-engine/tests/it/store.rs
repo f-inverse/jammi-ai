@@ -6,15 +6,17 @@ use arrow::record_batch::RecordBatch;
 use jammi_engine::catalog::result_repo::CreateResultTableParams;
 use jammi_engine::catalog::status::ResultTableStatus;
 use jammi_engine::catalog::Catalog;
-use jammi_engine::store::reader::{count_parquet_rows, is_valid_parquet};
-use jammi_engine::store::writer::ParquetResultWriter;
+use jammi_engine::storage::{
+    reader::{count_parquet_rows, is_valid_parquet},
+    JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl,
+};
 use jammi_engine::store::ResultStore;
 use tempfile::tempdir;
 
-// ─── ParquetResultWriter roundtrip ───────────────────────────────────────────
+// ─── ObjectParquetWriter roundtrip ───────────────────────────────────────────
 
-#[test]
-fn parquet_write_read_roundtrip() {
+#[tokio::test]
+async fn parquet_write_read_roundtrip() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.parquet");
 
@@ -23,7 +25,14 @@ fn parquet_write_read_roundtrip() {
         Field::new("value", DataType::Float32, false),
     ]));
 
-    let mut writer = ParquetResultWriter::new(&path, Arc::clone(&schema)).unwrap();
+    let url = StorageUrl::parse(path.to_str().unwrap()).unwrap();
+    let registry = StorageRegistry::new();
+    let driver = registry.driver_for(&url, None).unwrap();
+    let handle = JammiObjectStore::new(driver, url.clone());
+
+    let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema))
+        .await
+        .unwrap();
 
     // Multiple batches accumulate correctly
     for i in 0..3 {
@@ -35,13 +44,13 @@ fn parquet_write_read_roundtrip() {
             ],
         )
         .unwrap();
-        writer.write_batch(&batch).unwrap();
+        writer.write_batch(&batch).await.unwrap();
     }
-    let row_count = writer.close().unwrap();
+    let row_count = writer.close().await.unwrap();
 
     assert_eq!(row_count, 3);
-    assert!(is_valid_parquet(path.to_str().unwrap()));
-    assert_eq!(count_parquet_rows(path.to_str().unwrap()).unwrap(), 3);
+    assert!(is_valid_parquet(&handle).await.unwrap());
+    assert_eq!(count_parquet_rows(&handle).await.unwrap(), 3);
 }
 
 // ─── Catalog result_tables lifecycle ─────────────────────────────────────────
@@ -57,8 +66,8 @@ async fn result_table_crud_lifecycle() {
             source_id: "patents",
             model_id: "sentence-transformers/all-MiniLM-L6-v2",
             task: "text_embedding",
-            parquet_path: "/tmp/test.parquet",
-            index_path: Some("/tmp/test"),
+            parquet_path: "file:///tmp/test.parquet",
+            index_path: Some("file:///tmp/test.idx"),
             dimensions: Some(384),
             key_column: Some("id"),
             text_columns: Some("abstract"),
@@ -86,7 +95,7 @@ async fn result_table_crud_lifecycle() {
             source_id: "patents",
             model_id: "m",
             task: "classification",
-            parquet_path: "/tmp/t2.parquet",
+            parquet_path: "file:///tmp/t2.parquet",
             index_path: None,
             dimensions: None,
             key_column: None,
@@ -126,7 +135,7 @@ async fn find_result_tables_filters_by_source_and_task() {
                 source_id: source,
                 model_id: "model",
                 task,
-                parquet_path: &format!("/tmp/{name}.parquet"),
+                parquet_path: &format!("file:///tmp/{name}.parquet"),
                 index_path: None,
                 dimensions: None,
                 key_column: None,
@@ -169,7 +178,7 @@ async fn resolve_embedding_table_latest_explicit_and_missing() {
                 source_id: "patents",
                 model_id: "model",
                 task: "text_embedding",
-                parquet_path: &format!("/tmp/{name}.parquet"),
+                parquet_path: &format!("file:///tmp/{name}.parquet"),
                 index_path: None,
                 dimensions: Some(384),
                 key_column: None,
@@ -219,10 +228,12 @@ async fn result_store_create_table_generates_correct_paths() {
     assert!(info
         .table_name
         .starts_with("patents__text_embedding__sentence-transformers_all-MiniLM-L6-v2__"));
-    assert!(info.parquet_path.parent().unwrap().exists());
+    // parquet_url is a StorageUrl pointing at a file://… path under the
+    // jammi_db root we just created.
+    assert!(info.parquet_url.as_str().contains("jammi_db"));
     assert!(
-        info.index_path.is_some(),
-        "Embedding tables should have an index path"
+        info.index_url.is_some(),
+        "Embedding tables should have an index URL"
     );
 }
 
@@ -233,13 +244,20 @@ async fn recovery_marks_missing_parquet_as_failed() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
 
+    let missing_url = StorageUrl::parse(
+        dir.path()
+            .join("nonexistent.parquet")
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
     catalog
         .create_result_table(CreateResultTableParams {
             table_name: "orphan",
             source_id: "src",
             model_id: "model",
             task: "text_embedding",
-            parquet_path: dir.path().join("nonexistent.parquet").to_str().unwrap(),
+            parquet_path: missing_url.as_str(),
             index_path: None,
             dimensions: None,
             key_column: None,
@@ -271,6 +289,7 @@ async fn recovery_deletes_invalid_parquet_and_marks_failed() {
 
     let bad_path = db_dir.join("corrupt.parquet");
     std::fs::write(&bad_path, b"not valid parquet data").unwrap();
+    let bad_url = StorageUrl::parse(bad_path.to_str().unwrap()).unwrap();
 
     catalog
         .create_result_table(CreateResultTableParams {
@@ -278,7 +297,7 @@ async fn recovery_deletes_invalid_parquet_and_marks_failed() {
             source_id: "src",
             model_id: "model",
             task: "text_embedding",
-            parquet_path: bad_path.to_str().unwrap(),
+            parquet_path: bad_url.as_str(),
             index_path: None,
             dimensions: None,
             key_column: None,
@@ -320,9 +339,14 @@ async fn recovery_promotes_valid_parquet_to_ready() {
         vec![Arc::new(StringArray::from(vec!["r1", "r2", "r3"])) as ArrayRef],
     )
     .unwrap();
-    let mut writer = ParquetResultWriter::new(&parquet_path, schema).unwrap();
-    writer.write_batch(&batch).unwrap();
-    writer.close().unwrap();
+
+    let url = StorageUrl::parse(parquet_path.to_str().unwrap()).unwrap();
+    let registry = StorageRegistry::new();
+    let driver = registry.driver_for(&url, None).unwrap();
+    let handle = JammiObjectStore::new(driver, url.clone());
+    let mut writer = ObjectParquetWriter::open(&handle, schema).await.unwrap();
+    writer.write_batch(&batch).await.unwrap();
+    writer.close().await.unwrap();
 
     catalog
         .create_result_table(CreateResultTableParams {
@@ -330,7 +354,7 @@ async fn recovery_promotes_valid_parquet_to_ready() {
             source_id: "src",
             model_id: "model",
             task: "classification",
-            parquet_path: parquet_path.to_str().unwrap(),
+            parquet_path: url.as_str(),
             index_path: None,
             dimensions: None,
             key_column: None,

@@ -6,12 +6,12 @@ use jammi_engine::catalog::Catalog;
 use jammi_engine::error::{JammiError, Result};
 use jammi_engine::index::sidecar::SidecarIndex;
 use jammi_engine::index::VectorIndex;
-use jammi_engine::store::writer::ParquetResultWriter;
+use jammi_engine::storage::ObjectParquetWriter;
 
 /// Streams InferenceExec output to Parquet + optional ANN index,
 /// filtering failed rows for embedding tables.
 pub struct ResultSink<'a> {
-    writer: ParquetResultWriter,
+    writer: ObjectParquetWriter,
     index: Option<SidecarIndex>,
     catalog: &'a Catalog,
     table_name: String,
@@ -23,7 +23,7 @@ pub struct ResultSink<'a> {
 impl<'a> ResultSink<'a> {
     /// Create a sink for embedding results (filters OK rows, feeds sidecar index).
     pub fn for_embeddings(
-        writer: ParquetResultWriter,
+        writer: ObjectParquetWriter,
         index: SidecarIndex,
         catalog: &'a Catalog,
         table_name: String,
@@ -42,7 +42,7 @@ impl<'a> ResultSink<'a> {
 
     /// Create a sink for inference results (writes all rows, no index).
     pub fn for_inference(
-        writer: ParquetResultWriter,
+        writer: ObjectParquetWriter,
         catalog: &'a Catalog,
         table_name: String,
     ) -> Self {
@@ -63,7 +63,7 @@ impl<'a> ResultSink<'a> {
         if self.is_embedding {
             let (ok_batch, row_ids, vectors) = filter_ok_and_extract_vectors(batch)?;
             if ok_batch.num_rows() > 0 {
-                self.writer.write_batch(&ok_batch)?;
+                self.writer.write_batch(&ok_batch).await?;
                 if let Some(ref mut index) = self.index {
                     for (id, vec) in row_ids.iter().zip(vectors.iter()) {
                         index.add(id, vec)?;
@@ -71,7 +71,7 @@ impl<'a> ResultSink<'a> {
                 }
             }
         } else {
-            self.writer.write_batch(batch)?;
+            self.writer.write_batch(batch).await?;
         }
         if self.checkpoint_interval > 0 && self.batch_num % self.checkpoint_interval == 0 {
             self.catalog
@@ -82,8 +82,8 @@ impl<'a> ResultSink<'a> {
     }
 
     /// Close the writer and build the index (if embedding).
-    pub fn finalize(self) -> Result<(usize, Option<SidecarIndex>)> {
-        let row_count = self.writer.close()?;
+    pub async fn finalize(self) -> Result<(usize, Option<SidecarIndex>)> {
+        let row_count = self.writer.close().await?;
         let index = match self.index {
             Some(mut idx) if idx.len() > 0 => {
                 idx.build()?;

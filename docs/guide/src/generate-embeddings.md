@@ -164,7 +164,7 @@ results = db.infer(
     source="patents",
     model="sentence-transformers/all-MiniLM-L6-v2",
     columns=["abstract"],
-    task="embedding",
+    task="text_embedding",
     key="id",
 )
 ```

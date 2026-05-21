@@ -8,7 +8,14 @@ Join search results with a registered source to add context columns (e.g., compa
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use std::sync::Arc;
+# use jammi_ai::session::InferenceSession;
+# use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+# async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_engine::error::Result<()> {
 session.add_source("assignees", SourceType::File, SourceConnection {
     url: Some("file:///data/assignees.csv".into()),
     format: Some(FileFormat::Csv),
@@ -19,6 +26,7 @@ let results = session.search("patents", query, 10).await?
     .join("assignees", "assignee_id=id", None).await?  // left join by default
     .run().await?;
 // Results now include company_name, country from assignees
+# Ok(()) }
 ```
 
 ### Python
@@ -40,14 +48,21 @@ Run a model over search results to add new columns:
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use std::sync::Arc;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_engine::error::Result<()> {
 let results = session.search("patents", query, 10).await?
     .annotate(
         "sentence-transformers/all-MiniLM-L6-v2",
-        "embedding",
+        "text_embedding",
         &["abstract".to_string()],
     ).await?
     .run().await?;
+# Ok(()) }
 ```
 
 ### Python
@@ -56,7 +71,7 @@ let results = session.search("patents", query, 10).await?
 search = db.search("patents", query=query_vec, k=10)
 search.annotate(
     model="sentence-transformers/all-MiniLM-L6-v2",
-    task="embedding",
+    task="text_embedding",
     columns=["abstract"],
 )
 results = search.run()
@@ -79,15 +94,22 @@ All operations compose freely:
 
 ### Rust
 
-```rust
+```rust,no_run
+# extern crate jammi_engine;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use std::sync::Arc;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_engine::error::Result<()> {
 let results = session.search("patents", query, 100).await?
     .join("assignees", "assignee_id=id", None).await?
-    .annotate("all-MiniLM-L6-v2", "embedding", &["abstract".into()]).await?
+    .annotate("all-MiniLM-L6-v2", "text_embedding", &["abstract".into()]).await?
     .filter("country = 'US'")?
     .sort("similarity", true)?
     .limit(10)
     .select(&["title".into(), "company_name".into(), "similarity".into()])?
     .run().await?;
+# Ok(()) }
 ```
 
 ### Python
@@ -95,7 +117,7 @@ let results = session.search("patents", query, 100).await?
 ```python
 search = db.search("patents", query=query_vec, k=100)
 search.join("assignees", on="assignee_id=id")
-search.annotate(model="all-MiniLM-L6-v2", task="embedding", columns=["abstract"])
+search.annotate(model="all-MiniLM-L6-v2", task="text_embedding", columns=["abstract"])
 search.filter("country = 'US'")
 search.sort("similarity", descending=True)
 search.limit(10)

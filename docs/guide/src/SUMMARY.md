@@ -28,6 +28,7 @@
 - [Subscribe to a Topic with a SQL Predicate Filter](./subscribe-with-filter.md)
 - [Replay Events from the Backing Table](./replay-from-backing-table.md)
 - [Scope a Session to a Tenant](./multi-tenant.md)
+- [Scope a Federated Source by Tenant](./scope-source-by-tenant.md)
 - [Deploy as a Server](./deploy-server.md)
 - [Monitor Inference](./monitor-inference.md)
 

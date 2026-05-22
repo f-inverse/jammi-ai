@@ -12,6 +12,7 @@
 //! query returns*; that's semantics, not optimization.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, RwLock};
 
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -21,7 +22,19 @@ use datafusion::logical_expr::{BinaryExpr, Expr, Filter, LogicalPlan, Operator, 
 use datafusion::optimizer::AnalyzerRule;
 use datafusion::scalar::ScalarValue;
 
-use crate::tenant::TenantContext;
+use crate::tenant::{TenantContext, TenantId};
+
+tokio::task_local! {
+    /// Task-local tenant override consulted by [`TenantBinding::current`].
+    ///
+    /// Set by [`crate::session::JammiSession::with_tenant_scoped`] for the
+    /// duration of one closure (typically one gRPC request handler). When
+    /// present, it shadows the session's shared [`TenantBinding::shared`]
+    /// for the lifetime of the executing task — including across `.await`
+    /// points and recursive calls inside the closure — without mutating
+    /// any shared state. Concurrent tasks each see their own override.
+    static CURRENT_TENANT_OVERRIDE: TenantContext;
+}
 
 /// Source-name → optional `tenant_column` lookup. Populated from the catalog
 /// at session construction; the analyzer consults it when a `TableScan`'s
@@ -56,9 +69,101 @@ impl SourceTenantColumns {
     }
 }
 
-/// Per-session shared tenant state read by the analyzer rule on every plan
-/// analysis. Sessions update this via [`crate::session::JammiSession::with_tenant`].
-pub type TenantBinding = Arc<RwLock<TenantContext>>;
+/// Per-session tenant state consulted by the analyzer rule, the catalog,
+/// and the mutable-table read/write paths.
+///
+/// The binding overlays two values:
+///
+/// 1. A **task-local override** (`CURRENT_TENANT_OVERRIDE`) installed for
+///    the duration of one [`crate::session::JammiSession::with_tenant_scoped`]
+///    closure. Concurrent tasks each carry their own override — reads see
+///    the override of the task that initiated them, with no shared-state
+///    write involved.
+/// 2. A **shared default** (`Arc<RwLock<TenantContext>>`) mutated by the
+///    sticky session-level binding APIs ([`crate::session::JammiSession::bind_tenant`],
+///    [`crate::session::JammiSession::with_tenant`], the Flight SQL
+///    [`SessionStateProvider`] in `jammi-server`). Sticky-binding callers
+///    that hold the session behind `Arc` and serialise their requests still
+///    work unchanged.
+///
+/// [`Self::current`] returns the override when present, the shared value
+/// otherwise. Every reader on the engine side consults [`Self::current`];
+/// no reader peeks at the inner `RwLock` directly.
+///
+/// `Clone` is cheap (an `Arc` clone); the binding is shared between the
+/// session, the [`TenantScopeAnalyzerRule`], the [`crate::catalog::Catalog`],
+/// and the mutable-table provider/sink.
+///
+/// [`SessionStateProvider`]: https://docs.rs/datafusion-flight-sql-server/latest/datafusion_flight_sql_server/session/trait.SessionStateProvider.html
+#[derive(Debug, Clone)]
+pub struct TenantBinding {
+    shared: Arc<RwLock<TenantContext>>,
+}
+
+impl TenantBinding {
+    /// Construct a fresh binding whose shared default is [`TenantContext::Unscoped`].
+    pub fn unscoped() -> Self {
+        Self {
+            shared: Arc::new(RwLock::new(TenantContext::Unscoped)),
+        }
+    }
+
+    /// The currently effective tenant context for this binding.
+    ///
+    /// Returns the task-local override installed by
+    /// [`crate::session::JammiSession::with_tenant_scoped`] if the current
+    /// task is executing inside such a scope; otherwise returns the
+    /// session's sticky shared value.
+    pub fn current(&self) -> TenantContext {
+        CURRENT_TENANT_OVERRIDE
+            .try_with(|c| *c)
+            .unwrap_or_else(|_| self.read_shared())
+    }
+
+    /// Convenience: the [`TenantId`] of [`Self::current`], if any.
+    pub fn current_tenant(&self) -> Option<TenantId> {
+        self.current().tenant()
+    }
+
+    /// Snapshot the sticky shared value, ignoring any task-local override.
+    /// Used by the constructor helpers in tests and by the Flight SQL
+    /// `SessionStateProvider` which mutates the shared value directly.
+    pub fn read_shared(&self) -> TenantContext {
+        *self.shared.read().expect("tenant binding lock poisoned")
+    }
+
+    /// Replace the sticky shared value. Has no effect on tasks executing
+    /// inside a [`crate::session::JammiSession::with_tenant_scoped`] closure
+    /// — those reads continue to observe the task-local override.
+    pub fn set_shared(&self, ctx: TenantContext) {
+        *self.shared.write().expect("tenant binding lock poisoned") = ctx;
+    }
+
+    /// Shared handle to the inner `Arc<RwLock<TenantContext>>`. Used by the
+    /// server-side Flight SQL provider in `jammi-server`, which mutates the
+    /// shared value from a request interceptor that does not (yet) thread
+    /// the binding through a `with_tenant_scoped` closure.
+    pub fn shared_arc(&self) -> Arc<RwLock<TenantContext>> {
+        Arc::clone(&self.shared)
+    }
+
+    /// Run `f` with `ctx` installed as the task-local override for the
+    /// duration of the returned future. Concurrent calls on different tasks
+    /// each see their own `ctx` — no shared state is mutated, so there is no
+    /// race window between binding and read.
+    pub async fn scope<F, T>(&self, ctx: TenantContext, f: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        CURRENT_TENANT_OVERRIDE.scope(ctx, f).await
+    }
+}
+
+impl Default for TenantBinding {
+    fn default() -> Self {
+        Self::unscoped()
+    }
+}
 
 /// `AnalyzerRule` that wraps every tenant-aware `TableScan` in a `Filter`
 /// emitting the session's tenant predicate.
@@ -77,7 +182,7 @@ impl TenantScopeAnalyzerRule {
     }
 
     fn current_context(&self) -> TenantContext {
-        *self.binding.read().expect("tenant binding lock poisoned")
+        self.binding.current()
     }
 
     /// Find the tenant-discriminator column for a `TableScan`. Schema column
@@ -171,7 +276,6 @@ mod tests {
     use super::*;
     use std::str::FromStr;
     use std::sync::Arc;
-    use std::sync::RwLock;
 
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use datafusion::functions_aggregate::count::count;
@@ -199,11 +303,13 @@ mod tests {
     }
 
     fn scoped_binding(t: TenantId) -> TenantBinding {
-        Arc::new(RwLock::new(TenantContext::Scoped(t)))
+        let b = TenantBinding::unscoped();
+        b.set_shared(TenantContext::Scoped(t));
+        b
     }
 
     fn unscoped_binding() -> TenantBinding {
-        Arc::new(RwLock::new(TenantContext::Unscoped))
+        TenantBinding::unscoped()
     }
 
     fn rule_with(binding: TenantBinding) -> TenantScopeAnalyzerRule {

@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -25,6 +25,7 @@ use jammi_engine::source::mutable::MutableTableRegistry;
 use jammi_engine::store::mutable::sqlite::SqliteMutableBackend;
 use jammi_engine::store::mutable::MutableBackend;
 use jammi_engine::tenant::TenantContext;
+use jammi_engine::tenant_scope::TenantBinding;
 use jammi_engine::trigger::{
     DeliveredBatch, InMemoryBroker, Offset, Predicate, Publisher, Subscriber, TopicDefinition,
     TopicId, TriggerBroker,
@@ -120,10 +121,11 @@ async fn build_handles(
     let catalog = Arc::new(Catalog::from_backend(backend_impl));
     let backend = catalog.backend_arc();
 
-    let tenant_binding = Arc::new(RwLock::new(match tenant {
+    let tenant_binding = TenantBinding::unscoped();
+    tenant_binding.set_shared(match tenant {
         Some(t) => TenantContext::Scoped(t),
         None => TenantContext::Unscoped,
-    }));
+    });
     let mutable_backend: Arc<dyn MutableBackend> =
         Arc::new(SqliteMutableBackend::new(Arc::clone(&backend)));
     let registry = Arc::new(MutableTableRegistry::new(

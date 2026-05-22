@@ -94,11 +94,7 @@ impl DataSink for MutableTableSink {
         // Snapshot the tenant binding once per write_all call (not per row).
         // The DataSink contract is "exactly one write_all per DML statement"
         // so this is the natural unit of consistency.
-        let session_tenant = self
-            .tenant
-            .read()
-            .expect("tenant binding lock poisoned")
-            .tenant();
+        let session_tenant = self.tenant.current_tenant();
         let table_name = def.id.as_str().to_string();
         let written = self
             .backend

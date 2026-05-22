@@ -76,9 +76,20 @@ impl MutableTableProvider {
         // ship the correct row set off the SQLite/Postgres side, not just
         // the union (which DataFusion's AnalyzerRule would also filter, but
         // at the cost of materializing the full table first).
-        let tenant_pred = match self.tenant.current_tenant() {
-            Some(t) => Some(format!("(\"tenant_id\" = '{t}' OR \"tenant_id\" IS NULL)")),
-            None => Some("\"tenant_id\" IS NULL".to_string()),
+        //
+        // Skip the predicate entirely when the caller is executing inside a
+        // `JammiSession::with_admin_scope` closure: cross-tenant
+        // administrative scans (server-startup recovery, audit reads) need
+        // rows from every tenant. The analyzer-rule bypass on its own would
+        // still leave the provider's SQL filter in place, so the provider
+        // must consult the same marker.
+        let tenant_pred = if crate::tenant_scope::TenantBinding::is_admin_scope() {
+            None
+        } else {
+            match self.tenant.current_tenant() {
+                Some(t) => Some(format!("(\"tenant_id\" = '{t}' OR \"tenant_id\" IS NULL)")),
+                None => Some("\"tenant_id\" IS NULL".to_string()),
+            }
         };
         let sql = self
             .backend

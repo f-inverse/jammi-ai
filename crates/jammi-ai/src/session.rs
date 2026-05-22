@@ -190,6 +190,29 @@ impl InferenceSession {
         self.inner.with_tenant_scoped(tenant, f).await
     }
 
+    /// Run `f` with the tenant analyzer rule disabled for the duration of
+    /// the closure's future.
+    ///
+    /// Cross-tenant administrative reads (server-startup recovery scans,
+    /// background audit jobs) live here. The closure receives an
+    /// [`jammi_engine::AdminScope`] handle whose [`AdminScope::sql`] returns
+    /// fully materialised batches; once the closure resolves, subsequent
+    /// reads on the same session are tenant-filtered again.
+    ///
+    /// This surface is **not** exposed on the gRPC wire — `jammi-server`
+    /// must invoke it only from in-process administrative code paths, not
+    /// from a request handler.
+    ///
+    /// Delegates to [`jammi_engine::session::JammiSession::with_admin_scope`];
+    /// see that method for the safety contract.
+    pub async fn with_admin_scope<'a, F, Fut, T>(&'a self, f: F) -> T
+    where
+        F: FnOnce(jammi_engine::AdminScope<'a>) -> Fut,
+        Fut: std::future::Future<Output = T> + 'a,
+    {
+        self.inner.with_admin_scope(f).await
+    }
+
     /// Access the model cache.
     pub fn model_cache(&self) -> &Arc<ModelCache> {
         &self.model_cache

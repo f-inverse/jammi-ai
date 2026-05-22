@@ -29,6 +29,10 @@ fn tenant_b() -> TenantId {
     TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b").unwrap()
 }
 
+fn tenant_c() -> TenantId {
+    TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9c").unwrap()
+}
+
 async fn register_widgets(session: &JammiSession) {
     let def = MutableTableDefinitionBuilder::new(
         MutableTableId::new("widgets").unwrap(),
@@ -585,6 +589,363 @@ async fn with_tenant_scoped_does_not_mutate_sticky_binding() {
     // After the scope exits, the sticky binding (tenant_b) is restored
     // because it was never touched.
     assert_eq!(session.tenant(), Some(tenant_b()));
+}
+
+/// Headline safety property for [`jammi_engine::trigger::Subscriber::subscribe_scoped`].
+///
+/// A `gRPC` server-streaming handler enters `with_tenant_scoped(A)`, opens
+/// a subscription, returns the stream to tonic, and the closure resolves —
+/// the surrounding task-local binding clears the instant the closure
+/// returns. Tonic then polls the stream from a task that has no tenant
+/// binding of its own (no `with_tenant_scoped` wrapping its poll loop).
+///
+/// `subscribe_scoped` resolves the tenant filter at subscribe time, before
+/// returning the stream, so the replay rows materialised into the stream
+/// are filtered to the caller-supplied tenant regardless of what
+/// `current_tenant()` reads at poll time. This test directly populates the
+/// backing table with rows for two tenants, subscribes for tenant A from a
+/// task with no binding, and verifies the polled output never includes
+/// tenant B's rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribe_scoped_stream_remains_tenant_filtered_after_closure_returns() {
+    use arrow::array::RecordBatch;
+    use futures::StreamExt;
+    use jammi_engine::catalog::backend::TxOptions;
+    use jammi_engine::catalog::topic_repo::TopicRepo;
+    use jammi_engine::source::mutable::MutableTableRegistry;
+    use jammi_engine::trigger::{
+        InMemoryBroker, Offset, Predicate, Subscriber, TopicDefinition, TopicId, TriggerBroker,
+    };
+    use std::collections::BTreeMap;
+
+    let dir = tempdir().unwrap();
+    let cfg = common::test_config(dir.path());
+    let session = Arc::new(JammiSession::new(cfg).await.unwrap());
+
+    // Build a global (unscoped) topic so both tenants can write to the
+    // same backing table. The leak the PR fixes is on the read side; the
+    // backing-table population happens by hand below so the test does not
+    // depend on the publisher's tenant propagation path.
+    let topic_schema = Arc::new(Schema::new(vec![
+        Field::new("event_id", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, false),
+    ]));
+    let topic = TopicDefinition {
+        id: TopicId::new(),
+        name: "global.events".into(),
+        schema: Arc::clone(&topic_schema),
+        tenant: None,
+        broker_metadata: BTreeMap::new(),
+    };
+    let broker: Arc<dyn TriggerBroker> = Arc::new(InMemoryBroker::new());
+    broker.register_topic(&topic).await.unwrap();
+    let topic_repo = TopicRepo::new(Arc::clone(session.catalog()), session.mutable_tables_arc());
+    topic_repo.register_topic(&topic).await.unwrap();
+
+    // Build a subscriber on top of the same backing-table registry the
+    // session owns so the backing-table reads see the same data as the
+    // hand-rolled inserts below.
+    let registry: Arc<MutableTableRegistry> = session.mutable_tables_arc();
+    let subscriber = Arc::new(Subscriber::new(Arc::clone(&broker), Arc::clone(&registry)));
+
+    // Insert two rows for tenant A and two for tenant B straight into the
+    // backing table, each pair under its own transaction with the right
+    // `tx.set_tenant` binding so the rows carry the matching `tenant_id`.
+    let backing_id = MutableTableId::new(topic.backing_table_name()).unwrap();
+    let augmented_schema = topic.backing_table_schema();
+    let row_for = |offset: i64, event: i64, label: &str| -> RecordBatch {
+        use arrow::array::Int64Array;
+        RecordBatch::try_new(
+            Arc::clone(&augmented_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![offset])),
+                Arc::new(Int64Array::from(vec![0_i64])),
+                Arc::new(Int64Array::from(
+                    vec![chrono::Utc::now().timestamp_micros()],
+                )),
+                Arc::new(Int64Array::from(vec![event])),
+                Arc::new(StringArray::from(vec![label])),
+            ],
+        )
+        .unwrap()
+    };
+
+    let backend = session.catalog().backend_arc();
+    let registry_for_a = Arc::clone(&registry);
+    let backing_for_a = backing_id.clone();
+    let a_batch_one = row_for(0, 100, "a-one");
+    let a_batch_two = row_for(1, 101, "a-two");
+    backend
+        .transaction(TxOptions::default(), move |tx| {
+            Box::pin(async move {
+                tx.set_tenant(Some(tenant_a()));
+                registry_for_a
+                    .insert_batch(tx, &backing_for_a, &a_batch_one)
+                    .await
+                    .map_err(|e| {
+                        jammi_engine::catalog::backend::BackendError::Execution(e.to_string())
+                    })?;
+                registry_for_a
+                    .insert_batch(tx, &backing_for_a, &a_batch_two)
+                    .await
+                    .map_err(|e| {
+                        jammi_engine::catalog::backend::BackendError::Execution(e.to_string())
+                    })?;
+                Ok::<(), jammi_engine::catalog::backend::BackendError>(())
+            })
+        })
+        .await
+        .unwrap();
+
+    let registry_for_b = Arc::clone(&registry);
+    let backing_for_b = backing_id.clone();
+    let b_batch_one = row_for(2, 200, "b-one");
+    let b_batch_two = row_for(3, 201, "b-two");
+    backend
+        .transaction(TxOptions::default(), move |tx| {
+            Box::pin(async move {
+                tx.set_tenant(Some(tenant_b()));
+                registry_for_b
+                    .insert_batch(tx, &backing_for_b, &b_batch_one)
+                    .await
+                    .map_err(|e| {
+                        jammi_engine::catalog::backend::BackendError::Execution(e.to_string())
+                    })?;
+                registry_for_b
+                    .insert_batch(tx, &backing_for_b, &b_batch_two)
+                    .await
+                    .map_err(|e| {
+                        jammi_engine::catalog::backend::BackendError::Execution(e.to_string())
+                    })?;
+                Ok::<(), jammi_engine::catalog::backend::BackendError>(())
+            })
+        })
+        .await
+        .unwrap();
+
+    // Enter `with_tenant_scoped(A)` to subscribe for tenant A from inside a
+    // scope. The returned `Subscription` must remain safe to poll outside
+    // the scope — that is the exact pattern enterprise gRPC handlers want.
+    let subscription = session
+        .with_tenant_scoped(tenant_a(), |_scope| {
+            let subscriber = Arc::clone(&subscriber);
+            let topic = topic.clone();
+            async move {
+                subscriber
+                    .subscribe_scoped(
+                        &topic,
+                        Some(tenant_a()),
+                        Predicate::match_all(),
+                        Some(Offset::new(0, chrono::Utc::now())),
+                    )
+                    .await
+                    .unwrap()
+            }
+        })
+        .await;
+
+    // Move the subscription onto a task that has no tenant binding of its
+    // own — tonic's stream poller has the same shape: no surrounding
+    // `with_tenant_scoped` wraps the polls.
+    let polled = tokio::spawn(async move {
+        let mut stream = subscription;
+        let mut events: Vec<i64> = Vec::new();
+        // The replay materialises four candidate rows; only A's two pass
+        // the tenant filter baked in at subscribe time. Anything beyond
+        // that must come from the live broker tail, which is empty here.
+        while events.len() < 2 {
+            let next = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .expect("subscribe stream blocked");
+            let delivered = next.expect("stream ended early").unwrap();
+            let col = delivered
+                .batch
+                .column_by_name("event_id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..col.len() {
+                events.push(col.value(i));
+            }
+        }
+        // Drain a tiny window further to confirm no tenant-B rows arrive.
+        let extra =
+            tokio::time::timeout(std::time::Duration::from_millis(100), stream.next()).await;
+        assert!(
+            extra.is_err(),
+            "tenant-B rows leaked into a tenant-A subscription poll loop"
+        );
+        events
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(polled, vec![100, 101], "tenant-A events only");
+}
+
+/// `with_admin_scope` lifts the analyzer rule and the mutable-table
+/// provider's tenant filter so a cross-tenant administrative scan can
+/// enumerate rows owned by every tenant. The session is unbound (no
+/// sticky tenant, no `with_tenant_scoped` wrapper) when the admin scope
+/// opens; without the bypass it would see only globally-scoped
+/// (`tenant_id IS NULL`) rows.
+#[tokio::test]
+async fn with_admin_scope_sees_across_tenants() {
+    let dir = tempdir().unwrap();
+    let cfg = common::test_config(dir.path());
+
+    // Single session, used by every tenant in sequence — exercises the
+    // session-shared mutable-table registry that the leak path threads
+    // through.
+    let session = Arc::new(JammiSession::new(cfg).await.unwrap());
+    register_widgets(&session).await;
+
+    for (tenant, id, name) in [
+        (tenant_a(), 1_i64, "a-row"),
+        (tenant_b(), 2_i64, "b-row"),
+        (tenant_c(), 3_i64, "c-row"),
+    ] {
+        session
+            .with_tenant_scoped(tenant, |scope| async move {
+                scope
+                    .sql(&format!(
+                        "INSERT INTO mutable.public.widgets (id, name) VALUES ({id}, '{name}')"
+                    ))
+                    .await
+                    .unwrap();
+            })
+            .await;
+    }
+
+    // Outside an admin scope, an unbound session sees zero tenant-tagged
+    // rows (only globally-scoped, `tenant_id IS NULL` rows would surface).
+    let rows = session
+        .sql("SELECT COUNT(*) AS n FROM mutable.public.widgets")
+        .await
+        .unwrap();
+    let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
+    let n = batch
+        .column_by_name("n")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, 0, "unbound session must not see any tenant-tagged rows");
+
+    // Inside `with_admin_scope`, every row across every tenant is visible.
+    let ids: Vec<i64> = session
+        .with_admin_scope(|admin| async move {
+            let rows = admin
+                .sql("SELECT id FROM mutable.public.widgets ORDER BY id")
+                .await
+                .unwrap();
+            let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
+            let col = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            (0..col.len()).map(|i| col.value(i)).collect()
+        })
+        .await;
+
+    assert_eq!(
+        ids,
+        vec![1, 2, 3],
+        "admin scope must surface rows from every tenant"
+    );
+}
+
+/// The admin-scope task-local clears the moment the closure resolves; a
+/// subsequent SQL call on the same session is tenant-filtered again. A
+/// stale bypass leaking past the closure would silently widen the read
+/// surface of every later query and is exactly what the closure-shaped
+/// API exists to prevent.
+#[tokio::test]
+async fn admin_scope_does_not_leak_into_subsequent_calls() {
+    let dir = tempdir().unwrap();
+    let cfg = common::test_config(dir.path());
+
+    let session = Arc::new(JammiSession::new(cfg).await.unwrap());
+    register_widgets(&session).await;
+
+    session
+        .with_tenant_scoped(tenant_a(), |scope| async move {
+            scope
+                .sql("INSERT INTO mutable.public.widgets (id, name) VALUES (1, 'a')")
+                .await
+                .unwrap();
+        })
+        .await;
+    session
+        .with_tenant_scoped(tenant_b(), |scope| async move {
+            scope
+                .sql("INSERT INTO mutable.public.widgets (id, name) VALUES (2, 'b')")
+                .await
+                .unwrap();
+        })
+        .await;
+
+    // Admin scope: sees both rows.
+    let cross_tenant_count = session
+        .with_admin_scope(|admin| async move {
+            let rows = admin
+                .sql("SELECT COUNT(*) AS n FROM mutable.public.widgets")
+                .await
+                .unwrap();
+            let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
+            batch
+                .column_by_name("n")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        })
+        .await;
+    assert_eq!(cross_tenant_count, 2);
+
+    // After the closure resolves, the same `sql` call on the unbound
+    // session is tenant-filtered again — zero rows because none of the
+    // inserted rows have `tenant_id IS NULL`.
+    let rows = session
+        .sql("SELECT COUNT(*) AS n FROM mutable.public.widgets")
+        .await
+        .unwrap();
+    let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
+    let n = batch
+        .column_by_name("n")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(
+        n, 0,
+        "admin-scope bypass leaked past the closure into a subsequent query"
+    );
+
+    // And a tenant-scoped query after that still sees only its own row.
+    let visible_b = session
+        .with_tenant_scoped(tenant_b(), |scope| async move {
+            let rows = scope
+                .sql("SELECT id FROM mutable.public.widgets ORDER BY id")
+                .await
+                .unwrap();
+            let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
+            let col = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            (0..col.len()).map(|i| col.value(i)).collect::<Vec<i64>>()
+        })
+        .await;
+    assert_eq!(visible_b, vec![2]);
 }
 
 /// `Transaction::assert_tenant_matches` is the defence-in-depth write-side

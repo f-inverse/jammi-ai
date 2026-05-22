@@ -59,50 +59,22 @@ jobs:
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
 
-      - name: Publish jammi-engine
-        run: cargo publish -p jammi-engine
+      - name: Publish crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish jammi-lora
-        run: cargo publish -p jammi-lora
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish jammi-encoders
-        run: cargo publish -p jammi-encoders
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish jammi-ai
-        run: cargo publish -p jammi-ai
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish jammi-server
-        run: cargo publish -p jammi-server
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-
-      - name: Wait for crates.io index
-        run: sleep 30
-
-      - name: Publish jammi-cli
-        run: cargo publish -p jammi-cli
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          for crate in jammi-engine jammi-lora jammi-encoders jammi-ai jammi-server jammi-cli; do
+            if curl -sf "https://crates.io/api/v1/crates/${crate}/${VERSION}" >/dev/null; then
+              echo "${crate} ${VERSION} already on crates.io — skipping"
+            else
+              echo "Publishing ${crate} ${VERSION}"
+              cargo publish -p "${crate}"
+              echo "Waiting 30s for crates.io index..."
+              sleep 30
+            fi
+          done
 
   github-release:
     name: GitHub Release

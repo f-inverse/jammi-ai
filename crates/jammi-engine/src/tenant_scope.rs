@@ -34,6 +34,17 @@ tokio::task_local! {
     /// points and recursive calls inside the closure — without mutating
     /// any shared state. Concurrent tasks each see their own override.
     static CURRENT_TENANT_OVERRIDE: TenantContext;
+
+    /// Task-local admin-scope marker. When present (set by
+    /// [`crate::session::JammiSession::with_admin_scope`] for the duration
+    /// of one closure), the [`TenantScopeAnalyzerRule`] skips predicate
+    /// injection and the mutable-table read paths drop the tenant filter
+    /// from the backend SQL — yielding rows across every tenant. Concurrent
+    /// tasks each carry their own marker, so an admin scope on one task
+    /// does not bleed into a tenant-scoped query running on another.
+    ///
+    /// Read by [`TenantBinding::is_admin_scope`]; not exposed otherwise.
+    static ADMIN_SCOPE_ACTIVE: ();
 }
 
 /// Source-name → optional `tenant_column` lookup. Populated from the catalog
@@ -157,6 +168,33 @@ impl TenantBinding {
     {
         CURRENT_TENANT_OVERRIDE.scope(ctx, f).await
     }
+
+    /// Returns `true` when the current task is executing inside a
+    /// [`crate::session::JammiSession::with_admin_scope`] closure.
+    ///
+    /// Consulted by the [`TenantScopeAnalyzerRule`] and by the mutable-table
+    /// read path: when `true`, both drop the per-row tenant filter for the
+    /// duration of plan analysis / scan, yielding rows across every tenant.
+    /// The marker is task-local, so a concurrent task without admin scope
+    /// continues to observe its normal tenant binding.
+    pub fn is_admin_scope() -> bool {
+        ADMIN_SCOPE_ACTIVE.try_with(|_| ()).is_ok()
+    }
+
+    /// Run `f` with the admin-bypass task-local installed for the duration
+    /// of the returned future. Inside `f`, [`Self::is_admin_scope`] returns
+    /// `true`; the analyzer rule and mutable-table read path skip tenant
+    /// filtering.
+    ///
+    /// The closure-shaped surface — rather than a sticky toggle — exists so
+    /// the bypass cannot be left enabled by a panicking caller and cannot
+    /// be observed by a concurrent task on the same session.
+    pub async fn admin_scope<F, T>(f: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        ADMIN_SCOPE_ACTIVE.scope((), f).await
+    }
 }
 
 impl Default for TenantBinding {
@@ -259,6 +297,14 @@ impl AnalyzerRule for TenantScopeAnalyzerRule {
     }
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> DfResult<LogicalPlan> {
+        // Admin scope bypasses tenant-predicate injection entirely so that
+        // server-side administrative scans (e.g. recovery enumerating
+        // work-in-progress rows across tenants) can observe every row. The
+        // caller of `JammiSession::with_admin_scope` is responsible for the
+        // boundary; this rule trusts the task-local marker installed there.
+        if TenantBinding::is_admin_scope() {
+            return Ok(plan);
+        }
         let ctx = self.current_context();
         plan.transform_up(|node| self.rewrite_node(node, ctx))
             .map(|t| t.data)

@@ -17,6 +17,7 @@ use futures::StreamExt;
 
 use crate::source::mutable::MutableTableRegistry;
 use crate::store::mutable::definition::MutableTableId;
+use crate::tenant::TenantId;
 use crate::trigger::broker::TriggerBroker;
 use crate::trigger::error::TriggerError;
 use crate::trigger::ids::SubscriptionId;
@@ -40,13 +41,63 @@ impl Subscriber {
     /// concatenation of the backing-table replay (offsets `>= from_offset`,
     /// strictly less than the broker's first live offset) followed by the
     /// live broker stream.
+    ///
+    /// Resolves the tenant binding once, here, to filter the backing-table
+    /// replay. The resulting stream contains data only from that tenant
+    /// (plus globally-scoped rows), even if the caller polls it after the
+    /// surrounding [`crate::session::JammiSession::with_tenant_scoped`]
+    /// closure has returned and the task-local binding has cleared.
+    ///
+    /// For server-streaming gRPC handlers that return the stream past the
+    /// closure boundary, prefer [`Self::subscribe_scoped`]: it takes the
+    /// tenant explicitly so the binding does not have to be inferred from
+    /// whatever task-local is in effect at this method's await point.
     pub async fn subscribe(
         &self,
         topic: &TopicDefinition,
         predicate: Predicate,
         from_offset: Option<Offset>,
     ) -> Result<Subscription, TriggerError> {
-        let replay_delivered = self.drain_replay(topic, &predicate, from_offset).await?;
+        let tenant = self.mutable.binding().current_tenant();
+        self.subscribe_scoped(topic, tenant, predicate, from_offset)
+            .await
+    }
+
+    /// Open a subscription with an explicit `tenant` binding for the
+    /// backing-table replay query.
+    ///
+    /// The replay's tenant predicate is computed from `tenant` at subscribe
+    /// time and the resulting rows are materialised inside this call — no
+    /// subsequent `poll_next` consults `current_tenant()` for replay. The
+    /// live broker tail is keyed by `topic.id`, which is itself
+    /// tenant-partitioned via [`TopicDefinition::tenant`]; together these
+    /// guarantee the returned stream stays inside `tenant`'s data even when
+    /// polled outside any surrounding `with_tenant_scoped` block.
+    ///
+    /// This is the safe primitive for gRPC server-streaming handlers that
+    /// return the stream to tonic past the request closure boundary:
+    ///
+    /// ```ignore
+    /// async fn watch(&self, req) -> Result<Response<Stream>, Status> {
+    ///     let tenant = extract_tenant(&req)?;
+    ///     let topic  = self.lookup_topic(req, tenant).await?;
+    ///     let stream = self
+    ///         .subscriber
+    ///         .subscribe_scoped(&topic, Some(tenant), predicate, from_offset)
+    ///         .await?;
+    ///     Ok(Response::new(Box::pin(stream)))
+    /// }
+    /// ```
+    pub async fn subscribe_scoped(
+        &self,
+        topic: &TopicDefinition,
+        tenant: Option<TenantId>,
+        predicate: Predicate,
+        from_offset: Option<Offset>,
+    ) -> Result<Subscription, TriggerError> {
+        let replay_delivered = self
+            .drain_replay(topic, tenant, &predicate, from_offset)
+            .await?;
         let last_replayed = replay_delivered.iter().map(|d| d.offset.value()).max();
 
         // Live tail starts strictly above the replayed prefix so the two
@@ -88,15 +139,34 @@ impl Subscriber {
         predicate: Predicate,
         from_offset: Option<Offset>,
     ) -> Result<Vec<DeliveredBatch>, TriggerError> {
-        self.drain_replay(topic, &predicate, from_offset).await
+        let tenant = self.mutable.binding().current_tenant();
+        self.drain_replay(topic, tenant, &predicate, from_offset)
+            .await
+    }
+
+    /// Explicit-tenant variant of [`Self::replay_only`]. The replay query
+    /// uses `tenant` directly rather than consulting the session binding,
+    /// matching the safety contract of [`Self::subscribe_scoped`].
+    pub async fn replay_only_scoped(
+        &self,
+        topic: &TopicDefinition,
+        tenant: Option<TenantId>,
+        predicate: Predicate,
+        from_offset: Option<Offset>,
+    ) -> Result<Vec<DeliveredBatch>, TriggerError> {
+        self.drain_replay(topic, tenant, &predicate, from_offset)
+            .await
     }
 
     /// Shared helper: collect the replay prefix matching `predicate` from the
     /// backing table starting at `from_offset` (defaulting to the live tail
-    /// when `None`, in which case the replay is empty).
+    /// when `None`, in which case the replay is empty). The `tenant`
+    /// argument is baked into the backend SQL — no task-local lookup
+    /// happens inside the underlying scan.
     async fn drain_replay(
         &self,
         topic: &TopicDefinition,
+        tenant: Option<TenantId>,
         predicate: &Predicate,
         from_offset: Option<Offset>,
     ) -> Result<Vec<DeliveredBatch>, TriggerError> {
@@ -112,7 +182,7 @@ impl Subscriber {
                 let scan_after_value = (off.value() as i64).saturating_sub(1);
                 let mut stream = self
                     .mutable
-                    .scan_after(&backing_id, scan_after_value)
+                    .scan_after_for_tenant(&backing_id, scan_after_value, tenant)
                     .await
                     .map_err(TriggerError::BackingTable)?;
                 let mut batches: Vec<RecordBatch> = Vec::new();

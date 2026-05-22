@@ -135,6 +135,14 @@ impl MutableTableRegistry {
         ))
     }
 
+    /// Borrow the registry's tenant binding. Used by the subscriber's
+    /// non-scoped entry points to resolve the current tenant from the
+    /// session at subscribe time, before threading it explicitly through
+    /// the replay path.
+    pub fn binding(&self) -> &TenantBinding {
+        &self.tenant
+    }
+
     /// Append a `RecordBatch` to a mutable table without going through
     /// DataFusion's planner.
     ///
@@ -190,10 +198,15 @@ impl MutableTableRegistry {
     /// Errors with [`MutableTableError::NoOrderColumn`] if the table was
     /// registered without an `order_column`.
     ///
-    /// Tenant-scoped per the session binding. Implementation note: the
-    /// closure-passing [`crate::catalog::backend::CatalogBackend::transaction`]
-    /// API closes the transaction when the closure returns, so the stream
-    /// cannot lazily fetch rows across `poll_next` calls without leaking the
+    /// Resolves tenant from the registry's binding (session sticky value or
+    /// `with_tenant_scoped` task-local override). For paths that must bind
+    /// tenant explicitly — e.g. a subscriber stream whose lifetime extends
+    /// past the binding's task-local — use [`Self::scan_after_for_tenant`].
+    ///
+    /// Implementation note: the closure-passing
+    /// [`crate::catalog::backend::CatalogBackend::transaction`] API closes
+    /// the transaction when the closure returns, so the stream cannot
+    /// lazily fetch rows across `poll_next` calls without leaking the
     /// transaction. Instead, this materialises a single `RecordBatch` from
     /// the entire qualifying row set inside one read-only transaction, then
     /// yields it via [`futures::stream::iter`]. Memory is bounded by the
@@ -203,6 +216,29 @@ impl MutableTableRegistry {
         &self,
         table: &MutableTableId,
         after: i64,
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<RecordBatch, MutableTableError>> + Send>>,
+        MutableTableError,
+    > {
+        let tenant = self.catalog.current_tenant();
+        self.scan_after_for_tenant(table, after, tenant).await
+    }
+
+    /// Variant of [`Self::scan_after`] that takes an explicit `tenant`
+    /// rather than reading the binding.
+    ///
+    /// Used by the subscriber's `subscribe_scoped` path: the gRPC handler
+    /// resolves tenant once at request entry, then threads it down so the
+    /// backing-table replay query bakes the right filter into its SQL
+    /// regardless of whether any task-local override is still in effect
+    /// when this method is awaited. The returned stream is fully
+    /// materialised inside this call, so subsequent polls do not consult
+    /// any tenant state.
+    pub async fn scan_after_for_tenant(
+        &self,
+        table: &MutableTableId,
+        after: i64,
+        tenant: Option<TenantId>,
     ) -> Result<
         Pin<Box<dyn Stream<Item = Result<RecordBatch, MutableTableError>> + Send>>,
         MutableTableError,
@@ -217,7 +253,6 @@ impl MutableTableRegistry {
             .clone()
             .ok_or(MutableTableError::NoOrderColumn)?;
 
-        let tenant = self.catalog.current_tenant();
         let batch =
             fetch_scan_after_batch(Arc::clone(&self.backend), def, &order_col, after, tenant)
                 .await?;

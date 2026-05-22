@@ -304,6 +304,37 @@ impl JammiSession {
             .await
     }
 
+    /// Run `f` with the tenant analyzer rule disabled for the duration of
+    /// the closure's future.
+    ///
+    /// Intended for cross-tenant administrative scans — e.g. server-startup
+    /// recovery enumerating work-in-progress rows in a mutable companion
+    /// table across every tenant so each can be re-bound and resumed.
+    /// Inside the closure, SQL queries against tenant-aware tables return
+    /// rows from every tenant (and from globally-scoped rows whose
+    /// `tenant_id IS NULL`); the mutable-table provider's backend SQL also
+    /// drops its tenant filter. The caller is responsible for re-binding
+    /// the session to the row's `tenant_id` (via [`Self::with_tenant_scoped`])
+    /// before issuing any follow-up tenant-scoped work.
+    ///
+    /// This is **not** a general-purpose escape hatch. It is auditable, it
+    /// must not be exposed on the gRPC wire surface, and the closure must
+    /// fully consume any data it intends to use across tenants — the
+    /// bypass marker is task-local and clears the instant `f`'s future
+    /// resolves.
+    ///
+    /// Concurrent tasks each carry their own admin-scope marker; an
+    /// admin-scope on one task never bleeds into a tenant-scoped request
+    /// running on another task that shares the same `Arc<JammiSession>`.
+    pub async fn with_admin_scope<'a, F, Fut, T>(&'a self, f: F) -> T
+    where
+        F: FnOnce(AdminScope<'a>) -> Fut,
+        Fut: std::future::Future<Output = T> + 'a,
+    {
+        let scope = AdminScope { session: self };
+        TenantBinding::admin_scope(f(scope)).await
+    }
+
     /// Register a tenant-discriminator column for a federated source. The
     /// `TenantScopeAnalyzerRule` consults this lookup when a `TableScan`'s
     /// schema does *not* itself declare a `tenant_id` column — i.e., when
@@ -688,6 +719,42 @@ impl<'a> std::ops::Deref for TenantScope<'a> {
     type Target = JammiSession;
 
     fn deref(&self) -> &Self::Target {
+        self.session
+    }
+}
+
+/// Handle passed to the closure inside [`JammiSession::with_admin_scope`].
+///
+/// The presence of this handle signals that the surrounding closure is
+/// running inside the admin-bypass task-local: every SQL query issued
+/// through [`Self::sql`] yields rows across every tenant, and the
+/// mutable-table provider drops its backend-SQL tenant filter for the
+/// duration of the scope.
+///
+/// Construction is private to this module so the type cannot be forged: an
+/// `AdminScope` only exists for the lifetime of one `with_admin_scope`
+/// closure. The closure must finish consuming any cross-tenant data before
+/// it returns — once the scope drops, subsequent reads on the same session
+/// are tenant-filtered again, even if a stream from inside leaks past the
+/// closure boundary.
+pub struct AdminScope<'a> {
+    session: &'a JammiSession,
+}
+
+impl<'a> AdminScope<'a> {
+    /// Execute a SQL query with the tenant analyzer rule disabled.
+    ///
+    /// Returns the fully materialised `Vec<RecordBatch>` so the cross-tenant
+    /// data is collected inside the admin scope; the caller cannot
+    /// accidentally hold an unresolved stream past the closure boundary.
+    pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
+        self.session.sql(query).await
+    }
+
+    /// Borrow the underlying session. Use sparingly: any method called
+    /// through this borrow that consults the tenant binding will observe
+    /// the bypass.
+    pub fn session(&self) -> &'a JammiSession {
         self.session
     }
 }

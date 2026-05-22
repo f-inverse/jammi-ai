@@ -4,6 +4,7 @@ use thiserror::Error;
 
 use crate::catalog::backend::BackendError;
 use crate::store::mutable::definition::MutableTableError;
+use crate::tenant::TenantId;
 
 #[derive(Debug, Error)]
 pub enum TriggerError {
@@ -18,6 +19,15 @@ pub enum TriggerError {
 
     #[error("batch schema does not match topic schema: {0}")]
     BatchSchemaMismatch(String),
+
+    #[error(
+        "publish tenant mismatch on topic '{topic}': topic is pinned to {topic_tenant:?}, publish was scoped to {publish_tenant:?}"
+    )]
+    PublishTenantMismatch {
+        topic: String,
+        topic_tenant: Option<TenantId>,
+        publish_tenant: Option<TenantId>,
+    },
 
     #[error("predicate parse failure: {0}")]
     PredicateParse(String),

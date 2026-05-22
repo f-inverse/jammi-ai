@@ -1436,7 +1436,11 @@ async fn cookbook_publish_events_recipe_runs_end_to_end() {
         ],
     )
     .unwrap();
-    let offset = session.publisher().publish(&topic, batch).await.unwrap();
+    let offset = session
+        .publisher()
+        .publish_scoped(&topic, session.tenant(), batch)
+        .await
+        .unwrap();
     assert!(
         offset.value() == 0 || offset.value() == 3,
         "first publish offset must be 0 (pre-publish) or 3 (post-publish row count); got {}",
@@ -1453,7 +1457,11 @@ async fn cookbook_publish_events_recipe_runs_end_to_end() {
         ],
     )
     .unwrap();
-    let offset2 = session.publisher().publish(&topic, batch2).await.unwrap();
+    let offset2 = session
+        .publisher()
+        .publish_scoped(&topic, session.tenant(), batch2)
+        .await
+        .unwrap();
     assert!(
         offset2.value() > offset.value(),
         "offsets must monotonically advance"
@@ -1496,7 +1504,11 @@ async fn cookbook_subscribe_with_filter_recipe_runs_end_to_end() {
         ],
     )
     .unwrap();
-    session.publisher().publish(&topic, batch).await.unwrap();
+    session
+        .publisher()
+        .publish_scoped(&topic, session.tenant(), batch)
+        .await
+        .unwrap();
 
     // Recipe §"Predicate + Subscribe" — `op = 'd'` selects one row.
     let predicate =
@@ -1578,7 +1590,11 @@ async fn cookbook_replay_from_backing_table_recipe_runs_end_to_end() {
         ],
     )
     .unwrap();
-    session.publisher().publish(&topic, batch).await.unwrap();
+    session
+        .publisher()
+        .publish_scoped(&topic, session.tenant(), batch)
+        .await
+        .unwrap();
 
     // Recipe §"Replay" — the backing-table replay path is exercised by
     // opening a subscription with from_offset = 0 and Predicate::match_all,

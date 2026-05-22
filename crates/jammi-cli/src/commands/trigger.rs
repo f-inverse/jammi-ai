@@ -259,7 +259,10 @@ async fn publish_rows(
         }
     };
 
-    let offset = handles.publisher.publish(&topic, batch).await?;
+    let offset = handles
+        .publisher
+        .publish_scoped(&topic, tenant, batch)
+        .await?;
     println!("Published offset {}.", offset.value());
     Ok(())
 }

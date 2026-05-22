@@ -294,7 +294,11 @@ async fn uat_workflow_c_cdc_pipeline_isolates_tenants_and_predicates() {
         ],
     )
     .unwrap();
-    session.publisher().publish(&topic, batch).await.unwrap();
+    session
+        .publisher()
+        .publish_scoped(&topic, session.tenant(), batch)
+        .await
+        .unwrap();
 
     // Predicate-filtered subscriber: only deletes.
     let predicate =

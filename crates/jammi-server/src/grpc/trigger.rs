@@ -93,7 +93,7 @@ impl TriggerService for TriggerServer {
         let record_batch = decode_arrow_batch(&batch, &topic)?;
         let offset = self
             .publisher
-            .publish(&topic, record_batch)
+            .publish_scoped(&topic, tenant, record_batch)
             .await
             .map_err(map_trigger_error)?;
         Ok(Response::new(PublishResponse {
@@ -303,6 +303,13 @@ fn map_trigger_error(err: TriggerError) -> Status {
         TriggerError::UnsupportedSchemaType { column, data_type } => Status::invalid_argument(
             format!("unsupported topic schema type for '{column}': {data_type}"),
         ),
+        TriggerError::PublishTenantMismatch {
+            topic,
+            topic_tenant,
+            publish_tenant,
+        } => Status::permission_denied(format!(
+            "publish tenant mismatch on topic '{topic}': topic_tenant={topic_tenant:?}, publish_tenant={publish_tenant:?}"
+        )),
         TriggerError::PredicateParse(detail) | TriggerError::PredicateUnsupported(detail) => {
             Status::invalid_argument(format!("predicate: {detail}"))
         }

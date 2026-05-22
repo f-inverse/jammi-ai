@@ -147,7 +147,10 @@ async fn register_publish_subscribe_filter_end_to_end() {
             let ids: Vec<i64> = (i * 10..i * 10 + 10).collect();
             let values: Vec<f64> = (0..10).map(|j| (i * 10 + j) as f64).collect();
             let batch = batch_of(&ids, &kinds, &values);
-            publisher.publish(&topic_clone, batch).await.unwrap();
+            publisher
+                .publish_scoped(&topic_clone, None, batch)
+                .await
+                .unwrap();
         }
     });
 
@@ -185,7 +188,10 @@ async fn replay_correctness_after_broker_restart() {
     h.topic_repo.register_topic(&topic).await.unwrap();
     for i in 0..100i64 {
         let batch = batch_of(&[i], &["X"], &[i as f64]);
-        h.publisher.publish(&topic, batch).await.unwrap();
+        h.publisher
+            .publish_scoped(&topic, None, batch)
+            .await
+            .unwrap();
     }
 
     // Restart: build a fresh broker (empty in-memory state) bound to the
@@ -242,7 +248,10 @@ async fn broadcast_fan_out_to_two_subscribers() {
         for i in 0..100 {
             let kind = if i % 2 == 0 { "X" } else { "Y" };
             let batch = batch_of(&[i], &[kind], &[i as f64]);
-            publisher.publish(&topic_clone, batch).await.unwrap();
+            publisher
+                .publish_scoped(&topic_clone, None, batch)
+                .await
+                .unwrap();
         }
     });
 
@@ -316,7 +325,7 @@ async fn publish_rejects_schema_mismatch() {
     let wrong_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let wrong_batch =
         RecordBatch::try_new(wrong_schema, vec![Arc::new(Int64Array::from(vec![1_i64]))]).unwrap();
-    match h.publisher.publish(&topic, wrong_batch).await {
+    match h.publisher.publish_scoped(&topic, None, wrong_batch).await {
         Err(TriggerError::BatchSchemaMismatch(_)) => {}
         other => panic!("expected BatchSchemaMismatch, got {other:?}"),
     }
@@ -359,7 +368,10 @@ async fn backpressure_slows_publisher_without_dropping() {
     let publisher_handle = tokio::spawn(async move {
         for i in 0..200i64 {
             let batch = batch_of(&[i], &["X"], &[i as f64]);
-            publisher.publish(&topic_clone, batch).await.unwrap();
+            publisher
+                .publish_scoped(&topic_clone, None, batch)
+                .await
+                .unwrap();
         }
     });
 
@@ -395,7 +407,10 @@ async fn empty_predicate_matches_every_batch() {
     tokio::spawn(async move {
         for i in 0..5i64 {
             let batch = batch_of(&[i], &["X"], &[i as f64]);
-            publisher.publish(&topic_clone, batch).await.unwrap();
+            publisher
+                .publish_scoped(&topic_clone, None, batch)
+                .await
+                .unwrap();
         }
     });
 
@@ -504,7 +519,10 @@ async fn replay_only_drains_backing_table_without_live_tail() {
 
     for i in 0..2i64 {
         let batch = batch_of(&[i], &["X"], &[i as f64]);
-        h.publisher.publish(&topic, batch).await.unwrap();
+        h.publisher
+            .publish_scoped(&topic, None, batch)
+            .await
+            .unwrap();
     }
 
     let from = Offset::new(0, chrono::Utc::now());
@@ -530,7 +548,10 @@ async fn replay_only_returns_empty_when_from_offset_none() {
 
     for i in 0..3i64 {
         let batch = batch_of(&[i], &["X"], &[i as f64]);
-        h.publisher.publish(&topic, batch).await.unwrap();
+        h.publisher
+            .publish_scoped(&topic, None, batch)
+            .await
+            .unwrap();
     }
 
     let drained = h
@@ -551,11 +572,11 @@ async fn replay_only_applies_predicate_to_replay_window() {
     h.topic_repo.register_topic(&topic).await.unwrap();
 
     h.publisher
-        .publish(&topic, batch_of(&[0], &["X"], &[0.0]))
+        .publish_scoped(&topic, None, batch_of(&[0], &["X"], &[0.0]))
         .await
         .unwrap();
     h.publisher
-        .publish(&topic, batch_of(&[1], &["Y"], &[1.0]))
+        .publish_scoped(&topic, None, batch_of(&[1], &["Y"], &[1.0]))
         .await
         .unwrap();
 
@@ -569,4 +590,273 @@ async fn replay_only_applies_predicate_to_replay_window() {
         .unwrap();
     assert_eq!(drained.len(), 1);
     assert_eq!(drained[0].offset.value(), 0);
+}
+
+#[tokio::test]
+async fn publish_tags_rows_with_supplied_tenant() {
+    // `Publisher::publish_scoped` stamps every persisted row's `tenant_id`
+    // with the `tenant` argument by binding it on the backing-table
+    // transaction. We verify the stamp by replaying through
+    // `Subscriber::replay_only_scoped`, whose tenant-scoped backing-table
+    // query (`tenant_id = $current OR tenant_id IS NULL`) surfaces a row
+    // iff that row's tenant matches.
+    let tenant_a = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
+    let tenant_b = TenantId::from_str("01906c84-aaaa-7e10-9c4f-bbbbcccc8e9a").unwrap();
+
+    // The topic is declared unscoped so the publish-time tenant is the
+    // only thing that distinguishes the stored rows.
+    let h = build_harness().await;
+    let topic = topic_def("events.tenant_stamp", None);
+    h.broker.register_topic(&topic).await.unwrap();
+    h.topic_repo.register_topic(&topic).await.unwrap();
+
+    // Publish three rows under three different tenant scopes.
+    h.publisher
+        .publish_scoped(&topic, Some(tenant_a), batch_of(&[1], &["X"], &[1.0]))
+        .await
+        .unwrap();
+    h.publisher
+        .publish_scoped(&topic, Some(tenant_b), batch_of(&[2], &["X"], &[2.0]))
+        .await
+        .unwrap();
+    h.publisher
+        .publish_scoped(&topic, None, batch_of(&[3], &["X"], &[3.0]))
+        .await
+        .unwrap();
+
+    let from = Offset::new(0, chrono::Utc::now());
+
+    // Tenant A's scope: A's row + the globally-scoped (`None`) row.
+    let drained_a = h
+        .subscriber
+        .replay_only_scoped(&topic, Some(tenant_a), Predicate::match_all(), Some(from))
+        .await
+        .unwrap();
+    let ids_a: Vec<i64> = drained_a
+        .iter()
+        .flat_map(|d| {
+            let col = d
+                .batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        ids_a,
+        vec![1, 3],
+        "tenant A must see its row (id=1) plus the globally-scoped row (id=3)"
+    );
+
+    // Tenant B's scope: B's row + the globally-scoped row.
+    let drained_b = h
+        .subscriber
+        .replay_only_scoped(&topic, Some(tenant_b), Predicate::match_all(), Some(from))
+        .await
+        .unwrap();
+    let ids_b: Vec<i64> = drained_b
+        .iter()
+        .flat_map(|d| {
+            let col = d
+                .batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        ids_b,
+        vec![2, 3],
+        "tenant B must see its row (id=2) plus the globally-scoped row (id=3)"
+    );
+
+    // Unscoped (None): only globally-scoped rows.
+    let drained_none = h
+        .subscriber
+        .replay_only_scoped(&topic, None, Predicate::match_all(), Some(from))
+        .await
+        .unwrap();
+    let ids_none: Vec<i64> = drained_none
+        .iter()
+        .flat_map(|d| {
+            let col = d
+                .batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        ids_none,
+        vec![3],
+        "an unscoped subscriber sees only the row that was published with None"
+    );
+}
+
+#[tokio::test]
+async fn subscribe_scoped_filters_published_rows_by_tenant() {
+    // End-to-end check that `Publisher::publish_scoped(..., Some(t), ...)`
+    // segregates rows across tenants from the subscriber's vantage point.
+    // Three rows under {A, B, A}; tenant A's scope must see two, B's one,
+    // an unscoped scope zero.
+    let tenant_a = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
+    let tenant_b = TenantId::from_str("01906c84-aaaa-7e10-9c4f-bbbbcccc8e9a").unwrap();
+
+    let h = build_harness().await;
+    let topic = topic_def("events.scoped_filter", None);
+    h.broker.register_topic(&topic).await.unwrap();
+    h.topic_repo.register_topic(&topic).await.unwrap();
+
+    h.publisher
+        .publish_scoped(&topic, Some(tenant_a), batch_of(&[10], &["X"], &[10.0]))
+        .await
+        .unwrap();
+    h.publisher
+        .publish_scoped(&topic, Some(tenant_b), batch_of(&[20], &["X"], &[20.0]))
+        .await
+        .unwrap();
+    h.publisher
+        .publish_scoped(&topic, Some(tenant_a), batch_of(&[11], &["X"], &[11.0]))
+        .await
+        .unwrap();
+
+    let from = Offset::new(0, chrono::Utc::now());
+
+    let drained_a = h
+        .subscriber
+        .replay_only_scoped(&topic, Some(tenant_a), Predicate::match_all(), Some(from))
+        .await
+        .unwrap();
+    let ids_a: Vec<i64> = drained_a
+        .iter()
+        .flat_map(|d| {
+            let col = d
+                .batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        ids_a,
+        vec![10, 11],
+        "tenant A's scope must see exactly the two A-published rows in publish order"
+    );
+
+    let drained_b = h
+        .subscriber
+        .replay_only_scoped(&topic, Some(tenant_b), Predicate::match_all(), Some(from))
+        .await
+        .unwrap();
+    let ids_b: Vec<i64> = drained_b
+        .iter()
+        .flat_map(|d| {
+            let col = d
+                .batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        ids_b,
+        vec![20],
+        "tenant B's scope must see only the one B-published row"
+    );
+
+    // None-scoped subscribers see only `tenant_id IS NULL` rows; none were
+    // published under None here, so the replay is empty.
+    let drained_none = h
+        .subscriber
+        .replay_only_scoped(&topic, None, Predicate::match_all(), Some(from))
+        .await
+        .unwrap();
+    assert!(
+        drained_none.is_empty(),
+        "an unscoped subscriber must see zero rows when every publish was tenant-tagged"
+    );
+}
+
+#[tokio::test]
+async fn publish_returns_error_on_tenant_mismatch_when_topic_is_tenant_pinned() {
+    // When `TopicDefinition::tenant` is `Some(A)`, the topic is pinned and
+    // only an `A`-scoped publish is permitted. `Publisher::publish_scoped`
+    // rejects anything else with `PublishTenantMismatch` before opening a
+    // transaction; the backing table is never touched.
+    let tenant_a = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
+    let tenant_b = TenantId::from_str("01906c84-aaaa-7e10-9c4f-bbbbcccc8e9a").unwrap();
+
+    let h = build_harness_with_tenant(Some(tenant_a)).await;
+    let topic = topic_def("events.pinned", Some(tenant_a));
+    h.broker.register_topic(&topic).await.unwrap();
+    h.topic_repo.register_topic(&topic).await.unwrap();
+
+    // Wrong tenant — typed error, attributable to the publish argument.
+    let err = h
+        .publisher
+        .publish_scoped(&topic, Some(tenant_b), batch_of(&[1], &["X"], &[1.0]))
+        .await
+        .expect_err("publish under tenant B against an A-pinned topic must fail");
+    match err {
+        TriggerError::PublishTenantMismatch {
+            topic: ref name,
+            topic_tenant,
+            publish_tenant,
+        } => {
+            assert_eq!(name, "events.pinned");
+            assert_eq!(topic_tenant, Some(tenant_a));
+            assert_eq!(publish_tenant, Some(tenant_b));
+        }
+        other => panic!("expected PublishTenantMismatch, got {other:?}"),
+    }
+
+    // Unscoped publish against a pinned topic — also rejected.
+    let err = h
+        .publisher
+        .publish_scoped(&topic, None, batch_of(&[2], &["X"], &[2.0]))
+        .await
+        .expect_err("publish under None against an A-pinned topic must fail");
+    assert!(
+        matches!(
+            err,
+            TriggerError::PublishTenantMismatch {
+                publish_tenant: None,
+                ..
+            }
+        ),
+        "expected PublishTenantMismatch with publish_tenant=None, got {err:?}"
+    );
+
+    // Nothing landed in the backing table.
+    let from = Offset::new(0, chrono::Utc::now());
+    let drained = h
+        .subscriber
+        .replay_only_scoped(&topic, Some(tenant_a), Predicate::match_all(), Some(from))
+        .await
+        .unwrap();
+    assert!(
+        drained.is_empty(),
+        "rejected publishes must not write any row to the backing table"
+    );
+
+    // The matching-tenant publish still works.
+    h.publisher
+        .publish_scoped(&topic, Some(tenant_a), batch_of(&[3], &["X"], &[3.0]))
+        .await
+        .expect("publish under the topic's own tenant must succeed");
 }

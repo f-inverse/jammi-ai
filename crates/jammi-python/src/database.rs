@@ -132,6 +132,11 @@ impl PyDatabase {
     /// Publish one batch of rows to a topic. `batch` is a `pyarrow.Table`
     /// (zero-copy import via the Arrow C Stream Interface) whose schema
     /// must match the topic's. Returns the engine-assigned offset.
+    ///
+    /// The publish is scoped to the session's currently-bound tenant —
+    /// rows land with `tenant_id` equal to whatever `Database.tenant` is
+    /// set to (or `NULL` if the session is unscoped). For a tenant-pinned
+    /// topic, this must match the topic's tenant.
     #[pyo3(signature = (topic, *, batch))]
     fn publish_topic(&self, topic: &str, batch: PyTable) -> PyResult<u64> {
         let topic_repo = self.session.topic_repo();
@@ -160,7 +165,7 @@ impl PyDatabase {
         let publisher = self.session.publisher();
         let offset = self
             .runtime
-            .block_on(publisher.publish(&topic_def, concatenated))
+            .block_on(publisher.publish_scoped(&topic_def, tenant, concatenated))
             .map_err(to_pyerr)?;
         Ok(offset.value())
     }

@@ -20,6 +20,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::catalog::backend::{BackendImpl, TxOptions};
 use crate::source::mutable::MutableTableRegistry;
 use crate::store::mutable::definition::MutableTableId;
+use crate::tenant::TenantId;
 use crate::trigger::broker::TriggerBroker;
 use crate::trigger::error::TriggerError;
 use crate::trigger::ids::TopicId;
@@ -70,12 +71,42 @@ impl Publisher {
         }
     }
 
-    /// Publish one batch to `topic`. Validates the batch schema against
-    /// the topic's schema, mints an offset, commits to the backing table,
-    /// and fans out to the broker. Returns the assigned offset.
-    pub async fn publish(
+    /// Publish one batch to `topic` under the given `tenant` scope.
+    ///
+    /// `tenant` is the tenant whose rows are being published. It is bound on
+    /// the backing-table transaction via [`crate::catalog::backend::Transaction::set_tenant`]
+    /// so every row's `tenant_id` column is stamped with the same value the
+    /// mutable-table write-side guard
+    /// ([`crate::catalog::backend::Transaction::assert_tenant_matches`])
+    /// asserts. The resulting rows are visible to a tenant-scoped subscriber
+    /// (the `tenant_id = $current OR tenant_id IS NULL` predicate) only when
+    /// the subscriber's tenant equals `tenant`.
+    ///
+    /// `None` publishes a globally-scoped row (`tenant_id IS NULL`). This is
+    /// the right value for engine-default topics that are read by every
+    /// tenant; pass a `Some(_)` value for any topic whose readers are
+    /// tenant-scoped.
+    ///
+    /// # Tenant contract
+    ///
+    /// * If [`TopicDefinition::tenant`] is `Some(t)`, `tenant` must equal
+    ///   `Some(t)` — a mismatch returns [`TriggerError::PublishTenantMismatch`]
+    ///   before any transaction is opened. The topic itself is the source of
+    ///   truth: tenant-pinned topics never accept cross-tenant publishes.
+    /// * If [`TopicDefinition::tenant`] is `None`, `tenant` may be either
+    ///   `None` (global row) or `Some(_)` (tenant-tagged row on a globally-
+    ///   declared topic). Both shapes are well-defined; readers see them
+    ///   according to the standard `tenant_id = $current OR tenant_id IS NULL`
+    ///   predicate.
+    ///
+    /// Validates the batch schema against the topic's schema, mints an
+    /// offset, commits to the backing table inside a single transaction
+    /// with `tenant` bound, and best-effort fans out to the broker. Returns
+    /// the assigned offset.
+    pub async fn publish_scoped(
         &self,
         topic: &TopicDefinition,
+        tenant: Option<TenantId>,
         user_batch: RecordBatch,
     ) -> Result<Offset, TriggerError> {
         if user_batch.schema().as_ref() != topic.schema.as_ref() {
@@ -85,6 +116,20 @@ impl Publisher {
                 topic.schema.fields().len(),
                 user_batch.schema().fields().len()
             )));
+        }
+
+        // Tenant-pinned topics reject cross-tenant publishes up front rather
+        // than relying on the backing-table write-side guard to surface a
+        // generic `TenantMismatch` from inside the transaction. The pre-check
+        // keeps the failure attributable to the caller's `tenant` argument.
+        if let Some(topic_tenant) = topic.tenant {
+            if tenant != Some(topic_tenant) {
+                return Err(TriggerError::PublishTenantMismatch {
+                    topic: topic.name.clone(),
+                    topic_tenant: Some(topic_tenant),
+                    publish_tenant: tenant,
+                });
+            }
         }
 
         let counter = self.counter_for(topic.id);
@@ -120,6 +165,11 @@ impl Publisher {
                 let id = id_for_closure.clone();
                 let augmented = augmented_for_closure.clone();
                 Box::pin(async move {
+                    // Bind the publish-scoped tenant on the transaction so
+                    // `MutableTableRegistry::insert_batch` stamps every row's
+                    // `tenant_id` slot with `tenant` and its write-side
+                    // `assert_tenant_matches` guard agrees.
+                    tx.set_tenant(tenant);
                     registry
                         .insert_batch(tx, &id, &augmented)
                         .await

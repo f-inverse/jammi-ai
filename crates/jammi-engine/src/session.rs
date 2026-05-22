@@ -5,8 +5,6 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_federation::{FederatedQueryPlanner, FederationOptimizerRule};
 
-use std::sync::RwLock;
-
 use crate::catalog::topic_repo::TopicRepo;
 use crate::catalog::Catalog;
 use crate::config::JammiConfig;
@@ -62,10 +60,9 @@ impl JammiSession {
         // Construct the shared tenant binding first so the catalog can be
         // opened with it; downstream writes / reads in the catalog repos
         // consult the binding to bind / filter `tenant_id` on every row.
-        let tenant_binding: TenantBinding = Arc::new(RwLock::new(TenantContext::Unscoped));
+        let tenant_binding = TenantBinding::unscoped();
         let catalog = Arc::new(
-            Catalog::open_with_tenant(&config.artifact_dir, Some(Arc::clone(&tenant_binding)))
-                .await?,
+            Catalog::open_with_tenant(&config.artifact_dir, Some(tenant_binding.clone())).await?,
         );
         Self::build(config, catalog, tenant_binding).await
     }
@@ -86,11 +83,11 @@ impl JammiSession {
         backend: crate::catalog::backend::BackendImpl,
     ) -> Result<Self> {
         let config = Arc::new(config);
-        let tenant_binding: TenantBinding = Arc::new(RwLock::new(TenantContext::Unscoped));
+        let tenant_binding = TenantBinding::unscoped();
         backend.migrate().await?;
         let catalog = Arc::new(Catalog::from_backend_with_tenant(
             backend,
-            Some(Arc::clone(&tenant_binding)),
+            Some(tenant_binding.clone()),
         ));
         Self::build(config, catalog, tenant_binding).await
     }
@@ -123,7 +120,7 @@ impl JammiSession {
         // registry so every read/write surface observes the same value.
         let source_tenant_columns = Arc::new(SourceTenantColumns::new());
         let analyzer_rule = Arc::new(TenantScopeAnalyzerRule::new(
-            Arc::clone(&tenant_binding),
+            tenant_binding.clone(),
             Arc::clone(&source_tenant_columns),
         ));
 
@@ -152,7 +149,7 @@ impl JammiSession {
         let mutable = Arc::new(MutableTableRegistry::new(
             Arc::clone(&catalog),
             mutable_backend,
-            Arc::clone(&tenant_binding),
+            tenant_binding.clone(),
         ));
 
         // The "mutable" catalog hosts every registered mutable companion
@@ -204,17 +201,22 @@ impl JammiSession {
     /// whose `tenant_id = t` plus globally-scoped rows whose `tenant_id IS
     /// NULL`. Writes that target a different tenant are rejected by the
     /// write-side guard in [`crate::store::mutable::sink::MutableTableSink`].
+    ///
+    /// This is the **sticky** binding form: it mutates session-shared state
+    /// and stays in effect until [`Self::unbind_tenant`] or another bind
+    /// call replaces it. For concurrent multi-tenant request handlers on
+    /// the same session, prefer [`Self::with_tenant_scoped`].
     pub fn with_tenant(self, t: TenantId) -> Self {
-        *self.tenant.write().expect("tenant binding lock poisoned") = TenantContext::Scoped(t);
+        self.tenant.set_shared(TenantContext::Scoped(t));
         self
     }
 
-    /// Return the tenant scope bound to this session, if any.
+    /// Return the tenant scope effective on this session for the current
+    /// task: the task-local override installed by [`Self::with_tenant_scoped`]
+    /// when called from inside such a closure, otherwise the sticky shared
+    /// value set by [`Self::with_tenant`] / [`Self::bind_tenant`].
     pub fn tenant(&self) -> Option<TenantId> {
-        self.tenant
-            .read()
-            .expect("tenant binding lock poisoned")
-            .tenant()
+        self.tenant.current_tenant()
     }
 
     /// Shared handle to the underlying tenant binding. Used by server-side
@@ -223,21 +225,83 @@ impl JammiSession {
     /// crate) into the engine without re-creating the binding for every
     /// request.
     pub fn tenant_binding_arc(&self) -> crate::tenant_scope::TenantBinding {
-        std::sync::Arc::clone(&self.tenant)
+        self.tenant.clone()
     }
 
-    /// Mutate the bound tenant in place. Equivalent to `with_tenant` but does
-    /// not consume `self` — needed for callers that hold the session behind a
-    /// shared reference (`Arc<JammiSession>` in PyO3 / CLI wrappers, the
-    /// per-request gRPC handler reading `SessionTenant` from the request
-    /// interceptor).
+    /// Mutate the sticky bound tenant in place. Equivalent to
+    /// [`Self::with_tenant`] but does not consume `self` — needed for callers
+    /// that hold the session behind a shared reference (`Arc<JammiSession>`
+    /// in PyO3 / CLI wrappers, the per-request gRPC handler reading
+    /// `SessionTenant` from the request interceptor).
+    ///
+    /// Like [`Self::with_tenant`], this writes session-shared state and is
+    /// the wrong primitive for concurrent multi-tenant request handlers on
+    /// one shared session — see [`Self::with_tenant_scoped`].
     pub fn bind_tenant(&self, t: TenantId) {
-        *self.tenant.write().expect("tenant binding lock poisoned") = TenantContext::Scoped(t);
+        self.tenant.set_shared(TenantContext::Scoped(t));
     }
 
-    /// Clear the bound tenant in place.
+    /// Clear the sticky bound tenant.
     pub fn unbind_tenant(&self) {
-        *self.tenant.write().expect("tenant binding lock poisoned") = TenantContext::Unscoped;
+        self.tenant.set_shared(TenantContext::Unscoped);
+    }
+
+    /// Run `f` with `tenant` bound for the duration of the closure's future.
+    ///
+    /// The binding lives in a Tokio task-local installed for the executing
+    /// task; concurrent invocations from different tasks each see their own
+    /// `tenant` with no shared-state mutation between them. Reads inside the
+    /// closure — analyzer-rule predicate injection, catalog
+    /// `tenant_id`-aware queries, mutable-table sink / provider — observe
+    /// `tenant` regardless of what any other concurrent caller has set on
+    /// the sticky shared binding.
+    ///
+    /// Use this from concurrent gRPC handlers that share one
+    /// `Arc<JammiSession>` across requests. The sticky
+    /// [`Self::bind_tenant`] / [`Self::with_tenant`] surface remains for
+    /// single-flight callers (CLI, single-tenant embedding), but does not
+    /// fix the race when two handlers from different tenants overlap on a
+    /// shared session.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// use std::sync::Arc;
+    /// use jammi_engine::session::JammiSession;
+    /// use jammi_engine::TenantId;
+    ///
+    /// let session: Arc<JammiSession> = unimplemented!();
+    /// let tenant: TenantId = unimplemented!();
+    /// let rows = session
+    ///     .with_tenant_scoped(tenant, |scope| async move {
+    ///         scope.sql("SELECT COUNT(*) FROM mutable.public.widgets").await
+    ///     })
+    ///     .await?;
+    /// # let _ = rows;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Implementation note
+    ///
+    /// This is **Option β** from the design: rather than threading an
+    /// explicit `tenant` argument through every internal call (catalog,
+    /// mutable-table registry, analyzer rule), the binding's read path
+    /// consults a [`tokio::task_local`] override that
+    /// [`crate::tenant_scope::TenantBinding::scope`] installs for the
+    /// duration of `f`. The shared `Arc<RwLock<TenantContext>>` continues
+    /// to serve the sticky-binding path; the task-local shadows it for
+    /// concurrent scoped callers.
+    pub async fn with_tenant_scoped<'a, F, Fut, T>(&'a self, tenant: TenantId, f: F) -> T
+    where
+        F: FnOnce(TenantScope<'a>) -> Fut,
+        Fut: std::future::Future<Output = T> + 'a,
+    {
+        let scope = TenantScope { session: self };
+        self.tenant
+            .scope(TenantContext::Scoped(tenant), f(scope))
+            .await
     }
 
     /// Register a tenant-discriminator column for a federated source. The
@@ -598,5 +662,32 @@ impl JammiSession {
     /// Return a reference to the active configuration.
     pub fn config(&self) -> &JammiConfig {
         &self.config
+    }
+}
+
+/// Handle passed to the closure inside [`JammiSession::with_tenant_scoped`].
+///
+/// `Deref`s to the underlying [`JammiSession`] so the closure can call any
+/// session method (`sql`, `mutable_tables`, `catalog`, …) and observe the
+/// scoped tenant. Holding a `TenantScope` does not by itself bind anything —
+/// the binding is installed by the surrounding `with_tenant_scoped` call's
+/// task-local. The scope's lifetime is tied to the closure's stack frame so
+/// it cannot leak past the scoped region.
+pub struct TenantScope<'a> {
+    session: &'a JammiSession,
+}
+
+impl<'a> TenantScope<'a> {
+    /// Borrow the underlying session.
+    pub fn session(&self) -> &'a JammiSession {
+        self.session
+    }
+}
+
+impl<'a> std::ops::Deref for TenantScope<'a> {
+    type Target = JammiSession;
+
+    fn deref(&self) -> &Self::Target {
+        self.session
     }
 }

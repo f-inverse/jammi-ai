@@ -25,6 +25,7 @@ pub use catalog::backend::{
     BackendError, BackendImpl, BackendKind, CatalogBackend, IsolationLevel, Transaction, TxOptions,
 };
 pub use evidence_channel::ChannelId;
+pub use session::TenantScope;
 pub use tenant::TenantId;
 
 /// Initialize the tracing subscriber using the provided logging configuration.

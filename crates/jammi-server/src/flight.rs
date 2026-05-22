@@ -13,7 +13,6 @@
 //!   via the [`TenantBoundProvider`].
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::execution::context::{SessionContext, SessionState};
@@ -50,11 +49,8 @@ pub async fn serve_flight_with_session_service(
     addr: SocketAddr,
     store: SessionStore,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let provider = TenantBoundProvider::new(
-        base_ctx.state(),
-        Arc::clone(&base_tenant_binding),
-        store.clone(),
-    );
+    let provider =
+        TenantBoundProvider::new(base_ctx.state(), base_tenant_binding.clone(), store.clone());
     let flight = FlightSqlService::new_with_provider(Box::new(provider));
     let flight_svc = arrow_flight::flight_service_server::FlightServiceServer::new(flight);
 
@@ -85,7 +81,12 @@ pub async fn serve_flight_with_session_service(
 /// execution can return rows under a stale binding. The gRPC `SessionService`
 /// surface is the supported multi-tenant Flight SQL path for now; a future
 /// refactor moves the binding off the shared `SessionContext` into per-plan
-/// `ConfigExtension` state (SPEC-03 §13 OQ#3).
+/// `ConfigExtension` state (SPEC-03 §13 OQ#3). Downstream gRPC consumers
+/// that own their own request handlers can avoid the race today by routing
+/// each request through
+/// [`jammi_engine::session::JammiSession::with_tenant_scoped`], which
+/// installs the tenant as a Tokio task-local for the duration of the
+/// closure.
 pub struct TenantBoundProvider {
     base_state: SessionState,
     binding: TenantBinding,
@@ -112,15 +113,7 @@ impl SessionStateProvider for TenantBoundProvider {
             .map(SessionId::new)
             .and_then(|sid| self.store.get(&sid));
 
-        let mut binding = self
-            .binding
-            .write()
-            .map_err(|e| Status::internal(format!("tenant binding lock poisoned: {e}")))?;
-        *binding = match tenant {
-            Some(t) => TenantContext::Scoped(t),
-            None => TenantContext::Unscoped,
-        };
-        drop(binding);
+        self.binding.set_shared(TenantContext::from_option(tenant));
 
         Ok(self.base_state.clone())
     }

@@ -9,7 +9,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::time::Duration;
 
 use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
@@ -24,6 +23,7 @@ use jammi_engine::source::mutable::MutableTableRegistry;
 use jammi_engine::store::mutable::sqlite::SqliteMutableBackend;
 use jammi_engine::store::mutable::MutableBackend;
 use jammi_engine::tenant::{TenantContext, TenantId};
+use jammi_engine::tenant_scope::TenantBinding;
 use jammi_engine::trigger::{
     InMemoryBroker, Offset, Predicate, Publisher, Subscriber, TopicDefinition, TopicId,
     TriggerBroker, TriggerError,
@@ -56,13 +56,15 @@ async fn build_harness_with_tenant(tenant: Option<TenantId>) -> Harness {
 
     let mutable_backend: Arc<dyn MutableBackend> =
         Arc::new(SqliteMutableBackend::new(Arc::clone(&backend)));
+    let tenant_binding = TenantBinding::unscoped();
+    tenant_binding.set_shared(match tenant {
+        Some(t) => TenantContext::Scoped(t),
+        None => TenantContext::Unscoped,
+    });
     let registry = Arc::new(MutableTableRegistry::new(
         Arc::clone(&catalog),
         mutable_backend,
-        Arc::new(RwLock::new(match tenant {
-            Some(t) => TenantContext::Scoped(t),
-            None => TenantContext::Unscoped,
-        })),
+        tenant_binding,
     ));
 
     let broker: Arc<dyn TriggerBroker> = Arc::new(InMemoryBroker::new());

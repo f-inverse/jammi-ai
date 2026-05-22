@@ -106,11 +106,11 @@ impl Catalog {
     }
 
     /// The tenant currently bound to this catalog, or `None` if unscoped.
-    /// Resolved through the shared [`TenantBinding`] (so a `with_tenant`
-    /// call on the owning session is observable here immediately).
+    /// Resolved through the shared [`TenantBinding`] — observes both the
+    /// sticky session binding (`with_tenant` / `bind_tenant`) and any
+    /// task-local override installed by
+    /// [`crate::session::JammiSession::with_tenant_scoped`].
     pub fn current_tenant(&self) -> Option<TenantId> {
-        self.tenant
-            .as_ref()
-            .and_then(|b| b.read().ok().and_then(|c| c.tenant()))
+        self.tenant.as_ref().and_then(|b| b.current_tenant())
     }
 }

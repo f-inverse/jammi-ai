@@ -76,12 +76,7 @@ impl MutableTableProvider {
         // ship the correct row set off the SQLite/Postgres side, not just
         // the union (which DataFusion's AnalyzerRule would also filter, but
         // at the cost of materializing the full table first).
-        let tenant_pred = match self
-            .tenant
-            .read()
-            .expect("tenant binding lock poisoned")
-            .tenant()
-        {
+        let tenant_pred = match self.tenant.current_tenant() {
             Some(t) => Some(format!("(\"tenant_id\" = '{t}' OR \"tenant_id\" IS NULL)")),
             None => Some("\"tenant_id\" IS NULL".to_string()),
         };
@@ -177,7 +172,7 @@ impl TableProvider for MutableTableProvider {
         let sink = Arc::new(MutableTableSink::new(
             Arc::clone(&self.def),
             Arc::clone(&self.backend),
-            Arc::clone(&self.tenant),
+            self.tenant.clone(),
         ));
         Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }

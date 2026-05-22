@@ -469,6 +469,124 @@ async fn federated_source_tenant_column_filters_split_6_4() {
     );
 }
 
+/// `JammiSession::with_tenant_scoped` installs a Tokio task-local for the
+/// duration of the closure that shadows the session's sticky shared
+/// binding. Two concurrent tasks invoking the helper with different
+/// tenants on the *same* `Arc<JammiSession>` each see their own tenant
+/// inside the closure — no cross-pollution from the other task's binding.
+///
+/// This is the concurrency property that the helper exists for. Without
+/// it, two gRPC handlers from different tenants sharing one
+/// `Arc<JammiSession>` would race on the shared `Arc<RwLock<TenantContext>>`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_tenant_scoped_isolates_concurrent_tasks() {
+    let dir = tempdir().unwrap();
+    let cfg = common::test_config(dir.path());
+
+    let session = Arc::new(JammiSession::new(cfg).await.unwrap());
+    register_widgets(&session).await;
+
+    // Each task: enter its tenant's scope, insert a row tagged with its
+    // tenant name, count rows visible inside the scope, and snapshot
+    // `session.tenant()` from inside the closure. Both tasks run on the
+    // same `Arc<JammiSession>` concurrently on a multi-thread runtime.
+    async fn run_one(
+        session: Arc<JammiSession>,
+        tenant: TenantId,
+        row_id: i64,
+        row_name: &'static str,
+    ) -> (Option<TenantId>, i64) {
+        session
+            .with_tenant_scoped(tenant, |scope| async move {
+                scope
+                    .sql(&format!(
+                        "INSERT INTO mutable.public.widgets (id, name) VALUES ({row_id}, '{row_name}')"
+                    ))
+                    .await
+                    .unwrap();
+                let observed = scope.tenant();
+                let rows = scope
+                    .sql("SELECT id FROM mutable.public.widgets")
+                    .await
+                    .unwrap();
+                let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let visible_id = ids.value(0);
+                (observed, visible_id)
+            })
+            .await
+    }
+
+    // Launch many concurrent invocations on both tenants. The high
+    // iteration count exists to stress the race window: without the
+    // task-local override, each task would intermittently observe the
+    // other tenant's binding around the await point inside the helper.
+    let mut handles = Vec::new();
+    for i in 0..16 {
+        let session_a = Arc::clone(&session);
+        let session_b = Arc::clone(&session);
+        let id_a = (i * 2) + 1000;
+        let id_b = (i * 2) + 1001;
+        handles.push(tokio::spawn(async move {
+            run_one(session_a, tenant_a(), id_a, "alpha").await
+        }));
+        handles.push(tokio::spawn(async move {
+            run_one(session_b, tenant_b(), id_b, "beta").await
+        }));
+    }
+
+    for (i, h) in handles.into_iter().enumerate() {
+        let (observed, visible_id) = h.await.unwrap();
+        let task_is_a = i % 2 == 0;
+        let expected_tenant = if task_is_a { tenant_a() } else { tenant_b() };
+        assert_eq!(
+            observed,
+            Some(expected_tenant),
+            "task {i} observed wrong tenant inside scope",
+        );
+        // Every visible row id must belong to this task's tenant — the
+        // session-internal mutable-table scan applies the tenant filter
+        // based on the task-local override. Tenant A's task IDs are even
+        // offsets from 1000; tenant B's are odd.
+        let is_a_id = (visible_id - 1000) % 2 == 0;
+        assert_eq!(
+            is_a_id, task_is_a,
+            "task {i} saw a row ({visible_id}) belonging to the other tenant",
+        );
+    }
+}
+
+/// The task-local override installed by `with_tenant_scoped` does not
+/// mutate the session's sticky shared binding. After the closure
+/// returns, `session.tenant()` reflects whatever the sticky binding was
+/// before the scoped call — not the scope's tenant.
+#[tokio::test]
+async fn with_tenant_scoped_does_not_mutate_sticky_binding() {
+    let dir = tempdir().unwrap();
+    let cfg = common::test_config(dir.path());
+
+    let session = JammiSession::new(cfg).await.unwrap();
+    register_widgets(&session).await;
+    // Sticky-bind tenant_b so we can observe that the scoped call to
+    // tenant_a does not leak past the closure.
+    let session = session.with_tenant(tenant_b());
+    let session = Arc::new(session);
+
+    assert_eq!(session.tenant(), Some(tenant_b()));
+    let observed_inside = session
+        .with_tenant_scoped(tenant_a(), |scope| async move { scope.tenant() })
+        .await;
+    assert_eq!(observed_inside, Some(tenant_a()));
+    // After the scope exits, the sticky binding (tenant_b) is restored
+    // because it was never touched.
+    assert_eq!(session.tenant(), Some(tenant_b()));
+}
+
 /// `Transaction::assert_tenant_matches` is the defence-in-depth write-side
 /// guard. The sink calls it once per write_all; verify it rejects mismatches.
 #[tokio::test]

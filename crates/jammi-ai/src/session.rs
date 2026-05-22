@@ -148,6 +148,10 @@ impl InferenceSession {
 
     /// Bind a tenant scope to this session. Subsequent reads/writes filter
     /// to `tenant_id = t OR tenant_id IS NULL`; writes record `tenant_id = t`.
+    ///
+    /// This is the sticky form: it mutates session-shared state. For
+    /// concurrent gRPC request handlers on a shared `Arc<InferenceSession>`,
+    /// prefer [`Self::with_tenant_scoped`].
     pub fn bind_tenant(&self, t: jammi_engine::TenantId) {
         self.inner.bind_tenant(t);
     }
@@ -160,6 +164,30 @@ impl InferenceSession {
     /// Return the tenant currently bound, if any.
     pub fn tenant(&self) -> Option<jammi_engine::TenantId> {
         self.inner.tenant()
+    }
+
+    /// Run `f` with `tenant` bound for the duration of the closure's future.
+    ///
+    /// The binding is installed as a Tokio task-local that shadows the
+    /// session's sticky shared binding for the executing task only.
+    /// Concurrent invocations from different tasks each see their own
+    /// `tenant`; no race exists on the shared
+    /// `Arc<RwLock<TenantContext>>` because no shared write happens in the
+    /// scoped path.
+    ///
+    /// Delegates to [`jammi_engine::session::JammiSession::with_tenant_scoped`];
+    /// see that method for the design rationale (Option β: task-local
+    /// override rather than per-call session rebuild).
+    pub async fn with_tenant_scoped<'a, F, Fut, T>(
+        &'a self,
+        tenant: jammi_engine::TenantId,
+        f: F,
+    ) -> T
+    where
+        F: FnOnce(jammi_engine::TenantScope<'a>) -> Fut,
+        Fut: std::future::Future<Output = T> + 'a,
+    {
+        self.inner.with_tenant_scoped(tenant, f).await
     }
 
     /// Access the model cache.

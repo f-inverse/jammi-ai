@@ -46,6 +46,29 @@ impl InferenceSession {
         observer: Option<Arc<dyn InferenceObserver>>,
     ) -> Result<Self> {
         let inner = JammiSession::new(config).await?;
+        Self::wrap(inner, observer).await
+    }
+
+    /// Create a session whose trigger-stream surface is bound to a
+    /// caller-supplied broker. Forwarded to
+    /// [`jammi_engine::session::JammiSession::with_broker`]; the
+    /// `InferenceSession` adds model-loading, eval, and inference layers on
+    /// top. Used by tests that need a broker with controlled behaviour, e.g.
+    /// an [`jammi_engine::trigger::InMemoryBroker`] armed with
+    /// `trigger_failure_for_next_publish` to deterministically exercise
+    /// publisher-failure paths.
+    pub async fn with_broker(
+        config: JammiConfig,
+        trigger_broker: Arc<dyn jammi_engine::trigger::TriggerBroker>,
+    ) -> Result<Self> {
+        let inner = JammiSession::with_broker(config, trigger_broker).await?;
+        Self::wrap(inner, None).await
+    }
+
+    async fn wrap(
+        inner: JammiSession,
+        observer: Option<Arc<dyn InferenceObserver>>,
+    ) -> Result<Self> {
         let catalog = Arc::clone(inner.catalog());
         let resolver = ModelResolver::new(catalog.clone())?;
         let device_config = DeviceConfig::from_config(inner.config());

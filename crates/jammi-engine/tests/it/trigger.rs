@@ -860,3 +860,70 @@ async fn publish_returns_error_on_tenant_mismatch_when_topic_is_tenant_pinned() 
         .await
         .expect("publish under the topic's own tenant must succeed");
 }
+
+#[tokio::test]
+async fn session_with_broker_swallows_fan_out_failure() {
+    // Verifies the session-level broker injection point + the publisher's
+    // transactional-outbox contract: a caller-built `InMemoryBroker` armed
+    // with `trigger_failure_for_next_publish` is wired into the session via
+    // `JammiSession::with_broker`. When the publisher fans out, the broker
+    // returns its configured driver error; the publisher logs at WARN and
+    // still returns Ok because the backing table commit is the authoritative
+    // log. Subscribers see the row on replay. The next publish succeeds
+    // because the failure was one-shot.
+    //
+    // Underwrites the enterprise gate's "publish failure does not fail the
+    // check" invariant (PLAN-16 §14 risk #4) by giving downstream tests a
+    // deterministic failure injection point.
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = jammi_engine::config::JammiConfig {
+        artifact_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let broker = Arc::new(InMemoryBroker::new());
+    let session = jammi_engine::session::JammiSession::with_broker(
+        config,
+        Arc::clone(&broker) as Arc<dyn TriggerBroker>,
+    )
+    .await
+    .expect("session with broker");
+
+    let topic = topic_def("test.session_inject_failure", None);
+    session
+        .trigger_broker()
+        .register_topic(&topic)
+        .await
+        .unwrap();
+    session.topic_repo().register_topic(&topic).await.unwrap();
+
+    broker.trigger_failure_for_next_publish("simulated broker outage");
+
+    // Publisher returns Ok despite the armed driver error — the backing
+    // table commit is the authoritative log; broker fan-out is best-effort.
+    session
+        .publisher()
+        .publish_scoped(&topic, None, batch_of(&[1], &["X"], &[1.0]))
+        .await
+        .expect("publish returns Ok despite armed broker failure");
+
+    // Subscriber replay sees the row that landed in the backing table.
+    let from = Offset::new(0, chrono::Utc::now());
+    let drained = session
+        .subscriber()
+        .replay_only_scoped(&topic, None, Predicate::match_all(), Some(from))
+        .await
+        .unwrap();
+    assert_eq!(
+        drained.iter().map(|d| d.batch.num_rows()).sum::<usize>(),
+        1,
+        "publisher commits the backing table before broker fan-out per the outbox contract"
+    );
+
+    // The next publish reaches the broker normally — the failure was one-shot.
+    session
+        .publisher()
+        .publish_scoped(&topic, None, batch_of(&[2], &["Y"], &[2.0]))
+        .await
+        .expect("subsequent publish succeeds after the one-shot failure clears");
+}

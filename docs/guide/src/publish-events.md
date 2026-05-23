@@ -148,10 +148,12 @@ topic_repo.register_topic(topic).await?;
 # use arrow::array::{Int64Array, RecordBatch, StringArray};
 # use arrow_schema::SchemaRef;
 # use jammi_engine::trigger::{Publisher, TopicDefinition};
+# use jammi_engine::TenantId;
 # async fn ex(
 #     publisher: &Publisher,
 #     topic: &TopicDefinition,
 #     schema: SchemaRef,
+#     tenant: Option<TenantId>,
 # ) -> Result<(), jammi_engine::trigger::TriggerError> {
 let batch = RecordBatch::try_new(
     schema,
@@ -163,11 +165,16 @@ let batch = RecordBatch::try_new(
     ],
 )
 .unwrap();
-let offset = publisher.publish(topic, batch).await?;
+let offset = publisher.publish_scoped(topic, tenant, batch).await?;
 println!("published offset = {}", offset.value());
 # Ok(())
 # }
 ```
+
+`publish_scoped` tags every row's `tenant_id` column from the explicit
+`tenant: Option<TenantId>` argument — no silent dependency on session
+state at publish time. Pass `None` for global topics; pass the session's
+current tenant (`session.tenant()`) for tenant-scoped publishes.
 
 Python equivalent — `publish_topic` accepts a `pyarrow.Table` via the
 Arrow C Stream Interface so the conversion is zero-copy:
@@ -185,9 +192,12 @@ offset = db.publish_topic("cdc.orders", batch=table)
 print(f"published offset = {offset}")
 ```
 
-`publish()` validates the batch schema against the topic schema before
-opening a transaction. A mismatch returns `BatchSchemaMismatch` and
-nothing lands in the backing table.
+`publish_scoped` validates the batch schema against the topic schema
+before opening a transaction. A mismatch returns `BatchSchemaMismatch`
+and nothing lands in the backing table. If the topic is tenant-pinned
+(`TopicDefinition::tenant = Some(t)`) and the `tenant` argument doesn't
+match, the publish is rejected up front with
+`PublishTenantMismatch`.
 
 ## What just happened
 

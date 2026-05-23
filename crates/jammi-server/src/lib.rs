@@ -59,6 +59,9 @@ pub async fn serve_with_shutdown(
 /// Start the gRPC server hosting [`grpc::session::SessionServer`] behind
 /// the [`grpc::session::TenantInterceptor`]. Returns when `shutdown` resolves.
 ///
+/// Native gRPC clients reach the surface over HTTP/2; browser callers reach
+/// the same services over HTTP/1.1 via the gRPC-Web shim (`application/grpc-web+proto`).
+///
 /// Flight SQL queries running through `flight::serve` should share the same
 /// [`grpc::session::SessionStore`] so a tenant bound via `SessionService.SetTenant`
 /// applies to Flight SQL queries on the same `jammi-session-id`.
@@ -72,12 +75,16 @@ pub async fn serve_grpc_with_shutdown(
     use grpc::proto::trigger::trigger_service_server::TriggerServiceServer;
     use grpc::session::{SessionServer, TenantInterceptor};
     use grpc::trigger::TriggerServer;
+    use tonic_web::GrpcWebLayer;
 
     let interceptor = TenantInterceptor::new(store.clone());
     let session_svc =
         SessionServiceServer::with_interceptor(SessionServer::new(store), interceptor.clone());
 
-    let mut builder = tonic::transport::Server::builder().add_service(session_svc);
+    let mut builder = tonic::transport::Server::builder()
+        .accept_http1(true)
+        .layer(GrpcWebLayer::new())
+        .add_service(session_svc);
     if let Some(handles) = trigger {
         let trigger_svc = TriggerServiceServer::with_interceptor(
             TriggerServer::new(handles.topic_repo, handles.publisher, handles.subscriber),

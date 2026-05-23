@@ -80,7 +80,9 @@ connection via the `jammi.v1.session.SessionService.SetTenant` RPC. The
 server records the tenant against the `jammi-session-id` request metadata
 header; every Flight SQL query the same connection issues afterwards
 inherits the binding through the `TenantInterceptor` that fronts both
-services.
+services. Browser clients reach the same `SessionService` over HTTP/1.1
+via the gRPC-Web shim (`application/grpc-web+proto`) — no separate REST
+surface, same `jammi-session-id` header semantics.
 
 ```python
 import grpc

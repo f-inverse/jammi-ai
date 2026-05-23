@@ -195,7 +195,7 @@ impl InferenceSession {
     ///
     /// Cross-tenant administrative reads (server-startup recovery scans,
     /// background audit jobs) live here. The closure receives an
-    /// [`jammi_engine::AdminScope`] handle whose [`AdminScope::sql`] returns
+    /// [`jammi_engine::AdminScope`] handle whose [`jammi_engine::AdminScope::sql`] returns
     /// fully materialised batches; once the closure resolves, subsequent
     /// reads on the same session are tenant-filtered again.
     ///

@@ -1,13 +1,14 @@
-#[allow(unused_imports)]
-use jammi_ai::concurrency::GpuScheduler;
-#[allow(unused_imports)]
-use jammi_ai::model::{
-    backend::DeviceConfig, cache::ModelCache, resolver::ModelResolver, tokenizer::TokenizerWrapper,
-    BackendType, ModelId, ModelSource, ModelTask,
-};
+use jammi_ai::model::{resolver::ModelResolver, BackendType, ModelSource, ModelTask};
 use jammi_engine::catalog::Catalog;
 use std::sync::Arc;
 use tempfile::tempdir;
+
+#[cfg(feature = "live-hub-tests")]
+use jammi_ai::concurrency::GpuScheduler;
+#[cfg(feature = "live-hub-tests")]
+use jammi_ai::model::{
+    backend::DeviceConfig, cache::ModelCache, tokenizer::TokenizerWrapper, ModelId,
+};
 
 // --- HF Hub resolution (live only) ---
 

@@ -36,9 +36,16 @@ struct ChannelState {
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 
 /// `TriggerBroker` implementation that holds every channel in process memory.
+///
+/// Holds an optional pending-failure slot — when set, the next `publish` call
+/// consumes it and returns the corresponding [`TriggerError::Driver`] instead
+/// of broadcasting. Used by tests that need to exercise publisher failure
+/// paths (e.g. the enterprise gate's `publish_failure_does_not_fail_check`
+/// invariant) deterministically.
 pub struct InMemoryBroker {
     channels: RwLock<HashMap<TopicId, ChannelState>>,
     capacity: usize,
+    pending_failure: RwLock<Option<String>>,
 }
 
 impl InMemoryBroker {
@@ -50,7 +57,17 @@ impl InMemoryBroker {
         Self {
             channels: RwLock::new(HashMap::new()),
             capacity,
+            pending_failure: RwLock::new(None),
         }
+    }
+
+    /// Arm the broker so the next `publish` call returns
+    /// [`TriggerError::Driver`] with `message` and clears the arm. Subsequent
+    /// publishes (after the armed one) succeed normally. Useful for tests
+    /// that verify publisher-failure handling without depending on a real
+    /// broker outage.
+    pub fn trigger_failure_for_next_publish(&self, message: impl Into<String>) {
+        *self.pending_failure.write() = Some(message.into());
     }
 }
 
@@ -97,6 +114,9 @@ impl TriggerBroker for InMemoryBroker {
         produced_at: DateTime<Utc>,
         offset: u64,
     ) -> Result<Offset, TriggerError> {
+        if let Some(message) = self.pending_failure.write().take() {
+            return Err(TriggerError::Driver(message));
+        }
         let off = Offset::new(offset, produced_at);
         let sender = self
             .channels
@@ -156,5 +176,65 @@ impl TriggerBroker for InMemoryBroker {
 
     fn driver_kind(&self) -> BrokerKind {
         BrokerKind::InMemory
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow_schema::{DataType, Field, Schema};
+    use std::collections::BTreeMap;
+
+    fn topic(name: &str) -> TopicDefinition {
+        TopicDefinition {
+            id: TopicId::new(),
+            name: name.into(),
+            schema: Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+            tenant: None,
+            broker_metadata: BTreeMap::new(),
+        }
+    }
+
+    fn batch(schema: &SchemaRef, values: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![Arc::new(Int64Array::from(values.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn trigger_failure_consumes_one_publish() {
+        let broker = InMemoryBroker::new();
+        let t = topic("test.failure");
+        broker.register_topic(&t).await.unwrap();
+
+        broker.trigger_failure_for_next_publish("simulated broker outage");
+        let err = broker
+            .publish(t.id, batch(&t.schema, &[1]), Utc::now(), 0)
+            .await
+            .unwrap_err();
+        match err {
+            TriggerError::Driver(msg) => assert_eq!(msg, "simulated broker outage"),
+            other => panic!("expected Driver error, got {other:?}"),
+        }
+
+        // The next publish must succeed — the failure was one-shot.
+        broker
+            .publish(t.id, batch(&t.schema, &[2]), Utc::now(), 1)
+            .await
+            .expect("subsequent publish succeeds");
+    }
+
+    #[tokio::test]
+    async fn trigger_failure_unarmed_publish_succeeds() {
+        let broker = InMemoryBroker::new();
+        let t = topic("test.unarmed");
+        broker.register_topic(&t).await.unwrap();
+        broker
+            .publish(t.id, batch(&t.schema, &[42]), Utc::now(), 0)
+            .await
+            .expect("publish without arm succeeds");
     }
 }

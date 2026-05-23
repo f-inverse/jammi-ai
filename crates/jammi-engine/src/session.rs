@@ -43,9 +43,9 @@ pub struct JammiSession {
     storage_registry: StorageRegistry,
     mutable: Arc<MutableTableRegistry>,
     mutable_schema: Arc<JammiSchemaProvider>,
-    /// Default broker used by the in-process trigger surface — replaced at
-    /// deployment time by callers that wire a clustered broker (e.g.
-    /// JetStream) into the session via `with_trigger_broker`.
+    /// Broker for the trigger-stream surface. Defaults to [`InMemoryBroker`];
+    /// callers that wire a clustered broker (e.g. JetStream) pass it through
+    /// [`JammiSession::with_broker`] or [`JammiSession::with_backend_and_broker`].
     trigger_broker: Arc<dyn TriggerBroker>,
     topic_repo: Arc<TopicRepo>,
     publisher: Arc<Publisher>,
@@ -54,23 +54,36 @@ pub struct JammiSession {
 
 impl JammiSession {
     /// Create a new session, opening the catalog and configuring DataFusion.
+    /// Uses an in-process [`InMemoryBroker`] for the trigger-stream surface.
     pub async fn new(config: JammiConfig) -> Result<Self> {
-        let config = Arc::new(config);
+        Self::with_broker(config, Arc::new(InMemoryBroker::new())).await
+    }
 
-        // Construct the shared tenant binding first so the catalog can be
-        // opened with it; downstream writes / reads in the catalog repos
-        // consult the binding to bind / filter `tenant_id` on every row.
+    /// Create a new session with a caller-supplied trigger broker.
+    ///
+    /// Used by:
+    /// - deployments that wire a clustered broker (JetStream) instead of the
+    ///   default in-process one
+    /// - tests that need a broker with controlled behaviour, e.g. an
+    ///   [`InMemoryBroker`] armed with
+    ///   [`InMemoryBroker::trigger_failure_for_next_publish`] to exercise
+    ///   publisher-failure paths deterministically
+    pub async fn with_broker(
+        config: JammiConfig,
+        trigger_broker: Arc<dyn TriggerBroker>,
+    ) -> Result<Self> {
+        let config = Arc::new(config);
         let tenant_binding = TenantBinding::unscoped();
         let catalog = Arc::new(
             Catalog::open_with_tenant(&config.artifact_dir, Some(tenant_binding.clone())).await?,
         );
-        Self::build(config, catalog, tenant_binding).await
+        Self::build(config, catalog, tenant_binding, trigger_broker).await
     }
 
     /// Build a session around a caller-supplied catalog backend. Migrations
     /// are applied here so the caller hands in a connected-but-unmigrated
     /// [`crate::catalog::backend::BackendImpl`]; the session takes it from
-    /// there.
+    /// there. Uses the default in-process trigger broker.
     ///
     /// Used by:
     /// - tests that need to parameterize over backend (SQLite tempfile vs
@@ -82,6 +95,18 @@ impl JammiSession {
         config: JammiConfig,
         backend: crate::catalog::backend::BackendImpl,
     ) -> Result<Self> {
+        Self::with_backend_and_broker(config, backend, Arc::new(InMemoryBroker::new())).await
+    }
+
+    /// Build a session around a caller-supplied catalog backend AND a
+    /// caller-supplied trigger broker. The composable constructor: server
+    /// deployments combining a shared Postgres pool with a JetStream broker
+    /// reach for this one.
+    pub async fn with_backend_and_broker(
+        config: JammiConfig,
+        backend: crate::catalog::backend::BackendImpl,
+        trigger_broker: Arc<dyn TriggerBroker>,
+    ) -> Result<Self> {
         let config = Arc::new(config);
         let tenant_binding = TenantBinding::unscoped();
         backend.migrate().await?;
@@ -89,13 +114,14 @@ impl JammiSession {
             backend,
             Some(tenant_binding.clone()),
         ));
-        Self::build(config, catalog, tenant_binding).await
+        Self::build(config, catalog, tenant_binding, trigger_broker).await
     }
 
     async fn build(
         config: Arc<JammiConfig>,
         catalog: Arc<Catalog>,
         tenant_binding: TenantBinding,
+        trigger_broker: Arc<dyn TriggerBroker>,
     ) -> Result<Self> {
         let session_config = SessionConfig::new()
             .with_target_partitions(config.engine.execution_threads)
@@ -159,7 +185,6 @@ impl JammiSession {
         let mutable_catalog = Arc::new(SourceCatalog::new(Arc::clone(&mutable_schema)));
         ctx.register_catalog("mutable", mutable_catalog);
 
-        let trigger_broker: Arc<dyn TriggerBroker> = Arc::new(InMemoryBroker::new());
         let topic_repo = Arc::new(TopicRepo::new(Arc::clone(&catalog), Arc::clone(&mutable)));
         let publisher = Arc::new(Publisher::new(
             Arc::clone(&trigger_broker),

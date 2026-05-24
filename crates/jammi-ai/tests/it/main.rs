@@ -10,6 +10,7 @@ mod inference;
 mod merger;
 mod models;
 mod pipeline;
+mod read_vectors;
 mod scheduling;
 mod search;
 mod search_attribution;

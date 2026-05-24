@@ -317,6 +317,18 @@ impl InferenceSession {
         Ok(result)
     }
 
+    /// Read the `vector` column of an embedding result table into one
+    /// `Vec<f32>` per row.
+    ///
+    /// Resolves the table's parquet through the underlying session's storage
+    /// registry (so cloud credentials registered with the session are
+    /// inherited) and surfaces [`JammiError::Schema`] when the column is not
+    /// shaped `FixedSizeList<Float32>`. Delegates to
+    /// [`jammi_engine::session::JammiSession::read_vectors`].
+    pub async fn read_vectors(&self, table: &ResultTableRecord) -> Result<Vec<Vec<f32>>> {
+        self.inner.read_vectors(table).await
+    }
+
     /// Generate image embeddings for a source and persist to Jammi DB.
     pub async fn generate_image_embeddings(
         &self,

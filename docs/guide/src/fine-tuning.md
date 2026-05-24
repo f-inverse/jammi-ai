@@ -50,13 +50,14 @@ db.add_source("training", path="/data/training_pairs.csv", format="csv")
 # use jammi_ai::session::InferenceSession;
 # async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
 use jammi_ai::fine_tune::FineTuneMethod;
+use jammi_engine::ModelTask;
 
 let job = session.fine_tune(
     "training",
     "sentence-transformers/all-MiniLM-L6-v2",
     &["text_a".into(), "text_b".into(), "score".into()],
     FineTuneMethod::Lora,
-    "text_embedding",
+    ModelTask::TextEmbedding,
     None,  // default config
 ).await?;
 
@@ -93,6 +94,7 @@ print(f"Model: {job.model_id}")
 # use jammi_ai::fine_tune::{FineTuneMethod, LrSchedule};
 # async fn ex(session: &InferenceSession, model: &str, columns: Vec<String>) -> jammi_engine::error::Result<()> {
 use jammi_ai::fine_tune::FineTuneConfig;
+use jammi_engine::ModelTask;
 
 let config = FineTuneConfig {
     lora_rank: 4,
@@ -108,7 +110,7 @@ let config = FineTuneConfig {
 };
 
 let job = session.fine_tune(
-    "training", model, &columns, FineTuneMethod::Lora, "text_embedding", Some(config),
+    "training", model, &columns, FineTuneMethod::Lora, ModelTask::TextEmbedding, Some(config),
 ).await?;
 # Ok(()) }
 ```

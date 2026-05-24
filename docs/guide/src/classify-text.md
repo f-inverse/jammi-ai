@@ -86,13 +86,14 @@ text,label
 # use jammi_ai::session::InferenceSession;
 # async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
 use jammi_ai::fine_tune::FineTuneMethod;
+use jammi_engine::ModelTask;
 
 let job = session.fine_tune(
     "training",
     "sentence-transformers/all-MiniLM-L6-v2",
     &["text".into(), "label".into()],
     FineTuneMethod::Lora,
-    "classification",
+    ModelTask::Classification,
     None,
 ).await?;
 

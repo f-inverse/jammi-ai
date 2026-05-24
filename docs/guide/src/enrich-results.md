@@ -54,11 +54,12 @@ Run a model over search results to add new columns:
 # extern crate tokio;
 # use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
+use jammi_engine::ModelTask;
 # async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_engine::error::Result<()> {
 let results = session.search("patents", query, 10).await?
     .annotate(
         "sentence-transformers/all-MiniLM-L6-v2",
-        "text_embedding",
+        ModelTask::TextEmbedding,
         &["abstract".to_string()],
     ).await?
     .run().await?;
@@ -100,10 +101,11 @@ All operations compose freely:
 # extern crate tokio;
 # use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
+use jammi_engine::ModelTask;
 # async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_engine::error::Result<()> {
 let results = session.search("patents", query, 100).await?
     .join("assignees", "assignee_id=id", None).await?
-    .annotate("all-MiniLM-L6-v2", "text_embedding", &["abstract".into()]).await?
+    .annotate("all-MiniLM-L6-v2", ModelTask::TextEmbedding, &["abstract".into()]).await?
     .filter("country = 'US'")?
     .sort("similarity", true)?
     .limit(10)

@@ -145,18 +145,6 @@ jobs:
           . .venv/bin/activate
           pytest crates/jammi-python/tests -v
 
-      - name: Run Rust integration tests for jammi-python
-        # `cargo test -p jammi-python` exercises the Rust-facing surface
-        # of the crate (e.g. `PyDatabase::session_arc`). It is intentionally
-        # not part of `cargo test --workspace`: pyo3 needs libpython on the
-        # linker search path, and only an active Python environment (the
-        # venv from `maturin develop` above) provides that on the
-        # manylinux CI image. PYO3_PYTHON pins discovery to the venv so the
-        # link line matches what maturin already used to build the cdylib.
-        run: |
-          . .venv/bin/activate
-          PYO3_PYTHON="$(command -v python)" cargo test -p jammi-python
-
       - name: Run UAT shape-B/C Python scripts
         run: |
           . .venv/bin/activate

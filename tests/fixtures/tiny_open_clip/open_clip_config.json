@@ -11,10 +11,10 @@
       "global_average_pool": true
     },
     "text_cfg": {
-      "context_length": 77,
-      "vocab_size": 256,
-      "width": 16,
-      "heads": 2,
+      "context_length": 32,
+      "vocab_size": 97,
+      "width": 32,
+      "heads": 4,
       "layers": 1
     }
   },

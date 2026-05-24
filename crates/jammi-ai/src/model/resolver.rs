@@ -4,7 +4,7 @@ use std::sync::Arc;
 use jammi_engine::catalog::Catalog;
 use jammi_engine::error::{JammiError, Result};
 
-use super::{BackendType, ModelId, ModelSource, ModelTask, ResolvedModel};
+use super::{BackendType, ModelId, ModelSource, ModelTask, ResolvedModel, TokenizerSource};
 
 /// Resolves a `ModelSource` to file paths and backend selection.
 pub struct ModelResolver {
@@ -77,7 +77,7 @@ impl ModelResolver {
                     task,
                     config_path: base_resolved.config_path,
                     weights_paths: base_resolved.weights_paths,
-                    tokenizer_path: base_resolved.tokenizer_path,
+                    tokenizer: base_resolved.tokenizer,
                     model_config: base_resolved.model_config,
                     base_model_id: Some(ModelId(base_id.clone())),
                     adapter_path: record.artifact_path.map(PathBuf::from),
@@ -147,14 +147,7 @@ impl ModelResolver {
             _ => return Ok(None),
         };
 
-        let tokenizer_path = {
-            let p = artifact_dir.join("tokenizer.json");
-            if p.exists() {
-                Some(p)
-            } else {
-                None
-            }
-        };
+        let tokenizer = discover_local_tokenizer(&artifact_dir);
 
         let estimated_memory: usize = weights_paths
             .iter()
@@ -168,7 +161,7 @@ impl ModelResolver {
             task,
             config_path,
             weights_paths,
-            tokenizer_path,
+            tokenizer,
             model_config,
             base_model_id: record.base_model_id.map(ModelId),
             adapter_path: None,
@@ -262,14 +255,7 @@ impl ModelResolver {
             }
         };
 
-        let tokenizer_path = {
-            let p = path.join("tokenizer.json");
-            if p.exists() {
-                Some(p)
-            } else {
-                None
-            }
-        };
+        let tokenizer = discover_local_tokenizer(path);
 
         let estimated_memory: usize = weights_paths
             .iter()
@@ -283,7 +269,7 @@ impl ModelResolver {
             task,
             config_path,
             weights_paths,
-            tokenizer_path,
+            tokenizer,
             model_config: config,
             base_model_id: None,
             adapter_path: None,
@@ -324,7 +310,18 @@ impl ModelResolver {
             }
         };
 
-        let tokenizer_path = repo.get("tokenizer.json").ok();
+        // Prefer the HF-converted tokenizer.json if it exists; otherwise
+        // fall back to the OpenCLIP native vocab file for stock OpenCLIP
+        // repos that ship `bpe_simple_vocab_16e6.txt.gz` instead.
+        let tokenizer = repo
+            .get("tokenizer.json")
+            .ok()
+            .map(TokenizerSource::HuggingFaceJson)
+            .or_else(|| {
+                repo.get("bpe_simple_vocab_16e6.txt.gz")
+                    .ok()
+                    .map(TokenizerSource::OpenClipBpe)
+            });
 
         let estimated_memory: usize = weights_paths
             .iter()
@@ -338,7 +335,7 @@ impl ModelResolver {
             task,
             config_path,
             weights_paths,
-            tokenizer_path,
+            tokenizer,
             model_config: config,
             base_model_id: None,
             adapter_path: None,
@@ -396,4 +393,19 @@ impl ModelResolver {
                 message: format!("No ONNX model found: {e}"),
             })
     }
+}
+
+/// Locate a tokenizer artifact inside a local model directory, preferring
+/// an HF-shape `tokenizer.json` and falling back to OpenCLIP's native
+/// `bpe_simple_vocab_16e6.txt.gz`.
+fn discover_local_tokenizer(dir: &Path) -> Option<TokenizerSource> {
+    let hf = dir.join("tokenizer.json");
+    if hf.exists() {
+        return Some(TokenizerSource::HuggingFaceJson(hf));
+    }
+    let bpe = dir.join("bpe_simple_vocab_16e6.txt.gz");
+    if bpe.exists() {
+        return Some(TokenizerSource::OpenClipBpe(bpe));
+    }
+    None
 }

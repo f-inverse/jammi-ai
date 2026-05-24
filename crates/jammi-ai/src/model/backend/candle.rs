@@ -7,19 +7,30 @@ use jammi_encoders::{
 };
 use jammi_engine::error::{JammiError, Result};
 
+use jammi_encoders::{ClipText, ClipTextConfig};
+
+use super::open_clip_text::OpenClipTextForward;
 use super::open_clip_vit::{OpenClipVisionConfig, OpenClipVisionTransformer};
 use super::{DeviceConfig, ModelBackend};
 use crate::fine_tune::classifier::SeqClassifier;
 use crate::inference::adapter::BackendOutput;
 use crate::inference::{arrow_to_images, arrow_to_texts, image_preprocess};
 use crate::model::tokenizer::{BatchEncoding, TokenizerWrapper};
-use crate::model::{LoadedModel, ModelDimensions, ModelTask, ResolvedModel};
+use crate::model::{LoadedModel, ModelDimensions, ModelTask, ResolvedModel, TokenizerSource};
 
 /// Candle backend — loads safetensors models via candle.
 pub struct CandleBackend;
 
 /// Text architectures produce hidden states from tokenized input.
-trait CandleTextForward: Send + Sync {
+///
+/// `forward_hidden` returns `[batch, seq, hidden]` per-token hidden states
+/// for classification / NER paths. `forward_pooled` returns the final
+/// `[batch, output_dim]` pooled-and-L2-normalized embedding used by the
+/// embedding path; BERT-family encoders fall through to the provided
+/// default (mean-pool + L2-normalize over `forward_hidden`), while the
+/// OpenCLIP text tower overrides it to expose its pre-pooled projected
+/// output directly.
+pub(crate) trait CandleTextForward: Send + Sync {
     fn forward_hidden(
         &self,
         input_ids: &Tensor,
@@ -27,6 +38,22 @@ trait CandleTextForward: Send + Sync {
         encoding: &BatchEncoding,
         device: &Device,
     ) -> Result<Tensor>;
+
+    /// Pooled and L2-normalized `[batch, output_dim]` embedding. Default
+    /// implementation mean-pools the masked output of `forward_hidden` and
+    /// L2-normalizes it; encoders whose `forward_hidden` is already pooled
+    /// (e.g. OpenCLIP text) override this directly.
+    fn forward_pooled(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+        encoding: &BatchEncoding,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let hidden = self.forward_hidden(input_ids, attention_mask, encoding, device)?;
+        let pooled = mean_pool(&hidden, attention_mask)?;
+        l2_normalize(&pooled)
+    }
 }
 
 /// Vision architectures produce embeddings from pixel tensors.
@@ -222,41 +249,47 @@ pub struct CandleModel {
     ner_classifier: Option<candle_nn::Linear>,
 }
 
-impl CandleModel {
-    /// Mean-pool the last hidden state using the attention mask.
-    pub(crate) fn mean_pool(&self, hidden: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
-        let mask = attention_mask
-            .unsqueeze(2)
-            .map_err(|e| JammiError::Inference(e.to_string()))?
-            .to_dtype(hidden.dtype())
-            .map_err(|e| JammiError::Inference(e.to_string()))?;
-        let masked = hidden
-            .broadcast_mul(&mask)
-            .map_err(|e| JammiError::Inference(e.to_string()))?;
-        let sum = masked
-            .sum(1)
-            .map_err(|e| JammiError::Inference(e.to_string()))?;
-        let count = mask
-            .sum(1)
-            .map_err(|e| JammiError::Inference(e.to_string()))?;
-        sum.broadcast_div(&count)
-            .map_err(|e| JammiError::Inference(e.to_string()))
-    }
+/// Mean-pool the `[batch, seq, hidden]` tensor along seq using
+/// `attention_mask` to zero out padding positions.
+pub(crate) fn mean_pool(hidden: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
+    let mask = attention_mask
+        .unsqueeze(2)
+        .map_err(|e| JammiError::Inference(e.to_string()))?
+        .to_dtype(hidden.dtype())
+        .map_err(|e| JammiError::Inference(e.to_string()))?;
+    let masked = hidden
+        .broadcast_mul(&mask)
+        .map_err(|e| JammiError::Inference(e.to_string()))?;
+    let sum = masked
+        .sum(1)
+        .map_err(|e| JammiError::Inference(e.to_string()))?;
+    let count = mask
+        .sum(1)
+        .map_err(|e| JammiError::Inference(e.to_string()))?;
+    sum.broadcast_div(&count)
+        .map_err(|e| JammiError::Inference(e.to_string()))
+}
 
+/// L2-normalize each row of a `[batch, dim]` tensor.
+pub(crate) fn l2_normalize(tensor: &Tensor) -> Result<Tensor> {
+    let norm = tensor
+        .sqr()
+        .map_err(|e| JammiError::Inference(e.to_string()))?
+        .sum_keepdim(1)
+        .map_err(|e| JammiError::Inference(e.to_string()))?
+        .sqrt()
+        .map_err(|e| JammiError::Inference(e.to_string()))?
+        .clamp(1e-12, f64::MAX)
+        .map_err(|e| JammiError::Inference(e.to_string()))?;
+    tensor
+        .broadcast_div(&norm)
+        .map_err(|e| JammiError::Inference(e.to_string()))
+}
+
+impl CandleModel {
     /// L2-normalize each vector in a [batch, hidden_size] tensor.
     pub(crate) fn l2_normalize(&self, tensor: &Tensor) -> Result<Tensor> {
-        let norm = tensor
-            .sqr()
-            .map_err(|e| JammiError::Inference(e.to_string()))?
-            .sum_keepdim(1)
-            .map_err(|e| JammiError::Inference(e.to_string()))?
-            .sqrt()
-            .map_err(|e| JammiError::Inference(e.to_string()))?
-            .clamp(1e-12, f64::MAX)
-            .map_err(|e| JammiError::Inference(e.to_string()))?;
-        tensor
-            .broadcast_div(&norm)
-            .map_err(|e| JammiError::Inference(e.to_string()))
+        l2_normalize(tensor)
     }
 
     /// Convert token ID vectors into a candle Tensor on this model's device.
@@ -329,15 +362,16 @@ impl CandleModel {
             let input_ids = self.tokens_to_tensor(&encoding.input_ids)?;
             let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
 
-            let output = self.text_forward()?.forward_hidden(
+            // Each encoder controls its own pooling: BERT-family uses the
+            // default (mean-pool over `forward_hidden` masked by attention),
+            // OpenCLIP text returns its pre-pooled projected output. The
+            // result is already L2-normalized.
+            let normalized = self.text_forward()?.forward_pooled(
                 &input_ids,
                 &attention_mask,
                 &encoding,
                 &self.device,
             )?;
-
-            let pooled = self.mean_pool(&output, &attention_mask)?;
-            let normalized = self.l2_normalize(&pooled)?;
 
             // Apply the trained projection head if one was loaded.
             let final_output = if let Some(ref head) = self.projection_head {
@@ -748,25 +782,41 @@ impl ModelBackend for CandleBackend {
             resolved.weights_paths.iter().map(|p| p.as_path()).collect();
         let dummy_varmap = VarMap::new();
 
-        // Branch: vision model (OpenCLIP) vs text model (BERT family)
+        // Branch: cross-modal CLIP model (OpenCLIP — both vision and text
+        // towers in one checkpoint, shared latent space) vs text-only model
+        // (BERT family). OpenCLIP models always carry both towers; routing
+        // between them in `forward()` is by `ModelTask`.
         #[allow(clippy::type_complexity)]
         let (text, vision): (
             Option<Box<dyn CandleTextForward>>,
             Option<Box<dyn CandleVisionForward>>,
         ) = if is_open_clip {
-            let clip_config = OpenClipVisionConfig::from_open_clip_config(&resolved.model_config)
+            let vision_config = OpenClipVisionConfig::from_open_clip_config(&resolved.model_config)
                 .map_err(|e| JammiError::Model {
-                model_id: resolved.model_id.0.clone(),
-                message: format!("Failed to parse OpenCLIP config: {e}"),
-            })?;
-            let model =
-                OpenClipVisionTransformer::load(vb.pp("visual"), &clip_config).map_err(|e| {
-                    JammiError::Model {
-                        model_id: resolved.model_id.0.clone(),
-                        message: format!("Failed to construct OpenCLIP ViT: {e}"),
-                    }
+                    model_id: resolved.model_id.0.clone(),
+                    message: format!("Failed to parse OpenCLIP vision config: {e}"),
                 })?;
-            (None, Some(Box::new(model) as Box<dyn CandleVisionForward>))
+            let vision_inner = OpenClipVisionTransformer::load(vb.pp("visual"), &vision_config)
+                .map_err(|e| JammiError::Model {
+                    model_id: resolved.model_id.0.clone(),
+                    message: format!("Failed to construct OpenCLIP ViT: {e}"),
+                })?;
+
+            let text_config = ClipTextConfig::from_open_clip_config(&resolved.model_config)
+                .map_err(|e| JammiError::Model {
+                    model_id: resolved.model_id.0.clone(),
+                    message: format!("Failed to parse OpenCLIP text config: {e}"),
+                })?;
+            let text_inner =
+                ClipText::load(vb.clone(), &text_config).map_err(|e| JammiError::Model {
+                    model_id: resolved.model_id.0.clone(),
+                    message: format!("Failed to construct OpenCLIP text tower: {e}"),
+                })?;
+
+            (
+                Some(Box::new(OpenClipTextForward(text_inner)) as Box<dyn CandleTextForward>),
+                Some(Box::new(vision_inner) as Box<dyn CandleVisionForward>),
+            )
         } else {
             let text_inner: Box<dyn CandleTextForward> = match model_type {
                 "distilbert" if is_classification => {
@@ -925,9 +975,12 @@ impl ModelBackend for CandleBackend {
         };
 
         let tokenizer = resolved
-            .tokenizer_path
+            .tokenizer
             .as_ref()
-            .map(|p| TokenizerWrapper::from_file(p))
+            .map(|src| match src {
+                TokenizerSource::HuggingFaceJson(p) => TokenizerWrapper::from_file(p),
+                TokenizerSource::OpenClipBpe(p) => TokenizerWrapper::from_open_clip_bpe(p),
+            })
             .transpose()?;
 
         let dimensions =

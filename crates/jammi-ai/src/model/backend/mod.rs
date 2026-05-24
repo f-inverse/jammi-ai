@@ -1,5 +1,6 @@
 pub mod candle;
 pub mod http;
+pub mod open_clip_text;
 pub mod open_clip_vit;
 pub mod ort;
 

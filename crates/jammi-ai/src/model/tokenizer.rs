@@ -2,9 +2,17 @@ use std::path::Path;
 
 use jammi_engine::error::JammiError;
 
+use super::clip_bpe::load_open_clip_bpe;
+
 type Result<T> = std::result::Result<T, JammiError>;
 
-/// Wraps the HuggingFace tokenizer with Jammi's batching conventions.
+/// Wraps the HuggingFace `tokenizers` crate with Jammi's batching conventions.
+///
+/// Two source layouts are supported transparently:
+///   * HuggingFace `tokenizer.json` (any architecture) via [`Self::from_file`].
+///   * OpenCLIP's native `bpe_simple_vocab_16e6.txt.gz` via
+///     [`Self::from_open_clip_bpe`] — used when an OpenCLIP repo ships the
+///     legacy vocab file instead of a converted `tokenizer.json`.
 pub struct TokenizerWrapper {
     inner: tokenizers::Tokenizer,
 }
@@ -22,6 +30,15 @@ impl TokenizerWrapper {
             ..Default::default()
         }));
         Ok(Self { inner: tokenizer })
+    }
+
+    /// Load an OpenCLIP-native BPE tokenizer from
+    /// `bpe_simple_vocab_16e6.txt.gz`. Produces a tokenizer that wraps every
+    /// sequence in `<|startoftext|> ... <|endoftext|>` so the EOT-pool path
+    /// in the OpenCLIP text tower finds the EOT marker at the correct index.
+    pub fn from_open_clip_bpe(path: &Path) -> Result<Self> {
+        let inner = load_open_clip_bpe(path)?;
+        Ok(Self { inner })
     }
 
     /// Encode a batch of texts with optional truncation.

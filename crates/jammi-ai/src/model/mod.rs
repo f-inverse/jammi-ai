@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod cache;
+pub mod clip_bpe;
 pub mod resolver;
 pub mod tokenizer;
 
@@ -112,6 +113,30 @@ pub enum BackendType {
 /// on-disk spelling without `jammi_engine` depending on `jammi_ai`.
 pub use jammi_engine::ModelTask;
 
+/// Where the tokenizer for a resolved model lives, and what shape it is.
+///
+/// Most checkpoints carry an HF-converted `tokenizer.json`; stock OpenCLIP
+/// repos instead ship the legacy gzipped BPE vocab. The resolver picks
+/// whichever is present and the loader dispatches on the variant.
+#[derive(Debug, Clone)]
+pub enum TokenizerSource {
+    /// HuggingFace-shape `tokenizer.json` (works for BERT-family, ModernBERT,
+    /// DistilBERT, and OpenCLIP repos that ship a pre-converted file).
+    HuggingFaceJson(std::path::PathBuf),
+    /// OpenCLIP-native `bpe_simple_vocab_16e6.txt.gz` — built directly into a
+    /// BPE tokenizer at load time, no HF pre-conversion required.
+    OpenClipBpe(std::path::PathBuf),
+}
+
+impl TokenizerSource {
+    /// Filesystem path of the tokenizer artifact.
+    pub fn path(&self) -> &std::path::Path {
+        match self {
+            Self::HuggingFaceJson(p) | Self::OpenClipBpe(p) => p,
+        }
+    }
+}
+
 /// A resolved model — files located, backend determined, NOT yet loaded.
 pub struct ResolvedModel {
     /// HuggingFace or local identifier for this model.
@@ -124,8 +149,8 @@ pub struct ResolvedModel {
     pub config_path: std::path::PathBuf,
     /// Paths to weight files (safetensors shards or ONNX).
     pub weights_paths: Vec<std::path::PathBuf>,
-    /// Path to `tokenizer.json`, if present.
-    pub tokenizer_path: Option<std::path::PathBuf>,
+    /// Tokenizer source (HF JSON or OpenCLIP BPE), if present.
+    pub tokenizer: Option<TokenizerSource>,
     /// Parsed contents of `config.json`.
     pub model_config: serde_json::Value,
     /// Parent model ID for fine-tuned variants.
@@ -226,7 +251,17 @@ impl LoadedModel {
         }
     }
 
-    /// Return the embedding dimension (hidden size), if known.
+    /// Output dimensionality of the model's embedding head, if known.
+    ///
+    /// For BERT-family encoders this is the transformer's `hidden_size`.
+    /// For OpenCLIP-family models (vision and text towers) this is the
+    /// projected shared-latent `embed_dim` — the dimension that vectors
+    /// emitted by `generate_text_embeddings`, `generate_image_embeddings`,
+    /// `encode_text_query`, and `encode_image_query` carry, and the
+    /// dimension that cross-modal cosine similarity is computed in. It is
+    /// not the per-tower hidden `width`; the in-tower hidden size is
+    /// projected through `visual.proj` / `text_projection` before the
+    /// embedding is exposed.
     pub fn embedding_dim(&self) -> Option<usize> {
         match self {
             LoadedModel::Candle(m) => Some(m.dimensions.hidden_size),

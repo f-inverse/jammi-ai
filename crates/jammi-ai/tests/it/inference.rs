@@ -1,4 +1,3 @@
-#[cfg(feature = "live-hub-tests")]
 use crate::common;
 
 use jammi_ai::inference::adapter::{
@@ -73,6 +72,93 @@ fn contract_classification_adapter_schema_matches_adapt_output() {
             field.name()
         );
     }
+}
+
+// ─── Hermetic: OpenCLIP text tower via tiny fixture ─────────────────────────
+
+/// The OpenCLIP text tower must emit text embeddings in the shared CLIP
+/// latent space (`embed_dim`), not the per-token transformer `width`. This
+/// is the cross-modal invariant: text embeddings and image embeddings must
+/// share dimensionality so cosine similarity is well-defined.
+#[tokio::test]
+async fn text_embeddings_via_open_clip_share_latent_dim_with_vision() {
+    use jammi_ai::session::InferenceSession;
+    use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+
+    let model_id = format!(
+        "local:{}",
+        common::fixture("tiny_open_clip").to_str().unwrap()
+    );
+
+    // Encode a single text query — same path as cross-modal search uses.
+    let text_vec = session
+        .encode_text_query(&model_id, "a small figure")
+        .await
+        .unwrap();
+
+    // Encode a single image query through the vision tower.
+    let img_bytes = {
+        let img = image::RgbImage::from_pixel(8, 8, image::Rgb([200, 100, 50]));
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    };
+    let img_vec = session
+        .encode_image_query(&model_id, &img_bytes)
+        .await
+        .unwrap();
+
+    // Shared latent space invariant: text and image vectors have the same
+    // dimensionality, set by the OpenCLIP config's `embed_dim`.
+    assert_eq!(
+        text_vec.len(),
+        img_vec.len(),
+        "OpenCLIP text and image embeddings must share latent dim"
+    );
+    assert_eq!(text_vec.len(), 16, "tiny_open_clip embed_dim is 16");
+
+    // Both L2-normalized.
+    let text_norm: f32 = text_vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+    let img_norm: f32 = img_vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+    assert!(
+        (text_norm - 1.0).abs() < 0.01 && (img_norm - 1.0).abs() < 0.01,
+        "Both text ({text_norm}) and image ({img_norm}) vectors should be L2-normalized"
+    );
+
+    // Generate text embeddings for a parquet source the same way images are
+    // generated. The output `vector` column must have the same FixedSize as
+    // the image-side embedding.
+    session
+        .add_source(
+            "captions",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let record = session
+        .generate_text_embeddings("captions", &model_id, &["abstract".to_string()], "id")
+        .await
+        .unwrap();
+    assert_eq!(record.status, "ready");
+    assert_eq!(
+        record.dimensions,
+        Some(16),
+        "text-embedding result table must carry the shared embed_dim"
+    );
 }
 
 // ─── Live tests (behind feature gate, require HF Hub downloads) ────────────

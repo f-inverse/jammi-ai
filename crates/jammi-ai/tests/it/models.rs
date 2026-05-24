@@ -36,7 +36,7 @@ async fn resolve_hf_hub_sentence_transformer() {
     );
     assert!(resolved.config_path.exists(), "config.json should exist");
     assert!(
-        resolved.tokenizer_path.is_some(),
+        resolved.tokenizer.is_some(),
         "Sentence transformer should have a tokenizer"
     );
     assert!(

@@ -467,3 +467,83 @@ async fn search_returns_semantically_relevant_results() {
         );
     }
 }
+
+// ─── Cross-modal: OpenCLIP text query against image embeddings ──────────────
+
+fn tiny_open_clip_model() -> String {
+    "local:".to_string() + common::fixture("tiny_open_clip").to_str().unwrap()
+}
+
+/// Embed an image corpus with OpenCLIP vision, embed a text query with the
+/// same OpenCLIP checkpoint's text tower, and run `search()`. The text
+/// vector lives in the shared latent space the vision tower projects into,
+/// so cosine similarity is meaningful and `search()` returns ranked image
+/// rows — this is the cross-modal search path that the v0.5.9 text tower
+/// makes possible (no separate text encoder, no mismatched latent spaces).
+#[tokio::test]
+async fn cross_modal_text_to_image_search() {
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    let model_id = tiny_open_clip_model();
+
+    session
+        .add_source(
+            "figures",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("figures.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // 1. Embed the image corpus with the OpenCLIP vision tower.
+    session
+        .generate_image_embeddings("figures", &model_id, "image", "figure_id")
+        .await
+        .unwrap();
+
+    // 2. Embed a text query with the OpenCLIP text tower (same checkpoint).
+    let text_vec = session
+        .encode_text_query(&model_id, "a colored rectangle")
+        .await
+        .unwrap();
+
+    // 3. Run vector search against the image embeddings using the text vector.
+    let results = session
+        .search("figures", text_vec, 5)
+        .await
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert!(
+        total_rows > 0,
+        "Cross-modal search must return at least one image row"
+    );
+
+    // Hydrated columns: figure_id from the source, similarity from search.
+    let batch = &results[0];
+    assert!(
+        batch.schema().field_with_name("figure_id").is_ok(),
+        "Hydrated batch should carry the source key column"
+    );
+    let sims = batch
+        .column_by_name("similarity")
+        .expect("similarity column")
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap();
+    for i in 0..sims.len() {
+        let sim = sims.value(i);
+        assert!(
+            sim.is_finite(),
+            "Cross-modal similarity at row {i} should be finite, got {sim}"
+        );
+    }
+}

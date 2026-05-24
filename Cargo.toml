@@ -21,7 +21,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.5.8"
+version = "0.5.9"
 edition = "2021"
 rust-version = "1.88.0"
 license = "Apache-2.0"
@@ -29,11 +29,11 @@ repository = "https://github.com/f-inverse/jammi-ai"
 
 [workspace.dependencies]
 # Internal crates
-jammi-engine = { version = "0.5.8", path = "crates/jammi-engine" }
-jammi-ai = { version = "0.5.8", path = "crates/jammi-ai" }
-jammi-server = { version = "0.5.8", path = "crates/jammi-server" }
-jammi-lora = { version = "0.5.8", path = "crates/jammi-lora" }
-jammi-encoders = { version = "0.5.8", path = "crates/jammi-encoders" }
+jammi-engine = { version = "0.5.9", path = "crates/jammi-engine" }
+jammi-ai = { version = "0.5.9", path = "crates/jammi-ai" }
+jammi-server = { version = "0.5.9", path = "crates/jammi-server" }
+jammi-lora = { version = "0.5.9", path = "crates/jammi-lora" }
+jammi-encoders = { version = "0.5.9", path = "crates/jammi-encoders" }
 jammi-test-utils = { path = "crates/jammi-test-utils" }
 
 # Query engine
@@ -66,6 +66,7 @@ ort = { version = "2.0.0-rc.12", default-features = false, features = ["download
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 usearch = "2.25"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 # Python bindings
 # `extension-module` is *not* enabled at the workspace dep level — the

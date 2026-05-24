@@ -32,6 +32,9 @@ chrono.workspace = true
 # Image processing
 image.workspace = true
 
+# Gzip decompression for OpenCLIP BPE vocab (bpe_simple_vocab_16e6.txt.gz)
+flate2.workspace = true
+
 # HTTP backend
 reqwest.workspace = true
 

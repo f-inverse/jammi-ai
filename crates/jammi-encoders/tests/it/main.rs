@@ -2,6 +2,7 @@
 //! the pooling/mask module is owned by the main session in Phase A.
 
 mod bert;
+mod clip_text;
 mod distilbert;
 mod modernbert;
 mod pooling;

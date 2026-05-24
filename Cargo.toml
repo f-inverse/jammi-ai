@@ -21,7 +21,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.5.6"
+version = "0.5.7"
 edition = "2021"
 rust-version = "1.88.0"
 license = "Apache-2.0"
@@ -29,11 +29,11 @@ repository = "https://github.com/f-inverse/jammi-ai"
 
 [workspace.dependencies]
 # Internal crates
-jammi-engine = { version = "0.5.6", path = "crates/jammi-engine" }
-jammi-ai = { version = "0.5.6", path = "crates/jammi-ai" }
-jammi-server = { version = "0.5.6", path = "crates/jammi-server" }
-jammi-lora = { version = "0.5.6", path = "crates/jammi-lora" }
-jammi-encoders = { version = "0.5.6", path = "crates/jammi-encoders" }
+jammi-engine = { version = "0.5.7", path = "crates/jammi-engine" }
+jammi-ai = { version = "0.5.7", path = "crates/jammi-ai" }
+jammi-server = { version = "0.5.7", path = "crates/jammi-server" }
+jammi-lora = { version = "0.5.7", path = "crates/jammi-lora" }
+jammi-encoders = { version = "0.5.7", path = "crates/jammi-encoders" }
 jammi-test-utils = { path = "crates/jammi-test-utils" }
 
 # Query engine
@@ -68,7 +68,13 @@ usearch = "2.25"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
 
 # Python bindings
-pyo3 = { version = "0.28", features = ["abi3-py39", "extension-module"] }
+# `extension-module` is *not* enabled at the workspace dep level — the
+# `jammi-python` crate exposes its own `extension-module` feature that
+# forwards to pyo3's. The maturin build activates that feature via
+# `pyproject.toml`'s `[tool.maturin].features`; leaving it off in the
+# default `cargo test --workspace` lane lets the integration test binary
+# link against libpython without unresolved symbols.
+pyo3 = { version = "0.28", default-features = false, features = ["abi3-py39", "macros"] }
 pyo3-arrow = { version = "0.16", default-features = false }
 
 # HTTP / server

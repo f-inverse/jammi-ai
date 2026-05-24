@@ -39,4 +39,8 @@ Repository = "https://github.com/f-inverse/jammi-ai"
 manifest-path = "crates/jammi-python/Cargo.toml"
 module-name = "jammi._native"
 python-source = "python"
-features = []
+# `extension-module` is opt-in on the `jammi-python` crate so that
+# `cargo test --workspace` can link the integration test against
+# libpython. Maturin builds the extension module proper, so it activates
+# the feature explicitly here.
+features = ["extension-module"]

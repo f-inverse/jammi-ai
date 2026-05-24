@@ -38,8 +38,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # `jammi-python` is built via maturin, not workspace cargo — its
+      # `extension-module` feature is opt-in so the bare workspace test
+      # lane would fail to link `-lpython3.x` on the manylinux CI image.
+      # The crate is exercised end-to-end by the `Test (Python)` job in
+      # `ci.yml` (which also runs `cargo test -p jammi-python` against
+      # the venv's interpreter).
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude jammi-python
 
   publish:
     name: Publish to crates.io

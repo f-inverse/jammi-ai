@@ -501,3 +501,38 @@ async fn cache_load_failure_clears_in_flight_state() {
         .unwrap();
     assert!(std::mem::size_of_val(&*guard.model) > 0);
 }
+
+/// Registering a model with task `Ner` round-trips through the catalog
+/// without losing its variant — proves the `models.task` write/read path
+/// goes through `ModelTask::as_db_str` / `try_from_db_str` end-to-end
+/// (catches a regression where the catalog stored a raw string then
+/// `parse_model_row` decoded a different variant).
+#[tokio::test]
+async fn ner_model_round_trips_through_catalog() {
+    use jammi_engine::catalog::model_repo::RegisterModelParams;
+
+    let dir = tempdir().unwrap();
+    let catalog = Catalog::open(dir.path()).await.unwrap();
+
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "tenant/ner-model",
+            version: 1,
+            model_type: "huggingface",
+            backend: "candle",
+            task: ModelTask::Ner,
+            base_model_id: None,
+            artifact_path: None,
+            config_json: None,
+        })
+        .await
+        .unwrap();
+
+    let fetched = catalog
+        .get_model("tenant/ner-model")
+        .await
+        .unwrap()
+        .expect("model just registered should be present");
+    assert_eq!(fetched.task, ModelTask::Ner);
+    assert_eq!(fetched.backend, "candle");
+}

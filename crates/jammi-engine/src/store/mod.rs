@@ -16,6 +16,7 @@ use crate::catalog::Catalog;
 use crate::error::{JammiError, Result};
 use crate::index::sidecar::SidecarIndex;
 use crate::index::VectorIndex;
+use crate::model_task::ModelTask;
 use crate::storage::{
     self, JammiObjectStore, ObjectParquetWriter, Scheme, StorageRegistry, StorageUrl,
 };
@@ -125,7 +126,7 @@ impl ResultStore {
     pub async fn create_table(
         &self,
         source_id: &str,
-        task: &str,
+        task: ModelTask,
         model_id: &str,
         dimensions: Option<i32>,
         key_column: Option<&str>,
@@ -137,10 +138,11 @@ impl ResultStore {
         // when two tokio tasks call create_table within the same nanosecond
         // (concurrent embedding generation on the same source).
         let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
-        let table_name = format!("{source_id}__{task}__{sanitized}__{timestamp}_{suffix}");
+        let task_str = task.as_db_str();
+        let table_name = format!("{source_id}__{task_str}__{sanitized}__{timestamp}_{suffix}");
 
         let parquet_url = self.derive_url(&format!("{table_name}.parquet"))?;
-        let index_url = if task == "text_embedding" || task == "image_embedding" {
+        let index_url = if task.is_embedding() {
             // Index base path has no extension — the sidecar layout helpers
             // append .usearch / .rowmap / .manifest.json.
             Some(self.derive_url(&format!("{table_name}.idx"))?)
@@ -246,10 +248,7 @@ impl ResultStore {
             } else {
                 let row_count = storage::reader::count_parquet_rows(&parquet_handle).await?;
                 // Rebuild ANN index if this is an embedding table
-                if table.task == "embedding"
-                    || table.task == "text_embedding"
-                    || table.task == "image_embedding"
-                {
+                if table.task.is_embedding() {
                     if let Some(ref idx_path) = table.index_path {
                         let idx_url = StorageUrl::parse(idx_path)?;
                         if let Err(e) = self

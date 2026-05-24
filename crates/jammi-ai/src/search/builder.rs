@@ -252,15 +252,18 @@ impl SearchBuilder {
     }
 
     /// Annotate search results by running model inference over selected columns.
-    pub async fn annotate(mut self, model: &str, task: &str, columns: &[String]) -> Result<Self> {
+    pub async fn annotate(
+        mut self,
+        model: &str,
+        task: crate::model::ModelTask,
+        columns: &[String],
+    ) -> Result<Self> {
         let model_source = crate::model::ModelSource::parse(model);
-
-        let model_task: crate::model::ModelTask = task.parse()?;
 
         let guard = self
             .session
             .model_cache()
-            .get_or_load(&model_source, model_task, None)
+            .get_or_load(&model_source, task, None)
             .await?;
         let embedding_dim = guard.model.embedding_dim();
         drop(guard);
@@ -268,7 +271,7 @@ impl SearchBuilder {
         let inference = InferenceExecBuilder::new(
             self.plan,
             model_source,
-            model_task,
+            task,
             columns.to_vec(),
             "_row_id".to_string(),
             String::new(),

@@ -1,6 +1,7 @@
 use jammi_engine::cache::ann_cache::AnnCache;
 use jammi_engine::cache::inference_cache::InferenceCache;
 use jammi_engine::error::JammiError;
+use jammi_engine::model_task::ModelTask;
 use jammi_engine::source::retry::{retry_with_backoff, RetryConfig};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -91,13 +92,18 @@ async fn inference_cache_hit_and_model_version_miss() {
     let cache = InferenceCache::new(100);
 
     cache
-        .put("model-a::1", "embedding", "hello world", vec![])
+        .put(
+            "model-a::1",
+            ModelTask::TextEmbedding,
+            "hello world",
+            vec![],
+        )
         .await;
 
     // Hit with same key
     assert!(
         cache
-            .get("model-a::1", "embedding", "hello world")
+            .get("model-a::1", ModelTask::TextEmbedding, "hello world")
             .await
             .is_some(),
         "Same model+task+content should hit"
@@ -106,7 +112,7 @@ async fn inference_cache_hit_and_model_version_miss() {
     // Miss with different model version (simulates model update)
     assert!(
         cache
-            .get("model-a::2", "embedding", "hello world")
+            .get("model-a::2", ModelTask::TextEmbedding, "hello world")
             .await
             .is_none(),
         "Different model version should miss"
@@ -115,7 +121,7 @@ async fn inference_cache_hit_and_model_version_miss() {
     // Miss with different task
     assert!(
         cache
-            .get("model-a::1", "classification", "hello world")
+            .get("model-a::1", ModelTask::Classification, "hello world")
             .await
             .is_none(),
         "Different task should miss"

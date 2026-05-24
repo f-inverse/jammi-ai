@@ -6,6 +6,7 @@ use jammi_ai::search::SearchBuilder;
 
 use crate::convert::batches_to_pyarrow;
 use crate::error::to_pyerr;
+use crate::model_task::ModelTaskArg;
 
 /// Python SearchBuilder wrapping the Rust `SearchBuilder` for fluent chaining.
 ///
@@ -42,11 +43,11 @@ impl PySearchBuilder {
 
     /// Annotate results with model inference.
     #[pyo3(signature = (*, model, task, columns))]
-    fn annotate(&mut self, model: &str, task: &str, columns: Vec<String>) -> PyResult<()> {
+    fn annotate(&mut self, model: &str, task: ModelTaskArg, columns: Vec<String>) -> PyResult<()> {
         let builder = self.take_inner()?;
         self.inner = Some(
             self.runtime
-                .block_on(builder.annotate(model, task, &columns))
+                .block_on(builder.annotate(model, task.0, &columns))
                 .map_err(to_pyerr)?,
         );
         Ok(())

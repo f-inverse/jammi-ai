@@ -60,12 +60,11 @@ impl<'a> EmbeddingPipeline<'a> {
         // Create result table in catalog
         let canonical_model_id = model_source.to_string();
         let col_list = columns.join(",");
-        let task_str = self.task.to_string();
         let table_info = self
             .result_store
             .create_table(
                 source_id,
-                &task_str,
+                self.task,
                 &canonical_model_id,
                 Some(embedding_dim as i32),
                 Some(key_column),

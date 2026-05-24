@@ -18,6 +18,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod, LrSchedule};
+use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 
@@ -82,7 +83,7 @@ async fn encoder_adapters_bert_writes_adapter_marker() {
             &tiny_bert_model(),
             &training_columns(),
             FineTuneMethod::Lora,
-            "text_embedding",
+            ModelTask::TextEmbedding,
             Some(FineTuneConfig {
                 epochs: 2,
                 batch_size: 8,
@@ -138,7 +139,7 @@ async fn encoder_adapters_modernbert_writes_adapter_marker() {
             &tiny_modernbert_model(),
             &training_columns(),
             FineTuneMethod::Lora,
-            "text_embedding",
+            ModelTask::TextEmbedding,
             Some(FineTuneConfig {
                 epochs: 2,
                 batch_size: 8,
@@ -188,7 +189,7 @@ async fn encoder_adapters_changes_embeddings_versus_base() {
             &base,
             &training_columns(),
             FineTuneMethod::Lora,
-            "text_embedding",
+            ModelTask::TextEmbedding,
             Some(FineTuneConfig {
                 epochs: 5,
                 batch_size: 4,

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, Float32Array, Int64Array, ListArray, StringArray};
+use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
@@ -246,7 +247,7 @@ async fn search_with_annotate_on_real_column() {
         .unwrap()
         .annotate(
             &tiny_bert_model(),
-            "text_embedding",
+            ModelTask::TextEmbedding,
             &["abstract".to_string()],
         )
         .await
@@ -351,7 +352,7 @@ async fn search_resolves_to_latest_embedding_table() {
     // Both tables should exist in the catalog.
     let tables = session
         .catalog()
-        .find_result_tables("patents", Some("text_embedding"), None)
+        .find_result_tables("patents", Some(ModelTask::TextEmbedding), None)
         .await
         .unwrap();
     assert_eq!(tables.len(), 2);

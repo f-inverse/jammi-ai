@@ -1,6 +1,7 @@
 use crate::catalog::backend::{BackendError, Row, SqlValue, TxOptions};
 use crate::catalog::Catalog;
 use crate::error::{JammiError, Result};
+use crate::model_task::ModelTask;
 
 /// Parameters for creating a new result table entry.
 /// `status` defaults to `'building'` via SQL DEFAULT — not passed here.
@@ -9,7 +10,7 @@ pub struct CreateResultTableParams<'a> {
     pub table_name: &'a str,
     pub source_id: &'a str,
     pub model_id: &'a str,
-    pub task: &'a str,
+    pub task: ModelTask,
     pub parquet_path: &'a str,
     pub index_path: Option<&'a str>,
     pub dimensions: Option<i32>,
@@ -23,7 +24,7 @@ pub struct ResultTableRecord {
     pub table_name: String,
     pub source_id: String,
     pub model_id: String,
-    pub task: String,
+    pub task: ModelTask,
     pub parquet_path: String,
     pub index_path: Option<String>,
     pub dimensions: Option<i32>,
@@ -37,11 +38,16 @@ pub struct ResultTableRecord {
 }
 
 fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendError> {
+    let task_raw: String = row.get("task")?;
+    let task = ModelTask::try_from_db_str(&task_raw).map_err(|e| BackendError::TypeConversion {
+        column: "task".into(),
+        detail: e.to_string(),
+    })?;
     Ok(ResultTableRecord {
         table_name: row.get("table_name")?,
         source_id: row.get("source_id")?,
         model_id: row.get("model_id")?,
-        task: row.get("task")?,
+        task,
         parquet_path: row.get("parquet_path")?,
         index_path: row.try_get("index_path")?,
         dimensions: row.try_get("dimensions")?,
@@ -62,7 +68,7 @@ impl Catalog {
         let table_name = p.table_name.to_string();
         let source_id = p.source_id.to_string();
         let model_id = p.model_id.to_string();
-        let task = p.task.to_string();
+        let task = p.task.as_db_str();
         let parquet_path = p.parquet_path.to_string();
         let index_path = p.index_path.map(str::to_string);
         let dimensions = p.dimensions;
@@ -83,7 +89,7 @@ impl Catalog {
                             SqlValue::TextOwned(table_name),
                             SqlValue::TextOwned(source_id),
                             SqlValue::TextOwned(model_id),
-                            SqlValue::TextOwned(task),
+                            SqlValue::Text(task),
                             SqlValue::TextOwned(parquet_path),
                             SqlValue::from(index_path),
                             SqlValue::from(dimensions.map(|d| d as i64)),
@@ -215,7 +221,7 @@ impl Catalog {
     pub async fn find_result_tables(
         &self,
         source_id: &str,
-        task: Option<&str>,
+        task: Option<ModelTask>,
         model_id: Option<&str>,
     ) -> Result<Vec<ResultTableRecord>> {
         let mut sql = "SELECT * FROM result_tables WHERE source_id = $1".to_string();
@@ -223,7 +229,7 @@ impl Catalog {
 
         if let Some(t) = task {
             sql.push_str(&format!(" AND task = ${}", params.len() + 1));
-            params.push(SqlValue::TextOwned(t.to_string()));
+            params.push(SqlValue::Text(t.as_db_str()));
         }
         if let Some(m) = model_id {
             sql.push_str(&format!(" AND model_id = ${}", params.len() + 1));
@@ -298,6 +304,8 @@ impl Catalog {
 
         let sid = source_id.to_string();
         let tenant = self.current_tenant();
+        let text_task = ModelTask::TextEmbedding.as_db_str();
+        let image_task = ModelTask::ImageEmbedding.as_db_str();
         let found = self
             .backend()
             .transaction(
@@ -309,12 +317,14 @@ impl Catalog {
                     Box::pin(async move {
                         tx.query_opt(
                             "SELECT * FROM result_tables \
-                             WHERE source_id = $1 AND task IN ('text_embedding', 'image_embedding') \
+                             WHERE source_id = $1 AND task IN ($2, $3) \
                                AND status = 'ready' \
-                               AND (tenant_id = $2 OR tenant_id IS NULL) \
+                               AND (tenant_id = $4 OR tenant_id IS NULL) \
                              ORDER BY created_at DESC, rowid DESC LIMIT 1",
                             &[
                                 SqlValue::TextOwned(sid),
+                                SqlValue::Text(text_task),
+                                SqlValue::Text(image_task),
                                 SqlValue::from(tenant.map(|t| t.to_string())),
                             ],
                             parse_row,

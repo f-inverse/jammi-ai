@@ -7,6 +7,7 @@ use tempfile::TempDir;
 use jammi_ai::fine_tune::{
     data::TrainingDataLoader, trainer::compute_lr, FineTuneConfig, FineTuneMethod, LrSchedule,
 };
+use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
 use jammi_engine::catalog::status::FineTuneJobStatus;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
@@ -260,7 +261,7 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
                 "score".to_string(),
             ],
             FineTuneMethod::Lora,
-            "text_embedding",
+            ModelTask::TextEmbedding,
             Some(FineTuneConfig {
                 epochs: 2,
                 batch_size: 8,
@@ -386,8 +387,10 @@ async fn fine_tune_job_catalog_crud() {
             version: 1,
             model_type: "embedding",
             backend: "candle",
-            task: "text_embedding",
-            ..Default::default()
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: None,
+            config_json: None,
         })
         .await
         .unwrap();
@@ -554,8 +557,10 @@ async fn training_divergence_detection() {
             version: 1,
             model_type: "embedding",
             backend: "candle",
-            task: "text_embedding",
-            ..Default::default()
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: None,
+            config_json: None,
         })
         .await
         .unwrap();
@@ -663,8 +668,10 @@ async fn training_early_stopping_triggers() {
             version: 1,
             model_type: "embedding",
             backend: "candle",
-            task: "text_embedding",
-            ..Default::default()
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: None,
+            config_json: None,
         })
         .await
         .unwrap();
@@ -770,7 +777,7 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
             &model,
             &columns,
             FineTuneMethod::Lora,
-            "text_embedding",
+            ModelTask::TextEmbedding,
             Some(FineTuneConfig {
                 epochs: 10,
                 batch_size: 8,

@@ -431,10 +431,9 @@ impl InferenceSession {
 
         // Persist results to Parquet
         if !batches.is_empty() {
-            let task_str = task.to_string();
             let table_info = self
                 .result_store
-                .create_table(source_id, &task_str, &source.to_string(), None, None, None)
+                .create_table(source_id, task, &source.to_string(), None, None, None)
                 .await?;
             let schema = batches[0].schema();
             let mut writer = self
@@ -507,7 +506,7 @@ impl InferenceSession {
         base_model: &str,
         columns: &[String],
         _method: FineTuneMethod,
-        task: &str,
+        task: ModelTask,
         config: Option<FineTuneConfig>,
     ) -> Result<FineTuneJob> {
         let config = config.unwrap_or_default();
@@ -529,7 +528,9 @@ impl InferenceSession {
                     model_type: "embedding",
                     backend: "candle",
                     task,
-                    ..Default::default()
+                    base_model_id: None,
+                    artifact_path: None,
+                    config_json: None,
                 })
                 .await
             {
@@ -539,7 +540,7 @@ impl InferenceSession {
 
         // Persist job in catalog. FK references models.model_id PK = "{name}::{version}".
         let hyperparams = serde_json::to_string(&config)?;
-        let loss_type = if task == "classification" {
+        let loss_type = if task == ModelTask::Classification {
             config
                 .classification_loss
                 .map(|l| format!("{l:?}"))
@@ -589,7 +590,6 @@ impl InferenceSession {
         let job_id_clone = job_id.clone();
         let output_model_id_clone = output_model_id.clone();
         let base_model_str = base_model.to_string();
-        let task_str = task.to_string();
         let device_config = self.device_config.clone();
 
         let catalog_for_err = Arc::clone(&catalog);
@@ -604,7 +604,7 @@ impl InferenceSession {
                     job_id_clone,
                     output_model_id_clone,
                     base_model_str,
-                    task_str,
+                    task,
                     config,
                     data_loader,
                     base_model_arc,
@@ -903,7 +903,7 @@ fn run_fine_tune_blocking(
     job_id: String,
     output_model_id: String,
     base_model: String,
-    task: String,
+    task: ModelTask,
     config: FineTuneConfig,
     data_loader: crate::fine_tune::data::TrainingDataLoader,
     base_model_arc: Arc<crate::model::LoadedModel>,
@@ -922,7 +922,7 @@ fn run_fine_tune_blocking(
     // `target_modules`) or a projection head over a frozen base model.
     // No half-built state — only the chosen variant is materialised.
     let target = if config.target_modules.is_empty() {
-        let head = if task == "classification" {
+        let head = if task == ModelTask::Classification {
             let num_classes = match data_loader.format() {
                 crate::fine_tune::data::TrainingFormat::Classification { num_classes } => {
                     num_classes

@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Array, BinaryArray, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use futures::StreamExt;
 use jammi_engine::catalog::backend::{BackendKind, TxOptions};
@@ -551,6 +551,104 @@ async fn insert_batch_rejects_schema_mismatch(backend: BackendKind) {
         err.to_string().contains("SCHEMA_MISMATCH"),
         "expected schema mismatch error, got: {err}"
     );
+
+    session.drop_mutable_table(&id).await.unwrap();
+}
+
+/// Round-trip a `DataType::Binary` column through the DataFusion DML sink
+/// (writes BLOB/BYTEA bytes through `MutableTableSink::extract_value`) and
+/// the provider scan (reads bytes back through `decode_row`'s explicit
+/// `Binary` arm). Exercises non-UTF-8 byte sequences (`0x00`, `0xFF`,
+/// bincode-shaped payload) so a silent UTF-8 decode would observably
+/// truncate or null the value.
+///
+/// Postgres coverage runs in the same parameterised matrix as every other
+/// test in this file when the `live-postgres-tests` feature is on; the
+/// default hermetic `cargo test` lane runs the SQLite variant only.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn binary_column_roundtrip_through_provider(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = skip_if_no_backend!(backend, dir.path());
+
+    let id = unique_id("blobs");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("blob", DataType::Binary, false),
+    ]));
+    let def = MutableTableDefinitionBuilder::new(id.clone(), Arc::clone(&schema))
+        .primary_key(vec!["id".into()])
+        .build()
+        .unwrap();
+    session.create_mutable_table(def).await.unwrap();
+
+    // Two non-UTF-8 payloads: an embedded NUL/0xFF/high-bit pattern, plus a
+    // 256-byte bincode-shaped Vec<f32> blob (a realistic shape for callers
+    // who store serialised embeddings in a mutable companion table).
+    let payload_a: Vec<u8> = vec![0x00, 0xFF, 0xC3, 0x28, 0xA0, 0xA1, 0x80, 0x01];
+    let payload_b: Vec<u8> = {
+        let mut v = Vec::with_capacity(4 * 64);
+        for i in 0_u32..64 {
+            v.extend_from_slice(&(i as f32).to_le_bytes());
+        }
+        v
+    };
+
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2])),
+            Arc::new(BinaryArray::from_iter_values([
+                payload_a.as_slice(),
+                payload_b.as_slice(),
+            ])),
+        ],
+    )
+    .unwrap();
+
+    // Force the DataFusion sink path: register the source batch as a memory
+    // table, then `INSERT INTO mutable.public.<id> SELECT *` — equivalent
+    // to a user-written DML statement, which exercises `extract_value`'s
+    // Binary arm.
+    let src = format!("src_{}", id.as_str());
+    session.context().register_batch(&src, batch).unwrap();
+    session
+        .sql(&format!(
+            "INSERT INTO mutable.public.{name} (id, blob) SELECT id, blob FROM {src}",
+            name = id.as_str(),
+        ))
+        .await
+        .unwrap();
+
+    // Read back through the provider scan path — `decode_row`'s Binary arm
+    // must produce a BinaryArray (not a null StringArray) with the original
+    // bytes intact.
+    let batches = session
+        .sql(&format!(
+            "SELECT blob FROM mutable.public.{name} ORDER BY id",
+            name = id.as_str()
+        ))
+        .await
+        .unwrap();
+    let out = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+    assert_eq!(out.num_rows(), 2);
+    let blobs = out
+        .column_by_name("blob")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap_or_else(|| {
+            panic!(
+                "blob column is not BinaryArray; got {:?}",
+                out.column_by_name("blob").unwrap().data_type()
+            )
+        });
+    assert_eq!(blobs.value(0), payload_a.as_slice());
+    assert_eq!(blobs.value(1), payload_b.as_slice());
 
     session.drop_mutable_table(&id).await.unwrap();
 }

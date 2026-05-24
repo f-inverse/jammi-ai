@@ -90,6 +90,22 @@ pub enum JammiError {
     #[error("Storage error: {0}")]
     Storage(#[from] crate::storage::StorageError),
 
+    /// A typed read from a Parquet table found a column whose Arrow type
+    /// disagrees with what the caller asked for (missing column, wrong
+    /// `DataType`, wrong inner type on a list).
+    #[error("Schema error: table {table:?} column {column:?}: expected {expected}, got {actual}")]
+    Schema {
+        /// Table the read targeted (typically `ResultTableRecord::table_name`).
+        table: String,
+        /// Name of the column the read targeted.
+        column: String,
+        /// Expected Arrow shape (e.g. `"FixedSizeList<Float32>"`).
+        expected: String,
+        /// What the on-disk schema actually carried (or `"missing"` if the
+        /// column wasn't present at all).
+        actual: String,
+    },
+
     /// Catch-all for errors that don't fit another variant.
     #[error("{0}")]
     Other(String),

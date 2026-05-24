@@ -1,8 +1,9 @@
-use arrow::array::{Array, Float32Array, StringArray};
+use arrow::array::{Array, StringArray};
 use datafusion::prelude::SessionContext;
 
 use crate::error::{JammiError, Result};
 use crate::index::cosine_distance;
+use crate::store::vectors::extend_with_fixed_size_list_f32;
 
 /// Brute-force vector search over a registered Parquet table via DataFusion.
 ///
@@ -22,30 +23,19 @@ pub async fn exact_vector_search(
     let batches = df.collect().await?;
 
     let mut scored: Vec<(String, f32)> = Vec::new();
+    let mut vectors: Vec<Vec<f32>> = Vec::new();
     for batch in &batches {
         let row_ids = batch
             .column_by_name("_row_id")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>())
             .ok_or_else(|| JammiError::Other("Missing _row_id in exact search".into()))?;
-
-        let vectors = batch
-            .column_by_name("vector")
-            .and_then(|c| {
-                c.as_any()
-                    .downcast_ref::<arrow::array::FixedSizeListArray>()
-            })
-            .ok_or_else(|| JammiError::Other("Missing vector in exact search".into()))?;
-
-        for i in 0..row_ids.len() {
-            let row_id = row_ids.value(i).to_string();
-            let v = vectors.value(i);
-            let float_arr = v
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| JammiError::Other("Vector not Float32".into()))?;
-            let vec: Vec<f32> = (0..float_arr.len()).map(|j| float_arr.value(j)).collect();
-            let dist = cosine_distance(query, &vec);
-            scored.push((row_id, dist));
+        let before = vectors.len();
+        extend_with_fixed_size_list_f32(batch, table_name, "vector", &mut vectors)?;
+        // `extend_with_fixed_size_list_f32` appends exactly one Vec<f32> per
+        // row, so the new slice maps 1:1 with `row_ids`.
+        for (offset, vec) in vectors[before..].iter().enumerate() {
+            let dist = cosine_distance(query, vec);
+            scored.push((row_ids.value(offset).to_string(), dist));
         }
     }
 

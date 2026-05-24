@@ -719,6 +719,29 @@ impl JammiSession {
     pub fn config(&self) -> &JammiConfig {
         &self.config
     }
+
+    /// Read the `vector` column of an embedding result table into one
+    /// `Vec<f32>` per row.
+    ///
+    /// Resolves the table's `parquet_path` through the session's
+    /// [`StorageRegistry`] so cloud credentials registered with the session
+    /// are inherited; opens the underlying object via
+    /// [`crate::storage::JammiObjectStore`] and streams the column through
+    /// the engine's typed-vector reader.
+    ///
+    /// Surfaces [`JammiError::Schema`] when the table's parquet does not
+    /// carry a `vector` column shaped `FixedSizeList<Float32>`, so callers
+    /// see a typed signal instead of a panic on the downcast.
+    pub async fn read_vectors(
+        &self,
+        table: &crate::catalog::result_repo::ResultTableRecord,
+    ) -> Result<Vec<Vec<f32>>> {
+        let url = StorageUrl::parse(&table.parquet_path)?;
+        let driver = self.storage_registry.driver_for(&url, None)?;
+        let handle = crate::storage::JammiObjectStore::new(driver, url);
+        crate::store::vectors::read_fixed_size_list_f32_column(&handle, &table.table_name, "vector")
+            .await
+    }
 }
 
 /// Handle passed to the closure inside [`JammiSession::with_tenant_scoped`].

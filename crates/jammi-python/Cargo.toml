@@ -6,7 +6,14 @@ publish = false
 
 [lib]
 name = "_native"
-crate-type = ["cdylib"]
+# `cdylib` is the maturin-built Python extension module. `rlib` lets
+# downstream Rust crates (e.g. jammi-enterprise-python) depend on this
+# crate and consume its public surface — `PyDatabase::session_arc` and the
+# re-exported `InferenceSession` — to share a single session with the OSS
+# `jammi.Database` instead of opening a parallel one against the same
+# artifact directory. The same crate-type pair is also what allows the
+# integration test under `tests/` to drive `PyDatabase` from Rust.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 jammi-engine.workspace = true
@@ -24,5 +31,15 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
+# `extension-module` tells pyo3 to skip linking against libpython — the
+# right choice when the produced cdylib is loaded by a Python interpreter.
+# The maturin build activates it explicitly via `features =
+# ["extension-module"]` in `pyproject.toml`. Leaving it OFF by default
+# means `cargo test --workspace` links the integration test binary
+# against libpython and runs cleanly without per-crate flags.
+extension-module = ["pyo3/extension-module"]
 cuda = ["jammi-ai/cuda"]

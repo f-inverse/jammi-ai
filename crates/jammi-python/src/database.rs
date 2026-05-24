@@ -13,6 +13,7 @@ use pyo3_arrow::{PySchema, PyTable};
 use jammi_ai::fine_tune::{EarlyStoppingMetric, FineTuneConfig, FineTuneMethod};
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
+use jammi_engine::config::JammiConfig;
 use jammi_engine::error::JammiError;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
 use jammi_engine::store::mutable::{
@@ -31,6 +32,31 @@ use crate::search::PySearchBuilder;
 pub struct PyDatabase {
     pub(crate) session: Arc<InferenceSession>,
     pub(crate) runtime: Arc<tokio::runtime::Runtime>,
+}
+
+impl PyDatabase {
+    /// Construct a `PyDatabase` from a fully-built `JammiConfig`. This is
+    /// the Rust-shaped entry point that the `#[pyfunction] connect` wraps
+    /// for Python callers; downstream Rust consumers (e.g. enterprise
+    /// Python bindings layered on top of this crate) call it directly so
+    /// the resulting database shares the tokio runtime that drives every
+    /// `InferenceSession` future.
+    pub fn open(config: JammiConfig) -> Result<Self, JammiError> {
+        let runtime = Arc::new(tokio::runtime::Runtime::new()?);
+        let session = runtime.block_on(InferenceSession::new(config))?;
+        Ok(Self {
+            session: Arc::new(session),
+            runtime,
+        })
+    }
+
+    /// Return a cloned `Arc<InferenceSession>` so external consumers can
+    /// share this database's session — schema upgrade lock, trigger broker,
+    /// catalog cache, tenant binding — instead of opening a parallel
+    /// session against the same artifact directory.
+    pub fn session_arc(&self) -> Arc<InferenceSession> {
+        Arc::clone(&self.session)
+    }
 }
 
 #[pymethods]

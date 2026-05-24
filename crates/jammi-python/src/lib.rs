@@ -4,18 +4,27 @@ mod error;
 mod job;
 mod search;
 
-use std::sync::Arc;
-
 use pyo3::prelude::*;
 use tracing_subscriber::EnvFilter;
 
-use jammi_ai::session::InferenceSession;
 use jammi_engine::config::JammiConfig;
 
-use crate::database::PyDatabase;
 use crate::error::to_pyerr;
 use crate::job::PyFineTuneJob;
 use crate::search::PySearchBuilder;
+
+/// The `Database` pyclass. Re-exported so native Rust consumers (such as
+/// downstream crates that layer enterprise bindings on top of this one) can
+/// hold and drive the same instance the Python interpreter sees, and call
+/// [`PyDatabase::session_arc`] to share its underlying session.
+pub use crate::database::PyDatabase;
+
+/// Re-export of the underlying inference session type. External Rust
+/// consumers need to name this to receive the `Arc<InferenceSession>`
+/// returned by [`PyDatabase::session_arc`] and share schema-upgrade lock,
+/// trigger broker, catalog cache, and tenant binding with the OSS
+/// `jammi.Database`.
+pub use jammi_ai::session::InferenceSession;
 
 /// Module entry point for `jammi._native`.
 #[pymodule]
@@ -49,10 +58,6 @@ fn connect(
         .with_writer(std::io::stderr)
         .try_init();
 
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Tokio init: {e}")))?;
-    let rt = Arc::new(runtime);
-
     let mut cfg = match config {
         Some(path) => JammiConfig::load(Some(std::path::Path::new(&path))).map_err(to_pyerr)?,
         None => JammiConfig::default(),
@@ -68,9 +73,5 @@ fn connect(
         cfg.inference.batch_size = bs;
     }
 
-    let session = rt.block_on(InferenceSession::new(cfg)).map_err(to_pyerr)?;
-    Ok(PyDatabase {
-        session: Arc::new(session),
-        runtime: rt,
-    })
+    PyDatabase::open(cfg).map_err(to_pyerr)
 }

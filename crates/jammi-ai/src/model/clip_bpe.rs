@@ -98,13 +98,26 @@ pub fn build_open_clip_tokenizer(text: &str) -> Result<Tokenizer> {
     // Line 0 is a header; lines 1..=NUM_MERGES are merge pairs.
     let merges: Merges = lines[1..=NUM_MERGES]
         .iter()
-        .map(|line| {
+        .enumerate()
+        .map(|(offset, line)| {
             let mut parts = line.split_whitespace();
-            let a = parts.next().unwrap_or_default().to_string();
-            let b = parts.next().unwrap_or_default().to_string();
-            (a, b)
+            let a = parts.next().ok_or_else(|| JammiError::Model {
+                model_id: String::new(),
+                message: format!(
+                    "OpenCLIP BPE merge line {} is empty",
+                    offset + 1
+                ),
+            })?;
+            let b = parts.next().ok_or_else(|| JammiError::Model {
+                model_id: String::new(),
+                message: format!(
+                    "OpenCLIP BPE merge line {} has only one token; expected two",
+                    offset + 1
+                ),
+            })?;
+            Ok((a.to_string(), b.to_string()))
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     // Build the byte → printable-unicode mapping used by OpenCLIP.
     let byte_chars = bytes_to_unicode();

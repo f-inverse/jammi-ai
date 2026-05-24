@@ -103,10 +103,7 @@ pub fn build_open_clip_tokenizer(text: &str) -> Result<Tokenizer> {
             let mut parts = line.split_whitespace();
             let a = parts.next().ok_or_else(|| JammiError::Model {
                 model_id: String::new(),
-                message: format!(
-                    "OpenCLIP BPE merge line {} is empty",
-                    offset + 1
-                ),
+                message: format!("OpenCLIP BPE merge line {} is empty", offset + 1),
             })?;
             let b = parts.next().ok_or_else(|| JammiError::Model {
                 model_id: String::new(),

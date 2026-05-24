@@ -10,6 +10,7 @@ pub mod config;
 pub mod error;
 pub mod evidence_channel;
 pub mod index;
+pub mod model_task;
 pub mod session;
 pub mod source;
 pub mod sql;
@@ -25,6 +26,7 @@ pub use catalog::backend::{
     BackendError, BackendImpl, BackendKind, CatalogBackend, IsolationLevel, Transaction, TxOptions,
 };
 pub use evidence_channel::ChannelId;
+pub use model_task::ModelTask;
 pub use session::{AdminScope, TenantScope};
 pub use tenant::TenantId;
 

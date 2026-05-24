@@ -76,7 +76,7 @@ async fn generate_embeddings_produces_complete_result() {
 
     // Metadata tracked
     assert_eq!(record.source_id, "patents");
-    assert_eq!(record.task, "text_embedding");
+    assert_eq!(record.task, ModelTask::TextEmbedding);
     assert!(record.key_column.as_deref() == Some("id"));
     assert!(record.text_columns.as_deref() == Some("abstract"));
 
@@ -149,7 +149,7 @@ async fn multiple_tables_and_sidecar_fallback() {
     assert_ne!(r1.table_name, r2.table_name);
     let tables = session
         .catalog()
-        .find_result_tables("patents", Some("text_embedding"), None)
+        .find_result_tables("patents", Some(ModelTask::TextEmbedding), None)
         .await
         .unwrap();
     assert!(tables.len() >= 2);
@@ -236,7 +236,7 @@ async fn infer_persists_results_to_parquet() {
 
     let tables = session
         .catalog()
-        .find_result_tables("patents", Some("text_embedding"), None)
+        .find_result_tables("patents", Some(ModelTask::TextEmbedding), None)
         .await
         .unwrap();
     assert!(!tables.is_empty(), "Should have created a result table");
@@ -282,7 +282,7 @@ async fn existing_tables_loaded_on_new_session() {
         let session = InferenceSession::new(config).await.unwrap();
         let tables = session
             .catalog()
-            .find_result_tables("patents", Some("text_embedding"), None)
+            .find_result_tables("patents", Some(ModelTask::TextEmbedding), None)
             .await
             .unwrap();
         assert!(!tables.is_empty());

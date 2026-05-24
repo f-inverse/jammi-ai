@@ -329,7 +329,11 @@ async fn recipe_enrich_results() {
         .search("patents", query.clone(), 10)
         .await
         .unwrap()
-        .annotate(&model_id, "text_embedding", &["abstract".to_string()])
+        .annotate(
+            &model_id,
+            ModelTask::TextEmbedding,
+            &["abstract".to_string()],
+        )
         .await
         .unwrap()
         .run()
@@ -402,7 +406,7 @@ async fn recipe_fine_tune() {
             &model_id,
             &["text_a".into(), "text_b".into(), "score".into()],
             FineTuneMethod::Lora,
-            "text_embedding",
+            ModelTask::TextEmbedding,
             None,
         )
         .await
@@ -676,7 +680,7 @@ async fn recipe_model_management() {
     let model = &models[0];
     assert!(model.model_id.contains("tiny_bert"));
     assert_eq!(model.backend, "candle");
-    assert_eq!(model.task, "text_embedding");
+    assert_eq!(model.task, ModelTask::TextEmbedding);
 
     // Inspect specific model
     let found = session

@@ -1,5 +1,6 @@
 use crate::catalog::backend::{BackendError, Row, SqlValue, TxOptions};
 use crate::error::Result;
+use crate::model_task::ModelTask;
 
 use super::Catalog;
 
@@ -16,8 +17,8 @@ pub struct ModelRecord {
     pub base_model_id: Option<String>,
     /// Inference backend (e.g., `"candle"`, `"vllm"`, `"http"`).
     pub backend: String,
-    /// Task this model performs (e.g., `"text-generation"`, `"embedding"`).
-    pub task: String,
+    /// Task this model performs.
+    pub task: ModelTask,
     /// Filesystem path to model weights or adapter files.
     pub artifact_path: Option<String>,
     /// Serialized JSON blob with backend-specific configuration.
@@ -29,7 +30,7 @@ pub struct ModelRecord {
 }
 
 /// Input parameters for [`Catalog::register_model`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RegisterModelParams<'a> {
     /// Unique model name.
     pub model_id: &'a str,
@@ -40,7 +41,7 @@ pub struct RegisterModelParams<'a> {
     /// Inference backend identifier.
     pub backend: &'a str,
     /// Task this model performs.
-    pub task: &'a str,
+    pub task: ModelTask,
     /// Optional parent model ID (for fine-tuned variants).
     pub base_model_id: Option<&'a str>,
     /// Optional filesystem path to model weights.
@@ -65,7 +66,7 @@ impl Catalog {
         .to_string();
         let model_id = params.model_id.to_string();
         let model_type = params.model_type.to_string();
-        let task = params.task.to_string();
+        let task = params.task.as_db_str();
         let backend = params.backend.to_string();
         let version = params.version as i64;
         let tenant = self.current_tenant();
@@ -88,7 +89,7 @@ impl Catalog {
                             SqlValue::TextOwned(pk),
                             SqlValue::TextOwned(model_id),
                             SqlValue::TextOwned(model_type),
-                            SqlValue::TextOwned(task),
+                            SqlValue::Text(task),
                             SqlValue::TextOwned(backend),
                             SqlValue::Int(version),
                             SqlValue::TextOwned(metadata),
@@ -240,7 +241,11 @@ fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendErr
     let _pk: String = row.get("model_id")?;
     let name: String = row.get("name")?;
     let model_type: String = row.get("model_type")?;
-    let task: String = row.get("task")?;
+    let task_raw: String = row.get("task")?;
+    let task = ModelTask::try_from_db_str(&task_raw).map_err(|e| BackendError::TypeConversion {
+        column: "task".into(),
+        detail: e.to_string(),
+    })?;
     let backend: String = row.try_get("backend")?.unwrap_or_default();
     let version: i64 = row.try_get("version")?.unwrap_or(1);
     let status: String = row.try_get("status")?.unwrap_or_default();

@@ -4,6 +4,7 @@ use jammi_ai::eval::{
     golden::{ensure_column, RelevanceJudgment},
     metrics::{classification::ClassificationMetrics, retrieval::RetrievalMetrics},
 };
+use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
 use jammi_engine::catalog::eval_repo::EvalRunRecord;
 use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
@@ -275,8 +276,10 @@ async fn catalog_eval_run_crud_and_latest() {
             version: 1,
             model_type: "embedding",
             backend: "candle",
-            task: "text_embedding",
-            ..Default::default()
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: None,
+            config_json: None,
         })
         .await
         .unwrap();

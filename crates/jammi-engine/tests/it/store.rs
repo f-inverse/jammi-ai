@@ -6,6 +6,7 @@ use arrow::record_batch::RecordBatch;
 use jammi_engine::catalog::result_repo::CreateResultTableParams;
 use jammi_engine::catalog::status::ResultTableStatus;
 use jammi_engine::catalog::Catalog;
+use jammi_engine::model_task::ModelTask;
 use jammi_engine::storage::{
     reader::{count_parquet_rows, is_valid_parquet},
     JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl,
@@ -65,7 +66,7 @@ async fn result_table_crud_lifecycle() {
             table_name: "t1",
             source_id: "patents",
             model_id: "sentence-transformers/all-MiniLM-L6-v2",
-            task: "text_embedding",
+            task: ModelTask::TextEmbedding,
             parquet_path: "file:///tmp/test.parquet",
             index_path: Some("file:///tmp/test.idx"),
             dimensions: Some(384),
@@ -94,7 +95,7 @@ async fn result_table_crud_lifecycle() {
             table_name: "t2",
             source_id: "patents",
             model_id: "m",
-            task: "classification",
+            task: ModelTask::Classification,
             parquet_path: "file:///tmp/t2.parquet",
             index_path: None,
             dimensions: None,
@@ -125,9 +126,9 @@ async fn find_result_tables_filters_by_source_and_task() {
     let catalog = Catalog::open(dir.path()).await.unwrap();
 
     for (name, source, task) in [
-        ("t1", "patents", "text_embedding"),
-        ("t2", "patents", "classification"),
-        ("t3", "scores", "text_embedding"),
+        ("t1", "patents", ModelTask::TextEmbedding),
+        ("t2", "patents", ModelTask::Classification),
+        ("t3", "scores", ModelTask::TextEmbedding),
     ] {
         catalog
             .create_result_table(CreateResultTableParams {
@@ -154,7 +155,7 @@ async fn find_result_tables_filters_by_source_and_task() {
         2
     );
     let emb = catalog
-        .find_result_tables("patents", Some("text_embedding"), None)
+        .find_result_tables("patents", Some(ModelTask::TextEmbedding), None)
         .await
         .unwrap();
     assert_eq!(emb.len(), 1);
@@ -177,7 +178,7 @@ async fn resolve_embedding_table_latest_explicit_and_missing() {
                 table_name: name,
                 source_id: "patents",
                 model_id: "model",
-                task: "text_embedding",
+                task: ModelTask::TextEmbedding,
                 parquet_path: &format!("file:///tmp/{name}.parquet"),
                 index_path: None,
                 dimensions: Some(384),
@@ -205,6 +206,125 @@ async fn resolve_embedding_table_latest_explicit_and_missing() {
     assert_eq!(explicit.table_name, "old");
 }
 
+/// `resolve_embedding_table` must consider both embedding variants
+/// (`TextEmbedding`, `ImageEmbedding`) and ignore non-embedding tasks
+/// (classification, NER). Regression guard for the prior hard-coded
+/// `task IN ('text_embedding', 'image_embedding')` literal list — if a new
+/// embedding variant is ever introduced and the resolver isn't updated to
+/// gate via `ModelTask::is_embedding`, this test catches it.
+#[tokio::test]
+async fn resolve_embedding_table_accepts_image_and_text_but_not_classification() {
+    let dir = tempdir().unwrap();
+    let catalog = Catalog::open(dir.path()).await.unwrap();
+
+    for (name, task) in [
+        ("classify_first", ModelTask::Classification),
+        ("text_embed", ModelTask::TextEmbedding),
+        ("image_embed", ModelTask::ImageEmbedding),
+    ] {
+        catalog
+            .create_result_table(CreateResultTableParams {
+                table_name: name,
+                source_id: "media",
+                model_id: "model",
+                task,
+                parquet_path: &format!("file:///tmp/{name}.parquet"),
+                index_path: None,
+                dimensions: Some(8),
+                key_column: None,
+                text_columns: None,
+            })
+            .await
+            .unwrap();
+        catalog
+            .update_result_table_status(name, ResultTableStatus::Ready, 4)
+            .await
+            .unwrap();
+    }
+
+    // Resolver picks the latest-created embedding row (image_embed) and
+    // ignores classify_first even though it predates them.
+    let resolved = catalog
+        .resolve_embedding_table("media", None)
+        .await
+        .unwrap();
+    assert_eq!(resolved.table_name, "image_embed");
+    assert!(
+        resolved.task.is_embedding(),
+        "resolver must only return embedding tasks, got {:?}",
+        resolved.task
+    );
+}
+
+/// Crash recovery rebuilds the ANN sidecar index only for embedding-task
+/// rows. A classification table sitting in `Building` must promote to
+/// `Ready` without the recovery path trying to read a non-existent
+/// `vector` column. Regression guard for the prior literal-string
+/// `task == "embedding" || task == "text_embedding" || task ==
+/// "image_embedding"` branch.
+#[tokio::test]
+async fn recovery_skips_index_rebuild_for_non_embedding_task() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let db_dir = dir.path().join("jammi_db");
+    std::fs::create_dir_all(&db_dir).unwrap();
+
+    // Write a valid parquet that intentionally lacks the `vector` column
+    // an embedding-table sidecar rebuild would expect — proves the
+    // classification branch never reaches the rebuild path.
+    let parquet_path = db_dir.join("classify.parquet");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_row_id", DataType::Utf8, false),
+        Field::new("label", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec!["r1", "r2"])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["A", "B"])),
+        ],
+    )
+    .unwrap();
+
+    let url = StorageUrl::parse(parquet_path.to_str().unwrap()).unwrap();
+    let registry = StorageRegistry::new();
+    let driver = registry.driver_for(&url, None).unwrap();
+    let handle = JammiObjectStore::new(driver, url.clone());
+    let mut writer = ObjectParquetWriter::open(&handle, schema).await.unwrap();
+    writer.write_batch(&batch).await.unwrap();
+    writer.close().await.unwrap();
+
+    catalog
+        .create_result_table(CreateResultTableParams {
+            table_name: "classify_recover",
+            source_id: "src",
+            model_id: "model",
+            task: ModelTask::Classification,
+            parquet_path: url.as_str(),
+            index_path: None,
+            dimensions: None,
+            key_column: None,
+            text_columns: None,
+        })
+        .await
+        .unwrap();
+
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog)).unwrap();
+    store.recover().await.unwrap();
+
+    let record = catalog
+        .get_result_table("classify_recover")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.status, "ready");
+    assert_eq!(record.row_count, 2);
+    assert!(
+        !record.task.is_embedding(),
+        "test fixture should be a non-embedding task"
+    );
+}
+
 // ─── ResultStore table naming ────────────────────────────────────────────────
 
 #[tokio::test]
@@ -216,7 +336,7 @@ async fn result_store_create_table_generates_correct_paths() {
     let info = store
         .create_table(
             "patents",
-            "text_embedding",
+            ModelTask::TextEmbedding,
             "sentence-transformers/all-MiniLM-L6-v2",
             None,
             None,
@@ -251,7 +371,7 @@ async fn recovery_marks_missing_parquet_as_failed() {
             table_name: "orphan",
             source_id: "src",
             model_id: "model",
-            task: "text_embedding",
+            task: ModelTask::TextEmbedding,
             parquet_path: missing_url.as_str(),
             index_path: None,
             dimensions: None,
@@ -291,7 +411,7 @@ async fn recovery_deletes_invalid_parquet_and_marks_failed() {
             table_name: "corrupt",
             source_id: "src",
             model_id: "model",
-            task: "text_embedding",
+            task: ModelTask::TextEmbedding,
             parquet_path: bad_url.as_str(),
             index_path: None,
             dimensions: None,
@@ -348,7 +468,7 @@ async fn recovery_promotes_valid_parquet_to_ready() {
             table_name: "stuck",
             source_id: "src",
             model_id: "model",
-            task: "classification",
+            task: ModelTask::Classification,
             parquet_path: url.as_str(),
             index_path: None,
             dimensions: None,

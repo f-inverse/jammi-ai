@@ -143,7 +143,7 @@ pub struct OutputModelHandle {
     /// fine-tuned id alone.
     pub base_model_id: String,
     /// Task the fine-tuned model performs.
-    pub task: String,
+    pub task: ModelTask,
 }
 
 /// The training loop: runs LoRA fine-tuning with gradient accumulation,
@@ -498,7 +498,7 @@ impl TrainingLoop {
                     version: 1,
                     model_type: "fine-tuned",
                     backend: "candle",
-                    task: &output.task,
+                    task: output.task,
                     base_model_id: Some(&output.base_model_id),
                     artifact_path: checkpoint_dir.to_str(),
                     config_json: None,

@@ -171,7 +171,6 @@ impl ModelCache {
         // Store the parent directory of the first weights file so that
         // `build_encoder_adapters` can locate config.json and tokenizer.json.
         let backend_str = format!("{:?}", resolved.backend).to_lowercase();
-        let task_str = task.to_string();
         let model_type = match source {
             ModelSource::HuggingFace(_) => "huggingface",
             ModelSource::Local(_) => "local",
@@ -190,10 +189,10 @@ impl ModelCache {
                 version: 1,
                 model_type,
                 backend: &backend_str,
-                task: &task_str,
+                task,
+                base_model_id: None,
                 artifact_path: artifact_dir_str.as_deref(),
                 config_json: None,
-                ..Default::default()
             })
             .await
         {

@@ -2,6 +2,7 @@ mod convert;
 mod database;
 mod error;
 mod job;
+pub mod model_task;
 mod search;
 
 use pyo3::prelude::*;
@@ -11,6 +12,7 @@ use jammi_engine::config::JammiConfig;
 
 use crate::error::to_pyerr;
 use crate::job::PyFineTuneJob;
+use crate::model_task::PyModelTask;
 use crate::search::PySearchBuilder;
 
 /// The `Database` pyclass. Re-exported so native Rust consumers (such as
@@ -33,6 +35,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDatabase>()?;
     m.add_class::<PySearchBuilder>()?;
     m.add_class::<PyFineTuneJob>()?;
+    m.add_class::<PyModelTask>()?;
     Ok(())
 }
 

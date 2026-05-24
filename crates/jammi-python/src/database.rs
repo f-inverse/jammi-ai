@@ -25,6 +25,7 @@ use jammi_lora::BackboneDtype;
 use crate::convert::{batches_to_pyarrow, json_to_pydict};
 use crate::error::to_pyerr;
 use crate::job::PyFineTuneJob;
+use crate::model_task::ModelTaskArg;
 use crate::search::PySearchBuilder;
 
 /// Python Database wrapping `Arc<InferenceSession>` with a shared tokio runtime.
@@ -129,16 +130,15 @@ impl PyDatabase {
         source: &str,
         model: &str,
         columns: Vec<String>,
-        task: &str,
+        task: ModelTaskArg,
         key: &str,
     ) -> PyResult<Py<PyAny>> {
         let model_source = ModelSource::parse(model);
-        let model_task = parse_model_task(task)?;
         let batches = self
             .runtime
             .block_on(
                 self.session
-                    .infer(source, &model_source, model_task, &columns, key),
+                    .infer(source, &model_source, task.0, &columns, key),
             )
             .map_err(to_pyerr)?;
         batches_to_pyarrow(py, &batches)
@@ -454,7 +454,7 @@ impl PyDatabase {
         base_model,
         columns,
         method,
-        task = "embedding",
+        task = None,
         lora_rank = None,
         lora_alpha = None,
         lora_dropout = None,
@@ -480,7 +480,7 @@ impl PyDatabase {
         base_model: &str,
         columns: Vec<String>,
         method: &str,
-        task: &str,
+        task: Option<ModelTaskArg>,
         lora_rank: Option<usize>,
         lora_alpha: Option<f64>,
         lora_dropout: Option<f64>,
@@ -569,6 +569,7 @@ impl PyDatabase {
             cfg.max_grad_norm = v;
         }
 
+        let task = task.map(|t| t.0).unwrap_or(ModelTask::TextEmbedding);
         let job = self
             .runtime
             .block_on(self.session.fine_tune(
@@ -698,10 +699,6 @@ impl PyDatabase {
 }
 
 fn parse_file_format(s: &str) -> PyResult<FileFormat> {
-    s.parse().map_err(to_pyerr)
-}
-
-fn parse_model_task(s: &str) -> PyResult<ModelTask> {
     s.parse().map_err(to_pyerr)
 }
 

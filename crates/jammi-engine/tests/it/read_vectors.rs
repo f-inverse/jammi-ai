@@ -11,6 +11,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use jammi_engine::catalog::result_repo::CreateResultTableParams;
 use jammi_engine::catalog::status::ResultTableStatus;
 use jammi_engine::error::JammiError;
+use jammi_engine::model_task::ModelTask;
 use jammi_engine::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
 use jammi_engine::store::schema::embedding_table_schema;
 use jammi_test_utils::make_test_session;
@@ -82,7 +83,7 @@ async fn read_vectors_returns_input_rows_byte_for_byte() {
             table_name,
             source_id: "src",
             model_id: "model",
-            task: "text_embedding",
+            task: ModelTask::TextEmbedding,
             parquet_path: url.as_str(),
             index_path: None,
             dimensions: Some(dim),
@@ -156,7 +157,7 @@ async fn read_vectors_surfaces_typed_schema_error_on_wrong_column_shape() {
             table_name,
             source_id: "src",
             model_id: "model",
-            task: "text_embedding",
+            task: ModelTask::TextEmbedding,
             parquet_path: url.as_str(),
             index_path: None,
             dimensions: Some(4),

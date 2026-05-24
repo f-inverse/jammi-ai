@@ -12,6 +12,7 @@ use arrow::datatypes::{DataType, Field};
 use jammi_ai::session::InferenceSession;
 use jammi_engine::catalog::result_repo::CreateResultTableParams;
 use jammi_engine::catalog::status::ResultTableStatus;
+use jammi_engine::model_task::ModelTask;
 use jammi_engine::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
 use jammi_engine::store::schema::embedding_table_schema;
 use tempfile::tempdir;
@@ -71,7 +72,7 @@ async fn inference_session_read_vectors_forwards_to_jammi_session() {
             table_name,
             source_id: "src",
             model_id: "model",
-            task: "text_embedding",
+            task: ModelTask::TextEmbedding,
             parquet_path: url.as_str(),
             index_path: None,
             dimensions: Some(dim),

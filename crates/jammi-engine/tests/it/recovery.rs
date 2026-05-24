@@ -3,6 +3,7 @@ use std::sync::Arc;
 use jammi_engine::catalog::model_repo::RegisterModelParams;
 use jammi_engine::catalog::status::{FineTuneJobStatus, ResultTableStatus};
 use jammi_engine::catalog::Catalog;
+use jammi_engine::model_task::ModelTask;
 use jammi_engine::store::ResultStore;
 use tempfile::tempdir;
 
@@ -19,15 +20,24 @@ async fn crash_recovery_cleans_up_stale_result_tables_and_fine_tune_jobs() {
             version: 1,
             model_type: "embedding",
             backend: "candle",
-            task: "text_embedding",
-            ..Default::default()
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: None,
+            config_json: None,
         })
         .await
         .unwrap();
 
     let result_store = ResultStore::new(dir.path(), Arc::clone(&catalog)).unwrap();
     let table_info = result_store
-        .create_table("src1", "text_embedding", "test-model", None, None, None)
+        .create_table(
+            "src1",
+            ModelTask::TextEmbedding,
+            "test-model",
+            None,
+            None,
+            None,
+        )
         .await
         .unwrap();
 

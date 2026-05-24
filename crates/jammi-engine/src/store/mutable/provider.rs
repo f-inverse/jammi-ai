@@ -11,7 +11,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Float32Array, Float64Array, Int64Array, RecordBatch, StringArray,
+    ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int64Array, LargeBinaryArray,
+    RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
@@ -197,6 +198,7 @@ enum DecodedValue {
     Int(i64),
     Float(f64),
     Text(String),
+    Bytes(Vec<u8>),
 }
 
 fn decode_row(
@@ -206,11 +208,10 @@ fn decode_row(
     columns
         .iter()
         .map(|(name, ty)| match ty {
-            DataType::Boolean => row
+            DataType::Boolean => Ok(row
                 .try_get::<bool>(name)?
                 .map(DecodedValue::Bool)
-                .map(Ok)
-                .unwrap_or(Ok(DecodedValue::Null)),
+                .unwrap_or(DecodedValue::Null)),
             DataType::Int8
             | DataType::Int16
             | DataType::Int32
@@ -218,21 +219,25 @@ fn decode_row(
             | DataType::UInt8
             | DataType::UInt16
             | DataType::UInt32
-            | DataType::UInt64 => row
+            | DataType::UInt64 => Ok(row
                 .try_get::<i64>(name)?
                 .map(DecodedValue::Int)
-                .map(Ok)
-                .unwrap_or(Ok(DecodedValue::Null)),
-            DataType::Float16 | DataType::Float32 | DataType::Float64 => row
+                .unwrap_or(DecodedValue::Null)),
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => Ok(row
                 .try_get::<f64>(name)?
                 .map(DecodedValue::Float)
-                .map(Ok)
-                .unwrap_or(Ok(DecodedValue::Null)),
-            _ => row
+                .unwrap_or(DecodedValue::Null)),
+            DataType::Utf8 | DataType::LargeUtf8 => Ok(row
                 .try_get::<String>(name)?
                 .map(DecodedValue::Text)
-                .map(Ok)
-                .unwrap_or(Ok(DecodedValue::Null)),
+                .unwrap_or(DecodedValue::Null)),
+            DataType::Binary | DataType::LargeBinary => Ok(row
+                .try_get::<Vec<u8>>(name)?
+                .map(DecodedValue::Bytes)
+                .unwrap_or(DecodedValue::Null)),
+            other => Err(crate::catalog::backend::BackendError::Execution(format!(
+                "mutable-table scan: column {name:?} has unsupported Arrow type {other:?}"
+            ))),
         })
         .collect()
 }
@@ -293,7 +298,7 @@ fn build_arrays(
                         .collect();
                     Ok(Arc::new(arr) as ArrayRef)
                 }
-                _ => {
+                DataType::Utf8 | DataType::LargeUtf8 => {
                     let arr: StringArray = values
                         .into_iter()
                         .map(|v| match v {
@@ -303,6 +308,39 @@ fn build_arrays(
                         .collect();
                     Ok(Arc::new(arr) as ArrayRef)
                 }
+                DataType::Binary => {
+                    let owned: Vec<Option<Vec<u8>>> = values
+                        .into_iter()
+                        .map(|v| match v {
+                            DecodedValue::Bytes(b) => Some(b),
+                            _ => None,
+                        })
+                        .collect();
+                    let arr: BinaryArray = owned
+                        .iter()
+                        .map(|o| o.as_deref())
+                        .collect::<Vec<_>>()
+                        .into();
+                    Ok(Arc::new(arr) as ArrayRef)
+                }
+                DataType::LargeBinary => {
+                    let owned: Vec<Option<Vec<u8>>> = values
+                        .into_iter()
+                        .map(|v| match v {
+                            DecodedValue::Bytes(b) => Some(b),
+                            _ => None,
+                        })
+                        .collect();
+                    let arr: LargeBinaryArray = owned
+                        .iter()
+                        .map(|o| o.as_deref())
+                        .collect::<Vec<_>>()
+                        .into();
+                    Ok(Arc::new(arr) as ArrayRef)
+                }
+                other => Err(DataFusionError::NotImplemented(format!(
+                    "mutable-table scan cannot materialise Arrow type {other:?}"
+                ))),
             }
         })
         .collect()

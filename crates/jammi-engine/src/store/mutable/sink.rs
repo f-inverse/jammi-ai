@@ -13,9 +13,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray,
+    Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    LargeBinaryArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -202,6 +202,16 @@ fn extract_value(
             .downcast_ref::<StringArray>()
             .map(|a| SqlValue::TextOwned(a.value(idx).to_string()))
             .ok_or("expected StringArray"),
+        Binary => arr
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .map(|a| SqlValue::BytesOwned(a.value(idx).to_vec()))
+            .ok_or("expected BinaryArray"),
+        LargeBinary => arr
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .map(|a| SqlValue::BytesOwned(a.value(idx).to_vec()))
+            .ok_or("expected LargeBinaryArray"),
         // Timestamps map to their numeric tick (i64). The catalog backend
         // stores them as INTEGER for SQLite portability; consumers that
         // need wall-clock formatting do the conversion at read time. This

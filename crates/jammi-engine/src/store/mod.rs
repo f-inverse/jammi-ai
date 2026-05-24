@@ -1,5 +1,6 @@
 pub mod mutable;
 pub mod schema;
+pub mod vectors;
 
 use std::path::Path;
 use std::sync::Arc;

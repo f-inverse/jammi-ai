@@ -8,6 +8,7 @@ mod migrations;
 mod mutable_crash_recovery;
 mod mutable_federation;
 mod mutable_tables;
+mod read_vectors;
 mod recovery;
 mod sources;
 mod storage_cloud;

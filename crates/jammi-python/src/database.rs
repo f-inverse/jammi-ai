@@ -13,13 +13,13 @@ use pyo3_arrow::{PySchema, PyTable};
 use jammi_ai::fine_tune::{EarlyStoppingMetric, FineTuneConfig, FineTuneMethod};
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
-use jammi_engine::config::JammiConfig;
-use jammi_engine::error::JammiError;
-use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
-use jammi_engine::store::mutable::{
+use jammi_db::config::JammiConfig;
+use jammi_db::error::JammiError;
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::store::mutable::{
     MutableIndexDef, MutableTableDefinitionBuilder, MutableTableError, MutableTableId,
 };
-use jammi_engine::trigger::{Offset, Predicate, TopicDefinition, TopicId};
+use jammi_db::trigger::{Offset, Predicate, TopicDefinition, TopicId};
 use jammi_lora::BackboneDtype;
 
 use crate::convert::{batches_to_pyarrow, json_to_pydict};
@@ -72,7 +72,7 @@ impl PyDatabase {
             self.session.unbind_tenant();
             return Ok(());
         }
-        let t = jammi_engine::TenantId::from_str(tenant_id).map_err(to_pyerr)?;
+        let t = jammi_db::TenantId::from_str(tenant_id).map_err(to_pyerr)?;
         self.session.bind_tenant(t);
         Ok(())
     }
@@ -242,7 +242,7 @@ impl PyDatabase {
                         None => break,
                     }
                 }
-                Ok::<_, jammi_engine::trigger::TriggerError>(out)
+                Ok::<_, jammi_db::trigger::TriggerError>(out)
             })
             .map_err(to_pyerr)?;
         batches_to_pyarrow(py, &collected)
@@ -262,9 +262,9 @@ impl PyDatabase {
         priority: i32,
         columns: Vec<(String, String)>,
     ) -> PyResult<()> {
-        let id = jammi_engine::ChannelId::new(channel_id).map_err(to_pyerr)?;
+        let id = jammi_db::ChannelId::new(channel_id).map_err(to_pyerr)?;
         let cols = parse_channel_columns(&columns)?;
-        let spec = jammi_engine::catalog::channel_repo::ChannelSpec {
+        let spec = jammi_db::catalog::channel_repo::ChannelSpec {
             id,
             priority,
             columns: cols,
@@ -285,7 +285,7 @@ impl PyDatabase {
         channel_id: &str,
         columns: Vec<(String, String)>,
     ) -> PyResult<()> {
-        let id = jammi_engine::ChannelId::new(channel_id).map_err(to_pyerr)?;
+        let id = jammi_db::ChannelId::new(channel_id).map_err(to_pyerr)?;
         let cols = parse_channel_columns(&columns)?;
         self.runtime
             .block_on(self.session.catalog().channels().add_columns(&id, &cols))
@@ -708,14 +708,13 @@ fn parse_eval_task(s: &str) -> PyResult<jammi_ai::eval::EvalTask> {
 
 fn parse_channel_columns(
     columns: &[(String, String)],
-) -> PyResult<Vec<jammi_engine::catalog::channel_repo::ChannelColumn>> {
+) -> PyResult<Vec<jammi_db::catalog::channel_repo::ChannelColumn>> {
     columns
         .iter()
         .map(|(name, dtype)| {
-            let data_type =
-                jammi_engine::catalog::channel_repo::ChannelColumnType::from_sql_str(dtype)
-                    .map_err(to_pyerr)?;
-            Ok(jammi_engine::catalog::channel_repo::ChannelColumn {
+            let data_type = jammi_db::catalog::channel_repo::ChannelColumnType::from_sql_str(dtype)
+                .map_err(to_pyerr)?;
+            Ok(jammi_db::catalog::channel_repo::ChannelColumn {
                 name: name.clone(),
                 data_type,
             })

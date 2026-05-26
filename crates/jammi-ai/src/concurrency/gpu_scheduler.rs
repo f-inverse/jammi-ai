@@ -2,7 +2,7 @@ use std::hint;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use jammi_engine::error::{JammiError, Result};
+use jammi_db::error::{JammiError, Result};
 
 /// Memory-budget GPU scheduler with priority levels.
 ///

@@ -9,8 +9,8 @@ use jammi_ai::fine_tune::{
 };
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
-use jammi_engine::catalog::status::FineTuneJobStatus;
-use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::catalog::status::FineTuneJobStatus;
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_lora::LoraLinear;
 
 use crate::common;
@@ -376,13 +376,11 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
 #[tokio::test]
 async fn fine_tune_job_catalog_crud() {
     let dir = tempfile::tempdir().unwrap();
-    let catalog = jammi_engine::catalog::Catalog::open(dir.path())
-        .await
-        .unwrap();
+    let catalog = jammi_db::catalog::Catalog::open(dir.path()).await.unwrap();
 
     // Register base model (FK constraint)
     catalog
-        .register_model(jammi_engine::catalog::model_repo::RegisterModelParams {
+        .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
             model_id: "base-model",
             version: 1,
             model_type: "embedding",
@@ -544,15 +542,11 @@ async fn training_divergence_detection() {
         TrainingDataLoader::from_precomputed(vec![nan_batch.clone(), nan_batch.clone(), nan_batch]);
 
     let dir = tempfile::tempdir().unwrap();
-    let catalog = Arc::new(
-        jammi_engine::catalog::Catalog::open(dir.path())
-            .await
-            .unwrap(),
-    );
+    let catalog = Arc::new(jammi_db::catalog::Catalog::open(dir.path()).await.unwrap());
 
     // Register a model for the FK
     catalog
-        .register_model(jammi_engine::catalog::model_repo::RegisterModelParams {
+        .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
             model_id: "div-test-model",
             version: 1,
             model_type: "embedding",
@@ -656,14 +650,10 @@ async fn training_early_stopping_triggers() {
     let loader = TrainingDataLoader::from_precomputed(batches);
 
     let dir = tempfile::tempdir().unwrap();
-    let catalog = Arc::new(
-        jammi_engine::catalog::Catalog::open(dir.path())
-            .await
-            .unwrap(),
-    );
+    let catalog = Arc::new(jammi_db::catalog::Catalog::open(dir.path()).await.unwrap());
 
     catalog
-        .register_model(jammi_engine::catalog::model_repo::RegisterModelParams {
+        .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
             model_id: "es-test-model",
             version: 1,
             model_type: "embedding",

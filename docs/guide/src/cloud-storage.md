@@ -15,7 +15,7 @@ The default build ships only `file://` and the in-memory test driver. Cloud sche
 
 ```toml
 [dependencies]
-jammi-engine = { version = "0.5", features = ["storage-s3", "storage-gcs"] }
+jammi-db = { version = "0.5", features = ["storage-s3", "storage-gcs"] }
 ```
 
 Live integration tests live behind matching `live-s3-tests`, `live-gcs-tests`, `live-azure-tests` features so the hermetic `cargo test` lane never reaches the network.
@@ -25,13 +25,13 @@ Live integration tests live behind matching `live-s3-tests`, `live-gcs-tests`, `
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
 # async fn ex(session: &InferenceSession) -> Result<(), Box<dyn std::error::Error>> {
-use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
-use jammi_engine::storage::{CloudConfig, S3Config, StorageUrl};
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::storage::{CloudConfig, S3Config, StorageUrl};
 
 let url = StorageUrl::parse("s3://benchmarks/snapshots/2026/papers.parquet")?;
 
@@ -58,7 +58,7 @@ If the `cloud` field is `None` and the URL is a cloud scheme, the driver falls b
 ### Python
 
 ```python
-from jammi import Database
+from jammi_ai import Database
 
 db = Database()
 db.add_source("papers", url="s3://benchmarks/snapshots/2026/papers.parquet", format="parquet")
@@ -80,10 +80,10 @@ jammi sources add papers \
 The pattern is identical — only the URL prefix and the `CloudConfig` variant change:
 
 ```rust,no_run
-# extern crate jammi_engine;
-# use jammi_engine::source::{FileFormat, SourceConnection};
+# extern crate jammi_db;
+# use jammi_db::source::{FileFormat, SourceConnection};
 # fn make() -> SourceConnection {
-use jammi_engine::storage::{CloudConfig, GcsConfig};
+use jammi_db::storage::{CloudConfig, GcsConfig};
 
 let conn = SourceConnection {
     url: Some("gs://archives/2026/jan.parquet".into()),
@@ -98,10 +98,10 @@ let conn = SourceConnection {
 ```
 
 ```rust,no_run
-# extern crate jammi_engine;
-# use jammi_engine::source::{FileFormat, SourceConnection};
+# extern crate jammi_db;
+# use jammi_db::source::{FileFormat, SourceConnection};
 # fn make() -> Result<SourceConnection, Box<dyn std::error::Error>> {
-use jammi_engine::storage::{AzureConfig, CloudConfig};
+use jammi_db::storage::{AzureConfig, CloudConfig};
 
 let conn = SourceConnection {
     url: Some("azure://snapshots/model_outputs.parquet".into()),
@@ -121,12 +121,12 @@ let conn = SourceConnection {
 `ResultStore` accepts a [`StorageUrl`] root, so embedding and inference outputs land in the same bucket as the source data:
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # use std::sync::Arc;
-# use jammi_engine::catalog::Catalog;
-# fn ex(catalog: Arc<Catalog>) -> jammi_engine::error::Result<()> {
-use jammi_engine::storage::{StorageRegistry, StorageUrl};
-use jammi_engine::store::ResultStore;
+# use jammi_db::catalog::Catalog;
+# fn ex(catalog: Arc<Catalog>) -> jammi_db::error::Result<()> {
+use jammi_db::storage::{StorageRegistry, StorageUrl};
+use jammi_db::store::ResultStore;
 use std::sync::Arc;
 
 let root = StorageUrl::parse("s3://benchmarks/jammi_db")?;

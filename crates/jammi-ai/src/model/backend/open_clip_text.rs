@@ -7,8 +7,8 @@
 //! classification/NER paths (those are BERT-family specific).
 
 use candle_core::{Device, Tensor};
+use jammi_db::error::{JammiError, Result};
 use jammi_encoders::ClipText;
-use jammi_engine::error::{JammiError, Result};
 
 use crate::model::tokenizer::BatchEncoding;
 

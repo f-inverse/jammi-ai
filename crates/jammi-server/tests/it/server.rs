@@ -53,7 +53,7 @@ async fn health_and_fallback() {
 
 #[test]
 fn server_config_validation() {
-    use jammi_engine::config::ServerConfig;
+    use jammi_db::config::ServerConfig;
 
     // Valid default
     assert!(ServerConfig::default().validate().is_ok());

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pyarrow as pa
 
-import jammi
+import jammi_ai
 
 
 def _events_schema() -> pa.Schema:
@@ -31,7 +31,7 @@ def _events_schema() -> pa.Schema:
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         artifact_dir = str(Path(tmp))
-        db = jammi.connect(artifact_dir=artifact_dir)
+        db = jammi_ai.connect(artifact_dir=artifact_dir)
 
         topic_id = db.register_topic(
             "events.demo",

@@ -7,7 +7,7 @@ use parquet::arrow::ArrowWriter;
 use crate::common;
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
-use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
 
 fn tiny_bert_model() -> String {

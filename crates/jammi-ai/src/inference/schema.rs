@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Float32Array, StringArray};
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use jammi_engine::error::Result;
+use jammi_db::error::Result;
 
 use super::adapter;
 use crate::model::ModelTask;

@@ -1,6 +1,6 @@
 """Python `Database.register_topic` / `drop_topic` round-trip.
 
-Exercises the PyO3 surface end-to-end: a `jammi.connect` session
+Exercises the PyO3 surface end-to-end: a `jammi_ai.connect` session
 registers a trigger-stream topic; the catalog row + backing mutable
 table + broker driver entry commit atomically; publish + subscribe land
 matching rows back through the Python binding.
@@ -12,7 +12,7 @@ Mirrors `test_tenant.py` in style; uses generic schema shapes
 import pyarrow as pa
 import pytest
 
-import jammi
+import jammi_ai
 
 
 TENANT_A = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a"
@@ -40,7 +40,7 @@ def _orders_schema() -> pa.Schema:
 def test_register_publish_subscribe_round_trips(tmp_path):
     """Register `events.demo`, publish one batch, read it back via
     `subscribe_collect`."""
-    db = jammi.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(artifact_dir=str(tmp_path))
     db.register_topic("events.demo", schema=_events_schema())
 
     batch = pa.table(
@@ -70,7 +70,7 @@ def test_register_publish_subscribe_round_trips(tmp_path):
 def test_register_with_broker_metadata(tmp_path):
     """`broker_metadata` is opaque driver config; the topic catalog round-
     trips it as-is and `list_topics` includes the registered topic."""
-    db = jammi.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(artifact_dir=str(tmp_path))
     db.register_topic(
         "cdc.orders",
         schema=_orders_schema(),
@@ -86,7 +86,7 @@ def test_register_inherits_session_tenant(tmp_path):
     session: bound to tenant A, `events.demo` appears in `list_topics`;
     re-bound to tenant B, the same call excludes the A-scoped topic;
     re-bound back to A, the topic is visible again."""
-    db = jammi.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(artifact_dir=str(tmp_path))
     db.with_tenant(TENANT_A)
     db.register_topic("events.demo", schema=_events_schema())
 
@@ -102,7 +102,7 @@ def test_register_inherits_session_tenant(tmp_path):
 def test_drop_missing_without_if_exists_raises(tmp_path):
     """`drop_topic` over an unknown name raises — the binding rejects with
     `ValueError`."""
-    db = jammi.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(artifact_dir=str(tmp_path))
     with pytest.raises((ValueError, RuntimeError)) as info:
         db.drop_topic("never.registered")
     msg = str(info.value).lower()
@@ -113,7 +113,7 @@ def test_drop_missing_without_if_exists_raises(tmp_path):
 
 def test_drop_missing_with_if_exists_succeeds(tmp_path):
     """`drop_topic(if_exists=True)` over an unknown name is a no-op."""
-    db = jammi.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(artifact_dir=str(tmp_path))
     db.drop_topic("never.registered", if_exists=True)
 
 
@@ -121,7 +121,7 @@ def test_register_rejects_unsupported_schema_type(tmp_path):
     """A topic schema with a column dtype outside the catalog encoder's
     closed set (e.g. `Timestamp`) raises with `UnsupportedSchemaType` —
     the engine's typed error from the band-aid fix surfaces verbatim."""
-    db = jammi.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(artifact_dir=str(tmp_path))
     schema_with_timestamp = pa.schema(
         [
             pa.field("event_id", pa.int64(), nullable=False),

@@ -27,14 +27,14 @@ boundary.
 ## Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate tokio;
 use std::str::FromStr;
-use jammi_engine::TenantId;
-use jammi_engine::session::JammiSession;
-use jammi_engine::config::JammiConfig;
+use jammi_db::TenantId;
+use jammi_db::session::JammiSession;
+use jammi_db::config::JammiConfig;
 
-# async fn ex() -> jammi_engine::error::Result<()> {
+# async fn ex() -> jammi_db::error::Result<()> {
 let config = JammiConfig::default();
 let alice = TenantId::from_str("018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9a")?;
 
@@ -52,9 +52,9 @@ across all references.
 ## Python
 
 ```python
-import jammi
+import jammi_ai
 
-db = jammi.connect(artifact_dir="/tmp/jammi")
+db = jammi_ai.connect(artifact_dir="/tmp/jammi")
 db.with_tenant("018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9a")
 
 # Subsequent calls observe Alice's tenant scope.

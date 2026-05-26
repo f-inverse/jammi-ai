@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use jammi_engine::catalog::Catalog;
-use jammi_engine::error::{JammiError, Result};
+use jammi_db::catalog::Catalog;
+use jammi_db::error::{JammiError, Result};
 
 use super::{BackendType, ModelId, ModelSource, ModelTask, ResolvedModel, TokenizerSource};
 

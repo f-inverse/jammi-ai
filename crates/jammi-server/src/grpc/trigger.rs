@@ -32,11 +32,11 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use jammi_engine::catalog::topic_repo::TopicRepo;
-use jammi_engine::trigger::{
+use jammi_db::catalog::topic_repo::TopicRepo;
+use jammi_db::trigger::{
     DeliveredBatch, Offset, Predicate, Publisher, Subscriber, TopicDefinition, TriggerError,
 };
-use jammi_engine::TenantId;
+use jammi_db::TenantId;
 
 use crate::grpc::proto::trigger::trigger_service_server::TriggerService;
 use crate::grpc::proto::trigger::{

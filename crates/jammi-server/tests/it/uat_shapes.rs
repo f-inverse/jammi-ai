@@ -18,10 +18,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use jammi_engine::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
-use jammi_engine::session::JammiSession;
-use jammi_engine::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
-use jammi_engine::ChannelId;
+use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
+use jammi_db::session::JammiSession;
+use jammi_db::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
+use jammi_db::ChannelId;
 use jammi_server::grpc::session::SessionStore;
 use jammi_server::TriggerHandles;
 use jammi_test_utils::test_config;
@@ -34,7 +34,7 @@ async fn fresh_session(dir: &TempDir) -> JammiSession {
         .expect("session")
 }
 
-fn widget_def() -> jammi_engine::store::mutable::definition::MutableTableDefinition {
+fn widget_def() -> jammi_db::store::mutable::definition::MutableTableDefinition {
     use arrow_schema::{DataType, Field, Schema};
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -87,7 +87,7 @@ async fn shape_a_embedded_library_exercises_all_primitives() {
     // Phase 3 in the embedded shape: bind a tenant, the same session
     // observes scoped reads on its own tables.
     use std::str::FromStr;
-    let t = jammi_engine::TenantId::from_str("018f5a0e-c4c8-7e10-9c4f-aaaaaaaaaaaa").unwrap();
+    let t = jammi_db::TenantId::from_str("018f5a0e-c4c8-7e10-9c4f-aaaaaaaaaaaa").unwrap();
     session.bind_tenant(t);
     assert_eq!(session.tenant(), Some(t));
 

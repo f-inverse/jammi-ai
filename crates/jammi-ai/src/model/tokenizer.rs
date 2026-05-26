@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use jammi_engine::error::JammiError;
+use jammi_db::error::JammiError;
 
 use super::clip_bpe::load_open_clip_bpe;
 

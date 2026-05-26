@@ -19,12 +19,12 @@ Register the training data as a source:
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
+# use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 session.add_source("training", SourceType::File, SourceConnection {
     url: Some("file:///data/training_pairs.csv".into()),
     format: Some(FileFormat::Csv),
@@ -44,13 +44,13 @@ db.add_source("training", path="/data/training_pairs.csv", format="csv")
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 use jammi_ai::fine_tune::FineTuneMethod;
-use jammi_engine::ModelTask;
+use jammi_db::ModelTask;
 
 let job = session.fine_tune(
     "training",
@@ -87,14 +87,14 @@ print(f"Model: {job.model_id}")
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
 # use jammi_ai::fine_tune::{FineTuneMethod, LrSchedule};
-# async fn ex(session: &InferenceSession, model: &str, columns: Vec<String>) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &InferenceSession, model: &str, columns: Vec<String>) -> jammi_db::error::Result<()> {
 use jammi_ai::fine_tune::FineTuneConfig;
-use jammi_engine::ModelTask;
+use jammi_db::ModelTask;
 
 let config = FineTuneConfig {
     lora_rank: 4,
@@ -140,12 +140,12 @@ The fine-tuned model is automatically registered and can be used anywhere a mode
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
 # use jammi_ai::fine_tune::job::FineTuneJob;
-# async fn ex(session: &InferenceSession, job: &FineTuneJob) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &InferenceSession, job: &FineTuneJob) -> jammi_db::error::Result<()> {
 let model_id = job.model_id();
 
 let embedding = session.encode_text_query(model_id, "quantum computing").await?;

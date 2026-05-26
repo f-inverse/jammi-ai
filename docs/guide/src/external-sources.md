@@ -7,12 +7,12 @@ Jammi federates external databases alongside local files. Register a database as
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
-use jammi_engine::source::{SourceConnection, SourceType};
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
+use jammi_db::source::{SourceConnection, SourceType};
 
 session.add_source("pg_data", SourceType::Postgres, SourceConnection {
     url: Some("postgresql://user:pass@localhost:5432/mydb".into()),
@@ -30,12 +30,12 @@ let results = session.sql(
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# use jammi_engine::source::{SourceConnection, SourceType};
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
+# use jammi_db::source::{SourceConnection, SourceType};
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 session.add_source("mysql_data", SourceType::Mysql, SourceConnection {
     url: Some("mysql://user:pass@localhost:3306/mydb".into()),
     ..Default::default()

@@ -29,12 +29,12 @@ impl std::fmt::Display for EvalTask {
 }
 
 impl std::str::FromStr for EvalTask {
-    type Err = jammi_engine::error::JammiError;
+    type Err = jammi_db::error::JammiError;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "classification" => Ok(Self::Classification),
             "ner" => Ok(Self::Ner),
-            other => Err(jammi_engine::error::JammiError::Other(format!(
+            other => Err(jammi_db::error::JammiError::Other(format!(
                 "Unknown eval task '{other}'. Expected: classification, ner"
             ))),
         }

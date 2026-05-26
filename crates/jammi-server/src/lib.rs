@@ -12,8 +12,8 @@ use axum::Router;
 use tokio::net::TcpListener;
 use tokio::signal;
 
-use jammi_engine::catalog::topic_repo::TopicRepo;
-use jammi_engine::trigger::{Publisher, Subscriber};
+use jammi_db::catalog::topic_repo::TopicRepo;
+use jammi_db::trigger::{Publisher, Subscriber};
 
 use crate::error::fallback_handler;
 use crate::routes::health;

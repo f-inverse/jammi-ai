@@ -8,7 +8,7 @@ mod search;
 use pyo3::prelude::*;
 use tracing_subscriber::EnvFilter;
 
-use jammi_engine::config::JammiConfig;
+use jammi_db::config::JammiConfig;
 
 use crate::error::to_pyerr;
 use crate::job::PyFineTuneJob;
@@ -25,10 +25,10 @@ pub use crate::database::PyDatabase;
 /// consumers need to name this to receive the `Arc<InferenceSession>`
 /// returned by [`PyDatabase::session_arc`] and share schema-upgrade lock,
 /// trigger broker, catalog cache, and tenant binding with the OSS
-/// `jammi.Database`.
+/// `jammi_ai.Database`.
 pub use jammi_ai::session::InferenceSession;
 
-/// Module entry point for `jammi._native`.
+/// Module entry point for `jammi_ai._native`.
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(connect, m)?)?;
@@ -55,7 +55,7 @@ fn connect(
     // Reads RUST_LOG; falls back to showing INFO from jammi crates only.
     // try_init() is a no-op if a subscriber was already installed.
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("jammi_ai=info,jammi_engine=info"));
+        .unwrap_or_else(|_| EnvFilter::new("jammi_ai=info,jammi_db=info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

@@ -21,10 +21,10 @@ use arrow::array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
-use jammi_engine::catalog::backend::BackendKind;
-use jammi_engine::session::JammiSession;
-use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
-use jammi_engine::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
+use jammi_db::catalog::backend::BackendKind;
+use jammi_db::session::JammiSession;
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
 use jammi_test_utils::make_test_session;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;

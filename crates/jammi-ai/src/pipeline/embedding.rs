@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use datafusion::physical_plan::ExecutionPlan;
 
-use jammi_engine::catalog::result_repo::ResultTableRecord;
-use jammi_engine::error::{JammiError, Result};
-use jammi_engine::index::sidecar::SidecarIndex;
-use jammi_engine::store::ResultStore;
+use jammi_db::catalog::result_repo::ResultTableRecord;
+use jammi_db::error::{JammiError, Result};
+use jammi_db::index::sidecar::SidecarIndex;
+use jammi_db::store::ResultStore;
 
 use crate::model::{ModelSource, ModelTask};
 use crate::operator::inference_exec::InferenceExecBuilder;
@@ -105,7 +105,7 @@ impl<'a> EmbeddingPipeline<'a> {
         .build()?;
 
         // Create ResultSink
-        let embedding_schema = jammi_engine::store::schema::embedding_table_schema(embedding_dim);
+        let embedding_schema = jammi_db::store::schema::embedding_table_schema(embedding_dim);
         let writer = self
             .result_store
             .open_writer(&table_info.parquet_url, embedding_schema)

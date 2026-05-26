@@ -11,8 +11,8 @@ TINY_BERT = f"local:{os.path.join(FIXTURES, 'tiny_bert')}"
 
 
 def make_db(tmpdir):
-    import jammi
-    return jammi.connect(artifact_dir=tmpdir, gpu_device=-1, inference_batch_size=8)
+    import jammi_ai
+    return jammi_ai.connect(artifact_dir=tmpdir, gpu_device=-1, inference_batch_size=8)
 
 
 def test_query_data_with_sql():

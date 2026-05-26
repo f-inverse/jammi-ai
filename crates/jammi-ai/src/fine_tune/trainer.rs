@@ -6,9 +6,9 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, StringArray};
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarMap};
-use jammi_engine::catalog::status::FineTuneJobStatus;
-use jammi_engine::catalog::Catalog;
-use jammi_engine::error::{JammiError, Result};
+use jammi_db::catalog::status::FineTuneJobStatus;
+use jammi_db::catalog::Catalog;
+use jammi_db::error::{JammiError, Result};
 
 use super::data::{TextChunk, TrainingDataLoader};
 use super::target::TrainingTarget;
@@ -493,7 +493,7 @@ impl TrainingLoop {
                     .set_fine_tune_output_model(&self.job_id, &output.output_model_id),
             )?;
             handle.block_on(self.catalog.register_model(
-                jammi_engine::catalog::model_repo::RegisterModelParams {
+                jammi_db::catalog::model_repo::RegisterModelParams {
                     model_id: &output.output_model_id,
                     version: 1,
                     model_type: "fine-tuned",

@@ -8,12 +8,12 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use jammi_engine::catalog::result_repo::CreateResultTableParams;
-use jammi_engine::catalog::status::ResultTableStatus;
-use jammi_engine::error::JammiError;
-use jammi_engine::model_task::ModelTask;
-use jammi_engine::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
-use jammi_engine::store::schema::embedding_table_schema;
+use jammi_db::catalog::result_repo::CreateResultTableParams;
+use jammi_db::catalog::status::ResultTableStatus;
+use jammi_db::error::JammiError;
+use jammi_db::model_task::ModelTask;
+use jammi_db::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
+use jammi_db::store::schema::embedding_table_schema;
 use jammi_test_utils::make_test_session;
 use tempfile::tempdir;
 
@@ -39,12 +39,9 @@ fn fixed_size_list_from(rows: &[Vec<f32>], dim: i32) -> FixedSizeListArray {
 #[tokio::test]
 async fn read_vectors_returns_input_rows_byte_for_byte() {
     let dir = tempdir().unwrap();
-    let session = make_test_session(
-        jammi_engine::catalog::backend::BackendKind::Sqlite,
-        dir.path(),
-    )
-    .await
-    .expect("sqlite session");
+    let session = make_test_session(jammi_db::catalog::backend::BackendKind::Sqlite, dir.path())
+        .await
+        .expect("sqlite session");
 
     let dim = 4_i32;
     let schema = embedding_table_schema(dim as usize);
@@ -119,12 +116,9 @@ async fn read_vectors_surfaces_typed_schema_error_on_wrong_column_shape() {
     // see a typed signal instead of the panic-on-downcast the OSS path used
     // to emit when consumers reached straight at the parquet.
     let dir = tempdir().unwrap();
-    let session = make_test_session(
-        jammi_engine::catalog::backend::BackendKind::Sqlite,
-        dir.path(),
-    )
-    .await
-    .expect("sqlite session");
+    let session = make_test_session(jammi_db::catalog::backend::BackendKind::Sqlite, dir.path())
+        .await
+        .expect("sqlite session");
 
     let wrong_schema = Arc::new(Schema::new(vec![
         Field::new("_row_id", DataType::Utf8, false),

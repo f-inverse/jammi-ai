@@ -1,7 +1,7 @@
 //! SPEC-04 §15 #5b — `TriggerService.Publish` + `TriggerService.Subscribe`
 //! over a real Tonic gRPC transport.
 //!
-//! The engine-level trigger tests in `crates/jammi-engine/tests/it/trigger.rs`
+//! The engine-level trigger tests in `crates/jammi-db/tests/it/trigger.rs`
 //! exercise the publisher/subscriber surface directly; this module verifies
 //! the wire path: an in-process Tonic server hosting `SessionService` +
 //! `TriggerService` behind the shared `TenantInterceptor`, two client
@@ -24,8 +24,8 @@ use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::StreamExt;
-use jammi_engine::session::JammiSession;
-use jammi_engine::TenantId;
+use jammi_db::session::JammiSession;
+use jammi_db::TenantId;
 use jammi_server::grpc::proto::session::session_service_client::SessionServiceClient;
 use jammi_server::grpc::proto::session::{SetTenantRequest, Tenant};
 use jammi_server::grpc::proto::trigger::trigger_service_client::TriggerServiceClient;

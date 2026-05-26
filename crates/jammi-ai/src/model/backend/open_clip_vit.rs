@@ -7,7 +7,7 @@ use candle_core::{IndexOp, Module, Result as CandleResult, Tensor, D};
 use candle_nn::{
     conv2d_no_bias, layer_norm, linear, Conv2d, Conv2dConfig, LayerNorm, Linear, VarBuilder,
 };
-use jammi_engine::error::{JammiError, Result};
+use jammi_db::error::{JammiError, Result};
 
 /// Configuration for an OpenCLIP vision transformer.
 /// Default CLIP normalization constants (used when preprocess_cfg is absent).

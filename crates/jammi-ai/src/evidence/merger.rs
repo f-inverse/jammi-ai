@@ -12,10 +12,10 @@ use arrow::array::{new_null_array, ArrayRef, ListArray, RecordBatch, StringArray
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema};
 
-use jammi_engine::catalog::channel_repo::ChannelSpec;
-use jammi_engine::catalog::Catalog;
-use jammi_engine::error::{JammiError, Result};
-use jammi_engine::ChannelId;
+use jammi_db::catalog::channel_repo::ChannelSpec;
+use jammi_db::catalog::Catalog;
+use jammi_db::error::{JammiError, Result};
+use jammi_db::ChannelId;
 
 use super::channel::ChannelContribution;
 
@@ -216,7 +216,7 @@ mod tests {
     use super::*;
     use arrow::array::{Array, Float32Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
-    use jammi_engine::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
+    use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
     use tempfile::tempdir;
 
     async fn open_catalog() -> (tempfile::TempDir, Catalog) {

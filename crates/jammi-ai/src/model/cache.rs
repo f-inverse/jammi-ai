@@ -2,8 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use jammi_engine::catalog::model_repo::RegisterModelParams;
-use jammi_engine::error::{JammiError, Result};
+use jammi_db::catalog::model_repo::RegisterModelParams;
+use jammi_db::error::{JammiError, Result};
 use tokio::sync::RwLock;
 
 use super::backend::candle::CandleBackend;

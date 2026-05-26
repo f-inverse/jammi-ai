@@ -5,13 +5,13 @@ This walkthrough registers a local data file, runs a SQL query, generates embedd
 ## Full example
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 use std::sync::Arc;
 use jammi_ai::session::InferenceSession;
-use jammi_engine::config::JammiConfig;
-use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::config::JammiConfig;
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

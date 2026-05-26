@@ -1,4 +1,4 @@
-use jammi_engine::error::{JammiError, Result};
+use jammi_db::error::{JammiError, Result};
 
 use super::{DeviceConfig, ModelBackend};
 use crate::model::{LoadedModel, ModelDimensions, ResolvedModel};

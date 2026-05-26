@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use jammi_engine::error::{JammiError, Result};
+use jammi_db::error::{JammiError, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 

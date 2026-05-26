@@ -16,17 +16,17 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use clap::{ArgGroup, Subcommand};
 use datafusion::execution::context::SessionContext;
 use futures::StreamExt;
-use jammi_engine::catalog::backend::BackendImpl;
-use jammi_engine::catalog::backend_sqlite::SqliteBackend;
-use jammi_engine::catalog::topic_repo::TopicRepo;
-use jammi_engine::catalog::Catalog;
-use jammi_engine::config::JammiConfig;
-use jammi_engine::source::mutable::MutableTableRegistry;
-use jammi_engine::store::mutable::sqlite::SqliteMutableBackend;
-use jammi_engine::store::mutable::MutableBackend;
-use jammi_engine::tenant::TenantContext;
-use jammi_engine::tenant_scope::TenantBinding;
-use jammi_engine::trigger::{
+use jammi_db::catalog::backend::BackendImpl;
+use jammi_db::catalog::backend_sqlite::SqliteBackend;
+use jammi_db::catalog::topic_repo::TopicRepo;
+use jammi_db::catalog::Catalog;
+use jammi_db::config::JammiConfig;
+use jammi_db::source::mutable::MutableTableRegistry;
+use jammi_db::store::mutable::sqlite::SqliteMutableBackend;
+use jammi_db::store::mutable::MutableBackend;
+use jammi_db::tenant::TenantContext;
+use jammi_db::tenant_scope::TenantBinding;
+use jammi_db::trigger::{
     DeliveredBatch, InMemoryBroker, Offset, Predicate, Publisher, Subscriber, TopicDefinition,
     TopicId, TriggerBroker,
 };
@@ -111,7 +111,7 @@ struct Handles {
 
 async fn build_handles(
     config: JammiConfig,
-    tenant: Option<jammi_engine::TenantId>,
+    tenant: Option<jammi_db::TenantId>,
 ) -> Result<Handles, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&config.artifact_dir)?;
     let db_path = config.artifact_dir.join("catalog.db");
@@ -153,7 +153,7 @@ async fn build_handles(
 
 pub async fn run(
     config: JammiConfig,
-    tenant: Option<jammi_engine::TenantId>,
+    tenant: Option<jammi_db::TenantId>,
     action: TriggerAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let handles = build_handles(config, tenant).await?;
@@ -180,7 +180,7 @@ pub async fn run(
 
 async fn list_topics(
     handles: &Handles,
-    tenant: Option<jammi_engine::TenantId>,
+    tenant: Option<jammi_db::TenantId>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let topics = handles.topic_repo.list_topics(tenant).await?;
     if topics.is_empty() {
@@ -210,7 +210,7 @@ async fn list_topics(
 
 async fn register_topic(
     handles: &Handles,
-    tenant: Option<jammi_engine::TenantId>,
+    tenant: Option<jammi_db::TenantId>,
     name: &str,
     schema_spec: &str,
     broker_metadata: &str,
@@ -233,7 +233,7 @@ async fn register_topic(
 
 async fn publish_rows(
     handles: &Handles,
-    tenant: Option<jammi_engine::TenantId>,
+    tenant: Option<jammi_db::TenantId>,
     name: &str,
     rows: &[String],
     json_file: Option<&Path>,
@@ -269,7 +269,7 @@ async fn publish_rows(
 
 async fn subscribe_topic(
     handles: &Handles,
-    tenant: Option<jammi_engine::TenantId>,
+    tenant: Option<jammi_db::TenantId>,
     name: &str,
     predicate: &str,
     from_offset: Option<u64>,

@@ -6,7 +6,7 @@
 use candle_core::{Device, Tensor};
 use image::imageops::FilterType;
 use image::DynamicImage;
-use jammi_engine::error::{JammiError, Result};
+use jammi_db::error::{JammiError, Result};
 
 /// Preprocess a batch of images into a model-ready tensor.
 ///

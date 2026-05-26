@@ -31,10 +31,10 @@ use std::time::{Duration, Instant};
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use jammi_engine::catalog::backend::TxOptions;
-use jammi_engine::session::JammiSession;
-use jammi_engine::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
-use jammi_engine::store::mutable::test_hook::{CHECKPOINT_AFTER_ENV, READY_FILE_ENV};
+use jammi_db::catalog::backend::TxOptions;
+use jammi_db::session::JammiSession;
+use jammi_db::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
+use jammi_db::store::mutable::test_hook::{CHECKPOINT_AFTER_ENV, READY_FILE_ENV};
 
 use crate::common;
 
@@ -85,12 +85,12 @@ async fn child_workload() {
                 registry
                     .insert_batch(tx, &id, &b1)
                     .await
-                    .map_err(|e| jammi_engine::BackendError::Execution(e.to_string()))?;
+                    .map_err(|e| jammi_db::BackendError::Execution(e.to_string()))?;
                 registry
                     .insert_batch(tx, &id, &b2)
                     .await
-                    .map_err(|e| jammi_engine::BackendError::Execution(e.to_string()))?;
-                Ok::<(), jammi_engine::BackendError>(())
+                    .map_err(|e| jammi_db::BackendError::Execution(e.to_string()))?;
+                Ok::<(), jammi_db::BackendError>(())
             })
         })
         .await;

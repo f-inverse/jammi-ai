@@ -83,7 +83,7 @@ fn contract_classification_adapter_schema_matches_adapt_output() {
 #[tokio::test]
 async fn text_embeddings_via_open_clip_share_latent_dim_with_vision() {
     use jammi_ai::session::InferenceSession;
-    use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+    use jammi_db::source::{FileFormat, SourceConnection, SourceType};
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -169,7 +169,7 @@ mod live {
     use arrow::array::{Float32Array, StringArray};
     use jammi_ai::model::{ModelSource, ModelTask};
     use jammi_ai::session::InferenceSession;
-    use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+    use jammi_db::source::{FileFormat, SourceConnection, SourceType};
     use serial_test::serial;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -256,11 +256,7 @@ mod live {
         use jammi_ai::model::resolver::ModelResolver;
 
         let dir = tempdir().unwrap();
-        let catalog = Arc::new(
-            jammi_engine::catalog::Catalog::open(dir.path())
-                .await
-                .unwrap(),
-        );
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(dir.path()).await.unwrap());
         let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
         let device_config = DeviceConfig {
             gpu_device: -1,
@@ -364,11 +360,7 @@ mod live {
         use jammi_ai::model::resolver::ModelResolver;
 
         let dir = tempdir().unwrap();
-        let catalog = Arc::new(
-            jammi_engine::catalog::Catalog::open(dir.path())
-                .await
-                .unwrap(),
-        );
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(dir.path()).await.unwrap());
         let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
         let device_config = DeviceConfig {
             gpu_device: -1,

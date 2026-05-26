@@ -11,7 +11,7 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 use image::DynamicImage;
-use jammi_engine::error::{JammiError, Result};
+use jammi_db::error::{JammiError, Result};
 
 /// Extract text from Arrow string columns (handles Utf8, LargeUtf8, and Utf8View).
 /// If multiple columns, concatenate with " " separator.

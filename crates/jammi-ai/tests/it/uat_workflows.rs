@@ -21,11 +21,11 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Float32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use jammi_engine::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
-use jammi_engine::session::JammiSession;
-use jammi_engine::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
-use jammi_engine::trigger::Predicate;
-use jammi_engine::{ChannelId, TenantId};
+use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
+use jammi_db::session::JammiSession;
+use jammi_db::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
+use jammi_db::trigger::Predicate;
+use jammi_db::{ChannelId, TenantId};
 use tempfile::tempdir;
 
 use crate::common;
@@ -308,7 +308,7 @@ async fn uat_workflow_c_cdc_pipeline_isolates_tenants_and_predicates() {
         .subscribe(
             &topic,
             predicate,
-            Some(jammi_engine::trigger::Offset::new(0, chrono::Utc::now())),
+            Some(jammi_db::trigger::Offset::new(0, chrono::Utc::now())),
         )
         .await
         .unwrap();

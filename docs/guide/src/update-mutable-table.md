@@ -112,15 +112,15 @@ Two lower-level methods bypass DataFusion's planner for high-throughput
 event paths:
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate arrow;
 # extern crate tokio;
 # async fn ex(
-#     session: &jammi_engine::session::JammiSession,
+#     session: &jammi_db::session::JammiSession,
 #     batch: arrow::array::RecordBatch,
-# ) -> jammi_engine::error::Result<()> {
-use jammi_engine::store::mutable::definition::MutableTableId;
-use jammi_engine::catalog::backend::TxOptions;
+# ) -> jammi_db::error::Result<()> {
+use jammi_db::store::mutable::definition::MutableTableId;
+use jammi_db::catalog::backend::TxOptions;
 
 let id = MutableTableId::new("events").unwrap();
 let registry = session.mutable_tables_arc();
@@ -136,8 +136,8 @@ backend
             registry
                 .insert_batch(tx, &id, &batch)
                 .await
-                .map_err(|e| jammi_engine::BackendError::Execution(e.to_string()))?;
-            Ok::<(), jammi_engine::BackendError>(())
+                .map_err(|e| jammi_db::BackendError::Execution(e.to_string()))?;
+            Ok::<(), jammi_db::BackendError>(())
         })
     })
     .await?;
@@ -146,14 +146,14 @@ backend
 ```
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate futures;
 # extern crate tokio;
 # use futures::StreamExt;
 # async fn ex(
-#     session: &jammi_engine::session::JammiSession,
-# ) -> jammi_engine::error::Result<()> {
-use jammi_engine::store::mutable::definition::MutableTableId;
+#     session: &jammi_db::session::JammiSession,
+# ) -> jammi_db::error::Result<()> {
+use jammi_db::store::mutable::definition::MutableTableId;
 
 let id = MutableTableId::new("events").unwrap();
 // Stream rows where the registered `order_column` value > 100.
@@ -161,10 +161,10 @@ let mut stream = session
     .mutable_tables()
     .scan_after(&id, 100)
     .await
-    .map_err(|e| jammi_engine::error::JammiError::Catalog(e.to_string()))?;
+    .map_err(|e| jammi_db::error::JammiError::Catalog(e.to_string()))?;
 while let Some(batch) = stream.next().await {
     let _batch = batch
-        .map_err(|e| jammi_engine::error::JammiError::Catalog(e.to_string()))?;
+        .map_err(|e| jammi_db::error::JammiError::Catalog(e.to_string()))?;
     // …
 }
 # Ok(())

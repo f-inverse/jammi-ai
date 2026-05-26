@@ -1,5 +1,5 @@
-use jammi_engine::index::sidecar::SidecarIndex;
-use jammi_engine::index::VectorIndex;
+use jammi_db::index::sidecar::SidecarIndex;
+use jammi_db::index::VectorIndex;
 use tempfile::tempdir;
 
 // ─── SidecarIndex: add, search, edge cases ───────────────────────────────────

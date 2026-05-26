@@ -5,7 +5,7 @@ use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
-use jammi_engine::error::{JammiError, Result};
+use jammi_db::error::{JammiError, Result};
 use tokio::sync::mpsc::Sender;
 
 use super::adapter::{

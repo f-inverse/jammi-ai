@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use datafusion::physical_plan::ExecutionPlan;
-use jammi_engine::catalog::result_repo::ResultTableRecord;
-use jammi_engine::config::JammiConfig;
-use jammi_engine::error::{JammiError, Result};
-use jammi_engine::session::JammiSession;
-use jammi_engine::source::{SourceConnection, SourceType};
-use jammi_engine::store::ResultStore;
+use jammi_db::catalog::result_repo::ResultTableRecord;
+use jammi_db::config::JammiConfig;
+use jammi_db::error::{JammiError, Result};
+use jammi_db::session::JammiSession;
+use jammi_db::source::{SourceConnection, SourceType};
+use jammi_db::store::ResultStore;
 
 use crate::concurrency::GpuScheduler;
 use crate::eval::runner::EvalRunner;
@@ -21,7 +21,7 @@ use crate::model::{ModelSource, ModelTask};
 use crate::operator::inference_exec::InferenceExecBuilder;
 use crate::pipeline::embedding::EmbeddingPipeline;
 use crate::search::SearchBuilder;
-use jammi_engine::cache::ann_cache::AnnCache;
+use jammi_db::cache::ann_cache::AnnCache;
 
 /// An inference-capable session that wraps `JammiSession` with model loading
 /// and inference execution. This is the primary entry point for CP2+.
@@ -51,15 +51,15 @@ impl InferenceSession {
 
     /// Create a session whose trigger-stream surface is bound to a
     /// caller-supplied broker. Forwarded to
-    /// [`jammi_engine::session::JammiSession::with_broker`]; the
+    /// [`jammi_db::session::JammiSession::with_broker`]; the
     /// `InferenceSession` adds model-loading, eval, and inference layers on
     /// top. Used by tests that need a broker with controlled behaviour, e.g.
-    /// an [`jammi_engine::trigger::InMemoryBroker`] armed with
+    /// an [`jammi_db::trigger::InMemoryBroker`] armed with
     /// `trigger_failure_for_next_publish` to deterministically exercise
     /// publisher-failure paths.
     pub async fn with_broker(
         config: JammiConfig,
-        trigger_broker: Arc<dyn jammi_engine::trigger::TriggerBroker>,
+        trigger_broker: Arc<dyn jammi_db::trigger::TriggerBroker>,
     ) -> Result<Self> {
         let inner = JammiSession::with_broker(config, trigger_broker).await?;
         Self::wrap(inner, None).await
@@ -121,28 +121,28 @@ impl InferenceSession {
     }
 
     /// Access the catalog.
-    pub fn catalog(&self) -> &jammi_engine::catalog::Catalog {
+    pub fn catalog(&self) -> &jammi_db::catalog::Catalog {
         self.inner.catalog()
     }
 
     /// Access the topic-catalog repo (used by trigger-stream callers that
     /// do not want to go through Flight SQL DDL).
-    pub fn topic_repo(&self) -> Arc<jammi_engine::catalog::topic_repo::TopicRepo> {
+    pub fn topic_repo(&self) -> Arc<jammi_db::catalog::topic_repo::TopicRepo> {
         self.inner.topic_repo()
     }
 
     /// Access the trigger-stream publisher.
-    pub fn publisher(&self) -> Arc<jammi_engine::trigger::Publisher> {
+    pub fn publisher(&self) -> Arc<jammi_db::trigger::Publisher> {
         self.inner.publisher()
     }
 
     /// Access the trigger-stream subscriber.
-    pub fn subscriber(&self) -> Arc<jammi_engine::trigger::Subscriber> {
+    pub fn subscriber(&self) -> Arc<jammi_db::trigger::Subscriber> {
         self.inner.subscriber()
     }
 
     /// Access the trigger broker the session was constructed with.
-    pub fn trigger_broker(&self) -> Arc<dyn jammi_engine::trigger::TriggerBroker> {
+    pub fn trigger_broker(&self) -> Arc<dyn jammi_db::trigger::TriggerBroker> {
         self.inner.trigger_broker()
     }
 
@@ -151,21 +151,21 @@ impl InferenceSession {
     /// federates Parquet result tables and external sources.
     pub async fn create_mutable_table(
         &self,
-        def: jammi_engine::store::mutable::MutableTableDefinition,
-    ) -> Result<jammi_engine::store::mutable::MutableTableId> {
+        def: jammi_db::store::mutable::MutableTableDefinition,
+    ) -> Result<jammi_db::store::mutable::MutableTableId> {
         self.inner.create_mutable_table(def).await
     }
 
     /// Drop a mutable companion table.
     pub async fn drop_mutable_table(
         &self,
-        id: &jammi_engine::store::mutable::MutableTableId,
+        id: &jammi_db::store::mutable::MutableTableId,
     ) -> Result<()> {
         self.inner.drop_mutable_table(id).await
     }
 
     /// Reference to the mutable-table registry.
-    pub fn mutable_tables(&self) -> &jammi_engine::source::mutable::MutableTableRegistry {
+    pub fn mutable_tables(&self) -> &jammi_db::source::mutable::MutableTableRegistry {
         self.inner.mutable_tables()
     }
 
@@ -175,7 +175,7 @@ impl InferenceSession {
     /// This is the sticky form: it mutates session-shared state. For
     /// concurrent gRPC request handlers on a shared `Arc<InferenceSession>`,
     /// prefer [`Self::with_tenant_scoped`].
-    pub fn bind_tenant(&self, t: jammi_engine::TenantId) {
+    pub fn bind_tenant(&self, t: jammi_db::TenantId) {
         self.inner.bind_tenant(t);
     }
 
@@ -185,7 +185,7 @@ impl InferenceSession {
     }
 
     /// Return the tenant currently bound, if any.
-    pub fn tenant(&self) -> Option<jammi_engine::TenantId> {
+    pub fn tenant(&self) -> Option<jammi_db::TenantId> {
         self.inner.tenant()
     }
 
@@ -198,16 +198,12 @@ impl InferenceSession {
     /// `Arc<RwLock<TenantContext>>` because no shared write happens in the
     /// scoped path.
     ///
-    /// Delegates to [`jammi_engine::session::JammiSession::with_tenant_scoped`];
+    /// Delegates to [`jammi_db::session::JammiSession::with_tenant_scoped`];
     /// see that method for the design rationale (Option β: task-local
     /// override rather than per-call session rebuild).
-    pub async fn with_tenant_scoped<'a, F, Fut, T>(
-        &'a self,
-        tenant: jammi_engine::TenantId,
-        f: F,
-    ) -> T
+    pub async fn with_tenant_scoped<'a, F, Fut, T>(&'a self, tenant: jammi_db::TenantId, f: F) -> T
     where
-        F: FnOnce(jammi_engine::TenantScope<'a>) -> Fut,
+        F: FnOnce(jammi_db::TenantScope<'a>) -> Fut,
         Fut: std::future::Future<Output = T> + 'a,
     {
         self.inner.with_tenant_scoped(tenant, f).await
@@ -218,7 +214,7 @@ impl InferenceSession {
     ///
     /// Cross-tenant administrative reads (server-startup recovery scans,
     /// background audit jobs) live here. The closure receives an
-    /// [`jammi_engine::AdminScope`] handle whose [`jammi_engine::AdminScope::sql`] returns
+    /// [`jammi_db::AdminScope`] handle whose [`jammi_db::AdminScope::sql`] returns
     /// fully materialised batches; once the closure resolves, subsequent
     /// reads on the same session are tenant-filtered again.
     ///
@@ -226,11 +222,11 @@ impl InferenceSession {
     /// must invoke it only from in-process administrative code paths, not
     /// from a request handler.
     ///
-    /// Delegates to [`jammi_engine::session::JammiSession::with_admin_scope`];
+    /// Delegates to [`jammi_db::session::JammiSession::with_admin_scope`];
     /// see that method for the safety contract.
     pub async fn with_admin_scope<'a, F, Fut, T>(&'a self, f: F) -> T
     where
-        F: FnOnce(jammi_engine::AdminScope<'a>) -> Fut,
+        F: FnOnce(jammi_db::AdminScope<'a>) -> Fut,
         Fut: std::future::Future<Output = T> + 'a,
     {
         self.inner.with_admin_scope(f).await
@@ -252,7 +248,7 @@ impl InferenceSession {
     }
 
     /// Access the engine configuration.
-    pub fn inner_config(&self) -> &jammi_engine::config::JammiConfig {
+    pub fn inner_config(&self) -> &jammi_db::config::JammiConfig {
         self.inner.config()
     }
 
@@ -324,7 +320,7 @@ impl InferenceSession {
     /// registry (so cloud credentials registered with the session are
     /// inherited) and surfaces [`JammiError::Schema`] when the column is not
     /// shaped `FixedSizeList<Float32>`. Delegates to
-    /// [`jammi_engine::session::JammiSession::read_vectors`].
+    /// [`jammi_db::session::JammiSession::read_vectors`].
     pub async fn read_vectors(&self, table: &ResultTableRecord) -> Result<Vec<Vec<f32>>> {
         self.inner.read_vectors(table).await
     }
@@ -522,7 +518,7 @@ impl InferenceSession {
         if self.catalog().get_model(&canonical_name).await?.is_none() {
             if let Err(e) = self
                 .catalog()
-                .register_model(jammi_engine::catalog::model_repo::RegisterModelParams {
+                .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
                     model_id: &canonical_name,
                     version: 1,
                     model_type: "embedding",
@@ -884,11 +880,11 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// Record a terminal `Failed` status for a fine-tune job, surfacing the cause
 /// via the catalog metrics blob so callers polling `FineTuneJob::wait()` see
 /// the failure instead of an indefinite `Running` state.
-fn record_failed(catalog: &Arc<jammi_engine::catalog::Catalog>, job_id: &str, msg: String) {
+fn record_failed(catalog: &Arc<jammi_db::catalog::Catalog>, job_id: &str, msg: String) {
     let metrics = serde_json::json!({ "error_message": msg }).to_string();
     if let Err(e) = tokio::runtime::Handle::current().block_on(catalog.update_fine_tune_status(
         job_id,
-        jammi_engine::catalog::status::FineTuneJobStatus::Failed,
+        jammi_db::catalog::status::FineTuneJobStatus::Failed,
         Some(&metrics),
     )) {
         tracing::error!(job_id = %job_id, error = %e, "Failed to record terminal status");
@@ -898,7 +894,7 @@ fn record_failed(catalog: &Arc<jammi_engine::catalog::Catalog>, job_id: &str, ms
 /// Run fine-tuning in a blocking context.
 #[allow(clippy::too_many_arguments)]
 fn run_fine_tune_blocking(
-    catalog: Arc<jammi_engine::catalog::Catalog>,
+    catalog: Arc<jammi_db::catalog::Catalog>,
     artifact_dir: std::path::PathBuf,
     job_id: String,
     output_model_id: String,
@@ -984,7 +980,7 @@ fn run_fine_tune_blocking(
 /// metadata that pairs with the trained tensors on disk.
 fn build_encoder_adapters(
     base_model_id: &str,
-    catalog: &Arc<jammi_engine::catalog::Catalog>,
+    catalog: &Arc<jammi_db::catalog::Catalog>,
     config: &FineTuneConfig,
     varmap: &candle_nn::VarMap,
     device: &candle_core::Device,

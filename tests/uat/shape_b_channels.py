@@ -7,7 +7,7 @@ that the PyO3 binding contract Item 1 shipped is wired end-to-end.
 
 The "over Flight SQL + gRPC" wire variant is queued for a future
 iteration — the substrate-side surface is exercised here through the
-embedded `jammi.connect` path, which is what every adopter who builds
+embedded `jammi_ai.connect` path, which is what every adopter who builds
 on the PyO3 surface will see.
 
 Run with `python3 tests/uat/shape_b_channels.py`. Exits 0 on success.
@@ -19,13 +19,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-import jammi
+import jammi_ai
 
 
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         artifact_dir = str(Path(tmp))
-        db = jammi.connect(artifact_dir=artifact_dir)
+        db = jammi_ai.connect(artifact_dir=artifact_dir)
 
         db.register_channel(
             "scored_by",

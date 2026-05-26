@@ -38,12 +38,12 @@ analyzer rule does a string comparison after coercing the column to
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate tokio;
-use jammi_engine::session::JammiSession;
-use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::session::JammiSession;
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
-# async fn ex(session: &JammiSession) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &JammiSession) -> jammi_db::error::Result<()> {
 session
     .add_source(
         "notes",
@@ -70,8 +70,8 @@ db.add_source("notes", path="/data/notes.parquet", format="parquet")
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
-# use jammi_engine::session::JammiSession;
+# extern crate jammi_db;
+# use jammi_db::session::JammiSession;
 # fn ex(session: &JammiSession) {
 session.set_source_tenant_column("notes", Some("customer_id".into()));
 # }
@@ -100,13 +100,13 @@ globally visible.
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate tokio;
 # use std::str::FromStr;
-# use jammi_engine::TenantId;
-# use jammi_engine::session::JammiSession;
-# use jammi_engine::config::JammiConfig;
-# async fn ex() -> jammi_engine::error::Result<()> {
+# use jammi_db::TenantId;
+# use jammi_db::session::JammiSession;
+# use jammi_db::config::JammiConfig;
+# async fn ex() -> jammi_db::error::Result<()> {
 let alice = TenantId::from_str("018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9a")?;
 let bob = TenantId::from_str("018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9b")?;
 

@@ -17,7 +17,7 @@ use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
 use tonic::{Request, Response, Status};
 
-use jammi_engine::TenantId;
+use jammi_db::TenantId;
 
 use super::proto::session::session_service_server::SessionService;
 use super::proto::session::{GetTenantResponse, SetTenantRequest, Tenant};

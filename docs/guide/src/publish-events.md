@@ -56,10 +56,10 @@ The simplest path is the SQL surface — `session.sql("CREATE TOPIC …")`
 parses the same statement Flight SQL clients send across the wire:
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate tokio;
-# use jammi_engine::session::JammiSession;
-# async fn ex(session: &JammiSession) -> jammi_engine::error::Result<()> {
+# use jammi_db::session::JammiSession;
+# async fn ex(session: &JammiSession) -> jammi_db::error::Result<()> {
 session
     .sql(
         "CREATE TOPIC cdc.orders (\
@@ -75,9 +75,9 @@ session
 The CLI exposes the same shape via `jammi trigger register --name … --schema …`.
 
 ```python
-import jammi
+import jammi_ai
 
-db = jammi.connect(artifact_dir="/var/lib/jammi")
+db = jammi_ai.connect(artifact_dir="/var/lib/jammi")
 db.sql(
     """
     CREATE TOPIC cdc.orders (
@@ -94,12 +94,12 @@ For callers that build the topic programmatically (rather than via SQL),
 the Rust API surface is equivalent:
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate arrow_schema;
 # use std::collections::BTreeMap;
 # use std::sync::Arc;
 # use arrow_schema::SchemaRef;
-use jammi_engine::trigger::{TopicDefinition, TopicId};
+use jammi_db::trigger::{TopicDefinition, TopicId};
 
 # fn make(schema: SchemaRef) -> TopicDefinition {
 let topic = TopicDefinition {
@@ -122,15 +122,15 @@ Registration is atomic: the `topics` row, the backing mutable table,
 and any broker-side state commit together; nothing lands on failure.
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate tokio;
 # use std::sync::Arc;
-# use jammi_engine::trigger::{TopicDefinition, TriggerBroker};
+# use jammi_db::trigger::{TopicDefinition, TriggerBroker};
 # async fn ex(
-#     topic_repo: &jammi_engine::catalog::topic_repo::TopicRepo,
+#     topic_repo: &jammi_db::catalog::topic_repo::TopicRepo,
 #     broker: Arc<dyn TriggerBroker>,
 #     topic: &TopicDefinition,
-# ) -> Result<(), jammi_engine::trigger::TriggerError> {
+# ) -> Result<(), jammi_db::trigger::TriggerError> {
 broker.register_topic(topic).await?;
 topic_repo.register_topic(topic).await?;
 # Ok(())
@@ -140,21 +140,21 @@ topic_repo.register_topic(topic).await?;
 ## Publish a batch
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate arrow;
 # extern crate arrow_schema;
 # extern crate tokio;
 # use std::sync::Arc;
 # use arrow::array::{Int64Array, RecordBatch, StringArray};
 # use arrow_schema::SchemaRef;
-# use jammi_engine::trigger::{Publisher, TopicDefinition};
-# use jammi_engine::TenantId;
+# use jammi_db::trigger::{Publisher, TopicDefinition};
+# use jammi_db::TenantId;
 # async fn ex(
 #     publisher: &Publisher,
 #     topic: &TopicDefinition,
 #     schema: SchemaRef,
 #     tenant: Option<TenantId>,
-# ) -> Result<(), jammi_engine::trigger::TriggerError> {
+# ) -> Result<(), jammi_db::trigger::TriggerError> {
 let batch = RecordBatch::try_new(
     schema,
     vec![

@@ -17,10 +17,10 @@ pip install jammi-ai-cu12
 ## Quickstart
 
 ```python
-import jammi
+import jammi_ai
 
 # Connect (pass gpu_device=-1 to force CPU)
-db = jammi.connect()
+db = jammi_ai.connect()
 
 # Register a local data source
 db.add_source("patents", path="patents.parquet", format="parquet")

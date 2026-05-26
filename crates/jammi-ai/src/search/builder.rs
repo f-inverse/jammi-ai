@@ -13,9 +13,9 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
 
-use jammi_engine::catalog::Catalog;
-use jammi_engine::error::{JammiError, Result};
-use jammi_engine::ChannelId;
+use jammi_db::catalog::Catalog;
+use jammi_db::error::{JammiError, Result};
+use jammi_db::ChannelId;
 
 use crate::evidence::{merge_channels, ChannelContribution};
 use crate::operator::ann_search_exec::AnnSearchExec;

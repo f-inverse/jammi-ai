@@ -34,10 +34,10 @@ For multi-language access or BI tool integration, `jammi serve` starts an Arrow 
 
 | Crate | Purpose |
 |-------|---------|
-| `jammi-engine` | Query engine, configuration, catalog, source management, Parquet storage, ANN indexes |
+| `jammi-db` | Query engine, configuration, catalog, source management, Parquet storage, ANN indexes |
 | `jammi-ai` | Model loading, inference execution, embedding pipeline, vector search, evidence model, fine-tuning, evaluation |
 | `jammi-server` | Arrow Flight SQL server and HTTP health endpoint |
 | `jammi-cli` | Command-line interface |
 | `jammi-python` | Python bindings via PyO3 |
 
-`jammi-engine` has no dependency on `jammi-ai`. You can use it standalone for SQL queries over local data without pulling in the AI layer.
+`jammi-db` has no dependency on `jammi-ai`. You can use it standalone for SQL queries over local data without pulling in the AI layer.

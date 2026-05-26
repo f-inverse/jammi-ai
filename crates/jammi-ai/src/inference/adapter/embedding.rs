@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array};
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field};
-use jammi_engine::error::Result;
+use jammi_db::error::Result;
 
 use super::{BackendOutput, OutputAdapter};
 

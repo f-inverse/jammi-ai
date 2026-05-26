@@ -7,10 +7,10 @@ Jammi loads configuration from three sources, in priority order:
 3. **Defaults** — sensible defaults for all fields
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # use std::path::Path;
-# use jammi_engine::config::JammiConfig;
-# fn ex() -> jammi_engine::error::Result<()> {
+# use jammi_db::config::JammiConfig;
+# fn ex() -> jammi_db::error::Result<()> {
 // Load with defaults
 let config = JammiConfig::load(None)?;
 

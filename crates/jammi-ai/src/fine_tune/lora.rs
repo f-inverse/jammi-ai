@@ -7,7 +7,7 @@
 
 use candle_core::{DType, Tensor};
 use candle_nn::{Linear, VarBuilder};
-use jammi_engine::error::{JammiError, Result};
+use jammi_db::error::{JammiError, Result};
 use jammi_lora::LoraLinear;
 
 /// A sequence of named LoRA layers — the trainable state of a

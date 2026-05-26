@@ -9,9 +9,9 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Float32Array, StringArray};
 use jammi_ai::evidence::{merge_channels, ChannelContribution};
 use jammi_ai::session::InferenceSession;
-use jammi_engine::catalog::channel_repo::ChannelColumnType;
-use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
-use jammi_engine::ChannelId;
+use jammi_db::catalog::channel_repo::ChannelColumnType;
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::ChannelId;
 use jammi_test_utils::register_test_channel;
 use tempfile::TempDir;
 

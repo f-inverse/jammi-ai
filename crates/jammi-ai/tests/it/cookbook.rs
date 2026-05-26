@@ -9,7 +9,7 @@ use arrow::array::{Array, Float32Array, ListArray, StringArray};
 use jammi_ai::fine_tune::FineTuneMethod;
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
-use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
 
 use crate::common;
@@ -963,8 +963,8 @@ async fn recipe_generate_image_embeddings() {
 async fn cookbook_declare_provenance_channel_recipe_runs_end_to_end() {
     use arrow::array::ArrayRef;
     use jammi_ai::evidence::{merge_channels, ChannelContribution};
-    use jammi_engine::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
-    use jammi_engine::ChannelId;
+    use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
+    use jammi_db::ChannelId;
 
     let dir = TempDir::new().unwrap();
     let session = cookbook_session(&dir).await;
@@ -1037,9 +1037,9 @@ async fn cookbook_declare_provenance_channel_recipe_runs_end_to_end() {
 
 #[tokio::test]
 async fn cookbook_declare_provenance_channel_append_only_callout_matches_runtime() {
-    use jammi_engine::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
-    use jammi_engine::error::JammiError;
-    use jammi_engine::ChannelId;
+    use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
+    use jammi_db::error::JammiError;
+    use jammi_db::ChannelId;
 
     let dir = TempDir::new().unwrap();
     let session = cookbook_session(&dir).await;
@@ -1107,8 +1107,8 @@ async fn cookbook_declare_provenance_channel_append_only_callout_matches_runtime
 #[tokio::test]
 async fn cookbook_register_mutable_table_recipe_runs_end_to_end() {
     use arrow_schema::{DataType, Field, Schema};
-    use jammi_engine::session::JammiSession;
-    use jammi_engine::store::mutable::definition::{
+    use jammi_db::session::JammiSession;
+    use jammi_db::store::mutable::definition::{
         MutableIndexDef, MutableTableDefinitionBuilder, MutableTableId,
     };
 
@@ -1170,8 +1170,8 @@ async fn cookbook_update_mutable_table_recipe_runs_end_to_end() {
     // column-type listing.
     use arrow::array::Int64Array;
     use arrow_schema::{DataType, Field, Schema};
-    use jammi_engine::session::JammiSession;
-    use jammi_engine::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
+    use jammi_db::session::JammiSession;
+    use jammi_db::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
 
     let dir = TempDir::new().unwrap();
     let session = JammiSession::new(common::test_config(dir.path()))
@@ -1243,9 +1243,9 @@ async fn cookbook_update_mutable_table_recipe_runs_end_to_end() {
 async fn cookbook_multi_tenant_recipe_runs_end_to_end() {
     use arrow::array::Int64Array;
     use arrow_schema::{DataType, Field, Schema};
-    use jammi_engine::session::JammiSession;
-    use jammi_engine::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
-    use jammi_engine::TenantId;
+    use jammi_db::session::JammiSession;
+    use jammi_db::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
+    use jammi_db::TenantId;
     use std::str::FromStr;
 
     let dir = TempDir::new().unwrap();
@@ -1310,9 +1310,9 @@ async fn cookbook_multi_tenant_recipe_runs_end_to_end() {
 async fn cookbook_scope_source_by_tenant_recipe_runs_end_to_end() {
     use arrow::array::{ArrayRef, Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
-    use jammi_engine::session::JammiSession;
-    use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
-    use jammi_engine::TenantId;
+    use jammi_db::session::JammiSession;
+    use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+    use jammi_db::TenantId;
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
     use std::str::FromStr;
@@ -1408,7 +1408,7 @@ async fn cookbook_scope_source_by_tenant_recipe_runs_end_to_end() {
 #[tokio::test]
 async fn cookbook_publish_events_recipe_runs_end_to_end() {
     use arrow::array::{ArrayRef, Int64Array, RecordBatch};
-    use jammi_engine::session::JammiSession;
+    use jammi_db::session::JammiSession;
 
     let dir = TempDir::new().unwrap();
     let session = JammiSession::new(common::test_config(dir.path()))
@@ -1478,8 +1478,8 @@ async fn cookbook_publish_events_recipe_runs_end_to_end() {
 async fn cookbook_subscribe_with_filter_recipe_runs_end_to_end() {
     use arrow::array::{ArrayRef, Int64Array, RecordBatch};
     use futures::StreamExt;
-    use jammi_engine::session::JammiSession;
-    use jammi_engine::trigger::Predicate;
+    use jammi_db::session::JammiSession;
+    use jammi_db::trigger::Predicate;
 
     let dir = TempDir::new().unwrap();
     let session = JammiSession::new(common::test_config(dir.path()))
@@ -1553,8 +1553,8 @@ async fn cookbook_subscribe_with_filter_recipe_runs_end_to_end() {
         "SUM(ts_ms) > 0",
     );
     match bad {
-        Err(jammi_engine::trigger::TriggerError::PredicateUnsupported(_))
-        | Err(jammi_engine::trigger::TriggerError::PredicateParse(_)) => {}
+        Err(jammi_db::trigger::TriggerError::PredicateUnsupported(_))
+        | Err(jammi_db::trigger::TriggerError::PredicateParse(_)) => {}
         Err(other) => panic!("expected PredicateUnsupported / PredicateParse, got {other:?}"),
         Ok(_) => panic!("SUM() in predicate must be rejected"),
     }
@@ -1565,7 +1565,7 @@ async fn cookbook_subscribe_with_filter_recipe_runs_end_to_end() {
 #[tokio::test]
 async fn cookbook_replay_from_backing_table_recipe_runs_end_to_end() {
     use arrow::array::{ArrayRef, Int64Array, RecordBatch};
-    use jammi_engine::session::JammiSession;
+    use jammi_db::session::JammiSession;
 
     let dir = TempDir::new().unwrap();
     let session = JammiSession::new(common::test_config(dir.path()))
@@ -1607,7 +1607,7 @@ async fn cookbook_replay_from_backing_table_recipe_runs_end_to_end() {
     // contract (SPEC-04 §3.4 + §6) without needing to know the engine's
     // internal backing-table name.
     use futures::StreamExt;
-    use jammi_engine::trigger::{Offset, Predicate};
+    use jammi_db::trigger::{Offset, Predicate};
 
     let mut stream = session
         .subscriber()

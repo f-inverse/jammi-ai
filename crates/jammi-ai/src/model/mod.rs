@@ -11,7 +11,7 @@ use std::sync::Arc;
 use arrow::array::ArrayRef;
 use backend::candle::CandleModel;
 use backend::ort::OrtModel;
-use jammi_engine::error::{JammiError, Result};
+use jammi_db::error::{JammiError, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::inference::adapter::BackendOutput;
@@ -108,10 +108,10 @@ pub enum BackendType {
 
 /// What task this model performs.
 ///
-/// Re-exported from `jammi_engine` so the engine — which owns the catalog
+/// Re-exported from `jammi_db` so the engine — which owns the catalog
 /// tables that persist this — and `jammi_ai` agree on the variant set and
-/// on-disk spelling without `jammi_engine` depending on `jammi_ai`.
-pub use jammi_engine::ModelTask;
+/// on-disk spelling without `jammi_db` depending on `jammi_ai`.
+pub use jammi_db::ModelTask;
 
 /// Where the tokenizer for a resolved model lives, and what shape it is.
 ///

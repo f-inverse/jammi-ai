@@ -1,6 +1,6 @@
 use clap::Subcommand;
 use jammi_ai::session::InferenceSession;
-use jammi_engine::config::JammiConfig;
+use jammi_db::config::JammiConfig;
 
 #[derive(Subcommand)]
 pub enum ModelAction {
@@ -10,7 +10,7 @@ pub enum ModelAction {
 
 pub async fn run(
     config: JammiConfig,
-    tenant: Option<jammi_engine::TenantId>,
+    tenant: Option<jammi_db::TenantId>,
     action: ModelAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let session = InferenceSession::new(config).await?;

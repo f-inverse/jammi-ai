@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use jammi_engine::session::JammiSession;
+use jammi_db::session::JammiSession;
 use jammi_server::grpc::proto::session::session_service_client::SessionServiceClient;
 use jammi_server::grpc::proto::session::{SetTenantRequest, Tenant};
 use jammi_server::grpc::proto::trigger::trigger_service_client::TriggerServiceClient;

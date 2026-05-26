@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use arrow::array::{Array, StringArray};
 use arrow::datatypes::{DataType, Schema};
-use jammi_engine::error::{JammiError, Result};
+use jammi_db::error::{JammiError, Result};
 
 /// The input for a retrieval query — either text or image bytes.
 pub enum QueryInput {

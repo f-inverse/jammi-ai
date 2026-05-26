@@ -7,11 +7,11 @@ Run a Named Entity Recognition model over text columns to extract person names, 
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 use jammi_ai::model::{ModelSource, ModelTask};
 
 let model = ModelSource::hf("dslim/bert-base-NER");

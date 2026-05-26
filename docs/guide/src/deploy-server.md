@@ -12,8 +12,8 @@ jammi sources add patents --path /data/patents.parquet --format parquet
 
 # 2. Generate embeddings (library or Python — not available over Flight SQL)
 python3 -c "
-import jammi
-db = jammi.connect()
+import jammi_ai
+db = jammi_ai.connect()
 db.generate_embeddings(source='patents', model='sentence-transformers/all-MiniLM-L6-v2', columns=['abstract'], key='id')
 "
 

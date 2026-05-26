@@ -46,7 +46,7 @@ use arrow::record_batch::RecordBatch;
     feature = "live-gcs-tests",
     feature = "live-azure-tests"
 ))]
-use jammi_engine::storage::{
+use jammi_db::storage::{
     reader::{count_parquet_rows, is_valid_parquet},
     JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl,
 };

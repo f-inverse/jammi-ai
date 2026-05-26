@@ -117,7 +117,7 @@ jobs:
         # collide on freshly minted topic ids while one of them is still
         # tearing down.
         run: |
-          cargo test -p jammi-engine --features live-broker-tests --test it -- --test-threads=1
+          cargo test -p jammi-db --features live-broker-tests --test it -- --test-threads=1
 
   test-python:
     name: Test (Python)
@@ -185,4 +185,4 @@ jobs:
         # Tests share one catalog DB and serialise migrate() ledger writes.
         # `--test-threads=1` keeps that contract; the suite is small.
         run: |
-          cargo test -p jammi-engine --features live-postgres-tests --test it -- --test-threads=1
+          cargo test -p jammi-db --features live-postgres-tests --test it -- --test-threads=1

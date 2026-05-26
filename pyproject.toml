@@ -37,7 +37,7 @@ Repository = "https://github.com/f-inverse/jammi-ai"
 
 [tool.maturin]
 manifest-path = "crates/jammi-python/Cargo.toml"
-module-name = "jammi._native"
+module-name = "jammi_ai._native"
 python-source = "python"
 # `extension-module` is opt-in on the `jammi-python` crate so that
 # `cargo test --workspace` can link the integration test against

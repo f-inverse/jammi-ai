@@ -12,9 +12,9 @@ use arrow::array::{ArrayRef, Float32Array, Int32Array, RecordBatch, StringArray}
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
 use jammi_ai::evidence::{merge_channels, ChannelContribution};
-use jammi_engine::catalog::Catalog;
-use jammi_engine::error::JammiError;
-use jammi_engine::ChannelId;
+use jammi_db::catalog::Catalog;
+use jammi_db::error::JammiError;
+use jammi_db::ChannelId;
 use tempfile::tempdir;
 
 async fn open_catalog() -> (tempfile::TempDir, Catalog) {

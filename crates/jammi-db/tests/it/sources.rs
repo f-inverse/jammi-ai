@@ -1,6 +1,6 @@
 use crate::common;
 
-use jammi_engine::{
+use jammi_db::{
     session::JammiSession,
     source::{FileFormat, SourceConnection, SourceType},
 };
@@ -208,7 +208,7 @@ async fn session_respects_config_batch_size() {
 
 #[tokio::test]
 async fn session_tenant_defaults_to_none_and_with_tenant_sets_it() {
-    use jammi_engine::TenantId;
+    use jammi_db::TenantId;
     use std::str::FromStr;
 
     let dir = tempdir().unwrap();

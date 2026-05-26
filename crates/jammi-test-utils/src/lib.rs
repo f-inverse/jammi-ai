@@ -1,10 +1,10 @@
-//! Shared test helpers for jammi-engine and jammi-ai integration tests.
+//! Shared test helpers for jammi-db and jammi-ai integration tests.
 
 use std::path::{Path, PathBuf};
 
-use jammi_engine::catalog::backend::{BackendImpl, BackendKind};
-use jammi_engine::catalog::backend_postgres::PostgresBackend;
-use jammi_engine::session::JammiSession;
+use jammi_db::catalog::backend::{BackendImpl, BackendKind};
+use jammi_db::catalog::backend_postgres::PostgresBackend;
+use jammi_db::session::JammiSession;
 
 /// Env var inspected by [`pg_url_for_tests`] and [`make_test_session`] to
 /// reach a live Postgres instance. CI sets this for the `test-pg` job; local
@@ -87,18 +87,18 @@ pub fn url_to_path(url: &str) -> PathBuf {
 }
 
 /// Create a JammiConfig pointing at a temporary artifact directory.
-pub fn test_config(artifact_dir: &Path) -> jammi_engine::config::JammiConfig {
-    jammi_engine::config::JammiConfig {
+pub fn test_config(artifact_dir: &Path) -> jammi_db::config::JammiConfig {
+    jammi_db::config::JammiConfig {
         artifact_dir: artifact_dir.to_path_buf(),
-        gpu: jammi_engine::config::GpuConfig {
+        gpu: jammi_db::config::GpuConfig {
             device: -1,
             ..Default::default()
         },
-        inference: jammi_engine::config::InferenceConfig {
+        inference: jammi_db::config::InferenceConfig {
             batch_size: 8,
             ..Default::default()
         },
-        logging: jammi_engine::config::LoggingConfig {
+        logging: jammi_db::config::LoggingConfig {
             level: "debug".into(),
             ..Default::default()
         },
@@ -110,18 +110,18 @@ pub fn test_config(artifact_dir: &Path) -> jammi_engine::config::JammiConfig {
 /// that exercise the data-driven provenance machinery beyond the seeded
 /// `vector` and `inference` channels.
 pub async fn register_test_channel(
-    catalog: &jammi_engine::catalog::Catalog,
+    catalog: &jammi_db::catalog::Catalog,
     id: &str,
     priority: i32,
-    columns: &[(&str, jammi_engine::catalog::channel_repo::ChannelColumnType)],
-) -> jammi_engine::error::Result<()> {
-    let spec = jammi_engine::catalog::channel_repo::ChannelSpec {
-        id: jammi_engine::ChannelId::new(id)?,
+    columns: &[(&str, jammi_db::catalog::channel_repo::ChannelColumnType)],
+) -> jammi_db::error::Result<()> {
+    let spec = jammi_db::catalog::channel_repo::ChannelSpec {
+        id: jammi_db::ChannelId::new(id)?,
         priority,
         columns: columns
             .iter()
             .map(
-                |(name, dtype)| jammi_engine::catalog::channel_repo::ChannelColumn {
+                |(name, dtype)| jammi_db::catalog::channel_repo::ChannelColumn {
                     name: (*name).into(),
                     data_type: *dtype,
                 },

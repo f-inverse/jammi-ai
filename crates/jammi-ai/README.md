@@ -2,15 +2,15 @@
 
 Embeddable AI engine for inference, embeddings, vector search, and fine-tuning. Part of [Jammi AI](https://github.com/f-inverse/jammi-ai).
 
-`jammi-ai` builds on `jammi-engine` to add model loading (HuggingFace Hub, local safetensors, ONNX), embedding generation with persistent Parquet + ANN indexes, semantic vector search with a fluent SearchBuilder API, LoRA fine-tuning, and evaluation (retrieval, classification, summarization).
+`jammi-ai` builds on `jammi-db` to add model loading (HuggingFace Hub, local safetensors, ONNX), embedding generation with persistent Parquet + ANN indexes, semantic vector search with a fluent SearchBuilder API, LoRA fine-tuning, and evaluation (retrieval, classification, summarization).
 
 ## Usage
 
 ```rust
 use std::sync::Arc;
 use jammi_ai::session::InferenceSession;
-use jammi_engine::config::JammiConfig;
-use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::config::JammiConfig;
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
 let config = JammiConfig::load(None)?;
 let session = Arc::new(InferenceSession::new(config).await?);

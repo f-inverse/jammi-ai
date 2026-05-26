@@ -20,8 +20,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arrow::array::{Array, BinaryArray, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use futures::StreamExt;
-use jammi_engine::catalog::backend::{BackendKind, TxOptions};
-use jammi_engine::store::mutable::definition::{
+use jammi_db::catalog::backend::{BackendKind, TxOptions};
+use jammi_db::store::mutable::definition::{
     MutableIndexDef, MutableTableDefinitionBuilder, MutableTableError, MutableTableId,
 };
 use jammi_test_utils::make_test_session;
@@ -283,7 +283,7 @@ async fn register_emits_implicit_tenant_id_column_per_adr_00(backend: BackendKin
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn list_filters_by_tenant_scope(backend: BackendKind) {
-    use jammi_engine::TenantId;
+    use jammi_db::TenantId;
     use std::str::FromStr;
 
     let dir = tempdir().unwrap();
@@ -423,8 +423,8 @@ async fn insert_batch_appends_with_session_tenant(backend: BackendKind) {
                 let n = registry
                     .insert_batch(tx, &id, &batch)
                     .await
-                    .map_err(|e| jammi_engine::BackendError::Execution(e.to_string()))?;
-                Ok::<u64, jammi_engine::BackendError>(n)
+                    .map_err(|e| jammi_db::BackendError::Execution(e.to_string()))?;
+                Ok::<u64, jammi_db::BackendError>(n)
             })
         })
         .await
@@ -537,11 +537,11 @@ async fn insert_batch_rejects_schema_mismatch(backend: BackendKind) {
             let registry = Arc::clone(&registry);
             Box::pin(async move {
                 match registry.insert_batch(tx, &id, &batch).await {
-                    Ok(_) => Ok::<(), jammi_engine::BackendError>(()),
-                    Err(MutableTableError::Schema(msg)) => Err(
-                        jammi_engine::BackendError::Execution(format!("SCHEMA_MISMATCH:{msg}")),
-                    ),
-                    Err(other) => Err(jammi_engine::BackendError::Execution(other.to_string())),
+                    Ok(_) => Ok::<(), jammi_db::BackendError>(()),
+                    Err(MutableTableError::Schema(msg)) => Err(jammi_db::BackendError::Execution(
+                        format!("SCHEMA_MISMATCH:{msg}"),
+                    )),
+                    Err(other) => Err(jammi_db::BackendError::Execution(other.to_string())),
                 }
             })
         })

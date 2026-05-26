@@ -3,7 +3,7 @@
 ## Crate dependency graph
 
 ```text
-jammi-engine (foundation)
+jammi-db (foundation)
     |
     |-- Config, Catalog, Sources, SQL execution
     |-- Parquet storage, ANN indexes, crash recovery
@@ -32,11 +32,11 @@ jammi-cli
     '-- Clap CLI wrapping InferenceSession
 ```
 
-`jammi-engine` has no dependency on `jammi-ai`. The intelligence layer is an optional addition — you can use `jammi-engine` standalone for SQL queries over local data.
+`jammi-db` has no dependency on `jammi-ai`. The intelligence layer is an optional addition — you can use `jammi-db` standalone for SQL queries over local data.
 
 ## Key types and their responsibilities
 
-### Engine layer (`jammi-engine`)
+### Engine layer (`jammi-db`)
 
 | Type | Responsibility |
 |------|---------------|
@@ -134,7 +134,7 @@ InferenceSession::search(source, query_vec, k)
 ## Module layout
 
 ```text
-crates/jammi-engine/src/
+crates/jammi-db/src/
 |-- config.rs           # Configuration loading
 |-- error.rs            # Unified error type
 |-- session.rs          # JammiSession (DataFusion wrapper)

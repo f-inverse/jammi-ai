@@ -7,13 +7,13 @@ Attach an observer to inspect every output batch during inference. Use this for 
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate arrow;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# use jammi_engine::config::JammiConfig;
-# async fn ex(config: JammiConfig) -> jammi_engine::error::Result<()> {
+# use jammi_db::config::JammiConfig;
+# async fn ex(config: JammiConfig) -> jammi_db::error::Result<()> {
 use jammi_ai::inference::observer::InferenceObserver;
 use std::sync::Arc;
 

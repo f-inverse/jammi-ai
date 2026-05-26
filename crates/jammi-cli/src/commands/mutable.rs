@@ -14,8 +14,8 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use clap::Subcommand;
 use jammi_ai::session::InferenceSession;
-use jammi_engine::config::JammiConfig;
-use jammi_engine::store::mutable::definition::{
+use jammi_db::config::JammiConfig;
+use jammi_db::store::mutable::definition::{
     MutableIndexDef, MutableTableDefinitionBuilder, MutableTableId,
 };
 use serde::Deserialize;
@@ -58,7 +58,7 @@ pub enum MutableAction {
 
 pub async fn run(
     config: JammiConfig,
-    tenant: Option<jammi_engine::TenantId>,
+    tenant: Option<jammi_db::TenantId>,
     action: MutableAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let session = InferenceSession::new(config).await?;

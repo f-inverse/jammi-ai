@@ -1,7 +1,7 @@
 use clap::Subcommand;
 use jammi_ai::session::InferenceSession;
-use jammi_engine::config::JammiConfig;
-use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::config::JammiConfig;
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
 #[derive(Subcommand)]
 pub enum SourceAction {
@@ -25,7 +25,7 @@ pub enum SourceAction {
 
 pub async fn run(
     config: JammiConfig,
-    tenant: Option<jammi_engine::TenantId>,
+    tenant: Option<jammi_db::TenantId>,
     action: SourceAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {
@@ -53,7 +53,7 @@ pub async fn run(
         SourceAction::Add { name, url, format } => {
             let file_format: FileFormat = format
                 .parse()
-                .map_err(|e: jammi_engine::error::JammiError| e.to_string())?;
+                .map_err(|e: jammi_db::error::JammiError| e.to_string())?;
             let connection = SourceConnection::parse(&url, file_format)?;
             let session = InferenceSession::new(config).await?;
             if let Some(t) = tenant {

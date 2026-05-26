@@ -3,9 +3,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use jammi_engine::catalog::status::FineTuneJobStatus;
-use jammi_engine::catalog::Catalog;
-use jammi_engine::error::{JammiError, Result};
+use jammi_db::catalog::status::FineTuneJobStatus;
+use jammi_db::catalog::Catalog;
+use jammi_db::error::{JammiError, Result};
 
 /// Handle to a fine-tune job. Can be used to poll status or wait for completion.
 pub struct FineTuneJob {

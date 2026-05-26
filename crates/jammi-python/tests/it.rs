@@ -21,8 +21,8 @@ use std::sync::Arc;
 use _native::model_task::{ModelTaskArg, PyModelTask};
 use _native::PyDatabase;
 use jammi_ai::model::ModelTask;
-use jammi_engine::config::JammiConfig;
-use jammi_engine::TenantId;
+use jammi_db::config::JammiConfig;
+use jammi_db::TenantId;
 use pyo3::prelude::*;
 use pyo3::types::PyString;
 use tempfile::tempdir;
@@ -30,11 +30,11 @@ use tempfile::tempdir;
 fn test_config(artifact_dir: &std::path::Path) -> JammiConfig {
     JammiConfig {
         artifact_dir: artifact_dir.to_path_buf(),
-        gpu: jammi_engine::config::GpuConfig {
+        gpu: jammi_db::config::GpuConfig {
             device: -1,
             ..Default::default()
         },
-        inference: jammi_engine::config::InferenceConfig {
+        inference: jammi_db::config::InferenceConfig {
             batch_size: 8,
             ..Default::default()
         },

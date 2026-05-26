@@ -38,6 +38,22 @@ pub struct AggregateMetrics {
     pub ndcg: f64,
 }
 
+impl AggregateMetrics {
+    /// Look up an aggregate metric by string name. Transitional helper for
+    /// the pre-typed Gate config in jammi-enterprise; removed in E2 once the
+    /// Gate rule engine switches to a typed metric enum.
+    #[doc(hidden)]
+    pub fn field_by_name(&self, name: &str) -> Option<f64> {
+        match name {
+            "recall_at_k" => Some(self.recall_at_k),
+            "precision_at_k" => Some(self.precision_at_k),
+            "mrr" => Some(self.mrr),
+            "ndcg" => Some(self.ndcg),
+            _ => None,
+        }
+    }
+}
+
 pub struct RetrievalMetrics;
 
 impl RetrievalMetrics {

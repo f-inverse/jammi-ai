@@ -395,13 +395,35 @@ async fn eval_embeddings_end_to_end() {
         .await
         .unwrap();
 
-    // All four metric keys present and in valid range
-    for key in ["recall_at_k", "precision_at_k", "mrr", "ndcg"] {
-        let val = metrics[key]
-            .as_f64()
-            .unwrap_or_else(|| panic!("Missing metric: {key}"));
-        assert!((0.0..=1.0).contains(&val), "{key} = {val} outside [0, 1]");
+    // All four aggregate metrics present and in valid range
+    for name in ["recall_at_k", "precision_at_k", "mrr", "ndcg"] {
+        let val = metrics
+            .aggregate
+            .field_by_name(name)
+            .unwrap_or_else(|| panic!("Missing metric: {name}"));
+        assert!((0.0..=1.0).contains(&val), "{name} = {val} outside [0, 1]");
     }
+
+    // Per-query arrays returned alongside the aggregate; the join key is
+    // the golden source's `query_id` and every record carries finite metrics.
+    assert!(
+        !metrics.per_query.is_empty(),
+        "per_query must carry one record per golden-set query"
+    );
+    assert!(
+        !metrics.per_query[0].query_id.is_empty(),
+        "per_query records must carry the golden-set query_id"
+    );
+    assert!(
+        metrics
+            .per_query
+            .iter()
+            .all(|r| r.metrics.recall.is_finite()
+                && r.metrics.precision.is_finite()
+                && r.metrics.mrr.is_finite()
+                && r.metrics.ndcg.is_finite()),
+        "every per_query record must carry finite metrics"
+    );
 
     // UAT 15: eval run recorded in catalog with golden_source and k
     let runs = session.catalog().list_eval_runs().await.unwrap();
@@ -444,24 +466,28 @@ async fn eval_compare_self_comparison_has_zero_deltas() {
         .await
         .unwrap();
 
-    // Structure: baseline is a string, delta is an object
+    // Structure: baseline carries `delta: None`, follow-ups carry `Some`.
+    assert_eq!(comparison.per_table.len(), 2);
     assert!(
-        comparison["baseline"].is_string(),
-        "Should have baseline key"
+        comparison.per_table[0].delta.is_none(),
+        "Baseline entry must carry no delta"
     );
-    assert!(comparison["delta"].is_object(), "Should have delta key");
+    let delta = comparison.per_table[1]
+        .delta
+        .as_ref()
+        .expect("Non-baseline entry must carry a delta");
 
-    // Self-comparison: all deltas must be zero
-    let deltas = comparison["delta"].as_object().unwrap();
-    assert!(!deltas.is_empty(), "Should have at least one delta entry");
-    for (_table, table_deltas) in deltas {
-        for (metric, delta) in table_deltas.as_object().unwrap() {
-            let abs_delta = delta["absolute"].as_f64().unwrap();
-            assert!(
-                abs_delta.abs() < 1e-6,
-                "Self-comparison {metric} delta should be 0, got {abs_delta}"
-            );
-        }
+    // Self-comparison: every metric delta must be zero
+    for (metric, value) in [
+        ("recall_at_k", delta.recall_at_k.absolute),
+        ("precision_at_k", delta.precision_at_k.absolute),
+        ("mrr", delta.mrr.absolute),
+        ("ndcg", delta.ndcg.absolute),
+    ] {
+        assert!(
+            value.abs() < 1e-6,
+            "Self-comparison {metric} delta should be 0, got {value}"
+        );
     }
 }
 
@@ -495,12 +521,12 @@ async fn eval_embeddings_is_deterministic() {
         .await
         .unwrap();
 
-    for key in ["recall_at_k", "precision_at_k", "mrr", "ndcg"] {
-        let v1 = m1[key].as_f64().unwrap();
-        let v2 = m2[key].as_f64().unwrap();
+    for name in ["recall_at_k", "precision_at_k", "mrr", "ndcg"] {
+        let v1 = m1.aggregate.field_by_name(name).unwrap();
+        let v2 = m2.aggregate.field_by_name(name).unwrap();
         assert!(
             (v1 - v2).abs() < 1e-12,
-            "Determinism: {key} differs between runs: {v1} vs {v2}"
+            "Determinism: {name} differs between runs: {v1} vs {v2}"
         );
     }
 }
@@ -565,23 +591,34 @@ async fn eval_compare_distinct_tables_has_nonzero_deltas() {
         .await
         .unwrap();
 
-    // Baseline should be the first table
+    // Baseline should be the first table — no delta, original table_name
+    assert_eq!(comparison.per_table.len(), 2);
     assert_eq!(
-        comparison["baseline"].as_str().unwrap(),
-        rec1.table_name,
-        "Baseline should be first table"
+        comparison.per_table[0].table_name, rec1.table_name,
+        "Baseline should be the first table"
+    );
+    assert!(
+        comparison.per_table[0].delta.is_none(),
+        "Baseline entry must carry no delta"
     );
 
-    // Deltas should exist and at least one should be non-zero
-    // (title and abstract produce different embeddings → different retrieval quality)
-    let deltas = comparison["delta"].as_object().unwrap();
-    let table2_deltas = &deltas[&rec2.table_name];
-    let any_nonzero = ["recall_at_k", "precision_at_k", "mrr", "ndcg"]
-        .iter()
-        .any(|key| {
-            let abs = table2_deltas[key]["absolute"].as_f64().unwrap_or(0.0);
-            abs.abs() > 1e-10
-        });
+    // The second entry carries the delta against the baseline. At least one
+    // metric should be non-zero (title and abstract produce different
+    // embeddings → different retrieval quality).
+    let entry = &comparison.per_table[1];
+    assert_eq!(entry.table_name, rec2.table_name);
+    let delta = entry
+        .delta
+        .as_ref()
+        .expect("Non-baseline entry must carry a delta");
+    let any_nonzero = [
+        delta.recall_at_k.absolute,
+        delta.precision_at_k.absolute,
+        delta.mrr.absolute,
+        delta.ndcg.absolute,
+    ]
+    .iter()
+    .any(|v| v.abs() > 1e-10);
     assert!(
         any_nonzero,
         "Different text columns should produce at least one non-zero delta"
@@ -647,14 +684,15 @@ async fn eval_image_embeddings_end_to_end() {
         .await
         .unwrap();
 
-    // All four metric keys present and in valid range
-    for key in ["recall_at_k", "precision_at_k", "mrr", "ndcg"] {
-        let val = metrics[key]
-            .as_f64()
-            .unwrap_or_else(|| panic!("{key} missing or not a number"));
+    // All four aggregate metrics present and in valid range
+    for name in ["recall_at_k", "precision_at_k", "mrr", "ndcg"] {
+        let val = metrics
+            .aggregate
+            .field_by_name(name)
+            .unwrap_or_else(|| panic!("{name} missing"));
         assert!(
             (0.0..=1.0).contains(&val),
-            "{key} = {val} out of [0, 1] range"
+            "{name} = {val} out of [0, 1] range"
         );
     }
 }

@@ -65,11 +65,19 @@ def main() -> int:
         )
 
         # 4. Sanity-check every aggregate metric is in [0, 1].
+        aggregate = metrics["aggregate"]
         print("aggregate:")
         for key in ("recall_at_k", "precision_at_k", "mrr", "ndcg"):
-            value = metrics[key]
+            value = aggregate[key]
             assert 0.0 <= value <= 1.0, f"{key} out of range: {value}"
             print(f"  {key:<16} {value:.4f}")
+
+        # 5. Drill into the per-query records (one entry per golden-set query).
+        per_query = metrics["per_query"]
+        assert len(per_query) > 0, "per_query must carry one record per query"
+        first = per_query[0]
+        assert first["query_id"], "per_query records carry the golden-set query_id"
+        print(f"per_query: {len(per_query)} records (first: {first['query_id']})")
 
     print("eval_embeddings: OK")
     return 0

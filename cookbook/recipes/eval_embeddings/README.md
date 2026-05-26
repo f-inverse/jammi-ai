@@ -18,17 +18,17 @@ same loop powers nightly regression dashboards and A/B model comparison.
    `(query_id, query_text, relevant_id)` CSV shape `eval_embeddings`
    consumes, and registers it as a `golden` source
 5. Calls `db.eval_embeddings(source="corpus", golden_source="golden.public.golden", k=5)`
-6. Asserts each returned metric is in `[0.0, 1.0]`
+6. Asserts each aggregate metric is in `[0.0, 1.0]` and the per-query
+   records carry their golden-set `query_id`
 
 ## API surface exercised
 
 - `Database.generate_text_embeddings(source, *, model, columns, key)`
 - `Database.eval_embeddings(*, source, golden_source, model=None, k=10)`
 
-The returned dict carries the aggregate metrics `recall_at_k`,
-`precision_at_k`, `mrr`, and `ndcg` (averaged across queries). For
-per-query drill-down, call `RetrievalMetrics::compute_query` directly
-from `jammi-numerics`; the OSS Python surface returns the aggregate only.
+The returned dict carries `aggregate` (mean across queries — `recall_at_k`,
+`precision_at_k`, `mrr`, `ndcg`) and `per_query` (one entry per query with
+`query_id` and a `metrics` sub-dict of the same four names, un-averaged).
 
 ## Golden source shape
 

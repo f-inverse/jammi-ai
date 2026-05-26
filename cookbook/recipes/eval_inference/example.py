@@ -41,23 +41,32 @@ def main() -> int:
         )
 
         # 3. Sanity-check the aggregate metrics. `f1` is macro F1 averaged
-        #    across classes.
+        #    across classes. The aggregate is tagged by task kind.
+        aggregate = metrics["aggregate"]
+        assert aggregate["task"] == "classification", aggregate["task"]
         for key in ("accuracy", "f1"):
-            value = metrics[key]
+            value = aggregate[key]
             assert 0.0 <= value <= 1.0, f"{key} out of range: {value}"
 
-        # 4. Per-class metrics live under `per_class` — dict keyed by label.
-        per_class = metrics.get("per_class", {})
+        # 4. Per-class metrics live under `aggregate.per_class` — dict keyed
+        #    by label.
+        per_class = aggregate.get("per_class", {})
         assert isinstance(per_class, dict), f"per_class shape: {type(per_class)}"
 
-        print(f"accuracy:  {metrics['accuracy']:.4f}")
-        print(f"macro_f1:  {metrics['f1']:.4f}")
+        # 5. Per-record predictions live under `per_record` (one entry per
+        #    aligned predicted/gold pair).
+        per_record = metrics["per_record"]
+        assert len(per_record) > 0, "per_record must carry one entry per aligned row"
+
+        print(f"accuracy:  {aggregate['accuracy']:.4f}")
+        print(f"macro_f1:  {aggregate['f1']:.4f}")
         print("per_class:")
         for label, stats in per_class.items():
             print(
                 f"  {label:<12} precision={stats['precision']:.4f}"
                 f"  recall={stats['recall']:.4f}  f1={stats['f1']:.4f}"
             )
+        print(f"per_record: {len(per_record)} predictions")
 
     print("eval_inference: OK")
     return 0

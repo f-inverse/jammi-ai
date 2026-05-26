@@ -4,12 +4,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::ner::types::Entity;
 
 /// Entity-level NER metrics: strict matching (label + boundaries must match).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NerMetrics {
     pub precision: f64,
     pub recall: f64,
@@ -18,7 +18,7 @@ pub struct NerMetrics {
 }
 
 /// Per-entity-type precision, recall, F1, and support count.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypeMetrics {
     pub precision: f64,
     pub recall: f64,

@@ -5,6 +5,10 @@ use jammi_db::catalog::eval_repo::EvalRunRecord;
 use jammi_db::catalog::status::EvalRunStatus;
 use jammi_db::error::{JammiError, Result};
 
+use crate::eval::report::{
+    AggregateDelta, CompareEvalReport, EmbeddingEvalReport, InferenceAggregate,
+    InferenceEvalReport, MetricDelta, PerQueryRecord, PerRecordPrediction, TableEvalReport,
+};
 use crate::eval::EvalTask;
 use crate::model::ModelSource;
 use crate::session::InferenceSession;
@@ -24,6 +28,12 @@ pub struct EvalRunner<'a> {
 impl<'a> EvalRunner<'a> {
     /// Evaluate embedding quality against golden relevance judgments.
     ///
+    /// Returns an [`EmbeddingEvalReport`] containing both the aggregate over
+    /// all queries (`report.aggregate.recall_at_k`, etc.) and the per-query
+    /// arrays (`report.per_query[i].metrics.recall`). The per-query data is
+    /// what sample-based statistical rules consume; the aggregate is what
+    /// the catalog persists.
+    ///
     /// Uses the same search infrastructure as `db.search()` — SidecarIndex for ANN
     /// when available, exact_vector_search as fallback.
     pub async fn eval_embeddings(
@@ -32,7 +42,7 @@ impl<'a> EvalRunner<'a> {
         embedding_table: Option<&str>,
         golden_source: &str,
         k: usize,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<EmbeddingEvalReport> {
         // 1. Resolve embedding table.
         // result_tables.model_id stores the canonical model name (ModelSource::to_string()).
         let table = self
@@ -102,11 +112,27 @@ impl<'a> EvalRunner<'a> {
             ));
         }
 
-        // 5. Aggregate
-        let agg = RetrievalMetrics::aggregate(&query_metrics);
-        let metrics_json = serde_json::to_value(&agg)?;
+        // 5. Build typed report. `per_query` is the data the old shape was
+        //    discarding; the aggregate is the historical mean.
+        let aggregate = RetrievalMetrics::aggregate(&query_metrics);
+        let per_query: Vec<PerQueryRecord> = golden
+            .queries
+            .iter()
+            .zip(query_metrics)
+            .map(|(q, metrics)| PerQueryRecord {
+                query_id: q.query_id.clone(),
+                metrics,
+            })
+            .collect();
+        let report = EmbeddingEvalReport {
+            aggregate,
+            per_query,
+        };
 
-        // 6. Record in catalog
+        // 6. Record in catalog. Only the aggregate persists — per-query
+        //    arrays are a transient response shape kept out of long-term
+        //    storage because the catalog needs them only for historical
+        //    aggregate trend reporting.
         self.session
             .catalog()
             .record_eval_run(&EvalRunRecord {
@@ -116,16 +142,20 @@ impl<'a> EvalRunner<'a> {
                 source_id: source_id.into(),
                 golden_source: golden_source.into(),
                 k: Some(k as i32),
-                metrics_json: serde_json::to_string(&agg)?,
+                metrics_json: serde_json::to_string(&report.aggregate)?,
                 status: EvalRunStatus::Completed.to_string(),
                 created_at: chrono::Utc::now().to_rfc3339(),
             })
             .await?;
 
-        Ok(metrics_json)
+        Ok(report)
     }
 
     /// Evaluate inference quality against golden labels.
+    ///
+    /// Returns an [`InferenceEvalReport`] carrying the task-shaped
+    /// aggregate and the per-record predicted / gold pairs that
+    /// sample-based statistical rules consume.
     pub async fn eval_inference(
         &self,
         model_id: &str,
@@ -134,14 +164,14 @@ impl<'a> EvalRunner<'a> {
         task: EvalTask,
         golden_source: &str,
         label_column: &str,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<InferenceEvalReport> {
         // `model_id` is a user-supplied identifier (`local:/path`, `hf://owner/repo`,
         // or `owner/repo`) — parse it the same way every other public entry point
         // does. `from_canonical` is reserved for canonical names already stored in
         // the catalog (no `local:` prefix), which is not the shape callers pass here.
         let model_source = ModelSource::parse(model_id);
 
-        let metrics_json = match task {
+        let (aggregate, per_record) = match task {
             EvalTask::Classification => {
                 let golden_schema = self.source_schema(golden_source).await?;
                 ensure_column(&golden_schema, "id", DataType::Utf8)?;
@@ -166,6 +196,7 @@ impl<'a> EvalRunner<'a> {
                     )
                     .await?;
 
+                let mut per_record: Vec<PerRecordPrediction> = Vec::new();
                 let mut aligned_predicted = Vec::new();
                 let mut aligned_actual = Vec::new();
                 for batch in &results {
@@ -175,12 +206,17 @@ impl<'a> EvalRunner<'a> {
                         if let Some(actual) = golden.labels.get(id) {
                             aligned_predicted.push(pred.clone());
                             aligned_actual.push(actual.clone());
+                            per_record.push(PerRecordPrediction {
+                                record_id: id.clone(),
+                                predicted: pred.clone(),
+                                gold: actual.clone(),
+                            });
                         }
                     }
                 }
 
                 let result = ClassificationMetrics::compute(&aligned_predicted, &aligned_actual);
-                serde_json::to_value(&result)?
+                (InferenceAggregate::Classification(result), per_record)
             }
             EvalTask::Ner => {
                 return Err(JammiError::Eval(
@@ -189,6 +225,11 @@ impl<'a> EvalRunner<'a> {
                         .into(),
                 ));
             }
+        };
+
+        let report = InferenceEvalReport {
+            aggregate,
+            per_record,
         };
 
         // Record in catalog
@@ -202,13 +243,13 @@ impl<'a> EvalRunner<'a> {
                 source_id: source_id.into(),
                 golden_source: golden_source.into(),
                 k: None,
-                metrics_json: serde_json::to_string(&metrics_json)?,
+                metrics_json: serde_json::to_string(&report.aggregate)?,
                 status: EvalRunStatus::Completed.to_string(),
                 created_at: chrono::Utc::now().to_rfc3339(),
             })
             .await?;
 
-        Ok(metrics_json)
+        Ok(report)
     }
 
     /// Compare multiple embedding tables side-by-side.
@@ -219,61 +260,51 @@ impl<'a> EvalRunner<'a> {
         source_id: &str,
         golden_source: &str,
         k: usize,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<CompareEvalReport> {
         if embedding_tables.len() < 2 {
             return Err(JammiError::Eval(
                 "eval_compare requires at least 2 embedding tables".into(),
             ));
         }
 
-        let mut all_metrics: Vec<(String, serde_json::Value)> = Vec::new();
+        let mut all_reports: Vec<(String, EmbeddingEvalReport)> = Vec::new();
         for table_name in embedding_tables {
-            let metrics = self
+            let report = self
                 .eval_embeddings(source_id, Some(table_name), golden_source, k)
                 .await?;
-            all_metrics.push((table_name.clone(), metrics));
+            all_reports.push((table_name.clone(), report));
         }
 
-        let baseline = &all_metrics[0].1;
-        let metric_keys = ["recall_at_k", "precision_at_k", "mrr", "ndcg"];
-
-        let mut results = serde_json::Map::new();
-        for (name, metrics) in &all_metrics {
-            results.insert(name.clone(), metrics.clone());
-        }
-
-        let mut deltas = serde_json::Map::new();
-        for (name, metrics) in all_metrics.iter().skip(1) {
-            let mut model_delta = serde_json::Map::new();
-            for key in &metric_keys {
-                let base_val = baseline.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let model_val = metrics.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-                let absolute = model_val - base_val;
-                let relative = if base_val.abs() > f64::EPSILON {
-                    absolute / base_val
+        let baseline_agg = all_reports[0].1.aggregate.clone();
+        let per_table: Vec<TableEvalReport> = all_reports
+            .into_iter()
+            .enumerate()
+            .map(|(i, (table_name, embedding_eval))| {
+                let delta = if i == 0 {
+                    None
                 } else {
-                    0.0
+                    Some(AggregateDelta {
+                        recall_at_k: metric_delta(
+                            baseline_agg.recall_at_k,
+                            embedding_eval.aggregate.recall_at_k,
+                        ),
+                        precision_at_k: metric_delta(
+                            baseline_agg.precision_at_k,
+                            embedding_eval.aggregate.precision_at_k,
+                        ),
+                        mrr: metric_delta(baseline_agg.mrr, embedding_eval.aggregate.mrr),
+                        ndcg: metric_delta(baseline_agg.ndcg, embedding_eval.aggregate.ndcg),
+                    })
                 };
+                TableEvalReport {
+                    table_name,
+                    embedding_eval,
+                    delta,
+                }
+            })
+            .collect();
 
-                model_delta.insert(
-                    key.to_string(),
-                    serde_json::json!({
-                        "absolute": absolute,
-                        "relative": relative,
-                    }),
-                );
-            }
-            deltas.insert(name.clone(), serde_json::Value::Object(model_delta));
-        }
-
-        results.insert(
-            "baseline".into(),
-            serde_json::Value::String(all_metrics[0].0.clone()),
-        );
-        results.insert("delta".into(), serde_json::Value::Object(deltas));
-
-        Ok(serde_json::Value::Object(results))
+        Ok(CompareEvalReport { per_table })
     }
 
     /// Get the schema of a registered golden source.
@@ -297,4 +328,16 @@ impl<'a> EvalRunner<'a> {
             Ok(df.schema().as_arrow().clone())
         }
     }
+}
+
+/// Compute the absolute and relative delta between a baseline and a model
+/// aggregate metric. Relative is zero when the baseline is zero.
+fn metric_delta(base: f64, model: f64) -> MetricDelta {
+    let absolute = model - base;
+    let relative = if base.abs() > f64::EPSILON {
+        absolute / base
+    } else {
+        0.0
+    };
+    MetricDelta { absolute, relative }
 }

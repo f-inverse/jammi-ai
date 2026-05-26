@@ -38,17 +38,17 @@ db.add_source("golden", path="/data/golden_relevance.csv", format="csv")
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
-let metrics = session.eval_embeddings(
+let report = session.eval_embeddings(
     "patents",
     None,                              // use latest embedding table
     "golden.public.golden_relevance",  // golden dataset
     10,                                // k for recall@k, precision@k
 ).await?;
 
-println!("recall@10:    {}", metrics["recall_at_k"]);
-println!("precision@10: {}", metrics["precision_at_k"]);
-println!("MRR:          {}", metrics["mrr"]);
-println!("nDCG:         {}", metrics["ndcg"]);
+println!("recall@10:    {}", report.aggregate.recall_at_k);
+println!("precision@10: {}", report.aggregate.precision_at_k);
+println!("MRR:          {}", report.aggregate.mrr);
+println!("nDCG:         {}", report.aggregate.ndcg);
 # Ok(()) }
 ```
 
@@ -61,10 +61,35 @@ metrics = db.eval_embeddings(
     k=10,
 )
 
-print(f"recall@10:    {metrics['recall_at_k']:.3f}")
-print(f"precision@10: {metrics['precision_at_k']:.3f}")
-print(f"MRR:          {metrics['mrr']:.3f}")
-print(f"nDCG:         {metrics['ndcg']:.3f}")
+agg = metrics["aggregate"]
+print(f"recall@10:    {agg['recall_at_k']:.3f}")
+print(f"precision@10: {agg['precision_at_k']:.3f}")
+print(f"MRR:          {agg['mrr']:.3f}")
+print(f"nDCG:         {agg['ndcg']:.3f}")
+```
+
+### Per-query drill-down
+
+The report also carries a `per_query` array — one record per golden-set query, in golden order. This is what sample-based statistical rules (Welch's t, Mann-Whitney U) consume at gate time.
+
+```rust,no_run
+# extern crate jammi_db;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
+# let report = session.eval_embeddings("patents", None, "golden.public.golden_relevance", 10).await?;
+for record in &report.per_query {
+    println!("{}: recall={:.3} ndcg={:.3}",
+        record.query_id, record.metrics.recall, record.metrics.ndcg);
+}
+# Ok(()) }
+```
+
+```python
+for record in metrics["per_query"]:
+    m = record["metrics"]
+    print(f"{record['query_id']}: recall={m['recall']:.3f} ndcg={m['ndcg']:.3f}")
 ```
 
 ### Retrieval metrics
@@ -97,11 +122,15 @@ let comparison = session.eval_compare(
     10,
 ).await?;
 
-let deltas = &comparison["delta"];
-for (table, metrics) in deltas.as_object().unwrap() {
-    println!("{table}: recall@10 delta {:+.3} ({:+.1}%)",
-        metrics["recall_at_k"]["absolute"],
-        metrics["recall_at_k"]["relative"].as_f64().unwrap() * 100.0,
+// The first entry is the baseline (`delta: None`); every subsequent entry
+// carries a delta against it.
+for entry in comparison.per_table.iter().skip(1) {
+    let delta = entry.delta.as_ref().expect("non-baseline entries carry a delta");
+    println!(
+        "{}: recall@10 delta {:+.3} ({:+.1}%)",
+        entry.table_name,
+        delta.recall_at_k.absolute,
+        delta.recall_at_k.relative * 100.0,
     );
 }
 # Ok(()) }
@@ -116,7 +145,12 @@ comparison = db.eval_compare(
     golden_source="golden.public.golden_relevance",
     k=10,
 )
-print(comparison)
+# `per_table[0]` is the baseline (`delta` is None); subsequent entries
+# carry a `delta` dict keyed by metric name (recall_at_k, precision_at_k,
+# mrr, ndcg) with `absolute` and `relative` sub-keys.
+for entry in comparison["per_table"][1:]:
+    d = entry["delta"]["recall_at_k"]
+    print(f"{entry['table_name']}: recall@10 delta {d['absolute']:+.3f} ({d['relative']*100:+.1f}%)")
 ```
 
 The first table is the baseline. Deltas (absolute and relative) are computed for all subsequent tables.
@@ -131,9 +165,9 @@ The first table is the baseline. Deltas (absolute and relative) are computed for
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
-use jammi_ai::eval::EvalTask;
+use jammi_ai::eval::{EvalTask, InferenceAggregate};
 
-let metrics = session.eval_inference(
+let report = session.eval_inference(
     "facebook/bart-large-mnli",
     "test_data",
     &["text".into()],
@@ -142,8 +176,16 @@ let metrics = session.eval_inference(
     "category",
 ).await?;
 
-println!("Accuracy: {}", metrics["accuracy"]);
-println!("Macro F1: {}", metrics["f1"]);
+match &report.aggregate {
+    InferenceAggregate::Classification(c) => {
+        println!("Accuracy: {}", c.accuracy);
+        println!("Macro F1: {}", c.f1);
+    }
+    InferenceAggregate::Ner(n) => {
+        println!("NER F1: {}", n.f1);
+    }
+}
+println!("per_record predictions: {}", report.per_record.len());
 # Ok(()) }
 ```
 
@@ -159,8 +201,13 @@ metrics = db.eval_inference(
     label_column="category",
 )
 
-print(f"Accuracy: {metrics['accuracy']:.3f}")
-print(f"Macro F1: {metrics['f1']:.3f}")
+# `aggregate` is tagged by `task`; for classification it carries
+# `accuracy`, `f1`, and `per_class`.
+agg = metrics["aggregate"]
+print(f"Accuracy: {agg['accuracy']:.3f}")
+print(f"Macro F1: {agg['f1']:.3f}")
+# `per_record` is one entry per aligned predicted/gold pair.
+print(f"per_record predictions: {len(metrics['per_record'])}")
 ```
 
 ## Eval runs in the catalog

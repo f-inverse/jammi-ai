@@ -648,7 +648,7 @@ impl InferenceSession {
         embedding_table: Option<&str>,
         golden_source: &str,
         k: usize,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<crate::eval::EmbeddingEvalReport> {
         EvalRunner { session: self }
             .eval_embeddings(source_id, embedding_table, golden_source, k)
             .await
@@ -663,7 +663,7 @@ impl InferenceSession {
         task: crate::eval::EvalTask,
         golden_source: &str,
         label_column: &str,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<crate::eval::InferenceEvalReport> {
         EvalRunner { session: self }
             .eval_inference(
                 model_id,
@@ -683,7 +683,7 @@ impl InferenceSession {
         source_id: &str,
         golden_source: &str,
         k: usize,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<crate::eval::CompareEvalReport> {
         EvalRunner { session: self }
             .eval_compare(embedding_tables, source_id, golden_source, k)
             .await

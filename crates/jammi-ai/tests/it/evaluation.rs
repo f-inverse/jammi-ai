@@ -404,7 +404,8 @@ async fn eval_embeddings_end_to_end() {
         assert!((0.0..=1.0).contains(&val), "{name} = {val} outside [0, 1]");
     }
 
-    // S3: per-query arrays returned alongside the aggregate
+    // Per-query arrays returned alongside the aggregate; the join key is
+    // the golden source's `query_id` and every record carries finite metrics.
     assert!(
         !metrics.per_query.is_empty(),
         "per_query must carry one record per golden-set query"

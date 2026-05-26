@@ -130,7 +130,9 @@ impl<'a> EvalRunner<'a> {
         };
 
         // 6. Record in catalog. Only the aggregate persists — per-query
-        //    arrays are a transient response shape (see CHANGELOG v0.9.0).
+        //    arrays are a transient response shape kept out of long-term
+        //    storage because the catalog needs them only for historical
+        //    aggregate trend reporting.
         self.session
             .catalog()
             .record_eval_run(&EvalRunRecord {

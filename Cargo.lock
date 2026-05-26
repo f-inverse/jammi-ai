@@ -4101,6 +4101,7 @@ dependencies = [
  "jammi-lora",
  "pyo3",
  "pyo3-arrow",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

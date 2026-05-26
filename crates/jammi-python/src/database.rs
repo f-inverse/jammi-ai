@@ -22,7 +22,7 @@ use jammi_db::store::mutable::{
 use jammi_db::trigger::{Offset, Predicate, TopicDefinition, TopicId};
 use jammi_lora::BackboneDtype;
 
-use crate::convert::{batches_to_pyarrow, json_to_pydict};
+use crate::convert::{batches_to_pyarrow, serializable_to_pydict};
 use crate::error::to_pyerr;
 use crate::job::PyFineTuneJob;
 use crate::model_task::ModelTaskArg;
@@ -584,7 +584,9 @@ impl PyDatabase {
         Ok(PyFineTuneJob::new(job, Arc::clone(&self.runtime)))
     }
 
-    /// Evaluate embedding quality. Returns a dict with metric keys.
+    /// Evaluate embedding quality. Returns a dict with `aggregate` (mean
+    /// over all queries) and `per_query` (one record per golden-set query)
+    /// keys.
     #[pyo3(signature = (*, source, golden_source, model=None, k=10))]
     fn eval_embeddings(
         &self,
@@ -594,17 +596,19 @@ impl PyDatabase {
         model: Option<&str>,
         k: usize,
     ) -> PyResult<Py<PyAny>> {
-        let json = self
+        let report = self
             .runtime
             .block_on(
                 self.session
                     .eval_embeddings(source, model, golden_source, k),
             )
             .map_err(to_pyerr)?;
-        json_to_pydict(py, &json)
+        serializable_to_pydict(py, &report)
     }
 
-    /// Evaluate inference quality. Returns a dict with task-specific metrics.
+    /// Evaluate inference quality. Returns a dict with `aggregate`
+    /// (task-shaped, tagged by `"task"`) and `per_record` (one record per
+    /// predicted/gold pair) keys.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (*, model, source, columns, task, golden_source, label_column))]
     fn eval_inference(
@@ -618,7 +622,7 @@ impl PyDatabase {
         label_column: &str,
     ) -> PyResult<Py<PyAny>> {
         let eval_task = parse_eval_task(task)?;
-        let json = self
+        let report = self
             .runtime
             .block_on(self.session.eval_inference(
                 model,
@@ -629,10 +633,12 @@ impl PyDatabase {
                 label_column,
             ))
             .map_err(to_pyerr)?;
-        json_to_pydict(py, &json)
+        serializable_to_pydict(py, &report)
     }
 
-    /// Compare multiple embedding tables side-by-side.
+    /// Compare multiple embedding tables side-by-side. Returns a dict with a
+    /// `per_table` list; the first entry is the baseline (`delta: None`)
+    /// and every subsequent entry carries a `delta` against it.
     #[pyo3(signature = (*, embedding_tables, source, golden_source, k=10))]
     fn eval_compare(
         &self,
@@ -642,14 +648,14 @@ impl PyDatabase {
         golden_source: &str,
         k: usize,
     ) -> PyResult<Py<PyAny>> {
-        let json = self
+        let report = self
             .runtime
             .block_on(
                 self.session
                     .eval_compare(&embedding_tables, source, golden_source, k),
             )
             .map_err(to_pyerr)?;
-        json_to_pydict(py, &json)
+        serializable_to_pydict(py, &report)
     }
 
     /// Encode a text query into an embedding vector using the given model.

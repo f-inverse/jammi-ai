@@ -1,5 +1,5 @@
 use approx::assert_abs_diff_eq;
-use jammi_numerics::retrieval::{RelevanceJudgment, RetrievalMetrics};
+use jammi_numerics::retrieval::{AggregateMetrics, RelevanceJudgment, RetrievalMetrics};
 
 fn judgments_basic() -> Vec<RelevanceJudgment> {
     vec![
@@ -103,4 +103,19 @@ fn aggregate_averages_queries() {
     let agg = RetrievalMetrics::aggregate(&[q1, q2]);
     assert_abs_diff_eq!(agg.recall_at_k, 0.5, epsilon = 1e-12);
     assert_abs_diff_eq!(agg.precision_at_k, 0.5, epsilon = 1e-12);
+}
+
+#[test]
+fn aggregate_field_by_name_round_trips_known_keys() {
+    let a = AggregateMetrics {
+        recall_at_k: 0.1,
+        precision_at_k: 0.2,
+        mrr: 0.3,
+        ndcg: 0.4,
+    };
+    assert_eq!(a.field_by_name("recall_at_k"), Some(0.1));
+    assert_eq!(a.field_by_name("precision_at_k"), Some(0.2));
+    assert_eq!(a.field_by_name("mrr"), Some(0.3));
+    assert_eq!(a.field_by_name("ndcg"), Some(0.4));
+    assert_eq!(a.field_by_name("unknown"), None);
 }

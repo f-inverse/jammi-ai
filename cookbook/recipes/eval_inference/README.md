@@ -14,12 +14,17 @@ two classifiers, or to track drift over time on the same classifier.
 3. Registers `tiny_labels.csv` as `golden` (csv) — `(id, label)` rows
 4. Runs `db.eval_inference` with the local
    `tiny_modernbert_classifier` fixture against the `content` column
-5. Prints the returned `accuracy`, macro `f1`, and per-class metrics
+5. Prints the returned aggregate `accuracy`, macro `f1`, per-class
+   metrics, and the count of per-record predictions
 6. Asserts every reported rate is in `[0.0, 1.0]`
 
 ## API surface exercised
 
 - `Database.eval_inference(*, model, source, columns, task, golden_source, label_column)`
+
+The returned dict carries `aggregate` (tagged by `"task"` — currently
+`"classification"`) with `accuracy`, `f1`, and `per_class`, plus
+`per_record` (one entry per aligned `{record_id, predicted, gold}`).
 
 The `task` argument is the string form of the inference task —
 `"classification"` here. NER is recognized but not yet supported via this

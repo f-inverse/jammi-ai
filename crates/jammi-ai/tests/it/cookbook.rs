@@ -502,12 +502,14 @@ async fn recipe_evaluation() {
         .await
         .unwrap();
 
-    // Metrics present and in valid range
-    assert!(metrics["recall_at_k"].as_f64().unwrap() >= 0.0);
-    assert!(metrics["recall_at_k"].as_f64().unwrap() <= 1.0);
-    assert!(metrics["precision_at_k"].as_f64().unwrap() >= 0.0);
-    assert!(metrics["mrr"].as_f64().unwrap() >= 0.0);
-    assert!(metrics["ndcg"].as_f64().unwrap() >= 0.0);
+    // Aggregate metrics present and in valid range
+    assert!(metrics.aggregate.recall_at_k >= 0.0);
+    assert!(metrics.aggregate.recall_at_k <= 1.0);
+    assert!(metrics.aggregate.precision_at_k >= 0.0);
+    assert!(metrics.aggregate.mrr >= 0.0);
+    assert!(metrics.aggregate.ndcg >= 0.0);
+    // Per-query arrays carry one record per golden-set query
+    assert!(!metrics.per_query.is_empty());
 
     // eval_compare with two embedding tables (cookbook recipe)
     let record2 = session
@@ -525,8 +527,15 @@ async fn recipe_evaluation() {
         .await
         .unwrap();
 
-    assert!(comparison.get("baseline").is_some());
-    assert!(comparison.get("delta").is_some());
+    assert_eq!(comparison.per_table.len(), 2);
+    assert!(
+        comparison.per_table[0].delta.is_none(),
+        "Baseline carries no delta"
+    );
+    assert!(
+        comparison.per_table[1].delta.is_some(),
+        "Non-baseline entry carries a delta"
+    );
 }
 
 // ─── Recipe: ModernBERT Embeddings ───────────────────────────────────────────

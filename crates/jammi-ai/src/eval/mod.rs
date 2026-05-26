@@ -4,9 +4,14 @@
 //! (accuracy, F1) metrics. Results are recorded in the catalog for comparison
 //! and for Phase 13's ExperimentRunner.
 
-pub mod compare;
 pub mod golden;
+pub mod report;
 pub mod runner;
+
+pub use report::{
+    AggregateDelta, CompareEvalReport, EmbeddingEvalReport, InferenceAggregate,
+    InferenceEvalReport, MetricDelta, PerQueryRecord, PerRecordPrediction, TableEvalReport,
+};
 
 use serde::{Deserialize, Serialize};
 

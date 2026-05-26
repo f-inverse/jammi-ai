@@ -4,6 +4,51 @@ All notable changes to the Jammi AI workspace are recorded here. The
 workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
+## v0.9.0 — 2026-05-26
+
+### Changed
+
+- `eval_embeddings`, `eval_inference`, and `eval_compare` return typed
+  reports (`EmbeddingEvalReport`, `InferenceEvalReport`,
+  `CompareEvalReport`) instead of `serde_json::Value`. Each report carries
+  both the aggregate metrics and the per-query / per-record arrays. The
+  per-query data is what sample-based statistical rules (Welch's t,
+  Mann-Whitney U) consume at gate time; the aggregate is what the catalog
+  persists. `EmbeddingEvalReport.aggregate` is `AggregateMetrics` (same
+  fields as before); `InferenceEvalReport.aggregate` is the new
+  `InferenceAggregate` enum tagged by `task` (`"classification"` carries
+  the existing `ClassificationResult` shape; `"ner"` is still gated by
+  `EvalTask::Ner`'s not-yet-implemented error). `CompareEvalReport`
+  exposes `per_table` — the first entry is the baseline with `delta:
+  None`, and every subsequent entry carries `delta: Some(AggregateDelta)`
+  with per-metric `absolute` / `relative` values.
+- The Python `db.eval_embeddings`, `db.eval_inference`, and
+  `db.eval_compare` bindings now return dicts with `aggregate` plus
+  `per_query` / `per_record` / `per_table` keys (the JSON shape of the
+  new Rust types).
+- `jammi_python::convert` replaces `json_to_pydict(serde_json::Value)`
+  with a generic `serializable_to_pydict<T: Serialize>` helper so every
+  eval entry point routes its typed report through one converter.
+
+### Added
+
+- `AggregateMetrics::field_by_name(&str) -> Option<f64>` (`#[doc(hidden)]`)
+  in `jammi-numerics::retrieval`. Transitional helper for the
+  jammi-enterprise Gate config; removed in E2 once the Gate switches to a
+  typed metric enum.
+- `jammi_ai::eval::report` module exporting the new typed report types
+  (`EmbeddingEvalReport`, `PerQueryRecord`, `InferenceEvalReport`,
+  `InferenceAggregate`, `PerRecordPrediction`, `CompareEvalReport`,
+  `TableEvalReport`, `AggregateDelta`, `MetricDelta`).
+- `NerMetrics` and `TypeMetrics` now derive `Deserialize` so
+  `InferenceAggregate` round-trips through serde.
+
+### Removed
+
+- `jammi_ai::eval::compare` (empty placeholder module with no consumers).
+- `jammi_python::convert::json_to_pydict` (subsumed by
+  `serializable_to_pydict`).
+
 ## v0.8.0 — 2026-05-26
 
 ### Added

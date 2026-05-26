@@ -810,32 +810,34 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
         .await
         .unwrap();
 
-    // Both evals return valid JSON with all four metric keys in [0, 1]
-    let metric_keys = ["recall_at_k", "precision_at_k", "mrr", "ndcg"];
-    for (label, metrics) in [("base", &base_metrics), ("fine-tuned", &ft_metrics)] {
-        for key in &metric_keys {
-            let val = metrics[key]
-                .as_f64()
-                .unwrap_or_else(|| panic!("{label} missing metric: {key}"));
+    // Both reports carry all four aggregate metrics in [0, 1]
+    let metric_names = ["recall_at_k", "precision_at_k", "mrr", "ndcg"];
+    for (label, report) in [("base", &base_metrics), ("fine-tuned", &ft_metrics)] {
+        for name in &metric_names {
+            let val = report
+                .aggregate
+                .field_by_name(name)
+                .unwrap_or_else(|| panic!("{label} missing metric: {name}"));
             assert!(
                 (0.0..=1.0).contains(&val),
-                "{label} {key} = {val} outside [0, 1]"
+                "{label} {name} = {val} outside [0, 1]"
             );
         }
     }
 
-    // At least one metric must differ between base and fine-tuned (proves the
-    // adapter actually changes retrieval behavior, not a no-op)
-    let any_different = metric_keys.iter().any(|key| {
-        let base_val = base_metrics[key].as_f64().unwrap();
-        let ft_val = ft_metrics[key].as_f64().unwrap();
-        (base_val - ft_val).abs() > 1e-6
+    // At least one aggregate metric must differ between base and fine-tuned
+    // (proves the adapter actually changes retrieval behavior, not a no-op)
+    let any_different = metric_names.iter().any(|name| {
+        let b = base_metrics.aggregate.field_by_name(name).unwrap();
+        let f = ft_metrics.aggregate.field_by_name(name).unwrap();
+        (b - f).abs() > 1e-6
     });
     assert!(
         any_different,
         "Fine-tuned model should produce at least one different retrieval metric.\n\
-         base:       {base_metrics}\n\
-         fine-tuned: {ft_metrics}"
+         base:       {:?}\n\
+         fine-tuned: {:?}",
+        base_metrics.aggregate, ft_metrics.aggregate
     );
 }
 

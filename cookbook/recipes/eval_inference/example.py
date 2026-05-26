@@ -36,7 +36,7 @@ def main() -> int:
             source="corpus",
             columns=["content"],
             task="classification",
-            golden_source="golden.public.golden",
+            golden_source="golden.public.tiny_labels",
             label_column="label",
         )
 

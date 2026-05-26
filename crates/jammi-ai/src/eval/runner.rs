@@ -9,11 +9,12 @@ use crate::eval::EvalTask;
 use crate::model::ModelSource;
 use crate::session::InferenceSession;
 
+use jammi_numerics::classification::ClassificationMetrics;
+use jammi_numerics::retrieval::RetrievalMetrics;
+
 use super::golden::{
     ensure_column, load_classification_golden_from_batches, load_retrieval_golden_from_batches,
 };
-use super::metrics::classification::ClassificationMetrics;
-use super::metrics::retrieval::RetrievalMetrics;
 
 /// Orchestrates evaluation pipelines — retrieval and classification.
 pub struct EvalRunner<'a> {
@@ -180,7 +181,7 @@ impl<'a> EvalRunner<'a> {
             EvalTask::Ner => {
                 return Err(JammiError::Eval(
                     "NER evaluation via eval_inference is not yet implemented. \
-                     Use eval::metrics::ner::NerMetrics::compute() directly."
+                     Use jammi_numerics::ner::NerMetrics::compute() directly."
                         .into(),
                 ));
             }

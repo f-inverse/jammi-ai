@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/jammi-db",
+    "crates/jammi-numerics",
     "crates/jammi-ai",
     "crates/jammi-server",
     "crates/jammi-python",
@@ -13,6 +14,7 @@ members = [
 # jammi-python is a PyO3 cdylib — build via maturin, not cargo build --workspace
 default-members = [
     "crates/jammi-db",
+    "crates/jammi-numerics",
     "crates/jammi-ai",
     "crates/jammi-server",
     "crates/jammi-cli",
@@ -21,7 +23,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.88.0"
 license = "Apache-2.0"
@@ -29,11 +31,12 @@ repository = "https://github.com/f-inverse/jammi-ai"
 
 [workspace.dependencies]
 # Internal crates
-jammi-db = { version = "0.6.0", path = "crates/jammi-db" }
-jammi-ai = { version = "0.6.0", path = "crates/jammi-ai" }
-jammi-server = { version = "0.6.0", path = "crates/jammi-server" }
-jammi-lora = { version = "0.6.0", path = "crates/jammi-lora" }
-jammi-encoders = { version = "0.6.0", path = "crates/jammi-encoders" }
+jammi-db = { version = "0.7.0", path = "crates/jammi-db" }
+jammi-numerics = { version = "0.7.0", path = "crates/jammi-numerics" }
+jammi-ai = { version = "0.7.0", path = "crates/jammi-ai" }
+jammi-server = { version = "0.7.0", path = "crates/jammi-server" }
+jammi-lora = { version = "0.7.0", path = "crates/jammi-lora" }
+jammi-encoders = { version = "0.7.0", path = "crates/jammi-encoders" }
 jammi-test-utils = { path = "crates/jammi-test-utils" }
 
 # Query engine
@@ -117,6 +120,16 @@ futures = "0.3"
 async-stream = "0.3"
 parking_lot = "0.12"
 async-nats = "0.41"
+
+# Numerics (jammi-numerics) — pure-math kernels for stats, GP+EI, divergence,
+# eval metrics, distance, and Pareto. rand is pinned to 0.8 to keep
+# `build_projection_vector`'s output bit-equivalent with consumers (the
+# enterprise resilience layer reads the same projection seed).
+nalgebra = "0.34"
+rand = "0.8"
+rand_distr = "0.4"
+statrs = "0.18"
+approx = "0.5"
 
 # Test utilities
 test-case = "3.3"

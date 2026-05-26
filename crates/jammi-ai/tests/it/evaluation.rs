@@ -1,13 +1,12 @@
 use std::sync::Arc;
 
-use jammi_ai::eval::{
-    golden::{ensure_column, RelevanceJudgment},
-    metrics::{classification::ClassificationMetrics, retrieval::RetrievalMetrics},
-};
+use jammi_ai::eval::golden::{ensure_column, RelevanceJudgment};
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::eval_repo::EvalRunRecord;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_numerics::classification::ClassificationMetrics;
+use jammi_numerics::retrieval::RetrievalMetrics;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use tempfile::{tempdir, TempDir};

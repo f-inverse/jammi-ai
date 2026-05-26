@@ -657,7 +657,7 @@ impl CandleModel {
                 let offsets = &encoding.offsets[batch_idx];
                 let mask = &encoding.attention_masks[batch_idx];
 
-                let entities = crate::inference::ner_decode::decode_bio_spans(
+                let entities = jammi_numerics::ner::decode_bio_spans(
                     token_logits,
                     offsets,
                     mask,

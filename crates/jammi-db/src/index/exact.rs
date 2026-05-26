@@ -1,8 +1,9 @@
 use arrow::array::{Array, StringArray};
 use datafusion::prelude::SessionContext;
 
+use jammi_numerics::distance::cosine_distance;
+
 use crate::error::{JammiError, Result};
-use crate::index::cosine_distance;
 use crate::store::vectors::extend_with_fixed_size_list_f32;
 
 /// Brute-force vector search over a registered Parquet table via DataFusion.

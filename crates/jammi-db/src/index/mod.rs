@@ -30,21 +30,3 @@ pub trait VectorIndex: Send + Sync {
         self.len() == 0
     }
 }
-
-/// Compute cosine distance between two vectors: 1.0 - cosine_similarity.
-pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    let mut dot = 0.0_f32;
-    let mut norm_a = 0.0_f32;
-    let mut norm_b = 0.0_f32;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        norm_a += a[i] * a[i];
-        norm_b += b[i] * b[i];
-    }
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom < f32::EPSILON {
-        return 1.0;
-    }
-    1.0 - (dot / denom)
-}

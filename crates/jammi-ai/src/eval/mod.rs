@@ -6,7 +6,6 @@
 
 pub mod compare;
 pub mod golden;
-pub mod metrics;
 pub mod runner;
 
 use serde::{Deserialize, Serialize};

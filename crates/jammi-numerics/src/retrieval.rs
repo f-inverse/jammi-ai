@@ -1,10 +1,24 @@
-//! Retrieval metrics: recall@k, precision@k, MRR, nDCG with graded relevance.
+//! Retrieval metrics: recall@k, precision@k, MRR, nDCG with graded
+//! relevance. Includes the [`RelevanceJudgment`] type that serves both as
+//! the metric's input contract and as the standard golden-data row shape
+//! for any IR evaluation harness.
 
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::eval::golden::RelevanceJudgment;
+/// A relevance judgment: a document ID and its graded relevance.
+///
+/// The grade convention is standard for graded-relevance IR evaluation:
+/// `0` = not relevant, `1` = marginally, `2` = relevant, `3` = highly
+/// relevant. The kernel treats any positive grade as a "relevant" hit for
+/// recall / precision / MRR and uses the raw grade for nDCG's ideal-DCG
+/// computation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelevanceJudgment {
+    pub doc_id: String,
+    pub grade: i32,
+}
 
 /// Per-query metric values.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

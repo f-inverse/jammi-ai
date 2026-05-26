@@ -10,6 +10,7 @@ readme = "README.md"
 
 [dependencies]
 jammi-db.workspace = true
+jammi-numerics.workspace = true
 jammi-lora.workspace = true
 jammi-encoders.workspace = true
 candle-core.workspace = true

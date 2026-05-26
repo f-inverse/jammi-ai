@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use arrow::array::{Array, StringArray};
 use arrow::datatypes::{DataType, Schema};
 use jammi_db::error::{JammiError, Result};
+pub use jammi_numerics::retrieval::RelevanceJudgment;
 
 /// The input for a retrieval query — either text or image bytes.
 pub enum QueryInput {
@@ -19,13 +20,6 @@ pub struct RetrievalQuery {
     pub query_id: String,
     pub input: QueryInput,
     pub judgments: Vec<RelevanceJudgment>,
-}
-
-/// A relevance judgment: a document ID and its relevance grade.
-pub struct RelevanceJudgment {
-    pub doc_id: String,
-    /// 0 = not relevant, 1 = marginally, 2 = relevant, 3 = highly relevant.
-    pub grade: i32,
 }
 
 /// A loaded retrieval golden dataset, grouped by query.

@@ -1,6 +1,5 @@
 pub mod adapter;
 pub mod image_preprocess;
-pub mod ner_decode;
 pub mod observer;
 pub mod runner;
 pub mod schema;

@@ -37,6 +37,9 @@ live-gcs-tests = ["storage-gcs"]
 live-azure-tests = ["storage-azure"]
 
 [dependencies]
+# Internal
+jammi-numerics.workspace = true
+
 # Query engine
 datafusion.workspace = true
 datafusion-federation.workspace = true

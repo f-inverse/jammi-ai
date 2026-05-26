@@ -71,7 +71,23 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          for crate in jammi-db jammi-lora jammi-encoders jammi-ai jammi-server jammi-cli; do
+          # Publish in topological dependency order. Each entry must come
+          # after every crate it depends on, since `cargo publish` resolves
+          # workspace deps against crates.io once the path = is stripped:
+          #   - jammi-numerics is leaf (no internal deps)
+          #   - jammi-db depends on jammi-numerics
+          #   - jammi-lora is leaf
+          #   - jammi-encoders depends on jammi-lora
+          #   - jammi-ai depends on jammi-db, jammi-numerics, jammi-lora, jammi-encoders
+          #   - jammi-server depends on jammi-db, jammi-ai
+          #   - jammi-cli depends on jammi-db, jammi-ai, jammi-server
+          # The presence guard skips crates that don't exist at this tag's
+          # checkout — pre-S2 tags don't have jammi-numerics.
+          for crate in jammi-numerics jammi-db jammi-lora jammi-encoders jammi-ai jammi-server jammi-cli; do
+            if [ ! -f "crates/${crate}/Cargo.toml" ]; then
+              echo "${crate} not present at this tag — skipping"
+              continue
+            fi
             if curl -sf "https://crates.io/api/v1/crates/${crate}/${VERSION}" >/dev/null; then
               echo "${crate} ${VERSION} already on crates.io — skipping"
             else

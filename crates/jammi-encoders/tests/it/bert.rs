@@ -11,7 +11,7 @@ use jammi_encoders::{Bert, EncoderError, Pooling};
 use jammi_lora::{LoraBuildConfig, LoraInitMode};
 
 fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny_bert")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_bert")
 }
 
 fn load_config() -> BertConfig {

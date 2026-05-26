@@ -62,19 +62,43 @@ pub fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Root of the test fixtures directory (at workspace root).
+/// Root of the test fixtures directory (at workspace root). Houses the
+/// generic test-only fixtures (`patents.parquet`, `assignees.csv`,
+/// `golden_relevance.csv`, the tiny encoder fixtures that are not part of
+/// the public cookbook surface, etc.).
 pub fn fixtures_dir() -> PathBuf {
     workspace_root().join("tests").join("fixtures")
 }
 
-/// Path to a specific fixture file.
+/// Root of the cookbook fixtures directory (at workspace root). Houses
+/// the fixtures consumed by the OSS cookbook recipes — currently
+/// `tiny_bert/`, `tiny_modernbert_classifier/`, and the synthetic data
+/// files (`tiny_corpus.parquet`, `tiny_golden.json`, `tiny_labels.csv`,
+/// `tiny_pairs.csv`). Integration tests that exercise the same model
+/// fixtures the cookbook ships read from here so the recipe and the test
+/// share one source of truth.
+pub fn cookbook_fixtures_dir() -> PathBuf {
+    workspace_root().join("cookbook").join("fixtures")
+}
+
+/// Path to a specific fixture file under `tests/fixtures/`.
 pub fn fixture(name: &str) -> PathBuf {
     fixtures_dir().join(name)
 }
 
-/// URL for a fixture file suitable for DataFusion's ListingTable.
+/// Path to a specific fixture file under `cookbook/fixtures/`.
+pub fn cookbook_fixture(name: &str) -> PathBuf {
+    cookbook_fixtures_dir().join(name)
+}
+
+/// URL for a `tests/fixtures/` fixture suitable for DataFusion's ListingTable.
 pub fn fixture_url(name: &str) -> String {
     format!("file://{}", fixture(name).display())
+}
+
+/// URL for a `cookbook/fixtures/` fixture suitable for DataFusion's ListingTable.
+pub fn cookbook_fixture_url(name: &str) -> String {
+    format!("file://{}", cookbook_fixture(name).display())
 }
 
 /// Convert a `file://...` URL back into a filesystem `PathBuf` for tests

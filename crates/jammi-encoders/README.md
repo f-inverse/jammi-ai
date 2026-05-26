@@ -22,7 +22,7 @@ use jammi_encoders::{Bert, Pooling};
 use jammi_lora::LoraBuildConfig;
 
 let device = Device::Cpu;
-let fixture = PathBuf::from("tests/fixtures/tiny_bert");
+let fixture = PathBuf::from("cookbook/fixtures/tiny_bert");
 let config_str = std::fs::read_to_string(fixture.join("config.json"))?;
 let bert_config: jammi_encoders::BertConfig = serde_json::from_str(&config_str)?;
 

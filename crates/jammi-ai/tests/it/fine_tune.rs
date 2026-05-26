@@ -224,7 +224,7 @@ fn contract_lr_schedule_is_monotonic_after_warmup() {
 // Uses local tiny_bert fixture — no network access needed.
 
 fn tiny_bert_model() -> String {
-    "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()
+    "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
 }
 
 async fn session_with_training_data() -> (Arc<InferenceSession>, TempDir) {

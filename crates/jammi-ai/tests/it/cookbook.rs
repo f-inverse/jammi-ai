@@ -15,7 +15,7 @@ use tempfile::TempDir;
 use crate::common;
 
 fn tiny_bert_id() -> String {
-    "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()
+    "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
 }
 
 fn tiny_open_clip_id() -> String {
@@ -28,7 +28,7 @@ fn tiny_modernbert_id() -> String {
 
 fn tiny_modernbert_classifier_id() -> String {
     "local:".to_string()
-        + common::fixture("tiny_modernbert_classifier")
+        + common::cookbook_fixture("tiny_modernbert_classifier")
             .to_str()
             .unwrap()
 }

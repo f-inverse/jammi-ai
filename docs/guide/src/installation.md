@@ -34,7 +34,7 @@ All other native libraries (lzma, zstd, zlib, sqlite) are vendored and compiled 
 ## Python
 
 ```bash
-pip install jammi
+pip install jammi-ai
 ```
 
 Requires Python 3.8+. Pre-built wheels are available for Linux, macOS, and Windows.

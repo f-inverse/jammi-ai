@@ -16,36 +16,27 @@ pip install jammi-ai-cu12
 
 ## Quickstart
 
+The 5-minute walkthrough — install, connect, register a source, generate
+embeddings, search — lives in [`cookbook/quickstart/`](./cookbook/quickstart/)
+with a runnable [`quickstart.py`](./cookbook/quickstart/quickstart.py)
+gated by CI. The condensed version:
+
 ```python
 import jammi_ai
 
-# Connect (pass gpu_device=-1 to force CPU)
-db = jammi_ai.connect()
+db = jammi_ai.connect(gpu_device=-1)
+db.add_source("corpus", url="cookbook/fixtures/tiny_corpus.parquet", format="parquet")
 
-# Register a local data source
-db.add_source("patents", path="patents.parquet", format="parquet")
+MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+db.generate_text_embeddings(source="corpus", model=MODEL, columns=["content"], key="id")
 
-# Query with SQL — returns a pyarrow.Table
-table = db.sql("SELECT id, title, year FROM patents.public.patents WHERE year > 2020 LIMIT 5")
-print(table.to_pandas())
-
-# Generate and persist embeddings (with an ANN index)
-db.generate_text_embeddings(
-    source="patents",
-    model="sentence-transformers/all-MiniLM-L6-v2",
-    columns=["title"],
-    key="id",
-)
-
-# Semantic search
-query_vec = db.encode_text_query("sentence-transformers/all-MiniLM-L6-v2", "quantum computing applications")
-
-search = db.search("patents", query=query_vec, k=5)
-search.sort("similarity", descending=True)
-results = search.run()   # pyarrow.Table
-
+query_vec = db.encode_text_query(MODEL, "quantum computing applications")
+results = db.search("corpus", query=query_vec, k=5).run()
 print(results.to_pandas())
 ```
+
+For runnable end-to-end recipes — mutable tables, trigger streams, eval,
+fine-tuning, Flight SQL — see [`cookbook/`](./cookbook/).
 
 ## Features
 

@@ -11,6 +11,7 @@
 
 # Cookbook
 
+- [Runnable Recipes](./cookbook-recipes.md)
 - [Query Your Data with SQL](./query-data.md)
 - [Generate Embeddings](./generate-embeddings.md)
 - [Generate Image Embeddings](./generate-image-embeddings.md)

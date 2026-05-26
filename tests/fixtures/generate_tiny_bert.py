@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate a minimal BERT model fixture for hermetic end-to-end testing.
 
-Creates tests/fixtures/tiny_bert/ with:
+Creates cookbook/fixtures/tiny_bert/ with:
   - config.json      (BERT config, hidden=32, 1 layer, 2 heads, vocab=256)
   - model.safetensors (random weights in the correct tensor layout)
   - tokenizer.json    (minimal WordPiece tokenizer with 256-token vocab)
@@ -9,6 +9,11 @@ Creates tests/fixtures/tiny_bert/ with:
 The model is ~85KB total — small enough to commit to the repo.
 It produces garbage embeddings (random weights) but exercises the full
 CandleBackend::load() → BertModel::forward() → mean_pool → L2_normalize pipeline.
+
+The fixture lives under cookbook/fixtures/ because it is the local-model
+encoder every cookbook recipe loads; integration tests under
+crates/*/tests/it consume the same on-disk artifact via
+`jammi_test_utils::cookbook_fixture("tiny_bert")`.
 """
 
 import json
@@ -18,7 +23,14 @@ import numpy as np
 from safetensors.numpy import save_file
 from tokenizers import Tokenizer, models, normalizers, pre_tokenizers, processors
 
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tiny_bert")
+OUT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..",
+    "..",
+    "cookbook",
+    "fixtures",
+    "tiny_bert",
+)
 
 # Model dimensions
 HIDDEN = 32

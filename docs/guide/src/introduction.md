@@ -23,7 +23,7 @@ Jammi is an embeddable AI engine that brings model inference into your data pipe
 | Interface | Best for | Install |
 |-----------|----------|---------|
 | **Rust library** | Embedding Jammi into Rust applications | `cargo add jammi-ai` |
-| **Python package** | Data science, notebooks, scripts | `pip install jammi` |
+| **Python package** | Data science, notebooks, scripts | `pip install jammi-ai` |
 | **CLI** | Shell workflows, quick queries, ops | `cargo install jammi-cli` |
 
 All three interfaces share the same engine, configuration, and storage format. Embeddings generated from Python are queryable from the CLI, and vice versa.

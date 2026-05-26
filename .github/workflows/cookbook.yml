@@ -1,0 +1,76 @@
+name: Cookbook
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Nightly run includes the slow + integration recipes (fine_tune, flight_sql).
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: cookbook-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=mold"
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  smoke:
+    name: Smoke (fast)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Build wheel + venv
+        # The CI base image ships maturin + a system python3; venv-isolate to
+        # avoid polluting site-packages and to make `python` resolve to the
+        # venv's interpreter for the smoke runner.
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install maturin pyarrow
+          maturin develop --release
+
+      - name: Run cookbook smoke
+        run: |
+          . .venv/bin/activate
+          python tests/cookbook_smoke.py
+
+  smoke-slow:
+    name: Smoke (slow + integration)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Build wheel + jammi binary
+        # `flight_sql` shells out to `target/release/jammi`; build it before
+        # invoking the smoke runner.
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install maturin pyarrow
+          maturin develop --release
+          cargo build --release -p jammi-cli
+
+      - name: Run cookbook smoke (all recipes)
+        env:
+          JAMMI_COOKBOOK_SLOW: "1"
+        run: |
+          . .venv/bin/activate
+          python tests/cookbook_smoke.py

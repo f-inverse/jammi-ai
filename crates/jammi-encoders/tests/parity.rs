@@ -14,7 +14,7 @@ use jammi_encoders::{Bert, BertConfig, Pooling};
 use jammi_lora::LoraBuildConfig;
 
 fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny_bert")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_bert")
 }
 
 #[test]

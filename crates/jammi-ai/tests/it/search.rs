@@ -9,7 +9,7 @@ use tempfile::TempDir;
 use crate::common;
 
 fn tiny_bert_model() -> String {
-    "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()
+    "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
 }
 
 async fn session_with_embeddings() -> (Arc<InferenceSession>, TempDir) {

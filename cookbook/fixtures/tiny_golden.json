@@ -1,0 +1,47 @@
+[
+  {
+    "query_id": "q1",
+    "query_text": "quantum computing applications",
+    "relevant_ids": [
+      1,
+      4,
+      7,
+      11
+    ]
+  },
+  {
+    "query_id": "q2",
+    "query_text": "machine learning for science",
+    "relevant_ids": [
+      2,
+      5,
+      12
+    ]
+  },
+  {
+    "query_id": "q3",
+    "query_text": "gene therapy and editing",
+    "relevant_ids": [
+      3,
+      9,
+      18
+    ]
+  },
+  {
+    "query_id": "q4",
+    "query_text": "renewable energy technology",
+    "relevant_ids": [
+      10,
+      14
+    ]
+  },
+  {
+    "query_id": "q5",
+    "query_text": "chemical synthesis methods",
+    "relevant_ids": [
+      6,
+      15,
+      19
+    ]
+  }
+]

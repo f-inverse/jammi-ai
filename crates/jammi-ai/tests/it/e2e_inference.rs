@@ -2,7 +2,7 @@
 //
 // These tests exercise the full path: InferenceSession → add_source → infer()
 // → RecordBatch with vectors. They use a tiny BERT fixture (32-dim, 1 layer)
-// checked into tests/fixtures/tiny_bert/ — no network access required.
+// checked into cookbook/fixtures/tiny_bert/ — no network access required.
 
 use crate::common;
 
@@ -19,7 +19,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 fn tiny_bert_source() -> ModelSource {
-    ModelSource::local(common::fixture("tiny_bert"))
+    ModelSource::local(common::cookbook_fixture("tiny_bert"))
 }
 
 fn tiny_modernbert_source() -> ModelSource {
@@ -401,7 +401,7 @@ async fn embedding_vectors_are_semantically_meaningful_and_reproducible() {
     let config = common::test_config(dir.path());
     let session = InferenceSession::new(config).await.unwrap();
 
-    let model = "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap();
+    let model = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
 
     // Encode four queries: two physics, one biology, and a repeat of the first
     let vec_physics_1 = session
@@ -559,7 +559,7 @@ async fn e2e_modernbert_embedding_vectors_are_nonzero_and_reproducible() {
 // ─── Classification backend ─────────────────────────────────────────────────
 
 fn tiny_modernbert_classifier_source() -> ModelSource {
-    ModelSource::local(common::fixture("tiny_modernbert_classifier"))
+    ModelSource::local(common::cookbook_fixture("tiny_modernbert_classifier"))
 }
 
 #[tokio::test]

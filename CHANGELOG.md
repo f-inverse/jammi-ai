@@ -76,11 +76,52 @@ workspace ships every publishable crate at the same
 - **`InferenceSession::tenant_binding_arc`** accessor — required by the
   OSS server so the Flight SQL `TenantBoundProvider` can bind tenants
   for the duration of each query.
+- **`cookbook/` tree at the repo root** — OSS source of truth for runnable
+  Python recipes against `jammi-ai`. Layout:
+  - `cookbook/README.md` — index
+  - `cookbook/quickstart/` — 5-minute walkthrough (`README.md`,
+    `01_install.md` .. `04_vector_search.md`, runnable `quickstart.py`)
+  - `cookbook/recipes/{mutable_tables, trigger_streams, eval_embeddings,
+    eval_inference, fine_tune, flight_sql}/{README.md, example.py}`
+  - `cookbook/fixtures/` — deterministic `tiny_corpus.parquet`,
+    `tiny_golden.json`, `tiny_labels.csv`, `tiny_pairs.csv` plus
+    `generate.py`; `tiny_bert/` and `tiny_modernbert_classifier/` model
+    fixtures moved here from `tests/fixtures/`. Total tree < 250 KB.
+  Every recipe runs against the local fixture model so CI is hermetic;
+  every recipe's README has a "When to use this pattern" callout.
+- `tests/cookbook_smoke.py` — smoke runner that times every recipe,
+  fails the build if `quickstart.py` exceeds 60s wall-clock, excludes
+  `fine_tune` and `flight_sql` by default, surfaces them behind
+  `JAMMI_COOKBOOK_SLOW=1`.
+- `.github/workflows/cookbook.yml` — per-PR fast lane plus nightly
+  cron that sets `JAMMI_COOKBOOK_SLOW=1` and builds
+  `target/release/jammi` for the Flight SQL recipe.
+- `docs/guide/src/cookbook-recipes.md` — mdBook entry that
+  `{{#include}}`s every recipe README so the rendered guide and the
+  OSS recipes never drift apart.
+- `jammi_test_utils::{cookbook_fixture, cookbook_fixture_url,
+  cookbook_fixtures_dir}` — first-class helper for the cookbook
+  fixtures path. Every integration test that consumed `tiny_bert` /
+  `tiny_modernbert_classifier` now reads from `cookbook/fixtures/`.
 
 ### Changed
 
 - The CI `test-pg` job now uses `postgres:16` (was `postgres:15`),
   matching the spec's pinned base image.
+- `README.md` quickstart section collapsed to a 10-line inline example
+  with a link to `cookbook/quickstart/` for the full walkthrough — the
+  cookbook tree is the single source of truth.
+- `docs/guide/src/quickstart-python.md` rewritten as a stub that
+  `{{#include}}`s the cookbook quickstart README.
+
+### Removed
+
+- `tests/cookbook_smoke_test.py` (legacy file from before the cookbook
+  tree existed; used a non-existent `add_source(path=...)` kwarg and was
+  never wired into CI). Superseded by `tests/cookbook_smoke.py`.
+- `tests/fixtures/tiny_bert/` — relocated to `cookbook/fixtures/tiny_bert/`.
+- `tests/fixtures/tiny_modernbert_classifier/` — relocated to
+  `cookbook/fixtures/tiny_modernbert_classifier/`.
 
 ### Fixed
 
@@ -93,6 +134,12 @@ workspace ships every publishable crate at the same
   treated as an extension and stripped, so the `.usearch` / `.rowmap` /
   `.manifest.json` siblings were written under a truncated name.
   Affected any deployment whose model-id path contained a dot.
+- `docs/guide/src/installation.md` — Python install snippet was still
+  `pip install jammi`; corrected to `pip install jammi-ai` (post-S1
+  rename).
+- `docs/guide/src/introduction.md` — three-ways-to-use table row for
+  Python was still `pip install jammi`; corrected to
+  `pip install jammi-ai`.
 
 ### Breaking
 

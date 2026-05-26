@@ -25,7 +25,7 @@ use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use crate::common;
 
 fn tiny_bert_model() -> String {
-    "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()
+    "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
 }
 
 fn tiny_modernbert_model() -> String {

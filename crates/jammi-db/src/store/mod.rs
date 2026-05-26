@@ -49,12 +49,18 @@ pub struct ResultStore {
     catalog: Arc<Catalog>,
 }
 
-/// Sanitize a model ID for use in file names: `/`, `:`, spaces → `-`.
+/// Sanitize a model ID for use in file names.
+///
+/// Replaces every character that would be ambiguous in a path with `_`:
+/// `/`, `:`, ` ` (component separators / scheme delimiter / shell-unsafe),
+/// and `.` (interpreted by [`std::path::Path`] as an extension delimiter,
+/// which silently truncates sidecar filenames when the model-id path
+/// contains a dot — e.g. a `local:/path/with/.cache/model` source).
 fn sanitize_model_id(model_id: &str) -> String {
     model_id
         .chars()
         .map(|c| {
-            if c == '/' || c == ':' || c == ' ' {
+            if c == '/' || c == ':' || c == ' ' || c == '.' {
                 '_'
             } else {
                 c

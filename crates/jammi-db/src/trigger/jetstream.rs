@@ -8,6 +8,7 @@
 //! as message headers. Subscribes use an ordered pull consumer with a
 //! `DeliverByStartSequence` policy translated from `from_offset`.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,18 +53,44 @@ pub struct JetStreamBroker {
 }
 
 impl JetStreamBroker {
-    /// Open a broker bound to the NATS server at `url`. `retention_seconds`
-    /// applies to every freshly-created stream — operator overrides via
-    /// `TopicDefinition.broker_metadata` are honoured by `register_topic`.
+    /// Open an anonymous broker bound to the NATS server at `url`.
+    /// `retention_seconds` applies to every freshly-created stream —
+    /// operator overrides via `TopicDefinition.broker_metadata` are honoured
+    /// by `register_topic`.
     pub async fn connect(url: &str, retention_seconds: u64) -> Result<Self, TriggerError> {
         let client = async_nats::connect(url)
             .await
             .map_err(|e| TriggerError::Driver(format!("nats connect: {e}")))?;
-        Ok(Self {
+        Ok(Self::from_client(client, retention_seconds))
+    }
+
+    /// Open a broker authenticated with a NATS `.creds` file. Use this
+    /// constructor for SaaS deployments where the broker rejects anonymous
+    /// connections.
+    pub async fn connect_with_credentials(
+        url: &str,
+        retention_seconds: u64,
+        credentials_path: &Path,
+    ) -> Result<Self, TriggerError> {
+        let client = async_nats::ConnectOptions::with_credentials_file(credentials_path)
+            .await
+            .map_err(|e| TriggerError::Driver(format!("nats creds: {e}")))?
+            .connect(url)
+            .await
+            .map_err(|e| TriggerError::Driver(format!("nats connect: {e}")))?;
+        Ok(Self::from_client(client, retention_seconds))
+    }
+
+    /// Wrap a connected `async_nats::Client` into a [`JetStreamBroker`]
+    /// with the given retention. Shared by [`Self::connect`] and
+    /// [`Self::connect_with_credentials`] so the two paths agree on the
+    /// schemas-cache shape and the `JetStreamContext` derivation.
+    fn from_client(client: async_nats::Client, retention_seconds: u64) -> Self {
+        Self {
             context: jetstream::new(client),
             schemas: RwLock::new(HashMap::new()),
             retention: Duration::from_secs(retention_seconds),
-        })
+        }
     }
 
     fn stream_name(topic_id: TopicId) -> String {

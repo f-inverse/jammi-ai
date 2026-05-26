@@ -134,6 +134,12 @@ async fn build_handles(
         tenant_binding,
     ));
 
+    // The CLI is one-shot: each invocation builds fresh handles, talks to
+    // the catalog, then exits. Spinning up a JetStream connection per
+    // invocation would dwarf the work the command itself does, so the CLI
+    // intentionally uses the in-process broker even when the workspace
+    // config selects JetStream. Long-running consumers should talk to the
+    // server's gRPC `TriggerService`, which uses the config-driven broker.
     let broker: Arc<dyn TriggerBroker> = Arc::new(InMemoryBroker::new());
     let topic_repo = TopicRepo::new(Arc::clone(&catalog), Arc::clone(&registry));
     let publisher = Publisher::new(

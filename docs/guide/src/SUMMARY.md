@@ -37,4 +37,5 @@
 # Reference
 
 - [Configuration](./configuration.md)
+- [Catalog Backend and Trigger Broker](./catalog-and-broker.md)
 - [Architecture](./architecture.md)

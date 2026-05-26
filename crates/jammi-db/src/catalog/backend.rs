@@ -52,6 +52,12 @@ pub trait CatalogBackend: Send + Sync {
     /// Idempotent.
     fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + '_>>;
 
+    /// Cheap reachability test. Issued by health-endpoint consumers; never
+    /// takes a lock and never opens a transaction. Implementations run
+    /// `SELECT 1` against the connection pool and surface pool failures as
+    /// [`BackendError::Unavailable`] via [`classify`].
+    fn ping(&self) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + '_>>;
+
     /// Backend identity for telemetry and dialect-conditional code paths.
     fn backend_kind(&self) -> BackendKind;
 }
@@ -93,6 +99,39 @@ impl BackendImpl {
             BackendImpl::Sqlite(b) => b.migrate(),
             BackendImpl::Postgres(b) => b.migrate(),
         }
+    }
+
+    /// Dispatch [`CatalogBackend::ping`] to the inner backend.
+    pub fn ping(&self) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + '_>> {
+        match self {
+            BackendImpl::Sqlite(b) => b.ping(),
+            BackendImpl::Postgres(b) => b.ping(),
+        }
+    }
+
+    /// Construct a [`BackendImpl::Sqlite`] by opening (or creating) the
+    /// catalog DB at `path`. Migrations are *not* run here — call
+    /// [`BackendImpl::migrate`] after wiring.
+    pub async fn sqlite_from_path(path: &std::path::Path) -> Result<Self, BackendError> {
+        let sqlite = super::backend_sqlite::SqliteBackend::open(path).await?;
+        Ok(Self::Sqlite(sqlite))
+    }
+
+    /// Construct a [`BackendImpl::Postgres`] from a connection URL and pool
+    /// options. Migrations are *not* run here — call
+    /// [`BackendImpl::migrate`] after wiring.
+    pub async fn postgres_from_url(
+        url: &str,
+        pool_size: u32,
+        max_lifetime_secs: Option<u32>,
+    ) -> Result<Self, BackendError> {
+        let pg = super::backend_postgres::PostgresBackend::open_with_options(
+            url,
+            pool_size,
+            max_lifetime_secs,
+        )
+        .await?;
+        Ok(Self::Postgres(pg))
     }
 
     pub fn backend_kind(&self) -> BackendKind {

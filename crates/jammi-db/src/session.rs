@@ -5,9 +5,10 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_federation::{FederatedQueryPlanner, FederationOptimizerRule};
 
+use crate::catalog::backend::BackendImpl;
 use crate::catalog::topic_repo::TopicRepo;
 use crate::catalog::Catalog;
-use crate::config::JammiConfig;
+use crate::config::{BrokerConfig, CatalogConfig, JammiConfig};
 use crate::error::{JammiError, Result};
 use crate::source::mutable::MutableTableRegistry;
 use crate::source::registry::SourceCatalog;
@@ -53,37 +54,42 @@ pub struct JammiSession {
 }
 
 impl JammiSession {
-    /// Create a new session, opening the catalog and configuring DataFusion.
-    /// Uses an in-process [`InMemoryBroker`] for the trigger-stream surface.
+    /// Create a new session. The catalog backend and trigger broker are
+    /// constructed from `config.catalog` and `config.broker` respectively —
+    /// SQLite + in-process is the dev-laptop default, Postgres + JetStream
+    /// is the SaaS-deployment pairing.
+    ///
+    /// Selecting `BrokerConfig::JetStream` without the `jetstream-broker`
+    /// cargo feature on `jammi-db` returns [`JammiError::Config`] rather
+    /// than panicking — the broker variant is gone from the build, not
+    /// merely unreachable.
     pub async fn new(config: JammiConfig) -> Result<Self> {
-        Self::with_broker(config, Arc::new(InMemoryBroker::new())).await
+        let backend = build_backend_from_config(&config).await?;
+        let broker = build_broker_from_config(&config).await?;
+        Self::with_backend_and_broker(config, backend, broker).await
     }
 
-    /// Create a new session with a caller-supplied trigger broker.
-    ///
-    /// Used by:
-    /// - deployments that wire a clustered broker (JetStream) instead of the
-    ///   default in-process one
-    /// - tests that need a broker with controlled behaviour, e.g. an
-    ///   [`InMemoryBroker`] armed with
-    ///   [`InMemoryBroker::trigger_failure_for_next_publish`] to exercise
-    ///   publisher-failure paths deterministically
+    /// Create a new session with a caller-supplied trigger broker. The
+    /// catalog backend is still resolved from `config.catalog`, so callers
+    /// that just want to override the broker (test harnesses arming an
+    /// [`InMemoryBroker`] with
+    /// [`InMemoryBroker::trigger_failure_for_next_publish`] to exercise
+    /// publisher-failure paths) do not have to construct a backend
+    /// themselves.
     pub async fn with_broker(
         config: JammiConfig,
         trigger_broker: Arc<dyn TriggerBroker>,
     ) -> Result<Self> {
-        let config = Arc::new(config);
-        let tenant_binding = TenantBinding::unscoped();
-        let catalog = Arc::new(
-            Catalog::open_with_tenant(&config.artifact_dir, Some(tenant_binding.clone())).await?,
-        );
-        Self::build(config, catalog, tenant_binding, trigger_broker).await
+        let backend = build_backend_from_config(&config).await?;
+        Self::with_backend_and_broker(config, backend, trigger_broker).await
     }
 
     /// Build a session around a caller-supplied catalog backend. Migrations
     /// are applied here so the caller hands in a connected-but-unmigrated
     /// [`crate::catalog::backend::BackendImpl`]; the session takes it from
-    /// there. Uses the default in-process trigger broker.
+    /// there. The trigger broker is resolved from `config.broker` — pairs
+    /// with [`Self::with_broker`] for tests that want to override one
+    /// dimension and keep the other config-driven.
     ///
     /// Used by:
     /// - tests that need to parameterize over backend (SQLite tempfile vs
@@ -91,11 +97,9 @@ impl JammiSession {
     ///   [`Catalog::open_with_tenant`] surface
     /// - server deployments that compose their own backend (e.g. a shared
     ///   Postgres pool across multiple `jammi-server` replicas)
-    pub async fn with_backend(
-        config: JammiConfig,
-        backend: crate::catalog::backend::BackendImpl,
-    ) -> Result<Self> {
-        Self::with_backend_and_broker(config, backend, Arc::new(InMemoryBroker::new())).await
+    pub async fn with_backend(config: JammiConfig, backend: BackendImpl) -> Result<Self> {
+        let broker = build_broker_from_config(&config).await?;
+        Self::with_backend_and_broker(config, backend, broker).await
     }
 
     /// Build a session around a caller-supplied catalog backend AND a
@@ -104,7 +108,7 @@ impl JammiSession {
     /// reach for this one.
     pub async fn with_backend_and_broker(
         config: JammiConfig,
-        backend: crate::catalog::backend::BackendImpl,
+        backend: BackendImpl,
         trigger_broker: Arc<dyn TriggerBroker>,
     ) -> Result<Self> {
         let config = Arc::new(config);
@@ -742,6 +746,74 @@ impl JammiSession {
         crate::store::vectors::read_fixed_size_list_f32_column(&handle, &table.table_name, "vector")
             .await
     }
+}
+
+/// Build a [`BackendImpl`] from `config.catalog`, honouring the SQLite path
+/// default and the Postgres pool options.
+async fn build_backend_from_config(config: &JammiConfig) -> Result<BackendImpl> {
+    match &config.catalog {
+        CatalogConfig::Sqlite { path } => {
+            let db_path = match path {
+                Some(p) => p.clone(),
+                None => {
+                    std::fs::create_dir_all(&config.artifact_dir)?;
+                    config.artifact_dir.join("catalog.db")
+                }
+            };
+            Ok(BackendImpl::sqlite_from_path(&db_path).await?)
+        }
+        CatalogConfig::Postgres {
+            url,
+            pool_size,
+            max_lifetime_secs,
+        } => Ok(BackendImpl::postgres_from_url(url, *pool_size, *max_lifetime_secs).await?),
+    }
+}
+
+/// Build a trigger broker from `config.broker`. JetStream requires the
+/// `jetstream-broker` cargo feature; selecting it without the feature
+/// returns a typed [`JammiError::Config`] rather than panicking.
+async fn build_broker_from_config(config: &JammiConfig) -> Result<Arc<dyn TriggerBroker>> {
+    match &config.broker {
+        BrokerConfig::InMemory => Ok(Arc::new(InMemoryBroker::new())),
+        BrokerConfig::JetStream {
+            url,
+            retention_seconds,
+            credentials_path,
+        } => build_jetstream_broker(url, *retention_seconds, credentials_path.as_deref()).await,
+    }
+}
+
+#[cfg(feature = "jetstream-broker")]
+async fn build_jetstream_broker(
+    url: &str,
+    retention_seconds: u64,
+    credentials_path: Option<&std::path::Path>,
+) -> Result<Arc<dyn TriggerBroker>> {
+    let js = match credentials_path {
+        Some(p) => {
+            crate::trigger::jetstream::JetStreamBroker::connect_with_credentials(
+                url,
+                retention_seconds,
+                p,
+            )
+            .await?
+        }
+        None => crate::trigger::jetstream::JetStreamBroker::connect(url, retention_seconds).await?,
+    };
+    Ok(Arc::new(js))
+}
+
+#[cfg(not(feature = "jetstream-broker"))]
+async fn build_jetstream_broker(
+    _url: &str,
+    _retention_seconds: u64,
+    _credentials_path: Option<&std::path::Path>,
+) -> Result<Arc<dyn TriggerBroker>> {
+    Err(JammiError::Config(
+        "broker.kind = \"jet_stream\" requires the `jetstream-broker` cargo feature on jammi-db"
+            .into(),
+    ))
 }
 
 /// Handle passed to the closure inside [`JammiSession::with_tenant_scoped`].

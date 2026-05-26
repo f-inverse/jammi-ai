@@ -1,4 +1,5 @@
 mod caching;
+mod catalog_ping;
 mod channels;
 mod common;
 mod foundation;

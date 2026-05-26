@@ -113,4 +113,13 @@ impl Catalog {
     pub fn current_tenant(&self) -> Option<TenantId> {
         self.tenant.as_ref().and_then(|b| b.current_tenant())
     }
+
+    /// Cheap reachability test. Delegates to
+    /// [`backend::CatalogBackend::ping`]. Returns
+    /// [`backend::BackendError::Unavailable`] when the connection pool is
+    /// exhausted or closed; other failures pass through as
+    /// [`backend::BackendError::Sqlx`].
+    pub async fn ping(&self) -> std::result::Result<(), backend::BackendError> {
+        self.backend.ping().await
+    }
 }

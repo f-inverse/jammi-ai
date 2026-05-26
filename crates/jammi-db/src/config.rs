@@ -138,6 +138,24 @@ impl FromStr for LogFormat {
 /// Top-level configuration for the Jammi AI platform.
 ///
 /// Load from a TOML file via [`JammiConfig::load`], with environment variable overrides.
+///
+/// # Catalog and broker selection
+///
+/// ```toml
+/// artifact_dir = "/var/lib/jammi"
+///
+/// [catalog]
+/// kind = "postgres"
+/// url = "${POSTGRES_URL}"
+/// pool_size = 16
+/// max_lifetime_secs = 1800
+///
+/// [broker]
+/// kind = "jet_stream"
+/// url = "nats://${NATS_HOST}:4222"
+/// retention_seconds = 604800
+/// credentials_path = "/var/run/secrets/nats.creds"
+/// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct JammiConfig {
@@ -160,6 +178,112 @@ pub struct JammiConfig {
     pub server: ServerConfig,
     /// Tracing/logging configuration.
     pub logging: LoggingConfig,
+    /// Catalog backend selection. Default: SQLite under `artifact_dir`.
+    pub catalog: CatalogConfig,
+    /// Trigger broker selection. Default: in-process [`crate::trigger::InMemoryBroker`].
+    pub broker: BrokerConfig,
+}
+
+/// Catalog backend selection. The catalog and the mutable companion tables
+/// share this backend.
+///
+/// # TOML
+///
+/// ```toml
+/// [catalog]
+/// kind = "sqlite"
+/// # path = "/var/lib/jammi/catalog.db"   # optional override
+/// ```
+///
+/// ```toml
+/// [catalog]
+/// kind = "postgres"
+/// url = "${POSTGRES_URL}"
+/// pool_size = 16
+/// max_lifetime_secs = 1800
+/// ```
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CatalogConfig {
+    /// SQLite under `artifact_dir`. The laptop / dev default.
+    Sqlite {
+        /// Override the catalog DB path. Defaults to
+        /// `{artifact_dir}/catalog.db` when omitted.
+        #[serde(default)]
+        path: Option<PathBuf>,
+    },
+    /// Postgres (or compatible) catalog. Used for SaaS deployments and
+    /// self-hosted production.
+    Postgres {
+        /// Connection URL, e.g. `postgres://user:pass@host:5432/jammi`.
+        url: String,
+        /// `sqlx::PgPool` `max_connections`. Default: 8.
+        #[serde(default = "default_pool_size")]
+        pool_size: u32,
+        /// Optional `sqlx::PgPool` `max_lifetime` in seconds. `None`
+        /// leaves the pool default in effect.
+        #[serde(default)]
+        max_lifetime_secs: Option<u32>,
+    },
+}
+
+impl Default for CatalogConfig {
+    fn default() -> Self {
+        Self::Sqlite { path: None }
+    }
+}
+
+fn default_pool_size() -> u32 {
+    8
+}
+
+/// Trigger broker selection.
+///
+/// # TOML
+///
+/// ```toml
+/// [broker]
+/// kind = "in_memory"
+/// ```
+///
+/// ```toml
+/// [broker]
+/// kind = "jet_stream"
+/// url = "nats://${NATS_HOST}:4222"
+/// retention_seconds = 604800
+/// credentials_path = "/var/run/secrets/nats.creds"
+/// ```
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BrokerConfig {
+    /// In-process broker. Default; matches the laptop / dev workflow.
+    InMemory,
+    /// JetStream (NATS). Requires the `jetstream-broker` cargo feature on
+    /// `jammi-db`; building a session whose config selects `JetStream`
+    /// without the feature returns [`crate::error::JammiError::Config`].
+    JetStream {
+        /// NATS server URL, e.g. `nats://nats.svc:4222`.
+        url: String,
+        /// Default per-stream retention in seconds. Per-topic
+        /// `broker_metadata.retention_seconds` overrides this value.
+        /// Default: 7 days (604 800).
+        #[serde(default = "default_retention_secs")]
+        retention_seconds: u64,
+        /// Optional path to a NATS `.creds` file. When unset the broker
+        /// connects anonymously.
+        #[serde(default)]
+        credentials_path: Option<PathBuf>,
+    },
+}
+
+impl Default for BrokerConfig {
+    fn default() -> Self {
+        Self::InMemory
+    }
+}
+
+fn default_retention_secs() -> u64 {
+    7 * 24 * 60 * 60
 }
 
 /// DataFusion query-engine settings.
@@ -322,6 +446,8 @@ impl Default for JammiConfig {
             cache: CacheConfig::default(),
             server: ServerConfig::default(),
             logging: LoggingConfig::default(),
+            catalog: CatalogConfig::default(),
+            broker: BrokerConfig::default(),
         }
     }
 }
@@ -430,12 +556,19 @@ fn num_cpus() -> usize {
 impl JammiConfig {
     /// Load configuration from a TOML file (resolved via explicit path, `JAMMI_CONFIG` env,
     /// `./jammi.toml`, or platform config dir) and apply environment variable overrides.
+    ///
+    /// Before TOML parsing the loader runs [`interpolate_env_vars`] on the
+    /// raw file contents: `${NAME}` is substituted with the value of
+    /// `std::env::var("NAME")`, `$$` escapes a literal `$`, and a missing
+    /// variable is a hard error (no silent empty substitution). See
+    /// [`interpolate_env_vars`] for the full rules.
     pub fn load(path: Option<&Path>) -> Result<Self> {
         let config_path = Self::resolve_config_path(path);
         let mut config: Self = match config_path {
             Some(p) => {
                 let contents = std::fs::read_to_string(&p)?;
-                toml::from_str(&contents)?
+                let interpolated = interpolate_env_vars(&contents)?;
+                toml::from_str(&interpolated)?
             }
             None => Self::default(),
         };
@@ -549,5 +682,303 @@ impl JammiConfig {
         if let Ok(v) = std::env::var("JAMMI_SERVER__FLIGHT_LISTEN") {
             self.server.flight_listen = v;
         }
+    }
+}
+
+/// Substitute `${VAR}` patterns in `input` from the process environment.
+///
+/// Rules:
+/// - `${NAME}` is replaced by the value of `std::env::var("NAME")`. A name
+///   must start with `[A-Za-z_]` and continue with `[A-Za-z0-9_]`.
+/// - A missing variable returns [`JammiError::Config`]. The loader does
+///   **not** silently substitute an empty string — that is a common source of
+///   "deployed config has empty Postgres URL" outages.
+/// - `$$` escapes a literal `$`.
+/// - A bare `$` not followed by `$` or `{` is preserved verbatim (lets the
+///   raw `$` in a TOML password slip through unchanged).
+/// - An unterminated `${` returns [`JammiError::Config`].
+/// - Interpolation is one-pass and not recursive: the value of `${X}` is not
+///   re-scanned.
+pub fn interpolate_env_vars(input: &str) -> Result<String> {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b != b'$' {
+            // `bytes[i]` came from `input.as_bytes()` and indexing is at a
+            // char boundary at this point: every previous step either copied
+            // exactly one ASCII byte (`$`, `{`, `}`, or a variable-name
+            // character) or copied a whole UTF-8 substring from `input` via
+            // `&input[..]`. The non-ASCII branch below preserves boundaries.
+            if b < 0x80 {
+                out.push(b as char);
+                i += 1;
+            } else {
+                // Non-ASCII byte: scan to the next ASCII char or `$` and
+                // copy the slice in one go so we never split a code point.
+                let start = i;
+                while i < bytes.len() && bytes[i] >= 0x80 {
+                    i += 1;
+                }
+                out.push_str(&input[start..i]);
+            }
+            continue;
+        }
+
+        // We saw a `$`. Peek the next byte.
+        let next = bytes.get(i + 1).copied();
+        match next {
+            Some(b'$') => {
+                out.push('$');
+                i += 2;
+            }
+            Some(b'{') => {
+                let name_start = i + 2;
+                let close = bytes[name_start..]
+                    .iter()
+                    .position(|&c| c == b'}')
+                    .map(|off| name_start + off)
+                    .ok_or_else(|| {
+                        JammiError::Config(format!(
+                            "Unterminated env-var reference `${{` at offset {i}"
+                        ))
+                    })?;
+                let name = &input[name_start..close];
+                if !is_valid_env_name(name) {
+                    return Err(JammiError::Config(format!(
+                        "Invalid env-var name `${{{name}}}` at offset {i}: \
+                         names must match [A-Za-z_][A-Za-z0-9_]*"
+                    )));
+                }
+                let value = std::env::var(name).map_err(|_| {
+                    JammiError::Config(format!("Env var `{name}` referenced by config is not set"))
+                })?;
+                out.push_str(&value);
+                i = close + 1;
+            }
+            // A bare `$` (end of input or followed by anything else): keep
+            // the literal `$` so escaped passwords containing one `$` do
+            // not trip the loader.
+            _ => {
+                out.push('$');
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn is_valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_config_round_trip_sqlite_default() {
+        let toml_src = r#"
+            [catalog]
+            kind = "sqlite"
+        "#;
+        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.catalog, CatalogConfig::Sqlite { path: None });
+    }
+
+    #[test]
+    fn catalog_config_round_trip_sqlite_with_path() {
+        let toml_src = r#"
+            [catalog]
+            kind = "sqlite"
+            path = "/srv/jammi/catalog.db"
+        "#;
+        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(
+            cfg.catalog,
+            CatalogConfig::Sqlite {
+                path: Some(PathBuf::from("/srv/jammi/catalog.db"))
+            }
+        );
+    }
+
+    #[test]
+    fn catalog_config_round_trip_postgres() {
+        let toml_src = r#"
+            [catalog]
+            kind = "postgres"
+            url = "postgres://u:p@h/db"
+            pool_size = 16
+            max_lifetime_secs = 1800
+        "#;
+        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(
+            cfg.catalog,
+            CatalogConfig::Postgres {
+                url: "postgres://u:p@h/db".into(),
+                pool_size: 16,
+                max_lifetime_secs: Some(1800),
+            }
+        );
+    }
+
+    #[test]
+    fn catalog_config_postgres_defaults() {
+        let toml_src = r#"
+            [catalog]
+            kind = "postgres"
+            url = "postgres://u:p@h/db"
+        "#;
+        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(
+            cfg.catalog,
+            CatalogConfig::Postgres {
+                url: "postgres://u:p@h/db".into(),
+                pool_size: 8,
+                max_lifetime_secs: None,
+            }
+        );
+    }
+
+    #[test]
+    fn broker_config_round_trip_in_memory() {
+        let toml_src = r#"
+            [broker]
+            kind = "in_memory"
+        "#;
+        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.broker, BrokerConfig::InMemory);
+    }
+
+    #[test]
+    fn broker_config_round_trip_jetstream() {
+        let toml_src = r#"
+            [broker]
+            kind = "jet_stream"
+            url = "nats://nats.svc:4222"
+            retention_seconds = 86400
+            credentials_path = "/run/secrets/nats.creds"
+        "#;
+        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(
+            cfg.broker,
+            BrokerConfig::JetStream {
+                url: "nats://nats.svc:4222".into(),
+                retention_seconds: 86400,
+                credentials_path: Some(PathBuf::from("/run/secrets/nats.creds")),
+            }
+        );
+    }
+
+    #[test]
+    fn broker_config_jetstream_defaults() {
+        let toml_src = r#"
+            [broker]
+            kind = "jet_stream"
+            url = "nats://nats.svc:4222"
+        "#;
+        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(
+            cfg.broker,
+            BrokerConfig::JetStream {
+                url: "nats://nats.svc:4222".into(),
+                retention_seconds: 7 * 24 * 60 * 60,
+                credentials_path: None,
+            }
+        );
+    }
+
+    #[test]
+    fn jammi_config_default_uses_sqlite_and_in_memory() {
+        let cfg = JammiConfig::default();
+        assert_eq!(cfg.catalog, CatalogConfig::Sqlite { path: None });
+        assert_eq!(cfg.broker, BrokerConfig::InMemory);
+    }
+
+    #[test]
+    fn interpolate_env_vars_happy_path() {
+        // Parallel tests would collide on a shared env var; the test name is
+        // baked into the var name to keep each test's view independent.
+        std::env::set_var("JAMMI_TEST_INTERP_HAPPY", "from-env");
+        let out = interpolate_env_vars("url = \"${JAMMI_TEST_INTERP_HAPPY}\"").unwrap();
+        assert_eq!(out, "url = \"from-env\"");
+        std::env::remove_var("JAMMI_TEST_INTERP_HAPPY");
+    }
+
+    #[test]
+    fn interpolate_env_vars_missing_is_typed_error() {
+        // Use a unique name to dodge a parallel-test race that sets it.
+        std::env::remove_var("JAMMI_TEST_INTERP_DEFINITELY_NOT_SET");
+        let err =
+            interpolate_env_vars("url = \"${JAMMI_TEST_INTERP_DEFINITELY_NOT_SET}\"").unwrap_err();
+        match err {
+            JammiError::Config(msg) => {
+                assert!(
+                    msg.contains("JAMMI_TEST_INTERP_DEFINITELY_NOT_SET"),
+                    "msg = {msg}"
+                );
+            }
+            other => panic!("expected JammiError::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpolate_env_vars_escape_double_dollar() {
+        let out = interpolate_env_vars("password = \"$$secret$$\"").unwrap();
+        assert_eq!(out, "password = \"$secret$\"");
+    }
+
+    #[test]
+    fn interpolate_env_vars_unterminated_brace_errors() {
+        let err = interpolate_env_vars("url = \"${UNCLOSED\"").unwrap_err();
+        assert!(matches!(err, JammiError::Config(_)), "{err:?}");
+    }
+
+    #[test]
+    fn interpolate_env_vars_bare_dollar_preserved() {
+        let out = interpolate_env_vars("hint = \"price is $5\"").unwrap();
+        assert_eq!(out, "hint = \"price is $5\"");
+    }
+
+    #[test]
+    fn interpolate_env_vars_invalid_name_errors() {
+        let err = interpolate_env_vars("url = \"${1bad}\"").unwrap_err();
+        match err {
+            JammiError::Config(msg) => assert!(msg.contains("Invalid env-var name"), "{msg}"),
+            other => panic!("expected JammiError::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_interpolates_before_parse() {
+        std::env::set_var("JAMMI_TEST_LOAD_URL", "postgres://u:p@h/db");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jammi.toml");
+        std::fs::write(
+            &path,
+            r#"
+                [catalog]
+                kind = "postgres"
+                url = "${JAMMI_TEST_LOAD_URL}"
+                pool_size = 4
+            "#,
+        )
+        .unwrap();
+        let cfg = JammiConfig::load(Some(&path)).unwrap();
+        assert_eq!(
+            cfg.catalog,
+            CatalogConfig::Postgres {
+                url: "postgres://u:p@h/db".into(),
+                pool_size: 4,
+                max_lifetime_secs: None,
+            }
+        );
+        std::env::remove_var("JAMMI_TEST_LOAD_URL");
     }
 }

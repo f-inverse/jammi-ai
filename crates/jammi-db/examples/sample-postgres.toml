@@ -1,0 +1,35 @@
+# Sample Jammi config selecting Postgres + JetStream.
+#
+# `${...}` substitutions resolve from the process environment before the
+# TOML parser runs; a missing variable is an error (no silent empty
+# substitution). `$$` escapes a literal `$` for passwords that need one
+# verbatim.
+#
+# Load with `JammiConfig::load(Some(path))`. The resolver also honours
+# `JAMMI_CONFIG`, `./jammi.toml`, and the platform config directory; see
+# `jammi_db::config::JammiConfig::load` rustdoc for the full search order.
+
+artifact_dir = "/var/lib/jammi"
+
+[catalog]
+kind = "postgres"
+url = "${POSTGRES_URL}"
+pool_size = 16
+# Optional; PgBouncer / RDS-Proxy deployments cap connection lifetime so the
+# pool rotates onto fresh upstream connections instead of pinning one.
+max_lifetime_secs = 1800
+
+[broker]
+kind = "jet_stream"
+url = "nats://${NATS_HOST}:4222"
+# Default retention if a topic does not set `broker_metadata.retention_seconds`.
+retention_seconds = 604800
+credentials_path = "/var/run/secrets/nats.creds"
+
+[engine]
+execution_threads = 8
+batch_size = 8192
+
+[server]
+health_listen = "0.0.0.0:8080"
+flight_listen = "0.0.0.0:8081"

@@ -92,6 +92,16 @@ impl CatalogBackend for SqliteBackend {
         Box::pin(async move { super::migrations::run(self).await })
     }
 
+    fn ping(&self) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + '_>> {
+        Box::pin(async move {
+            sqlx::query("SELECT 1")
+                .execute(&self.pool)
+                .await
+                .map_err(classify)?;
+            Ok(())
+        })
+    }
+
     fn backend_kind(&self) -> BackendKind {
         BackendKind::Sqlite
     }

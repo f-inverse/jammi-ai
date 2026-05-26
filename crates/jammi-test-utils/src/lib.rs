@@ -39,7 +39,7 @@ pub async fn make_test_session(kind: BackendKind, artifact_dir: &Path) -> Option
         ),
         BackendKind::Postgres => {
             let url = pg_url_for_tests()?;
-            let pg = PostgresBackend::open(&url)
+            let pg = PostgresBackend::open_with_options(&url, 8, None)
                 .await
                 .expect("open postgres backend");
             let backend = BackendImpl::Postgres(pg);

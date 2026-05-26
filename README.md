@@ -93,6 +93,22 @@ job.wait()
 
 > **Windows** is not yet supported due to a dependency on POSIX memory-mapping APIs.
 
+## Running the OSS server
+
+For deployments that need a long-running Flight SQL + gRPC service rather than an embedded library, the workspace ships a Docker image:
+
+```bash
+docker run --rm \
+  -p 8080:8080 -p 8081:8081 \
+  -v jammi_data:/var/lib/jammi \
+  ghcr.io/f-inverse/jammi-ai-server:latest
+
+curl http://localhost:8080/healthz
+# {"status":"ok","version":"0.8.0"}
+```
+
+The OSS server is single-tenant — the deployer's network is the auth boundary. See [Deploy as a Server](https://f-inverse.github.io/jammi-ai/deploy-server.html) for the full guide.
+
 ## Documentation
 
 Full documentation, including guides for SQL queries, embeddings, search, fine-tuning, and evaluation:

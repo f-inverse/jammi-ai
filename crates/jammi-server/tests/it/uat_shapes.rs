@@ -5,8 +5,8 @@
 //!
 //! Shape A: embedded library (`JammiSession::new` in-process).
 //! Shape B: single-tenant Flight SQL server (`serve_flight`).
-//! Shape C: multi-tenant Flight + gRPC server (`serve_flight_with_session_service`
-//!          + `serve_grpc_with_shutdown`).
+//! Shape C: multi-tenant Flight + gRPC server
+//!          (`runtime::serve_grpc_chain`).
 //!
 //! Each test boots its specific shape, exercises a primitive from each
 //! Phase (1: channel registration, 2: mutable table, 3: tenant scope where
@@ -148,7 +148,7 @@ async fn shape_c_multi_tenant_server_isolates_two_tenants_across_primitives() {
 
     let store = SessionStore::new();
 
-    // gRPC server with SessionService + TriggerService.
+    // gRPC + Flight SQL chain on one port — the OSS server's shape.
     let grpc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let grpc_addr: SocketAddr = grpc_listener.local_addr().unwrap();
     drop(grpc_listener);
@@ -160,9 +160,13 @@ async fn shape_c_multi_tenant_server_isolates_two_tenants_across_primitives() {
         subscriber: session.subscriber(),
     };
     let store_for_grpc = store.clone();
+    let flight_ctx = session.context().clone();
+    let binding = session.tenant_binding_arc();
     let grpc_handle = tokio::spawn(async move {
-        jammi_server::serve_grpc_with_shutdown(
+        jammi_server::runtime::serve_grpc_chain(
             grpc_addr,
+            flight_ctx,
+            binding,
             store_for_grpc,
             Some(trigger),
             async move {
@@ -172,32 +176,14 @@ async fn shape_c_multi_tenant_server_isolates_two_tenants_across_primitives() {
         .await
         .expect("grpc server");
     });
-
-    // Flight server on a separate port, sharing the same SessionStore.
-    let flight_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let flight_addr: SocketAddr = flight_listener.local_addr().unwrap();
-    drop(flight_listener);
-
-    let ctx = session.context().clone();
-    let binding = session.tenant_binding_arc();
-    let store_for_flight = store.clone();
-    let flight_handle = tokio::spawn(async move {
-        let _ = jammi_server::flight::serve_flight_with_session_service(
-            &ctx,
-            binding,
-            flight_addr,
-            store_for_flight,
-        )
-        .await;
-    });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // The multi-tenant shape's contract: both surfaces boot, share one
-    // SessionStore, and the engine surface is reachable. Detailed
-    // tenant-isolation assertions are covered by `grpc_session.rs` and
+    // The multi-tenant shape's contract: the unified chain boots, the
+    // SessionStore is shared between Flight SQL and the gRPC services,
+    // and the engine surface is reachable. Detailed tenant-isolation
+    // assertions are covered by `grpc_session.rs` and
     // `flight_tenant.rs` — here we just prove Shape C composes.
     let _ = shutdown_tx.send(());
-    flight_handle.abort();
     let _ = grpc_handle.await;
 
     let listed = session.mutable_tables().list(None).await.unwrap();

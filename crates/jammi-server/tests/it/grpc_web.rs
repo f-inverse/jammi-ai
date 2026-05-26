@@ -8,27 +8,39 @@
 
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
+use jammi_db::session::JammiSession;
 use jammi_db::TenantId;
 use jammi_server::grpc::proto::session::{SetTenantRequest, Tenant};
 use jammi_server::grpc::session::{SessionId, SessionStore};
+use jammi_test_utils::test_config;
 use prost::Message;
+use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use super::common::grpc::TENANT_A;
 
-/// Spin up an in-process gRPC server hosting only `SessionService` (no
-/// trigger handles — this test does not need them). Returns the bound
-/// address, the shared store the server reads/writes, and the shutdown
-/// + join handles.
+/// Spin up an in-process gRPC server hosting `SessionService` (no
+/// trigger handles — this test does not need them). The Flight SQL
+/// service is mounted on the same chain as in production so the
+/// gRPC-Web routing assertion exercises the real binary's surface;
+/// the test never issues a Flight RPC. Returns the bound address,
+/// the shared store the server reads/writes, the shutdown + join
+/// handles, and the `TempDir` keeping the session's catalog alive.
 async fn start_session_only_server() -> (
     SocketAddr,
     SessionStore,
     oneshot::Sender<()>,
     tokio::task::JoinHandle<()>,
+    TempDir,
 ) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = test_config(dir.path());
+    let session = Arc::new(JammiSession::new(cfg).await.expect("session"));
+
     let store = SessionStore::new();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -36,10 +48,19 @@ async fn start_session_only_server() -> (
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let store_for_server = store.clone();
+    let flight_ctx = session.context().clone();
+    let binding = session.tenant_binding_arc();
     let handle = tokio::spawn(async move {
-        jammi_server::serve_grpc_with_shutdown(addr, store_for_server, None, async move {
-            let _ = shutdown_rx.await;
-        })
+        jammi_server::runtime::serve_grpc_chain(
+            addr,
+            flight_ctx,
+            binding,
+            store_for_server,
+            None,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        )
         .await
         .expect("grpc server");
     });
@@ -47,7 +68,7 @@ async fn start_session_only_server() -> (
     // Give the server a moment to bind.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    (addr, store, shutdown_tx, handle)
+    (addr, store, shutdown_tx, handle, dir)
 }
 
 /// Wrap a proto-encoded payload in a single gRPC-Web data frame:
@@ -98,7 +119,7 @@ fn unframe_grpc_web(body: &[u8]) -> (Vec<u8>, String) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grpc_web_set_tenant_round_trip() {
-    let (addr, store, shutdown, handle) = start_session_only_server().await;
+    let (addr, store, shutdown, handle, _dir) = start_session_only_server().await;
 
     // Build the request body: a length-prefixed SetTenantRequest{ tenant }.
     let request_proto = SetTenantRequest {

@@ -1,0 +1,15 @@
+# Docker-compose-flavoured config for the OSS `jammi-server`.
+#
+# Lives alongside `oss-server.yml` and is bind-mounted to
+# `/etc/jammi/jammi.toml` inside the container.
+
+artifact_dir = "/var/lib/jammi"
+
+[server]
+health_listen = "0.0.0.0:8080"
+flight_listen = "0.0.0.0:8081"
+preload_models = []
+
+[logging]
+level = "info"
+format = "json"

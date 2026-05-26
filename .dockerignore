@@ -1,0 +1,32 @@
+# Build artifacts — the BuildKit cache mount handles cargo state.
+target/
+**/target/
+
+# Local dev state.
+.git/
+.gitignore
+.docker/
+.devcontainer/
+.cargo/
+.claude/
+
+# Python toolchain output and venv state — the OSS server is a
+# Rust binary; nothing from these directories belongs in the
+# build context.
+**/__pycache__/
+**/*.pyc
+python/
+pyproject*.toml
+
+# Editor / OS clutter.
+.vscode/
+.idea/
+.DS_Store
+
+# Docs and other text the build doesn't read.
+docs/
+*.md
+!crates/*/README.md
+
+# CI metadata.
+.github/

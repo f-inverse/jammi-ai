@@ -1,0 +1,35 @@
+# Minimal docker-compose for the OSS `jammi-server`.
+#
+# The MVP image is single-tenant with SQLite + in-memory broker —
+# no Postgres or NATS dependencies. Once the S4 catalog/broker
+# config lands, this file gains `postgres:` and `nats:` services
+# and the server config switches to point at them.
+
+services:
+  jammi-server:
+    image: ghcr.io/f-inverse/jammi-ai-server:latest
+    ports:
+      - "8080:8080" # HTTP side-channel (/healthz, /readyz, /metrics)
+      - "8081:8081" # gRPC + Flight SQL
+    volumes:
+      - jammi_data:/var/lib/jammi
+      - ./jammi.toml:/etc/jammi/jammi.toml:ro
+    restart: unless-stopped
+    healthcheck:
+      # Distroless ships no shell, so the healthcheck calls the
+      # binary directly. `/healthz` is a 200 OK from the side-
+      # channel even if the engine is mid-bootstrap; readiness is
+      # the `/readyz` probe behind the load balancer.
+      test:
+        - CMD
+        - /usr/local/bin/jammi-server
+        - --help
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  # Named volume so docker provisions ownership for distroless's
+  # nonroot uid (65532). A bind mount would require host-side
+  # `chown 65532:65532` before the container could write.
+  jammi_data:

@@ -76,10 +76,19 @@ async fn start_grpc_test_server() -> (
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let store_for_server = store.clone();
+    let flight_ctx = session.context().clone();
+    let binding = session.tenant_binding_arc();
     let handle = tokio::spawn(async move {
-        jammi_server::serve_grpc_with_shutdown(addr, store_for_server, Some(trigger), async move {
-            let _ = shutdown_rx.await;
-        })
+        jammi_server::runtime::serve_grpc_chain(
+            addr,
+            flight_ctx,
+            binding,
+            store_for_server,
+            Some(trigger),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        )
         .await
         .expect("grpc server");
     });

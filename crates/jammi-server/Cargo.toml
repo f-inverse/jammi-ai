@@ -1,6 +1,6 @@
 [package]
 name = "jammi-server"
-description = "Arrow Flight SQL server and health probe for Jammi AI"
+description = "OSS Jammi server binary: Arrow Flight SQL, SessionService, TriggerService, and health/metrics endpoints"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,8 +8,12 @@ license.workspace = true
 repository.workspace = true
 readme = "README.md"
 
+[[bin]]
+name = "jammi-server"
+path = "src/main.rs"
+
 [dependencies]
-jammi-ai = { workspace = true, optional = true }
+jammi-ai.workspace = true
 jammi-db.workspace = true
 axum.workspace = true
 arrow.workspace = true
@@ -17,9 +21,11 @@ arrow-flight.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
 chrono.workspace = true
+clap.workspace = true
 datafusion.workspace = true
 datafusion-flight-sql-server.workspace = true
 futures.workspace = true
+prometheus.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
 tonic-web.workspace = true
@@ -29,7 +35,9 @@ tokio.workspace = true
 tokio-stream.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 uuid.workspace = true
 async-trait.workspace = true
 
@@ -38,8 +46,13 @@ tonic-build.workspace = true
 tonic-prost-build.workspace = true
 
 [features]
-cuda  = ["dep:jammi-ai", "jammi-ai/cuda"]
-metal = ["dep:jammi-ai", "jammi-ai/metal"]
+default = []
+cuda  = ["jammi-ai/cuda"]
+metal = ["jammi-ai/metal"]
+# Compiles the JetStream broker driver into the binary so production
+# deploys can run Postgres + NATS via config without rebuilding from
+# source. CI publishes the OSS image with this feature enabled.
+jetstream-broker = ["jammi-db/jetstream-broker"]
 
 [dev-dependencies]
 tokio.workspace = true

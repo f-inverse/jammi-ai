@@ -252,6 +252,13 @@ impl InferenceSession {
         self.inner.config()
     }
 
+    /// Shared handle to the engine's tenant binding. The OSS server's
+    /// Flight SQL `TenantBoundProvider` updates this for the duration of
+    /// each query so the analyzer rule scopes rows to the bound tenant.
+    pub fn tenant_binding_arc(&self) -> jammi_db::tenant_scope::TenantBinding {
+        self.inner.tenant_binding_arc()
+    }
+
     /// Access the ANN cache.
     pub fn ann_cache(&self) -> &Arc<AnnCache> {
         &self.ann_cache

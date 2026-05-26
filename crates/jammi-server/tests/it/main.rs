@@ -3,5 +3,7 @@ mod flight_tenant;
 mod grpc_session;
 mod grpc_trigger;
 mod grpc_web;
+mod health;
+mod serve_e2e;
 mod server;
 mod uat_shapes;

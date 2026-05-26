@@ -1,0 +1,38 @@
+# Sample configuration for the OSS `jammi-server`.
+#
+# The OSS server is single-tenant — the deployer's network is the
+# auth boundary. Run one server per tenant, or front it with a
+# reverse proxy that enforces tenancy at the HTTP layer.
+#
+# Persisted state lives under `artifact_dir`. The OSS image's
+# Dockerfile declares `/var/lib/jammi` as a volume; mount a named
+# Docker volume (so distroless's nonroot uid 65532 gets ownership)
+# or `chown 65532:65532` your bind-mount host directory.
+
+artifact_dir = "/var/lib/jammi"
+
+[server]
+# HTTP side-channel: `/healthz`, `/readyz`, `/metrics`.
+health_listen = "0.0.0.0:8080"
+# gRPC + Flight SQL: SessionService, TriggerService, FlightService.
+flight_listen = "0.0.0.0:8081"
+# Models to preload into memory at startup. Empty by default.
+preload_models = []
+
+[logging]
+level = "info"
+format = "json"
+
+# ─── Coming in v0.9 (S4 catalog/broker config) ──────────────────────
+#
+# After the S4 work lands, the OSS server will accept first-class
+# catalog and broker selection. Until then the SQLite catalog +
+# in-memory broker defaults apply.
+#
+# [catalog]
+# kind = "postgres"
+# url = "postgres://jammi:secret@postgres:5432/jammi"
+#
+# [broker]
+# kind = "jetstream"
+# url = "nats://nats:4222"

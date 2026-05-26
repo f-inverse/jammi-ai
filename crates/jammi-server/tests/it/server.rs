@@ -13,7 +13,7 @@ async fn health_and_fallback() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/health")
+                .uri("/healthz")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -92,7 +92,7 @@ async fn concurrent_health_checks() {
             let resp = app
                 .oneshot(
                     Request::builder()
-                        .uri("/health")
+                        .uri("/healthz")
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -130,7 +130,7 @@ async fn graceful_shutdown_completes_cleanly() {
     // Confirm the server is up.
     let client = reqwest::Client::new();
     let resp = client
-        .get(format!("http://{addr}/health"))
+        .get(format!("http://{addr}/healthz"))
         .send()
         .await
         .expect("Health request should succeed while server is running");

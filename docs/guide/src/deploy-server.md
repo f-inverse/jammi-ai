@@ -111,14 +111,32 @@ JAMMI_LOGGING__FORMAT=json \
 jammi serve
 ```
 
-## Health checks
+## Health, readiness, and metrics
 
-The server also exposes an HTTP endpoint for container liveness probes:
+The server exposes three HTTP side-channel endpoints on port `8080`:
 
 ```bash
-curl http://localhost:8080/health
-# {"status": "ok"}
+curl http://localhost:8080/healthz
+# {"status":"ok","version":"0.8.0"}
+
+curl http://localhost:8080/readyz
+# {"status":"ready"}
+
+curl http://localhost:8080/metrics
+# jammi_grpc_requests_total 0
+# jammi_flight_queries_total 0
+# jammi_eval_invocations_total 0
+# jammi_search_latency_seconds_bucket{...} 0
 ```
+
+`/healthz` is a liveness probe — a `200` means the process is running.
+`/readyz` is a readiness probe — `200` means the catalog backend
+responded; `503` means it didn't and traffic should be drained from
+this instance. Point your load balancer at `/readyz`.
+
+`/metrics` exposes a small, substrate-level set of Prometheus counters
+(gRPC requests, Flight SQL queries, eval invocations) plus a search-
+latency histogram. Wider observability lives in the commercial server.
 
 ## What the server can and cannot do
 
@@ -137,3 +155,61 @@ The server is a query interface. ML operations (embeddings, search, fine-tuning)
 ## Graceful shutdown
 
 The server drains active connections on SIGTERM / Ctrl+C before exiting. In-flight queries complete; long-running operations started via the library are unaffected.
+
+## Deploying as a container
+
+The OSS server ships as a public Docker image at `ghcr.io/f-inverse/jammi-ai-server`. The image is built from a distroless base, runs as the nonroot user (uid `65532`), and exposes the same `8080` / `8081` ports the local binary listens on.
+
+```bash
+docker run --rm \
+  -p 8080:8080 -p 8081:8081 \
+  -v jammi_data:/var/lib/jammi \
+  -v $(pwd)/jammi.toml:/etc/jammi/jammi.toml:ro \
+  ghcr.io/f-inverse/jammi-ai-server:latest
+```
+
+A minimal compose file lives in the workspace at `examples/docker-compose/oss-server.yml`:
+
+```bash
+cd examples/docker-compose
+docker compose -f oss-server.yml up
+```
+
+### Persistence
+
+`/var/lib/jammi` holds the catalog DB, model weights, and indices. The Dockerfile declares it as a `VOLUME` — bind mounts work, but the host directory must be writable by uid `65532`:
+
+```bash
+# Bind mount on the host.
+sudo chown -R 65532:65532 /opt/jammi/data
+docker run -v /opt/jammi/data:/var/lib/jammi ...
+```
+
+A named Docker volume (the compose default) sidesteps that step because Docker provisions ownership for the container's user automatically.
+
+### Configuration
+
+The container's entrypoint expects `/etc/jammi/jammi.toml`. Bind-mount your config there:
+
+```yaml
+# oss-server.yml
+services:
+  jammi-server:
+    image: ghcr.io/f-inverse/jammi-ai-server:latest
+    volumes:
+      - ./jammi.toml:/etc/jammi/jammi.toml:ro
+      - jammi_data:/var/lib/jammi
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+```
+
+### Building from source
+
+The Dockerfile lives at the workspace root and uses BuildKit cache mounts for the cargo registry and target directory:
+
+```bash
+DOCKER_BUILDKIT=1 docker build -t jammi-ai-server:dev -f Dockerfile .
+```
+
+Cold builds take ~30 minutes (the workspace is large); warm builds with cache hits land at ~3 minutes.

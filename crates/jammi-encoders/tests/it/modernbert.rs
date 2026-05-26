@@ -12,7 +12,7 @@ use jammi_lora::{LoraBuildConfig, LoraInitMode};
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/tiny_modernbert_classifier")
+        .join("../../cookbook/fixtures/tiny_modernbert_classifier")
 }
 
 fn load_config() -> ModernBertConfig {

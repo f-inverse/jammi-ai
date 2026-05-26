@@ -9,13 +9,13 @@ Join search results with a registered source to add context columns (e.g., compa
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
-# use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
-# async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_engine::error::Result<()> {
+# use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+# async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
 session.add_source("assignees", SourceType::File, SourceConnection {
     url: Some("file:///data/assignees.csv".into()),
     format: Some(FileFormat::Csv),
@@ -49,13 +49,13 @@ Run a model over search results to add new columns:
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
-use jammi_engine::ModelTask;
-# async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_engine::error::Result<()> {
+use jammi_db::ModelTask;
+# async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
 let results = session.search("patents", query, 10).await?
     .annotate(
         "sentence-transformers/all-MiniLM-L6-v2",
@@ -96,13 +96,13 @@ All operations compose freely:
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
-use jammi_engine::ModelTask;
-# async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_engine::error::Result<()> {
+use jammi_db::ModelTask;
+# async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
 let results = session.search("patents", query, 100).await?
     .join("assignees", "assignee_id=id", None).await?
     .annotate("all-MiniLM-L6-v2", ModelTask::TextEmbedding, &["abstract".into()]).await?

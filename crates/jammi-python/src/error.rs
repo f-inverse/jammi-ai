@@ -1,6 +1,6 @@
 use pyo3::PyErr;
 
-use jammi_engine::error::JammiError;
+use jammi_db::error::JammiError;
 
 /// Convert any error that maps into `JammiError` to a Python exception.
 ///

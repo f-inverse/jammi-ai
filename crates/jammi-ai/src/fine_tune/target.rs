@@ -16,8 +16,8 @@
 use std::collections::HashMap;
 
 use candle_core::{Device, Tensor};
+use jammi_db::error::{JammiError, Result};
 use jammi_encoders::AnyEncoder;
-use jammi_engine::error::{JammiError, Result};
 use jammi_lora::AdapterConfig;
 use serde::{Deserialize, Serialize};
 

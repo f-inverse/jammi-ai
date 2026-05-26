@@ -6,7 +6,7 @@ Add Jammi to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-jammi-engine = "0.1"
+jammi-db = "0.1"
 jammi-ai = "0.1"
 tokio = { version = "1", features = ["full"] }
 ```

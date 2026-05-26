@@ -9,11 +9,11 @@ This recipe shows the full path: index images with the vision tower, embed a tex
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 session.generate_image_embeddings(
     "figures",
     "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
@@ -41,11 +41,11 @@ db.generate_image_embeddings(
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 let query_vec = session
     .encode_text_query(
         "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
@@ -70,12 +70,12 @@ query_vec = db.encode_text_query(
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: Arc<InferenceSession>, query_vec: Vec<f32>) -> jammi_engine::error::Result<()> {
+# async fn ex(session: Arc<InferenceSession>, query_vec: Vec<f32>) -> jammi_db::error::Result<()> {
 let results = session.search("figures", query_vec, 10).await?.run().await?;
 # Ok(()) }
 ```

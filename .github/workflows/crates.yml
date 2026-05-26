@@ -71,7 +71,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          for crate in jammi-engine jammi-lora jammi-encoders jammi-ai jammi-server jammi-cli; do
+          for crate in jammi-db jammi-lora jammi-encoders jammi-ai jammi-server jammi-cli; do
             if curl -sf "https://crates.io/api/v1/crates/${crate}/${VERSION}" >/dev/null; then
               echo "${crate} ${VERSION} already on crates.io — skipping"
             else

@@ -9,7 +9,7 @@
 use std::net::SocketAddr;
 use std::str::FromStr;
 
-use jammi_engine::TenantId;
+use jammi_db::TenantId;
 use jammi_server::grpc::session::SESSION_HEADER;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;

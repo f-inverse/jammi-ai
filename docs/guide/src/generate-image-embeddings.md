@@ -9,11 +9,11 @@ The OpenCLIP family is cross-modal: the vision tower and the text tower in the s
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 let record = session.generate_image_embeddings(
     "figures",
     "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
@@ -60,7 +60,7 @@ To embed one image without persistence (e.g., for a query):
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;

@@ -25,7 +25,7 @@ Assumes the topic was registered (see
 ## Open the subscription
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate arrow;
 # extern crate arrow_schema;
 # extern crate datafusion;
@@ -35,12 +35,12 @@ Assumes the topic was registered (see
 # use arrow_schema::SchemaRef;
 # use datafusion::execution::context::SessionContext;
 # use futures::StreamExt;
-# use jammi_engine::trigger::{Predicate, Subscriber, TopicDefinition};
+# use jammi_db::trigger::{Predicate, Subscriber, TopicDefinition};
 # async fn ex(
 #     subscriber: &Subscriber,
 #     session: &SessionContext,
 #     topic: &TopicDefinition,
-# ) -> Result<(), jammi_engine::trigger::TriggerError> {
+# ) -> Result<(), jammi_db::trigger::TriggerError> {
 let predicate = Predicate::from_sql(session, Arc::clone(&topic.schema), "op = 'd'")?;
 
 let mut stream = subscriber
@@ -88,17 +88,17 @@ If your consumer disconnects and reconnects, pass the last-seen
 offset as `from_offset` to resume without missing events:
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate chrono;
 # extern crate tokio;
 # use chrono::Utc;
 # use std::sync::Arc;
-# use jammi_engine::trigger::{Offset, Predicate, Subscriber, TopicDefinition};
+# use jammi_db::trigger::{Offset, Predicate, Subscriber, TopicDefinition};
 # async fn ex(
 #     subscriber: &Subscriber,
 #     topic: &TopicDefinition,
 #     last_seen: u64,
-# ) -> Result<(), jammi_engine::trigger::TriggerError> {
+# ) -> Result<(), jammi_db::trigger::TriggerError> {
 let resume_from = Offset::new(last_seen + 1, Utc::now());
 let _stream = subscriber
     .subscribe(topic, Predicate::match_all(), Some(resume_from))

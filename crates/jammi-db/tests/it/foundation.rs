@@ -1,5 +1,5 @@
-use jammi_engine::catalog::status::ResultTableStatus;
-use jammi_engine::catalog::Catalog;
+use jammi_db::catalog::status::ResultTableStatus;
+use jammi_db::catalog::Catalog;
 use tempfile::tempdir;
 
 #[tokio::test]

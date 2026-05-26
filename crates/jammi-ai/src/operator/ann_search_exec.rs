@@ -12,11 +12,11 @@ use datafusion::physical_plan::{
 };
 use futures::stream;
 
-use jammi_engine::catalog::result_repo::ResultTableRecord;
-use jammi_engine::error::Result;
-use jammi_engine::index::exact::exact_vector_search;
-use jammi_engine::index::VectorIndex;
-use jammi_engine::store::ResultStore;
+use jammi_db::catalog::result_repo::ResultTableRecord;
+use jammi_db::error::Result;
+use jammi_db::index::exact::exact_vector_search;
+use jammi_db::index::VectorIndex;
+use jammi_db::store::ResultStore;
 
 /// ANN vector search over an embedding table.
 /// Delegates to `ResultStore::resolve_search_mode()` — ANN via SidecarIndex

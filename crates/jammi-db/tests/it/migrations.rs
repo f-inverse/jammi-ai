@@ -1,9 +1,9 @@
 //! End-to-end migration tests. Asserts via the new `applied_migrations`
 //! ledger and direct sqlx queries against the on-disk catalog.
 
-use jammi_engine::catalog::backend::{BackendImpl, TxOptions};
-use jammi_engine::catalog::backend_sqlite::SqliteBackend;
-use jammi_engine::catalog::Catalog;
+use jammi_db::catalog::backend::{BackendImpl, TxOptions};
+use jammi_db::catalog::backend_sqlite::SqliteBackend;
+use jammi_db::catalog::Catalog;
 use tempfile::tempdir;
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -73,8 +73,8 @@ async fn migration_005_creates_tenant_index_per_table() {
                         .query(
                             "SELECT 1 AS one FROM sqlite_master WHERE type='index' AND name=$1 AND tbl_name=$2",
                             &[
-                                jammi_engine::catalog::backend::SqlValue::TextOwned(idx.into()),
-                                jammi_engine::catalog::backend::SqlValue::TextOwned(table.into()),
+                                jammi_db::catalog::backend::SqlValue::TextOwned(idx.into()),
+                                jammi_db::catalog::backend::SqlValue::TextOwned(table.into()),
                             ],
                             |row| row.get::<i64>("one"),
                         )
@@ -181,7 +181,7 @@ async fn applied_migrations_ledger_records_all_migrations() {
 /// executes on a real upgrade.
 #[tokio::test]
 async fn migration_010_rewrites_legacy_local_rows_to_file() {
-    use jammi_engine::catalog::backend::SqlValue;
+    use jammi_db::catalog::backend::SqlValue;
 
     let dir = tempdir().unwrap();
     let _catalog = Catalog::open(dir.path()).await.unwrap();

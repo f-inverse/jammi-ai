@@ -7,11 +7,11 @@ Generate vector embeddings by running a model over text columns from a registere
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 let record = session.generate_text_embeddings(
     "patents",
     "sentence-transformers/all-MiniLM-L6-v2",
@@ -71,11 +71,11 @@ Pass multiple column names to concatenate them (space-separated) before embeddin
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 session.generate_text_embeddings(
     "papers",
     "sentence-transformers/all-MiniLM-L6-v2",
@@ -101,11 +101,11 @@ db.generate_text_embeddings(
 Each call creates a new table. Multiple tables can coexist for the same source (different models, different columns):
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 session.generate_text_embeddings("patents", "all-MiniLM-L6-v2", &["abstract".into()], "id").await?;
 session.generate_text_embeddings("patents", "bge-small-en-v1.5", &["title".into()], "id").await?;
 # Ok(()) }
@@ -145,11 +145,11 @@ To get embeddings as `RecordBatch` without writing to disk:
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 use jammi_ai::model::{ModelSource, ModelTask};
 
 let model = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");
@@ -208,12 +208,12 @@ No data is lost if the Parquet file was fully written.
 Result tables are automatically registered in DataFusion and queryable via SQL:
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# use jammi_engine::catalog::result_repo::ResultTableRecord;
-# async fn ex(session: &InferenceSession, record: &ResultTableRecord) -> jammi_engine::error::Result<()> {
+# use jammi_db::catalog::result_repo::ResultTableRecord;
+# async fn ex(session: &InferenceSession, record: &ResultTableRecord) -> jammi_db::error::Result<()> {
 let results = session.sql(&format!(
     "SELECT _row_id, _source_id FROM \"jammi.{}\" LIMIT 10",
     record.table_name

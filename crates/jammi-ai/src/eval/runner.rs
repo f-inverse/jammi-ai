@@ -1,9 +1,9 @@
 //! EvalRunner: orchestrates the evaluation pipeline.
 
 use arrow::datatypes::{DataType, Schema};
-use jammi_engine::catalog::eval_repo::EvalRunRecord;
-use jammi_engine::catalog::status::EvalRunStatus;
-use jammi_engine::error::{JammiError, Result};
+use jammi_db::catalog::eval_repo::EvalRunRecord;
+use jammi_db::catalog::status::EvalRunStatus;
+use jammi_db::error::{JammiError, Result};
 
 use crate::eval::EvalTask;
 use crate::model::ModelSource;

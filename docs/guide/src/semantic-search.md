@@ -7,12 +7,12 @@ Perform ANN vector similarity search over embedding tables. Results include all 
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# use jammi_engine::config::JammiConfig;
-# async fn ex(config: JammiConfig) -> jammi_engine::error::Result<()> {
+# use jammi_db::config::JammiConfig;
+# async fn ex(config: JammiConfig) -> jammi_db::error::Result<()> {
 use std::sync::Arc;
 
 let session = Arc::new(InferenceSession::new(config).await?);
@@ -61,11 +61,11 @@ Apply a SQL WHERE clause to hydrated columns:
 #### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
 session.search("patents", query, 20).await?
     .filter("year > 2020")?
     .run().await?;
@@ -85,11 +85,11 @@ results = search.run()
 #### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
 session.search("patents", query, 20).await?
     .sort("similarity", true)?  // descending
     .run().await?;
@@ -109,11 +109,11 @@ results = search.run()
 #### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
 session.search("patents", query, 20).await?
     .sort("similarity", true)?
     .limit(5)
@@ -137,11 +137,11 @@ Project specific columns. Note that `retrieved_by` and `annotated_by` evidence c
 #### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
 session.search("patents", query, 10).await?
     .select(&["_row_id".into(), "title".into(), "similarity".into()])?
     .run().await?;
@@ -161,11 +161,11 @@ results = search.run()
 #### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
 let results = session.search("patents", query, 100).await?
     .filter("year > 2020")?
     .sort("similarity", true)?

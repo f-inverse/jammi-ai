@@ -15,7 +15,7 @@ use std::io::Read;
 use std::path::Path;
 
 use flate2::read::GzDecoder;
-use jammi_engine::error::JammiError;
+use jammi_db::error::JammiError;
 use tokenizers::models::bpe::{Merges, Vocab, BPE};
 use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
 use tokenizers::processors::template::TemplateProcessing;

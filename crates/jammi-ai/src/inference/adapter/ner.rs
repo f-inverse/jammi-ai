@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field};
-use jammi_engine::error::Result;
+use jammi_db::error::Result;
 
 use super::{nullify_strings, BackendOutput, OutputAdapter};
 

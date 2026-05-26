@@ -3,15 +3,15 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Float32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use jammi_engine::catalog::result_repo::CreateResultTableParams;
-use jammi_engine::catalog::status::ResultTableStatus;
-use jammi_engine::catalog::Catalog;
-use jammi_engine::model_task::ModelTask;
-use jammi_engine::storage::{
+use jammi_db::catalog::result_repo::CreateResultTableParams;
+use jammi_db::catalog::status::ResultTableStatus;
+use jammi_db::catalog::Catalog;
+use jammi_db::model_task::ModelTask;
+use jammi_db::storage::{
     reader::{count_parquet_rows, is_valid_parquet},
     JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl,
 };
-use jammi_engine::store::ResultStore;
+use jammi_db::store::ResultStore;
 use tempfile::tempdir;
 
 // ─── ObjectParquetWriter roundtrip ───────────────────────────────────────────

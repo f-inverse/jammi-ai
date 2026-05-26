@@ -1,5 +1,5 @@
 use jammi_ai::model::{resolver::ModelResolver, BackendType, ModelSource, ModelTask};
-use jammi_engine::catalog::Catalog;
+use jammi_db::catalog::Catalog;
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -509,7 +509,7 @@ async fn cache_load_failure_clears_in_flight_state() {
 /// `parse_model_row` decoded a different variant).
 #[tokio::test]
 async fn ner_model_round_trips_through_catalog() {
-    use jammi_engine::catalog::model_repo::RegisterModelParams;
+    use jammi_db::catalog::model_repo::RegisterModelParams;
 
     let dir = tempdir().unwrap();
     let catalog = Catalog::open(dir.path()).await.unwrap();

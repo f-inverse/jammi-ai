@@ -99,7 +99,7 @@ impl InferenceExecBuilder {
         self
     }
 
-    pub fn build(self) -> jammi_engine::error::Result<InferenceExec> {
+    pub fn build(self) -> jammi_db::error::Result<InferenceExec> {
         let output_schema = build_output_schema(
             &self.task,
             &self.input.schema(),

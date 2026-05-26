@@ -1,9 +1,9 @@
 use jammi_ai::session::InferenceSession;
-use jammi_engine::config::JammiConfig;
+use jammi_db::config::JammiConfig;
 
 pub async fn run(
     config: JammiConfig,
-    tenant: Option<jammi_engine::TenantId>,
+    tenant: Option<jammi_db::TenantId>,
     sql: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let session = InferenceSession::new(config).await?;
@@ -26,7 +26,7 @@ pub async fn run(
 
 pub async fn explain(
     config: JammiConfig,
-    tenant: Option<jammi_engine::TenantId>,
+    tenant: Option<jammi_db::TenantId>,
     sql: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let session = InferenceSession::new(config).await?;

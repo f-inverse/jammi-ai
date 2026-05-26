@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Duration;
 
-use jammi_engine::TenantId;
+use jammi_db::TenantId;
 use jammi_server::grpc::proto::session::{SetTenantRequest, Tenant};
 use jammi_server::grpc::session::{SessionId, SessionStore};
 use prost::Message;

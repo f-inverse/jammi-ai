@@ -61,15 +61,15 @@ appends it implicitly.)
 `MutableTableDefinitionBuilder` chains the field validations:
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate arrow_schema;
 # use std::sync::Arc;
 # use arrow_schema::Schema;
-use jammi_engine::store::mutable::definition::{
+use jammi_db::store::mutable::definition::{
     MutableIndexDef, MutableTableDefinitionBuilder, MutableTableId,
 };
 
-# fn make(schema: Arc<Schema>) -> jammi_engine::store::mutable::definition::MutableTableDefinition {
+# fn make(schema: Arc<Schema>) -> jammi_db::store::mutable::definition::MutableTableDefinition {
 let def = MutableTableDefinitionBuilder::new(
         MutableTableId::new("item_dimensions").unwrap(),
         schema,
@@ -98,11 +98,11 @@ secondary `CREATE INDEX` commit together. If any step fails, nothing lands.
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate tokio;
-# use jammi_engine::store::mutable::definition::MutableTableDefinition;
-# use jammi_engine::session::JammiSession;
-# async fn ex(session: &JammiSession, def: MutableTableDefinition) -> jammi_engine::error::Result<()> {
+# use jammi_db::store::mutable::definition::MutableTableDefinition;
+# use jammi_db::session::JammiSession;
+# async fn ex(session: &JammiSession, def: MutableTableDefinition) -> jammi_db::error::Result<()> {
 let id = session.create_mutable_table(def).await?;
 // The table is now queryable as `mutable.public.item_dimensions` in the
 // same SQL surface that federates result tables and external sources.
@@ -114,9 +114,9 @@ let id = session.create_mutable_table(def).await?;
 
 ```python
 import pyarrow as pa
-import jammi
+import jammi_ai
 
-db = jammi.connect(artifact_dir="/var/lib/jammi")
+db = jammi_ai.connect(artifact_dir="/var/lib/jammi")
 # The Python wrapper exposes mutable-table registration through the
 # `create_mutable_table` accessor (see `jammi.mutable`). The recipe below
 # is illustrative; consult the API reference for the binding shape your
@@ -132,9 +132,9 @@ Python APIs.
 ## Verify
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate tokio;
-# async fn ex(session: &jammi_engine::session::JammiSession) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &jammi_db::session::JammiSession) -> jammi_db::error::Result<()> {
 let zero_rows = session
     .sql("SELECT * FROM mutable.public.item_dimensions LIMIT 0")
     .await?;

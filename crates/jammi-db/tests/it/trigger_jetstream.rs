@@ -14,7 +14,7 @@ use std::time::Duration;
 use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::StreamExt;
-use jammi_engine::trigger::{
+use jammi_db::trigger::{
     JetStreamBroker, Offset, Predicate, TopicDefinition, TopicId, TriggerBroker, TriggerError,
 };
 

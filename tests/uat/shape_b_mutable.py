@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pyarrow as pa
 
-import jammi
+import jammi_ai
 
 
 def _notes_schema() -> pa.Schema:
@@ -30,7 +30,7 @@ def _notes_schema() -> pa.Schema:
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         artifact_dir = str(Path(tmp))
-        db = jammi.connect(artifact_dir=artifact_dir)
+        db = jammi_ai.connect(artifact_dir=artifact_dir)
 
         table_id = db.create_mutable_table(
             "notes",

@@ -7,12 +7,12 @@ Register data files as named sources, then query them with full SQL. Sources are
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
-use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
 session.add_source("patents", SourceType::File, SourceConnection {
     url: Some("file:///data/patents.parquet".into()),
@@ -49,11 +49,11 @@ Sources are accessible via three-part SQL names: `<source_id>.public.<table_name
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 let results = session.sql(
     "SELECT id, title, year FROM patents.public.patents WHERE year > 2020 ORDER BY year"
 ).await?;
@@ -94,12 +94,12 @@ Register multiple sources and join them in a single query:
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
+# use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 session.add_source("companies", SourceType::File, SourceConnection {
     url: Some("file:///data/companies.csv".into()),
     format: Some(FileFormat::Csv),
@@ -131,11 +131,11 @@ table = db.sql("""
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 // List registered sources
 let sources = session.catalog().list_sources().await?;
 

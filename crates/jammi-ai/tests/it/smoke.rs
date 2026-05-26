@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Float32Array, ListArray, StringArray};
 use jammi_ai::session::InferenceSession;
-use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
 
 use crate::common;
@@ -109,7 +109,7 @@ async fn smoke_cp3_full_pipeline() {
     let declared = session
         .catalog()
         .channels()
-        .get(&jammi_engine::ChannelId::new("vector").unwrap())
+        .get(&jammi_db::ChannelId::new("vector").unwrap())
         .await
         .unwrap()
         .expect("vector channel must be seeded by migration 006");

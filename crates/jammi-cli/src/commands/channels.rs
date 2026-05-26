@@ -7,9 +7,9 @@
 
 use clap::Subcommand;
 use jammi_ai::session::InferenceSession;
-use jammi_engine::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
-use jammi_engine::config::JammiConfig;
-use jammi_engine::evidence_channel::ChannelId;
+use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
+use jammi_db::config::JammiConfig;
+use jammi_db::evidence_channel::ChannelId;
 
 #[derive(Subcommand)]
 pub enum ChannelAction {
@@ -47,7 +47,7 @@ pub enum ChannelAction {
 
 pub async fn run(
     config: JammiConfig,
-    tenant: Option<jammi_engine::TenantId>,
+    tenant: Option<jammi_db::TenantId>,
     action: ChannelAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let session = InferenceSession::new(config).await?;

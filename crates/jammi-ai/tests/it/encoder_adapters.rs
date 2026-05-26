@@ -20,7 +20,7 @@ use tempfile::TempDir;
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod, LrSchedule};
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
-use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
 use crate::common;
 

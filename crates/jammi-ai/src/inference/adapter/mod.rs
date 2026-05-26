@@ -4,7 +4,7 @@ pub mod ner;
 
 use arrow::array::{ArrayRef, Float32Array, StringArray};
 use arrow::datatypes::Field;
-use jammi_engine::error::Result;
+use jammi_db::error::Result;
 
 pub use classification::ClassificationAdapter;
 pub use embedding::EmbeddingAdapter;
@@ -36,7 +36,7 @@ pub trait OutputAdapter: Send + Sync {
 
 /// Create an adapter for a given task with model-derived dimensions.
 pub fn create_adapter(task: ModelTask, model: &LoadedModel) -> Result<Box<dyn OutputAdapter>> {
-    use jammi_engine::error::JammiError;
+    use jammi_db::error::JammiError;
     match task {
         ModelTask::TextEmbedding | ModelTask::ImageEmbedding => {
             let dim = model.embedding_dim().ok_or_else(|| {

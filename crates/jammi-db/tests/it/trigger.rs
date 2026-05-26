@@ -15,16 +15,16 @@ use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::context::SessionContext;
 use futures::StreamExt;
-use jammi_engine::catalog::backend::BackendImpl;
-use jammi_engine::catalog::backend_sqlite::SqliteBackend;
-use jammi_engine::catalog::topic_repo::TopicRepo;
-use jammi_engine::catalog::Catalog;
-use jammi_engine::source::mutable::MutableTableRegistry;
-use jammi_engine::store::mutable::sqlite::SqliteMutableBackend;
-use jammi_engine::store::mutable::MutableBackend;
-use jammi_engine::tenant::{TenantContext, TenantId};
-use jammi_engine::tenant_scope::TenantBinding;
-use jammi_engine::trigger::{
+use jammi_db::catalog::backend::BackendImpl;
+use jammi_db::catalog::backend_sqlite::SqliteBackend;
+use jammi_db::catalog::topic_repo::TopicRepo;
+use jammi_db::catalog::Catalog;
+use jammi_db::source::mutable::MutableTableRegistry;
+use jammi_db::store::mutable::sqlite::SqliteMutableBackend;
+use jammi_db::store::mutable::MutableBackend;
+use jammi_db::tenant::{TenantContext, TenantId};
+use jammi_db::tenant_scope::TenantBinding;
+use jammi_db::trigger::{
     InMemoryBroker, Offset, Predicate, Publisher, Subscriber, TopicDefinition, TopicId,
     TriggerBroker, TriggerError,
 };
@@ -428,8 +428,8 @@ async fn empty_predicate_matches_every_batch() {
 
 #[tokio::test]
 async fn session_create_topic_ddl_round_trip() {
-    use jammi_engine::config::JammiConfig;
-    use jammi_engine::session::JammiSession;
+    use jammi_db::config::JammiConfig;
+    use jammi_db::session::JammiSession;
     let dir = tempfile::tempdir().unwrap();
     let cfg = JammiConfig {
         artifact_dir: dir.path().to_path_buf(),
@@ -468,8 +468,8 @@ async fn session_create_topic_ddl_round_trip() {
 
 #[tokio::test]
 async fn session_drop_topic_missing_errors_without_if_exists() {
-    use jammi_engine::config::JammiConfig;
-    use jammi_engine::session::JammiSession;
+    use jammi_db::config::JammiConfig;
+    use jammi_db::session::JammiSession;
     let dir = tempfile::tempdir().unwrap();
     let cfg = JammiConfig {
         artifact_dir: dir.path().to_path_buf(),
@@ -877,12 +877,12 @@ async fn session_with_broker_swallows_fan_out_failure() {
     // deterministic failure injection point.
 
     let dir = tempfile::tempdir().unwrap();
-    let config = jammi_engine::config::JammiConfig {
+    let config = jammi_db::config::JammiConfig {
         artifact_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
     let broker = Arc::new(InMemoryBroker::new());
-    let session = jammi_engine::session::JammiSession::with_broker(
+    let session = jammi_db::session::JammiSession::with_broker(
         config,
         Arc::clone(&broker) as Arc<dyn TriggerBroker>,
     )

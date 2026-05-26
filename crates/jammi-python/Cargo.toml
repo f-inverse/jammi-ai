@@ -10,13 +10,13 @@ name = "_native"
 # downstream Rust crates (e.g. jammi-enterprise-python) depend on this
 # crate and consume its public surface — `PyDatabase::session_arc` and the
 # re-exported `InferenceSession` — to share a single session with the OSS
-# `jammi.Database` instead of opening a parallel one against the same
+# `jammi_ai.Database` instead of opening a parallel one against the same
 # artifact directory. The same crate-type pair is also what allows the
 # integration test under `tests/` to drive `PyDatabase` from Rust.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-jammi-engine.workspace = true
+jammi-db.workspace = true
 jammi-ai.workspace = true
 jammi-lora.workspace = true
 pyo3.workspace = true

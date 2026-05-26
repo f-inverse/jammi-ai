@@ -5,10 +5,10 @@ This walkthrough registers a local data file, runs a SQL query, generates embedd
 ## Full example
 
 ```python
-import jammi
+import jammi_ai
 
 # 1. Connect
-db = jammi.connect(gpu_device=-1)  # CPU-only; omit for GPU
+db = jammi_ai.connect(gpu_device=-1)  # CPU-only; omit for GPU
 
 # 2. Register a data source
 db.add_source("patents", path="patents.parquet", format="parquet")
@@ -37,7 +37,7 @@ print(results.to_pandas())
 
 ## What's happening
 
-1. **`jammi.connect()`** creates a `Database` backed by an `InferenceSession` with a shared tokio runtime
+1. **`jammi_ai.connect()`** creates a `Database` backed by an `InferenceSession` with a shared tokio runtime
 2. **`add_source`** registers a local file — Parquet, CSV, and JSON are supported
 3. **`sql`** returns a `pyarrow.Table` (zero-copy from Rust via pyo3-arrow)
 4. **`generate_text_embeddings`** runs the model and persists vectors to Parquet with an ANN index

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/jammi-engine",
+    "crates/jammi-db",
     "crates/jammi-ai",
     "crates/jammi-server",
     "crates/jammi-python",
@@ -12,7 +12,7 @@ members = [
 ]
 # jammi-python is a PyO3 cdylib — build via maturin, not cargo build --workspace
 default-members = [
-    "crates/jammi-engine",
+    "crates/jammi-db",
     "crates/jammi-ai",
     "crates/jammi-server",
     "crates/jammi-cli",
@@ -21,7 +21,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.5.9"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.88.0"
 license = "Apache-2.0"
@@ -29,11 +29,11 @@ repository = "https://github.com/f-inverse/jammi-ai"
 
 [workspace.dependencies]
 # Internal crates
-jammi-engine = { version = "0.5.9", path = "crates/jammi-engine" }
-jammi-ai = { version = "0.5.9", path = "crates/jammi-ai" }
-jammi-server = { version = "0.5.9", path = "crates/jammi-server" }
-jammi-lora = { version = "0.5.9", path = "crates/jammi-lora" }
-jammi-encoders = { version = "0.5.9", path = "crates/jammi-encoders" }
+jammi-db = { version = "0.6.0", path = "crates/jammi-db" }
+jammi-ai = { version = "0.6.0", path = "crates/jammi-ai" }
+jammi-server = { version = "0.6.0", path = "crates/jammi-server" }
+jammi-lora = { version = "0.6.0", path = "crates/jammi-lora" }
+jammi-encoders = { version = "0.6.0", path = "crates/jammi-encoders" }
 jammi-test-utils = { path = "crates/jammi-test-utils" }
 
 # Query engine

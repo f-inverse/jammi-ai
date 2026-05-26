@@ -10,11 +10,11 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field};
 use jammi_ai::session::InferenceSession;
-use jammi_engine::catalog::result_repo::CreateResultTableParams;
-use jammi_engine::catalog::status::ResultTableStatus;
-use jammi_engine::model_task::ModelTask;
-use jammi_engine::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
-use jammi_engine::store::schema::embedding_table_schema;
+use jammi_db::catalog::result_repo::CreateResultTableParams;
+use jammi_db::catalog::status::ResultTableStatus;
+use jammi_db::model_task::ModelTask;
+use jammi_db::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
+use jammi_db::store::schema::embedding_table_schema;
 use tempfile::tempdir;
 
 use crate::common;

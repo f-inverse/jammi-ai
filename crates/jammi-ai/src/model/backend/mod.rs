@@ -4,7 +4,7 @@ pub mod open_clip_text;
 pub mod open_clip_vit;
 pub mod ort;
 
-use jammi_engine::error::Result;
+use jammi_db::error::Result;
 
 use super::{LoadedModel, ResolvedModel};
 
@@ -28,7 +28,7 @@ pub struct DeviceConfig {
 
 impl DeviceConfig {
     /// Derive device configuration from the application config.
-    pub fn from_config(config: &jammi_engine::config::JammiConfig) -> Self {
+    pub fn from_config(config: &jammi_db::config::JammiConfig) -> Self {
         Self {
             gpu_device: config.gpu.device,
             memory_fraction: config.gpu.memory_fraction,

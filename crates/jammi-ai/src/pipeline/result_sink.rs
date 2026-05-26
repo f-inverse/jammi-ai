@@ -2,11 +2,11 @@ use arrow::array::{
     Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray, UInt32Array,
 };
 
-use jammi_engine::catalog::Catalog;
-use jammi_engine::error::{JammiError, Result};
-use jammi_engine::index::sidecar::SidecarIndex;
-use jammi_engine::index::VectorIndex;
-use jammi_engine::storage::ObjectParquetWriter;
+use jammi_db::catalog::Catalog;
+use jammi_db::error::{JammiError, Result};
+use jammi_db::index::sidecar::SidecarIndex;
+use jammi_db::index::VectorIndex;
+use jammi_db::storage::ObjectParquetWriter;
 
 /// Streams InferenceExec output to Parquet + optional ANN index,
 /// filtering failed rows for embedding tables.
@@ -145,7 +145,7 @@ pub fn filter_ok_and_extract_vectors(
         .map(|fsl| fsl.value_length() as usize)
         .unwrap_or(0);
 
-    let embedding_schema = jammi_engine::store::schema::embedding_table_schema(dims);
+    let embedding_schema = jammi_db::store::schema::embedding_table_schema(dims);
 
     // Build the output RecordBatch. Column mapping is positional:
     //   inference _row_id  → embedding _row_id     (same name)

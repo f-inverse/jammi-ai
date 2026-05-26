@@ -36,6 +36,6 @@ Repository = "https://github.com/f-inverse/jammi-ai"
 
 [tool.maturin]
 manifest-path = "crates/jammi-python/Cargo.toml"
-module-name = "jammi._native"
+module-name = "jammi_ai._native"
 python-source = "python"
 features = ["cuda"]

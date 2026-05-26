@@ -2,7 +2,7 @@
 
 use arrow::array::ArrayRef;
 
-use jammi_engine::ChannelId;
+use jammi_db::ChannelId;
 
 /// One channel's column values for one `RecordBatch`.
 ///

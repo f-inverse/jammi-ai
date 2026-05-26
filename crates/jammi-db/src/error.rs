@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-/// Unified error type for all Jammi Engine operations.
+/// Unified error type for all Jammi DB operations.
 #[derive(Debug, Error)]
 pub enum JammiError {
     /// Invalid or missing configuration value.

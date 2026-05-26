@@ -33,11 +33,11 @@ db.add_source("golden", path="/data/golden_relevance.csv", format="csv")
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 let metrics = session.eval_embeddings(
     "patents",
     None,                              // use latest embedding table
@@ -85,11 +85,11 @@ Compare a base model against a fine-tuned model:
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &InferenceSession, base_table: String, finetuned_table: String) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &InferenceSession, base_table: String, finetuned_table: String) -> jammi_db::error::Result<()> {
 let comparison = session.eval_compare(
     &[base_table.clone(), finetuned_table.clone()],
     "patents",
@@ -126,11 +126,11 @@ The first table is the baseline. Deltas (absolute and relative) are computed for
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 use jammi_ai::eval::EvalTask;
 
 let metrics = session.eval_inference(
@@ -168,11 +168,11 @@ print(f"Macro F1: {metrics['f1']:.3f}")
 Every evaluation is recorded automatically:
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# async fn ex(session: &InferenceSession) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 let runs = session.catalog().list_eval_runs().await?;
 for run in &runs {
     println!("{}: {} on {} (k={:?})", run.eval_run_id, run.eval_type, run.golden_source, run.k);

@@ -32,11 +32,11 @@ impl std::fmt::Display for FineTuneMethod {
 }
 
 impl std::str::FromStr for FineTuneMethod {
-    type Err = jammi_engine::error::JammiError;
+    type Err = jammi_db::error::JammiError;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "lora" => Ok(Self::Lora),
-            other => Err(jammi_engine::error::JammiError::FineTune(format!(
+            other => Err(jammi_db::error::JammiError::FineTune(format!(
                 "Unknown fine-tuning method '{other}'. Supported: lora"
             ))),
         }
@@ -242,8 +242,8 @@ impl Default for FineTuneConfig {
 
 impl FineTuneConfig {
     /// Validate all fields. Returns an error describing the first invalid field.
-    pub fn validate(&self) -> jammi_engine::error::Result<()> {
-        use jammi_engine::error::JammiError;
+    pub fn validate(&self) -> jammi_db::error::Result<()> {
+        use jammi_db::error::JammiError;
 
         if self.lora_rank == 0 {
             return Err(JammiError::FineTune("lora_rank must be > 0".into()));

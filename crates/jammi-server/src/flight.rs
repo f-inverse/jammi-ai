@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion_flight_sql_server::service::FlightSqlService;
 use datafusion_flight_sql_server::session::SessionStateProvider;
-use jammi_engine::tenant::TenantContext;
-use jammi_engine::tenant_scope::TenantBinding;
+use jammi_db::tenant::TenantContext;
+use jammi_db::tenant_scope::TenantBinding;
 use tonic::transport::Server;
 use tonic::{Request, Status};
 
@@ -84,7 +84,7 @@ pub async fn serve_flight_with_session_service(
 /// `ConfigExtension` state (SPEC-03 §13 OQ#3). Downstream gRPC consumers
 /// that own their own request handlers can avoid the race today by routing
 /// each request through
-/// [`jammi_engine::session::JammiSession::with_tenant_scoped`], which
+/// [`jammi_db::session::JammiSession::with_tenant_scoped`], which
 /// installs the tenant as a Tokio task-local for the duration of the
 /// closure.
 pub struct TenantBoundProvider {

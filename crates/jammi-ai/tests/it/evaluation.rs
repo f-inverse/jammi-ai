@@ -6,8 +6,8 @@ use jammi_ai::eval::{
 };
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
-use jammi_engine::catalog::eval_repo::EvalRunRecord;
-use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::catalog::eval_repo::EvalRunRecord;
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
 use arrow::datatypes::{DataType, Field, Schema};
 use tempfile::{tempdir, TempDir};
@@ -258,9 +258,7 @@ fn contract_metrics_in_valid_ranges() {
 #[tokio::test]
 async fn catalog_eval_run_crud_and_latest() {
     let dir = tempdir().unwrap();
-    let catalog = jammi_engine::catalog::Catalog::open(dir.path())
-        .await
-        .unwrap();
+    let catalog = jammi_db::catalog::Catalog::open(dir.path()).await.unwrap();
 
     // Missing model → None (not an error)
     assert!(catalog
@@ -271,7 +269,7 @@ async fn catalog_eval_run_crud_and_latest() {
 
     // Register model (FK constraint on eval_runs.model_id)
     catalog
-        .register_model(jammi_engine::catalog::model_repo::RegisterModelParams {
+        .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
             model_id: "model-a",
             version: 1,
             model_type: "embedding",

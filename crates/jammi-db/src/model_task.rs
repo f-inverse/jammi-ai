@@ -1,5 +1,5 @@
 //! ML task taxonomy shared across the catalog, store, cache, and inference
-//! call sites. Lives in `jammi-engine` because `jammi-engine` owns the
+//! call sites. Lives in `jammi-db` because `jammi-db` owns the
 //! catalog tables that persist it (`models.task`, `result_tables.task`) and
 //! the on-disk strings must agree across every crate that reads or writes
 //! them. `jammi-ai` re-exports the type for callers that consume the

@@ -77,12 +77,12 @@ async fn run(
     config_path: Option<&str>,
     tenant: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config = jammi_engine::config::JammiConfig::load(config_path.map(std::path::Path::new))?;
+    let config = jammi_db::config::JammiConfig::load(config_path.map(std::path::Path::new))?;
     let tenant = match tenant {
         None => None,
         Some(s) => {
             use std::str::FromStr;
-            Some(jammi_engine::TenantId::from_str(s)?)
+            Some(jammi_db::TenantId::from_str(s)?)
         }
     };
 

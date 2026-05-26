@@ -8,7 +8,7 @@
 //!   `batches()` returns them as-is. Used in tests.
 
 use candle_core::Tensor;
-use jammi_engine::error::{JammiError, Result};
+use jammi_db::error::{JammiError, Result};
 
 /// A training batch — either contrastive pairs or triplets.
 #[derive(Clone)]

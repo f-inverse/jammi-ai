@@ -1,8 +1,10 @@
-//! Jammi Engine — query engine, configuration, catalog, and source management.
+//! Jammi DB — vector database, SQL federation, mutable companion tables,
+//! and trigger broker for the Jammi AI platform.
 //!
-//! This crate provides the foundational infrastructure for the Jammi AI platform:
-//! data source registration, SQL query execution via DataFusion, SQLite-backed
-//! artifact catalog, and configuration management.
+//! Provides the foundational infrastructure: data source registration,
+//! SQL query execution via DataFusion, catalog persistence (SQLite or
+//! Postgres), mutable companion tables with crash-safe WAL, a trigger
+//! broker for provenance channels, and configuration management.
 
 pub mod cache;
 pub mod catalog;

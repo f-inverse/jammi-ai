@@ -1,6 +1,6 @@
 [package]
-name = "jammi-engine"
-description = "Query engine, catalog, and storage layer for Jammi AI"
+name = "jammi-db"
+description = "Vector database, SQL federation, mutable companion tables, and trigger broker for Jammi AI"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

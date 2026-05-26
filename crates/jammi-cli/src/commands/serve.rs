@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
-use jammi_engine::config::JammiConfig;
+use jammi_db::config::JammiConfig;
 
 pub async fn run(config: JammiConfig) -> Result<(), Box<dyn std::error::Error>> {
     let health_addr = config.server.health_listen.parse()?;

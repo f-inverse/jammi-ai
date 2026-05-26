@@ -293,8 +293,8 @@ impl JammiSession {
     /// ```no_run
     /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
     /// use std::sync::Arc;
-    /// use jammi_engine::session::JammiSession;
-    /// use jammi_engine::TenantId;
+    /// use jammi_db::session::JammiSession;
+    /// use jammi_db::TenantId;
     ///
     /// let session: Arc<JammiSession> = unimplemented!();
     /// let tenant: TenantId = unimplemented!();

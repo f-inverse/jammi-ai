@@ -2,10 +2,10 @@ use std::collections::HashMap;
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{VarBuilder, VarMap};
+use jammi_db::error::{JammiError, Result};
 use jammi_encoders::{
     Bert, BertConfig, DistilBert, DistilBertConfig, ModernBert, ModernBertConfig, Pooling,
 };
-use jammi_engine::error::{JammiError, Result};
 
 use jammi_encoders::{ClipText, ClipTextConfig};
 
@@ -1070,7 +1070,7 @@ fn load_projection_head(
     device: &Device,
     dimensions: &crate::model::ModelDimensions,
     model_id: &str,
-) -> jammi_engine::error::Result<Option<jammi_lora::LoraLinear>> {
+) -> jammi_db::error::Result<Option<jammi_lora::LoraLinear>> {
     let adapter_weights =
         candle_core::safetensors::load(adapter_file, device).map_err(|e| JammiError::Model {
             model_id: model_id.to_string(),

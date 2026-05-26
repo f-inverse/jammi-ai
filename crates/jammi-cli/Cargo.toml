@@ -9,7 +9,7 @@ repository.workspace = true
 readme = "README.md"
 
 [dependencies]
-jammi-engine.workspace = true
+jammi-db.workspace = true
 jammi-ai.workspace = true
 jammi-server.workspace = true
 arrow.workspace = true

@@ -9,19 +9,19 @@ This recipe walks through registering a third channel, `scored_by`, for a multi-
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate arrow;
 # extern crate tokio;
-# use jammi_engine::config::JammiConfig;
-# async fn ex(config: JammiConfig) -> jammi_engine::error::Result<()> {
+# use jammi_db::config::JammiConfig;
+# async fn ex(config: JammiConfig) -> jammi_db::error::Result<()> {
 use std::sync::Arc;
 use arrow::array::{ArrayRef, Float32Array, StringArray};
 use jammi_ai::evidence::{merge_channels, ChannelContribution};
 use jammi_ai::session::InferenceSession;
-use jammi_engine::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
-use jammi_engine::ChannelId;
-use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
+use jammi_db::ChannelId;
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
 let session = Arc::new(InferenceSession::new(config).await?);
 session.add_source("patents", SourceType::File, SourceConnection {
@@ -35,9 +35,9 @@ session.add_source("patents", SourceType::File, SourceConnection {
 ### Python
 
 ```python
-import jammi
+import jammi_ai
 
-db = jammi.connect(artifact_dir="/var/lib/jammi")
+db = jammi_ai.connect(artifact_dir="/var/lib/jammi")
 db.add_source("patents", path="/data/patents.parquet", format="parquet")
 ```
 
@@ -48,14 +48,14 @@ Channel declarations are catalog rows. Each declared column has a name, an Arrow
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
-# use jammi_engine::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
-# use jammi_engine::ChannelId;
-# async fn ex(session: &Arc<InferenceSession>) -> jammi_engine::error::Result<()> {
+# use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
+# use jammi_db::ChannelId;
+# async fn ex(session: &Arc<InferenceSession>) -> jammi_db::error::Result<()> {
 session.catalog().channels().register(&ChannelSpec {
     id: ChannelId::new("scored_by")?,
     priority: 3,
@@ -88,14 +88,14 @@ db.register_channel(
 To add more columns to an already-registered channel:
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate tokio;
 # use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
-# use jammi_engine::catalog::channel_repo::{ChannelColumn, ChannelColumnType};
-# use jammi_engine::ChannelId;
-# async fn ex(session: &Arc<InferenceSession>) -> jammi_engine::error::Result<()> {
+# use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType};
+# use jammi_db::ChannelId;
+# async fn ex(session: &Arc<InferenceSession>) -> jammi_db::error::Result<()> {
 session.catalog().channels().add_columns(
     &ChannelId::new("scored_by")?,
     &[ChannelColumn { name: "scored_at".into(), data_type: ChannelColumnType::Utf8 }],
@@ -116,7 +116,7 @@ Build a `ChannelContribution` for each batch your reranker produces. The arrays 
 ### Rust
 
 ```rust,no_run
-# extern crate jammi_engine;
+# extern crate jammi_db;
 # extern crate jammi_ai;
 # extern crate arrow;
 # extern crate tokio;
@@ -124,9 +124,9 @@ Build a `ChannelContribution` for each batch your reranker produces. The arrays 
 # use arrow::array::{ArrayRef, Float32Array, RecordBatch, StringArray};
 # use jammi_ai::evidence::{merge_channels, ChannelContribution};
 # use jammi_ai::session::InferenceSession;
-# use jammi_engine::ChannelId;
+# use jammi_db::ChannelId;
 # fn rerank_scores(_batch: &RecordBatch) -> Vec<f32> { vec![] }
-# async fn ex(session: &Arc<InferenceSession>, batches: Vec<RecordBatch>) -> jammi_engine::error::Result<()> {
+# async fn ex(session: &Arc<InferenceSession>, batches: Vec<RecordBatch>) -> jammi_db::error::Result<()> {
 let scored_by = ChannelId::new("scored_by")?;
 let vector = ChannelId::new("vector")?;
 

@@ -10,7 +10,7 @@ readme = "README.md"
 
 [dependencies]
 jammi-ai = { workspace = true, optional = true }
-jammi-engine.workspace = true
+jammi-db.workspace = true
 axum.workspace = true
 arrow.workspace = true
 arrow-flight.workspace = true

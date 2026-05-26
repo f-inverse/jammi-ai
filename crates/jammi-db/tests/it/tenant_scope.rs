@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use jammi_engine::session::JammiSession;
-use jammi_engine::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
-use jammi_engine::TenantId;
+use jammi_db::session::JammiSession;
+use jammi_db::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
+use jammi_db::TenantId;
 use tempfile::tempdir;
 
 use crate::common;
@@ -237,7 +237,7 @@ async fn with_tenant_returns_same_session_id() {
 /// the tenant binding on write together enforce isolation.
 #[tokio::test]
 async fn catalog_sources_isolated_by_tenant() {
-    use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+    use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
     let dir = tempdir().unwrap();
     let cfg = common::test_config(dir.path());
@@ -290,7 +290,7 @@ async fn catalog_sources_isolated_by_tenant() {
 /// predicate-injection rule).
 #[tokio::test]
 async fn catalog_unscoped_session_sees_global_only_after_scoped_writes() {
-    use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+    use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
     let dir = tempdir().unwrap();
     let cfg = common::test_config(dir.path());
@@ -348,7 +348,7 @@ async fn catalog_unscoped_session_sees_global_only_after_scoped_writes() {
 #[tokio::test]
 async fn federated_source_tenant_column_filters_split_6_4() {
     use arrow::array::{ArrayRef, RecordBatch};
-    use jammi_engine::source::{FileFormat, SourceConnection, SourceType};
+    use jammi_db::source::{FileFormat, SourceConnection, SourceType};
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
 
@@ -591,7 +591,7 @@ async fn with_tenant_scoped_does_not_mutate_sticky_binding() {
     assert_eq!(session.tenant(), Some(tenant_b()));
 }
 
-/// Headline safety property for [`jammi_engine::trigger::Subscriber::subscribe_scoped`].
+/// Headline safety property for [`jammi_db::trigger::Subscriber::subscribe_scoped`].
 ///
 /// A `gRPC` server-streaming handler enters `with_tenant_scoped(A)`, opens
 /// a subscription, returns the stream to tonic, and the closure resolves —
@@ -610,10 +610,10 @@ async fn with_tenant_scoped_does_not_mutate_sticky_binding() {
 async fn subscribe_scoped_stream_remains_tenant_filtered_after_closure_returns() {
     use arrow::array::RecordBatch;
     use futures::StreamExt;
-    use jammi_engine::catalog::backend::TxOptions;
-    use jammi_engine::catalog::topic_repo::TopicRepo;
-    use jammi_engine::source::mutable::MutableTableRegistry;
-    use jammi_engine::trigger::{
+    use jammi_db::catalog::backend::TxOptions;
+    use jammi_db::catalog::topic_repo::TopicRepo;
+    use jammi_db::source::mutable::MutableTableRegistry;
+    use jammi_db::trigger::{
         InMemoryBroker, Offset, Predicate, Subscriber, TopicDefinition, TopicId, TriggerBroker,
     };
     use std::collections::BTreeMap;
@@ -683,15 +683,15 @@ async fn subscribe_scoped_stream_remains_tenant_filtered_after_closure_returns()
                     .insert_batch(tx, &backing_for_a, &a_batch_one)
                     .await
                     .map_err(|e| {
-                        jammi_engine::catalog::backend::BackendError::Execution(e.to_string())
+                        jammi_db::catalog::backend::BackendError::Execution(e.to_string())
                     })?;
                 registry_for_a
                     .insert_batch(tx, &backing_for_a, &a_batch_two)
                     .await
                     .map_err(|e| {
-                        jammi_engine::catalog::backend::BackendError::Execution(e.to_string())
+                        jammi_db::catalog::backend::BackendError::Execution(e.to_string())
                     })?;
-                Ok::<(), jammi_engine::catalog::backend::BackendError>(())
+                Ok::<(), jammi_db::catalog::backend::BackendError>(())
             })
         })
         .await
@@ -709,15 +709,15 @@ async fn subscribe_scoped_stream_remains_tenant_filtered_after_closure_returns()
                     .insert_batch(tx, &backing_for_b, &b_batch_one)
                     .await
                     .map_err(|e| {
-                        jammi_engine::catalog::backend::BackendError::Execution(e.to_string())
+                        jammi_db::catalog::backend::BackendError::Execution(e.to_string())
                     })?;
                 registry_for_b
                     .insert_batch(tx, &backing_for_b, &b_batch_two)
                     .await
                     .map_err(|e| {
-                        jammi_engine::catalog::backend::BackendError::Execution(e.to_string())
+                        jammi_db::catalog::backend::BackendError::Execution(e.to_string())
                     })?;
-                Ok::<(), jammi_engine::catalog::backend::BackendError>(())
+                Ok::<(), jammi_db::catalog::backend::BackendError>(())
             })
         })
         .await
@@ -952,16 +952,16 @@ async fn admin_scope_does_not_leak_into_subsequent_calls() {
 /// guard. The sink calls it once per write_all; verify it rejects mismatches.
 #[tokio::test]
 async fn transaction_tenant_guard_rejects_mismatch() {
-    use jammi_engine::catalog::backend::{BackendError, TxOptions};
-    use jammi_engine::catalog::backend_sqlite::SqliteBackend;
-    use jammi_engine::catalog::Catalog;
-    use jammi_engine::CatalogBackend;
+    use jammi_db::catalog::backend::{BackendError, TxOptions};
+    use jammi_db::catalog::backend_sqlite::SqliteBackend;
+    use jammi_db::catalog::Catalog;
+    use jammi_db::CatalogBackend;
 
     let dir = tempdir().unwrap();
     let backend = SqliteBackend::open(&dir.path().join("guard.db"))
         .await
         .unwrap();
-    let _catalog = Catalog::from_backend(jammi_engine::BackendImpl::Sqlite(backend.clone()));
+    let _catalog = Catalog::from_backend(jammi_db::BackendImpl::Sqlite(backend.clone()));
 
     let bound = tenant_a();
     let other = tenant_b();

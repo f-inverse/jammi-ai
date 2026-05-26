@@ -4,7 +4,7 @@
 //! sites like `db.infer(..., task=ModelTask.TextEmbedding, ...)` exchange
 //! typed values across the FFI boundary. Strings are still accepted at every
 //! task-bearing argument — they decode through
-//! [`jammi_engine::ModelTask::try_from_db_str`] exactly once at the binding
+//! [`jammi_db::ModelTask::try_from_db_str`] exactly once at the binding
 //! edge, so the Rust side never sees `&str` for `task`.
 
 use pyo3::exceptions::PyTypeError;
@@ -43,7 +43,7 @@ impl PyModelTask {
     }
 
     /// Parse a catalog string into a `ModelTask` enum value. Mirrors
-    /// `jammi_engine::ModelTask::try_from_db_str` exactly.
+    /// `jammi_db::ModelTask::try_from_db_str` exactly.
     #[staticmethod]
     fn from_str(s: &str) -> PyResult<Self> {
         ModelTask::try_from_db_str(s)

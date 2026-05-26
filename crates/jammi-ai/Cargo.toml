@@ -9,7 +9,7 @@ repository.workspace = true
 readme = "README.md"
 
 [dependencies]
-jammi-engine.workspace = true
+jammi-db.workspace = true
 jammi-lora.workspace = true
 jammi-encoders.workspace = true
 candle-core.workspace = true

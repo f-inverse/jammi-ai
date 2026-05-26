@@ -135,7 +135,11 @@ impl<'a> EvalRunner<'a> {
         golden_source: &str,
         label_column: &str,
     ) -> Result<serde_json::Value> {
-        let model_source = ModelSource::from_canonical(model_id);
+        // `model_id` is a user-supplied identifier (`local:/path`, `hf://owner/repo`,
+        // or `owner/repo`) — parse it the same way every other public entry point
+        // does. `from_canonical` is reserved for canonical names already stored in
+        // the catalog (no `local:` prefix), which is not the shape callers pass here.
+        let model_source = ModelSource::parse(model_id);
 
         let metrics_json = match task {
             EvalTask::Classification => {

@@ -862,6 +862,97 @@ async fn publish_returns_error_on_tenant_mismatch_when_topic_is_tenant_pinned() 
 }
 
 #[tokio::test]
+async fn list_consumers_returns_each_subscribers_last_delivered_offset() {
+    // SPEC-04 backup/restore hook: `TriggerBroker::list_consumers` returns one
+    // `ConsumerOffsetSnapshot` per live subscription, carrying the broker's
+    // last-delivered stream sequence. The capture is what the
+    // jammi-enterprise backup path will dump into the manifest so a restored
+    // deployment can resume subscriptions at the right point.
+    //
+    // Test: register a topic, attach two subscribers, publish three batches,
+    // drive both subscriber streams until they observe every batch, then call
+    // `list_consumers` and verify both names plus a matching last-delivered
+    // offset come back. The in-memory broker has no ack model, so
+    // `last_ack_stream_sequence == last_delivered_stream_sequence` by design.
+    let h = build_harness().await;
+    let topic = topic_def("events.list_consumers", None);
+    h.broker.register_topic(&topic).await.unwrap();
+    h.topic_repo.register_topic(&topic).await.unwrap();
+
+    let mut sub_a = h
+        .broker
+        .subscribe(topic.id, Predicate::match_all(), None)
+        .await
+        .unwrap();
+    let consumer_a = sub_a.id.to_string();
+    let mut sub_b = h
+        .broker
+        .subscribe(topic.id, Predicate::match_all(), None)
+        .await
+        .unwrap();
+    let consumer_b = sub_b.id.to_string();
+
+    for i in 0..3i64 {
+        let batch = batch_of(&[i], &["X"], &[i as f64]);
+        h.publisher
+            .publish_scoped(&topic, None, batch)
+            .await
+            .unwrap();
+    }
+
+    // Drain three batches per subscriber so each tracker observes
+    // offset = 2 (the last published value).
+    for _ in 0..3 {
+        let _ = tokio::time::timeout(Duration::from_secs(2), sub_a.next())
+            .await
+            .expect("sub_a timed out")
+            .expect("sub_a stream ended early")
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), sub_b.next())
+            .await
+            .expect("sub_b timed out")
+            .expect("sub_b stream ended early")
+            .unwrap();
+    }
+
+    let mut snapshots = h.broker.list_consumers(topic.id).await.unwrap();
+    snapshots.sort_by(|x, y| x.consumer_name.cmp(&y.consumer_name));
+    assert_eq!(
+        snapshots.len(),
+        2,
+        "expected one snapshot per live subscription, got {snapshots:?}"
+    );
+    let names: std::collections::BTreeSet<&str> =
+        snapshots.iter().map(|s| s.consumer_name.as_str()).collect();
+    assert!(
+        names.contains(consumer_a.as_str()) && names.contains(consumer_b.as_str()),
+        "list_consumers must surface both subscription ids; got {names:?}, expected {consumer_a} and {consumer_b}"
+    );
+    for snap in &snapshots {
+        assert_eq!(snap.topic_id, topic.id, "snapshot topic_id mismatch");
+        assert_eq!(
+            snap.last_delivered_stream_sequence, 2,
+            "subscriber {} should be at offset 2 after draining three batches",
+            snap.consumer_name
+        );
+        assert_eq!(
+            snap.last_ack_stream_sequence, snap.last_delivered_stream_sequence,
+            "in-memory broker has no ack model; ack floor must equal delivered"
+        );
+    }
+
+    // Dropping one subscription removes it from the listing on the next call.
+    drop(sub_a);
+    let after_drop = h.broker.list_consumers(topic.id).await.unwrap();
+    assert_eq!(
+        after_drop.len(),
+        1,
+        "list_consumers must prune the dropped subscription"
+    );
+    assert_eq!(after_drop[0].consumer_name, consumer_b);
+}
+
+#[tokio::test]
 async fn session_with_broker_swallows_fan_out_failure() {
     // Verifies the session-level broker injection point + the publisher's
     // transactional-outbox contract: a caller-built `InMemoryBroker` armed

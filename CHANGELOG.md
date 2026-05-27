@@ -4,6 +4,19 @@ All notable changes to the Jammi AI workspace are recorded here. The
 workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
+## [Unreleased]
+
+### Added
+
+- `TriggerBroker::list_consumers(topic_id) -> Vec<ConsumerOffsetSnapshot>`
+  returns one snapshot per consumer currently bound to the topic, carrying
+  the broker's last-delivered and ack-floor stream sequences. Unblocks
+  the OSS broker listing gap noted in jammi-enterprise's E5 CHANGELOG
+  entry; the enterprise backup path will adopt it once this release
+  publishes. Wired through both the JetStream driver (via
+  `stream.consumers()`) and the in-memory broker (each subscription
+  registers a tracker that's pruned when the subscription drops).
+
 ## v0.9.0 — 2026-05-26
 
 ### Changed

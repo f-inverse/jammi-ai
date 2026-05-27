@@ -6,7 +6,8 @@
 //! backing-table replay.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -17,6 +18,7 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
 use crate::trigger::broker::{BrokerKind, TriggerBroker};
+use crate::trigger::consumer::ConsumerOffsetSnapshot;
 use crate::trigger::error::TriggerError;
 use crate::trigger::ids::{SubscriptionId, TopicId};
 use crate::trigger::offset::Offset;
@@ -24,11 +26,23 @@ use crate::trigger::predicate::Predicate;
 use crate::trigger::subscription::{DeliveredBatch, Subscription};
 use crate::trigger::topic::TopicDefinition;
 
-/// Per-topic broadcast channel and its committed schema (for the idempotency
-/// check during re-registration).
+/// Per-subscription bookkeeping the broker hands back through
+/// [`TriggerBroker::list_consumers`]. The subscription's async stream
+/// owns the `Arc`; the channel state holds a `Weak` so dropping the
+/// stream automatically prunes the consumer from the listing.
+struct ConsumerTracker {
+    consumer_name: String,
+    topic_id: TopicId,
+    last_delivered: AtomicU64,
+}
+
+/// Per-topic broadcast channel, its committed schema (for the idempotency
+/// check during re-registration), and weak references to every live
+/// subscription on the topic.
 struct ChannelState {
     sender: broadcast::Sender<DeliveredBatch>,
     schema: SchemaRef,
+    consumers: Vec<Weak<ConsumerTracker>>,
 }
 
 /// Capacity of each topic's broadcast channel. Lagged receivers fall back to
@@ -97,6 +111,7 @@ impl TriggerBroker for InMemoryBroker {
             ChannelState {
                 sender,
                 schema: Arc::clone(&topic.schema),
+                consumers: Vec::new(),
             },
         );
         Ok(())
@@ -140,14 +155,32 @@ impl TriggerBroker for InMemoryBroker {
         predicate: Predicate,
         from_offset: Option<Offset>,
     ) -> Result<Subscription, TriggerError> {
-        let mut rx = self
-            .channels
-            .read()
-            .get(&topic_id)
-            .map(|s| s.sender.subscribe())
-            .ok_or_else(|| TriggerError::TopicNotFound(topic_id.to_string()))?;
+        let subscription_id = SubscriptionId::new();
+        let tracker = Arc::new(ConsumerTracker {
+            consumer_name: subscription_id.to_string(),
+            topic_id,
+            last_delivered: AtomicU64::new(0),
+        });
+
+        let mut rx = {
+            let mut channels = self.channels.write();
+            let state = channels
+                .get_mut(&topic_id)
+                .ok_or_else(|| TriggerError::TopicNotFound(topic_id.to_string()))?;
+            // Drop tracker weaks that have already been collected so the
+            // per-topic vector does not grow without bound across the
+            // lifetime of long-lived brokers (UAT, dashboards).
+            state.consumers.retain(|w| w.strong_count() > 0);
+            state.consumers.push(Arc::downgrade(&tracker));
+            state.sender.subscribe()
+        };
         let after = from_offset.map(|o| o.value());
+        // The stream takes ownership of `tracker` so it stays alive for the
+        // lifetime of the subscription. When the consumer drops the
+        // `Subscription`, the tracker is dropped and the broker's `Weak`
+        // entry stops upgrading — `list_consumers` filters it out.
         let stream = try_stream! {
+            let _tracker_guard = Arc::clone(&tracker);
             loop {
                 match rx.recv().await {
                     Ok(d) => {
@@ -156,6 +189,9 @@ impl TriggerBroker for InMemoryBroker {
                                 continue;
                             }
                         }
+                        tracker
+                            .last_delivered
+                            .store(d.offset.value(), Ordering::Relaxed);
                         if let Some(filtered) = predicate.evaluate(&d.batch)? {
                             yield DeliveredBatch {
                                 offset: d.offset,
@@ -171,7 +207,40 @@ impl TriggerBroker for InMemoryBroker {
                 }
             }
         };
-        Ok(Subscription::new(SubscriptionId::new(), Box::pin(stream)))
+        Ok(Subscription::new(subscription_id, Box::pin(stream)))
+    }
+
+    async fn list_consumers(
+        &self,
+        topic_id: TopicId,
+    ) -> Result<Vec<ConsumerOffsetSnapshot>, TriggerError> {
+        let mut channels = self.channels.write();
+        let state = channels
+            .get_mut(&topic_id)
+            .ok_or_else(|| TriggerError::TopicNotFound(topic_id.to_string()))?;
+        let mut snapshots: Vec<ConsumerOffsetSnapshot> = Vec::with_capacity(state.consumers.len());
+        state.consumers.retain(|w| {
+            if let Some(tracker) = w.upgrade() {
+                let last_delivered = tracker.last_delivered.load(Ordering::Relaxed);
+                snapshots.push(ConsumerOffsetSnapshot {
+                    consumer_name: tracker.consumer_name.clone(),
+                    topic_id: tracker.topic_id,
+                    last_delivered_stream_sequence: last_delivered,
+                    // The in-memory broker delivers via `tokio::broadcast`,
+                    // which has no explicit-ack model; every received batch
+                    // is implicitly acknowledged the moment the subscriber
+                    // observes it. Surfacing the same value for both fields
+                    // keeps the round-trip stable through the backup-restore
+                    // path (`last_ack` is the field a restore would use to
+                    // resume).
+                    last_ack_stream_sequence: last_delivered,
+                });
+                true
+            } else {
+                false
+            }
+        });
+        Ok(snapshots)
     }
 
     fn driver_kind(&self) -> BrokerKind {
@@ -236,5 +305,46 @@ mod tests {
             .publish(t.id, batch(&t.schema, &[42]), Utc::now(), 0)
             .await
             .expect("publish without arm succeeds");
+    }
+
+    #[tokio::test]
+    async fn list_consumers_on_unknown_topic_returns_not_found() {
+        let broker = InMemoryBroker::new();
+        match broker.list_consumers(TopicId::new()).await {
+            Err(TriggerError::TopicNotFound(_)) => {}
+            other => panic!("expected TopicNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_consumers_on_topic_without_subscribers_is_empty() {
+        let broker = InMemoryBroker::new();
+        let t = topic("test.no_subscribers");
+        broker.register_topic(&t).await.unwrap();
+        let consumers = broker.list_consumers(t.id).await.unwrap();
+        assert!(consumers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_consumers_prunes_dropped_subscriptions() {
+        let broker = InMemoryBroker::new();
+        let t = topic("test.drop_prunes");
+        broker.register_topic(&t).await.unwrap();
+        {
+            let _sub = broker
+                .subscribe(t.id, Predicate::match_all(), None)
+                .await
+                .unwrap();
+            let alive = broker.list_consumers(t.id).await.unwrap();
+            assert_eq!(alive.len(), 1, "subscription must register a consumer");
+        }
+        // After the subscription scope ends the tracker's strong count drops
+        // to zero; `list_consumers` upgrades the weaks and prunes the dead
+        // entry, returning an empty list.
+        let after_drop = broker.list_consumers(t.id).await.unwrap();
+        assert!(
+            after_drop.is_empty(),
+            "dropped subscription must not appear in list_consumers"
+        );
     }
 }

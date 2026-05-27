@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, Float32Array, ListArray, StringArray};
+use jammi_ai::eval::{EvalTask, InferenceAggregate, PerRecordPrediction};
 use jammi_ai::fine_tune::FineTuneMethod;
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
@@ -811,7 +812,10 @@ async fn recipe_classification_inference() {
 // ─── Recipe: NER Inference ───────────────────────────────────────────────────
 
 fn tiny_modernbert_ner_id() -> String {
-    "local:".to_string() + common::fixture("tiny_modernbert_ner").to_str().unwrap()
+    "local:".to_string()
+        + common::cookbook_fixture("tiny_modernbert_ner")
+            .to_str()
+            .unwrap()
 }
 
 #[tokio::test]
@@ -876,6 +880,126 @@ async fn recipe_ner_inference() {
             assert!(json.is_array(), "entities should be a JSON array");
         }
     }
+}
+
+// ─── Recipe: Evaluation (NER) ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn recipe_evaluation_ner() {
+    let dir = TempDir::new().unwrap();
+    let session = cookbook_session(&dir).await;
+    let model_id = tiny_modernbert_ner_id();
+
+    // Register the cookbook NER corpus + gold spans (cookbook recipe).
+    session
+        .add_source(
+            "corpus",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::cookbook_fixture_url("tiny_ner_corpus.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    session
+        .add_source(
+            "golden",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::cookbook_fixture_url("tiny_ner_gold.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let run = async || {
+        session
+            .eval_inference(
+                &model_id,
+                "corpus",
+                &["text".to_string()],
+                EvalTask::Ner,
+                "golden.public.tiny_ner_gold",
+                "label",
+            )
+            .await
+            .expect("eval_inference NER succeeds")
+    };
+
+    let report = run().await;
+
+    // Aggregate is the NER variant carrying entity-level metrics.
+    let metrics = match &report.aggregate {
+        InferenceAggregate::Ner(m) => m,
+        other => panic!("expected InferenceAggregate::Ner, got {other:?}"),
+    };
+
+    // The random-init fixture may produce zero entities for every row —
+    // the recipe only guarantees the metrics are well-defined rates, not
+    // strictly positive.
+    assert!(
+        (0.0..=1.0).contains(&metrics.precision),
+        "precision out of range: {}",
+        metrics.precision
+    );
+    assert!(
+        (0.0..=1.0).contains(&metrics.recall),
+        "recall out of range: {}",
+        metrics.recall
+    );
+    assert!(
+        (0.0..=1.0).contains(&metrics.f1),
+        "f1 out of range: {}",
+        metrics.f1
+    );
+
+    // Per-record predictions are present for every aligned row and every
+    // entry is tagged as the NER variant — never the Classification one.
+    assert!(
+        !report.per_record.is_empty(),
+        "per_record must carry one entry per aligned row"
+    );
+    for entry in &report.per_record {
+        match entry {
+            PerRecordPrediction::Ner { .. } => {}
+            PerRecordPrediction::Classification { .. } => {
+                panic!("NER eval emitted a Classification per-record entry")
+            }
+        }
+    }
+
+    // Determinism: the second invocation against the same fixture must
+    // return bit-identical metrics. Random-init weights are loaded from
+    // the same on-disk safetensors and the fixture text is fixed, so any
+    // drift indicates non-determinism in tokenization, batching, or
+    // decoding — a regression worth catching at the recipe layer.
+    let report_again = run().await;
+    let metrics_again = match &report_again.aggregate {
+        InferenceAggregate::Ner(m) => m,
+        other => panic!("expected InferenceAggregate::Ner on rerun, got {other:?}"),
+    };
+    assert_eq!(
+        metrics.precision, metrics_again.precision,
+        "precision must be deterministic across runs"
+    );
+    assert_eq!(
+        metrics.recall, metrics_again.recall,
+        "recall must be deterministic across runs"
+    );
+    assert_eq!(
+        metrics.f1, metrics_again.f1,
+        "f1 must be deterministic across runs"
+    );
+    assert_eq!(
+        report.per_record.len(),
+        report_again.per_record.len(),
+        "per_record length must be deterministic across runs"
+    );
 }
 
 // ─── Recipe: Generate Image Embeddings ──────────────────────────────────────

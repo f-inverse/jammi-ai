@@ -27,9 +27,7 @@ The returned dict carries `aggregate` (tagged by `"task"` — currently
 `per_record` (one entry per aligned `{record_id, predicted, gold}`).
 
 The `task` argument is the string form of the inference task —
-`"classification"` here. NER is recognized but not yet supported via this
-entrypoint (see the runner's `EvalTask::Ner` branch); for token-level
-eval, call the `jammi-numerics` NER kernels directly.
+`"classification"` here. For NER, see `../eval_inference_ner/`.
 
 ## Golden source shape
 

@@ -16,6 +16,12 @@ workspace ships every publishable crate at the same
   wire change — `as_db_str` / `try_from_db_str` continue to map the same
   four snake_case strings, persisted `task` columns and serde JSON
   round-trip identically.
+- `eval_inference` `PerRecordPrediction` is now a serde-tagged enum
+  (`{"task": "classification", ...}` / `{"task": "ner", ...}`) mirroring
+  the existing `InferenceAggregate` shape. Classification per-record
+  dicts gain a `"task": "classification"` tag (additive); NER per-record
+  dicts gain a `"task": "ner"` tag carrying `predicted`/`gold` entity
+  lists.
 
 ### Added
 
@@ -24,6 +30,19 @@ workspace ships every publishable crate at the same
   exhaustive-`match` test guards against `ALL` drifting from the enum
   body (adding a variant without extending `ALL` either fails to
   compile or fails the membership assertion).
+- `EvalTask::Ner` is now implemented end-to-end through `eval_inference`.
+  The runner loads per-span gold rows `(id, label, start, end)` from
+  the registered golden source, runs NER inference, parses the
+  `entities` JSON payload, and computes entity-level
+  precision/recall/F1 + per-type breakdown via
+  `jammi_numerics::ner::NerMetrics`. New cookbook recipe
+  `cookbook/recipes/eval_inference_ner/` exercises the path against the
+  shipped `tiny_modernbert_ner` model fixture (relocated from
+  `tests/fixtures/` to `cookbook/fixtures/` for the same reason the
+  classifier fixture lives there). `jammi_numerics::ner::Entity` gains
+  a `Deserialize` derive so the round-trip from the NER inference
+  adapter's JSON column back into typed entity sets uses the same serde
+  contract as serialization.
 
 ## v0.10.0 — 2026-05-27
 

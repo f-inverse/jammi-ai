@@ -14,10 +14,12 @@ use crate::model::ModelSource;
 use crate::session::InferenceSession;
 
 use jammi_numerics::classification::ClassificationMetrics;
+use jammi_numerics::ner::{Entity, NerMetrics};
 use jammi_numerics::retrieval::RetrievalMetrics;
 
 use super::golden::{
-    ensure_column, load_classification_golden_from_batches, load_retrieval_golden_from_batches,
+    ensure_column, ensure_column_int64, load_classification_golden_from_batches,
+    load_ner_golden_from_batches, load_retrieval_golden_from_batches,
 };
 
 /// Orchestrates evaluation pipelines — retrieval and classification.
@@ -206,7 +208,7 @@ impl<'a> EvalRunner<'a> {
                         if let Some(actual) = golden.labels.get(id) {
                             aligned_predicted.push(pred.clone());
                             aligned_actual.push(actual.clone());
-                            per_record.push(PerRecordPrediction {
+                            per_record.push(PerRecordPrediction::Classification {
                                 record_id: id.clone(),
                                 predicted: pred.clone(),
                                 gold: actual.clone(),
@@ -219,11 +221,74 @@ impl<'a> EvalRunner<'a> {
                 (InferenceAggregate::Classification(result), per_record)
             }
             EvalTask::Ner => {
-                return Err(JammiError::Eval(
-                    "NER evaluation via eval_inference is not yet implemented. \
-                     Use jammi_numerics::ner::NerMetrics::compute() directly."
-                        .into(),
-                ));
+                // NER goldens carry one entity span per row. The runner
+                // joins on `id`, then groups spans into per-row entity
+                // sets — the shape `NerMetrics::compute` consumes.
+                let golden_schema = self.source_schema(golden_source).await?;
+                ensure_column(&golden_schema, "id", DataType::Utf8)?;
+                ensure_column(&golden_schema, label_column, DataType::Utf8)?;
+                ensure_column_int64(&golden_schema, "start")?;
+                ensure_column_int64(&golden_schema, "end")?;
+
+                let batches = self
+                    .session
+                    .sql(&format!(
+                        "SELECT \"id\", \"{label_column}\" AS \"label\", \"start\", \"end\" \
+                         FROM {golden_source}"
+                    ))
+                    .await?;
+                let golden = load_ner_golden_from_batches(&batches)?;
+
+                let results = self
+                    .session
+                    .infer(
+                        source_id,
+                        &model_source,
+                        crate::model::ModelTask::Ner,
+                        columns,
+                        "id",
+                    )
+                    .await?;
+
+                let mut per_record: Vec<PerRecordPrediction> = Vec::new();
+                let mut aligned_predicted: Vec<Vec<Entity>> = Vec::new();
+                let mut aligned_gold: Vec<Vec<Entity>> = Vec::new();
+                for batch in &results {
+                    let ids = super::golden::extract_string_column(batch, "_row_id")?;
+                    let statuses = super::golden::extract_string_column(batch, "_status")?;
+                    let entities_col = super::golden::extract_string_column(batch, "entities")?;
+                    for ((id, status), entities_json) in
+                        ids.iter().zip(&statuses).zip(&entities_col)
+                    {
+                        // Rows that errored mid-batch carry `_status != "ok"`;
+                        // skip them so a single backend error doesn't poison
+                        // the aggregate. Rows without a gold counterpart are
+                        // also dropped — same alignment rule the
+                        // classification arm uses.
+                        if status != "ok" {
+                            continue;
+                        }
+                        let Some(gold) = golden.entities.get(id) else {
+                            continue;
+                        };
+                        let predicted: Vec<Entity> =
+                            serde_json::from_str(entities_json).map_err(|e| {
+                                JammiError::Eval(format!(
+                                    "NER entities JSON parse failed for row {id}: {e}"
+                                ))
+                            })?;
+                        aligned_predicted.push(predicted.clone());
+                        aligned_gold.push(gold.clone());
+                        per_record.push(PerRecordPrediction::Ner {
+                            record_id: id.clone(),
+                            predicted,
+                            gold: gold.clone(),
+                        });
+                    }
+                }
+
+                let metrics = NerMetrics::compute(&aligned_predicted, &aligned_gold);
+                (InferenceAggregate::Ner(metrics), per_record)
             }
         };
 

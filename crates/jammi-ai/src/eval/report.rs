@@ -8,7 +8,7 @@
 //! historical reporting.
 
 use jammi_numerics::classification::ClassificationResult;
-use jammi_numerics::ner::NerMetrics;
+use jammi_numerics::ner::{Entity, NerMetrics};
 use jammi_numerics::retrieval::{AggregateMetrics, QueryMetrics};
 use serde::{Deserialize, Serialize};
 
@@ -47,12 +47,32 @@ pub enum InferenceAggregate {
     Ner(NerMetrics),
 }
 
-/// One predicted / gold label pair from `eval_inference`.
+/// One predicted / gold prediction pair from `eval_inference`, tagged by
+/// task kind so the per-record array carries task-shaped payloads instead
+/// of a single string-pair shape.
+///
+/// Classification carries the predicted/gold label strings; NER carries
+/// the predicted/gold entity-span sets so downstream consumers can compute
+/// per-record precision/recall without re-decoding the JSON payload the
+/// NER inference adapter wrote.
+///
+/// Wire shape mirrors [`InferenceAggregate`]: a serde-tagged enum with
+/// `"task": "classification"` or `"task": "ner"` discriminating the
+/// variant, so both wire formats round-trip through the same
+/// `serializable_to_pydict` conversion used by every other eval response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PerRecordPrediction {
-    pub record_id: String,
-    pub predicted: String,
-    pub gold: String,
+#[serde(tag = "task", rename_all = "snake_case")]
+pub enum PerRecordPrediction {
+    Classification {
+        record_id: String,
+        predicted: String,
+        gold: String,
+    },
+    Ner {
+        record_id: String,
+        predicted: Vec<Entity>,
+        gold: Vec<Entity>,
+    },
 }
 
 /// Result of one `eval_compare` invocation across multiple embedding tables.

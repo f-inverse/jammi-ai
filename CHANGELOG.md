@@ -6,6 +6,8 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.10.0 — 2026-05-27
+
 ### Added
 
 - `TriggerBroker::list_consumers(topic_id) -> Vec<ConsumerOffsetSnapshot>`

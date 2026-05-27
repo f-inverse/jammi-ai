@@ -40,6 +40,10 @@ RECIPES: tuple[Recipe, ...] = (
     Recipe("trigger_streams", COOKBOOK / "recipes" / "trigger_streams" / "example.py"),
     Recipe("eval_embeddings", COOKBOOK / "recipes" / "eval_embeddings" / "example.py"),
     Recipe("eval_inference", COOKBOOK / "recipes" / "eval_inference" / "example.py"),
+    Recipe(
+        "eval_inference_ner",
+        COOKBOOK / "recipes" / "eval_inference_ner" / "example.py",
+    ),
     Recipe("fine_tune", COOKBOOK / "recipes" / "fine_tune" / "example.py", slow=True),
     Recipe("flight_sql", COOKBOOK / "recipes" / "flight_sql" / "example.py", slow=True),
 )

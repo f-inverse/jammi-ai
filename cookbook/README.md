@@ -14,6 +14,7 @@ blocks the merge.
 | Publish + subscribe on a topic | [`recipes/trigger_streams/`](./recipes/trigger_streams/) |
 | Measure recall@k / nDCG against a golden set | [`recipes/eval_embeddings/`](./recipes/eval_embeddings/) |
 | Measure classification accuracy against gold labels | [`recipes/eval_inference/`](./recipes/eval_inference/) |
+| Measure NER precision/recall/F1 against gold spans | [`recipes/eval_inference_ner/`](./recipes/eval_inference_ner/) |
 | Fine-tune an encoder with LoRA | [`recipes/fine_tune/`](./recipes/fine_tune/) |
 | Connect to a remote `jammi-server` via Flight SQL | [`recipes/flight_sql/`](./recipes/flight_sql/) |
 
@@ -28,10 +29,16 @@ Every example loads from `cookbook/fixtures/`:
 - `tiny_labels.csv` — per-row classification labels for `eval_inference`
 - `tiny_pairs.csv` — contrastive (text_a, text_b, score) pairs for
   `fine_tune`
+- `tiny_ner_corpus.parquet` — 20 generic PER/ORG sentences for the
+  `eval_inference_ner` recipe
+- `tiny_ner_gold.csv` — per-span gold entities (`id`, `label`, `start`,
+  `end`) for the NER corpus
 - `tiny_bert/` — 32-dim BERT encoder weights (88 KB) for every text
   embedding example
 - `tiny_modernbert_classifier/` — tiny ModernBERT-for-classification
   weights for `eval_inference`
+- `tiny_modernbert_ner/` — tiny ModernBERT-for-token-classification
+  weights (PER + ORG labels) for `eval_inference_ner`
 
 The fixture tree is under 5 MB total so CI checkouts stay fast. Regenerate
 the data files with `python cookbook/fixtures/generate.py`; the encoder

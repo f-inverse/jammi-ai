@@ -14,6 +14,7 @@ The recipes shipped at MVP:
 | [`trigger_streams`](#trigger-streams) | Publish + subscribe on a topic via the in-process broker |
 | [`eval_embeddings`](#evaluate-retrieval-quality) | recall@k, MRR, nDCG against a golden set |
 | [`eval_inference`](#evaluate-inference-classification) | Accuracy + macro F1 against gold labels |
+| [`eval_inference_ner`](#evaluate-inference-ner) | Entity-level precision / recall / F1 against gold spans |
 | [`fine_tune`](#fine-tune-an-encoder) | LoRA fine-tune end-to-end |
 | [`flight_sql`](#connect-via-flight-sql) | Query a remote `jammi serve` over Arrow Flight SQL |
 
@@ -40,6 +41,12 @@ The recipes shipped at MVP:
 ## Evaluate inference (classification)
 
 {{#include ../../../cookbook/recipes/eval_inference/README.md:3:}}
+
+---
+
+## Evaluate inference (NER)
+
+{{#include ../../../cookbook/recipes/eval_inference_ner/README.md:3:}}
 
 ---
 

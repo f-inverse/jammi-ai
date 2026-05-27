@@ -652,7 +652,7 @@ async fn e2e_classification_labels_match_id2label() {
 // ─── NER backend ─────────────────────────────────────────────────────────────
 
 fn tiny_modernbert_ner_source() -> ModelSource {
-    ModelSource::local(common::fixture("tiny_modernbert_ner"))
+    ModelSource::local(common::cookbook_fixture("tiny_modernbert_ner"))
 }
 
 #[tokio::test]

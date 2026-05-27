@@ -1,7 +1,7 @@
 //! The single `Entity` type used by both the BIO span decoder and the
 //! entity-level NER evaluation metric.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A decoded or gold named entity span.
 ///
@@ -12,7 +12,12 @@ use serde::Serialize;
 /// `confidence`). The eval metric's strict-matching contract is "did the
 /// model predict an entity with this exact label and these exact byte
 /// offsets," which the custom equality preserves.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `Deserialize` is derived so the eval runner can round-trip the JSON
+/// payload the NER inference adapter writes to its `entities` column
+/// back into typed `Entity` values for metric computation and per-record
+/// reporting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entity {
     /// Entity type without B-/I- prefix (e.g. "PER", "ORG", "LOC").
     pub label: String,

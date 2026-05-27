@@ -17,6 +17,21 @@ workspace ships every publishable crate at the same
   `stream.consumers()`) and the in-memory broker (each subscription
   registers a tracker that's pruned when the subscription drops).
 
+### Changed
+
+- `jammi_server::runtime::CatalogPingProbe` now drives readiness through
+  `Catalog::ping` (the backend-native reachability primitive) instead of a
+  `SELECT 1` round-trip on the DataFusion `SessionContext`. The probe now
+  takes an `Arc<InferenceSession>` at construction.
+
+### Removed
+
+- `jammi_numerics::retrieval::AggregateMetrics::field_by_name` — the
+  transitional helper flagged for removal in the v0.9.0 entry below. The
+  jammi-enterprise Gate now routes its metric selection through its typed
+  `MetricName` enum, leaving only test consumers, which iterate over a
+  `[(&'static str, f64); 4]` array built from the struct's fields directly.
+
 ## v0.9.0 — 2026-05-26
 
 ### Changed

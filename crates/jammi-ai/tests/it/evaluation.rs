@@ -396,11 +396,7 @@ async fn eval_embeddings_end_to_end() {
         .unwrap();
 
     // All four aggregate metrics present and in valid range
-    for name in ["recall_at_k", "precision_at_k", "mrr", "ndcg"] {
-        let val = metrics
-            .aggregate
-            .field_by_name(name)
-            .unwrap_or_else(|| panic!("Missing metric: {name}"));
+    for (name, val) in common::aggregate_named_metrics(&metrics.aggregate) {
         assert!((0.0..=1.0).contains(&val), "{name} = {val} outside [0, 1]");
     }
 
@@ -521,9 +517,9 @@ async fn eval_embeddings_is_deterministic() {
         .await
         .unwrap();
 
-    for name in ["recall_at_k", "precision_at_k", "mrr", "ndcg"] {
-        let v1 = m1.aggregate.field_by_name(name).unwrap();
-        let v2 = m2.aggregate.field_by_name(name).unwrap();
+    let run1 = common::aggregate_named_metrics(&m1.aggregate);
+    let run2 = common::aggregate_named_metrics(&m2.aggregate);
+    for ((name, v1), (_, v2)) in run1.into_iter().zip(run2) {
         assert!(
             (v1 - v2).abs() < 1e-12,
             "Determinism: {name} differs between runs: {v1} vs {v2}"
@@ -685,11 +681,7 @@ async fn eval_image_embeddings_end_to_end() {
         .unwrap();
 
     // All four aggregate metrics present and in valid range
-    for name in ["recall_at_k", "precision_at_k", "mrr", "ndcg"] {
-        let val = metrics
-            .aggregate
-            .field_by_name(name)
-            .unwrap_or_else(|| panic!("{name} missing"));
+    for (name, val) in common::aggregate_named_metrics(&metrics.aggregate) {
         assert!(
             (0.0..=1.0).contains(&val),
             "{name} = {val} out of [0, 1] range"

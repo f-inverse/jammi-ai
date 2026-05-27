@@ -87,29 +87,27 @@ impl ReadinessProbe {
     }
 }
 
-/// Readiness check backed by the engine's DataFusion `SessionContext`.
-///
-/// TODO(S4): replace with `session.catalog().ping().await` once the S4
-/// `CatalogBackend::ping` surface lands. The S5 worktree is forked from
-/// `main` before S4 merges; the `SELECT 1` fallback exercises the same
-/// catalog roundtrip end-to-end and removes cleanly when S4 arrives.
+/// Readiness check backed by the engine's catalog backend. Delegates to
+/// [`jammi_db::catalog::Catalog::ping`], which issues a backend-native
+/// reachability probe (no transaction, no lock) and surfaces pool failures
+/// as [`jammi_db::catalog::backend::BackendError::Unavailable`].
 pub struct CatalogPingProbe {
-    ctx: SessionContext,
+    session: Arc<InferenceSession>,
 }
 
 impl CatalogPingProbe {
-    pub fn new(ctx: SessionContext) -> Self {
-        Self { ctx }
+    pub fn new(session: Arc<InferenceSession>) -> Self {
+        Self { session }
     }
 }
 
 #[async_trait]
 impl ReadinessCheck for CatalogPingProbe {
     async fn check(&self) -> Result<(), String> {
-        self.ctx
-            .sql("SELECT 1")
+        self.session
+            .catalog()
+            .ping()
             .await
-            .map(|_| ())
             .map_err(|e| e.to_string())
     }
 }
@@ -146,7 +144,7 @@ impl OssServer {
         let session_store = SessionStore::new();
         let metrics = Arc::new(MetricsRegistry::new()?);
         let readiness = Arc::new(ReadinessProbe::new(Arc::new(CatalogPingProbe::new(
-            session.context().clone(),
+            Arc::clone(&session),
         ))));
 
         Ok(Self {

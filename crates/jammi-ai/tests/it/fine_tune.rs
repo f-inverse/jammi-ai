@@ -811,13 +811,8 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
         .unwrap();
 
     // Both reports carry all four aggregate metrics in [0, 1]
-    let metric_names = ["recall_at_k", "precision_at_k", "mrr", "ndcg"];
     for (label, report) in [("base", &base_metrics), ("fine-tuned", &ft_metrics)] {
-        for name in &metric_names {
-            let val = report
-                .aggregate
-                .field_by_name(name)
-                .unwrap_or_else(|| panic!("{label} missing metric: {name}"));
+        for (name, val) in common::aggregate_named_metrics(&report.aggregate) {
             assert!(
                 (0.0..=1.0).contains(&val),
                 "{label} {name} = {val} outside [0, 1]"
@@ -827,11 +822,12 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
 
     // At least one aggregate metric must differ between base and fine-tuned
     // (proves the adapter actually changes retrieval behavior, not a no-op)
-    let any_different = metric_names.iter().any(|name| {
-        let b = base_metrics.aggregate.field_by_name(name).unwrap();
-        let f = ft_metrics.aggregate.field_by_name(name).unwrap();
-        (b - f).abs() > 1e-6
-    });
+    let base_named = common::aggregate_named_metrics(&base_metrics.aggregate);
+    let ft_named = common::aggregate_named_metrics(&ft_metrics.aggregate);
+    let any_different = base_named
+        .into_iter()
+        .zip(ft_named)
+        .any(|((_, b), (_, f))| (b - f).abs() > 1e-6);
     assert!(
         any_different,
         "Fine-tuned model should produce at least one different retrieval metric.\n\

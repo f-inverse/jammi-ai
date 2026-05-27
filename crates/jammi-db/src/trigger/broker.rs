@@ -3,6 +3,7 @@
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 
+use crate::trigger::consumer::ConsumerOffsetSnapshot;
 use crate::trigger::error::TriggerError;
 use crate::trigger::ids::TopicId;
 use crate::trigger::offset::Offset;
@@ -47,6 +48,20 @@ pub trait TriggerBroker: Send + Sync + 'static {
         predicate: Predicate,
         from_offset: Option<Offset>,
     ) -> Result<Subscription, TriggerError>;
+
+    /// Snapshot every consumer currently bound to `topic_id`. Returns one
+    /// [`ConsumerOffsetSnapshot`] per consumer with the broker's
+    /// last-delivered and ack-floor stream sequences. Used by the
+    /// backup-restore path to capture consumer state so a fresh broker
+    /// can be primed with the same offsets after a restore (see the
+    /// jammi-enterprise `backup` module for the consuming side).
+    ///
+    /// Returns [`TriggerError::TopicNotFound`] when `topic_id` was never
+    /// registered with this broker.
+    async fn list_consumers(
+        &self,
+        topic_id: TopicId,
+    ) -> Result<Vec<ConsumerOffsetSnapshot>, TriggerError>;
 
     /// Driver identity for telemetry and routing.
     fn driver_kind(&self) -> BrokerKind;

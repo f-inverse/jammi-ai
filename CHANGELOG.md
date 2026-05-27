@@ -6,6 +6,17 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Added
+
+- `TriggerBroker::list_consumers(topic_id) -> Vec<ConsumerOffsetSnapshot>`
+  returns one snapshot per consumer currently bound to the topic, carrying
+  the broker's last-delivered and ack-floor stream sequences. Unblocks
+  the OSS broker listing gap noted in jammi-enterprise's E5 CHANGELOG
+  entry; the enterprise backup path will adopt it once this release
+  publishes. Wired through both the JetStream driver (via
+  `stream.consumers()`) and the in-memory broker (each subscription
+  registers a tracker that's pruned when the subscription drops).
+
 ### Changed
 
 - `jammi_server::runtime::CatalogPingProbe` now drives readiness through

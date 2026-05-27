@@ -4,6 +4,7 @@
 //! `docs/plans/cp9-substrate-primitives/SPEC-04-trigger-stream.md`.
 
 pub mod broker;
+pub mod consumer;
 pub mod error;
 pub mod ids;
 pub mod in_memory;
@@ -17,6 +18,7 @@ pub mod subscription;
 pub mod topic;
 
 pub use broker::{BrokerKind, TriggerBroker};
+pub use consumer::ConsumerOffsetSnapshot;
 pub use error::TriggerError;
 pub use ids::{SubscriptionId, TopicId};
 pub use in_memory::InMemoryBroker;

@@ -23,11 +23,12 @@ use async_nats::jetstream::{self, Context as JetStreamContext};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 
 use crate::trigger::broker::{BrokerKind, TriggerBroker};
+use crate::trigger::consumer::ConsumerOffsetSnapshot;
 use crate::trigger::error::TriggerError;
 use crate::trigger::ids::{SubscriptionId, TopicId};
 use crate::trigger::offset::Offset;
@@ -234,6 +235,42 @@ impl TriggerBroker for JetStreamBroker {
             }
         };
         Ok(Subscription::new(SubscriptionId::new(), Box::pin(inner)))
+    }
+
+    async fn list_consumers(
+        &self,
+        topic_id: TopicId,
+    ) -> Result<Vec<ConsumerOffsetSnapshot>, TriggerError> {
+        // Reject unknown topics with the same shape as `publish` / `subscribe`
+        // so callers can treat the trait surface uniformly. JetStream's own
+        // `get_stream` returns a stream-not-found error we translate, but the
+        // schemas-cache check catches topics this broker has never registered
+        // without a round-trip.
+        if !self.schemas.read().contains_key(&topic_id) {
+            return Err(TriggerError::TopicNotFound(topic_id.to_string()));
+        }
+        let stream_name = Self::stream_name(topic_id);
+        let stream = self
+            .context
+            .get_stream(&stream_name)
+            .await
+            .map_err(|e| TriggerError::Driver(format!("get_stream {stream_name}: {e}")))?;
+
+        let mut consumers = stream.consumers();
+        let mut snapshots: Vec<ConsumerOffsetSnapshot> = Vec::new();
+        while let Some(info) = consumers
+            .try_next()
+            .await
+            .map_err(|e| TriggerError::Driver(format!("list consumers {stream_name}: {e}")))?
+        {
+            snapshots.push(ConsumerOffsetSnapshot {
+                consumer_name: info.name,
+                topic_id,
+                last_delivered_stream_sequence: info.delivered.stream_sequence,
+                last_ack_stream_sequence: info.ack_floor.stream_sequence,
+            });
+        }
+        Ok(snapshots)
     }
 
     fn driver_kind(&self) -> BrokerKind {

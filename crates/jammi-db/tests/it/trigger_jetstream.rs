@@ -118,6 +118,92 @@ async fn publish_subscribe_filter() {
 }
 
 #[tokio::test]
+async fn list_consumers_returns_jetstream_consumer_info() {
+    // Mirrors the in-memory `list_consumers` integration test against a real
+    // JetStream server. Subscribe twice, publish, drain, then confirm both
+    // consumer names + the broker's `delivered.stream_sequence` round-trip
+    // through `ConsumerOffsetSnapshot`.
+    let broker = open_broker().await;
+    let topic = make_topic("live.list_consumers");
+    broker.register_topic(&topic).await.unwrap();
+
+    let mut sub_a = broker
+        .subscribe(
+            topic.id,
+            Predicate::match_all(),
+            Some(Offset::new(0, chrono::Utc::now())),
+        )
+        .await
+        .unwrap();
+    let mut sub_b = broker
+        .subscribe(
+            topic.id,
+            Predicate::match_all(),
+            Some(Offset::new(0, chrono::Utc::now())),
+        )
+        .await
+        .unwrap();
+
+    for i in 0..3i64 {
+        let batch = batch_of(&[i], &["X"], &[i as f64]);
+        broker
+            .publish(topic.id, batch, chrono::Utc::now(), i as u64)
+            .await
+            .unwrap();
+    }
+
+    // Drain three batches per subscriber so JetStream advances each
+    // consumer's ack floor to the head of the stream before we list.
+    for _ in 0..3 {
+        let _ = tokio::time::timeout(Duration::from_secs(5), sub_a.next())
+            .await
+            .expect("sub_a timed out")
+            .expect("sub_a stream ended early")
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), sub_b.next())
+            .await
+            .expect("sub_b timed out")
+            .expect("sub_b stream ended early")
+            .unwrap();
+    }
+
+    let snapshots = broker.list_consumers(topic.id).await.unwrap();
+    assert_eq!(
+        snapshots.len(),
+        2,
+        "expected one snapshot per live JetStream consumer, got {snapshots:?}"
+    );
+    for snap in &snapshots {
+        assert_eq!(snap.topic_id, topic.id);
+        // The first published offset is 0, so three batches advance the
+        // stream sequence to 3 (JetStream sequences are 1-based per
+        // message).
+        assert_eq!(
+            snap.last_delivered_stream_sequence, 3,
+            "consumer {} should be at stream sequence 3 after draining three batches",
+            snap.consumer_name
+        );
+        assert_eq!(
+            snap.last_ack_stream_sequence, snap.last_delivered_stream_sequence,
+            "every delivered batch was acked in the drain loop above"
+        );
+    }
+
+    drop(sub_a);
+    drop(sub_b);
+    broker.drop_topic(topic.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn list_consumers_on_unknown_topic_is_not_found() {
+    let broker = open_broker().await;
+    match broker.list_consumers(TopicId::new()).await {
+        Err(TriggerError::TopicNotFound(_)) => {}
+        other => panic!("expected TopicNotFound, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn publish_to_unregistered_topic_is_not_found() {
     let broker = open_broker().await;
     let stray = TopicId::new();

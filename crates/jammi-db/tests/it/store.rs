@@ -206,28 +206,30 @@ async fn resolve_embedding_table_latest_explicit_and_missing() {
     assert_eq!(explicit.table_name, "old");
 }
 
-/// `resolve_embedding_table` must consider both embedding variants
-/// (`TextEmbedding`, `ImageEmbedding`) and ignore non-embedding tasks
-/// (classification, NER). Regression guard for the prior hard-coded
-/// `task IN ('text_embedding', 'image_embedding')` literal list — if a new
-/// embedding variant is ever introduced and the resolver isn't updated to
-/// gate via `ModelTask::is_embedding`, this test catches it.
+/// `resolve_embedding_table` must consider every `ModelTask` variant for
+/// which `is_embedding()` returns `true`, and must ignore non-embedding
+/// tasks. Drives the seed loop off `ModelTask::ALL` so that adding a new
+/// embedding variant in the future automatically extends coverage — the
+/// previous version enumerated `TextEmbedding` and `ImageEmbedding` by
+/// hand and would have masked the regression that the dynamic IN-clause
+/// in `resolve_embedding_table` was introduced to fix.
 #[tokio::test]
-async fn resolve_embedding_table_accepts_image_and_text_but_not_classification() {
+async fn resolve_embedding_table_accepts_every_embedding_variant() {
     let dir = tempdir().unwrap();
     let catalog = Catalog::open(dir.path()).await.unwrap();
 
-    for (name, task) in [
-        ("classify_first", ModelTask::Classification),
-        ("text_embed", ModelTask::TextEmbedding),
-        ("image_embed", ModelTask::ImageEmbedding),
-    ] {
+    // Seed one Ready table per variant. Created-at ordering puts the
+    // last-inserted embedding variant on top of the resolver's
+    // `ORDER BY created_at DESC` tiebreaker.
+    let mut expected_winner: Option<String> = None;
+    for task in ModelTask::ALL {
+        let name = format!("row_{}", task.as_db_str());
         catalog
             .create_result_table(CreateResultTableParams {
-                table_name: name,
+                table_name: &name,
                 source_id: "media",
                 model_id: "model",
-                task,
+                task: *task,
                 parquet_path: &format!("file:///tmp/{name}.parquet"),
                 index_path: None,
                 dimensions: Some(8),
@@ -237,22 +239,26 @@ async fn resolve_embedding_table_accepts_image_and_text_but_not_classification()
             .await
             .unwrap();
         catalog
-            .update_result_table_status(name, ResultTableStatus::Ready, 4)
+            .update_result_table_status(&name, ResultTableStatus::Ready, 4)
             .await
             .unwrap();
+        if task.is_embedding() {
+            expected_winner = Some(name);
+        }
     }
 
-    // Resolver picks the latest-created embedding row (image_embed) and
-    // ignores classify_first even though it predates them.
     let resolved = catalog
         .resolve_embedding_table("media", None)
         .await
         .unwrap();
-    assert_eq!(resolved.table_name, "image_embed");
     assert!(
         resolved.task.is_embedding(),
-        "resolver must only return embedding tasks, got {:?}",
+        "resolver returned non-embedding task {:?}",
         resolved.task
+    );
+    assert_eq!(
+        resolved.table_name,
+        expected_winner.expect("ModelTask::ALL has at least one embedding variant"),
     );
 }
 

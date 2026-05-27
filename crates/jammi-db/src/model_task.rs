@@ -30,6 +30,19 @@ pub enum ModelTask {
 }
 
 impl ModelTask {
+    /// Every variant in declaration order. The single source of truth for
+    /// "what tasks exist" — `ResultStore`, the catalog SQL builders, and
+    /// any future caller that needs to fan over the full set must read it
+    /// here rather than re-listing variants. Kept consistent with the
+    /// `enum` body by `all_covers_every_variant_via_exhaustive_match` in
+    /// `tests` below.
+    pub const ALL: &'static [ModelTask] = &[
+        ModelTask::TextEmbedding,
+        ModelTask::ImageEmbedding,
+        ModelTask::Classification,
+        ModelTask::Ner,
+    ];
+
     /// Canonical snake-case string stored in the catalog. The single source
     /// of truth — `Display`, `FromStr`, serde all route through this.
     pub fn as_db_str(&self) -> &'static str {
@@ -95,18 +108,37 @@ mod tests {
 
     #[test]
     fn db_str_round_trip_covers_every_variant() {
-        for variant in [
-            ModelTask::TextEmbedding,
-            ModelTask::ImageEmbedding,
-            ModelTask::Classification,
-            ModelTask::Ner,
-        ] {
+        for variant in ModelTask::ALL {
             let s = variant.as_db_str();
             assert_eq!(
                 ModelTask::try_from_db_str(s).unwrap(),
-                variant,
+                *variant,
                 "round-trip failed for {variant:?} via '{s}'"
             );
+        }
+    }
+
+    #[test]
+    fn all_covers_every_variant_via_exhaustive_match() {
+        // The match below is exhaustive — adding a new variant to the
+        // enum without extending `ALL` either fails to compile here
+        // (new arm needed) or fails the `contains` assertion at test
+        // time. Two-layer defense against `ALL` drifting from the enum.
+        fn assert_listed_in_all(t: ModelTask) {
+            match t {
+                ModelTask::TextEmbedding
+                | ModelTask::ImageEmbedding
+                | ModelTask::Classification
+                | ModelTask::Ner => {
+                    assert!(
+                        ModelTask::ALL.contains(&t),
+                        "ModelTask::ALL is missing {t:?}"
+                    );
+                }
+            }
+        }
+        for v in ModelTask::ALL {
+            assert_listed_in_all(*v);
         }
     }
 
@@ -147,15 +179,10 @@ mod tests {
 
     #[test]
     fn serde_round_trips_via_canonical_string() {
-        for variant in [
-            ModelTask::TextEmbedding,
-            ModelTask::ImageEmbedding,
-            ModelTask::Classification,
-            ModelTask::Ner,
-        ] {
-            let json = serde_json::to_string(&variant).unwrap();
+        for variant in ModelTask::ALL {
+            let json = serde_json::to_string(variant).unwrap();
             let decoded: ModelTask = serde_json::from_str(&json).unwrap();
-            assert_eq!(decoded, variant);
+            assert_eq!(decoded, *variant);
             // serde flatten via String -> the JSON is the canonical
             // snake-case spelling wrapped in quotes.
             assert_eq!(json, format!("\"{}\"", variant.as_db_str()));

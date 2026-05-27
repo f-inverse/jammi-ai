@@ -6,6 +6,25 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Changed
+
+- `jammi_db::catalog::resolve_embedding_table` derives its embedding-task
+  list from `ModelTask::ALL.iter().filter(|t| t.is_embedding())` instead
+  of a hardcoded `task IN ('text_embedding', 'image_embedding')` literal.
+  Adding a future embedding variant only requires extending `ModelTask` +
+  its new `ALL` constant; the resolver recovers it automatically. No
+  wire change — `as_db_str` / `try_from_db_str` continue to map the same
+  four snake_case strings, persisted `task` columns and serde JSON
+  round-trip identically.
+
+### Added
+
+- `ModelTask::ALL: &'static [ModelTask]` — single source of truth for
+  "every variant," consumed by the catalog SQL builders. An
+  exhaustive-`match` test guards against `ALL` drifting from the enum
+  body (adding a variant without extending `ALL` either fails to
+  compile or fails the membership assertion).
+
 ## v0.10.0 — 2026-05-27
 
 ### Added

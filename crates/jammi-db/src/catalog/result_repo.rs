@@ -302,10 +302,48 @@ impl Catalog {
                 .ok_or_else(|| JammiError::Catalog(format!("Result table '{name}' not found")));
         }
 
+        // Derive the embedding-task list from `ModelTask::ALL` so that
+        // adding a future embedding variant automatically extends this
+        // resolver — the enum is the single source of truth, not a
+        // hardcoded `task IN ('text_embedding', 'image_embedding')`
+        // literal. Mirrors the dynamic-placeholder idiom that
+        // `find_result_tables` above uses for its conditional binds.
+        let embedding_tasks: Vec<&'static str> = ModelTask::ALL
+            .iter()
+            .filter(|t| t.is_embedding())
+            .map(|t| t.as_db_str())
+            .collect();
+        if embedding_tasks.is_empty() {
+            return Err(JammiError::Catalog(
+                "ModelTask defines no embedding variants — resolver cannot run".into(),
+            ));
+        }
+
         let sid = source_id.to_string();
         let tenant = self.current_tenant();
-        let text_task = ModelTask::TextEmbedding.as_db_str();
-        let image_task = ModelTask::ImageEmbedding.as_db_str();
+
+        // $1 = source_id; $2..$(1+N) = embedding tasks; $(2+N) = tenant.
+        let mut params: Vec<SqlValue<'static>> = Vec::with_capacity(embedding_tasks.len() + 2);
+        params.push(SqlValue::TextOwned(sid));
+        let task_placeholders: Vec<String> = (0..embedding_tasks.len())
+            .map(|i| format!("${}", i + 2))
+            .collect();
+        for t in &embedding_tasks {
+            params.push(SqlValue::Text(t));
+        }
+        let tenant_placeholder = format!("${}", params.len() + 1);
+        params.push(SqlValue::from(tenant.map(|t| t.to_string())));
+
+        let sql = format!(
+            "SELECT * FROM result_tables \
+             WHERE source_id = $1 AND task IN ({tasks}) \
+               AND status = 'ready' \
+               AND (tenant_id = {tenant} OR tenant_id IS NULL) \
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            tasks = task_placeholders.join(", "),
+            tenant = tenant_placeholder,
+        );
+
         let found = self
             .backend()
             .transaction(
@@ -313,25 +351,7 @@ impl Catalog {
                     read_only: true,
                     ..Default::default()
                 },
-                |tx| {
-                    Box::pin(async move {
-                        tx.query_opt(
-                            "SELECT * FROM result_tables \
-                             WHERE source_id = $1 AND task IN ($2, $3) \
-                               AND status = 'ready' \
-                               AND (tenant_id = $4 OR tenant_id IS NULL) \
-                             ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                            &[
-                                SqlValue::TextOwned(sid),
-                                SqlValue::Text(text_task),
-                                SqlValue::Text(image_task),
-                                SqlValue::from(tenant.map(|t| t.to_string())),
-                            ],
-                            parse_row,
-                        )
-                        .await
-                    })
-                },
+                |tx| Box::pin(async move { tx.query_opt(&sql, &params, parse_row).await }),
             )
             .await?;
         found.ok_or_else(|| {

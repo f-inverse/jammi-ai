@@ -104,4 +104,3 @@ fn aggregate_averages_queries() {
     assert_abs_diff_eq!(agg.recall_at_k, 0.5, epsilon = 1e-12);
     assert_abs_diff_eq!(agg.precision_at_k, 0.5, epsilon = 1e-12);
 }
-

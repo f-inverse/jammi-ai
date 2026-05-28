@@ -237,12 +237,12 @@ pub fn ensure_column_int64(schema: &Schema, name: &str) -> Result<()> {
 
 /// Load an NER golden dataset from DataFusion query results.
 ///
-/// Input batches must carry four columns: `id` (Utf8 or numeric coerced via
-/// [`extract_string_column`]), `label` (Utf8), `start` (any integer width),
-/// and `end` (any integer width). Each row contributes one entity span to
-/// `entities[id]`; multiple rows sharing an `id` accumulate into the same
-/// span vector. `text` is left empty and `confidence` is `0.0`, which the
-/// metric ignores via [`Entity`]'s custom equality.
+/// Input batches must carry four columns: `id` (Utf8 or numeric, coerced
+/// to a string id internally), `label` (Utf8), `start` (any integer
+/// width), and `end` (any integer width). Each row contributes one entity
+/// span to `entities[id]`; multiple rows sharing an `id` accumulate into
+/// the same span vector. `text` is left empty and `confidence` is `0.0`,
+/// which the metric ignores via [`Entity`]'s custom equality.
 pub fn load_ner_golden_from_batches(batches: &[arrow::array::RecordBatch]) -> Result<NerGolden> {
     let mut entities: HashMap<String, Vec<Entity>> = HashMap::new();
 

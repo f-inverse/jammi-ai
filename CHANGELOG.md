@@ -6,6 +6,8 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.11.0 — 2026-05-27
+
 ### Changed
 
 - `jammi_db::catalog::resolve_embedding_table` derives its embedding-task

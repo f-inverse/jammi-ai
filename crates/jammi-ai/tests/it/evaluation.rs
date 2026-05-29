@@ -391,6 +391,7 @@ async fn eval_embeddings_end_to_end() {
             Some(&table_name),
             "golden_rel.public.golden_relevance",
             10,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -441,6 +442,92 @@ async fn eval_embeddings_end_to_end() {
     let latest = latest.unwrap();
     assert_eq!(latest.eval_type, "embedding");
     assert!(latest.k.is_some());
+}
+
+// ─── End-to-end: per-query eval persistence + cohorts (spec J9) ──────────────
+//
+// Running an embedding eval persists one `_jammi_eval_per_query` row per query
+// keyed by the run's eval_run_id, carrying Recall@{1,3,5,10} + MRR + nDCG +
+// distance and any supplied cohort tags. The aggregate path is unchanged.
+
+#[tokio::test]
+async fn eval_embeddings_persists_per_query_rows_with_cohorts() {
+    use std::collections::{BTreeMap, HashMap};
+
+    let (session, table_name, _dir) = session_with_embeddings_and_golden().await;
+
+    // Tag query `q1` with an opaque cohort; other queries carry none.
+    let mut cohorts: HashMap<String, BTreeMap<String, String>> = HashMap::new();
+    let mut q1_tags = BTreeMap::new();
+    q1_tags.insert("split".to_string(), "val".to_string());
+    q1_tags.insert("domain".to_string(), "quantum".to_string());
+    cohorts.insert("q1".to_string(), q1_tags);
+
+    let report = session
+        .eval_embeddings(
+            "patents",
+            Some(&table_name),
+            "golden_rel.public.golden_relevance",
+            10,
+            &cohorts,
+        )
+        .await
+        .unwrap();
+
+    // The report surfaces the run id that keys the persisted per-query rows.
+    assert!(!report.eval_run_id.is_empty());
+
+    // One persisted per-query row per golden-set query.
+    let persisted = session.eval_per_query(&report.eval_run_id).await.unwrap();
+    assert_eq!(
+        persisted.len(),
+        report.per_query.len(),
+        "one persisted row per query"
+    );
+
+    // Every row carries the full metric vector keys and a cohorts JSON.
+    for rec in &persisted {
+        let m: serde_json::Value = serde_json::from_str(&rec.metrics_json).unwrap();
+        for key in [
+            "recall@1",
+            "recall@3",
+            "recall@5",
+            "recall@10",
+            "mrr",
+            "ndcg",
+            "distance",
+        ] {
+            assert!(
+                m.get(key).is_some(),
+                "metric '{key}' missing for {}",
+                rec.query_id
+            );
+        }
+        // cohorts is always a JSON object ("{}" when none).
+        let c: serde_json::Value = serde_json::from_str(&rec.cohorts_json).unwrap();
+        assert!(c.is_object(), "cohorts must be a JSON object");
+    }
+
+    // The q1 row carries the supplied cohort tags verbatim; another query's
+    // row carries "{}".
+    let q1 = persisted
+        .iter()
+        .find(|r| r.query_id == "q1")
+        .expect("q1 row");
+    let q1_cohorts: BTreeMap<String, String> = serde_json::from_str(&q1.cohorts_json).unwrap();
+    assert_eq!(q1_cohorts.get("split").map(String::as_str), Some("val"));
+    assert_eq!(
+        q1_cohorts.get("domain").map(String::as_str),
+        Some("quantum")
+    );
+
+    let untagged = persisted.iter().find(|r| r.query_id != "q1");
+    if let Some(rec) = untagged {
+        assert_eq!(
+            rec.cohorts_json, "{}",
+            "untagged query stores empty cohorts"
+        );
+    }
 }
 
 // ─── End-to-end: eval_compare pipeline ──────────────────────────────────────
@@ -503,6 +590,7 @@ async fn eval_embeddings_is_deterministic() {
             Some(&table_name),
             "golden_rel.public.golden_relevance",
             10,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -513,6 +601,7 @@ async fn eval_embeddings_is_deterministic() {
             Some(&table_name),
             "golden_rel.public.golden_relevance",
             10,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -676,6 +765,7 @@ async fn eval_image_embeddings_end_to_end() {
             Some(&table_name),
             "golden_img.public.golden_image_relevance",
             5,
+            &Default::default(),
         )
         .await
         .unwrap();

@@ -696,16 +696,31 @@ impl InferenceSession {
     // =====================================================================
 
     /// Evaluate embedding quality against golden relevance judgments.
+    ///
+    /// `cohorts` maps a golden-set `query_id` to an opaque `{key: value}`
+    /// segment map persisted alongside that query's per-query metrics
+    /// (`_jammi_eval_per_query`, spec J9). Pass an empty map for no tags.
     pub async fn eval_embeddings(
         &self,
         source_id: &str,
         embedding_table: Option<&str>,
         golden_source: &str,
         k: usize,
+        cohorts: &std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
     ) -> Result<crate::eval::EmbeddingEvalReport> {
         EvalRunner { session: self }
-            .eval_embeddings(source_id, embedding_table, golden_source, k)
+            .eval_embeddings(source_id, embedding_table, golden_source, k, cohorts)
             .await
+    }
+
+    /// Read back the persisted per-query eval records for a run, scoped to the
+    /// session tenant (spec J9). Returns Recall@{1,3,5,10}, MRR, nDCG,
+    /// distance, and any cohort tags stored at eval time.
+    pub async fn eval_per_query(
+        &self,
+        eval_run_id: &str,
+    ) -> Result<Vec<jammi_db::catalog::eval_repo::PerQueryEvalRecord>> {
+        self.catalog().get_eval_per_query(eval_run_id).await
     }
 
     /// Evaluate inference quality against golden labels.

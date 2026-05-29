@@ -170,6 +170,7 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "008_mutable_order_column",
             "009_topics",
             "010_rename_source_type_local_to_file",
+            "011_eval_per_query",
         ]
     );
 }

@@ -4,6 +4,7 @@ mod catalog_ping;
 mod channels;
 mod common;
 mod ephemeral;
+mod eval_per_query;
 mod foundation;
 mod index;
 mod migrations;

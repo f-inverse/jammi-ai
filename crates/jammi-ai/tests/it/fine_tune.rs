@@ -795,6 +795,7 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
             Some(&base_rec.table_name),
             "golden_rel.public.golden_relevance",
             10,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -806,6 +807,7 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
             Some(&ft_rec.table_name),
             "golden_rel.public.golden_relevance",
             10,
+            &Default::default(),
         )
         .await
         .unwrap();

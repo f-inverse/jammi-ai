@@ -7,6 +7,8 @@
 //! consume at gate time; the aggregate is what the catalog persists for
 //! historical reporting.
 
+use std::collections::BTreeMap;
+
 use jammi_numerics::classification::ClassificationResult;
 use jammi_numerics::ner::{Entity, NerMetrics};
 use jammi_numerics::retrieval::{AggregateMetrics, QueryMetrics};
@@ -17,6 +19,12 @@ use serde::{Deserialize, Serialize};
 /// sample-based statistical rules consume at gate time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingEvalReport {
+    /// The catalog id of the recorded run. The same id keys the persisted
+    /// per-query rows (`_jammi_eval_per_query`), so a caller can read them
+    /// back via `eval_per_query(eval_run_id)` (spec J9). Every embedding eval
+    /// records a run, so this is always a valid, re-readable run id.
+    #[serde(default)]
+    pub eval_run_id: String,
     /// Mean metrics across all queries.
     pub aggregate: AggregateMetrics,
     /// One record per query, in golden-set order.
@@ -24,12 +32,34 @@ pub struct EmbeddingEvalReport {
 }
 
 /// A single query's metrics plus its `query_id` join key.
+///
+/// `metrics` (the historical single-cutoff [`QueryMetrics`]) is unchanged so
+/// existing consumers keep reading `metrics.recall` / `metrics.mrr` / etc.
+/// The J9 additions — `recall_at_ks` (Recall@{1,3,5,10}), `distance` (the
+/// top-1 result's score), and opaque `cohorts` tags — are additive fields that
+/// older callers can ignore. These are the fields persisted to
+/// `_jammi_eval_per_query`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerQueryRecord {
     /// `query_id` from the golden source (the join key).
     pub query_id: String,
     pub metrics: QueryMetrics,
+    /// Recall at multiple cutoffs as `(k, recall@k)` pairs, in ascending k.
+    #[serde(default)]
+    pub recall_at_ks: Vec<(usize, f64)>,
+    /// The top-1 retrieved result's score (distance / similarity), or `0.0`
+    /// when the query returned no results.
+    #[serde(default)]
+    pub distance: f64,
+    /// Opaque per-query cohort tags supplied at eval time (`{}` when none).
+    /// The substrate never interprets these — declaration/validation is the
+    /// enterprise layer's concern (J7).
+    #[serde(default)]
+    pub cohorts: BTreeMap<String, String>,
 }
+
+/// The cutoffs at which per-query Recall@k is recorded and persisted (spec J9).
+pub const PER_QUERY_RECALL_KS: [usize; 4] = [1, 3, 5, 10];
 
 /// Result of one `eval_inference` invocation. The aggregate variant matches
 /// the task kind.

@@ -119,6 +119,44 @@ impl RetrievalMetrics {
         }
     }
 
+    /// Recall@k for each k in `ks`, for a single query.
+    ///
+    /// Returns one `(k, recall@k)` pair per requested cutoff, in the order
+    /// `ks` was given. This is the multi-cutoff companion to
+    /// [`Self::compute_query`] (which records recall at a single k): it reuses
+    /// the exact same recall definition — `|relevant ∩ top-k| / |relevant|`,
+    /// `0.0` when no judgments are positive — applied at several cutoffs so a
+    /// per-query record can carry Recall@{1,3,5,10} without re-deriving the
+    /// formula. Each cutoff is clamped to the number of retrieved ids, matching
+    /// `compute_query`'s `k.min(len)` slicing.
+    pub fn recall_at_ks(
+        retrieved_ids: &[String],
+        judgments: &[RelevanceJudgment],
+        ks: &[usize],
+    ) -> Vec<(usize, f64)> {
+        let relevant_set: HashSet<&str> = judgments
+            .iter()
+            .filter(|j| j.grade > 0)
+            .map(|j| j.doc_id.as_str())
+            .collect();
+
+        ks.iter()
+            .map(|&k| {
+                let recall = if relevant_set.is_empty() {
+                    0.0
+                } else {
+                    let top_k = &retrieved_ids[..k.min(retrieved_ids.len())];
+                    let hits = top_k
+                        .iter()
+                        .filter(|id| relevant_set.contains(id.as_str()))
+                        .count();
+                    hits as f64 / relevant_set.len() as f64
+                };
+                (k, recall)
+            })
+            .collect()
+    }
+
     /// Average metrics across multiple queries.
     pub fn aggregate(queries: &[QueryMetrics]) -> AggregateMetrics {
         let n = queries.len() as f64;

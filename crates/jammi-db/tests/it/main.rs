@@ -1,3 +1,4 @@
+mod audit;
 mod caching;
 mod catalog_ping;
 mod channels;

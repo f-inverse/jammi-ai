@@ -1,3 +1,4 @@
+mod audit;
 mod convert;
 mod database;
 mod error;
@@ -36,6 +37,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySearchBuilder>()?;
     m.add_class::<PyFineTuneJob>()?;
     m.add_class::<PyModelTask>()?;
+    m.add_class::<crate::audit::PyPerQueryAudit>()?;
+    m.add_class::<crate::audit::PyAuditHandle>()?;
     Ok(())
 }
 

@@ -82,6 +82,17 @@ impl PyDatabase {
         self.session.tenant().map(|t| t.to_string())
     }
 
+    /// Handle to the per-query audit primitive: `db.audit.log([...])`,
+    /// `db.audit.fetch_by_query_id(...)`, `db.audit.fetch_recent(...)`.
+    /// Shares this connection's session, runtime, and tenant binding.
+    #[getter]
+    fn audit(&self) -> crate::audit::PyAuditHandle {
+        crate::audit::PyAuditHandle {
+            session: Arc::clone(&self.session),
+            runtime: Arc::clone(&self.runtime),
+        }
+    }
+
     /// Register a file-shaped data source. `url` accepts a local path
     /// (parsed into `file://...`) or any storage URL the build was
     /// compiled with: `s3://bucket/key`, `gs://bucket/key`,

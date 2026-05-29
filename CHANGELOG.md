@@ -6,6 +6,37 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.12.0 — 2026-05-28
+
+### Added
+
+- **Per-query audit record primitive** (`jammi_db::audit`, re-exported from
+  `jammi_ai`). A standardized, tenant-scoped, HMAC-signed record of *what was
+  queried, with what model, what came back, and when*. It composes the existing
+  substrate primitives — mutable tables (storage), tenant scope (auto-injected
+  `tenant_id` + scoped reads), the trigger stream (publication), and the catalog
+  (registration) — so audited-ML tenants no longer hand-roll an incompatible
+  audit schema, signature scheme, and stream integration per project.
+  - `PerQueryAudit` typed record with canonical (fixed field order, recursively
+    sorted keys, no whitespace) serialization used as the signing input.
+  - `session.audit().log([...])` resolves the session tenant, enforces the
+    `query_lineage` size cap by construction (`JAMMI_AUDIT_MAX_LINEAGE_BYTES`,
+    default 8 KiB), signs each record with a per-tenant HMAC-SHA256 secret
+    derived via HKDF-SHA256 from `JAMMI_AUDIT_MASTER_KEY`, batch-inserts into the
+    reserved `_jammi_search_audit` mutable table, and publishes the batch to the
+    `jammi.audit.search.v1` trigger topic.
+  - `audit::fetch_by_query_id` / `fetch_recent` typed reads; tenant scope
+    auto-applied by the analyzer.
+  - `audit::verify` / `verify_with_env` signature checks, deterministic across
+    restarts; `ensure_master_key_present` server-startup gate (a missing or
+    invalid key is fatal for any signing or verification).
+  - `create_mutable_table` now rejects any reserved `_jammi_*` table name; the
+    audit table is created via a substrate-internal unchecked path.
+  - PyO3 bindings: `db.audit.log([...])`, `db.audit.fetch_by_query_id(...)`,
+    `db.audit.fetch_recent(...)`, and a `PerQueryAudit` record class with a
+    `.verify()` method.
+  - Cookbook recipe `cookbook/recipes/search_audit/` + smoke-test entry.
+
 ## v0.11.0 — 2026-05-27
 
 ### Changed

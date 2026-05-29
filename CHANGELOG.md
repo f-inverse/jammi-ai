@@ -37,6 +37,37 @@ workspace ships every publishable crate at the same
     `.verify()` method.
   - Cookbook recipe `cookbook/recipes/search_audit/` + smoke-test entry.
 
+- **Ephemeral session-storage primitive** (`jammi_db::ephemeral`, re-exported
+  from `jammi_ai`). A tenant-scoped storage context whose mutable tables are
+  auto-deleted when the session ends — on explicit `close()`, on `Drop`
+  (best-effort), or when the timeout scanner force-closes a session past its
+  deadline. It composes the existing substrate primitives directly: mutable
+  tables (session-prefixed storage), tenant scope (tables created and read under
+  the session's bound tenant), the trigger stream (lifecycle publication), and
+  the catalog (registration). Satisfies the requirement to delete uploaded data
+  and derived representations immediately on session end while keeping durable
+  audit lineage that references only hashes.
+  - `EphemeralSession::open` opens a session pinned to the parent's bound tenant
+    (refusing to open without one); `create_ephemeral_table`, `insert`, `sql`,
+    and `count_rows` operate on real federated mutable tables whose physical ids
+    are namespaced `__eph_<session-uuid>_<name>`.
+  - `close()` (the safe path) drops every table the session created, sums the
+    deleted rows, and publishes a terminal lifecycle event; partial drop
+    failures emit a `partial_deletion_failure` event listing survivors.
+  - Lifecycle events (`opened`, `closed`, `timed_out`, `partial_deletion_failure`)
+    publish to the new `jammi.audit.session_lifecycle.v1` trigger topic
+    (registered lookup-or-create per tenant, mirroring the audit topic path),
+    carrying session id, tenant, table count, and deleted-row count.
+  - A process-shared `ActiveSessions` registry + `spawn_timeout_scanner`
+    background task force-closes expired sessions on a 60-second interval;
+    explicit close and the scanner coordinate through the registry so tables are
+    never double-dropped.
+  - PyO3 bindings: `db.ephemeral_session(timeout_seconds=...)` returns a
+    context-manager `EphemeralSession` (`create_ephemeral_table`, `insert`,
+    `sql`, `count_rows`, `physical_table_ref`, `close`); the in-process timeout
+    scanner is spawned on first use.
+  - Cookbook recipe `cookbook/recipes/session_lifecycle/` + smoke-test entry.
+
 ## v0.11.0 — 2026-05-27
 
 ### Changed

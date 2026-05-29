@@ -46,6 +46,10 @@ RECIPES: tuple[Recipe, ...] = (
         COOKBOOK / "recipes" / "eval_inference_ner" / "example.py",
     ),
     Recipe("search_audit", COOKBOOK / "recipes" / "search_audit" / "example.py"),
+    Recipe(
+        "session_lifecycle",
+        COOKBOOK / "recipes" / "session_lifecycle" / "example.py",
+    ),
     Recipe("fine_tune", COOKBOOK / "recipes" / "fine_tune" / "example.py", slow=True),
     Recipe("flight_sql", COOKBOOK / "recipes" / "flight_sql" / "example.py", slow=True),
 )

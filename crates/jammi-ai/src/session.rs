@@ -26,12 +26,14 @@ use jammi_db::cache::ann_cache::AnnCache;
 /// An inference-capable session that wraps `JammiSession` with model loading
 /// and inference execution. This is the primary entry point for CP2+.
 pub struct InferenceSession {
-    inner: JammiSession,
+    inner: Arc<JammiSession>,
     model_cache: Arc<ModelCache>,
     result_store: Arc<ResultStore>,
     observer: Option<Arc<dyn InferenceObserver>>,
     ann_cache: Arc<AnnCache>,
     device_config: DeviceConfig,
+    /// Registry of open ephemeral sessions, shared with the timeout scanner.
+    ephemeral_sessions: jammi_db::ephemeral::ActiveSessions,
 }
 
 impl InferenceSession {
@@ -69,6 +71,7 @@ impl InferenceSession {
         inner: JammiSession,
         observer: Option<Arc<dyn InferenceObserver>>,
     ) -> Result<Self> {
+        let inner = Arc::new(inner);
         let catalog = Arc::clone(inner.catalog());
         let resolver = ModelResolver::new(catalog.clone())?;
         let device_config = DeviceConfig::from_config(inner.config());
@@ -92,6 +95,7 @@ impl InferenceSession {
             observer,
             ann_cache,
             device_config,
+            ephemeral_sessions: jammi_db::ephemeral::ActiveSessions::new(),
         })
     }
 
@@ -193,6 +197,50 @@ impl InferenceSession {
     /// tenant. Delegates to [`jammi_db::session::JammiSession::audit`].
     pub fn audit(&self) -> jammi_db::AuditHandle<'_> {
         self.inner.audit()
+    }
+
+    /// Open an ephemeral, session-scoped storage context bound to the tenant
+    /// currently set on this connection.
+    ///
+    /// Tables created through the returned [`jammi_db::EphemeralSession`] are
+    /// auto-deleted when it ends (explicit `close`, `Drop`, or timeout), and
+    /// every transition publishes to `jammi.audit.session_lifecycle.v1`. The
+    /// session shares this connection's `JammiSession` (tenant binding, trigger
+    /// broker, catalog), and registers with the connection's timeout-scanner
+    /// registry — call [`Self::spawn_ephemeral_timeout_scanner`] once to enforce
+    /// timeouts in-process.
+    ///
+    /// Returns [`jammi_db::EphemeralError::NoTenantBinding`] if no tenant is
+    /// bound.
+    pub async fn ephemeral_session(
+        &self,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<jammi_db::EphemeralSession, jammi_db::EphemeralError> {
+        jammi_db::EphemeralSession::open(
+            Arc::clone(&self.inner),
+            timeout,
+            self.ephemeral_sessions.clone(),
+        )
+        .await
+    }
+
+    /// Shared handle to the ephemeral-session registry the timeout scanner reads.
+    pub fn ephemeral_sessions(&self) -> jammi_db::ephemeral::ActiveSessions {
+        self.ephemeral_sessions.clone()
+    }
+
+    /// Spawn the in-process timeout scanner that force-closes ephemeral sessions
+    /// past their deadline. Returns the task handle; the scanner runs until the
+    /// handle is aborted or the runtime shuts down. Call once per connection.
+    pub fn spawn_ephemeral_timeout_scanner(
+        &self,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        jammi_db::ephemeral::spawn_timeout_scanner(
+            Arc::clone(&self.inner),
+            self.ephemeral_sessions.clone(),
+            interval,
+        )
     }
 
     /// Run `f` with `tenant` bound for the duration of the closure's future.

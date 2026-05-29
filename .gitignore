@@ -22,6 +22,8 @@ __pycache__/
 dist/
 .venv/
 *.so
+# maturin develop drops a debug-symbols bundle next to the extension module
+*.dSYM/
 
 # Test artifacts
 /tmp/jammi-test-*/

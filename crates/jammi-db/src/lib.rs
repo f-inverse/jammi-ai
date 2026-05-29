@@ -10,6 +10,7 @@ pub mod audit;
 pub mod cache;
 pub mod catalog;
 pub mod config;
+pub mod ephemeral;
 pub mod error;
 pub mod evidence_channel;
 pub mod index;
@@ -28,6 +29,10 @@ use config::{LogFormat, LoggingConfig};
 pub use audit::{AuditError, AuditHandle, PerQueryAudit};
 pub use catalog::backend::{
     BackendError, BackendImpl, BackendKind, CatalogBackend, IsolationLevel, Transaction, TxOptions,
+};
+pub use ephemeral::{
+    ActiveSessions, EphemeralError, EphemeralSession, SessionLifecycleEvent,
+    SessionLifecycleRecord, SESSION_LIFECYCLE_TOPIC,
 };
 pub use evidence_channel::ChannelId;
 pub use model_task::ModelTask;

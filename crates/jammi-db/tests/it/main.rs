@@ -3,6 +3,7 @@ mod caching;
 mod catalog_ping;
 mod channels;
 mod common;
+mod ephemeral;
 mod foundation;
 mod index;
 mod migrations;

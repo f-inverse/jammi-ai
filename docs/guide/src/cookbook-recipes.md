@@ -13,6 +13,7 @@ The recipes shipped at MVP:
 | [`mutable_tables`](#mutable-tables) | Create/insert/select/drop on a mutable companion table |
 | [`trigger_streams`](#trigger-streams) | Publish + subscribe on a topic via the in-process broker |
 | [`eval_embeddings`](#evaluate-retrieval-quality) | recall@k, MRR, nDCG against a golden set |
+| [`image_search`](#image-search) | Image-to-image search with PatentCLIP + Recall@K / MRR eval |
 | [`eval_inference`](#evaluate-inference-classification) | Accuracy + macro F1 against gold labels |
 | [`eval_inference_ner`](#evaluate-inference-ner) | Entity-level precision / recall / F1 against gold spans |
 | [`fine_tune`](#fine-tune-an-encoder) | LoRA fine-tune end-to-end |
@@ -35,6 +36,12 @@ The recipes shipped at MVP:
 ## Evaluate retrieval quality
 
 {{#include ../../../cookbook/recipes/eval_embeddings/README.md:3:}}
+
+---
+
+## Image search
+
+{{#include ../../../cookbook/recipes/image_search/README.md:3:}}
 
 ---
 

@@ -13,19 +13,25 @@ Produces:
 - `tiny_ner_gold.csv`       — per-span gold entities for the NER corpus
   (id, label, start, end), label set restricted to PER + ORG to match the
   shipped `tiny_modernbert_ner` id2label
+- `tiny_image_corpus/`      — 20 synthetic 224x224 PNGs (geometric line
+  drawings, 5 shape families) for the `image_search` recipe
+- `tiny_image_golden.json`  — query-image -> expected corpus-image top-K
+  judgments for the image-search eval (`db.eval_embeddings` image mode)
 
 Re-run with `python cookbook/fixtures/generate.py` whenever the schema or row
 shape needs to change. Output is fully deterministic — same content every run.
 
 The corpus is synthetic public-domain text (no tenant data, no scraped content)
 and the row count is intentionally small so the entire cookbook fixtures tree
-stays under 5 MB.
+stays under 5 MB. The image corpus is rendered programmatically (no real patent
+imagery — licensing) as simple geometric shapes.
 """
 
 from __future__ import annotations
 
 import csv
 import json
+import math
 from pathlib import Path
 
 import pyarrow as pa
@@ -301,6 +307,138 @@ def write_ner_gold() -> None:
                 writer.writerow([row_id, label, start, end])
 
 
+# ─── Image-search fixtures ──────────────────────────────────────────────────
+#
+# 20 synthetic 224x224 RGB PNGs grouped into 5 shape families (4 images per
+# family). Each image is a simple geometric line drawing on a white ground —
+# circles, triangles, squares, hexagons, parallel-line gratings. Within a
+# family the four members differ by size/position/stroke so the corpus is not
+# degenerate, but members of the same family are visually closer to each other
+# than to other families. NO real patent imagery (licensing) — every pixel is
+# rendered here.
+#
+# The held-out query set is one extra image per family (a fifth member, drawn
+# the same way with a distinct seed). `tiny_image_golden.json` maps each query
+# to the corpus IDs in its own family — the expected top-K for an image-to-image
+# nearest-neighbour search.
+
+IMAGE_SIZE = 224
+SHAPE_FAMILIES = ("circle", "triangle", "square", "hexagon", "grating")
+PER_FAMILY = 4  # corpus members per family (5 families * 4 = 20 images)
+
+
+def _regular_polygon(cx: float, cy: float, radius: float, sides: int, rot: float):
+    """Vertices of a regular polygon centred at (cx, cy)."""
+    return [
+        (
+            cx + radius * math.cos(rot + 2 * math.pi * i / sides),
+            cy + radius * math.sin(rot + 2 * math.pi * i / sides),
+        )
+        for i in range(sides)
+    ]
+
+
+def _draw_shape(draw, family: str, variant: int) -> None:
+    """Render one shape of `family` parameterised by `variant` (0..n).
+
+    Variants shift size / position / stroke so members of a family are
+    distinct images while staying recognisably the same shape — that is what
+    makes nearest-neighbour retrieval within a family meaningful.
+    """
+    # Variant-driven parameters, all deterministic.
+    radius = 55 + variant * 14
+    cx = 90 + (variant % 2) * 44
+    cy = 90 + (variant % 3) * 30
+    stroke = 3 + (variant % 3)
+    ink = (20, 20, 20)
+
+    if family == "circle":
+        draw.ellipse(
+            [cx - radius, cy - radius, cx + radius, cy + radius],
+            outline=ink,
+            width=stroke,
+        )
+    elif family == "triangle":
+        draw.polygon(
+            _regular_polygon(cx, cy, radius, 3, rot=-math.pi / 2 + variant * 0.2),
+            outline=ink,
+            width=stroke,
+        )
+    elif family == "square":
+        draw.polygon(
+            _regular_polygon(cx, cy, radius, 4, rot=math.pi / 4 + variant * 0.1),
+            outline=ink,
+            width=stroke,
+        )
+    elif family == "hexagon":
+        draw.polygon(
+            _regular_polygon(cx, cy, radius, 6, rot=variant * 0.15),
+            outline=ink,
+            width=stroke,
+        )
+    elif family == "grating":
+        gap = 16 + variant * 4
+        x = 20
+        while x < IMAGE_SIZE - 20:
+            draw.line([(x, 20), (x, IMAGE_SIZE - 20)], fill=ink, width=stroke)
+            x += gap
+    else:  # pragma: no cover - guarded by SHAPE_FAMILIES
+        raise ValueError(f"unknown shape family {family!r}")
+
+
+def _render_png(family: str, variant: int) -> bytes:
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (IMAGE_SIZE, IMAGE_SIZE), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    _draw_shape(draw, family, variant)
+    from io import BytesIO
+
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def write_image_corpus() -> None:
+    """20 synthetic 224x224 PNGs + the query->top-K golden judgments.
+
+    Corpus image IDs are `img_<family>_<variant>` (e.g. `img_circle_0`); the
+    held-out query images are the family's variant `PER_FAMILY` member, written
+    to a sibling `queries/` dir and referenced (by inline bytes) from the
+    golden file at recipe runtime.
+    """
+    corpus_dir = OUT / "tiny_image_corpus"
+    corpus_dir.mkdir(exist_ok=True)
+    queries_dir = corpus_dir / "queries"
+    queries_dir.mkdir(exist_ok=True)
+
+    golden: list[dict] = []
+    for family in SHAPE_FAMILIES:
+        family_ids = []
+        for variant in range(PER_FAMILY):
+            img_id = f"img_{family}_{variant}"
+            (corpus_dir / f"{img_id}.png").write_bytes(_render_png(family, variant))
+            family_ids.append(img_id)
+
+        # One held-out query per family (a distinct fifth variant). Its
+        # expected neighbours are exactly that family's corpus members.
+        query_id = f"q_{family}"
+        (queries_dir / f"{query_id}.png").write_bytes(
+            _render_png(family, PER_FAMILY)
+        )
+        golden.append(
+            {
+                "query_id": query_id,
+                "query_image": f"queries/{query_id}.png",
+                "relevant_ids": family_ids,
+            }
+        )
+
+    (OUT / "tiny_image_golden.json").write_text(
+        json.dumps(golden, indent=2, sort_keys=True) + "\n"
+    )
+
+
 def main() -> None:
     write_corpus()
     write_golden()
@@ -308,6 +446,7 @@ def main() -> None:
     write_pairs()
     write_ner_corpus()
     write_ner_gold()
+    write_image_corpus()
     print(f"Cookbook fixtures regenerated in {OUT}")
 
 

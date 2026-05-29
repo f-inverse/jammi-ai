@@ -1,0 +1,52 @@
+[
+  {
+    "query_id": "q_circle",
+    "query_image": "queries/q_circle.png",
+    "relevant_ids": [
+      "img_circle_0",
+      "img_circle_1",
+      "img_circle_2",
+      "img_circle_3"
+    ]
+  },
+  {
+    "query_id": "q_triangle",
+    "query_image": "queries/q_triangle.png",
+    "relevant_ids": [
+      "img_triangle_0",
+      "img_triangle_1",
+      "img_triangle_2",
+      "img_triangle_3"
+    ]
+  },
+  {
+    "query_id": "q_square",
+    "query_image": "queries/q_square.png",
+    "relevant_ids": [
+      "img_square_0",
+      "img_square_1",
+      "img_square_2",
+      "img_square_3"
+    ]
+  },
+  {
+    "query_id": "q_hexagon",
+    "query_image": "queries/q_hexagon.png",
+    "relevant_ids": [
+      "img_hexagon_0",
+      "img_hexagon_1",
+      "img_hexagon_2",
+      "img_hexagon_3"
+    ]
+  },
+  {
+    "query_id": "q_grating",
+    "query_image": "queries/q_grating.png",
+    "relevant_ids": [
+      "img_grating_0",
+      "img_grating_1",
+      "img_grating_2",
+      "img_grating_3"
+    ]
+  }
+]

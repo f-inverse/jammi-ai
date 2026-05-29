@@ -1,6 +1,7 @@
 mod audit;
 mod convert;
 mod database;
+mod ephemeral;
 mod error;
 mod job;
 pub mod model_task;
@@ -39,6 +40,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyModelTask>()?;
     m.add_class::<crate::audit::PyPerQueryAudit>()?;
     m.add_class::<crate::audit::PyAuditHandle>()?;
+    m.add_class::<crate::ephemeral::PyEphemeralSession>()?;
     Ok(())
 }
 

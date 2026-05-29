@@ -653,7 +653,43 @@ impl JammiSession {
     /// Register a mutable companion table. After this returns, the table is
     /// queryable as `mutable.public.<id>` in the same SQL surface that
     /// federates Parquet result tables and external sources.
+    ///
+    /// Reserved system table names (the `_jammi_` prefix) cannot be created
+    /// through this user-facing path. The substrate owns those tables and
+    /// creates them implicitly (e.g. the per-query audit table
+    /// `_jammi_search_audit` is created by the audit module). Allowing a user
+    /// to pre-create them would let writes bypass substrate-enforced invariants
+    /// such as audit signing.
     pub async fn create_mutable_table(
+        &self,
+        def: MutableTableDefinition,
+    ) -> Result<MutableTableId> {
+        if crate::audit::is_reserved_table_name(def.id.as_str()) {
+            return Err(JammiError::MutableTable(
+                crate::store::mutable::MutableTableError::InvalidId(format!(
+                    "table name '{}' is reserved for the Jammi substrate; names \
+                     beginning with '_jammi_' are created implicitly and must not \
+                     be created by users",
+                    def.id.as_str()
+                )),
+            ));
+        }
+        self.create_mutable_table_unchecked(def).await
+    }
+
+    /// Register a mutable companion table without the reserved-name guard.
+    ///
+    /// Internal to the substrate: used by system components (e.g. the audit
+    /// primitive) that legitimately own a reserved `_jammi_*` table. Not part
+    /// of the user-facing surface.
+    pub async fn register_mutable_table_unchecked(
+        &self,
+        def: MutableTableDefinition,
+    ) -> Result<MutableTableId> {
+        self.create_mutable_table_unchecked(def).await
+    }
+
+    async fn create_mutable_table_unchecked(
         &self,
         def: MutableTableDefinition,
     ) -> Result<MutableTableId> {
@@ -699,6 +735,12 @@ impl JammiSession {
     /// transaction and calling `insert_batch` inside it).
     pub fn mutable_tables_arc(&self) -> Arc<MutableTableRegistry> {
         Arc::clone(&self.mutable)
+    }
+
+    /// Typed handle to the per-query audit primitive, scoped to this session's
+    /// tenant. See [`crate::audit`].
+    pub fn audit(&self) -> crate::audit::AuditHandle<'_> {
+        crate::audit::AuditHandle::new(self)
     }
 
     /// Return a reference to the underlying DataFusion `SessionContext`.

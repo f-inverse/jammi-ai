@@ -6,6 +6,7 @@
 //! Postgres), mutable companion tables with crash-safe WAL, a trigger
 //! broker for provenance channels, and configuration management.
 
+pub mod audit;
 pub mod cache;
 pub mod catalog;
 pub mod config;
@@ -24,6 +25,7 @@ pub mod trigger;
 
 use config::{LogFormat, LoggingConfig};
 
+pub use audit::{AuditError, AuditHandle, PerQueryAudit};
 pub use catalog::backend::{
     BackendError, BackendImpl, BackendKind, CatalogBackend, IsolationLevel, Transaction, TxOptions,
 };
@@ -31,6 +33,7 @@ pub use evidence_channel::ChannelId;
 pub use model_task::ModelTask;
 pub use session::{AdminScope, TenantScope};
 pub use tenant::TenantId;
+pub use trigger::TopicId;
 
 /// Initialize the tracing subscriber using the provided logging configuration.
 pub fn init_tracing(config: &LoggingConfig) {

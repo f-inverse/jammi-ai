@@ -15,3 +15,9 @@ pub mod operator;
 pub mod pipeline;
 pub mod search;
 pub mod session;
+
+/// The per-query audit primitive lives in the `jammi-db` substrate (it composes
+/// mutable tables, tenant scope, and the trigger stream). It is re-exported here
+/// so AI-layer users can `use jammi_ai::PerQueryAudit`.
+pub use jammi_db::audit;
+pub use jammi_db::{AuditError, AuditHandle, PerQueryAudit};

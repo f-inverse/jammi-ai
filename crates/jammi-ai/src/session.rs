@@ -189,6 +189,12 @@ impl InferenceSession {
         self.inner.tenant()
     }
 
+    /// Typed handle to the per-query audit primitive, scoped to this session's
+    /// tenant. Delegates to [`jammi_db::session::JammiSession::audit`].
+    pub fn audit(&self) -> jammi_db::AuditHandle<'_> {
+        self.inner.audit()
+    }
+
     /// Run `f` with `tenant` bound for the duration of the closure's future.
     ///
     /// The binding is installed as a Tokio task-local that shadows the

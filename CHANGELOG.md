@@ -10,6 +10,32 @@ workspace ships every publishable crate at the same
 
 ### Added
 
+- **Per-query eval persistence + cohort tagging** (`jammi_db::catalog::eval_repo`,
+  wired through the `jammi_ai` eval runner). Embedding evals now persist a
+  companion per-query row alongside the historical aggregate, so per-query
+  results survive the call and can be re-aggregated by segment downstream
+  without re-running the eval.
+  - New reserved, tenant-scoped catalog table `_jammi_eval_per_query`
+    (migration `011`): one row per `(eval_run_id, query_id)` carrying a metrics
+    JSON (`recall@1/3/5/10`, `mrr`, `ndcg`, `distance`) and an opaque `cohorts`
+    JSON object (`{}` when none).
+  - `Catalog::record_eval_per_query` (bulk multi-row insert, tenant-asserted)
+    and `Catalog::get_eval_per_query` (tenant-scoped read, ordered by
+    `query_id`).
+  - `RetrievalMetrics::recall_at_ks` extends the numerics kernel to emit
+    Recall@k at several cutoffs without re-deriving the recall definition.
+  - `eval_embeddings` accepts an optional per-`query_id` `cohorts:
+    map<string,string>` (opaque — the substrate never interprets keys/values),
+    persists per-query rows always-on (no opt-in flag), and surfaces the
+    `eval_run_id` on `EmbeddingEvalReport`. `PerQueryRecord` additionally
+    carries `recall_at_ks`, `distance`, and `cohorts` (additive; existing
+    `metrics` fields unchanged).
+  - `session.eval_per_query(eval_run_id)` (Rust) and `db.eval_per_query(...)`
+    (Python, returning dicts with decoded `cohorts` + `metrics`); `cohorts=`
+    kwarg on `db.eval_embeddings`.
+  - Cookbook `eval_embeddings` recipe extended with per-query drill-down and a
+    cohort-tag round-trip.
+
 - **Per-query audit record primitive** (`jammi_db::audit`, re-exported from
   `jammi_ai`). A standardized, tenant-scoped, HMAC-signed record of *what was
   queried, with what model, what came back, and when*. It composes the existing

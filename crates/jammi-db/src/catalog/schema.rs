@@ -253,3 +253,30 @@ CREATE TABLE topics (
 CREATE INDEX idx_topics_tenant ON topics(tenant_id);
 CREATE INDEX idx_topics_name ON topics(name);
 "#;
+
+/// Migration 011 — per-query eval persistence (spec J9).
+///
+/// Companion to `eval_runs`: one row per (eval_run_id, query_id), carrying the
+/// per-query metric vector (Recall@{1,3,5,10}, MRR, nDCG, distance) as JSON and
+/// an opaque `cohorts` JSON object (`'{}'` when none supplied). The aggregate
+/// `eval_runs.metrics` path is untouched; this table is purely additive so
+/// downstream consumers (J7 enterprise cohort aggregation) can re-aggregate
+/// stored per-query arrays instead of re-running the eval.
+///
+/// The `_jammi_` name prefix marks the table substrate-owned (same reserved
+/// convention as the J2 audit table): users may read it but the substrate owns
+/// writes. `tenant_id` follows the catalog convention (migration 005) —
+/// nullable `TEXT` holding the canonical hyphenated `Uuid::Display` form — and
+/// reads are tenant-filtered exactly like `eval_runs`.
+pub(super) const MIGRATION_011_EVAL_PER_QUERY: &str = r#"
+CREATE TABLE _jammi_eval_per_query (
+    eval_run_id TEXT NOT NULL,
+    query_id    TEXT NOT NULL,
+    cohorts     TEXT NOT NULL DEFAULT '{}',
+    metrics     TEXT NOT NULL,
+    tenant_id   TEXT,
+    PRIMARY KEY (eval_run_id, query_id)
+);
+CREATE INDEX idx_eval_per_query_run    ON _jammi_eval_per_query(eval_run_id);
+CREATE INDEX idx_eval_per_query_tenant ON _jammi_eval_per_query(tenant_id);
+"#;

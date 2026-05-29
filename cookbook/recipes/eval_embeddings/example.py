@@ -79,6 +79,33 @@ def main() -> int:
         assert first["query_id"], "per_query records carry the golden-set query_id"
         print(f"per_query: {len(per_query)} records (first: {first['query_id']})")
 
+        # 6. Per-query results are also persisted in the catalog, keyed by the
+        #    run's eval_run_id. Read them back to inspect Recall@{1,3,5,10},
+        #    MRR, nDCG, and distance for each query — and any cohort tags you
+        #    attached at eval time (see step 7).
+        eval_run_id = metrics["eval_run_id"]
+        persisted = db.eval_per_query(eval_run_id)
+        assert len(persisted) == len(per_query), "one persisted row per query"
+        row = persisted[0]
+        for key in ("recall@1", "recall@3", "recall@5", "recall@10", "mrr", "ndcg", "distance"):
+            assert key in row["metrics"], f"persisted metric '{key}' present"
+        print(f"persisted per-query rows: {len(persisted)} (run {eval_run_id})")
+
+        # 7. Optional: attach opaque cohort tags per query_id so you can later
+        #    aggregate quality by segment. The substrate stores them verbatim;
+        #    it never interprets the keys/values.
+        tagged = db.eval_embeddings(
+            source="corpus",
+            golden_source="golden.public.golden",
+            k=5,
+            cohorts={"q1": {"split": "val"}},
+        )
+        tagged_rows = db.eval_per_query(tagged["eval_run_id"])
+        by_query = {r["query_id"]: r for r in tagged_rows}
+        if "q1" in by_query:
+            assert by_query["q1"]["cohorts"].get("split") == "val", "cohort stored verbatim"
+            print("cohort tag round-trip: OK (q1 -> {'split': 'val'})")
+
     print("eval_embeddings: OK")
     return 0
 

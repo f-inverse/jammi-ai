@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -644,7 +644,11 @@ impl PyDatabase {
     /// Evaluate embedding quality. Returns a dict with `aggregate` (mean
     /// over all queries) and `per_query` (one record per golden-set query)
     /// keys.
-    #[pyo3(signature = (*, source, golden_source, model=None, k=10))]
+    ///
+    /// `cohorts` optionally maps a golden-set `query_id` to an opaque
+    /// `{key: value}` segment map, persisted with that query's per-query
+    /// metrics (read back via `db.eval_per_query(...)`, spec J9).
+    #[pyo3(signature = (*, source, golden_source, model=None, k=10, cohorts=None))]
     fn eval_embeddings(
         &self,
         py: Python<'_>,
@@ -652,15 +656,44 @@ impl PyDatabase {
         golden_source: &str,
         model: Option<&str>,
         k: usize,
+        cohorts: Option<HashMap<String, BTreeMap<String, String>>>,
     ) -> PyResult<Py<PyAny>> {
+        let cohorts = cohorts.unwrap_or_default();
         let report = self
             .runtime
             .block_on(
                 self.session
-                    .eval_embeddings(source, model, golden_source, k),
+                    .eval_embeddings(source, model, golden_source, k, &cohorts),
             )
             .map_err(to_pyerr)?;
         serializable_to_pydict(py, &report)
+    }
+
+    /// Read back the persisted per-query eval records for a run (spec J9),
+    /// scoped to the calling tenant. Returns a list of dicts, each carrying
+    /// `eval_run_id`, `query_id`, `cohorts` (a dict), and `metrics` (a dict
+    /// of `recall@1/3/5/10`, `mrr`, `ndcg`, `distance`).
+    fn eval_per_query(&self, py: Python<'_>, eval_run_id: &str) -> PyResult<Py<PyAny>> {
+        let records = self
+            .runtime
+            .block_on(self.session.eval_per_query(eval_run_id))
+            .map_err(to_pyerr)?;
+
+        let out = pyo3::types::PyList::empty(py);
+        for rec in records {
+            let item = PyDict::new(py);
+            item.set_item("eval_run_id", rec.eval_run_id)?;
+            item.set_item("query_id", rec.query_id)?;
+            // `cohorts` and `metrics` are stored as JSON objects; decode them
+            // into Python dicts so callers get structured values, not strings.
+            let json_mod = py.import("json")?;
+            let cohorts = json_mod.call_method1("loads", (rec.cohorts_json,))?;
+            let metrics = json_mod.call_method1("loads", (rec.metrics_json,))?;
+            item.set_item("cohorts", cohorts)?;
+            item.set_item("metrics", metrics)?;
+            out.append(item)?;
+        }
+        Ok(out.unbind().into())
     }
 
     /// Evaluate inference quality. Returns a dict with `aggregate`

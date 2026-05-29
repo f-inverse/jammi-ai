@@ -499,6 +499,7 @@ async fn recipe_evaluation() {
             None, // use latest embedding table
             "golden.public.golden_relevance",
             10,
+            &Default::default(),
         )
         .await
         .unwrap();

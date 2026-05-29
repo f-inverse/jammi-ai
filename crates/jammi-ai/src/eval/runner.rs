@@ -1,13 +1,16 @@
 //! EvalRunner: orchestrates the evaluation pipeline.
 
+use std::collections::{BTreeMap, HashMap};
+
 use arrow::datatypes::{DataType, Schema};
-use jammi_db::catalog::eval_repo::EvalRunRecord;
+use jammi_db::catalog::eval_repo::{EvalRunRecord, PerQueryEvalRecord};
 use jammi_db::catalog::status::EvalRunStatus;
 use jammi_db::error::{JammiError, Result};
 
 use crate::eval::report::{
     AggregateDelta, CompareEvalReport, EmbeddingEvalReport, InferenceAggregate,
     InferenceEvalReport, MetricDelta, PerQueryRecord, PerRecordPrediction, TableEvalReport,
+    PER_QUERY_RECALL_KS,
 };
 use crate::eval::EvalTask;
 use crate::model::ModelSource;
@@ -34,7 +37,14 @@ impl<'a> EvalRunner<'a> {
     /// all queries (`report.aggregate.recall_at_k`, etc.) and the per-query
     /// arrays (`report.per_query[i].metrics.recall`). The per-query data is
     /// what sample-based statistical rules consume; the aggregate is what
-    /// the catalog persists.
+    /// the `eval_runs` catalog row records.
+    ///
+    /// The per-query arrays are also persisted to `_jammi_eval_per_query`
+    /// (spec J9): one row per query keyed by the run's `eval_run_id`, carrying
+    /// Recall@{1,3,5,10}, MRR, nDCG, distance, and any opaque `cohorts` tags
+    /// supplied for that `query_id`. Persistence is always-on — there is no
+    /// opt-in flag. `cohorts` maps a golden-set `query_id` to an opaque
+    /// `{key: value}` segment map; a query with no entry stores `{}`.
     ///
     /// Uses the same search infrastructure as `db.search()` — SidecarIndex for ANN
     /// when available, exact_vector_search as fallback.
@@ -44,6 +54,7 @@ impl<'a> EvalRunner<'a> {
         embedding_table: Option<&str>,
         golden_source: &str,
         k: usize,
+        cohorts: &HashMap<String, BTreeMap<String, String>>,
     ) -> Result<EmbeddingEvalReport> {
         // 1. Resolve embedding table.
         // result_tables.model_id stores the canonical model name (ModelSource::to_string()).
@@ -90,6 +101,10 @@ impl<'a> EvalRunner<'a> {
         let model_source = ModelSource::from_canonical(canonical_model);
         let encode_id = model_source.to_string();
         let mut query_metrics = Vec::new();
+        // Recall@{1,3,5,10} and the top-1 distance, captured per query so the
+        // per-query record carries the multi-cutoff vector J7 re-aggregates.
+        let mut per_query_recalls: Vec<Vec<(usize, f64)>> = Vec::new();
+        let mut per_query_distances: Vec<f64> = Vec::new();
         for query in &golden.queries {
             let query_vec = match &query.input {
                 super::golden::QueryInput::Text(text) => {
@@ -107,6 +122,22 @@ impl<'a> EvalRunner<'a> {
             let retrieved_ids: Vec<String> =
                 search_results.iter().map(|(id, _)| id.clone()).collect();
 
+            // Distance = the top-1 result's score (0.0 when nothing retrieved).
+            per_query_distances.push(
+                search_results
+                    .first()
+                    .map(|(_, s)| *s as f64)
+                    .unwrap_or(0.0),
+            );
+
+            // Multi-K recall reuses the numerics kernel — extended, not
+            // re-implemented — at the fixed J9 cutoffs.
+            per_query_recalls.push(RetrievalMetrics::recall_at_ks(
+                &retrieved_ids,
+                &query.judgments,
+                &PER_QUERY_RECALL_KS,
+            ));
+
             query_metrics.push(RetrievalMetrics::compute_query(
                 &retrieved_ids,
                 &query.judgments,
@@ -114,31 +145,42 @@ impl<'a> EvalRunner<'a> {
             ));
         }
 
-        // 5. Build typed report. `per_query` is the data the old shape was
-        //    discarding; the aggregate is the historical mean.
+        // 5. Build typed report. `per_query` carries the historical
+        //    single-cutoff `metrics` plus the J9 additions (multi-K recall,
+        //    top-1 distance, opaque cohort tags); the aggregate is the mean.
         let aggregate = RetrievalMetrics::aggregate(&query_metrics);
         let per_query: Vec<PerQueryRecord> = golden
             .queries
             .iter()
             .zip(query_metrics)
-            .map(|(q, metrics)| PerQueryRecord {
+            .zip(per_query_recalls)
+            .zip(per_query_distances)
+            .map(|(((q, metrics), recall_at_ks), distance)| PerQueryRecord {
                 query_id: q.query_id.clone(),
                 metrics,
+                recall_at_ks,
+                distance,
+                cohorts: cohorts.get(&q.query_id).cloned().unwrap_or_default(),
             })
             .collect();
+        // The run id keys both the aggregate `eval_runs` row and the per-query
+        // rows, and is surfaced on the report so callers can read the per-query
+        // arrays back via `eval_per_query`.
+        let eval_run_id = uuid::Uuid::new_v4().to_string();
         let report = EmbeddingEvalReport {
+            eval_run_id: eval_run_id.clone(),
             aggregate,
             per_query,
         };
 
-        // 6. Record in catalog. Only the aggregate persists — per-query
-        //    arrays are a transient response shape kept out of long-term
-        //    storage because the catalog needs them only for historical
-        //    aggregate trend reporting.
+        // 6. Record the aggregate in the `eval_runs` catalog row (unchanged
+        //    historical path), then persist the per-query arrays to
+        //    `_jammi_eval_per_query` keyed by the same `eval_run_id`. Per-query
+        //    persistence is always-on (spec J9) — no opt-in flag.
         self.session
             .catalog()
             .record_eval_run(&EvalRunRecord {
-                eval_run_id: uuid::Uuid::new_v4().to_string(),
+                eval_run_id: eval_run_id.clone(),
                 eval_type: "embedding".into(),
                 model_id: crate::model::to_catalog_pk(canonical_model, 1),
                 source_id: source_id.into(),
@@ -148,6 +190,12 @@ impl<'a> EvalRunner<'a> {
                 status: EvalRunStatus::Completed.to_string(),
                 created_at: chrono::Utc::now().to_rfc3339(),
             })
+            .await?;
+
+        let per_query_rows = build_per_query_rows(&eval_run_id, &report.per_query)?;
+        self.session
+            .catalog()
+            .record_eval_per_query(&per_query_rows)
             .await?;
 
         Ok(report)
@@ -332,10 +380,13 @@ impl<'a> EvalRunner<'a> {
             ));
         }
 
+        // `eval_compare` does not surface cohort tagging; each per-table eval
+        // persists per-query rows with empty cohorts.
+        let no_cohorts: HashMap<String, BTreeMap<String, String>> = HashMap::new();
         let mut all_reports: Vec<(String, EmbeddingEvalReport)> = Vec::new();
         for table_name in embedding_tables {
             let report = self
-                .eval_embeddings(source_id, Some(table_name), golden_source, k)
+                .eval_embeddings(source_id, Some(table_name), golden_source, k, &no_cohorts)
                 .await?;
             all_reports.push((table_name.clone(), report));
         }
@@ -393,6 +444,36 @@ impl<'a> EvalRunner<'a> {
             Ok(df.schema().as_arrow().clone())
         }
     }
+}
+
+/// Serialize the per-query report records into the `_jammi_eval_per_query`
+/// row shape (spec J9): one row per query, carrying a `metrics` JSON object
+/// (`recall@1/3/5/10`, `mrr`, `ndcg`, `distance`) and a `cohorts` JSON object
+/// (`{}` when none). The metric JSON keys are stable so J7's enterprise cohort
+/// aggregation can read them back without re-deriving the schema.
+fn build_per_query_rows(
+    eval_run_id: &str,
+    per_query: &[PerQueryRecord],
+) -> Result<Vec<PerQueryEvalRecord>> {
+    per_query
+        .iter()
+        .map(|rec| {
+            let mut metrics = serde_json::Map::new();
+            for (k, recall) in &rec.recall_at_ks {
+                metrics.insert(format!("recall@{k}"), serde_json::Value::from(*recall));
+            }
+            metrics.insert("mrr".into(), serde_json::Value::from(rec.metrics.mrr));
+            metrics.insert("ndcg".into(), serde_json::Value::from(rec.metrics.ndcg));
+            metrics.insert("distance".into(), serde_json::Value::from(rec.distance));
+
+            Ok(PerQueryEvalRecord {
+                eval_run_id: eval_run_id.to_string(),
+                query_id: rec.query_id.clone(),
+                cohorts_json: serde_json::to_string(&rec.cohorts)?,
+                metrics_json: serde_json::Value::Object(metrics).to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Compute the absolute and relative delta between a baseline and a model

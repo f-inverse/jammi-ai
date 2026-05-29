@@ -28,6 +28,39 @@ DEFAULT_BIN = REPO_ROOT / "target" / "release" / "jammi"
 HEALTH_URL = "http://127.0.0.1:8080/healthz"
 FLIGHT_URL = "grpc://127.0.0.1:8081"
 
+# FlightSQL carries a SQL statement as a `CommandStatementQuery` protobuf
+# (field 1 = the query string) packed into a `google.protobuf.Any`. The
+# server (datafusion-flight-sql-server) decodes the FlightDescriptor command
+# as that Any, so a bare SQL string is rejected as an invalid command. We
+# encode it directly to keep the recipe dependency-free (no FlightSQL client
+# package); these are the two short length-delimited protobuf messages the
+# wire format requires.
+_FLIGHTSQL_STATEMENT_TYPE_URL = (
+    b"type.googleapis.com/arrow.flight.protocol.sql.CommandStatementQuery"
+)
+
+
+def _protobuf_varint(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        out.append(byte | (0x80 if value else 0))
+        if not value:
+            return bytes(out)
+
+
+def _protobuf_field(field_no: int, payload: bytes) -> bytes:
+    """Encode one length-delimited (wire type 2) protobuf field."""
+    tag = (field_no << 3) | 2
+    return _protobuf_varint(tag) + _protobuf_varint(len(payload)) + payload
+
+
+def flightsql_statement_command(sql: str) -> bytes:
+    """Encode `Any { CommandStatementQuery { query = sql } }` for FlightSQL."""
+    command = _protobuf_field(1, sql.encode("utf-8"))  # CommandStatementQuery.query
+    return _protobuf_field(1, _FLIGHTSQL_STATEMENT_TYPE_URL) + _protobuf_field(2, command)
+
 READY_TIMEOUT_S = 10
 POLL_INTERVAL_S = 0.1
 
@@ -95,7 +128,9 @@ def main() -> int:
             # `do_get` each ticket. The FlightDescriptor.for_command bytes
             # carry the SQL statement.
             client = flight.FlightClient(FLIGHT_URL)
-            descriptor = flight.FlightDescriptor.for_command(b"SELECT 1 AS one")
+            descriptor = flight.FlightDescriptor.for_command(
+                flightsql_statement_command("SELECT 1 AS one")
+            )
             info = client.get_flight_info(descriptor)
             reader = client.do_get(info.endpoints[0].ticket)
             table = reader.read_all()

@@ -11,7 +11,7 @@ use assert_cmd::Command;
 use tempfile::TempDir;
 
 fn jammi_cmd(artifact_dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("jammi-cli").expect("jammi-cli binary built");
+    let mut cmd = Command::cargo_bin("jammi").expect("jammi-cli binary built");
     cmd.env("JAMMI_ARTIFACT_DIR", artifact_dir)
         .env_remove("JAMMI_CONFIG");
     cmd

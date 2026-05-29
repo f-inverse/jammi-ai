@@ -2,7 +2,7 @@
 //!
 //! An [`EphemeralSession`] is a tenant-scoped context whose mutable tables are
 //! auto-deleted when the session ends — on explicit [`EphemeralSession::close`],
-//! on [`Drop`] (best-effort), or when the timeout [`scanner`] force-closes it.
+//! on [`Drop`] (best-effort), or when the timeout scanner force-closes it.
 //! Every transition publishes a [`SessionLifecycleRecord`] to the
 //! `jammi.audit.session_lifecycle.v1` trigger topic, giving downstream audit-log
 //! aggregators a durable, subscribable proof of deletion.

@@ -25,7 +25,7 @@ import pyarrow.flight as flight
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 DEFAULT_BIN = REPO_ROOT / "target" / "release" / "jammi"
 
-HEALTH_URL = "http://127.0.0.1:8080/health"
+HEALTH_URL = "http://127.0.0.1:8080/healthz"
 FLIGHT_URL = "grpc://127.0.0.1:8081"
 
 READY_TIMEOUT_S = 10

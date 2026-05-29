@@ -12,7 +12,7 @@ driver, and BI tools speak natively.
 
 1. Spawns `target/release/jammi serve` as a child process pointed at a
    temp `artifact_dir`
-2. Polls the health endpoint (`http://127.0.0.1:8080/health`) until the
+2. Polls the health endpoint (`http://127.0.0.1:8080/healthz`) until the
    server is ready (5 s budget)
 3. Opens a `pyarrow.flight.FlightClient` against `grpc://127.0.0.1:8081`
 4. Submits `SELECT 1 AS one` over Flight SQL and confirms the response

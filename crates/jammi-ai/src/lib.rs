@@ -21,3 +21,11 @@ pub mod session;
 /// so AI-layer users can `use jammi_ai::PerQueryAudit`.
 pub use jammi_db::audit;
 pub use jammi_db::{AuditError, AuditHandle, PerQueryAudit};
+
+/// The ephemeral session-storage primitive lives in the `jammi-db` substrate
+/// (it composes mutable tables, tenant scope, and the trigger stream). It is
+/// re-exported here so AI-layer users can `use jammi_ai::EphemeralSession`.
+pub use jammi_db::ephemeral;
+pub use jammi_db::{
+    EphemeralError, EphemeralSession, SessionLifecycleEvent, SessionLifecycleRecord,
+};

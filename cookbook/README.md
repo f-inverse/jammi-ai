@@ -12,6 +12,7 @@ blocks the merge.
 | Run your first vector query in 5 minutes | [`quickstart/`](./quickstart/) |
 | See create/insert/select on a mutable table | [`recipes/mutable_tables/`](./recipes/mutable_tables/) |
 | Publish + subscribe on a topic | [`recipes/trigger_streams/`](./recipes/trigger_streams/) |
+| Store transient data that is auto-deleted on session end | [`recipes/session_lifecycle/`](./recipes/session_lifecycle/) |
 | Measure recall@k / nDCG against a golden set | [`recipes/eval_embeddings/`](./recipes/eval_embeddings/) |
 | Measure classification accuracy against gold labels | [`recipes/eval_inference/`](./recipes/eval_inference/) |
 | Measure NER precision/recall/F1 against gold spans | [`recipes/eval_inference_ner/`](./recipes/eval_inference_ner/) |

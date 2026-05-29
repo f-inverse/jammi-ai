@@ -33,6 +33,9 @@ use crate::search::PySearchBuilder;
 pub struct PyDatabase {
     pub(crate) session: Arc<InferenceSession>,
     pub(crate) runtime: Arc<tokio::runtime::Runtime>,
+    /// Guards spawning the ephemeral timeout scanner exactly once per
+    /// connection, on the first `ephemeral_session` call.
+    ephemeral_scanner: std::sync::Once,
 }
 
 impl PyDatabase {
@@ -48,7 +51,20 @@ impl PyDatabase {
         Ok(Self {
             session: Arc::new(session),
             runtime,
+            ephemeral_scanner: std::sync::Once::new(),
         })
+    }
+
+    /// Spawn the ephemeral timeout scanner on first use. The scanner runs on
+    /// the shared runtime for the lifetime of the connection; the spawn must
+    /// happen inside the runtime context, so it is driven through `block_on`.
+    fn ensure_ephemeral_scanner(&self) {
+        self.ephemeral_scanner.call_once(|| {
+            let session = Arc::clone(&self.session);
+            self.runtime.block_on(async {
+                session.spawn_ephemeral_timeout_scanner(jammi_db::ephemeral::DEFAULT_SCAN_INTERVAL);
+            });
+        });
     }
 
     /// Return a cloned `Arc<InferenceSession>` so external consumers can
@@ -91,6 +107,36 @@ impl PyDatabase {
             session: Arc::clone(&self.session),
             runtime: Arc::clone(&self.runtime),
         }
+    }
+
+    /// Open an ephemeral, session-scoped storage context bound to the tenant
+    /// currently set via `with_tenant`. Use as a context manager:
+    ///
+    /// ```python
+    /// with db.ephemeral_session(timeout_seconds=3600) as ephem:
+    ///     ephem.create_ephemeral_table("imgs", schema=s, primary_key=["id"])
+    ///     ephem.insert("imgs", batch=tbl)
+    /// # tables deleted on exit; a `closed` event is published
+    /// ```
+    ///
+    /// Raises `ValueError` if no tenant is bound. Timeout enforcement runs via
+    /// the in-process scanner spawned by the first `ephemeral_session` call on
+    /// this connection.
+    #[pyo3(signature = (*, timeout_seconds))]
+    fn ephemeral_session(
+        &self,
+        timeout_seconds: u64,
+    ) -> PyResult<crate::ephemeral::PyEphemeralSession> {
+        self.ensure_ephemeral_scanner();
+        let timeout = std::time::Duration::from_secs(timeout_seconds);
+        let session = self
+            .runtime
+            .block_on(self.session.ephemeral_session(timeout))
+            .map_err(crate::ephemeral::ephemeral_err)?;
+        Ok(crate::ephemeral::PyEphemeralSession::new(
+            session,
+            Arc::clone(&self.runtime),
+        ))
     }
 
     /// Register a file-shaped data source. `url` accepts a local path

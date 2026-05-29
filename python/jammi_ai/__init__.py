@@ -8,6 +8,7 @@ from jammi_ai._native import (
     ModelTask,
     PerQueryAudit,
     AuditHandle,
+    EphemeralSession,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "ModelTask",
     "PerQueryAudit",
     "AuditHandle",
+    "EphemeralSession",
 ]

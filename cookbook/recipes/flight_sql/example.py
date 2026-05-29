@@ -137,7 +137,7 @@ def main() -> int:
 
             assert table.num_rows == 1, f"expected 1 row, got {table.num_rows}"
             assert table.column("one").to_pylist() == [1]
-            print(table.to_pandas())
+            print(table.to_pydict())
         finally:
             proc.terminate()
             try:

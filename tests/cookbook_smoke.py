@@ -39,6 +39,7 @@ RECIPES: tuple[Recipe, ...] = (
     Recipe("mutable_tables", COOKBOOK / "recipes" / "mutable_tables" / "example.py"),
     Recipe("trigger_streams", COOKBOOK / "recipes" / "trigger_streams" / "example.py"),
     Recipe("eval_embeddings", COOKBOOK / "recipes" / "eval_embeddings" / "example.py"),
+    Recipe("image_search", COOKBOOK / "recipes" / "image_search" / "example.py"),
     Recipe("eval_inference", COOKBOOK / "recipes" / "eval_inference" / "example.py"),
     Recipe(
         "eval_inference_ner",

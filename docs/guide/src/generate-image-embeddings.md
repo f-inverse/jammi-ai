@@ -92,6 +92,8 @@ vector = db.encode_image_query("laion/CLIP-ViT-B-32-laion2B-s34B-b79K", image_by
 
 The architecture (ViT width, layers, heads, patch size, pooling strategy), the shared latent dimensionality (`embed_dim`), and the preprocessing config (mean, std, image size) are detected automatically from the config — no per-model code path.
 
+Known-working models include `patentclip/PatentCLIP_Vit_B` (512-dim, the patent-figure use case — uses global average pooling), OpenAI CLIP, and the LAION `CLIP-ViT-B-32-*` variants. For an end-to-end image-to-image search + retrieval-eval walkthrough, see the runnable [`image_search`](./cookbook-recipes.md#image-search) recipe.
+
 ## Output schema
 
 Same as text embeddings:

@@ -40,9 +40,10 @@ db.add_source("golden", path="/data/golden_relevance.csv", format="csv")
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 let report = session.eval_embeddings(
     "patents",
-    None,                              // use latest embedding table
-    "golden.public.golden_relevance",  // golden dataset
-    10,                                // k for recall@k, precision@k
+    None,                                // use latest embedding table
+    "golden.public.golden_relevance",    // golden dataset
+    10,                                  // k for recall@k, precision@k
+    &std::collections::HashMap::new(),   // no cohort tags
 ).await?;
 
 println!("recall@10:    {}", report.aggregate.recall_at_k);
@@ -78,7 +79,7 @@ The report also carries a `per_query` array — one record per golden-set query,
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
-# let report = session.eval_embeddings("patents", None, "golden.public.golden_relevance", 10).await?;
+# let report = session.eval_embeddings("patents", None, "golden.public.golden_relevance", 10, &std::collections::HashMap::new()).await?;
 for record in &report.per_query {
     println!("{}: recall={:.3} ndcg={:.3}",
         record.query_id, record.metrics.recall, record.metrics.ndcg);

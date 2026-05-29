@@ -28,7 +28,7 @@ fn workspace_fixture(name: &str) -> PathBuf {
 }
 
 fn jammi_cmd(artifact_dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("jammi-cli").expect("jammi-cli binary built");
+    let mut cmd = Command::cargo_bin("jammi").expect("jammi-cli binary built");
     cmd.env("JAMMI_ARTIFACT_DIR", artifact_dir)
         .env_remove("JAMMI_CONFIG");
     cmd

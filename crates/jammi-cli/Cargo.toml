@@ -8,6 +8,13 @@ license.workspace = true
 repository.workspace = true
 readme = "README.md"
 
+# The crate is `jammi-cli`, but the shipped binary is `jammi` — that's the
+# command users invoke and what the cookbook recipes / docs / smoke tests
+# expect at `target/<profile>/jammi`.
+[[bin]]
+name = "jammi"
+path = "src/main.rs"
+
 [dependencies]
 jammi-db.workspace = true
 jammi-ai.workspace = true

@@ -280,3 +280,57 @@ CREATE TABLE _jammi_eval_per_query (
 CREATE INDEX idx_eval_per_query_run    ON _jammi_eval_per_query(eval_run_id);
 CREATE INDEX idx_eval_per_query_tenant ON _jammi_eval_per_query(tenant_id);
 "#;
+
+/// Migration 012 — scope topic-name uniqueness per tenant.
+///
+/// Migration 009 created `topics` with a global `name TEXT NOT NULL UNIQUE`.
+/// That is wrong for the substrate's trigger-stream model: per-tenant topics
+/// (`tenant: Some(_)`) are the norm, and two tenants must be able to hold the
+/// same logical topic name (e.g. each tenant's own `jammi.audit.search.v1`).
+/// Under the global unique, the first tenant to register a topic claims the
+/// name process-wide and every other tenant's first registration fails with
+/// `UNIQUE constraint failed: topics.name` — the J2 per-query audit log
+/// crashes for the second tenant onward.
+///
+/// SQLite cannot drop or alter a column-level `UNIQUE` constraint in place, so
+/// this migration rebuilds `topics` via the canonical
+/// create-new / copy / drop / rename dance, replacing the global unique on
+/// `name` with a composite `UNIQUE(name, tenant_id)` (mirroring the enterprise
+/// `UNIQUE(tenant_id, name)` convention). The rebuilt table carries identical
+/// columns, defaults, and the same FK / `ON DELETE RESTRICT` on
+/// `backing_table`; only the uniqueness rule changes.
+///
+/// Per-tenant rows with the same name now coexist. SQLite treats NULLs as
+/// distinct in UNIQUE constraints, so global (`tenant_id IS NULL`) topics with
+/// the same name are *not* deduplicated by this constraint — but the only
+/// globally-registered topics today are user-declared via the CLI/session/
+/// Python surfaces, and the substrate-owned topics (audit, session lifecycle)
+/// are all tenant-pinned, so this matches existing behaviour. The
+/// `idx_topics_tenant` and `idx_topics_name` secondary indexes are recreated.
+///
+/// `PRAGMA foreign_keys` is OFF inside the migration transaction (sqlx opens
+/// SQLite connections without it), so the temporary FK-less window during the
+/// table swap does not trip referential checks; the `backing_table` FK is
+/// restored on the rebuilt table.
+pub(super) const MIGRATION_012_TOPICS_TENANT_UNIQUE: &str = r#"
+CREATE TABLE topics_new (
+    topic_id          TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    schema_json       TEXT NOT NULL,
+    tenant_id         TEXT,
+    broker_metadata   TEXT NOT NULL DEFAULT '{}',
+    backing_table     TEXT NOT NULL UNIQUE REFERENCES mutable_tables(id) ON DELETE RESTRICT,
+    created_at        TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT)),
+    UNIQUE(name, tenant_id)
+);
+
+INSERT INTO topics_new (topic_id, name, schema_json, tenant_id, broker_metadata, backing_table, created_at)
+    SELECT topic_id, name, schema_json, tenant_id, broker_metadata, backing_table, created_at FROM topics;
+
+DROP TABLE topics;
+
+ALTER TABLE topics_new RENAME TO topics;
+
+CREATE INDEX idx_topics_tenant ON topics(tenant_id);
+CREATE INDEX idx_topics_name ON topics(name);
+"#;

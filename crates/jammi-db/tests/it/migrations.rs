@@ -171,7 +171,95 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "009_topics",
             "010_rename_source_type_local_to_file",
             "011_eval_per_query",
+            "012_topics_tenant_unique",
         ]
+    );
+}
+
+/// Migration 012 rebuilds `topics` so name uniqueness is scoped per tenant
+/// (`UNIQUE(name, tenant_id)`) instead of the global `UNIQUE(name)` migration
+/// 009 created. After the migration, two different tenants must be able to
+/// hold the same topic name; inserting a duplicate `(name, tenant_id)` pair is
+/// still rejected. Exercised directly against the rebuilt table.
+#[tokio::test]
+async fn migration_012_scopes_topic_name_uniqueness_per_tenant() {
+    use jammi_db::catalog::backend::SqlValue;
+
+    let dir = tempdir().unwrap();
+    let _catalog = Catalog::open(dir.path()).await.unwrap();
+    let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
+
+    // Two backing mutable-table rows so the `backing_table` FK is satisfied for
+    // the two topic rows we insert (one per tenant, same topic name).
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                for id in ["topic_back_a", "topic_back_b"] {
+                    tx.execute(
+                        "INSERT INTO mutable_tables (id, schema_json, primary_key, backend_kind) \
+                         VALUES ($1, '{}', '[]', 'sqlite')",
+                        &[SqlValue::TextOwned(id.into())],
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+    let tenant_a = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a";
+    let tenant_b = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8eff";
+
+    // Two tenants registering the same topic name must both succeed.
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            let (a, b) = (tenant_a.to_string(), tenant_b.to_string());
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO topics (topic_id, name, schema_json, tenant_id, backing_table) \
+                     VALUES ('t-a', 'jammi.audit.search.v1', '{}', $1, 'topic_back_a')",
+                    &[SqlValue::TextOwned(a)],
+                )
+                .await?;
+                tx.execute(
+                    "INSERT INTO topics (topic_id, name, schema_json, tenant_id, backing_table) \
+                     VALUES ('t-b', 'jammi.audit.search.v1', '{}', $1, 'topic_back_b')",
+                    &[SqlValue::TextOwned(b)],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("two tenants may hold the same topic name after migration 012");
+
+    // A duplicate (name, tenant_id) pair is still rejected.
+    let dup = backend
+        .transaction(TxOptions::default(), |tx| {
+            let a = tenant_a.to_string();
+            Box::pin(async move {
+                // Reuse a fresh backing table so only the (name, tenant) unique
+                // — not the backing_table unique — can be the failure cause.
+                tx.execute(
+                    "INSERT INTO mutable_tables (id, schema_json, primary_key, backend_kind) \
+                     VALUES ('topic_back_dup', '{}', '[]', 'sqlite')",
+                    &[],
+                )
+                .await?;
+                tx.execute(
+                    "INSERT INTO topics (topic_id, name, schema_json, tenant_id, backing_table) \
+                     VALUES ('t-dup', 'jammi.audit.search.v1', '{}', $1, 'topic_back_dup')",
+                    &[SqlValue::TextOwned(a)],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await;
+    assert!(
+        dup.is_err(),
+        "a duplicate (name, tenant_id) topic row must still be rejected"
     );
 }
 

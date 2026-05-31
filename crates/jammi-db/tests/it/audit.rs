@@ -109,6 +109,72 @@ async fn tenant_isolation() {
 }
 
 #[tokio::test]
+async fn two_tenants_can_both_log() {
+    // Regression for the per-tenant audit-topic uniqueness defect: the
+    // `topics` catalog table used to enforce a *global* `UNIQUE(name)`, so the
+    // first tenant to `log` claimed `jammi.audit.search.v1` process-wide and
+    // the SECOND tenant's first `log` crashed with
+    // `UNIQUE constraint failed: topics.name`. Both tenants must succeed, and
+    // each must see only its own audit records (delivered isolation preserved).
+    let _g = env_lock().lock().await;
+    set_master_key();
+    let s = session().await;
+
+    // Tenant A's first log registers its own `jammi.audit.search.v1` topic.
+    let a_tenant = TENANT_A.parse().unwrap();
+    s.bind_tenant(a_tenant);
+    let a_rec = sample("model/a");
+    let a_qid = a_rec.query_id;
+    s.audit().log(vec![a_rec]).await.expect("tenant A log");
+
+    // Tenant B's first log must ALSO register `jammi.audit.search.v1` — under
+    // the old global unique this panicked; under `UNIQUE(name, tenant_id)` the
+    // two per-tenant topics coexist.
+    let b_tenant = TENANT_B.parse().unwrap();
+    s.bind_tenant(b_tenant);
+    let b_rec = sample("model/b");
+    let b_qid = b_rec.query_id;
+    s.audit()
+        .log(vec![b_rec])
+        .await
+        .expect("tenant B log must succeed (second-tenant audit-topic register)");
+
+    // Each tenant registered its own distinct, tenant-pinned audit topic.
+    let a_topic = s
+        .topic_repo()
+        .lookup_by_name(AUDIT_TOPIC, Some(a_tenant))
+        .await
+        .unwrap()
+        .expect("tenant A audit topic");
+    let b_topic = s
+        .topic_repo()
+        .lookup_by_name(AUDIT_TOPIC, Some(b_tenant))
+        .await
+        .unwrap()
+        .expect("tenant B audit topic");
+    assert_eq!(a_topic.tenant, Some(a_tenant));
+    assert_eq!(b_topic.tenant, Some(b_tenant));
+    assert_ne!(
+        a_topic.id, b_topic.id,
+        "each tenant owns a distinct audit topic"
+    );
+
+    // Stored-data isolation: tenant B sees only its own record, not A's.
+    s.bind_tenant(b_tenant);
+    let b_rows = s.audit().fetch_recent(100).await.unwrap();
+    assert_eq!(b_rows.len(), 1, "tenant B sees only its own audit row");
+    assert_eq!(b_rows[0].query_id, b_qid);
+    assert_eq!(b_rows[0].tenant_id.as_deref(), Some(TENANT_B));
+
+    // ...and tenant A still sees only its own record, not B's.
+    s.bind_tenant(a_tenant);
+    let a_rows = s.audit().fetch_recent(100).await.unwrap();
+    assert_eq!(a_rows.len(), 1, "tenant A sees only its own audit row");
+    assert_eq!(a_rows[0].query_id, a_qid);
+    assert_eq!(a_rows[0].tenant_id.as_deref(), Some(TENANT_A));
+}
+
+#[tokio::test]
 async fn raw_sql_is_tenant_scoped() {
     let _g = env_lock().lock().await;
     set_master_key();

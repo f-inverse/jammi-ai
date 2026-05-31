@@ -6,7 +6,23 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
-## v0.12.0 — 2026-05-28
+## v0.12.1 — 2026-05-30
+
+### Fixed
+
+- **Per-query audit log crashed for the second tenant onward** in multi-tenant
+  deployments. The `topics` catalog table (migration `009`) enforced a *global*
+  `UNIQUE(name)`, but the audit primitive — like every substrate-owned
+  trigger-stream topic — registers a *per-tenant* `jammi.audit.search.v1` topic.
+  The first tenant to call `session.audit().log(...)` claimed the topic name
+  process-wide; every other tenant's first `log` failed with
+  `UNIQUE constraint failed: topics.name`. Direct multi-tenant `jammi-ai`
+  library users hit this on their second tenant.
+  - Migration `012` rebuilds `topics` with a composite `UNIQUE(name, tenant_id)`
+    so per-tenant topics sharing a logical name coexist. Existing catalogs pick
+    up the new constraint on next open via the numbered migration runner. The
+    fix is engine-side, so no consumer workaround is required and delivered
+    audit events remain tenant-isolated.
 
 ### Added
 

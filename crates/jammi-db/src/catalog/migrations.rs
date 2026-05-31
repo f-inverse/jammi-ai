@@ -35,6 +35,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         schema::MIGRATION_010_RENAME_SOURCE_TYPE_LOCAL_TO_FILE,
     ),
     ("011_eval_per_query", schema::MIGRATION_011_EVAL_PER_QUERY),
+    (
+        "012_topics_tenant_unique",
+        schema::MIGRATION_012_TOPICS_TENANT_UNIQUE,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

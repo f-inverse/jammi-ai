@@ -29,12 +29,15 @@ test-hooks = []
 storage-s3 = ["object_store/aws"]
 storage-gcs = ["object_store/gcp"]
 storage-azure = ["object_store/azure"]
-storage-cloud = ["storage-s3", "storage-gcs", "storage-azure"]
+# R2 is the S3 driver pointed at an R2 endpoint, so it reuses the AWS backend.
+storage-r2 = ["object_store/aws"]
+storage-cloud = ["storage-s3", "storage-gcs", "storage-azure", "storage-r2"]
 # Live cloud tests: require credentials + JAMMI_TEST_*_BUCKET env vars.
 # Each implies the matching driver feature so the live test compiles.
 live-s3-tests = ["storage-s3"]
 live-gcs-tests = ["storage-gcs"]
 live-azure-tests = ["storage-azure"]
+live-r2-tests = ["storage-r2"]
 
 [dependencies]
 # Internal

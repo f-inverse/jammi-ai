@@ -72,6 +72,32 @@ pub struct AzureConfig {
     pub client_secret: Option<String>,
 }
 
+/// Cloudflare R2 connection details.
+///
+/// R2 speaks the S3 API, so the driver is the S3 driver underneath. This
+/// config exists so a deployer supplies only the R2-shaped inputs and the
+/// engine derives the two S3 quirks R2 imposes — an account-scoped endpoint
+/// and `region = "auto"` — rather than the deployer hand-rolling an
+/// [`S3Config`] and risking either one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct R2Config {
+    /// Cloudflare account id. The endpoint is derived as
+    /// `https://{account_id}.r2.cloudflarestorage.com` unless
+    /// [`Self::endpoint`] overrides it.
+    pub account_id: Option<String>,
+    /// Explicit endpoint override — an R2 custom domain, or a test endpoint.
+    /// Takes precedence over the account-derived endpoint.
+    pub endpoint: Option<String>,
+    /// R2 access key id (an S3-style token minted in the R2 dashboard / API).
+    /// When unset, the S3 SDK's default credential chain applies.
+    pub access_key_id: Option<String>,
+    /// Secret access key paired with [`Self::access_key_id`].
+    pub secret_access_key: Option<String>,
+    /// Allow plain HTTP — only for test endpoints. Defaults `false` (fail closed).
+    #[serde(default)]
+    pub allow_http: bool,
+}
+
 /// Tagged union of per-cloud configuration. The variant selects which
 /// driver the [`crate::storage::builder`] will construct.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +109,8 @@ pub enum CloudConfig {
     Gcs(GcsConfig),
     /// Azure Blob — see [`AzureConfig`].
     Azure(AzureConfig),
+    /// Cloudflare R2 — see [`R2Config`].
+    R2(R2Config),
 }
 
 impl CloudConfig {
@@ -95,6 +123,7 @@ impl CloudConfig {
             Self::S3(c) => c.validate(),
             Self::Gcs(c) => c.validate(),
             Self::Azure(c) => c.validate(),
+            Self::R2(c) => c.validate(),
         }
     }
 }
@@ -188,6 +217,45 @@ impl AzureConfig {
     }
 }
 
+impl R2Config {
+    /// The S3 endpoint the R2 driver talks to: the explicit `endpoint` override
+    /// if set, else the account-scoped `https://{account_id}.r2.cloudflarestorage.com`.
+    /// `None` when neither is available — a config error caught by [`Self::validate`].
+    pub fn resolved_endpoint(&self) -> Option<String> {
+        self.endpoint.clone().or_else(|| {
+            self.account_id
+                .as_ref()
+                .map(|a| format!("https://{a}.r2.cloudflarestorage.com"))
+        })
+    }
+
+    /// Require an addressable endpoint (an `account_id` or an explicit `endpoint`),
+    /// and reject a half-set credential pair — the same fail-closed discipline the
+    /// other backends apply.
+    pub fn validate(&self) -> Result<(), StorageError> {
+        if self.resolved_endpoint().is_none() {
+            return Err(StorageError::DriverInit {
+                scheme: Scheme::R2,
+                reason: "R2 requires either account_id or an explicit endpoint".into(),
+            });
+        }
+        match (
+            self.access_key_id.as_deref(),
+            self.secret_access_key.as_deref(),
+        ) {
+            (Some(_), None) => Err(StorageError::DriverInit {
+                scheme: Scheme::R2,
+                reason: "access_key_id is set but secret_access_key is missing".into(),
+            }),
+            (None, Some(_)) => Err(StorageError::DriverInit {
+                scheme: Scheme::R2,
+                reason: "secret_access_key is set but access_key_id is missing".into(),
+            }),
+            _ => Ok(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +312,66 @@ mod tests {
         let good = S3Config {
             access_key_id: Some("AKIA…".into()),
             secret_access_key: Some("xyz".into()),
+            ..Default::default()
+        };
+        assert!(good.validate().is_ok());
+    }
+
+    #[test]
+    fn r2_derives_endpoint_from_account_id() {
+        let cfg = R2Config {
+            account_id: Some("abc123".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolved_endpoint().as_deref(),
+            Some("https://abc123.r2.cloudflarestorage.com")
+        );
+    }
+
+    #[test]
+    fn r2_explicit_endpoint_overrides_account_id() {
+        let cfg = R2Config {
+            account_id: Some("abc123".into()),
+            endpoint: Some("https://files.example.com".into()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolved_endpoint().as_deref(), Some("https://files.example.com"));
+    }
+
+    #[test]
+    fn r2_validate_requires_account_or_endpoint() {
+        assert!(matches!(
+            R2Config::default().validate(),
+            Err(StorageError::DriverInit {
+                scheme: Scheme::R2,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn r2_validate_rejects_half_credentials() {
+        let bad = R2Config {
+            account_id: Some("abc".into()),
+            access_key_id: Some("k".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            bad.validate(),
+            Err(StorageError::DriverInit {
+                scheme: Scheme::R2,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn r2_validate_accepts_account_plus_full_credentials() {
+        let good = R2Config {
+            account_id: Some("abc".into()),
+            access_key_id: Some("k".into()),
+            secret_access_key: Some("s".into()),
             ..Default::default()
         };
         assert!(good.validate().is_ok());

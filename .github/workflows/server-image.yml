@@ -4,6 +4,16 @@ name: Server Image
 # on every `v*` tag (which matches the workspace's release tagging
 # scheme) and on workflow_dispatch for one-off builds.
 #
+# Two image variants share this workflow:
+#   * the generic image (`:latest`, `:vX.Y.Z`, …) — operator-supplied
+#     config + mounted volume; published on tags and dispatch.
+#   * the self-contained image (`:selfcontained`, `:sha-…`) — baked
+#     config + `tiny_clap` encoder, boots standalone on a runtime that
+#     provides no config/volume (Cloudflare Containers). Published on
+#     dispatch when `selfcontained=true`, always from the dispatched
+#     ref (so it carries whatever the default branch has, incl.
+#     EmbeddingService) — it is never gated on a tag.
+#
 # This workflow is independent of `image.yml`, which builds the CI
 # base image (`ghcr.io/f-inverse/jammi-ai-ci`). The two images are
 # distinct artifacts: `jammi-ai-ci` is the toolchain layer used as a
@@ -15,6 +25,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      selfcontained:
+        description: "Also build+push the self-contained image (:selfcontained)"
+        type: boolean
+        default: false
 
 concurrency:
   group: server-image-${{ github.ref }}
@@ -60,6 +75,53 @@ jobs:
         with:
           context: .
           file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Self-contained variant: opt-in, dispatch-only. Builds the
+  # `runtime-selfcontained` stage (baked config + encoder) from the
+  # dispatched ref and pushes `:selfcontained` + a `:sha-<sha>` tag.
+  # Independent of the tag-triggered generic publish above.
+  build-and-push-selfcontained:
+    if: github.event_name == 'workflow_dispatch' && inputs.selfcontained
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=selfcontained
+            type=sha,prefix=selfcontained-,format=long
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          build-args: |
+            RUNTIME_VARIANT=runtime-selfcontained
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

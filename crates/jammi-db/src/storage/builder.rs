@@ -36,6 +36,7 @@ pub fn build_object_store(
         Scheme::S3 => build_s3(url, config),
         Scheme::Gcs => build_gcs(url, config),
         Scheme::Azure => build_azure(url, config),
+        Scheme::R2 => build_r2(url, config),
     }
 }
 
@@ -210,6 +211,72 @@ fn build_azure(
     })
 }
 
+// R2 is the S3 driver underneath; W2 keeps it a first-class scheme so the two
+// quirks R2 imposes — an account-scoped endpoint and `region = "auto"` — are
+// derived here instead of being a deployer's hand-rolled `S3Config` incantation.
+#[cfg(feature = "storage-r2")]
+fn build_r2(
+    url: &StorageUrl,
+    config: Option<&CloudConfig>,
+) -> Result<DynObjectStore, StorageError> {
+    let bucket = url
+        .path()
+        .split('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| StorageError::DriverInit {
+            scheme: Scheme::R2,
+            reason: "R2 URL has no bucket".into(),
+        })?;
+
+    // R2 has no public default endpoint, so unlike S3 it requires a config to
+    // know which account to talk to.
+    let r2 = match config {
+        Some(CloudConfig::R2(r2)) => r2,
+        _ => {
+            return Err(StorageError::DriverInit {
+                scheme: Scheme::R2,
+                reason: "R2 requires an R2Config with account_id or endpoint".into(),
+            })
+        }
+    };
+    let endpoint = r2.resolved_endpoint().ok_or_else(|| StorageError::DriverInit {
+        scheme: Scheme::R2,
+        reason: "R2 requires either account_id or an explicit endpoint".into(),
+    })?;
+
+    // R2 speaks S3 with `region = "auto"`, reached at the account-scoped
+    // endpoint, with path-style addressing (object_store's default — R2 has no
+    // per-bucket subdomains on the account endpoint).
+    let mut builder = object_store::aws::AmazonS3Builder::from_env()
+        .with_bucket_name(bucket)
+        .with_region("auto")
+        .with_endpoint(endpoint);
+    if let Some(key) = &r2.access_key_id {
+        builder = builder.with_access_key_id(key);
+    }
+    if let Some(secret) = &r2.secret_access_key {
+        builder = builder.with_secret_access_key(secret);
+    }
+    if r2.allow_http {
+        builder = builder.with_allow_http(true);
+    }
+
+    let store = builder.build().map_err(|e| StorageError::DriverInit {
+        scheme: Scheme::R2,
+        reason: e.to_string(),
+    })?;
+    Ok(Arc::new(store))
+}
+
+#[cfg(not(feature = "storage-r2"))]
+fn build_r2(
+    _url: &StorageUrl,
+    _config: Option<&CloudConfig>,
+) -> Result<DynObjectStore, StorageError> {
+    Err(StorageError::SchemeNotEnabled { scheme: Scheme::R2 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +304,47 @@ mod tests {
         assert!(matches!(
             err,
             StorageError::SchemeNotEnabled { scheme: Scheme::S3 }
+        ));
+    }
+
+    #[cfg(not(feature = "storage-r2"))]
+    #[test]
+    fn r2_disabled_without_feature() {
+        let url = StorageUrl::parse("r2://archives/x").unwrap();
+        let err = build_object_store(&url, None).unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::SchemeNotEnabled { scheme: Scheme::R2 }
+        ));
+    }
+
+    #[cfg(feature = "storage-r2")]
+    #[test]
+    fn r2_builds_driver_from_account_config() {
+        use super::super::config::R2Config;
+        let url = StorageUrl::parse("r2://archives/x").unwrap();
+        let cfg = CloudConfig::R2(R2Config {
+            account_id: Some("abc123".into()),
+            access_key_id: Some("k".into()),
+            secret_access_key: Some("s".into()),
+            ..Default::default()
+        });
+        // No network: AmazonS3Builder::build() only constructs the client.
+        let store = build_object_store(&url, Some(&cfg)).expect("r2 driver builds");
+        let _ = format!("{store}");
+    }
+
+    #[cfg(feature = "storage-r2")]
+    #[test]
+    fn r2_requires_config() {
+        let url = StorageUrl::parse("r2://archives/x").unwrap();
+        let err = build_object_store(&url, None).unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::DriverInit {
+                scheme: Scheme::R2,
+                ..
+            }
         ));
     }
 }

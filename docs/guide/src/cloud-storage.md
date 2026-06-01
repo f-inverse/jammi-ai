@@ -1,6 +1,6 @@
 # Store Sources and Results in Cloud Object Storage
 
-Jammi treats local disk, S3, GCS, and Azure Blob as interchangeable backends. Any place the engine accepts a local file path it also accepts a storage URL — `file://`, `s3://`, `gs://`, or `azure://` — including registered file-shaped sources and the result-table Parquet that embedding and inference jobs write.
+Jammi treats local disk, S3, GCS, Azure Blob, and Cloudflare R2 as interchangeable backends. Any place the engine accepts a local file path it also accepts a storage URL — `file://`, `s3://`, `gs://`, `azure://`, or `r2://` — including registered file-shaped sources and the result-table Parquet that embedding and inference jobs write.
 
 ## Build with the cloud features you need
 
@@ -8,10 +8,11 @@ The default build ships only `file://` and the in-memory test driver. Cloud sche
 
 | Feature | Schemes it enables |
 |---------|--------------------|
-| `storage-s3` | `s3://` (AWS S3 and S3-compatible: MinIO, R2, LocalStack) |
+| `storage-s3` | `s3://` (AWS S3 and S3-compatible: MinIO, LocalStack) |
 | `storage-gcs` | `gs://` |
 | `storage-azure` | `azure://`, `abfss://` |
-| `storage-cloud` | All three (umbrella) |
+| `storage-r2` | `r2://` (Cloudflare R2 — the S3 driver with R2's endpoint + region derived) |
+| `storage-cloud` | All four (umbrella) |
 
 ```toml
 [dependencies]
@@ -115,6 +116,32 @@ let conn = SourceConnection {
 };
 # Ok(conn) }
 ```
+
+## Cloudflare R2
+
+R2 speaks the S3 API, so it rides the same driver — but `r2://` is a first-class scheme so you supply only the R2-shaped inputs and the engine derives the two quirks R2 imposes: the account-scoped endpoint `https://<account_id>.r2.cloudflarestorage.com` and `region = "auto"`. Mint an S3-style access key pair in the R2 dashboard (or via the API) and give Jammi the account id:
+
+```rust,no_run
+# extern crate jammi_db;
+# use jammi_db::source::{FileFormat, SourceConnection};
+# fn make() -> Result<SourceConnection, Box<dyn std::error::Error>> {
+use jammi_db::storage::{CloudConfig, R2Config};
+
+let conn = SourceConnection {
+    url: Some("r2://archives/snapshots/2026.parquet".into()),
+    format: Some(FileFormat::Parquet),
+    cloud: Some(CloudConfig::R2(R2Config {
+        account_id: Some(std::env::var("R2_ACCOUNT_ID")?),
+        access_key_id: Some(std::env::var("R2_ACCESS_KEY_ID")?),
+        secret_access_key: Some(std::env::var("R2_SECRET_ACCESS_KEY")?),
+        ..Default::default()
+    })),
+    ..Default::default()
+};
+# Ok(conn) }
+```
+
+Set `endpoint` instead of `account_id` to point at an R2 custom domain. Result tables and their sidecar ANN indexes persist to `r2://` exactly as to any other cloud backend.
 
 ## Persist result tables to the cloud
 

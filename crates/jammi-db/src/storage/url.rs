@@ -24,6 +24,9 @@ pub enum Scheme {
     /// Azure Blob Storage via `azure://container/blob` or the
     /// `abfss://`/`https://...blob.core.windows.net` URL forms.
     Azure,
+    /// Cloudflare R2 via `r2://bucket/key`. R2 speaks the S3 API; the driver is
+    /// the S3 driver pointed at an account-scoped endpoint with `region = auto`.
+    R2,
 }
 
 impl fmt::Display for Scheme {
@@ -34,6 +37,7 @@ impl fmt::Display for Scheme {
             Self::S3 => "s3",
             Self::Gcs => "gs",
             Self::Azure => "azure",
+            Self::R2 => "r2",
         };
         f.write_str(s)
     }
@@ -119,6 +123,7 @@ impl StorageUrl {
             "s3" => Ok(Scheme::S3),
             "gs" | "gcs" => Ok(Scheme::Gcs),
             "azure" | "abfss" => Ok(Scheme::Azure),
+            "r2" => Ok(Scheme::R2),
             other => Err(StorageError::InvalidUrl {
                 input: other.to_string(),
                 reason: format!("unknown scheme '{other}://'"),
@@ -168,6 +173,18 @@ mod tests {
     fn parses_azure_url() {
         let u = StorageUrl::parse("azure://archives/snapshots/x.parquet").unwrap();
         assert_eq!(u.scheme(), Scheme::Azure);
+    }
+
+    #[test]
+    fn parses_r2_url() {
+        let u = StorageUrl::parse("r2://archives/2026/jan.parquet").unwrap();
+        assert_eq!(u.scheme(), Scheme::R2);
+        assert_eq!(u.path(), "archives/2026/jan.parquet");
+    }
+
+    #[test]
+    fn r2_scheme_round_trips_through_display() {
+        assert_eq!(Scheme::R2.to_string(), "r2");
     }
 
     #[test]

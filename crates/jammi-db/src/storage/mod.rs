@@ -17,7 +17,7 @@ pub mod url;
 pub mod writer;
 
 pub use builder::{build_object_store, DynObjectStore};
-pub use config::{AzureConfig, CloudConfig, GcsConfig, S3Config};
+pub use config::{AzureConfig, CloudConfig, GcsConfig, R2Config, S3Config};
 pub use error::StorageError;
 pub use object_store_handle::JammiObjectStore;
 pub use registry::StorageRegistry;

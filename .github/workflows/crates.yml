@@ -101,7 +101,11 @@ jobs:
               echo "${crate} not present at this tag — skipping"
               continue
             fi
-            if curl -sf "https://crates.io/api/v1/crates/${crate}/${VERSION}" >/dev/null; then
+            # crates.io's API rejects requests with no User-Agent (403), which a
+            # bare `curl -sf` cannot distinguish from "not published" — it would
+            # then try to republish an existing crate and fail. Send a UA so the
+            # existence check is accurate on a re-run.
+            if curl -sf -A "jammi-ai release CI (github.com/f-inverse/jammi-ai)" "https://crates.io/api/v1/crates/${crate}/${VERSION}" >/dev/null; then
               echo "${crate} ${VERSION} already on crates.io — skipping"
             else
               echo "Publishing ${crate} ${VERSION}"

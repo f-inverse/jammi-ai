@@ -11,11 +11,6 @@ Jammi names no consumer. Not in code, config, docs, tests, fixtures, or scripts.
 **References point one way only: a consumer may depend on Jammi; Jammi depends on no
 consumer.** A consumer's name anywhere in the engine repo is a bug.
 
-The engine is **edition-agnostic**: it makes no mention of a commercial, managed, paid, or
-"enterprise" version — not even generically, and not in comments, docs, config, or specs. It
-does not acknowledge that any such edition exists. Engine behavior is justified on its own
-terms, never by what a downstream layer needs.
-
 A real consumer need is a fine forcing function for the roadmap — but the thing that lands
 in the engine is the generic primitive the need pointed at, with the name filed off. Two
 unrelated consumers independently reaching for the same primitive is the strongest evidence

@@ -1,7 +1,7 @@
 //! Integration test for the Rust-facing surface of `jammi-python`.
 //!
 //! `PyDatabase::session_arc` is what lets a downstream Rust crate
-//! (e.g. an enterprise Python-bindings layer) share the OSS database's
+//! (e.g. a downstream Python-bindings layer) share the OSS database's
 //! `Arc<InferenceSession>` — and therefore its schema-upgrade lock,
 //! trigger broker, catalog cache, and tenant binding — instead of opening
 //! a parallel session against the same artifact directory. Without that

@@ -725,7 +725,8 @@ async fn subscribe_scoped_stream_remains_tenant_filtered_after_closure_returns()
 
     // Enter `with_tenant_scoped(A)` to subscribe for tenant A from inside a
     // scope. The returned `Subscription` must remain safe to poll outside
-    // the scope — that is the exact pattern enterprise gRPC handlers want.
+    // the scope — that is the exact pattern a downstream consumer's gRPC
+    // handlers want.
     let subscription = session
         .with_tenant_scoped(tenant_a(), |_scope| {
             let subscriber = Arc::clone(&subscriber);

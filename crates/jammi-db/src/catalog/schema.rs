@@ -260,8 +260,8 @@ CREATE INDEX idx_topics_name ON topics(name);
 /// per-query metric vector (Recall@{1,3,5,10}, MRR, nDCG, distance) as JSON and
 /// an opaque `cohorts` JSON object (`'{}'` when none supplied). The aggregate
 /// `eval_runs.metrics` path is untouched; this table is purely additive so
-/// downstream consumers (J7 enterprise cohort aggregation) can re-aggregate
-/// stored per-query arrays instead of re-running the eval.
+/// downstream consumers can re-aggregate the stored per-query arrays by cohort
+/// instead of re-running the eval.
 ///
 /// The `_jammi_` name prefix marks the table substrate-owned (same reserved
 /// convention as the J2 audit table): users may read it but the substrate owns
@@ -295,9 +295,8 @@ CREATE INDEX idx_eval_per_query_tenant ON _jammi_eval_per_query(tenant_id);
 /// SQLite cannot drop or alter a column-level `UNIQUE` constraint in place, so
 /// this migration rebuilds `topics` via the canonical
 /// create-new / copy / drop / rename dance, replacing the global unique on
-/// `name` with a composite `UNIQUE(name, tenant_id)` (mirroring the enterprise
-/// `UNIQUE(tenant_id, name)` convention). The rebuilt table carries identical
-/// columns, defaults, and the same FK / `ON DELETE RESTRICT` on
+/// `name` with a composite `UNIQUE(name, tenant_id)`. The rebuilt table carries
+/// identical columns, defaults, and the same FK / `ON DELETE RESTRICT` on
 /// `backing_table`; only the uniqueness rule changes.
 ///
 /// Per-tenant rows with the same name now coexist. SQLite treats NULLs as

@@ -19,8 +19,8 @@
 //!
 //! `jammi-numerics` depends on `nalgebra`, `rand`, `rand_distr`, `statrs`,
 //! `serde`, and `thiserror` — no other workspace crate. Downstream consumers
-//! (`jammi-db`, `jammi-ai`, `jammi-enterprise`) depend on this crate, never
-//! the reverse.
+//! (`jammi-db`, `jammi-ai`, and any downstream layers) depend on this crate,
+//! never the reverse.
 
 pub mod classification;
 pub mod distance;

@@ -41,8 +41,8 @@ pub struct PyDatabase {
 impl PyDatabase {
     /// Construct a `PyDatabase` from a fully-built `JammiConfig`. This is
     /// the Rust-shaped entry point that the `#[pyfunction] connect` wraps
-    /// for Python callers; downstream Rust consumers (e.g. enterprise
-    /// Python bindings layered on top of this crate) call it directly so
+    /// for Python callers; downstream Rust consumers (e.g. a Python-bindings
+    /// layer built on top of this crate) call it directly so
     /// the resulting database shares the tokio runtime that drives every
     /// `InferenceSession` future.
     pub fn open(config: JammiConfig) -> Result<Self, JammiError> {

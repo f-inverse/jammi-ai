@@ -865,8 +865,8 @@ async fn publish_returns_error_on_tenant_mismatch_when_topic_is_tenant_pinned() 
 async fn list_consumers_returns_each_subscribers_last_delivered_offset() {
     // SPEC-04 backup/restore hook: `TriggerBroker::list_consumers` returns one
     // `ConsumerOffsetSnapshot` per live subscription, carrying the broker's
-    // last-delivered stream sequence. The capture is what the
-    // jammi-enterprise backup path will dump into the manifest so a restored
+    // last-delivered stream sequence. The capture is what a downstream
+    // consumer's backup path will dump into the manifest so a restored
     // deployment can resume subscriptions at the right point.
     //
     // Test: register a topic, attach two subscribers, publish three batches,
@@ -963,9 +963,9 @@ async fn session_with_broker_swallows_fan_out_failure() {
     // log. Subscribers see the row on replay. The next publish succeeds
     // because the failure was one-shot.
     //
-    // Underwrites the enterprise gate's "publish failure does not fail the
-    // check" invariant (PLAN-16 §14 risk #4) by giving downstream tests a
-    // deterministic failure injection point.
+    // Underwrites a downstream consumer's "publish failure does not fail the
+    // check" invariant by giving downstream tests a deterministic failure
+    // injection point.
 
     let dir = tempfile::tempdir().unwrap();
     let config = jammi_db::config::JammiConfig {

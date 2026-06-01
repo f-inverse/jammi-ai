@@ -6,7 +6,7 @@ The OSS server binary for [Jammi AI](https://github.com/f-inverse/jammi-ai).
 
 `jammi-server` is the substrate-level service for Jammi: a single-process binary that exposes Jammi's data sources, mutable tables, trigger streams, and vector search over Arrow Flight SQL and typed gRPC. It is the runnable artifact behind `docker pull ghcr.io/f-inverse/jammi-ai-server`.
 
-The OSS server is **single-tenant**. The deployer's network is the authentication boundary — run one server per tenant, or front the binary with a reverse proxy that enforces tenancy at the HTTP layer. Multi-tenant SaaS, authentication, and the enterprise feature set (Registry, Gate, Monitor, Experiment, Blocks, Resilience) live in a separate commercial server.
+The OSS server is **single-tenant**. The deployer's network is the authentication boundary — run one server per tenant, or front the binary with a reverse proxy that enforces tenancy at the HTTP layer.
 
 ## What it exposes
 
@@ -26,7 +26,6 @@ The gRPC chain and Flight SQL share one Tonic server so a client binding a tenan
 - Not multi-tenant. No tenant column on OSS-exclusive tables; no auth on the wire.
 - Not clustered. Single-instance only; no leader election, no replication.
 - Not authenticated. The OSS server speaks unauthenticated gRPC. Run it behind your own boundary.
-- Not the enterprise binary. Registry / Gate / Monitor / Experiment / Blocks / Resilience are commercial features and ship in a separate image.
 
 ## Quickstart (Docker)
 

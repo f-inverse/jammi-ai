@@ -457,8 +457,8 @@ impl<'a> EvalRunner<'a> {
 /// Serialize the per-query report records into the `_jammi_eval_per_query`
 /// row shape (spec J9): one row per query, carrying a `metrics` JSON object
 /// (`recall@1/3/5/10`, `mrr`, `ndcg`, `distance`) and a `cohorts` JSON object
-/// (`{}` when none). The metric JSON keys are stable so J7's enterprise cohort
-/// aggregation can read them back without re-deriving the schema.
+/// (`{}` when none). The metric JSON keys are stable so a downstream consumer's
+/// cohort aggregation can read them back without re-deriving the schema.
 fn build_per_query_rows(
     eval_run_id: &str,
     per_query: &[PerQueryRecord],

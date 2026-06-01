@@ -12,10 +12,9 @@
 //!   [`tokio::sync::broadcast`] so every component drains in parallel
 //!
 //! The structure is intentionally flat: no `runtime/` directory, no
-//! per-component sub-modules. When a second binary materialises (e.g.
-//! an enterprise edition) the same shape can be reused — the
-//! orchestration is the engine of last resort and earns its keep by
-//! being grep-able in one place.
+//! per-component sub-modules. When a second binary materialises the same
+//! shape can be reused — the orchestration is the engine of last resort
+//! and earns its keep by being grep-able in one place.
 
 use std::future::Future;
 use std::net::SocketAddr;

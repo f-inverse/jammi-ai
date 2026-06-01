@@ -1,5 +1,5 @@
 //! Jammi DB — vector database, SQL federation, mutable companion tables,
-//! and trigger broker for the Jammi AI platform.
+//! and trigger broker for the Jammi AI engine.
 //!
 //! Provides the foundational infrastructure: data source registration,
 //! SQL query execution via DataFusion, catalog persistence (SQLite or

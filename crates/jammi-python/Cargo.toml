@@ -7,7 +7,7 @@ publish = false
 [lib]
 name = "_native"
 # `cdylib` is the maturin-built Python extension module. `rlib` lets
-# downstream Rust crates (e.g. jammi-enterprise-python) depend on this
+# downstream Rust crates (e.g. a downstream Python-bindings crate) depend on this
 # crate and consume its public surface — `PyDatabase::session_arc` and the
 # re-exported `InferenceSession` — to share a single session with the OSS
 # `jammi_ai.Database` instead of opening a parallel one against the same

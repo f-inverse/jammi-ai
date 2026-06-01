@@ -792,6 +792,31 @@ impl PyDatabase {
             .block_on(self.session.encode_image_query(model_id, image_bytes))
             .map_err(to_pyerr)
     }
+
+    /// Generate audio embeddings for a registered source.
+    #[pyo3(signature = (*, source, model, audio_column, key))]
+    fn generate_audio_embeddings(
+        &self,
+        source: &str,
+        model: &str,
+        audio_column: &str,
+        key: &str,
+    ) -> PyResult<()> {
+        self.runtime
+            .block_on(
+                self.session
+                    .generate_audio_embeddings(source, model, audio_column, key),
+            )
+            .map_err(to_pyerr)?;
+        Ok(())
+    }
+
+    /// Encode an audio clip into an embedding vector using the given audio model.
+    fn encode_audio_query(&self, model_id: &str, audio_bytes: &[u8]) -> PyResult<Vec<f32>> {
+        self.runtime
+            .block_on(self.session.encode_audio_query(model_id, audio_bytes))
+            .map_err(to_pyerr)
+    }
 }
 
 fn parse_file_format(s: &str) -> PyResult<FileFormat> {

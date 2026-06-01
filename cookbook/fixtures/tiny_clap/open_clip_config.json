@@ -1,0 +1,17 @@
+{
+  "model_cfg": {
+    "embed_dim": 16,
+    "audio_cfg": {
+      "n_mels": 16,
+      "n_frames": 32,
+      "patch_size": 4,
+      "width": 32,
+      "layers": 1,
+      "heads": 4,
+      "mlp_ratio": 4.0,
+      "sample_rate": 16000,
+      "n_fft": 256,
+      "hop_length": 128
+    }
+  }
+}

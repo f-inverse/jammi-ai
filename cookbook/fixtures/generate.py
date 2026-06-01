@@ -17,6 +17,10 @@ Produces:
   drawings, 5 shape families) for the `image_search` recipe
 - `tiny_image_golden.json`  — query-image -> expected corpus-image top-K
   judgments for the image-search eval (`db.eval_embeddings` image mode)
+- `tiny_audio_corpus/`      — 20 synthetic mono WAV clips (5 timbre families)
+  for the `audio_search` recipe
+- `tiny_audio_golden.json`  — query-clip -> expected corpus-clip top-K
+  judgments for the audio-search eval (`db.eval_embeddings` audio mode)
 
 Re-run with `python cookbook/fixtures/generate.py` whenever the schema or row
 shape needs to change. Output is fully deterministic — same content every run.
@@ -32,6 +36,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import random
 from pathlib import Path
 
 import pyarrow as pa
@@ -439,6 +444,115 @@ def write_image_corpus() -> None:
     )
 
 
+# ─── Audio-search fixtures ──────────────────────────────────────────────────
+#
+# 20 synthetic mono WAV clips grouped into 5 timbre families (4 clips per
+# family). Each family is a distinct waveform shape at a distinct base pitch:
+# pure sine, two-partial harmonic stack, square-ish, sawtooth-ish, and
+# band-limited noise. Within a family the four members differ by a small pitch
+# detune / duration so the corpus is not degenerate, but members of the same
+# family are spectrally closer to each other than to other families. Every
+# sample is synthesised here — no recorded audio (licensing), no tenant data.
+#
+# The held-out query set is one extra clip per family (a fifth member with a
+# distinct detune). `tiny_audio_golden.json` maps each query to its family's
+# corpus IDs — the expected top-K for an audio-to-audio nearest-neighbour
+# search. Clips are tiny (16 kHz, <=0.25 s) so the fixtures tree stays small.
+
+AUDIO_SAMPLE_RATE = 16_000
+TIMBRE_FAMILIES = ("sine", "harmonic", "square", "saw", "noise")
+AUDIO_PER_FAMILY = 4
+AUDIO_BASE_HZ = {
+    "sine": 220.0,
+    "harmonic": 330.0,
+    "square": 440.0,
+    "saw": 550.0,
+    "noise": 660.0,
+}
+
+
+def _synth_clip(family: str, variant: int) -> list[int]:
+    """Synthesise one mono clip of `family` as a list of 16-bit PCM samples.
+
+    `variant` detunes the base pitch and nudges the duration so members of a
+    family are distinct signals while sharing a timbre and pitch register.
+    """
+    base = AUDIO_BASE_HZ[family]
+    freq = base * (1.0 + 0.015 * variant)
+    n = int(AUDIO_SAMPLE_RATE * (0.18 + 0.01 * variant))
+    rng = random.Random(hash((family, variant)) & 0xFFFFFFFF)
+
+    samples: list[int] = []
+    for i in range(n):
+        t = i / AUDIO_SAMPLE_RATE
+        phase = 2 * math.pi * freq * t
+        if family == "sine":
+            v = math.sin(phase)
+        elif family == "harmonic":
+            v = 0.6 * math.sin(phase) + 0.4 * math.sin(2 * phase)
+        elif family == "square":
+            v = 1.0 if math.sin(phase) >= 0 else -1.0
+        elif family == "saw":
+            frac = (freq * t) % 1.0
+            v = 2.0 * frac - 1.0
+        elif family == "noise":
+            # Band-feel noise: white noise lightly biased by the base tone so
+            # the family is still spectrally distinct from the others.
+            v = 0.7 * (rng.random() * 2.0 - 1.0) + 0.3 * math.sin(phase)
+        else:  # pragma: no cover - guarded by TIMBRE_FAMILIES
+            raise ValueError(f"unknown timbre family {family!r}")
+        samples.append(max(-32767, min(32767, int(0.5 * v * 32767))))
+    return samples
+
+
+def _write_wav(path: Path, samples: list[int]) -> None:
+    import wave
+
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(AUDIO_SAMPLE_RATE)
+        w.writeframes(b"".join(int(s).to_bytes(2, "little", signed=True) for s in samples))
+
+
+def write_audio_corpus() -> None:
+    """20 synthetic WAV clips + the query->top-K golden judgments.
+
+    Corpus clip IDs are `clip_<family>_<variant>` (e.g. `clip_sine_0`); the
+    held-out query clips are the family's variant `AUDIO_PER_FAMILY` member,
+    written to a sibling `queries/` dir and referenced (by inline bytes) from
+    the golden file at recipe runtime.
+    """
+    corpus_dir = OUT / "tiny_audio_corpus"
+    corpus_dir.mkdir(exist_ok=True)
+    queries_dir = corpus_dir / "queries"
+    queries_dir.mkdir(exist_ok=True)
+
+    golden: list[dict] = []
+    for family in TIMBRE_FAMILIES:
+        family_ids = []
+        for variant in range(AUDIO_PER_FAMILY):
+            clip_id = f"clip_{family}_{variant}"
+            _write_wav(corpus_dir / f"{clip_id}.wav", _synth_clip(family, variant))
+            family_ids.append(clip_id)
+
+        query_id = f"q_{family}"
+        _write_wav(
+            queries_dir / f"{query_id}.wav", _synth_clip(family, AUDIO_PER_FAMILY)
+        )
+        golden.append(
+            {
+                "query_id": query_id,
+                "query_audio": f"queries/{query_id}.wav",
+                "relevant_ids": family_ids,
+            }
+        )
+
+    (OUT / "tiny_audio_golden.json").write_text(
+        json.dumps(golden, indent=2, sort_keys=True) + "\n"
+    )
+
+
 def main() -> None:
     write_corpus()
     write_golden()
@@ -447,6 +561,7 @@ def main() -> None:
     write_ner_corpus()
     write_ner_gold()
     write_image_corpus()
+    write_audio_corpus()
     print(f"Cookbook fixtures regenerated in {OUT}")
 
 

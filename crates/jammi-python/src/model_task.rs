@@ -23,6 +23,7 @@ use crate::error::to_pyerr;
 pub enum PyModelTask {
     TextEmbedding,
     ImageEmbedding,
+    AudioEmbedding,
     Classification,
     Ner,
 }
@@ -57,6 +58,7 @@ impl From<PyModelTask> for ModelTask {
         match value {
             PyModelTask::TextEmbedding => ModelTask::TextEmbedding,
             PyModelTask::ImageEmbedding => ModelTask::ImageEmbedding,
+            PyModelTask::AudioEmbedding => ModelTask::AudioEmbedding,
             PyModelTask::Classification => ModelTask::Classification,
             PyModelTask::Ner => ModelTask::Ner,
         }
@@ -68,6 +70,7 @@ impl From<ModelTask> for PyModelTask {
         match value {
             ModelTask::TextEmbedding => PyModelTask::TextEmbedding,
             ModelTask::ImageEmbedding => PyModelTask::ImageEmbedding,
+            ModelTask::AudioEmbedding => PyModelTask::AudioEmbedding,
             ModelTask::Classification => PyModelTask::Classification,
             ModelTask::Ner => PyModelTask::Ner,
         }
@@ -94,7 +97,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ModelTaskArg {
         }
         Err(PyTypeError::new_err(
             "task must be a ModelTask enum value or its snake_case string \
-             (text_embedding, image_embedding, classification, ner)",
+             (text_embedding, image_embedding, audio_embedding, classification, ner)",
         ))
     }
 }

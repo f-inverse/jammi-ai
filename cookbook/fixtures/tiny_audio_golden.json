@@ -1,0 +1,52 @@
+[
+  {
+    "query_audio": "queries/q_sine.wav",
+    "query_id": "q_sine",
+    "relevant_ids": [
+      "clip_sine_0",
+      "clip_sine_1",
+      "clip_sine_2",
+      "clip_sine_3"
+    ]
+  },
+  {
+    "query_audio": "queries/q_harmonic.wav",
+    "query_id": "q_harmonic",
+    "relevant_ids": [
+      "clip_harmonic_0",
+      "clip_harmonic_1",
+      "clip_harmonic_2",
+      "clip_harmonic_3"
+    ]
+  },
+  {
+    "query_audio": "queries/q_square.wav",
+    "query_id": "q_square",
+    "relevant_ids": [
+      "clip_square_0",
+      "clip_square_1",
+      "clip_square_2",
+      "clip_square_3"
+    ]
+  },
+  {
+    "query_audio": "queries/q_saw.wav",
+    "query_id": "q_saw",
+    "relevant_ids": [
+      "clip_saw_0",
+      "clip_saw_1",
+      "clip_saw_2",
+      "clip_saw_3"
+    ]
+  },
+  {
+    "query_audio": "queries/q_noise.wav",
+    "query_id": "q_noise",
+    "relevant_ids": [
+      "clip_noise_0",
+      "clip_noise_1",
+      "clip_noise_2",
+      "clip_noise_3"
+    ]
+  }
+]

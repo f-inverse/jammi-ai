@@ -7,14 +7,16 @@ use jammi_encoders::{
     Bert, BertConfig, DistilBert, DistilBertConfig, ModernBert, ModernBertConfig, Pooling,
 };
 
-use jammi_encoders::{ClipText, ClipTextConfig};
+use jammi_encoders::{ClapAudio, ClapAudioConfig, ClipText, ClipTextConfig};
 
 use super::open_clip_text::OpenClipTextForward;
 use super::open_clip_vit::{OpenClipVisionConfig, OpenClipVisionTransformer};
 use super::{DeviceConfig, ModelBackend};
 use crate::fine_tune::classifier::SeqClassifier;
 use crate::inference::adapter::BackendOutput;
-use crate::inference::{arrow_to_images, arrow_to_texts, image_preprocess};
+use crate::inference::{
+    arrow_to_audio, arrow_to_images, arrow_to_texts, audio_preprocess, image_preprocess,
+};
 use crate::model::tokenizer::{BatchEncoding, TokenizerWrapper};
 use crate::model::{LoadedModel, ModelDimensions, ModelTask, ResolvedModel, TokenizerSource};
 
@@ -78,6 +80,42 @@ impl CandleVisionForward for OpenClipVisionTransformer {
     }
     fn preprocess_std(&self) -> [f32; 3] {
         self.preprocess_std()
+    }
+}
+
+/// Audio architectures produce embeddings from a log-mel spectrogram.
+/// Feature-extraction geometry (mel bins, frame count, FFT size, hop, sample
+/// rate) is model-driven so the decode/resample/mel front-end is config-driven.
+pub(crate) trait CandleAudioForward: Send + Sync {
+    /// Pooled, L2-normalized `[batch, embed_dim]` embedding for a
+    /// `[batch, n_mels, n_frames]` log-mel spectrogram batch.
+    fn forward_audio(&self, mel: &Tensor) -> Result<Tensor>;
+    fn n_mels(&self) -> usize;
+    fn n_frames(&self) -> usize;
+    fn n_fft(&self) -> usize;
+    fn hop_length(&self) -> usize;
+    fn sample_rate(&self) -> u32;
+}
+
+impl CandleAudioForward for ClapAudio {
+    fn forward_audio(&self, mel: &Tensor) -> Result<Tensor> {
+        self.forward(mel)
+            .map_err(|e| JammiError::Inference(format!("Audio forward pass failed: {e}")))
+    }
+    fn n_mels(&self) -> usize {
+        self.n_mels()
+    }
+    fn n_frames(&self) -> usize {
+        self.n_frames()
+    }
+    fn n_fft(&self) -> usize {
+        self.n_fft()
+    }
+    fn hop_length(&self) -> usize {
+        self.hop_length()
+    }
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate()
     }
 }
 
@@ -234,6 +272,8 @@ pub struct CandleModel {
     text: Option<Box<dyn CandleTextForward>>,
     /// Vision architecture forward pass (OpenCLIP ViT).
     vision: Option<Box<dyn CandleVisionForward>>,
+    /// Audio architecture forward pass (CLAP audio tower).
+    audio: Option<Box<dyn CandleAudioForward>>,
     /// Tokenizer for text-to-token conversion, if available.
     pub tokenizer: Option<TokenizerWrapper>,
     /// Device the model weights reside on (CPU, CUDA, or Metal).
@@ -313,6 +353,7 @@ impl CandleModel {
         match task {
             ModelTask::TextEmbedding => self.forward_embedding(content),
             ModelTask::ImageEmbedding => self.forward_image_embedding(content),
+            ModelTask::AudioEmbedding => self.forward_audio_embedding(content),
             ModelTask::Classification => self.forward_classification(content),
             ModelTask::Ner => self.forward_ner(content),
         }
@@ -468,6 +509,87 @@ impl CandleModel {
             } else {
                 normalized.to_dtype(DType::F32).map_err(|e| {
                     JammiError::Inference(format!("Image embedding dtype cast: {e}"))
+                })?
+            };
+            let embeddings = normalized_f32
+                .to_vec2::<f32>()
+                .map_err(|e| JammiError::Inference(format!("Tensor to vec failed: {e}")))?;
+
+            for (emb_idx, &orig_idx) in valid_indices.iter().enumerate() {
+                let start = orig_idx * hidden_size;
+                all_embeddings[start..start + hidden_size].copy_from_slice(&embeddings[emb_idx]);
+            }
+        }
+
+        Ok(BackendOutput {
+            float_outputs: vec![all_embeddings],
+            string_outputs: vec![],
+            row_status,
+            row_errors,
+            shapes: vec![(num_rows, hidden_size)],
+        })
+    }
+
+    fn forward_audio_embedding(&self, content: &[arrow::array::ArrayRef]) -> Result<BackendOutput> {
+        let audio = self.audio.as_deref().ok_or_else(|| {
+            JammiError::Inference("No audio model loaded for audio embedding".into())
+        })?;
+
+        let clips = arrow_to_audio(content)?;
+        let num_rows = clips.len();
+
+        if num_rows == 0 {
+            return Ok(BackendOutput {
+                float_outputs: vec![vec![]],
+                string_outputs: vec![],
+                row_status: vec![],
+                row_errors: vec![],
+                shapes: vec![(0, self.dimensions.hidden_size)],
+            });
+        }
+
+        let mut row_status = vec![true; num_rows];
+        let mut row_errors = vec![String::new(); num_rows];
+        let mut valid_indices = Vec::new();
+        let mut valid_clips = Vec::new();
+
+        for (i, clip) in clips.into_iter().enumerate() {
+            match clip {
+                Some(c) => {
+                    valid_indices.push(i);
+                    valid_clips.push(c);
+                }
+                None => {
+                    row_status[i] = false;
+                    row_errors[i] = "Null or missing audio input".into();
+                }
+            }
+        }
+
+        let hidden_size = self.dimensions.hidden_size;
+        let mut all_embeddings = vec![0.0_f32; num_rows * hidden_size];
+
+        if !valid_clips.is_empty() {
+            let mel = audio_preprocess::preprocess_audio_batch(
+                &valid_clips,
+                audio.n_mels(),
+                audio.n_frames(),
+                audio.n_fft(),
+                audio.hop_length(),
+                audio.sample_rate(),
+                &self.device,
+            )?;
+
+            // The CLAP audio tower emits L2-normalized embeddings directly
+            // (like the text tower), so no further normalization is applied —
+            // unlike the vision tower whose raw output is normalized here.
+            let normalized = audio.forward_audio(&mel)?;
+
+            let normalized_f32 = if normalized.dtype() == DType::F32 {
+                normalized
+            } else {
+                normalized.to_dtype(DType::F32).map_err(|e| {
+                    JammiError::Inference(format!("Audio embedding dtype cast: {e}"))
                 })?
             };
             let embeddings = normalized_f32
@@ -715,7 +837,16 @@ impl ModelBackend for CandleBackend {
 
         let is_classification = resolved.task == ModelTask::Classification && id2label.is_some();
         let is_ner = resolved.task == ModelTask::Ner && id2label.is_some();
-        let is_open_clip = resolved.model_config.get("model_cfg").is_some();
+        // CLAP audio checkpoints carry `model_cfg.audio_cfg`; OpenCLIP vision
+        // checkpoints carry `model_cfg.vision_cfg`. The two are disjoint — a
+        // pure-audio CLAP config has no `vision_cfg` — so the audio branch is
+        // checked first and OpenCLIP detection stays unchanged for the vision
+        // case it already handled.
+        let is_clap = resolved
+            .model_config
+            .pointer("/model_cfg/audio_cfg")
+            .is_some();
+        let is_open_clip = !is_clap && resolved.model_config.get("model_cfg").is_some();
 
         // Normalize DistilBERT config fields to standard BERT names.
         // DistilBERT uses dim/n_heads/n_layers/hidden_dim instead of
@@ -782,15 +913,37 @@ impl ModelBackend for CandleBackend {
             resolved.weights_paths.iter().map(|p| p.as_path()).collect();
         let dummy_varmap = VarMap::new();
 
-        // Branch: cross-modal CLIP model (OpenCLIP — both vision and text
-        // towers in one checkpoint, shared latent space) vs text-only model
-        // (BERT family). OpenCLIP models always carry both towers; routing
-        // between them in `forward()` is by `ModelTask`.
+        // Branch: cross-modal model selection.
+        //   - CLAP (`model_cfg.audio_cfg`): a single audio tower producing
+        //     shared-latent embeddings; routed in `forward()` by
+        //     `ModelTask::AudioEmbedding`.
+        //   - OpenCLIP (`model_cfg.vision_cfg`): both vision and text towers in
+        //     one checkpoint, routed by `ModelTask::{Image,Text}Embedding`.
+        //   - otherwise: text-only (BERT family).
         #[allow(clippy::type_complexity)]
-        let (text, vision): (
+        let (text, vision, audio): (
             Option<Box<dyn CandleTextForward>>,
             Option<Box<dyn CandleVisionForward>>,
-        ) = if is_open_clip {
+            Option<Box<dyn CandleAudioForward>>,
+        ) = if is_clap {
+            let audio_config =
+                ClapAudioConfig::from_clap_config(&resolved.model_config).map_err(|e| {
+                    JammiError::Model {
+                        model_id: resolved.model_id.0.clone(),
+                        message: format!("Failed to parse CLAP audio config: {e}"),
+                    }
+                })?;
+            let audio_inner =
+                ClapAudio::load(vb.pp("audio"), &audio_config).map_err(|e| JammiError::Model {
+                    model_id: resolved.model_id.0.clone(),
+                    message: format!("Failed to construct CLAP audio tower: {e}"),
+                })?;
+            (
+                None,
+                None,
+                Some(Box::new(audio_inner) as Box<dyn CandleAudioForward>),
+            )
+        } else if is_open_clip {
             let vision_config = OpenClipVisionConfig::from_open_clip_config(&resolved.model_config)
                 .map_err(|e| JammiError::Model {
                     model_id: resolved.model_id.0.clone(),
@@ -816,6 +969,7 @@ impl ModelBackend for CandleBackend {
             (
                 Some(Box::new(OpenClipTextForward(text_inner)) as Box<dyn CandleTextForward>),
                 Some(Box::new(vision_inner) as Box<dyn CandleVisionForward>),
+                None,
             )
         } else {
             let text_inner: Box<dyn CandleTextForward> = match model_type {
@@ -971,7 +1125,7 @@ impl ModelBackend for CandleBackend {
                     });
                 }
             };
-            (Some(text_inner), None)
+            (Some(text_inner), None, None)
         };
 
         let tokenizer = resolved
@@ -1033,6 +1187,7 @@ impl ModelBackend for CandleBackend {
             dimensions,
             text,
             vision,
+            audio,
             tokenizer,
             device,
             projection_head,

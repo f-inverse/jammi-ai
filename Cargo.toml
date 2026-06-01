@@ -70,6 +70,9 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 usearch = "2.25"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Pure-Rust audio container demux + codec decode for the audio-embedding path
+# (bytes-in: WAV/FLAC/MP3/Ogg-Vorbis). No system libraries — hermetic builds.
+symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm", "flac", "mp3", "ogg", "vorbis"] }
 
 # Python bindings
 # `extension-module` is *not* enabled at the workspace dep level — the

@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod audio_preprocess;
 pub mod image_preprocess;
 pub mod observer;
 pub mod runner;
@@ -178,6 +179,95 @@ pub fn arrow_to_images(columns: &[ArrayRef]) -> Result<Vec<Option<DynamicImage>>
     }
 
     Ok(images)
+}
+
+/// Extract and decode audio clips from an Arrow column.
+///
+/// Supports two input modes, mirroring [`arrow_to_images`]:
+/// - `Utf8` / `LargeUtf8`: values are file paths, read and decoded from disk.
+/// - `Binary` / `LargeBinary` / `BinaryView`: values are encoded audio bytes
+///   (WAV/FLAC/MP3/Ogg), decoded in memory.
+///
+/// Each value is decoded to mono PCM via
+/// [`audio_preprocess::decode_audio_bytes`]. Null values produce `None`
+/// (caller tracks via `row_status`).
+pub fn arrow_to_audio(columns: &[ArrayRef]) -> Result<Vec<Option<audio_preprocess::DecodedAudio>>> {
+    if columns.is_empty() {
+        return Err(JammiError::Inference("No audio columns provided".into()));
+    }
+    // Use the first column only (audio embedding expects a single column).
+    let col = &columns[0];
+    let row_count = col.len();
+    let mut clips = Vec::with_capacity(row_count);
+
+    for i in 0..row_count {
+        if col.is_null(i) {
+            clips.push(None);
+            continue;
+        }
+        let bytes: std::borrow::Cow<[u8]> = match col.data_type() {
+            DataType::Utf8 => {
+                let path = col
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .map(|a| a.value(i))
+                    .ok_or_else(|| {
+                        JammiError::Inference(format!("Failed to read path at row {i}"))
+                    })?;
+                std::borrow::Cow::Owned(std::fs::read(path).map_err(|e| {
+                    JammiError::Inference(format!("Failed to read audio file '{path}': {e}"))
+                })?)
+            }
+            DataType::LargeUtf8 => {
+                let path = col
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .map(|a| a.value(i))
+                    .ok_or_else(|| {
+                        JammiError::Inference(format!("Failed to read path at row {i}"))
+                    })?;
+                std::borrow::Cow::Owned(std::fs::read(path).map_err(|e| {
+                    JammiError::Inference(format!("Failed to read audio file '{path}': {e}"))
+                })?)
+            }
+            DataType::Binary => std::borrow::Cow::Borrowed(
+                col.as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .map(|a| a.value(i))
+                    .ok_or_else(|| {
+                        JammiError::Inference(format!("Failed to read bytes at row {i}"))
+                    })?,
+            ),
+            DataType::LargeBinary => std::borrow::Cow::Borrowed(
+                col.as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .map(|a| a.value(i))
+                    .ok_or_else(|| {
+                        JammiError::Inference(format!("Failed to read bytes at row {i}"))
+                    })?,
+            ),
+            DataType::BinaryView => std::borrow::Cow::Borrowed(
+                col.as_any()
+                    .downcast_ref::<BinaryViewArray>()
+                    .map(|a| a.value(i))
+                    .ok_or_else(|| {
+                        JammiError::Inference(format!("Failed to read bytes at row {i}"))
+                    })?,
+            ),
+            dt => {
+                return Err(JammiError::Inference(format!(
+                    "Unsupported column type for audio input: {dt}. \
+                     Expected Utf8 (file paths) or Binary (audio bytes)"
+                )));
+            }
+        };
+        let decoded = audio_preprocess::decode_audio_bytes(&bytes).map_err(|e| {
+            JammiError::Inference(format!("Failed to decode audio at row {i}: {e}"))
+        })?;
+        clips.push(Some(decoded));
+    }
+
+    Ok(clips)
 }
 
 /// Slice a set of columns to a sub-range.

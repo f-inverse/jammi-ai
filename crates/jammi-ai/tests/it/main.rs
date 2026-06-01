@@ -7,6 +7,7 @@ mod encoder_adapters;
 mod evaluation;
 mod fine_tune;
 mod inference;
+mod local_session;
 mod merger;
 mod models;
 mod pipeline;

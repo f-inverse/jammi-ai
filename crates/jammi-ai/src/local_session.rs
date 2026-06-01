@@ -28,7 +28,7 @@
 //!   `Vec<RecordBatch>` out. The fluent [`crate::search::SearchBuilder`] is an
 //!   internal mechanism `LocalSession` drives — never the return type.
 //! * **Fine-tune** returns a job **id**; status is polled by id through
-//!   [`Session::fine_tune_status`]. The in-process [`crate::fine_tune::FineTuneJob`]
+//!   [`Session::fine_tune_status`]. The in-process `FineTuneJob`
 //!   handle never escapes.
 //! * **Audit** is three flat methods rather than a borrow-scoped handle.
 //! * **Subscribe** returns a `Pin<Box<dyn Stream>>`, the transport-neutral
@@ -106,7 +106,7 @@ pub struct SearchRequest {
 }
 
 /// Identifier of a fine-tune job started through [`Session::fine_tune`].
-/// Returned in place of the in-process [`crate::fine_tune::FineTuneJob`] handle
+/// Returned in place of the in-process `FineTuneJob` handle
 /// so the job is addressable across a transport boundary; poll it with
 /// [`Session::fine_tune_status`].
 #[derive(Debug, Clone, PartialEq, Eq)]

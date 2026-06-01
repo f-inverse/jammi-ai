@@ -200,13 +200,20 @@ impl JammiSession {
             Arc::clone(&mutable),
         ));
 
+        // The session's driver cache carries the deploy-wide `[storage.cloud]`
+        // credentials as its default. Every `driver_for(url, None)` — source
+        // reads, result-table reads/writes, cleanup — falls back to it, so a
+        // wire `AddSource("r2://…")` (no inline creds) and the result root
+        // both resolve with the configured credentials.
+        let storage_registry = StorageRegistry::with_default_cloud(config.storage.cloud.clone());
+
         let session = Self {
             ctx,
             catalog,
             config,
             tenant: tenant_binding,
             source_tenant_columns,
-            storage_registry: StorageRegistry::new(),
+            storage_registry,
             mutable,
             mutable_schema,
             trigger_broker,

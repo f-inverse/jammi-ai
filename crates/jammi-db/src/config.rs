@@ -5,6 +5,7 @@ use std::str::FromStr;
 use serde::Deserialize;
 
 use crate::error::{JammiError, Result};
+use crate::storage::CloudConfig;
 
 // ─── Config-layer enums ─────────────────────────────────────────────────────
 
@@ -182,6 +183,64 @@ pub struct JammiConfig {
     pub catalog: CatalogConfig,
     /// Trigger broker selection. Default: in-process [`crate::trigger::InMemoryBroker`].
     pub broker: BrokerConfig,
+    /// Object-storage selection for result tables and cloud sources. Default:
+    /// empty — result tables live on local disk under `artifact_dir` and
+    /// `r2://`/`s3://`/`gs://`/`azure://` sources resolve via the SDK's
+    /// default credential chain.
+    pub storage: StorageConfig,
+}
+
+/// Object-storage configuration for Jammi-owned result tables and for
+/// resolving cloud data sources.
+///
+/// Both fields are optional. When `result_root` is unset, result tables
+/// (Parquet + USearch sidecar indexes) live on local disk under
+/// `{artifact_dir}/jammi_db/` — today's behaviour. When set, it is a storage
+/// URL (`r2://bucket/prefix`, `s3://bucket/prefix`, `gs://…`, `azure://…`,
+/// or a local `file:///…`) the session roots every new result table under.
+///
+/// `cloud` carries the driver credentials. It is the **default** cloud config
+/// the session threads to every object-store driver it builds — for the result
+/// root *and* for a wire `AddSource("r2://…")` whose `SourceConnection` carries
+/// no inline credentials. Secrets are not required here: the S3/R2 drivers read
+/// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_ENDPOINT_URL` from the
+/// process environment (`AmazonS3Builder::from_env`), so a deployer can supply
+/// only the non-secret bits in the TOML and inject the access key + secret as
+/// container env vars.
+///
+/// # TOML — Cloudflare R2 result tables
+///
+/// ```toml
+/// [storage]
+/// result_root = "r2://jammi-results/prod"
+///
+/// [storage.cloud]
+/// kind = "r2"
+/// account_id = "abc123def456"
+/// # access_key_id / secret_access_key come from the environment:
+/// #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+/// ```
+///
+/// # TOML — S3 with an explicit region, secrets from env
+///
+/// ```toml
+/// [storage]
+/// result_root = "s3://jammi-results/prod"
+///
+/// [storage.cloud]
+/// kind = "s3"
+/// region = "us-east-1"
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct StorageConfig {
+    /// Storage URL the session roots result tables under. `None` → local
+    /// `{artifact_dir}/jammi_db/`.
+    pub result_root: Option<String>,
+    /// Default per-cloud driver credentials. Threaded to every driver the
+    /// session builds for the result root and for cloud sources. `None` → the
+    /// SDK default credential chain (env vars, instance profile, …).
+    pub cloud: Option<CloudConfig>,
 }
 
 /// Catalog backend selection. The catalog and the mutable companion tables
@@ -448,6 +507,7 @@ impl Default for JammiConfig {
             logging: LoggingConfig::default(),
             catalog: CatalogConfig::default(),
             broker: BrokerConfig::default(),
+            storage: StorageConfig::default(),
         }
     }
 }
@@ -573,6 +633,12 @@ impl JammiConfig {
             None => Self::default(),
         };
         config.apply_env_overrides();
+        // Catch a partial cloud-credential set (e.g. an R2 `access_key_id`
+        // without its `secret_access_key`) at load time rather than deep
+        // inside the first object-store request.
+        if let Some(cloud) = &config.storage.cloud {
+            cloud.validate()?;
+        }
         Ok(config)
     }
 
@@ -899,6 +965,90 @@ mod tests {
         let cfg = JammiConfig::default();
         assert_eq!(cfg.catalog, CatalogConfig::Sqlite { path: None });
         assert_eq!(cfg.broker, BrokerConfig::InMemory);
+    }
+
+    #[test]
+    fn storage_config_default_is_local() {
+        let cfg = JammiConfig::default();
+        assert!(cfg.storage.result_root.is_none());
+        assert!(cfg.storage.cloud.is_none());
+    }
+
+    #[test]
+    fn storage_config_round_trip_r2() {
+        // Secrets (access_key_id / secret_access_key) are deliberately absent:
+        // they come from the container's AWS_* env vars at driver-build time.
+        let toml_src = r#"
+            [storage]
+            result_root = "r2://jammi-results/prod"
+
+            [storage.cloud]
+            kind = "r2"
+            account_id = "abc123def456"
+        "#;
+        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(
+            cfg.storage.result_root.as_deref(),
+            Some("r2://jammi-results/prod")
+        );
+        match cfg.storage.cloud {
+            Some(CloudConfig::R2(r2)) => {
+                assert_eq!(r2.account_id.as_deref(), Some("abc123def456"));
+                assert!(r2.access_key_id.is_none());
+                assert!(r2.secret_access_key.is_none());
+            }
+            other => panic!("expected R2 cloud config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn storage_config_round_trip_s3() {
+        let toml_src = r#"
+            [storage]
+            result_root = "s3://jammi-results/prod"
+
+            [storage.cloud]
+            kind = "s3"
+            region = "us-east-1"
+        "#;
+        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(
+            cfg.storage.result_root.as_deref(),
+            Some("s3://jammi-results/prod")
+        );
+        match cfg.storage.cloud {
+            Some(CloudConfig::S3(s3)) => {
+                assert_eq!(s3.region.as_deref(), Some("us-east-1"));
+                assert!(s3.access_key_id.is_none());
+            }
+            other => panic!("expected S3 cloud config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_partial_r2_credentials() {
+        // account_id + access_key_id but no secret — the fail-closed
+        // CloudConfig::validate must reject this at load time.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jammi.toml");
+        std::fs::write(
+            &path,
+            r#"
+                [storage]
+                result_root = "r2://bucket/prefix"
+
+                [storage.cloud]
+                kind = "r2"
+                account_id = "abc"
+                access_key_id = "only-the-key"
+            "#,
+        )
+        .unwrap();
+        let err = JammiConfig::load(Some(&path)).unwrap_err();
+        assert!(
+            matches!(err, JammiError::Storage(_)),
+            "expected a Storage validation error, got {err:?}"
+        );
     }
 
     #[test]

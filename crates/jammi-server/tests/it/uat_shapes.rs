@@ -169,6 +169,7 @@ async fn shape_c_multi_tenant_server_isolates_two_tenants_across_primitives() {
             binding,
             store_for_grpc,
             Some(trigger),
+            None,
             async move {
                 let _ = shutdown_rx.await;
             },

@@ -1,0 +1,112 @@
+syntax = "proto3";
+
+package jammi.v1.embedding;
+
+import "google/protobuf/empty.proto";
+
+// EmbeddingService — the wire surface for the engine's audio-embedding
+// verbs. These are imperative session methods, not SQL queries, so they
+// live as typed gRPC RPCs alongside SessionService / TriggerService rather
+// than on the Flight SQL surface (which carries query/result only, per
+// ADR-01 §3.2).
+//
+// Each verb delegates 1:1 to an `InferenceSession` method introduced by the
+// audio-embedding path (JA1) — the service reimplements no decode, log-mel,
+// or forward logic; it is purely a wire adapter over the in-process engine.
+// Jammi stays non-generative: these encode audio → vector, never generate.
+//
+// Tenant scope is read from the request's `SessionTenant` extension, set by
+// the shared TenantInterceptor from the `jammi-session-id` header — the same
+// mechanism SessionService / TriggerService / Flight SQL already use.
+service EmbeddingService {
+  // Register a data source so a later GenerateAudioEmbeddings call can scan
+  // it. Peer of the engine's `add_source`. Idempotent only insofar as the
+  // engine allows — re-registering an id that already exists is an error.
+  rpc AddSource(AddSourceRequest) returns (google.protobuf.Empty);
+
+  // Scan `audio_column` (raw encoded audio bytes) on a registered source,
+  // run decode → resample → log-mel → audio tower for every row, persist one
+  // L2-normalized vector per row keyed by `key_column`, and return the
+  // result-table record. Peer of the engine's `generate_audio_embeddings`.
+  rpc GenerateAudioEmbeddings(GenerateAudioEmbeddingsRequest)
+      returns (ResultTable);
+
+  // Encode a single audio clip (WAV/FLAC/MP3/Ogg bytes) into one
+  // L2-normalized embedding. Peer of the engine's `encode_audio_query`.
+  rpc EncodeAudioQuery(EncodeAudioQueryRequest)
+      returns (EncodeAudioQueryResponse);
+}
+
+// Source backend kind. Mirrors the engine's `SourceType`; the audio path
+// reads encoded bytes out of a file-shaped source, but the verb stays
+// general so the same surface registers any source the engine supports.
+enum SourceKind {
+  SOURCE_KIND_UNSPECIFIED = 0;
+  SOURCE_KIND_FILE = 1;
+  SOURCE_KIND_POSTGRES = 2;
+  SOURCE_KIND_MYSQL = 3;
+}
+
+// File format for a file-shaped source. Mirrors the engine's `FileFormat`.
+enum FileFormat {
+  FILE_FORMAT_UNSPECIFIED = 0;
+  FILE_FORMAT_PARQUET = 1;
+  FILE_FORMAT_CSV = 2;
+  FILE_FORMAT_JSON = 3;
+  FILE_FORMAT_AVRO = 4;
+}
+
+// Connection parameters for a source. Maps onto the engine's
+// `SourceConnection`; only the fields a wire client needs to register a
+// file-shaped audio corpus are exposed (storage URL + format). Cloud
+// credentials are configured server-side, not carried on the wire.
+message SourceConnection {
+  // Storage URL (file://, s3://, gs://, azure://) or external-source
+  // connection string (postgres://, mysql://).
+  string url = 1;
+  // File format — required for a FILE source, ignored otherwise.
+  FileFormat format = 2;
+}
+
+message AddSourceRequest {
+  string source_id = 1;
+  SourceKind source_kind = 2;
+  SourceConnection connection = 3;
+}
+
+message GenerateAudioEmbeddingsRequest {
+  // Registered source to scan.
+  string source_id = 1;
+  // Audio encoder model. `local:<path>`, an HF repo id, or a fine-tuned id.
+  string model_id = 2;
+  // Column holding raw encoded audio bytes.
+  string audio_column = 3;
+  // Column whose value becomes each embedding row's key.
+  string key_column = 4;
+}
+
+// Subset of the engine's `ResultTableRecord` a client needs to locate and
+// query the persisted embedding table. Internal bookkeeping columns
+// (parquet/index paths, timestamps) stay server-side.
+message ResultTable {
+  string table_name = 1;
+  string source_id = 2;
+  string model_id = 3;
+  // Embedding dimensionality; unset on the wire as 0 when the engine did
+  // not record one (an empty source produces no vectors).
+  int32 dimensions = 4;
+  uint64 row_count = 5;
+  // Lifecycle status reported by the engine ("ready" on success).
+  string status = 6;
+}
+
+message EncodeAudioQueryRequest {
+  string model_id = 1;
+  // Encoded audio clip (WAV/FLAC/MP3/Ogg).
+  bytes audio_bytes = 2;
+}
+
+message EncodeAudioQueryResponse {
+  // The L2-normalized embedding for the clip.
+  repeated float embedding = 1;
+}

@@ -5,6 +5,7 @@ fn main() {
     let proto_files = vec![
         proto_root.join("jammi/v1/session.proto"),
         proto_root.join("jammi/v1/trigger.proto"),
+        proto_root.join("jammi/v1/embedding.proto"),
     ];
 
     for f in &proto_files {

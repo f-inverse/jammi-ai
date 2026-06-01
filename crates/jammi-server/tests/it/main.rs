@@ -4,6 +4,7 @@ mod grpc_embedding;
 mod grpc_eval;
 mod grpc_fine_tune;
 mod grpc_inference;
+mod grpc_mutable_topic_audit;
 mod grpc_session;
 mod grpc_trigger;
 mod grpc_web;

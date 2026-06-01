@@ -1,7 +1,12 @@
 //! `TriggerService` gRPC implementation.
 //!
-//! Three methods land on the wire surface per ADR-01 §5.1:
+//! Five methods land on the wire surface (ADR-01 §5.1, extended with the
+//! topic-admin verbs):
 //!
+//! * `RegisterTopic` — unary; decodes the Arrow IPC schema, mints a topic id,
+//!   and registers the topic (and its backing table) via the `TopicRepo`.
+//! * `DropTopic` — unary; resolves the topic by name (tenant-scoped) and drops
+//!   it; `if_exists` turns a missing topic into a no-op.
 //! * `Publish` — unary; encodes the request batch through Arrow IPC,
 //!   delegates to the engine's `Publisher` (transactional outbox), and
 //!   returns the assigned offset and commit timestamp.
@@ -16,6 +21,7 @@
 //! when the session tenant is unset — a session-bound tenant cannot
 //! sidestep its scope by setting `tenant_id` on the body.
 
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -31,6 +37,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use jammi_db::catalog::topic_repo::TopicRepo;
+use jammi_db::trigger::ids::TopicId;
 use jammi_db::trigger::{
     DeliveredBatch, Offset, Predicate, Publisher, Subscriber, TopicDefinition, TriggerError,
 };
@@ -38,11 +45,12 @@ use jammi_db::TenantId;
 
 use crate::grpc::proto::trigger::trigger_service_server::TriggerService;
 use crate::grpc::proto::trigger::{
-    ArrowBatch, ListTopicsRequest, ListTopicsResponse, PublishRequest, PublishResponse,
-    SubscribeRequest, SubscribedBatch, TopicName,
+    ArrowBatch, DropTopicRequest, ListTopicsRequest, ListTopicsResponse, PublishRequest,
+    PublishResponse, RegisterTopicRequest, RegisterTopicResponse, SubscribeRequest,
+    SubscribedBatch, TopicName,
 };
 use crate::grpc::session::SessionTenant;
-use crate::grpc::wire::{decode_ipc_stream, encode_ipc_stream};
+use crate::grpc::wire::{decode_ipc_schema, decode_ipc_stream, encode_ipc_stream};
 
 /// Server-side handler for the trigger-stream gRPC surface. Holds shared
 /// references to the engine-side publisher, subscriber, topic catalog repo,
@@ -78,6 +86,56 @@ const SUBSCRIBE_BUFFER: usize = 256;
 impl TriggerService for TriggerServer {
     type SubscribeStream =
         Pin<Box<dyn Stream<Item = Result<SubscribedBatch, Status>> + Send + 'static>>;
+
+    async fn register_topic(
+        &self,
+        request: Request<RegisterTopicRequest>,
+    ) -> Result<Response<RegisterTopicResponse>, Status> {
+        let tenant = resolve_tenant(&request, None)?;
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        let schema = decode_ipc_schema(&req.schema)?;
+        let broker_metadata: BTreeMap<String, String> = req.broker_metadata.into_iter().collect();
+        let topic = TopicDefinition {
+            id: TopicId::new(),
+            name: req.name,
+            schema,
+            tenant,
+            broker_metadata,
+        };
+        self.topic_repo
+            .register_topic(&topic)
+            .await
+            .map_err(map_trigger_error)?;
+        Ok(Response::new(RegisterTopicResponse {
+            topic_id: topic.id.to_string(),
+        }))
+    }
+
+    async fn drop_topic(&self, request: Request<DropTopicRequest>) -> Result<Response<()>, Status> {
+        let tenant = resolve_tenant(&request, None)?;
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        let topic = self
+            .topic_repo
+            .lookup_by_name(&req.name, tenant)
+            .await
+            .map_err(map_trigger_error)?;
+        match topic {
+            Some(topic) => self
+                .topic_repo
+                .drop_topic(topic.id, tenant)
+                .await
+                .map_err(map_trigger_error)
+                .map(Response::new),
+            None if req.if_exists => Ok(Response::new(())),
+            None => Err(Status::not_found(format!("topic '{}' not found", req.name))),
+        }
+    }
 
     async fn publish(
         &self,

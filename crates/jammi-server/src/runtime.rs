@@ -36,14 +36,20 @@ use tonic_web::GrpcWebLayer;
 
 use crate::error::fallback_handler;
 use crate::flight::TenantBoundProvider;
+use crate::grpc::audit::AuditServer;
+use crate::grpc::channel::ChannelServer;
 use crate::grpc::embedding::EmbeddingServer;
 use crate::grpc::eval::EvalServer;
 use crate::grpc::fine_tune::FineTuneServer;
 use crate::grpc::inference::InferenceServer;
+use crate::grpc::mutable_table::MutableTableServer;
+use crate::grpc::proto::audit::audit_service_server::AuditServiceServer;
+use crate::grpc::proto::channel::channel_service_server::ChannelServiceServer;
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingServiceServer;
 use crate::grpc::proto::eval::eval_service_server::EvalServiceServer;
 use crate::grpc::proto::fine_tune::fine_tune_service_server::FineTuneServiceServer;
 use crate::grpc::proto::inference::inference_service_server::InferenceServiceServer;
+use crate::grpc::proto::mutable_table::mutable_table_service_server::MutableTableServiceServer;
 use crate::grpc::proto::session::session_service_server::SessionServiceServer;
 use crate::grpc::proto::trigger::trigger_service_server::TriggerServiceServer;
 use crate::grpc::session::{SessionServer, SessionStore, TenantInterceptor};
@@ -301,16 +307,17 @@ impl OssServer {
 
 /// Build and run the gRPC chain (Flight SQL + SessionService +
 /// TriggerService + EmbeddingService + InferenceService + EvalService +
-/// FineTuneService) on `addr`, sharing the supplied `SessionStore` between
-/// every service. Trigger handles and the engine session are optional —
-/// passing `None` keeps that surface unmounted, which is what the gRPC-Web and
-/// `JammiSession`-only fixtures need (the engine-backed services operate at the
-/// `InferenceSession` layer those fixtures don't construct).
+/// FineTuneService + MutableTableService + ChannelService + AuditService) on
+/// `addr`, sharing the supplied `SessionStore` between every service. Trigger
+/// handles and the engine session are optional — passing `None` keeps that
+/// surface unmounted, which is what the gRPC-Web and `JammiSession`-only
+/// fixtures need (the engine-backed services operate at the `InferenceSession`
+/// layer those fixtures don't construct).
 ///
-/// The `engine` session backs all four engine-layer services
-/// (`EmbeddingService`, `InferenceService`, `EvalService`, `FineTuneService`);
-/// they share one `Arc<InferenceSession>` and each wraps it in a per-call
-/// `LocalSession`.
+/// The `engine` session backs all of the engine-layer services
+/// (`EmbeddingService`, `InferenceService`, `EvalService`, `FineTuneService`,
+/// `MutableTableService`, `ChannelService`, `AuditService`); they share one
+/// `Arc<InferenceSession>` and each wraps it in a per-call `LocalSession`.
 ///
 /// This is the test-fixture entry-point. Production code goes
 /// through [`OssServer::run`] which derives every component from
@@ -372,10 +379,31 @@ pub async fn serve_grpc_chain(
         builder = builder.add_service(eval_svc);
         mounted.push("EvalService");
 
-        let fine_tune_svc =
-            FineTuneServiceServer::with_interceptor(FineTuneServer::new(session), interceptor);
+        let fine_tune_svc = FineTuneServiceServer::with_interceptor(
+            FineTuneServer::new(Arc::clone(&session)),
+            interceptor.clone(),
+        );
         builder = builder.add_service(fine_tune_svc);
         mounted.push("FineTuneService");
+
+        let mutable_svc = MutableTableServiceServer::with_interceptor(
+            MutableTableServer::new(Arc::clone(&session)),
+            interceptor.clone(),
+        );
+        builder = builder.add_service(mutable_svc);
+        mounted.push("MutableTableService");
+
+        let channel_svc = ChannelServiceServer::with_interceptor(
+            ChannelServer::new(Arc::clone(&session)),
+            interceptor.clone(),
+        );
+        builder = builder.add_service(channel_svc);
+        mounted.push("ChannelService");
+
+        let audit_svc =
+            AuditServiceServer::with_interceptor(AuditServer::new(session), interceptor);
+        builder = builder.add_service(audit_svc);
+        mounted.push("AuditService");
     }
 
     tracing::info!("gRPC chain ({}) listening on {addr}", mounted.join(" + "));

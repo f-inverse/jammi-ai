@@ -2,13 +2,25 @@ syntax = "proto3";
 
 package jammi.v1.trigger;
 
+import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
 
 // TriggerService — primitive pub/sub over Arrow record batches.
 //
-// Verb vocabulary is closed: Publish, Subscribe, ListTopics. No
-// domain-shaped verbs (no Discover, no Ingest*, no Run*). See ADR-01 §3.4.
+// Verb vocabulary is closed: RegisterTopic, DropTopic, Publish, Subscribe,
+// ListTopics. No domain-shaped verbs (no Discover, no Ingest*, no Run*). See
+// ADR-01 §3.4.
 service TriggerService {
+  // Register a topic (provisions its backing table) for the trigger stream.
+  // Peer of the abstraction's `register_topic`. The schema is the contract
+  // every published batch must satisfy.
+  rpc RegisterTopic(RegisterTopicRequest) returns (RegisterTopicResponse);
+
+  // Drop a topic and its backing table. Peer of the abstraction's
+  // `drop_topic`. `if_exists` makes a missing topic a no-op rather than a
+  // NotFound error.
+  rpc DropTopic(DropTopicRequest) returns (google.protobuf.Empty);
+
   // Publish a single batch to a topic. Unary RPC.
   rpc Publish(PublishRequest) returns (PublishResponse);
 
@@ -19,6 +31,28 @@ service TriggerService {
 
   // List topics registered in the catalog. Pagination follows AIP-132.
   rpc ListTopics(ListTopicsRequest) returns (ListTopicsResponse);
+}
+
+message RegisterTopicRequest {
+  // Fully-qualified catalog name for the topic.
+  string name = 1;
+  // Arrow schema for batch payloads, encoded as an Arrow IPC schema message
+  // (the same self-describing IPC framing the batch payloads use).
+  bytes schema = 2;
+  // Broker-driver-specific configuration (retention, replication, etc.),
+  // opaque to the engine. Empty == no driver metadata.
+  map<string, string> broker_metadata = 3;
+}
+
+message RegisterTopicResponse {
+  // The engine-minted topic id (UUID string).
+  string topic_id = 1;
+}
+
+message DropTopicRequest {
+  string name = 1;
+  // When true, a missing topic is a no-op instead of a NotFound error.
+  bool if_exists = 2;
 }
 
 // Topic identifier. Topics are catalog-registered (Phase 4); the name is

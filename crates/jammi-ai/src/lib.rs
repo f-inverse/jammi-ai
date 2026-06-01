@@ -17,6 +17,14 @@ pub mod pipeline;
 pub mod search;
 pub mod session;
 
+/// The gRPC wire surface: generated `jammi.v1` tonic stubs plus the
+/// proto↔domain conversions. Gated behind the default-off `wire` feature so a
+/// default / embedded build pulls no transport stack. `jammi-server` enables
+/// it for the server stubs + conversions; a future `RemoteSession` will reuse
+/// the same module's client stubs.
+#[cfg(feature = "wire")]
+pub mod wire;
+
 /// The transport-agnostic consumer surface: a closed `enum` over session
 /// transports, with the in-process [`local_session::LocalSession`] behind it.
 pub use local_session::{LocalSession, Modality, QueryInput, SearchQuery, SearchRequest, Session};

@@ -22,9 +22,9 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
+use jammi_ai::wire::parse_query_id;
 use jammi_ai::{AuditError, LocalSession, PerQueryAudit, Session};
 use tonic::{Request, Response, Status};
-use uuid::Uuid;
 
 use crate::grpc::proto::audit as pb;
 use crate::grpc::proto::audit::audit_service_server::AuditService;
@@ -87,7 +87,7 @@ impl AuditService for AuditServer {
         .map_err(map_audit_error)?;
 
         Ok(Response::new(pb::AuditFetchByQueryIdResponse {
-            record: record.map(record_to_proto),
+            record: record.map(Into::into),
         }))
     }
 
@@ -106,22 +106,17 @@ impl AuditService for AuditServer {
         .map_err(map_audit_error)?;
 
         Ok(Response::new(pb::AuditFetchRecentResponse {
-            records: records.into_iter().map(record_to_proto).collect(),
+            records: records.into_iter().map(Into::into).collect(),
         }))
     }
 }
 
-/// Parse a wire query-id string into a [`Uuid`].
-fn parse_query_id(id: &str) -> Result<Uuid, Status> {
-    if id.is_empty() {
-        return Err(Status::invalid_argument("query_id is required"));
-    }
-    Uuid::parse_str(id).map_err(|e| Status::invalid_argument(format!("invalid query_id: {e}")))
-}
-
-/// Build an engine [`PerQueryAudit`] from the wire message. Uses
-/// [`PerQueryAudit::new`] so the length-agreement invariant between
-/// `top_k_result_ids` and `retrieval_scores` is enforced at the boundary. The
+/// Build an engine [`PerQueryAudit`] from the wire message. This is the
+/// receive-side decode (not a pure wire conversion): it shares the query-id
+/// parse with the wire module but constructs the record through
+/// [`PerQueryAudit::new`] — enforcing the length-agreement invariant between
+/// `top_k_result_ids` and `retrieval_scores` at the boundary — and maps the
+/// resulting [`AuditError`] through the server's [`map_audit_error`]. The
 /// caller-supplied `tenant_id`/`signature`/`executed_at` are ignored — the
 /// engine stamps the tenant, signs, and timestamps on write.
 fn record_from_proto(p: pb::PerQueryAudit) -> Result<PerQueryAudit, Status> {
@@ -141,22 +136,6 @@ fn record_from_proto(p: pb::PerQueryAudit) -> Result<PerQueryAudit, Status> {
         p.retrieval_scores,
     )
     .map_err(map_audit_error)
-}
-
-/// Map an engine [`PerQueryAudit`] onto the wire message, carrying the tenant
-/// and signature the engine populated on the stored record.
-fn record_to_proto(r: PerQueryAudit) -> pb::PerQueryAudit {
-    pb::PerQueryAudit {
-        query_id: r.query_id.to_string(),
-        tenant_id: r.tenant_id.unwrap_or_default(),
-        model_id: r.model_id,
-        model_version: r.model_version,
-        query_lineage: r.query_lineage.to_string(),
-        top_k_result_ids: r.top_k_result_ids,
-        retrieval_scores: r.retrieval_scores,
-        executed_at_micros: r.executed_at.timestamp_micros(),
-        signature: r.signature,
-    }
 }
 
 /// Map an [`AuditError`] onto a gRPC [`Status`], preserving the failure kind so

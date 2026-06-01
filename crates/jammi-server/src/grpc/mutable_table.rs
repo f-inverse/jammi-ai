@@ -12,7 +12,8 @@
 //! session's resolved tenant onto the engine definition before registering it
 //! (the catalog row's `tenant_id` sink, matching the trigger DDL path). The
 //! schema rides as an Arrow IPC schema message decoded through the shared
-//! [`decode_ipc_schema`].
+//! `decode_ipc_schema` helper. The conversion itself is
+//! [`jammi_ai::wire::definition_from_proto`].
 //!
 //! Tenant scope is read from the request's [`crate::grpc::session::
 //! SessionTenant`] extension (set upstream by the shared `TenantInterceptor`)
@@ -22,18 +23,13 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
+use jammi_ai::wire::{definition_from_proto, parse_table_id};
 use jammi_ai::{LocalSession, Session};
-use jammi_db::store::mutable::{
-    MutableIndexDef, MutableTableDefinition, MutableTableDefinitionBuilder, MutableTableId,
-};
-use jammi_db::TenantId;
 use tonic::{Request, Response, Status};
 
 use crate::grpc::proto::mutable_table as pb;
 use crate::grpc::proto::mutable_table::mutable_table_service_server::MutableTableService;
-use crate::grpc::wire::{
-    decode_ipc_schema, map_engine_error, require_nonempty, scoped, session_tenant,
-};
+use crate::grpc::wire::{map_engine_error, scoped, session_tenant};
 
 /// Server-side handler for the mutable-table gRPC surface. Holds a shared engine
 /// session it wraps in a [`LocalSession`] per call to reach the unified
@@ -65,7 +61,7 @@ impl MutableTableService for MutableTableServer {
         let def_proto = req
             .definition
             .ok_or_else(|| Status::invalid_argument("definition is required"))?;
-        let def = build_definition(def_proto, tenant)?;
+        let def = definition_from_proto(def_proto, tenant)?;
         let session = self.local();
 
         let id = scoped(&self.session, tenant, || session.create_mutable_table(def))
@@ -92,50 +88,4 @@ impl MutableTableService for MutableTableServer {
 
         Ok(Response::new(()))
     }
-}
-
-/// Build the engine [`jammi_db::store::mutable::MutableTableDefinition`] from the
-/// wire message, stamping the resolved session `tenant` onto it (the wire body
-/// is tenant-free). All schema/primary-key/order-column validation is delegated
-/// to the engine builder so the wire path enforces the identical invariants the
-/// in-process path does.
-fn build_definition(
-    def: pb::MutableTableDefinition,
-    tenant: Option<TenantId>,
-) -> Result<MutableTableDefinition, Status> {
-    let id = parse_table_id(&def.id)?;
-    let schema = decode_ipc_schema(&def.schema)?;
-
-    let mut builder = MutableTableDefinitionBuilder::new(id, schema)
-        .primary_key(def.primary_key)
-        .tenant(tenant);
-
-    for idx in def.indexes {
-        builder = builder.index(MutableIndexDef {
-            name: idx.name,
-            columns: idx.columns,
-            unique: idx.unique,
-        });
-    }
-    if !def.order_column.is_empty() {
-        builder = builder.order_column(def.order_column);
-    }
-    if def.chunk_size != 0 {
-        builder = builder.chunk_size(def.chunk_size as usize);
-    }
-    if !def.user_metadata.is_empty() {
-        let value: serde_json::Value = serde_json::from_str(&def.user_metadata)
-            .map_err(|e| Status::invalid_argument(format!("user_metadata is not JSON: {e}")))?;
-        builder = builder.user_metadata(value);
-    }
-
-    builder
-        .build()
-        .map_err(|e| Status::invalid_argument(e.to_string()))
-}
-
-/// Parse a wire id string into a validated [`MutableTableId`].
-fn parse_table_id(id: &str) -> Result<MutableTableId, Status> {
-    require_nonempty(id, "mutable_table_id")?;
-    MutableTableId::new(id).map_err(|e| Status::invalid_argument(e.to_string()))
 }

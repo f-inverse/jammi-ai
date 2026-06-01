@@ -27,30 +27,27 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use futures::Stream;
 use futures::StreamExt;
-use prost_types::Timestamp;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+use jammi_ai::wire::{
+    decode_ipc_schema, decode_publish_batch, encode_delivered_batch, to_proto_timestamp,
+};
 use jammi_db::catalog::topic_repo::TopicRepo;
 use jammi_db::trigger::ids::TopicId;
-use jammi_db::trigger::{
-    DeliveredBatch, Offset, Predicate, Publisher, Subscriber, TopicDefinition, TriggerError,
-};
+use jammi_db::trigger::{Offset, Predicate, Publisher, Subscriber, TopicDefinition, TriggerError};
 use jammi_db::TenantId;
 
 use crate::grpc::proto::trigger::trigger_service_server::TriggerService;
 use crate::grpc::proto::trigger::{
-    ArrowBatch, DropTopicRequest, ListTopicsRequest, ListTopicsResponse, PublishRequest,
-    PublishResponse, RegisterTopicRequest, RegisterTopicResponse, SubscribeRequest,
-    SubscribedBatch, TopicName,
+    DropTopicRequest, ListTopicsRequest, ListTopicsResponse, PublishRequest, PublishResponse,
+    RegisterTopicRequest, RegisterTopicResponse, SubscribeRequest, SubscribedBatch, TopicName,
 };
 use crate::grpc::session::SessionTenant;
-use crate::grpc::wire::{decode_ipc_schema, decode_ipc_stream, encode_ipc_stream};
 
 /// Server-side handler for the trigger-stream gRPC surface. Holds shared
 /// references to the engine-side publisher, subscriber, topic catalog repo,
@@ -147,7 +144,7 @@ impl TriggerService for TriggerServer {
         let batch = req
             .batch
             .ok_or_else(|| Status::invalid_argument("batch is required"))?;
-        let record_batch = decode_arrow_batch(&batch, &topic)?;
+        let record_batch = decode_publish_batch(&batch, &topic)?;
         let offset = self
             .publisher
             .publish_scoped(&topic, tenant, record_batch)
@@ -287,58 +284,6 @@ fn resolve_tenant<T>(
         .get::<SessionTenant>()
         .and_then(|s| s.0);
     Ok(session_tenant.or(body_override))
-}
-
-fn decode_arrow_batch(wire: &ArrowBatch, topic: &TopicDefinition) -> Result<RecordBatch, Status> {
-    // Per ADR-01 §5.1 the wire pairing is `data_header` + `data_body`; the
-    // shared decoder concatenates them and reads the IPC stream. A publish
-    // carries exactly one batch — reject an empty or multi-batch payload so a
-    // malformed publish is a typed client error, not a silent partial write.
-    let mut batches = decode_ipc_stream(&wire.data_header, &wire.data_body)?;
-    let batch = match batches.len() {
-        1 => batches.pop().expect("len checked == 1"),
-        0 => {
-            return Err(Status::invalid_argument(
-                "batch IPC stream contains no batch",
-            ))
-        }
-        n => {
-            return Err(Status::invalid_argument(format!(
-                "publish carries exactly one batch, got {n}"
-            )))
-        }
-    };
-    if batch.schema().as_ref() != topic.schema.as_ref() {
-        return Err(Status::invalid_argument(
-            "batch schema does not match topic schema",
-        ));
-    }
-    Ok(batch)
-}
-
-fn encode_delivered_batch(
-    schema: &arrow_schema::SchemaRef,
-    delivered: DeliveredBatch,
-) -> Result<SubscribedBatch, Status> {
-    // The `StreamWriter` format is a single contiguous IPC stream; surface it
-    // as one `data_body` payload with `data_header` empty — the shared decoder
-    // concatenates the two anyway, so the wire shape is symmetric.
-    let buf = encode_ipc_stream(schema, std::slice::from_ref(&delivered.batch))?;
-    Ok(SubscribedBatch {
-        offset: delivered.offset.value(),
-        produced_at: Some(to_proto_timestamp(delivered.produced_at)),
-        batch: Some(ArrowBatch {
-            data_header: Vec::new(),
-            data_body: buf,
-            app_metadata: Vec::new(),
-        }),
-    })
-}
-
-fn to_proto_timestamp(dt: chrono::DateTime<chrono::Utc>) -> Timestamp {
-    let seconds = dt.timestamp();
-    let nanos = dt.timestamp_subsec_nanos() as i32;
-    Timestamp { seconds, nanos }
 }
 
 fn map_trigger_error(err: TriggerError) -> Status {

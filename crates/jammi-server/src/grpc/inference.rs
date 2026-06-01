@@ -8,7 +8,7 @@
 //! `Session::infer` returns `Vec<RecordBatch>`; the handler carries them as one
 //! Arrow IPC stream in the response's `ArrowBatch` — the same Flight-IPC
 //! pairing `TriggerService` uses, encoded through the shared
-//! [`crate::grpc::wire::encode_ipc_stream`] helper.
+//! [`jammi_ai::wire::infer_result_to_proto`] helper.
 //!
 //! Tenant scope is read from the request's [`crate::grpc::session::
 //! SessionTenant`] extension (set upstream by the shared `TenantInterceptor`)
@@ -18,16 +18,13 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
+use jammi_ai::wire::{infer_result_to_proto, model_task_from_proto};
 use jammi_ai::{LocalSession, Session};
 use tonic::{Request, Response, Status};
 
 use crate::grpc::proto::inference::inference_service_server::InferenceService;
 use crate::grpc::proto::inference::{InferRequest, InferResponse};
-use crate::grpc::proto::trigger::ArrowBatch;
-use crate::grpc::wire::{
-    encode_ipc_stream, map_engine_error, model_task_from_proto, require_nonempty, scoped,
-    session_tenant,
-};
+use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant};
 
 /// Server-side handler for the inference gRPC surface. Holds a shared engine
 /// session it wraps in a [`LocalSession`] per call to reach the unified
@@ -79,23 +76,8 @@ impl InferenceService for InferenceServer {
         .await
         .map_err(map_engine_error)?;
 
-        // Carry the result rows as one self-describing IPC stream. An empty
-        // result (empty source) has no schema to encode, so it round-trips as
-        // an empty `ArrowBatch`.
-        let result = match batches.first() {
-            Some(first) => {
-                let body = encode_ipc_stream(&first.schema(), &batches)?;
-                ArrowBatch {
-                    data_header: Vec::new(),
-                    data_body: body,
-                    app_metadata: Vec::new(),
-                }
-            }
-            None => ArrowBatch::default(),
-        };
-
         Ok(Response::new(InferResponse {
-            result: Some(result),
+            result: Some(infer_result_to_proto(batches)?),
         }))
     }
 }

@@ -80,9 +80,11 @@ impl SessionStore {
     }
 }
 
-/// Header name carrying the session identifier. Clients must include this
-/// on every request that needs tenant-scoped semantics.
-pub const SESSION_HEADER: &str = "jammi-session-id";
+/// Header name carrying the session identifier. Clients must include this on
+/// every request that needs tenant-scoped semantics. Defined once in
+/// [`jammi_ai::wire`] (shared with a future remote client) and re-exported here
+/// so server-side callers and the integration tests keep their existing path.
+pub use jammi_ai::wire::SESSION_HEADER;
 
 /// Tonic gRPC service impl backed by a shared [`SessionStore`].
 #[derive(Debug, Clone)]

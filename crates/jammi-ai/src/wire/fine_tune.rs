@@ -1,0 +1,161 @@
+//! `FineTuneService` proto↔domain conversions.
+//!
+//! The request `FineTuneConfig` mirrors the engine's [`FineTuneConfig`] field
+//! for field; decode maps it (and its nested loss / enum types) onto the engine
+//! struct, leaving the engine's defaults for any field left `UNSPECIFIED` (an
+//! absent `config` message → the engine default entirely). Validation stays in
+//! the engine (`FineTuneConfig::validate`, called inside `fine_tune`); this is a
+//! pure shape map. `task` reuses `jammi.v1.inference.ModelTask` via the shared
+//! [`super::model_task_from_proto`].
+
+use tonic::Status;
+
+use crate::fine_tune::{
+    BackboneDtype, ClassificationLoss, EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig,
+    FineTuneMethod, LoraInitMode, LrSchedule,
+};
+
+use crate::wire::proto::fine_tune as pb;
+
+/// Map the wire [`pb::FineTuneMethod`] discriminant onto the engine's
+/// [`FineTuneMethod`]. An unspecified or unknown method is rejected — a request
+/// that names no method is a client error, not a silent default.
+pub fn method_from_proto(method: i32) -> Result<FineTuneMethod, Status> {
+    match pb::FineTuneMethod::try_from(method) {
+        Ok(pb::FineTuneMethod::Lora) => Ok(FineTuneMethod::Lora),
+        Ok(pb::FineTuneMethod::Unspecified) | Err(_) => {
+            Err(Status::invalid_argument("method must be specified"))
+        }
+    }
+}
+
+/// Map the wire [`pb::FineTuneConfig`] onto the engine's [`FineTuneConfig`].
+///
+/// Every numeric field carries straight through. The optional loss messages map
+/// to `Option<…Loss>` (unset → engine auto-selects from the data format). The
+/// enum-typed fields fall back to the engine default variant when left
+/// `UNSPECIFIED`, so a config that sets only the numeric knobs behaves exactly
+/// like `FineTuneConfig::default()` for the rest.
+impl TryFrom<pb::FineTuneConfig> for FineTuneConfig {
+    type Error = Status;
+
+    fn try_from(c: pb::FineTuneConfig) -> Result<Self, Self::Error> {
+        let defaults = FineTuneConfig::default();
+        Ok(FineTuneConfig {
+            lora_rank: c.lora_rank as usize,
+            lora_alpha: c.lora_alpha,
+            lora_dropout: c.lora_dropout,
+            learning_rate: c.learning_rate,
+            epochs: c.epochs as usize,
+            batch_size: c.batch_size as usize,
+            max_seq_length: c.max_seq_length as usize,
+            embedding_loss: c
+                .embedding_loss
+                .map(embedding_loss_from_proto)
+                .transpose()?,
+            classification_loss: c
+                .classification_loss
+                .map(classification_loss_from_proto)
+                .transpose()?,
+            gradient_accumulation_steps: c.gradient_accumulation_steps as usize,
+            validation_fraction: c.validation_fraction,
+            early_stopping_patience: c.early_stopping_patience as usize,
+            warmup_steps: c.warmup_steps as usize,
+            lr_schedule: lr_schedule_from_proto(c.lr_schedule, defaults.lr_schedule)?,
+            early_stopping_metric: early_stopping_metric_from_proto(
+                c.early_stopping_metric,
+                defaults.early_stopping_metric,
+            )?,
+            target_modules: c.target_modules,
+            layers_to_transform: c
+                .layers_to_transform
+                .map(|l| l.layers.into_iter().map(|n| n as usize).collect()),
+            use_rslora: c.use_rslora,
+            rank_pattern: c
+                .rank_pattern
+                .into_iter()
+                .map(|(k, v)| (k, v as usize))
+                .collect(),
+            init_lora_weights: lora_init_mode_from_proto(
+                c.init_lora_weights,
+                defaults.init_lora_weights,
+            )?,
+            backbone_dtype: backbone_dtype_from_proto(c.backbone_dtype, defaults.backbone_dtype)?,
+            weight_decay: c.weight_decay,
+            max_grad_norm: c.max_grad_norm,
+        })
+    }
+}
+
+/// Map the wire embedding-loss message onto the engine's [`EmbeddingLoss`]. A
+/// present message with no `loss` set is a malformed request.
+fn embedding_loss_from_proto(loss: pb::EmbeddingLoss) -> Result<EmbeddingLoss, Status> {
+    use pb::embedding_loss::Loss;
+    match loss.loss {
+        Some(Loss::CoSent(_)) => Ok(EmbeddingLoss::CoSent),
+        Some(Loss::Triplet(t)) => Ok(EmbeddingLoss::Triplet { margin: t.margin }),
+        Some(Loss::MultipleNegativesRanking(m)) => Ok(EmbeddingLoss::MultipleNegativesRanking {
+            temperature: m.temperature,
+        }),
+        None => Err(Status::invalid_argument(
+            "embedding_loss is set but carries no variant",
+        )),
+    }
+}
+
+/// Map the wire [`pb::ClassificationLoss`] onto the engine's
+/// [`ClassificationLoss`]. An unspecified value on a present field is a
+/// malformed request — omit the field instead to let the engine auto-select.
+fn classification_loss_from_proto(loss: i32) -> Result<ClassificationLoss, Status> {
+    match pb::ClassificationLoss::try_from(loss) {
+        Ok(pb::ClassificationLoss::CrossEntropy) => Ok(ClassificationLoss::CrossEntropy),
+        Ok(pb::ClassificationLoss::Unspecified) | Err(_) => Err(Status::invalid_argument(
+            "classification_loss is set but unspecified; omit it to auto-select",
+        )),
+    }
+}
+
+/// Map the wire [`pb::LrSchedule`]; `UNSPECIFIED` keeps the engine default.
+fn lr_schedule_from_proto(schedule: i32, default: LrSchedule) -> Result<LrSchedule, Status> {
+    match pb::LrSchedule::try_from(schedule) {
+        Ok(pb::LrSchedule::Unspecified) => Ok(default),
+        Ok(pb::LrSchedule::Constant) => Ok(LrSchedule::Constant),
+        Ok(pb::LrSchedule::CosineDecay) => Ok(LrSchedule::CosineDecay),
+        Ok(pb::LrSchedule::LinearDecay) => Ok(LrSchedule::LinearDecay),
+        Err(_) => Err(Status::invalid_argument("unknown lr_schedule")),
+    }
+}
+
+/// Map the wire [`pb::EarlyStoppingMetric`]; `UNSPECIFIED` keeps the default.
+fn early_stopping_metric_from_proto(
+    metric: i32,
+    default: EarlyStoppingMetric,
+) -> Result<EarlyStoppingMetric, Status> {
+    match pb::EarlyStoppingMetric::try_from(metric) {
+        Ok(pb::EarlyStoppingMetric::Unspecified) => Ok(default),
+        Ok(pb::EarlyStoppingMetric::ValLoss) => Ok(EarlyStoppingMetric::ValLoss),
+        Ok(pb::EarlyStoppingMetric::TrainLoss) => Ok(EarlyStoppingMetric::TrainLoss),
+        Err(_) => Err(Status::invalid_argument("unknown early_stopping_metric")),
+    }
+}
+
+/// Map the wire [`pb::LoraInitMode`]; `UNSPECIFIED` keeps the default.
+fn lora_init_mode_from_proto(mode: i32, default: LoraInitMode) -> Result<LoraInitMode, Status> {
+    match pb::LoraInitMode::try_from(mode) {
+        Ok(pb::LoraInitMode::Unspecified) => Ok(default),
+        Ok(pb::LoraInitMode::ZerosB) => Ok(LoraInitMode::ZerosB),
+        Ok(pb::LoraInitMode::Gaussian) => Ok(LoraInitMode::Gaussian),
+        Err(_) => Err(Status::invalid_argument("unknown init_lora_weights")),
+    }
+}
+
+/// Map the wire [`pb::BackboneDtype`]; `UNSPECIFIED` keeps the default.
+fn backbone_dtype_from_proto(dtype: i32, default: BackboneDtype) -> Result<BackboneDtype, Status> {
+    match pb::BackboneDtype::try_from(dtype) {
+        Ok(pb::BackboneDtype::Unspecified) => Ok(default),
+        Ok(pb::BackboneDtype::F32) => Ok(BackboneDtype::F32),
+        Ok(pb::BackboneDtype::Bf16) => Ok(BackboneDtype::BF16),
+        Ok(pb::BackboneDtype::F16) => Ok(BackboneDtype::F16),
+        Err(_) => Err(Status::invalid_argument("unknown backbone_dtype")),
+    }
+}

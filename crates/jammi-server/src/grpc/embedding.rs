@@ -32,10 +32,9 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
-use jammi_ai::{
-    LocalSession, Modality, QueryInput, SearchQuery, SearchRequest as SessionSearch, Session,
-};
-use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_ai::wire::{source_type_from_proto, ProtoQueryInput};
+use jammi_ai::{LocalSession, Modality, SearchQuery, SearchRequest as SessionSearch, Session};
+use jammi_db::source::SourceConnection;
 use tonic::{Request, Response, Status};
 
 use std::collections::HashMap;
@@ -45,10 +44,9 @@ use arrow::util::display::{ArrayFormatter, FormatOptions};
 
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingService;
 use crate::grpc::proto::embedding::{
-    encode_query_request::Input as ProtoInput, search_request::Query as ProtoQuery,
-    AddSourceRequest, EncodeQueryRequest, EncodeQueryResponse, FileFormat as ProtoFileFormat,
-    GenerateEmbeddingsRequest, Modality as ProtoModality, RemoveSourceRequest, ResultTable,
-    SearchHit, SearchRequest, SearchResponse, SourceKind as ProtoSourceKind,
+    search_request::Query as ProtoQuery, AddSourceRequest, EncodeQueryRequest, EncodeQueryResponse,
+    GenerateEmbeddingsRequest, RemoveSourceRequest, ResultTable, SearchHit, SearchRequest,
+    SearchResponse,
 };
 use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant};
 
@@ -80,7 +78,10 @@ impl EmbeddingService for EmbeddingServer {
         let req = request.into_inner();
         require_nonempty(&req.source_id, "source_id")?;
         let source_type = source_type_from_proto(req.source_kind)?;
-        let connection = connection_from_proto(req.connection)?;
+        let connection: SourceConnection = req
+            .connection
+            .ok_or_else(|| Status::invalid_argument("connection is required"))?
+            .try_into()?;
         let session = self.local();
 
         scoped(&self.session, tenant, || {
@@ -120,7 +121,7 @@ impl EmbeddingService for EmbeddingServer {
         if req.columns.is_empty() {
             return Err(Status::invalid_argument("columns is required"));
         }
-        let modality = modality_from_proto(req.modality)?;
+        let modality = Modality::try_from(req.modality)?;
         let session = self.local();
 
         let record = scoped(&self.session, tenant, || {
@@ -135,14 +136,7 @@ impl EmbeddingService for EmbeddingServer {
         .await
         .map_err(map_engine_error)?;
 
-        Ok(Response::new(ResultTable {
-            table_name: record.table_name,
-            source_id: record.source_id,
-            model_id: record.model_id,
-            dimensions: record.dimensions.unwrap_or(0),
-            row_count: record.row_count as u64,
-            status: record.status,
-        }))
+        Ok(Response::new(ResultTable::from(record)))
     }
 
     async fn encode_query(
@@ -152,8 +146,12 @@ impl EmbeddingService for EmbeddingServer {
         let tenant = session_tenant(&request);
         let req = request.into_inner();
         require_nonempty(&req.model_id, "model_id")?;
-        let modality = modality_from_proto(req.modality)?;
-        let input = query_input_from_proto(req.input, modality)?;
+        let modality = Modality::try_from(req.modality)?;
+        let input = ProtoQueryInput {
+            input: req.input,
+            modality,
+        }
+        .try_into()?;
         let session = self.local();
 
         let embedding = scoped(&self.session, tenant, || {
@@ -271,92 +269,4 @@ fn column_as<'a, A: Array + 'static>(batch: &'a RecordBatch, name: &str) -> Resu
         .ok_or_else(|| {
             Status::internal(format!("search result '{name}' column has unexpected type"))
         })
-}
-
-/// Map the proto [`Modality`] onto the abstraction's [`Modality`]. An
-/// unspecified modality is rejected — a request that names no tower is a
-/// client error, not a silent default.
-fn modality_from_proto(modality: i32) -> Result<Modality, Status> {
-    match ProtoModality::try_from(modality) {
-        Ok(ProtoModality::Text) => Ok(Modality::Text),
-        Ok(ProtoModality::Image) => Ok(Modality::Image),
-        Ok(ProtoModality::Audio) => Ok(Modality::Audio),
-        Ok(ProtoModality::Unspecified) | Err(_) => {
-            Err(Status::invalid_argument("modality must be specified"))
-        }
-    }
-}
-
-/// Build the abstraction's [`QueryInput`] from the proto oneof, rejecting an
-/// input that does not match the modality: TEXT requires `text`, IMAGE/AUDIO
-/// require `data` (raw bytes). A missing oneof or a mismatch is a client error.
-fn query_input_from_proto(
-    input: Option<ProtoInput>,
-    modality: Modality,
-) -> Result<QueryInput, Status> {
-    let input =
-        input.ok_or_else(|| Status::invalid_argument("input (text or data) is required"))?;
-    match (modality, input) {
-        (Modality::Text, ProtoInput::Text(text)) => {
-            if text.is_empty() {
-                return Err(Status::invalid_argument("text is required"));
-            }
-            Ok(QueryInput::Text(text))
-        }
-        (Modality::Image | Modality::Audio, ProtoInput::Data(data)) => {
-            if data.is_empty() {
-                return Err(Status::invalid_argument("data is required"));
-            }
-            Ok(QueryInput::Bytes(data))
-        }
-        (Modality::Text, ProtoInput::Data(_)) => Err(Status::invalid_argument(
-            "TEXT modality requires text input, got data",
-        )),
-        (Modality::Image | Modality::Audio, ProtoInput::Text(_)) => Err(Status::invalid_argument(
-            "IMAGE/AUDIO modality requires data input, got text",
-        )),
-    }
-}
-
-/// Map the proto [`SourceKind`] enum onto the engine's [`SourceType`].
-/// An unspecified kind is rejected — a registration with no backend is a
-/// client error, not a silent default.
-fn source_type_from_proto(kind: i32) -> Result<SourceType, Status> {
-    match ProtoSourceKind::try_from(kind) {
-        Ok(ProtoSourceKind::File) => Ok(SourceType::File),
-        Ok(ProtoSourceKind::Postgres) => Ok(SourceType::Postgres),
-        Ok(ProtoSourceKind::Mysql) => Ok(SourceType::Mysql),
-        Ok(ProtoSourceKind::Unspecified) | Err(_) => {
-            Err(Status::invalid_argument("source_kind must be specified"))
-        }
-    }
-}
-
-/// Map the proto [`FileFormat`] enum onto the engine's [`FileFormat`].
-fn file_format_from_proto(format: i32) -> Result<Option<FileFormat>, Status> {
-    match ProtoFileFormat::try_from(format) {
-        Ok(ProtoFileFormat::Parquet) => Ok(Some(FileFormat::Parquet)),
-        Ok(ProtoFileFormat::Csv) => Ok(Some(FileFormat::Csv)),
-        Ok(ProtoFileFormat::Json) => Ok(Some(FileFormat::Json)),
-        Ok(ProtoFileFormat::Avro) => Ok(Some(FileFormat::Avro)),
-        Ok(ProtoFileFormat::Unspecified) | Err(_) => Ok(None),
-    }
-}
-
-/// Build the engine's [`SourceConnection`] from the proto message. Only the
-/// URL + format are carried on the wire; cloud credentials are server-side.
-fn connection_from_proto(
-    conn: Option<crate::grpc::proto::embedding::SourceConnection>,
-) -> Result<SourceConnection, Status> {
-    let conn = conn.ok_or_else(|| Status::invalid_argument("connection is required"))?;
-    let url = if conn.url.is_empty() {
-        None
-    } else {
-        Some(conn.url)
-    };
-    Ok(SourceConnection {
-        url,
-        format: file_format_from_proto(conn.format)?,
-        ..Default::default()
-    })
 }

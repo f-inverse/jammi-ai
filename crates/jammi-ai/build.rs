@@ -1,6 +1,21 @@
-use std::path::PathBuf;
+//! Codegen for the gRPC wire surface.
+//!
+//! Gated behind the default-off `wire` feature so a default `jammi-ai` build
+//! (and every embedded / PyO3 consumer) invokes no protoc, reads no `.proto`,
+//! and links none of the tonic build-deps. Cargo compiles this whole script in
+//! every build, so the `tonic_prost_build` reference is itself behind
+//! `#[cfg(feature = "wire")]` — without the feature the script is an empty
+//! `main`.
 
 fn main() {
+    #[cfg(feature = "wire")]
+    generate();
+}
+
+#[cfg(feature = "wire")]
+fn generate() {
+    use std::path::PathBuf;
+
     let proto_root = PathBuf::from("proto");
     let proto_files = vec![
         proto_root.join("jammi/v1/session.proto"),
@@ -20,12 +35,10 @@ fn main() {
     println!("cargo:rerun-if-changed=proto");
 
     tonic_prost_build::configure()
-        // Client stubs are used by the integration-test harness
-        // (crates/jammi-server/tests/it/{flight_tenant,grpc_session}.rs)
-        // to drive `SessionService.SetTenant` and `TriggerService.ListTopics`
-        // against an in-process server. Other callers of the gRPC surface
-        // (jammi-cli, future SDK crates) build their own clients on top of
-        // these generated stubs.
+        // Both client and server stubs are built: the server stubs back
+        // `jammi-server`'s service impls; the client stubs back the integration-
+        // test harness (crates/jammi-server/tests/it/*) that drives an in-process
+        // server, and a future `RemoteSession` in this crate.
         .build_client(true)
         .build_server(true)
         .compile_protos(

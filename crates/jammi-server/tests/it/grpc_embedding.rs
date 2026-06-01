@@ -1,15 +1,21 @@
 //! `EmbeddingService` end-to-end over the wire.
 //!
-//! An in-process Tonic server hosts the gRPC chain including the new
-//! `EmbeddingService`. A client registers a synthetic audio corpus, calls
-//! `GenerateAudioEmbeddings`, and calls `EncodeAudioQuery` — all over a real
-//! HTTP/2 channel — and asserts the engine returns embeddings. Hermetic: the
-//! corpus is three synthetic WAV tones built in-process and the encoder is
-//! the `tiny_clap` random-weight cookbook fixture (no network, no download).
+//! An in-process Tonic server hosts the gRPC chain including the
+//! `EmbeddingService`. A client registers a source, calls the unified
+//! `GenerateEmbeddings` / `EncodeQuery` verbs keyed by a `Modality`, and
+//! searches — all over a real HTTP/2 channel — asserting the engine returns
+//! embeddings. The unification is exercised across two modalities:
 //!
-//! This pins the wire adapter's contract: the verbs delegate to the
-//! `InferenceSession` audio-embedding path and round-trip its results to a
-//! remote client.
+//! * `AUDIO` over a synthetic three-tone WAV corpus encoded by the
+//!   `tiny_clap` random-weight cookbook fixture.
+//! * `TEXT` over the `patents.parquet` fixture's `abstract` column encoded by
+//!   the `tiny_bert` cookbook fixture.
+//!
+//! Both are hermetic: the audio corpus is built in-process and both encoders
+//! are local fixtures (no network, no download). This pins the wire adapter's
+//! contract: the verbs route through the `Session`/`LocalSession` abstraction
+//! and round-trip its results to a remote client. `RemoveSource` and the
+//! modality/input validation at the wire edge are covered too.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -20,13 +26,14 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use jammi_ai::session::InferenceSession;
 use jammi_server::grpc::proto::embedding::embedding_service_client::EmbeddingServiceClient;
+use jammi_server::grpc::proto::embedding::encode_query_request::Input as EncodeInput;
 use jammi_server::grpc::proto::embedding::search_request::Query as SearchQuery;
 use jammi_server::grpc::proto::embedding::{
-    AddSourceRequest, EncodeAudioQueryRequest, FileFormat, GenerateAudioEmbeddingsRequest,
-    QueryVector, SearchRequest, SourceConnection, SourceKind,
+    AddSourceRequest, EncodeQueryRequest, FileFormat, GenerateEmbeddingsRequest, Modality,
+    QueryVector, RemoveSourceRequest, SearchRequest, SourceConnection, SourceKind,
 };
 use jammi_server::grpc::session::SessionStore;
-use jammi_test_utils::{cookbook_fixture, test_config};
+use jammi_test_utils::{cookbook_fixture, fixture, test_config};
 use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -36,6 +43,14 @@ use super::common::grpc::channel;
 
 fn tiny_clap_model_id() -> String {
     format!("local:{}", cookbook_fixture("tiny_clap").display())
+}
+
+fn tiny_bert_model_id() -> String {
+    format!("local:{}", cookbook_fixture("tiny_bert").display())
+}
+
+fn patents_url() -> String {
+    format!("file://{}", fixture("patents.parquet").display())
 }
 
 /// Build a minimal 16-bit PCM mono WAV (16 kHz) holding a sine tone at
@@ -139,7 +154,7 @@ async fn start_embedding_server() -> (
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn embedding_service_generates_and_encodes_audio_over_the_wire() {
+async fn generate_and_encode_audio_modality_over_the_wire() {
     let (addr, shutdown, dir, handle) = start_embedding_server().await;
     let parquet_path = write_corpus_parquet(&dir);
     let model_id = tiny_clap_model_id();
@@ -159,16 +174,17 @@ async fn embedding_service_generates_and_encodes_audio_over_the_wire() {
         .await
         .expect("add_source");
 
-    // GenerateAudioEmbeddings — one vector per row, persisted server-side.
+    // GenerateEmbeddings(AUDIO) — one vector per row, persisted server-side.
     let table = client
-        .generate_audio_embeddings(GenerateAudioEmbeddingsRequest {
+        .generate_embeddings(GenerateEmbeddingsRequest {
             source_id: "clips".into(),
             model_id: model_id.clone(),
-            audio_column: "audio".into(),
+            columns: vec!["audio".into()],
             key_column: "clip_id".into(),
+            modality: Modality::Audio as i32,
         })
         .await
-        .expect("generate_audio_embeddings")
+        .expect("generate_embeddings")
         .into_inner();
 
     assert_eq!(table.status, "ready", "embedding table must be ready");
@@ -180,15 +196,16 @@ async fn embedding_service_generates_and_encodes_audio_over_the_wire() {
         table.dimensions
     );
 
-    // EncodeAudioQuery — a single clip → one L2-normalized vector.
+    // EncodeQuery(AUDIO) — a single clip → one L2-normalized vector.
     let query_wav = sine_wav_bytes(440.0);
     let resp = client
-        .encode_audio_query(EncodeAudioQueryRequest {
+        .encode_query(EncodeQueryRequest {
             model_id,
-            audio_bytes: query_wav,
+            modality: Modality::Audio as i32,
+            input: Some(EncodeInput::Data(query_wav)),
         })
         .await
-        .expect("encode_audio_query")
+        .expect("encode_query")
         .into_inner();
 
     assert_eq!(
@@ -206,8 +223,77 @@ async fn embedding_service_generates_and_encodes_audio_over_the_wire() {
     let _ = handle.await;
 }
 
-/// Register the synthetic corpus and embed it, returning the embedding-table
-/// dimensionality. Shared setup for the `Search` wire tests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generate_and_encode_text_modality_over_the_wire() {
+    let (addr, shutdown, _dir, handle) = start_embedding_server().await;
+    let model_id = tiny_bert_model_id();
+
+    let mut client = EmbeddingServiceClient::new(channel(addr).await);
+
+    // AddSource — the patents fixture, embedded over its `abstract` column.
+    client
+        .add_source(AddSourceRequest {
+            source_id: "patents".into(),
+            source_kind: SourceKind::File as i32,
+            connection: Some(SourceConnection {
+                url: patents_url(),
+                format: FileFormat::Parquet as i32,
+            }),
+        })
+        .await
+        .expect("add_source");
+
+    // GenerateEmbeddings(TEXT) — the same unified verb, a different tower.
+    let table = client
+        .generate_embeddings(GenerateEmbeddingsRequest {
+            source_id: "patents".into(),
+            model_id: model_id.clone(),
+            columns: vec!["abstract".into()],
+            key_column: "id".into(),
+            modality: Modality::Text as i32,
+        })
+        .await
+        .expect("generate_embeddings")
+        .into_inner();
+
+    assert_eq!(table.status, "ready", "embedding table must be ready");
+    assert!(table.row_count > 0, "patents corpus embeds some rows");
+    assert_eq!(table.source_id, "patents");
+    assert!(
+        table.dimensions > 0,
+        "tiny BERT records an embedding dimensionality; got {}",
+        table.dimensions
+    );
+
+    // EncodeQuery(TEXT) — a text string → one L2-normalized vector whose
+    // dimensionality matches the corpus the same model produced.
+    let resp = client
+        .encode_query(EncodeQueryRequest {
+            model_id,
+            modality: Modality::Text as i32,
+            input: Some(EncodeInput::Text("quantum computing applications".into())),
+        })
+        .await
+        .expect("encode_query")
+        .into_inner();
+
+    assert_eq!(
+        resp.embedding.len() as i32,
+        table.dimensions,
+        "query embedding dim must match the corpus embedding dim"
+    );
+    let norm: f32 = resp.embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
+    assert!(
+        (norm - 1.0).abs() < 0.01,
+        "query vector must be L2-normalized, got norm={norm}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Register the synthetic corpus and embed it (AUDIO modality). Shared setup
+/// for the `Search` wire tests.
 async fn embed_corpus(
     client: &mut EmbeddingServiceClient<tonic::transport::Channel>,
     dir: &TempDir,
@@ -225,14 +311,32 @@ async fn embed_corpus(
         .await
         .expect("add_source");
     client
-        .generate_audio_embeddings(GenerateAudioEmbeddingsRequest {
+        .generate_embeddings(GenerateEmbeddingsRequest {
             source_id: "clips".into(),
             model_id: tiny_clap_model_id(),
-            audio_column: "audio".into(),
+            columns: vec!["audio".into()],
             key_column: "clip_id".into(),
+            modality: Modality::Audio as i32,
         })
         .await
-        .expect("generate_audio_embeddings");
+        .expect("generate_embeddings");
+}
+
+/// Encode `clip`'s tone into a query vector over the wire (AUDIO modality).
+async fn encode_audio_query(
+    client: &mut EmbeddingServiceClient<tonic::transport::Channel>,
+    clip: Vec<u8>,
+) -> Vec<f32> {
+    client
+        .encode_query(EncodeQueryRequest {
+            model_id: tiny_clap_model_id(),
+            modality: Modality::Audio as i32,
+            input: Some(EncodeInput::Data(clip)),
+        })
+        .await
+        .expect("encode_query")
+        .into_inner()
+        .embedding
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -243,16 +347,7 @@ async fn search_by_query_vector_ranks_self_match_first_over_the_wire() {
 
     // Encode clip_1's tone and search by that vector: clip_1 must rank first
     // (a clip is its own nearest neighbor under cosine similarity).
-    let query_clip = sine_wav_bytes(440.0);
-    let query_vec = client
-        .encode_audio_query(EncodeAudioQueryRequest {
-            model_id: tiny_clap_model_id(),
-            audio_bytes: query_clip,
-        })
-        .await
-        .expect("encode_audio_query")
-        .into_inner()
-        .embedding;
+    let query_vec = encode_audio_query(&mut client, sine_wav_bytes(440.0)).await;
 
     let resp = client
         .search(SearchRequest {
@@ -347,6 +442,36 @@ async fn search_applies_filter_and_select_projection_over_the_wire() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_source_drops_the_source_over_the_wire() {
+    let (addr, shutdown, dir, handle) = start_embedding_server().await;
+    let mut client = EmbeddingServiceClient::new(channel(addr).await);
+    embed_corpus(&mut client, &dir).await;
+
+    // RemoveSource drops the registered source; a search against it then fails
+    // because the source no longer resolves.
+    client
+        .remove_source(RemoveSourceRequest {
+            source_id: "clips".into(),
+        })
+        .await
+        .expect("remove_source");
+
+    client
+        .search(SearchRequest {
+            source_id: "clips".into(),
+            query: Some(SearchQuery::RowKey("clip_0".into())),
+            k: 3,
+            filter: None,
+            select: Vec::new(),
+        })
+        .await
+        .expect_err("search against a removed source must fail: the source no longer resolves");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_requires_a_query_over_the_wire() {
     let (addr, shutdown, _dir, handle) = start_embedding_server().await;
     let mut client = EmbeddingServiceClient::new(channel(addr).await);
@@ -361,6 +486,58 @@ async fn search_requires_a_query_over_the_wire() {
         })
         .await
         .expect_err("a search with no query must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generate_embeddings_rejects_unspecified_modality() {
+    let (addr, shutdown, _dir, handle) = start_embedding_server().await;
+    let mut client = EmbeddingServiceClient::new(channel(addr).await);
+
+    let err = client
+        .generate_embeddings(GenerateEmbeddingsRequest {
+            source_id: "clips".into(),
+            model_id: tiny_clap_model_id(),
+            columns: vec!["audio".into()],
+            key_column: "clip_id".into(),
+            modality: Modality::Unspecified as i32,
+        })
+        .await
+        .expect_err("unspecified modality must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encode_query_rejects_input_modality_mismatch() {
+    let (addr, shutdown, _dir, handle) = start_embedding_server().await;
+    let mut client = EmbeddingServiceClient::new(channel(addr).await);
+
+    // TEXT modality with bytes input is a wire-edge mismatch.
+    let err = client
+        .encode_query(EncodeQueryRequest {
+            model_id: tiny_bert_model_id(),
+            modality: Modality::Text as i32,
+            input: Some(EncodeInput::Data(vec![1, 2, 3])),
+        })
+        .await
+        .expect_err("text modality with bytes input must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    // AUDIO modality with text input is the symmetric mismatch.
+    let err = client
+        .encode_query(EncodeQueryRequest {
+            model_id: tiny_clap_model_id(),
+            modality: Modality::Audio as i32,
+            input: Some(EncodeInput::Text("not audio".into())),
+        })
+        .await
+        .expect_err("audio modality with text input must be rejected");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
     let _ = shutdown.send(());
@@ -390,17 +567,18 @@ async fn embedding_service_rejects_unspecified_source_kind() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn encode_audio_query_rejects_empty_bytes() {
+async fn encode_query_rejects_empty_data() {
     let (addr, shutdown, _dir, handle) = start_embedding_server().await;
     let mut client = EmbeddingServiceClient::new(channel(addr).await);
 
     let err = client
-        .encode_audio_query(EncodeAudioQueryRequest {
+        .encode_query(EncodeQueryRequest {
             model_id: tiny_clap_model_id(),
-            audio_bytes: Vec::new(),
+            modality: Modality::Audio as i32,
+            input: Some(EncodeInput::Data(Vec::new())),
         })
         .await
-        .expect_err("empty audio_bytes must be rejected");
+        .expect_err("empty data must be rejected");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
     let _ = shutdown.send(());

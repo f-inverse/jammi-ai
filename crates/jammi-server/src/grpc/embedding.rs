@@ -1,32 +1,38 @@
 //! `EmbeddingService` gRPC implementation.
 //!
-//! Each verb is a 1:1 delegation to an [`InferenceSession`] method from the
-//! audio-embedding path (JA1):
+//! Each verb is a thin wire adapter over the transport-agnostic
+//! [`Session`]/[`LocalSession`] abstraction (never raw [`InferenceSession`]
+//! calls): proto in, one `Session` method, proto out.
 //!
-//! * `AddSource` — registers a data source (peer of `add_source`).
-//! * `GenerateAudioEmbeddings` — scans a source's audio column, runs the
-//!   decode → log-mel → audio-tower pipeline, persists one vector per row
-//!   (peer of `generate_audio_embeddings`).
-//! * `EncodeAudioQuery` — encodes a single clip into one vector (peer of
-//!   `encode_audio_query`).
+//! * `AddSource` / `RemoveSource` — register / drop a data source (peers of
+//!   `Session::add_source` / `Session::remove_source`).
+//! * `GenerateEmbeddings` — scan a source's `columns`, run the modality's
+//!   tower, persist one vector per row (peer of `Session::generate_embeddings`,
+//!   keyed by [`Modality`]).
+//! * `EncodeQuery` — encode a single query into one vector with the modality's
+//!   tower (peer of `Session::encode_query`).
 //! * `Search` — nearest-neighbor search over a source's embedding table, by a
-//!   precomputed vector (peer of `search`) or by an existing row's key (peer
-//!   of `search_by_id`, which resolves that row's vector inside the engine).
-//!   This is the embedding-consumption verb on the gRPC-web transport edge
-//!   runtimes reach; it adds no new consumption model.
+//!   precomputed vector or an existing row's key (peer of the abstraction's
+//!   flat `Session::search`). This is the embedding-consumption verb on the
+//!   gRPC-web transport edge runtimes reach; it adds no new consumption model.
 //!
-//! The service reimplements no embedding logic — decode, feature extraction,
-//! the forward pass, and the search plan all live in the engine. This module
-//! is purely the wire adapter: proto in, engine call, proto out.
+//! The abstraction dispatches each [`Modality`] onto the engine's concrete
+//! tower method; this module reimplements no embedding logic. Modality and
+//! input are validated at the wire edge: an unspecified modality and a
+//! text/bytes-vs-modality mismatch are rejected with `invalid_argument`.
 //!
 //! Tenant scope is read from the request's [`SessionTenant`] extension (set
-//! upstream by [`crate::grpc::session::TenantInterceptor`]) and applied to
-//! the engine call via `with_tenant_scoped`, matching how the Flight SQL and
-//! Trigger surfaces resolve their tenant.
+//! upstream by [`crate::grpc::session::TenantInterceptor`]) and applied to the
+//! call via `with_tenant_scoped` — the same task-local the engine the
+//! [`LocalSession`] wraps observes — matching how the Flight SQL and Trigger
+//! surfaces resolve their tenant.
 
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
+use jammi_ai::{
+    LocalSession, Modality, QueryInput, SearchQuery, SearchRequest as SessionSearch, Session,
+};
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::TenantId;
@@ -37,18 +43,18 @@ use std::collections::HashMap;
 use arrow::array::{Array, Float32Array, RecordBatch, StringArray};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 
-use jammi_ai::search::SearchBuilder;
-
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingService;
 use crate::grpc::proto::embedding::{
-    search_request::Query as ProtoQuery, AddSourceRequest, EncodeAudioQueryRequest,
-    EncodeAudioQueryResponse, FileFormat as ProtoFileFormat, GenerateAudioEmbeddingsRequest,
-    ResultTable, SearchHit, SearchRequest, SearchResponse, SourceKind as ProtoSourceKind,
+    encode_query_request::Input as ProtoInput, search_request::Query as ProtoQuery,
+    AddSourceRequest, EncodeQueryRequest, EncodeQueryResponse, FileFormat as ProtoFileFormat,
+    GenerateEmbeddingsRequest, Modality as ProtoModality, RemoveSourceRequest, ResultTable,
+    SearchHit, SearchRequest, SearchResponse, SourceKind as ProtoSourceKind,
 };
 use crate::grpc::session::SessionTenant;
 
-/// Server-side handler for the audio-embedding gRPC surface. Holds a shared
-/// reference to the engine session it delegates every verb to.
+/// Server-side handler for the embedding gRPC surface. Holds a shared engine
+/// session it wraps in a [`LocalSession`] per call to reach the unified
+/// transport surface.
 pub struct EmbeddingServer {
     session: Arc<InferenceSession>,
 }
@@ -57,6 +63,14 @@ impl EmbeddingServer {
     pub fn new(session: Arc<InferenceSession>) -> Self {
         Self { session }
     }
+
+    /// A [`Session`] over the shared engine. Wrapping is an `Arc` clone; the
+    /// resulting `LocalSession` delegates to the same engine, so a tenant scope
+    /// installed by [`scoped`] (a task-local on this task) is observed by the
+    /// call made through it.
+    fn local(&self) -> Session {
+        Session::Local(LocalSession::new(Arc::clone(&self.session)))
+    }
 }
 
 #[tonic::async_trait]
@@ -64,38 +78,58 @@ impl EmbeddingService for EmbeddingServer {
     async fn add_source(&self, request: Request<AddSourceRequest>) -> Result<Response<()>, Status> {
         let tenant = session_tenant(&request);
         let req = request.into_inner();
-        if req.source_id.is_empty() {
-            return Err(Status::invalid_argument("source_id is required"));
-        }
+        require_nonempty(&req.source_id, "source_id")?;
         let source_type = source_type_from_proto(req.source_kind)?;
         let connection = connection_from_proto(req.connection)?;
+        let session = self.local();
 
         scoped(&self.session, tenant, || {
-            self.session
-                .add_source(&req.source_id, source_type, connection)
+            session.add_source(&req.source_id, source_type, connection)
         })
         .await
         .map_err(map_engine_error)?;
         Ok(Response::new(()))
     }
 
-    async fn generate_audio_embeddings(
+    async fn remove_source(
         &self,
-        request: Request<GenerateAudioEmbeddingsRequest>,
+        request: Request<RemoveSourceRequest>,
+    ) -> Result<Response<()>, Status> {
+        let tenant = session_tenant(&request);
+        let req = request.into_inner();
+        require_nonempty(&req.source_id, "source_id")?;
+        let session = self.local();
+
+        scoped(&self.session, tenant, || {
+            session.remove_source(&req.source_id)
+        })
+        .await
+        .map_err(map_engine_error)?;
+        Ok(Response::new(()))
+    }
+
+    async fn generate_embeddings(
+        &self,
+        request: Request<GenerateEmbeddingsRequest>,
     ) -> Result<Response<ResultTable>, Status> {
         let tenant = session_tenant(&request);
         let req = request.into_inner();
         require_nonempty(&req.source_id, "source_id")?;
         require_nonempty(&req.model_id, "model_id")?;
-        require_nonempty(&req.audio_column, "audio_column")?;
         require_nonempty(&req.key_column, "key_column")?;
+        if req.columns.is_empty() {
+            return Err(Status::invalid_argument("columns is required"));
+        }
+        let modality = modality_from_proto(req.modality)?;
+        let session = self.local();
 
         let record = scoped(&self.session, tenant, || {
-            self.session.generate_audio_embeddings(
+            session.generate_embeddings(
                 &req.source_id,
                 &req.model_id,
-                &req.audio_column,
+                &req.columns,
                 &req.key_column,
+                modality,
             )
         })
         .await
@@ -111,25 +145,24 @@ impl EmbeddingService for EmbeddingServer {
         }))
     }
 
-    async fn encode_audio_query(
+    async fn encode_query(
         &self,
-        request: Request<EncodeAudioQueryRequest>,
-    ) -> Result<Response<EncodeAudioQueryResponse>, Status> {
+        request: Request<EncodeQueryRequest>,
+    ) -> Result<Response<EncodeQueryResponse>, Status> {
         let tenant = session_tenant(&request);
         let req = request.into_inner();
         require_nonempty(&req.model_id, "model_id")?;
-        if req.audio_bytes.is_empty() {
-            return Err(Status::invalid_argument("audio_bytes is required"));
-        }
+        let modality = modality_from_proto(req.modality)?;
+        let input = query_input_from_proto(req.input, modality)?;
+        let session = self.local();
 
         let embedding = scoped(&self.session, tenant, || {
-            self.session
-                .encode_audio_query(&req.model_id, &req.audio_bytes)
+            session.encode_query(&req.model_id, input, modality)
         })
         .await
         .map_err(map_engine_error)?;
 
-        Ok(Response::new(EncodeAudioQueryResponse { embedding }))
+        Ok(Response::new(EncodeQueryResponse { embedding }))
     }
 
     async fn search(
@@ -139,45 +172,44 @@ impl EmbeddingService for EmbeddingServer {
         let tenant = session_tenant(&request);
         let req = request.into_inner();
         require_nonempty(&req.source_id, "source_id")?;
-        let query = req.query.ok_or_else(|| {
+        let query = match req.query.ok_or_else(|| {
             Status::invalid_argument("query (query_vector or row_key) is required")
-        })?;
-        let k = req.k as usize;
+        })? {
+            ProtoQuery::QueryVector(v) => SearchQuery::Vector(v.values),
+            ProtoQuery::RowKey(key) => SearchQuery::RowKey(key),
+        };
         let select = req.select;
-        let filter = req.filter;
+        let request = SessionSearch {
+            source_id: req.source_id,
+            query,
+            k: req.k as usize,
+            filter: req.filter,
+            // The abstraction projects exactly the requested columns; the
+            // handler needs `_row_id` + `similarity` for every hit's key and
+            // score, so add them when a non-empty select would otherwise drop
+            // them. An empty select keeps every hydrated column (key + score
+            // included).
+            select: search_select(&select),
+        };
+        let session = self.local();
 
-        let batches = scoped(&self.session, tenant, || async {
-            let builder = match query {
-                ProtoQuery::QueryVector(v) => {
-                    self.session.search(&req.source_id, v.values, k).await?
-                }
-                ProtoQuery::RowKey(key) => {
-                    self.session.search_by_id(&req.source_id, &key, k).await?
-                }
-            };
-            let builder = match filter.as_deref() {
-                Some(predicate) => builder.filter(predicate)?,
-                None => builder,
-            };
-            let builder = apply_select(builder, &select)?;
-            builder.run().await
-        })
-        .await
-        .map_err(map_engine_error)?;
+        let batches = scoped(&self.session, tenant, || session.search(request))
+            .await
+            .map_err(map_engine_error)?;
 
         let hits = batches_to_hits(&batches, &select)?;
         Ok(Response::new(SearchResponse { hits }))
     }
 }
 
-/// Project the requested columns onto the search builder. An empty `select`
-/// leaves the builder unprojected (all hydrated columns survive, so the key
-/// and score are present). A non-empty `select` projects the requested columns
+/// The projection the abstraction's `search` runs for a client `select`. An
+/// empty `select` projects nothing (all hydrated columns survive, so key and
+/// score are present). A non-empty `select` projects the requested columns
 /// **plus** `_row_id` and `similarity` — the handler always needs those to
 /// build each hit's key and score, even when the client did not list them.
-fn apply_select(builder: SearchBuilder, select: &[String]) -> Result<SearchBuilder, JammiError> {
+fn search_select(select: &[String]) -> Vec<String> {
     if select.is_empty() {
-        return Ok(builder);
+        return Vec::new();
     }
     let mut columns: Vec<String> = vec!["_row_id".to_string(), "similarity".to_string()];
     for name in select {
@@ -185,7 +217,7 @@ fn apply_select(builder: SearchBuilder, select: &[String]) -> Result<SearchBuild
             columns.push(name.clone());
         }
     }
-    builder.select(&columns)
+    columns
 }
 
 /// Map each result row to a [`SearchHit`]: `_row_id` → key, `similarity` →
@@ -250,16 +282,16 @@ fn session_tenant<T>(request: &Request<T>) -> Option<TenantId> {
         .and_then(|s| s.0)
 }
 
-/// Run an engine call under the request's tenant scope.
+/// Run a session call under the request's tenant scope.
 ///
 /// A bound tenant installs the engine's task-local tenant override for the
 /// duration of the call via `with_tenant_scoped` — the concurrency-safe form
 /// the gRPC handlers must use, since they share one `Arc<InferenceSession>`
 /// and the sticky `bind_tenant` would race across concurrent requests. The
 /// `TenantScope` handle the closure receives is the marker that the scope is
-/// active on this task; `f` calls the embedding verbs on the outer session
-/// reference and observes the same task-local. An unscoped session runs the
-/// call directly.
+/// active on this task; `f` calls the verb on the [`LocalSession`] (which
+/// delegates to the same engine) and observes the same task-local. An
+/// unscoped session runs the call directly.
 async fn scoped<F, Fut, T>(
     session: &Arc<InferenceSession>,
     tenant: Option<TenantId>,
@@ -280,6 +312,51 @@ fn require_nonempty(value: &str, field: &str) -> Result<(), Status> {
         Err(Status::invalid_argument(format!("{field} is required")))
     } else {
         Ok(())
+    }
+}
+
+/// Map the proto [`Modality`] onto the abstraction's [`Modality`]. An
+/// unspecified modality is rejected — a request that names no tower is a
+/// client error, not a silent default.
+fn modality_from_proto(modality: i32) -> Result<Modality, Status> {
+    match ProtoModality::try_from(modality) {
+        Ok(ProtoModality::Text) => Ok(Modality::Text),
+        Ok(ProtoModality::Image) => Ok(Modality::Image),
+        Ok(ProtoModality::Audio) => Ok(Modality::Audio),
+        Ok(ProtoModality::Unspecified) | Err(_) => {
+            Err(Status::invalid_argument("modality must be specified"))
+        }
+    }
+}
+
+/// Build the abstraction's [`QueryInput`] from the proto oneof, rejecting an
+/// input that does not match the modality: TEXT requires `text`, IMAGE/AUDIO
+/// require `data` (raw bytes). A missing oneof or a mismatch is a client error.
+fn query_input_from_proto(
+    input: Option<ProtoInput>,
+    modality: Modality,
+) -> Result<QueryInput, Status> {
+    let input =
+        input.ok_or_else(|| Status::invalid_argument("input (text or data) is required"))?;
+    match (modality, input) {
+        (Modality::Text, ProtoInput::Text(text)) => {
+            if text.is_empty() {
+                return Err(Status::invalid_argument("text is required"));
+            }
+            Ok(QueryInput::Text(text))
+        }
+        (Modality::Image | Modality::Audio, ProtoInput::Data(data)) => {
+            if data.is_empty() {
+                return Err(Status::invalid_argument("data is required"));
+            }
+            Ok(QueryInput::Bytes(data))
+        }
+        (Modality::Text, ProtoInput::Data(_)) => Err(Status::invalid_argument(
+            "TEXT modality requires text input, got data",
+        )),
+        (Modality::Image | Modality::Audio, ProtoInput::Text(_)) => Err(Status::invalid_argument(
+            "IMAGE/AUDIO modality requires data input, got text",
+        )),
     }
 }
 

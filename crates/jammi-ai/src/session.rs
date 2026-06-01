@@ -708,8 +708,14 @@ impl InferenceSession {
             .ok_or_else(|| JammiError::FineTune("Base model does not support embeddings".into()))?;
         drop(guard);
 
-        // Spawn training in a blocking task
-        let catalog = Arc::clone(self.inner.catalog());
+        // Spawn training in a blocking task. The blocking thread carries no
+        // task-local tenant override (that lives only on the request task that
+        // called `fine_tune`), so its catalog writes would resolve `Unscoped`
+        // and miss a tenant-scoped job's rows. Pin a catalog handle to the
+        // tenant the job was created under so every background status update
+        // and model registration stays in scope.
+        let tenant = self.inner.catalog().current_tenant();
+        let catalog = Arc::new(self.inner.catalog().pinned_to_tenant(tenant));
         let artifact_dir = self.inner.config().artifact_dir.clone();
         let job_id_clone = job_id.clone();
         let output_model_id_clone = output_model_id.clone();

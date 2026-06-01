@@ -8,6 +8,7 @@ fn main() {
         proto_root.join("jammi/v1/embedding.proto"),
         proto_root.join("jammi/v1/inference.proto"),
         proto_root.join("jammi/v1/eval.proto"),
+        proto_root.join("jammi/v1/fine_tune.proto"),
     ];
 
     for f in &proto_files {

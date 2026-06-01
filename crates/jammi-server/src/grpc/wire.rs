@@ -25,11 +25,13 @@ use arrow::record_batch::RecordBatch;
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::SchemaRef;
+use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
 use jammi_db::error::JammiError;
 use jammi_db::TenantId;
 use tonic::{Request, Status};
 
+use crate::grpc::proto::inference::ModelTask as ProtoModelTask;
 use crate::grpc::session::SessionTenant;
 
 /// Read the bound tenant the [`crate::grpc::session::TenantInterceptor`]
@@ -63,6 +65,23 @@ where
     match tenant {
         Some(t) => session.with_tenant_scoped(t, |_scope| f()).await,
         None => f().await,
+    }
+}
+
+/// Map the wire [`ProtoModelTask`] onto the engine's [`ModelTask`]. An
+/// unspecified task is rejected — a request that names no task is a client
+/// error, not a silent default. Shared by [`crate::grpc::inference`] and
+/// [`crate::grpc::fine_tune`], which both carry `jammi.v1.inference.ModelTask`.
+pub fn model_task_from_proto(task: i32) -> Result<ModelTask, Status> {
+    match ProtoModelTask::try_from(task) {
+        Ok(ProtoModelTask::TextEmbedding) => Ok(ModelTask::TextEmbedding),
+        Ok(ProtoModelTask::ImageEmbedding) => Ok(ModelTask::ImageEmbedding),
+        Ok(ProtoModelTask::AudioEmbedding) => Ok(ModelTask::AudioEmbedding),
+        Ok(ProtoModelTask::Classification) => Ok(ModelTask::Classification),
+        Ok(ProtoModelTask::Ner) => Ok(ModelTask::Ner),
+        Ok(ProtoModelTask::Unspecified) | Err(_) => {
+            Err(Status::invalid_argument("task must be specified"))
+        }
     }
 }
 

@@ -17,16 +17,16 @@
 
 use std::sync::Arc;
 
-use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
 use jammi_ai::{LocalSession, Session};
 use tonic::{Request, Response, Status};
 
 use crate::grpc::proto::inference::inference_service_server::InferenceService;
-use crate::grpc::proto::inference::{InferRequest, InferResponse, ModelTask as ProtoModelTask};
+use crate::grpc::proto::inference::{InferRequest, InferResponse};
 use crate::grpc::proto::trigger::ArrowBatch;
 use crate::grpc::wire::{
-    encode_ipc_stream, map_engine_error, require_nonempty, scoped, session_tenant,
+    encode_ipc_stream, map_engine_error, model_task_from_proto, require_nonempty, scoped,
+    session_tenant,
 };
 
 /// Server-side handler for the inference gRPC surface. Holds a shared engine
@@ -97,21 +97,5 @@ impl InferenceService for InferenceServer {
         Ok(Response::new(InferResponse {
             result: Some(result),
         }))
-    }
-}
-
-/// Map the proto [`ModelTask`] onto the engine's [`ModelTask`]. An unspecified
-/// task is rejected — a request that names no task is a client error, not a
-/// silent default.
-fn model_task_from_proto(task: i32) -> Result<ModelTask, Status> {
-    match ProtoModelTask::try_from(task) {
-        Ok(ProtoModelTask::TextEmbedding) => Ok(ModelTask::TextEmbedding),
-        Ok(ProtoModelTask::ImageEmbedding) => Ok(ModelTask::ImageEmbedding),
-        Ok(ProtoModelTask::AudioEmbedding) => Ok(ModelTask::AudioEmbedding),
-        Ok(ProtoModelTask::Classification) => Ok(ModelTask::Classification),
-        Ok(ProtoModelTask::Ner) => Ok(ModelTask::Ner),
-        Ok(ProtoModelTask::Unspecified) | Err(_) => {
-            Err(Status::invalid_argument("task must be specified"))
-        }
     }
 }

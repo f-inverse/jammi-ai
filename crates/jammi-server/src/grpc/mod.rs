@@ -11,6 +11,7 @@
 
 pub mod embedding;
 pub mod eval;
+pub mod fine_tune;
 pub mod inference;
 pub mod session;
 pub mod trigger;
@@ -32,5 +33,8 @@ pub mod proto {
     }
     pub mod eval {
         tonic::include_proto!("jammi.v1.eval");
+    }
+    pub mod fine_tune {
+        tonic::include_proto!("jammi.v1.fine_tune");
     }
 }

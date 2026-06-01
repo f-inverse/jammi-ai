@@ -106,6 +106,10 @@ Full documentation, including guides for SQL queries, embeddings, search, fine-t
 
 **[https://f-inverse.github.io/jammi-ai/](https://f-inverse.github.io/jammi-ai/)**
 
+For the engine's design philosophy — what belongs in Jammi versus a consumer's own repo, how
+embeddings are consumed, and how it deploys — see
+[Design Philosophy](./docs/guide/src/philosophy.md).
+
 ## License
 
 Apache-2.0

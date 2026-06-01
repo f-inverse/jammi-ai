@@ -38,9 +38,11 @@ use crate::error::fallback_handler;
 use crate::flight::TenantBoundProvider;
 use crate::grpc::embedding::EmbeddingServer;
 use crate::grpc::eval::EvalServer;
+use crate::grpc::fine_tune::FineTuneServer;
 use crate::grpc::inference::InferenceServer;
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingServiceServer;
 use crate::grpc::proto::eval::eval_service_server::EvalServiceServer;
+use crate::grpc::proto::fine_tune::fine_tune_service_server::FineTuneServiceServer;
 use crate::grpc::proto::inference::inference_service_server::InferenceServiceServer;
 use crate::grpc::proto::session::session_service_server::SessionServiceServer;
 use crate::grpc::proto::trigger::trigger_service_server::TriggerServiceServer;
@@ -298,16 +300,17 @@ impl OssServer {
 }
 
 /// Build and run the gRPC chain (Flight SQL + SessionService +
-/// TriggerService + EmbeddingService + InferenceService + EvalService) on
-/// `addr`, sharing the supplied `SessionStore` between every service. Trigger
-/// handles and the engine session are optional — passing `None` keeps that
-/// surface unmounted, which is what the gRPC-Web and `JammiSession`-only
-/// fixtures need (the engine-backed services operate at the `InferenceSession`
-/// layer those fixtures don't construct).
+/// TriggerService + EmbeddingService + InferenceService + EvalService +
+/// FineTuneService) on `addr`, sharing the supplied `SessionStore` between
+/// every service. Trigger handles and the engine session are optional —
+/// passing `None` keeps that surface unmounted, which is what the gRPC-Web and
+/// `JammiSession`-only fixtures need (the engine-backed services operate at the
+/// `InferenceSession` layer those fixtures don't construct).
 ///
-/// The `engine` session backs all three engine-layer services
-/// (`EmbeddingService`, `InferenceService`, `EvalService`); they share one
-/// `Arc<InferenceSession>` and each wraps it in a per-call `LocalSession`.
+/// The `engine` session backs all four engine-layer services
+/// (`EmbeddingService`, `InferenceService`, `EvalService`, `FineTuneService`);
+/// they share one `Arc<InferenceSession>` and each wraps it in a per-call
+/// `LocalSession`.
 ///
 /// This is the test-fixture entry-point. Production code goes
 /// through [`OssServer::run`] which derives every component from
@@ -362,9 +365,17 @@ pub async fn serve_grpc_chain(
         builder = builder.add_service(inference_svc);
         mounted.push("InferenceService");
 
-        let eval_svc = EvalServiceServer::with_interceptor(EvalServer::new(session), interceptor);
+        let eval_svc = EvalServiceServer::with_interceptor(
+            EvalServer::new(Arc::clone(&session)),
+            interceptor.clone(),
+        );
         builder = builder.add_service(eval_svc);
         mounted.push("EvalService");
+
+        let fine_tune_svc =
+            FineTuneServiceServer::with_interceptor(FineTuneServer::new(session), interceptor);
+        builder = builder.add_service(fine_tune_svc);
+        mounted.push("FineTuneService");
     }
 
     tracing::info!("gRPC chain ({}) listening on {addr}", mounted.join(" + "));

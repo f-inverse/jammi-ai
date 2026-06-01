@@ -87,6 +87,29 @@ impl Catalog {
         }
     }
 
+    /// A catalog handle over the same backend, pinned to a fixed `tenant`
+    /// regardless of any task-local scope.
+    ///
+    /// The session's [`TenantBinding`] resolves the tenant from a task-local
+    /// override that exists only on the task inside a
+    /// [`crate::session::JammiSession::with_tenant_scoped`] closure. Background
+    /// work spawned off that task — a `spawn_blocking` training loop, a timeout
+    /// scanner — runs on a thread with no such override, so its catalog writes
+    /// would resolve `Unscoped` and miss the tenant's rows. This constructor
+    /// captures the tenant at spawn time into a sticky binding so every read
+    /// and write on the returned handle is scoped to it, sharing the original
+    /// catalog's backend (`Arc`) so it sees the same database.
+    pub fn pinned_to_tenant(&self, tenant: Option<TenantId>) -> Self {
+        let binding = TenantBinding::unscoped();
+        if let Some(t) = tenant {
+            binding.set_shared(crate::tenant::TenantContext::Scoped(t));
+        }
+        Self {
+            backend: Arc::clone(&self.backend),
+            tenant: Some(binding),
+        }
+    }
+
     /// Repository view over the evidence-channel tables.
     pub fn channels(&self) -> ChannelRepo<'_> {
         ChannelRepo::new(self)

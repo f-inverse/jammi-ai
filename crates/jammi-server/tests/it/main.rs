@@ -2,6 +2,7 @@ mod common;
 mod flight_tenant;
 mod grpc_embedding;
 mod grpc_eval;
+mod grpc_fine_tune;
 mod grpc_inference;
 mod grpc_session;
 mod grpc_trigger;

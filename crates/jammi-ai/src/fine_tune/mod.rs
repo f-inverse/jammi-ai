@@ -15,6 +15,12 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+// The LoRA init/backbone-dtype knobs are part of `FineTuneConfig`'s public
+// shape, so re-export them here: a consumer constructing a config through the
+// SDK boundary reaches every field's type from this module, without depending
+// on `jammi-lora` directly.
+pub use jammi_lora::{BackboneDtype, LoraInitMode};
+
 /// Supported fine-tuning methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

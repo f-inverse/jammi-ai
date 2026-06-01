@@ -6,6 +6,31 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.13.0 — 2026-06-01
+
+### Added
+
+- **Audio embedding modality.** An `AudioEmbedding` task plus a CLAP-style audio
+  encoder: decode → resample → log-mel → audio tower, producing L2-normalized
+  vectors alongside the existing text and image modalities.
+- **Audio-encoder fine-tuning.** The LoRA / contrastive fine-tune path accepts the
+  audio encoder via a projection head, so a domain can adapt audio embeddings the
+  same way it adapts text ones.
+- **`EmbeddingService` gRPC surface.** `AddSource`, `GenerateAudioEmbeddings`, and
+  `EncodeAudioQuery` exposed as typed gRPC RPCs, served over gRPC-web (tonic-web)
+  so HTTP/2-less runtimes can drive the audio-embedding path.
+- **`Search` on the gRPC wire.** The engine's `search` is now an `EmbeddingService`
+  RPC (query by vector or by an existing row via `search_by_id`, with SQL-predicate
+  filter and column projection), reachable over gRPC-web — the consumption verb for
+  embeddings without the Flight SQL (HTTP/2) surface.
+- **First-class `r2://` object-store backend.** Cloudflare R2 joins `s3://`/`gs://`/
+  `azure://` as a named scheme; `R2Config` derives R2's account-scoped endpoint and
+  `region = "auto"` so a deployer cannot misconfigure them. Gated behind `storage-r2`.
+- **Self-contained server image variant.** A deployable image that bakes a config and
+  a small encoder, for container-sidecar deployments.
+- **Design Philosophy guide** (`docs/guide/src/philosophy.md`) — the engine-vs-consumer
+  boundary, the discipline test, and the one-binary/pluggable-backends deployment stance.
+
 ## v0.12.1 — 2026-05-30
 
 ### Fixed

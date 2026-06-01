@@ -1,5 +1,11 @@
 # syntax=docker/dockerfile:1.7
 
+# Runtime variant selector for the final image. This MUST be a GLOBAL arg (declared before the
+# first FROM) so it is in scope for the `FROM ${RUNTIME_VARIANT}` selector at the bottom:
+#   runtime-generic        (default) — operator-supplied config + volume
+#   runtime-selfcontained  — standalone, baked config + encoder (e.g. Cloudflare Containers)
+ARG RUNTIME_VARIANT=runtime-generic
+
 # ---- builder ----
 # The CI base image carries the full Rust toolchain (rustc 1.88.0,
 # protoc, mold, sccache). Pinning to `:latest` is intentional —
@@ -82,8 +88,6 @@ USER nonroot:nonroot
 CMD ["--config", "/etc/jammi/jammi.toml"]
 
 # ---- final ----
-# Select the variant with `--build-arg RUNTIME_VARIANT=...`:
-#   runtime-generic        (default) — operator-supplied config + volume
-#   runtime-selfcontained  — standalone, baked config + encoder
-ARG RUNTIME_VARIANT=runtime-generic
+# Resolve the variant chosen by the global `RUNTIME_VARIANT` arg at the top of this file
+# (`--build-arg RUNTIME_VARIANT=runtime-selfcontained` to bake config + encoder).
 FROM ${RUNTIME_VARIANT}

@@ -1,5 +1,7 @@
 //! Shared wire-adapter helpers for the engine-backed gRPC services
-//! (`EmbeddingService`, `InferenceService`, `EvalService`).
+//! (`EmbeddingService`, `InferenceService`, `EvalService`, `FineTuneService`,
+//! `MutableTableService`, `ChannelService`, `AuditService`, and the topic-admin
+//! verbs on `TriggerService`).
 //!
 //! These services are all thin adapters over the transport-agnostic
 //! [`jammi_ai::Session`]/[`jammi_ai::LocalSession`] abstraction wrapping one
@@ -53,14 +55,20 @@ pub fn session_tenant<T>(request: &Request<T>) -> Option<TenantId> {
 /// active on this task; `f` calls the verb on the [`jammi_ai::LocalSession`]
 /// (which delegates to the same engine) and observes the same task-local. An
 /// unscoped session runs the call directly.
-pub async fn scoped<F, Fut, T>(
+///
+/// Generic over the call's error type: most verbs return [`JammiError`], but the
+/// trigger and audit verbs return their own error enums (`TriggerError`,
+/// `AuditError`). The scoping mechanism is identical regardless, so the one
+/// helper serves them all — only the per-verb `Status` mapping differs at the
+/// call site.
+pub async fn scoped<F, Fut, T, E>(
     session: &Arc<InferenceSession>,
     tenant: Option<TenantId>,
     f: F,
-) -> Result<T, JammiError>
+) -> Result<T, E>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T, JammiError>>,
+    Fut: std::future::Future<Output = Result<T, E>>,
 {
     match tenant {
         Some(t) => session.with_tenant_scoped(t, |_scope| f()).await,
@@ -136,6 +144,21 @@ pub fn encode_ipc_stream(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<
             .map_err(|e| Status::internal(format!("batch encode: {e}")))?;
     }
     Ok(buf)
+}
+
+/// Decode an Arrow IPC stream's schema message into a [`SchemaRef`]. The bytes
+/// are a self-describing IPC stream (a `schema` message, optionally followed by
+/// batches) — the same framing [`encode_ipc_stream`] produces; a schema-only
+/// payload is `encode_ipc_stream(schema, &[])`. Used by the verbs that carry a
+/// table/topic schema declaration on the wire rather than a batch of rows.
+pub fn decode_ipc_schema(bytes: &[u8]) -> Result<SchemaRef, Status> {
+    if bytes.is_empty() {
+        return Err(Status::invalid_argument("schema is required"));
+    }
+    let cursor = std::io::Cursor::new(bytes.to_vec());
+    let reader = StreamReader::try_new(cursor, None)
+        .map_err(|e| Status::invalid_argument(format!("schema decode: {e}")))?;
+    Ok(reader.schema())
 }
 
 /// Decode the `data_header` + `data_body` of an `ArrowBatch` into the record

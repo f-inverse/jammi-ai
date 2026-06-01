@@ -114,6 +114,72 @@ async fn search_returns_hydrated_results_with_provenance() {
     }
 }
 
+// ─── Query-by-example: search_by_id resolves the row's vector internally ─────
+
+#[tokio::test]
+async fn search_by_id_ranks_the_query_row_first() {
+    let (session, _dir) = session_with_embeddings().await;
+
+    // Discover a real key by reading one row's `_row_id` from a plain search.
+    let seed = session
+        .search("patents", vec![0.5_f32; 32], 1)
+        .await
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+    let row_id_col = seed[0]
+        .column_by_name("_row_id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let row_key = row_id_col.value(0).to_string();
+
+    // search_by_id resolves that row's stored vector internally and ranks by
+    // it; a row is its own nearest neighbor, so it must come back first.
+    let results = session
+        .search_by_id("patents", &row_key, 5)
+        .await
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+
+    let top = results[0]
+        .column_by_name("_row_id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(top.value(0), row_key, "the query row ranks first");
+
+    let sim = results[0]
+        .column_by_name("similarity")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap();
+    assert!(
+        (sim.value(0) - 1.0).abs() < 1e-3,
+        "self-match similarity is ~1.0, got {}",
+        sim.value(0)
+    );
+}
+
+#[tokio::test]
+async fn search_by_id_rejects_an_unknown_key() {
+    let (session, _dir) = session_with_embeddings().await;
+    let err = match session.search_by_id("patents", "no-such-key", 5).await {
+        Ok(_) => panic!("an unknown key must error, not silently return nothing"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("no-such-key"),
+        "error must name the missing key, got: {err}"
+    );
+}
+
 // ─── Sort + limit compose correctly ──────────────────────────────────────────
 
 #[tokio::test]

@@ -35,6 +35,15 @@ service EmbeddingService {
   // L2-normalized embedding. Peer of the engine's `encode_audio_query`.
   rpc EncodeAudioQuery(EncodeAudioQueryRequest)
       returns (EncodeAudioQueryResponse);
+
+  // Nearest-neighbor search over a source's embedding table. The query is
+  // either a precomputed vector (encode-then-search) or an existing row's key
+  // (query-by-example; the engine resolves that row's stored vector
+  // internally — the vector never crosses the wire). Peer of the engine's
+  // `search` / `search_by_id`. This is the embedding-consumption verb on the
+  // gRPC surface edge runtimes reach (gRPC-web); it adds no new consumption
+  // model, only an additional transport for the existing capability.
+  rpc Search(SearchRequest) returns (SearchResponse);
 }
 
 // Source backend kind. Mirrors the engine's `SourceType`; the audio path
@@ -109,4 +118,44 @@ message EncodeAudioQueryRequest {
 message EncodeAudioQueryResponse {
   // The L2-normalized embedding for the clip.
   repeated float embedding = 1;
+}
+
+// A packed f32 query vector — the output of `EncodeAudioQuery` (or any
+// client-side encoder) fed back as a search query.
+message QueryVector {
+  repeated float values = 1;
+}
+
+message SearchRequest {
+  // Source whose embedding table is searched.
+  string source_id = 1;
+  // Either a precomputed query vector or an existing row's key. A row_key
+  // resolves that row's stored vector inside the engine (query-by-example);
+  // the vector is never carried on the wire.
+  oneof query {
+    QueryVector query_vector = 2;
+    string row_key = 3;
+  }
+  // Number of nearest neighbors to return.
+  uint32 k = 4;
+  // Optional SQL predicate pushed into the search (predicate pushdown). The
+  // engine treats it as an opaque expression over the result columns; it
+  // carries no domain semantics.
+  optional string filter = 5;
+  // Columns to project into each hit's `columns` map. Empty = key + score
+  // only (no projected columns).
+  repeated string select = 6;
+}
+
+message SearchResponse {
+  repeated SearchHit hits = 1;
+}
+
+message SearchHit {
+  // The matched row's key (the source's key-column value).
+  string key = 1;
+  // Similarity score from the ANN search.
+  float score = 2;
+  // Projected scalar columns, stringified, when `select` is non-empty.
+  map<string, string> columns = 3;
 }

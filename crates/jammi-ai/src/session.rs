@@ -333,6 +333,27 @@ impl InferenceSession {
         SearchBuilder::new(Arc::clone(self), source_id, query, k, None).await
     }
 
+    /// Start a search ranked by an existing row (query-by-example).
+    ///
+    /// Resolves `row_key`'s stored vector from the source's embedding table
+    /// **inside the engine** and delegates to [`Self::search`]. The vector
+    /// never crosses the API boundary — this is consistent with the engine's
+    /// "no raw-vector reads" line while exposing the standard vector-search
+    /// primitive ("rows like this row").
+    pub async fn search_by_id(
+        self: &Arc<Self>,
+        source_id: &str,
+        row_key: &str,
+        k: usize,
+    ) -> Result<SearchBuilder> {
+        let table = self
+            .catalog()
+            .resolve_embedding_table(source_id, None)
+            .await?;
+        let query = self.inner.read_vector_by_key(&table, row_key).await?;
+        self.search(source_id, query, k).await
+    }
+
     /// Encode a single text query into a vector using the given model.
     pub async fn encode_text_query(&self, model_id: &str, text: &str) -> Result<Vec<f32>> {
         let model_source = ModelSource::parse(model_id);

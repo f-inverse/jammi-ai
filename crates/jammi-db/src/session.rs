@@ -788,6 +788,55 @@ impl JammiSession {
         crate::store::vectors::read_fixed_size_list_f32_column(&handle, &table.table_name, "vector")
             .await
     }
+
+    /// Read a single row's stored `vector` from an embedding result table by
+    /// its `_row_id` (the key-column value set at embedding time).
+    ///
+    /// Scans the registered `jammi.{table_name}` table through DataFusion with
+    /// a typed equality filter (no SQL string interpolation of the key, so an
+    /// arbitrary key is not an injection vector) and extracts the one
+    /// `FixedSizeList<Float32>` cell. Returns [`JammiError::Catalog`] when no
+    /// row matches the key, and [`JammiError::Schema`] when the `vector`
+    /// column is not shaped `FixedSizeList<Float32>` — the same typed signal
+    /// [`Self::read_vectors`] gives. The vector stays inside the engine; this
+    /// is the resolver behind `search_by_id`'s query-by-example path.
+    pub async fn read_vector_by_key(
+        &self,
+        table: &crate::catalog::result_repo::ResultTableRecord,
+        row_key: &str,
+    ) -> Result<Vec<f32>> {
+        use datafusion::prelude::{col, lit};
+
+        let table_ref = format!("jammi.{}", table.table_name);
+        let batches = self
+            .ctx
+            .table(&table_ref)
+            .await
+            .map_err(|e| JammiError::Other(format!("Resolve embedding table '{table_ref}': {e}")))?
+            .filter(col("_row_id").eq(lit(row_key)))
+            .map_err(|e| JammiError::Other(format!("Vector-by-key filter: {e}")))?
+            .select_columns(&["vector"])
+            .map_err(|e| JammiError::Other(format!("Vector-by-key projection: {e}")))?
+            .collect()
+            .await
+            .map_err(|e| JammiError::Other(format!("Vector-by-key scan: {e}")))?;
+
+        let mut out: Vec<Vec<f32>> = Vec::new();
+        for batch in &batches {
+            crate::store::vectors::extend_with_fixed_size_list_f32(
+                batch,
+                &table.table_name,
+                "vector",
+                &mut out,
+            )?;
+        }
+        out.into_iter().next().ok_or_else(|| {
+            JammiError::Catalog(format!(
+                "no row with key '{row_key}' in embedding table '{}'",
+                table.table_name
+            ))
+        })
+    }
 }
 
 /// Build a [`BackendImpl`] from `config.catalog`, honouring the SQLite path

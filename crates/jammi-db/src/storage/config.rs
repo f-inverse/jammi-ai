@@ -336,7 +336,10 @@ mod tests {
             endpoint: Some("https://files.example.com".into()),
             ..Default::default()
         };
-        assert_eq!(cfg.resolved_endpoint().as_deref(), Some("https://files.example.com"));
+        assert_eq!(
+            cfg.resolved_endpoint().as_deref(),
+            Some("https://files.example.com")
+        );
     }
 
     #[test]

@@ -2,11 +2,20 @@
 
 End-to-end walkthrough: load a small audio corpus -> generate audio
 embeddings -> run cosine nearest-neighbour search with an audio query ->
-evaluate retrieval quality (Recall@K / MRR) against a held-out golden set.
+evaluate retrieval quality (Recall@K / MRR) against a held-out golden set ->
+domain-tune a projection head on audio triplets and re-evaluate.
 
-The numbered scripts (`01-load-corpus.py` ... `04-eval.py`) decompose this
-same flow step by step; this file runs all four phases in one process and is
-the version wired into `tests/cookbook_smoke.py`.
+The numbered scripts (`01-load-corpus.py` ... `04-eval.py`) decompose the
+search-and-eval flow step by step; this file runs every phase in one process
+and is the version wired into `tests/cookbook_smoke.py`.
+
+Fine-tuning. Phase 5 trains a lightweight projection head on a *frozen* CLAP
+audio tower from `(anchor, positive, negative)` audio triplets and re-runs the
+eval, showing the tuned embeddings differ from the base. The triplets here are
+synthetic — positive = a same-family clip, negative = a different-family clip —
+but what makes a clip a "positive" (augmentation-similar, or co-occurring-
+complementary) is entirely the caller's data; the trainer only minimizes the
+contrastive objective over whatever clips you pair.
 
 Model. The default model is the hermetic `tiny_clap` fixture so the recipe
 runs offline in CI in well under 60s. Any CLAP-format audio model works the
@@ -90,6 +99,58 @@ def build_audio_golden(json_path: Path) -> pa.Table:
     )
 
 
+def corpus_by_family() -> dict[str, list[tuple[str, bytes]]]:
+    """Group the corpus clips by timbre family (the token in
+    `clip_<family>_<idx>.wav`), preserving a deterministic order."""
+    families: dict[str, list[tuple[str, bytes]]] = {}
+    for path in sorted(AUDIO_CORPUS_DIR.glob("clip_*.wav")):
+        stem = path.stem  # clip_sine_0
+        family = stem[len("clip_") :].rsplit("_", 1)[0]  # -> sine
+        families.setdefault(family, []).append((stem, path.read_bytes()))
+    assert families, f"no corpus clips under {AUDIO_CORPUS_DIR}"
+    return families
+
+
+def build_audio_triplets() -> pa.Table:
+    """Synthetic `(anchor, positive, negative)` audio triplets.
+
+    For each clip: positive = the next clip in the same family, negative = a
+    clip from a different family. All three columns are raw audio bytes — the
+    same encoded clips the embedding pipeline consumes. The trainer encodes
+    them through the frozen audio tower + projection head and minimizes the
+    triplet loss; the *meaning* of the pairing is this builder's choice, not
+    the trainer's.
+    """
+    families = corpus_by_family()
+    fam_names = list(families)
+    anchors: list[bytes] = []
+    positives: list[bytes] = []
+    negatives: list[bytes] = []
+    for fi, fam in enumerate(fam_names):
+        clips = families[fam]
+        neg_clips = families[fam_names[(fi + 1) % len(fam_names)]]
+        for ci, (_, anchor) in enumerate(clips):
+            positives.append(clips[(ci + 1) % len(clips)][1])
+            negatives.append(neg_clips[ci % len(neg_clips)][1])
+            anchors.append(anchor)
+    return pa.table(
+        {
+            "anchor": pa.array(anchors, type=pa.binary()),
+            "positive": pa.array(positives, type=pa.binary()),
+            "negative": pa.array(negatives, type=pa.binary()),
+        }
+    )
+
+
+def aggregate_line(metrics: dict) -> str:
+    """One-line summary of the four aggregate retrieval metrics."""
+    agg = metrics["aggregate"]
+    return "  ".join(
+        f"{key}={agg[key]:.4f}"
+        for key in ("recall_at_k", "precision_at_k", "mrr", "ndcg")
+    )
+
+
 def main() -> int:
     print(f"audio_search: model = {MODEL}")
     with tempfile.TemporaryDirectory() as tmp:
@@ -135,22 +196,87 @@ def main() -> int:
         pq.write_table(build_audio_golden(GOLDEN_PATH), golden_parquet)
         db.add_source("golden", url=str(golden_parquet), format="parquet")
 
-        metrics = db.eval_embeddings(
+        base_metrics = db.eval_embeddings(
             source="corpus",
             golden_source="golden.public.golden",
             k=5,
         )
 
-        aggregate = metrics["aggregate"]
-        print("aggregate retrieval metrics:")
+        aggregate = base_metrics["aggregate"]
+        print("base aggregate retrieval metrics:")
         for key in ("recall_at_k", "precision_at_k", "mrr", "ndcg"):
             value = aggregate[key]
             assert 0.0 <= value <= 1.0, f"{key} out of range: {value}"
             print(f"  {key:<16} {value:.4f}")
 
-        per_query = metrics["per_query"]
+        per_query = base_metrics["per_query"]
         assert len(per_query) > 0, "per_query must carry one record per query"
         print(f"per_query: {len(per_query)} records")
+
+        # 5. Domain-tune a projection head on audio triplets, then re-evaluate.
+        #    Empty target_modules => a trainable projection head on the FROZEN
+        #    CLAP audio tower (the cheap, low-risk lightweight mode). The
+        #    triplet loss only needs (anchor, positive, negative) clips; the
+        #    pairing semantics are ours, above, not the trainer's.
+        triplets_parquet = tmp_path / "audio_triplets.parquet"
+        pq.write_table(build_audio_triplets(), triplets_parquet)
+        db.add_source("triplets", url=str(triplets_parquet), format="parquet")
+
+        job = db.fine_tune(
+            source="triplets",
+            base_model=MODEL,
+            columns=["anchor", "positive", "negative"],
+            method="lora",
+            task="audio_embedding",
+            lora_rank=4,
+            learning_rate=1e-3,
+            epochs=8,
+            batch_size=4,
+            warmup_steps=0,
+            validation_fraction=0.0,
+            early_stopping_metric="train_loss",
+        )
+        job.wait()
+        tuned_model = job.model_id
+        assert tuned_model.startswith("jammi:fine-tuned:"), (
+            f"unexpected fine-tuned model_id: {tuned_model}"
+        )
+        print(f"fine-tuned audio model: {tuned_model}")
+
+        # Re-embed the corpus with the tuned model and eval against the same
+        # held-out golden set.
+        db.generate_audio_embeddings(
+            source="corpus",
+            model=tuned_model,
+            audio_column="audio",
+            key="clip_id",
+        )
+        tuned_metrics = db.eval_embeddings(
+            source="corpus",
+            golden_source="golden.public.golden",
+            k=5,
+        )
+        for key in ("recall_at_k", "precision_at_k", "mrr", "ndcg"):
+            value = tuned_metrics["aggregate"][key]
+            assert 0.0 <= value <= 1.0, f"tuned {key} out of range: {value}"
+
+        print(f"base : {aggregate_line(base_metrics)}")
+        print(f"tuned: {aggregate_line(tuned_metrics)}")
+
+        # The projection head measurably changed audio retrieval — at least one
+        # aggregate metric moved. (With the random-weight fixture the direction
+        # is not meaningful; a real CLAP checkpoint is where tuning lifts
+        # quality. We assert change, not improvement.)
+        base_agg = base_metrics["aggregate"]
+        tuned_agg = tuned_metrics["aggregate"]
+        changed = any(
+            abs(base_agg[k] - tuned_agg[k]) > 1e-6
+            for k in ("recall_at_k", "precision_at_k", "mrr", "ndcg")
+        )
+        assert changed, (
+            "fine-tuned audio embeddings should differ from base "
+            f"(base={base_agg}, tuned={tuned_agg})"
+        )
 
     print("audio_search: OK")
     return 0

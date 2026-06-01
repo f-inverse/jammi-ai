@@ -368,6 +368,347 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
     );
 }
 
+// ─── Audio projection-head fine-tune: tuned audio retrieval differs from base ─
+//
+// JA2. The contrastive fine-tune path accepts JA1's audio encoder family via a
+// trainable projection head on a frozen CLAP audio tower. This drives the full
+// audio path end-to-end on the hermetic `tiny_clap` fixture (random weights, no
+// network): build (anchor, positive, negative) audio triplets from the corpus
+// (positive = same timbre family, negative = a different family — caller-supplied
+// pairing, the trainer stays agnostic), fine-tune a projection head, then eval
+// audio→audio retrieval for both the base and tuned embeddings and assert the
+// adapter measurably changed retrieval. Mirrors the text quality test above; the
+// only difference is the modality of the encoded inputs.
+
+fn tiny_clap_model() -> String {
+    "local:".to_string() + common::cookbook_fixture("tiny_clap").to_str().unwrap()
+}
+
+/// Every `clip_*.wav` under the tiny audio corpus, keyed by stem, grouped by
+/// timbre family (the token between `clip_` and the trailing index).
+fn audio_corpus_by_family() -> std::collections::BTreeMap<String, Vec<(String, Vec<u8>)>> {
+    let corpus_dir = common::cookbook_fixture("tiny_audio_corpus");
+    let mut families: std::collections::BTreeMap<String, Vec<(String, Vec<u8>)>> =
+        std::collections::BTreeMap::new();
+    let mut entries: Vec<_> = std::fs::read_dir(&corpus_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().and_then(|s| s.to_str()) == Some("wav")
+                && p.file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.starts_with("clip_"))
+        })
+        .collect();
+    entries.sort();
+    for path in entries {
+        let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
+        // "clip_sine_0" → family "sine"; "clip_harmonic_2" → "harmonic".
+        let family = stem
+            .strip_prefix("clip_")
+            .and_then(|rest| rest.rsplit_once('_').map(|(fam, _)| fam.to_string()))
+            .expect("corpus clip name follows clip_<family>_<idx>");
+        let bytes = std::fs::read(&path).unwrap();
+        families.entry(family).or_default().push((stem, bytes));
+    }
+    families
+}
+
+/// Write the corpus as a `(clip_id, audio)` Parquet table for embedding +
+/// eval, and a held-out `(query_id, query_audio, relevant_id)` golden table
+/// where each query clip is relevant to the *other* clips in its family.
+fn write_audio_corpus_and_golden(
+    dir: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    use arrow::array::{ArrayRef, BinaryArray, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+
+    let families = audio_corpus_by_family();
+
+    // Corpus: one row per clip.
+    let mut clip_ids: Vec<String> = Vec::new();
+    let mut clip_bytes: Vec<Vec<u8>> = Vec::new();
+    for clips in families.values() {
+        for (id, bytes) in clips {
+            clip_ids.push(id.clone());
+            clip_bytes.push(bytes.clone());
+        }
+    }
+    let corpus_schema = Arc::new(Schema::new(vec![
+        Field::new("clip_id", DataType::Utf8, false),
+        Field::new("audio", DataType::Binary, false),
+    ]));
+    let corpus_batch = RecordBatch::try_new(
+        corpus_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                clip_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(BinaryArray::from(
+                clip_bytes.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let corpus_path = dir.join("audio_corpus.parquet");
+    let mut w = ArrowWriter::try_new(
+        std::fs::File::create(&corpus_path).unwrap(),
+        corpus_schema,
+        None,
+    )
+    .unwrap();
+    w.write(&corpus_batch).unwrap();
+    w.close().unwrap();
+
+    // Golden: each clip is a query; its relevant docs are its same-family
+    // siblings (excluding itself). Audio-query mode is triggered by the
+    // binary `query_audio` column.
+    let mut query_ids: Vec<String> = Vec::new();
+    let mut query_audios: Vec<Vec<u8>> = Vec::new();
+    let mut relevant_ids: Vec<String> = Vec::new();
+    for clips in families.values() {
+        for (qid, qbytes) in clips {
+            for (rid, _) in clips {
+                if rid == qid {
+                    continue;
+                }
+                query_ids.push(qid.clone());
+                query_audios.push(qbytes.clone());
+                relevant_ids.push(rid.clone());
+            }
+        }
+    }
+    let golden_schema = Arc::new(Schema::new(vec![
+        Field::new("query_id", DataType::Utf8, false),
+        Field::new("query_audio", DataType::Binary, false),
+        Field::new("relevant_id", DataType::Utf8, false),
+    ]));
+    let golden_batch = RecordBatch::try_new(
+        golden_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                query_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(BinaryArray::from(
+                query_audios
+                    .iter()
+                    .map(|b| b.as_slice())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                relevant_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let golden_path = dir.join("audio_golden.parquet");
+    let mut w = ArrowWriter::try_new(
+        std::fs::File::create(&golden_path).unwrap(),
+        golden_schema,
+        None,
+    )
+    .unwrap();
+    w.write(&golden_batch).unwrap();
+    w.close().unwrap();
+
+    (corpus_path, golden_path)
+}
+
+/// Write an `(anchor, positive, negative)` audio-triplet Parquet table: for
+/// each clip, pair it with a same-family sibling (positive) and a
+/// different-family clip (negative). The "meaning" of the pairing is the
+/// caller's — the trainer only minimizes the contrastive objective.
+fn write_audio_triplets(dir: &std::path::Path) -> std::path::PathBuf {
+    use arrow::array::{ArrayRef, BinaryArray, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+
+    let families = audio_corpus_by_family();
+    let fam_names: Vec<&String> = families.keys().collect();
+
+    let mut anchors: Vec<Vec<u8>> = Vec::new();
+    let mut positives: Vec<Vec<u8>> = Vec::new();
+    let mut negatives: Vec<Vec<u8>> = Vec::new();
+    for (fi, fam) in fam_names.iter().enumerate() {
+        let clips = &families[*fam];
+        // A different family, deterministically chosen.
+        let other_fam = fam_names[(fi + 1) % fam_names.len()];
+        let neg_clips = &families[other_fam];
+        for (ci, (_, anchor)) in clips.iter().enumerate() {
+            let (_, positive) = &clips[(ci + 1) % clips.len()];
+            let (_, negative) = &neg_clips[ci % neg_clips.len()];
+            anchors.push(anchor.clone());
+            positives.push(positive.clone());
+            negatives.push(negative.clone());
+        }
+    }
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("anchor", DataType::Binary, false),
+        Field::new("positive", DataType::Binary, false),
+        Field::new("negative", DataType::Binary, false),
+    ]));
+    let to_bin = |v: &[Vec<u8>]| -> ArrayRef {
+        Arc::new(BinaryArray::from(
+            v.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
+        )) as ArrayRef
+    };
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![to_bin(&anchors), to_bin(&positives), to_bin(&negatives)],
+    )
+    .unwrap();
+    let path = dir.join("audio_triplets.parquet");
+    let mut w = ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    path
+}
+
+#[tokio::test]
+async fn audio_projection_head_fine_tune_changes_retrieval() {
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    let model = tiny_clap_model();
+
+    // Triplet source (audio bytes), corpus, and golden.
+    let triplets_path = write_audio_triplets(dir.path());
+    let (corpus_path, golden_path) = write_audio_corpus_and_golden(dir.path());
+
+    for (name, path) in [
+        ("audio_triplets", &triplets_path),
+        ("audio_corpus", &corpus_path),
+        ("audio_golden", &golden_path),
+    ] {
+        session
+            .add_source(
+                name,
+                SourceType::File,
+                SourceConnection {
+                    url: Some(format!("file://{}", path.display())),
+                    format: Some(FileFormat::Parquet),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // Base audio embeddings over the corpus.
+    let base_rec = session
+        .generate_audio_embeddings("audio_corpus", &model, "audio", "clip_id")
+        .await
+        .unwrap();
+
+    // Fine-tune a projection head on the audio triplets. Empty target_modules
+    // → projection head on the frozen CLAP audio tower. Triplet loss; enough
+    // total gradient to shift LoRA's zero-init B off the identity projection.
+    let job = session
+        .fine_tune(
+            "audio_triplets",
+            &model,
+            &[
+                "anchor".to_string(),
+                "positive".to_string(),
+                "negative".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::AudioEmbedding,
+            Some(FineTuneConfig {
+                epochs: 8,
+                batch_size: 4,
+                learning_rate: 1e-3,
+                lora_rank: 4,
+                warmup_steps: 0,
+                lr_schedule: LrSchedule::Constant,
+                validation_fraction: 0.0,
+                early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        job.model_id().starts_with("jammi:fine-tuned:"),
+        "model_id should carry the fine-tuned prefix, got '{}'",
+        job.model_id()
+    );
+    job.wait().await.unwrap();
+
+    // The tuned model is registered as an audio-embedding model.
+    let models = session.catalog().list_models().await.unwrap();
+    let ft = models
+        .iter()
+        .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
+        .expect("fine-tuned audio model registered in catalog");
+    assert_eq!(ft.model_type, "fine-tuned");
+    assert_eq!(
+        ft.task,
+        ModelTask::AudioEmbedding,
+        "fine-tuned model should carry the audio-embedding task"
+    );
+
+    // Tuned audio embeddings over the same corpus.
+    let ft_rec = session
+        .generate_audio_embeddings("audio_corpus", job.model_id(), "audio", "clip_id")
+        .await
+        .unwrap();
+
+    // Eval audio→audio retrieval for both, against the held-out golden set.
+    let base_metrics = session
+        .eval_embeddings(
+            "audio_corpus",
+            Some(&base_rec.table_name),
+            "audio_golden.public.audio_golden",
+            5,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    let ft_metrics = session
+        .eval_embeddings(
+            "audio_corpus",
+            Some(&ft_rec.table_name),
+            "audio_golden.public.audio_golden",
+            5,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+    // Every aggregate metric stays in range for both.
+    for (label, report) in [("base", &base_metrics), ("tuned", &ft_metrics)] {
+        for (name, val) in common::aggregate_named_metrics(&report.aggregate) {
+            assert!(
+                (0.0..=1.0).contains(&val),
+                "{label} {name} = {val} outside [0, 1]"
+            );
+        }
+    }
+
+    // The adapter measurably changed audio retrieval: at least one aggregate
+    // metric differs from base (proves the projection head is not a no-op on
+    // the audio path).
+    let base_named = common::aggregate_named_metrics(&base_metrics.aggregate);
+    let ft_named = common::aggregate_named_metrics(&ft_metrics.aggregate);
+    let any_different = base_named
+        .into_iter()
+        .zip(ft_named)
+        .any(|((_, b), (_, f))| (b - f).abs() > 1e-6);
+    assert!(
+        any_different,
+        "Tuned audio model should produce at least one different retrieval metric.\n\
+         base:  {:?}\n\
+         tuned: {:?}",
+        base_metrics.aggregate, ft_metrics.aggregate
+    );
+}
+
 // UAT 6 (QLoRA): Invalid methods are now unrepresentable at the type level
 // via `FineTuneMethod` enum. No runtime test needed.
 

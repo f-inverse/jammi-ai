@@ -240,10 +240,12 @@ fn build_r2(
             })
         }
     };
-    let endpoint = r2.resolved_endpoint().ok_or_else(|| StorageError::DriverInit {
-        scheme: Scheme::R2,
-        reason: "R2 requires either account_id or an explicit endpoint".into(),
-    })?;
+    let endpoint = r2
+        .resolved_endpoint()
+        .ok_or_else(|| StorageError::DriverInit {
+            scheme: Scheme::R2,
+            reason: "R2 requires either account_id or an explicit endpoint".into(),
+        })?;
 
     // R2 speaks S3 with `region = "auto"`, reached at the account-scoped
     // endpoint, with path-style addressing (object_store's default — R2 has no

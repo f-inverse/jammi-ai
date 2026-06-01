@@ -37,6 +37,8 @@ use tonic_web::GrpcWebLayer;
 
 use crate::error::fallback_handler;
 use crate::flight::TenantBoundProvider;
+use crate::grpc::embedding::EmbeddingServer;
+use crate::grpc::proto::embedding::embedding_service_server::EmbeddingServiceServer;
 use crate::grpc::proto::session::session_service_server::SessionServiceServer;
 use crate::grpc::proto::trigger::trigger_service_server::TriggerServiceServer;
 use crate::grpc::session::{SessionServer, SessionStore, TenantInterceptor};
@@ -284,6 +286,7 @@ impl OssServer {
             self.session.tenant_binding_arc(),
             self.session_store.clone(),
             Some(trigger),
+            Some(Arc::clone(&self.session)),
             shutdown,
         )
         .await
@@ -292,10 +295,12 @@ impl OssServer {
 }
 
 /// Build and run the gRPC chain (Flight SQL + SessionService +
-/// TriggerService) on `addr`, sharing the supplied `SessionStore`
-/// between every service. Trigger handles are optional — passing
-/// `None` keeps the trigger surface unmounted, which is what the
-/// gRPC-Web test needs.
+/// TriggerService + EmbeddingService) on `addr`, sharing the supplied
+/// `SessionStore` between every service. Trigger handles and the embedding
+/// session are optional — passing `None` keeps that surface unmounted, which
+/// is what the gRPC-Web and `JammiSession`-only fixtures need (the embedding
+/// service operates at the `InferenceSession` layer those fixtures don't
+/// construct).
 ///
 /// This is the test-fixture entry-point. Production code goes
 /// through [`OssServer::run`] which derives every component from
@@ -307,6 +312,7 @@ pub async fn serve_grpc_chain(
     flight_binding: jammi_db::tenant_scope::TenantBinding,
     store: SessionStore,
     trigger: Option<crate::TriggerHandles>,
+    embedding: Option<Arc<InferenceSession>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
     let interceptor = TenantInterceptor::new(store.clone());
@@ -324,19 +330,24 @@ pub async fn serve_grpc_chain(
         .add_service(flight_svc)
         .add_service(session_svc);
 
+    let mut mounted = vec!["Flight SQL", "SessionService"];
     if let Some(handles) = trigger {
         let trigger_svc = TriggerServiceServer::with_interceptor(
             TriggerServer::new(handles.topic_repo, handles.publisher, handles.subscriber),
-            interceptor,
+            interceptor.clone(),
         );
         builder = builder.add_service(trigger_svc);
-        tracing::info!(
-            "gRPC chain (Flight SQL + SessionService + TriggerService) listening on {addr}"
-        );
-    } else {
-        tracing::info!("gRPC chain (Flight SQL + SessionService) listening on {addr}");
+        mounted.push("TriggerService");
     }
 
+    if let Some(session) = embedding {
+        let embedding_svc =
+            EmbeddingServiceServer::with_interceptor(EmbeddingServer::new(session), interceptor);
+        builder = builder.add_service(embedding_svc);
+        mounted.push("EmbeddingService");
+    }
+
+    tracing::info!("gRPC chain ({}) listening on {addr}", mounted.join(" + "));
     builder.serve_with_shutdown(addr, shutdown).await
 }
 

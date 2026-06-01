@@ -57,6 +57,7 @@ async fn start_session_only_server() -> (
             binding,
             store_for_server,
             None,
+            None,
             async move {
                 let _ = shutdown_rx.await;
             },

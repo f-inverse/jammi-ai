@@ -85,6 +85,7 @@ async fn start_grpc_test_server() -> (
             binding,
             store_for_server,
             Some(trigger),
+            None,
             async move {
                 let _ = shutdown_rx.await;
             },

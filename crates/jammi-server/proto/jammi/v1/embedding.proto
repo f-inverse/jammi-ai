@@ -4,51 +4,70 @@ package jammi.v1.embedding;
 
 import "google/protobuf/empty.proto";
 
-// EmbeddingService — the wire surface for the engine's audio-embedding
-// verbs. These are imperative session methods, not SQL queries, so they
-// live as typed gRPC RPCs alongside SessionService / TriggerService rather
-// than on the Flight SQL surface (which carries query/result only, per
-// ADR-01 §3.2).
+// EmbeddingService — the wire surface for the engine's embedding verbs.
+// These are imperative session methods, not SQL queries, so they live as
+// typed gRPC RPCs alongside SessionService / TriggerService rather than on
+// the Flight SQL surface (which carries query/result only, per ADR-01 §3.2).
 //
-// Each verb delegates 1:1 to an `InferenceSession` method introduced by the
-// audio-embedding path (JA1) — the service reimplements no decode, log-mel,
-// or forward logic; it is purely a wire adapter over the in-process engine.
-// Jammi stays non-generative: these encode audio → vector, never generate.
+// The surface is modality-agnostic: one GenerateEmbeddings / EncodeQuery pair
+// keyed by a `Modality` selects the text, image, or audio tower, rather than a
+// verb per modality. Each verb delegates 1:1 to the consumer-facing
+// `Session`/`LocalSession` abstraction, which dispatches the modality onto the
+// engine's concrete tower method — the service reimplements no decode,
+// feature-extraction, or forward logic; it is purely a wire adapter over the
+// in-process engine. Jammi stays non-generative: these encode input → vector,
+// never generate.
 //
 // Tenant scope is read from the request's `SessionTenant` extension, set by
 // the shared TenantInterceptor from the `jammi-session-id` header — the same
 // mechanism SessionService / TriggerService / Flight SQL already use.
 service EmbeddingService {
-  // Register a data source so a later GenerateAudioEmbeddings call can scan
-  // it. Peer of the engine's `add_source`. Idempotent only insofar as the
-  // engine allows — re-registering an id that already exists is an error.
+  // Register a data source so a later GenerateEmbeddings call can scan it.
+  // Peer of the abstraction's `add_source`. The source carries any modality
+  // the engine supports; the kind here is the storage backend, not the
+  // content modality. Idempotent only insofar as the engine allows —
+  // re-registering an id that already exists is an error.
   rpc AddSource(AddSourceRequest) returns (google.protobuf.Empty);
 
-  // Scan `audio_column` (raw encoded audio bytes) on a registered source,
-  // run decode → resample → log-mel → audio tower for every row, persist one
-  // L2-normalized vector per row keyed by `key_column`, and return the
-  // result-table record. Peer of the engine's `generate_audio_embeddings`.
-  rpc GenerateAudioEmbeddings(GenerateAudioEmbeddingsRequest)
-      returns (ResultTable);
+  // Remove a registered source and all associated state (embedding tables,
+  // indexes). Peer of the abstraction's `remove_source`.
+  rpc RemoveSource(RemoveSourceRequest) returns (google.protobuf.Empty);
 
-  // Encode a single audio clip (WAV/FLAC/MP3/Ogg bytes) into one
-  // L2-normalized embedding. Peer of the engine's `encode_audio_query`.
-  rpc EncodeAudioQuery(EncodeAudioQueryRequest)
-      returns (EncodeAudioQueryResponse);
+  // Scan `columns` on a registered source, run the modality's tower over
+  // every row (decode/feature-extraction as the modality requires → forward
+  // pass), persist one L2-normalized vector per row keyed by `key_column`,
+  // and return the result-table record. The `modality` selects which tower.
+  // Peer of the abstraction's `generate_embeddings`.
+  rpc GenerateEmbeddings(GenerateEmbeddingsRequest) returns (ResultTable);
+
+  // Encode a single query into one L2-normalized embedding with the modality's
+  // tower. The `modality` selects the tower; the `input` oneof must match it —
+  // `text` for TEXT, `data` (raw encoded bytes) for IMAGE/AUDIO. Peer of the
+  // abstraction's `encode_query`.
+  rpc EncodeQuery(EncodeQueryRequest) returns (EncodeQueryResponse);
 
   // Nearest-neighbor search over a source's embedding table. The query is
   // either a precomputed vector (encode-then-search) or an existing row's key
   // (query-by-example; the engine resolves that row's stored vector
-  // internally — the vector never crosses the wire). Peer of the engine's
-  // `search` / `search_by_id`. This is the embedding-consumption verb on the
+  // internally — the vector never crosses the wire). Peer of the
+  // abstraction's flat `search`. This is the embedding-consumption verb on the
   // gRPC surface edge runtimes reach (gRPC-web); it adds no new consumption
   // model, only an additional transport for the existing capability.
   rpc Search(SearchRequest) returns (SearchResponse);
 }
 
-// Source backend kind. Mirrors the engine's `SourceType`; the audio path
-// reads encoded bytes out of a file-shaped source, but the verb stays
-// general so the same surface registers any source the engine supports.
+// Which embedding tower a GenerateEmbeddings / EncodeQuery call targets.
+// Mirrors the abstraction's `Modality`; unifying the three per-modality verbs
+// into one parameter is what lets the service carry one embedding verb pair.
+enum Modality {
+  MODALITY_UNSPECIFIED = 0;
+  TEXT = 1;
+  IMAGE = 2;
+  AUDIO = 3;
+}
+
+// Source backend kind. Mirrors the engine's `SourceType`. The kind is the
+// storage backend, independent of the content modality embedded out of it.
 enum SourceKind {
   SOURCE_KIND_UNSPECIFIED = 0;
   SOURCE_KIND_FILE = 1;
@@ -67,8 +86,8 @@ enum FileFormat {
 
 // Connection parameters for a source. Maps onto the engine's
 // `SourceConnection`; only the fields a wire client needs to register a
-// file-shaped audio corpus are exposed (storage URL + format). Cloud
-// credentials are configured server-side, not carried on the wire.
+// file-shaped corpus are exposed (storage URL + format). Cloud credentials
+// are configured server-side, not carried on the wire.
 message SourceConnection {
   // Storage URL (file://, s3://, gs://, azure://) or external-source
   // connection string (postgres://, mysql://).
@@ -83,15 +102,22 @@ message AddSourceRequest {
   SourceConnection connection = 3;
 }
 
-message GenerateAudioEmbeddingsRequest {
+message RemoveSourceRequest {
+  string source_id = 1;
+}
+
+message GenerateEmbeddingsRequest {
   // Registered source to scan.
   string source_id = 1;
-  // Audio encoder model. `local:<path>`, an HF repo id, or a fine-tuned id.
+  // Encoder model. `local:<path>`, an HF repo id, or a fine-tuned id.
   string model_id = 2;
-  // Column holding raw encoded audio bytes.
-  string audio_column = 3;
+  // Content columns to embed. The TEXT tower embeds the listed columns; the
+  // IMAGE and AUDIO towers take exactly one content column.
+  repeated string columns = 3;
   // Column whose value becomes each embedding row's key.
   string key_column = 4;
+  // Which tower to run over the columns.
+  Modality modality = 5;
 }
 
 // Subset of the engine's `ResultTableRecord` a client needs to locate and
@@ -109,19 +135,25 @@ message ResultTable {
   string status = 6;
 }
 
-message EncodeAudioQueryRequest {
+message EncodeQueryRequest {
   string model_id = 1;
-  // Encoded audio clip (WAV/FLAC/MP3/Ogg).
-  bytes audio_bytes = 2;
+  // Which tower to encode the input with.
+  Modality modality = 2;
+  // The query input. `text` for TEXT; `data` (raw encoded bytes — an image
+  // file or an audio clip) for IMAGE/AUDIO. Must match `modality`.
+  oneof input {
+    string text = 3;
+    bytes data = 4;
+  }
 }
 
-message EncodeAudioQueryResponse {
-  // The L2-normalized embedding for the clip.
+message EncodeQueryResponse {
+  // The L2-normalized embedding for the query.
   repeated float embedding = 1;
 }
 
-// A packed f32 query vector — the output of `EncodeAudioQuery` (or any
-// client-side encoder) fed back as a search query.
+// A packed f32 query vector — the output of `EncodeQuery` (or any client-side
+// encoder) fed back as a search query.
 message QueryVector {
   repeated float values = 1;
 }

@@ -424,6 +424,53 @@ impl InferenceSession {
         Ok(output.float_outputs[0][..dim].to_vec())
     }
 
+    /// Generate audio embeddings for a source and persist to Jammi DB.
+    ///
+    /// Peer of [`Self::generate_image_embeddings`]: scans `audio_column` (raw
+    /// encoded audio bytes or file paths), decodes → resamples → log-mel →
+    /// CLAP audio tower, and writes one L2-normalized vector per row. Reuses
+    /// the modality-agnostic [`EmbeddingPipeline`] unchanged.
+    pub async fn generate_audio_embeddings(
+        &self,
+        source_id: &str,
+        model_id: &str,
+        audio_column: &str,
+        key_column: &str,
+    ) -> Result<ResultTableRecord> {
+        let result = EmbeddingPipeline::new(self, &self.result_store, ModelTask::AudioEmbedding)
+            .run(source_id, model_id, &[audio_column.to_string()], key_column)
+            .await?;
+        self.ann_cache.invalidate_source(source_id)?;
+        Ok(result)
+    }
+
+    /// Encode a single audio clip into a vector using the given audio model.
+    ///
+    /// Peer of [`Self::encode_image_query`]: `audio_bytes` is an encoded clip
+    /// (WAV/FLAC/MP3/Ogg); the backend owns decode → resample → log-mel →
+    /// forward, returning the L2-normalized shared-latent embedding.
+    pub async fn encode_audio_query(&self, model_id: &str, audio_bytes: &[u8]) -> Result<Vec<f32>> {
+        let model_source = ModelSource::parse(model_id);
+
+        let guard = self
+            .model_cache
+            .get_or_load(&model_source, ModelTask::AudioEmbedding, None)
+            .await?;
+
+        let binary_array =
+            Arc::new(arrow::array::BinaryArray::from(vec![audio_bytes])) as arrow::array::ArrayRef;
+        let output = guard
+            .model
+            .forward(&[binary_array], ModelTask::AudioEmbedding)
+            .map_err(|e| JammiError::Inference(format!("encode_audio_query forward: {e}")))?;
+
+        let dim = output.shapes.first().map(|(_, c)| *c).unwrap_or(0);
+        if output.float_outputs.is_empty() || output.float_outputs[0].is_empty() {
+            return Err(JammiError::Inference("No embedding output".into()));
+        }
+        Ok(output.float_outputs[0][..dim].to_vec())
+    }
+
     /// Run inference on a registered source using a model.
     ///
     /// Scans the source, feeds `content_columns` through the model,

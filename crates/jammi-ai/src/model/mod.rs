@@ -199,6 +199,31 @@ impl ModelDimensions {
 
         // OpenCLIP format: model_cfg.vision_cfg with embed_dim at top level
         if let Some(model_cfg) = config.get("model_cfg") {
+            // CLAP audio tower: model_cfg.audio_cfg, embed_dim at top level.
+            // Checked before vision_cfg since the two tower configs are
+            // disjoint — a CLAP checkpoint carries audio_cfg, not vision_cfg.
+            if let Some(audio_cfg) = model_cfg.get("audio_cfg") {
+                let embed_dim = model_cfg.get("embed_dim").and_then(|v| v.as_u64())? as usize;
+                let width = audio_cfg.get("width").and_then(|v| v.as_u64())? as usize;
+                let num_layers = audio_cfg.get("layers").and_then(|v| v.as_u64())? as usize;
+                let num_attention_heads = audio_cfg
+                    .get("heads")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or((width / 64).max(1) as u64)
+                    as usize;
+                let mlp_ratio = audio_cfg
+                    .get("mlp_ratio")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(4.0);
+                let intermediate_size = (width as f64 * mlp_ratio) as usize;
+                return Some(Self {
+                    hidden_size: embed_dim,
+                    num_layers,
+                    num_attention_heads,
+                    intermediate_size,
+                });
+            }
+
             let vision_cfg = model_cfg.get("vision_cfg")?;
             let embed_dim = model_cfg.get("embed_dim").and_then(|v| v.as_u64())? as usize;
             let width = vision_cfg.get("width").and_then(|v| v.as_u64())? as usize;

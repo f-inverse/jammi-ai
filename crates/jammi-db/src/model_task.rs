@@ -23,6 +23,8 @@ pub enum ModelTask {
     TextEmbedding,
     /// Produce dense vector representations of input images.
     ImageEmbedding,
+    /// Produce dense vector representations of input audio clips.
+    AudioEmbedding,
     /// Assign a label and confidence score to input text.
     Classification,
     /// Extract named entities (person, org, location, etc.) from text.
@@ -39,6 +41,7 @@ impl ModelTask {
     pub const ALL: &'static [ModelTask] = &[
         ModelTask::TextEmbedding,
         ModelTask::ImageEmbedding,
+        ModelTask::AudioEmbedding,
         ModelTask::Classification,
         ModelTask::Ner,
     ];
@@ -49,6 +52,7 @@ impl ModelTask {
         match self {
             Self::TextEmbedding => "text_embedding",
             Self::ImageEmbedding => "image_embedding",
+            Self::AudioEmbedding => "audio_embedding",
             Self::Classification => "classification",
             Self::Ner => "ner",
         }
@@ -61,10 +65,11 @@ impl ModelTask {
         match s {
             "text_embedding" => Ok(Self::TextEmbedding),
             "image_embedding" => Ok(Self::ImageEmbedding),
+            "audio_embedding" => Ok(Self::AudioEmbedding),
             "classification" => Ok(Self::Classification),
             "ner" => Ok(Self::Ner),
             other => Err(JammiError::Other(format!(
-                "Unknown model task '{other}'. Expected: text_embedding, image_embedding, classification, ner"
+                "Unknown model task '{other}'. Expected: text_embedding, image_embedding, audio_embedding, classification, ner"
             ))),
         }
     }
@@ -72,7 +77,10 @@ impl ModelTask {
     /// `true` for the two embedding variants that participate in vector
     /// search and ANN sidecar indexes; `false` for inference-only tasks.
     pub fn is_embedding(&self) -> bool {
-        matches!(self, Self::TextEmbedding | Self::ImageEmbedding)
+        matches!(
+            self,
+            Self::TextEmbedding | Self::ImageEmbedding | Self::AudioEmbedding
+        )
     }
 }
 
@@ -128,6 +136,7 @@ mod tests {
             match t {
                 ModelTask::TextEmbedding
                 | ModelTask::ImageEmbedding
+                | ModelTask::AudioEmbedding
                 | ModelTask::Classification
                 | ModelTask::Ner => {
                     assert!(
@@ -155,6 +164,7 @@ mod tests {
     fn display_matches_db_str() {
         assert_eq!(format!("{}", ModelTask::TextEmbedding), "text_embedding");
         assert_eq!(format!("{}", ModelTask::ImageEmbedding), "image_embedding");
+        assert_eq!(format!("{}", ModelTask::AudioEmbedding), "audio_embedding");
         assert_eq!(format!("{}", ModelTask::Classification), "classification");
         assert_eq!(format!("{}", ModelTask::Ner), "ner");
     }
@@ -173,6 +183,7 @@ mod tests {
     fn is_embedding_is_true_only_for_embedding_variants() {
         assert!(ModelTask::TextEmbedding.is_embedding());
         assert!(ModelTask::ImageEmbedding.is_embedding());
+        assert!(ModelTask::AudioEmbedding.is_embedding());
         assert!(!ModelTask::Classification.is_embedding());
         assert!(!ModelTask::Ner.is_embedding());
     }

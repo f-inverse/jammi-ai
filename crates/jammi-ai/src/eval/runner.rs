@@ -22,7 +22,7 @@ use jammi_numerics::retrieval::RetrievalMetrics;
 
 use super::golden::{
     ensure_column, ensure_column_int64, load_classification_golden_from_batches,
-    load_ner_golden_from_batches, load_retrieval_golden_from_batches,
+    load_ner_golden_from_batches, load_retrieval_golden_from_batches, QueryModality,
 };
 
 /// Orchestrates evaluation pipelines — retrieval and classification.
@@ -67,21 +67,26 @@ impl<'a> EvalRunner<'a> {
 
         let result_store = self.session.result_store();
 
-        // 2. Load golden dataset — detect text vs image queries
+        // 2. Load golden dataset — detect query modality from the present
+        //    column: query_image (binary) / query_audio (binary) / query_text.
         let golden_schema = self.source_schema(golden_source).await?;
         ensure_column(&golden_schema, "query_id", DataType::Utf8)?;
         ensure_column(&golden_schema, "relevant_id", DataType::Utf8)?;
         let has_grades = golden_schema.field_with_name("relevance_grade").is_ok();
 
-        let is_image = golden_schema.field_with_name("query_image").is_ok();
-        if !is_image {
-            ensure_column(&golden_schema, "query_text", DataType::Utf8)?;
-        }
-
-        let query_col = if is_image {
-            "\"query_image\""
+        let modality = if golden_schema.field_with_name("query_image").is_ok() {
+            QueryModality::Image
+        } else if golden_schema.field_with_name("query_audio").is_ok() {
+            QueryModality::Audio
         } else {
-            "\"query_text\""
+            ensure_column(&golden_schema, "query_text", DataType::Utf8)?;
+            QueryModality::Text
+        };
+
+        let query_col = match modality {
+            QueryModality::Image => "\"query_image\"",
+            QueryModality::Audio => "\"query_audio\"",
+            QueryModality::Text => "\"query_text\"",
         };
         let grade_select = if has_grades {
             ", \"relevance_grade\""
@@ -95,7 +100,7 @@ impl<'a> EvalRunner<'a> {
             ))
             .await?;
 
-        let golden = load_retrieval_golden_from_batches(&batches, has_grades, is_image)?;
+        let golden = load_retrieval_golden_from_batches(&batches, has_grades, modality)?;
 
         // 4. For each query: encode → search → compute metrics.
         let model_source = ModelSource::from_canonical(canonical_model);
@@ -112,6 +117,9 @@ impl<'a> EvalRunner<'a> {
                 }
                 super::golden::QueryInput::Image(bytes) => {
                     self.session.encode_image_query(&encode_id, bytes).await?
+                }
+                super::golden::QueryInput::Audio(bytes) => {
+                    self.session.encode_audio_query(&encode_id, bytes).await?
                 }
             };
 

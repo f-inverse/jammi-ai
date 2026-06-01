@@ -8,12 +8,27 @@ use jammi_db::error::{JammiError, Result};
 use jammi_numerics::ner::Entity;
 pub use jammi_numerics::retrieval::RelevanceJudgment;
 
-/// The input for a retrieval query — either text or image bytes.
+/// The input for a retrieval query — text, image bytes, or audio bytes.
 pub enum QueryInput {
-    /// Text query to encode via `encode_query()`.
+    /// Text query to encode via `encode_text_query()`.
     Text(String),
     /// Image bytes (PNG/JPEG) to encode via `encode_image_query()`.
     Image(Vec<u8>),
+    /// Audio bytes (WAV/FLAC/MP3/Ogg) to encode via `encode_audio_query()`.
+    Audio(Vec<u8>),
+}
+
+/// Which encode path a retrieval golden set drives, selected by the query
+/// column present in the golden schema (`query_text` / `query_image` /
+/// `query_audio`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryModality {
+    /// `query_text` (Utf8) column.
+    Text,
+    /// `query_image` (Binary) column.
+    Image,
+    /// `query_audio` (Binary) column.
+    Audio,
 }
 
 /// A retrieval query with relevance judgments.
@@ -100,13 +115,15 @@ pub fn ensure_column(schema: &Schema, name: &str, expected: DataType) -> Result<
 
 /// Load a retrieval golden dataset from DataFusion query results.
 ///
-/// Supports two modes:
-/// - Text queries: golden source has `query_text` (Utf8) column
-/// - Image queries: golden source has `query_image` (Binary) column
+/// The `modality` selects which query column the loader reads and which
+/// [`QueryInput`] variant it produces:
+/// - [`QueryModality::Text`]: `query_text` (Utf8) column.
+/// - [`QueryModality::Image`]: `query_image` (Binary) column.
+/// - [`QueryModality::Audio`]: `query_audio` (Binary) column.
 pub fn load_retrieval_golden_from_batches(
     batches: &[arrow::array::RecordBatch],
     has_grades: bool,
-    is_image: bool,
+    modality: QueryModality,
 ) -> Result<RetrievalGolden> {
     let mut query_map: HashMap<String, (QueryInput, Vec<RelevanceJudgment>)> = HashMap::new();
 
@@ -124,31 +141,41 @@ pub fn load_retrieval_golden_from_batches(
             vec![1; batch.num_rows()]
         };
 
-        if is_image {
-            let image_col = batch.column_by_name("query_image").ok_or_else(|| {
-                JammiError::Eval("Column 'query_image' not found in batch".into())
-            })?;
-            let image_bytes = extract_binary_column(image_col)?;
-            for i in 0..batch.num_rows() {
-                let entry = query_map
-                    .entry(query_ids[i].clone())
-                    .or_insert_with(|| (QueryInput::Image(image_bytes[i].clone()), Vec::new()));
-                entry.1.push(RelevanceJudgment {
-                    doc_id: relevant_ids[i].clone(),
-                    grade: grades[i],
-                });
+        // Decode the per-row query inputs once for this batch, then fold them
+        // into the query map with their judgments.
+        let inputs: Vec<QueryInput> = match modality {
+            QueryModality::Image => {
+                let col = batch.column_by_name("query_image").ok_or_else(|| {
+                    JammiError::Eval("Column 'query_image' not found in batch".into())
+                })?;
+                extract_binary_column(col)?
+                    .into_iter()
+                    .map(QueryInput::Image)
+                    .collect()
             }
-        } else {
-            let query_texts = extract_string_column(batch, "query_text")?;
-            for i in 0..batch.num_rows() {
-                let entry = query_map
-                    .entry(query_ids[i].clone())
-                    .or_insert_with(|| (QueryInput::Text(query_texts[i].clone()), Vec::new()));
-                entry.1.push(RelevanceJudgment {
-                    doc_id: relevant_ids[i].clone(),
-                    grade: grades[i],
-                });
+            QueryModality::Audio => {
+                let col = batch.column_by_name("query_audio").ok_or_else(|| {
+                    JammiError::Eval("Column 'query_audio' not found in batch".into())
+                })?;
+                extract_binary_column(col)?
+                    .into_iter()
+                    .map(QueryInput::Audio)
+                    .collect()
             }
+            QueryModality::Text => extract_string_column(batch, "query_text")?
+                .into_iter()
+                .map(QueryInput::Text)
+                .collect(),
+        };
+
+        for i in 0..batch.num_rows() {
+            let entry = query_map
+                .entry(query_ids[i].clone())
+                .or_insert_with(|| (clone_query_input(&inputs[i]), Vec::new()));
+            entry.1.push(RelevanceJudgment {
+                doc_id: relevant_ids[i].clone(),
+                grade: grades[i],
+            });
         }
     }
 
@@ -162,6 +189,17 @@ pub fn load_retrieval_golden_from_batches(
         .collect();
 
     Ok(RetrievalGolden { queries })
+}
+
+/// Clone a [`QueryInput`] for the first-row-wins insertion into the query map
+/// (only the first occurrence of a `query_id` seeds the stored input; later
+/// rows contribute judgments only).
+fn clone_query_input(input: &QueryInput) -> QueryInput {
+    match input {
+        QueryInput::Text(s) => QueryInput::Text(s.clone()),
+        QueryInput::Image(b) => QueryInput::Image(b.clone()),
+        QueryInput::Audio(b) => QueryInput::Audio(b.clone()),
+    }
 }
 
 /// Extract binary data from an Arrow column (handles Binary, LargeBinary, BinaryView).

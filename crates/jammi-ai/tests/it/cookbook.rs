@@ -23,6 +23,10 @@ fn tiny_open_clip_id() -> String {
     "local:".to_string() + common::fixture("tiny_open_clip").to_str().unwrap()
 }
 
+fn tiny_clap_id() -> String {
+    "local:".to_string() + common::cookbook_fixture("tiny_clap").to_str().unwrap()
+}
+
 fn tiny_modernbert_id() -> String {
     "local:".to_string() + common::fixture("tiny_modernbert").to_str().unwrap()
 }
@@ -1081,6 +1085,131 @@ async fn recipe_generate_image_embeddings() {
     // Search with the query vector (cookbook recipe: semantic search over images)
     let results = session
         .search("figures", query_vec, 3)
+        .await
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert!(total_rows > 0, "Search should return results");
+    assert!(results[0].schema().field_with_name("similarity").is_ok());
+}
+
+// ─── Recipe: Generate Audio Embeddings ──────────────────────────────────────
+
+/// Build a minimal 16-bit PCM mono WAV (16 kHz) holding a sine tone at `freq`.
+fn sine_wav_bytes(freq: f32) -> Vec<u8> {
+    let sample_rate: u32 = 16_000;
+    let n = (sample_rate as f32 * 0.2) as usize;
+    let samples: Vec<i16> = (0..n)
+        .map(|i| {
+            let t = i as f32 / sample_rate as f32;
+            (0.5 * (2.0 * std::f32::consts::PI * freq * t).sin() * i16::MAX as f32) as i16
+        })
+        .collect();
+    let data_len = (samples.len() * 2) as u32;
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&(36 + data_len).to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+    buf.extend_from_slice(&2u16.to_le_bytes());
+    buf.extend_from_slice(&16u16.to_le_bytes());
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_len.to_le_bytes());
+    for s in samples {
+        buf.extend_from_slice(&s.to_le_bytes());
+    }
+    buf
+}
+
+#[tokio::test]
+async fn recipe_generate_audio_embeddings() {
+    use arrow::array::{ArrayRef, BinaryArray, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+
+    let dir = TempDir::new().unwrap();
+    let session = cookbook_session(&dir).await;
+    let model_id = tiny_clap_id();
+
+    // Build a tiny audio corpus parquet (clip_id, audio bytes) with three
+    // synthetic WAV tones at distinct pitches.
+    let clips: Vec<Vec<u8>> = [220.0_f32, 440.0, 880.0]
+        .iter()
+        .map(|&f| sine_wav_bytes(f))
+        .collect();
+    let parquet_path = dir.path().join("clips.parquet");
+    {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("clip_id", DataType::Utf8, false),
+            Field::new("audio", DataType::Binary, false),
+        ]));
+        let ids = Arc::new(StringArray::from(vec!["clip_0", "clip_1", "clip_2"])) as ArrayRef;
+        let audio: Vec<&[u8]> = clips.iter().map(|v| v.as_slice()).collect();
+        let audio_array = Arc::new(BinaryArray::from(audio)) as ArrayRef;
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids, audio_array]).unwrap();
+        let file = std::fs::File::create(&parquet_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    session
+        .add_source(
+            "clips",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", parquet_path.display())),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Generate audio embeddings (decode -> resample -> log-mel -> forward).
+    let record = session
+        .generate_audio_embeddings("clips", &model_id, "audio", "clip_id")
+        .await
+        .unwrap();
+
+    assert_eq!(record.status, "ready");
+    assert_eq!(record.row_count, 3);
+    assert!(record.dimensions.is_some());
+    assert!(common::url_to_path(&record.parquet_path).exists());
+
+    // Sidecar index files exist (the audio path participates in ANN like the
+    // text and image paths — it is an embedding task).
+    let base = common::url_to_path(record.index_path.as_ref().unwrap());
+    assert!(base.with_extension("usearch").exists());
+    assert!(base.with_extension("rowmap").exists());
+    assert!(base.with_extension("manifest.json").exists());
+
+    // Encode a single audio query (cookbook recipe: encode_audio_query).
+    let query_wav = sine_wav_bytes(440.0);
+    let query_vec = session
+        .encode_audio_query(&model_id, &query_wav)
+        .await
+        .unwrap();
+    assert_eq!(query_vec.len(), 16); // tiny CLAP embed_dim=16
+
+    // L2-normalized.
+    let norm: f32 = query_vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+    assert!(
+        (norm - 1.0).abs() < 0.01,
+        "Query vector should be L2-normalized, got norm={norm}"
+    );
+
+    // Search with the query vector (cookbook recipe: semantic search over audio).
+    let results = session
+        .search("clips", query_vec, 3)
         .await
         .unwrap()
         .run()

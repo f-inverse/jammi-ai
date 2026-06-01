@@ -202,3 +202,23 @@ When multiple embedding tables exist for a source, search uses the most recently
 1. Explicit table name (if provided)
 2. Latest ready embedding table for the source (by `created_at`)
 3. Error if no embedding table exists
+
+## Search over gRPC (edge runtimes)
+
+`EmbeddingService` exposes `Search` on the typed gRPC surface, so a process that reaches the engine over gRPC-web — an edge function that cannot speak Flight SQL's bidirectional HTTP/2 — can run the same similarity search it already uses for `AddSource`, `GenerateAudioEmbeddings`, and `EncodeAudioQuery`. It is the same engine capability on an additional transport, not a second search path.
+
+A `SearchRequest` carries the source, a `k`, an optional SQL `filter` (predicate pushdown), and an optional `select` column list. The query is a `oneof`:
+
+- **`query_vector`** — a precomputed vector. The usual flow is encode-then-search: call `EncodeAudioQuery` (or any client-side encoder) to get the vector, then feed it back as the query.
+- **`row_key`** — query-by-example. The engine resolves that row's stored vector **internally** and ranks by it ("rows like this row"). The vector never crosses the wire.
+
+```text
+// encode-then-search
+embedding = EncodeAudioQuery{ model_id, audio_bytes }.embedding
+hits      = Search{ source_id, query_vector: { values: embedding }, k: 10 }.hits
+
+// query-by-example (no re-encode round-trip; vector stays in the engine)
+hits      = Search{ source_id, row_key: "clip_1", k: 10 }.hits
+```
+
+Each `SearchHit` carries the `key` (the matched row's key-column value), the `score` (similarity), and a `columns` map. `columns` is empty unless `select` is non-empty, in which case it holds the requested columns stringified — the engine always projects the key and score alongside them so a hit is fully formed. Heavy clients that want Arrow batches keep using Flight SQL; `Search` returns lightweight structured rows so an edge bundle needs no Arrow reader.

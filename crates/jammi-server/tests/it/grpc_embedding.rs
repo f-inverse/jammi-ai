@@ -20,9 +20,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use jammi_ai::session::InferenceSession;
 use jammi_server::grpc::proto::embedding::embedding_service_client::EmbeddingServiceClient;
+use jammi_server::grpc::proto::embedding::search_request::Query as SearchQuery;
 use jammi_server::grpc::proto::embedding::{
     AddSourceRequest, EncodeAudioQueryRequest, FileFormat, GenerateAudioEmbeddingsRequest,
-    SourceConnection, SourceKind,
+    QueryVector, SearchRequest, SourceConnection, SourceKind,
 };
 use jammi_server::grpc::session::SessionStore;
 use jammi_test_utils::{cookbook_fixture, test_config};
@@ -200,6 +201,167 @@ async fn embedding_service_generates_and_encodes_audio_over_the_wire() {
         (norm - 1.0).abs() < 0.01,
         "query vector must be L2-normalized, got norm={norm}"
     );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Register the synthetic corpus and embed it, returning the embedding-table
+/// dimensionality. Shared setup for the `Search` wire tests.
+async fn embed_corpus(
+    client: &mut EmbeddingServiceClient<tonic::transport::Channel>,
+    dir: &TempDir,
+) {
+    let parquet_path = write_corpus_parquet(dir);
+    client
+        .add_source(AddSourceRequest {
+            source_id: "clips".into(),
+            source_kind: SourceKind::File as i32,
+            connection: Some(SourceConnection {
+                url: format!("file://{}", parquet_path.display()),
+                format: FileFormat::Parquet as i32,
+            }),
+        })
+        .await
+        .expect("add_source");
+    client
+        .generate_audio_embeddings(GenerateAudioEmbeddingsRequest {
+            source_id: "clips".into(),
+            model_id: tiny_clap_model_id(),
+            audio_column: "audio".into(),
+            key_column: "clip_id".into(),
+        })
+        .await
+        .expect("generate_audio_embeddings");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_by_query_vector_ranks_self_match_first_over_the_wire() {
+    let (addr, shutdown, dir, handle) = start_embedding_server().await;
+    let mut client = EmbeddingServiceClient::new(channel(addr).await);
+    embed_corpus(&mut client, &dir).await;
+
+    // Encode clip_1's tone and search by that vector: clip_1 must rank first
+    // (a clip is its own nearest neighbor under cosine similarity).
+    let query_clip = sine_wav_bytes(440.0);
+    let query_vec = client
+        .encode_audio_query(EncodeAudioQueryRequest {
+            model_id: tiny_clap_model_id(),
+            audio_bytes: query_clip,
+        })
+        .await
+        .expect("encode_audio_query")
+        .into_inner()
+        .embedding;
+
+    let resp = client
+        .search(SearchRequest {
+            source_id: "clips".into(),
+            query: Some(SearchQuery::QueryVector(QueryVector { values: query_vec })),
+            k: 3,
+            filter: None,
+            select: Vec::new(),
+        })
+        .await
+        .expect("search by vector")
+        .into_inner();
+
+    assert_eq!(resp.hits.len(), 3, "k=3 over a three-row corpus");
+    assert_eq!(resp.hits[0].key, "clip_1", "self-match ranks first");
+    assert!(
+        resp.hits[0].score >= resp.hits[1].score && resp.hits[1].score >= resp.hits[2].score,
+        "hits must be ordered by descending score, got {:?}",
+        resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+    );
+    assert!(
+        resp.hits.iter().all(|h| h.columns.is_empty()),
+        "empty select returns key + score only, no columns"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_by_row_key_ranks_that_row_first_over_the_wire() {
+    let (addr, shutdown, dir, handle) = start_embedding_server().await;
+    let mut client = EmbeddingServiceClient::new(channel(addr).await);
+    embed_corpus(&mut client, &dir).await;
+
+    // Query-by-example: the engine resolves clip_2's stored vector internally;
+    // the vector never crosses the wire. clip_2 is its own top neighbor.
+    let resp = client
+        .search(SearchRequest {
+            source_id: "clips".into(),
+            query: Some(SearchQuery::RowKey("clip_2".into())),
+            k: 3,
+            filter: None,
+            select: Vec::new(),
+        })
+        .await
+        .expect("search by row_key")
+        .into_inner();
+
+    assert_eq!(resp.hits.len(), 3, "k=3 over a three-row corpus");
+    assert_eq!(resp.hits[0].key, "clip_2", "the query row ranks first");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_applies_filter_and_select_projection_over_the_wire() {
+    let (addr, shutdown, dir, handle) = start_embedding_server().await;
+    let mut client = EmbeddingServiceClient::new(channel(addr).await);
+    embed_corpus(&mut client, &dir).await;
+
+    // Filter pushes a predicate over the hydrated source columns; select
+    // projects `clip_id` into each hit's columns map.
+    let resp = client
+        .search(SearchRequest {
+            source_id: "clips".into(),
+            query: Some(SearchQuery::RowKey("clip_0".into())),
+            k: 3,
+            filter: Some("clip_id != 'clip_0'".into()),
+            select: vec!["clip_id".into()],
+        })
+        .await
+        .expect("search with filter + select")
+        .into_inner();
+
+    assert!(
+        !resp.hits.is_empty() && resp.hits.len() <= 2,
+        "filter excludes clip_0, leaving at most the two other rows"
+    );
+    for hit in &resp.hits {
+        assert_ne!(hit.key, "clip_0", "filtered row must not appear");
+        assert_eq!(
+            hit.columns.get("clip_id").map(String::as_str),
+            Some(hit.key.as_str()),
+            "projected clip_id must equal the hit key"
+        );
+    }
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_requires_a_query_over_the_wire() {
+    let (addr, shutdown, _dir, handle) = start_embedding_server().await;
+    let mut client = EmbeddingServiceClient::new(channel(addr).await);
+
+    let err = client
+        .search(SearchRequest {
+            source_id: "clips".into(),
+            query: None,
+            k: 3,
+            filter: None,
+            select: Vec::new(),
+        })
+        .await
+        .expect_err("a search with no query must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
     let _ = shutdown.send(());
     let _ = handle.await;

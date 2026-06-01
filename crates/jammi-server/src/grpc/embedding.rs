@@ -1,7 +1,7 @@
 //! `EmbeddingService` gRPC implementation.
 //!
-//! Three verbs land on the wire surface, each a 1:1 delegation to an
-//! [`InferenceSession`] method from the audio-embedding path (JA1):
+//! Each verb is a 1:1 delegation to an [`InferenceSession`] method from the
+//! audio-embedding path (JA1):
 //!
 //! * `AddSource` — registers a data source (peer of `add_source`).
 //! * `GenerateAudioEmbeddings` — scans a source's audio column, runs the
@@ -9,10 +9,15 @@
 //!   (peer of `generate_audio_embeddings`).
 //! * `EncodeAudioQuery` — encodes a single clip into one vector (peer of
 //!   `encode_audio_query`).
+//! * `Search` — nearest-neighbor search over a source's embedding table, by a
+//!   precomputed vector (peer of `search`) or by an existing row's key (peer
+//!   of `search_by_id`, which resolves that row's vector inside the engine).
+//!   This is the embedding-consumption verb on the gRPC-web transport edge
+//!   runtimes reach; it adds no new consumption model.
 //!
 //! The service reimplements no embedding logic — decode, feature extraction,
-//! and the forward pass all live in the engine. This module is purely the
-//! wire adapter: proto in, engine call, proto out.
+//! the forward pass, and the search plan all live in the engine. This module
+//! is purely the wire adapter: proto in, engine call, proto out.
 //!
 //! Tenant scope is read from the request's [`SessionTenant`] extension (set
 //! upstream by [`crate::grpc::session::TenantInterceptor`]) and applied to
@@ -27,11 +32,18 @@ use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::TenantId;
 use tonic::{Request, Response, Status};
 
+use std::collections::HashMap;
+
+use arrow::array::{Array, Float32Array, RecordBatch, StringArray};
+use arrow::util::display::{ArrayFormatter, FormatOptions};
+
+use jammi_ai::search::SearchBuilder;
+
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingService;
 use crate::grpc::proto::embedding::{
-    AddSourceRequest, EncodeAudioQueryRequest, EncodeAudioQueryResponse,
-    FileFormat as ProtoFileFormat, GenerateAudioEmbeddingsRequest, ResultTable,
-    SourceKind as ProtoSourceKind,
+    search_request::Query as ProtoQuery, AddSourceRequest, EncodeAudioQueryRequest,
+    EncodeAudioQueryResponse, FileFormat as ProtoFileFormat, GenerateAudioEmbeddingsRequest,
+    ResultTable, SearchHit, SearchRequest, SearchResponse, SourceKind as ProtoSourceKind,
 };
 use crate::grpc::session::SessionTenant;
 
@@ -119,6 +131,114 @@ impl EmbeddingService for EmbeddingServer {
 
         Ok(Response::new(EncodeAudioQueryResponse { embedding }))
     }
+
+    async fn search(
+        &self,
+        request: Request<SearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        let tenant = session_tenant(&request);
+        let req = request.into_inner();
+        require_nonempty(&req.source_id, "source_id")?;
+        let query = req.query.ok_or_else(|| {
+            Status::invalid_argument("query (query_vector or row_key) is required")
+        })?;
+        let k = req.k as usize;
+        let select = req.select;
+        let filter = req.filter;
+
+        let batches = scoped(&self.session, tenant, || async {
+            let builder = match query {
+                ProtoQuery::QueryVector(v) => {
+                    self.session.search(&req.source_id, v.values, k).await?
+                }
+                ProtoQuery::RowKey(key) => {
+                    self.session.search_by_id(&req.source_id, &key, k).await?
+                }
+            };
+            let builder = match filter.as_deref() {
+                Some(predicate) => builder.filter(predicate)?,
+                None => builder,
+            };
+            let builder = apply_select(builder, &select)?;
+            builder.run().await
+        })
+        .await
+        .map_err(map_engine_error)?;
+
+        let hits = batches_to_hits(&batches, &select)?;
+        Ok(Response::new(SearchResponse { hits }))
+    }
+}
+
+/// Project the requested columns onto the search builder. An empty `select`
+/// leaves the builder unprojected (all hydrated columns survive, so the key
+/// and score are present). A non-empty `select` projects the requested columns
+/// **plus** `_row_id` and `similarity` — the handler always needs those to
+/// build each hit's key and score, even when the client did not list them.
+fn apply_select(builder: SearchBuilder, select: &[String]) -> Result<SearchBuilder, JammiError> {
+    if select.is_empty() {
+        return Ok(builder);
+    }
+    let mut columns: Vec<String> = vec!["_row_id".to_string(), "similarity".to_string()];
+    for name in select {
+        if name != "_row_id" && name != "similarity" {
+            columns.push(name.clone());
+        }
+    }
+    builder.select(&columns)
+}
+
+/// Map each result row to a [`SearchHit`]: `_row_id` → key, `similarity` →
+/// score, and each requested `select` column stringified into `columns`.
+///
+/// `select` columns are read from the projected batch via the type-general
+/// Arrow formatter, so any scalar column the engine returns is carried on the
+/// wire without a per-dtype branch here.
+fn batches_to_hits(batches: &[RecordBatch], select: &[String]) -> Result<Vec<SearchHit>, Status> {
+    let mut hits = Vec::new();
+    let format = FormatOptions::default();
+    for batch in batches {
+        let keys = column_as::<StringArray>(batch, "_row_id")?;
+        let scores = column_as::<Float32Array>(batch, "similarity")?;
+        let formatters: Vec<(String, ArrayFormatter)> = select
+            .iter()
+            .map(|name| {
+                let array = batch.column_by_name(name).ok_or_else(|| {
+                    Status::invalid_argument(format!("select column '{name}' not in results"))
+                })?;
+                let formatter = ArrayFormatter::try_new(array.as_ref(), &format)
+                    .map_err(|e| Status::internal(format!("format column '{name}': {e}")))?;
+                Ok((name.clone(), formatter))
+            })
+            .collect::<Result<_, Status>>()?;
+
+        for row in 0..batch.num_rows() {
+            let columns: HashMap<String, String> = formatters
+                .iter()
+                .map(|(name, fmt)| (name.clone(), fmt.value(row).to_string()))
+                .collect();
+            hits.push(SearchHit {
+                key: keys.value(row).to_string(),
+                score: scores.value(row),
+                columns,
+            });
+        }
+    }
+    Ok(hits)
+}
+
+/// Downcast a named column to a concrete Arrow array, mapping a missing or
+/// wrong-typed column to an internal [`Status`] (the search plan owns these
+/// columns, so a mismatch is a server-side invariant break, not a bad input).
+fn column_as<'a, A: Array + 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a A, Status> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| Status::internal(format!("search result missing '{name}' column")))?
+        .as_any()
+        .downcast_ref::<A>()
+        .ok_or_else(|| {
+            Status::internal(format!("search result '{name}' column has unexpected type"))
+        })
 }
 
 /// Read the bound tenant the [`crate::grpc::session::TenantInterceptor`]

@@ -152,6 +152,8 @@ latency histogram. Wider observability lives in the commercial server.
 
 The server is a query interface. ML operations (embeddings, search, fine-tuning) are done through the Rust library, Python package, or CLI — then the results are queryable over Flight SQL.
 
+The typed gRPC surface is the exception for the embedding path. `EmbeddingService` serves `AddSource`, `GenerateAudioEmbeddings`, `EncodeAudioQuery`, and `Search` over plain gRPC — and, since tonic-web is mounted, over **gRPC-web**. That is the transport an edge runtime can speak (it has no HTTP/2 client for Flight SQL's bidirectional streaming), so an edge function running the engine as a sidecar can ingest, encode, **and** search without the library or CLI. `Search` accepts a precomputed vector or an existing `row_key` (query-by-example, with the vector resolved inside the engine); see [Semantic Search](./semantic-search.md#search-over-grpc-edge-runtimes).
+
 ## Graceful shutdown
 
 The server drains active connections on SIGTERM / Ctrl+C before exiting. In-flight queries complete; long-running operations started via the library are unaffected.

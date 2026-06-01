@@ -75,12 +75,20 @@ vectors land in a result-table plus its sidecar index, consumption is identical:
 `search(source, query, k)` returns top-k ids and scores — ANN over the sidecar index, with an
 exact scan as the fallback when no index is present.
 
-The engine does **not** expose a "read the raw vector by id" path. Embeddings are write-only
-from the consumer's side: you ask the engine for the nearest matches, you do not pull vectors
-back to score them yourself. A consumer that needs to combine similarity with its own
-predicates pushes those predicates into the search query (it is SQL underneath) or filters
-`search` results in its own layer — it never reconstructs the ranking from raw vectors. Adding
-a vector-by-id verb is domain pull; it fails the discipline test.
+`search` is the curated path because it is where the engine adds value: the ANN index, the
+exact-scan fallback, and the evidence/provenance attached to results. The raw vector itself is
+a column in a SQL-addressable result-table, so it is reachable through the generic SQL surface
+(`SELECT <vector_column> FROM <result_table> …`) — the same as selecting any other column. That
+generic read path is legitimate, and making it ergonomic and documented is ordinary engine work;
+it is *not* a violation of anything here. It is the right home for the rare genuine need —
+exporting embeddings, a custom-metric re-rank, debugging.
+
+What the engine does **not** add is a *dedicated vector-retrieval verb* on the embedding/search
+API. A consumer should not pull vectors back to reconstruct a ranking the engine already
+computes, or to compare across models (re-encode for that). A bespoke `get_vector` verb with no
+caller is speculative domain-convenience: it competes with `search` as "how you consume
+embeddings" and owes a per-id contract across every storage backend. So the line is precise —
+the capability is the SQL surface, not a verb; the verb is what fails the discipline test.
 
 ## How it deploys: one binary, pluggable backends
 

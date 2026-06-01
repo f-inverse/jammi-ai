@@ -3,6 +3,15 @@ name: Crates
 on:
   push:
     tags: ["v*"]
+  # Manual re-run to finish a release whose publish step was interrupted (e.g. a
+  # runner ran out of disk mid-publish). Pass the version to (re)publish; the
+  # per-crate "already on crates.io" guard skips whatever already landed.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to (re)publish, e.g. 0.13.0. Defaults to the pushed tag."
+        required: false
+        type: string
 
 concurrency:
   group: release
@@ -24,6 +33,7 @@ jobs:
       - uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Verify tag matches workspace version
+        if: github.event_name == 'push'
         run: |
           tag="${GITHUB_REF#refs/tags/v}"
           version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
@@ -70,7 +80,10 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          # On a tag push, derive the version from the tag (v0.13.0 -> 0.13.0);
+          # on a manual dispatch, take it from the input.
+          VERSION="${{ github.event.inputs.version }}"
+          VERSION="${VERSION:-${GITHUB_REF_NAME#v}}"
           # Publish in topological dependency order. Each entry must come
           # after every crate it depends on, since `cargo publish` resolves
           # workspace deps against crates.io once the path = is stripped:
@@ -92,7 +105,11 @@ jobs:
               echo "${crate} ${VERSION} already on crates.io — skipping"
             else
               echo "Publishing ${crate} ${VERSION}"
-              cargo publish -p "${crate}"
+              # --no-verify: the `validate` job above already compiled and tested
+              # the whole workspace, so cargo's per-crate pre-publish recompile is
+              # redundant — and recompiling the full arrow/candle/datafusion tree
+              # once per crate overflows the runner's disk on the last crate.
+              cargo publish -p "${crate}" --no-verify
               echo "Waiting 30s for crates.io index..."
               sleep 30
             fi
@@ -101,6 +118,9 @@ jobs:
   github-release:
     name: GitHub Release
     needs: publish
+    # Only on a tag push — a manual dispatch (used to finish an interrupted
+    # publish) has no tag ref to create a release from.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write

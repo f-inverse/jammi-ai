@@ -164,6 +164,59 @@ let result_store = Arc::new(ResultStore::with_root(root, registry, catalog)?);
 
 Every result table the session creates writes its Parquet and sidecar ANN index to that prefix; `delete_table_files` and the crash-recovery pass operate against the same backend.
 
+## Config-driven result storage
+
+A deployment usually does not hand-build the `ResultStore` — it sets a `[storage]` section in the config file and lets the session do it. `result_root` is the storage URL result tables are rooted at; `cloud` carries the driver credentials, and is the **default** cloud config the session threads to every driver it builds — both for the result root *and* for cloud data sources whose `add_source` call carries no inline credentials.
+
+```toml
+[storage]
+result_root = "r2://jammi-results/prod"
+
+[storage.cloud]
+kind = "r2"
+account_id = "abc123def456"
+# access_key_id / secret_access_key are read from the environment — see below.
+```
+
+Both fields are optional. With `result_root` unset, result tables stay on local disk under `{artifact_dir}/jammi_db/`. The catalog backend is independent of this setting (configure it under `[catalog]`); `[storage]` governs only result-table and source object storage.
+
+The `kind` selects the driver and the remaining keys mirror the matching `CloudConfig` variant:
+
+```toml
+# AWS S3 (region in TOML, secrets from env)
+[storage.cloud]
+kind = "s3"
+region = "us-east-1"
+```
+
+```toml
+# Google Cloud Storage
+[storage.cloud]
+kind = "gcs"
+service_account_path = "/etc/jammi/sa.json"
+```
+
+```toml
+# Azure Blob
+[storage.cloud]
+kind = "azure"
+account_name = "mystorage"
+```
+
+### Credentials come from the environment
+
+Secrets are deploy secrets, not config-file values. The S3 and R2 drivers build on `object_store`'s `AmazonS3Builder::from_env()`, which reads:
+
+| Env var | Used for |
+|---------|----------|
+| `AWS_ACCESS_KEY_ID` | S3 / R2 access key id |
+| `AWS_SECRET_ACCESS_KEY` | S3 / R2 secret access key |
+| `AWS_SESSION_TOKEN` | optional STS session token (S3) |
+| `AWS_ENDPOINT` | optional S3 endpoint override |
+| `AWS_REGION` | optional S3 region |
+
+GCS reads `GOOGLE_APPLICATION_CREDENTIALS` (or Workload Identity); Azure reads the standard `AZURE_*` chain. So the R2 example above needs only `account_id` in the TOML — `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in the container's environment supply the rest. Any field you *do* set in `[storage.cloud]` overrides the value the env chain produced. A half-set credential pair (an `access_key_id` with no `secret_access_key`, or vice-versa) is rejected at config-load time rather than on the first request.
+
 ## How the layout maps onto buckets
 
 For a result table named `papers__text_embedding__bge-m3__20260520T120000Z_abc12345`, the engine writes three siblings:

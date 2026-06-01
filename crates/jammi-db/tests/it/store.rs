@@ -363,6 +363,60 @@ async fn result_store_create_table_generates_correct_paths() {
     );
 }
 
+/// A `ResultStore` rooted at a `memory://` URL roots every created table
+/// under that URL and round-trips a written batch back through the shared
+/// in-memory object store — the hermetic stand-in for an `r2://`/`s3://`
+/// result root, exercising the cloud code path with no network.
+#[tokio::test]
+async fn result_store_with_memory_root_roots_and_roundtrips() {
+    let dir = tempdir().unwrap();
+    // Catalog stays local (SQLite under artifact_dir); only the result
+    // tables move to the in-memory "cloud" root.
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let registry = StorageRegistry::new();
+    let root = StorageUrl::memory("jammi_results");
+    let store = ResultStore::with_root(root, registry, Arc::clone(&catalog)).unwrap();
+
+    let info = store
+        .create_table(
+            "patents",
+            ModelTask::Classification,
+            "model",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // The table's parquet URL is rooted at the memory root, not local disk.
+    assert!(
+        info.parquet_url
+            .as_str()
+            .starts_with("memory:///jammi_results/"),
+        "parquet_url not under memory root: {}",
+        info.parquet_url
+    );
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef],
+    )
+    .unwrap();
+    let mut writer = store
+        .open_writer(&info.parquet_url, Arc::clone(&schema))
+        .await
+        .unwrap();
+    writer.write_batch(&batch).await.unwrap();
+    let rows = writer.close().await.unwrap();
+    assert_eq!(rows, 3);
+
+    // Read back through the same registry-cached in-memory driver.
+    let handle = store.open_parquet(&info.parquet_url).unwrap();
+    assert!(is_valid_parquet(&handle).await.unwrap());
+    assert_eq!(count_parquet_rows(&handle).await.unwrap(), 3);
+}
+
 // ─── Crash recovery (3 branches) ────────────────────────────────────────────
 
 #[tokio::test]

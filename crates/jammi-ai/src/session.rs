@@ -77,10 +77,7 @@ impl InferenceSession {
         let device_config = DeviceConfig::from_config(inner.config());
         let scheduler = Arc::new(GpuScheduler::new_unlimited());
         let model_cache = Arc::new(ModelCache::new(resolver, device_config.clone(), scheduler));
-        let result_store = Arc::new(ResultStore::new(
-            inner.config().artifact_dir.as_path(),
-            Arc::clone(&catalog),
-        )?);
+        let result_store = Arc::new(build_result_store(&inner, Arc::clone(&catalog))?);
         result_store.recover().await?;
         catalog.cleanup_stale_fine_tune_jobs().await?;
         result_store.load_existing_tables(inner.context()).await?;
@@ -826,6 +823,27 @@ impl InferenceSession {
         EvalRunner { session: self }
             .eval_compare(embedding_tables, source_id, golden_source, k)
             .await
+    }
+}
+
+/// Construct the session's [`ResultStore`], honouring `config.storage`.
+///
+/// When `storage.result_root` is set, result tables (Parquet + USearch
+/// sidecars) are rooted there via [`ResultStore::with_root`], sharing the
+/// session's [`jammi_db::storage::StorageRegistry`] so the deploy-wide
+/// `[storage.cloud]` credentials resolve the root's driver. When it is unset,
+/// result tables live on local disk under `{artifact_dir}/jammi_db/` —
+/// today's behaviour. The catalog backend is independent of this choice.
+fn build_result_store(
+    inner: &JammiSession,
+    catalog: Arc<jammi_db::catalog::Catalog>,
+) -> Result<ResultStore> {
+    match inner.config().storage.result_root.as_deref() {
+        Some(root) => {
+            let root = jammi_db::storage::StorageUrl::parse(root)?;
+            ResultStore::with_root(root, inner.storage_registry(), catalog)
+        }
+        None => ResultStore::new(inner.config().artifact_dir.as_path(), catalog),
     }
 }
 

@@ -20,20 +20,11 @@
 //! and applied via `with_tenant_scoped`, matching every other engine-backed
 //! gRPC surface.
 
-use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use jammi_ai::eval::report::{
-    AggregateDelta, CompareEvalReport, EmbeddingEvalReport, InferenceAggregate,
-    InferenceEvalReport, MetricDelta, PerQueryRecord, PerRecordPrediction, TableEvalReport,
-};
-use jammi_ai::eval::EvalTask;
 use jammi_ai::session::InferenceSession;
+use jammi_ai::wire::{cohorts_from_proto, EvalTaskFromWire};
 use jammi_ai::{LocalSession, Session};
-use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
-use jammi_numerics::classification::{ClassMetrics, ClassificationResult};
-use jammi_numerics::ner::{Entity, NerMetrics, TypeMetrics};
-use jammi_numerics::retrieval::{AggregateMetrics, QueryMetrics};
 use tonic::{Request, Response, Status};
 
 use crate::grpc::proto::eval as pb;
@@ -85,7 +76,7 @@ impl EvalService for EvalServer {
         .await
         .map_err(map_engine_error)?;
 
-        Ok(Response::new(embedding_report_to_proto(report)))
+        Ok(Response::new(report.into()))
     }
 
     async fn eval_per_query(
@@ -104,7 +95,7 @@ impl EvalService for EvalServer {
         .map_err(map_engine_error)?;
 
         Ok(Response::new(pb::EvalPerQueryResponse {
-            records: records.into_iter().map(per_query_record_to_proto).collect(),
+            records: records.into_iter().map(Into::into).collect(),
         }))
     }
 
@@ -121,7 +112,7 @@ impl EvalService for EvalServer {
         if req.columns.is_empty() {
             return Err(Status::invalid_argument("columns is required"));
         }
-        let task = eval_task_from_proto(req.task)?;
+        let task = EvalTaskFromWire::try_from(req.task)?.0;
         let session = self.local();
 
         let report = scoped(&self.session, tenant, || {
@@ -137,7 +128,7 @@ impl EvalService for EvalServer {
         .await
         .map_err(map_engine_error)?;
 
-        Ok(Response::new(inference_report_to_proto(report)))
+        Ok(Response::new(report.into()))
     }
 
     async fn eval_compare(
@@ -166,7 +157,7 @@ impl EvalService for EvalServer {
         .await
         .map_err(map_engine_error)?;
 
-        Ok(Response::new(compare_report_to_proto(report)))
+        Ok(Response::new(report.into()))
     }
 }
 
@@ -177,224 +168,5 @@ fn optional_str(s: &str) -> Option<&str> {
         None
     } else {
         Some(s)
-    }
-}
-
-/// Map the proto [`EvalTask`] onto the engine's [`EvalTask`]. An unspecified
-/// task is rejected — a request that names no task is a client error.
-fn eval_task_from_proto(task: i32) -> Result<EvalTask, Status> {
-    match pb::EvalTask::try_from(task) {
-        Ok(pb::EvalTask::Classification) => Ok(EvalTask::Classification),
-        Ok(pb::EvalTask::Ner) => Ok(EvalTask::Ner),
-        Ok(pb::EvalTask::Unspecified) | Err(_) => {
-            Err(Status::invalid_argument("task must be specified"))
-        }
-    }
-}
-
-/// Rebuild the engine's `query_id → {key: value}` cohort map from the proto
-/// `map<string, CohortTags>`. The substrate never interprets these tags.
-fn cohorts_from_proto(
-    cohorts: HashMap<String, pb::CohortTags>,
-) -> HashMap<String, BTreeMap<String, String>> {
-    cohorts
-        .into_iter()
-        .map(|(query_id, tags)| (query_id, tags.tags.into_iter().collect()))
-        .collect()
-}
-
-// ─── Report → proto ──────────────────────────────────────────────────────────
-
-fn aggregate_to_proto(a: &AggregateMetrics) -> pb::AggregateMetrics {
-    pb::AggregateMetrics {
-        recall_at_k: a.recall_at_k,
-        precision_at_k: a.precision_at_k,
-        mrr: a.mrr,
-        ndcg: a.ndcg,
-    }
-}
-
-fn query_metrics_to_proto(m: &QueryMetrics) -> pb::QueryMetrics {
-    pb::QueryMetrics {
-        recall: m.recall,
-        precision: m.precision,
-        mrr: m.mrr,
-        ndcg: m.ndcg,
-    }
-}
-
-fn per_query_to_proto(r: PerQueryRecord) -> pb::PerQueryRecord {
-    pb::PerQueryRecord {
-        query_id: r.query_id,
-        metrics: Some(query_metrics_to_proto(&r.metrics)),
-        recall_at_ks: r
-            .recall_at_ks
-            .into_iter()
-            .map(|(k, recall)| pb::RecallAtK {
-                k: k as u32,
-                recall,
-            })
-            .collect(),
-        distance: r.distance,
-        cohorts: r.cohorts.into_iter().collect(),
-    }
-}
-
-fn embedding_report_to_proto(report: EmbeddingEvalReport) -> pb::EmbeddingEvalReport {
-    pb::EmbeddingEvalReport {
-        eval_run_id: report.eval_run_id,
-        aggregate: Some(aggregate_to_proto(&report.aggregate)),
-        per_query: report
-            .per_query
-            .into_iter()
-            .map(per_query_to_proto)
-            .collect(),
-    }
-}
-
-fn per_query_record_to_proto(rec: PerQueryEvalRecord) -> pb::PerQueryEvalRecord {
-    pb::PerQueryEvalRecord {
-        eval_run_id: rec.eval_run_id,
-        query_id: rec.query_id,
-        cohorts_json: rec.cohorts_json,
-        metrics_json: rec.metrics_json,
-    }
-}
-
-fn class_metrics_to_proto(m: &ClassMetrics) -> pb::ClassMetrics {
-    pb::ClassMetrics {
-        precision: m.precision,
-        recall: m.recall,
-        f1: m.f1,
-    }
-}
-
-fn classification_to_proto(c: &ClassificationResult) -> pb::ClassificationResult {
-    pb::ClassificationResult {
-        accuracy: c.accuracy,
-        f1: c.f1,
-        per_class: c
-            .per_class
-            .iter()
-            .map(|(k, v)| (k.clone(), class_metrics_to_proto(v)))
-            .collect(),
-    }
-}
-
-fn type_metrics_to_proto(m: &TypeMetrics) -> pb::TypeMetrics {
-    pb::TypeMetrics {
-        precision: m.precision,
-        recall: m.recall,
-        f1: m.f1,
-        support: m.support as u64,
-    }
-}
-
-fn ner_metrics_to_proto(n: &NerMetrics) -> pb::NerMetrics {
-    pb::NerMetrics {
-        precision: n.precision,
-        recall: n.recall,
-        f1: n.f1,
-        per_type: n
-            .per_type
-            .iter()
-            .map(|(k, v)| (k.clone(), type_metrics_to_proto(v)))
-            .collect(),
-    }
-}
-
-fn entity_to_proto(e: &Entity) -> pb::Entity {
-    pb::Entity {
-        label: e.label.clone(),
-        start: e.start as u64,
-        end: e.end as u64,
-        text: e.text.clone(),
-        confidence: e.confidence,
-    }
-}
-
-fn inference_aggregate_to_proto(a: &InferenceAggregate) -> pb::InferenceAggregate {
-    let aggregate = match a {
-        InferenceAggregate::Classification(c) => {
-            pb::inference_aggregate::Aggregate::Classification(classification_to_proto(c))
-        }
-        InferenceAggregate::Ner(n) => {
-            pb::inference_aggregate::Aggregate::Ner(ner_metrics_to_proto(n))
-        }
-    };
-    pb::InferenceAggregate {
-        aggregate: Some(aggregate),
-    }
-}
-
-fn per_record_to_proto(p: PerRecordPrediction) -> pb::PerRecordPrediction {
-    use pb::per_record_prediction as wire;
-    let prediction = match p {
-        PerRecordPrediction::Classification {
-            record_id,
-            predicted,
-            gold,
-        } => wire::Prediction::Classification(wire::Classification {
-            record_id,
-            predicted,
-            gold,
-        }),
-        PerRecordPrediction::Ner {
-            record_id,
-            predicted,
-            gold,
-        } => wire::Prediction::Ner(wire::Ner {
-            record_id,
-            predicted: predicted.iter().map(entity_to_proto).collect(),
-            gold: gold.iter().map(entity_to_proto).collect(),
-        }),
-    };
-    pb::PerRecordPrediction {
-        prediction: Some(prediction),
-    }
-}
-
-fn inference_report_to_proto(report: InferenceEvalReport) -> pb::InferenceEvalReport {
-    pb::InferenceEvalReport {
-        aggregate: Some(inference_aggregate_to_proto(&report.aggregate)),
-        per_record: report
-            .per_record
-            .into_iter()
-            .map(per_record_to_proto)
-            .collect(),
-    }
-}
-
-fn metric_delta_to_proto(d: &MetricDelta) -> pb::MetricDelta {
-    pb::MetricDelta {
-        absolute: d.absolute,
-        relative: d.relative,
-    }
-}
-
-fn aggregate_delta_to_proto(d: &AggregateDelta) -> pb::AggregateDelta {
-    pb::AggregateDelta {
-        recall_at_k: Some(metric_delta_to_proto(&d.recall_at_k)),
-        precision_at_k: Some(metric_delta_to_proto(&d.precision_at_k)),
-        mrr: Some(metric_delta_to_proto(&d.mrr)),
-        ndcg: Some(metric_delta_to_proto(&d.ndcg)),
-    }
-}
-
-fn table_report_to_proto(t: TableEvalReport) -> pb::TableEvalReport {
-    pb::TableEvalReport {
-        table_name: t.table_name,
-        embedding_eval: Some(embedding_report_to_proto(t.embedding_eval)),
-        delta: t.delta.as_ref().map(aggregate_delta_to_proto),
-    }
-}
-
-fn compare_report_to_proto(report: CompareEvalReport) -> pb::CompareEvalReport {
-    pb::CompareEvalReport {
-        per_table: report
-            .per_table
-            .into_iter()
-            .map(table_report_to_proto)
-            .collect(),
     }
 }

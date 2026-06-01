@@ -19,14 +19,14 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
+use jammi_ai::wire::{columns_from_proto, parse_channel_id};
 use jammi_ai::{LocalSession, Session};
-use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
-use jammi_db::ChannelId;
+use jammi_db::catalog::channel_repo::ChannelSpec;
 use tonic::{Request, Response, Status};
 
 use crate::grpc::proto::channel as pb;
 use crate::grpc::proto::channel::channel_service_server::ChannelService;
-use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant};
+use crate::grpc::wire::{map_engine_error, scoped, session_tenant};
 
 /// Server-side handler for the channel gRPC surface. Holds a shared engine
 /// session it wraps in a [`LocalSession`] per call to reach the unified
@@ -88,43 +88,5 @@ impl ChannelService for ChannelServer {
         .map_err(map_engine_error)?;
 
         Ok(Response::new(()))
-    }
-}
-
-/// Parse a wire channel id into the validated [`ChannelId`] newtype.
-fn parse_channel_id(id: &str) -> Result<ChannelId, Status> {
-    require_nonempty(id, "channel_id")?;
-    ChannelId::new(id).map_err(|e| Status::invalid_argument(e.to_string()))
-}
-
-/// Map the wire columns onto the engine's [`ChannelColumn`], rejecting a missing
-/// or unspecified column type — a column that names no type is a client error,
-/// not a silent default.
-fn columns_from_proto(columns: Vec<pb::ChannelColumn>) -> Result<Vec<ChannelColumn>, Status> {
-    columns
-        .into_iter()
-        .map(|c| {
-            require_nonempty(&c.name, "column name")?;
-            Ok(ChannelColumn {
-                name: c.name,
-                data_type: column_type_from_proto(c.data_type)?,
-            })
-        })
-        .collect()
-}
-
-/// Map the proto [`pb::ChannelColumnType`] onto the engine's closed
-/// [`ChannelColumnType`]. An unspecified type is rejected.
-fn column_type_from_proto(ty: i32) -> Result<ChannelColumnType, Status> {
-    match pb::ChannelColumnType::try_from(ty) {
-        Ok(pb::ChannelColumnType::Float32) => Ok(ChannelColumnType::Float32),
-        Ok(pb::ChannelColumnType::Float64) => Ok(ChannelColumnType::Float64),
-        Ok(pb::ChannelColumnType::Int32) => Ok(ChannelColumnType::Int32),
-        Ok(pb::ChannelColumnType::Int64) => Ok(ChannelColumnType::Int64),
-        Ok(pb::ChannelColumnType::Utf8) => Ok(ChannelColumnType::Utf8),
-        Ok(pb::ChannelColumnType::Boolean) => Ok(ChannelColumnType::Boolean),
-        Ok(pb::ChannelColumnType::Unspecified) | Err(_) => Err(Status::invalid_argument(
-            "column data_type must be specified",
-        )),
     }
 }

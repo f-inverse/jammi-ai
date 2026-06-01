@@ -13,13 +13,14 @@ name = "jammi-server"
 path = "src/main.rs"
 
 [dependencies]
-jammi-ai.workspace = true
+# The `wire` feature pulls jammi-ai's gRPC surface: the generated `jammi.v1`
+# stubs and the proto↔domain conversions this crate's service impls consume.
+jammi-ai = { workspace = true, features = ["wire"] }
 jammi-db.workspace = true
 jammi-numerics.workspace = true
 axum.workspace = true
 arrow.workspace = true
 arrow-flight.workspace = true
-arrow-ipc.workspace = true
 arrow-schema.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -30,8 +31,6 @@ prometheus.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
 tonic-web.workspace = true
-prost.workspace = true
-prost-types.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 serde.workspace = true
@@ -41,10 +40,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 async-trait.workspace = true
-
-[build-dependencies]
-tonic-build.workspace = true
-tonic-prost-build.workspace = true
 
 [features]
 default = []
@@ -62,3 +57,9 @@ reqwest.workspace = true
 jammi-test-utils.workspace = true
 tempfile = "3"
 parquet.workspace = true
+# The gRPC integration tests build Arrow IPC payloads and encode raw protos by
+# hand to exercise the wire surface end-to-end; the server's own code reaches
+# these only through `jammi_ai::wire`, so they are test-only deps.
+arrow-ipc.workspace = true
+prost.workspace = true
+prost-types.workspace = true

@@ -136,7 +136,7 @@ this instance. Point your load balancer at `/readyz`.
 
 `/metrics` exposes a small, substrate-level set of Prometheus counters
 (gRPC requests, Flight SQL queries, eval invocations) plus a search-
-latency histogram. Wider observability lives in the commercial server.
+latency histogram.
 
 ## What the server can and cannot do
 

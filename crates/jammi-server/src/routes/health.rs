@@ -87,8 +87,7 @@ pub async fn metrics(State(registry): State<Arc<MetricsRegistry>>) -> Response {
 ///
 /// The counters are intentionally lite — gRPC requests, Flight queries,
 /// eval invocations, and a search-latency histogram — matching the
-/// SPEC-S5 §"Observability" line item. Wider observability lives in
-/// the enterprise binary.
+/// SPEC-S5 §"Observability" line item.
 pub struct MetricsRegistry {
     inner: Registry,
     pub grpc_requests: IntCounter,

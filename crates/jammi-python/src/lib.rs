@@ -18,7 +18,7 @@ use crate::model_task::PyModelTask;
 use crate::search::PySearchBuilder;
 
 /// The `Database` pyclass. Re-exported so native Rust consumers (such as
-/// downstream crates that layer enterprise bindings on top of this one) can
+/// downstream crates that layer their own bindings on top of this one) can
 /// hold and drive the same instance the Python interpreter sees, and call
 /// [`PyDatabase::session_arc`] to share its underlying session.
 pub use crate::database::PyDatabase;

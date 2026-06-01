@@ -54,7 +54,7 @@ pub const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 /// Holds an optional pending-failure slot — when set, the next `publish` call
 /// consumes it and returns the corresponding [`TriggerError::Driver`] instead
 /// of broadcasting. Used by tests that need to exercise publisher failure
-/// paths (e.g. the enterprise gate's `publish_failure_does_not_fail_check`
+/// paths (e.g. a downstream consumer's `publish_failure_does_not_fail_check`
 /// invariant) deterministically.
 pub struct InMemoryBroker {
     channels: RwLock<HashMap<TopicId, ChannelState>>,

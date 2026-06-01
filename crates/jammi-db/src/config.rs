@@ -135,7 +135,7 @@ impl FromStr for LogFormat {
 
 // ─── Config structs ─────────────────────────────────────────────────────────
 
-/// Top-level configuration for the Jammi AI platform.
+/// Top-level configuration for the Jammi AI engine.
 ///
 /// Load from a TOML file via [`JammiConfig::load`], with environment variable overrides.
 ///

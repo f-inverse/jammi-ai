@@ -25,7 +25,7 @@ pub struct EvalRunRecord {
 /// nDCG, distance — as a JSON object; `cohorts_json` carries an opaque
 /// `{key: value}` segment map (`"{}"` when none supplied at eval time). The
 /// substrate stores both verbatim and never interprets cohort keys/values —
-/// declaration/validation is the enterprise layer's concern (J7).
+/// declaration/validation is a downstream consumer's concern.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerQueryEvalRecord {
     pub eval_run_id: String,

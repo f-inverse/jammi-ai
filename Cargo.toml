@@ -133,8 +133,8 @@ async-nats = "0.41"
 
 # Numerics (jammi-numerics) — pure-math kernels for stats, GP+EI, divergence,
 # eval metrics, distance, and Pareto. rand is pinned to 0.8 to keep
-# `build_projection_vector`'s output bit-equivalent with consumers (the
-# enterprise resilience layer reads the same projection seed).
+# `build_projection_vector`'s output bit-equivalent with consumers (a
+# downstream consumer reads the same projection seed).
 nalgebra = "0.34"
 rand = "0.8"
 rand_distr = "0.4"

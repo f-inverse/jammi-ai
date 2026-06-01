@@ -52,8 +52,8 @@ pub struct PerQueryRecord {
     #[serde(default)]
     pub distance: f64,
     /// Opaque per-query cohort tags supplied at eval time (`{}` when none).
-    /// The substrate never interprets these — declaration/validation is the
-    /// enterprise layer's concern (J7).
+    /// The substrate never interprets these — declaration/validation is a
+    /// downstream consumer's concern.
     #[serde(default)]
     pub cohorts: BTreeMap<String, String>,
 }

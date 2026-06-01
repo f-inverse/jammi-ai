@@ -53,8 +53,8 @@ pub trait TriggerBroker: Send + Sync + 'static {
     /// [`ConsumerOffsetSnapshot`] per consumer with the broker's
     /// last-delivered and ack-floor stream sequences. Used by the
     /// backup-restore path to capture consumer state so a fresh broker
-    /// can be primed with the same offsets after a restore (see the
-    /// jammi-enterprise `backup` module for the consuming side).
+    /// can be primed with the same offsets after a restore (a downstream
+    /// consumer's backup module is the consuming side).
     ///
     /// Returns [`TriggerError::TopicNotFound`] when `topic_id` was never
     /// registered with this broker.

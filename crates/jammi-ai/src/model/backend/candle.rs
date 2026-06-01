@@ -585,10 +585,21 @@ impl CandleModel {
             // unlike the vision tower whose raw output is normalized here.
             let normalized = audio.forward_audio(&mel)?;
 
-            let normalized_f32 = if normalized.dtype() == DType::F32 {
-                normalized
+            // Apply the trained projection head if one was loaded. The head is
+            // a post-pool transform on the shared-latent embedding, so an audio
+            // fine-tune trained as a projection head shifts audio embeddings
+            // exactly as a text fine-tune shifts text embeddings.
+            let projected = if let Some(ref head) = self.projection_head {
+                head.forward(&normalized)
+                    .map_err(|e| JammiError::Inference(format!("Projection head: {e}")))?
             } else {
-                normalized.to_dtype(DType::F32).map_err(|e| {
+                normalized
+            };
+
+            let normalized_f32 = if projected.dtype() == DType::F32 {
+                projected
+            } else {
+                projected.to_dtype(DType::F32).map_err(|e| {
                     JammiError::Inference(format!("Audio embedding dtype cast: {e}"))
                 })?
             };

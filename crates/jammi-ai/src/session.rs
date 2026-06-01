@@ -674,12 +674,14 @@ impl InferenceSession {
         );
         let batches = self.sql(&query).await?;
 
-        let data_loader = build_training_data_loader(&batches, columns)?;
+        let data_loader = build_training_data_loader(&batches, columns, task)?;
 
-        // Load base model to get hidden_size and pass to training loop
+        // Load the base model under the task being fine-tuned so the right
+        // tower (text vs audio) is materialised and `embedding_dim()` reports
+        // the shared-latent width the projection head must match.
         let guard = self
             .model_cache
-            .get_or_load(&model_source, ModelTask::TextEmbedding, None)
+            .get_or_load(&model_source, task, None)
             .await?;
         let base_model_arc = Arc::clone(&guard.model);
         let hidden_size = guard
@@ -839,9 +841,17 @@ fn extract_string_column(col: &dyn arrow::array::Array) -> Option<Vec<String>> {
 }
 
 /// Build a TrainingDataLoader from query result batches.
+///
+/// `task` selects how `anchor`/`positive`/`negative` triplet columns are
+/// read: an audio embedding task reads them as encoded-audio bytes; every
+/// other task reads them as text. The column names are identical across
+/// modalities (the triplet shape is the same) — only the cell decoding
+/// differs, so the caller's chosen task is the discriminator, not a parallel
+/// set of column names.
 fn build_training_data_loader(
     batches: &[RecordBatch],
     columns: &[String],
+    task: ModelTask,
 ) -> Result<crate::fine_tune::data::TrainingDataLoader> {
     // Detect format from column names
     let col_names: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
@@ -853,6 +863,10 @@ fn build_training_data_loader(
         && col_names.contains(&"positive")
         && col_names.contains(&"negative");
     let has_classification = col_names.contains(&"text") && col_names.contains(&"label");
+
+    if has_triplet && task == ModelTask::AudioEmbedding {
+        return build_audio_triplet_loader(batches);
+    }
 
     if has_contrastive {
         let mut rows = Vec::new();
@@ -984,9 +998,85 @@ fn build_training_data_loader(
         Err(JammiError::FineTune(format!(
             "Cannot detect training format from columns: {col_names:?}. \
              Expected contrastive (text_a, text_b, score), triplet (anchor, positive, negative), \
-             or classification (text, label)."
+             or classification (text, label). For audio triplets, use the same \
+             (anchor, positive, negative) columns with task=audio_embedding."
         )))
     }
+}
+
+/// Build an audio-triplet loader: read `anchor`/`positive`/`negative` as
+/// encoded-audio byte columns. Shares the triplet column shape with the text
+/// path; only the cell type differs (binary clips vs strings).
+fn build_audio_triplet_loader(
+    batches: &[RecordBatch],
+) -> Result<crate::fine_tune::data::TrainingDataLoader> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let schema_info = || {
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| format!("{}:{}", f.name(), f.data_type()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let anchor_vals = batch
+            .column_by_name("anchor")
+            .and_then(|c| extract_binary_column(c.as_ref()))
+            .ok_or_else(|| {
+                JammiError::FineTune(format!(
+                    "Missing/invalid binary 'anchor' column for audio triplets. Batch schema: [{}]",
+                    schema_info()
+                ))
+            })?;
+        let pos_vals = batch
+            .column_by_name("positive")
+            .and_then(|c| extract_binary_column(c.as_ref()))
+            .ok_or_else(|| {
+                JammiError::FineTune(format!(
+                    "Missing/invalid binary 'positive' column for audio triplets. Batch schema: [{}]",
+                    schema_info()
+                ))
+            })?;
+        let neg_vals = batch
+            .column_by_name("negative")
+            .and_then(|c| extract_binary_column(c.as_ref()))
+            .ok_or_else(|| {
+                JammiError::FineTune(format!(
+                    "Missing/invalid binary 'negative' column for audio triplets. Batch schema: [{}]",
+                    schema_info()
+                ))
+            })?;
+
+        for i in 0..batch.num_rows() {
+            rows.push((
+                anchor_vals[i].clone(),
+                pos_vals[i].clone(),
+                neg_vals[i].clone(),
+            ));
+        }
+    }
+    Ok(crate::fine_tune::data::TrainingDataLoader::from_audio_triplets(rows))
+}
+
+/// Extract a binary column into owned byte vectors, accepting the Arrow binary
+/// families DataFusion produces for an audio-bytes column
+/// (`Binary`/`LargeBinary`/`BinaryView`). Returns `None` for any other type so
+/// the caller can surface a typed schema error.
+fn extract_binary_column(col: &dyn arrow::array::Array) -> Option<Vec<Vec<u8>>> {
+    use arrow::array::{Array, BinaryArray, BinaryViewArray, LargeBinaryArray};
+
+    if let Some(a) = col.as_any().downcast_ref::<BinaryArray>() {
+        return Some((0..a.len()).map(|i| a.value(i).to_vec()).collect());
+    }
+    if let Some(a) = col.as_any().downcast_ref::<LargeBinaryArray>() {
+        return Some((0..a.len()).map(|i| a.value(i).to_vec()).collect());
+    }
+    if let Some(a) = col.as_any().downcast_ref::<BinaryViewArray>() {
+        return Some((0..a.len()).map(|i| a.value(i).to_vec()).collect());
+    }
+    None
 }
 
 /// Extract a human-readable message from a panic payload.

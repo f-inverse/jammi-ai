@@ -1,9 +1,12 @@
 //! Training data loader: reads from DataFusion, produces training batches.
 //!
 //! Two modes:
-//! - **Text-based** (`from_contrastive` / `from_triplets` / `from_rows`):
-//!   stores raw text. Use `text_chunks()` to get batches of text for
-//!   model-in-loop training (encode through base model, project through LoRA).
+//! - **Encode-in-loop** (`from_contrastive` / `from_triplets` /
+//!   `from_audio_triplets` / `from_rows`): stores raw inputs (text strings or
+//!   encoded audio clips). Use `text_chunks()` to get batches for
+//!   model-in-loop training (encode through the base model, project through
+//!   LoRA). Text and audio chunks differ only in how the base model turns one
+//!   example into an embedding — the loss, head, and optimizer are shared.
 //! - **Precomputed** (`from_precomputed`): stores pre-built tensor batches.
 //!   `batches()` returns them as-is. Used in tests.
 
@@ -42,8 +45,15 @@ pub enum TrainingBatch {
 pub enum TrainingFormat {
     /// `text_a, text_b, score` — contrastive pairs with scores.
     Contrastive,
-    /// `anchor, positive, negative` — triplet format.
+    /// `anchor, positive, negative` — text triplet format.
     Triplet,
+    /// `anchor, positive, negative` — audio triplet format. The three
+    /// columns carry encoded audio clips (WAV/FLAC/MP3/Ogg bytes), not text.
+    /// What makes a clip a "positive" (augmentation-similar or
+    /// co-occurring-complementary) is the caller's data, not the trainer's
+    /// concern — the loss only minimizes the triplet objective over whatever
+    /// clips the caller paired.
+    AudioTriplet,
     /// Classification with label-to-index mapping.
     Classification { num_classes: usize },
     /// NER with BIO tag mapping.
@@ -62,6 +72,15 @@ pub enum TextChunk {
         anchors: Vec<String>,
         positives: Vec<String>,
         negatives: Vec<String>,
+    },
+    /// One batch of audio triplets. Each clip is encoded audio bytes the base
+    /// audio model decodes itself; the training loop runs them through the
+    /// frozen audio encoder, then the LoRA projection head, exactly as the
+    /// text path does for [`TextChunk::Triplet`].
+    AudioTriplet {
+        anchors: Vec<Vec<u8>>,
+        positives: Vec<Vec<u8>>,
+        negatives: Vec<Vec<u8>>,
     },
     Classification {
         texts: Vec<String>,
@@ -104,6 +123,11 @@ enum TrainingRow {
         anchor: String,
         positive: String,
         negative: String,
+    },
+    AudioTriplet {
+        anchor: Vec<u8>,
+        positive: Vec<u8>,
+        negative: Vec<u8>,
     },
     Classification {
         text: String,
@@ -167,6 +191,26 @@ impl TrainingDataLoader {
             data: LoaderData::TextRows(
                 rows.into_iter()
                     .map(|(a, p, n)| TrainingRow::Triplet {
+                        anchor: a,
+                        positive: p,
+                        negative: n,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Create a loader from audio triplet rows. Each element is
+    /// `(anchor_bytes, positive_bytes, negative_bytes)` where every field is
+    /// one encoded audio clip. The trainer encodes these through the frozen
+    /// audio base model and the LoRA projection head; the contrastive
+    /// objective is identical to the text triplet path.
+    pub fn from_audio_triplets(rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>) -> Self {
+        Self {
+            format: TrainingFormat::AudioTriplet,
+            data: LoaderData::TextRows(
+                rows.into_iter()
+                    .map(|(a, p, n)| TrainingRow::AudioTriplet {
                         anchor: a,
                         positive: p,
                         negative: n,
@@ -335,6 +379,29 @@ impl TrainingDataLoader {
                             .map(|r| match r {
                                 TrainingRow::Triplet { negative, .. } => negative.clone(),
                                 _ => String::new(),
+                            })
+                            .collect(),
+                    },
+                    TrainingFormat::AudioTriplet => TextChunk::AudioTriplet {
+                        anchors: chunk
+                            .iter()
+                            .map(|r| match r {
+                                TrainingRow::AudioTriplet { anchor, .. } => anchor.clone(),
+                                _ => Vec::new(),
+                            })
+                            .collect(),
+                        positives: chunk
+                            .iter()
+                            .map(|r| match r {
+                                TrainingRow::AudioTriplet { positive, .. } => positive.clone(),
+                                _ => Vec::new(),
+                            })
+                            .collect(),
+                        negatives: chunk
+                            .iter()
+                            .map(|r| match r {
+                                TrainingRow::AudioTriplet { negative, .. } => negative.clone(),
+                                _ => Vec::new(),
                             })
                             .collect(),
                     },

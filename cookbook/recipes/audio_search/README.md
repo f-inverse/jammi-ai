@@ -1,7 +1,8 @@
 # Audio search
 
 Run audio-to-audio similarity search over a corpus with a CLAP-format audio
-model, then measure retrieval quality.
+model, measure retrieval quality, and domain-tune the audio embeddings on
+caller-supplied triplets.
 
 **When to use this pattern.** You have a corpus of sounds (clips, stems,
 loops, recordings) and want to find the ones most similar to a query clip — and
@@ -15,6 +16,7 @@ embedding modality the engine supports alongside text and images.
 2. **Generate** L2-normalized audio embeddings over the audio column
 3. **Search** the index with an encoded audio query (cosine ANN)
 4. **Eval** retrieval quality (Recall@K / MRR) against a held-out golden set
+5. **Fine-tune** a projection head on audio triplets and re-eval (tuned ≠ base)
 
 ## Model
 
@@ -44,14 +46,29 @@ meaningless — it exercises the full pipeline, not model quality. Point
 4. `db.encode_audio_query(MODEL, wav_bytes)` → `db.search("corpus", query=vec, k=5).run()`
 5. Builds the audio-query golden source from `tiny_audio_golden.json` and calls
    `db.eval_embeddings(source="corpus", golden_source="golden.public.golden", k=5)`
-6. Prints the aggregate Recall@K / precision@K / MRR / nDCG and the per-query
-   records. It **reports** the metrics; it does **not** assert a quality bar.
+6. Prints the base aggregate Recall@K / precision@K / MRR / nDCG and the
+   per-query records. It **reports** the metrics; it does **not** assert a
+   quality bar.
+7. Builds synthetic `(anchor, positive, negative)` audio triplets from the
+   corpus (positive = same timbre family, negative = a different family) and
+   calls
+   `db.fine_tune(source="triplets", base_model=MODEL, columns=["anchor","positive","negative"], method="lora", task="audio_embedding", ...)`.
+   Empty `target_modules` ⇒ a trainable **projection head on the frozen CLAP
+   audio tower** (the cheap, low-risk lightweight mode). It then re-embeds the
+   corpus with the tuned model, re-evals, prints base-vs-tuned, and asserts at
+   least one aggregate metric **changed** (proves the adapter alters audio
+   retrieval — not that it improves it; the random-weight fixture's direction
+   is not meaningful, real lift comes from a real checkpoint).
+
+The pairing semantics (what a "positive" *means*) are the caller's training
+data, not the trainer's: the trainer only minimizes the contrastive triplet
+loss over whatever clips you pair.
 
 ## Stepwise scripts
 
-`example.py` runs all four phases in one process (this is the version wired into
-`tests/cookbook_smoke.py`). The numbered scripts decompose the same flow and
-share a persistent workdir, so run them in order:
+`example.py` runs every phase in one process (this is the version wired into
+`tests/cookbook_smoke.py`). The numbered scripts decompose the search-and-eval
+flow and share a persistent workdir, so run them in order:
 
 ```bash
 python cookbook/recipes/audio_search/01-load-corpus.py
@@ -66,6 +83,18 @@ python cookbook/recipes/audio_search/04-eval.py
 - `Database.encode_audio_query(model_id, audio_bytes)` → `list[float]`
 - `Database.search(source, *, query, k)` → `SearchBuilder` → `.run()`
 - `Database.eval_embeddings(*, source, golden_source, model=None, k=10)`
+- `Database.fine_tune(*, source, base_model, columns, method, task="audio_embedding", ...)` → `FineTuneJob`
+
+### Audio triplet schema (fine-tune input)
+
+| column     | type   | notes                                   |
+|------------|--------|-----------------------------------------|
+| `anchor`   | binary | encoded audio clip                      |
+| `positive` | binary | a clip the caller deems related         |
+| `negative` | binary | a clip the caller deems unrelated       |
+
+Same column shape as text triplets — `task="audio_embedding"` is what tells the
+loader to read the three columns as encoded audio rather than text.
 
 ## Input schema
 

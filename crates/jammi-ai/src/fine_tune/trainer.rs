@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, StringArray};
+use arrow::array::{ArrayRef, BinaryArray, StringArray};
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarMap};
 use jammi_db::catalog::status::FineTuneJobStatus;
@@ -540,7 +540,8 @@ impl TrainingLoop {
     ///
     /// - `ProjectionHead`: run the texts through the frozen base model to
     ///   produce pooled embeddings, then project through the head's first
-    ///   LoRA layer.
+    ///   LoRA layer (shared with the audio path via
+    ///   [`Self::project_frozen_embedding`]).
     /// - `EncoderAdapters`: tokenize the texts via the base model's tokenizer,
     ///   then forward through the LoRA-injected encoder directly (the encoder
     ///   does its own pooling and normalisation).
@@ -550,20 +551,10 @@ impl TrainingLoop {
             .as_ref()
             .ok_or_else(|| JammiError::FineTune("encode_texts requires a base model".into()))?;
         match &self.target {
-            TrainingTarget::ProjectionHead { head } => {
+            TrainingTarget::ProjectionHead { .. } => {
                 let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
                 let arr = Arc::new(StringArray::from(text_refs)) as ArrayRef;
-                let output = base
-                    .forward(&[arr], ModelTask::TextEmbedding)
-                    .map_err(|e| JammiError::FineTune(format!("Encode: {e}")))?;
-                let n = output.shapes[0].0;
-                let dim = output.shapes[0].1;
-                let raw = Tensor::from_vec(output.float_outputs[0].clone(), (n, dim), &self.device)
-                    .map_err(|e| JammiError::FineTune(format!("Encode tensor: {e}")))?;
-                head.layers[0]
-                    .1
-                    .forward(&raw)
-                    .map_err(|e| JammiError::FineTune(format!("LoRA projection: {e}")))
+                self.project_frozen_embedding(base, arr, ModelTask::TextEmbedding)
             }
             TrainingTarget::EncoderAdapters(state) => {
                 let encoder = &state.encoder;
@@ -614,6 +605,68 @@ impl TrainingLoop {
         }
     }
 
+    /// Encode a slice of audio clips into a `[batch, hidden]` embedding
+    /// tensor through the frozen audio base model and the LoRA projection
+    /// head.
+    ///
+    /// Each clip is encoded audio bytes (WAV/FLAC/MP3/Ogg); the base model
+    /// owns decode → resample → log-mel → audio-tower forward, exactly as the
+    /// `encode_audio_query` inference path does. Only the `ProjectionHead`
+    /// target trains an audio adapter — LoRA injected *inside* an audio
+    /// encoder is not supported, so `EncoderAdapters` here is a typed error
+    /// rather than a silent wrong path.
+    fn encode_audio(&self, clips: &[Vec<u8>]) -> Result<Tensor> {
+        let base = self
+            .base_model
+            .as_ref()
+            .ok_or_else(|| JammiError::FineTune("encode_audio requires a base model".into()))?;
+        match &self.target {
+            TrainingTarget::ProjectionHead { .. } => {
+                let clip_refs: Vec<&[u8]> = clips.iter().map(|c| c.as_slice()).collect();
+                let arr = Arc::new(BinaryArray::from(clip_refs)) as ArrayRef;
+                self.project_frozen_embedding(base, arr, ModelTask::AudioEmbedding)
+            }
+            TrainingTarget::EncoderAdapters(_) => Err(JammiError::FineTune(
+                "Audio fine-tuning trains a projection head on a frozen audio encoder; \
+                 LoRA injected inside the audio encoder is not supported. \
+                 Leave `target_modules` empty for audio tasks."
+                    .into(),
+            )),
+        }
+    }
+
+    /// Run a content column through the frozen base model for `task`, then
+    /// project the pooled embeddings through the projection head's first LoRA
+    /// layer. Shared by the text and audio projection-head paths — the only
+    /// difference between modalities is the Arrow array type and the
+    /// `ModelTask`, both supplied by the caller.
+    fn project_frozen_embedding(
+        &self,
+        base: &Arc<LoadedModel>,
+        content: ArrayRef,
+        task: ModelTask,
+    ) -> Result<Tensor> {
+        let head = match &self.target {
+            TrainingTarget::ProjectionHead { head } => head,
+            TrainingTarget::EncoderAdapters(_) => {
+                return Err(JammiError::FineTune(
+                    "project_frozen_embedding is only valid for a projection-head target".into(),
+                ))
+            }
+        };
+        let output = base
+            .forward(&[content], task)
+            .map_err(|e| JammiError::FineTune(format!("Encode: {e}")))?;
+        let n = output.shapes[0].0;
+        let dim = output.shapes[0].1;
+        let raw = Tensor::from_vec(output.float_outputs[0].clone(), (n, dim), &self.device)
+            .map_err(|e| JammiError::FineTune(format!("Encode tensor: {e}")))?;
+        head.layers[0]
+            .1
+            .forward(&raw)
+            .map_err(|e| JammiError::FineTune(format!("LoRA projection: {e}")))
+    }
+
     /// Encode a text chunk into a `TrainingBatch` ready for loss computation.
     fn encode_chunk(&self, chunk: &TextChunk) -> Result<super::data::TrainingBatch> {
         let encode = |texts: &Vec<String>| -> Result<Tensor> { self.encode_texts(texts) };
@@ -642,6 +695,23 @@ impl TrainingLoop {
                 let proj_a = encode(anchors)?;
                 let proj_p = encode(positives)?;
                 let proj_n = encode(negatives)?;
+                Ok(super::data::TrainingBatch::Triplet {
+                    anchor: proj_a,
+                    positive: proj_p,
+                    negative: proj_n,
+                })
+            }
+            TextChunk::AudioTriplet {
+                anchors,
+                positives,
+                negatives,
+            } => {
+                // Audio triplets reuse the triplet contrastive objective
+                // verbatim — only the encode step differs (audio bytes →
+                // frozen audio tower → projection head, vs text → text tower).
+                let proj_a = self.encode_audio(anchors)?;
+                let proj_p = self.encode_audio(positives)?;
+                let proj_n = self.encode_audio(negatives)?;
                 Ok(super::data::TrainingBatch::Triplet {
                     anchor: proj_a,
                     positive: proj_p,

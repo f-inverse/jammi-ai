@@ -8,9 +8,16 @@
 
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
 
+use jammi_ai::session::InferenceSession;
 use jammi_db::TenantId;
-use jammi_server::grpc::session::SESSION_HEADER;
+use jammi_server::grpc::session::{SessionStore, SESSION_HEADER};
+use jammi_test_utils::test_config;
+use tempfile::TempDir;
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tonic::Request;
@@ -42,6 +49,64 @@ pub async fn channel(addr: SocketAddr) -> Channel {
         .connect()
         .await
         .expect("channel connect")
+}
+
+/// Guards that keep an in-process engine-backed gRPC server (and its catalog)
+/// alive for the duration of a test. Dropping `shutdown` or letting it fall out
+/// of scope tears the server down; `_dir` roots the engine's temp artifact dir.
+pub struct EngineServer {
+    pub addr: SocketAddr,
+    pub shutdown: oneshot::Sender<()>,
+    /// RAII guard: roots the engine's temp artifact dir for the server's
+    /// lifetime and deletes it on drop. Held, never read.
+    pub _dir: TempDir,
+    pub handle: tokio::task::JoinHandle<()>,
+}
+
+/// Spin up an in-process gRPC server hosting the chain *with* the engine-backed
+/// services (`EmbeddingService`, `InferenceService`, `EvalService`). These are
+/// the only services that need a real `InferenceSession`; the trigger/session
+/// surfaces are unmounted (`None`). Shared by the `grpc_inference` and
+/// `grpc_eval` suites so they drive the same wiring the embedding suite does.
+pub async fn start_engine_server() -> EngineServer {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(cfg).await.expect("session"));
+
+    let store = SessionStore::new();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    drop(listener);
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let flight_ctx = session.context().clone();
+    let binding = session.tenant_binding_arc();
+    let handle = tokio::spawn(async move {
+        jammi_server::runtime::serve_grpc_chain(
+            addr,
+            flight_ctx,
+            binding,
+            store,
+            None,
+            Some(session),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await
+        .expect("grpc server");
+    });
+
+    // Give the server a moment to bind.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    EngineServer {
+        addr,
+        shutdown: shutdown_tx,
+        _dir: dir,
+        handle,
+    }
 }
 
 /// Build a request-extending interceptor closure that injects the

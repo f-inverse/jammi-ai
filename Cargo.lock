@@ -4138,6 +4138,7 @@ dependencies = [
  "futures",
  "jammi-ai",
  "jammi-db",
+ "jammi-numerics",
  "jammi-test-utils",
  "parquet",
  "prometheus",

@@ -37,7 +37,11 @@ use tonic_web::GrpcWebLayer;
 use crate::error::fallback_handler;
 use crate::flight::TenantBoundProvider;
 use crate::grpc::embedding::EmbeddingServer;
+use crate::grpc::eval::EvalServer;
+use crate::grpc::inference::InferenceServer;
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingServiceServer;
+use crate::grpc::proto::eval::eval_service_server::EvalServiceServer;
+use crate::grpc::proto::inference::inference_service_server::InferenceServiceServer;
 use crate::grpc::proto::session::session_service_server::SessionServiceServer;
 use crate::grpc::proto::trigger::trigger_service_server::TriggerServiceServer;
 use crate::grpc::session::{SessionServer, SessionStore, TenantInterceptor};
@@ -294,12 +298,16 @@ impl OssServer {
 }
 
 /// Build and run the gRPC chain (Flight SQL + SessionService +
-/// TriggerService + EmbeddingService) on `addr`, sharing the supplied
-/// `SessionStore` between every service. Trigger handles and the embedding
-/// session are optional — passing `None` keeps that surface unmounted, which
-/// is what the gRPC-Web and `JammiSession`-only fixtures need (the embedding
-/// service operates at the `InferenceSession` layer those fixtures don't
-/// construct).
+/// TriggerService + EmbeddingService + InferenceService + EvalService) on
+/// `addr`, sharing the supplied `SessionStore` between every service. Trigger
+/// handles and the engine session are optional — passing `None` keeps that
+/// surface unmounted, which is what the gRPC-Web and `JammiSession`-only
+/// fixtures need (the engine-backed services operate at the `InferenceSession`
+/// layer those fixtures don't construct).
+///
+/// The `engine` session backs all three engine-layer services
+/// (`EmbeddingService`, `InferenceService`, `EvalService`); they share one
+/// `Arc<InferenceSession>` and each wraps it in a per-call `LocalSession`.
 ///
 /// This is the test-fixture entry-point. Production code goes
 /// through [`OssServer::run`] which derives every component from
@@ -311,7 +319,7 @@ pub async fn serve_grpc_chain(
     flight_binding: jammi_db::tenant_scope::TenantBinding,
     store: SessionStore,
     trigger: Option<crate::TriggerHandles>,
-    embedding: Option<Arc<InferenceSession>>,
+    engine: Option<Arc<InferenceSession>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
     let interceptor = TenantInterceptor::new(store.clone());
@@ -339,11 +347,24 @@ pub async fn serve_grpc_chain(
         mounted.push("TriggerService");
     }
 
-    if let Some(session) = embedding {
-        let embedding_svc =
-            EmbeddingServiceServer::with_interceptor(EmbeddingServer::new(session), interceptor);
+    if let Some(session) = engine {
+        let embedding_svc = EmbeddingServiceServer::with_interceptor(
+            EmbeddingServer::new(Arc::clone(&session)),
+            interceptor.clone(),
+        );
         builder = builder.add_service(embedding_svc);
         mounted.push("EmbeddingService");
+
+        let inference_svc = InferenceServiceServer::with_interceptor(
+            InferenceServer::new(Arc::clone(&session)),
+            interceptor.clone(),
+        );
+        builder = builder.add_service(inference_svc);
+        mounted.push("InferenceService");
+
+        let eval_svc = EvalServiceServer::with_interceptor(EvalServer::new(session), interceptor);
+        builder = builder.add_service(eval_svc);
+        mounted.push("EvalService");
     }
 
     tracing::info!("gRPC chain ({}) listening on {addr}", mounted.join(" + "));

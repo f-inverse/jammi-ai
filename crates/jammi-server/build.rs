@@ -6,6 +6,8 @@ fn main() {
         proto_root.join("jammi/v1/session.proto"),
         proto_root.join("jammi/v1/trigger.proto"),
         proto_root.join("jammi/v1/embedding.proto"),
+        proto_root.join("jammi/v1/inference.proto"),
+        proto_root.join("jammi/v1/eval.proto"),
     ];
 
     for f in &proto_files {

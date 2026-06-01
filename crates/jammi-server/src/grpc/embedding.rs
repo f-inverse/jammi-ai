@@ -23,9 +23,11 @@
 //!
 //! Tenant scope is read from the request's [`SessionTenant`] extension (set
 //! upstream by [`crate::grpc::session::TenantInterceptor`]) and applied to the
-//! call via `with_tenant_scoped` — the same task-local the engine the
+//! call via [`crate::grpc::wire::scoped`] — the same task-local the engine the
 //! [`LocalSession`] wraps observes — matching how the Flight SQL and Trigger
 //! surfaces resolve their tenant.
+//!
+//! [`SessionTenant`]: crate::grpc::session::SessionTenant
 
 use std::sync::Arc;
 
@@ -33,9 +35,7 @@ use jammi_ai::session::InferenceSession;
 use jammi_ai::{
     LocalSession, Modality, QueryInput, SearchQuery, SearchRequest as SessionSearch, Session,
 };
-use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_db::TenantId;
 use tonic::{Request, Response, Status};
 
 use std::collections::HashMap;
@@ -50,7 +50,7 @@ use crate::grpc::proto::embedding::{
     GenerateEmbeddingsRequest, Modality as ProtoModality, RemoveSourceRequest, ResultTable,
     SearchHit, SearchRequest, SearchResponse, SourceKind as ProtoSourceKind,
 };
-use crate::grpc::session::SessionTenant;
+use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant};
 
 /// Server-side handler for the embedding gRPC surface. Holds a shared engine
 /// session it wraps in a [`LocalSession`] per call to reach the unified
@@ -273,48 +273,6 @@ fn column_as<'a, A: Array + 'static>(batch: &'a RecordBatch, name: &str) -> Resu
         })
 }
 
-/// Read the bound tenant the [`crate::grpc::session::TenantInterceptor`]
-/// attached to the request.
-fn session_tenant<T>(request: &Request<T>) -> Option<TenantId> {
-    request
-        .extensions()
-        .get::<SessionTenant>()
-        .and_then(|s| s.0)
-}
-
-/// Run a session call under the request's tenant scope.
-///
-/// A bound tenant installs the engine's task-local tenant override for the
-/// duration of the call via `with_tenant_scoped` — the concurrency-safe form
-/// the gRPC handlers must use, since they share one `Arc<InferenceSession>`
-/// and the sticky `bind_tenant` would race across concurrent requests. The
-/// `TenantScope` handle the closure receives is the marker that the scope is
-/// active on this task; `f` calls the verb on the [`LocalSession`] (which
-/// delegates to the same engine) and observes the same task-local. An
-/// unscoped session runs the call directly.
-async fn scoped<F, Fut, T>(
-    session: &Arc<InferenceSession>,
-    tenant: Option<TenantId>,
-    f: F,
-) -> Result<T, JammiError>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T, JammiError>>,
-{
-    match tenant {
-        Some(t) => session.with_tenant_scoped(t, |_scope| f()).await,
-        None => f().await,
-    }
-}
-
-fn require_nonempty(value: &str, field: &str) -> Result<(), Status> {
-    if value.is_empty() {
-        Err(Status::invalid_argument(format!("{field} is required")))
-    } else {
-        Ok(())
-    }
-}
-
 /// Map the proto [`Modality`] onto the abstraction's [`Modality`]. An
 /// unspecified modality is rejected — a request that names no tower is a
 /// client error, not a silent default.
@@ -401,22 +359,4 @@ fn connection_from_proto(
         format: file_format_from_proto(conn.format)?,
         ..Default::default()
     })
-}
-
-/// Map an engine [`JammiError`] to a gRPC [`Status`], preserving the kind of
-/// failure so a client can distinguish a bad request from an internal fault.
-fn map_engine_error(err: JammiError) -> Status {
-    match err {
-        JammiError::Source { source_id, message } => {
-            Status::invalid_argument(format!("source {source_id}: {message}"))
-        }
-        JammiError::Model { model_id, message } => {
-            Status::invalid_argument(format!("model {model_id}: {message}"))
-        }
-        JammiError::Tenant(detail) => Status::invalid_argument(format!("tenant: {detail}")),
-        JammiError::Config(detail) => Status::invalid_argument(format!("config: {detail}")),
-        JammiError::Schema { .. } => Status::invalid_argument(err.to_string()),
-        JammiError::Inference(detail) => Status::internal(format!("inference: {detail}")),
-        other => Status::internal(other.to_string()),
-    }
 }

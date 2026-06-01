@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package jammi.v1.inference;
+
+import "jammi/v1/trigger.proto";
+
+// InferenceService — the wire surface for the engine's inference verb.
+//
+// `Infer` is an imperative session method, not a SQL query, so it lives as a
+// typed gRPC RPC alongside SessionService / TriggerService / EmbeddingService
+// rather than on the Flight SQL surface (which carries query/result only, per
+// ADR-01 §3.2). The verb is a substrate primitive: it names the act of running
+// a model over a source, not any tenant-domain concept.
+//
+// The verb delegates 1:1 to the consumer-facing `Session`/`LocalSession`
+// abstraction; the service reimplements no model loading, scan, or forward
+// logic — it is purely a wire adapter over the in-process engine.
+//
+// Tenant scope is read from the request's `SessionTenant` extension, set by the
+// shared TenantInterceptor from the `jammi-session-id` header — the same
+// mechanism every other gRPC service and Flight SQL already use.
+service InferenceService {
+  // Scan `columns` on a registered source, run `model_id` over every row for
+  // `task`, and return the result as Arrow IPC. Peer of the abstraction's
+  // `infer`, which returns `Vec<RecordBatch>` — the batches are carried in one
+  // `ArrowBatch` (the same Flight-IPC pairing TriggerService uses).
+  rpc Infer(InferRequest) returns (InferResponse);
+}
+
+// Which model task `Infer` runs over the columns. Mirrors the engine's
+// `ModelTask` (`jammi-db`); the embedding variants encode to vectors, the
+// inference variants assign labels / extract entities.
+enum ModelTask {
+  MODEL_TASK_UNSPECIFIED = 0;
+  TEXT_EMBEDDING = 1;
+  IMAGE_EMBEDDING = 2;
+  AUDIO_EMBEDDING = 3;
+  CLASSIFICATION = 4;
+  NER = 5;
+}
+
+message InferRequest {
+  // Registered source to scan.
+  string source_id = 1;
+  // Model to run. `local:<path>`, an HF repo id, or a fine-tuned id.
+  string model_id = 2;
+  // Which task to run over the columns.
+  ModelTask task = 3;
+  // Content columns fed through the model. At least one is required.
+  repeated string columns = 4;
+  // Column whose value becomes each output row's `_row_id` key.
+  string key_column = 5;
+  // Optional tenant scope override; if unset, the session's tenant
+  // (set via SessionService.SetTenant) applies. Empty string == none.
+  string tenant_id = 6;
+}
+
+message InferResponse {
+  // The inference output rows, encoded as a single Arrow IPC stream
+  // (schema + batches) in `data_body`. Mirrors the `Vec<RecordBatch>` the
+  // engine's `infer` returns; reuses TriggerService's `ArrowBatch` shape.
+  jammi.v1.trigger.ArrowBatch result = 1;
+}

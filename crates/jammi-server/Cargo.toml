@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 jammi-ai.workspace = true
 jammi-db.workspace = true
+jammi-numerics.workspace = true
 axum.workspace = true
 arrow.workspace = true
 arrow-flight.workspace = true

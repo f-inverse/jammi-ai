@@ -1,0 +1,277 @@
+syntax = "proto3";
+
+package jammi.v1.eval;
+
+// EvalService — the wire surface for the engine's evaluation verbs.
+//
+// `EvalEmbeddings`, `EvalPerQuery`, `EvalInference`, and `EvalCompare` are
+// imperative session methods, not SQL queries, so they live as typed gRPC RPCs
+// alongside SessionService / TriggerService / EmbeddingService / Inference-
+// Service rather than on the Flight SQL surface (which carries query/result
+// only, per ADR-01 §3.2). The verbs are substrate primitives — measuring model
+// quality against golden data — and name no tenant-domain concept.
+//
+// Each verb delegates 1:1 to the consumer-facing `Session`/`LocalSession`
+// abstraction; the service reimplements no metric, retrieval, or scan logic.
+// The response messages mirror the Rust report structs the abstraction returns
+// (`EmbeddingEvalReport`, `InferenceEvalReport`, `CompareEvalReport`, and the
+// catalog's `PerQueryEvalRecord`) with typed fields, not opaque JSON.
+//
+// Tenant scope is read from the request's `SessionTenant` extension, set by the
+// shared TenantInterceptor from the `jammi-session-id` header — the same
+// mechanism every other gRPC service and Flight SQL already use.
+service EvalService {
+  // Evaluate embedding retrieval quality against a golden relevance set.
+  // Peer of the abstraction's `eval_embeddings`.
+  rpc EvalEmbeddings(EvalEmbeddingsRequest) returns (EmbeddingEvalReport);
+
+  // Read back the persisted per-query eval records for a run. Peer of the
+  // abstraction's `eval_per_query`.
+  rpc EvalPerQuery(EvalPerQueryRequest) returns (EvalPerQueryResponse);
+
+  // Evaluate inference (classification / NER) quality against golden labels.
+  // Peer of the abstraction's `eval_inference`.
+  rpc EvalInference(EvalInferenceRequest) returns (InferenceEvalReport);
+
+  // Compare multiple embedding tables side-by-side against one golden set.
+  // Peer of the abstraction's `eval_compare`.
+  rpc EvalCompare(EvalCompareRequest) returns (CompareEvalReport);
+}
+
+// Inference-evaluation task kind. Mirrors the engine's `EvalTask`: the two
+// inference tasks that carry golden labels.
+enum EvalTask {
+  EVAL_TASK_UNSPECIFIED = 0;
+  EVAL_TASK_CLASSIFICATION = 1;
+  EVAL_TASK_NER = 2;
+}
+
+// ─── Requests ───────────────────────────────────────────────────────────────
+
+message EvalEmbeddingsRequest {
+  // Source whose embedding table is evaluated.
+  string source_id = 1;
+  // Embedding result table to evaluate; empty == the engine resolves the
+  // source's most recent embedding table.
+  string embedding_table = 2;
+  // Fully-qualified golden relevance source (e.g. "golden.public.relevance").
+  string golden_source = 3;
+  // Retrieval cutoff k.
+  uint32 k = 4;
+  // Opaque per-query cohort tags: query_id → {key: value}. The substrate
+  // stores these verbatim and never interprets them.
+  map<string, CohortTags> cohorts = 5;
+  // Optional tenant scope override; empty == none.
+  string tenant_id = 6;
+}
+
+// A single query's cohort tags. Wrapper message because proto3 maps cannot
+// nest a map as the value type.
+message CohortTags {
+  map<string, string> tags = 1;
+}
+
+message EvalPerQueryRequest {
+  // Run id returned by a prior EvalEmbeddings call.
+  string eval_run_id = 1;
+  string tenant_id = 2;
+}
+
+message EvalInferenceRequest {
+  // Model to run over the source.
+  string model_id = 1;
+  // Source to scan.
+  string source_id = 2;
+  // Content columns fed through the model.
+  repeated string columns = 3;
+  // Inference task kind.
+  EvalTask task = 4;
+  // Fully-qualified golden label source.
+  string golden_source = 5;
+  // Column in the golden source carrying the gold label.
+  string label_column = 6;
+  string tenant_id = 7;
+}
+
+message EvalCompareRequest {
+  // Embedding tables to compare; the first is the baseline. At least two.
+  repeated string embedding_tables = 1;
+  string source_id = 2;
+  string golden_source = 3;
+  uint32 k = 4;
+  string tenant_id = 5;
+}
+
+// ─── Retrieval report (mirrors jammi_numerics + jammi_ai::eval::report) ──────
+
+// Mean retrieval metrics across all queries. Mirrors
+// `jammi_numerics::retrieval::AggregateMetrics`.
+message AggregateMetrics {
+  double recall_at_k = 1;
+  double precision_at_k = 2;
+  double mrr = 3;
+  double ndcg = 4;
+}
+
+// Per-query metric values at a single cutoff. Mirrors
+// `jammi_numerics::retrieval::QueryMetrics`.
+message QueryMetrics {
+  double recall = 1;
+  double precision = 2;
+  double mrr = 3;
+  double ndcg = 4;
+}
+
+// Recall at one cutoff `k`. Mirrors the `(usize, f64)` pairs in
+// `PerQueryRecord.recall_at_ks`.
+message RecallAtK {
+  uint32 k = 1;
+  double recall = 2;
+}
+
+// One query's metrics plus its join key. Mirrors
+// `jammi_ai::eval::report::PerQueryRecord`.
+message PerQueryRecord {
+  string query_id = 1;
+  QueryMetrics metrics = 2;
+  repeated RecallAtK recall_at_ks = 3;
+  double distance = 4;
+  map<string, string> cohorts = 5;
+}
+
+// Result of one EvalEmbeddings invocation. Mirrors
+// `jammi_ai::eval::report::EmbeddingEvalReport`.
+message EmbeddingEvalReport {
+  string eval_run_id = 1;
+  AggregateMetrics aggregate = 2;
+  repeated PerQueryRecord per_query = 3;
+}
+
+// ─── Per-query persistence (mirrors catalog eval_repo::PerQueryEvalRecord) ───
+
+// One persisted per-query eval row. Mirrors
+// `jammi_db::catalog::eval_repo::PerQueryEvalRecord`, whose `cohorts`/`metrics`
+// columns are JSON-object strings by storage shape — carried verbatim.
+message PerQueryEvalRecord {
+  string eval_run_id = 1;
+  string query_id = 2;
+  // Opaque cohort tags as a JSON object string; "{}" when none.
+  string cohorts_json = 3;
+  // Per-query metrics as a JSON object string.
+  string metrics_json = 4;
+}
+
+message EvalPerQueryResponse {
+  repeated PerQueryEvalRecord records = 1;
+}
+
+// ─── Inference report (mirrors jammi_numerics + jammi_ai::eval::report) ──────
+
+// Per-class precision/recall/F1. Mirrors
+// `jammi_numerics::classification::ClassMetrics`.
+message ClassMetrics {
+  double precision = 1;
+  double recall = 2;
+  double f1 = 3;
+}
+
+// Classification eval result. Mirrors
+// `jammi_numerics::classification::ClassificationResult`.
+message ClassificationResult {
+  double accuracy = 1;
+  double f1 = 2;
+  map<string, ClassMetrics> per_class = 3;
+}
+
+// Per-entity-type precision/recall/F1/support. Mirrors
+// `jammi_numerics::ner::TypeMetrics`.
+message TypeMetrics {
+  double precision = 1;
+  double recall = 2;
+  double f1 = 3;
+  uint64 support = 4;
+}
+
+// NER eval metrics. Mirrors `jammi_numerics::ner::NerMetrics`.
+message NerMetrics {
+  double precision = 1;
+  double recall = 2;
+  double f1 = 3;
+  map<string, TypeMetrics> per_type = 4;
+}
+
+// A named-entity span. Mirrors `jammi_numerics::ner::Entity`.
+message Entity {
+  string label = 1;
+  uint64 start = 2;
+  uint64 end = 3;
+  string text = 4;
+  float confidence = 5;
+}
+
+// Aggregate inference metrics, tagged by task kind. Mirrors
+// `jammi_ai::eval::report::InferenceAggregate`.
+message InferenceAggregate {
+  oneof aggregate {
+    ClassificationResult classification = 1;
+    NerMetrics ner = 2;
+  }
+}
+
+// One predicted/gold pair, tagged by task kind. Mirrors
+// `jammi_ai::eval::report::PerRecordPrediction`.
+message PerRecordPrediction {
+  message Classification {
+    string record_id = 1;
+    string predicted = 2;
+    string gold = 3;
+  }
+  message Ner {
+    string record_id = 1;
+    repeated Entity predicted = 2;
+    repeated Entity gold = 3;
+  }
+  oneof prediction {
+    Classification classification = 1;
+    Ner ner = 2;
+  }
+}
+
+// Result of one EvalInference invocation. Mirrors
+// `jammi_ai::eval::report::InferenceEvalReport`.
+message InferenceEvalReport {
+  InferenceAggregate aggregate = 1;
+  repeated PerRecordPrediction per_record = 2;
+}
+
+// ─── Compare report (mirrors jammi_ai::eval::report) ─────────────────────────
+
+// Single-metric delta: absolute = model - baseline, relative = absolute /
+// baseline. Mirrors `jammi_ai::eval::report::MetricDelta`.
+message MetricDelta {
+  double absolute = 1;
+  double relative = 2;
+}
+
+// Per-metric deltas relative to the baseline. Mirrors
+// `jammi_ai::eval::report::AggregateDelta`.
+message AggregateDelta {
+  MetricDelta recall_at_k = 1;
+  MetricDelta precision_at_k = 2;
+  MetricDelta mrr = 3;
+  MetricDelta ndcg = 4;
+}
+
+// One table's embedding eval plus its delta vs the baseline. Mirrors
+// `jammi_ai::eval::report::TableEvalReport`; `delta` is unset for the baseline.
+message TableEvalReport {
+  string table_name = 1;
+  EmbeddingEvalReport embedding_eval = 2;
+  optional AggregateDelta delta = 3;
+}
+
+// Result of one EvalCompare invocation. Mirrors
+// `jammi_ai::eval::report::CompareEvalReport`.
+message CompareEvalReport {
+  repeated TableEvalReport per_table = 1;
+}

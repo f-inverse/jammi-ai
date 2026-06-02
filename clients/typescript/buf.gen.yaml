@@ -1,0 +1,16 @@
+# Codegen config for @jammi/client.
+#
+# The canonical proto at ../../crates/jammi-ai/proto is the single source for
+# every language client; this package references it as the buf input (see the
+# `generate` script in package.json) rather than vendoring a copy, so the TS
+# surface can never drift from the proto.
+#
+# protoc-gen-es (protobuf-es v2) emits both the message types AND the GenService
+# service descriptors; Connect-ES's `createClient` consumes those descriptors
+# directly, so there is no separate connect plugin in this toolchain.
+version: v2
+plugins:
+  - local: protoc-gen-es
+    out: src/gen
+    opt:
+      - target=ts

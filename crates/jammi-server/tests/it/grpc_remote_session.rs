@@ -27,14 +27,14 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::StreamExt;
 use jammi_ai::audit::{verify_with_env, MASTER_KEY_ENV};
 use jammi_ai::{
-    LocalSession, Modality, PerQueryAudit, QueryInput, RemoteSession, SearchQuery, SearchRequest,
-    Session,
+    Jammi, LocalSession, Modality, PerQueryAudit, QueryInput, RemoteSession, SearchQuery,
+    SearchRequest, Session, Target,
 };
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::trigger::{DeliveredBatch, Predicate, TopicDefinition, TopicId, TriggerError};
 use jammi_db::AuditError;
-use jammi_test_utils::{cookbook_fixture, fixture};
+use jammi_test_utils::{cookbook_fixture, fixture, test_config};
 use tonic::transport::Endpoint;
 
 use super::common::grpc::{
@@ -687,6 +687,88 @@ async fn remote_reconstructs_the_exact_audit_error_variant_local_returns() {
             "remote did not reconstruct the NoTenantBinding variant the engine produces: {other:?}"
         ),
     }
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// The SDK front door selects the transport. `Jammi::open(Target::Remote(_))`
+/// connects to the in-process server and yields a `Session::Remote`;
+/// `Jammi::open(Target::Local(_))` builds an embedded engine and yields a
+/// `Session::Local`. Both are the same `Session` type, and a verb run through
+/// either returns the same shape — so the two transports are interchangeable
+/// through the `Session` the factory returns. The remote arm is compared to a
+/// `LocalSession` over the *same* engine the server drives (so any divergence is
+/// the transport's, not the engine's); the local-front-door arm proves
+/// `Target::Local` independently opens a live embedded session that runs the
+/// same verb.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn front_door_opens_interchangeable_local_and_remote_sessions() {
+    let server = start_engine_server().await;
+    let model_id = tiny_bert_model_id();
+    let query = "quantum computing applications";
+
+    // Front door, remote arm: Target::Remote → Session::Remote against the server.
+    let endpoint = Endpoint::from_shared(format!("http://{}", server.addr)).expect("endpoint");
+    let remote = Jammi::open(Target::Remote(endpoint))
+        .await
+        .expect("open remote session");
+    assert!(
+        matches!(remote, Session::Remote(_)),
+        "Target::Remote opens a Session::Remote"
+    );
+
+    // A LocalSession over the SAME engine the server drives — the parity peer.
+    let local_same_engine = local(&server);
+
+    let remote_vec = remote
+        .encode_query(
+            &model_id,
+            QueryInput::Text(query.to_string()),
+            Modality::Text,
+        )
+        .await
+        .expect("remote encode_query");
+    let local_vec = local_same_engine
+        .encode_query(
+            &model_id,
+            QueryInput::Text(query.to_string()),
+            Modality::Text,
+        )
+        .await
+        .expect("local encode_query");
+    assert_eq!(
+        remote_vec, local_vec,
+        "the factory's remote Session and a local Session over the same engine \
+         encode the same query identically — interchangeable through Session"
+    );
+
+    // Front door, local arm: Target::Local → Session::Local over a fresh
+    // embedded engine, proving the same verb runs end to end through the
+    // factory-opened embedded session (its own engine, so dimensionality — not
+    // the exact vector — is the cross-engine-stable invariant).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let embedded = Jammi::open(Target::Local(test_config(dir.path())))
+        .await
+        .expect("open local session");
+    assert!(
+        matches!(embedded, Session::Local(_)),
+        "Target::Local opens a Session::Local"
+    );
+    let embedded_vec = embedded
+        .encode_query(
+            &model_id,
+            QueryInput::Text(query.to_string()),
+            Modality::Text,
+        )
+        .await
+        .expect("embedded encode_query");
+    assert_eq!(
+        embedded_vec.len(),
+        remote_vec.len(),
+        "a verb through the factory-opened embedded Session yields the same \
+         vector shape the remote Session does — same surface, either transport"
+    );
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;

@@ -17,6 +17,7 @@ pub mod bert;
 pub mod clap_audio;
 pub mod clip_text;
 pub mod distilbert;
+pub mod htsat_audio;
 pub mod modernbert;
 
 mod any;

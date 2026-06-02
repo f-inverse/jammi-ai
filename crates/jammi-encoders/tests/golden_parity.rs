@@ -23,7 +23,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use candle_core::{Device, Tensor, D};
+use candle_core::{DType, Device, Tensor, D};
+use candle_nn::VarBuilder;
+use jammi_encoders::htsat_audio::{HtsatAudioConfig, HtsatAudioEncoder};
 
 /// Max-abs tolerance for large-magnitude intermediate boundaries. Looser than
 /// `parity.rs`'s 1e-5 because the oracle is a *different* framework (PyTorch)
@@ -183,4 +185,74 @@ fn goldens_are_self_consistent() {
     assert_eq!(pinned.dims(), &[2, 4, 500, 32], "pinned input shape");
     let mel_in = goldens.get("mel_in").expect("mel_in golden");
     assert_close_max_abs(&pinned, mel_in, "mel_in vs pinned_input");
+}
+
+/// Parse the committed fixture `config.json` into an [`HtsatAudioConfig`].
+fn load_config() -> HtsatAudioConfig {
+    let path = fixture_dir().join("config.json");
+    let s = std::fs::read_to_string(&path).expect("read config.json");
+    let json: serde_json::Value = serde_json::from_str(&s).expect("parse config.json");
+    HtsatAudioConfig::from_hf_clap_config(&json).expect("HtsatAudioConfig from fixture")
+}
+
+/// Build the front-half encoder from the committed `model.safetensors`.
+fn load_front_encoder(device: &Device) -> HtsatAudioEncoder {
+    let config = load_config();
+    let weights = fixture_dir().join("model.safetensors");
+    let vb = unsafe {
+        VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, device)
+            .expect("mmap model.safetensors")
+    };
+    let encoder_vb = vb.pp("audio_model").pp("audio_encoder");
+    HtsatAudioEncoder::load(encoder_vb, &config, device).expect("load front-half encoder")
+}
+
+/// Drive the real front half of the HTSAT-Swin tower on the pinned input and
+/// gate every boundary — batch-norm, bicubic time-resample, `reshape_mel2img`,
+/// the rectangular-stride `mel_conv2d`, AFF fusion, and the flattened
+/// `patch_embed` output — against its committed golden. A divergence localizes
+/// to the unit that produced it.
+#[test]
+fn front_half_matches_goldens() {
+    let device = Device::Cpu;
+    let goldens = Goldens::load().expect("load goldens.safetensors");
+    let encoder = load_front_encoder(&device);
+    let input = load_pinned_input().expect("load pinned_input");
+
+    let front = encoder.forward_front(&input).expect("front-half forward");
+
+    assert_close_max_abs(
+        &front.post_batch_norm,
+        goldens.get("post_batch_norm").expect("post_batch_norm"),
+        "post_batch_norm",
+    );
+    assert_close_max_abs(
+        &front.post_interpolation,
+        goldens
+            .get("post_interpolation")
+            .expect("post_interpolation"),
+        "post_interpolation",
+    );
+    assert_close_max_abs(
+        &front.post_reshape_mel2img,
+        goldens
+            .get("post_reshape_mel2img")
+            .expect("post_reshape_mel2img"),
+        "post_reshape_mel2img",
+    );
+    assert_close_max_abs(
+        &front.mel_conv2d_out,
+        goldens.get("mel_conv2d_out").expect("mel_conv2d_out"),
+        "mel_conv2d_out",
+    );
+    assert_close_max_abs(
+        &front.fusion_model_out,
+        goldens.get("fusion_model_out").expect("fusion_model_out"),
+        "fusion_model_out",
+    );
+    assert_close_max_abs(
+        &front.patch_embed_out,
+        goldens.get("patch_embed_out").expect("patch_embed_out"),
+        "patch_embed_out",
+    );
 }

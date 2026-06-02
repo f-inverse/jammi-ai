@@ -1,0 +1,163 @@
+{
+  "mel_in": {
+    "shape": [
+      2,
+      4,
+      512,
+      32
+    ],
+    "dtype": "float32"
+  },
+  "post_batch_norm": {
+    "shape": [
+      2,
+      32,
+      512,
+      4
+    ],
+    "dtype": "float32"
+  },
+  "post_reshape_mel2img": {
+    "shape": [
+      2,
+      4,
+      128,
+      128
+    ],
+    "dtype": "float32"
+  },
+  "patch_embed_out": {
+    "shape": [
+      2,
+      1024,
+      16
+    ],
+    "dtype": "float32"
+  },
+  "stage0.block0_out": {
+    "shape": [
+      2,
+      1024,
+      16
+    ],
+    "dtype": "float32"
+  },
+  "stage0.block1_out": {
+    "shape": [
+      2,
+      1024,
+      16
+    ],
+    "dtype": "float32"
+  },
+  "stage0.downsample_out": {
+    "shape": [
+      2,
+      256,
+      32
+    ],
+    "dtype": "float32"
+  },
+  "stage1.block0_out": {
+    "shape": [
+      2,
+      256,
+      32
+    ],
+    "dtype": "float32"
+  },
+  "stage1.block1_out": {
+    "shape": [
+      2,
+      256,
+      32
+    ],
+    "dtype": "float32"
+  },
+  "stage1.downsample_out": {
+    "shape": [
+      2,
+      64,
+      64
+    ],
+    "dtype": "float32"
+  },
+  "stage2.block0_out": {
+    "shape": [
+      2,
+      64,
+      64
+    ],
+    "dtype": "float32"
+  },
+  "stage2.block1_out": {
+    "shape": [
+      2,
+      64,
+      64
+    ],
+    "dtype": "float32"
+  },
+  "stage2.downsample_out": {
+    "shape": [
+      2,
+      16,
+      128
+    ],
+    "dtype": "float32"
+  },
+  "stage3.block0_out": {
+    "shape": [
+      2,
+      16,
+      128
+    ],
+    "dtype": "float32"
+  },
+  "stage3.block1_out": {
+    "shape": [
+      2,
+      16,
+      128
+    ],
+    "dtype": "float32"
+  },
+  "final_norm_out": {
+    "shape": [
+      2,
+      16,
+      128
+    ],
+    "dtype": "float32"
+  },
+  "pre_pool": {
+    "shape": [
+      2,
+      128,
+      1,
+      16
+    ],
+    "dtype": "float32"
+  },
+  "pooler_out": {
+    "shape": [
+      2,
+      128
+    ],
+    "dtype": "float32"
+  },
+  "projected_unnormalized": {
+    "shape": [
+      2,
+      8
+    ],
+    "dtype": "float32"
+  },
+  "projected_normalized": {
+    "shape": [
+      2,
+      8
+    ],
+    "dtype": "float32"
+  }
+}

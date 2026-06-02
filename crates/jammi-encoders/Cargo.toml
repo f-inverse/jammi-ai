@@ -20,6 +20,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 candle-transformers.workspace = true
+serde_json.workspace = true
 tempfile = "3"
 
 [features]
@@ -27,6 +28,11 @@ default = []
 # Enables tests/parity.rs which depends on candle-transformers as a numerical
 # oracle for the Bert frozen forward pass.
 parity-test = []
+# Enables tests/golden_parity.rs, which checks the HTSAT-Swin CLAP audio tower
+# against committed per-boundary golden activations (dumped from PyTorch
+# transformers by tests/fixtures/generate_htsat_clap.py). Needs no torch and no
+# network — the goldens are committed binaries.
+golden-parity = []
 
 [[test]]
 name = "it"
@@ -35,3 +41,7 @@ path = "tests/it/main.rs"
 [[test]]
 name = "parity"
 path = "tests/parity.rs"
+
+[[test]]
+name = "golden_parity"
+path = "tests/golden_parity.rs"

@@ -1,4 +1,4 @@
-// @jammi/client — the official TypeScript gRPC-web client for the Jammi engine.
+// @f-inverse/jammi-client — the official TypeScript gRPC-web client for the Jammi engine.
 //
 // The wire surface is GENERATED from the canonical jammi.v1 proto by
 // protoc-gen-es (see buf.gen.yaml + the `generate` script); this module is the

@@ -101,6 +101,38 @@ jobs:
       - name: Test (jammi-ai wire)
         run: cargo test -p jammi-ai --features wire
 
+  ts-client:
+    name: TS client (@jammi/client)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/typescript
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # `@jammi/client` is generated from the canonical proto at
+      # `crates/jammi-ai/proto` by `buf generate` (run inside `npm run build`),
+      # then type-checked and smoke-tested. Running it on every PR catches a
+      # proto change that breaks TS codegen — or a regression in the thin
+      # hand-written wrapper — here, not only at the release-tag publish in
+      # `npm.yml`. Plain ubuntu (not the Rust CI container): this lane needs
+      # Node, not cargo.
+      - name: Install
+        run: npm ci
+
+      - name: Build (generate + tsc)
+        run: npm run build
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test (hermetic)
+        run: npm run test
+
   test-broker:
     name: Test (NATS JetStream)
     runs-on: ubuntu-latest

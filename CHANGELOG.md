@@ -6,6 +6,40 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.14.0 — 2026-06-02
+
+### Added
+
+- **Transport-agnostic SDK.** `Session` is now `Local(LocalSession)` plus a
+  `wire`-gated `Remote(RemoteSession)`, dispatched by enum match — the same
+  surface drives an in-process engine or a remote server. `Jammi::open(Target)`
+  is the one front door selecting the transport; `Target::Remote` and the remote
+  arm are `#[cfg(feature = "wire")]`, so a build without `wire` cannot name a
+  remote target.
+- **Complete gRPC wire surface.** Every `Session` method (sans `ephemeral`) is
+  reachable over typed gRPC verbs: embeddings / encode-query / source / search,
+  inference, eval, fine-tune (+status), mutable tables, topics (publish /
+  server-streaming subscribe / register / drop), provenance channels, and audit.
+- **Faithful typed-error wire contract.** `JammiError`, `TriggerError`, and
+  `AuditError` reconstruct to their exact variant + fields across the wire (a
+  structured error detail in the gRPC `Status`), so `Remote` returns the same
+  error `Local` does — never a lossy gRPC-code guess. Engine-owned wrapped
+  errors (e.g. `MutableTableError`, `BackendError`) reconstruct faithfully; only
+  genuinely-foreign source errors degrade to a faithful `Display` string.
+- **`@f-inverse/jammi-client`.** The official TypeScript gRPC-web SDK, generated
+  from the canonical proto (protobuf-es + Connect-ES), for V8/Workers consumers
+  that cannot load native code. Published to npm in lockstep with the engine.
+- **Config-driven cloud result-table storage.** `[storage]` selects a cloud
+  object-store backend (R2 / S3 / GCS / Azure) for result tables, alongside the
+  local default.
+
+### Internal
+
+- The gRPC proto, generated client+server stubs, and proto↔domain conversions
+  live in `jammi-ai` behind a default-off `wire` feature (one conversion set
+  shared by the server handlers and `RemoteSession`); the embeddable engine and
+  the PyO3 wheel stay free of tonic/prost by default.
+
 ## v0.13.0 — 2026-06-01
 
 ### Added

@@ -18,13 +18,15 @@ package jammi.v1.error;
 // embedding/search verb surface has its own message carrying exactly the
 // fields needed to reconstruct it.
 //
-// Consumer-driven: the variants modelled here are precisely those a
-// `RemoteSession` reaches on the embeddings/encode-query/search/remove-source
-// path. `JammiError` variants that wrap a foreign source error (DataFusion, IO,
-// storage, …) carry a non-serialisable payload and are not reconstructable as
-// themselves; the server's central error mapping folds them into `other`
-// carrying the rendered message, reconstructed as `JammiError::Other` — the
-// same string the in-process `Display` would surface.
+// The contract is complete over `JammiError`: every owned-shape variant — the
+// String- and struct-carrying ones whose fields fully reconstruct the variant —
+// has its own typed arm here. The only variants folded into `other` are the
+// `#[from]` foreign-source ones (`Io`, `BackendDriver`, `Toml`, `Json`,
+// `DataFusion`, `MutableTable`, `Trigger`, `Storage`): their inner foreign error
+// cannot cross a process boundary, so they reconstruct as `JammiError::Other`
+// carrying the faithful `Display` string — the genuine fidelity limit, not a
+// lossy guess. Faithfulness is a property of the error type, so the mapping
+// covers the whole enum, not only one verb surface.
 message JammiErrorDetail {
   oneof variant {
     SourceError source = 1;
@@ -36,11 +38,16 @@ message JammiErrorDetail {
     StringError eval = 7;
     StringError tenant = 8;
     StringError other = 9;
+    StringError fine_tune = 10;
+    StringError gpu = 11;
+    StringError backend = 12;
+    StringError evidence_channel = 13;
   }
 }
 
-// A `JammiError` variant carrying a single human-readable string
-// (`Inference`, `Catalog`, `Config`, `Eval`, `Tenant`, `Other`).
+// A `JammiError` variant carrying a single human-readable string (`Inference`,
+// `Catalog`, `Config`, `Eval`, `Tenant`, `FineTune`, `Gpu`, `Backend`,
+// `EvidenceChannel`, `Other`).
 message StringError {
   string message = 1;
 }

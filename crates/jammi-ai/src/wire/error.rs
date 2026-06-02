@@ -17,13 +17,17 @@
 //! generated type, so `From` to/from the foreign `JammiError` is allowed
 //! without a newtype.
 //!
-//! `JammiError` variants that wrap a foreign source error (`Io`, `DataFusion`,
-//! `Storage`, the `#[from]` arms) carry a non-serialisable payload and have no
-//! faithful field-level reconstruction; the encode folds them into the `other`
-//! arm carrying `err.to_string()`, which decodes to [`JammiError::Other`] — the
-//! same string the in-process `Display` surfaces. These arms are unreachable as
-//! *distinct* targets on the embedding/search verb surface this stage wires, so
-//! the fold loses nothing a caller on this path could observe.
+//! The contract's fidelity boundary is precise, and faithfulness is a property
+//! of the error type — not of any one verb surface — so the mapping is complete
+//! over `JammiError`: every owned-shape variant (the String- and struct-carrying
+//! ones — `Source`, `Model`, `Inference`, `Catalog`, `Schema`, `Config`, `Eval`,
+//! `Tenant`, `FineTune`, `Gpu`, `Backend`, `EvidenceChannel`) reconstructs
+//! exactly, field for field. The only variants that fold into `other` are the
+//! eight `#[from]` foreign-source ones (`Io`, `BackendDriver`, `Toml`, `Json`,
+//! `DataFusion`, `MutableTable`, `Trigger`, `Storage`): their inner foreign
+//! error cannot cross a process boundary, so they reconstruct as
+//! [`JammiError::Other`] carrying the faithful `Display` string — this is the
+//! genuine limit, not a lossy guess.
 
 use jammi_db::error::JammiError;
 use prost::bytes::Bytes;
@@ -73,10 +77,25 @@ impl From<&JammiError> for pb::JammiErrorDetail {
             JammiError::Tenant(message) => Variant::Tenant(pb::StringError {
                 message: message.clone(),
             }),
-            // Every other variant either carries a non-serialisable foreign
-            // source error or is the existing catch-all; both reconstruct
-            // faithfully only as the rendered string the in-process `Display`
-            // would surface. `to_string()` is that string.
+            JammiError::FineTune(message) => Variant::FineTune(pb::StringError {
+                message: message.clone(),
+            }),
+            JammiError::Gpu(message) => Variant::Gpu(pb::StringError {
+                message: message.clone(),
+            }),
+            JammiError::Backend(message) => Variant::Backend(pb::StringError {
+                message: message.clone(),
+            }),
+            JammiError::EvidenceChannel(message) => Variant::EvidenceChannel(pb::StringError {
+                message: message.clone(),
+            }),
+            // The fold reaches ONLY the eight `#[from]` foreign-source variants
+            // (`Io`, `BackendDriver`, `Toml`, `Json`, `DataFusion`,
+            // `MutableTable`, `Trigger`, `Storage`) and the existing `Other`:
+            // every owned-shape variant has an explicit arm above. A foreign
+            // source error cannot cross a process boundary, so it reconstructs
+            // as `JammiError::Other` carrying the faithful `Display` string —
+            // the genuine fidelity limit. `to_string()` is that string.
             other => Variant::Other(pb::StringError {
                 message: other.to_string(),
             }),
@@ -113,6 +132,10 @@ impl From<pb::JammiErrorDetail> for JammiError {
             Some(Variant::Config(e)) => JammiError::Config(e.message),
             Some(Variant::Eval(e)) => JammiError::Eval(e.message),
             Some(Variant::Tenant(e)) => JammiError::Tenant(e.message),
+            Some(Variant::FineTune(e)) => JammiError::FineTune(e.message),
+            Some(Variant::Gpu(e)) => JammiError::Gpu(e.message),
+            Some(Variant::Backend(e)) => JammiError::Backend(e.message),
+            Some(Variant::EvidenceChannel(e)) => JammiError::EvidenceChannel(e.message),
             Some(Variant::Other(e)) => JammiError::Other(e.message),
             None => JammiError::Other(String::new()),
         }
@@ -142,5 +165,86 @@ pub fn error_from_status(status: &Status) -> JammiError {
     match pb::JammiErrorDetail::decode(details) {
         Ok(detail) => JammiError::from(detail),
         Err(_) => JammiError::Other(status.message().to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Send an error through the full Status round-trip a real server/client
+    /// pair uses (`attach_error_detail` → encode → decode → `error_from_status`).
+    fn round_trip(err: &JammiError) -> JammiError {
+        let status = attach_error_detail(Code::Internal, err.to_string(), err);
+        error_from_status(&status)
+    }
+
+    /// Every owned-shape variant — the String- and struct-carrying ones — must
+    /// reconstruct to the IDENTICAL variant and fields after a wire round-trip.
+    /// This is the completeness proof: the contract is faithful over the whole
+    /// owned-shape surface of `JammiError`, not just the verbs one stage wires.
+    #[test]
+    fn every_owned_shape_variant_round_trips_to_itself() {
+        let owned = [
+            JammiError::Config("missing api key".into()),
+            JammiError::Catalog("no embedding table for source".into()),
+            JammiError::Source {
+                source_id: "patents".into(),
+                message: "scan failed".into(),
+            },
+            JammiError::Model {
+                model_id: "local:/models/tiny_bert".into(),
+                message: "Model directory does not exist".into(),
+            },
+            JammiError::Inference("encode_query forward: shape mismatch".into()),
+            JammiError::FineTune("checkpoint epoch 3 diverged".into()),
+            JammiError::Eval("golden NER fixture row 7 mismatch".into()),
+            JammiError::Gpu("no CUDA device visible".into()),
+            JammiError::Backend("vLLM returned HTTP 503".into()),
+            JammiError::Tenant("nil UUID is not a valid tenant".into()),
+            JammiError::EvidenceChannel("channel 'patents' not registered".into()),
+            JammiError::Schema {
+                table: "patents_embeddings".into(),
+                column: "vector".into(),
+                expected: "FixedSizeList<Float32>".into(),
+                actual: "missing".into(),
+            },
+            JammiError::Other("an error with no more specific shape".into()),
+        ];
+        for err in &owned {
+            let back = round_trip(err);
+            assert_eq!(
+                std::mem::discriminant(&back),
+                std::mem::discriminant(err),
+                "owned-shape variant must reconstruct as itself: {err:?} -> {back:?}"
+            );
+            assert_eq!(
+                back.to_string(),
+                err.to_string(),
+                "owned-shape variant must reconstruct its fields faithfully: {err:?} -> {back:?}"
+            );
+        }
+    }
+
+    /// The eight `#[from]` foreign-source variants carry an inner error that
+    /// cannot cross a process boundary, so they reconstruct as
+    /// `JammiError::Other` carrying the faithful `Display` string — the genuine
+    /// fidelity limit. `Io` is the representative case; the fold is identical
+    /// for all eight (`BackendDriver`, `Toml`, `Json`, `DataFusion`,
+    /// `MutableTable`, `Trigger`, `Storage`).
+    #[test]
+    fn foreign_source_variant_folds_to_other_with_faithful_display() {
+        let io = JammiError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "model.safetensors not found",
+        ));
+        let display = io.to_string();
+        match round_trip(&io) {
+            JammiError::Other(message) => assert_eq!(
+                message, display,
+                "the foreign-source fold carries the faithful Display string"
+            ),
+            other => panic!("a foreign-source variant must fold to Other, got {other:?}"),
+        }
     }
 }

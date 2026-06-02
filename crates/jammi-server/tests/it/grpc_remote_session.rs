@@ -228,6 +228,70 @@ async fn remote_reconstructs_the_exact_error_variant_local_returns() {
     let _ = server.handle.await;
 }
 
+/// Error-parity, second distinct variant on THIS surface. `encode_query` runs
+/// model inference: resolving a `local:` model whose directory does not exist
+/// fails inside the engine with `JammiError::Model { model_id, message }` — a
+/// struct variant distinct from the `Catalog` case above, and one the typed wire
+/// detail must reconstruct field-for-field. A heuristic reverse-map from the
+/// gRPC code (`invalid_argument`) could not recover `model_id` or distinguish
+/// `Model` from `Source` / `Config` / `Tenant`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_reconstructs_a_model_error_from_an_inference_failure() {
+    let server = start_engine_server().await;
+    let remote = Session::Remote(remote(&server).await);
+    let local = local(&server);
+
+    // A syntactically valid `local:` model id pointing at a directory that does
+    // not exist. The query input matches the modality, so the request clears
+    // wire validation and reaches the engine's model resolver, which fails.
+    let missing_model = "local:/nonexistent/jammi-test-model";
+    let query = || {
+        (
+            missing_model.to_string(),
+            QueryInput::Text("quantum computing".to_string()),
+            Modality::Text,
+        )
+    };
+
+    let (m, i, md) = query();
+    let local_err = local
+        .encode_query(&m, i, md)
+        .await
+        .expect_err("local encode_query on a missing model must fail");
+    let (m, i, md) = query();
+    let remote_err = remote
+        .encode_query(&m, i, md)
+        .await
+        .expect_err("remote encode_query on a missing model must fail");
+
+    // Same variant AND same fields — the struct variant crosses the wire intact.
+    match (&local_err, &remote_err) {
+        (
+            JammiError::Model {
+                model_id: local_id,
+                message: local_msg,
+            },
+            JammiError::Model {
+                model_id: remote_id,
+                message: remote_msg,
+            },
+        ) => {
+            assert_eq!(
+                local_id, remote_id,
+                "the remote transport carries the same model_id the engine produced"
+            );
+            assert_eq!(
+                local_msg, remote_msg,
+                "the remote transport carries the same model message the engine produced"
+            );
+        }
+        other => panic!("expected a faithful Model error from both transports, got {other:?}"),
+    }
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
 /// Tenant trio over the wire: a `bind_tenant` (now async) followed by a
 /// `tenant()` read observes the bound tenant; the binding is keyed by the
 /// client's own session id, so a second client sees nothing.

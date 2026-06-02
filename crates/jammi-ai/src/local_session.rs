@@ -125,40 +125,23 @@ pub enum Session {
     Remote(crate::remote_session::RemoteSession),
 }
 
-/// The verbs a [`Session::Remote`] does not yet drive over the wire return this
-/// — a real, propagated value, never a panic. The wired surface covers the
-/// embeddings / encode-query / search / remove-source verbs, the tenant trio,
-/// and the `JammiError`-returning compute verbs (inference, eval, fine-tune,
-/// mutable-table create/drop, channel register / add-columns); the still-pending
-/// verbs are `add_source` / `sql` / `read_vectors`, the topic-admin + subscribe
-/// surface, and the audit surface (their own error types + streaming). A caller
-/// that reaches an unwired verb on a remote session gets a typed error naming
-/// the verb, which is the truthful answer to "is this verb available on this
-/// transport yet?" — not a stand-in for a domain failure.
-///
-/// The three constructors below render the same message into the three error
-/// types the [`Session`] surface returns; each uses that type's catch-all /
-/// message-carrying arm (`JammiError::Other`, `TriggerError::Driver`,
-/// `AuditError::Storage`) — the message is explicit that the cause is transport
-/// coverage, not a backing-store fault, so the error is self-describing.
-#[cfg(feature = "wire")]
-fn remote_verb_pending_message(verb: &str) -> String {
-    format!("{verb} is not yet available on the remote (gRPC) session transport")
-}
-
+/// The three Flight-SQL-shaped verbs a [`Session::Remote`] does not drive over
+/// the typed-RPC surface (`add_source` / `sql` / `read_vectors`) return this — a
+/// real, propagated value, never a panic. Every other verb on the [`Session`]
+/// surface is wire-reachable: the embeddings / encode-query / search /
+/// remove-source verbs, the tenant trio, the `JammiError`-returning compute
+/// verbs (inference, eval, fine-tune, mutable-table create/drop, channel
+/// register / add-columns), the topics + subscribe-streaming surface, and the
+/// audit surface. A caller that reaches one of the three unwired verbs on a
+/// remote session gets a typed error naming the verb — the truthful answer to
+/// "is this verb available on this transport yet?", not a stand-in for a domain
+/// failure. (These three carry SQL / raw-vector payloads that ride the Flight
+/// SQL surface, not a typed gRPC verb, so they are wired in that lane, not here.)
 #[cfg(feature = "wire")]
 fn remote_verb_pending(verb: &str) -> jammi_db::error::JammiError {
-    jammi_db::error::JammiError::Other(remote_verb_pending_message(verb))
-}
-
-#[cfg(feature = "wire")]
-fn remote_verb_pending_trigger(verb: &str) -> TriggerError {
-    TriggerError::Driver(remote_verb_pending_message(verb))
-}
-
-#[cfg(feature = "wire")]
-fn remote_verb_pending_audit(verb: &str) -> jammi_db::AuditError {
-    jammi_db::AuditError::Storage(remote_verb_pending_message(verb))
+    jammi_db::error::JammiError::Other(format!(
+        "{verb} is not yet available on the remote (gRPC) session transport"
+    ))
 }
 
 impl Session {
@@ -444,7 +427,7 @@ impl Session {
         match self {
             Session::Local(s) => s.register_topic(topic).await,
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending_trigger("register_topic")),
+            Session::Remote(s) => s.register_topic(topic).await,
         }
     }
 
@@ -453,7 +436,7 @@ impl Session {
         match self {
             Session::Local(s) => s.list_topics().await,
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending_trigger("list_topics")),
+            Session::Remote(s) => s.list_topics().await,
         }
     }
 
@@ -462,7 +445,7 @@ impl Session {
         match self {
             Session::Local(s) => s.drop_topic(topic_id).await,
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending_trigger("drop_topic")),
+            Session::Remote(s) => s.drop_topic(topic_id).await,
         }
     }
 
@@ -476,7 +459,7 @@ impl Session {
         match self {
             Session::Local(s) => s.publish(topic, batch).await,
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending_trigger("publish")),
+            Session::Remote(s) => s.publish(topic, batch).await,
         }
     }
 
@@ -495,7 +478,7 @@ impl Session {
         match self {
             Session::Local(s) => s.subscribe(topic, predicate, from_offset).await,
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending_trigger("subscribe")),
+            Session::Remote(s) => s.subscribe(topic, predicate, from_offset).await,
         }
     }
 
@@ -568,7 +551,7 @@ impl Session {
         match self {
             Session::Local(s) => s.audit_log(records).await,
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending_audit("audit_log")),
+            Session::Remote(s) => s.audit_log(records).await,
         }
     }
 
@@ -580,7 +563,7 @@ impl Session {
         match self {
             Session::Local(s) => s.audit_fetch_by_query_id(query_id).await,
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending_audit("audit_fetch_by_query_id")),
+            Session::Remote(s) => s.audit_fetch_by_query_id(query_id).await,
         }
     }
 
@@ -592,7 +575,7 @@ impl Session {
         match self {
             Session::Local(s) => s.audit_fetch_recent(limit).await,
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending_audit("audit_fetch_recent")),
+            Session::Remote(s) => s.audit_fetch_recent(limit).await,
         }
     }
 }

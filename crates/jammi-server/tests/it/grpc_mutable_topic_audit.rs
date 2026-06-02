@@ -248,6 +248,9 @@ async fn register_topic_then_list_then_drop() {
             name: "events".into(),
             schema: encode_schema_ipc(&schema),
             broker_metadata: HashMap::new(),
+            // Empty id: this DDL-style caller has no client-minted id, so the
+            // server mints a fresh UUIDv7.
+            topic_id: String::new(),
         })
         .await
         .expect("register topic")
@@ -274,7 +277,7 @@ async fn register_topic_then_list_then_drop() {
 
     client
         .drop_topic(DropTopicRequest {
-            name: "events".into(),
+            topic_id: registered.topic_id.clone(),
             if_exists: false,
         })
         .await
@@ -302,10 +305,13 @@ async fn drop_topic_if_exists_is_noop_for_missing_topic() {
     let mut client =
         TriggerServiceClient::with_interceptor(ch, with_session("session-topic-missing"));
 
+    // A syntactically valid UUID that was never registered.
+    let missing = Uuid::now_v7().to_string();
+
     // if_exists = true on a missing topic is a no-op.
     client
         .drop_topic(DropTopicRequest {
-            name: "never_registered".into(),
+            topic_id: missing.clone(),
             if_exists: true,
         })
         .await
@@ -314,7 +320,7 @@ async fn drop_topic_if_exists_is_noop_for_missing_topic() {
     // if_exists = false on a missing topic is NotFound.
     let err = client
         .drop_topic(DropTopicRequest {
-            name: "never_registered".into(),
+            topic_id: missing,
             if_exists: false,
         })
         .await

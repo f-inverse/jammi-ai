@@ -19,16 +19,24 @@
 //!   reimplements a mapping.
 //!
 //! The wired verbs span the embeddings / encode-query / search / remove-source
-//! surface, the tenant trio, and the `JammiError`-returning compute verbs —
-//! inference, the four eval verbs, fine-tune (start + status), the
-//! mutable-table create/drop lifecycle, and the channel register / add-columns
-//! verbs. The topics/subscribe and audit surfaces (their own error types +
-//! streaming) follow in a later slice.
+//! surface, the tenant trio, the `JammiError`-returning compute verbs
+//! (inference, the four eval verbs, fine-tune start + status, the mutable-table
+//! create/drop lifecycle, and the channel register / add-columns verbs), the
+//! topics surface (register / drop / publish / list) with its server-streaming
+//! `subscribe`, and the audit surface (log / fetch). The two surfaces that
+//! return their own error types — `TriggerError` and `AuditError` — decode the
+//! same way `JammiError` does: the server attaches a structured detail
+//! (`TriggerErrorDetail` / `AuditErrorDetail`) and the client reconstructs the
+//! exact variant, including a `subscribe` stream's terminal failure. The only
+//! verbs still unreachable here are the Flight-SQL-shaped `add_source` / `sql` /
+//! `read_vectors` (wired on that lane, not the typed-RPC surface).
 
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use futures::{Stream, StreamExt};
 use tonic::codegen::InterceptedService;
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
@@ -41,11 +49,16 @@ use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
-use jammi_db::{ChannelId, ModelTask, TenantId};
+use jammi_db::trigger::{DeliveredBatch, Offset, Predicate, TopicDefinition, TriggerError};
+use jammi_db::{AuditError, ChannelId, ModelTask, PerQueryAudit, TenantId, TopicId};
 
 use crate::eval::{CompareEvalReport, EmbeddingEvalReport, EvalTask, InferenceEvalReport};
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
 use crate::local_session::{ChannelColumn, ChannelSpec, FineTuneJobId};
+use crate::wire::proto::audit::audit_service_client::AuditServiceClient;
+use crate::wire::proto::audit::{
+    AuditFetchByQueryIdRequest, AuditFetchRecentRequest, AuditLogRequest,
+};
 use crate::wire::proto::channel::channel_service_client::ChannelServiceClient;
 use crate::wire::proto::channel::{AddChannelColumnsRequest, RegisterChannelRequest};
 use crate::wire::proto::embedding::embedding_service_client::EmbeddingServiceClient;
@@ -64,10 +77,17 @@ use crate::wire::proto::mutable_table::mutable_table_service_client::MutableTabl
 use crate::wire::proto::mutable_table::{CreateMutableTableRequest, DropMutableTableRequest};
 use crate::wire::proto::session::session_service_client::SessionServiceClient;
 use crate::wire::proto::session::{SetTenantRequest, Tenant};
+use crate::wire::proto::trigger::trigger_service_client::TriggerServiceClient;
+use crate::wire::proto::trigger::{
+    DropTopicRequest, ListTopicsRequest, PublishRequest, RegisterTopicRequest, SubscribeRequest,
+    TopicName,
+};
 use crate::wire::{
-    cohorts_to_proto, columns_to_proto, config_to_proto, decode_ipc_stream, definition_to_proto,
-    error_from_status, eval_task_to_proto, method_to_proto, model_task_to_proto,
-    result_table_from_proto, SESSION_HEADER,
+    audit_error_from_status, cohorts_to_proto, columns_to_proto, config_to_proto,
+    decode_ipc_stream, decode_subscribed_batch, definition_to_proto, encode_ipc_stream,
+    encode_publish_batch, error_from_status, eval_task_to_proto, method_to_proto,
+    model_task_to_proto, record_from_wire, result_table_from_proto, topic_from_proto,
+    trigger_error_from_status, SESSION_HEADER,
 };
 use crate::{Modality, QueryInput, SearchQuery, SearchRequest as SessionSearch};
 
@@ -166,6 +186,14 @@ impl RemoteSession {
 
     fn channel_client(&self) -> ChannelServiceClient<InterceptedService<Channel, SessionHeader>> {
         ChannelServiceClient::with_interceptor(self.channel.clone(), self.header.clone())
+    }
+
+    fn trigger_client(&self) -> TriggerServiceClient<InterceptedService<Channel, SessionHeader>> {
+        TriggerServiceClient::with_interceptor(self.channel.clone(), self.header.clone())
+    }
+
+    fn audit_client(&self) -> AuditServiceClient<InterceptedService<Channel, SessionHeader>> {
+        AuditServiceClient::with_interceptor(self.channel.clone(), self.header.clone())
     }
 
     // --- sources ---------------------------------------------------------
@@ -504,6 +532,177 @@ impl RemoteSession {
         id.parse()
             .map(Some)
             .map_err(|e| JammiError::Tenant(format!("invalid tenant id from server: {e}")))
+    }
+
+    // --- trigger ---------------------------------------------------------
+
+    pub(crate) async fn register_topic(
+        &self,
+        topic: &TopicDefinition,
+    ) -> std::result::Result<(), TriggerError> {
+        let schema =
+            encode_ipc_stream(&topic.schema, &[]).map_err(|s| trigger_error_from_status(&s))?;
+        self.trigger_client()
+            .register_topic(RegisterTopicRequest {
+                name: topic.name.clone(),
+                schema,
+                broker_metadata: topic.broker_metadata.clone().into_iter().collect(),
+                // Carry the caller-minted id so the topic's identity matches the
+                // in-process path; a later `drop_topic(topic.id)` then resolves.
+                topic_id: topic.id.to_string(),
+            })
+            .await
+            .map_err(|s| trigger_error_from_status(&s))?;
+        Ok(())
+    }
+
+    pub(crate) async fn list_topics(
+        &self,
+    ) -> std::result::Result<Vec<TopicDefinition>, TriggerError> {
+        let resp = self
+            .trigger_client()
+            .list_topics(ListTopicsRequest {
+                page_size: 0,
+                page_token: String::new(),
+                // Tenant scope rides on the session header, not the body.
+                tenant_id: String::new(),
+            })
+            .await
+            .map_err(|s| trigger_error_from_status(&s))?
+            .into_inner();
+        // Each page entry is a fully-materialized `Topic` (id / name / schema /
+        // tenant / broker_metadata), so the remote arm reconstructs the same
+        // `Vec<TopicDefinition>` the in-process path returns — a corrupt entry
+        // surfaces as the faithful `Status` the decoder builds.
+        resp.topics
+            .into_iter()
+            .map(|t| topic_from_proto(t).map_err(|s| trigger_error_from_status(&s)))
+            .collect()
+    }
+
+    pub(crate) async fn drop_topic(
+        &self,
+        topic_id: TopicId,
+    ) -> std::result::Result<(), TriggerError> {
+        self.trigger_client()
+            .drop_topic(DropTopicRequest {
+                topic_id: topic_id.to_string(),
+                if_exists: false,
+            })
+            .await
+            .map_err(|s| trigger_error_from_status(&s))?;
+        Ok(())
+    }
+
+    pub(crate) async fn publish(
+        &self,
+        topic: &TopicDefinition,
+        batch: RecordBatch,
+    ) -> std::result::Result<Offset, TriggerError> {
+        let wire_batch = encode_publish_batch(&batch).map_err(|s| trigger_error_from_status(&s))?;
+        let resp = self
+            .trigger_client()
+            .publish(PublishRequest {
+                topic: Some(TopicName {
+                    name: topic.name.clone(),
+                }),
+                batch: Some(wire_batch),
+                // Tenant scope rides on the session header, not the body.
+                tenant_id: String::new(),
+            })
+            .await
+            .map_err(|s| trigger_error_from_status(&s))?
+            .into_inner();
+        let committed_at = resp
+            .committed_at
+            .as_ref()
+            .map(crate::wire::from_proto_timestamp)
+            .transpose()
+            .map_err(|s| trigger_error_from_status(&s))?
+            .ok_or_else(|| TriggerError::Driver("publish response missing committed_at".into()))?;
+        Ok(Offset::new(resp.offset, committed_at))
+    }
+
+    pub(crate) async fn subscribe(
+        &self,
+        topic: &TopicDefinition,
+        predicate: Predicate,
+        from_offset: Option<Offset>,
+    ) -> std::result::Result<
+        Pin<Box<dyn Stream<Item = std::result::Result<DeliveredBatch, TriggerError>> + Send>>,
+        TriggerError,
+    > {
+        let streaming = self
+            .trigger_client()
+            .subscribe(SubscribeRequest {
+                topic: Some(TopicName {
+                    name: topic.name.clone(),
+                }),
+                // The predicate crosses the wire as the SQL it was parsed from
+                // (empty == match-all); the server re-parses it against the same
+                // topic schema, so the in-process and remote filters are identical.
+                predicate: predicate.source_sql().unwrap_or("").to_string(),
+                from_offset: from_offset.map(|o| o.value()),
+                tenant_id: String::new(),
+            })
+            .await
+            .map_err(|s| trigger_error_from_status(&s))?
+            .into_inner();
+        // Map each streamed item into the same `Result<DeliveredBatch, TriggerError>`
+        // a local subscription yields. A terminal `tonic::Status` (a mid-stream
+        // or final failure) reconstructs to its faithful `TriggerError` via the
+        // attached detail — never a gRPC-code-category guess; a payload-decode
+        // failure surfaces as the faithful `Status` the decoder built.
+        let mapped = streaming.map(|item| match item {
+            Ok(wire) => decode_subscribed_batch(wire).map_err(|s| trigger_error_from_status(&s)),
+            Err(status) => Err(trigger_error_from_status(&status)),
+        });
+        Ok(Box::pin(mapped))
+    }
+
+    // --- audit -----------------------------------------------------------
+
+    pub(crate) async fn audit_log(
+        &self,
+        records: Vec<PerQueryAudit>,
+    ) -> std::result::Result<(), AuditError> {
+        self.audit_client()
+            .audit_log(AuditLogRequest {
+                records: records.into_iter().map(Into::into).collect(),
+            })
+            .await
+            .map_err(|s| audit_error_from_status(&s))?;
+        Ok(())
+    }
+
+    pub(crate) async fn audit_fetch_by_query_id(
+        &self,
+        query_id: uuid::Uuid,
+    ) -> std::result::Result<Option<PerQueryAudit>, AuditError> {
+        let resp = self
+            .audit_client()
+            .audit_fetch_by_query_id(AuditFetchByQueryIdRequest {
+                query_id: query_id.to_string(),
+            })
+            .await
+            .map_err(|s| audit_error_from_status(&s))?
+            .into_inner();
+        resp.record.map(record_from_wire).transpose()
+    }
+
+    pub(crate) async fn audit_fetch_recent(
+        &self,
+        limit: usize,
+    ) -> std::result::Result<Vec<PerQueryAudit>, AuditError> {
+        let resp = self
+            .audit_client()
+            .audit_fetch_recent(AuditFetchRecentRequest {
+                limit: limit as u32,
+            })
+            .await
+            .map_err(|s| audit_error_from_status(&s))?
+            .into_inner();
+        resp.records.into_iter().map(record_from_wire).collect()
     }
 }
 

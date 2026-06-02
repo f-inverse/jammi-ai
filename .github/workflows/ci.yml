@@ -79,6 +79,28 @@ jobs:
         # only the maturin-managed build (Test (Python) job) provides.
         run: cargo test --workspace --exclude jammi-python --features live-hub-tests
 
+  test-wire:
+    name: Test (jammi-ai wire)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      # The wire-gated unit tests in `jammi-ai` (the faithful typed-error
+      # round-trips in `src/wire/`) otherwise run only incidentally — when
+      # `jammi-server` pulls `jammi-ai/wire` and Cargo feature-unifies it into
+      # the workspace test build. That edge is a latent silent-skip: if it ever
+      # changes, the wire tests + lints stop running with no signal. Run them
+      # deterministically in their own right.
+      - name: Clippy (jammi-ai wire)
+        run: cargo clippy -p jammi-ai --features wire --all-targets -- -D warnings
+
+      - name: Test (jammi-ai wire)
+        run: cargo test -p jammi-ai --features wire
+
   test-broker:
     name: Test (NATS JetStream)
     runs-on: ubuntu-latest

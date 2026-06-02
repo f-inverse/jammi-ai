@@ -136,3 +136,96 @@ message SchemaError {
   string expected = 3;
   string actual = 4;
 }
+
+// TriggerErrorDetail — the structured wire detail for `jammi_db::TriggerError`,
+// attached to a `tonic::Status` by the server's `map_trigger_error` so a remote
+// `RemoteSession` reconstructs the EXACT `TriggerError` the in-process path
+// returns (the standard gRPC code set collapses several variants onto one code).
+//
+// The contract is complete and faithful over `TriggerError`. Every owned-shape
+// variant has its own typed arm. The two `#[from]` variants do NOT fold: their
+// inner errors are engine-owned and fully reconstructable, so `backing_table`
+// nests the shared `MutableTableErrorDetail` and `backend` nests the shared
+// `BackendErrorDetail` — the same faithful taxonomies `JammiErrorDetail` reuses.
+// No `TriggerError` variant degrades to a lossy string.
+message TriggerErrorDetail {
+  oneof variant {
+    string topic_not_found = 1;
+    SchemaConflict schema_conflict = 2;
+    UnsupportedSchemaType unsupported_schema_type = 3;
+    string batch_schema_mismatch = 4;
+    PublishTenantMismatch publish_tenant_mismatch = 5;
+    string predicate_parse = 6;
+    string predicate_eval = 7;
+    string predicate_unsupported = 8;
+    uint64 offset_evicted = 9;
+    // `TriggerError::BackingTable(MutableTableError)` — engine-owned, nested
+    // faithfully (never folded to a string).
+    MutableTableErrorDetail backing_table = 10;
+    // `TriggerError::Backend(BackendError)` — engine-owned, nested faithfully.
+    BackendErrorDetail backend = 11;
+    string driver = 12;
+    string catalog = 13;
+  }
+}
+
+// `TriggerError::SchemaConflict { topic, detail }`.
+message SchemaConflict {
+  string topic = 1;
+  string detail = 2;
+}
+
+// `TriggerError::UnsupportedSchemaType { column, data_type }`.
+message UnsupportedSchemaType {
+  string column = 1;
+  string data_type = 2;
+}
+
+// `TriggerError::PublishTenantMismatch { topic, topic_tenant, publish_tenant }`.
+// The tenant ids are UUID strings; an empty string means `None` (an unscoped
+// publish or a global topic).
+message PublishTenantMismatch {
+  string topic = 1;
+  string topic_tenant = 2;
+  string publish_tenant = 3;
+}
+
+// AuditErrorDetail — the structured wire detail for `jammi_db::AuditError`,
+// attached to a `tonic::Status` by the server's `map_audit_error` so a remote
+// `RemoteSession` reconstructs the EXACT `AuditError` the in-process path
+// returns.
+//
+// Every owned-shape variant has its own typed arm and reconstructs faithfully.
+// The only fold is `serde` — `AuditError::Serde(#[from] serde_json::Error)`
+// wraps a foreign error that cannot cross a process boundary, so it carries its
+// faithful `Display` string (the genuine fidelity limit, mirroring how
+// `JammiErrorDetail` folds its own foreign `#[from]` variants).
+message AuditErrorDetail {
+  oneof variant {
+    LengthMismatch length_mismatch = 1;
+    LineageTooLarge lineage_too_large = 2;
+    // `AuditError::NoTenantBinding` carries no payload.
+    bool no_tenant_binding = 3;
+    // `AuditError::SignatureMismatch(Uuid)` — the offending query id (UUID
+    // string).
+    string signature_mismatch = 4;
+    string master_key = 5;
+    // `AuditError::Serde` — the lone genuinely-foreign arm; its `Display`
+    // string is carried because a `serde_json::Error` does not cross the wire.
+    string serde = 6;
+    string storage = 7;
+    string broker = 8;
+  }
+}
+
+// `AuditError::LengthMismatch { ids, scores }`. Both are element counts.
+message LengthMismatch {
+  uint64 ids = 1;
+  uint64 scores = 2;
+}
+
+// `AuditError::LineageTooLarge { actual, max }`. Both are byte counts.
+message LineageTooLarge {
+  uint64 actual = 1;
+  uint64 max = 2;
+}

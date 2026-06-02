@@ -18,8 +18,12 @@
 //!   [`crate::wire`] conversions the server's receive side uses — neither side
 //!   reimplements a mapping.
 //!
-//! This stage wires the embeddings / encode-query / search / remove-source verbs
-//! plus the tenant trio; the remaining verbs follow in a later stage.
+//! The wired verbs span the embeddings / encode-query / search / remove-source
+//! surface, the tenant trio, and the `JammiError`-returning compute verbs —
+//! inference, the four eval verbs, fine-tune (start + status), the
+//! mutable-table create/drop lifecycle, and the channel register / add-columns
+//! verbs. The topics/subscribe and audit surfaces (their own error types +
+//! streaming) follow in a later slice.
 
 use std::sync::Arc;
 
@@ -31,20 +35,40 @@ use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 
+use std::collections::{BTreeMap, HashMap};
+
+use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
-use jammi_db::TenantId;
+use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
+use jammi_db::{ChannelId, ModelTask, TenantId};
 
-use crate::wire::error_from_status;
+use crate::eval::{CompareEvalReport, EmbeddingEvalReport, EvalTask, InferenceEvalReport};
+use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
+use crate::local_session::{ChannelColumn, ChannelSpec, FineTuneJobId};
+use crate::wire::proto::channel::channel_service_client::ChannelServiceClient;
+use crate::wire::proto::channel::{AddChannelColumnsRequest, RegisterChannelRequest};
 use crate::wire::proto::embedding::embedding_service_client::EmbeddingServiceClient;
 use crate::wire::proto::embedding::{
     encode_query_request::Input as ProtoEncodeInput, search_request::Query as ProtoSearchQuery,
     EncodeQueryRequest, GenerateEmbeddingsRequest, QueryVector, RemoveSourceRequest, SearchRequest,
     SearchResponse,
 };
+use crate::wire::proto::eval as eval_pb;
+use crate::wire::proto::eval::eval_service_client::EvalServiceClient;
+use crate::wire::proto::fine_tune::fine_tune_service_client::FineTuneServiceClient;
+use crate::wire::proto::fine_tune::{FineTuneStatusRequest, StartFineTuneRequest};
+use crate::wire::proto::inference::inference_service_client::InferenceServiceClient;
+use crate::wire::proto::inference::InferRequest;
+use crate::wire::proto::mutable_table::mutable_table_service_client::MutableTableServiceClient;
+use crate::wire::proto::mutable_table::{CreateMutableTableRequest, DropMutableTableRequest};
 use crate::wire::proto::session::session_service_client::SessionServiceClient;
 use crate::wire::proto::session::{SetTenantRequest, Tenant};
-use crate::wire::{result_table_from_proto, SESSION_HEADER};
+use crate::wire::{
+    cohorts_to_proto, columns_to_proto, config_to_proto, decode_ipc_stream, definition_to_proto,
+    error_from_status, eval_task_to_proto, method_to_proto, model_task_to_proto,
+    result_table_from_proto, SESSION_HEADER,
+};
 use crate::{Modality, QueryInput, SearchQuery, SearchRequest as SessionSearch};
 
 /// Injects the [`SESSION_HEADER`] carrying this client's opaque session id on
@@ -116,6 +140,32 @@ impl RemoteSession {
 
     fn session_client(&self) -> SessionServiceClient<InterceptedService<Channel, SessionHeader>> {
         SessionServiceClient::with_interceptor(self.channel.clone(), self.header.clone())
+    }
+
+    fn inference_client(
+        &self,
+    ) -> InferenceServiceClient<InterceptedService<Channel, SessionHeader>> {
+        InferenceServiceClient::with_interceptor(self.channel.clone(), self.header.clone())
+    }
+
+    fn eval_client(&self) -> EvalServiceClient<InterceptedService<Channel, SessionHeader>> {
+        EvalServiceClient::with_interceptor(self.channel.clone(), self.header.clone())
+    }
+
+    fn fine_tune_client(
+        &self,
+    ) -> FineTuneServiceClient<InterceptedService<Channel, SessionHeader>> {
+        FineTuneServiceClient::with_interceptor(self.channel.clone(), self.header.clone())
+    }
+
+    fn mutable_table_client(
+        &self,
+    ) -> MutableTableServiceClient<InterceptedService<Channel, SessionHeader>> {
+        MutableTableServiceClient::with_interceptor(self.channel.clone(), self.header.clone())
+    }
+
+    fn channel_client(&self) -> ChannelServiceClient<InterceptedService<Channel, SessionHeader>> {
+        ChannelServiceClient::with_interceptor(self.channel.clone(), self.header.clone())
     }
 
     // --- sources ---------------------------------------------------------
@@ -205,6 +255,219 @@ impl RemoteSession {
             .map_err(|s| error_from_status(&s))?
             .into_inner();
         hits_to_batch(resp, &select)
+    }
+
+    // --- inference -------------------------------------------------------
+
+    pub(crate) async fn infer(
+        &self,
+        source_id: &str,
+        model_id: &str,
+        task: ModelTask,
+        content_columns: &[String],
+        key_column: &str,
+    ) -> Result<Vec<RecordBatch>> {
+        let resp = self
+            .inference_client()
+            .infer(InferRequest {
+                source_id: source_id.to_string(),
+                model_id: model_id.to_string(),
+                task: model_task_to_proto(task) as i32,
+                columns: content_columns.to_vec(),
+                key_column: key_column.to_string(),
+                tenant_id: String::new(),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        let batch = resp.result.unwrap_or_default();
+        decode_ipc_stream(&batch.data_header, &batch.data_body).map_err(|s| error_from_status(&s))
+    }
+
+    // --- fine-tune -------------------------------------------------------
+
+    pub(crate) async fn fine_tune(
+        &self,
+        source: &str,
+        base_model: &str,
+        columns: &[String],
+        method: FineTuneMethod,
+        task: ModelTask,
+        config: Option<FineTuneConfig>,
+    ) -> Result<FineTuneJobId> {
+        let resp = self
+            .fine_tune_client()
+            .start_fine_tune(StartFineTuneRequest {
+                source_id: source.to_string(),
+                base_model: base_model.to_string(),
+                columns: columns.to_vec(),
+                method: method_to_proto(method) as i32,
+                task: model_task_to_proto(task) as i32,
+                config: config.as_ref().map(config_to_proto),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        Ok(FineTuneJobId(resp.job_id))
+    }
+
+    pub(crate) async fn fine_tune_status(&self, id: &FineTuneJobId) -> Result<String> {
+        let resp = self
+            .fine_tune_client()
+            .fine_tune_status(FineTuneStatusRequest {
+                job_id: id.0.clone(),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        Ok(resp.status)
+    }
+
+    // --- eval ------------------------------------------------------------
+
+    pub(crate) async fn eval_embeddings(
+        &self,
+        source_id: &str,
+        embedding_table: Option<&str>,
+        golden_source: &str,
+        k: usize,
+        cohorts: &HashMap<String, BTreeMap<String, String>>,
+    ) -> Result<EmbeddingEvalReport> {
+        let resp = self
+            .eval_client()
+            .eval_embeddings(eval_pb::EvalEmbeddingsRequest {
+                source_id: source_id.to_string(),
+                embedding_table: embedding_table.unwrap_or_default().to_string(),
+                golden_source: golden_source.to_string(),
+                k: k as u32,
+                cohorts: cohorts_to_proto(cohorts),
+                tenant_id: String::new(),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        Ok(resp.into())
+    }
+
+    pub(crate) async fn eval_per_query(
+        &self,
+        eval_run_id: &str,
+    ) -> Result<Vec<PerQueryEvalRecord>> {
+        let resp = self
+            .eval_client()
+            .eval_per_query(eval_pb::EvalPerQueryRequest {
+                eval_run_id: eval_run_id.to_string(),
+                tenant_id: String::new(),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        Ok(resp.records.into_iter().map(Into::into).collect())
+    }
+
+    pub(crate) async fn eval_inference(
+        &self,
+        model_id: &str,
+        source_id: &str,
+        columns: &[String],
+        task: EvalTask,
+        golden_source: &str,
+        label_column: &str,
+    ) -> Result<InferenceEvalReport> {
+        let resp = self
+            .eval_client()
+            .eval_inference(eval_pb::EvalInferenceRequest {
+                model_id: model_id.to_string(),
+                source_id: source_id.to_string(),
+                columns: columns.to_vec(),
+                task: eval_task_to_proto(task) as i32,
+                golden_source: golden_source.to_string(),
+                label_column: label_column.to_string(),
+                tenant_id: String::new(),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        Ok(resp.into())
+    }
+
+    pub(crate) async fn eval_compare(
+        &self,
+        embedding_tables: &[String],
+        source_id: &str,
+        golden_source: &str,
+        k: usize,
+    ) -> Result<CompareEvalReport> {
+        let resp = self
+            .eval_client()
+            .eval_compare(eval_pb::EvalCompareRequest {
+                embedding_tables: embedding_tables.to_vec(),
+                source_id: source_id.to_string(),
+                golden_source: golden_source.to_string(),
+                k: k as u32,
+                tenant_id: String::new(),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        Ok(resp.into())
+    }
+
+    // --- mutable tables --------------------------------------------------
+
+    pub(crate) async fn create_mutable_table(
+        &self,
+        def: MutableTableDefinition,
+    ) -> Result<MutableTableId> {
+        let definition = definition_to_proto(&def).map_err(|s| error_from_status(&s))?;
+        let resp = self
+            .mutable_table_client()
+            .create_mutable_table(CreateMutableTableRequest {
+                definition: Some(definition),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        MutableTableId::new(resp.mutable_table_id).map_err(JammiError::MutableTable)
+    }
+
+    pub(crate) async fn drop_mutable_table(&self, id: &MutableTableId) -> Result<()> {
+        self.mutable_table_client()
+            .drop_mutable_table(DropMutableTableRequest {
+                mutable_table_id: id.to_string(),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?;
+        Ok(())
+    }
+
+    // --- channels --------------------------------------------------------
+
+    pub(crate) async fn register_channel(&self, spec: &ChannelSpec) -> Result<()> {
+        self.channel_client()
+            .register_channel(RegisterChannelRequest {
+                channel_id: spec.id.as_str().to_string(),
+                priority: spec.priority,
+                columns: columns_to_proto(&spec.columns),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?;
+        Ok(())
+    }
+
+    pub(crate) async fn add_channel_columns(
+        &self,
+        channel: &ChannelId,
+        new_columns: &[ChannelColumn],
+    ) -> Result<()> {
+        self.channel_client()
+            .add_channel_columns(AddChannelColumnsRequest {
+                channel_id: channel.as_str().to_string(),
+                columns: columns_to_proto(new_columns),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?;
+        Ok(())
     }
 
     // --- tenant ----------------------------------------------------------

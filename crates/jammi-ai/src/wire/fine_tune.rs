@@ -159,3 +159,116 @@ fn backbone_dtype_from_proto(dtype: i32, default: BackboneDtype) -> Result<Backb
         Err(_) => Err(Status::invalid_argument("unknown backbone_dtype")),
     }
 }
+
+// ─── domain → proto (the RemoteSession send side) ────────────────────────────
+//
+// The inverse of the decodes above. The [`crate::RemoteSession`] encodes the
+// engine [`FineTuneConfig`] (and its method) onto the wire so the server's
+// decode rebuilds the identical config. Every concrete engine value maps to a
+// concrete wire value — never `UNSPECIFIED`; the `UNSPECIFIED` arms exist only
+// so a client that omits a field gets the engine default, which a fully-formed
+// engine config never needs.
+
+/// Encode the engine's [`FineTuneMethod`] onto the wire enum. Total — the engine
+/// type has no unspecified variant.
+pub fn method_to_proto(method: FineTuneMethod) -> pb::FineTuneMethod {
+    match method {
+        FineTuneMethod::Lora => pb::FineTuneMethod::Lora,
+    }
+}
+
+/// Encode the engine [`FineTuneConfig`] onto the wire message. Mirrors
+/// [`TryFrom<pb::FineTuneConfig> for FineTuneConfig`] field for field; every
+/// enum-typed field encodes to its concrete wire variant (never `UNSPECIFIED`),
+/// and the optional losses / layer restriction encode to their `Option`-shaped
+/// wire fields.
+pub fn config_to_proto(config: &FineTuneConfig) -> pb::FineTuneConfig {
+    pb::FineTuneConfig {
+        lora_rank: config.lora_rank as u32,
+        lora_alpha: config.lora_alpha,
+        lora_dropout: config.lora_dropout,
+        learning_rate: config.learning_rate,
+        epochs: config.epochs as u32,
+        batch_size: config.batch_size as u32,
+        max_seq_length: config.max_seq_length as u32,
+        embedding_loss: config.embedding_loss.as_ref().map(embedding_loss_to_proto),
+        classification_loss: config
+            .classification_loss
+            .as_ref()
+            .map(|l| classification_loss_to_proto(l) as i32),
+        gradient_accumulation_steps: config.gradient_accumulation_steps as u32,
+        validation_fraction: config.validation_fraction,
+        early_stopping_patience: config.early_stopping_patience as u32,
+        warmup_steps: config.warmup_steps as u32,
+        lr_schedule: lr_schedule_to_proto(config.lr_schedule) as i32,
+        early_stopping_metric: early_stopping_metric_to_proto(config.early_stopping_metric) as i32,
+        target_modules: config.target_modules.clone(),
+        layers_to_transform: config.layers_to_transform.as_ref().map(|layers| {
+            pb::LayersToTransform {
+                layers: layers.iter().map(|n| *n as u32).collect(),
+            }
+        }),
+        use_rslora: config.use_rslora,
+        rank_pattern: config
+            .rank_pattern
+            .iter()
+            .map(|(k, v)| (k.clone(), *v as u32))
+            .collect(),
+        init_lora_weights: lora_init_mode_to_proto(config.init_lora_weights) as i32,
+        backbone_dtype: backbone_dtype_to_proto(config.backbone_dtype) as i32,
+        weight_decay: config.weight_decay,
+        max_grad_norm: config.max_grad_norm,
+    }
+}
+
+fn embedding_loss_to_proto(loss: &EmbeddingLoss) -> pb::EmbeddingLoss {
+    use pb::embedding_loss::Loss;
+    let inner = match loss {
+        EmbeddingLoss::CoSent => Loss::CoSent(pb::embedding_loss::CoSent {}),
+        EmbeddingLoss::Triplet { margin } => {
+            Loss::Triplet(pb::embedding_loss::Triplet { margin: *margin })
+        }
+        EmbeddingLoss::MultipleNegativesRanking { temperature } => {
+            Loss::MultipleNegativesRanking(pb::embedding_loss::MultipleNegativesRanking {
+                temperature: *temperature,
+            })
+        }
+    };
+    pb::EmbeddingLoss { loss: Some(inner) }
+}
+
+fn classification_loss_to_proto(loss: &ClassificationLoss) -> pb::ClassificationLoss {
+    match loss {
+        ClassificationLoss::CrossEntropy => pb::ClassificationLoss::CrossEntropy,
+    }
+}
+
+fn lr_schedule_to_proto(schedule: LrSchedule) -> pb::LrSchedule {
+    match schedule {
+        LrSchedule::Constant => pb::LrSchedule::Constant,
+        LrSchedule::CosineDecay => pb::LrSchedule::CosineDecay,
+        LrSchedule::LinearDecay => pb::LrSchedule::LinearDecay,
+    }
+}
+
+fn early_stopping_metric_to_proto(metric: EarlyStoppingMetric) -> pb::EarlyStoppingMetric {
+    match metric {
+        EarlyStoppingMetric::ValLoss => pb::EarlyStoppingMetric::ValLoss,
+        EarlyStoppingMetric::TrainLoss => pb::EarlyStoppingMetric::TrainLoss,
+    }
+}
+
+fn lora_init_mode_to_proto(mode: LoraInitMode) -> pb::LoraInitMode {
+    match mode {
+        LoraInitMode::ZerosB => pb::LoraInitMode::ZerosB,
+        LoraInitMode::Gaussian => pb::LoraInitMode::Gaussian,
+    }
+}
+
+fn backbone_dtype_to_proto(dtype: BackboneDtype) -> pb::BackboneDtype {
+    match dtype {
+        BackboneDtype::F32 => pb::BackboneDtype::F32,
+        BackboneDtype::BF16 => pb::BackboneDtype::Bf16,
+        BackboneDtype::F16 => pb::BackboneDtype::F16,
+    }
+}

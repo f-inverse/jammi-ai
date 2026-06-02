@@ -15,6 +15,7 @@ use jammi_db::store::mutable::{
 use jammi_db::TenantId;
 use tonic::Status;
 
+use crate::wire::encode_ipc_stream;
 use crate::wire::proto::mutable_table as pb;
 
 /// Build the engine [`MutableTableDefinition`] from the wire message, stamping
@@ -52,6 +53,37 @@ pub fn definition_from_proto(
     builder
         .build()
         .map_err(|e| Status::invalid_argument(e.to_string()))
+}
+
+/// Encode the engine [`MutableTableDefinition`] onto its wire message — the
+/// inverse of [`definition_from_proto`], for the [`crate::RemoteSession`] send
+/// side. The schema rides as a schema-only Arrow IPC stream (the framing
+/// [`super::decode_ipc_schema`] reads back). The `tenant` field is intentionally
+/// dropped: the wire body stays tenant-free and the server stamps the session's
+/// tenant onto the catalog row, so a remote client carries no tenant in the body
+/// (it rides the `SESSION_HEADER` instead). `user_metadata` serialises to its
+/// JSON-object string (`"{}"` when the default empty object).
+pub fn definition_to_proto(
+    def: &MutableTableDefinition,
+) -> Result<pb::MutableTableDefinition, Status> {
+    let schema = encode_ipc_stream(&def.schema, &[])?;
+    Ok(pb::MutableTableDefinition {
+        id: def.id.to_string(),
+        schema,
+        primary_key: def.primary_key.clone(),
+        indexes: def
+            .indexes
+            .iter()
+            .map(|idx| pb::MutableIndex {
+                name: idx.name.clone(),
+                columns: idx.columns.clone(),
+                unique: idx.unique,
+            })
+            .collect(),
+        order_column: def.order_column.clone().unwrap_or_default(),
+        chunk_size: def.chunk_size as u64,
+        user_metadata: def.user_metadata.to_string(),
+    })
 }
 
 /// Parse a wire id string into a validated [`MutableTableId`]. Shared by the

@@ -9,6 +9,7 @@
 pub mod error;
 pub mod flight;
 pub mod grpc;
+pub mod grpc_web_trailers;
 pub mod routes;
 pub mod runtime;
 

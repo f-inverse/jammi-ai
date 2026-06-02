@@ -54,6 +54,7 @@ use crate::grpc::proto::session::session_service_server::SessionServiceServer;
 use crate::grpc::proto::trigger::trigger_service_server::TriggerServiceServer;
 use crate::grpc::session::{SessionServer, SessionStore, TenantInterceptor};
 use crate::grpc::trigger::TriggerServer;
+use crate::grpc_web_trailers::GrpcWebTrailersLayer;
 use crate::routes::health::{self, MetricsRegistry};
 
 /// Errors `OssServer::run` can surface to the binary's `main`.
@@ -341,8 +342,18 @@ pub async fn serve_grpc_chain(
     let session_svc =
         SessionServiceServer::with_interceptor(SessionServer::new(store), interceptor.clone());
 
+    // Layer order matters. `GrpcWebTrailersLayer` is added first, so in the
+    // tower `ServiceBuilder` stack it wraps `GrpcWebLayer` and post-processes
+    // the gRPC-Web-framed response: tonic encodes a unary handler error as a
+    // trailers-only response (grpc-status in the HTTP headers, empty body) that
+    // `GrpcWebLayer` passes through untouched, leaving a gRPC-Web client with no
+    // in-body trailer frame to read. The repair layer rewrites that into the
+    // in-body `0x80` trailer frame the gRPC-Web wire format requires. Raw gRPC
+    // over HTTP/2 (the Rust `RemoteSession`) is unaffected — those responses are
+    // not gRPC-Web and the layer skips them.
     let mut builder = Server::builder()
         .accept_http1(true)
+        .layer(GrpcWebTrailersLayer::new())
         .layer(GrpcWebLayer::new())
         .add_service(flight_svc)
         .add_service(session_svc);

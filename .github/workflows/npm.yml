@@ -1,6 +1,6 @@
 name: npm
 
-# Publishes @jammi/client (the TypeScript gRPC-web SDK) to npm, in LOCKSTEP with
+# Publishes @f-inverse/jammi-client (the TypeScript gRPC-web SDK) to npm, in LOCKSTEP with
 # the engine: the same `v*` release tag that drives the crates.io / PyPI publish.
 # It runs ONLY on a release tag push — never on a PR or a branch push — so a
 # merge to `main` cannot publish.
@@ -48,7 +48,7 @@ jobs:
           tag="${GITHUB_REF#refs/tags/v}"
           version=$(node -p "require('./package.json').version")
           if [ "$tag" != "$version" ]; then
-            echo "Tag v$tag does not match @jammi/client version $version"
+            echo "Tag v$tag does not match @f-inverse/jammi-client version $version"
             exit 1
           fi
 
@@ -75,9 +75,9 @@ jobs:
           VERSION="${VERSION:-${GITHUB_REF_NAME#v}}"
           # Skip if this version is already on npm (idempotent re-run); `npm view`
           # exits non-zero when the exact version does not exist yet.
-          if npm view "@jammi/client@${VERSION}" version >/dev/null 2>&1; then
-            echo "@jammi/client ${VERSION} already on npm — skipping"
+          if npm view "@f-inverse/jammi-client@${VERSION}" version >/dev/null 2>&1; then
+            echo "@f-inverse/jammi-client ${VERSION} already on npm — skipping"
           else
-            echo "Publishing @jammi/client ${VERSION}"
+            echo "Publishing @f-inverse/jammi-client ${VERSION}"
             npm publish --provenance --access public
           fi

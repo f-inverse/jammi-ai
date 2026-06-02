@@ -1,4 +1,4 @@
-// Hermetic smoke test for @jammi/client.
+// Hermetic smoke test for @f-inverse/jammi-client.
 //
 // It does NOT hit the network. It proves two things the generated surface must
 // guarantee, entirely at construction + type level:

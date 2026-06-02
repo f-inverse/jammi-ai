@@ -1,4 +1,4 @@
-# @jammi/client
+# @f-inverse/jammi-client
 
 The official TypeScript gRPC-web client for the Jammi engine.
 
@@ -12,7 +12,7 @@ with the server's `tonic-web` surface.
 ## Use
 
 ```ts
-import { connect, Modality } from "@jammi/client";
+import { connect, Modality } from "@f-inverse/jammi-client";
 
 // One transport, one session-scoped tenant binding, a client per service.
 const jammi = connect("https://engine.example.com");

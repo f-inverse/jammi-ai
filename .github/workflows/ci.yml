@@ -102,7 +102,7 @@ jobs:
         run: cargo test -p jammi-ai --features wire
 
   ts-client:
-    name: TS client (@jammi/client)
+    name: TS client (@f-inverse/jammi-client)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -114,7 +114,7 @@ jobs:
         with:
           node-version: "22"
 
-      # `@jammi/client` is generated from the canonical proto at
+      # `@f-inverse/jammi-client` is generated from the canonical proto at
       # `crates/jammi-ai/proto` by `buf generate` (run inside `npm run build`),
       # then type-checked and smoke-tested. Running it on every PR catches a
       # proto change that breaks TS codegen — or a regression in the thin

@@ -1,4 +1,4 @@
-# Codegen config for @jammi/client.
+# Codegen config for @f-inverse/jammi-client.
 #
 # The canonical proto at ../../crates/jammi-ai/proto is the single source for
 # every language client; this package references it as the buf input (see the

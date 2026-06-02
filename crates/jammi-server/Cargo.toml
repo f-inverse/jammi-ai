@@ -31,6 +31,14 @@ prometheus.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
 tonic-web.workspace = true
+# The gRPC-Web trailers-only repair layer (`grpc_web_trailers`) sits outside
+# `tonic-web` and rewrites a trailers-only error response into the in-body
+# trailer frame a gRPC-Web client requires. It needs the tower `Layer` trait
+# and the low-level HTTP body framing primitives directly.
+tower = { workspace = true, features = ["util"] }
+http-body.workspace = true
+pin-project.workspace = true
+bytes = "1"
 tokio.workspace = true
 tokio-stream.workspace = true
 serde.workspace = true
@@ -52,7 +60,6 @@ jetstream-broker = ["jammi-db/jetstream-broker"]
 
 [dev-dependencies]
 tokio.workspace = true
-tower = { workspace = true, features = ["util"] }
 reqwest.workspace = true
 jammi-test-utils.workspace = true
 tempfile = "3"

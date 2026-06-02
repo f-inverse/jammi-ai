@@ -2,13 +2,11 @@
 """Generate the HTSAT-Swin CLAP audio-tower oracle: a tiny real-HTSAT fixture
 plus per-boundary golden activations, for hermetic numerical parity testing.
 
-Unlike `generate_tiny_clap.py` (which fabricates a flat-ViT layout that matches
-no public checkpoint), this builds a real HuggingFace `transformers`
-`ClapAudioModelWithProjection` so the committed `model.safetensors` carries the
-exact `audio_model.audio_encoder.*` + `audio_projection.*` key layout of
-`laion/clap-htsat-fused`. The Rust HTSAT tower is parity-tested against the
-golden activations dumped here at every forward boundary, so any divergence is
-localized to the unit that produced it.
+This builds a real HuggingFace `transformers` `ClapAudioModelWithProjection` so
+the committed `model.safetensors` carries the exact `audio_model.audio_encoder.*`
++ `audio_projection.*` key layout of `laion/clap-htsat-fused`. The Rust HTSAT
+tower is parity-tested against the golden activations dumped here at every
+forward boundary, so any divergence is localized to the unit that produced it.
 
 Two artifact sets are written under cookbook/fixtures/:
 

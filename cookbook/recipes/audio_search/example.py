@@ -17,13 +17,15 @@ but what makes a clip a "positive" (augmentation-similar, or co-occurring-
 complementary) is entirely the caller's data; the trainer only minimizes the
 contrastive objective over whatever clips you pair.
 
-Model. The default model is the hermetic `tiny_clap` fixture so the recipe
-runs offline in CI in well under 60s. Any CLAP-format audio model works the
+Model. The default model is the hermetic `htsat_clap_tiny` fixture so the recipe
+runs offline in CI in well under 60s. Any HuggingFace CLAP audio model works the
 same way — point `JAMMI_AUDIO_MODEL` at a Hugging Face repo id or
-`local:<path>` whose `open_clip_config.json` carries a `model_cfg.audio_cfg`
-block and whose checkpoint exposes the `audio.*` tower keys:
+`local:<path>` whose `config.json` declares `model_type = "clap_audio_model"`
+(or lists `ClapModel` / `ClapAudioModelWithProjection` in `architectures`) and
+whose checkpoint exposes the `audio_model.audio_encoder.*` + `audio_projection.*`
+tower keys, alongside a `preprocessor_config.json` feature-extractor config:
 
-    JAMMI_AUDIO_MODEL=laion/clap-htsat-unfused   # (illustrative)
+    JAMMI_AUDIO_MODEL=laion/clap-htsat-fused   # (illustrative)
 
 The fixture has random weights, so its embeddings are garbage and the eval
 numbers are not meaningful — the recipe measures and reports them to exercise
@@ -51,7 +53,7 @@ GOLDEN_PATH = FIXTURES / "tiny_audio_golden.json"
 
 # Default to the hermetic local fixture so CI runs offline. Override with
 # JAMMI_AUDIO_MODEL=<hf-repo-id> or `local:<path>` for any CLAP-format model.
-DEFAULT_MODEL = f"local:{FIXTURES / 'tiny_clap'}"
+DEFAULT_MODEL = f"local:{FIXTURES / 'htsat_clap_tiny'}"
 MODEL = os.environ.get("JAMMI_AUDIO_MODEL", DEFAULT_MODEL)
 
 

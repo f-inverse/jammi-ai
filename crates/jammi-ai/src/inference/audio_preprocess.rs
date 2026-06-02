@@ -6,20 +6,14 @@
 //! Parallel to [`super::image_preprocess`] — the caller hands raw bytes, the
 //! backend produces a model-ready tensor; no DSP knobs are exposed.
 //!
-//! Two spectrogram front-ends live here:
-//!
-//! - [`preprocess_clap_fusion`] reproduces HuggingFace `ClapFeatureExtractor`
-//!   (truncation `"fusion"`, padding `"repeatpad"`) exactly: repeatpad to the
-//!   fixed window, reflect-centered Hann STFT (power 2), an HTK mel filterbank
-//!   built in Hz space (`norm=None`), the `10·log10` dB nonlinearity, and the
-//!   4-channel fusion packing. It emits `[batch, 4, time, n_mels]` and the
-//!   per-clip `is_longer` flag the HTSAT tower's fusion path keys on. Every
-//!   numeric is derived from a [`ClapFrontendConfig`] read off the model /
-//!   feature-extractor config — nothing is hardcoded.
-//! - [`preprocess_audio_batch`] is the fixed-window `[batch, n_mels, n_frames]`
-//!   front-end of the flat-ViT `ClapAudio` tower. It remains until the audio
-//!   backend is migrated onto the HTSAT tower + [`preprocess_clap_fusion`]; at
-//!   that point this function and the flat-ViT tower are removed together.
+//! [`preprocess_clap_fusion`] reproduces HuggingFace `ClapFeatureExtractor`
+//! (truncation `"fusion"`, padding `"repeatpad"`) exactly: repeatpad to the
+//! fixed window, reflect-centered Hann STFT (power 2), an HTK mel filterbank
+//! built in Hz space (`norm=None`), the `10·log10` dB nonlinearity, and the
+//! 4-channel fusion packing. It emits `[batch, 4, time, n_mels]` and the
+//! per-clip `is_longer` flag, feeding the HTSAT-Swin CLAP audio tower. Every
+//! numeric is derived from a [`ClapFrontendConfig`] read off the model /
+//! feature-extractor config — nothing is hardcoded.
 
 use std::io::Cursor;
 
@@ -639,217 +633,6 @@ fn fft_f64(re: &mut [f64], im: &mut [f64]) {
     }
 }
 
-// ===========================================================================
-// Flat-ViT front-end — fixed-window `[batch, n_mels, n_frames]` log-mel.
-//
-// Serves the `ClapAudio` (flat-ViT) tower the audio backend currently runs.
-// Removed together with that tower once the backend migrates onto the HTSAT
-// tower + `preprocess_clap_fusion` above.
-// ===========================================================================
-
-/// In-place iterative radix-2 Cooley-Tukey FFT over interleaved complex data.
-///
-/// `data` holds `n` complex numbers as `[re0, im0, re1, im1, ...]` where `n`
-/// is a power of two. Iterative (no recursion) — bounded work, no stack risk
-/// regardless of `n`.
-fn fft_in_place(data: &mut [f32]) {
-    let n = data.len() / 2;
-    if n < 2 {
-        return;
-    }
-    debug_assert!(n.is_power_of_two(), "FFT length must be a power of two");
-
-    // Bit-reversal permutation.
-    let mut j = 0usize;
-    for i in 0..n {
-        if i < j {
-            data.swap(2 * i, 2 * j);
-            data.swap(2 * i + 1, 2 * j + 1);
-        }
-        let mut m = n >> 1;
-        while m >= 1 && j & m != 0 {
-            j ^= m;
-            m >>= 1;
-        }
-        j |= m;
-    }
-
-    // Danielson-Lanczos butterflies.
-    let mut len = 2;
-    while len <= n {
-        let half = len / 2;
-        let theta = -2.0 * std::f32::consts::PI / len as f32;
-        let (wm_re, wm_im) = (theta.cos(), theta.sin());
-        let mut start = 0;
-        while start < n {
-            let (mut w_re, mut w_im) = (1.0f32, 0.0f32);
-            for k in 0..half {
-                let i = start + k;
-                let l = i + half;
-                let (ir, ii) = (data[2 * i], data[2 * i + 1]);
-                let (lr, li) = (data[2 * l], data[2 * l + 1]);
-                let tr = w_re * lr - w_im * li;
-                let ti = w_re * li + w_im * lr;
-                data[2 * l] = ir - tr;
-                data[2 * l + 1] = ii - ti;
-                data[2 * i] = ir + tr;
-                data[2 * i + 1] = ii + ti;
-                let nw_re = w_re * wm_re - w_im * wm_im;
-                w_im = w_re * wm_im + w_im * wm_re;
-                w_re = nw_re;
-            }
-            start += len;
-        }
-        len <<= 1;
-    }
-}
-
-/// Convert a frequency in Hz to the HTK mel scale.
-fn hz_to_mel(hz: f32) -> f32 {
-    2595.0 * (1.0 + hz / 700.0).log10()
-}
-
-/// Convert a value on the HTK mel scale back to Hz.
-fn mel_to_hz(mel: f32) -> f32 {
-    700.0 * (10f32.powf(mel / 2595.0) - 1.0)
-}
-
-/// Build a `[n_mels, n_fft/2 + 1]` triangular mel filterbank (HTK convention)
-/// spanning `0..sample_rate/2`. Row-major: `filters[m * n_bins + b]`.
-fn mel_filterbank(n_mels: usize, n_fft: usize, sample_rate: u32) -> Vec<f32> {
-    let n_bins = n_fft / 2 + 1;
-    let f_max = sample_rate as f32 / 2.0;
-    let mel_min = hz_to_mel(0.0);
-    let mel_max = hz_to_mel(f_max);
-
-    // n_mels + 2 mel points → n_mels triangular filters.
-    let mel_points: Vec<f32> = (0..n_mels + 2)
-        .map(|i| mel_min + (mel_max - mel_min) * i as f32 / (n_mels + 1) as f32)
-        .collect();
-    let hz_points: Vec<f32> = mel_points.iter().map(|&m| mel_to_hz(m)).collect();
-    // FFT bin index (fractional) for each mel point.
-    let bin_points: Vec<f32> = hz_points
-        .iter()
-        .map(|&hz| hz * (n_fft as f32) / sample_rate as f32)
-        .collect();
-
-    let mut filters = vec![0f32; n_mels * n_bins];
-    for m in 0..n_mels {
-        let left = bin_points[m];
-        let center = bin_points[m + 1];
-        let right = bin_points[m + 2];
-        for (b, slot) in filters[m * n_bins..(m + 1) * n_bins].iter_mut().enumerate() {
-            let bf = b as f32;
-            let w = if bf >= left && bf <= center && center > left {
-                (bf - left) / (center - left)
-            } else if bf > center && bf <= right && right > center {
-                (right - bf) / (right - center)
-            } else {
-                0.0
-            };
-            *slot = w;
-        }
-    }
-    filters
-}
-
-/// Compute a `[n_mels, n_frames]` log-mel spectrogram for one mono clip.
-///
-/// Frames the signal with a Hann-windowed STFT (`n_fft` window, `hop_length`
-/// stride), maps each power spectrum through the triangular mel filterbank,
-/// and takes the natural log. The clip is padded or truncated to exactly
-/// `n_frames` frames so every clip yields a fixed-shape spectrogram (the
-/// fixed-window pooling strategy).
-fn log_mel_spectrogram(
-    samples: &[f32],
-    n_mels: usize,
-    n_frames: usize,
-    n_fft: usize,
-    hop_length: usize,
-    filters: &[f32],
-) -> Vec<f32> {
-    let n_bins = n_fft / 2 + 1;
-    let hann: Vec<f32> = (0..n_fft)
-        .map(|i| {
-            let x = 2.0 * std::f32::consts::PI * i as f32 / n_fft as f32;
-            0.5 * (1.0 - x.cos())
-        })
-        .collect();
-
-    // Row-major mel spectrogram [n_mels, n_frames], log floor 1e-10.
-    let mut mel = vec![(1e-10f32).ln(); n_mels * n_frames];
-    let mut fft_buf = vec![0f32; 2 * n_fft];
-    let mut power = vec![0f32; n_bins];
-
-    for frame in 0..n_frames {
-        let offset = frame * hop_length;
-        // Window into the complex FFT buffer (imag = 0); zero-pad past the end.
-        for k in 0..n_fft {
-            let s = samples.get(offset + k).copied().unwrap_or(0.0);
-            fft_buf[2 * k] = s * hann[k];
-            fft_buf[2 * k + 1] = 0.0;
-        }
-        fft_in_place(&mut fft_buf);
-
-        for (b, slot) in power.iter_mut().enumerate() {
-            let re = fft_buf[2 * b];
-            let im = fft_buf[2 * b + 1];
-            *slot = re * re + im * im;
-        }
-
-        for m in 0..n_mels {
-            let mut energy = 0f32;
-            let row = &filters[m * n_bins..(m + 1) * n_bins];
-            for (b, &w) in row.iter().enumerate() {
-                energy += w * power[b];
-            }
-            mel[m * n_frames + frame] = energy.max(1e-10).ln();
-        }
-    }
-    mel
-}
-
-/// Preprocess a batch of decoded clips into a model-ready `[batch, n_mels,
-/// n_frames]` log-mel tensor for the flat-ViT `ClapAudio` tower.
-///
-/// Each clip is resampled to `sample_rate`, transformed to a fixed-window
-/// log-mel spectrogram, and stacked. Clips shorter than `n_frames * hop`
-/// samples are zero-padded; longer clips are truncated — fixed-window pooling
-/// keyed on the model's configured frame count.
-pub fn preprocess_audio_batch(
-    clips: &[DecodedAudio],
-    n_mels: usize,
-    n_frames: usize,
-    n_fft: usize,
-    hop_length: usize,
-    sample_rate: u32,
-    device: &Device,
-) -> Result<Tensor> {
-    if clips.is_empty() {
-        return Err(JammiError::Inference(
-            "Cannot preprocess empty audio batch".into(),
-        ));
-    }
-    if !n_fft.is_power_of_two() {
-        return Err(JammiError::Inference(format!(
-            "Audio n_fft ({n_fft}) must be a power of two for the radix-2 FFT"
-        )));
-    }
-
-    let filters = mel_filterbank(n_mels, n_fft, sample_rate);
-    let per_clip = n_mels * n_frames;
-    let mut flat = Vec::with_capacity(clips.len() * per_clip);
-
-    for clip in clips {
-        let resampled = resample_linear(&clip.samples, clip.sample_rate, sample_rate);
-        let mel = log_mel_spectrogram(&resampled, n_mels, n_frames, n_fft, hop_length, &filters);
-        flat.extend_from_slice(&mel);
-    }
-
-    Tensor::from_vec(flat, (clips.len(), n_mels, n_frames), device)
-        .map_err(|e| JammiError::Inference(format!("Failed to create audio tensor: {e}")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,20 +698,6 @@ mod tests {
     }
 
     #[test]
-    fn fft_matches_naive_dft_on_small_input() {
-        // Impulse at index 1 → known DFT (cos/-sin ramp).
-        let n = 8;
-        let mut data = vec![0f32; 2 * n];
-        data[2] = 1.0; // real part of sample index 1
-        fft_in_place(&mut data);
-        for k in 0..n {
-            let angle = -2.0 * std::f32::consts::PI * k as f32 / n as f32;
-            assert!((data[2 * k] - angle.cos()).abs() < 1e-4);
-            assert!((data[2 * k + 1] - angle.sin()).abs() < 1e-4);
-        }
-    }
-
-    #[test]
     fn fft_f64_matches_naive_dft_on_small_input() {
         // Impulse at index 1 → known DFT (cos/-sin ramp), f64 precision.
         let n = 8;
@@ -960,33 +729,56 @@ mod tests {
     }
 
     #[test]
-    fn mel_filterbank_rows_are_nonnegative_and_nonempty() {
-        let filters = mel_filterbank(8, 64, 16_000);
-        assert_eq!(filters.len(), 8 * (64 / 2 + 1));
-        assert!(filters.iter().all(|&w| w >= 0.0));
+    fn mel_filterbank_hz_rows_are_nonnegative_and_nonempty() {
+        let config = ClapFrontendConfig {
+            n_mels: 8,
+            sample_rate: 16_000,
+            fft_window_size: 64,
+            hop_length: 32,
+            frequency_min: 0.0,
+            frequency_max: 8_000.0,
+            max_length_s: 1,
+        };
+        let filters = mel_filterbank_hz(&config);
+        assert_eq!(filters.weights.len(), 8 * (64 / 2 + 1));
+        assert!(filters.weights.iter().all(|&w| w >= 0.0));
         // At least one filter must have positive weight somewhere.
-        assert!(filters.iter().any(|&w| w > 0.0));
+        assert!(filters.weights.iter().any(|&w| w > 0.0));
+    }
+
+    /// A tiny fusion front-end config whose fixed window comfortably exceeds a
+    /// short clip, so the repeatpad branch runs and the output shape is fixed.
+    fn tiny_fusion_config() -> ClapFrontendConfig {
+        ClapFrontendConfig {
+            n_mels: 16,
+            sample_rate: 16_000,
+            fft_window_size: 256,
+            hop_length: 128,
+            frequency_min: 0.0,
+            frequency_max: 8_000.0,
+            max_length_s: 1,
+        }
     }
 
     #[test]
-    fn preprocess_batch_produces_fixed_shape_and_distinguishes_pitch() {
+    fn fusion_produces_fixed_shape_and_distinguishes_pitch() {
         let device = Device::Cpu;
         let low = decode_audio_bytes(&sine_wav(220.0, 16_000, 4000)).unwrap();
         let high = decode_audio_bytes(&sine_wav(3000.0, 16_000, 4000)).unwrap();
+        let config = tiny_fusion_config();
 
-        let n_mels = 16;
-        let n_frames = 24;
-        let tensor =
-            preprocess_audio_batch(&[low, high], n_mels, n_frames, 256, 128, 16_000, &device)
-                .unwrap();
-        assert_eq!(tensor.dims(), &[2, n_mels, n_frames]);
+        let (tensor, is_longer) = preprocess_clap_fusion(&[low, high], &config, &device).unwrap();
+        // [batch, 4, time, n_mels]; short clips are repeatpadded, not longer.
+        let time = config.chunk_frames();
+        assert_eq!(tensor.dims(), &[2, 4, time, config.n_mels]);
+        assert_eq!(is_longer, vec![false, false]);
 
-        // The two clips differ in pitch → their mel spectrograms differ.
-        let rows = tensor.to_vec3::<f32>().unwrap();
-        let diff: f32 = rows[0]
+        // The two clips differ in pitch → their fusion spectrograms differ.
+        let rows = tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let half = rows.len() / 2;
+        let diff: f32 = rows[..half]
             .iter()
-            .flatten()
-            .zip(rows[1].iter().flatten())
+            .zip(&rows[half..])
             .map(|(a, b)| (a - b).abs())
             .sum();
         assert!(
@@ -996,14 +788,16 @@ mod tests {
     }
 
     #[test]
-    fn preprocess_empty_batch_errors() {
-        assert!(preprocess_audio_batch(&[], 16, 24, 256, 128, 16_000, &Device::Cpu).is_err());
+    fn fusion_empty_batch_errors() {
+        assert!(preprocess_clap_fusion(&[], &tiny_fusion_config(), &Device::Cpu).is_err());
     }
 
     #[test]
-    fn preprocess_rejects_non_power_of_two_fft() {
+    fn fusion_rejects_non_power_of_two_fft() {
         let clip = decode_audio_bytes(&sine_wav(440.0, 16_000, 2000)).unwrap();
-        assert!(preprocess_audio_batch(&[clip], 16, 24, 200, 128, 16_000, &Device::Cpu).is_err());
+        let mut config = tiny_fusion_config();
+        config.fft_window_size = 200; // not a power of two
+        assert!(preprocess_clap_fusion(&[clip], &config, &Device::Cpu).is_err());
     }
 
     // -- CLAP fusion front-end parity against the committed golden -----------

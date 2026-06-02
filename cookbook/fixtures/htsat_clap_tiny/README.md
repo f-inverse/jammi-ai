@@ -12,6 +12,7 @@ real activations rather than a fabricated layout.
 | File | Contents |
 |---|---|
 | `config.json` | tiny `ClapAudioConfig` (`model_type = "clap_audio_model"`) |
+| `preprocessor_config.json` | tiny `ClapFeatureExtractor` geometry (`feature_size = 32` to match `num_mel_bins`; small window/hop so the fusion front-end emits a valid small input — the tower bicubic-resamples any time length to `spec_width`) |
 | `model.safetensors` | tiny real-HTSAT weights (~1.6 MB) |
 | `pinned_input.safetensors` | the deterministic `input_features` `[2, 4, 500, 32]` the tower is tested on, independent of the audio front-end |
 | `goldens.safetensors` | per-boundary activations (see naming below) |
@@ -44,6 +45,12 @@ pip install "torch==2.8.0" "transformers==4.57.6" "safetensors"
 python tests/fixtures/generate_htsat_clap.py            # this fixture (hermetic)
 python tests/fixtures/generate_htsat_clap.py --real     # + ../htsat_clap_real (downloads laion/clap-htsat-fused)
 ```
+
+`preprocessor_config.json` is hand-authored, not regenerated: its `feature_size`
+matches the model's `num_mel_bins` (32) and its window/hop/`max_length_s` produce
+a small valid `[B, 4, T, 32]` input, letting audio→embedding run end-to-end
+hermetically. The tower bicubic-resamples any `T` to `spec_width`, so the exact
+frame count is not load-bearing.
 
 ## Run the parity harness
 

@@ -346,3 +346,250 @@ fn full_forward_matches_goldens() {
         "projected_normalized",
     );
 }
+
+/// The tower must accept ANY input time length, not the fixture's 500: the
+/// bicubic resample builds its matrix from the runtime `T` and maps it to
+/// `spec_width`, after which the geometry is config-driven and T-independent.
+/// This is what lets the real `laion/clap-htsat-fused` (T≈1001) run; a tower
+/// pinned to one length would silently work only on the tiny fixture. Drives a
+/// length below `spec_width` (resampled) and one equal to it (resample skipped),
+/// asserting a well-formed unit-norm embedding either way.
+#[test]
+fn tower_accepts_arbitrary_input_length() {
+    let device = Device::Cpu;
+    let tower = load_full_tower(&device);
+    let n_mels = load_config().num_mel_bins;
+
+    for t in [300usize, 512] {
+        let input = Tensor::randn(0f32, 1f32, (2, 4, t, n_mels), &device).expect("random input");
+        let emb = tower
+            .forward(&input)
+            .unwrap_or_else(|e| panic!("forward at T={t}: {e}"));
+        assert_eq!(
+            emb.dims(),
+            &[2, tower.projection_dim()],
+            "T={t}: embedding shape"
+        );
+        // L2-normalized rows: each row's norm ≈ 1 (and finite).
+        let norms = emb.sqr().unwrap().sum(D::Minus1).unwrap().sqrt().unwrap();
+        let min = norms.min(0).unwrap().to_scalar::<f32>().unwrap();
+        let max = norms.max(0).unwrap().to_scalar::<f32>().unwrap();
+        assert!(
+            min.is_finite() && (min - 1.0).abs() < 1e-4 && (max - 1.0).abs() < 1e-4,
+            "T={t}: embedding rows not unit-norm: [{min}, {max}]"
+        );
+    }
+}
+
+// ── Weight-key coverage ──────────────────────────────────────────────────────
+//
+// The boundary-parity tests above prove the tower is numerically correct on the
+// committed input; this test proves it consumes the FULL checkpoint — every
+// learned weight is loaded, with the right shape, and the tower invents no key
+// the checkpoint lacks. It derives the expected `{key → shape}` set purely from
+// the parsed `HtsatAudioConfig` (looping stages × blocks), then asserts an exact
+// bijection with `model.safetensors`'s non-ignored keys: no checkpoint key is
+// unexpected, no expected key is missing, every shape matches.
+//
+// Ignore-set invariant: exactly two key families carry no learned parameter and
+// are intentionally NOT loaded by the tower —
+//   * `*.relative_position_index` — the Swin window's pairwise index buffer,
+//     recomputed from the window size in `SwinSelfAttention::build_rel_index`
+//     (verified bit-exact against the stored buffer by the parity tests), so the
+//     stored copy is redundant.
+//   * `*.num_batches_tracked` — a BatchNorm step counter used only by training's
+//     running-stat momentum; eval-mode inference reads `running_mean/var`, never
+//     the counter.
+// Both are non-parametric bookkeeping. Every OTHER key must be a real weight the
+// tower loads; the ignore-set is closed (nothing else may be skipped).
+
+/// Expected `{key → shape}` derived from config: append the `audio_encoder`
+/// prefix and collect.
+fn expected_weight_shapes(config: &HtsatAudioConfig) -> HashMap<String, Vec<usize>> {
+    let mut want: HashMap<String, Vec<usize>> = HashMap::new();
+    let enc = "audio_model.audio_encoder";
+    let mut put = |key: String, shape: Vec<usize>| {
+        want.insert(key, shape);
+    };
+
+    // Input batch-norm over the mel axis: weight/bias/running_mean/running_var.
+    for p in ["weight", "bias", "running_mean", "running_var"] {
+        put(format!("{enc}.batch_norm.{p}"), vec![config.num_mel_bins]);
+    }
+
+    // Patch embedding.
+    let phs = config.patch_embeds_hidden_size;
+    let in_c = config.patch_embed_input_channels;
+    let ps = config.patch_size;
+    let pe = format!("{enc}.patch_embed");
+    put(format!("{pe}.proj.weight"), vec![phs, in_c, ps, ps]);
+    put(format!("{pe}.proj.bias"), vec![phs]);
+    put(
+        format!("{pe}.mel_conv2d.weight"),
+        vec![phs, in_c, ps, ps * 3],
+    );
+    put(format!("{pe}.mel_conv2d.bias"), vec![phs]);
+    put(format!("{pe}.norm.weight"), vec![phs]);
+    put(format!("{pe}.norm.bias"), vec![phs]);
+
+    // AFF fusion block: two MLP branches (local/global), each conv → BN → conv →
+    // BN with a `phs/aff_block_r` bottleneck. The Sequential indices match the
+    // HF layout: convs at 0/3 (local) and 1/4 (global), BNs at 1/4 and 2/5.
+    let inter = phs / config.aff_block_r;
+    let conv = |w: &mut dyn FnMut(String, Vec<usize>), base: &str, out: usize, inp: usize| {
+        w(format!("{base}.weight"), vec![out, inp, 1, 1]);
+        w(format!("{base}.bias"), vec![out]);
+    };
+    let bn = |w: &mut dyn FnMut(String, Vec<usize>), base: &str, c: usize| {
+        for p in ["weight", "bias", "running_mean", "running_var"] {
+            w(format!("{base}.{p}"), vec![c]);
+        }
+    };
+    let fm = format!("{pe}.fusion_model");
+    conv(&mut put, &format!("{fm}.local_att.0"), inter, phs);
+    bn(&mut put, &format!("{fm}.local_att.1"), inter);
+    conv(&mut put, &format!("{fm}.local_att.3"), phs, inter);
+    bn(&mut put, &format!("{fm}.local_att.4"), phs);
+    conv(&mut put, &format!("{fm}.global_att.1"), inter, phs);
+    bn(&mut put, &format!("{fm}.global_att.2"), inter);
+    conv(&mut put, &format!("{fm}.global_att.4"), phs, inter);
+    bn(&mut put, &format!("{fm}.global_att.5"), phs);
+
+    // Swin stages: `depths[s]` blocks at width `phs << s`, then a patch-merging
+    // downsample on every stage but the last.
+    let num_stages = config.num_stages();
+    for s in 0..num_stages {
+        let dim = phs << s;
+        let inter_mlp = (config.mlp_ratio * dim as f64) as usize;
+        let heads = config.num_attention_heads[s];
+        for b in 0..config.depths[s] {
+            let blk = format!("{enc}.layers.{s}.blocks.{b}");
+            // Pre/post-attention LayerNorms.
+            for ln in ["layernorm_before", "layernorm_after"] {
+                put(format!("{blk}.{ln}.weight"), vec![dim]);
+                put(format!("{blk}.{ln}.bias"), vec![dim]);
+            }
+            // Window self-attention: q/k/v + the relative-position bias table.
+            for proj in ["query", "key", "value"] {
+                put(
+                    format!("{blk}.attention.self.{proj}.weight"),
+                    vec![dim, dim],
+                );
+                put(format!("{blk}.attention.self.{proj}.bias"), vec![dim]);
+            }
+            put(
+                format!("{blk}.attention.self.relative_position_bias_table"),
+                vec![49, heads],
+            );
+            // Attention output projection.
+            put(
+                format!("{blk}.attention.output.dense.weight"),
+                vec![dim, dim],
+            );
+            put(format!("{blk}.attention.output.dense.bias"), vec![dim]);
+            // MLP: intermediate (dim → inter) then output (inter → dim).
+            put(
+                format!("{blk}.intermediate.dense.weight"),
+                vec![inter_mlp, dim],
+            );
+            put(format!("{blk}.intermediate.dense.bias"), vec![inter_mlp]);
+            put(format!("{blk}.output.dense.weight"), vec![dim, inter_mlp]);
+            put(format!("{blk}.output.dense.bias"), vec![dim]);
+        }
+        if s < num_stages - 1 {
+            let ds = format!("{enc}.layers.{s}.downsample");
+            put(format!("{ds}.norm.weight"), vec![4 * dim]);
+            put(format!("{ds}.norm.bias"), vec![4 * dim]);
+            put(format!("{ds}.reduction.weight"), vec![2 * dim, 4 * dim]);
+        }
+    }
+
+    // Final encoder LayerNorm at the widest width.
+    put(format!("{enc}.norm.weight"), vec![config.hidden_size]);
+    put(format!("{enc}.norm.bias"), vec![config.hidden_size]);
+
+    // Projection head (sibling of `audio_model`): linear1 → act → linear2.
+    let pd = config.projection_dim;
+    put(
+        "audio_projection.linear1.weight".into(),
+        vec![pd, config.hidden_size],
+    );
+    put("audio_projection.linear1.bias".into(), vec![pd]);
+    put("audio_projection.linear2.weight".into(), vec![pd, pd]);
+    put("audio_projection.linear2.bias".into(), vec![pd]);
+
+    want
+}
+
+/// A checkpoint key carries no learned parameter (recomputed index buffer or BN
+/// step counter) and is therefore intentionally not loaded by the tower.
+fn is_ignored_key(key: &str) -> bool {
+    key.ends_with("relative_position_index") || key.ends_with("num_batches_tracked")
+}
+
+#[test]
+fn every_checkpoint_weight_is_loaded_with_the_right_shape() {
+    let config = load_config();
+    let weights = fixture_dir().join("model.safetensors");
+    let checkpoint =
+        candle_core::safetensors::load(&weights, &Device::Cpu).expect("load model.safetensors");
+
+    let expected = expected_weight_shapes(&config);
+
+    // 1. Every non-ignored checkpoint key is expected, with the right shape.
+    let mut extras = Vec::new();
+    let mut shape_mismatches = Vec::new();
+    for (key, tensor) in &checkpoint {
+        if is_ignored_key(key) {
+            continue;
+        }
+        match expected.get(key) {
+            None => extras.push(key.clone()),
+            Some(want_shape) => {
+                if tensor.dims() != want_shape.as_slice() {
+                    shape_mismatches.push(format!(
+                        "{key}: checkpoint {:?} != expected {:?}",
+                        tensor.dims(),
+                        want_shape
+                    ));
+                }
+            }
+        }
+    }
+
+    // 2. Every expected key is present in the checkpoint.
+    let mut missing: Vec<String> = expected
+        .keys()
+        .filter(|k| !checkpoint.contains_key(*k))
+        .cloned()
+        .collect();
+
+    extras.sort();
+    missing.sort();
+    shape_mismatches.sort();
+
+    assert!(
+        extras.is_empty(),
+        "checkpoint keys not derived from config (the tower would silently ignore real \
+         weights, or the ignore-set is too narrow): {extras:#?}"
+    );
+    assert!(
+        missing.is_empty(),
+        "config-derived keys absent from the checkpoint (the tower expects weights that \
+         don't exist): {missing:#?}"
+    );
+    assert!(
+        shape_mismatches.is_empty(),
+        "shape mismatches between checkpoint and config-derived expectation: {shape_mismatches:#?}"
+    );
+
+    // The ignore-set is real, not a way to dodge coverage: every ignored key
+    // must be one of the two non-parametric families, and the non-ignored count
+    // must exactly equal the derived expectation.
+    let non_ignored = checkpoint.keys().filter(|k| !is_ignored_key(k)).count();
+    assert_eq!(
+        non_ignored,
+        expected.len(),
+        "non-ignored checkpoint key count must equal the config-derived expectation"
+    );
+}

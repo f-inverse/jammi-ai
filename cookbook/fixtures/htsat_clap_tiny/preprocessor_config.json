@@ -1,0 +1,15 @@
+{
+  "feature_extractor_type": "ClapFeatureExtractor",
+  "feature_size": 32,
+  "sampling_rate": 48000,
+  "hop_length": 577,
+  "fft_window_size": 1024,
+  "frequency_min": 50.0,
+  "frequency_max": 14000.0,
+  "max_length_s": 6,
+  "padding": "repeatpad",
+  "padding_side": "right",
+  "padding_value": 0.0,
+  "return_attention_mask": false,
+  "truncation": "fusion"
+}

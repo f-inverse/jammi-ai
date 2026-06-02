@@ -372,16 +372,20 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
 //
 // JA2. The contrastive fine-tune path accepts JA1's audio encoder family via a
 // trainable projection head on a frozen CLAP audio tower. This drives the full
-// audio path end-to-end on the hermetic `tiny_clap` fixture (random weights, no
-// network): build (anchor, positive, negative) audio triplets from the corpus
+// audio path end-to-end on the hermetic `htsat_clap_tiny` fixture (real-key
+// weights, no network): build (anchor, positive, negative) audio triplets from
+// the corpus
 // (positive = same timbre family, negative = a different family — caller-supplied
 // pairing, the trainer stays agnostic), fine-tune a projection head, then eval
 // audio→audio retrieval for both the base and tuned embeddings and assert the
 // adapter measurably changed retrieval. Mirrors the text quality test above; the
 // only difference is the modality of the encoded inputs.
 
-fn tiny_clap_model() -> String {
-    "local:".to_string() + common::cookbook_fixture("tiny_clap").to_str().unwrap()
+fn htsat_clap_model() -> String {
+    "local:".to_string()
+        + common::cookbook_fixture("htsat_clap_tiny")
+            .to_str()
+            .unwrap()
 }
 
 /// Every `clip_*.wav` under the tiny audio corpus, keyed by stem, grouped by
@@ -574,7 +578,7 @@ async fn audio_projection_head_fine_tune_changes_retrieval() {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
-    let model = tiny_clap_model();
+    let model = htsat_clap_model();
 
     // Triplet source (audio bytes), corpus, and golden.
     let triplets_path = write_audio_triplets(dir.path());
@@ -606,8 +610,10 @@ async fn audio_projection_head_fine_tune_changes_retrieval() {
         .unwrap();
 
     // Fine-tune a projection head on the audio triplets. Empty target_modules
-    // → projection head on the frozen CLAP audio tower. Triplet loss; enough
-    // total gradient to shift LoRA's zero-init B off the identity projection.
+    // → projection head on the frozen CLAP audio tower. Triplet loss; the epoch
+    // count and learning rate are sized to give the zero-init LoRA B enough
+    // total gradient to move the 8-d shared-latent embeddings far enough off the
+    // identity projection to reorder retrieval on the held-out golden set.
     let job = session
         .fine_tune(
             "audio_triplets",
@@ -620,9 +626,9 @@ async fn audio_projection_head_fine_tune_changes_retrieval() {
             FineTuneMethod::Lora,
             ModelTask::AudioEmbedding,
             Some(FineTuneConfig {
-                epochs: 8,
+                epochs: 40,
                 batch_size: 4,
-                learning_rate: 1e-3,
+                learning_rate: 5e-3,
                 lora_rank: 4,
                 warmup_steps: 0,
                 lr_schedule: LrSchedule::Constant,

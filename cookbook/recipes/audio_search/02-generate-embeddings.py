@@ -2,12 +2,13 @@
 
 Connects to the shared persistent artifact dir, registers the `corpus` source
 written by step 01, and builds an L2-normalized audio-embedding index over the
-`audio` column. The backend owns decode -> resample -> log-mel -> forward. The
+`audio` column. The backend owns decode -> resample -> CLAP fusion log-mel ->
+HTSAT-Swin tower forward. The
 embedding table + ANN sidecar persist in the artifact dir, so step 03 (search)
 and step 04 (eval) reopen the same dir and reuse them.
 
 The model is auto-detected from its CLAP config. Default is the hermetic
-`tiny_clap` fixture; set JAMMI_AUDIO_MODEL=<hf-repo-id> for a real CLAP model.
+`htsat_clap_tiny` fixture; set JAMMI_AUDIO_MODEL=<hf-repo-id> for a real CLAP model.
 """
 
 from __future__ import annotations

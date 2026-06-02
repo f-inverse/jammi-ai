@@ -13,9 +13,9 @@
 #     tables, and indices have a writable home without a provisioned
 #     volume. State is per-instance and does not survive a restart —
 #     which is what an embedding-only, request/response deployment wants.
-#   * The encoder is the `tiny_clap` cookbook fixture, baked into the
-#     image at `/opt/jammi/models/tiny_clap`. Clients pass it per request
-#     as `model_id = "local:/opt/jammi/models/tiny_clap"`; no network
+#   * The encoder is the `htsat_clap_tiny` cookbook fixture, baked into the
+#     image at `/opt/jammi/models/htsat_clap_tiny`. Clients pass it per request
+#     as `model_id = "local:/opt/jammi/models/htsat_clap_tiny"`; no network
 #     fetch, no Hub credentials.
 #
 # The gRPC + Flight SQL surface (incl. EmbeddingService) binds 8081 and

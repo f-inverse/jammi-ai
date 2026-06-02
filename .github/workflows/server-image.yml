@@ -8,7 +8,7 @@ name: Server Image
 #   * the generic image (`:latest`, `:vX.Y.Z`, …) — operator-supplied
 #     config + mounted volume; published on tags and dispatch.
 #   * the self-contained image (`:selfcontained`, `:sha-…`) — baked
-#     config + `tiny_clap` encoder, boots standalone on a runtime that
+#     config + `htsat_clap_tiny` encoder, boots standalone on a runtime that
 #     provides no config/volume (Cloudflare Containers). Published on
 #     dispatch when `selfcontained=true`, always from the dispatched
 #     ref (so it carries whatever the default branch has, incl.

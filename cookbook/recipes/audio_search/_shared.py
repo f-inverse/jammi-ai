@@ -22,7 +22,7 @@ GOLDEN_PATH = FIXTURES / "tiny_audio_golden.json"
 
 # Default to the hermetic local fixture (offline CI). Override with
 # JAMMI_AUDIO_MODEL=<hf-repo-id> or `local:<path>` for any CLAP-format model.
-DEFAULT_MODEL = f"local:{FIXTURES / 'tiny_clap'}"
+DEFAULT_MODEL = f"local:{FIXTURES / 'htsat_clap_tiny'}"
 MODEL = os.environ.get("JAMMI_AUDIO_MODEL", DEFAULT_MODEL)
 
 # Persistent scratch dir shared across the numbered steps in one sequence.

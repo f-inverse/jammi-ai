@@ -133,8 +133,12 @@ impl HtsatAudioConfig {
 /// reproduces the native kernel to ~5e-7; computing the weights in f64 instead
 /// drifts the result ~2e-4 from the reference.
 struct TimeInterp {
-    /// `[out_len, in_len]` resample weights on the target device/dtype.
-    weights: Tensor,
+    /// Target time width (`spec_size * freq_ratio`) every input is resampled to.
+    /// The `[out_len, in_len]` weight matrix is built per forward from the
+    /// input's actual time length, so the tower handles any clip length (e.g.
+    /// the tiny fixture's 500 and the real checkpoint's 1001), not a fixed one.
+    out_len: usize,
+    device: candle_core::Device,
 }
 
 /// Keys cubic-convolution coefficient `a`. PyTorch's bicubic default.
@@ -194,28 +198,32 @@ impl TimeInterp {
         Tensor::from_vec(data, (out_len, in_len), device).expect("build bicubic matrix")
     }
 
-    fn new(out_len: usize, in_len: usize, device: &candle_core::Device) -> Self {
+    fn new(out_len: usize, device: &candle_core::Device) -> Self {
         Self {
-            weights: Self::build_matrix(out_len, in_len, device),
+            out_len,
+            device: device.clone(),
         }
     }
 
-    /// Resample the time axis (dim 2) of `[B, C, in_len, F]` to
-    /// `[B, C, out_len, F]` via the fixed matrix.
+    /// Resample the time axis (dim 2) of `[B, C, T, F]` to `[B, C, out_len, F]`,
+    /// building the bicubic matrix for this input's `T` (matching the reference,
+    /// which interpolates the time axis up to `spec_width`). When `T == out_len`
+    /// no resample is needed — the reference skips it too.
     fn forward(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
-        // out[b,c,o,f] = sum_i W[o,i] x[b,c,i,f]. Move time to the second-last
-        // axis, contract it with W^T, then restore the layout.
         let (b, c, t, f) = x.dims4()?;
-        // [B, C, T, F] -> [B, C, F, T]
-        let xt = x.transpose(2, 3)?.contiguous()?;
-        // [B, C, F, T] -> [B*C*F, T]
-        let xt = xt.reshape((b * c * f, t))?;
-        // [B*C*F, T] @ [T, O] = [B*C*F, O]
-        let out = xt.matmul(&self.weights.t()?)?;
-        let out_len = self.weights.dim(0)?;
-        // [B*C*F, O] -> [B, C, F, O] -> [B, C, O, F]
+        if t == self.out_len {
+            return Ok(x.clone());
+        }
+        // out[b,c,o,f] = sum_i W[o,i] x[b,c,i,f], W = [out_len, T] built for this
+        // input length. Move time to the second-last axis, contract with W^T.
+        let weights = Self::build_matrix(self.out_len, t, &self.device);
+        // [B, C, T, F] -> [B, C, F, T] -> [B*C*F, T]
+        let xt = x.transpose(2, 3)?.contiguous()?.reshape((b * c * f, t))?;
+        // [B*C*F, T] @ [T, out_len] = [B*C*F, out_len]
+        let out = xt.matmul(&weights.t()?)?;
+        // [B*C*F, out_len] -> [B, C, F, out_len] -> [B, C, out_len, F]
         let out = out
-            .reshape((b, c, f, out_len))?
+            .reshape((b, c, f, self.out_len))?
             .transpose(2, 3)?
             .contiguous()?;
         Ok(out)
@@ -925,7 +933,7 @@ impl HtsatAudioEncoder {
 
         Ok(Self {
             batch_norm,
-            time_interp: TimeInterp::new(spec_width, 500, device),
+            time_interp: TimeInterp::new(spec_width, device),
             patch_embed,
             stages,
             norm,
@@ -947,7 +955,7 @@ impl HtsatAudioEncoder {
         Ok(x.reshape((batch, channels, freq * r, time / r))?)
     }
 
-    /// Run the front half on `input_features` `[B, 4, 500, num_mel_bins]`,
+    /// Run the front half on `input_features` `[B, 4, T, num_mel_bins]` (any T),
     /// capturing every gated boundary.
     pub fn forward_front(&self, input_features: &Tensor) -> Result<FrontHalf, EncoderError> {
         // transpose(1,3) -> [B, freq, time, 4]; batch-norm over the freq axis
@@ -956,7 +964,7 @@ impl HtsatAudioEncoder {
         let post_batch_norm = self.batch_norm.forward_t(&x, false)?;
         let normalized = post_batch_norm.transpose(1, 3)?.contiguous()?;
 
-        // Bicubic time-resample 500 -> spec_width (freq already == spec_height,
+        // Bicubic time-resample T -> spec_width (freq already == spec_height,
         // so the frequency interpolation in the reference is a no-op).
         let post_interpolation = self.time_interp.forward(&normalized)?;
         debug_assert_eq!(post_interpolation.dim(2)?, self.spec_width);
@@ -1137,6 +1145,8 @@ pub fn l2_normalize(t: &Tensor) -> Result<Tensor, EncoderError> {
 pub struct HtsatAudio {
     encoder: HtsatAudioEncoder,
     projection: ClapAudioProjection,
+    projection_dim: usize,
+    num_mel_bins: usize,
 }
 
 impl HtsatAudio {
@@ -1153,7 +1163,19 @@ impl HtsatAudio {
         Ok(Self {
             encoder,
             projection,
+            projection_dim: config.projection_dim,
+            num_mel_bins: config.num_mel_bins,
         })
+    }
+
+    /// Shared CLAP latent dimensionality of the output (`projection_dim`).
+    pub fn projection_dim(&self) -> usize {
+        self.projection_dim
+    }
+
+    /// Number of mel bins the input fusion spectrogram must carry.
+    pub fn num_mel_bins(&self) -> usize {
+        self.num_mel_bins
     }
 
     /// Borrow the underlying encoder (for boundary-level parity checks).
@@ -1166,7 +1188,7 @@ impl HtsatAudio {
         &self.projection
     }
 
-    /// Full forward on `input_features` `[B, 4, 500, num_mel_bins]`, returning
+    /// Full forward on `input_features` `[B, 4, T, num_mel_bins]` (any T), returning
     /// the L2-normalized audio embedding `[B, projection_dim]`.
     pub fn forward(&self, input_features: &Tensor) -> Result<Tensor, EncoderError> {
         let front = self.encoder.forward_front(input_features)?;

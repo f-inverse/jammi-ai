@@ -7,7 +7,7 @@
 //! embeddings. The unification is exercised across two modalities:
 //!
 //! * `AUDIO` over a synthetic three-tone WAV corpus encoded by the
-//!   `tiny_clap` random-weight cookbook fixture.
+//!   `htsat_clap_tiny` real-key cookbook fixture.
 //! * `TEXT` over the `patents.parquet` fixture's `abstract` column encoded by
 //!   the `tiny_bert` cookbook fixture.
 //!
@@ -41,8 +41,8 @@ use tokio::sync::oneshot;
 
 use super::common::grpc::channel;
 
-fn tiny_clap_model_id() -> String {
-    format!("local:{}", cookbook_fixture("tiny_clap").display())
+fn htsat_clap_model_id() -> String {
+    format!("local:{}", cookbook_fixture("htsat_clap_tiny").display())
 }
 
 fn tiny_bert_model_id() -> String {
@@ -157,7 +157,7 @@ async fn start_embedding_server() -> (
 async fn generate_and_encode_audio_modality_over_the_wire() {
     let (addr, shutdown, dir, handle) = start_embedding_server().await;
     let parquet_path = write_corpus_parquet(&dir);
-    let model_id = tiny_clap_model_id();
+    let model_id = htsat_clap_model_id();
 
     let mut client = EmbeddingServiceClient::new(channel(addr).await);
 
@@ -313,7 +313,7 @@ async fn embed_corpus(
     client
         .generate_embeddings(GenerateEmbeddingsRequest {
             source_id: "clips".into(),
-            model_id: tiny_clap_model_id(),
+            model_id: htsat_clap_model_id(),
             columns: vec!["audio".into()],
             key_column: "clip_id".into(),
             modality: Modality::Audio as i32,
@@ -329,7 +329,7 @@ async fn encode_audio_query(
 ) -> Vec<f32> {
     client
         .encode_query(EncodeQueryRequest {
-            model_id: tiny_clap_model_id(),
+            model_id: htsat_clap_model_id(),
             modality: Modality::Audio as i32,
             input: Some(EncodeInput::Data(clip)),
         })
@@ -500,7 +500,7 @@ async fn generate_embeddings_rejects_unspecified_modality() {
     let err = client
         .generate_embeddings(GenerateEmbeddingsRequest {
             source_id: "clips".into(),
-            model_id: tiny_clap_model_id(),
+            model_id: htsat_clap_model_id(),
             columns: vec!["audio".into()],
             key_column: "clip_id".into(),
             modality: Modality::Unspecified as i32,
@@ -532,7 +532,7 @@ async fn encode_query_rejects_input_modality_mismatch() {
     // AUDIO modality with text input is the symmetric mismatch.
     let err = client
         .encode_query(EncodeQueryRequest {
-            model_id: tiny_clap_model_id(),
+            model_id: htsat_clap_model_id(),
             modality: Modality::Audio as i32,
             input: Some(EncodeInput::Text("not audio".into())),
         })
@@ -573,7 +573,7 @@ async fn encode_query_rejects_empty_data() {
 
     let err = client
         .encode_query(EncodeQueryRequest {
-            model_id: tiny_clap_model_id(),
+            model_id: htsat_clap_model_id(),
             modality: Modality::Audio as i32,
             input: Some(EncodeInput::Data(Vec::new())),
         })

@@ -126,11 +126,14 @@ pub enum Session {
 }
 
 /// The verbs a [`Session::Remote`] does not yet drive over the wire return this
-/// — a real, propagated value, never a panic. This stage (3b-1) wires the
-/// embeddings / encode-query / search / remove-source verbs and the tenant
-/// trio; the rest gain their gRPC mapping in a later stage. A caller that
-/// reaches an unwired verb on a remote session gets a typed error naming the
-/// verb, which is the truthful answer to "is this verb available on this
+/// — a real, propagated value, never a panic. The wired surface covers the
+/// embeddings / encode-query / search / remove-source verbs, the tenant trio,
+/// and the `JammiError`-returning compute verbs (inference, eval, fine-tune,
+/// mutable-table create/drop, channel register / add-columns); the still-pending
+/// verbs are `add_source` / `sql` / `read_vectors`, the topic-admin + subscribe
+/// surface, and the audit surface (their own error types + streaming). A caller
+/// that reaches an unwired verb on a remote session gets a typed error naming
+/// the verb, which is the truthful answer to "is this verb available on this
 /// transport yet?" — not a stand-in for a domain failure.
 ///
 /// The three constructors below render the same message into the three error
@@ -275,7 +278,10 @@ impl Session {
                     .await
             }
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending("infer")),
+            Session::Remote(s) => {
+                s.infer(source_id, model_id, task, content_columns, key_column)
+                    .await
+            }
         }
     }
 
@@ -298,7 +304,10 @@ impl Session {
                     .await
             }
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending("fine_tune")),
+            Session::Remote(s) => {
+                s.fine_tune(source, base_model, columns, method, task, config)
+                    .await
+            }
         }
     }
 
@@ -307,7 +316,7 @@ impl Session {
         match self {
             Session::Local(s) => s.fine_tune_status(id).await,
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending("fine_tune_status")),
+            Session::Remote(s) => s.fine_tune_status(id).await,
         }
     }
 
@@ -328,7 +337,10 @@ impl Session {
                     .await
             }
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending("eval_embeddings")),
+            Session::Remote(s) => {
+                s.eval_embeddings(source_id, embedding_table, golden_source, k, cohorts)
+                    .await
+            }
         }
     }
 
@@ -337,7 +349,7 @@ impl Session {
         match self {
             Session::Local(s) => s.eval_per_query(eval_run_id).await,
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending("eval_per_query")),
+            Session::Remote(s) => s.eval_per_query(eval_run_id).await,
         }
     }
 
@@ -364,7 +376,17 @@ impl Session {
                 .await
             }
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending("eval_inference")),
+            Session::Remote(s) => {
+                s.eval_inference(
+                    model_id,
+                    source_id,
+                    columns,
+                    task,
+                    golden_source,
+                    label_column,
+                )
+                .await
+            }
         }
     }
 
@@ -382,7 +404,10 @@ impl Session {
                     .await
             }
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending("eval_compare")),
+            Session::Remote(s) => {
+                s.eval_compare(embedding_tables, source_id, golden_source, k)
+                    .await
+            }
         }
     }
 
@@ -396,7 +421,7 @@ impl Session {
         match self {
             Session::Local(s) => s.create_mutable_table(def).await,
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending("create_mutable_table")),
+            Session::Remote(s) => s.create_mutable_table(def).await,
         }
     }
 
@@ -405,7 +430,7 @@ impl Session {
         match self {
             Session::Local(s) => s.drop_mutable_table(id).await,
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending("drop_mutable_table")),
+            Session::Remote(s) => s.drop_mutable_table(id).await,
         }
     }
 
@@ -481,7 +506,7 @@ impl Session {
         match self {
             Session::Local(s) => s.register_channel(spec).await,
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending("register_channel")),
+            Session::Remote(s) => s.register_channel(spec).await,
         }
     }
 
@@ -494,7 +519,7 @@ impl Session {
         match self {
             Session::Local(s) => s.add_channel_columns(channel, new_columns).await,
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending("add_channel_columns")),
+            Session::Remote(s) => s.add_channel_columns(channel, new_columns).await,
         }
     }
 

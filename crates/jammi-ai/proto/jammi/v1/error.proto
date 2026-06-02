@@ -20,13 +20,17 @@ package jammi.v1.error;
 //
 // The contract is complete over `JammiError`: every owned-shape variant — the
 // String- and struct-carrying ones whose fields fully reconstruct the variant —
-// has its own typed arm here. The only variants folded into `other` are the
-// `#[from]` foreign-source ones (`Io`, `BackendDriver`, `Toml`, `Json`,
-// `DataFusion`, `MutableTable`, `Trigger`, `Storage`): their inner foreign error
-// cannot cross a process boundary, so they reconstruct as `JammiError::Other`
-// carrying the faithful `Display` string — the genuine fidelity limit, not a
-// lossy guess. Faithfulness is a property of the error type, so the mapping
-// covers the whole enum, not only one verb surface.
+// has its own typed arm here. `MutableTable` is NOT folded: its inner
+// `MutableTableError` is engine-owned (every field reconstructs), so it carries
+// its own structured `MutableTableErrorDetail` and reconstructs faithfully —
+// the same standard the owned-shape variants meet. The only variants folded
+// into `other` are the genuinely-foreign `#[from]` ones whose inner error
+// cannot cross a process boundary (`Io`/`std::io::Error`,
+// `BackendDriver`/`Toml`/`Json`/`DataFusion`/`Trigger`/`Storage`): they
+// reconstruct as `JammiError::Other` carrying the faithful `Display` string —
+// the genuine fidelity limit, not a lossy guess. Faithfulness is a property of
+// the error type, so the mapping covers the whole enum, not only one verb
+// surface.
 message JammiErrorDetail {
   oneof variant {
     SourceError source = 1;
@@ -42,7 +46,68 @@ message JammiErrorDetail {
     StringError gpu = 11;
     StringError backend = 12;
     StringError evidence_channel = 13;
+    MutableTableErrorDetail mutable_table = 14;
   }
+}
+
+// `JammiError::MutableTable(MutableTableError)`. The inner taxonomy is
+// engine-owned and every variant's fields reconstruct, so it crosses the wire
+// faithfully rather than folding to `other`. Each arm carries exactly the
+// fields the matching `MutableTableError` variant holds; the id-carrying
+// variants (`not_found`/`already_exists`) carry the table id string, and
+// `backend` nests the engine-owned `BackendErrorDetail`.
+message MutableTableErrorDetail {
+  oneof variant {
+    string invalid_id = 1;
+    string schema = 2;
+    string missing_primary_key = 3;
+    string reserved_column = 4;
+    string not_found = 5;
+    string already_exists = 6;
+    // `MutableTableError::NoOrderColumn` carries no payload.
+    bool no_order_column = 7;
+    BackendErrorDetail backend = 8;
+  }
+}
+
+// `MutableTableError::Backend(BackendError)`. The backend taxonomy is
+// engine-owned; every variant but `Sqlx` reconstructs field-for-field. A raw
+// `sqlx::Error` cannot cross a process boundary, so `Sqlx` is the one arm that
+// folds to a faithful `Display` string — the genuine fidelity limit, mirroring
+// how `JammiErrorDetail` folds its own foreign `#[from]` variants.
+message BackendErrorDetail {
+  oneof variant {
+    string execution = 1;
+    ConstraintViolation constraint = 2;
+    string unavailable = 3;
+    string retry = 4;
+    string migration = 5;
+    TypeConversion type_conversion = 6;
+    TenantMismatch tenant_mismatch = 7;
+    // `BackendError::Sqlx` — the lone genuinely-foreign arm; its `Display`
+    // string is carried because a `sqlx::Error` does not cross the wire.
+    string sqlx = 8;
+  }
+}
+
+// `BackendError::Constraint { table, detail }`.
+message ConstraintViolation {
+  string table = 1;
+  string detail = 2;
+}
+
+// `BackendError::TypeConversion { column, detail }`.
+message TypeConversion {
+  string column = 1;
+  string detail = 2;
+}
+
+// `BackendError::TenantMismatch { table, expected, got }`. The tenant ids are
+// UUID strings; an empty string means `None` (no tenant on that side).
+message TenantMismatch {
+  string table = 1;
+  string expected = 2;
+  string got = 3;
 }
 
 // A `JammiError` variant carrying a single human-readable string (`Inference`,

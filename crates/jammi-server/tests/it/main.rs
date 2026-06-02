@@ -5,6 +5,7 @@ mod grpc_eval;
 mod grpc_fine_tune;
 mod grpc_inference;
 mod grpc_mutable_topic_audit;
+mod grpc_remote_compute;
 mod grpc_remote_session;
 mod grpc_session;
 mod grpc_trigger;

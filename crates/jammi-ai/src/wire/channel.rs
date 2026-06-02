@@ -38,6 +38,33 @@ pub fn columns_from_proto(columns: Vec<pb::ChannelColumn>) -> Result<Vec<Channel
         .collect()
 }
 
+/// Encode the engine's [`ChannelColumn`] list onto the wire — the inverse of
+/// [`columns_from_proto`], for the [`crate::RemoteSession`] send side. Total:
+/// every engine column maps to a fully-specified wire column (the engine's
+/// `ChannelColumnType` is a closed enum with no unspecified state).
+pub fn columns_to_proto(columns: &[ChannelColumn]) -> Vec<pb::ChannelColumn> {
+    columns
+        .iter()
+        .map(|c| pb::ChannelColumn {
+            name: c.name.clone(),
+            data_type: column_type_to_proto(c.data_type) as i32,
+        })
+        .collect()
+}
+
+/// Map the engine's closed [`ChannelColumnType`] onto the wire enum. Total — the
+/// engine type has no unspecified variant, so this never emits `UNSPECIFIED`.
+fn column_type_to_proto(ty: ChannelColumnType) -> pb::ChannelColumnType {
+    match ty {
+        ChannelColumnType::Float32 => pb::ChannelColumnType::Float32,
+        ChannelColumnType::Float64 => pb::ChannelColumnType::Float64,
+        ChannelColumnType::Int32 => pb::ChannelColumnType::Int32,
+        ChannelColumnType::Int64 => pb::ChannelColumnType::Int64,
+        ChannelColumnType::Utf8 => pb::ChannelColumnType::Utf8,
+        ChannelColumnType::Boolean => pb::ChannelColumnType::Boolean,
+    }
+}
+
 /// Map the proto [`pb::ChannelColumnType`] discriminant onto the engine's closed
 /// [`ChannelColumnType`]. An unspecified or unknown type is rejected.
 fn column_type_from_proto(ty: i32) -> Result<ChannelColumnType, Status> {

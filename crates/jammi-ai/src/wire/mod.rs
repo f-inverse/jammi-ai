@@ -41,15 +41,15 @@ mod mutable_table;
 mod trigger;
 
 pub use audit::parse_query_id;
-pub use channel::{columns_from_proto, parse_channel_id};
+pub use channel::{columns_from_proto, columns_to_proto, parse_channel_id};
 pub use embedding::{
     embedding_task_for, result_table_from_proto, source_type_from_proto, ProtoQueryInput,
 };
 pub use error::{attach_error_detail, error_from_status};
-pub use eval::{cohorts_from_proto, EvalTaskFromWire};
-pub use fine_tune::method_from_proto;
+pub use eval::{cohorts_from_proto, cohorts_to_proto, eval_task_to_proto, EvalTaskFromWire};
+pub use fine_tune::{config_to_proto, method_from_proto, method_to_proto};
 pub use inference::infer_result_to_proto;
-pub use mutable_table::{definition_from_proto, parse_table_id};
+pub use mutable_table::{definition_from_proto, definition_to_proto, parse_table_id};
 pub use trigger::{decode_publish_batch, encode_delivered_batch, to_proto_timestamp};
 
 /// Header name carrying the opaque session identifier. Clients mint a
@@ -78,6 +78,25 @@ pub fn model_task_from_proto(task: i32) -> Result<crate::model::ModelTask, Statu
         Ok(ProtoModelTask::Unspecified) | Err(_) => {
             Err(Status::invalid_argument("task must be specified"))
         }
+    }
+}
+
+/// Encode the engine's [`jammi_ai::model::ModelTask`] onto the wire enum — the
+/// inverse of [`model_task_from_proto`], for the [`crate::RemoteSession`] send
+/// side. Total: every engine task maps to a concrete wire variant (the engine
+/// type has no unspecified state). Shared by the inference and fine-tune send
+/// surfaces, which both carry `jammi.v1.inference.ModelTask`.
+///
+/// [`jammi_ai::model::ModelTask`]: crate::model::ModelTask
+pub fn model_task_to_proto(task: crate::model::ModelTask) -> proto::inference::ModelTask {
+    use crate::model::ModelTask;
+    use proto::inference::ModelTask as ProtoModelTask;
+    match task {
+        ModelTask::TextEmbedding => ProtoModelTask::TextEmbedding,
+        ModelTask::ImageEmbedding => ProtoModelTask::ImageEmbedding,
+        ModelTask::AudioEmbedding => ProtoModelTask::AudioEmbedding,
+        ModelTask::Classification => ProtoModelTask::Classification,
+        ModelTask::Ner => ProtoModelTask::Ner,
     }
 }
 

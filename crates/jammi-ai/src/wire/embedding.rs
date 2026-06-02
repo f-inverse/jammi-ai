@@ -15,6 +15,7 @@
 
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::ModelTask;
 use tonic::Status;
 
 use crate::wire::proto::embedding as pb;
@@ -143,6 +144,18 @@ fn file_format_from_proto(format: i32) -> Result<Option<FileFormat>, Status> {
     }
 }
 
+/// Map a [`Modality`] onto the embedding [`ModelTask`] its tower produces. The
+/// wire `ResultTable` deliberately omits the engine's `task` (server-internal
+/// bookkeeping), but a remote client knows the modality it requested, so the
+/// reconstruction recovers `task` faithfully from that — never a guess.
+pub fn embedding_task_for(modality: Modality) -> ModelTask {
+    match modality {
+        Modality::Text => ModelTask::TextEmbedding,
+        Modality::Image => ModelTask::ImageEmbedding,
+        Modality::Audio => ModelTask::AudioEmbedding,
+    }
+}
+
 /// Encode the engine's result-table record into the wire `ResultTable`. The
 /// engine's optional `dimensions` is flattened to `0` for a non-embedding /
 /// unset result, and `row_count` widens to the wire's `u64`.
@@ -156,5 +169,36 @@ impl From<ResultTableRecord> for pb::ResultTable {
             row_count: record.row_count as u64,
             status: record.status,
         }
+    }
+}
+
+/// Reconstruct the engine's result-table record from the wire `ResultTable` a
+/// `GenerateEmbeddings` response carries, plus the `modality` the client
+/// requested (which recovers the omitted `task`).
+///
+/// The wire message is the client-observable projection: it carries the fields
+/// a client needs to locate and query the persisted embedding table
+/// (`table_name`, `source_id`, `model_id`, `dimensions`, `row_count`,
+/// `status`). The engine's server-internal bookkeeping — storage/index paths,
+/// timestamps, the originating columns — is intentionally not on the wire, so
+/// the reconstruction leaves those at their "not carried" values (`String::new`
+/// / `None`). A remote consumer keys off the same fields a local one reads back
+/// from this verb; the dropped fields are server-side state, not result data.
+pub fn result_table_from_proto(table: pb::ResultTable, modality: Modality) -> ResultTableRecord {
+    ResultTableRecord {
+        table_name: table.table_name,
+        source_id: table.source_id,
+        model_id: table.model_id,
+        task: embedding_task_for(modality),
+        parquet_path: String::new(),
+        index_path: None,
+        dimensions: (table.dimensions != 0).then_some(table.dimensions),
+        distance_metric: String::new(),
+        row_count: table.row_count as usize,
+        status: table.status,
+        key_column: None,
+        text_columns: None,
+        created_at: String::new(),
+        completed_at: None,
     }
 }

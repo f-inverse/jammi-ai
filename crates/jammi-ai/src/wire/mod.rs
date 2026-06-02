@@ -33,6 +33,7 @@ pub mod proto;
 mod audit;
 mod channel;
 mod embedding;
+mod error;
 mod eval;
 mod fine_tune;
 mod inference;
@@ -41,7 +42,10 @@ mod trigger;
 
 pub use audit::parse_query_id;
 pub use channel::{columns_from_proto, parse_channel_id};
-pub use embedding::{source_type_from_proto, ProtoQueryInput};
+pub use embedding::{
+    embedding_task_for, result_table_from_proto, source_type_from_proto, ProtoQueryInput,
+};
+pub use error::{attach_error_detail, error_from_status};
 pub use eval::{cohorts_from_proto, EvalTaskFromWire};
 pub use fine_tune::method_from_proto;
 pub use inference::infer_result_to_proto;

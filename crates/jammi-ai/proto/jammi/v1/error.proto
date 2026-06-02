@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package jammi.v1.error;
+
+// JammiErrorDetail — the structured domain-error payload a server attaches to
+// a `tonic::Status` so a remote client can reconstruct the EXACT engine
+// `JammiError` the in-process path returns, not a lossy gRPC-code-category
+// guess. Carried in the Status `details` bytes (the gRPC richer-error model);
+// the Status `code` + `message` still hold the idiomatic gRPC surface for
+// clients that do not decode the detail.
+//
+// The standard gRPC code set is insufficient to distinguish the engine's
+// failure modes — `invalid_argument` alone collapses Source / Model / Tenant /
+// Config / Schema / Eval into one code — so a typed detail payload is the
+// ADR-01 §5.3-sanctioned mechanism for "structured error information when the
+// standard gRPC code set is insufficient". A typed `oneof` (not a
+// `google.rpc.Any`) keeps it type-driven: each engine variant reachable on the
+// embedding/search verb surface has its own message carrying exactly the
+// fields needed to reconstruct it.
+//
+// The contract is complete over `JammiError`: every owned-shape variant — the
+// String- and struct-carrying ones whose fields fully reconstruct the variant —
+// has its own typed arm here. The only variants folded into `other` are the
+// `#[from]` foreign-source ones (`Io`, `BackendDriver`, `Toml`, `Json`,
+// `DataFusion`, `MutableTable`, `Trigger`, `Storage`): their inner foreign error
+// cannot cross a process boundary, so they reconstruct as `JammiError::Other`
+// carrying the faithful `Display` string — the genuine fidelity limit, not a
+// lossy guess. Faithfulness is a property of the error type, so the mapping
+// covers the whole enum, not only one verb surface.
+message JammiErrorDetail {
+  oneof variant {
+    SourceError source = 1;
+    ModelError model = 2;
+    StringError inference = 3;
+    StringError catalog = 4;
+    SchemaError schema = 5;
+    StringError config = 6;
+    StringError eval = 7;
+    StringError tenant = 8;
+    StringError other = 9;
+    StringError fine_tune = 10;
+    StringError gpu = 11;
+    StringError backend = 12;
+    StringError evidence_channel = 13;
+  }
+}
+
+// A `JammiError` variant carrying a single human-readable string (`Inference`,
+// `Catalog`, `Config`, `Eval`, `Tenant`, `FineTune`, `Gpu`, `Backend`,
+// `EvidenceChannel`, `Other`).
+message StringError {
+  string message = 1;
+}
+
+// `JammiError::Source { source_id, message }`.
+message SourceError {
+  string source_id = 1;
+  string message = 2;
+}
+
+// `JammiError::Model { model_id, message }`.
+message ModelError {
+  string model_id = 1;
+  string message = 2;
+}
+
+// `JammiError::Schema { table, column, expected, actual }`.
+message SchemaError {
+  string table = 1;
+  string column = 2;
+  string expected = 3;
+  string actual = 4;
+}

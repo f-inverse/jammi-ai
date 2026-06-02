@@ -6,6 +6,9 @@
 //! back `jammi-server`'s service impls, the client stubs back the integration-
 //! test harness and a future `RemoteSession`.
 
+pub mod error {
+    tonic::include_proto!("jammi.v1.error");
+}
 pub mod session {
     tonic::include_proto!("jammi.v1.session");
 }

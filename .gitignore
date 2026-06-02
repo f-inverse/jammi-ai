@@ -34,6 +34,11 @@ dist/
 # mdbook build output
 docs/guide/book/
 
+# TypeScript client (@jammi/client) — generated-at-build, never committed.
+# The proto stays the single source; `src/gen` is emitted by `buf generate`.
+clients/typescript/node_modules/
+clients/typescript/src/gen/
+
 # Claude
 .claude
 CLAUDE.md

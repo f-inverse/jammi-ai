@@ -1,0 +1,40 @@
+{
+  "name": "@jammi/client",
+  "version": "0.13.0",
+  "description": "Official TypeScript gRPC-web client for the Jammi engine, generated from the canonical jammi.v1 proto. Runs on fetch (Cloudflare Workers / V8 isolates).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "generate": "buf generate ../../crates/jammi-ai/proto",
+    "clean": "rm -rf dist src/gen",
+    "prebuild": "npm run clean && npm run generate",
+    "build": "tsc -p tsconfig.build.json",
+    "pretypecheck": "npm run generate",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pretest": "npm run generate",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.12.0",
+    "@connectrpc/connect": "^2.1.1",
+    "@connectrpc/connect-web": "^2.1.1"
+  },
+  "devDependencies": {
+    "@bufbuild/buf": "^1.70.0",
+    "@bufbuild/protoc-gen-es": "^2.12.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.0.0"
+  }
+}

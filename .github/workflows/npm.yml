@@ -1,0 +1,83 @@
+name: npm
+
+# Publishes @jammi/client (the TypeScript gRPC-web SDK) to npm, in LOCKSTEP with
+# the engine: the same `v*` release tag that drives the crates.io / PyPI publish.
+# It runs ONLY on a release tag push — never on a PR or a branch push — so a
+# merge to `main` cannot publish.
+on:
+  push:
+    tags: ["v*"]
+  # Manual re-run to finish a release whose publish step was interrupted. The
+  # `npm publish` below is a no-op (skipped) if the version is already on npm.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to (re)publish, e.g. 0.13.0. Defaults to the pushed tag."
+        required: false
+        type: string
+
+concurrency:
+  group: release-npm
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/typescript
+    permissions:
+      # `id-token: write` lets `npm publish --provenance` mint a signed
+      # provenance attestation (and sets up the later OIDC trusted-publishing
+      # migration); `contents: read` is the checkout default.
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Verify tag matches package version
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/v}"
+          version=$(node -p "require('./package.json').version")
+          if [ "$tag" != "$version" ]; then
+            echo "Tag v$tag does not match @jammi/client version $version"
+            exit 1
+          fi
+
+      - name: Install
+        run: npm ci
+
+      - name: Build (generate + tsc)
+        run: npm run build
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test (hermetic)
+        run: npm run test
+
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          # On a tag push, derive the version from the tag (v0.13.0 -> 0.13.0);
+          # on a manual dispatch, take it from the input.
+          VERSION="${{ github.event.inputs.version }}"
+          VERSION="${VERSION:-${GITHUB_REF_NAME#v}}"
+          # Skip if this version is already on npm (idempotent re-run); `npm view`
+          # exits non-zero when the exact version does not exist yet.
+          if npm view "@jammi/client@${VERSION}" version >/dev/null 2>&1; then
+            echo "@jammi/client ${VERSION} already on npm — skipping"
+          else
+            echo "Publishing @jammi/client ${VERSION}"
+            npm publish --provenance --access public
+          fi

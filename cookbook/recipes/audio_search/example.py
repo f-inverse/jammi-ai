@@ -263,19 +263,30 @@ def main() -> int:
         print(f"base : {aggregate_line(base_metrics)}")
         print(f"tuned: {aggregate_line(tuned_metrics)}")
 
-        # The projection head measurably changed audio retrieval — at least one
-        # aggregate metric moved. (With the random-weight fixture the direction
-        # is not meaningful; a real CLAP checkpoint is where tuning lifts
-        # quality. We assert change, not improvement.)
-        base_agg = base_metrics["aggregate"]
-        tuned_agg = tuned_metrics["aggregate"]
-        changed = any(
-            abs(base_agg[k] - tuned_agg[k]) > 1e-6
-            for k in ("recall_at_k", "precision_at_k", "mrr", "ndcg")
+        # The projection head changed the audio embeddings — re-encode the SAME
+        # query through the tuned tower+head and compare the vectors to the base
+        # encoding (`query_vec`, from step 3). Vector change is the real
+        # invariant fine-tuning guarantees: the training loss moves, so the
+        # projected embeddings must differ. We assert on the vectors, not on the
+        # coarse top-k metrics above — on this tiny eval set the rankings rarely
+        # flip even when the vectors move, so a metric-inequality check passes
+        # only intermittently. (With the random-weight fixture the *direction*
+        # of the change is not meaningful; a real CLAP checkpoint is where
+        # tuning lifts quality. We assert change, not improvement.)
+        tuned_query_vec = db.encode_audio_query(tuned_model, query_wav)
+        assert len(tuned_query_vec) == len(query_vec), (
+            "tuned query embedding dim must match the base dim "
+            f"(base={len(query_vec)}, tuned={len(tuned_query_vec)})"
         )
-        assert changed, (
-            "fine-tuned audio embeddings should differ from base "
-            f"(base={base_agg}, tuned={tuned_agg})"
+        max_abs_diff = max(
+            abs(b - t) for b, t in zip(query_vec, tuned_query_vec)
+        )
+        print(f"query embedding max |Δ| (base vs tuned): {max_abs_diff:.6f}")
+        assert max_abs_diff > 1e-4, (
+            "fine-tuned audio embeddings should differ from base: the tuned "
+            "query vector is identical to the base vector "
+            f"(max |Δ| = {max_abs_diff:.2e} <= 1e-4) — the projection head did "
+            "not change the embedding"
         )
 
     print("audio_search: OK")

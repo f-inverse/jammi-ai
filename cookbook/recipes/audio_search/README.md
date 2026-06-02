@@ -55,10 +55,15 @@ meaningless — it exercises the full pipeline, not model quality. Point
    `db.fine_tune(source="triplets", base_model=MODEL, columns=["anchor","positive","negative"], method="lora", task="audio_embedding", ...)`.
    Empty `target_modules` ⇒ a trainable **projection head on the frozen CLAP
    audio tower** (the cheap, low-risk lightweight mode). It then re-embeds the
-   corpus with the tuned model, re-evals, prints base-vs-tuned, and asserts at
-   least one aggregate metric **changed** (proves the adapter alters audio
-   retrieval — not that it improves it; the random-weight fixture's direction
-   is not meaningful, real lift comes from a real checkpoint).
+   corpus with the tuned model, re-evals, and prints base-vs-tuned metrics for
+   narrative. For correctness it re-encodes the **same** query clip through the
+   tuned model and asserts the **embedding vector** changed (max elementwise
+   `|Δ| > 1e-4` versus the base encoding) — the real invariant fine-tuning
+   guarantees, and a deterministic check. (Asserting on the coarse top-k metrics
+   instead is flaky: on this tiny eval set the rankings rarely flip even when the
+   vectors move.) It proves the adapter alters audio retrieval — not that it
+   improves it; the random-weight fixture's direction is not meaningful, real
+   lift comes from a real checkpoint.
 
 The pairing semantics (what a "positive" *means*) are the caller's training
 data, not the trainer's: the trainer only minimizes the contrastive triplet

@@ -176,10 +176,11 @@ fn goldens_are_self_consistent() {
         "normalized rows not unit length: [{min_norm}, {max_norm}]"
     );
 
-    // The pinned input is the global-path forward's `mel_in` boundary, with the
-    // 4-channel fused input shape the real checkpoint takes for short clips.
+    // The pinned input is the forward's `mel_in` boundary: the 4-channel
+    // is_longer=True fused input the real checkpoint takes, with a time dim (500)
+    // that triggers bicubic interpolation up to spec_width (512).
     let pinned = load_pinned_input().expect("load pinned_input");
-    assert_eq!(pinned.dims(), &[2, 4, 512, 32], "pinned input shape");
+    assert_eq!(pinned.dims(), &[2, 4, 500, 32], "pinned input shape");
     let mel_in = goldens.get("mel_in").expect("mel_in golden");
     assert_close_max_abs(&pinned, mel_in, "mel_in vs pinned_input");
 }

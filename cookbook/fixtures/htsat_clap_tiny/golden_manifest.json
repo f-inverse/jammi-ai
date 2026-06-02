@@ -3,7 +3,7 @@
     "shape": [
       2,
       4,
-      512,
+      500,
       32
     ],
     "dtype": "float32"
@@ -12,7 +12,7 @@
     "shape": [
       2,
       32,
-      512,
+      500,
       4
     ],
     "dtype": "float32"
@@ -23,6 +23,24 @@
       4,
       128,
       128
+    ],
+    "dtype": "float32"
+  },
+  "mel_conv2d_out": {
+    "shape": [
+      6,
+      16,
+      32,
+      10
+    ],
+    "dtype": "float32"
+  },
+  "fusion_model_out": {
+    "shape": [
+      2,
+      16,
+      32,
+      32
     ],
     "dtype": "float32"
   },
@@ -143,6 +161,15 @@
     "shape": [
       2,
       128
+    ],
+    "dtype": "float32"
+  },
+  "post_interpolation": {
+    "shape": [
+      2,
+      4,
+      512,
+      32
     ],
     "dtype": "float32"
   },

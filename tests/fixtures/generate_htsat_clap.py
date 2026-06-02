@@ -24,13 +24,15 @@ Two artifact sets are written under cookbook/fixtures/:
     embedding golden + a few boundary activations for the real checkpoint, for
     the live-gated numerical acceptance test.
 
-Scope: the fixture is `enable_fusion=True` to match the real target's key
-layout, but the pinned input is `is_longer=False`, so the forward exercises only
-the standard global patch-embed -> Swin path — the path the real fused
-checkpoint runs for normal (<=~10s) clips, and the only path the Rust tower
-ports. The AFF fusion submodules (`fusion_model.*`, `mel_conv2d`) are present in
-the weights but never executed on this path; the Rust weight-coverage test
-excludes them by a documented ignore-set.
+Scope: the fixture reproduces the REAL forward of `laion/clap-htsat-fused`. Its
+default feature extractor (`truncation="fusion"`) returns `is_longer=True` for
+every clip, and a clip's mel frame count is below `spec_size*freq_ratio`, so a
+normal forward ALWAYS runs (a) bicubic time-interpolation in `reshape_mel2img`
+and (b) the AFF fusion path (`mel_conv2d` + `fusion_model`). The pinned input is
+therefore `is_longer=True` with 4 distinct channels and a time dim that triggers
+interpolation, so the goldens cover both. The Rust tower ports both paths; only
+`*.relative_position_index` (recomputed) and `*.num_batches_tracked` are excluded
+from the weight-coverage test.
 
 Environment (run on Linux; x86_64 macOS caps torch too low for current ClapModel):
 
@@ -86,9 +88,13 @@ TINY_CONFIG = dict(
 
 BATCH = 2
 # enable_fusion=True forward takes a 4-channel `input_features` [B, 4, T, mel].
-# freq_ratio = spec_size // num_mel_bins = 4, so a no-interpolate time axis is
-# T = spec_size * freq_ratio = 512; mel = num_mel_bins = 32.
-PINNED_SHAPE = (BATCH, 4, 512, 32)
+# freq_ratio = spec_size // num_mel_bins = 4, so spec_width = spec_size*freq_ratio
+# = 512. T = 500 < 512 triggers the bicubic time-interpolation in reshape_mel2img
+# (mel = num_mel_bins = 32 = spec_height, so freq is NOT interpolated). The 4
+# channels are distinct (randn, not repeated) so the AFF fusion path on channels
+# 1:4 is genuinely exercised.
+PINNED_SHAPE = (BATCH, 4, 500, 32)
+SPEC_WIDTH = 512  # time axis is bicubic-interpolated up to this (spec_size*freq_ratio)
 
 
 def build_tiny_model():
@@ -106,7 +112,10 @@ def build_tiny_model():
 def pinned_input():
     g = torch.Generator().manual_seed(0)
     feats = torch.randn(*PINNED_SHAPE, generator=g, dtype=torch.float32)
-    is_longer = torch.zeros(BATCH, 1, dtype=torch.bool)  # all short -> global path only
+    # is_longer=True for the whole batch -> is_longer_idx = [0,1] -> the AFF
+    # fusion path (mel_conv2d + fusion_model) executes on every row, matching the
+    # real fused checkpoint's default truncation="fusion" feature extractor.
+    is_longer = torch.ones(BATCH, 1, dtype=torch.bool)
     return feats, is_longer
 
 
@@ -151,6 +160,10 @@ def collect_goldens(model, feats, is_longer):
     # reshape_mel2img is a method, not a module: its output is patch_embed's input.
     handles.append(encoder.patch_embed.register_forward_pre_hook(save_pre_input("post_reshape_mel2img")))
     handles.append(encoder.patch_embed.register_forward_hook(save_out("patch_embed_out")))
+    # AFF fusion path (executes because is_longer=True): the local mel conv and
+    # the attention-feature-fusion block.
+    handles.append(encoder.patch_embed.mel_conv2d.register_forward_hook(save_out("mel_conv2d_out")))
+    handles.append(encoder.patch_embed.fusion_model.register_forward_hook(save_out("fusion_model_out")))
 
     for s, stage in enumerate(encoder.layers):
         for b, block in enumerate(stage.blocks):
@@ -168,6 +181,20 @@ def collect_goldens(model, feats, is_longer):
 
     for h in handles:
         h.remove()
+
+    # post_interpolation: the bicubic time-interpolation reshape_mel2img performs
+    # internally (1001->spec_width in the real model; 500->512 here). It equals
+    # F.interpolate of reshape_mel2img's input = the batch_norm output transposed
+    # back to [B,4,T,mel]. Captured here as the exact op the Rust port must match.
+    reshape_input = goldens["post_batch_norm"].transpose(1, 3)  # [2,32,500,4] -> [2,4,500,32]
+    goldens["post_interpolation"] = _as_tensor(
+        F.interpolate(
+            reshape_input,
+            size=(SPEC_WIDTH, TINY_CONFIG["num_mel_bins"]),
+            mode="bicubic",
+            align_corners=True,
+        )
+    )
 
     # projected: audio_projection MLP output (linear1 -> relu -> linear2),
     # UNNORMALIZED, and its explicit L2-normalized form (the jammi tower

@@ -25,9 +25,21 @@ pub mod session;
 #[cfg(feature = "wire")]
 pub mod wire;
 
+/// The remote [`local_session::Session`] transport: a gRPC client peer of
+/// [`local_session::LocalSession`]. Gated behind `wire` alongside the stubs it
+/// drives; a default / embedded build has no remote transport and the
+/// [`local_session::Session`] enum is the one-arm `Local` shape.
+#[cfg(feature = "wire")]
+pub mod remote_session;
+
 /// The transport-agnostic consumer surface: a closed `enum` over session
 /// transports, with the in-process [`local_session::LocalSession`] behind it.
 pub use local_session::{LocalSession, Modality, QueryInput, SearchQuery, SearchRequest, Session};
+
+/// The remote transport behind the [`Session`] enum's `wire`-gated `Remote`
+/// arm.
+#[cfg(feature = "wire")]
+pub use remote_session::RemoteSession;
 
 /// The per-query audit primitive lives in the `jammi-db` substrate (it composes
 /// mutable tables, tenant scope, and the trigger stream). It is re-exported here

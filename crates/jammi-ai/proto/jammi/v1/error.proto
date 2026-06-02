@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package jammi.v1.error;
+
+// JammiErrorDetail — the structured domain-error payload a server attaches to
+// a `tonic::Status` so a remote client can reconstruct the EXACT engine
+// `JammiError` the in-process path returns, not a lossy gRPC-code-category
+// guess. Carried in the Status `details` bytes (the gRPC richer-error model);
+// the Status `code` + `message` still hold the idiomatic gRPC surface for
+// clients that do not decode the detail.
+//
+// The standard gRPC code set is insufficient to distinguish the engine's
+// failure modes — `invalid_argument` alone collapses Source / Model / Tenant /
+// Config / Schema / Eval into one code — so a typed detail payload is the
+// ADR-01 §5.3-sanctioned mechanism for "structured error information when the
+// standard gRPC code set is insufficient". A typed `oneof` (not a
+// `google.rpc.Any`) keeps it type-driven: each engine variant reachable on the
+// embedding/search verb surface has its own message carrying exactly the
+// fields needed to reconstruct it.
+//
+// Consumer-driven: the variants modelled here are precisely those a
+// `RemoteSession` reaches on the embeddings/encode-query/search/remove-source
+// path. `JammiError` variants that wrap a foreign source error (DataFusion, IO,
+// storage, …) carry a non-serialisable payload and are not reconstructable as
+// themselves; the server's central error mapping folds them into `other`
+// carrying the rendered message, reconstructed as `JammiError::Other` — the
+// same string the in-process `Display` would surface.
+message JammiErrorDetail {
+  oneof variant {
+    SourceError source = 1;
+    ModelError model = 2;
+    StringError inference = 3;
+    StringError catalog = 4;
+    SchemaError schema = 5;
+    StringError config = 6;
+    StringError eval = 7;
+    StringError tenant = 8;
+    StringError other = 9;
+  }
+}
+
+// A `JammiError` variant carrying a single human-readable string
+// (`Inference`, `Catalog`, `Config`, `Eval`, `Tenant`, `Other`).
+message StringError {
+  string message = 1;
+}
+
+// `JammiError::Source { source_id, message }`.
+message SourceError {
+  string source_id = 1;
+  string message = 2;
+}
+
+// `JammiError::Model { model_id, message }`.
+message ModelError {
+  string model_id = 1;
+  string message = 2;
+}
+
+// `JammiError::Schema { table, column, expected, actual }`.
+message SchemaError {
+  string table = 1;
+  string column = 2;
+  string expected = 3;
+  string actual = 4;
+}

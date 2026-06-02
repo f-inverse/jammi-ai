@@ -119,6 +119,43 @@ pub struct FineTuneJobId(pub String);
 pub enum Session {
     /// An in-process session driving a local [`InferenceSession`].
     Local(LocalSession),
+    /// A remote session driving an engine over the gRPC wire surface. Present
+    /// only under the `wire` feature; an embedded build sees the one-arm enum.
+    #[cfg(feature = "wire")]
+    Remote(crate::remote_session::RemoteSession),
+}
+
+/// The verbs a [`Session::Remote`] does not yet drive over the wire return this
+/// — a real, propagated value, never a panic. This stage (3b-1) wires the
+/// embeddings / encode-query / search / remove-source verbs and the tenant
+/// trio; the rest gain their gRPC mapping in a later stage. A caller that
+/// reaches an unwired verb on a remote session gets a typed error naming the
+/// verb, which is the truthful answer to "is this verb available on this
+/// transport yet?" — not a stand-in for a domain failure.
+///
+/// The three constructors below render the same message into the three error
+/// types the [`Session`] surface returns; each uses that type's catch-all /
+/// message-carrying arm (`JammiError::Other`, `TriggerError::Driver`,
+/// `AuditError::Storage`) — the message is explicit that the cause is transport
+/// coverage, not a backing-store fault, so the error is self-describing.
+#[cfg(feature = "wire")]
+fn remote_verb_pending_message(verb: &str) -> String {
+    format!("{verb} is not yet available on the remote (gRPC) session transport")
+}
+
+#[cfg(feature = "wire")]
+fn remote_verb_pending(verb: &str) -> jammi_db::error::JammiError {
+    jammi_db::error::JammiError::Other(remote_verb_pending_message(verb))
+}
+
+#[cfg(feature = "wire")]
+fn remote_verb_pending_trigger(verb: &str) -> TriggerError {
+    TriggerError::Driver(remote_verb_pending_message(verb))
+}
+
+#[cfg(feature = "wire")]
+fn remote_verb_pending_audit(verb: &str) -> jammi_db::AuditError {
+    jammi_db::AuditError::Storage(remote_verb_pending_message(verb))
 }
 
 impl Session {
@@ -133,6 +170,8 @@ impl Session {
     ) -> Result<()> {
         match self {
             Session::Local(s) => s.add_source(source_id, source_type, connection).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending("add_source")),
         }
     }
 
@@ -140,6 +179,8 @@ impl Session {
     pub async fn remove_source(&self, source_id: &str) -> Result<()> {
         match self {
             Session::Local(s) => s.remove_source(source_id).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(s) => s.remove_source(source_id).await,
         }
     }
 
@@ -149,6 +190,8 @@ impl Session {
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
         match self {
             Session::Local(s) => s.sql(query).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending("sql")),
         }
     }
 
@@ -170,6 +213,11 @@ impl Session {
                 s.generate_embeddings(source_id, model_id, columns, key_column, modality)
                     .await
             }
+            #[cfg(feature = "wire")]
+            Session::Remote(s) => {
+                s.generate_embeddings(source_id, model_id, columns, key_column, modality)
+                    .await
+            }
         }
     }
 
@@ -184,6 +232,8 @@ impl Session {
     ) -> Result<Vec<f32>> {
         match self {
             Session::Local(s) => s.encode_query(model_id, input, modality).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(s) => s.encode_query(model_id, input, modality).await,
         }
     }
 
@@ -192,6 +242,8 @@ impl Session {
     pub async fn read_vectors(&self, table: &ResultTableRecord) -> Result<Vec<Vec<f32>>> {
         match self {
             Session::Local(s) => s.read_vectors(table).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending("read_vectors")),
         }
     }
 
@@ -201,6 +253,8 @@ impl Session {
     pub async fn search(&self, request: SearchRequest) -> Result<Vec<RecordBatch>> {
         match self {
             Session::Local(s) => s.search(request).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(s) => s.search(request).await,
         }
     }
 
@@ -220,6 +274,8 @@ impl Session {
                 s.infer(source_id, model_id, task, content_columns, key_column)
                     .await
             }
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending("infer")),
         }
     }
 
@@ -241,6 +297,8 @@ impl Session {
                 s.fine_tune(source, base_model, columns, method, task, config)
                     .await
             }
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending("fine_tune")),
         }
     }
 
@@ -248,6 +306,8 @@ impl Session {
     pub async fn fine_tune_status(&self, id: &FineTuneJobId) -> Result<String> {
         match self {
             Session::Local(s) => s.fine_tune_status(id).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending("fine_tune_status")),
         }
     }
 
@@ -267,6 +327,8 @@ impl Session {
                 s.eval_embeddings(source_id, embedding_table, golden_source, k, cohorts)
                     .await
             }
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending("eval_embeddings")),
         }
     }
 
@@ -274,6 +336,8 @@ impl Session {
     pub async fn eval_per_query(&self, eval_run_id: &str) -> Result<Vec<PerQueryEvalRecord>> {
         match self {
             Session::Local(s) => s.eval_per_query(eval_run_id).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending("eval_per_query")),
         }
     }
 
@@ -299,6 +363,8 @@ impl Session {
                 )
                 .await
             }
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending("eval_inference")),
         }
     }
 
@@ -315,6 +381,8 @@ impl Session {
                 s.eval_compare(embedding_tables, source_id, golden_source, k)
                     .await
             }
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending("eval_compare")),
         }
     }
 
@@ -327,6 +395,8 @@ impl Session {
     ) -> Result<MutableTableId> {
         match self {
             Session::Local(s) => s.create_mutable_table(def).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending("create_mutable_table")),
         }
     }
 
@@ -334,6 +404,8 @@ impl Session {
     pub async fn drop_mutable_table(&self, id: &MutableTableId) -> Result<()> {
         match self {
             Session::Local(s) => s.drop_mutable_table(id).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending("drop_mutable_table")),
         }
     }
 
@@ -346,6 +418,8 @@ impl Session {
     ) -> std::result::Result<(), TriggerError> {
         match self {
             Session::Local(s) => s.register_topic(topic).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending_trigger("register_topic")),
         }
     }
 
@@ -353,6 +427,8 @@ impl Session {
     pub async fn list_topics(&self) -> std::result::Result<Vec<TopicDefinition>, TriggerError> {
         match self {
             Session::Local(s) => s.list_topics().await,
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending_trigger("list_topics")),
         }
     }
 
@@ -360,6 +436,8 @@ impl Session {
     pub async fn drop_topic(&self, topic_id: TopicId) -> std::result::Result<(), TriggerError> {
         match self {
             Session::Local(s) => s.drop_topic(topic_id).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending_trigger("drop_topic")),
         }
     }
 
@@ -372,6 +450,8 @@ impl Session {
     ) -> std::result::Result<Offset, TriggerError> {
         match self {
             Session::Local(s) => s.publish(topic, batch).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending_trigger("publish")),
         }
     }
 
@@ -389,6 +469,8 @@ impl Session {
     > {
         match self {
             Session::Local(s) => s.subscribe(topic, predicate, from_offset).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending_trigger("subscribe")),
         }
     }
 
@@ -398,6 +480,8 @@ impl Session {
     pub async fn register_channel(&self, spec: &ChannelSpec) -> Result<()> {
         match self {
             Session::Local(s) => s.register_channel(spec).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending("register_channel")),
         }
     }
 
@@ -409,29 +493,42 @@ impl Session {
     ) -> Result<()> {
         match self {
             Session::Local(s) => s.add_channel_columns(channel, new_columns).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending("add_channel_columns")),
         }
     }
 
     // --- tenant ----------------------------------------------------------
 
     /// Bind a tenant scope to this session (sticky form).
-    pub fn bind_tenant(&self, t: TenantId) {
+    ///
+    /// `async` because a network transport cannot honor a tenant round-trip
+    /// without a blocking call it has no honest way to make synchronously; the
+    /// in-process [`LocalSession`] simply `async`-wraps its sync engine call,
+    /// while a remote variant maps it to a `SessionService.SetTenant` RPC.
+    pub async fn bind_tenant(&self, t: TenantId) -> Result<()> {
         match self {
-            Session::Local(s) => s.bind_tenant(t),
+            Session::Local(s) => s.bind_tenant(t).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(s) => s.bind_tenant(t).await,
         }
     }
 
     /// Clear the bound tenant.
-    pub fn unbind_tenant(&self) {
+    pub async fn unbind_tenant(&self) -> Result<()> {
         match self {
-            Session::Local(s) => s.unbind_tenant(),
+            Session::Local(s) => s.unbind_tenant().await,
+            #[cfg(feature = "wire")]
+            Session::Remote(s) => s.unbind_tenant().await,
         }
     }
 
     /// The tenant currently bound, if any.
-    pub fn tenant(&self) -> Option<TenantId> {
+    pub async fn tenant(&self) -> Result<Option<TenantId>> {
         match self {
-            Session::Local(s) => s.tenant(),
+            Session::Local(s) => s.tenant().await,
+            #[cfg(feature = "wire")]
+            Session::Remote(s) => s.tenant().await,
         }
     }
 
@@ -445,6 +542,8 @@ impl Session {
     ) -> std::result::Result<(), jammi_db::AuditError> {
         match self {
             Session::Local(s) => s.audit_log(records).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending_audit("audit_log")),
         }
     }
 
@@ -455,6 +554,8 @@ impl Session {
     ) -> std::result::Result<Option<PerQueryAudit>, jammi_db::AuditError> {
         match self {
             Session::Local(s) => s.audit_fetch_by_query_id(query_id).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending_audit("audit_fetch_by_query_id")),
         }
     }
 
@@ -465,6 +566,8 @@ impl Session {
     ) -> std::result::Result<Vec<PerQueryAudit>, jammi_db::AuditError> {
         match self {
             Session::Local(s) => s.audit_fetch_recent(limit).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(_) => Err(remote_verb_pending_audit("audit_fetch_recent")),
         }
     }
 }
@@ -756,16 +859,22 @@ impl LocalSession {
             .await
     }
 
-    fn bind_tenant(&self, t: TenantId) {
+    /// `async` to match the [`Session`] surface (a remote transport's tenant
+    /// trio is a round-trip); the in-process engine binding is synchronous, so
+    /// this is an `async`-wrap with no inner await — infallible in-process, but
+    /// the surface returns `Result` because a remote transport's bind can fail.
+    async fn bind_tenant(&self, t: TenantId) -> Result<()> {
         self.engine.bind_tenant(t);
+        Ok(())
     }
 
-    fn unbind_tenant(&self) {
+    async fn unbind_tenant(&self) -> Result<()> {
         self.engine.unbind_tenant();
+        Ok(())
     }
 
-    fn tenant(&self) -> Option<TenantId> {
-        self.engine.tenant()
+    async fn tenant(&self) -> Result<Option<TenantId>> {
+        Ok(self.engine.tenant())
     }
 
     async fn audit_log(

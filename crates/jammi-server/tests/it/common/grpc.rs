@@ -61,6 +61,10 @@ pub struct EngineServer {
     /// lifetime and deletes it on drop. Held, never read.
     pub _dir: TempDir,
     pub handle: tokio::task::JoinHandle<()>,
+    /// The same `Arc<InferenceSession>` the server task drives. Shared so a
+    /// test can wrap it in a `LocalSession` and assert a `RemoteSession` over
+    /// the wire returns identical results / errors against the *same* engine.
+    pub engine: Arc<InferenceSession>,
 }
 
 /// Spin up an in-process gRPC server hosting the chain *with* the engine-backed
@@ -82,6 +86,7 @@ pub async fn start_engine_server() -> EngineServer {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let flight_ctx = session.context().clone();
     let binding = session.tenant_binding_arc();
+    let engine = Arc::clone(&session);
     let handle = tokio::spawn(async move {
         jammi_server::runtime::serve_grpc_chain(
             addr,
@@ -106,6 +111,7 @@ pub async fn start_engine_server() -> EngineServer {
         shutdown: shutdown_tx,
         _dir: dir,
         handle,
+        engine,
     }
 }
 

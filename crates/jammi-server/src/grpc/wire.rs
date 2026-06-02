@@ -20,9 +20,10 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
+use jammi_ai::wire::attach_error_detail;
 use jammi_db::error::JammiError;
 use jammi_db::TenantId;
-use tonic::{Request, Status};
+use tonic::{Code, Request, Status};
 
 use crate::grpc::session::SessionTenant;
 
@@ -77,19 +78,31 @@ pub fn require_nonempty(value: &str, field: &str) -> Result<(), Status> {
 
 /// Map an engine [`JammiError`] to a gRPC [`Status`], preserving the kind of
 /// failure so a client can distinguish a bad request from an internal fault.
+///
+/// The `code` + `message` are the idiomatic gRPC surface (a client that does
+/// not decode the structured detail still sees a sensible status). On top of
+/// that, every status carries a faithful [`jammi_ai::wire`] error detail so a
+/// remote client (`RemoteSession`) reconstructs the *exact* `JammiError` the
+/// in-process [`jammi_ai::Session`] returns — the standard gRPC code set is too
+/// coarse to distinguish Source / Model / Tenant / Config / Schema / Eval, all
+/// of which collapse onto `invalid_argument`. The detail is built centrally
+/// here so the faithful path covers the whole `JammiError` enum from one place.
 pub fn map_engine_error(err: JammiError) -> Status {
-    match err {
-        JammiError::Source { source_id, message } => {
-            Status::invalid_argument(format!("source {source_id}: {message}"))
-        }
-        JammiError::Model { model_id, message } => {
-            Status::invalid_argument(format!("model {model_id}: {message}"))
-        }
-        JammiError::Tenant(detail) => Status::invalid_argument(format!("tenant: {detail}")),
-        JammiError::Config(detail) => Status::invalid_argument(format!("config: {detail}")),
-        JammiError::Schema { .. } => Status::invalid_argument(err.to_string()),
-        JammiError::Eval(detail) => Status::invalid_argument(format!("eval: {detail}")),
-        JammiError::Inference(detail) => Status::internal(format!("inference: {detail}")),
-        other => Status::internal(other.to_string()),
-    }
+    let (code, message) = match &err {
+        JammiError::Source { source_id, message } => (
+            Code::InvalidArgument,
+            format!("source {source_id}: {message}"),
+        ),
+        JammiError::Model { model_id, message } => (
+            Code::InvalidArgument,
+            format!("model {model_id}: {message}"),
+        ),
+        JammiError::Tenant(detail) => (Code::InvalidArgument, format!("tenant: {detail}")),
+        JammiError::Config(detail) => (Code::InvalidArgument, format!("config: {detail}")),
+        JammiError::Schema { .. } => (Code::InvalidArgument, err.to_string()),
+        JammiError::Eval(detail) => (Code::InvalidArgument, format!("eval: {detail}")),
+        JammiError::Inference(detail) => (Code::Internal, format!("inference: {detail}")),
+        other => (Code::Internal, other.to_string()),
+    };
+    attach_error_detail(code, message, &err)
 }

@@ -21,15 +21,35 @@ use crate::trigger::error::TriggerError;
 
 /// A parsed-and-type-checked predicate ready to evaluate against a batch.
 /// `None` ≡ match every row (the proto's empty-string default).
+///
+/// The `source_sql` the predicate was parsed from is retained alongside the
+/// compiled expression so the predicate is transport-expressible: an in-process
+/// subscribe evaluates `physical` directly, while a remote subscribe carries
+/// the predicate to the server as the SQL string it was built from (the wire's
+/// `SubscribeRequest.predicate` is a SQL fragment, re-parsed server-side against
+/// the same topic schema). `match_all` carries `None`, the wire's empty-string
+/// default. This is what makes `Session::subscribe` genuinely Local≡Remote: the
+/// same `Predicate` value drives either transport.
 #[derive(Clone)]
 pub struct Predicate {
     physical: Option<Arc<dyn PhysicalExpr>>,
+    source_sql: Option<String>,
 }
 
 impl Predicate {
     /// The identity predicate — every row passes.
     pub fn match_all() -> Self {
-        Self { physical: None }
+        Self {
+            physical: None,
+            source_sql: None,
+        }
+    }
+
+    /// The SQL fragment this predicate was parsed from, or `None` for
+    /// [`Self::match_all`]. The remote transport re-sends this over the wire so
+    /// the server re-parses the identical predicate against the topic schema.
+    pub fn source_sql(&self) -> Option<&str> {
+        self.source_sql.as_deref()
     }
 
     /// Parse a SQL `WHERE`-clause fragment against `schema`. The DataFusion
@@ -55,6 +75,7 @@ impl Predicate {
             .map_err(|e| TriggerError::PredicateParse(e.to_string()))?;
         Ok(Self {
             physical: Some(physical),
+            source_sql: Some(trimmed.to_string()),
         })
     }
 

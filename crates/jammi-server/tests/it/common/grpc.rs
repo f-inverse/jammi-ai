@@ -73,11 +73,29 @@ pub struct EngineServer {
 /// surfaces are unmounted (`None`). Shared by the `grpc_inference` and
 /// `grpc_eval` suites so they drive the same wiring the embedding suite does.
 pub async fn start_engine_server() -> EngineServer {
+    start_engine_server_inner(false).await
+}
+
+/// Like [`start_engine_server`] but also mounts the trigger handles, so the
+/// `TriggerService` (topics / publish / subscribe) and the audit service are
+/// reachable over the wire. Shared by the `RemoteSession` topic/subscribe/audit
+/// parity tests, which drive those surfaces against the same engine a
+/// `LocalSession` wraps.
+pub async fn start_engine_server_with_trigger() -> EngineServer {
+    start_engine_server_inner(true).await
+}
+
+async fn start_engine_server_inner(with_trigger: bool) -> EngineServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg = test_config(dir.path());
     let session = Arc::new(InferenceSession::new(cfg).await.expect("session"));
 
     let store = SessionStore::new();
+    let trigger = with_trigger.then(|| jammi_server::TriggerHandles {
+        topic_repo: session.topic_repo(),
+        publisher: session.publisher(),
+        subscriber: session.subscriber(),
+    });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -93,7 +111,7 @@ pub async fn start_engine_server() -> EngineServer {
             flight_ctx,
             binding,
             store,
-            None,
+            trigger,
             Some(session),
             async move {
                 let _ = shutdown_rx.await;

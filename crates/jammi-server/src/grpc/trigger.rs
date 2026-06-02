@@ -35,7 +35,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use jammi_ai::wire::{
-    decode_ipc_schema, decode_publish_batch, encode_delivered_batch, to_proto_timestamp,
+    attach_trigger_detail, decode_ipc_schema, decode_publish_batch, encode_delivered_batch,
+    to_proto_timestamp, topic_to_proto,
 };
 use jammi_db::catalog::topic_repo::TopicRepo;
 use jammi_db::trigger::ids::TopicId;
@@ -95,8 +96,18 @@ impl TriggerService for TriggerServer {
         }
         let schema = decode_ipc_schema(&req.schema)?;
         let broker_metadata: BTreeMap<String, String> = req.broker_metadata.into_iter().collect();
+        // Honor a caller-supplied id (the `Session::register_topic` surface
+        // carries the `TopicDefinition.id` the caller minted) so the topic's
+        // identity is consistent across transports; the DDL / CLI path leaves it
+        // empty and the server mints a fresh UUIDv7.
+        let id = if req.topic_id.is_empty() {
+            TopicId::new()
+        } else {
+            TopicId::from_str(&req.topic_id)
+                .map_err(|e| Status::invalid_argument(format!("invalid topic_id: {e}")))?
+        };
         let topic = TopicDefinition {
-            id: TopicId::new(),
+            id,
             name: req.name,
             schema,
             tenant,
@@ -114,23 +125,17 @@ impl TriggerService for TriggerServer {
     async fn drop_topic(&self, request: Request<DropTopicRequest>) -> Result<Response<()>, Status> {
         let tenant = resolve_tenant(&request, None)?;
         let req = request.into_inner();
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument("name is required"));
+        if req.topic_id.is_empty() {
+            return Err(Status::invalid_argument("topic_id is required"));
         }
-        let topic = self
-            .topic_repo
-            .lookup_by_name(&req.name, tenant)
-            .await
-            .map_err(map_trigger_error)?;
-        match topic {
-            Some(topic) => self
-                .topic_repo
-                .drop_topic(topic.id, tenant)
-                .await
-                .map_err(map_trigger_error)
-                .map(Response::new),
-            None if req.if_exists => Ok(Response::new(())),
-            None => Err(Status::not_found(format!("topic '{}' not found", req.name))),
+        let topic_id = TopicId::from_str(&req.topic_id)
+            .map_err(|e| Status::invalid_argument(format!("invalid topic_id: {e}")))?;
+        // The repo resolves the topic by id (tenant-scoped) and returns
+        // `TopicNotFound` when it is absent; `if_exists` turns that into a no-op.
+        match self.topic_repo.drop_topic(topic_id, tenant).await {
+            Ok(()) => Ok(Response::new(())),
+            Err(TriggerError::TopicNotFound(_)) if req.if_exists => Ok(Response::new(())),
+            Err(e) => Err(map_trigger_error(e)),
         }
     }
 
@@ -201,12 +206,12 @@ impl TriggerService for TriggerServer {
             .list_topics(tenant)
             .await
             .map_err(map_trigger_error)?;
-        let names = topics
-            .into_iter()
-            .map(|t| TopicName { name: t.name })
-            .collect();
+        let topics = topics
+            .iter()
+            .map(topic_to_proto)
+            .collect::<Result<Vec<_>, Status>>()?;
         Ok(Response::new(ListTopicsResponse {
-            topics: names,
+            topics,
             // Pagination is not yet implemented — `next_page_token` empty
             // means "this is the complete result set."
             next_page_token: String::new(),
@@ -286,35 +291,57 @@ fn resolve_tenant<T>(
     Ok(session_tenant.or(body_override))
 }
 
+/// Map a [`TriggerError`] onto a gRPC [`Status`], preserving the failure kind so
+/// a client can distinguish a bad request from an internal fault.
+///
+/// The `code` + `message` are the idiomatic gRPC surface (a client that does not
+/// decode the structured detail still sees a sensible status). On top of that,
+/// every status carries a faithful [`jammi_ai::wire`] trigger-error detail so a
+/// remote `RemoteSession` reconstructs the *exact* [`TriggerError`] the
+/// in-process path returns — the standard gRPC code set is too coarse to
+/// distinguish, e.g., `PredicateParse` from `PredicateUnsupported`, or the two
+/// engine-owned `#[from]` nests. The detail is built centrally here so the
+/// faithful path covers the whole `TriggerError` enum from one place — the
+/// trigger analogue of `map_engine_error`.
 fn map_trigger_error(err: TriggerError) -> Status {
-    match err {
-        TriggerError::TopicNotFound(name) => Status::not_found(name),
-        TriggerError::BatchSchemaMismatch(detail) => Status::invalid_argument(detail),
-        TriggerError::SchemaConflict { topic, detail } => {
-            Status::failed_precondition(format!("schema conflict on {topic}: {detail}"))
+    let (code, message) = match &err {
+        TriggerError::TopicNotFound(name) => (tonic::Code::NotFound, name.clone()),
+        TriggerError::BatchSchemaMismatch(detail) => {
+            (tonic::Code::InvalidArgument, detail.clone())
         }
-        TriggerError::UnsupportedSchemaType { column, data_type } => Status::invalid_argument(
+        TriggerError::SchemaConflict { topic, detail } => (
+            tonic::Code::FailedPrecondition,
+            format!("schema conflict on {topic}: {detail}"),
+        ),
+        TriggerError::UnsupportedSchemaType { column, data_type } => (
+            tonic::Code::InvalidArgument,
             format!("unsupported topic schema type for '{column}': {data_type}"),
         ),
         TriggerError::PublishTenantMismatch {
             topic,
             topic_tenant,
             publish_tenant,
-        } => Status::permission_denied(format!(
-            "publish tenant mismatch on topic '{topic}': topic_tenant={topic_tenant:?}, publish_tenant={publish_tenant:?}"
-        )),
+        } => (
+            tonic::Code::PermissionDenied,
+            format!(
+                "publish tenant mismatch on topic '{topic}': topic_tenant={topic_tenant:?}, publish_tenant={publish_tenant:?}"
+            ),
+        ),
         TriggerError::PredicateParse(detail) | TriggerError::PredicateUnsupported(detail) => {
-            Status::invalid_argument(format!("predicate: {detail}"))
+            (tonic::Code::InvalidArgument, format!("predicate: {detail}"))
         }
-        TriggerError::PredicateEval(detail) => Status::internal(format!("predicate: {detail}")),
+        TriggerError::PredicateEval(detail) => {
+            (tonic::Code::Internal, format!("predicate: {detail}"))
+        }
         TriggerError::OffsetEvicted(n) => {
-            Status::failed_precondition(format!("offset {n} evicted"))
+            (tonic::Code::FailedPrecondition, format!("offset {n} evicted"))
         }
-        TriggerError::BackingTable(e) => Status::internal(format!("backing table: {e}")),
-        TriggerError::Backend(e) => Status::internal(format!("backend: {e}")),
-        TriggerError::Driver(detail) => Status::unavailable(format!("broker: {detail}")),
-        TriggerError::Catalog(detail) => Status::internal(format!("catalog: {detail}")),
-    }
+        TriggerError::BackingTable(e) => (tonic::Code::Internal, format!("backing table: {e}")),
+        TriggerError::Backend(e) => (tonic::Code::Internal, format!("backend: {e}")),
+        TriggerError::Driver(detail) => (tonic::Code::Unavailable, format!("broker: {detail}")),
+        TriggerError::Catalog(detail) => (tonic::Code::Internal, format!("catalog: {detail}")),
+    };
+    attach_trigger_detail(code, message, &err)
 }
 
 // Re-export `Duration` so the `Subscribe` test future can clamp its wait

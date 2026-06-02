@@ -16,6 +16,8 @@
 use tonic::Status;
 use uuid::Uuid;
 
+use jammi_db::AuditError;
+
 use crate::wire::proto::audit as pb;
 use crate::PerQueryAudit;
 
@@ -44,4 +46,45 @@ impl From<PerQueryAudit> for pb::PerQueryAudit {
             signature: r.signature,
         }
     }
+}
+
+/// Reconstruct a stored [`PerQueryAudit`] from the wire message a fetch verb
+/// returns — the inverse of the encode above, for the [`crate::RemoteSession`]
+/// read side.
+///
+/// Unlike the receive-side `record_from_proto` in `jammi-server` (which rebuilds
+/// an *unsigned* record on `AuditLog` and lets the engine stamp tenant /
+/// signature / timestamp), this decodes a record the engine has already stamped:
+/// every field — including `tenant_id`, `signature`, and `executed_at` — is
+/// carried verbatim so the remote read is byte-for-byte the local read and the
+/// caller's signature `verify()` covers the identical canonical bytes. An empty
+/// `tenant_id` decodes to `None`; the decode is fallible (uuid parse, lineage
+/// JSON, timestamp range) and surfaces corruption as [`AuditError::Storage`]
+/// rather than fabricating a value.
+pub fn record_from_wire(p: pb::PerQueryAudit) -> Result<PerQueryAudit, AuditError> {
+    let query_id = Uuid::parse_str(&p.query_id)
+        .map_err(|e| AuditError::Storage(format!("invalid query_id from server: {e}")))?;
+    let query_lineage: serde_json::Value = if p.query_lineage.is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        serde_json::from_str(&p.query_lineage)?
+    };
+    let executed_at = chrono::DateTime::from_timestamp_micros(p.executed_at_micros)
+        .ok_or_else(|| AuditError::Storage("executed_at_micros out of range".into()))?;
+    let tenant_id = if p.tenant_id.is_empty() {
+        None
+    } else {
+        Some(p.tenant_id)
+    };
+    Ok(PerQueryAudit {
+        query_id,
+        tenant_id,
+        model_id: p.model_id,
+        model_version: p.model_version,
+        query_lineage,
+        top_k_result_ids: p.top_k_result_ids,
+        retrieval_scores: p.retrieval_scores,
+        executed_at,
+        signature: p.signature,
+    })
 }

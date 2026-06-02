@@ -22,9 +22,9 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
-use jammi_ai::wire::parse_query_id;
+use jammi_ai::wire::{attach_audit_detail, parse_query_id};
 use jammi_ai::{AuditError, LocalSession, PerQueryAudit, Session};
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 
 use crate::grpc::proto::audit as pb;
 use crate::grpc::proto::audit::audit_service_server::AuditService;
@@ -142,16 +142,21 @@ fn record_from_proto(p: pb::PerQueryAudit) -> Result<PerQueryAudit, Status> {
 /// a client can tell a bad request from an internal fault. A missing tenant
 /// binding is a precondition failure (the caller must scope the session first);
 /// a signature mismatch is data loss; size/length violations are bad arguments.
+///
+/// The `code` + `message` are the idiomatic gRPC surface; on top of that every
+/// status carries a faithful [`jammi_ai::wire`] audit-error detail so a remote
+/// `RemoteSession` reconstructs the *exact* [`AuditError`] the in-process path
+/// returns. The detail is built centrally here so the faithful path covers the
+/// whole `AuditError` enum from one place — the audit analogue of
+/// `map_engine_error`.
 fn map_audit_error(err: AuditError) -> Status {
-    match err {
+    let code = match &err {
         AuditError::LengthMismatch { .. } | AuditError::LineageTooLarge { .. } => {
-            Status::invalid_argument(err.to_string())
+            Code::InvalidArgument
         }
-        AuditError::NoTenantBinding => Status::failed_precondition(err.to_string()),
-        AuditError::SignatureMismatch(_) => Status::data_loss(err.to_string()),
-        AuditError::MasterKey(_) => Status::failed_precondition(err.to_string()),
-        AuditError::Serde(_) | AuditError::Storage(_) | AuditError::Broker(_) => {
-            Status::internal(err.to_string())
-        }
-    }
+        AuditError::NoTenantBinding | AuditError::MasterKey(_) => Code::FailedPrecondition,
+        AuditError::SignatureMismatch(_) => Code::DataLoss,
+        AuditError::Serde(_) | AuditError::Storage(_) | AuditError::Broker(_) => Code::Internal,
+    };
+    attach_audit_detail(code, err.to_string(), &err)
 }

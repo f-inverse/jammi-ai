@@ -8,13 +8,18 @@
 //! up) and the `TriggerError` → `Status` mapping stay in the `jammi-server`
 //! handler — those are catalog and transport concerns, not conversions.
 
+use std::collections::BTreeMap;
+use std::str::FromStr;
+
 use arrow::record_batch::RecordBatch;
-use jammi_db::trigger::{DeliveredBatch, TopicDefinition};
+use jammi_db::trigger::ids::TopicId;
+use jammi_db::trigger::{DeliveredBatch, Offset, TopicDefinition};
+use jammi_db::TenantId;
 use prost_types::Timestamp;
 use tonic::Status;
 
-use crate::wire::proto::trigger::{ArrowBatch, SubscribedBatch};
-use crate::wire::{decode_ipc_stream, encode_ipc_stream};
+use crate::wire::proto::trigger::{ArrowBatch, SubscribedBatch, Topic};
+use crate::wire::{decode_ipc_schema, decode_ipc_stream, encode_ipc_stream};
 
 /// Decode the single record batch a `Publish` carries, checking it against the
 /// topic schema. Per ADR-01 §5.1 the wire pairing is `data_header` +
@@ -68,9 +73,108 @@ pub fn encode_delivered_batch(
     })
 }
 
+/// Encode a [`TopicDefinition`] onto the wire `Topic` a `ListTopics` page
+/// carries — the send side of the materialized listing. The schema rides as a
+/// schema-only Arrow IPC stream (the same framing `RegisterTopicRequest.schema`
+/// uses). Fallible only on the schema encode.
+pub fn topic_to_proto(topic: &TopicDefinition) -> Result<Topic, Status> {
+    let schema = encode_ipc_stream(&topic.schema, &[])?;
+    Ok(Topic {
+        topic_id: topic.id.to_string(),
+        name: topic.name.clone(),
+        schema,
+        tenant_id: topic.tenant.map(|t| t.to_string()).unwrap_or_default(),
+        broker_metadata: topic.broker_metadata.clone().into_iter().collect(),
+    })
+}
+
+/// Reconstruct the [`TopicDefinition`] from the wire `Topic` — the inverse of
+/// [`topic_to_proto`], for the [`crate::RemoteSession`] `list_topics` read side.
+/// Fallible: the id and (non-empty) tenant are re-parsed and the schema is
+/// decoded from its IPC framing, so a corrupt page surfaces as a `Status` rather
+/// than a fabricated definition.
+pub fn topic_from_proto(wire: Topic) -> Result<TopicDefinition, Status> {
+    let id = TopicId::from_str(&wire.topic_id)
+        .map_err(|e| Status::invalid_argument(format!("invalid topic_id: {e}")))?;
+    let schema = decode_ipc_schema(&wire.schema)?;
+    let tenant = if wire.tenant_id.is_empty() {
+        None
+    } else {
+        Some(
+            TenantId::from_str(&wire.tenant_id)
+                .map_err(|e| Status::invalid_argument(format!("invalid tenant id: {e}")))?,
+        )
+    };
+    let broker_metadata: BTreeMap<String, String> = wire.broker_metadata.into_iter().collect();
+    Ok(TopicDefinition {
+        id,
+        name: wire.name,
+        schema,
+        tenant,
+        broker_metadata,
+    })
+}
+
 /// Encode a UTC instant as a protobuf well-known `Timestamp`.
 pub fn to_proto_timestamp(dt: chrono::DateTime<chrono::Utc>) -> Timestamp {
     let seconds = dt.timestamp();
     let nanos = dt.timestamp_subsec_nanos() as i32;
     Timestamp { seconds, nanos }
+}
+
+/// Decode a protobuf well-known `Timestamp` back to a UTC instant. The inverse
+/// of [`to_proto_timestamp`]; an out-of-range timestamp is a corrupt payload, so
+/// the decode is fallible. Used by the remote subscribe path to rebuild each
+/// delivered batch's `produced_at`.
+pub fn from_proto_timestamp(ts: &Timestamp) -> Result<chrono::DateTime<chrono::Utc>, Status> {
+    chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32)
+        .ok_or_else(|| Status::invalid_argument("produced_at timestamp out of range"))
+}
+
+/// Encode a single topic-payload batch into the wire `ArrowBatch` a `Publish`
+/// carries — the send-side inverse of [`decode_publish_batch`]. The batch rides
+/// as one self-describing IPC stream in `data_body`; the schema is the batch's
+/// own (which a faithful caller has already matched to the topic).
+pub fn encode_publish_batch(batch: &RecordBatch) -> Result<ArrowBatch, Status> {
+    let buf = encode_ipc_stream(&batch.schema(), std::slice::from_ref(batch))?;
+    Ok(ArrowBatch {
+        data_header: Vec::new(),
+        data_body: buf,
+        app_metadata: Vec::new(),
+    })
+}
+
+/// Decode a streamed wire `SubscribedBatch` back into the engine
+/// [`DeliveredBatch`] a local subscription yields — the receive-side inverse of
+/// [`encode_delivered_batch`], for the remote subscribe stream.
+///
+/// A batch carries exactly one record batch (the publish unit); an absent or
+/// multi-batch payload is a corrupt frame, surfaced as an `Err` so the stream's
+/// item is a faithful failure rather than a fabricated batch. The offset's
+/// `committed_at` is set to `produced_at` — the two are the same instant by the
+/// broker's contract (see [`DeliveredBatch`]).
+pub fn decode_subscribed_batch(wire: SubscribedBatch) -> Result<DeliveredBatch, Status> {
+    let arrow = wire
+        .batch
+        .ok_or_else(|| Status::invalid_argument("subscribed batch missing payload"))?;
+    let mut batches = decode_ipc_stream(&arrow.data_header, &arrow.data_body)?;
+    let batch = match batches.len() {
+        1 => batches.pop().expect("len checked == 1"),
+        n => {
+            return Err(Status::invalid_argument(format!(
+                "subscribed batch carries exactly one record batch, got {n}"
+            )))
+        }
+    };
+    let produced_at = wire
+        .produced_at
+        .as_ref()
+        .map(from_proto_timestamp)
+        .transpose()?
+        .ok_or_else(|| Status::invalid_argument("subscribed batch missing produced_at"))?;
+    Ok(DeliveredBatch {
+        offset: Offset::new(wire.offset, produced_at),
+        produced_at,
+        batch,
+    })
 }

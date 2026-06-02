@@ -42,6 +42,13 @@ message RegisterTopicRequest {
   // Broker-driver-specific configuration (retention, replication, etc.),
   // opaque to the engine. Empty == no driver metadata.
   map<string, string> broker_metadata = 3;
+  // Caller-supplied topic id (UUID string). The `Session::register_topic`
+  // surface takes a `TopicDefinition` whose `id` the caller already minted, so
+  // the wire carries it and the server persists *that* id — keeping the topic's
+  // identity (and a later `DropTopic` by id) consistent across the in-process
+  // and remote transports. Empty == server mints a fresh id (the DDL / CLI path
+  // that has no client-side id).
+  string topic_id = 4;
 }
 
 message RegisterTopicResponse {
@@ -50,7 +57,10 @@ message RegisterTopicResponse {
 }
 
 message DropTopicRequest {
-  string name = 1;
+  // Topic id (UUID string) to drop. The `Session::drop_topic` surface is keyed
+  // by `TopicId`, so the wire carries the id and the server resolves the topic
+  // (tenant-scoped) by it — the same identity the in-process path uses.
+  string topic_id = 1;
   // When true, a missing topic is a no-op instead of a NotFound error.
   bool if_exists = 2;
 }
@@ -113,7 +123,24 @@ message ListTopicsRequest {
   string tenant_id = 3;
 }
 
+// A fully-materialized topic in a `ListTopics` page. Carries everything a
+// `TopicDefinition` holds so a remote `Session::list_topics` reconstructs the
+// identical value the in-process path returns — not just the name.
+message Topic {
+  // Engine-minted topic id (UUID string).
+  string topic_id = 1;
+  // Fully-qualified catalog name.
+  string name = 2;
+  // Arrow schema for batch payloads, encoded as a self-describing Arrow IPC
+  // schema message (the same framing `RegisterTopicRequest.schema` uses).
+  bytes schema = 3;
+  // Tenant scope (the tenant's canonical string form); empty == global topic.
+  string tenant_id = 4;
+  // Broker-driver-specific configuration, opaque to the engine.
+  map<string, string> broker_metadata = 5;
+}
+
 message ListTopicsResponse {
-  repeated TopicName topics = 1;
+  repeated Topic topics = 1;
   string next_page_token = 2;
 }

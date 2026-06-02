@@ -40,17 +40,23 @@ mod inference;
 mod mutable_table;
 mod trigger;
 
-pub use audit::parse_query_id;
+pub use audit::{parse_query_id, record_from_wire};
 pub use channel::{columns_from_proto, columns_to_proto, parse_channel_id};
 pub use embedding::{
     embedding_task_for, result_table_from_proto, source_type_from_proto, ProtoQueryInput,
 };
-pub use error::{attach_error_detail, error_from_status};
+pub use error::{
+    attach_audit_detail, attach_error_detail, attach_trigger_detail, audit_error_from_status,
+    error_from_status, trigger_error_from_status,
+};
 pub use eval::{cohorts_from_proto, cohorts_to_proto, eval_task_to_proto, EvalTaskFromWire};
 pub use fine_tune::{config_to_proto, method_from_proto, method_to_proto};
 pub use inference::infer_result_to_proto;
 pub use mutable_table::{definition_from_proto, definition_to_proto, parse_table_id};
-pub use trigger::{decode_publish_batch, encode_delivered_batch, to_proto_timestamp};
+pub use trigger::{
+    decode_publish_batch, decode_subscribed_batch, encode_delivered_batch, encode_publish_batch,
+    from_proto_timestamp, to_proto_timestamp, topic_from_proto, topic_to_proto,
+};
 
 /// Header name carrying the opaque session identifier. Clients mint a
 /// per-connection id and include it on every request that needs tenant-scoped

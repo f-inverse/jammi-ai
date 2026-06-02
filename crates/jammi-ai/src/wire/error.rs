@@ -37,10 +37,12 @@
 use jammi_db::catalog::backend::BackendError;
 use jammi_db::error::JammiError;
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
-use jammi_db::TenantId;
+use jammi_db::trigger::TriggerError;
+use jammi_db::{AuditError, TenantId};
 use prost::bytes::Bytes;
 use prost::Message;
 use tonic::{Code, Status};
+use uuid::Uuid;
 
 use crate::wire::proto::error as pb;
 
@@ -294,6 +296,187 @@ impl From<pb::BackendErrorDetail> for BackendError {
     }
 }
 
+/// Encode an optional tenant onto its wire string form — a UUID string, or the
+/// empty string for `None`. Shared by the tenant-carrying error arms; the
+/// inverse [`parse_optional_tenant`] reads it back.
+fn tenant_to_wire(t: Option<TenantId>) -> String {
+    t.map(|t| t.to_string()).unwrap_or_default()
+}
+
+/// Parse a wire tenant string back to `Option<TenantId>` (empty == `None`). A
+/// non-empty string that fails to parse reconstructs as `None` — the only total
+/// option for a forged payload, since the faithful path always carries a valid
+/// UUID or the empty string.
+fn parse_optional_tenant(s: String) -> Option<TenantId> {
+    if s.is_empty() {
+        None
+    } else {
+        s.parse().ok()
+    }
+}
+
+/// Build the structured wire detail for a [`TriggerError`]. One match over every
+/// variant so the server's `map_trigger_error` emits a faithful detail for the
+/// whole enum from one place.
+///
+/// No arm folds: every owned-shape variant has its own message, and the two
+/// `#[from]` variants (`BackingTable`, `Backend`) wrap engine-owned errors that
+/// reconstruct faithfully through the shared [`pb::MutableTableErrorDetail`] /
+/// [`pb::BackendErrorDetail`] taxonomies. The whole `TriggerError` enum crosses
+/// the wire without loss.
+impl From<&TriggerError> for pb::TriggerErrorDetail {
+    fn from(err: &TriggerError) -> Self {
+        use pb::trigger_error_detail::Variant;
+        let variant = match err {
+            TriggerError::TopicNotFound(m) => Variant::TopicNotFound(m.clone()),
+            TriggerError::SchemaConflict { topic, detail } => {
+                Variant::SchemaConflict(pb::SchemaConflict {
+                    topic: topic.clone(),
+                    detail: detail.clone(),
+                })
+            }
+            TriggerError::UnsupportedSchemaType { column, data_type } => {
+                Variant::UnsupportedSchemaType(pb::UnsupportedSchemaType {
+                    column: column.clone(),
+                    data_type: data_type.clone(),
+                })
+            }
+            TriggerError::BatchSchemaMismatch(m) => Variant::BatchSchemaMismatch(m.clone()),
+            TriggerError::PublishTenantMismatch {
+                topic,
+                topic_tenant,
+                publish_tenant,
+            } => Variant::PublishTenantMismatch(pb::PublishTenantMismatch {
+                topic: topic.clone(),
+                topic_tenant: tenant_to_wire(*topic_tenant),
+                publish_tenant: tenant_to_wire(*publish_tenant),
+            }),
+            TriggerError::PredicateParse(m) => Variant::PredicateParse(m.clone()),
+            TriggerError::PredicateEval(m) => Variant::PredicateEval(m.clone()),
+            TriggerError::PredicateUnsupported(m) => Variant::PredicateUnsupported(m.clone()),
+            TriggerError::OffsetEvicted(n) => Variant::OffsetEvicted(*n),
+            TriggerError::BackingTable(e) => Variant::BackingTable(e.into()),
+            TriggerError::Backend(e) => Variant::Backend(e.into()),
+            TriggerError::Driver(m) => Variant::Driver(m.clone()),
+            TriggerError::Catalog(m) => Variant::Catalog(m.clone()),
+        };
+        pb::TriggerErrorDetail {
+            variant: Some(variant),
+        }
+    }
+}
+
+/// Reconstruct the [`TriggerError`] from its wire detail — the inverse of the
+/// encode above. The nested engine-owned details (`backing_table`, `backend`)
+/// reconstruct through their own `From<pb>` impls. A detail with no variant set
+/// (an older / corrupt payload) reconstructs as `TriggerError::Catalog` carrying
+/// the empty marker — kept inside the trigger taxonomy rather than escaping.
+impl From<pb::TriggerErrorDetail> for TriggerError {
+    fn from(detail: pb::TriggerErrorDetail) -> Self {
+        use pb::trigger_error_detail::Variant;
+        match detail.variant {
+            Some(Variant::TopicNotFound(m)) => TriggerError::TopicNotFound(m),
+            Some(Variant::SchemaConflict(c)) => TriggerError::SchemaConflict {
+                topic: c.topic,
+                detail: c.detail,
+            },
+            Some(Variant::UnsupportedSchemaType(u)) => TriggerError::UnsupportedSchemaType {
+                column: u.column,
+                data_type: u.data_type,
+            },
+            Some(Variant::BatchSchemaMismatch(m)) => TriggerError::BatchSchemaMismatch(m),
+            Some(Variant::PublishTenantMismatch(p)) => TriggerError::PublishTenantMismatch {
+                topic: p.topic,
+                topic_tenant: parse_optional_tenant(p.topic_tenant),
+                publish_tenant: parse_optional_tenant(p.publish_tenant),
+            },
+            Some(Variant::PredicateParse(m)) => TriggerError::PredicateParse(m),
+            Some(Variant::PredicateEval(m)) => TriggerError::PredicateEval(m),
+            Some(Variant::PredicateUnsupported(m)) => TriggerError::PredicateUnsupported(m),
+            Some(Variant::OffsetEvicted(n)) => TriggerError::OffsetEvicted(n),
+            Some(Variant::BackingTable(e)) => TriggerError::BackingTable(e.into()),
+            Some(Variant::Backend(e)) => TriggerError::Backend(e.into()),
+            Some(Variant::Driver(m)) => TriggerError::Driver(m),
+            Some(Variant::Catalog(m)) => TriggerError::Catalog(m),
+            None => TriggerError::Catalog(String::new()),
+        }
+    }
+}
+
+/// Build the structured wire detail for an [`AuditError`]. One match over every
+/// variant so the server's `map_audit_error` emits a faithful detail for the
+/// whole enum from one place.
+///
+/// Every owned-shape variant has its own message. The lone fold is `Serde`:
+/// `AuditError::Serde(#[from] serde_json::Error)` wraps a foreign error that
+/// cannot cross a process boundary, so it carries its faithful `Display` string
+/// — the genuine fidelity limit, mirroring the foreign-source fold in
+/// `JammiErrorDetail`.
+impl From<&AuditError> for pb::AuditErrorDetail {
+    fn from(err: &AuditError) -> Self {
+        use pb::audit_error_detail::Variant;
+        let variant = match err {
+            AuditError::LengthMismatch { ids, scores } => {
+                Variant::LengthMismatch(pb::LengthMismatch {
+                    ids: *ids as u64,
+                    scores: *scores as u64,
+                })
+            }
+            AuditError::LineageTooLarge { actual, max } => {
+                Variant::LineageTooLarge(pb::LineageTooLarge {
+                    actual: *actual as u64,
+                    max: *max as u64,
+                })
+            }
+            AuditError::NoTenantBinding => Variant::NoTenantBinding(true),
+            AuditError::SignatureMismatch(id) => Variant::SignatureMismatch(id.to_string()),
+            AuditError::MasterKey(m) => Variant::MasterKey(m.clone()),
+            // The one genuinely-foreign arm: a `serde_json::Error` cannot be
+            // rebuilt across the wire, so its faithful `Display` string lands in
+            // the dedicated `serde` arm. `to_string()` is that string.
+            AuditError::Serde(e) => Variant::Serde(e.to_string()),
+            AuditError::Storage(m) => Variant::Storage(m.clone()),
+            AuditError::Broker(m) => Variant::Broker(m.clone()),
+        };
+        pb::AuditErrorDetail {
+            variant: Some(variant),
+        }
+    }
+}
+
+/// Reconstruct the [`AuditError`] from its wire detail — the inverse of the
+/// encode above. The `signature_mismatch` arm re-parses the query-id UUID; a
+/// forged string that fails to parse reconstructs as the nil UUID (total, since
+/// the faithful path always carries a valid UUID). The `serde` arm reconstructs
+/// as `AuditError::Storage` carrying the original `Display` string — the raw
+/// `serde_json::Error` cannot be rebuilt, so the faithful message lands in the
+/// nearest audit-owned string arm rather than escaping the taxonomy. A detail
+/// with no variant reconstructs as an empty `Storage`.
+impl From<pb::AuditErrorDetail> for AuditError {
+    fn from(detail: pb::AuditErrorDetail) -> Self {
+        use pb::audit_error_detail::Variant;
+        match detail.variant {
+            Some(Variant::LengthMismatch(l)) => AuditError::LengthMismatch {
+                ids: l.ids as usize,
+                scores: l.scores as usize,
+            },
+            Some(Variant::LineageTooLarge(l)) => AuditError::LineageTooLarge {
+                actual: l.actual as usize,
+                max: l.max as usize,
+            },
+            Some(Variant::NoTenantBinding(_)) => AuditError::NoTenantBinding,
+            Some(Variant::SignatureMismatch(id)) => {
+                AuditError::SignatureMismatch(Uuid::parse_str(&id).unwrap_or_default())
+            }
+            Some(Variant::MasterKey(m)) => AuditError::MasterKey(m),
+            Some(Variant::Serde(m)) => AuditError::Storage(m),
+            Some(Variant::Storage(m)) => AuditError::Storage(m),
+            Some(Variant::Broker(m)) => AuditError::Broker(m),
+            None => AuditError::Storage(String::new()),
+        }
+    }
+}
+
 /// Attach a faithful [`pb::JammiErrorDetail`] for `err` to a [`Status`] of the
 /// given `code` and `message`. The detail rides in the Status `details` bytes
 /// (the gRPC richer-error model) so a decoding client reconstructs the precise
@@ -317,6 +500,58 @@ pub fn error_from_status(status: &Status) -> JammiError {
     match pb::JammiErrorDetail::decode(details) {
         Ok(detail) => JammiError::from(detail),
         Err(_) => JammiError::Other(status.message().to_string()),
+    }
+}
+
+/// Attach a faithful [`pb::TriggerErrorDetail`] for `err` to a [`Status`]. The
+/// trigger verbs surface [`TriggerError`] directly (not `JammiError`), so the
+/// server's `map_trigger_error` is the single emission point for this detail —
+/// the trigger analogue of [`attach_error_detail`].
+pub fn attach_trigger_detail(code: Code, message: String, err: &TriggerError) -> Status {
+    let detail = pb::TriggerErrorDetail::from(err);
+    Status::with_details(code, message, Bytes::from(detail.encode_to_vec()))
+}
+
+/// Reconstruct the [`TriggerError`] a server attached to a [`Status`]. When the
+/// status carries a decodable [`pb::TriggerErrorDetail`] the exact variant is
+/// rebuilt; otherwise (no detail, or undecodable bytes) the status `message`
+/// stands in as [`TriggerError::Driver`] — the faithful fallback for a status
+/// that by construction carries no trigger detail. This is also the path a
+/// mid-stream subscribe failure takes: a terminal `tonic::Status` reconstructs
+/// to the faithful variant, never a gRPC-code-category guess.
+pub fn trigger_error_from_status(status: &Status) -> TriggerError {
+    let details = status.details();
+    if details.is_empty() {
+        return TriggerError::Driver(status.message().to_string());
+    }
+    match pb::TriggerErrorDetail::decode(details) {
+        Ok(detail) => TriggerError::from(detail),
+        Err(_) => TriggerError::Driver(status.message().to_string()),
+    }
+}
+
+/// Attach a faithful [`pb::AuditErrorDetail`] for `err` to a [`Status`]. The
+/// audit verbs surface [`AuditError`] directly, so the server's
+/// `map_audit_error` is the single emission point for this detail — the audit
+/// analogue of [`attach_error_detail`].
+pub fn attach_audit_detail(code: Code, message: String, err: &AuditError) -> Status {
+    let detail = pb::AuditErrorDetail::from(err);
+    Status::with_details(code, message, Bytes::from(detail.encode_to_vec()))
+}
+
+/// Reconstruct the [`AuditError`] a server attached to a [`Status`]. When the
+/// status carries a decodable [`pb::AuditErrorDetail`] the exact variant is
+/// rebuilt; otherwise (no detail, or undecodable bytes) the status `message`
+/// stands in as [`AuditError::Storage`] — the faithful fallback for a status
+/// that by construction carries no audit detail.
+pub fn audit_error_from_status(status: &Status) -> AuditError {
+    let details = status.details();
+    if details.is_empty() {
+        return AuditError::Storage(status.message().to_string());
+    }
+    match pb::AuditErrorDetail::decode(details) {
+        Ok(detail) => AuditError::from(detail),
+        Err(_) => AuditError::Storage(status.message().to_string()),
     }
 }
 
@@ -453,6 +688,132 @@ mod tests {
                 err.to_string(),
                 "MutableTable variant must reconstruct its fields faithfully: {err:?} -> {back:?}"
             );
+        }
+    }
+
+    /// Round-trip a [`TriggerError`] through the full Status path
+    /// (`attach_trigger_detail` → encode → decode → `trigger_error_from_status`).
+    fn round_trip_trigger(err: &TriggerError) -> TriggerError {
+        let status = attach_trigger_detail(Code::Internal, err.to_string(), err);
+        trigger_error_from_status(&status)
+    }
+
+    /// Every `TriggerError` variant — including the two engine-owned `#[from]`
+    /// nests (`BackingTable`, `Backend`) — must reconstruct to the IDENTICAL
+    /// variant and `Display` after a wire round-trip. No `TriggerError` variant
+    /// folds to a lossy string; this is the completeness proof for the error
+    /// type the topics/subscribe surface returns.
+    #[test]
+    fn every_trigger_variant_round_trips_to_itself() {
+        let tenant_a: TenantId = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a"
+            .parse()
+            .expect("uuid");
+        let cases = [
+            TriggerError::TopicNotFound("events.changes".into()),
+            TriggerError::SchemaConflict {
+                topic: "events.changes".into(),
+                detail: "column 'kind' type changed Utf8 -> Int64".into(),
+            },
+            TriggerError::UnsupportedSchemaType {
+                column: "payload".into(),
+                data_type: "Struct".into(),
+            },
+            TriggerError::BatchSchemaMismatch("publish has 3 columns, topic has 2".into()),
+            TriggerError::PublishTenantMismatch {
+                topic: "events.changes".into(),
+                topic_tenant: Some(tenant_a),
+                publish_tenant: None,
+            },
+            TriggerError::PredicateParse("unexpected token at column 4".into()),
+            TriggerError::PredicateEval("predicate did not produce Boolean array".into()),
+            TriggerError::PredicateUnsupported("aggregate functions are not allowed".into()),
+            TriggerError::OffsetEvicted(42),
+            TriggerError::BackingTable(MutableTableError::AlreadyExists(
+                MutableTableId::new("__topic_abc").expect("valid id"),
+            )),
+            TriggerError::Backend(BackendError::Constraint {
+                table: "topics".into(),
+                detail: "duplicate key value violates unique constraint".into(),
+            }),
+            TriggerError::Driver("nats: connection closed".into()),
+            TriggerError::Catalog("topic_id parse: invalid".into()),
+        ];
+        for err in &cases {
+            let back = round_trip_trigger(err);
+            assert_eq!(
+                std::mem::discriminant(&back),
+                std::mem::discriminant(err),
+                "TriggerError variant must reconstruct as itself: {err:?} -> {back:?}"
+            );
+            assert_eq!(
+                back.to_string(),
+                err.to_string(),
+                "TriggerError variant must reconstruct its fields faithfully: {err:?} -> {back:?}"
+            );
+        }
+    }
+
+    /// Round-trip an [`AuditError`] through the full Status path.
+    fn round_trip_audit(err: &AuditError) -> AuditError {
+        let status = attach_audit_detail(Code::Internal, err.to_string(), err);
+        audit_error_from_status(&status)
+    }
+
+    /// Every owned-shape `AuditError` variant must reconstruct to the IDENTICAL
+    /// variant and `Display` after a wire round-trip. `Serde` is deliberately
+    /// NOT here — it is the one genuinely-foreign leaf and folds (see
+    /// `audit_serde_leaf_folds_to_faithful_string`).
+    #[test]
+    fn every_owned_shape_audit_variant_round_trips_to_itself() {
+        let cases = [
+            AuditError::LengthMismatch { ids: 3, scores: 2 },
+            AuditError::LineageTooLarge {
+                actual: 70_000,
+                max: 65_536,
+            },
+            AuditError::NoTenantBinding,
+            AuditError::SignatureMismatch(
+                "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a"
+                    .parse()
+                    .expect("uuid"),
+            ),
+            AuditError::MasterKey("expected 64 hex chars, got 10".into()),
+            AuditError::Storage("mutable-table registry unavailable".into()),
+            AuditError::Broker("audit topic publish failed".into()),
+        ];
+        for err in &cases {
+            let back = round_trip_audit(err);
+            assert_eq!(
+                std::mem::discriminant(&back),
+                std::mem::discriminant(err),
+                "AuditError variant must reconstruct as itself: {err:?} -> {back:?}"
+            );
+            assert_eq!(
+                back.to_string(),
+                err.to_string(),
+                "AuditError variant must reconstruct its fields faithfully: {err:?} -> {back:?}"
+            );
+        }
+    }
+
+    /// `AuditError::Serde` wraps a foreign `serde_json::Error` that cannot cross
+    /// a process boundary, so it folds — carrying the inner error's faithful
+    /// `Display` string in the nearest audit-owned arm (`Storage`), mirroring how
+    /// `BackendError::Sqlx` carries its inner `Display`. The inner message is
+    /// preserved verbatim (without the `AuditError::Serde` wrapper's "serde: "
+    /// prefix, which the typed arm would otherwise re-add on reconstruction).
+    #[test]
+    fn audit_serde_leaf_folds_to_faithful_string() {
+        let serde_err = serde_json::from_str::<serde_json::Value>("{not json")
+            .expect_err("malformed JSON must fail to parse");
+        let inner_display = serde_err.to_string();
+        let err = AuditError::Serde(serde_err);
+        match round_trip_audit(&err) {
+            AuditError::Storage(message) => assert_eq!(
+                message, inner_display,
+                "the foreign serde leaf carries the inner error's faithful Display string"
+            ),
+            other => panic!("a foreign serde leaf must fold to Storage, got {other:?}"),
         }
     }
 }

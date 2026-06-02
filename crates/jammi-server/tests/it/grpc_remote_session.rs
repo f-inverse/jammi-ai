@@ -22,15 +22,66 @@
 
 use std::sync::Arc;
 
+use arrow::array::{Int64Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use futures::StreamExt;
+use jammi_ai::audit::{verify_with_env, MASTER_KEY_ENV};
 use jammi_ai::{
-    LocalSession, Modality, QueryInput, RemoteSession, SearchQuery, SearchRequest, Session,
+    LocalSession, Modality, PerQueryAudit, QueryInput, RemoteSession, SearchQuery, SearchRequest,
+    Session,
 };
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::trigger::{DeliveredBatch, Predicate, TopicDefinition, TopicId, TriggerError};
+use jammi_db::AuditError;
 use jammi_test_utils::{cookbook_fixture, fixture};
 use tonic::transport::Endpoint;
 
-use super::common::grpc::{start_engine_server, tenant_a, EngineServer};
+use super::common::grpc::{
+    start_engine_server, start_engine_server_with_trigger, tenant_a, EngineServer, TENANT_A,
+};
+
+/// 32-byte hex master key for the audit HMAC. Deterministic so signature
+/// verification is reproducible; matches the engine-level audit tests.
+const AUDIT_TEST_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+
+/// A realistic CDC-event topic schema: an id, a record kind, and an op code.
+fn events_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("op", DataType::Utf8, false),
+    ]))
+}
+
+/// One batch of CDC events matching [`events_schema`].
+fn events_batch() -> RecordBatch {
+    RecordBatch::try_new(
+        events_schema(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["order", "order", "user"])),
+            Arc::new(StringArray::from(vec!["c", "u", "d"])),
+        ],
+    )
+    .expect("events batch")
+}
+
+/// A global (tenant-`None`) topic with a freshly-minted id. The trigger
+/// round-trip tests use an unscoped session on both transports, so a global
+/// topic keeps the publish/subscribe tenant scope identical (`None`) across
+/// `LocalSession` and `RemoteSession` without a sticky-vs-task-local binding
+/// mismatch on the shared engine; the minted id lets a later
+/// `drop_topic(topic.id)` resolve on either transport.
+fn events_topic() -> TopicDefinition {
+    TopicDefinition {
+        id: TopicId::new(),
+        name: "cdc.events".to_string(),
+        schema: events_schema(),
+        tenant: None,
+        broker_metadata: std::collections::BTreeMap::new(),
+    }
+}
 
 fn tiny_bert_model_id() -> String {
     format!("local:{}", cookbook_fixture("tiny_bert").display())
@@ -324,6 +375,366 @@ async fn remote_binds_and_reads_tenant_over_the_wire() {
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;
+}
+
+/// Topics over the wire: a `RemoteSession` registers a topic, publishes a
+/// batch, lists it, and drops it — and a `LocalSession` over the same engine
+/// observes every effect identically. Proves the register → publish → list →
+/// drop lifecycle is faithful across transports (the publish offset and the
+/// listed `TopicDefinition` match what the in-process path produces).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_round_trips_the_topic_lifecycle_like_local() {
+    let server = start_engine_server_with_trigger().await;
+    let remote = Session::Remote(remote(&server).await);
+    let local = local(&server);
+    let topic = events_topic();
+
+    // Register over the wire; the local session (same engine) must see it.
+    remote
+        .register_topic(&topic)
+        .await
+        .expect("remote register");
+    let listed_local = local.list_topics().await.expect("local list");
+    assert!(
+        listed_local
+            .iter()
+            .any(|t| t.name == topic.name && t.id == topic.id),
+        "the topic the remote registered (with its client-minted id) is visible locally"
+    );
+
+    // The remote `list_topics` reconstructs the SAME full definitions the local
+    // one returns — id, name, schema, tenant — not just names.
+    let listed_remote = remote.list_topics().await.expect("remote list");
+    let remote_ours = listed_remote
+        .iter()
+        .find(|t| t.id == topic.id)
+        .expect("remote list includes our topic");
+    assert_eq!(remote_ours.name, topic.name);
+    assert_eq!(remote_ours.tenant, topic.tenant);
+    assert_eq!(
+        remote_ours.schema.as_ref(),
+        topic.schema.as_ref(),
+        "remote list reconstructs the topic's payload schema"
+    );
+
+    // Publish over the wire; the offset is the engine-assigned one.
+    let offset = remote
+        .publish(&topic, events_batch())
+        .await
+        .expect("remote publish");
+    assert_eq!(
+        offset.value(),
+        0,
+        "first publish to a fresh topic is offset 0"
+    );
+
+    // Drop over the wire by the topic id; the local session no longer sees it.
+    remote.drop_topic(topic.id).await.expect("remote drop");
+    let after = local.list_topics().await.expect("local list after drop");
+    assert!(
+        !after.iter().any(|t| t.id == topic.id),
+        "the dropped topic is gone on both transports"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// Subscribe streaming over the wire. A `RemoteSession` opens a server-streaming
+/// subscription from offset 0; after a publish, the stream yields the SAME
+/// `DeliveredBatch` a `LocalSession`'s subscription yields against the same
+/// engine — same offset, same rows. Proves the streaming verb (not just the
+/// unary ones) is faithful end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_subscribe_stream_yields_the_same_batches_as_local() {
+    let server = start_engine_server_with_trigger().await;
+    let remote = Session::Remote(remote(&server).await);
+    let local = local(&server);
+    let topic = events_topic();
+
+    local.register_topic(&topic).await.expect("register topic");
+    // `Session::register_topic` registers the catalog row + backing table; the
+    // broker's live-tail channel is provisioned separately (the CREATE TOPIC DDL
+    // path does both). Register it on the broker so the subscribe live tail
+    // attaches — the same engine both sessions share.
+    server
+        .engine
+        .trigger_broker()
+        .register_topic(&topic)
+        .await
+        .expect("broker register");
+
+    // Publish one batch first (it lands at offset 0 in the backing table), then
+    // open both subscriptions from offset 0. The deterministic backing-table
+    // *replay* (not the racy live broadcast) delivers that batch to each stream,
+    // so the parity assertion does not depend on subscribe/publish interleaving.
+    local
+        .publish(&topic, events_batch())
+        .await
+        .expect("publish");
+
+    let mut remote_stream = remote
+        .subscribe(&topic, Predicate::match_all(), Some(offset_zero()))
+        .await
+        .expect("remote subscribe");
+    let mut local_stream = local
+        .subscribe(&topic, Predicate::match_all(), Some(offset_zero()))
+        .await
+        .expect("local subscribe");
+
+    let remote_delivered = next_delivered(&mut remote_stream).await;
+    let local_delivered = next_delivered(&mut local_stream).await;
+
+    assert_eq!(
+        remote_delivered.offset.value(),
+        local_delivered.offset.value(),
+        "both transports deliver the batch at the same offset"
+    );
+    assert_eq!(
+        remote_delivered.batch, local_delivered.batch,
+        "the remote stream rebuilds the identical record batch the local stream yields"
+    );
+    assert_eq!(
+        remote_delivered.batch,
+        events_batch(),
+        "and that batch is exactly what was published"
+    );
+
+    // Drop the streams before signalling shutdown: an open server-streaming
+    // subscription keeps its connection (and the server task) alive, so
+    // awaiting `server.handle` with a live stream would hang the test.
+    drop(remote_stream);
+    drop(local_stream);
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// Trigger error parity. A subscribe predicate that references a column the
+/// topic schema does not have fails inside the engine's predicate parser with
+/// `TriggerError::PredicateParse`. The remote transport must reconstruct that
+/// EXACT variant from the typed trigger detail — not merely report
+/// `invalid_argument`, which `PredicateUnsupported` and `BatchSchemaMismatch`
+/// also map onto. A heuristic reverse-map from the gRPC code could not tell
+/// `PredicateParse` from those siblings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_reconstructs_the_exact_trigger_error_variant_local_returns() {
+    let server = start_engine_server_with_trigger().await;
+    let remote = Session::Remote(remote(&server).await);
+    let local = local(&server);
+    let topic = events_topic();
+    local.register_topic(&topic).await.expect("register topic");
+
+    // Parsing a predicate that names a column absent from the topic schema fails
+    // with `PredicateParse`. This is the variant the engine produces in-process.
+    let unknown_col = "no_such_column = 1";
+    let local_err = match Predicate::from_sql(
+        server.engine.context(),
+        Arc::clone(&topic.schema),
+        unknown_col,
+    ) {
+        Ok(_) => panic!("unknown-column predicate must fail to parse against the topic schema"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(local_err, TriggerError::PredicateParse(_)),
+        "local predicate parse on an unknown column is PredicateParse, got {local_err:?}"
+    );
+
+    // Build a well-formed predicate that carries the same SQL (parsed against a
+    // schema that *does* declare the column) and subscribe remotely: the SQL
+    // crosses the wire, the server re-parses it against the REAL topic schema,
+    // and fails with the same `PredicateParse`. The remote arm reconstructs the
+    // exact variant from the attached detail.
+    let remote_err = match remote
+        .subscribe(
+            &topic,
+            predicate_referencing_unknown_column(unknown_col),
+            None,
+        )
+        .await
+    {
+        Ok(_) => panic!("remote subscribe with an unknown-column predicate must fail"),
+        Err(e) => e,
+    };
+    match (&local_err, &remote_err) {
+        (TriggerError::PredicateParse(_), TriggerError::PredicateParse(_)) => {}
+        other => panic!(
+            "remote did not reconstruct the PredicateParse variant the engine produces: {other:?}"
+        ),
+    }
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// Audit over the wire: a `RemoteSession` (tenant-bound) logs a record, fetches
+/// it by id and via recent, and the fetched record's engine-computed signature
+/// verifies — proving every field crossed the wire byte-for-byte. The fetched
+/// record matches the one a `LocalSession` fetch returns for the same query id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_round_trips_audit_log_and_fetch_like_local() {
+    let _g = audit_env_lock().lock().await;
+    std::env::set_var(MASTER_KEY_ENV, AUDIT_TEST_KEY);
+
+    let server = start_engine_server_with_trigger().await;
+    let remote = Session::Remote(remote(&server).await);
+    let local = local(&server);
+
+    // The audit primitive requires a bound tenant. Bind the remote session over
+    // the wire; the LocalSession reads back through the same engine, so scope it
+    // identically via the engine's sticky binding for the fetch comparison.
+    remote.bind_tenant(tenant_a()).await.expect("remote bind");
+
+    let query_id = uuid::Uuid::now_v7();
+    let record = PerQueryAudit::new(
+        query_id,
+        "openai/clip-vit-base",
+        "rev-3",
+        serde_json::json!({ "examiner_id": "42" }),
+        vec!["doc-1".to_string(), "doc-2".to_string()],
+        vec![0.91, 0.84],
+    )
+    .expect("record");
+
+    remote
+        .audit_log(vec![record])
+        .await
+        .expect("remote audit_log");
+
+    // Fetch by id over the wire; the record is fully reconstructed (tenant,
+    // signature, executed_at) so its signature verifies.
+    let fetched = remote
+        .audit_fetch_by_query_id(query_id)
+        .await
+        .expect("remote fetch")
+        .expect("record present");
+    assert_eq!(fetched.query_id, query_id);
+    assert_eq!(fetched.tenant_id.as_deref(), Some(TENANT_A));
+    assert!(!fetched.signature.is_empty(), "signature crossed the wire");
+    verify_with_env(&fetched).expect("remote-fetched record signature verifies");
+
+    // The local fetch (same engine, same tenant scope) returns the identical
+    // record — the remote read is byte-for-byte the local read.
+    let local_fetched = server
+        .engine
+        .with_tenant_scoped(tenant_a(), |_| local.audit_fetch_by_query_id(query_id))
+        .await
+        .expect("local fetch")
+        .expect("record present locally");
+    assert_eq!(
+        fetched, local_fetched,
+        "the remote-fetched audit record equals the local-fetched one field for field"
+    );
+
+    // fetch_recent over the wire surfaces the same record.
+    let recent = remote
+        .audit_fetch_recent(10)
+        .await
+        .expect("remote fetch_recent");
+    assert!(
+        recent.iter().any(|r| r.query_id == query_id),
+        "fetch_recent includes the logged record"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// Audit error parity. An audit log on an UNSCOPED session fails inside the
+/// engine with `AuditError::NoTenantBinding`. The remote transport must
+/// reconstruct that EXACT variant from the typed audit detail — not merely
+/// report `failed_precondition`, which `MasterKey` shares.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_reconstructs_the_exact_audit_error_variant_local_returns() {
+    let _g = audit_env_lock().lock().await;
+    std::env::set_var(MASTER_KEY_ENV, AUDIT_TEST_KEY);
+
+    let server = start_engine_server_with_trigger().await;
+    let remote = Session::Remote(remote(&server).await);
+    let local = local(&server);
+
+    let record = || {
+        PerQueryAudit::new(
+            uuid::Uuid::now_v7(),
+            "m",
+            "v",
+            serde_json::json!({}),
+            vec![],
+            vec![],
+        )
+        .expect("record")
+    };
+
+    // Local: an unscoped audit_log is NoTenantBinding.
+    let local_err = local
+        .audit_log(vec![record()])
+        .await
+        .expect_err("local unscoped audit_log must fail");
+    assert!(
+        matches!(local_err, AuditError::NoTenantBinding),
+        "local unscoped audit_log is NoTenantBinding, got {local_err:?}"
+    );
+
+    // Remote: the unscoped session (no bind_tenant) hits the same engine path;
+    // the typed detail reconstructs the IDENTICAL variant, not a category guess.
+    let remote_err = remote
+        .audit_log(vec![record()])
+        .await
+        .expect_err("remote unscoped audit_log must fail");
+    match (&local_err, &remote_err) {
+        (AuditError::NoTenantBinding, AuditError::NoTenantBinding) => {}
+        other => panic!(
+            "remote did not reconstruct the NoTenantBinding variant the engine produces: {other:?}"
+        ),
+    }
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// Offset 0 — the replay-from-earliest starting point for the subscribe tests.
+fn offset_zero() -> jammi_db::trigger::Offset {
+    jammi_db::trigger::Offset::new(0, chrono::Utc::now())
+}
+
+/// Pull the next delivered batch off a subscription stream, failing the test if
+/// the stream ends, errors, or stalls. The timeout keeps a delivery miss a fast,
+/// legible failure rather than a hang (a tailing subscription never ends on its
+/// own, so an unbounded `next().await` would block forever on a regression).
+async fn next_delivered<S>(stream: &mut S) -> DeliveredBatch
+where
+    S: futures::Stream<Item = Result<DeliveredBatch, TriggerError>> + Unpin,
+{
+    let next = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next()).await;
+    match next {
+        Ok(Some(Ok(delivered))) => delivered,
+        Ok(Some(Err(e))) => panic!("subscription yielded an error instead of a batch: {e:?}"),
+        Ok(None) => panic!("subscription ended before delivering a batch"),
+        Err(_) => panic!("subscription did not deliver a batch within the timeout"),
+    }
+}
+
+/// Build a well-formed `Predicate` carrying `sql` as its source, parsed against
+/// a schema that *declares* the referenced column — so the predicate is valid
+/// locally and carries its SQL across the wire. The server re-parses that SQL
+/// against the real topic schema (which lacks the column) and surfaces the
+/// `PredicateParse` error there, exercising the server-side error-parity path.
+fn predicate_referencing_unknown_column(sql: &str) -> Predicate {
+    let permissive = Arc::new(Schema::new(vec![Field::new(
+        "no_such_column",
+        DataType::Int64,
+        true,
+    )]));
+    let ctx = datafusion::execution::context::SessionContext::new();
+    Predicate::from_sql(&ctx, permissive, sql)
+        .expect("predicate parses against the permissive schema")
+}
+
+/// Serialize the audit tests that mutate the process-global
+/// `JAMMI_AUDIT_MASTER_KEY`. Held across `.await`, so an async mutex.
+fn audit_env_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// Extract the (key, score) of each hit from a search result, the

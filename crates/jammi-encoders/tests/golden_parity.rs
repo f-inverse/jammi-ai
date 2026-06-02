@@ -25,7 +25,7 @@ use std::path::PathBuf;
 
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::VarBuilder;
-use jammi_encoders::htsat_audio::{HtsatAudioConfig, HtsatAudioEncoder};
+use jammi_encoders::htsat_audio::{HtsatAudio, HtsatAudioConfig, HtsatAudioEncoder};
 
 /// Max-abs tolerance for large-magnitude intermediate boundaries. Looser than
 /// `parity.rs`'s 1e-5 because the oracle is a *different* framework (PyTorch)
@@ -254,5 +254,95 @@ fn front_half_matches_goldens() {
         &front.patch_embed_out,
         goldens.get("patch_embed_out").expect("patch_embed_out"),
         "patch_embed_out",
+    );
+}
+
+/// Build the full HTSAT-Swin tower (encoder + projection) from the committed
+/// `model.safetensors` (root scope).
+fn load_full_tower(device: &Device) -> HtsatAudio {
+    let config = load_config();
+    let weights = fixture_dir().join("model.safetensors");
+    let vb = unsafe {
+        VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, device)
+            .expect("mmap model.safetensors")
+    };
+    HtsatAudio::load(vb, &config, device).expect("load full HTSAT tower")
+}
+
+/// Drive the full HTSAT-Swin tower on the pinned input and gate EVERY boundary
+/// through the final L2-normalized embedding: the front half, every Swin block
+/// and patch-merging downsample across all four stages, the final LayerNorm,
+/// the group-2D pooling reshape and pool, and the projection head (unnormalized
+/// max-abs + normalized cosine). A divergence localizes to its unit.
+#[test]
+fn full_forward_matches_goldens() {
+    let device = Device::Cpu;
+    let goldens = Goldens::load().expect("load goldens.safetensors");
+    let tower = load_full_tower(&device);
+    let input = load_pinned_input().expect("load pinned_input");
+
+    // Front half (gated again here so the full tower stands alone).
+    let front = tower
+        .encoder()
+        .forward_front(&input)
+        .expect("front-half forward");
+    let frames_num = front
+        .post_reshape_mel2img
+        .dim(2)
+        .expect("frames_num from reshape_mel2img");
+
+    let spine = tower
+        .encoder()
+        .forward_spine(&front.patch_embed_out, frames_num)
+        .expect("spine forward");
+
+    // Per-stage block + downsample boundaries.
+    for (s, stage_blocks) in spine.blocks.iter().enumerate() {
+        for (b, out) in stage_blocks.iter().enumerate() {
+            let name = format!("stage{s}.block{b}_out");
+            assert_close_max_abs(out, goldens.get(&name).expect("block golden"), &name);
+        }
+        if let Some(ds) = &spine.downsamples[s] {
+            let name = format!("stage{s}.downsample_out");
+            assert_close_max_abs(ds, goldens.get(&name).expect("downsample golden"), &name);
+        }
+    }
+
+    assert_close_max_abs(
+        &spine.final_norm_out,
+        goldens.get("final_norm_out").expect("final_norm_out"),
+        "final_norm_out",
+    );
+    assert_close_max_abs(
+        &spine.pre_pool,
+        goldens.get("pre_pool").expect("pre_pool"),
+        "pre_pool",
+    );
+    assert_close_max_abs(
+        &spine.pooler_out,
+        goldens.get("pooler_out").expect("pooler_out"),
+        "pooler_out",
+    );
+
+    // Projection head: unnormalized (max-abs) then normalized (cosine).
+    let unnorm = tower
+        .projection()
+        .forward_unnormalized(&spine.pooler_out)
+        .expect("projection forward");
+    assert_close_max_abs(
+        &unnorm,
+        goldens
+            .get("projected_unnormalized")
+            .expect("projected_unnormalized"),
+        "projected_unnormalized",
+    );
+
+    let normalized = tower.forward(&input).expect("full forward");
+    assert_close_cosine(
+        &normalized,
+        goldens
+            .get("projected_normalized")
+            .expect("projected_normalized"),
+        "projected_normalized",
     );
 }

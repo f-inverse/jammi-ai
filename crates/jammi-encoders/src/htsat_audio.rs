@@ -1,4 +1,4 @@
-//! HTSAT-Swin CLAP audio tower (front half).
+//! HTSAT-Swin CLAP audio tower.
 //!
 //! The audio tower of a CLAP (Contrastive Language-Audio Pretraining) model in
 //! the HuggingFace `ClapAudioModelWithProjection` lineage: an HTSAT
@@ -9,18 +9,23 @@
 //! square "image", and patch-embeds it through an Attentional-Feature-Fusion
 //! (AFF) block.
 //!
-//! This module currently implements the front half — everything through the
-//! `patch_embed` boundary `[batch, num_patches, patch_embeds_hidden_size]`.
-//! The Swin spine, pooling, and projection are layered on top of this boundary.
+//! This module implements the complete tower: the front half (batch-norm →
+//! bicubic time-resample → `reshape_mel2img` → fused patch-embed) through the
+//! `patch_embed` boundary, the four-stage Swin spine (W-MSA / SW-MSA blocks with
+//! recomputed relative-position bias and shift-window masks, plus patch-merging
+//! downsamples), the final LayerNorm and group-2D pooling, and the projection
+//! head with L2-normalization producing the shared-latent audio embedding.
 //!
-//! Weight keys follow the HF safetensors layout under
-//! `audio_model.audio_encoder.*`; callers build the encoder modules from
-//! `vb.pp("audio_model").pp("audio_encoder")`.
+//! Weight keys follow the HF safetensors layout. The encoder modules live under
+//! `audio_model.audio_encoder.*` (built from
+//! `vb.pp("audio_model").pp("audio_encoder")`); the projection head lives at
+//! `audio_projection.*`, a sibling of `audio_model`. [`HtsatAudio::load`] takes
+//! the safetensors root and wires both.
 
-use candle_core::{Module, ModuleT, Tensor, D};
+use candle_core::{IndexOp, Module, ModuleT, Tensor, D};
 use candle_nn::{
-    batch_norm, conv2d, layer_norm, BatchNorm, BatchNormConfig, Conv2d, Conv2dConfig, LayerNorm,
-    VarBuilder,
+    batch_norm, conv2d, layer_norm, linear, linear_no_bias, BatchNorm, BatchNormConfig, Conv2d,
+    Conv2dConfig, LayerNorm, Linear, VarBuilder,
 };
 
 use crate::error::EncoderError;
@@ -454,18 +459,409 @@ impl HtsatPatchEmbed {
     }
 }
 
-/// HTSAT-Swin CLAP audio encoder — front half (through `patch_embed`).
+/// `window_partition`: tile `[B, H, W, C]` into non-overlapping `ws × ws`
+/// windows, returning `[B*nW, ws, ws, C]`.
+fn window_partition(x: &Tensor, ws: usize) -> Result<Tensor, EncoderError> {
+    let (b, h, w, c) = x.dims4()?;
+    let x = x.reshape((b, h / ws, ws, w / ws, ws, c))?;
+    let x = x.permute((0, 1, 3, 2, 4, 5))?.contiguous()?;
+    Ok(x.reshape((b * (h / ws) * (w / ws), ws, ws, c))?)
+}
+
+/// `window_reverse`: merge `[B*nW, ws, ws, C]` windows back into `[B, H, W, C]`.
+fn window_reverse(x: &Tensor, ws: usize, h: usize, w: usize) -> Result<Tensor, EncoderError> {
+    let c = x.dim(D::Minus1)?;
+    let x = x.reshape((x.dim(0)? / ((h / ws) * (w / ws)), h / ws, w / ws, ws, ws, c))?;
+    let x = x.permute((0, 1, 3, 2, 4, 5))?.contiguous()?;
+    Ok(x.reshape((x.dim(0)?, h, w, c))?)
+}
+
+/// Self-attention inside a Swin window (W-MSA / SW-MSA), with the recomputed
+/// relative-position bias and an optional precomputed shift-window mask.
+struct SwinSelfAttention {
+    query: Linear,
+    key: Linear,
+    value: Linear,
+    /// `[49, num_heads]` learned relative-position bias table.
+    rel_bias_table: Tensor,
+    /// `[256]` flattened `[16, 16]` relative-position index (U32), recomputed.
+    rel_index: Tensor,
+    num_heads: usize,
+    head_size: usize,
+}
+
+impl SwinSelfAttention {
+    fn load(vb: VarBuilder, dim: usize, num_heads: usize) -> Result<Self, EncoderError> {
+        let query = linear(dim, dim, vb.pp("query"))?;
+        let key = linear(dim, dim, vb.pp("key"))?;
+        let value = linear(dim, dim, vb.pp("value"))?;
+        let rel_bias_table = vb.get((49, num_heads), "relative_position_bias_table")?;
+        let rel_index = Self::build_rel_index(WINDOW_SIZE, vb.device())?;
+        Ok(Self {
+            query,
+            key,
+            value,
+            rel_bias_table,
+            rel_index,
+            num_heads,
+            head_size: dim / num_heads,
+        })
+    }
+
+    /// Recompute the pairwise relative-position index over a `ws × ws` window
+    /// (verified bit-exact against the stored buffer), flattened to U32 for the
+    /// bias-table gather.
+    fn build_rel_index(ws: usize, device: &candle_core::Device) -> Result<Tensor, EncoderError> {
+        let n = ws * ws;
+        // coords_flatten[axis][token], token = h*ws + w.
+        let mut idx = vec![0u32; n * n];
+        for i in 0..n {
+            let (hi, wi) = (i / ws, i % ws);
+            for j in 0..n {
+                let (hj, wj) = (j / ws, j % ws);
+                // relative_coords (permuted to [i, j, axis]): coord_i - coord_j.
+                let mut rh = (hi as i64) - (hj as i64);
+                let mut rw = (wi as i64) - (wj as i64);
+                rh += ws as i64 - 1;
+                rw += ws as i64 - 1;
+                rh *= 2 * ws as i64 - 1;
+                idx[i * n + j] = (rh + rw) as u32;
+            }
+        }
+        Ok(Tensor::from_vec(idx, n * n, device)?)
+    }
+
+    /// Split the last dim into heads: `[BnW, L, C]` -> `[BnW, heads, L, head]`.
+    fn heads(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
+        let (bnw, l, _c) = x.dims3()?;
+        Ok(x.reshape((bnw, l, self.num_heads, self.head_size))?
+            .transpose(1, 2)?
+            .contiguous()?)
+    }
+
+    /// `hidden`: `[B*nW, L=16, C]`; `mask`: optional `[nW, L, L]`; `num_windows`
+    /// is nW (needed to fold the mask over the batch axis).
+    fn forward(
+        &self,
+        hidden: &Tensor,
+        mask: Option<&Tensor>,
+        num_windows: usize,
+    ) -> Result<Tensor, EncoderError> {
+        let (bnw, l, c) = hidden.dims3()?;
+        let q = self.heads(&self.query.forward(hidden)?)?;
+        let k = self.heads(&self.key.forward(hidden)?)?;
+        let v = self.heads(&self.value.forward(hidden)?)?;
+
+        let scale = 1.0 / (self.head_size as f64).sqrt();
+        let scores = (q.matmul(&k.transpose(D::Minus1, D::Minus2)?.contiguous()?)? * scale)?;
+
+        // bias = rel_bias_table[rel_index][L,L,heads].permute(2,0,1) -> [heads,L,L].
+        let bias = self
+            .rel_bias_table
+            .index_select(&self.rel_index, 0)?
+            .reshape((l, l, self.num_heads))?
+            .permute((2, 0, 1))?
+            .contiguous()?;
+        let scores = scores.broadcast_add(&bias.unsqueeze(0)?)?;
+
+        let scores = match mask {
+            Some(mask) => {
+                // scores [B//nW, nW, heads, L, L] + mask [1, nW, 1, L, L].
+                let scores =
+                    scores.reshape((bnw / num_windows, num_windows, self.num_heads, l, l))?;
+                let mask = mask.unsqueeze(1)?.unsqueeze(0)?;
+                scores
+                    .broadcast_add(&mask)?
+                    .reshape((bnw, self.num_heads, l, l))?
+            }
+            None => scores,
+        };
+
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let ctx = probs.matmul(&v)?; // [BnW, heads, L, head]
+        let ctx = ctx.transpose(1, 2)?.contiguous()?.reshape((bnw, l, c))?;
+        Ok(ctx)
+    }
+}
+
+/// A single Swin block (pre-norm, W-MSA or SW-MSA) with the two residual MLP.
+struct SwinBlock {
+    layernorm_before: LayerNorm,
+    attention: SwinSelfAttention,
+    attention_output: Linear,
+    layernorm_after: LayerNorm,
+    intermediate: Linear,
+    output: Linear,
+    /// `(height, width)` patch resolution this block operates on.
+    input_resolution: (usize, usize),
+    /// Cyclic shift (0 for W-MSA, window/2 for SW-MSA; forced 0 when the grid is
+    /// no larger than the window).
+    shift_size: usize,
+    /// Effective window size (clamped to the grid when the grid is smaller).
+    window_size: usize,
+    /// Precomputed `[nW, L, L]` attention mask for SW-MSA, or `None`.
+    attn_mask: Option<Tensor>,
+}
+
+/// Window side length from the tiny/real config (`window_size = 4`).
+const WINDOW_SIZE: usize = 4;
+
+impl SwinBlock {
+    fn load(
+        vb: VarBuilder,
+        config: &HtsatAudioConfig,
+        dim: usize,
+        num_heads: usize,
+        input_resolution: (usize, usize),
+        block_index: usize,
+        device: &candle_core::Device,
+    ) -> Result<Self, EncoderError> {
+        let eps = config.layer_norm_eps;
+        let layernorm_before = layer_norm(dim, eps, vb.pp("layernorm_before"))?;
+        let attention = SwinSelfAttention::load(vb.pp("attention").pp("self"), dim, num_heads)?;
+        let attention_output = linear(dim, dim, vb.pp("attention").pp("output").pp("dense"))?;
+        let layernorm_after = layer_norm(dim, eps, vb.pp("layernorm_after"))?;
+        let inter = (config.mlp_ratio * dim as f64) as usize;
+        let intermediate = linear(dim, inter, vb.pp("intermediate").pp("dense"))?;
+        let output = linear(inter, dim, vb.pp("output").pp("dense"))?;
+
+        // set_shift_and_window_size: window/2 for odd blocks, forced 0 (with the
+        // window clamped to the grid) when the grid is no larger than the window.
+        let mut window_size = config.window_size;
+        let mut shift_size = if block_index % 2 == 0 {
+            0
+        } else {
+            config.window_size / 2
+        };
+        if input_resolution.0.min(input_resolution.1) <= config.window_size {
+            shift_size = 0;
+            window_size = input_resolution.0.min(input_resolution.1);
+        }
+
+        let attn_mask = if shift_size > 0 {
+            Some(Self::build_attn_mask(
+                input_resolution.0,
+                input_resolution.1,
+                window_size,
+                shift_size,
+                device,
+            )?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            layernorm_before,
+            attention,
+            attention_output,
+            layernorm_after,
+            intermediate,
+            output,
+            input_resolution,
+            shift_size,
+            window_size,
+            attn_mask,
+        })
+    }
+
+    /// Build the SW-MSA attention mask `[nW, L, L]` from the 9-region label map.
+    fn build_attn_mask(
+        h: usize,
+        w: usize,
+        ws: usize,
+        shift: usize,
+        device: &candle_core::Device,
+    ) -> Result<Tensor, EncoderError> {
+        // img_mask[1, H, W, 1] labelled by the 3×3 slice regions.
+        let region = |i: usize, len: usize| -> usize {
+            // slices: (0..len-ws), (len-ws..len-shift), (len-shift..len).
+            if i < len - ws {
+                0
+            } else if i < len - shift {
+                1
+            } else {
+                2
+            }
+        };
+        let mut img = vec![0f32; h * w];
+        for hi in 0..h {
+            for wi in 0..w {
+                img[hi * w + wi] = (region(hi, h) * 3 + region(wi, w)) as f32;
+            }
+        }
+        let img = Tensor::from_vec(img, (1, h, w, 1), device)?;
+        let mask_windows = window_partition(&img, ws)?; // [nW, ws, ws, 1]
+        let nw = mask_windows.dim(0)?;
+        let mask_windows = mask_windows.reshape((nw, ws * ws))?;
+        // attn_mask = mask[:, None, :] - mask[:, :, None]
+        let a = mask_windows.unsqueeze(1)?; // [nW, 1, L]
+        let b = mask_windows.unsqueeze(2)?; // [nW, L, 1]
+        let diff = a.broadcast_sub(&b)?; // [nW, L, L]
+                                         // (diff != 0) * -100.0
+        let mask = (diff.ne(0f32)?.to_dtype(candle_core::DType::F32)? * -100.0)?;
+        Ok(mask)
+    }
+
+    fn forward(&self, hidden: &Tensor) -> Result<Tensor, EncoderError> {
+        let (b, _l, c) = hidden.dims3()?;
+        let (h, w) = self.input_resolution;
+        let ws = self.window_size;
+
+        let shortcut = hidden;
+        let x = self.layernorm_before.forward(hidden)?;
+        let x = x.reshape((b, h, w, c))?;
+
+        // Cyclic shift (two single-dim rolls compose the 2-D torch.roll).
+        let x = if self.shift_size > 0 {
+            x.roll(-(self.shift_size as i32), 1)?
+                .roll(-(self.shift_size as i32), 2)?
+        } else {
+            x
+        };
+
+        let windows = window_partition(&x, ws)?; // [B*nW, ws, ws, C]
+        let num_windows = (h / ws) * (w / ws);
+        let windows = windows.reshape((b * num_windows, ws * ws, c))?;
+
+        let ctx = self
+            .attention
+            .forward(&windows, self.attn_mask.as_ref(), num_windows)?;
+        let attn = self.attention_output.forward(&ctx)?;
+
+        // window_reverse -> [B, H, W, C].
+        let attn = attn.reshape((b * num_windows, ws, ws, c))?;
+        let attn = window_reverse(&attn, ws, h, w)?;
+
+        // Reverse cyclic shift.
+        let attn = if self.shift_size > 0 {
+            attn.roll(self.shift_size as i32, 1)?
+                .roll(self.shift_size as i32, 2)?
+        } else {
+            attn
+        };
+        let attn = attn.reshape((b, h * w, c))?;
+
+        // Residual 1.
+        let hidden = (shortcut + attn)?;
+
+        // MLP with residual 2.
+        let y = self.layernorm_after.forward(&hidden)?;
+        let y = self.intermediate.forward(&y)?;
+        let y = y.gelu_erf()?;
+        let y = self.output.forward(&y)?;
+        Ok((&hidden + y)?)
+    }
+}
+
+/// Swin patch-merging downsample: `2×` spatial reduction with a `4C → 2C`
+/// linear over the concatenated `2×2` neighbourhood.
+struct PatchMerging {
+    norm: LayerNorm,
+    reduction: Linear,
+    input_resolution: (usize, usize),
+}
+
+impl PatchMerging {
+    fn load(
+        vb: VarBuilder,
+        config: &HtsatAudioConfig,
+        dim: usize,
+        input_resolution: (usize, usize),
+    ) -> Result<Self, EncoderError> {
+        let norm = layer_norm(4 * dim, config.layer_norm_eps, vb.pp("norm"))?;
+        let reduction = linear_no_bias(4 * dim, 2 * dim, vb.pp("reduction"))?;
+        Ok(Self {
+            norm,
+            reduction,
+            input_resolution,
+        })
+    }
+
+    fn forward(&self, hidden: &Tensor) -> Result<Tensor, EncoderError> {
+        let (b, _l, c) = hidden.dims3()?;
+        let (h, w) = self.input_resolution;
+        // [B, H, W, C] -> [B, H/2, 2, W/2, 2, C] for strided ::2 slicing.
+        let x = hidden.reshape((b, h / 2, 2, w / 2, 2, c))?.contiguous()?;
+        // f0=(0,0), f1=(1,0), f2=(0,1), f3=(1,1) on (row-parity, col-parity).
+        let pick = |kr: usize, kc: usize| -> Result<Tensor, EncoderError> {
+            Ok(x.i((.., .., kr, .., kc, ..))?.contiguous()?)
+        };
+        let f0 = pick(0, 0)?;
+        let f1 = pick(1, 0)?;
+        let f2 = pick(0, 1)?;
+        let f3 = pick(1, 1)?;
+        let cat = Tensor::cat(&[f0, f1, f2, f3], D::Minus1)?; // [B, H/2, W/2, 4C]
+        let cat = cat.reshape((b, (h / 2) * (w / 2), 4 * c))?;
+        let cat = self.norm.forward(&cat)?;
+        Ok(self.reduction.forward(&cat)?)
+    }
+}
+
+/// One hierarchical Swin stage: `depth` blocks then an optional downsample.
+struct SwinStage {
+    blocks: Vec<SwinBlock>,
+    downsample: Option<PatchMerging>,
+}
+
+impl SwinStage {
+    #[allow(clippy::too_many_arguments)]
+    fn load(
+        vb: VarBuilder,
+        config: &HtsatAudioConfig,
+        dim: usize,
+        num_heads: usize,
+        depth: usize,
+        input_resolution: (usize, usize),
+        has_downsample: bool,
+        device: &candle_core::Device,
+    ) -> Result<Self, EncoderError> {
+        let blocks_vb = vb.pp("blocks");
+        let mut blocks = Vec::with_capacity(depth);
+        for i in 0..depth {
+            blocks.push(SwinBlock::load(
+                blocks_vb.pp(i),
+                config,
+                dim,
+                num_heads,
+                input_resolution,
+                i,
+                device,
+            )?);
+        }
+        let downsample = if has_downsample {
+            Some(PatchMerging::load(
+                vb.pp("downsample"),
+                config,
+                dim,
+                input_resolution,
+            )?)
+        } else {
+            None
+        };
+        Ok(Self { blocks, downsample })
+    }
+}
+
+/// HTSAT-Swin CLAP audio encoder — front half (through `patch_embed`) plus the
+/// full Swin spine, final LayerNorm, and group-2D pooling.
 ///
 /// `forward_front` runs the batch-norm → bicubic time-resample →
 /// `reshape_mel2img` → fused patch-embed pipeline and returns the patch
 /// embeddings `[B, num_patches, patch_embeds_hidden_size]` together with the
-/// intermediate boundaries that the parity harness gates on.
+/// intermediate boundaries that the parity harness gates on. `forward_spine`
+/// continues from the patch embeddings through to the pooled `[B, hidden_size]`.
 pub struct HtsatAudioEncoder {
     batch_norm: BatchNorm,
     time_interp: TimeInterp,
     patch_embed: HtsatPatchEmbed,
+    stages: Vec<SwinStage>,
+    norm: LayerNorm,
     freq_ratio: usize,
     spec_width: usize,
+    /// First-stage patch grid resolution `(height, width)`.
+    grid: (usize, usize),
+    num_stages: usize,
+    patch_stride: [usize; 2],
 }
 
 /// The per-boundary activations produced while running the front half, captured
@@ -503,12 +899,41 @@ impl HtsatAudioEncoder {
         let spec_width = config.spec_size * freq_ratio;
         let patch_embed = HtsatPatchEmbed::load(vb.pp("patch_embed"), config)?;
 
+        // First-stage patch grid: spec_size / patch_stride per axis.
+        let grid = (
+            config.spec_size / config.patch_stride[0],
+            config.spec_size / config.patch_stride[1],
+        );
+        let num_stages = config.num_stages();
+        let layers_vb = vb.pp("layers");
+        let mut stages = Vec::with_capacity(num_stages);
+        for i in 0..num_stages {
+            let dim = config.patch_embeds_hidden_size << i;
+            let input_resolution = (grid.0 >> i, grid.1 >> i);
+            stages.push(SwinStage::load(
+                layers_vb.pp(i),
+                config,
+                dim,
+                config.num_attention_heads[i],
+                config.depths[i],
+                input_resolution,
+                i < num_stages - 1,
+                device,
+            )?);
+        }
+        let norm = layer_norm(config.hidden_size, config.layer_norm_eps, vb.pp("norm"))?;
+
         Ok(Self {
             batch_norm,
             time_interp: TimeInterp::new(spec_width, 500, device),
             patch_embed,
+            stages,
+            norm,
             freq_ratio,
             spec_width,
+            grid,
+            num_stages,
+            patch_stride: config.patch_stride,
         })
     }
 
@@ -559,6 +984,198 @@ impl HtsatAudioEncoder {
             fusion_model_out,
             patch_embed_out,
         })
+    }
+
+    /// Run the Swin spine from the patch embeddings `[B, num_patches, C0]`
+    /// through the final LayerNorm and group-2D pooling, capturing every gated
+    /// boundary. `frames_num` is the spatial height of `post_reshape_mel2img`
+    /// (the post-fold image side fed to `patch_embed`); it drives the pooling
+    /// reshape (= `spec_size` for the standard config).
+    pub fn forward_spine(
+        &self,
+        patch_embed_out: &Tensor,
+        frames_num: usize,
+    ) -> Result<Spine, EncoderError> {
+        let mut blocks: Vec<Vec<Tensor>> = Vec::with_capacity(self.num_stages);
+        let mut downsamples: Vec<Option<Tensor>> = Vec::with_capacity(self.num_stages);
+
+        let mut hidden = patch_embed_out.clone();
+        for stage in &self.stages {
+            let mut stage_blocks = Vec::with_capacity(stage.blocks.len());
+            for block in &stage.blocks {
+                hidden = block.forward(&hidden)?;
+                stage_blocks.push(hidden.clone());
+            }
+            blocks.push(stage_blocks);
+            match &stage.downsample {
+                Some(ds) => {
+                    hidden = ds.forward(&hidden)?;
+                    downsamples.push(Some(hidden.clone()));
+                }
+                None => downsamples.push(None),
+            }
+        }
+
+        let final_norm_out = self.norm.forward(&hidden)?;
+
+        // Group-2D pooling: permute to channel-first, fold the spatial plane into
+        // freq/temporal, regroup by `c_freq_bin`, then adaptive-avg-pool to [B, C].
+        let (batch, _l, n_channels) = final_norm_out.dims3()?;
+        let pow = 2usize.pow((self.num_stages - 1) as u32);
+        let freq_shape = frames_num / pow / self.patch_stride[0];
+        let temporal_shape = frames_num / pow / self.patch_stride[1];
+        let c_freq_bin = freq_shape / self.freq_ratio;
+
+        let h = final_norm_out.permute((0, 2, 1))?.contiguous()?.reshape((
+            batch,
+            n_channels,
+            freq_shape,
+            temporal_shape,
+        ))?;
+        let h = h.reshape((
+            batch,
+            n_channels,
+            freq_shape / c_freq_bin,
+            c_freq_bin,
+            temporal_shape,
+        ))?;
+        let pre_pool = h.permute((0, 1, 3, 2, 4))?.contiguous()?.reshape((
+            batch,
+            n_channels,
+            c_freq_bin,
+            freq_shape / c_freq_bin * temporal_shape,
+        ))?;
+
+        // AdaptiveAvgPool1d(1) over the flattened spatial tail.
+        let pooler_out = pre_pool.flatten_from(2)?.mean(D::Minus1)?;
+
+        Ok(Spine {
+            blocks,
+            downsamples,
+            final_norm_out,
+            pre_pool,
+            pooler_out,
+        })
+    }
+
+    /// First-stage patch grid resolution `(height, width)`.
+    pub fn grid(&self) -> (usize, usize) {
+        self.grid
+    }
+}
+
+/// The per-boundary activations produced while running the Swin spine, captured
+/// so the parity harness can gate every unit against its golden. `blocks[s][b]`
+/// is stage `s` block `b`'s output; `downsamples[s]` is stage `s`'s
+/// patch-merging output (`None` for the final stage).
+pub struct Spine {
+    /// `blocks[stage][block]` block outputs `[B, L, C]`.
+    pub blocks: Vec<Vec<Tensor>>,
+    /// `downsamples[stage]` patch-merging output (`None` for the last stage).
+    pub downsamples: Vec<Option<Tensor>>,
+    /// `[B, num_patches_final, hidden_size]` after the final LayerNorm.
+    pub final_norm_out: Tensor,
+    /// `[B, hidden_size, c_freq_bin, *]` regrouped pre-pool tensor.
+    pub pre_pool: Tensor,
+    /// `[B, hidden_size]` pooled audio descriptor.
+    pub pooler_out: Tensor,
+}
+
+/// The CLAP audio projection head: `linear1 → act → linear2`, then L2-normalize.
+pub struct ClapAudioProjection {
+    linear1: Linear,
+    linear2: Linear,
+    act: String,
+}
+
+impl ClapAudioProjection {
+    /// Build from a root-scoped [`VarBuilder`] (projection lives at
+    /// `audio_projection.*`, a sibling of `audio_model`).
+    pub fn load(vb: VarBuilder, config: &HtsatAudioConfig) -> Result<Self, EncoderError> {
+        let linear1 = linear(config.hidden_size, config.projection_dim, vb.pp("linear1"))?;
+        let linear2 = linear(
+            config.projection_dim,
+            config.projection_dim,
+            vb.pp("linear2"),
+        )?;
+        Ok(Self {
+            linear1,
+            linear2,
+            act: config.projection_hidden_act.clone(),
+        })
+    }
+
+    /// Project `[B, hidden_size]` to the unnormalized latent `[B, projection_dim]`.
+    pub fn forward_unnormalized(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
+        let x = self.linear1.forward(x)?;
+        let x = match self.act.as_str() {
+            "relu" => x.relu()?,
+            "gelu" => x.gelu_erf()?,
+            other => {
+                return Err(EncoderError::Config(format!(
+                    "unsupported projection activation '{other}'"
+                )))
+            }
+        };
+        Ok(self.linear2.forward(&x)?)
+    }
+}
+
+/// L2-normalize each row of a `[B, D]` tensor along the last axis
+/// (`F.normalize(p=2, dim=-1, eps=1e-12)`).
+pub fn l2_normalize(t: &Tensor) -> Result<Tensor, EncoderError> {
+    let norm = t
+        .sqr()?
+        .sum_keepdim(D::Minus1)?
+        .sqrt()?
+        .clamp(1e-12, f32::MAX)?;
+    Ok(t.broadcast_div(&norm)?)
+}
+
+/// The full HTSAT-Swin CLAP audio tower: encoder spine + projection head,
+/// returning the L2-normalized shared-latent embedding.
+pub struct HtsatAudio {
+    encoder: HtsatAudioEncoder,
+    projection: ClapAudioProjection,
+}
+
+impl HtsatAudio {
+    /// Build the full tower from a root-scoped [`VarBuilder`] (the safetensors
+    /// root holding both `audio_model` and `audio_projection`).
+    pub fn load(
+        vb: VarBuilder,
+        config: &HtsatAudioConfig,
+        device: &candle_core::Device,
+    ) -> Result<Self, EncoderError> {
+        let encoder =
+            HtsatAudioEncoder::load(vb.pp("audio_model").pp("audio_encoder"), config, device)?;
+        let projection = ClapAudioProjection::load(vb.pp("audio_projection"), config)?;
+        Ok(Self {
+            encoder,
+            projection,
+        })
+    }
+
+    /// Borrow the underlying encoder (for boundary-level parity checks).
+    pub fn encoder(&self) -> &HtsatAudioEncoder {
+        &self.encoder
+    }
+
+    /// Borrow the projection head (for boundary-level parity checks).
+    pub fn projection(&self) -> &ClapAudioProjection {
+        &self.projection
+    }
+
+    /// Full forward on `input_features` `[B, 4, 500, num_mel_bins]`, returning
+    /// the L2-normalized audio embedding `[B, projection_dim]`.
+    pub fn forward(&self, input_features: &Tensor) -> Result<Tensor, EncoderError> {
+        let front = self.encoder.forward_front(input_features)?;
+        let frames_num = front.post_reshape_mel2img.dim(2)?;
+        let spine = self
+            .encoder
+            .forward_spine(&front.patch_embed_out, frames_num)?;
+        let unnorm = self.projection.forward_unnormalized(&spine.pooler_out)?;
+        l2_normalize(&unnorm)
     }
 }
 

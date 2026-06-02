@@ -10,6 +10,7 @@ pub mod eval;
 pub mod evidence;
 pub mod fine_tune;
 pub mod inference;
+pub mod jammi;
 pub mod local_session;
 pub mod model;
 pub mod operator;
@@ -35,6 +36,11 @@ pub mod remote_session;
 /// The transport-agnostic consumer surface: a closed `enum` over session
 /// transports, with the in-process [`local_session::LocalSession`] behind it.
 pub use local_session::{LocalSession, Modality, QueryInput, SearchQuery, SearchRequest, Session};
+
+/// The SDK front door: [`jammi::Jammi::open`] opens a [`Session`] against a
+/// [`jammi::Target`], selecting the embedded (`Local`) or — under `wire` — the
+/// remote (`Remote`) transport in one call.
+pub use jammi::{Jammi, Target};
 
 /// The remote transport behind the [`Session`] enum's `wire`-gated `Remote`
 /// arm.

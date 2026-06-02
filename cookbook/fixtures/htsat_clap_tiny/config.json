@@ -1,0 +1,48 @@
+{
+  "aff_block_r": 4,
+  "architectures": [
+    "ClapAudioModelWithProjection"
+  ],
+  "attention_probs_dropout_prob": 0.0,
+  "depths": [
+    2,
+    2,
+    2,
+    2
+  ],
+  "drop_path_rate": 0.0,
+  "dtype": "float32",
+  "enable_fusion": true,
+  "enable_patch_layer_norm": true,
+  "flatten_patch_embeds": true,
+  "fusion_type": null,
+  "hidden_act": "gelu",
+  "hidden_dropout_prob": 0.1,
+  "hidden_size": 128,
+  "initializer_factor": 1.0,
+  "layer_norm_eps": 1e-05,
+  "mlp_ratio": 2.0,
+  "model_type": "clap_audio_model",
+  "num_attention_heads": [
+    2,
+    2,
+    4,
+    4
+  ],
+  "num_classes": 527,
+  "num_hidden_layers": 4,
+  "num_mel_bins": 32,
+  "patch_embed_input_channels": 1,
+  "patch_embeds_hidden_size": 16,
+  "patch_size": 4,
+  "patch_stride": [
+    4,
+    4
+  ],
+  "projection_dim": 8,
+  "projection_hidden_act": "relu",
+  "qkv_bias": true,
+  "spec_size": 128,
+  "transformers_version": "4.57.6",
+  "window_size": 4
+}

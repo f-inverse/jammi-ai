@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// Result of one `eval_embeddings` invocation. Carries the mean over all
 /// queries (`aggregate.recall_at_k`, etc.) and the per-query records that
 /// sample-based statistical rules consume at gate time.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingEvalReport {
     /// The catalog id of the recorded run. The same id keys the persisted
     /// per-query rows (`_jammi_eval_per_query`), so a caller can read them
@@ -134,7 +134,7 @@ pub struct AggregateDelta {
 
 /// Single-metric delta: `absolute = model - baseline`, `relative = absolute /
 /// baseline` (or `0.0` when the baseline is zero).
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct MetricDelta {
     pub absolute: f64,
     pub relative: f64,

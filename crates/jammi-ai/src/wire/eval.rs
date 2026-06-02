@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
+use jammi_db::error::JammiError;
 use jammi_numerics::classification::{ClassMetrics, ClassificationResult};
 use jammi_numerics::ner::{Entity, NerMetrics, TypeMetrics};
 use jammi_numerics::retrieval::{AggregateMetrics, QueryMetrics};
@@ -309,9 +310,24 @@ impl From<CompareEvalReport> for pb::CompareEvalReport {
 // the wire and rebuilds the engine report struct so `Session::Remote` returns
 // the identical type `Session::Local` does. Each decode mirrors its encode
 // field for field; the report structs and the metric structs are local crates,
-// so these `From` impls are orphan-rule-clean without a newtype. A `None` on a
-// required nested message (a malformed payload) rebuilds the zero value for that
-// metric block rather than panicking — decode stays total.
+// so these impls are orphan-rule-clean without a newtype.
+//
+// A field that proto3 represents as a nested *message* but the engine domain
+// requires (a metric block the server always populates) decodes through a
+// fallible `TryFrom`: a `None` there is only reachable on a corrupt or
+// incompatible wire payload, and fabricating the zero value (recall = 0.0, …)
+// would hand a consumer plausible-wrong result data it cannot distinguish from
+// a real score. At the network boundary the right idiom is to propagate the
+// error as a value — [`malformed`] builds a [`JammiError::Eval`] naming the
+// missing field, and the [`crate::RemoteSession`] eval verb returns it as the
+// call's `Err`. Scalar proto3 primitives keep their proto-default (0 / "");
+// only required nested messages reject. Genuinely-optional fields
+// ([`TableEvalReport::delta`], `None` for the compare baseline) stay `Option`.
+
+/// Build the decode error for a required nested message that arrived `None`.
+fn malformed(field: &str) -> JammiError {
+    JammiError::Eval(format!("malformed eval report: missing {field}"))
+}
 
 impl From<pb::AggregateMetrics> for AggregateMetrics {
     fn from(a: pb::AggregateMetrics) -> Self {
@@ -335,11 +351,16 @@ impl From<pb::QueryMetrics> for QueryMetrics {
     }
 }
 
-impl From<pb::PerQueryRecord> for PerQueryRecord {
-    fn from(r: pb::PerQueryRecord) -> Self {
-        PerQueryRecord {
+impl TryFrom<pb::PerQueryRecord> for PerQueryRecord {
+    type Error = JammiError;
+
+    fn try_from(r: pb::PerQueryRecord) -> Result<Self, Self::Error> {
+        Ok(PerQueryRecord {
             query_id: r.query_id,
-            metrics: r.metrics.map(Into::into).unwrap_or_default(),
+            metrics: r
+                .metrics
+                .map(Into::into)
+                .ok_or_else(|| malformed("PerQueryRecord.metrics"))?,
             recall_at_ks: r
                 .recall_at_ks
                 .into_iter()
@@ -347,17 +368,26 @@ impl From<pb::PerQueryRecord> for PerQueryRecord {
                 .collect(),
             distance: r.distance,
             cohorts: r.cohorts.into_iter().collect(),
-        }
+        })
     }
 }
 
-impl From<pb::EmbeddingEvalReport> for EmbeddingEvalReport {
-    fn from(report: pb::EmbeddingEvalReport) -> Self {
-        EmbeddingEvalReport {
+impl TryFrom<pb::EmbeddingEvalReport> for EmbeddingEvalReport {
+    type Error = JammiError;
+
+    fn try_from(report: pb::EmbeddingEvalReport) -> Result<Self, Self::Error> {
+        Ok(EmbeddingEvalReport {
             eval_run_id: report.eval_run_id,
-            aggregate: report.aggregate.map(Into::into).unwrap_or_default(),
-            per_query: report.per_query.into_iter().map(Into::into).collect(),
-        }
+            aggregate: report
+                .aggregate
+                .map(Into::into)
+                .ok_or_else(|| malformed("EmbeddingEvalReport.aggregate"))?,
+            per_query: report
+                .per_query
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+        })
     }
 }
 
@@ -430,53 +460,60 @@ impl From<pb::Entity> for Entity {
     }
 }
 
-impl From<pb::InferenceAggregate> for InferenceAggregate {
-    fn from(a: pb::InferenceAggregate) -> Self {
+impl TryFrom<pb::InferenceAggregate> for InferenceAggregate {
+    type Error = JammiError;
+
+    fn try_from(a: pb::InferenceAggregate) -> Result<Self, Self::Error> {
         use pb::inference_aggregate::Aggregate;
         match a.aggregate {
-            Some(Aggregate::Classification(c)) => InferenceAggregate::Classification(c.into()),
-            Some(Aggregate::Ner(n)) => InferenceAggregate::Ner(n.into()),
-            // A report with no aggregate is a malformed payload; the engine
-            // never emits one. Rebuild an empty classification result rather
-            // than panic — decode is total.
-            None => InferenceAggregate::Classification(ClassificationResult::default()),
+            Some(Aggregate::Classification(c)) => Ok(InferenceAggregate::Classification(c.into())),
+            Some(Aggregate::Ner(n)) => Ok(InferenceAggregate::Ner(n.into())),
+            // An aggregate with no variant is only reachable on a corrupt
+            // payload; the engine always tags one. Reject rather than fabricate
+            // an empty result a gate would read as a real score.
+            None => Err(malformed("InferenceAggregate.aggregate")),
         }
     }
 }
 
-impl From<pb::PerRecordPrediction> for PerRecordPrediction {
-    fn from(p: pb::PerRecordPrediction) -> Self {
+impl TryFrom<pb::PerRecordPrediction> for PerRecordPrediction {
+    type Error = JammiError;
+
+    fn try_from(p: pb::PerRecordPrediction) -> Result<Self, Self::Error> {
         use pb::per_record_prediction::Prediction;
         match p.prediction {
-            Some(Prediction::Classification(c)) => PerRecordPrediction::Classification {
+            Some(Prediction::Classification(c)) => Ok(PerRecordPrediction::Classification {
                 record_id: c.record_id,
                 predicted: c.predicted,
                 gold: c.gold,
-            },
-            Some(Prediction::Ner(n)) => PerRecordPrediction::Ner {
+            }),
+            Some(Prediction::Ner(n)) => Ok(PerRecordPrediction::Ner {
                 record_id: n.record_id,
                 predicted: n.predicted.into_iter().map(Into::into).collect(),
                 gold: n.gold.into_iter().map(Into::into).collect(),
-            },
-            // A prediction with no variant is a malformed payload; the engine
-            // never emits one. Rebuild an empty classification record.
-            None => PerRecordPrediction::Classification {
-                record_id: String::new(),
-                predicted: String::new(),
-                gold: String::new(),
-            },
+            }),
+            // A prediction with no variant is only reachable on a corrupt
+            // payload; the engine always tags one.
+            None => Err(malformed("PerRecordPrediction.prediction")),
         }
     }
 }
 
-impl From<pb::InferenceEvalReport> for InferenceEvalReport {
-    fn from(report: pb::InferenceEvalReport) -> Self {
-        InferenceEvalReport {
-            aggregate: report.aggregate.map(Into::into).unwrap_or_else(|| {
-                InferenceAggregate::Classification(ClassificationResult::default())
-            }),
-            per_record: report.per_record.into_iter().map(Into::into).collect(),
-        }
+impl TryFrom<pb::InferenceEvalReport> for InferenceEvalReport {
+    type Error = JammiError;
+
+    fn try_from(report: pb::InferenceEvalReport) -> Result<Self, Self::Error> {
+        Ok(InferenceEvalReport {
+            aggregate: report
+                .aggregate
+                .ok_or_else(|| malformed("InferenceEvalReport.aggregate"))?
+                .try_into()?,
+            per_record: report
+                .per_record
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+        })
     }
 }
 
@@ -489,31 +526,219 @@ impl From<pb::MetricDelta> for MetricDelta {
     }
 }
 
-impl From<pb::AggregateDelta> for AggregateDelta {
-    fn from(d: pb::AggregateDelta) -> Self {
-        AggregateDelta {
-            recall_at_k: d.recall_at_k.map(Into::into).unwrap_or_default(),
-            precision_at_k: d.precision_at_k.map(Into::into).unwrap_or_default(),
-            mrr: d.mrr.map(Into::into).unwrap_or_default(),
-            ndcg: d.ndcg.map(Into::into).unwrap_or_default(),
-        }
+impl TryFrom<pb::AggregateDelta> for AggregateDelta {
+    type Error = JammiError;
+
+    fn try_from(d: pb::AggregateDelta) -> Result<Self, Self::Error> {
+        Ok(AggregateDelta {
+            recall_at_k: d
+                .recall_at_k
+                .map(Into::into)
+                .ok_or_else(|| malformed("AggregateDelta.recall_at_k"))?,
+            precision_at_k: d
+                .precision_at_k
+                .map(Into::into)
+                .ok_or_else(|| malformed("AggregateDelta.precision_at_k"))?,
+            mrr: d
+                .mrr
+                .map(Into::into)
+                .ok_or_else(|| malformed("AggregateDelta.mrr"))?,
+            ndcg: d
+                .ndcg
+                .map(Into::into)
+                .ok_or_else(|| malformed("AggregateDelta.ndcg"))?,
+        })
     }
 }
 
-impl From<pb::TableEvalReport> for TableEvalReport {
-    fn from(t: pb::TableEvalReport) -> Self {
-        TableEvalReport {
+impl TryFrom<pb::TableEvalReport> for TableEvalReport {
+    type Error = JammiError;
+
+    fn try_from(t: pb::TableEvalReport) -> Result<Self, Self::Error> {
+        Ok(TableEvalReport {
             table_name: t.table_name,
-            embedding_eval: t.embedding_eval.map(Into::into).unwrap_or_default(),
-            delta: t.delta.map(Into::into),
-        }
+            embedding_eval: t
+                .embedding_eval
+                .ok_or_else(|| malformed("TableEvalReport.embedding_eval"))?
+                .try_into()?,
+            // `delta` is genuinely optional: `None` is the compare baseline,
+            // not a corrupt payload.
+            delta: t.delta.map(TryInto::try_into).transpose()?,
+        })
     }
 }
 
-impl From<pb::CompareEvalReport> for CompareEvalReport {
-    fn from(report: pb::CompareEvalReport) -> Self {
-        CompareEvalReport {
-            per_table: report.per_table.into_iter().map(Into::into).collect(),
+impl TryFrom<pb::CompareEvalReport> for CompareEvalReport {
+    type Error = JammiError;
+
+    fn try_from(report: pb::CompareEvalReport) -> Result<Self, Self::Error> {
+        Ok(CompareEvalReport {
+            per_table: report
+                .per_table
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Decode-side rejection of corrupt payloads. The engine always populates
+    //! every required nested metric block, so a `None` there is only reachable
+    //! on a corrupt/incompatible wire payload: the decode must reject it as an
+    //! `Err`, never fabricate a zeroed report a consumer would read as a real
+    //! score. The happy path (every block present) is exercised end-to-end by
+    //! the `grpc_remote_compute` round-trip integration test.
+
+    use super::*;
+
+    fn populated_aggregate() -> pb::AggregateMetrics {
+        pb::AggregateMetrics {
+            recall_at_k: 0.8,
+            precision_at_k: 0.7,
+            mrr: 0.6,
+            ndcg: 0.9,
         }
+    }
+
+    fn populated_query_metrics() -> pb::QueryMetrics {
+        pb::QueryMetrics {
+            recall: 1.0,
+            precision: 1.0,
+            mrr: 1.0,
+            ndcg: 1.0,
+        }
+    }
+
+    fn assert_missing(err: JammiError, field: &str) {
+        match err {
+            JammiError::Eval(msg) => assert_eq!(
+                msg,
+                format!("malformed eval report: missing {field}"),
+                "decode error names the missing field"
+            ),
+            other => panic!("expected JammiError::Eval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn per_query_record_missing_metrics_is_rejected() {
+        let wire = pb::PerQueryRecord {
+            query_id: "q1".into(),
+            metrics: None,
+            recall_at_ks: vec![],
+            distance: 0.0,
+            cohorts: Default::default(),
+        };
+        assert_missing(
+            PerQueryRecord::try_from(wire).expect_err("missing metrics must reject"),
+            "PerQueryRecord.metrics",
+        );
+    }
+
+    #[test]
+    fn embedding_report_missing_aggregate_is_rejected() {
+        let wire = pb::EmbeddingEvalReport {
+            eval_run_id: "run-1".into(),
+            aggregate: None,
+            per_query: vec![],
+        };
+        assert_missing(
+            EmbeddingEvalReport::try_from(wire).expect_err("missing aggregate must reject"),
+            "EmbeddingEvalReport.aggregate",
+        );
+    }
+
+    #[test]
+    fn embedding_report_with_aggregate_decodes() {
+        let wire = pb::EmbeddingEvalReport {
+            eval_run_id: "run-1".into(),
+            aggregate: Some(populated_aggregate()),
+            per_query: vec![pb::PerQueryRecord {
+                query_id: "q1".into(),
+                metrics: Some(populated_query_metrics()),
+                recall_at_ks: vec![pb::RecallAtK { k: 1, recall: 1.0 }],
+                distance: 0.42,
+                cohorts: Default::default(),
+            }],
+        };
+        let report = EmbeddingEvalReport::try_from(wire).expect("a fully populated report decodes");
+        assert_eq!(report.aggregate.recall_at_k, 0.8);
+        assert_eq!(report.per_query.len(), 1);
+        assert_eq!(report.per_query[0].metrics.recall, 1.0);
+    }
+
+    #[test]
+    fn inference_aggregate_with_no_variant_is_rejected() {
+        let wire = pb::InferenceAggregate { aggregate: None };
+        assert_missing(
+            InferenceAggregate::try_from(wire).expect_err("untagged aggregate must reject"),
+            "InferenceAggregate.aggregate",
+        );
+    }
+
+    #[test]
+    fn aggregate_delta_missing_metric_block_is_rejected() {
+        let wire = pb::AggregateDelta {
+            recall_at_k: Some(pb::MetricDelta {
+                absolute: 0.1,
+                relative: 0.2,
+            }),
+            precision_at_k: None,
+            mrr: None,
+            ndcg: None,
+        };
+        assert_missing(
+            AggregateDelta::try_from(wire).expect_err("missing precision delta must reject"),
+            "AggregateDelta.precision_at_k",
+        );
+    }
+
+    #[test]
+    fn table_report_missing_embedding_eval_is_rejected() {
+        let wire = pb::TableEvalReport {
+            table_name: "patents".into(),
+            embedding_eval: None,
+            delta: None,
+        };
+        assert_missing(
+            TableEvalReport::try_from(wire).expect_err("missing embedding_eval must reject"),
+            "TableEvalReport.embedding_eval",
+        );
+    }
+
+    #[test]
+    fn table_report_baseline_keeps_optional_delta_none() {
+        // `delta = None` is the compare baseline, a genuinely-optional field —
+        // it decodes to `None`, not an error, when the required block is present.
+        let wire = pb::TableEvalReport {
+            table_name: "patents".into(),
+            embedding_eval: Some(pb::EmbeddingEvalReport {
+                eval_run_id: "run-1".into(),
+                aggregate: Some(populated_aggregate()),
+                per_query: vec![],
+            }),
+            delta: None,
+        };
+        let report = TableEvalReport::try_from(wire).expect("baseline table decodes");
+        assert!(report.delta.is_none(), "baseline carries no delta");
+    }
+
+    #[test]
+    fn corrupt_inner_table_fails_the_whole_compare_decode() {
+        // A corrupt block nested inside `per_table` propagates out as the
+        // compare decode's error rather than yielding a zeroed table entry.
+        let wire = pb::CompareEvalReport {
+            per_table: vec![pb::TableEvalReport {
+                table_name: "patents".into(),
+                embedding_eval: None,
+                delta: None,
+            }],
+        };
+        assert_missing(
+            CompareEvalReport::try_from(wire).expect_err("corrupt inner table must reject"),
+            "TableEvalReport.embedding_eval",
+        );
     }
 }

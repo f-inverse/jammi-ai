@@ -346,7 +346,7 @@ impl RemoteSession {
             .await
             .map_err(|s| error_from_status(&s))?
             .into_inner();
-        Ok(resp.into())
+        resp.try_into()
     }
 
     pub(crate) async fn eval_per_query(
@@ -388,7 +388,7 @@ impl RemoteSession {
             .await
             .map_err(|s| error_from_status(&s))?
             .into_inner();
-        Ok(resp.into())
+        resp.try_into()
     }
 
     pub(crate) async fn eval_compare(
@@ -410,7 +410,7 @@ impl RemoteSession {
             .await
             .map_err(|s| error_from_status(&s))?
             .into_inner();
-        Ok(resp.into())
+        resp.try_into()
     }
 
     // --- mutable tables --------------------------------------------------

@@ -58,6 +58,17 @@ metal = ["jammi-ai/metal"]
 # source. CI publishes the OSS image with this feature enabled.
 jetstream-broker = ["jammi-db/jetstream-broker"]
 
+# Cloud object-store backends for source reads / result-table storage, forwarded
+# to jammi-db (which gates each behind object_store's cloud SDKs). The published
+# server image enables `storage-cloud` so it is deployment-agnostic — it reads
+# r2:// / s3:// / gs:// / azure:// sources without a rebuild. Individual features
+# let a deployer compile in only the cloud they use.
+storage-s3 = ["jammi-db/storage-s3"]
+storage-gcs = ["jammi-db/storage-gcs"]
+storage-azure = ["jammi-db/storage-azure"]
+storage-r2 = ["jammi-db/storage-r2"]
+storage-cloud = ["jammi-db/storage-cloud"]
+
 [dev-dependencies]
 tokio.workspace = true
 reqwest.workspace = true

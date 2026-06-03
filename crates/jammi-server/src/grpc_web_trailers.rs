@@ -14,9 +14,15 @@
 //! sent together with response headers, with no message in the body" describes
 //! the *wire-format* a compliant client must still read in-body). Connect-ES
 //! enforces this strictly and has no opt-out, so without the in-body frame it
-//! reports `ConnectError [unimplemented] "missing trailer"` for every
+//! reports `ConnectError [unimplemented] "missing message"` for every
 //! detail-bearing engine error — the structured [`jammi_ai::wire`] detail is
 //! lost to the TypeScript / Workers edge.
+//!
+//! This layer only moves the status into the body; the *content* of the
+//! `grpc-status-details-bin` trailer must independently be a spec-compliant
+//! `google.rpc.Status` envelope (built in [`jammi_ai::wire`]) for a gRPC-web
+//! client to surface the typed error rather than read `code == 0` and still
+//! fail the unary read.
 //!
 //! This layer sits *outside* [`tonic_web::GrpcWebLayer`] (added first in the
 //! `ServiceBuilder` chain so it post-processes the gRPC-Web-framed response).

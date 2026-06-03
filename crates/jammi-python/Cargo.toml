@@ -17,7 +17,13 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 jammi-db.workspace = true
-jammi-ai.workspace = true
+# `wire` is enabled here so this crate sees `RemoteSession` and the
+# `Target::Remote` arm of `Jammi::open`: the remote-transport binding
+# (`RemoteDatabase` / `connect_remote`) reuses the one Rust gRPC client rather
+# than hand-rolling a second one. This is the embedded+remote wheel, so it pulls
+# tonic/prost — expected for a remote-capable SDK; the prior "embedded-only,
+# tonic-free wheel" invariant no longer applies.
+jammi-ai = { workspace = true, features = ["wire"] }
 jammi-lora.workspace = true
 pyo3.workspace = true
 arrow.workspace = true
@@ -27,6 +33,7 @@ datafusion.workspace = true
 futures.workspace = true
 pyo3-arrow.workspace = true
 tokio.workspace = true
+tonic.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -35,6 +42,12 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# The remote-binding integration test stands up an in-process gRPC chain
+# (`jammi-server::runtime::serve_grpc_chain`) and connects a `RemoteDatabase` to
+# it, asserting wire parity with the embedded path against the same engine.
+jammi-server.workspace = true
+jammi-test-utils.workspace = true
+tokio.workspace = true
 
 [features]
 # `extension-module` tells pyo3 to skip linking against libpython — the

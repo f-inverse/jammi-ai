@@ -2,7 +2,9 @@
 
 from jammi_ai._native import (
     connect,
+    connect_remote,
     Database,
+    RemoteDatabase,
     SearchBuilder,
     FineTuneJob,
     ModelTask,
@@ -13,7 +15,9 @@ from jammi_ai._native import (
 
 __all__ = [
     "connect",
+    "connect_remote",
     "Database",
+    "RemoteDatabase",
     "SearchBuilder",
     "FineTuneJob",
     "ModelTask",

@@ -6,6 +6,23 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.18.0 — 2026-06-03
+
+### Added
+- `EmbeddingService.ListSources` / `DescribeSource` — source-registry introspection,
+  returning a `SourceDescriptor { source_id, kind, status, result_tables }`. The typed
+  home for "what sources are registered and what's each one's status," so consumers
+  (and downstream tiers) build on the engine instead of reimplementing it. (`DescribeSource`
+  returns `NotFound` for an absent id; the remote surface maps that to `None`.)
+- `SessionService.GetServerInfo` — a capabilities handshake reporting `{ version,
+  features, storage_backends }`, so clients negotiate availability instead of discovering
+  it via a runtime error.
+
+### Changed
+- The wire `ResultTable` is now self-describing — it carries its own `task` (a
+  `jammi.v1.inference.ModelTask`), so `GenerateEmbeddings` and `DescribeSource` share one
+  shape and `result_table_from_proto` no longer needs an out-of-band `modality` argument.
+
 ## v0.17.0 — 2026-06-03
 
 ### Added

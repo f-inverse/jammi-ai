@@ -4,14 +4,16 @@ package jammi.v1.session;
 
 import "google/protobuf/empty.proto";
 
-// SessionService — primitive session-attribute surface for tenant binding
-// from remote clients. Verb vocabulary is closed: SetTenant, GetTenant,
-// ClearTenant. No domain-shaped verbs (per ADR-01 §3.2).
+// SessionService — primitive session-attribute and server-handshake surface
+// for remote clients. Verb vocabulary is closed: SetTenant, GetTenant,
+// ClearTenant, GetServerInfo. No domain-shaped verbs (per ADR-01 §3.2).
 //
-// The service is stateless w.r.t. the engine — calls update an in-process
+// The tenant trio is stateless w.r.t. the engine — calls update an in-process
 // session table that the Tonic TenantInterceptor reads on every downstream
 // gRPC / Flight SQL request and propagates to the engine via the request
-// extension (TenantId).
+// extension (TenantId). GetServerInfo is likewise engine-independent: it
+// reports compile-time facts about the running binary, so it is mounted on
+// this always-present service rather than behind the engine-gated services.
 service SessionService {
   // Bind a tenant for the calling session. Idempotent — calling twice with
   // the same tenant is a no-op. Replacing an existing binding is allowed
@@ -25,6 +27,25 @@ service SessionService {
   // Clear the tenant binding for the calling session. After this returns,
   // subsequent requests on the same session see an unscoped tenant.
   rpc ClearTenant(google.protobuf.Empty) returns (google.protobuf.Empty);
+
+  // Capabilities handshake: the engine's version, the feature flags this
+  // build was compiled with, and the storage backends it can address. Static
+  // per build, tenant-agnostic, and engine-independent.
+  rpc GetServerInfo(google.protobuf.Empty) returns (ServerInfo);
+}
+
+// The engine's self-description, returned by GetServerInfo. Every field is a
+// compile-time fact about the running binary, so a client can negotiate
+// capability without probing each verb.
+message ServerInfo {
+  // The engine version (the `jammi` workspace version, e.g. "0.17.0").
+  string version = 1;
+  // Engine capability feature flags compiled into this build (e.g. "postgres",
+  // "mysql", "jetstream-broker"), sorted.
+  repeated string features = 2;
+  // Storage URL schemes this build can address (always "file" and "memory";
+  // cloud schemes appear when their driver feature is compiled in), sorted.
+  repeated string storage_backends = 3;
 }
 
 // A tenant identifier carried over the wire. UUID v4 / v7 string per ADR-00;

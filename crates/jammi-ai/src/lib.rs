@@ -54,6 +54,14 @@ pub mod remote_session;
 /// transport-neutral and always present.
 pub use local_session::{Modality, QueryInput, SearchQuery, SearchRequest, Session};
 
+/// Engine introspection shapes the [`Session`] surface returns: a per-source
+/// [`SourceDescriptor`] (registry identity joined with its embedding result
+/// tables) and the build's capabilities [`ServerInfo`]. Both originate in the
+/// `jammi-db` substrate (the catalog and the compile-time capability facts) and
+/// are re-exported here so SDK consumers reach them as `jammi_ai::*`.
+pub use jammi_db::catalog::source_repo::SourceDescriptor;
+pub use jammi_db::ServerInfo;
+
 /// The in-process [`Session`] transport, behind the `local` feature with the
 /// embedded engine it drives.
 #[cfg(feature = "local")]

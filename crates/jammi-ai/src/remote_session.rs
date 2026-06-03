@@ -47,11 +47,12 @@ use std::collections::{BTreeMap, HashMap};
 
 use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
 use jammi_db::catalog::result_repo::ResultTableRecord;
+use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
 use jammi_db::trigger::{DeliveredBatch, Offset, Predicate, TopicDefinition, TriggerError};
-use jammi_db::{AuditError, ChannelId, ModelTask, PerQueryAudit, TenantId, TopicId};
+use jammi_db::{AuditError, ChannelId, ModelTask, PerQueryAudit, ServerInfo, TenantId, TopicId};
 
 use crate::eval::{CompareEvalReport, EmbeddingEvalReport, EvalTask, InferenceEvalReport};
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
@@ -65,8 +66,8 @@ use crate::wire::proto::channel::{AddChannelColumnsRequest, RegisterChannelReque
 use crate::wire::proto::embedding::embedding_service_client::EmbeddingServiceClient;
 use crate::wire::proto::embedding::{
     encode_query_request::Input as ProtoEncodeInput, search_request::Query as ProtoSearchQuery,
-    AddSourceRequest, EncodeQueryRequest, GenerateEmbeddingsRequest, QueryVector,
-    RemoveSourceRequest, SearchRequest, SearchResponse,
+    AddSourceRequest, DescribeSourceRequest, EncodeQueryRequest, GenerateEmbeddingsRequest,
+    ListSourcesRequest, QueryVector, RemoveSourceRequest, SearchRequest, SearchResponse,
 };
 use crate::wire::proto::eval as eval_pb;
 use crate::wire::proto::eval::eval_service_client::EvalServiceClient;
@@ -87,8 +88,8 @@ use crate::wire::{
     audit_error_from_status, cohorts_to_proto, columns_to_proto, config_to_proto,
     decode_ipc_stream, decode_subscribed_batch, definition_to_proto, encode_ipc_stream,
     encode_publish_batch, error_from_status, eval_task_to_proto, method_to_proto,
-    model_task_to_proto, record_from_wire, result_table_from_proto, source_type_to_proto,
-    topic_from_proto, trigger_error_from_status, SESSION_HEADER,
+    model_task_to_proto, record_from_wire, result_table_from_proto, source_descriptor_from_proto,
+    source_type_to_proto, topic_from_proto, trigger_error_from_status, SESSION_HEADER,
 };
 use crate::{Modality, QueryInput, SearchQuery, SearchRequest as SessionSearch};
 
@@ -226,6 +227,59 @@ impl RemoteSession {
         Ok(())
     }
 
+    pub(crate) async fn list_sources(&self) -> Result<Vec<SourceDescriptor>> {
+        let resp = self
+            .embedding_client()
+            .list_sources(ListSourcesRequest {})
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        // Each entry rebuilds the same descriptor the in-process path returns;
+        // a corrupt entry surfaces as the faithful status the decoder builds.
+        resp.sources
+            .into_iter()
+            .map(|d| source_descriptor_from_proto(d).map_err(|s| error_from_status(&s)))
+            .collect()
+    }
+
+    pub(crate) async fn describe_source(
+        &self,
+        source_id: &str,
+    ) -> Result<Option<SourceDescriptor>> {
+        // The wire verb returns a `SourceDescriptor` for a present source and a
+        // `NotFound` status for an absent one; the remote arm maps that one
+        // status code back to `None` so the verb's `Option` shape matches the
+        // in-process path, while any other failure decodes to its faithful
+        // `JammiError`.
+        match self
+            .embedding_client()
+            .describe_source(DescribeSourceRequest {
+                source_id: source_id.to_string(),
+            })
+            .await
+        {
+            Ok(resp) => source_descriptor_from_proto(resp.into_inner())
+                .map(Some)
+                .map_err(|s| error_from_status(&s)),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(status) => Err(error_from_status(&status)),
+        }
+    }
+
+    pub(crate) async fn server_info(&self) -> Result<ServerInfo> {
+        let resp = self
+            .session_client()
+            .get_server_info(())
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        Ok(ServerInfo {
+            version: resp.version,
+            features: resp.features,
+            storage_backends: resp.storage_backends,
+        })
+    }
+
     // --- embeddings ------------------------------------------------------
 
     pub(crate) async fn generate_embeddings(
@@ -248,7 +302,10 @@ impl RemoteSession {
             .await
             .map_err(|s| error_from_status(&s))?
             .into_inner();
-        Ok(result_table_from_proto(table, modality))
+        // The wire `ResultTable` is self-describing in `task`, so the
+        // reconstruction recovers it from the message rather than from the
+        // requested modality; a corrupt task surfaces as the faithful status.
+        result_table_from_proto(table).map_err(|s| error_from_status(&s))
     }
 
     pub(crate) async fn encode_query(

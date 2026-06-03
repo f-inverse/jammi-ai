@@ -43,8 +43,8 @@ mod trigger;
 pub use audit::{parse_query_id, record_from_wire};
 pub use channel::{columns_from_proto, columns_to_proto, parse_channel_id};
 pub use embedding::{
-    embedding_task_for, result_table_from_proto, source_type_from_proto, source_type_to_proto,
-    ProtoQueryInput,
+    result_table_from_proto, source_descriptor_from_proto, source_type_from_proto,
+    source_type_to_proto, ProtoQueryInput,
 };
 pub use error::{
     attach_audit_detail, attach_error_detail, attach_trigger_detail, audit_error_from_status,

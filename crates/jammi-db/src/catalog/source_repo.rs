@@ -2,7 +2,30 @@ use crate::error::{JammiError, Result};
 use crate::source::{SourceConnection, SourceType};
 
 use super::backend::{SqlValue, TxOptions};
+use super::result_repo::ResultTableRecord;
 use super::Catalog;
+
+/// Registry introspection for one registered source: its registration identity
+/// joined with the embedding result tables produced out of it.
+///
+/// The descriptor holds no copy of the embedding numbers: `source_id` /
+/// `source_type` / `status` come from the [`SourceRecord`], and the embedding
+/// `status` / `row_count` / `dimensions` ride on the [`ResultTableRecord`]s in
+/// `result_tables` — the same records [`Catalog::find_result_tables`] and a
+/// `generate_embeddings` call return, so there is one source-of-truth for those
+/// numbers rather than a parallel registry.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SourceDescriptor {
+    /// The source's stable id.
+    pub source_id: String,
+    /// The storage backend the source was registered with.
+    pub source_type: SourceType,
+    /// Registration lifecycle status from the source catalog (e.g. `"active"`).
+    pub status: String,
+    /// Every embedding result table produced from this source, in registration
+    /// order. Empty until a `generate_embeddings` call persists one.
+    pub result_tables: Vec<ResultTableRecord>,
+}
 
 /// Materialized row from the `sources` catalog table.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -127,6 +150,50 @@ impl Catalog {
             )
             .await?;
         raws.into_iter().map(parse_source_row).collect()
+    }
+
+    /// Describe one registered source: its registry record joined with the
+    /// embedding result tables produced from it. Tenant-scoped (own rows plus
+    /// globally-scoped). Returns `None` when no source with that id is visible
+    /// to the session's tenant.
+    ///
+    /// The result tables carry the embedding `status` / `row_count` /
+    /// `dimensions` — read from [`Self::find_result_tables`], the same records
+    /// `generate_embeddings` returns — so the descriptor reports those numbers
+    /// from their source-of-truth rather than a parallel store.
+    pub async fn describe_source(&self, source_id: &str) -> Result<Option<SourceDescriptor>> {
+        let record = match self.get_source(source_id).await? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        Ok(Some(self.descriptor_for(record).await?))
+    }
+
+    /// Describe every source visible to the session's tenant, in registration
+    /// order. This is [`Self::describe_source`] applied over [`Self::list_sources`]
+    /// — one descriptor shape, one operator, no per-source special-casing.
+    pub async fn list_source_descriptors(&self) -> Result<Vec<SourceDescriptor>> {
+        let records = self.list_sources().await?;
+        let mut descriptors = Vec::with_capacity(records.len());
+        for record in records {
+            descriptors.push(self.descriptor_for(record).await?);
+        }
+        Ok(descriptors)
+    }
+
+    /// Join one [`SourceRecord`] with its embedding result tables into a
+    /// [`SourceDescriptor`]. The single operator both descriptor verbs descend
+    /// through.
+    async fn descriptor_for(&self, record: SourceRecord) -> Result<SourceDescriptor> {
+        let result_tables = self
+            .find_result_tables(&record.source_id, None, None)
+            .await?;
+        Ok(SourceDescriptor {
+            source_id: record.source_id,
+            source_type: record.source_type,
+            status: record.status,
+            result_tables,
+        })
     }
 
     /// Remove a source from the catalog. Scoped to the session's tenant —

@@ -6,6 +6,27 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.16.0 — 2026-06-03
+
+### Added
+
+- **Python remote sessions.** `jammi_ai.connect_remote(endpoint=…)` returns a
+  `RemoteDatabase` that drives the engine over gRPC via the single Rust
+  `RemoteSession` — the Python SDK can now run jammi in a remote deployment, not
+  just embedded. The wheel gains the gRPC client; embedded use is unchanged.
+- **Cloud storage in the published server image.** The `jammi-ai-server` image
+  is built with the `r2`/`s3`/`gcs`/`azure` object-store backends enabled, so it
+  reads `r2://` / `s3://` / `gs://` / `azure://` sources out of the box — no
+  rebuild. (The default library build keeps these features opt-in for embedders.)
+
+### Fixed
+
+- **gRPC-web typed errors reach Connect clients.** Engine errors over gRPC-web
+  now carry a canonical `google.rpc.Status` envelope (the typed detail as its
+  `Any`), so a Connect-ES client surfaces the real status + message + detail
+  instead of `"missing message"` for a trailers-only unary error. Raw gRPC /
+  Flight SQL / success responses are unaffected.
+
 ## v0.15.0 — 2026-06-03
 
 ### Added

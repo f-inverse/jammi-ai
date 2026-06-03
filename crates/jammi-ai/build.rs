@@ -35,6 +35,17 @@ fn generate() {
     }
     println!("cargo:rerun-if-changed=proto");
 
+    // Generate `prost::Name` for every message, with the standard
+    // `type.googleapis.com` domain. The error-wire path packs a typed detail
+    // into a `google.rpc.Status.details` `Any`, whose `type_url` must be the
+    // canonical `type.googleapis.com/<full.name>` a gRPC-web client (and the
+    // gRPC rich-error spec) expects; `Name::type_url()` supplies exactly that.
+    // These are `prost_build::Config` knobs, so they ride a `compile_with_config`
+    // rather than the tonic `Builder` surface.
+    let mut config = tonic_prost_build::Config::new();
+    config.enable_type_names();
+    config.type_name_domain(["."], "type.googleapis.com");
+
     tonic_prost_build::configure()
         // Both client and server stubs are built: the server stubs back
         // `jammi-server`'s service impls; the client stubs back the integration-
@@ -42,7 +53,8 @@ fn generate() {
         // server, and a future `RemoteSession` in this crate.
         .build_client(true)
         .build_server(true)
-        .compile_protos(
+        .compile_with_config(
+            config,
             &proto_files
                 .iter()
                 .map(|p| p.to_str().unwrap())

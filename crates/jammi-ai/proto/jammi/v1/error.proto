@@ -2,6 +2,31 @@ syntax = "proto3";
 
 package jammi.v1.error;
 
+import "google/protobuf/any.proto";
+
+// RpcStatus — the canonical `google.rpc.Status` wire shape (field numbers and
+// types identical to `google/rpc/status.proto`), defined here so the engine
+// emits a *spec-compliant* `grpc-status-details-bin` without taking a
+// `tonic-types` / `googleapis` dependency for one three-field message.
+//
+// The gRPC rich-error contract — which every gRPC-web client (Connect-ES,
+// grpc-web) and the canonical spec assume — requires `grpc-status-details-bin`
+// to carry a serialized `google.rpc.Status` whose `code` mirrors the
+// `grpc-status` trailer and whose `details` is a list of `Any`. tonic's
+// `Status::with_details` writes the raw `details` bytes verbatim into the
+// header, so the engine must construct this envelope itself: a bare
+// `JammiErrorDetail` in the header has no `code` field, and a gRPC-web client
+// reading it as a `google.rpc.Status` sees `code == 0` (success) and then fails
+// the unary read with "missing message". The engine packs its typed detail
+// (`JammiErrorDetail` / `TriggerErrorDetail` / `AuditErrorDetail`) as the single
+// `Any` in `details`, so both the spec-compliant code/message AND the faithful
+// typed detail cross the wire.
+message RpcStatus {
+  int32 code = 1;
+  string message = 2;
+  repeated google.protobuf.Any details = 3;
+}
+
 // JammiErrorDetail — the structured domain-error payload a server attaches to
 // a `tonic::Status` so a remote client can reconstruct the EXACT engine
 // `JammiError` the in-process path returns, not a lossy gRPC-code-category

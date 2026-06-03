@@ -6,6 +6,30 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.15.0 — 2026-06-03
+
+### Added
+
+- **Real HTSAT-Swin CLAP audio encoder.** The audio tower is now a faithful port
+  of the HuggingFace `transformers` `ClapModel` audio branch (an HTSAT Swin
+  transformer): batch-norm → bicubic time-resample → `reshape_mel2img` → fused
+  patch-embed (Attentional Feature Fusion) → four hierarchical Swin stages
+  (windowed / shifted-window MSA with relative-position bias, patch-merging) →
+  group-2D pooling → projection, fed by a `ClapFeatureExtractor`-matching
+  front-end. `laion/clap-htsat-fused` now loads and embeds audio, reproducing
+  HF `get_audio_features` (live cosine 1.0000002). A hermetic per-boundary golden
+  suite parity-tests every unit against PyTorch, and a weight-key coverage test
+  proves the full checkpoint is consumed.
+
+### Changed
+
+- **Replaced the flat-ViT `ClapAudio` placeholder.** The previous CLAP audio
+  encoder was a single-scale ViT that matched no public checkpoint and only
+  loaded a synthetic fixture; it is removed in favor of the real HTSAT-Swin
+  tower. HF `clap` architectures (`model_type = "clap_audio_model"`) dispatch to
+  the new tower, and the synthetic `tiny_clap` fixture is retired for the
+  real-key `htsat_clap_tiny` fixture.
+
 ## v0.14.0 — 2026-06-02
 
 ### Added

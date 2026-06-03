@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo build --release \
         --package jammi-server \
         --bin jammi-server \
-        --features jetstream-broker \
+        --features jetstream-broker,storage-cloud \
     && cp target/release/jammi-server /tmp/jammi-server \
     && strip /tmp/jammi-server
 

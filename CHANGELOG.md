@@ -6,6 +6,23 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.17.0 — 2026-06-03
+
+### Added
+- `RemoteSession` (and the Python `RemoteDatabase` / `connect_remote`) now wire
+  `add_source` over the typed `EmbeddingService.AddSource` RPC. A remote (Shape C)
+  consumer can register sources over the wire — not just `generate_embeddings` /
+  `encode_query` / `search` — so the full ingest path runs against a remote engine.
+  `sql` / `read_vectors` remain on the Flight SQL lane (no typed RPC) and still
+  return the truthful "not available on the remote transport" error.
+
+### Changed
+- A default-on `local` cargo feature on `jammi-ai` gates the embedded ML engine
+  (candle / hf-hub / tokenizers / symphonia / jammi-encoders). A remote-only client
+  builds with `--no-default-features --features wire` and links none of those heavy
+  deps; the embedded / PyO3 build is byte-unchanged (`default = ["local"]`). A CI
+  lane guards the thin build against dependency regressions.
+
 ## v0.16.0 — 2026-06-03
 
 ### Added

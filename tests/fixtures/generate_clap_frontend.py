@@ -10,8 +10,11 @@ parity-tested against these goldens hermetically — CI needs no torch.
 Two waveforms pin both `_get_input_mel` branches that a fusion-truncation
 extractor takes, with every source of randomness removed:
 
-  short  (len < nb_max_samples): repeatpad -> single mel -> stacked x4,
-         is_longer=False. Fully deterministic; no random anywhere.
+  short  (len < nb_max_samples): repeatpad -> single mel -> stacked x4.
+         (This is `_get_input_mel`'s per-clip branch flag, one DSP layer below
+         jammi's front-end policy, which deterministically marks every clip
+         is_longer=True; only the channel construction is asserted here.)
+         Fully deterministic; no random anywhere.
   long   (len  > nb_max_samples): `_random_mel_fusion`. The waveform length is
          chosen so `total_frames - chunk_frames + 1 == 3`, hence
          `np.array_split(range(3), 3) == [[0],[1],[2]]` and every

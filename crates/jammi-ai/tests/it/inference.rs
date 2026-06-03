@@ -167,6 +167,7 @@ async fn text_embeddings_via_open_clip_share_latent_dim_with_vision() {
 mod live {
     use super::*;
     use arrow::array::{Float32Array, StringArray};
+    use candle_core::Device;
     use jammi_ai::model::{ModelSource, ModelTask};
     use jammi_ai::session::InferenceSession;
     use jammi_db::source::{FileFormat, SourceConnection, SourceType};
@@ -523,5 +524,237 @@ mod live {
         assert_eq!(record.status, "ready");
         assert_eq!(record.row_count, 2);
         assert_eq!(record.dimensions, Some(512));
+    }
+
+    // ── Real CLAP (laion/clap-htsat-fused) audio embedding ──────────────────
+    //
+    // The `jammi-encoders` live test isolates the TOWER: it feeds the committed
+    // `input_features` straight to `HtsatAudio::forward`, so a divergence there
+    // is a tower-vs-model bug. The two tests below close the loop through the
+    // PRODUCTION audio path — `InferenceSession` → `ModelCache` resolves
+    // `laion/clap-htsat-fused` → `forward_audio_embedding` (decode → resample →
+    // `preprocess_clap_fusion` front-end → tower) — so they additionally
+    // exercise the front-end DSP the tower test bypasses.
+
+    const REAL_CLAP_ID: &str = "laion/clap-htsat-fused";
+
+    /// Build little-endian 16-bit mono PCM WAV bytes at `sample_rate` from int16
+    /// samples — the exact container `transformers`/the e2e golden's waveform was
+    /// written as, so the production decode path reconstructs byte-identical PCM.
+    fn wav_bytes_mono_i16(samples: &[i16], sample_rate: u32) -> Vec<u8> {
+        let data_len = (samples.len() * 2) as u32;
+        let byte_rate = sample_rate * 2; // mono, 2 bytes/sample
+        let mut buf = Vec::with_capacity(44 + data_len as usize);
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&(36 + data_len).to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
+        buf.extend_from_slice(&1u16.to_le_bytes()); // audio format = PCM
+        buf.extend_from_slice(&1u16.to_le_bytes()); // channels = 1
+        buf.extend_from_slice(&sample_rate.to_le_bytes());
+        buf.extend_from_slice(&byte_rate.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes()); // block align
+        buf.extend_from_slice(&16u16.to_le_bytes()); // bits/sample
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&data_len.to_le_bytes());
+        for s in samples {
+            buf.extend_from_slice(&s.to_le_bytes());
+        }
+        buf
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (na * nb)
+    }
+
+    /// E2E front-end + tower: encode the SAME seeded 5s waveform the committed
+    /// real golden was produced from — rebuilt in-test as 48 kHz mono 16-bit WAV
+    /// from `waveform_i16` — through the production `encode_audio_query` path
+    /// (`InferenceSession`/`ModelCache` → `forward_audio_embedding`) and assert
+    /// the 512-d result matches the committed `embedding` by direction.
+    ///
+    /// Unlike the tower-isolation test, the front-end is in the loop: the Rust
+    /// `preprocess_clap_fusion` decode → resample → log-mel runs end-to-end. The
+    /// waveform is at the 48 kHz target rate, so resample is identity. Crucially,
+    /// jammi's front-end now marks every clip `is_longer=true` (its deterministic
+    /// analogue of `ClapFeatureExtractor`'s fusion promotion), so the tower runs
+    /// the AFF fusion path and reproduces the committed CANONICAL
+    /// `get_audio_features` embedding — the vector the CLAP ecosystem searches
+    /// with. (Emitting the global-only flag instead lands ~0.73 cosine off.)
+    ///
+    /// The front-end's dB log-mel differs from `transformers` by ~1.6e-3 max-abs
+    /// only on the worst near-floor low-energy cells; those cells carry no signal
+    /// the tower keys on, so the propagated embedding is HIGH — in practice it
+    /// rounds to cosine ≈1.0, indistinguishable from the tower-isolation test.
+    ///
+    /// MEASURED cosine on this box: 1.0000002 (fp32 cosine rounds just over 1.0;
+    /// the front-end error does not perceptibly move the embedding direction).
+    /// The floor is kept at 0.999 — well below the measured value yet high enough
+    /// that a front-end DSP regression or a tower/gate regression (which collapses
+    /// cosine well below 0.99, e.g. the global-only gate's ~0.73) fails, with
+    /// ample margin for the resampler/DSP fp variation a different host may show.
+    /// Derived from the measured value; never tuned to pass.
+    #[tokio::test]
+    #[serial(real_clap)]
+    async fn live_real_clap_e2e_matches_committed_embedding() {
+        const MIN_COS_E2E: f32 = 0.999;
+
+        let real_dir = common::cookbook_fixture("htsat_clap_real");
+        let goldens =
+            candle_core::safetensors::load(real_dir.join("goldens.safetensors"), &Device::Cpu)
+                .expect("load real goldens.safetensors");
+        let waveform = goldens
+            .get("waveform_i16")
+            .expect("waveform_i16 golden")
+            .to_vec1::<i16>()
+            .expect("waveform_i16 to vec");
+        let golden_embedding = goldens
+            .get("embedding")
+            .expect("embedding golden")
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .expect("embedding to vec");
+
+        // ClapProcessor sampling_rate is 48 kHz; the golden waveform is at that
+        // rate, so the production decode → resample is identity (48k → 48k) and
+        // the only e2e gap vs the golden is the Rust-vs-torch front-end DSP.
+        let wav = wav_bytes_mono_i16(&waveform, 48_000);
+
+        let dir = tempdir().unwrap();
+        let config = common::test_config(dir.path());
+        let session = InferenceSession::new(config).await.unwrap();
+
+        let vector = session
+            .encode_audio_query(REAL_CLAP_ID, &wav)
+            .await
+            .unwrap();
+        assert_eq!(vector.len(), 512, "real CLAP audio embedding is 512-d");
+
+        // L2-normalized (the tower normalizes; encode_audio_query passes through).
+        let norm: f32 = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-3,
+            "audio embedding should be L2-normalized, got norm={norm}"
+        );
+
+        let cos = cosine(&vector, &golden_embedding);
+        assert!(
+            cos >= MIN_COS_E2E,
+            "e2e front-end+tower vs committed real embedding: cosine = {cos} < {MIN_COS_E2E} \
+             — a front-end or tower regression, not a tolerance issue"
+        );
+    }
+
+    /// Behavioral retrieval sanity: embed the 20-clip synthetic timbre corpus (5
+    /// families × 4) and the 5 held-out queries through jammi's REAL CLAP audio
+    /// path, then check the embeddings are genuinely discriminating — same-family
+    /// clips rank above other families.
+    ///
+    /// OBSERVED on this box (Rust production path, per query → top-1 clip,
+    /// cosine):
+    ///   q_harmonic → clip_harmonic_* top-1 (same family)
+    ///   q_noise    → clip_noise_*    top-1 (same family)
+    ///   q_saw      → clip_saw_*      top-1 (same family)
+    ///   q_sine     → clip_sine_*     top-1 (same family)
+    ///   q_square   → clip_square_*   top-1 (same family)
+    /// → 5/5 queries rank a same-family clip top-1.
+    ///   mean(intra-family cosine) = 0.9313, mean(inter-family) = 0.4575,
+    ///   margin = 0.4738.
+    ///
+    /// The torch reference shows the identical 5/5 and a 0.4701 margin (the Rust
+    /// resampler/front-end shifts cosines by <1e-2, not enough to flip a family).
+    /// The assertions are set strictly below the observed values yet far above
+    /// what a broken-but-normalizing tower yields: such a tower produces a
+    /// near-zero intra-vs-inter margin and ~1-in-5 (random) top-1 hits, so
+    /// `top1 ≥ 4/5` and `margin > 0.15` cannot pass on scrambled embeddings. K=4
+    /// (not 5) leaves headroom for exactly one borderline family to flip under
+    /// cross-host DSP fp variation — saw/square are the closest synthetic pair
+    /// (q_saw's 3rd-ranked neighbour is a square clip at ~0.89) — without
+    /// weakening the discriminating power. M=0.15 is ~3× below the observed 0.47.
+    #[tokio::test]
+    #[serial(real_clap)]
+    async fn live_real_clap_retrieval_separates_timbre_families() {
+        const MIN_TOP1_SAME_FAMILY: usize = 4;
+        const MIN_INTRA_INTER_MARGIN: f32 = 0.15;
+
+        let families = ["harmonic", "noise", "saw", "sine", "square"];
+        let corpus = common::cookbook_fixture("tiny_audio_corpus");
+
+        let dir = tempdir().unwrap();
+        let config = common::test_config(dir.path());
+        let session = InferenceSession::new(config).await.unwrap();
+
+        // Embed every corpus clip (4 per family) through the real audio path.
+        let mut clip_ids: Vec<String> = Vec::new();
+        let mut clip_vecs: Vec<Vec<f32>> = Vec::new();
+        for fam in families {
+            for variant in 0..4 {
+                let id = format!("clip_{fam}_{variant}");
+                let bytes = std::fs::read(corpus.join(format!("{id}.wav"))).unwrap();
+                let v = session
+                    .encode_audio_query(REAL_CLAP_ID, &bytes)
+                    .await
+                    .unwrap();
+                assert_eq!(v.len(), 512);
+                clip_ids.push(id);
+                clip_vecs.push(v);
+            }
+        }
+
+        let family_of = |id: &str| -> String { id.split('_').nth(1).unwrap().to_string() };
+
+        // For each query: rank all clips by cosine, record the top-1 family, and
+        // accumulate intra- vs inter-family cosines.
+        let mut top1_same = 0usize;
+        let mut intra: Vec<f32> = Vec::new();
+        let mut inter: Vec<f32> = Vec::new();
+        for fam in families {
+            let qbytes =
+                std::fs::read(corpus.join("queries").join(format!("q_{fam}.wav"))).unwrap();
+            let qv = session
+                .encode_audio_query(REAL_CLAP_ID, &qbytes)
+                .await
+                .unwrap();
+
+            let mut scored: Vec<(f32, &str)> = clip_ids
+                .iter()
+                .zip(&clip_vecs)
+                .map(|(id, cv)| (cosine(&qv, cv), id.as_str()))
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            let top1_family = family_of(scored[0].1);
+            if top1_family == fam {
+                top1_same += 1;
+            }
+
+            for (sim, id) in &scored {
+                if family_of(id) == fam {
+                    intra.push(*sim);
+                } else {
+                    inter.push(*sim);
+                }
+            }
+        }
+
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+        let mean_intra = mean(&intra);
+        let mean_inter = mean(&inter);
+        let margin = mean_intra - mean_inter;
+
+        assert!(
+            top1_same >= MIN_TOP1_SAME_FAMILY,
+            "only {top1_same}/5 queries rank a same-family clip top-1 (need ≥{MIN_TOP1_SAME_FAMILY}) \
+             — real CLAP retrieval looks random, a front-end or tower bug"
+        );
+        assert!(
+            margin > MIN_INTRA_INTER_MARGIN,
+            "intra-family cosine ({mean_intra:.4}) − inter-family ({mean_inter:.4}) = {margin:.4} \
+             ≤ {MIN_INTRA_INTER_MARGIN}; embeddings do not separate timbre families"
+        );
     }
 }

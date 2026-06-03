@@ -5,6 +5,7 @@ mod ephemeral;
 mod error;
 mod job;
 pub mod model_task;
+mod remote;
 mod search;
 
 use pyo3::prelude::*;
@@ -23,6 +24,12 @@ use crate::search::PySearchBuilder;
 /// [`PyDatabase::session_arc`] to share its underlying session.
 pub use crate::database::PyDatabase;
 
+/// The remote-transport `RemoteDatabase` pyclass and its `connect_remote`
+/// constructor. Re-exported so the Rust integration test (and any downstream
+/// Rust consumer layering its own bindings) can drive a remote Python session
+/// against an in-process gRPC server.
+pub use crate::remote::{connect_remote, PyRemoteDatabase};
+
 /// Re-export of the underlying inference session type. External Rust
 /// consumers need to name this to receive the `Arc<InferenceSession>`
 /// returned by [`PyDatabase::session_arc`] and share schema-upgrade lock,
@@ -34,7 +41,9 @@ pub use jammi_ai::session::InferenceSession;
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(connect, m)?)?;
+    m.add_function(wrap_pyfunction!(connect_remote, m)?)?;
     m.add_class::<PyDatabase>()?;
+    m.add_class::<PyRemoteDatabase>()?;
     m.add_class::<PySearchBuilder>()?;
     m.add_class::<PyFineTuneJob>()?;
     m.add_class::<PyModelTask>()?;

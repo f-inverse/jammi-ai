@@ -15,17 +15,26 @@
 //!      (proven by binding a tenant via the freshly-cloned `Arc` and
 //!      reading it back through a second clone).
 
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use _native::model_task::{ModelTaskArg, PyModelTask};
-use _native::PyDatabase;
+use _native::{connect_remote, PyDatabase};
+use jammi_ai::local_session::{LocalSession, Modality, QueryInput, Session};
 use jammi_ai::model::ModelTask;
+use jammi_ai::session::InferenceSession;
 use jammi_db::config::JammiConfig;
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::TenantId;
+use jammi_server::grpc::session::SessionStore;
+use jammi_server::runtime::serve_grpc_chain;
+use jammi_test_utils::{cookbook_fixture, fixture};
 use pyo3::prelude::*;
 use pyo3::types::PyString;
 use tempfile::tempdir;
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 
 fn test_config(artifact_dir: &std::path::Path) -> JammiConfig {
     JammiConfig {
@@ -144,4 +153,156 @@ fn model_task_arg_accepts_pyclass_and_string_identically() {
         let err: PyResult<ModelTaskArg> = bad.as_borrowed().extract();
         assert!(err.is_err(), "unknown task string must surface a PyErr");
     });
+}
+
+/// An in-process engine-backed gRPC server held alive for the duration of a
+/// test. Dropping `_shutdown` tears it down; `_dir` roots the engine's temp
+/// artifact dir; `_rt` keeps the server's runtime (and the spawned serve task)
+/// running on a dedicated thread so the synchronous `RemoteDatabase` — which
+/// builds and `block_on`s its *own* runtime, exactly as a Python caller does —
+/// can drive it without nesting runtimes.
+struct RemoteFixture {
+    addr: SocketAddr,
+    engine: Arc<InferenceSession>,
+    _rt: tokio::runtime::Runtime,
+    _shutdown: oneshot::Sender<()>,
+    _dir: tempfile::TempDir,
+}
+
+/// Stand up the engine-backed gRPC chain on a dedicated runtime thread and
+/// return its address plus the shared engine `Arc`. Mirrors the
+/// `jammi-server` `start_engine_server` fixture, inlined here because that
+/// crate's `tests/it/common` module is test-private.
+fn start_remote_fixture() -> RemoteFixture {
+    let dir = tempdir().expect("tempdir");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("server runtime");
+
+    let cfg = test_config(dir.path());
+    let session =
+        rt.block_on(async { Arc::new(InferenceSession::new(cfg).await.expect("session")) });
+
+    let listener = rt.block_on(async { TcpListener::bind("127.0.0.1:0").await.expect("bind") });
+    let addr = listener.local_addr().expect("local_addr");
+    drop(listener);
+
+    let store = SessionStore::new();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let flight_ctx = session.context().clone();
+    let binding = session.tenant_binding_arc();
+    let engine = Arc::clone(&session);
+    rt.spawn(async move {
+        serve_grpc_chain(
+            addr,
+            flight_ctx,
+            binding,
+            store,
+            None,
+            Some(session),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await
+        .expect("grpc server");
+    });
+    // Give the server a moment to bind before the client connects.
+    rt.block_on(async { tokio::time::sleep(std::time::Duration::from_millis(100)).await });
+
+    RemoteFixture {
+        addr,
+        engine,
+        _rt: rt,
+        _shutdown: shutdown_tx,
+        _dir: dir,
+    }
+}
+
+/// The remote Python binding (`connect_remote(endpoint=...)` →
+/// `RemoteDatabase`) reuses the one Rust `RemoteSession` over the wire: a query
+/// encoded through the remote Python session must equal the byte-identical
+/// vector a `LocalSession` produces against the *same* engine. This is the
+/// Shape-C parity proof — same engine, two transports, identical result — and
+/// it is fully hermetic: the encoder is the bundled `tiny_bert` cookbook
+/// fixture and the corpus is the bundled `patents.parquet`, no live network.
+#[test]
+fn remote_database_encode_query_matches_local_over_the_wire() {
+    let srv = start_remote_fixture();
+    let model_id = format!("local:{}", cookbook_fixture("tiny_bert").display());
+    let query = "quantum computing applications";
+
+    // Remote path: the synchronous Python-facing binding. It opens its own
+    // runtime internally (as it would under a Python interpreter) and drives
+    // the wire via `Session::Remote` → the Rust `RemoteSession` gRPC client.
+    let remote_db = connect_remote(&format!("http://{}", srv.addr)).expect("connect_remote");
+    let remote_vec = remote_db
+        .encode_query_for_test(&model_id, query, Modality::Text)
+        .expect("remote encode_query");
+
+    // Local baseline: a `LocalSession` over the *same* engine `Arc` the server
+    // drives, so any divergence is the transport's fault, not the engine's.
+    let local = Session::Local(LocalSession::new(Arc::clone(&srv.engine)));
+    let local_rt = tokio::runtime::Runtime::new().expect("local runtime");
+    let local_vec = local_rt
+        .block_on(local.encode_query(
+            &model_id,
+            QueryInput::Text(query.to_string()),
+            Modality::Text,
+        ))
+        .expect("local encode_query");
+
+    assert!(!remote_vec.is_empty(), "encode_query returns a vector");
+    assert_eq!(
+        remote_vec.len(),
+        local_vec.len(),
+        "remote/local query vectors share dimensionality",
+    );
+    assert_eq!(
+        remote_vec, local_vec,
+        "the same query through either transport encodes to the same vector",
+    );
+}
+
+/// `generate_embeddings` + `search` through the remote Python binding return a
+/// non-empty hydrated result against a corpus embedded over the wire — the
+/// compute verbs are reachable, not stubbed. The source is registered on the
+/// shared engine (AddSource rides the Flight-SQL lane, not the typed-RPC
+/// surface), then embedded and searched entirely through `RemoteDatabase`.
+#[test]
+fn remote_database_generate_embeddings_and_search() {
+    let srv = start_remote_fixture();
+    let model_id = format!("local:{}", cookbook_fixture("tiny_bert").display());
+
+    // Register the corpus on the shared engine (the remote arm does not wire
+    // AddSource); both transports then see the same source.
+    let setup_rt = tokio::runtime::Runtime::new().expect("setup runtime");
+    setup_rt
+        .block_on(srv.engine.add_source(
+            "patents",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", fixture("patents.parquet").display())),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        ))
+        .expect("add_source");
+
+    let remote_db = connect_remote(&format!("http://{}", srv.addr)).expect("connect_remote");
+
+    let table = remote_db
+        .generate_embeddings_for_test("patents", &model_id, &["abstract"], "id", Modality::Text)
+        .expect("remote generate_embeddings");
+    assert!(!table.is_empty(), "result table name is returned");
+
+    let query = remote_db
+        .encode_query_for_test(&model_id, "quantum computing", Modality::Text)
+        .expect("remote encode_query");
+    let hits = remote_db
+        .search_for_test("patents", query, 5)
+        .expect("remote search");
+    assert!(hits > 0, "search over the embedded corpus returns hits");
 }

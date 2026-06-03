@@ -34,7 +34,7 @@ use pyo3::Borrowed;
 use std::str::FromStr;
 use tonic::transport::Endpoint;
 
-use crate::convert::batches_to_pyarrow;
+use crate::convert::{batches_to_pyarrow, serializable_to_pydict};
 use crate::error::to_pyerr;
 use crate::model_task::ModelTaskArg;
 
@@ -205,6 +205,44 @@ impl PyRemoteDatabase {
     #[pyo3(signature = (name, *, url, format))]
     fn add_source(&self, name: &str, url: &str, format: &str) -> PyResult<()> {
         self.add_source_for_test(name, url, format)
+    }
+
+    /// List a descriptor for every source registered to the current tenant on
+    /// the remote engine. Same dict shape as the embedded
+    /// [`crate::PyDatabase::list_sources`]: each carries `source_id`,
+    /// `source_type`, `status`, and `result_tables`. Maps to
+    /// `EmbeddingService.ListSources`.
+    fn list_sources(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let descriptors = self
+            .runtime
+            .block_on(self.session.list_sources())
+            .map_err(to_pyerr)?;
+        serializable_to_pydict(py, &descriptors)
+    }
+
+    /// Describe one registered source by id on the remote engine, or `None`
+    /// when no source with that id is visible to the current tenant. Maps to
+    /// `EmbeddingService.DescribeSource`; the embedded peer is
+    /// [`crate::PyDatabase::describe_source`].
+    fn describe_source(&self, py: Python<'_>, source_id: &str) -> PyResult<Option<Py<PyAny>>> {
+        let descriptor = self
+            .runtime
+            .block_on(self.session.describe_source(source_id))
+            .map_err(to_pyerr)?;
+        descriptor
+            .map(|d| serializable_to_pydict(py, &d))
+            .transpose()
+    }
+
+    /// The remote engine's capabilities handshake: a dict with `version`,
+    /// `features`, and `storage_backends`. Maps to `SessionService.GetServerInfo`;
+    /// the embedded peer is [`crate::PyDatabase::server_info`].
+    fn server_info(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let info = self
+            .runtime
+            .block_on(self.session.server_info())
+            .map_err(to_pyerr)?;
+        serializable_to_pydict(py, &info)
     }
 
     /// Encode a single query into an embedding vector using the given model.

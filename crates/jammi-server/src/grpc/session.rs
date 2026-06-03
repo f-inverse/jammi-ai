@@ -20,7 +20,7 @@ use tonic::{Request, Response, Status};
 use jammi_db::TenantId;
 
 use super::proto::session::session_service_server::SessionService;
-use super::proto::session::{GetTenantResponse, SetTenantRequest, Tenant};
+use super::proto::session::{GetTenantResponse, ServerInfo, SetTenantRequest, Tenant};
 
 /// Opaque session identifier carried in the `jammi-session-id` request
 /// header. Clients mint a UUID for each connection / session; the server
@@ -128,6 +128,17 @@ impl SessionService for SessionServer {
         let session = session_id_from_request(&request)?;
         self.store.clear(&session);
         Ok(Response::new(()))
+    }
+
+    async fn get_server_info(&self, _request: Request<()>) -> Result<Response<ServerInfo>, Status> {
+        // A compile-time fact about the running binary: no session, no tenant,
+        // no engine. Reads straight off the engine's `ServerInfo::current`.
+        let info = jammi_db::ServerInfo::current();
+        Ok(Response::new(ServerInfo {
+            version: info.version,
+            features: info.features,
+            storage_backends: info.storage_backends,
+        }))
     }
 }
 

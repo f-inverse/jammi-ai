@@ -44,9 +44,10 @@ use arrow::util::display::{ArrayFormatter, FormatOptions};
 
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingService;
 use crate::grpc::proto::embedding::{
-    search_request::Query as ProtoQuery, AddSourceRequest, EncodeQueryRequest, EncodeQueryResponse,
-    GenerateEmbeddingsRequest, RemoveSourceRequest, ResultTable, SearchHit, SearchRequest,
-    SearchResponse,
+    search_request::Query as ProtoQuery, AddSourceRequest, DescribeSourceRequest,
+    EncodeQueryRequest, EncodeQueryResponse, GenerateEmbeddingsRequest, ListSourcesRequest,
+    ListSourcesResponse, RemoveSourceRequest, ResultTable, SearchHit, SearchRequest,
+    SearchResponse, SourceDescriptor,
 };
 use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant};
 
@@ -107,6 +108,46 @@ impl EmbeddingService for EmbeddingServer {
         .await
         .map_err(map_engine_error)?;
         Ok(Response::new(()))
+    }
+
+    async fn list_sources(
+        &self,
+        request: Request<ListSourcesRequest>,
+    ) -> Result<Response<ListSourcesResponse>, Status> {
+        let tenant = session_tenant(&request);
+        let session = self.local();
+
+        let descriptors = scoped(&self.session, tenant, || session.list_sources())
+            .await
+            .map_err(map_engine_error)?;
+
+        let sources = descriptors
+            .into_iter()
+            .map(SourceDescriptor::from)
+            .collect();
+        Ok(Response::new(ListSourcesResponse { sources }))
+    }
+
+    async fn describe_source(
+        &self,
+        request: Request<DescribeSourceRequest>,
+    ) -> Result<Response<SourceDescriptor>, Status> {
+        let tenant = session_tenant(&request);
+        let req = request.into_inner();
+        require_nonempty(&req.source_id, "source_id")?;
+        let session = self.local();
+
+        // An absent source returns NotFound — the truthful "no such source for
+        // this tenant" the remote arm maps back to `None`, never a faked empty
+        // descriptor.
+        let descriptor = scoped(&self.session, tenant, || {
+            session.describe_source(&req.source_id)
+        })
+        .await
+        .map_err(map_engine_error)?
+        .ok_or_else(|| Status::not_found(format!("source '{}' not found", req.source_id)))?;
+
+        Ok(Response::new(SourceDescriptor::from(descriptor)))
     }
 
     async fn generate_embeddings(

@@ -15,6 +15,7 @@ pub mod error;
 pub mod evidence_channel;
 pub mod index;
 pub mod model_task;
+pub mod server_info;
 pub mod session;
 pub mod source;
 pub mod sql;
@@ -36,6 +37,7 @@ pub use ephemeral::{
 };
 pub use evidence_channel::ChannelId;
 pub use model_task::ModelTask;
+pub use server_info::ServerInfo;
 pub use session::{AdminScope, TenantScope};
 pub use tenant::TenantId;
 pub use trigger::TopicId;

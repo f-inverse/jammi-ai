@@ -152,6 +152,39 @@ impl PyDatabase {
             .map_err(to_pyerr)
     }
 
+    /// List a descriptor for every source registered to the current tenant.
+    /// Each is a dict carrying `source_id`, `source_type`, `status`, and
+    /// `result_tables` (the embedding result tables produced from it, each
+    /// with its own `status` / `row_count` / `dimensions`). Registry
+    /// introspection, not a SQL query.
+    fn list_sources(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let descriptors = self
+            .runtime
+            .block_on(self.session.catalog().list_source_descriptors())
+            .map_err(to_pyerr)?;
+        serializable_to_pydict(py, &descriptors)
+    }
+
+    /// Describe one registered source by id, or `None` when no source with
+    /// that id is visible to the current tenant. Returns the same dict shape
+    /// `list_sources` yields per entry.
+    fn describe_source(&self, py: Python<'_>, source_id: &str) -> PyResult<Option<Py<PyAny>>> {
+        let descriptor = self
+            .runtime
+            .block_on(self.session.catalog().describe_source(source_id))
+            .map_err(to_pyerr)?;
+        descriptor
+            .map(|d| serializable_to_pydict(py, &d))
+            .transpose()
+    }
+
+    /// The engine's capabilities handshake: a dict with `version`, `features`
+    /// (compiled feature flags), and `storage_backends` (addressable storage
+    /// URL schemes). A compile-time fact about the running build.
+    fn server_info(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        serializable_to_pydict(py, &jammi_db::ServerInfo::current())
+    }
+
     /// Execute a SQL query. Returns a `pyarrow.Table`.
     fn sql(&self, py: Python<'_>, query: &str) -> PyResult<Py<PyAny>> {
         let batches = self

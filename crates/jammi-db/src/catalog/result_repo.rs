@@ -19,7 +19,7 @@ pub struct CreateResultTableParams<'a> {
 }
 
 /// A row from the `result_tables` catalog table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ResultTableRecord {
     pub table_name: String,
     pub source_id: String,

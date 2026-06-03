@@ -43,11 +43,12 @@ use futures::Stream;
 
 use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
 use jammi_db::catalog::result_repo::ResultTableRecord;
+use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::error::Result;
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
 use jammi_db::trigger::{DeliveredBatch, Offset, Predicate, TopicDefinition, TriggerError};
-use jammi_db::{ModelTask, PerQueryAudit, TenantId, TopicId};
+use jammi_db::{ModelTask, PerQueryAudit, ServerInfo, TenantId, TopicId};
 
 use crate::eval::{CompareEvalReport, EmbeddingEvalReport, EvalTask, InferenceEvalReport};
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
@@ -175,6 +176,43 @@ impl Session {
             Session::Local(s) => s.remove_source(source_id).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.remove_source(source_id).await,
+        }
+    }
+
+    /// Describe every source registered to the session's tenant: each one's
+    /// registry identity plus the embedding result tables produced from it.
+    /// Registry introspection, not a SQL query.
+    pub async fn list_sources(&self) -> Result<Vec<SourceDescriptor>> {
+        match self {
+            #[cfg(feature = "local")]
+            Session::Local(s) => s.list_sources().await,
+            #[cfg(feature = "wire")]
+            Session::Remote(s) => s.list_sources().await,
+        }
+    }
+
+    /// Describe one registered source by id, or `None` when no source with
+    /// that id is visible to the session's tenant. The embedding
+    /// `status`/`row_count`/`dimensions` ride on the descriptor's result
+    /// tables — the same source-of-truth `generate_embeddings` returns.
+    pub async fn describe_source(&self, source_id: &str) -> Result<Option<SourceDescriptor>> {
+        match self {
+            #[cfg(feature = "local")]
+            Session::Local(s) => s.describe_source(source_id).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(s) => s.describe_source(source_id).await,
+        }
+    }
+
+    /// The engine's capabilities handshake: version, compiled feature flags,
+    /// and addressable storage backends. Tenant-agnostic; the same value for
+    /// every session against a given build.
+    pub async fn server_info(&self) -> Result<ServerInfo> {
+        match self {
+            #[cfg(feature = "local")]
+            Session::Local(s) => s.server_info().await,
+            #[cfg(feature = "wire")]
+            Session::Remote(s) => s.server_info().await,
         }
     }
 
@@ -657,6 +695,21 @@ impl LocalSession {
 
     async fn remove_source(&self, source_id: &str) -> Result<()> {
         self.engine.remove_source(source_id).await
+    }
+
+    async fn list_sources(&self) -> Result<Vec<SourceDescriptor>> {
+        self.engine.catalog().list_source_descriptors().await
+    }
+
+    async fn describe_source(&self, source_id: &str) -> Result<Option<SourceDescriptor>> {
+        self.engine.catalog().describe_source(source_id).await
+    }
+
+    /// The engine's capabilities are a compile-time fact, so this reads them
+    /// straight off [`ServerInfo::current`]; it is `async` only to match the
+    /// transport-agnostic [`Session`] surface (the remote arm round-trips).
+    async fn server_info(&self) -> Result<ServerInfo> {
+        Ok(ServerInfo::current())
     }
 
     async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {

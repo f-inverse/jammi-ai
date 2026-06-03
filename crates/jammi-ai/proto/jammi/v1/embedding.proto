@@ -3,6 +3,7 @@ syntax = "proto3";
 package jammi.v1.embedding;
 
 import "google/protobuf/empty.proto";
+import "jammi/v1/inference.proto";
 
 // EmbeddingService — the wire surface for the engine's embedding verbs.
 // These are imperative session methods, not SQL queries, so they live as
@@ -32,6 +33,21 @@ service EmbeddingService {
   // Remove a registered source and all associated state (embedding tables,
   // indexes). Peer of the abstraction's `remove_source`.
   rpc RemoveSource(RemoveSourceRequest) returns (google.protobuf.Empty);
+
+  // List a `SourceDescriptor` for every source registered to the calling
+  // tenant. Peer of the abstraction's `list_sources`; registry introspection,
+  // not a SQL query. `ListSources` is `DescribeSource` applied over every
+  // registered source — one descriptor shape, one operator, no per-source
+  // special-casing.
+  rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
+
+  // Describe one registered source: its registry identity (id / kind /
+  // lifecycle status) plus the result tables embedded out of it (each carrying
+  // its own status / row_count / dimensions). Peer of the abstraction's
+  // `describe_source`. The embedding status / row_count / dimensions are read
+  // from the engine's result-table record — the same source-of-truth a
+  // `GenerateEmbeddings` response returns — never a parallel registry.
+  rpc DescribeSource(DescribeSourceRequest) returns (SourceDescriptor);
 
   // Scan `columns` on a registered source, run the modality's tower over
   // every row (decode/feature-extraction as the modality requires → forward
@@ -106,6 +122,36 @@ message RemoveSourceRequest {
   string source_id = 1;
 }
 
+message ListSourcesRequest {}
+
+message ListSourcesResponse {
+  // One descriptor per source registered to the calling tenant, in the
+  // engine's registration order.
+  repeated SourceDescriptor sources = 1;
+}
+
+message DescribeSourceRequest {
+  string source_id = 1;
+}
+
+// Registry introspection for one source: its registration identity plus the
+// embedding result tables produced out of it. The embedding-side
+// status/row_count/dimensions are carried by the `ResultTable` records
+// (`result_tables`) — the same shape `GenerateEmbeddings` returns — rather than
+// duplicated as descriptor fields, so there is one source-of-truth for those
+// numbers. A freshly-registered source with no embeddings yet carries an empty
+// `result_tables`.
+message SourceDescriptor {
+  string source_id = 1;
+  // The storage backend the source was registered with.
+  SourceKind kind = 2;
+  // Registration lifecycle status from the source catalog (e.g. "active").
+  string status = 3;
+  // Every embedding result table produced from this source. Empty until a
+  // `GenerateEmbeddings` call persists one.
+  repeated ResultTable result_tables = 4;
+}
+
 message GenerateEmbeddingsRequest {
   // Registered source to scan.
   string source_id = 1;
@@ -122,7 +168,10 @@ message GenerateEmbeddingsRequest {
 
 // Subset of the engine's `ResultTableRecord` a client needs to locate and
 // query the persisted embedding table. Internal bookkeeping columns
-// (parquet/index paths, timestamps) stay server-side.
+// (parquet/index paths, timestamps) stay server-side. The record is
+// self-describing — it carries its own `task` — so it reconstructs without the
+// caller supplying the modality out of band; this is the one shape both
+// GenerateEmbeddings and DescribeSource return.
 message ResultTable {
   string table_name = 1;
   string source_id = 2;
@@ -133,6 +182,10 @@ message ResultTable {
   uint64 row_count = 5;
   // Lifecycle status reported by the engine ("ready" on success).
   string status = 6;
+  // The task that produced this table (the embedding tower: text / image /
+  // audio). Carried so the record reconstructs its `ModelTask` faithfully on
+  // the wire rather than from a guessed default.
+  jammi.v1.inference.ModelTask task = 7;
 }
 
 message EncodeQueryRequest {

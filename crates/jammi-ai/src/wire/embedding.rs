@@ -17,8 +17,8 @@
 //! connection message, carrying the same URL + format the decode reads back.
 
 use jammi_db::catalog::result_repo::ResultTableRecord;
+use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_db::ModelTask;
 use tonic::Status;
 
 use crate::wire::proto::embedding as pb;
@@ -192,20 +192,14 @@ fn file_format_from_proto(format: i32) -> Result<Option<FileFormat>, Status> {
 }
 
 /// Map a [`Modality`] onto the embedding [`ModelTask`] its tower produces. The
-/// wire `ResultTable` deliberately omits the engine's `task` (server-internal
-/// bookkeeping), but a remote client knows the modality it requested, so the
-/// reconstruction recovers `task` faithfully from that — never a guess.
-pub fn embedding_task_for(modality: Modality) -> ModelTask {
-    match modality {
-        Modality::Text => ModelTask::TextEmbedding,
-        Modality::Image => ModelTask::ImageEmbedding,
-        Modality::Audio => ModelTask::AudioEmbedding,
-    }
-}
-
+/// wire `ResultTable` carries its own `task` (the embedding tower), so the
+/// reconstruction recovers it faithfully from the message itself — never from a
+/// modality threaded in out of band, never a guess.
+///
 /// Encode the engine's result-table record into the wire `ResultTable`. The
 /// engine's optional `dimensions` is flattened to `0` for a non-embedding /
-/// unset result, and `row_count` widens to the wire's `u64`.
+/// unset result, `row_count` widens to the wire's `u64`, and `task` rides the
+/// shared [`super::model_task_to_proto`] task vocabulary.
 impl From<ResultTableRecord> for pb::ResultTable {
     fn from(record: ResultTableRecord) -> Self {
         pb::ResultTable {
@@ -215,28 +209,31 @@ impl From<ResultTableRecord> for pb::ResultTable {
             dimensions: record.dimensions.unwrap_or(0),
             row_count: record.row_count as u64,
             status: record.status,
+            task: super::model_task_to_proto(record.task) as i32,
         }
     }
 }
 
 /// Reconstruct the engine's result-table record from the wire `ResultTable` a
-/// `GenerateEmbeddings` response carries, plus the `modality` the client
-/// requested (which recovers the omitted `task`).
+/// `GenerateEmbeddings` or `DescribeSource` response carries.
 ///
 /// The wire message is the client-observable projection: it carries the fields
 /// a client needs to locate and query the persisted embedding table
-/// (`table_name`, `source_id`, `model_id`, `dimensions`, `row_count`,
-/// `status`). The engine's server-internal bookkeeping — storage/index paths,
+/// (`table_name`, `source_id`, `model_id`, `dimensions`, `row_count`, `status`,
+/// `task`). The engine's server-internal bookkeeping — storage/index paths,
 /// timestamps, the originating columns — is intentionally not on the wire, so
 /// the reconstruction leaves those at their "not carried" values (`String::new`
-/// / `None`). A remote consumer keys off the same fields a local one reads back
-/// from this verb; the dropped fields are server-side state, not result data.
-pub fn result_table_from_proto(table: pb::ResultTable, modality: Modality) -> ResultTableRecord {
-    ResultTableRecord {
+/// / `None`). A remote consumer keys off the same fields a local one reads back;
+/// the dropped fields are server-side state, not result data. The message is
+/// self-describing in `task`, so an out-of-range/unspecified task is the
+/// faithful `invalid_argument` the shared decoder builds.
+pub fn result_table_from_proto(table: pb::ResultTable) -> Result<ResultTableRecord, Status> {
+    let task = super::model_task_from_proto(table.task)?;
+    Ok(ResultTableRecord {
         table_name: table.table_name,
         source_id: table.source_id,
         model_id: table.model_id,
-        task: embedding_task_for(modality),
+        task,
         parquet_path: String::new(),
         index_path: None,
         dimensions: (table.dimensions != 0).then_some(table.dimensions),
@@ -247,5 +244,45 @@ pub fn result_table_from_proto(table: pb::ResultTable, modality: Modality) -> Re
         text_columns: None,
         created_at: String::new(),
         completed_at: None,
+    })
+}
+
+/// Encode the engine's [`SourceDescriptor`] into the wire message: the registry
+/// identity (`source_id` / `kind` / `status`) plus each embedding result table
+/// in the same self-describing [`pb::ResultTable`] shape `GenerateEmbeddings`
+/// returns — one source-of-truth for the embedding numbers, not a parallel one.
+impl From<SourceDescriptor> for pb::SourceDescriptor {
+    fn from(descriptor: SourceDescriptor) -> Self {
+        pb::SourceDescriptor {
+            source_id: descriptor.source_id,
+            kind: source_type_to_proto(descriptor.source_type) as i32,
+            status: descriptor.status,
+            result_tables: descriptor
+                .result_tables
+                .into_iter()
+                .map(pb::ResultTable::from)
+                .collect(),
+        }
     }
+}
+
+/// Reconstruct the engine's [`SourceDescriptor`] from the wire message — the
+/// inverse of the encode above, for the [`crate::RemoteSession`] receive side.
+/// The kind decodes through the shared [`source_type_from_proto`] (an
+/// unspecified/unknown backend is the faithful `invalid_argument`), and each
+/// result table through [`result_table_from_proto`], so a remote
+/// `describe_source` rebuilds the same descriptor a local one returns.
+pub fn source_descriptor_from_proto(
+    descriptor: pb::SourceDescriptor,
+) -> Result<SourceDescriptor, Status> {
+    Ok(SourceDescriptor {
+        source_id: descriptor.source_id,
+        source_type: source_type_from_proto(descriptor.kind)?,
+        status: descriptor.status,
+        result_tables: descriptor
+            .result_tables
+            .into_iter()
+            .map(result_table_from_proto)
+            .collect::<Result<_, Status>>()?,
+    })
 }

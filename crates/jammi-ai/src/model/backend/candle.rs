@@ -577,8 +577,10 @@ impl CandleModel {
             }
 
             // Decode → resample → CLAP fusion front-end → [B, 4, time, n_mels]
-            // plus the per-clip `is_longer` flags that gate the patch-embed
-            // fusion per sample (a short clip uses the global patch-conv alone).
+            // plus the `is_longer` flags. The front-end emits all-true
+            // (deterministic always-fusion) so every clip runs the AFF path,
+            // reproducing HF's canonical get_audio_features embedding; the tower
+            // gates fusion per sample, so it still honors a false flag if passed.
             let (input_features, is_longer) =
                 audio_preprocess::preprocess_clap_fusion(&valid_clips, frontend, &self.device)?;
 

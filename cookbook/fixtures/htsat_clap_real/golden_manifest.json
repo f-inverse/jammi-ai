@@ -1,0 +1,31 @@
+{
+  "input_features": {
+    "shape": [
+      1,
+      4,
+      1001,
+      64
+    ],
+    "dtype": "float32"
+  },
+  "is_longer": {
+    "shape": [
+      1,
+      1
+    ],
+    "dtype": "uint8"
+  },
+  "embedding": {
+    "shape": [
+      1,
+      512
+    ],
+    "dtype": "float32"
+  },
+  "waveform_i16": {
+    "shape": [
+      240000
+    ],
+    "dtype": "int16"
+  }
+}

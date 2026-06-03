@@ -10,9 +10,10 @@
 //! (truncation `"fusion"`, padding `"repeatpad"`) exactly: repeatpad to the
 //! fixed window, reflect-centered Hann STFT (power 2), an HTK mel filterbank
 //! built in Hz space (`norm=None`), the `10·log10` dB nonlinearity, and the
-//! 4-channel fusion packing. It emits `[batch, 4, time, n_mels]` and the
-//! per-clip `is_longer` flag, feeding the HTSAT-Swin CLAP audio tower. Every
-//! numeric is derived from a [`ClapFrontendConfig`] read off the model /
+//! 4-channel fusion packing. It emits `[batch, 4, time, n_mels]` plus a
+//! `is_longer` flag per clip that is DETERMINISTICALLY `true` for every clip
+//! (see [`preprocess_clap_fusion`]), feeding the HTSAT-Swin CLAP audio tower.
+//! Every numeric is derived from a [`ClapFrontendConfig`] read off the model /
 //! feature-extractor config — nothing is hardcoded.
 
 use std::io::Cursor;
@@ -201,28 +202,38 @@ impl ClapFrontendConfig {
 }
 
 /// One clip's CLAP fusion features: the 4-channel dB mel `[4, time, n_mels]`
-/// (row-major) and whether the source clip exceeded the fixed window.
+/// (row-major). The channel construction is length-determined (short clips →
+/// the repeatpad mel stacked four times; long clips → crops + downsample); the
+/// emitted `is_longer` flag the tower gates on is constant `true` (set at the
+/// batch level in [`preprocess_clap_fusion`]), so it is not carried here.
 pub struct ClapFusionFeatures {
     /// `[4, time, n_mels]` dB log-mel, row-major over `(channel, time, mel)`.
     pub features: Vec<f32>,
     /// Time-frame count `T` (equal to the frontend's fixed `chunk_frames`).
     pub time: usize,
-    /// `is_longer`: the source clip was longer than the fixed window, so the
-    /// fusion (`mel_conv2d` + AFF) tower path applies.
-    pub is_longer: bool,
 }
 
 /// Preprocess a batch of decoded clips into the CLAP fusion tensor
-/// `[batch, 4, time, n_mels]` plus the per-clip `is_longer` flags.
+/// `[batch, 4, time, n_mels]` plus the `is_longer` flags (always `true`).
 ///
 /// Reproduces `ClapFeatureExtractor.__call__` for `truncation="fusion"`,
 /// `padding="repeatpad"`: each clip is resampled to `config.sample_rate`,
 /// repeatpadded (or, when longer than the window, left whole), run through the
 /// reflect-centered Hann STFT and the HTK/`norm=None` mel filterbank to a dB
-/// log-mel, then packed into 4 channels. The unbatched `_get_input_mel` path is
-/// reproduced per clip; the batch-level "mark one clip longer at random" branch
-/// is intentionally not — it is RNG the engine must not introduce, and the
-/// tower keys fusion on the deterministic per-clip flag.
+/// log-mel, then packed into 4 channels.
+///
+/// `is_longer` policy — read carefully. HF's `ClapFeatureExtractor`
+/// deterministically promotes a single clip to `is_longer=True` even when the
+/// whole batch fits inside the fixed window (its `_get_input_mel` marks the
+/// global-only mel "longer" so the AFF fusion path runs), so `get_audio_features`
+/// returns the FUSION embedding — the vector the CLAP ecosystem indexes and
+/// searches with. To reproduce that canonical embedding, jammi marks EVERY clip
+/// `is_longer=true` (its deterministic analogue of the feature extractor's
+/// promotion), rather than RNG-promoting one clip or emitting the global-only
+/// flag (which yields a different, ecosystem-incompatible embedding ~0.73 cosine
+/// off). The CHANNEL construction stays length-determined (short → the repeatpad
+/// mel stacked four times; long → crops + downsample); only the emitted gate the
+/// tower keys fusion on is forced on, so the flags are simply `vec![true; n]`.
 pub fn preprocess_clap_fusion(
     clips: &[DecodedAudio],
     config: &ClapFrontendConfig,
@@ -246,7 +257,6 @@ pub fn preprocess_clap_fusion(
     let per_clip = 4 * time * config.n_mels;
 
     let mut flat = Vec::with_capacity(clips.len() * per_clip);
-    let mut is_longer = Vec::with_capacity(clips.len());
 
     for clip in clips {
         let resampled = resample_linear(&clip.samples, clip.sample_rate, config.sample_rate);
@@ -254,12 +264,14 @@ pub fn preprocess_clap_fusion(
         debug_assert_eq!(feat.time, time);
         debug_assert_eq!(feat.features.len(), per_clip);
         flat.extend_from_slice(&feat.features);
-        is_longer.push(feat.is_longer);
     }
 
     let tensor = Tensor::from_vec(flat, (clips.len(), 4, time, config.n_mels), device)
         .map_err(|e| JammiError::Inference(format!("Failed to create audio tensor: {e}")))?;
-    Ok((tensor, is_longer))
+    // Always-fusion: every clip is marked `is_longer=true` so the tower runs the
+    // AFF fusion path and reproduces HF's canonical `get_audio_features` vector
+    // (see the policy note above). The flag is constant, not data-dependent.
+    Ok((tensor, vec![true; clips.len()]))
 }
 
 /// `ClapFeatureExtractor._get_input_mel` for one resampled clip: repeatpad or
@@ -281,20 +293,19 @@ fn clap_fusion_features(
         let total = mel.len() / n_mels;
         if total == chunk {
             // Corner case (window < clip <= window + hop): use the whole mel
-            // four times, marked not-longer — `_get_input_mel`'s
-            // `chunk_frames == total_frames` branch.
+            // four times — `_get_input_mel`'s `chunk_frames == total_frames`
+            // branch (channel construction; the emitted gate is set in
+            // `preprocess_clap_fusion`).
             let features = stack4(&mel);
             ClapFusionFeatures {
                 features,
                 time: chunk,
-                is_longer: false,
             }
         } else {
             let features = random_mel_fusion(&mel, total, chunk, n_mels);
             ClapFusionFeatures {
                 features,
                 time: chunk,
-                is_longer: true,
             }
         }
     } else {
@@ -307,7 +318,6 @@ fn clap_fusion_features(
         ClapFusionFeatures {
             features,
             time: chunk,
-            is_longer: false,
         }
     }
 }
@@ -768,10 +778,13 @@ mod tests {
         let config = tiny_fusion_config();
 
         let (tensor, is_longer) = preprocess_clap_fusion(&[low, high], &config, &device).unwrap();
-        // [batch, 4, time, n_mels]; short clips are repeatpadded, not longer.
+        // [batch, 4, time, n_mels]; short clips are repeatpadded.
         let time = config.chunk_frames();
         assert_eq!(tensor.dims(), &[2, 4, time, config.n_mels]);
-        assert_eq!(is_longer, vec![false, false]);
+        // Always-fusion policy: every clip is marked is_longer=true (jammi's
+        // deterministic analogue of ClapFeatureExtractor's promotion) so the
+        // tower reproduces HF's canonical get_audio_features embedding.
+        assert_eq!(is_longer, vec![true, true]);
 
         // The two clips differ in pitch → their fusion spectrograms differ.
         let rows = tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -955,15 +968,38 @@ mod tests {
                 preprocess_clap_fusion(&[clip], &config, &Device::Cpu).unwrap();
 
             let want_t = &goldens[&format!("{tag}_input_features")];
+            let want_time = want_t.dim(1).unwrap();
             assert_eq!(
                 tensor.dims(),
-                &[1, 4, want_t.dim(1).unwrap(), config.n_mels],
+                &[1, 4, want_time, config.n_mels],
                 "{tag}: shape mismatch"
             );
-            let expect_longer = tag == "long";
-            assert_eq!(is_longer, vec![expect_longer], "{tag}: is_longer mismatch");
+            // Always-fusion policy: the emitted gate is constant `true` for both
+            // the short and long clip (jammi's deterministic analogue of
+            // ClapFeatureExtractor's promotion).
+            assert_eq!(is_longer, vec![true], "{tag}: is_longer must be true");
 
             let got = tensor_f64(&tensor);
+
+            // The length-based channel construction is still distinct even though
+            // both flag true: a short (repeatpad) clip stacks one mel into 4
+            // identical channels, while a long clip's channels 1-3 are crops that
+            // differ from channel 0's downsample.
+            let chan = want_time * config.n_mels;
+            let ch0 = &got[..chan];
+            let ch1 = &got[chan..2 * chan];
+            let channels_identical = ch0 == ch1;
+            if tag == "short" {
+                assert!(
+                    channels_identical,
+                    "short clip's 4 channels must be the same repeatpad mel"
+                );
+            } else {
+                assert!(
+                    !channels_identical,
+                    "long clip's fusion crops must differ across channels"
+                );
+            }
             let want = tensor_f64(want_t);
             let (abs, _) = errors(&got, &want);
             println!("[{tag}] dB input_features: max_abs={abs:.3e}");

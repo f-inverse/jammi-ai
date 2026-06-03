@@ -20,6 +20,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 candle-transformers.workspace = true
+hf-hub.workspace = true
 serde_json.workspace = true
 tempfile = "3"
 
@@ -33,6 +34,11 @@ parity-test = []
 # transformers by tests/fixtures/generate_htsat_clap.py). Needs no torch and no
 # network — the goldens are committed binaries.
 golden-parity = []
+# Enables tests/live_real_clap.rs, which downloads the REAL
+# `laion/clap-htsat-fused` checkpoint from the HF Hub and asserts the HTSAT-Swin
+# tower reproduces its audio embedding on the committed pinned input. Live: makes
+# a network call, so the default `cargo test` stays hermetic.
+live-hub-tests = []
 
 [[test]]
 name = "it"
@@ -45,3 +51,7 @@ path = "tests/parity.rs"
 [[test]]
 name = "golden_parity"
 path = "tests/golden_parity.rs"
+
+[[test]]
+name = "live_real_clap"
+path = "tests/live_real_clap.rs"

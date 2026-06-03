@@ -4074,6 +4074,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "candle-transformers",
+ "hf-hub",
  "jammi-lora",
  "serde",
  "serde_json",

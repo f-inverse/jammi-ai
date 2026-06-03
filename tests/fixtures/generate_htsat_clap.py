@@ -19,8 +19,12 @@ Two artifact sets are written under cookbook/fixtures/:
     golden_manifest.json   name -> shape -> dtype index of the goldens
 
   htsat_clap_real/   (written only by `--real`; small)
-    embedding golden + a few boundary activations for the real checkpoint, for
-    the live-gated numerical acceptance test.
+    goldens.safetensors    pinned `input_features` + `is_longer`, the real
+                           checkpoint's L2-normalized `embedding`, and the
+                           int16 `waveform_i16` that produced them, for the
+                           live-gated numerical-acceptance + e2e tests.
+    golden_manifest.json   name -> shape -> dtype index of the goldens
+    model_id.txt           the checkpoint id the golden was dumped from
 
 Scope: the fixture reproduces the REAL forward of `laion/clap-htsat-fused`. Its
 default feature extractor (`truncation="fusion"`) returns `is_longer=True` for
@@ -247,9 +251,29 @@ def generate_tiny():
 
 
 def generate_real(model_id):
-    """Commit a SMALL real-model golden (final embedding + a few boundaries) for
-    the live numerical-acceptance test. Uses the full ClapModel so the
-    L2-normalized embedding comes from get_audio_features on a pinned short clip.
+    """Commit a SMALL real-model golden (final embedding + the pinned input) for
+    the live numerical-acceptance tests, the CANONICAL CLAP audio embedding.
+
+    The golden is the L2-normalized `get_audio_features` embedding of a pinned 5s
+    clip, computed from the feature extractor's NATURAL output. The same
+    int16-quantized waveform that produces it is committed as `waveform_i16`, so
+    the e2e front-end+tower test can rebuild a byte-identical 48 kHz mono WAV
+    in-Rust and exercise the production decode → front-end → tower path against
+    this committed embedding. The torch path is fed the *dequantized* int16 signal
+    (not the raw float) so the committed embedding corresponds to the exact
+    samples the Rust WAV carries.
+
+    `is_longer` policy — read carefully. `ClapFeatureExtractor.__call__` with
+    `truncation="fusion"` DETERMINISTICALLY marks a single short clip
+    `is_longer=True` (its `_get_input_mel` promotes the global-only mel so the AFF
+    fusion path runs), so `get_audio_features` returns the FUSION embedding — the
+    vector the CLAP ecosystem indexes and searches with. We build the golden from
+    that natural output: `model.get_audio_features(**inputs)` with the processor's
+    own `is_longer` (True for this clip). jammi's front-end reproduces this by
+    deterministically marking every clip `is_longer=True` (its analogue of the
+    extractor's promotion), so both the tower-isolation and e2e tests target this
+    same canonical, reproducible embedding — not the global-only one (which sits
+    ~0.73 cosine off and is ecosystem-incompatible).
     """
     from transformers import ClapModel, ClapProcessor
 
@@ -258,24 +282,49 @@ def generate_real(model_id):
     processor = ClapProcessor.from_pretrained(model_id)
 
     sr = processor.feature_extractor.sampling_rate
-    # A deterministic short clip (< the fusion window, so is_longer=False).
     g = torch.Generator().manual_seed(0)
-    audio = (torch.randn(sr * 5, generator=g) * 0.1).numpy()  # 5s mono
+    audio_f32 = (torch.randn(sr * 5, generator=g) * 0.1).to(torch.float32)
+    # Round-trip through int16 PCM so the committed embedding corresponds to the
+    # exact waveform the Rust e2e test reconstructs from `waveform_i16`.
+    waveform_i16 = torch.clamp((audio_f32 * 32767.0).round(), -32768.0, 32767.0).to(torch.int16)
+    audio = (waveform_i16.to(torch.float32) / 32767.0).numpy()
     inputs = processor(audios=audio, sampling_rate=sr, return_tensors="pt")
-    assert not bool(inputs["is_longer"].any()), "pinned real clip must be is_longer=False"
+
+    # The 5s clip is shorter than the 10s window, so its 4 channels are the
+    # repeatpad-stacked mel; the feature extractor nonetheless marks the clip
+    # is_longer=True (deterministic fusion promotion), so get_audio_features runs
+    # the AFF fusion path and returns the canonical embedding.
+    input_features = inputs["input_features"]
+    ch = input_features[0]
+    assert torch.equal(ch[0], ch[1]) and torch.equal(ch[0], ch[2]) and torch.equal(ch[0], ch[3]), (
+        "short-clip mel must be the repeatpad-stacked 4-identical-channel form"
+    )
+    is_longer = inputs["is_longer"].to(torch.bool)
+    assert bool(is_longer.any()) is True, (
+        "ClapFeatureExtractor must mark the clip is_longer=True (canonical fusion path)"
+    )
 
     with torch.inference_mode():
         embedding = model.get_audio_features(**inputs)
 
     goldens = {
-        "input_features": inputs["input_features"].to(torch.float32).cpu().contiguous(),
+        "input_features": input_features.to(torch.float32).cpu().contiguous(),
+        # Fusion gate as u8 (0/1): candle's safetensors loader has no BOOL dtype,
+        # so the Rust live test reads this and maps != 0 -> bool. This is the
+        # canonical always-fusion flag (True) jammi's front-end emits for every
+        # clip, matching the feature extractor's deterministic promotion.
+        "is_longer": is_longer.to(torch.uint8).cpu().contiguous(),
         "embedding": embedding.to(torch.float32).cpu().contiguous(),
+        "waveform_i16": waveform_i16.cpu().contiguous(),
     }
     save_file(goldens, os.path.join(REAL_OUT, "goldens.safetensors"))
     write_manifest(goldens, os.path.join(REAL_OUT, "golden_manifest.json"))
     with open(os.path.join(REAL_OUT, "model_id.txt"), "w") as f:
         f.write(model_id + "\n")
-    print(f"[real] {REAL_OUT}: embedding {tuple(embedding.shape)} from {model_id}")
+    print(
+        f"[real] {REAL_OUT}: embedding {tuple(embedding.shape)} "
+        f"is_longer={is_longer.tolist()} (canonical fusion) from {model_id}"
+    )
 
 
 if __name__ == "__main__":

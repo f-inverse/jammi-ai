@@ -21,20 +21,28 @@
 //! remote arm (under `wire`) is `RemoteSession::connect` → `Session::Remote`. No
 //! construction logic is duplicated here.
 
+#[cfg(feature = "local")]
 use std::sync::Arc;
 
+#[cfg(feature = "local")]
 use jammi_db::config::JammiConfig;
 use jammi_db::error::Result;
 
-use crate::local_session::{LocalSession, Session};
+#[cfg(feature = "local")]
+use crate::local_session::LocalSession;
+use crate::local_session::Session;
+#[cfg(feature = "local")]
 use crate::session::InferenceSession;
 
 /// Where a [`Session`] should run. The transport is chosen once, here, when the
 /// caller opens the SDK; every verb on the resulting [`Session`] is then
 /// transport-agnostic.
 pub enum Target {
-    /// An embedded, in-process engine built from this [`JammiConfig`]. Always
-    /// available — the embeddable engine needs no transport stack.
+    /// An embedded, in-process engine built from this [`JammiConfig`]. Present
+    /// only under the default-on `local` feature; a thin remote-only (`wire`-only)
+    /// build cannot name an embedded target — there is no dead arm, no
+    /// `unreachable!`, just the one `Remote` constructor.
+    #[cfg(feature = "local")]
     Local(JammiConfig),
     /// A remote engine reached over the `jammi.v1` gRPC wire at this endpoint.
     /// Present only under the `wire` feature; a default / embedded build has no
@@ -58,6 +66,7 @@ impl Jammi {
     ///   it as `Session::Remote` (only under the `wire` feature).
     pub async fn open(target: Target) -> Result<Session> {
         match target {
+            #[cfg(feature = "local")]
             Target::Local(config) => {
                 let engine = Arc::new(InferenceSession::new(config).await?);
                 Ok(Session::Local(LocalSession::new(engine)))

@@ -6,6 +6,11 @@
 
 pub mod golden;
 pub mod report;
+// The eval *runner* drives the embedded engine (it loads models and runs
+// inference/search), so it rides the `local` feature. The report shapes and
+// `EvalTask` below stay transport-neutral — the `wire` surface and
+// `RemoteSession` decode them without the engine.
+#[cfg(feature = "local")]
 pub mod runner;
 
 pub use report::{

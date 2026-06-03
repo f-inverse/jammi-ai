@@ -11,12 +11,32 @@ readme = "README.md"
 [dependencies]
 jammi-db.workspace = true
 jammi-numerics.workspace = true
+# `jammi-lora` is pulled for its candle-free config vocabulary (the `BackboneDtype`
+# / `LoraInitMode` fields of `FineTuneConfig`, on the wire surface) at all times
+# — the workspace pins it `default-features = false`. Its candle stack is opt-in:
+# the `local` feature turns `jammi-lora/candle` back on for the embedded fine-tune
+# engine.
 jammi-lora.workspace = true
-jammi-encoders.workspace = true
-candle-core.workspace = true
-candle-nn.workspace = true
-hf-hub.workspace = true
-tokenizers.workspace = true
+
+# ── The embedded ML engine. Every dep below pulls a heavy ML / decode stack and
+# is needed only by the in-process engine (the `model` / `inference` / `session`
+# / engine-`fine_tune` / `eval::runner` modules). They are gated behind the
+# default-on `local` feature so a remote-only `wire` build pulls none of them and
+# stays a thin wire-speaker. A default / embedded / PyO3 build keeps them all.
+jammi-encoders = { workspace = true, optional = true }
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+hf-hub = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+# Image processing
+image = { workspace = true, optional = true }
+# Audio decode/demux for the audio-embedding path (bytes-in: WAV/FLAC/MP3/Ogg)
+symphonia = { workspace = true, optional = true }
+# Gzip decompression for OpenCLIP BPE vocab (bpe_simple_vocab_16e6.txt.gz)
+flate2 = { workspace = true, optional = true }
+# HTTP backend
+reqwest = { workspace = true, optional = true }
+
 datafusion.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
@@ -29,18 +49,6 @@ tokio.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 chrono.workspace = true
-
-# Image processing
-image.workspace = true
-
-# Audio decode/demux for the audio-embedding path (bytes-in: WAV/FLAC/MP3/Ogg)
-symphonia.workspace = true
-
-# Gzip decompression for OpenCLIP BPE vocab (bpe_simple_vocab_16e6.txt.gz)
-flate2.workspace = true
-
-# HTTP backend
-reqwest.workspace = true
 
 # gRPC wire surface (default-off `wire` feature). These pull the transport
 # stack only when a consumer that speaks gRPC — `jammi-server`, a future
@@ -68,9 +76,31 @@ serial_test = "3"
 jammi-test-utils.workspace = true
 
 [features]
+default = ["local"]
+# The embedded in-process engine: model loading + inference + fine-tune training
+# + embedding/search pipelines, and the candle / hf-hub / symphonia / tokenizers
+# / image stack they run on. Default-on, so a plain / embedded / PyO3 build is
+# byte-unchanged. Turning it OFF (with `wire` ON) yields a thin remote-only client
+# — `RemoteSession` + `Session::Remote` + `Jammi::open(Target::Remote)` — that
+# pulls no ML stack. The `Session` / `Target` enums gain their `Local` arm only
+# under this feature, mirroring how `Remote` rides `wire`: the buildable surface
+# equals the runtime capability.
+local = [
+    "dep:jammi-encoders",
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:hf-hub",
+    "dep:tokenizers",
+    "dep:image",
+    "dep:symphonia",
+    "dep:flate2",
+    "dep:reqwest",
+    "jammi-lora/candle",
+]
 live-hub-tests = []
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
-metal = ["candle-core/metal", "candle-nn/metal"]
+# CUDA / Metal acceleration of the embedded engine — only meaningful with `local`.
+cuda = ["local", "candle-core/cuda", "candle-nn/cuda"]
+metal = ["local", "candle-core/metal", "candle-nn/metal"]
 # The gRPC wire surface: generated tonic stubs (build.rs codegen) plus the
 # proto↔domain conversions in `src/wire`. Default-off so the embeddable engine
 # pulls no transport stack; `jammi-server` and a future `RemoteSession` enable
@@ -86,3 +116,14 @@ wire = [
     "dep:tonic-build",
     "dep:tonic-prost-build",
 ]
+
+# The `it` integration suite drives the embedded engine end-to-end (model loading,
+# inference, fine-tune, search), so it requires the `local` feature. Declaring the
+# requirement here lets `--all-targets` skip it cleanly in the thin `wire`-only
+# build rather than fail to compile an engine test with no engine. The wire
+# proto↔domain conversions keep their own in-lib `#[cfg(test)]` unit tests, which
+# the thin build still compiles and runs.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+required-features = ["local"]

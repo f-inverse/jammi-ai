@@ -5,17 +5,31 @@
 //! with backpressure, and typed output adapters for embedding,
 //! classification, summarization, and other ML tasks.
 
+// The embedded engine: model loading, inference execution, fine-tune training,
+// and the embedding/search pipelines that run on the candle stack. Gated behind
+// the default-on `local` feature so a remote-only `wire` build pulls none of it.
+// `eval` and `fine_tune` keep their candle-free config / report vocabulary
+// (`EvalTask`, the eval reports, `FineTuneConfig`/`FineTuneMethod`) available
+// either way — only their engine-running submodules ride `local`.
+#[cfg(feature = "local")]
 pub mod concurrency;
 pub mod eval;
+#[cfg(feature = "local")]
 pub mod evidence;
 pub mod fine_tune;
+#[cfg(feature = "local")]
 pub mod inference;
 pub mod jammi;
 pub mod local_session;
+#[cfg(feature = "local")]
 pub mod model;
+#[cfg(feature = "local")]
 pub mod operator;
+#[cfg(feature = "local")]
 pub mod pipeline;
+#[cfg(feature = "local")]
 pub mod search;
+#[cfg(feature = "local")]
 pub mod session;
 
 /// The gRPC wire surface: generated `jammi.v1` tonic stubs plus the
@@ -34,8 +48,16 @@ pub mod wire;
 pub mod remote_session;
 
 /// The transport-agnostic consumer surface: a closed `enum` over session
-/// transports, with the in-process [`local_session::LocalSession`] behind it.
-pub use local_session::{LocalSession, Modality, QueryInput, SearchQuery, SearchRequest, Session};
+/// transports. The in-process [`local_session::LocalSession`] behind the
+/// `Local` arm rides the `local` feature alongside the engine it drives; the
+/// request/result vocabulary ([`Modality`], the query and search shapes) is
+/// transport-neutral and always present.
+pub use local_session::{Modality, QueryInput, SearchQuery, SearchRequest, Session};
+
+/// The in-process [`Session`] transport, behind the `local` feature with the
+/// embedded engine it drives.
+#[cfg(feature = "local")]
+pub use local_session::LocalSession;
 
 /// The SDK front door: [`jammi::Jammi::open`] opens a [`Session`] against a
 /// [`jammi::Target`], selecting the embedded (`Local`) or — under `wire` — the

@@ -131,17 +131,17 @@ pub enum Session {
     Remote(crate::remote_session::RemoteSession),
 }
 
-/// The three Flight-SQL-shaped verbs a [`Session::Remote`] does not drive over
-/// the typed-RPC surface (`add_source` / `sql` / `read_vectors`) return this — a
-/// real, propagated value, never a panic. Every other verb on the [`Session`]
-/// surface is wire-reachable: the embeddings / encode-query / search /
+/// The two Flight-SQL-shaped verbs a [`Session::Remote`] does not drive over
+/// the typed-RPC surface (`sql` / `read_vectors`) return this — a real,
+/// propagated value, never a panic. Every other verb on the [`Session`] surface
+/// is wire-reachable: the embeddings / encode-query / search / add-source /
 /// remove-source verbs, the tenant trio, the `JammiError`-returning compute
 /// verbs (inference, eval, fine-tune, mutable-table create/drop, channel
 /// register / add-columns), the topics + subscribe-streaming surface, and the
-/// audit surface. A caller that reaches one of the three unwired verbs on a
+/// audit surface. A caller that reaches one of the two unwired verbs on a
 /// remote session gets a typed error naming the verb — the truthful answer to
 /// "is this verb available on this transport yet?", not a stand-in for a domain
-/// failure. (These three carry SQL / raw-vector payloads that ride the Flight
+/// failure. (These two carry SQL / raw-vector payloads that ride the Flight
 /// SQL surface, not a typed gRPC verb, so they are wired in that lane, not here.)
 #[cfg(feature = "wire")]
 fn remote_verb_pending(verb: &str) -> jammi_db::error::JammiError {
@@ -154,12 +154,6 @@ impl Session {
     // --- sources ---------------------------------------------------------
 
     /// Register a data source.
-    // The Flight-SQL-shaped verbs (`add_source` / `sql` / `read_vectors`) ride the
-    // engine arm; the remote arm returns `remote_verb_pending` (wired on the Flight
-    // SQL lane, not the typed-RPC surface), so their params are consumed only by the
-    // `local` arm. A thin `wire`-only build keeps the params for API parity but does
-    // not read them.
-    #[cfg_attr(not(feature = "local"), allow(unused_variables))]
     pub async fn add_source(
         &self,
         source_id: &str,
@@ -170,7 +164,7 @@ impl Session {
             #[cfg(feature = "local")]
             Session::Local(s) => s.add_source(source_id, source_type, connection).await,
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending("add_source")),
+            Session::Remote(s) => s.add_source(source_id, source_type, connection).await,
         }
     }
 

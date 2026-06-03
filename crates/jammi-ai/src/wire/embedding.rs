@@ -11,7 +11,10 @@
 //! The engine's [`SourceType`] / [`SourceConnection`] are foreign types (they
 //! live in `jammi-db`), so their decodes take the **proto** message as the
 //! `From` side (a local generated type) rather than a raw `i32` — that is the
-//! orphan-rule-clean shape and the handler passes the proto enum directly.
+//! orphan-rule-clean shape and the handler passes the proto enum directly. The
+//! send side (the remote `add_source` client) gets the inverse encodes:
+//! [`source_type_to_proto`] for the kind and `From<SourceConnection>` for the
+//! connection message, carrying the same URL + format the decode reads back.
 
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
@@ -112,6 +115,19 @@ pub fn source_type_from_proto(kind: i32) -> Result<SourceType, Status> {
     }
 }
 
+/// Encode the engine's [`SourceType`] onto the proto `SourceKind` discriminant —
+/// the inverse of [`source_type_from_proto`], for the [`crate::RemoteSession`]
+/// send side. Total: every engine source type maps to a concrete wire variant
+/// (the engine type has no unspecified state). Mirrors
+/// [`super::model_task_to_proto`].
+pub fn source_type_to_proto(source_type: SourceType) -> pb::SourceKind {
+    match source_type {
+        SourceType::File => pb::SourceKind::File,
+        SourceType::Postgres => pb::SourceKind::Postgres,
+        SourceType::Mysql => pb::SourceKind::Mysql,
+    }
+}
+
 /// Build the engine's [`SourceConnection`] from the proto message. Only the URL
 /// and format are carried on the wire; cloud credentials are server-side, so
 /// the rest comes from `Default`.
@@ -129,6 +145,37 @@ impl TryFrom<pb::SourceConnection> for SourceConnection {
             format: file_format_from_proto(conn.format)?,
             ..Default::default()
         })
+    }
+}
+
+/// Encode the engine's [`SourceConnection`] into the proto message for an
+/// `AddSource` request — the inverse of the decode above, for the
+/// [`crate::RemoteSession`] send side. Only the URL + format cross the wire
+/// (matching what the decode reads back): cloud credentials, file-extension
+/// overrides, and driver options are server-side and have no wire field, so the
+/// send side does not carry them. A `None` URL encodes as the empty string the
+/// decode reads back as `None`; an unset format encodes as
+/// `FILE_FORMAT_UNSPECIFIED`, which the decode maps to "let the engine infer".
+impl From<SourceConnection> for pb::SourceConnection {
+    fn from(conn: SourceConnection) -> Self {
+        pb::SourceConnection {
+            url: conn.url.unwrap_or_default(),
+            format: file_format_to_proto(conn.format) as i32,
+        }
+    }
+}
+
+/// Map the engine's [`FileFormat`] onto the proto enum — the inverse of
+/// [`file_format_from_proto`]. An absent format encodes as
+/// `FILE_FORMAT_UNSPECIFIED` (the decode reads that back as "let the engine
+/// infer").
+fn file_format_to_proto(format: Option<FileFormat>) -> pb::FileFormat {
+    match format {
+        Some(FileFormat::Parquet) => pb::FileFormat::Parquet,
+        Some(FileFormat::Csv) => pb::FileFormat::Csv,
+        Some(FileFormat::Json) => pb::FileFormat::Json,
+        Some(FileFormat::Avro) => pb::FileFormat::Avro,
+        None => pb::FileFormat::Unspecified,
     }
 }
 

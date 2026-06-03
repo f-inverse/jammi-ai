@@ -219,7 +219,9 @@ fn front_half_matches_goldens() {
     let encoder = load_front_encoder(&device);
     let input = load_pinned_input().expect("load pinned_input");
 
-    let front = encoder.forward_front(&input).expect("front-half forward");
+    let front = encoder
+        .forward_front(&input, &[true, true])
+        .expect("front-half forward");
 
     assert_close_max_abs(
         &front.post_batch_norm,
@@ -257,6 +259,44 @@ fn front_half_matches_goldens() {
     );
 }
 
+/// The `is_longer=false` patch-embed path: a short clip's patch embedding is the
+/// global patch-conv ALONE, with no AFF fusion (HF `ClapAudioPatchEmbed` skips
+/// `mel_conv2d`+`fusion_model` when `is_longer_idx` is empty). Driving the front
+/// half with `is_longer=[false, false]` on the SAME pinned input must reproduce
+/// the `patch_embed_out_global_only` golden — proving the per-sample fusion gate,
+/// not the unconditional-fusion path that produces a different (wrong) embedding.
+#[test]
+fn patch_embed_global_only_matches_golden() {
+    let device = Device::Cpu;
+    let goldens = Goldens::load().expect("load goldens.safetensors");
+    let encoder = load_front_encoder(&device);
+    let input = load_pinned_input().expect("load pinned_input");
+
+    let front = encoder
+        .forward_front(&input, &[false, false])
+        .expect("front-half forward (is_longer=false)");
+
+    assert_close_max_abs(
+        &front.patch_embed_out,
+        goldens
+            .get("patch_embed_out_global_only")
+            .expect("patch_embed_out_global_only"),
+        "patch_embed_out_global_only",
+    );
+
+    // The gate is real: the is_longer=true patch embed differs from the
+    // global-only one on this input (the fusion path changes the embedding).
+    let fused = encoder
+        .forward_front(&input, &[true, true])
+        .expect("front-half forward (is_longer=true)");
+    let delta = max_abs_diff(&fused.patch_embed_out, &front.patch_embed_out)
+        .expect("fused vs global-only diff");
+    assert!(
+        delta > TOL_ABS,
+        "is_longer gate is a no-op: fused and global-only patch embeds agree (Δ={delta})"
+    );
+}
+
 /// Build the full HTSAT-Swin tower (encoder + projection) from the committed
 /// `model.safetensors` (root scope).
 fn load_full_tower(device: &Device) -> HtsatAudio {
@@ -284,7 +324,7 @@ fn full_forward_matches_goldens() {
     // Front half (gated again here so the full tower stands alone).
     let front = tower
         .encoder()
-        .forward_front(&input)
+        .forward_front(&input, &[true, true])
         .expect("front-half forward");
     let frames_num = front
         .post_reshape_mel2img
@@ -337,7 +377,7 @@ fn full_forward_matches_goldens() {
         "projected_unnormalized",
     );
 
-    let normalized = tower.forward(&input).expect("full forward");
+    let normalized = tower.forward(&input, &[true, true]).expect("full forward");
     assert_close_cosine(
         &normalized,
         goldens
@@ -363,7 +403,7 @@ fn tower_accepts_arbitrary_input_length() {
     for t in [300usize, 512] {
         let input = Tensor::randn(0f32, 1f32, (2, 4, t, n_mels), &device).expect("random input");
         let emb = tower
-            .forward(&input)
+            .forward(&input, &[true, true])
             .unwrap_or_else(|e| panic!("forward at T={t}: {e}"));
         assert_eq!(
             emb.dims(),
@@ -477,9 +517,12 @@ fn expected_weight_shapes(config: &HtsatAudioConfig) -> HashMap<String, Vec<usiz
                 );
                 put(format!("{blk}.attention.self.{proj}.bias"), vec![dim]);
             }
+            // HF sizes the bias table by the config window: (2·ws−1)² rows.
+            let ws = config.window_size;
+            let table_rows = (2 * ws - 1) * (2 * ws - 1);
             put(
                 format!("{blk}.attention.self.relative_position_bias_table"),
-                vec![49, heads],
+                vec![table_rows, heads],
             );
             // Attention output projection.
             put(

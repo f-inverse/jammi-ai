@@ -180,6 +180,17 @@ def collect_goldens(model, feats, is_longer):
     for h in handles:
         h.remove()
 
+    # is_longer=False patch-embed boundary: the SAME post_reshape_mel2img input
+    # the main forward fed patch_embed, but with an empty is_longer_idx so the
+    # fusion (mel_conv2d + AFF) path is skipped and every sample is the global
+    # patch-conv alone. This pins the short-clip branch the Rust tower selects
+    # per sample. The existing is_longer=True goldens above are untouched.
+    with torch.inference_mode():
+        empty_idx = torch.where(torch.zeros(BATCH, dtype=torch.bool))[0]
+        goldens["patch_embed_out_global_only"] = _as_tensor(
+            encoder.patch_embed(goldens["post_reshape_mel2img"], empty_idx)
+        )
+
     # post_interpolation: the bicubic time-interpolation reshape_mel2img performs
     # internally (1001->spec_width in the real model; 500->512 here). It equals
     # F.interpolate of reshape_mel2img's input = the batch_norm output transposed

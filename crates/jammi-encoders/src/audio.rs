@@ -38,9 +38,9 @@ impl AudioEncoder for HtsatAudio {
     fn embed_batch(
         &self,
         input_features: &Tensor,
-        _is_longer: &[bool],
+        is_longer: &[bool],
     ) -> Result<Tensor, EncoderError> {
-        self.forward(input_features)
+        self.forward(input_features, is_longer)
     }
     fn embedding_dim(&self) -> usize {
         self.projection_dim()

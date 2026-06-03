@@ -164,6 +164,14 @@
     ],
     "dtype": "float32"
   },
+  "patch_embed_out_global_only": {
+    "shape": [
+      2,
+      1024,
+      16
+    ],
+    "dtype": "float32"
+  },
   "post_interpolation": {
     "shape": [
       2,

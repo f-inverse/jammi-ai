@@ -6,8 +6,10 @@
 //! spine. It consumes a fused 4-channel log-mel spectrogram
 //! `[batch, 4, time, freq]`, batch-normalizes it, bicubic-resamples the time
 //! axis up to the Swin input width, reshapes the time-frequency plane into a
-//! square "image", and patch-embeds it through an Attentional-Feature-Fusion
-//! (AFF) block.
+//! square "image", and patch-embeds it. The patch embedding is gated per sample
+//! by `is_longer`: a longer clip's embedding is the Attentional-Feature-Fusion
+//! (AFF) blend of the global patch-conv and the local mel channels, while a
+//! short clip uses the global patch-conv alone.
 //!
 //! This module implements the complete tower: the front half (batch-norm →
 //! bicubic time-resample → `reshape_mel2img` → fused patch-embed) through the
@@ -175,7 +177,11 @@ impl TimeInterp {
     /// exactly as ATen does, then folded into the dense row; edge taps are
     /// clamped (replicate padding), accumulating their weight onto the nearest
     /// valid input index, matching PyTorch's boundary handling.
-    fn build_matrix(out_len: usize, in_len: usize, device: &candle_core::Device) -> Tensor {
+    fn build_matrix(
+        out_len: usize,
+        in_len: usize,
+        device: &candle_core::Device,
+    ) -> Result<Tensor, EncoderError> {
         let mut data = vec![0.0_f32; out_len * in_len];
         // align_corners=True: src(o) = o * (in_len - 1) / (out_len - 1).
         let scale = if out_len > 1 {
@@ -195,7 +201,7 @@ impl TimeInterp {
                 data[o * in_len + idx] += coeffs[k];
             }
         }
-        Tensor::from_vec(data, (out_len, in_len), device).expect("build bicubic matrix")
+        Ok(Tensor::from_vec(data, (out_len, in_len), device)?)
     }
 
     fn new(out_len: usize, device: &candle_core::Device) -> Self {
@@ -216,7 +222,7 @@ impl TimeInterp {
         }
         // out[b,c,o,f] = sum_i W[o,i] x[b,c,i,f], W = [out_len, T] built for this
         // input length. Move time to the second-last axis, contract with W^T.
-        let weights = Self::build_matrix(self.out_len, t, &self.device);
+        let weights = Self::build_matrix(self.out_len, t, &self.device)?;
         // [B, C, T, F] -> [B, C, F, T] -> [B*C*F, T]
         let xt = x.transpose(2, 3)?.contiguous()?.reshape((b * c * f, t))?;
         // [B*C*F, T] @ [T, out_len] = [B*C*F, out_len]
@@ -420,9 +426,18 @@ impl HtsatPatchEmbed {
     /// Patch-embed the fused image `[B, 4, spec_size, spec_size]` to
     /// `[B, num_patches, patch_embeds_hidden_size]`. `mel_conv2d_out` and
     /// `fusion_out` receive the two intermediate boundaries.
+    ///
+    /// Fusion is gated per sample by `is_longer` (HF `ClapAudioPatchEmbed`): an
+    /// `is_longer=true` sample's patch embedding is the AFF blend of the global
+    /// patch-conv and the local `mel_conv2d` channels, while an `is_longer=false`
+    /// sample uses the global patch-conv alone. Both paths are computed for the
+    /// whole batch and selected per sample by a `[B, 1, 1, 1]` mask, matching
+    /// HF's `global_hidden_states[is_longer_idx] = fusion(...)` index-assignment
+    /// without per-row scatter.
     fn forward(
         &self,
         x: &Tensor,
+        is_longer: &[bool],
         mel_conv2d_out: &mut Option<Tensor>,
         fusion_out: &mut Option<Tensor>,
     ) -> Result<Tensor, EncoderError> {
@@ -431,6 +446,12 @@ impl HtsatPatchEmbed {
             return Err(EncoderError::Config(format!(
                 "HTSAT patch embed expected [{batch}, _, {0}, {0}], got height={height} width={width}",
                 self.img_size
+            )));
+        }
+        if is_longer.len() != batch {
+            return Err(EncoderError::Config(format!(
+                "HTSAT patch embed: is_longer has {} flags for a batch of {batch}",
+                is_longer.len()
             )));
         }
 
@@ -461,8 +482,19 @@ impl HtsatPatchEmbed {
         let fused = self.fusion_model.forward(&global, &local)?;
         *fusion_out = Some(fused.clone());
 
+        // Per-sample select: fused where is_longer, global patch-conv otherwise.
+        // Mask is [B, 1, 1, 1] broadcasting over channels and the patch grid.
+        let mask: Vec<f32> = is_longer
+            .iter()
+            .map(|&b| if b { 1.0 } else { 0.0 })
+            .collect();
+        let mask = Tensor::from_vec(mask, (batch, 1, 1, 1), global.device())?;
+        let patch_map = mask
+            .broadcast_mul(&fused)?
+            .add(&(1.0 - &mask)?.broadcast_mul(&global)?)?;
+
         // Flatten the patch grid and LayerNorm: [B, C, gh, gw] -> [B, gh*gw, C].
-        let flat = fused.flatten_from(2)?.transpose(1, 2)?.contiguous()?;
+        let flat = patch_map.flatten_from(2)?.transpose(1, 2)?.contiguous()?;
         Ok(self.norm.forward(&flat)?)
     }
 }
@@ -490,21 +522,32 @@ struct SwinSelfAttention {
     query: Linear,
     key: Linear,
     value: Linear,
-    /// `[49, num_heads]` learned relative-position bias table.
+    /// `[(2·ws−1)², num_heads]` learned relative-position bias table, sized by
+    /// the config window (HF sizes the table by `config.window_size`, not the
+    /// block's effective window).
     rel_bias_table: Tensor,
-    /// `[256]` flattened `[16, 16]` relative-position index (U32), recomputed.
+    /// `[(ws·ws)²]` flattened relative-position index (U32), recomputed over the
+    /// config window.
     rel_index: Tensor,
     num_heads: usize,
     head_size: usize,
 }
 
 impl SwinSelfAttention {
-    fn load(vb: VarBuilder, dim: usize, num_heads: usize) -> Result<Self, EncoderError> {
+    /// `ws` is the config window size (`config.window_size`): HF constructs
+    /// `ClapAudioSelfAttention` with `window_size=config.window_size` and never
+    /// re-sizes it when a block's effective window is clamped to a smaller grid,
+    /// so the bias table and relative-position index are both sized by the config
+    /// window. (Token count per window equals the effective window squared, which
+    /// coincides with `ws·ws` in every reachable config since the deepest stage's
+    /// grid equals the window.)
+    fn load(vb: VarBuilder, dim: usize, num_heads: usize, ws: usize) -> Result<Self, EncoderError> {
         let query = linear(dim, dim, vb.pp("query"))?;
         let key = linear(dim, dim, vb.pp("key"))?;
         let value = linear(dim, dim, vb.pp("value"))?;
-        let rel_bias_table = vb.get((49, num_heads), "relative_position_bias_table")?;
-        let rel_index = Self::build_rel_index(WINDOW_SIZE, vb.device())?;
+        let table_rows = (2 * ws - 1) * (2 * ws - 1);
+        let rel_bias_table = vb.get((table_rows, num_heads), "relative_position_bias_table")?;
+        let rel_index = Self::build_rel_index(ws, vb.device())?;
         Ok(Self {
             query,
             key,
@@ -547,8 +590,9 @@ impl SwinSelfAttention {
             .contiguous()?)
     }
 
-    /// `hidden`: `[B*nW, L=16, C]`; `mask`: optional `[nW, L, L]`; `num_windows`
-    /// is nW (needed to fold the mask over the batch axis).
+    /// `hidden`: `[B*nW, L, C]` (`L = ws·ws` tokens per window); `mask`: optional
+    /// `[nW, L, L]`; `num_windows` is nW (needed to fold the mask over the batch
+    /// axis).
     fn forward(
         &self,
         hidden: &Tensor,
@@ -611,9 +655,6 @@ struct SwinBlock {
     attn_mask: Option<Tensor>,
 }
 
-/// Window side length from the tiny/real config (`window_size = 4`).
-const WINDOW_SIZE: usize = 4;
-
 impl SwinBlock {
     fn load(
         vb: VarBuilder,
@@ -626,7 +667,12 @@ impl SwinBlock {
     ) -> Result<Self, EncoderError> {
         let eps = config.layer_norm_eps;
         let layernorm_before = layer_norm(dim, eps, vb.pp("layernorm_before"))?;
-        let attention = SwinSelfAttention::load(vb.pp("attention").pp("self"), dim, num_heads)?;
+        let attention = SwinSelfAttention::load(
+            vb.pp("attention").pp("self"),
+            dim,
+            num_heads,
+            config.window_size,
+        )?;
         let attention_output = linear(dim, dim, vb.pp("attention").pp("output").pp("dense"))?;
         let layernorm_after = layer_norm(dim, eps, vb.pp("layernorm_after"))?;
         let inter = (config.mlp_ratio * dim as f64) as usize;
@@ -956,8 +1002,13 @@ impl HtsatAudioEncoder {
     }
 
     /// Run the front half on `input_features` `[B, 4, T, num_mel_bins]` (any T),
-    /// capturing every gated boundary.
-    pub fn forward_front(&self, input_features: &Tensor) -> Result<FrontHalf, EncoderError> {
+    /// capturing every gated boundary. `is_longer` gates the per-sample fusion in
+    /// the patch embedding (`true` → AFF blend, `false` → global patch-conv only).
+    pub fn forward_front(
+        &self,
+        input_features: &Tensor,
+        is_longer: &[bool],
+    ) -> Result<FrontHalf, EncoderError> {
         // transpose(1,3) -> [B, freq, time, 4]; batch-norm over the freq axis
         // (now channel dim 1); transpose back.
         let x = input_features.transpose(1, 3)?.contiguous()?;
@@ -975,6 +1026,7 @@ impl HtsatAudioEncoder {
         let mut fusion_model_out = None;
         let patch_embed_out = self.patch_embed.forward(
             &post_reshape_mel2img,
+            is_longer,
             &mut mel_conv2d_out,
             &mut fusion_model_out,
         )?;
@@ -1188,10 +1240,15 @@ impl HtsatAudio {
         &self.projection
     }
 
-    /// Full forward on `input_features` `[B, 4, T, num_mel_bins]` (any T), returning
-    /// the L2-normalized audio embedding `[B, projection_dim]`.
-    pub fn forward(&self, input_features: &Tensor) -> Result<Tensor, EncoderError> {
-        let front = self.encoder.forward_front(input_features)?;
+    /// Full forward on `input_features` `[B, 4, T, num_mel_bins]` (any T), with
+    /// the per-sample `is_longer` fusion gate, returning the L2-normalized audio
+    /// embedding `[B, projection_dim]`.
+    pub fn forward(
+        &self,
+        input_features: &Tensor,
+        is_longer: &[bool],
+    ) -> Result<Tensor, EncoderError> {
+        let front = self.encoder.forward_front(input_features, is_longer)?;
         let frames_num = front.post_reshape_mel2img.dim(2)?;
         let spine = self
             .encoder
@@ -1245,7 +1302,7 @@ mod tests {
     /// check of `build_matrix` independent of any golden dump.
     #[test]
     fn bicubic_matrix_small_case() {
-        let w = TimeInterp::build_matrix(8, 5, &Device::Cpu);
+        let w = TimeInterp::build_matrix(8, 5, &Device::Cpu).unwrap();
         let rows = w.to_vec2::<f32>().unwrap();
         assert_eq!(rows.len(), 8);
         assert_eq!(rows[0].len(), 5);
@@ -1261,5 +1318,47 @@ mod tests {
             "first output = first input"
         );
         assert!((rows[7][4] - 1.0).abs() < 1e-6, "last output = last input");
+    }
+
+    /// FIX-1 generality: the Swin self-attention's relative-position bias-table
+    /// row count and recomputed index are sized purely by the window size, with
+    /// no hardcoded `window=4`. Both the tiny config (window=4 → 49 rows) and the
+    /// real `laion/clap-htsat-fused` config (window=8 → 225 rows) must derive
+    /// correctly. The index is `ws·ws` tokens squared, with every entry in range
+    /// for the `(2·ws−1)²`-row table (HF's `relative_position_index` bound).
+    #[test]
+    fn rel_pos_table_and_index_are_window_sized() {
+        for ws in [4usize, 8] {
+            let table_rows = (2 * ws - 1) * (2 * ws - 1);
+            assert_eq!(
+                table_rows,
+                match ws {
+                    4 => 49,
+                    8 => 225,
+                    _ => unreachable!(),
+                },
+                "ws={ws}: table rows"
+            );
+
+            let index = SwinSelfAttention::build_rel_index(ws, &Device::Cpu).unwrap();
+            let n = ws * ws;
+            assert_eq!(index.dims(), &[n * n], "ws={ws}: index length = (ws·ws)²");
+            let max = index.max(0).unwrap().to_scalar::<u32>().unwrap();
+            assert!(
+                (max as usize) < table_rows,
+                "ws={ws}: index max {max} must address within {table_rows} table rows"
+            );
+            // The self-position (token i to itself) maps to the table centre,
+            // index (2·ws−1)·(ws−1) + (ws−1) = 2·(ws−1)·ws, for every token.
+            let centre = 2 * (ws - 1) * ws;
+            let flat = index.to_vec1::<u32>().unwrap();
+            for i in 0..n {
+                assert_eq!(
+                    flat[i * n + i] as usize,
+                    centre,
+                    "ws={ws}: token {i} self-index must be the table centre"
+                );
+            }
+        }
     }
 }

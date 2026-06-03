@@ -90,15 +90,16 @@ impl CandleVisionForward for OpenClipVisionTransformer {
 /// `num_mel_bins`, which the front-end's mel-filter count must match.
 pub(crate) trait CandleAudioForward: Send + Sync {
     /// Pooled, L2-normalized `[batch, projection_dim]` embedding for a
-    /// `[batch, 4, time, num_mel_bins]` CLAP fusion spectrogram batch.
-    fn forward_audio(&self, input_features: &Tensor) -> Result<Tensor>;
+    /// `[batch, 4, time, num_mel_bins]` CLAP fusion spectrogram batch. `is_longer`
+    /// gates the per-sample fusion path in the patch embedding.
+    fn forward_audio(&self, input_features: &Tensor, is_longer: &[bool]) -> Result<Tensor>;
     /// Mel bins the input fusion spectrogram must carry.
     fn num_mel_bins(&self) -> usize;
 }
 
 impl CandleAudioForward for HtsatAudio {
-    fn forward_audio(&self, input_features: &Tensor) -> Result<Tensor> {
-        self.forward(input_features)
+    fn forward_audio(&self, input_features: &Tensor, is_longer: &[bool]) -> Result<Tensor> {
+        self.forward(input_features, is_longer)
             .map_err(|e| JammiError::Inference(format!("Audio forward pass failed: {e}")))
     }
     fn num_mel_bins(&self) -> usize {
@@ -575,17 +576,16 @@ impl CandleModel {
                 )));
             }
 
-            // Decode → resample → CLAP fusion front-end → [B, 4, time, n_mels].
-            // `is_longer` is produced per clip but the tower's fusion path is
-            // unconditional on the standard fused checkpoint, so it is not
-            // threaded into the forward here.
-            let (input_features, _is_longer) =
+            // Decode → resample → CLAP fusion front-end → [B, 4, time, n_mels]
+            // plus the per-clip `is_longer` flags that gate the patch-embed
+            // fusion per sample (a short clip uses the global patch-conv alone).
+            let (input_features, is_longer) =
                 audio_preprocess::preprocess_clap_fusion(&valid_clips, frontend, &self.device)?;
 
             // The CLAP audio tower emits L2-normalized embeddings directly
             // (like the text tower), so no further normalization is applied —
             // unlike the vision tower whose raw output is normalized here.
-            let normalized = audio.forward_audio(&input_features)?;
+            let normalized = audio.forward_audio(&input_features, &is_longer)?;
 
             // Apply the trained projection head if one was loaded. The head is
             // a post-pool transform on the shared-latent embedding, so an audio

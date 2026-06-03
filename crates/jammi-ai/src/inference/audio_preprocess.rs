@@ -205,7 +205,7 @@ impl ClapFrontendConfig {
 pub struct ClapFusionFeatures {
     /// `[4, time, n_mels]` dB log-mel, row-major over `(channel, time, mel)`.
     pub features: Vec<f32>,
-    /// Time-frame count `T` (equal to [`ClapFrontendConfig::chunk_frames`]).
+    /// Time-frame count `T` (equal to the frontend's fixed `chunk_frames`).
     pub time: usize,
     /// `is_longer`: the source clip was longer than the fixed window, so the
     /// fusion (`mel_conv2d` + AFF) tower path applies.

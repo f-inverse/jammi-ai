@@ -23,8 +23,11 @@ fn tiny_open_clip_id() -> String {
     "local:".to_string() + common::fixture("tiny_open_clip").to_str().unwrap()
 }
 
-fn tiny_clap_id() -> String {
-    "local:".to_string() + common::cookbook_fixture("tiny_clap").to_str().unwrap()
+fn htsat_clap_id() -> String {
+    "local:".to_string()
+        + common::cookbook_fixture("htsat_clap_tiny")
+            .to_str()
+            .unwrap()
 }
 
 fn tiny_modernbert_id() -> String {
@@ -1137,7 +1140,7 @@ async fn recipe_generate_audio_embeddings() {
 
     let dir = TempDir::new().unwrap();
     let session = cookbook_session(&dir).await;
-    let model_id = tiny_clap_id();
+    let model_id = htsat_clap_id();
 
     // Build a tiny audio corpus parquet (clip_id, audio bytes) with three
     // synthetic WAV tones at distinct pitches.
@@ -1198,7 +1201,7 @@ async fn recipe_generate_audio_embeddings() {
         .encode_audio_query(&model_id, &query_wav)
         .await
         .unwrap();
-    assert_eq!(query_vec.len(), 16); // tiny CLAP embed_dim=16
+    assert_eq!(query_vec.len(), 8); // htsat_clap_tiny projection_dim=8
 
     // L2-normalized.
     let norm: f32 = query_vec.iter().map(|v| v * v).sum::<f32>().sqrt();

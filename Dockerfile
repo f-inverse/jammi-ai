@@ -71,17 +71,17 @@ CMD ["--config", "/etc/jammi/jammi.toml"]
 # Boots with zero external config and no mounted volume: the baked
 # config (`deploy/jammi.selfcontained.toml`) points `artifact_dir`
 # under `/tmp` (the only path the distroless nonroot user can write
-# without a provisioned volume) and the baked `tiny_clap` encoder
-# fixture lets `EncodeAudioQuery` / `GenerateAudioEmbeddings` run
-# offline. Clients pass the encoder per request as
-# `model_id = "local:/opt/jammi/models/tiny_clap"`.
+# without a provisioned volume) and the baked `htsat_clap_tiny`
+# encoder fixture lets `EncodeAudioQuery` / `GenerateAudioEmbeddings`
+# run offline. Clients pass the encoder per request as
+# `model_id = "local:/opt/jammi/models/htsat_clap_tiny"`.
 #
 # No `VOLUME` here — declaring one on a runtime that provides no
 # volume just yields an anonymous mount the deploy can't reach.
 FROM runtime-base AS runtime-selfcontained
 
 COPY deploy/jammi.selfcontained.toml /etc/jammi/jammi.toml
-COPY cookbook/fixtures/tiny_clap /opt/jammi/models/tiny_clap
+COPY cookbook/fixtures/htsat_clap_tiny /opt/jammi/models/htsat_clap_tiny
 
 USER nonroot:nonroot
 

@@ -12,22 +12,27 @@ real activations rather than a fabricated layout.
 | File | Contents |
 |---|---|
 | `config.json` | tiny `ClapAudioConfig` (`model_type = "clap_audio_model"`) |
+| `preprocessor_config.json` | tiny `ClapFeatureExtractor` geometry (`feature_size = 32` to match `num_mel_bins`; small window/hop so the fusion front-end emits a valid small input — the tower bicubic-resamples any time length to `spec_width`) |
 | `model.safetensors` | tiny real-HTSAT weights (~1.6 MB) |
-| `pinned_input.safetensors` | the deterministic `input_features` `[2, 4, 512, 32]` the tower is tested on, independent of the audio front-end |
+| `pinned_input.safetensors` | the deterministic `input_features` `[2, 4, 500, 32]` the tower is tested on, independent of the audio front-end |
 | `goldens.safetensors` | per-boundary activations (see naming below) |
 | `golden_manifest.json` | `name -> {shape, dtype}` index of the goldens |
 
 ## Golden boundary names
 
-`mel_in`, `post_batch_norm`, `post_reshape_mel2img`, `patch_embed_out`,
+`mel_in`, `post_batch_norm`, `post_interpolation`, `post_reshape_mel2img`,
+`mel_conv2d_out`, `fusion_model_out`, `patch_embed_out`,
 `stage{0..3}.block{0,1}_out`, `stage{0..2}.downsample_out`, `final_norm_out`,
 `pre_pool`, `pooler_out`, `projected_unnormalized`, `projected_normalized`.
 
-The fixture is `enable_fusion=True` (to match the real key layout) but the pinned
-input is `is_longer=False`, so the forward exercises only the standard global
-patch-embed → Swin path — the path the real fused checkpoint runs for normal
-clips, and the only path the Rust tower ports. The AFF fusion submodules
-(`fusion_model.*`, `mel_conv2d`) are present in the weights but never executed.
+The fixture reproduces the **real** `laion/clap-htsat-fused` forward. The pinned
+input is `is_longer=True` with 4 distinct channels and a time dim (500) below
+`spec_width` (512), so the forward exercises **both** paths the real fused
+checkpoint always runs on a normal clip: bicubic time-interpolation in
+`reshape_mel2img` (`post_interpolation`), and the AFF fusion path —
+`mel_conv2d` (`mel_conv2d_out`) + `fusion_model` (`fusion_model_out`). Only
+`*.relative_position_index` (recomputed) and `*.num_batches_tracked` are excluded
+from the weight-coverage test.
 
 ## Regenerate
 
@@ -40,6 +45,12 @@ pip install "torch==2.8.0" "transformers==4.57.6" "safetensors"
 python tests/fixtures/generate_htsat_clap.py            # this fixture (hermetic)
 python tests/fixtures/generate_htsat_clap.py --real     # + ../htsat_clap_real (downloads laion/clap-htsat-fused)
 ```
+
+`preprocessor_config.json` is hand-authored, not regenerated: its `feature_size`
+matches the model's `num_mel_bins` (32) and its window/hop/`max_length_s` produce
+a small valid `[B, 4, T, 32]` input, letting audio→embedding run end-to-end
+hermetically. The tower bicubic-resamples any `T` to `spec_width`, so the exact
+frame count is not load-bearing.
 
 ## Run the parity harness
 

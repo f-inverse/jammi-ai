@@ -79,6 +79,7 @@ impl ModelResolver {
                     weights_paths: base_resolved.weights_paths,
                     tokenizer: base_resolved.tokenizer,
                     model_config: base_resolved.model_config,
+                    preprocessor_config: base_resolved.preprocessor_config,
                     base_model_id: Some(ModelId(base_id.clone())),
                     adapter_path: record.artifact_path.map(PathBuf::from),
                     estimated_memory: base_resolved.estimated_memory,
@@ -163,6 +164,7 @@ impl ModelResolver {
             weights_paths,
             tokenizer,
             model_config,
+            preprocessor_config: read_local_preprocessor_config(&artifact_dir),
             base_model_id: record.base_model_id.map(ModelId),
             adapter_path: None,
             estimated_memory,
@@ -271,6 +273,7 @@ impl ModelResolver {
             weights_paths,
             tokenizer,
             model_config: config,
+            preprocessor_config: read_local_preprocessor_config(path),
             base_model_id: None,
             adapter_path: None,
             estimated_memory,
@@ -296,6 +299,15 @@ impl ModelResolver {
             })?;
         let config: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(&config_path)?)?;
+
+        // Feature-extractor geometry for the audio (CLAP fusion) front-end.
+        // Optional: text/vision repos don't ship it, so a missing file is not
+        // an error — only audio models read it downstream.
+        let preprocessor_config: Option<serde_json::Value> = repo
+            .get("preprocessor_config.json")
+            .ok()
+            .and_then(|p| std::fs::File::open(p).ok())
+            .and_then(|f| serde_json::from_reader(f).ok());
 
         let backend = backend_hint.unwrap_or_else(|| self.select_backend_hf(&repo));
 
@@ -337,6 +349,7 @@ impl ModelResolver {
             weights_paths,
             tokenizer,
             model_config: config,
+            preprocessor_config,
             base_model_id: None,
             adapter_path: None,
             estimated_memory,
@@ -393,6 +406,16 @@ impl ModelResolver {
                 message: format!("No ONNX model found: {e}"),
             })
     }
+}
+
+/// Read and parse `preprocessor_config.json` from a local model directory,
+/// if present. This is the feature-extractor geometry the audio (CLAP fusion)
+/// front-end is driven by; absent for text/vision models, which don't use it.
+fn read_local_preprocessor_config(dir: &Path) -> Option<serde_json::Value> {
+    let path = dir.join("preprocessor_config.json");
+    std::fs::File::open(path)
+        .ok()
+        .and_then(|f| serde_json::from_reader(f).ok())
 }
 
 /// Locate a tokenizer artifact inside a local model directory, preferring

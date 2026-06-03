@@ -153,6 +153,11 @@ pub struct ResolvedModel {
     pub tokenizer: Option<TokenizerSource>,
     /// Parsed contents of `config.json`.
     pub model_config: serde_json::Value,
+    /// Parsed contents of `preprocessor_config.json`, if present. Carries the
+    /// feature-extractor geometry (CLAP fusion front-end: sample rate, FFT
+    /// window, hop, mel-filter band, max length) the audio path needs so the
+    /// bytes-to-spectrogram transform is config-driven, not hardcoded.
+    pub preprocessor_config: Option<serde_json::Value>,
     /// Parent model ID for fine-tuned variants.
     pub base_model_id: Option<ModelId>,
     /// Path to LoRA adapter directory (for fine-tuned models).
@@ -177,6 +182,16 @@ pub struct ModelDimensions {
 impl ModelDimensions {
     /// Parse from HuggingFace config.json or OpenCLIP open_clip_config.json.
     pub fn from_config(config: &serde_json::Value) -> Option<Self> {
+        // HF-CLAP audio tower (`ClapAudioModelWithProjection`): top-level
+        // `clap_audio_model` config (or a nested `audio_config` block under a
+        // top-level `ClapConfig`). Its embedding dimensionality is
+        // `projection_dim`; `num_attention_heads`/`depths` are per-stage arrays,
+        // so the standard scalar-`num_attention_heads` text branch cannot parse
+        // it — detect it first off `model_type`.
+        if let Some(dims) = Self::from_hf_clap_config(config) {
+            return Some(dims);
+        }
+
         // Standard text model format (BERT, ModernBERT, etc.)
         if let Some(hidden_size) = config.get("hidden_size").and_then(|v| v.as_u64()) {
             let hidden_size = hidden_size as usize;
@@ -199,31 +214,6 @@ impl ModelDimensions {
 
         // OpenCLIP format: model_cfg.vision_cfg with embed_dim at top level
         if let Some(model_cfg) = config.get("model_cfg") {
-            // CLAP audio tower: model_cfg.audio_cfg, embed_dim at top level.
-            // Checked before vision_cfg since the two tower configs are
-            // disjoint — a CLAP checkpoint carries audio_cfg, not vision_cfg.
-            if let Some(audio_cfg) = model_cfg.get("audio_cfg") {
-                let embed_dim = model_cfg.get("embed_dim").and_then(|v| v.as_u64())? as usize;
-                let width = audio_cfg.get("width").and_then(|v| v.as_u64())? as usize;
-                let num_layers = audio_cfg.get("layers").and_then(|v| v.as_u64())? as usize;
-                let num_attention_heads = audio_cfg
-                    .get("heads")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or((width / 64).max(1) as u64)
-                    as usize;
-                let mlp_ratio = audio_cfg
-                    .get("mlp_ratio")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(4.0);
-                let intermediate_size = (width as f64 * mlp_ratio) as usize;
-                return Some(Self {
-                    hidden_size: embed_dim,
-                    num_layers,
-                    num_attention_heads,
-                    intermediate_size,
-                });
-            }
-
             let vision_cfg = model_cfg.get("vision_cfg")?;
             let embed_dim = model_cfg.get("embed_dim").and_then(|v| v.as_u64())? as usize;
             let width = vision_cfg.get("width").and_then(|v| v.as_u64())? as usize;
@@ -247,6 +237,46 @@ impl ModelDimensions {
         }
 
         None
+    }
+
+    /// Parse the HF-CLAP audio-tower geometry (`ClapAudioModelWithProjection`),
+    /// returning `None` for any non-CLAP config.
+    ///
+    /// Accepts both the flat `clap_audio_model` config and a top-level
+    /// `ClapConfig` carrying a nested `audio_config`. The reported
+    /// `hidden_size` is the tower's output embedding dimensionality
+    /// (`projection_dim`, the shared cross-modal latent); `num_layers` is the
+    /// number of hierarchical Swin stages (`depths.len()`); attention heads and
+    /// the intermediate FFN size are taken from the final stage (the widest),
+    /// which bounds the per-batch activation footprint.
+    fn from_hf_clap_config(config: &serde_json::Value) -> Option<Self> {
+        let audio = config.get("audio_config").unwrap_or(config);
+        if audio.get("model_type").and_then(|v| v.as_str()) != Some("clap_audio_model") {
+            return None;
+        }
+        let projection_dim = config
+            .get("projection_dim")
+            .or_else(|| audio.get("projection_dim"))
+            .and_then(|v| v.as_u64())? as usize;
+        let final_width = audio.get("hidden_size").and_then(|v| v.as_u64())? as usize;
+        let depths = audio.get("depths").and_then(|v| v.as_array())?;
+        let num_layers = depths.len();
+        let num_attention_heads = audio
+            .get("num_attention_heads")
+            .and_then(|v| v.as_array())
+            .and_then(|h| h.last())
+            .and_then(|v| v.as_u64())? as usize;
+        let mlp_ratio = audio
+            .get("mlp_ratio")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(4.0);
+        let intermediate_size = (final_width as f64 * mlp_ratio) as usize;
+        Some(Self {
+            hidden_size: projection_dim,
+            num_layers,
+            num_attention_heads,
+            intermediate_size,
+        })
     }
 
     /// Peak activation memory for one inference batch (encoder-only, no gradients).

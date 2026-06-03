@@ -1,0 +1,87 @@
+{
+  "params": {
+    "feature_size": 64,
+    "sampling_rate": 48000,
+    "hop_length": 480,
+    "fft_window_size": 1024,
+    "frequency_min": 50.0,
+    "frequency_max": 14000.0,
+    "truncation": "fusion",
+    "padding": "repeatpad",
+    "max_length_s": 10
+  },
+  "clips": {
+    "short": {
+      "is_longer": false,
+      "mel_linear_shape": [
+        1001,
+        64
+      ],
+      "input_features_shape": [
+        4,
+        1001,
+        64
+      ],
+      "n_samples": 240000,
+      "packed_db_vs_log_linear_max_abs": 0.0
+    },
+    "long": {
+      "is_longer": true,
+      "mel_linear_shape": [
+        1003,
+        64
+      ],
+      "input_features_shape": [
+        4,
+        1001,
+        64
+      ],
+      "n_samples": 480960,
+      "packed_db_vs_log_linear_max_abs": 0.0
+    }
+  },
+  "tensors": {
+    "short_waveform": {
+      "shape": [
+        240000
+      ],
+      "dtype": "float64"
+    },
+    "short_mel_linear": {
+      "shape": [
+        1001,
+        64
+      ],
+      "dtype": "float64"
+    },
+    "short_input_features": {
+      "shape": [
+        4,
+        1001,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "long_waveform": {
+      "shape": [
+        480960
+      ],
+      "dtype": "float64"
+    },
+    "long_mel_linear": {
+      "shape": [
+        1003,
+        64
+      ],
+      "dtype": "float64"
+    },
+    "long_input_features": {
+      "shape": [
+        4,
+        1001,
+        64
+      ],
+      "dtype": "float32"
+    }
+  }
+}

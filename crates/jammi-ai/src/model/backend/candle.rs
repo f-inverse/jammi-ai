@@ -7,7 +7,7 @@ use jammi_encoders::{
     Bert, BertConfig, DistilBert, DistilBertConfig, ModernBert, ModernBertConfig, Pooling,
 };
 
-use jammi_encoders::{ClapAudio, ClapAudioConfig, ClipText, ClipTextConfig};
+use jammi_encoders::{ClipText, ClipTextConfig, HtsatAudio, HtsatAudioConfig};
 
 use super::open_clip_text::OpenClipTextForward;
 use super::open_clip_vit::{OpenClipVisionConfig, OpenClipVisionTransformer};
@@ -83,39 +83,27 @@ impl CandleVisionForward for OpenClipVisionTransformer {
     }
 }
 
-/// Audio architectures produce embeddings from a log-mel spectrogram.
-/// Feature-extraction geometry (mel bins, frame count, FFT size, hop, sample
-/// rate) is model-driven so the decode/resample/mel front-end is config-driven.
+/// Audio architectures produce embeddings from a 4-channel CLAP fusion
+/// spectrogram. The bytes-to-spectrogram front-end geometry (sample rate, FFT
+/// size, hop, mel band) is owned by the feature-extractor `ClapFrontendConfig`
+/// read off `preprocessor_config.json`, not the tower; the tower reports only
+/// `num_mel_bins`, which the front-end's mel-filter count must match.
 pub(crate) trait CandleAudioForward: Send + Sync {
-    /// Pooled, L2-normalized `[batch, embed_dim]` embedding for a
-    /// `[batch, n_mels, n_frames]` log-mel spectrogram batch.
-    fn forward_audio(&self, mel: &Tensor) -> Result<Tensor>;
-    fn n_mels(&self) -> usize;
-    fn n_frames(&self) -> usize;
-    fn n_fft(&self) -> usize;
-    fn hop_length(&self) -> usize;
-    fn sample_rate(&self) -> u32;
+    /// Pooled, L2-normalized `[batch, projection_dim]` embedding for a
+    /// `[batch, 4, time, num_mel_bins]` CLAP fusion spectrogram batch. `is_longer`
+    /// gates the per-sample fusion path in the patch embedding.
+    fn forward_audio(&self, input_features: &Tensor, is_longer: &[bool]) -> Result<Tensor>;
+    /// Mel bins the input fusion spectrogram must carry.
+    fn num_mel_bins(&self) -> usize;
 }
 
-impl CandleAudioForward for ClapAudio {
-    fn forward_audio(&self, mel: &Tensor) -> Result<Tensor> {
-        self.forward(mel)
+impl CandleAudioForward for HtsatAudio {
+    fn forward_audio(&self, input_features: &Tensor, is_longer: &[bool]) -> Result<Tensor> {
+        self.forward(input_features, is_longer)
             .map_err(|e| JammiError::Inference(format!("Audio forward pass failed: {e}")))
     }
-    fn n_mels(&self) -> usize {
-        self.n_mels()
-    }
-    fn n_frames(&self) -> usize {
-        self.n_frames()
-    }
-    fn n_fft(&self) -> usize {
-        self.n_fft()
-    }
-    fn hop_length(&self) -> usize {
-        self.hop_length()
-    }
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate()
+    fn num_mel_bins(&self) -> usize {
+        self.num_mel_bins()
     }
 }
 
@@ -272,8 +260,12 @@ pub struct CandleModel {
     text: Option<Box<dyn CandleTextForward>>,
     /// Vision architecture forward pass (OpenCLIP ViT).
     vision: Option<Box<dyn CandleVisionForward>>,
-    /// Audio architecture forward pass (CLAP audio tower).
+    /// Audio architecture forward pass (HTSAT-Swin CLAP audio tower).
     audio: Option<Box<dyn CandleAudioForward>>,
+    /// CLAP fusion front-end geometry, read off `preprocessor_config.json`.
+    /// `Some` exactly when `audio` is — the audio path turns raw bytes into the
+    /// tower's 4-channel fusion spectrogram through it.
+    audio_frontend: Option<audio_preprocess::ClapFrontendConfig>,
     /// Tokenizer for text-to-token conversion, if available.
     pub tokenizer: Option<TokenizerWrapper>,
     /// Device the model weights reside on (CPU, CUDA, or Metal).
@@ -534,6 +526,9 @@ impl CandleModel {
         let audio = self.audio.as_deref().ok_or_else(|| {
             JammiError::Inference("No audio model loaded for audio embedding".into())
         })?;
+        let frontend = self.audio_frontend.as_ref().ok_or_else(|| {
+            JammiError::Inference("No audio feature-extractor config loaded".into())
+        })?;
 
         let clips = arrow_to_audio(content)?;
         let num_rows = clips.len();
@@ -570,20 +565,27 @@ impl CandleModel {
         let mut all_embeddings = vec![0.0_f32; num_rows * hidden_size];
 
         if !valid_clips.is_empty() {
-            let mel = audio_preprocess::preprocess_audio_batch(
-                &valid_clips,
-                audio.n_mels(),
-                audio.n_frames(),
-                audio.n_fft(),
-                audio.hop_length(),
-                audio.sample_rate(),
-                &self.device,
-            )?;
+            // The front-end's mel-filter count must match the tower's input
+            // contract; a mismatch is a misconfigured preprocessor_config.json.
+            if frontend.n_mels != audio.num_mel_bins() {
+                return Err(JammiError::Inference(format!(
+                    "Audio feature-extractor feature_size ({}) does not match the tower's \
+                     num_mel_bins ({})",
+                    frontend.n_mels,
+                    audio.num_mel_bins()
+                )));
+            }
+
+            // Decode → resample → CLAP fusion front-end → [B, 4, time, n_mels]
+            // plus the per-clip `is_longer` flags that gate the patch-embed
+            // fusion per sample (a short clip uses the global patch-conv alone).
+            let (input_features, is_longer) =
+                audio_preprocess::preprocess_clap_fusion(&valid_clips, frontend, &self.device)?;
 
             // The CLAP audio tower emits L2-normalized embeddings directly
             // (like the text tower), so no further normalization is applied —
             // unlike the vision tower whose raw output is normalized here.
-            let normalized = audio.forward_audio(&mel)?;
+            let normalized = audio.forward_audio(&input_features, &is_longer)?;
 
             // Apply the trained projection head if one was loaded. The head is
             // a post-pool transform on the shared-latent embedding, so an audio
@@ -848,15 +850,13 @@ impl ModelBackend for CandleBackend {
 
         let is_classification = resolved.task == ModelTask::Classification && id2label.is_some();
         let is_ner = resolved.task == ModelTask::Ner && id2label.is_some();
-        // CLAP audio checkpoints carry `model_cfg.audio_cfg`; OpenCLIP vision
-        // checkpoints carry `model_cfg.vision_cfg`. The two are disjoint — a
-        // pure-audio CLAP config has no `vision_cfg` — so the audio branch is
-        // checked first and OpenCLIP detection stays unchanged for the vision
-        // case it already handled.
-        let is_clap = resolved
-            .model_config
-            .pointer("/model_cfg/audio_cfg")
-            .is_some();
+        // HF-CLAP audio checkpoints (`ClapAudioModelWithProjection`) declare
+        // `model_type == "clap_audio_model"` at the top level (flat
+        // `ClapAudioConfig`) or under a nested `audio_config` (top-level
+        // `ClapConfig`), and/or list `ClapModel`/`ClapAudioModelWithProjection`
+        // in `architectures`. OpenCLIP vision checkpoints carry `model_cfg`.
+        // The two are disjoint, so the audio branch is checked first.
+        let is_clap = is_hf_clap_config(&resolved.model_config);
         let is_open_clip = !is_clap && resolved.model_config.get("model_cfg").is_some();
 
         // Normalize DistilBERT config fields to standard BERT names.
@@ -925,8 +925,8 @@ impl ModelBackend for CandleBackend {
         let dummy_varmap = VarMap::new();
 
         // Branch: cross-modal model selection.
-        //   - CLAP (`model_cfg.audio_cfg`): a single audio tower producing
-        //     shared-latent embeddings; routed in `forward()` by
+        //   - HF-CLAP (`clap_audio_model`): a single HTSAT-Swin audio tower
+        //     producing shared-latent embeddings; routed in `forward()` by
         //     `ModelTask::AudioEmbedding`.
         //   - OpenCLIP (`model_cfg.vision_cfg`): both vision and text towers in
         //     one checkpoint, routed by `ModelTask::{Image,Text}Embedding`.
@@ -937,17 +937,19 @@ impl ModelBackend for CandleBackend {
             Option<Box<dyn CandleVisionForward>>,
             Option<Box<dyn CandleAudioForward>>,
         ) = if is_clap {
-            let audio_config =
-                ClapAudioConfig::from_clap_config(&resolved.model_config).map_err(|e| {
+            let audio_config = HtsatAudioConfig::from_hf_clap_config(&resolved.model_config)
+                .map_err(|e| JammiError::Model {
+                    model_id: resolved.model_id.0.clone(),
+                    message: format!("Failed to parse CLAP audio config: {e}"),
+                })?;
+            // HF-CLAP safetensors keys are rooted at `audio_model.audio_encoder.*`
+            // and `audio_projection.*`, so the tower loads from the root VarBuilder.
+            let audio_inner =
+                HtsatAudio::load(vb.clone(), &audio_config, &device).map_err(|e| {
                     JammiError::Model {
                         model_id: resolved.model_id.0.clone(),
-                        message: format!("Failed to parse CLAP audio config: {e}"),
+                        message: format!("Failed to construct HTSAT-Swin CLAP audio tower: {e}"),
                     }
-                })?;
-            let audio_inner =
-                ClapAudio::load(vb.pp("audio"), &audio_config).map_err(|e| JammiError::Model {
-                    model_id: resolved.model_id.0.clone(),
-                    message: format!("Failed to construct CLAP audio tower: {e}"),
                 })?;
             (
                 None,
@@ -1194,11 +1196,34 @@ impl ModelBackend for CandleBackend {
             None
         };
 
+        // Audio models need the CLAP fusion front-end geometry from
+        // `preprocessor_config.json`; an audio tower without it is unusable.
+        let audio_frontend = if audio.is_some() {
+            let prep = resolved
+                .preprocessor_config
+                .as_ref()
+                .ok_or_else(|| JammiError::Model {
+                    model_id: resolved.model_id.0.clone(),
+                    message: "CLAP audio model is missing preprocessor_config.json \
+                              (the feature-extractor geometry the front-end is driven by)"
+                        .into(),
+                })?;
+            Some(
+                clap_frontend_from_preprocessor(prep).map_err(|e| JammiError::Model {
+                    model_id: resolved.model_id.0.clone(),
+                    message: format!("Invalid CLAP preprocessor_config.json: {e}"),
+                })?,
+            )
+        } else {
+            None
+        };
+
         Ok(LoadedModel::Candle(Box::new(CandleModel {
             dimensions,
             text,
             vision,
             audio,
+            audio_frontend,
             tokenizer,
             device,
             projection_head,
@@ -1215,6 +1240,61 @@ impl ModelBackend for CandleBackend {
             .map(|m| m.len() as usize)
             .sum()
     }
+}
+
+/// Detect an HF-CLAP audio checkpoint (`ClapAudioModelWithProjection` lineage)
+/// from its config: `model_type == "clap_audio_model"` at the top level (flat
+/// `ClapAudioConfig`) or under a nested `audio_config` (top-level `ClapConfig`),
+/// or `architectures` listing `ClapModel` / `ClapAudioModelWithProjection`.
+fn is_hf_clap_config(config: &serde_json::Value) -> bool {
+    let model_type_is_clap = |v: &serde_json::Value| {
+        v.get("model_type").and_then(|m| m.as_str()) == Some("clap_audio_model")
+    };
+    if model_type_is_clap(config) {
+        return true;
+    }
+    if config.get("audio_config").is_some_and(model_type_is_clap) {
+        return true;
+    }
+    config
+        .get("architectures")
+        .and_then(|a| a.as_array())
+        .is_some_and(|arch| {
+            arch.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    Some("ClapModel") | Some("ClapAudioModelWithProjection")
+                )
+            })
+        })
+}
+
+/// Build the CLAP fusion front-end geometry from a HuggingFace
+/// `preprocessor_config.json` (`ClapFeatureExtractor` arguments). Every numeric
+/// the bytes-to-spectrogram transform needs is read from the config — nothing
+/// is hardcoded.
+fn clap_frontend_from_preprocessor(
+    prep: &serde_json::Value,
+) -> Result<audio_preprocess::ClapFrontendConfig> {
+    let u = |key: &str| -> Result<u64> {
+        prep.get(key)
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| JammiError::Inference(format!("missing integer field '{key}'")))
+    };
+    let f = |key: &str| -> Result<f64> {
+        prep.get(key)
+            .and_then(|v| v.as_f64())
+            .ok_or_else(|| JammiError::Inference(format!("missing numeric field '{key}'")))
+    };
+    Ok(audio_preprocess::ClapFrontendConfig {
+        n_mels: u("feature_size")? as usize,
+        sample_rate: u("sampling_rate")? as u32,
+        fft_window_size: u("fft_window_size")? as usize,
+        hop_length: u("hop_length")? as usize,
+        frequency_min: f("frequency_min")?,
+        frequency_max: f("frequency_max")?,
+        max_length_s: u("max_length_s")? as u32,
+    })
 }
 
 /// Convert token ID vectors into a candle Tensor on the given device.

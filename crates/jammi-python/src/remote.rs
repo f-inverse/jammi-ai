@@ -3,8 +3,8 @@
 //! [`PyRemoteDatabase`] is the network peer of the embedded
 //! [`crate::PyDatabase`]: a Python consumer that wants to drive a *remote*
 //! jammi engine over the `jammi.v1` gRPC wire opens one with
-//! [`connect_remote`] and calls the transport-agnostic verbs (encode-query,
-//! generate-embeddings, search, infer, the tenant trio) on it.
+//! [`connect_remote`] and calls the transport-agnostic verbs (add-source,
+//! encode-query, generate-embeddings, search, infer, the tenant trio) on it.
 //!
 //! It mirrors the Rust front door exactly — [`Jammi::open`] with
 //! [`Target::Remote`] — and then holds the resulting [`Session`]. Every verb
@@ -15,17 +15,17 @@
 //! remote Python surfaces agree by construction rather than by a parallel
 //! reimplementation.
 //!
-//! The three Flight-SQL-lane verbs (`add_source` / `sql` / `read_vectors`) are
-//! not wired on the typed-RPC surface; reaching them on a remote session
-//! returns the engine's own typed "not yet available on the remote transport"
-//! error, surfaced here as a Python `RuntimeError` — the truthful answer, never
-//! a faked success.
+//! The two Flight-SQL-lane verbs (`sql` / `read_vectors`) are not wired on the
+//! typed-RPC surface; reaching them on a remote session returns the engine's own
+//! typed "not yet available on the remote transport" error, surfaced here as a
+//! Python `RuntimeError` — the truthful answer, never a faked success.
 
 use std::sync::Arc;
 
 use jammi_ai::jammi::{Jammi, Target};
 use jammi_ai::local_session::{Modality, QueryInput, SearchQuery, SearchRequest, Session};
 use jammi_ai::model::ModelTask;
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::TenantId;
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
@@ -92,6 +92,19 @@ impl PyRemoteDatabase {
             .block_on(Jammi::open(Target::Remote(ep)))
             .map_err(to_pyerr)?;
         Ok(Self { session, runtime })
+    }
+
+    /// Register a file-shaped source over the wire. The Rust-shaped peer of
+    /// [`Self::add_source`] that skips the PyO3 argument shims, so the
+    /// integration test can drive the wired `AddSource` verb without a Python
+    /// interpreter. Drives the exact same `Session::add_source` verb the Python
+    /// method does.
+    pub fn add_source_for_test(&self, name: &str, url: &str, format: &str) -> PyResult<()> {
+        let file_format: FileFormat = format.parse().map_err(to_pyerr)?;
+        let connection = SourceConnection::parse(url, file_format).map_err(to_pyerr)?;
+        self.runtime
+            .block_on(self.session.add_source(name, SourceType::File, connection))
+            .map_err(to_pyerr)
     }
 
     /// Encode a query over the wire, returning the raw vector. The Rust-shaped
@@ -182,6 +195,16 @@ impl PyRemoteDatabase {
             .block_on(self.session.tenant())
             .map_err(to_pyerr)?;
         Ok(t.map(|t| t.to_string()))
+    }
+
+    /// Register a file-shaped data source on the remote engine. `url` accepts a
+    /// local path (parsed into `file://...`) or any storage URL the server was
+    /// compiled with: `s3://bucket/key`, `gs://bucket/key`,
+    /// `azure://container/blob`. Maps to `EmbeddingService.AddSource` over the
+    /// wire; the embedded peer is [`crate::PyDatabase::add_source`].
+    #[pyo3(signature = (name, *, url, format))]
+    fn add_source(&self, name: &str, url: &str, format: &str) -> PyResult<()> {
+        self.add_source_for_test(name, url, format)
     }
 
     /// Encode a single query into an embedding vector using the given model.

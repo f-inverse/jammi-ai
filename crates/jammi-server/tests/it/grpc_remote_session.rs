@@ -117,8 +117,9 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
     let model_id = tiny_bert_model_id();
 
     // The local session registers + embeds the corpus directly on the shared
-    // engine (AddSource is a 3b-2 verb on the remote arm); both sessions then
-    // search the same persisted embedding table.
+    // engine; both sessions then search the same persisted embedding table.
+    // (AddSource over the remote transport has its own round-trip proof in
+    // `remote_add_source_round_trips_like_local`.)
     let local = local(&server);
     local
         .add_source("patents", SourceType::File, patents_connection())
@@ -218,6 +219,91 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
         std::mem::discriminant(&remote_err),
         std::mem::discriminant(&local_err),
         "remote and local agree on the failure variant after removal"
+    );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+/// `add_source` over the wire, proven interchangeable with `LocalSession`. The
+/// remote transport registers the `patents` corpus through
+/// `EmbeddingService.AddSource` (the typed RPC the server and the TS gRPC-web
+/// client already drive); the registration must reach the shared engine, so a
+/// `generate_embeddings` against that source then succeeds — the source is
+/// real and usable, not stubbed. Error parity is pinned too: re-registering the
+/// same id fails inside the engine, and both transports reconstruct the same
+/// `JammiError` variant + message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_add_source_round_trips_like_local() {
+    let server = start_engine_server().await;
+    let remote = Session::Remote(remote(&server).await);
+    let local = local(&server);
+
+    // Register the corpus over the REMOTE transport. Before this call the engine
+    // has no `patents` source; the registration must cross the wire and land on
+    // the shared engine.
+    remote
+        .add_source("patents", SourceType::File, patents_connection())
+        .await
+        .expect("remote add_source");
+
+    // The source is usable: embeddings generate over it through the remote
+    // transport, producing a ready table with rows — proof the registration took
+    // effect, not a silent no-op.
+    let remote_table = remote
+        .generate_embeddings(
+            "patents",
+            &tiny_bert_model_id(),
+            &["abstract".to_string()],
+            "id",
+            Modality::Text,
+        )
+        .await
+        .expect("generate_embeddings over the remote-registered source");
+    assert_eq!(remote_table.status, "ready");
+    assert!(
+        remote_table.row_count > 0,
+        "the remote-registered patents corpus embeds rows"
+    );
+    assert_eq!(remote_table.source_id, "patents");
+
+    // The local session sees the same source on the shared engine — its own
+    // `infer` resolves `patents`, which would error if the remote registration
+    // had not reached the engine.
+    let local_rows = local
+        .infer(
+            "patents",
+            &tiny_bert_model_id(),
+            jammi_db::ModelTask::TextEmbedding,
+            &["abstract".to_string()],
+            "id",
+        )
+        .await
+        .expect("local infer resolves the remote-registered source");
+    assert!(
+        local_rows.iter().map(|b| b.num_rows()).sum::<usize>() > 0,
+        "infer over the remote-registered source returns rows"
+    );
+
+    // Error parity: re-registering the same id fails inside the engine; both
+    // transports reconstruct the identical variant + message.
+    let local_err = local
+        .add_source("patents", SourceType::File, patents_connection())
+        .await
+        .expect_err("local re-add of an existing source must fail");
+    let remote_err = remote
+        .add_source("patents", SourceType::File, patents_connection())
+        .await
+        .expect_err("remote re-add of an existing source must fail");
+    assert_eq!(
+        std::mem::discriminant(&local_err),
+        std::mem::discriminant(&remote_err),
+        "remote reconstructs the same add_source failure variant: {local_err:?} vs {remote_err:?}"
+    );
+    assert_eq!(
+        local_err.to_string(),
+        remote_err.to_string(),
+        "remote carries the same add_source failure message the engine produced"
     );
 
     let _ = server.shutdown.send(());

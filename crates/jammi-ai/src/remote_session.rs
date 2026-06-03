@@ -18,8 +18,8 @@
 //!   [`crate::wire`] conversions the server's receive side uses — neither side
 //!   reimplements a mapping.
 //!
-//! The wired verbs span the embeddings / encode-query / search / remove-source
-//! surface, the tenant trio, the `JammiError`-returning compute verbs
+//! The wired verbs span the embeddings / encode-query / search / add-source /
+//! remove-source surface, the tenant trio, the `JammiError`-returning compute verbs
 //! (inference, the four eval verbs, fine-tune start + status, the mutable-table
 //! create/drop lifecycle, and the channel register / add-columns verbs), the
 //! topics surface (register / drop / publish / list) with its server-streaming
@@ -28,8 +28,8 @@
 //! same way `JammiError` does: the server attaches a structured detail
 //! (`TriggerErrorDetail` / `AuditErrorDetail`) and the client reconstructs the
 //! exact variant, including a `subscribe` stream's terminal failure. The only
-//! verbs still unreachable here are the Flight-SQL-shaped `add_source` / `sql` /
-//! `read_vectors` (wired on that lane, not the typed-RPC surface).
+//! verbs still unreachable here are the Flight-SQL-shaped `sql` / `read_vectors`
+//! (wired on that lane, not the typed-RPC surface).
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -48,6 +48,7 @@ use std::collections::{BTreeMap, HashMap};
 use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
+use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
 use jammi_db::trigger::{DeliveredBatch, Offset, Predicate, TopicDefinition, TriggerError};
 use jammi_db::{AuditError, ChannelId, ModelTask, PerQueryAudit, TenantId, TopicId};
@@ -64,8 +65,8 @@ use crate::wire::proto::channel::{AddChannelColumnsRequest, RegisterChannelReque
 use crate::wire::proto::embedding::embedding_service_client::EmbeddingServiceClient;
 use crate::wire::proto::embedding::{
     encode_query_request::Input as ProtoEncodeInput, search_request::Query as ProtoSearchQuery,
-    EncodeQueryRequest, GenerateEmbeddingsRequest, QueryVector, RemoveSourceRequest, SearchRequest,
-    SearchResponse,
+    AddSourceRequest, EncodeQueryRequest, GenerateEmbeddingsRequest, QueryVector,
+    RemoveSourceRequest, SearchRequest, SearchResponse,
 };
 use crate::wire::proto::eval as eval_pb;
 use crate::wire::proto::eval::eval_service_client::EvalServiceClient;
@@ -86,8 +87,8 @@ use crate::wire::{
     audit_error_from_status, cohorts_to_proto, columns_to_proto, config_to_proto,
     decode_ipc_stream, decode_subscribed_batch, definition_to_proto, encode_ipc_stream,
     encode_publish_batch, error_from_status, eval_task_to_proto, method_to_proto,
-    model_task_to_proto, record_from_wire, result_table_from_proto, topic_from_proto,
-    trigger_error_from_status, SESSION_HEADER,
+    model_task_to_proto, record_from_wire, result_table_from_proto, source_type_to_proto,
+    topic_from_proto, trigger_error_from_status, SESSION_HEADER,
 };
 use crate::{Modality, QueryInput, SearchQuery, SearchRequest as SessionSearch};
 
@@ -197,6 +198,23 @@ impl RemoteSession {
     }
 
     // --- sources ---------------------------------------------------------
+
+    pub(crate) async fn add_source(
+        &self,
+        source_id: &str,
+        source_type: SourceType,
+        connection: SourceConnection,
+    ) -> Result<()> {
+        self.embedding_client()
+            .add_source(AddSourceRequest {
+                source_id: source_id.to_string(),
+                source_kind: source_type_to_proto(source_type) as i32,
+                connection: Some(connection.into()),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?;
+        Ok(())
+    }
 
     pub(crate) async fn remove_source(&self, source_id: &str) -> Result<()> {
         self.embedding_client()

@@ -25,7 +25,6 @@ use jammi_ai::local_session::{LocalSession, Modality, QueryInput, Session};
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
 use jammi_db::config::JammiConfig;
-use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::TenantId;
 use jammi_server::grpc::session::SessionStore;
 use jammi_server::runtime::serve_grpc_chain;
@@ -266,32 +265,29 @@ fn remote_database_encode_query_matches_local_over_the_wire() {
     );
 }
 
-/// `generate_embeddings` + `search` through the remote Python binding return a
-/// non-empty hydrated result against a corpus embedded over the wire — the
-/// compute verbs are reachable, not stubbed. The source is registered on the
-/// shared engine (AddSource rides the Flight-SQL lane, not the typed-RPC
-/// surface), then embedded and searched entirely through `RemoteDatabase`.
+/// `add_source` + `generate_embeddings` + `search` entirely through the remote
+/// Python binding return a non-empty hydrated result against a corpus
+/// registered and embedded over the wire — the source verb and the compute
+/// verbs are all reachable, not stubbed. `add_source` maps to
+/// `EmbeddingService.AddSource` (the typed RPC), so the whole pipeline crosses
+/// the wire through `RemoteDatabase`.
 #[test]
-fn remote_database_generate_embeddings_and_search() {
+fn remote_database_add_source_generate_embeddings_and_search() {
     let srv = start_remote_fixture();
     let model_id = format!("local:{}", cookbook_fixture("tiny_bert").display());
 
-    // Register the corpus on the shared engine (the remote arm does not wire
-    // AddSource); both transports then see the same source.
-    let setup_rt = tokio::runtime::Runtime::new().expect("setup runtime");
-    setup_rt
-        .block_on(srv.engine.add_source(
-            "patents",
-            SourceType::File,
-            SourceConnection {
-                url: Some(format!("file://{}", fixture("patents.parquet").display())),
-                format: Some(FileFormat::Parquet),
-                ..Default::default()
-            },
-        ))
-        .expect("add_source");
-
     let remote_db = connect_remote(&format!("http://{}", srv.addr)).expect("connect_remote");
+
+    // Register the corpus over the wire through the remote binding's `add_source`
+    // (no engine-side setup): the registration must reach the shared engine for
+    // the embed/search below to resolve `patents`.
+    remote_db
+        .add_source_for_test(
+            "patents",
+            &fixture("patents.parquet").display().to_string(),
+            "parquet",
+        )
+        .expect("remote add_source");
 
     let table = remote_db
         .generate_embeddings_for_test("patents", &model_id, &["abstract"], "id", Modality::Text)

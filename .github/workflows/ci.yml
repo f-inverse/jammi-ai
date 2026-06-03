@@ -101,6 +101,38 @@ jobs:
       - name: Test (jammi-ai wire)
         run: cargo test -p jammi-ai --features wire
 
+  test-thin-wire:
+    name: Test (jammi-ai thin wire)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      # The remote-only client: `local` OFF, `wire` ON. This build must stay a
+      # thin wire-speaker — `RemoteSession` + `Session::Remote` + the wire
+      # conversions — pulling NO candle / hf-hub / symphonia / tokenizers ML
+      # stack. Without its own lane the thin build is never exercised in CI (the
+      # workspace build always feature-unifies `local` on via jammi-server /
+      # jammi-python / jammi-cli), so a change that re-couples the engine into the
+      # wire surface would compile everywhere else and silently regress only here.
+      # Build + clippy + the wire unit tests, then assert the ML deps are absent.
+      - name: Clippy (jammi-ai thin wire)
+        run: cargo clippy -p jammi-ai --no-default-features --features wire --all-targets -- -D warnings
+
+      - name: Test (jammi-ai thin wire)
+        run: cargo test -p jammi-ai --no-default-features --features wire
+
+      - name: Assert no ML deps in the thin tree
+        run: |
+          if cargo tree -p jammi-ai --no-default-features --features wire -e normal \
+              | grep -iE 'candle|hf-hub|symphonia|tokenizers'; then
+            echo "::error::thin wire build pulled an embedded-engine ML dep — the local feature gate regressed"
+            exit 1
+          fi
+
   ts-client:
     name: TS client (@f-inverse/jammi-client)
     runs-on: ubuntu-latest

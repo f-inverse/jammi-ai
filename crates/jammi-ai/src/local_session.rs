@@ -35,6 +35,7 @@
 //!   streaming shape.
 
 use std::pin::Pin;
+#[cfg(feature = "local")]
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -50,7 +51,9 @@ use jammi_db::{ModelTask, PerQueryAudit, TenantId, TopicId};
 
 use crate::eval::{CompareEvalReport, EmbeddingEvalReport, EvalTask, InferenceEvalReport};
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
+#[cfg(feature = "local")]
 use crate::model::ModelSource;
+#[cfg(feature = "local")]
 use crate::session::InferenceSession;
 
 /// Which embedding tower an [`Session::generate_embeddings`] /
@@ -117,7 +120,10 @@ pub struct FineTuneJobId(pub String);
 /// Every method delegates to the underlying transport's implementation of the
 /// same verb. The surface is the contract; the variant is the wiring.
 pub enum Session {
-    /// An in-process session driving a local [`InferenceSession`].
+    /// An in-process session driving a local [`InferenceSession`]. Present only
+    /// under the default-on `local` feature; a thin remote-only (`wire`-only)
+    /// build sees the one-arm `Remote` enum.
+    #[cfg(feature = "local")]
     Local(LocalSession),
     /// A remote session driving an engine over the gRPC wire surface. Present
     /// only under the `wire` feature; an embedded build sees the one-arm enum.
@@ -148,6 +154,12 @@ impl Session {
     // --- sources ---------------------------------------------------------
 
     /// Register a data source.
+    // The Flight-SQL-shaped verbs (`add_source` / `sql` / `read_vectors`) ride the
+    // engine arm; the remote arm returns `remote_verb_pending` (wired on the Flight
+    // SQL lane, not the typed-RPC surface), so their params are consumed only by the
+    // `local` arm. A thin `wire`-only build keeps the params for API parity but does
+    // not read them.
+    #[cfg_attr(not(feature = "local"), allow(unused_variables))]
     pub async fn add_source(
         &self,
         source_id: &str,
@@ -155,6 +167,7 @@ impl Session {
         connection: SourceConnection,
     ) -> Result<()> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.add_source(source_id, source_type, connection).await,
             #[cfg(feature = "wire")]
             Session::Remote(_) => Err(remote_verb_pending("add_source")),
@@ -164,6 +177,7 @@ impl Session {
     /// Remove a source and all associated state.
     pub async fn remove_source(&self, source_id: &str) -> Result<()> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.remove_source(source_id).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.remove_source(source_id).await,
@@ -173,8 +187,10 @@ impl Session {
     // --- sql -------------------------------------------------------------
 
     /// Execute a SQL query.
+    #[cfg_attr(not(feature = "local"), allow(unused_variables))]
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.sql(query).await,
             #[cfg(feature = "wire")]
             Session::Remote(_) => Err(remote_verb_pending("sql")),
@@ -195,6 +211,7 @@ impl Session {
         modality: Modality,
     ) -> Result<ResultTableRecord> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => {
                 s.generate_embeddings(source_id, model_id, columns, key_column, modality)
                     .await
@@ -217,6 +234,7 @@ impl Session {
         modality: Modality,
     ) -> Result<Vec<f32>> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.encode_query(model_id, input, modality).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.encode_query(model_id, input, modality).await,
@@ -225,8 +243,10 @@ impl Session {
 
     /// Read the `vector` column of an embedding result table into one
     /// `Vec<f32>` per row.
+    #[cfg_attr(not(feature = "local"), allow(unused_variables))]
     pub async fn read_vectors(&self, table: &ResultTableRecord) -> Result<Vec<Vec<f32>>> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.read_vectors(table).await,
             #[cfg(feature = "wire")]
             Session::Remote(_) => Err(remote_verb_pending("read_vectors")),
@@ -238,6 +258,7 @@ impl Session {
     /// Run a vector search and return the terminal hydrated batches.
     pub async fn search(&self, request: SearchRequest) -> Result<Vec<RecordBatch>> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.search(request).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.search(request).await,
@@ -256,6 +277,7 @@ impl Session {
         key_column: &str,
     ) -> Result<Vec<RecordBatch>> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => {
                 s.infer(source_id, model_id, task, content_columns, key_column)
                     .await
@@ -282,6 +304,7 @@ impl Session {
         config: Option<FineTuneConfig>,
     ) -> Result<FineTuneJobId> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => {
                 s.fine_tune(source, base_model, columns, method, task, config)
                     .await
@@ -297,6 +320,7 @@ impl Session {
     /// Current status string for a fine-tune job, looked up by id.
     pub async fn fine_tune_status(&self, id: &FineTuneJobId) -> Result<String> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.fine_tune_status(id).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.fine_tune_status(id).await,
@@ -315,6 +339,7 @@ impl Session {
         cohorts: &std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
     ) -> Result<EmbeddingEvalReport> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => {
                 s.eval_embeddings(source_id, embedding_table, golden_source, k, cohorts)
                     .await
@@ -330,6 +355,7 @@ impl Session {
     /// Read back the persisted per-query eval records for a run.
     pub async fn eval_per_query(&self, eval_run_id: &str) -> Result<Vec<PerQueryEvalRecord>> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.eval_per_query(eval_run_id).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.eval_per_query(eval_run_id).await,
@@ -347,6 +373,7 @@ impl Session {
         label_column: &str,
     ) -> Result<InferenceEvalReport> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => {
                 s.eval_inference(
                     model_id,
@@ -382,6 +409,7 @@ impl Session {
         k: usize,
     ) -> Result<CompareEvalReport> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => {
                 s.eval_compare(embedding_tables, source_id, golden_source, k)
                     .await
@@ -402,6 +430,7 @@ impl Session {
         def: MutableTableDefinition,
     ) -> Result<MutableTableId> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.create_mutable_table(def).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.create_mutable_table(def).await,
@@ -411,6 +440,7 @@ impl Session {
     /// Drop a mutable companion table.
     pub async fn drop_mutable_table(&self, id: &MutableTableId) -> Result<()> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.drop_mutable_table(id).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.drop_mutable_table(id).await,
@@ -425,6 +455,7 @@ impl Session {
         topic: &TopicDefinition,
     ) -> std::result::Result<(), TriggerError> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.register_topic(topic).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.register_topic(topic).await,
@@ -434,6 +465,7 @@ impl Session {
     /// List every topic visible to the session's tenant.
     pub async fn list_topics(&self) -> std::result::Result<Vec<TopicDefinition>, TriggerError> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.list_topics().await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.list_topics().await,
@@ -443,6 +475,7 @@ impl Session {
     /// Drop a topic and its backing table.
     pub async fn drop_topic(&self, topic_id: TopicId) -> std::result::Result<(), TriggerError> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.drop_topic(topic_id).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.drop_topic(topic_id).await,
@@ -457,6 +490,7 @@ impl Session {
         batch: RecordBatch,
     ) -> std::result::Result<Offset, TriggerError> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.publish(topic, batch).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.publish(topic, batch).await,
@@ -476,6 +510,7 @@ impl Session {
         TriggerError,
     > {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.subscribe(topic, predicate, from_offset).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.subscribe(topic, predicate, from_offset).await,
@@ -487,6 +522,7 @@ impl Session {
     /// Register an evidence channel and its columns.
     pub async fn register_channel(&self, spec: &ChannelSpec) -> Result<()> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.register_channel(spec).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.register_channel(spec).await,
@@ -500,6 +536,7 @@ impl Session {
         new_columns: &[ChannelColumn],
     ) -> Result<()> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.add_channel_columns(channel, new_columns).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.add_channel_columns(channel, new_columns).await,
@@ -516,6 +553,7 @@ impl Session {
     /// while a remote variant maps it to a `SessionService.SetTenant` RPC.
     pub async fn bind_tenant(&self, t: TenantId) -> Result<()> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.bind_tenant(t).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.bind_tenant(t).await,
@@ -525,6 +563,7 @@ impl Session {
     /// Clear the bound tenant.
     pub async fn unbind_tenant(&self) -> Result<()> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.unbind_tenant().await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.unbind_tenant().await,
@@ -534,6 +573,7 @@ impl Session {
     /// The tenant currently bound, if any.
     pub async fn tenant(&self) -> Result<Option<TenantId>> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.tenant().await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.tenant().await,
@@ -549,6 +589,7 @@ impl Session {
         records: Vec<PerQueryAudit>,
     ) -> std::result::Result<(), jammi_db::AuditError> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.audit_log(records).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.audit_log(records).await,
@@ -561,6 +602,7 @@ impl Session {
         query_id: uuid::Uuid,
     ) -> std::result::Result<Option<PerQueryAudit>, jammi_db::AuditError> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.audit_fetch_by_query_id(query_id).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.audit_fetch_by_query_id(query_id).await,
@@ -573,6 +615,7 @@ impl Session {
         limit: usize,
     ) -> std::result::Result<Vec<PerQueryAudit>, jammi_db::AuditError> {
         match self {
+            #[cfg(feature = "local")]
             Session::Local(s) => s.audit_fetch_recent(limit).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.audit_fetch_recent(limit).await,
@@ -585,11 +628,14 @@ pub use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelSpec};
 /// In-process [`Session`] transport. Owns an `Arc<InferenceSession>` because
 /// the engine's `search` entry point is keyed on `Arc<Self>` (it hands the
 /// shared session to the search plan); every other verb delegates straight
-/// through.
+/// through. Present only under the default-on `local` feature, alongside the
+/// embedded engine it drives.
+#[cfg(feature = "local")]
 pub struct LocalSession {
     engine: Arc<InferenceSession>,
 }
 
+#[cfg(feature = "local")]
 impl LocalSession {
     /// Wrap an existing engine session.
     pub fn new(engine: Arc<InferenceSession>) -> Self {
@@ -910,7 +956,9 @@ impl LocalSession {
 /// Resolve a single-column embedding input. The image and audio engine verbs
 /// each take exactly one content column; the unified surface passes a slice, so
 /// reject anything but a one-element slice with a typed error naming the
-/// modality rather than silently using the first column.
+/// modality rather than silently using the first column. Used only by the
+/// `local` [`LocalSession`] embedding path.
+#[cfg(feature = "local")]
 fn single_column<'a>(columns: &'a [String], modality: &str) -> Result<&'a str> {
     match columns {
         [single] => Ok(single.as_str()),

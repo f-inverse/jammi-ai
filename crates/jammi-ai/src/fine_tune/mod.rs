@@ -4,11 +4,22 @@
 //! models. Training data is read through DataFusion, so any registered source
 //! (Parquet, CSV, Postgres) works as long as it has the right schema.
 
+// The candle-backed training engine (data loading, the LoRA model, the trainer
+// loop, the job handle). Gated behind the default-on `local` feature; the
+// config vocabulary below (`FineTuneConfig`, `FineTuneMethod`, the loss / schedule
+// enums) stays transport-neutral so the `wire` surface and `RemoteSession` can
+// encode a fine-tune request without the engine.
+#[cfg(feature = "local")]
 pub mod classifier;
+#[cfg(feature = "local")]
 pub mod data;
+#[cfg(feature = "local")]
 pub mod job;
+#[cfg(feature = "local")]
 pub mod lora;
+#[cfg(feature = "local")]
 pub mod target;
+#[cfg(feature = "local")]
 pub mod trainer;
 
 use std::collections::HashMap;

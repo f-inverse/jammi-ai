@@ -65,15 +65,14 @@ pub use trigger::{
 /// by both sides so the header name cannot drift.
 pub const SESSION_HEADER: &str = "jammi-session-id";
 
-/// Map the wire [`proto::inference::ModelTask`] onto the engine's
-/// [`jammi_ai::model::ModelTask`]. An unspecified task is rejected — a request
-/// that names no task is a client error, not a silent default. Shared by the
+/// Map the wire [`proto::inference::ModelTask`] onto the substrate's
+/// [`jammi_db::ModelTask`]. An unspecified task is rejected — a request that
+/// names no task is a client error, not a silent default. Shared by the
 /// inference and fine-tune surfaces, which both carry `jammi.v1.inference
-/// .ModelTask`.
-///
-/// [`jammi_ai::model::ModelTask`]: crate::model::ModelTask
-pub fn model_task_from_proto(task: i32) -> Result<crate::model::ModelTask, Status> {
-    use crate::model::ModelTask;
+/// .ModelTask`. References the type at its substrate owner (`jammi_db`), not the
+/// engine's re-export, so this conversion stays in the thin `wire`-only build.
+pub fn model_task_from_proto(task: i32) -> Result<jammi_db::ModelTask, Status> {
+    use jammi_db::ModelTask;
     use proto::inference::ModelTask as ProtoModelTask;
     match ProtoModelTask::try_from(task) {
         Ok(ProtoModelTask::TextEmbedding) => Ok(ModelTask::TextEmbedding),
@@ -87,15 +86,13 @@ pub fn model_task_from_proto(task: i32) -> Result<crate::model::ModelTask, Statu
     }
 }
 
-/// Encode the engine's [`jammi_ai::model::ModelTask`] onto the wire enum — the
+/// Encode the substrate's [`jammi_db::ModelTask`] onto the wire enum — the
 /// inverse of [`model_task_from_proto`], for the [`crate::RemoteSession`] send
-/// side. Total: every engine task maps to a concrete wire variant (the engine
-/// type has no unspecified state). Shared by the inference and fine-tune send
-/// surfaces, which both carry `jammi.v1.inference.ModelTask`.
-///
-/// [`jammi_ai::model::ModelTask`]: crate::model::ModelTask
-pub fn model_task_to_proto(task: crate::model::ModelTask) -> proto::inference::ModelTask {
-    use crate::model::ModelTask;
+/// side. Total: every task maps to a concrete wire variant (the type has no
+/// unspecified state). Shared by the inference and fine-tune send surfaces, which
+/// both carry `jammi.v1.inference.ModelTask`.
+pub fn model_task_to_proto(task: jammi_db::ModelTask) -> proto::inference::ModelTask {
+    use jammi_db::ModelTask;
     use proto::inference::ModelTask as ProtoModelTask;
     match task {
         ModelTask::TextEmbedding => ProtoModelTask::TextEmbedding,

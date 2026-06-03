@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+#[cfg(feature = "candle")]
 use candle_core::DType;
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +25,10 @@ pub enum BackboneDtype {
     F16,
 }
 
+/// The `BackboneDtype -> candle DType` mapping is the one place this config enum
+/// touches candle, so it rides the `candle` feature; the config-vocabulary build
+/// keeps the enum without the tensor stack.
+#[cfg(feature = "candle")]
 impl From<BackboneDtype> for DType {
     fn from(d: BackboneDtype) -> Self {
         match d {

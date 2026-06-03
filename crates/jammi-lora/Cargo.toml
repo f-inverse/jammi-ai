@@ -11,11 +11,27 @@ categories = ["science"]
 readme = "README.md"
 
 [dependencies]
-candle-core.workspace = true
-candle-nn.workspace = true
+# The candle tensor stack backs every LoRA *primitive* (the linear layers, the
+# adapter save/load, the dtype mapping). It is gated behind the default-on
+# `candle` feature so a consumer that only needs the LoRA *config vocabulary* —
+# `LoraInitMode`, `BackboneDtype`, `LoraBuildConfig`, `AdapterConfig` and the
+# module-matching helpers, the fields a `FineTuneConfig` is built from — can
+# depend on this crate without pulling candle. Every existing consumer keeps the
+# default and is byte-unchanged.
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+default = ["candle"]
+# The candle-backed LoRA primitives: the `LoraLinear` / `MaybeLoraLinear` layers,
+# adapter save/load, the `BackboneDtype -> candle DType` mapping, and the candle
+# tensor-error arm of `LoraError`. Default-on; turning it off leaves the
+# candle-free config vocabulary (`LoraInitMode`, `BackboneDtype`, `LoraBuildConfig`,
+# `AdapterConfig`, `should_apply_lora`, `effective_rank`).
+candle = ["dep:candle-core", "dep:candle-nn"]

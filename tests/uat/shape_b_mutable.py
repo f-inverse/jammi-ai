@@ -30,7 +30,7 @@ def _notes_schema() -> pa.Schema:
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         artifact_dir = str(Path(tmp))
-        db = jammi_ai.connect(artifact_dir=artifact_dir)
+        db = jammi_ai.connect(f"file://{artifact_dir}")
 
         table_id = db.create_mutable_table(
             "notes",

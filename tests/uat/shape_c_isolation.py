@@ -51,7 +51,7 @@ def _events_schema() -> pa.Schema:
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         artifact_dir = str(Path(tmp))
-        db = jammi_ai.connect(artifact_dir=artifact_dir)
+        db = jammi_ai.connect(f"file://{artifact_dir}")
 
         # Tenant A: register both primitives and insert one row.
         db.with_tenant(TENANT_A)

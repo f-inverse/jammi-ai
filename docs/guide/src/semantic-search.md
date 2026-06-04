@@ -32,7 +32,7 @@ let results = session.search("patents", query, 10).await?
 ### Python
 
 ```python
-query_vec = db.encode_text_query("sentence-transformers/all-MiniLM-L6-v2", "quantum computing applications")
+query_vec = db.encode_query(model="sentence-transformers/all-MiniLM-L6-v2", query="quantum computing applications")
 
 search = db.search("patents", query=query_vec, k=10)
 results = search.run()

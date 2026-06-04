@@ -11,11 +11,11 @@ The server is a **read path**. Set up your data with the library or CLI, then de
 jammi sources add patents --path /data/patents.parquet --format parquet
 
 # 2. Generate embeddings (library or Python — not available over Flight SQL)
-python3 -c "
+python3 -c '
 import jammi_ai
-db = jammi_ai.connect()
-db.generate_embeddings(source='patents', model='sentence-transformers/all-MiniLM-L6-v2', columns=['abstract'], key='id')
-"
+db = jammi_ai.connect("file:///var/lib/jammi")
+db.generate_embeddings(source="patents", model="sentence-transformers/all-MiniLM-L6-v2", columns=["abstract"], key="id", modality="text")
+'
 
 # 3. Start the server
 jammi serve

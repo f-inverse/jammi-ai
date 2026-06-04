@@ -25,7 +25,7 @@ import jammi_ai
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         artifact_dir = str(Path(tmp))
-        db = jammi_ai.connect(artifact_dir=artifact_dir)
+        db = jammi_ai.connect(f"file://{artifact_dir}")
 
         db.register_channel(
             "scored_by",

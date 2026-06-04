@@ -77,7 +77,7 @@ The CLI exposes the same shape via `jammi trigger register --name â€¦ --schema â
 ```python
 import jammi_ai
 
-db = jammi_ai.connect(artifact_dir="/var/lib/jammi")
+db = jammi_ai.connect("file:///var/lib/jammi")
 db.sql(
     """
     CREATE TOPIC cdc.orders (

@@ -45,8 +45,8 @@ meaningless — it exercises the full pipeline, not model quality. Point
 2. Reads the 20 committed mono WAV clips under
    `cookbook/fixtures/tiny_audio_corpus/` into a Parquet `corpus` source
    (`clip_id`, `audio` bytes)
-3. `db.generate_audio_embeddings(source="corpus", model=MODEL, audio_column="audio", key="clip_id")`
-4. `db.encode_audio_query(MODEL, wav_bytes)` → `db.search("corpus", query=vec, k=5).run()`
+3. `db.generate_embeddings(source="corpus", model=MODEL, columns=["audio"], key="clip_id", modality="audio")`
+4. `db.encode_query(model=MODEL, query=wav_bytes, modality="audio")` → `db.search("corpus", query=vec, k=5).run()`
 5. Builds the audio-query golden source from `tiny_audio_golden.json` and calls
    `db.eval_embeddings(source="corpus", golden_source="golden.public.golden", k=5)`
 6. Prints the base aggregate Recall@K / precision@K / MRR / nDCG and the
@@ -87,8 +87,8 @@ python cookbook/recipes/audio_search/04-eval.py
 
 ## API surface exercised
 
-- `Database.generate_audio_embeddings(*, source, model, audio_column, key)`
-- `Database.encode_audio_query(model_id, audio_bytes)` → `list[float]`
+- `Database.generate_embeddings(*, source, model, columns, key, modality="audio")`
+- `Database.encode_query(*, model, query, modality="audio")` → `list[float]`
 - `Database.search(source, *, query, k)` → `SearchBuilder` → `.run()`
 - `Database.eval_embeddings(*, source, golden_source, model=None, k=10)`
 - `Database.fine_tune(*, source, base_model, columns, method, task="audio_embedding", ...)` → `FineTuneJob`

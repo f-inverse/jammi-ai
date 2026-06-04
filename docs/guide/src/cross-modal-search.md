@@ -26,17 +26,18 @@ session.generate_image_embeddings(
 ### Python
 
 ```python
-db.generate_image_embeddings(
+db.generate_embeddings(
     source="figures",
     model="laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
-    image_column="image",
+    columns=["image"],
     key="figure_id",
+    modality="image",
 )
 ```
 
 ## 2. Embed a text query with the same model's text tower
 
-`encode_text_query` dispatches to the OpenCLIP text tower when the model ID resolves to an OpenCLIP checkpoint. The output vector dimensionality matches `embed_dim` — the same dim the image embeddings carry.
+`encode_query` dispatches to the OpenCLIP text tower when the model ID resolves to an OpenCLIP checkpoint. The output vector dimensionality matches `embed_dim` — the same dim the image embeddings carry.
 
 ### Rust
 
@@ -59,10 +60,7 @@ let query_vec = session
 ### Python
 
 ```python
-query_vec = db.encode_text_query(
-    "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
-    "a red circle on a white background",
-)
+query_vec = db.encode_query(model="laion/CLIP-ViT-B-32-laion2B-s34B-b79K", query="a red circle on a white background",)
 ```
 
 ## 3. Search image embeddings with the text vector

@@ -5,12 +5,14 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use futures::StreamExt;
-use pyo3::exceptions::{PyKeyError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyString};
+use pyo3::Borrowed;
 use pyo3_arrow::{PySchema, PyTable};
 
 use jammi_ai::fine_tune::{EarlyStoppingMetric, FineTuneConfig, FineTuneMethod};
+use jammi_ai::local_session::{LocalSession, Modality, QueryInput, Session};
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
 use jammi_db::config::JammiConfig;
@@ -73,6 +75,16 @@ impl PyDatabase {
     /// session against the same artifact directory.
     pub fn session_arc(&self) -> Arc<InferenceSession> {
         Arc::clone(&self.session)
+    }
+
+    /// Wrap this database's engine as the transport-agnostic [`Session`] front
+    /// door (the local arm). The unified `encode_query` / `generate_embeddings`
+    /// verbs dispatch the `modality` onto the engine's concrete tower through
+    /// this one surface — the same shape the bundled `jammi-client` speaks
+    /// remotely, so the embedded and remote verb vocabularies agree by sharing
+    /// the `Session` abstraction rather than by a parallel reimplementation.
+    fn local_session(&self) -> Session {
+        Session::Local(LocalSession::new(Arc::clone(&self.session)))
     }
 }
 
@@ -180,8 +192,10 @@ impl PyDatabase {
 
     /// The engine's capabilities handshake: a dict with `version`, `features`
     /// (compiled feature flags), and `storage_backends` (addressable storage
-    /// URL schemes). A compile-time fact about the running build.
-    fn server_info(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    /// URL schemes). A compile-time fact about the running build. Named to match
+    /// the bundled `jammi-client`'s `get_server_info` (and `SessionService.
+    /// GetServerInfo`) so the embedded and remote surfaces agree.
+    fn get_server_info(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         serializable_to_pydict(py, &jammi_db::ServerInfo::current())
     }
 
@@ -194,22 +208,30 @@ impl PyDatabase {
         batches_to_pyarrow(py, &batches)
     }
 
-    /// Generate text embeddings for a registered source.
-    #[pyo3(signature = (*, source, model, columns, key))]
-    fn generate_text_embeddings(
+    /// Generate embeddings for `columns` of a registered source with the given
+    /// model and modality, persisting one L2-normalized vector per row. The
+    /// `modality` (`"text"`/`"image"`/`"audio"`) selects the tower; the image
+    /// and audio towers take exactly one content column. Returns the result
+    /// table name. The unified form — one verb keyed by modality, identical to
+    /// the bundled `jammi-client`'s.
+    #[pyo3(signature = (*, source, model, columns, key, modality=None))]
+    fn generate_embeddings(
         &self,
         source: &str,
         model: &str,
         columns: Vec<String>,
         key: &str,
-    ) -> PyResult<()> {
-        self.runtime
+        modality: Option<ModalityArg>,
+    ) -> PyResult<String> {
+        let modality = modality.map(|m| m.0).unwrap_or(Modality::Text);
+        let record = self
+            .runtime
             .block_on(
-                self.session
-                    .generate_text_embeddings(source, model, &columns, key),
+                self.local_session()
+                    .generate_embeddings(source, model, &columns, key, modality),
             )
             .map_err(to_pyerr)?;
-        Ok(())
+        Ok(record.table_name)
     }
 
     /// Run inference. Returns a `pyarrow.Table`.
@@ -781,10 +803,21 @@ impl PyDatabase {
         serializable_to_pydict(py, &report)
     }
 
-    /// Encode a text query into an embedding vector using the given model.
-    fn encode_text_query(&self, model_id: &str, text: &str) -> PyResult<Vec<f32>> {
+    /// Encode a single query into an embedding vector using the given model.
+    /// `modality` selects the tower (`"text"`/`"image"`/`"audio"`); `query` is a
+    /// string for the text tower or raw bytes for the image/audio tower. The
+    /// unified form — one verb keyed by modality, identical to the bundled
+    /// `jammi-client`'s.
+    #[pyo3(signature = (*, model, query, modality=None))]
+    fn encode_query(
+        &self,
+        model: &str,
+        query: QueryArg,
+        modality: Option<ModalityArg>,
+    ) -> PyResult<Vec<f32>> {
+        let modality = modality.map(|m| m.0).unwrap_or(Modality::Text);
         self.runtime
-            .block_on(self.session.encode_text_query(model_id, text))
+            .block_on(self.local_session().encode_query(model, query.0, modality))
             .map_err(to_pyerr)
     }
 
@@ -800,55 +833,54 @@ impl PyDatabase {
             .map_err(to_pyerr)?;
         Ok(())
     }
+}
 
-    /// Generate image embeddings for a registered source.
-    #[pyo3(signature = (*, source, model, image_column, key))]
-    fn generate_image_embeddings(
-        &self,
-        source: &str,
-        model: &str,
-        image_column: &str,
-        key: &str,
-    ) -> PyResult<()> {
-        self.runtime
-            .block_on(
-                self.session
-                    .generate_image_embeddings(source, model, image_column, key),
-            )
-            .map_err(to_pyerr)?;
-        Ok(())
+/// Argument shim for every Python-facing `modality=` parameter: the snake-case
+/// string `"text"` / `"image"` / `"audio"`. Decoded once at the binding
+/// boundary into a typed [`Modality`]. Shared by the unified `encode_query` and
+/// `generate_embeddings` verbs.
+struct ModalityArg(Modality);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for ModalityArg {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        let s = ob
+            .cast::<PyString>()
+            .map_err(|_| PyTypeError::new_err("modality must be a string"))?;
+        let raw: String = s.str()?.to_string();
+        let modality = match raw.as_str() {
+            "text" => Modality::Text,
+            "image" => Modality::Image,
+            "audio" => Modality::Audio,
+            other => {
+                return Err(PyTypeError::new_err(format!(
+                    "modality must be 'text', 'image', or 'audio' (got '{other}')"
+                )))
+            }
+        };
+        Ok(ModalityArg(modality))
     }
+}
 
-    /// Encode an image into an embedding vector using the given vision model.
-    fn encode_image_query(&self, model_id: &str, image_bytes: &[u8]) -> PyResult<Vec<f32>> {
-        self.runtime
-            .block_on(self.session.encode_image_query(model_id, image_bytes))
-            .map_err(to_pyerr)
-    }
+/// Argument shim for `encode_query`'s `query=`: a string is text for the text
+/// tower; raw bytes are an image/audio clip for the vision/audio tower. Decoded
+/// once at the boundary into the engine's [`QueryInput`].
+struct QueryArg(QueryInput);
 
-    /// Generate audio embeddings for a registered source.
-    #[pyo3(signature = (*, source, model, audio_column, key))]
-    fn generate_audio_embeddings(
-        &self,
-        source: &str,
-        model: &str,
-        audio_column: &str,
-        key: &str,
-    ) -> PyResult<()> {
-        self.runtime
-            .block_on(
-                self.session
-                    .generate_audio_embeddings(source, model, audio_column, key),
-            )
-            .map_err(to_pyerr)?;
-        Ok(())
-    }
+impl<'a, 'py> FromPyObject<'a, 'py> for QueryArg {
+    type Error = PyErr;
 
-    /// Encode an audio clip into an embedding vector using the given audio model.
-    fn encode_audio_query(&self, model_id: &str, audio_bytes: &[u8]) -> PyResult<Vec<f32>> {
-        self.runtime
-            .block_on(self.session.encode_audio_query(model_id, audio_bytes))
-            .map_err(to_pyerr)
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        if let Ok(s) = ob.cast::<PyString>() {
+            return Ok(QueryArg(QueryInput::Text(s.str()?.to_string())));
+        }
+        if let Ok(bytes) = ob.extract::<Vec<u8>>() {
+            return Ok(QueryArg(QueryInput::Bytes(bytes)));
+        }
+        Err(PyTypeError::new_err(
+            "query must be a str (text tower) or bytes (image/audio tower)",
+        ))
     }
 }
 

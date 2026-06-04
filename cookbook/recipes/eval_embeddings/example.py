@@ -36,19 +36,16 @@ def expand_golden_to_csv(json_path: Path, out_path: Path) -> None:
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        db = jammi_ai.connect(
-            artifact_dir=str(tmp_path),
-            gpu_device=-1,
-            inference_batch_size=8,
-        )
+        db = jammi_ai.connect(f"file://{str(tmp_path)}")
 
         # 1. Register the corpus and build the embedding index.
         db.add_source("corpus", url=str(CORPUS_PATH), format="parquet")
-        db.generate_text_embeddings(
+        db.generate_embeddings(
             source="corpus",
             model=MODEL,
             columns=["content"],
             key="id",
+            modality="text",
         )
 
         # 2. Expand the JSON golden set into the CSV shape eval_embeddings

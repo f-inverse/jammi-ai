@@ -39,6 +39,18 @@ docs/guide/book/
 clients/typescript/node_modules/
 clients/typescript/src/gen/
 
+# Python client (jammi-client) — generated-at-build, never committed.
+# The proto stays the single source; `_generated/` is emitted by `make generate`.
+clients/python/jammi_client/_generated/
+clients/python/.venv/
+clients/python/dist/
+clients/python/build/
+clients/python/*.egg-info/
+
+# In-repo cargo target + tmp dirs (CARGO_TARGET_DIR / TMPDIR for local gating)
+.cargo-target/
+.tmp/
+
 # Claude
 .claude
 CLAUDE.md

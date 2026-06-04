@@ -32,7 +32,7 @@ def main() -> None:
         os.environ["JAMMI_AUDIT_MASTER_KEY"] = "00" * 32
 
     with tempfile.TemporaryDirectory() as tmp:
-        db = jammi_ai.connect(artifact_dir=tmp)
+        db = jammi_ai.connect(f"file://{tmp}")
         db.with_tenant(TENANT)
 
         # 1. Build an audit record for a (hypothetical) search. query_lineage

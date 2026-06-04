@@ -18,16 +18,12 @@ from _shared import ARTIFACT_DIR, CORPUS_PARQUET, IMAGE_CORPUS_DIR, MODEL, ensur
 def main() -> int:
     assert CORPUS_PARQUET.exists(), "run 01-load-corpus.py and 02 first"
 
-    db = jammi_ai.connect(
-        artifact_dir=str(ARTIFACT_DIR),
-        gpu_device=-1,
-        inference_batch_size=8,
-    )
+    db = jammi_ai.connect(f"file://{str(ARTIFACT_DIR)}")
     ensure_source(db, "corpus", str(CORPUS_PARQUET))
 
     # Encode an image query (the held-out "circle" query) and search.
     query_png = (IMAGE_CORPUS_DIR / "queries" / "q_circle.png").read_bytes()
-    query_vec = db.encode_image_query(MODEL, query_png)
+    query_vec = db.encode_query(model=MODEL, query=query_png, modality="image")
     print(f"query embedding dim: {len(query_vec)}")
 
     results = db.search("corpus", query=query_vec, k=5).run()

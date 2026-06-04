@@ -157,11 +157,7 @@ def main() -> int:
     print(f"audio_search: model = {MODEL}")
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        db = jammi_ai.connect(
-            artifact_dir=str(tmp_path),
-            gpu_device=-1,
-            inference_batch_size=8,
-        )
+        db = jammi_ai.connect(f"file://{str(tmp_path)}")
 
         # 1. Load the corpus clips into a Parquet source (inline audio bytes).
         corpus_parquet = tmp_path / "corpus.parquet"
@@ -171,16 +167,17 @@ def main() -> int:
         # 2. Generate audio embeddings over the `audio` column. The model is
         #    auto-detected from its CLAP config; the backend owns
         #    decode -> resample -> log-mel -> forward; output is L2-normalized.
-        db.generate_audio_embeddings(
+        db.generate_embeddings(
             source="corpus",
             model=MODEL,
-            audio_column="audio",
+            columns=["audio"],
             key="clip_id",
+            modality="audio",
         )
 
         # 3. Encode a single audio query and run cosine ANN search.
         query_wav = (AUDIO_CORPUS_DIR / "queries" / "q_sine.wav").read_bytes()
-        query_vec = db.encode_audio_query(MODEL, query_wav)
+        query_vec = db.encode_query(model=MODEL, query=query_wav, modality="audio")
         assert query_vec, "query embedding must be non-empty"
         print(f"query embedding dim: {len(query_vec)}")
 
@@ -247,11 +244,12 @@ def main() -> int:
 
         # Re-embed the corpus with the tuned model and eval against the same
         # held-out golden set.
-        db.generate_audio_embeddings(
+        db.generate_embeddings(
             source="corpus",
             model=tuned_model,
-            audio_column="audio",
+            columns=["audio"],
             key="clip_id",
+            modality="audio",
         )
         tuned_metrics = db.eval_embeddings(
             source="corpus",
@@ -275,7 +273,7 @@ def main() -> int:
         # only intermittently. (With the random-weight fixture the *direction*
         # of the change is not meaningful; a real CLAP checkpoint is where
         # tuning lifts quality. We assert change, not improvement.)
-        tuned_query_vec = db.encode_audio_query(tuned_model, query_wav)
+        tuned_query_vec = db.encode_query(model=tuned_model, query=query_wav, modality="audio")
         assert len(tuned_query_vec) == len(query_vec), (
             "tuned query embedding dim must match the base dim "
             f"(base={len(query_vec)}, tuned={len(tuned_query_vec)})"

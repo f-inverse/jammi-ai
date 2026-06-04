@@ -3,11 +3,12 @@
 ## Build the embedding table
 
 ```python
-db.generate_text_embeddings(
+db.generate_embeddings(
     source="corpus",
     model=MODEL,        # e.g. "local:cookbook/fixtures/tiny_bert"
     columns=["content"],
     key="id",
+    modality="text",
 )
 ```
 
@@ -27,10 +28,10 @@ where it left off.
 ## Encode the query
 
 ```python
-query_vec = db.encode_text_query(MODEL, "how does quantum computing work?")
+query_vec = db.encode_query(model=MODEL, query="how does quantum computing work?")
 ```
 
-`encode_text_query` runs the same model that built the index and returns a
+`encode_query` runs the same model that built the index and returns a
 `list[float]`. The dimension must match the index — 32 for `tiny_bert`,
 384 for `all-MiniLM-L6-v2`, and so on.
 

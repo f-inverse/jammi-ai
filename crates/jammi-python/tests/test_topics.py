@@ -40,7 +40,7 @@ def _orders_schema() -> pa.Schema:
 def test_register_publish_subscribe_round_trips(tmp_path):
     """Register `events.demo`, publish one batch, read it back via
     `subscribe_collect`."""
-    db = jammi_ai.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(f"file://{tmp_path}")
     db.register_topic("events.demo", schema=_events_schema())
 
     batch = pa.table(
@@ -70,7 +70,7 @@ def test_register_publish_subscribe_round_trips(tmp_path):
 def test_register_with_broker_metadata(tmp_path):
     """`broker_metadata` is opaque driver config; the topic catalog round-
     trips it as-is and `list_topics` includes the registered topic."""
-    db = jammi_ai.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(f"file://{tmp_path}")
     db.register_topic(
         "cdc.orders",
         schema=_orders_schema(),
@@ -86,7 +86,7 @@ def test_register_inherits_session_tenant(tmp_path):
     session: bound to tenant A, `events.demo` appears in `list_topics`;
     re-bound to tenant B, the same call excludes the A-scoped topic;
     re-bound back to A, the topic is visible again."""
-    db = jammi_ai.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(f"file://{tmp_path}")
     db.with_tenant(TENANT_A)
     db.register_topic("events.demo", schema=_events_schema())
 
@@ -102,7 +102,7 @@ def test_register_inherits_session_tenant(tmp_path):
 def test_drop_missing_without_if_exists_raises(tmp_path):
     """`drop_topic` over an unknown name raises — the binding rejects with
     `ValueError`."""
-    db = jammi_ai.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(f"file://{tmp_path}")
     with pytest.raises((ValueError, RuntimeError)) as info:
         db.drop_topic("never.registered")
     msg = str(info.value).lower()
@@ -113,7 +113,7 @@ def test_drop_missing_without_if_exists_raises(tmp_path):
 
 def test_drop_missing_with_if_exists_succeeds(tmp_path):
     """`drop_topic(if_exists=True)` over an unknown name is a no-op."""
-    db = jammi_ai.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(f"file://{tmp_path}")
     db.drop_topic("never.registered", if_exists=True)
 
 
@@ -121,7 +121,7 @@ def test_register_rejects_unsupported_schema_type(tmp_path):
     """A topic schema with a column dtype outside the catalog encoder's
     closed set (e.g. `Timestamp`) raises with `UnsupportedSchemaType` —
     the engine's typed error from the band-aid fix surfaces verbatim."""
-    db = jammi_ai.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(f"file://{tmp_path}")
     schema_with_timestamp = pa.schema(
         [
             pa.field("event_id", pa.int64(), nullable=False),

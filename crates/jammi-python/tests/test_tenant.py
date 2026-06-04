@@ -51,14 +51,14 @@ def test_with_tenant_filters_federated_source(tmp_path):
 
     # Register the source once with an unbound session. Both per-tenant
     # sessions reload it from the catalog on connect.
-    registrar = jammi_ai.connect(artifact_dir=str(artifact_dir))
+    registrar = jammi_ai.connect(f"file://{artifact_dir}")
     registrar.add_source("notes", url=str(pq_path), format="parquet")
     del registrar
 
-    db_a = jammi_ai.connect(artifact_dir=str(artifact_dir))
+    db_a = jammi_ai.connect(f"file://{artifact_dir}")
     db_a.with_tenant(TENANT_A)
 
-    db_b = jammi_ai.connect(artifact_dir=str(artifact_dir))
+    db_b = jammi_ai.connect(f"file://{artifact_dir}")
     db_b.with_tenant(TENANT_B)
 
     count_a = (
@@ -90,7 +90,7 @@ def test_with_tenant_filters_federated_source(tmp_path):
 def test_with_tenant_rejects_invalid_uuid(tmp_path):
     """ADR-00 invariant: a non-UUID tenant id raises `ValueError`
     (PyO3 mapping of `JammiError::Tenant`)."""
-    db = jammi_ai.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(f"file://{tmp_path}")
     with pytest.raises((ValueError, RuntimeError)) as info:
         db.with_tenant("not-a-uuid")
     msg = str(info.value).lower()
@@ -102,7 +102,7 @@ def test_with_tenant_rejects_invalid_uuid(tmp_path):
 def test_empty_tenant_clears_binding(tmp_path):
     """`with_tenant('')` clears the binding — the engine's API contract
     treats empty string as unbind, per `crates/jammi-python/src/database.rs:38`."""
-    db = jammi_ai.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(f"file://{tmp_path}")
     db.with_tenant(TENANT_A)
     assert db.tenant() == TENANT_A
     db.with_tenant("")
@@ -113,7 +113,7 @@ def test_register_channel_round_trips_through_python(tmp_path):
     """SPEC-01 §7 dual-language hook landed in this iteration: register
     a new evidence-provenance channel from Python; merging in the engine
     sees the declared columns."""
-    db = jammi_ai.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(f"file://{tmp_path}")
     db.register_channel(
         "scored_by",
         priority=3,

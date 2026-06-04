@@ -26,7 +26,7 @@ model rather than a re-distributed full checkpoint.
 - `Database.fine_tune(*, source, base_model, columns, method, task=..., ...)`
 - `FineTuneJob.wait()`
 - `FineTuneJob.job_id`, `FineTuneJob.model_id`
-- `Database.encode_text_query(model_id, text)`
+- `Database.encode_query(*, model, query, modality="text")`
 
 The full keyword list on `fine_tune` covers LoRA rank/alpha/dropout,
 learning rate, epochs, batch size, max sequence length, validation

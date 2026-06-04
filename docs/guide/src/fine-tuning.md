@@ -158,8 +158,8 @@ session.generate_text_embeddings("patents", model_id, &["abstract".into()], "id"
 ```python
 model_id = job.model_id
 
-query_vec = db.encode_text_query(model_id, "quantum computing")
-db.generate_text_embeddings(source="patents", model=model_id, columns=["abstract"], key="id")
+query_vec = db.encode_query(model=model_id, query="quantum computing")
+db.generate_embeddings(source="patents", model=model_id, columns=["abstract"], key="id", modality="text")
 ```
 
 ## How it works

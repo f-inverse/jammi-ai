@@ -44,12 +44,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      # jammi-ai's build.rs compiles the gRPC proto when the `wire` feature is on
-      # (jammi-python enables it for the remote-session binding). The bare macOS
-      # runners have no protoc; the Linux job gets it from the CI container image.
-      - name: Install protoc
-        run: brew install protobuf
-
+      # The embed wheel is local-only — `jammi-python` no longer enables
+      # `jammi-ai/wire`, so nothing here compiles the gRPC proto and no protoc
+      # is needed. (The remote arm is the pure-Python `jammi-client`, published
+      # in lockstep by pypi-client.yml on the same `py-v*` tag.)
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:

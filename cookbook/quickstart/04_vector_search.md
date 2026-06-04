@@ -38,15 +38,16 @@ query_vec = db.encode_query(model=MODEL, query="how does quantum computing work?
 ## Search
 
 ```python
-results = db.search("corpus", query=query_vec, k=3).run()
+results = db.search("corpus", query=query_vec, k=3)  # pyarrow.Table
 for row in results.to_pylist():
     print(f"id={row['_row_id']}  score={row['similarity']:.4f}  {row['title']}")
 ```
 
-`db.search` returns a `SearchBuilder`. Call `.run()` to execute, or chain
-`.filter("year > 2020")`, `.sort("similarity", descending=True)`,
-`.limit(n)`, `.select([...])`, `.join("other_source", on="...")`,
-`.annotate(model=..., task=..., columns=...)` first.
+`db.search` returns a `pyarrow.Table` directly. Pass `filter="year > 2020"` and
+`select=[...]` for the bounded knobs. For compound retrieval — joining sources or
+running a model over the results with the `annotate(...)` table function — use
+`db.sql(...)`; the same SQL runs in-process or against a remote engine over Flight
+SQL.
 
 Every result row carries:
 

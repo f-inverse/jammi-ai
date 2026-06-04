@@ -28,7 +28,7 @@ pub mod operator;
 #[cfg(feature = "local")]
 pub mod pipeline;
 #[cfg(feature = "local")]
-pub mod search;
+pub mod query;
 #[cfg(feature = "local")]
 pub mod session;
 

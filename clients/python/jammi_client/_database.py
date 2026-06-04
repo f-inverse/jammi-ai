@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import grpc
 import pyarrow as pa
+import pyarrow.flight  # noqa: F401  (registers the `pa.flight` submodule)
 
 from ._generated.jammi.v1 import embedding_pb2, embedding_pb2_grpc
 from ._generated.jammi.v1 import session_pb2, session_pb2_grpc
@@ -146,12 +147,25 @@ class RemoteDatabase:
     transport differs. Use as a context manager to close the channel on exit.
     """
 
-    def __init__(self, channel: grpc.Channel, *, session_id: str) -> None:
+    def __init__(
+        self,
+        channel: grpc.Channel,
+        *,
+        session_id: str,
+        endpoint: str,
+        tls: bool,
+    ) -> None:
         self._channel = channel
         self._session_id = session_id
+        self._endpoint = endpoint
+        self._tls = tls
         self._metadata = ((SESSION_HEADER, session_id),)
         self._embedding = embedding_pb2_grpc.EmbeddingServiceStub(channel)
         self._session = session_pb2_grpc.SessionServiceStub(channel)
+        # The Flight SQL client shares the gRPC endpoint (the server co-mounts
+        # Flight SQL and the typed gRPC services on one Tonic port); built lazily
+        # on first `sql` so a connection that never queries SQL pays nothing.
+        self._flight = None
 
     @property
     def session_id(self) -> str:
@@ -342,10 +356,59 @@ class RemoteDatabase:
         resp = self._embedding.Search(request, metadata=self._metadata)
         return _hits_to_table(list(resp.hits))
 
+    # --- Compound query (Flight SQL) --------------------------------------------
+
+    def sql(self, query: str) -> pa.Table:
+        """Run a SQL query against the remote engine over the Flight SQL lane.
+
+        This is the open, caller-shaped compound surface — `join` / `filter` /
+        `select` over registered sources, and crucially `annotate(...)`, the
+        engine's model-inference table function, so compound retrieval +
+        inference run in one round-trip:
+
+        ```python
+        db.sql(
+            "SELECT a._row_id, a.vector "
+            "FROM annotate('local:/models/bert', 'text_embedding', "
+            "              'docs.public.papers', 'id', 'abstract') AS a"
+        )
+        ```
+
+        The same `jammi-session-id` that scopes this connection's tenant on the
+        typed gRPC verbs is sent on the Flight SQL query, so SQL reads observe
+        the same tenant scope. Returns a `pyarrow.Table`. The embedded
+        `Database.sql` is the in-process peer of this verb — same SQL, same
+        `annotate` function, transport apart.
+        """
+        client = self._flight_client()
+        options = self._flight_options()
+        info = client.get_flight_info(
+            pa.flight.FlightDescriptor.for_command(_command_statement_query(query)),
+            options,
+        )
+        reader = client.do_get(info.endpoints[0].ticket, options)
+        return reader.read_all()
+
+    def _flight_client(self):
+        if self._flight is None:
+            scheme = "grpc+tls" if self._tls else "grpc+tcp"
+            self._flight = pa.flight.FlightClient(f"{scheme}://{self._endpoint}")
+        return self._flight
+
+    def _flight_options(self):
+        # Carry the connection's session id as the tenant-scoping header, the
+        # same key the typed gRPC verbs send.
+        return pa.flight.FlightCallOptions(
+            headers=[(SESSION_HEADER.encode(), self._session_id.encode())]
+        )
+
     # --- Lifecycle ---------------------------------------------------------------
 
     def close(self) -> None:
         """Close the underlying channel. Idempotent."""
+        if self._flight is not None:
+            self._flight.close()
+            self._flight = None
         self._channel.close()
 
     def __enter__(self) -> "RemoteDatabase":
@@ -367,7 +430,7 @@ def open_remote(endpoint: str, *, tls: bool) -> RemoteDatabase:
         channel = grpc.secure_channel(endpoint, grpc.ssl_channel_credentials())
     else:
         channel = grpc.insecure_channel(endpoint)
-    return RemoteDatabase(channel, session_id=session_id)
+    return RemoteDatabase(channel, session_id=session_id, endpoint=endpoint, tls=tls)
 
 
 # `google.protobuf.empty_pb2.Empty` is what the no-argument session RPCs take;
@@ -376,3 +439,48 @@ def _empty():
     from google.protobuf import empty_pb2
 
     return empty_pb2.Empty()
+
+
+# The Flight SQL type URL for a plain "run this SQL string" command. The server
+# (DataFusion's Flight SQL service) dispatches on this `Any` type URL.
+_STATEMENT_QUERY_TYPE_URL = (
+    b"type.googleapis.com/arrow.flight.protocol.sql.CommandStatementQuery"
+)
+
+
+def _proto_len_delimited(field_number: int, payload: bytes) -> bytes:
+    """Encode one length-delimited (wire type 2) protobuf field.
+
+    `tag = (field_number << 3) | 2`, then the varint length, then the bytes.
+    Only the two messages this client constructs — `Any` and
+    `CommandStatementQuery` — are encoded here, both of which use exactly this
+    one wire type, so a full protobuf runtime is unnecessary.
+    """
+    tag = (field_number << 3) | 2
+    return bytes([tag]) + _varint(len(payload)) + payload
+
+
+def _varint(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def _command_statement_query(query: str) -> bytes:
+    """Build the `google.protobuf.Any`-wrapped `CommandStatementQuery` bytes a
+    Flight SQL `get_flight_info` command carries for a SQL string.
+
+    `CommandStatementQuery { query = 1 }` → wrapped in
+    `Any { type_url = 1, value = 2 }`.
+    """
+    inner = _proto_len_delimited(1, query.encode("utf-8"))
+    any_msg = _proto_len_delimited(1, _STATEMENT_QUERY_TYPE_URL) + _proto_len_delimited(
+        2, inner
+    )
+    return any_msg

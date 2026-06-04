@@ -34,8 +34,7 @@ let results = session.search("patents", query, 10).await?
 ```python
 query_vec = db.encode_query(model="sentence-transformers/all-MiniLM-L6-v2", query="quantum computing applications")
 
-search = db.search("patents", query=query_vec, k=10)
-results = search.run()
+results = db.search("patents", query=query_vec, k=10)  # pyarrow.Table
 print(results.to_pandas())
 ```
 
@@ -50,13 +49,15 @@ Results are `RecordBatch` / `pyarrow.Table` with:
 - `retrieved_by` — `List<Utf8>` provenance: which channels found this row
 - `annotated_by` — `List<Utf8>` provenance: which channels added evidence post-retrieval
 
-## SearchBuilder
+## Refining a search
 
-The SearchBuilder composes query operations. Each method adds a node to a DataFusion execution plan — no data is processed until `.run()`.
+`search` carries the two knobs the bounded primitive owns directly: a SQL `filter`
+predicate over the hydrated results and a `select` column projection. In Python they
+are keyword arguments and `search` returns the table; in Rust they are methods on the
+fluent `QueryBuilder` (`session.search(...)` returns the builder, which also carries
+`sort` / `limit` / `join` / `annotate` and a `.run()`).
 
-### Filter
-
-Apply a SQL WHERE clause to hydrated columns:
+### Filter and select
 
 #### Rust
 
@@ -68,81 +69,8 @@ Apply a SQL WHERE clause to hydrated columns:
 # async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
 session.search("patents", query, 20).await?
     .filter("year > 2020")?
-    .run().await?;
-# Ok(()) }
-```
-
-#### Python
-
-```python
-search = db.search("patents", query=query_vec, k=20)
-search.filter("year > 2020")
-results = search.run()
-```
-
-### Sort
-
-#### Rust
-
-```rust,no_run
-# extern crate jammi_db;
-# extern crate jammi_ai;
-# extern crate tokio;
-# use jammi_ai::session::InferenceSession;
-# async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
-session.search("patents", query, 20).await?
     .sort("similarity", true)?  // descending
-    .run().await?;
-# Ok(()) }
-```
-
-#### Python
-
-```python
-search = db.search("patents", query=query_vec, k=20)
-search.sort("similarity", descending=True)
-results = search.run()
-```
-
-### Limit
-
-#### Rust
-
-```rust,no_run
-# extern crate jammi_db;
-# extern crate jammi_ai;
-# extern crate tokio;
-# use jammi_ai::session::InferenceSession;
-# async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
-session.search("patents", query, 20).await?
-    .sort("similarity", true)?
     .limit(5)
-    .run().await?;
-# Ok(()) }
-```
-
-#### Python
-
-```python
-search = db.search("patents", query=query_vec, k=20)
-search.sort("similarity", descending=True)
-search.limit(5)
-results = search.run()
-```
-
-### Select
-
-Project specific columns. Note that `retrieved_by` and `annotated_by` evidence columns are always appended to the output regardless of your selection:
-
-#### Rust
-
-```rust,no_run
-# extern crate jammi_db;
-# extern crate jammi_ai;
-# extern crate tokio;
-# use jammi_ai::session::InferenceSession;
-# async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
-session.search("patents", query, 10).await?
     .select(&["_row_id".into(), "title".into(), "similarity".into()])?
     .run().await?;
 # Ok(()) }
@@ -151,12 +79,18 @@ session.search("patents", query, 10).await?
 #### Python
 
 ```python
-search = db.search("patents", query=query_vec, k=10)
-search.select(["_row_id", "title", "similarity"])
-results = search.run()
+results = db.search(
+    "patents", query=query_vec, k=20,
+    filter="year > 2020",
+    select=["_row_id", "title", "similarity"],
+)  # pyarrow.Table
 ```
 
-### Chaining everything
+### Compound query (join, annotate)
+
+Joining other sources and running a model over the results is open composition, so
+in Python and over the wire it is SQL — `db.sql(...)`, with the `annotate(...)` table
+function for inference. In Rust the same operations compose on the fluent builder:
 
 #### Rust
 
@@ -178,13 +112,17 @@ let results = session.search("patents", query, 100).await?
 #### Python
 
 ```python
-search = db.search("patents", query=query_vec, k=100)
-search.filter("year > 2020")
-search.sort("similarity", descending=True)
-search.limit(10)
-search.select(["title", "similarity"])
-results = search.run()
+results = db.sql("""
+    SELECT title, vector
+    FROM annotate('local:/models/all-MiniLM-L6-v2', 'text_embedding',
+                  'patents.public.patents', 'id', 'abstract') AS a
+    JOIN patents.public.patents AS p ON a._row_id = arrow_cast(p.id, 'Utf8')
+    WHERE p.year > 2020
+    LIMIT 10
+""")
 ```
+
+See [Compound Retrieval and Inference over Flight SQL](./remote-compound-query.md) for the full compound surface — it runs the same SQL in-process or against a remote engine over Flight SQL.
 
 ## ANN vs exact search
 

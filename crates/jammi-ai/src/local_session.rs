@@ -25,7 +25,7 @@
 //!   by a [`Modality`]. The engine keeps its three concrete methods; the
 //!   dispatch lives here.
 //! * **Search** is flattened: a [`SearchRequest`] in, the terminal
-//!   `Vec<RecordBatch>` out. The fluent [`crate::search::SearchBuilder`] is an
+//!   `Vec<RecordBatch>` out. The fluent [`crate::query::QueryBuilder`] is an
 //!   internal mechanism `LocalSession` drives — never the return type.
 //! * **Fine-tune** returns a job **id**; status is polled by id through
 //!   [`Session::fine_tune_status`]. The in-process `FineTuneJob`
@@ -92,7 +92,7 @@ pub enum SearchQuery {
 }
 
 /// A flattened vector-search request. Replaces the stateful
-/// [`crate::search::SearchBuilder`] on the consumer surface: every knob the
+/// [`crate::query::QueryBuilder`] on the consumer surface: every knob the
 /// builder exposed for a one-shot search (`filter`, `select`) is a field here,
 /// so a remote transport can serialise the whole request rather than replay a
 /// chain of builder calls.

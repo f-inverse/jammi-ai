@@ -40,7 +40,7 @@ MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 db.generate_embeddings(source="corpus", model=MODEL, columns=["content"], key="id", modality="text")
 
 query_vec = db.encode_query(model=MODEL, query="quantum computing applications")
-results = db.search("corpus", query=query_vec, k=5).run()
+results = db.search("corpus", query=query_vec, k=5)  # pyarrow.Table
 print(results.to_pandas())
 ```
 
@@ -53,24 +53,35 @@ fine-tuning, Flight SQL — see [`cookbook/`](./cookbook/).
 - **Federated queries** — join local files with PostgreSQL or MySQL
 - **Text embeddings** — load any BERT-family model from Hugging Face Hub (or local safetensors / ONNX) and persist results to Parquet with ANN indexes
 - **Image embeddings** — CLIP-style vision encoders
-- **Vector search** — ANN similarity search with automatic brute-force fallback
-- **SearchBuilder** — fluent API for `.filter()`, `.sort()`, `.join()`, `.annotate()`, `.limit()`, `.select()`, `.run()`
-- **Evidence provenance** — `retrieved_by` and `annotated_by` tracking on every search result
+- **Vector search** — ANN similarity search with automatic brute-force fallback; `search` returns a table directly, same shape embedded or remote
+- **Compound query** — `join` / `filter` / `select` and model inference (the `annotate` SQL table function) over your data, in-process or over the Flight SQL lane in one round-trip
+- **Evidence provenance** — `retrieved_by` and `annotated_by` tracking on the fluent Rust query builder's results
 - **Fine-tuning** — LoRA / deep LoRA adapters with contrastive loss to improve embeddings for your domain
 - **Evaluation** — recall@k, precision@k, MRR, nDCG, accuracy, F1, and A/B model comparison
 - **Model caching** — LRU eviction, ref-counted guards, single-flight loading
 - **GPU scheduling** — memory-budget admission control with RAII permits
 - **Crash recovery** — recovers embedding tables stuck in "building" state on restart
 
-## SearchBuilder
+## Search and compound query
+
+`search` is the bounded primitive — nearest-neighbor top-k with optional `filter` / `select`, returning a `pyarrow.Table` directly (the same call, embedded or remote):
 
 ```python
-search = db.search("patents", query=query_vec, k=20)
-search.filter("year >= 2020")
-search.sort("similarity", descending=True)
-search.limit(5)
-search.select(["id", "title", "similarity"])
-results = search.run()   # pyarrow.Table
+results = db.search(
+    "patents", query=query_vec, k=20,
+    filter="year >= 2020", select=["id", "title", "similarity"],
+)   # pyarrow.Table
+```
+
+For open, compound retrieval + inference — `join`, `filter`, and running a model over a relation — use SQL. The `annotate(...)` table function runs a model over a relation's columns; it works identically in-process (embed wheel) and over the Flight SQL lane (remote engine via `jammi-client`):
+
+```python
+results = db.sql("""
+    SELECT p.title, a.vector
+    FROM annotate('all-MiniLM-L6-v2', 'text_embedding',
+                  'patents.public.patents', 'id', 'abstract') AS a
+    JOIN patents.public.patents AS p ON a._row_id = arrow_cast(p.id, 'Utf8')
+""")
 ```
 
 All results are returned as `pyarrow.Table` — zero-copy from the Rust engine.

@@ -239,7 +239,7 @@ async fn recipe_semantic_search() {
     assert!(results[0].schema().field_with_name("similarity").is_ok());
     assert!(results[0].schema().field_with_name("title").is_ok());
 
-    // SearchBuilder: filter + sort + limit + select (cookbook recipe)
+    // QueryBuilder: filter + sort + limit + select (cookbook recipe)
     let filtered = session
         .search("patents", query.clone(), 20)
         .await

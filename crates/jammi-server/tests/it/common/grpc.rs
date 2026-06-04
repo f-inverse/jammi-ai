@@ -99,7 +99,11 @@ pub async fn start_engine_server_with_trigger() -> EngineServer {
 pub async fn start_engine_server_with_tiers(tiers: jammi_server::tiers::TierSet) -> EngineServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg = test_config(dir.path());
-    let session = Arc::new(InferenceSession::new(cfg).await.expect("session"));
+    // `open` (not `new`) so the engine-backed server registers the compound
+    // query SQL functions (`annotate`, …) on its context — the same shape the
+    // production `OssServer` builds, and what the Flight SQL `annotate` test
+    // exercises.
+    let session = InferenceSession::open(cfg).await.expect("session");
 
     let store = SessionStore::new();
     let trigger = tiers

@@ -19,10 +19,9 @@ use jammi_db::ChannelId;
 
 use crate::evidence::{merge_channels, ChannelContribution};
 use crate::operator::ann_search_exec::AnnSearchExec;
-use crate::operator::inference_exec::InferenceExecBuilder;
 use crate::session::InferenceSession;
 
-/// Fluent API for constructing search queries.
+/// Fluent API for constructing vector-search-seeded compound queries.
 ///
 /// Each method adds a node to a DataFusion execution plan.
 /// `.run()` executes the plan and adds evidence provenance columns.
@@ -31,14 +30,20 @@ use crate::session::InferenceSession;
 /// joining back to the source table — so all original columns (e.g.
 /// `title`, `abstract`, `assignee_id`) are available for downstream
 /// operations like `.join()`, `.annotate()`, `.filter()`, `.select()`.
-pub struct SearchBuilder {
+///
+/// This is the in-process compound surface. Its remote peer is the Flight SQL
+/// lane, where the same `annotate` (model-over-columns) operation is exposed as
+/// a DataFusion table function — both descend through
+/// [`InferenceSession::annotate_plan`], so a compound query runs the same plan
+/// node whether it was built in-process or parsed from remote SQL.
+pub struct QueryBuilder {
     session: Arc<InferenceSession>,
     plan: Arc<dyn ExecutionPlan>,
     channels: Vec<ChannelId>,
     annotated: bool,
 }
 
-impl SearchBuilder {
+impl QueryBuilder {
     /// Start a search over an embedding table.
     ///
     /// Creates an ANN search plan, then automatically hydrates results
@@ -251,7 +256,12 @@ impl SearchBuilder {
         Ok(self)
     }
 
-    /// Annotate search results by running model inference over selected columns.
+    /// Annotate query results by running model inference over selected columns.
+    ///
+    /// Delegates to [`InferenceSession::annotate_plan`] — the one
+    /// model-over-columns operator shared with the Flight SQL `annotate` table
+    /// function. The hydrated query rows carry `_row_id`, so the inference
+    /// output keys back to them through it.
     pub async fn annotate(
         mut self,
         model: &str,
@@ -259,30 +269,10 @@ impl SearchBuilder {
         columns: &[String],
     ) -> Result<Self> {
         let model_source = crate::model::ModelSource::parse(model);
-
-        let guard = self
+        self.plan = self
             .session
-            .model_cache()
-            .get_or_load(&model_source, task, None)
+            .annotate_plan(self.plan, &model_source, task, columns, "_row_id")
             .await?;
-        let embedding_dim = guard.model.embedding_dim();
-        drop(guard);
-
-        let inference = InferenceExecBuilder::new(
-            self.plan,
-            model_source,
-            task,
-            columns.to_vec(),
-            "_row_id".to_string(),
-            String::new(),
-            std::sync::Arc::clone(self.session.model_cache()),
-        )
-        .batch_size(self.session.inner_config().inference.batch_size)
-        .observer(self.session.observer().clone())
-        .embedding_dim(embedding_dim)
-        .build()?;
-
-        self.plan = Arc::new(inference);
         self.channels.push(ChannelId::new("inference")?);
         self.annotated = true;
         Ok(self)

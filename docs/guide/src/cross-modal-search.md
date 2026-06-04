@@ -81,10 +81,10 @@ let results = session.search("figures", query_vec, 10).await?.run().await?;
 ### Python
 
 ```python
-results = db.search("figures", query=query_vec, k=10).run()
+results = db.search("figures", query=query_vec, k=10)  # pyarrow.Table
 ```
 
-The hydrated results carry your source's columns (`figure_id`, plus any joined / annotated columns) alongside the `similarity` score. All `SearchBuilder` operations — `join`, `filter`, `sort`, `limit`, `annotate` — compose identically to text-against-text search.
+`search` returns a `pyarrow.Table` directly, carrying your source's columns (`figure_id`) alongside the `similarity` score; pass `filter=` / `select=` to refine. For compound retrieval — joining sources or running a model over the results with `annotate(...)` — use `db.sql(...)` (see [Compound Retrieval and Inference over Flight SQL](./remote-compound-query.md)); it composes identically for cross-modal search.
 
 ## Why this works
 

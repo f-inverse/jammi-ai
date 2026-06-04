@@ -7,9 +7,9 @@ Jammi is an embeddable AI engine that brings model inference into your data pipe
 - **Query local data with SQL** — register Parquet, CSV, and JSON files, run full SQL via DataFusion
 - **Federate external databases** — query PostgreSQL and MySQL alongside local files
 - **Generate embeddings** — load any BERT-family model from HuggingFace Hub (or local safetensors / ONNX), persist results to Parquet with sidecar ANN indexes
-- **Vector search** — ANN similarity search over embedding tables with automatic fallback to brute-force
-- **Search builder** — fluent API for `.join()`, `.annotate()`, `.filter()`, `.sort()`, `.limit()`, `.select()`, `.run()`
-- **Evidence provenance** — `retrieved_by` and `annotated_by` tracking on every search result
+- **Vector search** — ANN similarity search over embedding tables with automatic fallback to brute-force; `search` returns a table directly, same shape embedded or remote
+- **Compound query** — join sources, filter, and run a model over a relation (the `annotate` SQL table function), in-process or over the Flight SQL lane in one round-trip; a fluent `QueryBuilder` composes the same operations in Rust
+- **Evidence provenance** — `retrieved_by` and `annotated_by` tracking on the fluent query builder's results
 - **Fine-tuning** — LoRA adapters with contrastive loss to improve embeddings for your domain
 - **Evaluation** — retrieval metrics (recall@k, precision@k, MRR, nDCG), classification (accuracy, F1), and A/B model comparison
 - **Per-row error handling** — null or invalid text produces error status per row, not a batch failure

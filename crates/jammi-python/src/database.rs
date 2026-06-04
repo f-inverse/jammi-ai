@@ -12,7 +12,9 @@ use pyo3::Borrowed;
 use pyo3_arrow::{PySchema, PyTable};
 
 use jammi_ai::fine_tune::{EarlyStoppingMetric, FineTuneConfig, FineTuneMethod};
-use jammi_ai::local_session::{LocalSession, Modality, QueryInput, Session};
+use jammi_ai::local_session::{
+    LocalSession, Modality, QueryInput, SearchQuery, SearchRequest, Session,
+};
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
 use jammi_db::config::JammiConfig;
@@ -28,7 +30,6 @@ use crate::convert::{batches_to_pyarrow, serializable_to_pydict};
 use crate::error::to_pyerr;
 use crate::job::PyFineTuneJob;
 use crate::model_task::ModelTaskArg;
-use crate::search::PySearchBuilder;
 
 /// Python Database wrapping `Arc<InferenceSession>` with a shared tokio runtime.
 #[pyclass(name = "Database")]
@@ -49,9 +50,9 @@ impl PyDatabase {
     /// `InferenceSession` future.
     pub fn open(config: JammiConfig) -> Result<Self, JammiError> {
         let runtime = Arc::new(tokio::runtime::Runtime::new()?);
-        let session = runtime.block_on(InferenceSession::new(config))?;
+        let session = runtime.block_on(InferenceSession::open(config))?;
         Ok(Self {
-            session: Arc::new(session),
+            session,
             runtime,
             ephemeral_scanner: std::sync::Once::new(),
         })
@@ -528,18 +529,34 @@ impl PyDatabase {
         }
     }
 
-    /// Start a vector search. Returns a `SearchBuilder` for fluent chaining.
-    #[pyo3(signature = (source, *, query, k))]
-    fn search(&self, source: &str, query: Vec<f32>, k: usize) -> PyResult<PySearchBuilder> {
-        let session_arc = Arc::clone(&self.session);
-        let builder = self
+    /// Nearest-neighbor search over a source's embedding table. Returns a
+    /// `pyarrow.Table` directly — the same shape, the same call, as the bundled
+    /// `jammi-client`'s `search` (and the typed `Search` gRPC verb). `filter` is
+    /// an optional SQL predicate over the hydrated results; `select` projects
+    /// columns (empty keeps every hydrated column). For compound retrieval
+    /// (join / model inference over the results), use `query` (SQL).
+    #[pyo3(signature = (source, *, query, k, filter=None, select=None))]
+    fn search(
+        &self,
+        py: Python<'_>,
+        source: &str,
+        query: Vec<f32>,
+        k: usize,
+        filter: Option<String>,
+        select: Option<Vec<String>>,
+    ) -> PyResult<Py<PyAny>> {
+        let request = SearchRequest {
+            source_id: source.to_string(),
+            query: SearchQuery::Vector(query),
+            k,
+            filter,
+            select: select.unwrap_or_default(),
+        };
+        let batches = self
             .runtime
-            .block_on(session_arc.search(source, query, k))
+            .block_on(self.local_session().search(request))
             .map_err(to_pyerr)?;
-        Ok(PySearchBuilder {
-            inner: Some(builder),
-            runtime: Arc::clone(&self.runtime),
-        })
+        batches_to_pyarrow(py, &batches)
     }
 
     /// Start a fine-tuning job. Returns a `FineTuneJob` handle.

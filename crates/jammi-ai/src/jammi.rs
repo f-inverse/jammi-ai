@@ -22,9 +22,6 @@
 //! construction logic is duplicated here.
 
 #[cfg(feature = "local")]
-use std::sync::Arc;
-
-#[cfg(feature = "local")]
 use jammi_db::config::JammiConfig;
 use jammi_db::error::Result;
 
@@ -68,7 +65,7 @@ impl Jammi {
         match target {
             #[cfg(feature = "local")]
             Target::Local(config) => {
-                let engine = Arc::new(InferenceSession::new(config).await?);
+                let engine = InferenceSession::open(config).await?;
                 Ok(Session::Local(LocalSession::new(engine)))
             }
             #[cfg(feature = "wire")]

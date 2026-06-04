@@ -36,6 +36,9 @@ symphonia = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 # HTTP backend
 reqwest = { workspace = true, optional = true }
+# `#[async_trait]` for the `annotate` table function's `TableProvider` impl
+# (the in-process compound-query surface); only the `local` engine builds it.
+async-trait = { workspace = true, optional = true }
 
 datafusion.workspace = true
 arrow.workspace = true
@@ -95,6 +98,7 @@ local = [
     "dep:symphonia",
     "dep:flate2",
     "dep:reqwest",
+    "dep:async-trait",
     "jammi-lora/candle",
 ]
 live-hub-tests = []

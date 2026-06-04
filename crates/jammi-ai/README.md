@@ -2,7 +2,7 @@
 
 Embeddable AI engine for inference, embeddings, vector search, and fine-tuning. Part of [Jammi AI](https://github.com/f-inverse/jammi-ai).
 
-`jammi-ai` builds on `jammi-db` to add model loading (HuggingFace Hub, local safetensors, ONNX), embedding generation with persistent Parquet + ANN indexes, semantic vector search with a fluent SearchBuilder API, LoRA fine-tuning, and evaluation (retrieval, classification, summarization).
+`jammi-ai` builds on `jammi-db` to add model loading (HuggingFace Hub, local safetensors, ONNX), embedding generation with persistent Parquet + ANN indexes, semantic vector search plus a fluent `QueryBuilder` for compound retrieval (join / annotate / filter / select), LoRA fine-tuning, and evaluation (retrieval, classification, summarization).
 
 ## Usage
 

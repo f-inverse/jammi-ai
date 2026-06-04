@@ -3,9 +3,9 @@
 Encodes a held-out query image into a vector and runs cosine nearest-neighbour
 search over the corpus index built in step 02. Prints the top-K image IDs.
 
-The `SearchBuilder` returned by `db.search(...)` supports `.filter()`,
-`.select()`, `.sort()`, `.limit()`, `.join()` and `.annotate()` before `.run()`
-— here we keep it to a plain top-K.
+`db.search(...)` returns a `pyarrow.Table` directly, with `filter=` / `select=`
+for the bounded knobs; compound retrieval (join, or running a model over the
+results with `annotate(...)`) is `db.sql(...)`. Here we keep it to a plain top-K.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ def main() -> int:
     query_vec = db.encode_query(model=MODEL, query=query_png, modality="image")
     print(f"query embedding dim: {len(query_vec)}")
 
-    results = db.search("corpus", query=query_vec, k=5).run()
+    results = db.search("corpus", query=query_vec, k=5)  # pyarrow.Table
     assert results.num_rows > 0, "search must return a non-empty top-K"
     print(f"top-{results.num_rows} for q_circle: {results.column('image_id').to_pylist()}")
 

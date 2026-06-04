@@ -116,7 +116,7 @@ def main() -> int:
         assert query_vec, "query embedding must be non-empty"
         print(f"query embedding dim: {len(query_vec)}")
 
-        results = db.search("corpus", query=query_vec, k=5).run()
+        results = db.search("corpus", query=query_vec, k=5)  # pyarrow.Table
         assert results.num_rows > 0, "search must return a non-empty top-K"
         top_ids = results.column("image_id").to_pylist()
         print(f"top-{results.num_rows} for q_circle: {top_ids}")

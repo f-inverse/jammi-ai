@@ -165,7 +165,10 @@ impl OssServer {
         // startup error, not a silent degrade.
         let tiers = TierSet::from_config(&config.server.services)?;
 
-        let session = Arc::new(InferenceSession::new(config).await?);
+        // `open` (not `new`) registers the `annotate` query UDTF on the engine's
+        // DataFusion context — the Flight SQL surface needs it. It already returns
+        // an `Arc<InferenceSession>`.
+        let session = InferenceSession::open(config).await?;
         let session_store = SessionStore::new();
         let metrics = Arc::new(MetricsRegistry::new()?);
         let readiness = Arc::new(ReadinessProbe::new(Arc::new(CatalogPingProbe::new(

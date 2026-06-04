@@ -62,6 +62,7 @@ _REMOTE_VERBS = {
     "generate_embeddings",
     "encode_query",
     "search",
+    "sql",
     "list_sources",
     "describe_source",
     "with_tenant",

@@ -20,7 +20,7 @@ use crate::model::resolver::ModelResolver;
 use crate::model::{ModelSource, ModelTask};
 use crate::operator::inference_exec::InferenceExecBuilder;
 use crate::pipeline::embedding::EmbeddingPipeline;
-use crate::search::SearchBuilder;
+use crate::query::QueryBuilder;
 use jammi_db::cache::ann_cache::AnnCache;
 
 /// An inference-capable session that wraps `JammiSession` with model loading
@@ -40,6 +40,19 @@ impl InferenceSession {
     /// Create a new session with model loading and inference capabilities.
     pub async fn new(config: JammiConfig) -> Result<Self> {
         Self::with_observer(config, None).await
+    }
+
+    /// Build a session behind an `Arc` with the compound-query SQL functions
+    /// registered (`annotate`, …). This is the canonical constructor for any
+    /// long-lived shared session — the embedded `Database`, the OSS server, and
+    /// the `Jammi::open` local arm — so the in-process `sql` surface and the
+    /// Flight SQL lane both expose the same SQL functions. Sessions that never
+    /// run compound SQL (short-lived CLI commands) can still use the plain
+    /// [`Self::new`].
+    pub async fn open(config: JammiConfig) -> Result<Arc<Self>> {
+        let session = Arc::new(Self::new(config).await?);
+        session.register_query_functions();
+        Ok(session)
     }
 
     /// Create a new session with an optional inference observer.
@@ -94,6 +107,27 @@ impl InferenceSession {
             device_config,
             ephemeral_sessions: jammi_db::ephemeral::ActiveSessions::new(),
         })
+    }
+
+    /// Register the engine's compound-query SQL functions on this session's
+    /// `SessionContext`, so SQL — in-process (`sql`) and over the Flight SQL
+    /// lane alike — can call them.
+    ///
+    /// Currently this registers the `annotate(model, task, relation, key, col…)`
+    /// table function (model inference as a relation). It must be called once
+    /// per session, after the session is behind an `Arc`, because the function
+    /// holds a [`std::sync::Weak`] back-reference to the session it serves —
+    /// weak to avoid the cycle the strong handle would form (the session owns
+    /// the context the function registers on). The Flight SQL request path
+    /// clones this context's state, so registering here makes `annotate`
+    /// reachable on every Flight SQL session too.
+    pub fn register_query_functions(self: &Arc<Self>) {
+        self.context().register_udtf(
+            crate::query::AnnotateTableFunction::NAME,
+            Arc::new(crate::query::AnnotateTableFunction::new(Arc::downgrade(
+                self,
+            ))),
+        );
     }
 
     /// Register a data source.
@@ -320,14 +354,20 @@ impl InferenceSession {
         &self.observer
     }
 
-    /// Start a vector search query over an embedding table.
+    /// Start a vector-search-seeded compound query over an embedding table.
+    ///
+    /// Returns the fluent [`QueryBuilder`]: the first node is the ANN search,
+    /// onto which `join` / `annotate` / `filter` / `select` / `sort` / `limit`
+    /// compose. The bounded typed `search` verb (on [`crate::Session`]) is a
+    /// thin wrapper over this — vector-search then optional `filter`/`select`
+    /// then `run`.
     pub async fn search(
         self: &Arc<Self>,
         source_id: &str,
         query: Vec<f32>,
         k: usize,
-    ) -> Result<SearchBuilder> {
-        SearchBuilder::new(Arc::clone(self), source_id, query, k, None).await
+    ) -> Result<QueryBuilder> {
+        QueryBuilder::new(Arc::clone(self), source_id, query, k, None).await
     }
 
     /// Start a search ranked by an existing row (query-by-example).
@@ -342,13 +382,55 @@ impl InferenceSession {
         source_id: &str,
         row_key: &str,
         k: usize,
-    ) -> Result<SearchBuilder> {
+    ) -> Result<QueryBuilder> {
         let table = self
             .catalog()
             .resolve_embedding_table(source_id, None)
             .await?;
         let query = self.inner.read_vector_by_key(&table, row_key).await?;
         self.search(source_id, query, k).await
+    }
+
+    /// Run a model over `columns` of an arbitrary input plan, appending the
+    /// task's inference columns (the `annotate` operation).
+    ///
+    /// This is the single inference-over-a-relation operator. Both the fluent
+    /// [`crate::query::QueryBuilder::annotate`] and the Flight-SQL `annotate`
+    /// table function descend through it, so the in-process and remote compound
+    /// surfaces run the *same* plan node rather than two reimplementations of
+    /// "run inference over these columns".
+    ///
+    /// The output schema is the inference prefix (`_row_id`, `_source`,
+    /// `_model`, `_status`, `_error`, `_latency_ms`) followed by the task's
+    /// columns (e.g. a `vector` FixedSizeList for an embedding task). `key_column`
+    /// names the input column carried through as `_row_id`.
+    pub async fn annotate_plan(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        model: &ModelSource,
+        task: ModelTask,
+        columns: &[String],
+        key_column: &str,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let guard = self.model_cache.get_or_load(model, task, None).await?;
+        let embedding_dim = guard.model.embedding_dim();
+        drop(guard);
+
+        let inference = InferenceExecBuilder::new(
+            input,
+            model.clone(),
+            task,
+            columns.to_vec(),
+            key_column.to_string(),
+            String::new(),
+            Arc::clone(&self.model_cache),
+        )
+        .batch_size(self.inner.config().inference.batch_size)
+        .observer(self.observer.clone())
+        .embedding_dim(embedding_dim)
+        .build()?;
+
+        Ok(Arc::new(inference))
     }
 
     /// Encode a single text query into a vector using the given model.

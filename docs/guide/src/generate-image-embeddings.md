@@ -112,10 +112,10 @@ Image embeddings work with the same `search()` API as text embeddings:
 
 ```python
 vector = db.encode_query(model="laion/CLIP-ViT-B-32-laion2B-s34B-b79K", query=query_bytes, modality="image")
-results = db.search("figures", query=vector, k=10).run()
+results = db.search("figures", query=vector, k=10)  # pyarrow.Table
 ```
 
-All SearchBuilder operations (join, filter, sort, limit, annotate) compose identically.
+`search` returns a `pyarrow.Table` directly; for compound retrieval (join / `annotate(...)`) use `db.sql(...)`.
 
 ## Error handling
 

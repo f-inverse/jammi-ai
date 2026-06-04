@@ -5,7 +5,7 @@ Walks the four steps from `cookbook/quickstart/`'s README:
 1. `jammi_ai.connect("file://…")` — open a local in-process session
 2. `db.add_source` — attach the tiny corpus fixture
 3. `db.generate_embeddings(..., modality="text")` — build a 32-dim USEARCH-backed index
-4. `db.encode_query(...)` + `db.search(...).run()` — execute a similarity query
+4. `db.encode_query(...)` + `db.search(...)` — execute a similarity query (returns a table)
 
 `connect(target)` is the one front door: a `file://` target runs the engine
 in-process; flipping to a `https://` / `grpc://` target — no code change —
@@ -57,7 +57,7 @@ def main() -> int:
 
         # 4. Encode a query and run a top-3 similarity search.
         query_vec = db.encode_query(model=MODEL, query="how does quantum computing work?")
-        results = db.search("corpus", query=query_vec, k=3).run()
+        results = db.search("corpus", query=query_vec, k=3)  # pyarrow.Table
 
         rows = results.to_pylist()
         if not rows:

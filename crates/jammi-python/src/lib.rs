@@ -5,7 +5,6 @@ mod ephemeral;
 mod error;
 mod job;
 pub mod model_task;
-mod search;
 
 use pyo3::prelude::*;
 use tracing_subscriber::EnvFilter;
@@ -15,7 +14,6 @@ use jammi_db::config::JammiConfig;
 use crate::error::to_pyerr;
 use crate::job::PyFineTuneJob;
 use crate::model_task::PyModelTask;
-use crate::search::PySearchBuilder;
 
 /// The `Database` pyclass. Re-exported so native Rust consumers (such as
 /// downstream crates that layer their own bindings on top of this one) can
@@ -41,7 +39,6 @@ pub use jammi_ai::session::InferenceSession;
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open_local, m)?)?;
     m.add_class::<PyDatabase>()?;
-    m.add_class::<PySearchBuilder>()?;
     m.add_class::<PyFineTuneJob>()?;
     m.add_class::<PyModelTask>()?;
     m.add_class::<crate::audit::PyPerQueryAudit>()?;

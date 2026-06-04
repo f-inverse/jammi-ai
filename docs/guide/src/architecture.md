@@ -14,7 +14,7 @@ jammi-ai (intelligence)
     |-- Model resolution, loading, caching
     |-- InferenceExec, AnnSearchExec operators
     |-- Embedding pipeline, result persistence
-    |-- SearchBuilder, evidence provenance
+    |-- QueryBuilder, annotate table function, evidence provenance
     |-- Fine-tuning, evaluation
     |-- GPU scheduling
     |-- InferenceSession (wraps JammiSession)
@@ -61,7 +61,8 @@ jammi-cli
 | `AnnSearchExec` | DataFusion `ExecutionPlan` leaf node for ANN vector search |
 | `EmbeddingPipeline` | Orchestrates embedding generation (text or image): model -> InferenceExec -> ResultSink -> index. Parameterized by ModelTask |
 | `ResultSink` | Streams inference output to Parquet + sidecar index, filters failed rows |
-| `SearchBuilder` | Fluent API: join, annotate, filter, sort, limit, select, run |
+| `QueryBuilder` | Fluent in-process compound query: join, annotate, filter, sort, limit, select, run |
+| `AnnotateTableFunction` | `annotate(...)` DataFusion table function — model inference as a SQL relation, reachable in-process and over Flight SQL |
 | `EvidenceRow` / `RowProvenance` | Evidence model types for provenance tracking |
 | `OutputAdapter` | Trait that converts raw model output to Arrow arrays per task |
 | `GpuScheduler` | GPU memory permit system with budget-based admission control |
@@ -80,8 +81,7 @@ jammi-cli
 
 | Type | Responsibility |
 |------|---------------|
-| `Database` | PyO3 class wrapping `Arc<InferenceSession>` with shared tokio runtime |
-| `SearchBuilder` | PyO3 class with imperative-style search composition |
+| `Database` | PyO3 class wrapping `Arc<InferenceSession>` with shared tokio runtime; `search` returns a table, `sql` runs compound SQL (with `annotate`) |
 | `FineTuneJob` | PyO3 class for monitoring fine-tuning jobs |
 | `connect()` | Module-level function to create a `Database` |
 
@@ -126,7 +126,7 @@ InferenceSession::search(source, query_vec, k)
     -> Resolve embedding table from catalog
     -> AnnSearchExec: SidecarIndex (ANN) or exact_vector_search (fallback)
     -> Hydration: join ANN results back to source table
-    -> SearchBuilder: .join() .annotate() .filter() .sort() .limit() .select()
+    -> QueryBuilder: .join() .annotate() .filter() .sort() .limit() .select()
     -> .run(): execute DataFusion plan, add provenance columns
     -> Returns Vec<RecordBatch> with similarity + original columns + evidence
 ```
@@ -150,7 +150,7 @@ crates/jammi-ai/src/
 |-- inference/          # Runner, observer, output adapters, image preprocessing
 |-- pipeline/           # EmbeddingPipeline, ResultSink
 |-- evidence/           # Provenance types and columns
-|-- search/             # SearchBuilder
+|-- query/              # QueryBuilder, annotate table function
 |-- fine_tune/          # LoRA training, config, jobs
 |-- eval/               # Retrieval and classification eval
 '-- concurrency/        # GpuScheduler, permits
@@ -167,8 +167,7 @@ crates/jammi-cli/src/
 
 crates/jammi-python/src/
 |-- lib.rs              # PyO3 module, connect()
-|-- database.rs         # Database class
-|-- search.rs           # SearchBuilder class
+|-- database.rs         # Database class (search -> table, sql -> compound query)
 |-- job.rs              # FineTuneJob class
 |-- convert.rs          # Arrow <-> PyArrow conversion
 '-- error.rs            # Error conversion

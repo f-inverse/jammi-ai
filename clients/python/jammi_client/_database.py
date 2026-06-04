@@ -186,12 +186,20 @@ class RemoteDatabase:
 
     def get_server_info(self) -> Dict[str, Any]:
         """The engine's capabilities handshake: ``version`` / ``features`` /
-        ``storage_backends``. Maps to `SessionService.GetServerInfo`."""
+        ``storage_backends`` / ``services``. Maps to `SessionService.GetServerInfo`.
+
+        Same four keys the embedded `Database.get_server_info` returns, so the
+        handshake shape agrees across transports. ``services`` is the runtime
+        fact a remote caller most needs — the gRPC service tiers this deployment
+        actually mounted (a serve-only box mounts fewer than an all-in-one), so a
+        client can negotiate capability without probing each verb.
+        """
         resp = self._session.GetServerInfo(_empty(), metadata=self._metadata)
         return {
             "version": resp.version,
             "features": list(resp.features),
             "storage_backends": list(resp.storage_backends),
+            "services": list(resp.services),
         }
 
     # --- Sources -----------------------------------------------------------------

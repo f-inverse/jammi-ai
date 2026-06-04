@@ -40,8 +40,9 @@ workspace ships every publishable crate at the same
   (and downstream tiers) build on the engine instead of reimplementing it. (`DescribeSource`
   returns `NotFound` for an absent id; the remote surface maps that to `None`.)
 - `SessionService.GetServerInfo` — a capabilities handshake reporting `{ version,
-  features, storage_backends }`, so clients negotiate availability instead of discovering
-  it via a runtime error.
+  features, storage_backends, services }`, so clients negotiate availability instead of
+  discovering it via a runtime error. `services` is the runtime tier fact (which gRPC
+  service tiers this deployment mounted); the rest are compile-time facts about the build.
 
 ### Changed
 - The wire `ResultTable` is now self-describing — it carries its own `task` (a

@@ -20,20 +20,17 @@ from _shared import ARTIFACT_DIR, CORPUS_PARQUET, MODEL, ensure_source
 def main() -> int:
     assert CORPUS_PARQUET.exists(), "run 01-load-corpus.py first"
 
-    db = jammi_ai.connect(
-        artifact_dir=str(ARTIFACT_DIR),
-        gpu_device=-1,
-        inference_batch_size=8,
-    )
+    db = jammi_ai.connect(f"file://{str(ARTIFACT_DIR)}")
     ensure_source(db, "corpus", str(CORPUS_PARQUET))
 
     print(f"generating image embeddings with {MODEL} ...")
-    db.generate_image_embeddings(
-        source="corpus",
-        model=MODEL,
-        image_column="image",
-        key="image_id",
-    )
+    db.generate_embeddings(
+            source="corpus",
+            model=MODEL,
+            columns=["image"],
+            key="image_id",
+            modality="image",
+        )
 
     print("02-generate-embeddings: OK")
     return 0

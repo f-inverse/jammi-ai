@@ -20,11 +20,7 @@ MODEL = f"local:{FIXTURES / 'tiny_modernbert_classifier'}"
 
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
-        db = jammi_ai.connect(
-            artifact_dir=tmp,
-            gpu_device=-1,
-            inference_batch_size=8,
-        )
+        db = jammi_ai.connect(f"file://{tmp}")
 
         # 1. Register the corpus and the gold labels.
         db.add_source("corpus", url=str(CORPUS_PATH), format="parquet")

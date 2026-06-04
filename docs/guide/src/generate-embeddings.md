@@ -26,11 +26,12 @@ println!("Embedded {} rows, {} dimensions", record.row_count, record.dimensions.
 ### Python
 
 ```python
-db.generate_text_embeddings(
+db.generate_embeddings(
     source="patents",
     model="sentence-transformers/all-MiniLM-L6-v2",
     columns=["abstract"],
     key="id",
+    modality="text",
 )
 ```
 
@@ -88,11 +89,12 @@ session.generate_text_embeddings(
 ### Python
 
 ```python
-db.generate_text_embeddings(
+db.generate_embeddings(
     source="papers",
     model="sentence-transformers/all-MiniLM-L6-v2",
     columns=["title", "abstract"],
     key="doi",
+    modality="text",
 )
 ```
 

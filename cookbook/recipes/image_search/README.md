@@ -42,8 +42,8 @@ meaningless — it exercises the full pipeline, not model quality. Use PatentCLI
 2. Reads the 20 committed 224×224 PNGs under
    `cookbook/fixtures/tiny_image_corpus/` into a Parquet `corpus` source
    (`image_id`, `image` bytes)
-3. `db.generate_image_embeddings(source="corpus", model=MODEL, image_column="image", key="image_id")`
-4. `db.encode_image_query(MODEL, png_bytes)` → `db.search("corpus", query=vec, k=5).run()`
+3. `db.generate_embeddings(source="corpus", model=MODEL, columns=["image"], key="image_id", modality="image")`
+4. `db.encode_query(model=MODEL, query=png_bytes, modality="image")` → `db.search("corpus", query=vec, k=5).run()`
 5. Builds the image-query golden source from `tiny_image_golden.json` and calls
    `db.eval_embeddings(source="corpus", golden_source="golden.public.golden", k=5)`
 6. Prints the aggregate Recall@K / precision@K / MRR / nDCG and the per-query
@@ -64,8 +64,8 @@ python cookbook/recipes/image_search/04-eval.py
 
 ## API surface exercised
 
-- `Database.generate_image_embeddings(*, source, model, image_column, key)`
-- `Database.encode_image_query(model_id, image_bytes)` → `list[float]`
+- `Database.generate_embeddings(*, source, model, columns, key, modality="image")`
+- `Database.encode_query(*, model, query, modality="image")` → `list[float]`
 - `Database.search(source, *, query, k)` → `SearchBuilder` → `.run()`
 - `Database.eval_embeddings(*, source, golden_source, model=None, k=10)`
 

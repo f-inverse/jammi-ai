@@ -165,6 +165,35 @@ jobs:
       - name: Test (hermetic)
         run: npm run test
 
+  py-client:
+    name: Python client (jammi-client)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/python
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # `jammi-client` is the pure-Python (no-Rust) deploy half: generated from
+      # the canonical `crates/jammi-ai/proto` by `make generate`, then installed
+      # and tested. Running it on every PR catches a proto change that breaks the
+      # Python codegen — or a regression in the hand-written `connect` /
+      # `RemoteDatabase` seam — here, not only at the `py-v*` publish in
+      # `pypi-client.yml`. Plain ubuntu (not the Rust CI container): this lane
+      # needs Python, not cargo.
+      - name: Install (with dev extra) + generate stubs
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+          make generate
+
+      - name: Test (hermetic)
+        run: make test
+
   test-broker:
     name: Test (NATS JetStream)
     runs-on: ubuntu-latest
@@ -219,11 +248,20 @@ jobs:
         # The CI base image ships maturin + a python3 toolchain; use a
         # venv to avoid polluting the system site-packages and to make
         # `python` resolve to the venv's interpreter for pytest.
+        #
+        # The embed wheel now hard-deps `jammi-client` (the remote arm, by
+        # composition). It is not on PyPI for an unreleased commit, so install
+        # it from the in-repo source first — generate its proto stubs, then
+        # `pip install -e` it — before `maturin develop` resolves the dep. This
+        # is also exactly what makes the conformance test (`jammi_ai.connect`'s
+        # remote IS `jammi_client.RemoteDatabase`) runnable in this lane.
         run: |
           python3 -m venv .venv
           . .venv/bin/activate
           pip install --upgrade pip
-          pip install maturin pytest pyarrow
+          pip install maturin pytest pyarrow grpcio grpcio-tools protobuf typing_extensions
+          make -C clients/python generate
+          pip install -e clients/python
           maturin develop --release
 
       - name: Run pytest

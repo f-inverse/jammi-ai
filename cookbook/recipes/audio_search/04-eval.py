@@ -29,11 +29,7 @@ from _shared import (
 def main() -> int:
     assert CORPUS_PARQUET.exists(), "run 01..03 first"
 
-    db = jammi_ai.connect(
-        artifact_dir=str(ARTIFACT_DIR),
-        gpu_device=-1,
-        inference_batch_size=8,
-    )
+    db = jammi_ai.connect(f"file://{str(ARTIFACT_DIR)}")
     ensure_source(db, "corpus", str(CORPUS_PARQUET))
 
     pq.write_table(build_audio_golden_table(), GOLDEN_PARQUET)

@@ -28,11 +28,12 @@ println!("Embedded {} images, {} dimensions", record.row_count, record.dimension
 ### Python
 
 ```python
-db.generate_image_embeddings(
+db.generate_embeddings(
     source="figures",
     model="laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
-    image_column="image",
+    columns=["image"],
     key="figure_id",
+    modality="image",
 )
 ```
 
@@ -79,7 +80,7 @@ let vector = session
 with open("query.png", "rb") as f:
     image_bytes = f.read()
 
-vector = db.encode_image_query("laion/CLIP-ViT-B-32-laion2B-s34B-b79K", image_bytes)
+vector = db.encode_query(model="laion/CLIP-ViT-B-32-laion2B-s34B-b79K", query=image_bytes, modality="image")
 ```
 
 ## Supported models
@@ -110,7 +111,7 @@ Same as text embeddings:
 Image embeddings work with the same `search()` API as text embeddings:
 
 ```python
-vector = db.encode_image_query("laion/CLIP-ViT-B-32-laion2B-s34B-b79K", query_bytes)
+vector = db.encode_query(model="laion/CLIP-ViT-B-32-laion2B-s34B-b79K", query=query_bytes, modality="image")
 results = db.search("figures", query=vector, k=10).run()
 ```
 

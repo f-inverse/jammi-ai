@@ -63,11 +63,12 @@ External databases work as sources for embedding generation:
 # which exposes the typed SourceType::Postgres / SourceType::Mysql variants.
 # The Python `add_source(url=…, format=…)` surface is for file-shaped sources.
 
-db.generate_text_embeddings(
+db.generate_embeddings(
     source="pg_articles",
     model="sentence-transformers/all-MiniLM-L6-v2",
     columns=["title", "abstract"],
     key="id",
+    modality="text",
 )
 ```
 

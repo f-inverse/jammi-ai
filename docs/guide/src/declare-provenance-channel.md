@@ -37,7 +37,7 @@ session.add_source("patents", SourceType::File, SourceConnection {
 ```python
 import jammi_ai
 
-db = jammi_ai.connect(artifact_dir="/var/lib/jammi")
+db = jammi_ai.connect("file:///var/lib/jammi")
 db.add_source("patents", path="/data/patents.parquet", format="parquet")
 ```
 

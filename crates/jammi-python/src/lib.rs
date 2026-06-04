@@ -5,7 +5,6 @@ mod ephemeral;
 mod error;
 mod job;
 pub mod model_task;
-mod remote;
 mod search;
 
 use pyo3::prelude::*;
@@ -24,12 +23,6 @@ use crate::search::PySearchBuilder;
 /// [`PyDatabase::session_arc`] to share its underlying session.
 pub use crate::database::PyDatabase;
 
-/// The remote-transport `RemoteDatabase` pyclass and its `connect_remote`
-/// constructor. Re-exported so the Rust integration test (and any downstream
-/// Rust consumer layering its own bindings) can drive a remote Python session
-/// against an in-process gRPC server.
-pub use crate::remote::{connect_remote, PyRemoteDatabase};
-
 /// Re-export of the underlying inference session type. External Rust
 /// consumers need to name this to receive the `Arc<InferenceSession>`
 /// returned by [`PyDatabase::session_arc`] and share schema-upgrade lock,
@@ -38,12 +31,16 @@ pub use crate::remote::{connect_remote, PyRemoteDatabase};
 pub use jammi_ai::session::InferenceSession;
 
 /// Module entry point for `jammi_ai._native`.
+///
+/// `_native` exposes only the LOCAL, in-process engine. There is no remote
+/// transport here: the embed wheel links no tonic/proto, and its remote arm is
+/// the bundled pure-Python `jammi-client`, dispatched in `jammi_ai/__init__.py`.
+/// This is the runtime shape of the Rust build's `#[cfg(feature = "local")]`
+/// gate — the wheel cannot even name a remote transport.
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(connect, m)?)?;
-    m.add_function(wrap_pyfunction!(connect_remote, m)?)?;
+    m.add_function(wrap_pyfunction!(open_local, m)?)?;
     m.add_class::<PyDatabase>()?;
-    m.add_class::<PyRemoteDatabase>()?;
     m.add_class::<PySearchBuilder>()?;
     m.add_class::<PyFineTuneJob>()?;
     m.add_class::<PyModelTask>()?;
@@ -53,13 +50,15 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-/// Create a connected Database instance.
+/// Open the embedded, in-process engine and return a [`PyDatabase`].
 ///
-/// All parameters are optional keyword-only arguments that override
-/// the default or file-based configuration.
+/// The local arm of the unified `connect(target)` — `jammi_ai.connect` calls
+/// this for a `file://` target and delegates a remote target to the bundled
+/// `jammi-client`. All parameters are optional keyword-only arguments that
+/// override the default or file-based configuration.
 #[pyfunction]
 #[pyo3(signature = (*, config=None, artifact_dir=None, gpu_device=None, inference_batch_size=None))]
-fn connect(
+fn open_local(
     config: Option<String>,
     artifact_dir: Option<String>,
     gpu_device: Option<i32>,

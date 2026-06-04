@@ -3,21 +3,33 @@
 ```python
 import jammi_ai
 
-db = jammi_ai.connect(artifact_dir="/tmp/jammi-quickstart", gpu_device=-1)
+db = jammi_ai.connect("file:///tmp/jammi-quickstart")
 ```
 
-`jammi_ai.connect` returns a `Database` handle backed by a shared tokio
-runtime and a SQLite catalog rooted at `artifact_dir`. Everything you do
-through this handle — registered sources, embedding tables, mutable
-companions, trigger topics — is persisted under that directory.
+`jammi_ai.connect(target)` is the one front door. A `file://` target returns a
+`Database` handle backed by a shared tokio runtime and a SQLite catalog rooted
+at the target's path; everything you do through it — registered sources,
+embedding tables, mutable companions, trigger topics — is persisted under that
+directory. Flip the target to `https://host` or `grpc://host:8081` — no code
+change — and the same `connect(target)` returns a remote handle over the
+bundled `jammi-client`.
 
-## Arguments worth knowing
+## The target
 
-- `artifact_dir` — root for the catalog DB and result Parquet files. Pass
+- `file:///abs/path` — an embedded, in-process engine rooted at the path. Pass
   an empty directory the first time; subsequent runs reuse what's there.
-- `gpu_device` — `-1` forces CPU, omit to auto-select GPU 0 when available,
-  pass a positive integer to pin a specific device.
-- `inference_batch_size` — defaults are tuned for production batch sizes;
+- `https://host` / `grpcs://host:8081` / `http://host` / `grpc://host:8081` —
+  a remote engine over the `jammi.v1` gRPC wire.
+
+## Engine tuning is configuration, not arguments
+
+Device and batch size are engine *config*, read from the environment (or a
+`JAMMI_CONFIG` TOML), so they apply identically whether the engine runs
+in-process or behind a server:
+
+- `JAMMI_GPU__DEVICE` — `-1` forces CPU, `0`+ pins a device (auto-selects GPU 0
+  when available otherwise).
+- `JAMMI_ENGINE__BATCH_SIZE` — defaults are tuned for production batch sizes;
   override for tiny workloads (the quickstart uses 8).
 
 ## Tenant scoping

@@ -44,7 +44,7 @@ def test_create_drop_round_trips_through_python(tmp_path):
     """Register `notes`, write 3 rows through the federated SQL surface,
     count them, drop the table, and verify the SQL surface no longer sees
     it."""
-    db = jammi_ai.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(f"file://{tmp_path}")
     table_id = db.create_mutable_table(
         "notes",
         schema=_notes_schema(),
@@ -73,7 +73,7 @@ def test_create_with_index_and_order_column(tmp_path):
     """Register a table with a secondary index and an order_column. The
     index DDL is committed inside the same transaction as the CREATE
     TABLE; the table is queryable through the federated SQL surface."""
-    db = jammi_ai.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(f"file://{tmp_path}")
     table_id = db.create_mutable_table(
         "sensor_readings",
         schema=_sensor_schema(),
@@ -108,7 +108,7 @@ def test_create_inherits_session_tenant(tmp_path):
     analyzer injects `tenant_id = B OR IS NULL`, so the row authored
     under A becomes invisible. Re-bound back to A: the row is visible
     again."""
-    db = jammi_ai.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(f"file://{tmp_path}")
     db.with_tenant(TENANT_A)
     db.create_mutable_table(
         "notes_a",
@@ -144,7 +144,7 @@ def test_create_inherits_session_tenant(tmp_path):
 def test_create_rejects_invalid_id(tmp_path):
     """`MutableTableId::new` rejects non-lowercase-ASCII identifiers and
     the typed `MutableTableError::InvalidId` surfaces through the binding."""
-    db = jammi_ai.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(f"file://{tmp_path}")
     with pytest.raises((ValueError, RuntimeError)) as info:
         db.create_mutable_table(
             "Notes-Bad",
@@ -159,7 +159,7 @@ def test_create_rejects_invalid_id(tmp_path):
 
 def test_create_rejects_pk_not_in_schema(tmp_path):
     """The builder rejects a primary key column that isn't in `schema`."""
-    db = jammi_ai.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(f"file://{tmp_path}")
     with pytest.raises((ValueError, RuntimeError)) as info:
         db.create_mutable_table(
             "notes",
@@ -174,7 +174,7 @@ def test_create_rejects_pk_not_in_schema(tmp_path):
 def test_double_create_raises(tmp_path):
     """Registering the same id twice raises with the typed
     `MutableTableError::AlreadyExists` surface."""
-    db = jammi_ai.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(f"file://{tmp_path}")
     db.create_mutable_table("notes", schema=_notes_schema(), primary_key=["note_id"])
     with pytest.raises((ValueError, RuntimeError)):
         db.create_mutable_table(
@@ -185,7 +185,7 @@ def test_double_create_raises(tmp_path):
 def test_drop_missing_without_if_exists_raises(tmp_path):
     """`drop_mutable_table` over a not-registered id raises — the typed
     `MutableTableError::NotFound` propagates without `if_exists=True`."""
-    db = jammi_ai.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(f"file://{tmp_path}")
     with pytest.raises((ValueError, RuntimeError)) as info:
         db.drop_mutable_table("never_registered")
     msg = str(info.value).lower()
@@ -197,5 +197,5 @@ def test_drop_missing_without_if_exists_raises(tmp_path):
 def test_drop_missing_with_if_exists_succeeds(tmp_path):
     """`drop_mutable_table(if_exists=True)` over a not-registered id is a
     no-op — the binding short-circuits on the typed NotFound variant."""
-    db = jammi_ai.connect(artifact_dir=str(tmp_path))
+    db = jammi_ai.connect(f"file://{tmp_path}")
     db.drop_mutable_table("never_registered", if_exists=True)

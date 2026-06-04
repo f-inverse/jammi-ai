@@ -18,16 +18,12 @@ from _shared import ARTIFACT_DIR, AUDIO_CORPUS_DIR, CORPUS_PARQUET, MODEL, ensur
 def main() -> int:
     assert CORPUS_PARQUET.exists(), "run 01-load-corpus.py and 02 first"
 
-    db = jammi_ai.connect(
-        artifact_dir=str(ARTIFACT_DIR),
-        gpu_device=-1,
-        inference_batch_size=8,
-    )
+    db = jammi_ai.connect(f"file://{str(ARTIFACT_DIR)}")
     ensure_source(db, "corpus", str(CORPUS_PARQUET))
 
     # Encode an audio query (the held-out "sine" query) and search.
     query_wav = (AUDIO_CORPUS_DIR / "queries" / "q_sine.wav").read_bytes()
-    query_vec = db.encode_audio_query(MODEL, query_wav)
+    query_vec = db.encode_query(model=MODEL, query=query_wav, modality="audio")
     print(f"query embedding dim: {len(query_vec)}")
 
     results = db.search("corpus", query=query_vec, k=5).run()

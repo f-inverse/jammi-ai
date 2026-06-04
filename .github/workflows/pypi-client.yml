@@ -1,0 +1,64 @@
+name: PyPI (jammi-client)
+
+# Publishes the pure-Python `jammi-client` to PyPI on a `py-v*` tag — the SAME
+# tag that publishes the `jammi-ai` embed wheel (pypi.yml). The two ship in
+# LOCKSTEP at one version so `jammi-ai`'s `dependencies = ["jammi-client==X"]`
+# always resolves to a published client. Uses PyPI Trusted Publishing (OIDC) —
+# no API token; the repo/workflow/environment is registered as a trusted
+# publisher (a "pending publisher" for the first release of the new
+# `jammi-client` project name) on pypi.org under the `pypi` environment.
+
+on:
+  push:
+    tags: ["py-v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build wheel (py3-none-any)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/python
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Generate the proto stubs from the canonical jammi.v1 proto, then build
+      # the universal wheel. The stubs are generated-at-build (never committed),
+      # exactly like the npm client's `src/gen`.
+      - name: Generate proto stubs
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install grpcio-tools
+          make generate
+
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build --wheel --outdir dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-dist
+          path: clients/python/dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: client-dist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

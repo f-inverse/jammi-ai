@@ -23,7 +23,7 @@ same loop powers nightly regression dashboards and A/B model comparison.
 
 ## API surface exercised
 
-- `Database.generate_text_embeddings(source, *, model, columns, key)`
+- `Database.generate_embeddings(*, source, model, columns, key, modality="text")`
 - `Database.eval_embeddings(*, source, golden_source, model=None, k=10)`
 
 The returned dict carries `aggregate` (mean across queries — `recall_at_k`,

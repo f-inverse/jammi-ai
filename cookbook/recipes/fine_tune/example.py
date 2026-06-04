@@ -20,11 +20,7 @@ BASE_MODEL = f"local:{FIXTURES / 'tiny_bert'}"
 
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
-        db = jammi_ai.connect(
-            artifact_dir=tmp,
-            gpu_device=-1,
-            inference_batch_size=8,
-        )
+        db = jammi_ai.connect(f"file://{tmp}")
 
         # 1. Register the contrastive training pairs.
         db.add_source("training", url=str(PAIRS_PATH), format="csv")
@@ -56,7 +52,7 @@ def main() -> int:
 
         # 5. Encode a query through the fine-tuned model to confirm it
         #    loads end-to-end from the catalog.
-        query_vec = db.encode_text_query(model_id, "quantum computing applications")
+        query_vec = db.encode_query(model=model_id, query="quantum computing applications")
         assert len(query_vec) == 32, (
             f"tiny_bert is 32-dim; got {len(query_vec)}-dim from fine-tuned"
         )

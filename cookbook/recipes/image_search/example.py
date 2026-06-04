@@ -93,11 +93,7 @@ def main() -> int:
     print(f"image_search: model = {MODEL}")
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        db = jammi_ai.connect(
-            artifact_dir=str(tmp_path),
-            gpu_device=-1,
-            inference_batch_size=8,
-        )
+        db = jammi_ai.connect(f"file://{str(tmp_path)}")
 
         # 1. Load the corpus images into a Parquet source (inline image bytes).
         corpus_parquet = tmp_path / "corpus.parquet"
@@ -106,16 +102,17 @@ def main() -> int:
 
         # 2. Generate vision embeddings over the `image` column. The model is
         #    auto-detected from its OpenCLIP config; output is L2-normalized.
-        db.generate_image_embeddings(
+        db.generate_embeddings(
             source="corpus",
             model=MODEL,
-            image_column="image",
+            columns=["image"],
             key="image_id",
+            modality="image",
         )
 
         # 3. Encode a single image query and run cosine ANN search.
         query_png = (IMAGE_CORPUS_DIR / "queries" / "q_circle.png").read_bytes()
-        query_vec = db.encode_image_query(MODEL, query_png)
+        query_vec = db.encode_query(model=MODEL, query=query_png, modality="image")
         assert query_vec, "query embedding must be non-empty"
         print(f"query embedding dim: {len(query_vec)}")
 

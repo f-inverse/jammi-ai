@@ -54,7 +54,7 @@ across all references.
 ```python
 import jammi_ai
 
-db = jammi_ai.connect(artifact_dir="/tmp/jammi")
+db = jammi_ai.connect("file:///tmp/jammi")
 db.with_tenant("018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9a")
 
 # Subsequent calls observe Alice's tenant scope.

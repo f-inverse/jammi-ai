@@ -8,11 +8,17 @@ Jammi is an embeddable AI engine that brings model inference into your data pipe
 pip install jammi-ai
 ```
 
-For CUDA/GPU support:
+The embed wheel runs the engine in-process and bundles
+[`jammi-client`](./clients/python/) for remote targets. For a lean,
+engine-free deploy footprint that talks to a remote server, install the client
+on its own:
 
 ```bash
-pip install jammi-ai-cu12
+pip install jammi-client
 ```
+
+(GPU/CUDA lives on the [server image](https://github.com/f-inverse/jammi-ai/pkgs/container/jammi-ai-server),
+not the embed wheel.)
 
 ## Quickstart
 
@@ -24,13 +30,15 @@ gated by CI. The condensed version:
 ```python
 import jammi_ai
 
-db = jammi_ai.connect(gpu_device=-1)
+# One front door. `file://` runs the in-process engine; flip to a
+# `https://` / `grpc://` target — no code change — to talk to a remote server.
+db = jammi_ai.connect("file://.jammi")
 db.add_source("corpus", url="cookbook/fixtures/tiny_corpus.parquet", format="parquet")
 
 MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-db.generate_text_embeddings(source="corpus", model=MODEL, columns=["content"], key="id")
+db.generate_embeddings(source="corpus", model=MODEL, columns=["content"], key="id", modality="text")
 
-query_vec = db.encode_text_query(MODEL, "quantum computing applications")
+query_vec = db.encode_query(model=MODEL, query="quantum computing applications")
 results = db.search("corpus", query=query_vec, k=5).run()
 print(results.to_pandas())
 ```

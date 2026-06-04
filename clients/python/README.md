@@ -24,6 +24,23 @@ hits = db.search("patents", query=q, k=5)   # -> pyarrow.Table
 `connect(target)` is the Python mirror of the Rust `Jammi::open(Target)`:
 transport is config, not a code path.
 
+## Authenticated channels
+
+A bearer-protected endpoint is reached by attaching credentials to the channel
+— the bearer rides the channel (attached once at connect), not threaded through
+every call:
+
+```python
+from jammi_client import connect, BearerCredentials
+
+db = connect("https://engine.example.com", credentials=BearerCredentials(token))
+```
+
+The same works on a plaintext `grpc://` target for local development. The
+channel-level bearer covers the typed gRPC verbs; `db.sql()` (the Flight SQL
+lane) does not yet carry it — tracked at
+[issue #96](https://github.com/f-inverse/jammi-ai/issues/96).
+
 | target | transport |
 |---|---|
 | `https://host` / `grpcs://host:8081` | secure remote |

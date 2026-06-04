@@ -14,18 +14,22 @@ local engine this build does not carry, so it raises the truthful
 
 from __future__ import annotations
 
-from typing import Union
+from importlib.metadata import version
+from typing import Optional, Union
 
+from ._credentials import BearerCredentials, ChannelCredentials
 from ._database import RemoteDatabase
 from ._errors import NoEmbeddedEngineError
 from ._target import LocalTarget, RemoteTarget, Target, parse_target
 
-__version__ = "0.19.0"
+__version__ = version("jammi-client")
 
 __all__ = [
     "connect",
     "RemoteDatabase",
     "NoEmbeddedEngineError",
+    "ChannelCredentials",
+    "BearerCredentials",
     "LocalTarget",
     "RemoteTarget",
     "Target",
@@ -34,7 +38,11 @@ __all__ = [
 ]
 
 
-def connect(target: Union[str, Target]) -> RemoteDatabase:
+def connect(
+    target: Union[str, Target],
+    *,
+    credentials: Optional[ChannelCredentials] = None,
+) -> RemoteDatabase:
     """Open a session against `target`, selecting its transport once.
 
     `target` is a URI string or a structured :class:`Target`:
@@ -44,6 +52,14 @@ def connect(target: Union[str, Target]) -> RemoteDatabase:
     * ``file:///data`` → a local engine. `jammi-client` carries no compiled
       engine, so this raises :class:`NoEmbeddedEngineError` pointing at
       `pip install jammi-ai`.
+
+    `credentials` decides what identity rides the channel. ``None`` opens an
+    anonymous channel; a :class:`BearerCredentials` attaches
+    `authorization: Bearer <token>` to every call on both TLS and plaintext
+    transports — the bearer rides the channel, not each verb. The channel-level
+    bearer covers the typed gRPC verbs; :meth:`RemoteDatabase.sql` (the Flight
+    SQL lane) does not yet carry it — see
+    https://github.com/f-inverse/jammi-ai/issues/96.
 
     Scaling local→remote is an env flip (``connect(os.environ["JAMMI_TARGET"])``)
     with no code change; productionising from the embed wheel to this lean client
@@ -56,4 +72,4 @@ def connect(target: Union[str, Target]) -> RemoteDatabase:
     # RemoteTarget — the only transport this build carries.
     from ._database import open_remote
 
-    return open_remote(parsed.endpoint, tls=parsed.tls)
+    return open_remote(parsed.endpoint, tls=parsed.tls, credentials=credentials)

@@ -34,9 +34,11 @@ service SessionService {
   rpc GetServerInfo(google.protobuf.Empty) returns (ServerInfo);
 }
 
-// The engine's self-description, returned by GetServerInfo. Every field is a
-// compile-time fact about the running binary, so a client can negotiate
-// capability without probing each verb.
+// The engine's self-description, returned by GetServerInfo. `version`,
+// `features`, and `storage_backends` are compile-time facts about the running
+// binary; `services` is the runtime tier handshake — which gRPC service tiers
+// this particular deployment actually mounted. Together they let a client
+// negotiate capability without probing each verb.
 message ServerInfo {
   // The engine version (the `jammi` workspace version, e.g. "0.17.0").
   string version = 1;
@@ -46,6 +48,15 @@ message ServerInfo {
   // Storage URL schemes this build can address (always "file" and "memory";
   // cloud schemes appear when their driver feature is compiled in), sorted.
   repeated string storage_backends = 3;
+  // The gRPC service tiers this deployment mounted, sorted. The core tier
+  // (session/embedding/inference + introspection) is always present; the
+  // optional tiers ("train", "event", "eval") appear only when both their
+  // compile feature is present and the deployment's config enabled them. A
+  // client reads this to know which verbs are reachable on *this* server —
+  // reaching an unmounted tier returns a truthful "not enabled" error. The
+  // embedded (in-process, `file://`) engine mounts no gRPC services, so it
+  // reports an empty list.
+  repeated string services = 4;
 }
 
 // A tenant identifier carried over the wire. UUID v4 / v7 string per ADR-00;

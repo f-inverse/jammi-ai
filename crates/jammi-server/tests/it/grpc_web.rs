@@ -52,12 +52,16 @@ async fn start_session_only_server() -> (
     let binding = session.tenant_binding_arc();
     let handle = tokio::spawn(async move {
         jammi_server::runtime::serve_grpc_chain(
-            addr,
-            flight_ctx,
-            binding,
-            store_for_server,
-            None,
-            None,
+            jammi_server::runtime::GrpcChain {
+                addr,
+                flight_ctx,
+                flight_binding: binding,
+                store: store_for_server,
+                trigger: None,
+                engine: None,
+                tiers: jammi_server::tiers::TierSet::resolve(std::iter::empty())
+                    .expect("core-only tier set resolves"),
+            },
             async move {
                 let _ = shutdown_rx.await;
             },

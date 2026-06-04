@@ -277,6 +277,7 @@ impl RemoteSession {
             version: resp.version,
             features: resp.features,
             storage_backends: resp.storage_backends,
+            services: resp.services,
         })
     }
 

@@ -49,6 +49,7 @@ clients/python/*.egg-info/
 
 # In-repo cargo target + tmp dirs (CARGO_TARGET_DIR / TMPDIR for local gating)
 .cargo-target/
+.target/
 .tmp/
 
 # Claude

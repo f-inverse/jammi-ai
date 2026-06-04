@@ -12,7 +12,7 @@ use pyo3::PyErr;
 use uuid::Uuid;
 
 use jammi_ai::session::InferenceSession;
-use jammi_db::audit::{self, AuditError, PerQueryAudit};
+use jammi_db::audit::{self, AuditError, EnvSigningKeyStore, PerQueryAudit};
 
 use crate::convert::serializable_to_pydict;
 
@@ -129,10 +129,10 @@ impl PyPerQueryAudit {
     }
 
     /// Verify this record's HMAC signature, re-deriving the per-tenant secret
-    /// from `JAMMI_AUDIT_MASTER_KEY`. Raises if the signature does not verify
-    /// or the master key is unavailable.
+    /// using the env-backed audit signing key store. Raises if the signature
+    /// does not verify or the master key is unavailable.
     fn verify(&self) -> PyResult<()> {
-        audit::verify_with_env(&self.inner).map_err(audit_err)
+        audit::verify_with_store(&self.inner, &EnvSigningKeyStore).map_err(audit_err)
     }
 
     fn __repr__(&self) -> String {

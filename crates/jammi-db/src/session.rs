@@ -5,10 +5,11 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_federation::{FederatedQueryPlanner, FederationOptimizerRule};
 
+use crate::audit::{EnvSigningKeyStore, SigningKeyStore};
 use crate::catalog::backend::BackendImpl;
 use crate::catalog::topic_repo::TopicRepo;
 use crate::catalog::Catalog;
-use crate::config::{BrokerConfig, CatalogConfig, JammiConfig};
+use crate::config::{BrokerConfig, CatalogConfig, JammiConfig, SigningKeyConfig};
 use crate::error::{JammiError, Result};
 use crate::source::mutable::MutableTableRegistry;
 use crate::source::registry::SourceCatalog;
@@ -51,6 +52,10 @@ pub struct JammiSession {
     topic_repo: Arc<TopicRepo>,
     publisher: Arc<Publisher>,
     subscriber: Arc<Subscriber>,
+    /// Source of the audit HMAC master key. Composed once from
+    /// `config.signing_key`; read via [`JammiSession::signing_key_store`] by the
+    /// audit write path. Defaults to [`EnvSigningKeyStore`].
+    signing_key_store: Arc<dyn SigningKeyStore>,
 }
 
 impl JammiSession {
@@ -111,6 +116,9 @@ impl JammiSession {
         backend: BackendImpl,
         trigger_broker: Arc<dyn TriggerBroker>,
     ) -> Result<Self> {
+        let signing_key_store: Arc<dyn SigningKeyStore> = match config.signing_key {
+            SigningKeyConfig::Env => Arc::new(EnvSigningKeyStore),
+        };
         let config = Arc::new(config);
         let tenant_binding = TenantBinding::unscoped();
         backend.migrate().await?;
@@ -118,7 +126,14 @@ impl JammiSession {
             backend,
             Some(tenant_binding.clone()),
         ));
-        Self::build(config, catalog, tenant_binding, trigger_broker).await
+        Self::build(
+            config,
+            catalog,
+            tenant_binding,
+            trigger_broker,
+            signing_key_store,
+        )
+        .await
     }
 
     async fn build(
@@ -126,6 +141,7 @@ impl JammiSession {
         catalog: Arc<Catalog>,
         tenant_binding: TenantBinding,
         trigger_broker: Arc<dyn TriggerBroker>,
+        signing_key_store: Arc<dyn SigningKeyStore>,
     ) -> Result<Self> {
         let session_config = SessionConfig::new()
             .with_target_partitions(config.engine.execution_threads)
@@ -220,6 +236,7 @@ impl JammiSession {
             topic_repo,
             publisher,
             subscriber,
+            signing_key_store,
         };
         session.reload_sources().await?;
         session.reload_mutable_tables().await?;
@@ -640,6 +657,12 @@ impl JammiSession {
     /// Shared handle to the trigger broker the session was constructed with.
     pub fn trigger_broker(&self) -> Arc<dyn TriggerBroker> {
         Arc::clone(&self.trigger_broker)
+    }
+
+    /// Shared handle to the audit signing-key store the session was constructed
+    /// with. The audit write path reads this to obtain the HMAC master key.
+    pub fn signing_key_store(&self) -> Arc<dyn SigningKeyStore> {
+        Arc::clone(&self.signing_key_store)
     }
 
     /// Shared handle to the topic-catalog repo.

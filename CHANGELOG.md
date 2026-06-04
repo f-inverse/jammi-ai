@@ -6,6 +6,31 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.19.0 — 2026-06-03
+
+**Breaking — packaging & client-API redesign (spec M2 Stages 2+3).**
+
+### Added
+- **`jammi-client`** — a new pure-Python (`py3-none-any`), proto-generated remote
+  client; the lean Shape-C deploy package, peer to the npm `@f-inverse/jammi-client`.
+
+### Changed (breaking)
+- **Unified `connect(target)`** replaces `connect()` / `connect_remote()` — one
+  operator over a target (`file://…` embedded, `https://…` / `grpc://…` remote),
+  mirroring the Rust `Jammi::open(Target)`. Transport is configuration (env-drivable
+  via `JAMMI_TARGET`); scaling local→remote is a config change, not a code change.
+  Engine tuning (`gpu_device`, batch size) moves to env (`JAMMI_GPU__*`, `JAMMI_ENGINE__*`).
+- **The `jammi-ai` wheel is now local-only** — it links no tonic/proto. Its remote
+  arm is provided by the new `jammi-client` dependency (composition: jammi-ai's remote
+  *is* jammi-client's, by construction).
+- Per-modality method names dropped in favor of the unified `modality=` form
+  (`encode_query` / `generate_embeddings`).
+
+### Removed
+- **`jammi-ai-cu12`** (the CUDA embed wheel) and its `py-cu-v*` lane — CUDA now lives
+  only on the server image. The PyO3 `connect_remote` / `RemoteDatabase` binding
+  (superseded by the pure-Python `jammi-client`).
+
 ## v0.18.0 — 2026-06-03
 
 ### Added

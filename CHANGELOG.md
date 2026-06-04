@@ -6,6 +6,30 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.20.0 — 2026-06-04
+
+### Added
+- **Service tiers (S8).** The server mounts a configurable set of gRPC service
+  tiers — *core* (Session / Embedding / Inference + introspection / MutableTable /
+  Channel / Audit) always, plus optional *train* (FineTune), *event* (Trigger),
+  *tooling* (Eval) — selected via `[server] services`, layered on the compile
+  features. A compiled-out tier named in config is a truthful `FeatureNotCompiled`
+  startup error, never a silent drop; a serve-only deployment no longer advertises
+  train verbs (it returns `Unimplemented`). `ServerInfo.services` now reports the
+  mounted tier set — the runtime capability handshake a remote caller needs.
+- **Compound query over the wire (S7).** `annotate(model, task, relation, …)` — a
+  DataFusion table function exposing model inference inside SQL, registered once on
+  the engine context and reachable over both Flight SQL and the in-process `sql`
+  surface — so a caller composes search → join → annotate → filter in one round-trip.
+  `RemoteDatabase.sql(...)` runs SQL over Flight SQL, tenant-scoped.
+- **`jammi-ai-server-cu12`** — a CUDA build of the server image, published on `v*`.
+
+### Changed
+- `search` is now a single bounded primitive returning a table directly on **both**
+  the embedded and remote Python surfaces (the `.run()` builder is gone); the fluent
+  compound builder is `QueryBuilder` (`crates/jammi-ai/src/query/`, renamed from
+  `src/search/`). Embedded and remote `search` agree by construction.
+
 ## v0.19.0 — 2026-06-03
 
 **Breaking — packaging & client-API redesign (spec M2 Stages 2+3).**

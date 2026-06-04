@@ -4,26 +4,36 @@ name: Server Image
 # on every `v*` tag (which matches the workspace's release tagging
 # scheme) and on workflow_dispatch for one-off builds.
 #
-# Two image variants share this workflow:
-#   * the generic image (`:latest`, `:vX.Y.Z`, …) — operator-supplied
-#     config + mounted volume; published on tags and dispatch.
-#   * the self-contained image (`:selfcontained`, `:sha-…`) — baked
-#     config + `htsat_clap_tiny` encoder, boots standalone on a runtime that
+# Three images are published from this workflow:
+#   * the generic CPU image `jammi-ai-server` (`:latest`, `:vX.Y.Z`, …) —
+#     operator-supplied config + mounted volume; published on tags and dispatch.
+#   * the self-contained CPU image (`jammi-ai-server:selfcontained`, `:sha-…`) —
+#     baked config + `htsat_clap_tiny` encoder, boots standalone on a runtime that
 #     provides no config/volume (Cloudflare Containers). Published on
 #     dispatch when `selfcontained=true`, always from the dispatched
 #     ref (so it carries whatever the default branch has, incl.
 #     EmbeddingService) — it is never gated on a tag.
+#   * the CUDA image `jammi-ai-server-cu12` (`:latest`, `:vX.Y.Z`, …) —
+#     GPU-accelerated inference, same tag scheme as the CPU image, published
+#     on the same `v*` tags. CUDA lives only on the server image (M2 §1, §5d).
+#     GPU *runtime* is not testable in CI (no GPU on CI runners), so a
+#     build-only `pull_request` job (below) proves the CUDA Dockerfile compiles
+#     before a tag; the build succeeding is the gate.
 #
 # This workflow is independent of `image.yml`, which builds the CI
-# base image (`ghcr.io/f-inverse/jammi-ai-ci`). The two images are
-# distinct artifacts: `jammi-ai-ci` is the toolchain layer used as a
-# build stage; `jammi-ai-server` is the runtime distroless image
-# users `docker pull`.
+# base images (`ghcr.io/f-inverse/jammi-ai-ci` and `-ci-cuda`). Those are
+# distinct artifacts: the `-ci` images are the toolchain layers used as a
+# build stage; `jammi-ai-server` / `-cu12` are the runtime images users
+# `docker pull`.
 
 on:
   push:
     tags:
       - "v*"
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".github/workflows/server-image.yml"
   workflow_dispatch:
     inputs:
       selfcontained:
@@ -38,9 +48,14 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/jammi-ai-server
+  IMAGE_NAME_CU12: ${{ github.repository_owner }}/jammi-ai-server-cu12
 
 jobs:
+  # CPU image: tag- and dispatch-triggered push. Never runs on pull_request
+  # (PRs must not push to GHCR); the CPU image already builds on every CI run
+  # via the workspace's regular pipeline, so no PR build-only job is needed here.
   build-and-push:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -128,3 +143,83 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # CUDA image `jammi-ai-server-cu12`: tag- and dispatch-triggered push.
+  # Builds the `runtime-cuda` stage (candle CUDA backend + NVIDIA runtime base)
+  # and pushes the same tag scheme as the CPU image. GPU runtime is not tested
+  # here (no GPU on CI runners) — the `build-cuda-pr` job below proves the
+  # Dockerfile compiles on every PR that touches it, before any tag lands.
+  build-and-push-cu12:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_CU12 }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          build-args: |
+            RUNTIME_VARIANT=runtime-cuda
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=cu12
+          cache-to: type=gha,mode=max,scope=cu12
+
+  # Build-only verification for the CUDA image on pull requests that touch the
+  # Dockerfile or this workflow. GPU runtime can't be exercised in CI (no GPU on
+  # the runners), so this proves the CUDA Dockerfile *compiles* (`jammi-server
+  # --features cuda` builds, candle's CUDA backend links, the runtime stage
+  # assembles) before a `v*` tag triggers the real push. No `--push`, no tags
+  # consumed, no GHCR write.
+  build-cuda-pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build CUDA image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          build-args: |
+            RUNTIME_VARIANT=runtime-cuda
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=cu12
+          cache-to: type=gha,mode=max,scope=cu12

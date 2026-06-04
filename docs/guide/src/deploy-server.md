@@ -160,7 +160,12 @@ The server drains active connections on SIGTERM / Ctrl+C before exiting. In-flig
 
 ## Deploying as a container
 
-The OSS server ships as a public Docker image at `ghcr.io/f-inverse/jammi-ai-server`. The image is built from a distroless base, runs as the nonroot user (uid `65532`), and exposes the same `8080` / `8081` ports the local binary listens on.
+The OSS server ships as two public Docker images on GHCR:
+
+- `ghcr.io/f-inverse/jammi-ai-server` — **CPU**, built from a distroless base.
+- `ghcr.io/f-inverse/jammi-ai-server-cu12` — **CUDA**, for GPU-accelerated inference (see [GPU serving](#gpu-serving)).
+
+Both run as the nonroot user (uid `65532`), expose the same `8080` / `8081` ports the local binary listens on, and share the same tag scheme (`:latest`, `:vX.Y.Z`, `:vX.Y`). The examples below use the CPU image.
 
 ```bash
 docker run --rm \
@@ -206,12 +211,31 @@ services:
       - "8081:8081"
 ```
 
+### GPU serving
+
+The `jammi-ai-server-cu12` image builds `jammi-server --features cuda` (candle's CUDA backend) on an NVIDIA CUDA 12.6 runtime base, so `libcudart` and the rest of the CUDA runtime libraries are present in the image. Run it on a host with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) and pass `--gpus all`:
+
+```bash
+docker run --rm --gpus all \
+  -p 8080:8080 -p 8081:8081 \
+  -v jammi_data:/var/lib/jammi \
+  -v $(pwd)/jammi.toml:/etc/jammi/jammi.toml:ro \
+  ghcr.io/f-inverse/jammi-ai-server-cu12:latest
+```
+
+Set `gpu.device = 0` in `jammi.toml` (or `JAMMI_GPU__DEVICE=0`) to select the CUDA device; see [GPU configuration](#gpu-configuration). The image is compiled for compute capability `8.6`. The CPU image ignores GPU config and runs inference on the CPU.
+
 ### Building from source
 
 The Dockerfile lives at the workspace root and uses BuildKit cache mounts for the cargo registry and target directory:
 
 ```bash
+# CPU image (default).
 DOCKER_BUILDKIT=1 docker build -t jammi-ai-server:dev -f Dockerfile .
+
+# CUDA image — selected by the RUNTIME_VARIANT build-arg.
+DOCKER_BUILDKIT=1 docker build -t jammi-ai-server-cu12:dev \
+  --build-arg RUNTIME_VARIANT=runtime-cuda -f Dockerfile .
 ```
 
-Cold builds take ~30 minutes (the workspace is large); warm builds with cache hits land at ~3 minutes.
+Cold builds take ~30 minutes (the workspace is large); warm builds with cache hits land at ~3 minutes. The CUDA build additionally compiles candle's CUDA kernels, so its cold build is longer.

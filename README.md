@@ -17,7 +17,8 @@ on its own:
 pip install jammi-client
 ```
 
-(GPU/CUDA lives on the [server image](https://github.com/f-inverse/jammi-ai/pkgs/container/jammi-ai-server),
+(GPU/CUDA lives on the server image — the CUDA variant
+[`jammi-ai-server-cu12`](https://github.com/f-inverse/jammi-ai/pkgs/container/jammi-ai-server-cu12) —
 not the embed wheel.)
 
 ## Quickstart
@@ -105,6 +106,8 @@ docker run --rm \
 curl http://localhost:8080/healthz
 # {"status":"ok","version":"0.8.0"}
 ```
+
+For GPU-accelerated inference, pull the CUDA variant `ghcr.io/f-inverse/jammi-ai-server-cu12:latest` and run it with `--gpus all` on a host with the NVIDIA Container Toolkit.
 
 The OSS server is single-tenant — the deployer's network is the auth boundary. See [Deploy as a Server](https://f-inverse.github.io/jammi-ai/deploy-server.html) for the full guide.
 

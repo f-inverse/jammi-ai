@@ -2,8 +2,16 @@
 
 # Runtime variant selector for the final image. This MUST be a GLOBAL arg (declared before the
 # first FROM) so it is in scope for the `FROM ${RUNTIME_VARIANT}` selector at the bottom:
-#   runtime-generic        (default) — operator-supplied config + volume
-#   runtime-selfcontained  — standalone, baked config + encoder (e.g. Cloudflare Containers)
+#   runtime-generic        (default) — operator-supplied config + volume (CPU)
+#   runtime-selfcontained  — standalone, baked config + encoder (e.g. Cloudflare Containers) (CPU)
+#   runtime-cuda           — CUDA build: GPU-accelerated inference, NVIDIA runtime base
+#
+# CUDA lives only on the server image (M2 §1, §5d). The CPU variants build on the generic
+# CI base (`jammi-ai-ci`) and a distroless runtime; the CUDA variant builds on the CUDA CI
+# base (`jammi-ai-ci-cuda`, which carries the CUDA 12.6 toolkit + CUDA_COMPUTE_CAP=86) and a
+# CUDA runtime base that ships `libcudart` for candle's cudarc backend. Each runtime stage
+# copies from the builder it needs, so the single `RUNTIME_VARIANT` selector still resolves
+# the whole image — no Dockerfile fork.
 ARG RUNTIME_VARIANT=runtime-generic
 
 # ---- builder ----
@@ -30,17 +38,39 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && cp target/release/jammi-server /tmp/jammi-server \
     && strip /tmp/jammi-server
 
+# ---- builder: cuda ----
+# The CUDA CI base extends `jammi-ai-ci` with the CUDA 12.6 toolkit (nvcc), GCC 13
+# (CUDA 12.6 supports GCC ≤ 13.2), and `CUDA_COMPUTE_CAP=86` — the same image the
+# (now-retired) CUDA wheel lane built against. `candle-core/cuda` reads CUDA_COMPUTE_CAP
+# at build time to target the GPU architecture; CC/CXX/PATH for nvcc are baked into the base.
+FROM ghcr.io/f-inverse/jammi-ai-ci-cuda:latest AS builder-cuda
+
+WORKDIR /workspace
+COPY . .
+
+# Same cache-mount strategy as the CPU builder. The only delta is `--features cuda`,
+# which pulls in candle's CUDA backend (compiled for compute capability 86).
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/workspace/target,sharing=locked \
+    cargo build --release \
+        --package jammi-server \
+        --bin jammi-server \
+        --features cuda,jetstream-broker,storage-cloud \
+    && cp target/release/jammi-server /tmp/jammi-server \
+    && strip /tmp/jammi-server
+
 # ---- runtime base ----
 # Distroless `cc` ships glibc and libstdc++ (Rust binaries linked
 # against the system C++ runtime via tonic + tokio's syscall layer
 # expect both). Image size lands ~50MB with a stripped binary.
 #
-# This base is shared by both image variants. The generic variant
+# This base is shared by the two CPU variants. The generic variant
 # (`runtime-generic`) expects an operator-supplied config at
 # `/etc/jammi/jammi.toml` and a mounted volume at `/var/lib/jammi`.
 # The self-contained variant (`runtime-selfcontained`) bakes both in
 # so it boots standalone on a runtime that provides neither (e.g.
-# Cloudflare Containers).
+# Cloudflare Containers). The CUDA variant (`runtime-cuda`) has its
+# own NVIDIA runtime base below — distroless ships no CUDA libraries.
 FROM gcr.io/distroless/cc-debian12 AS runtime-base
 
 # Bring just the stripped binary across — none of the source tree,
@@ -87,7 +117,39 @@ USER nonroot:nonroot
 
 CMD ["--config", "/etc/jammi/jammi.toml"]
 
+# ---- runtime: cuda ----
+# GPU runtime base. `nvidia/cuda:*-runtime-ubi8` ships `libcudart` (and the rest of the
+# CUDA runtime libraries candle's cudarc backend dlopen's) on a glibc-2.28 UBI8 userland —
+# matching the manylinux_2_28 / AlmaLinux 8 lineage the CUDA CI base built the binary
+# against, so the binary's glibc symbols resolve. The `-runtime-` (not `-devel-`) image
+# carries the shared libraries without the toolkit, keeping the image lean.
+#
+# GPU access at run time requires the NVIDIA Container Toolkit on the host
+# (`docker run --gpus all …`); set `gpu.device = 0` in jammi.toml (or `JAMMI_GPU__DEVICE=0`).
+# This path is GPU-only at runtime and is NOT exercised in CI (no GPU on CI runners) — the
+# Dockerfile compiling is the CI gate; GPU inference is verified out-of-band.
+FROM nvidia/cuda:12.6.3-runtime-ubi8 AS runtime-cuda
+
+# Bring just the stripped CUDA-enabled binary across from the CUDA builder.
+COPY --from=builder-cuda /tmp/jammi-server /usr/local/bin/jammi-server
+
+# Health side-channel on 8080, gRPC + Flight SQL on 8081.
+EXPOSE 8080 8081
+
+# Persistent state: catalog DB, model weights, indices.
+VOLUME ["/var/lib/jammi"]
+
+# UBI8 has no pre-provisioned `nonroot` user; create one with the same uid (65532) the
+# distroless variants use so volume-ownership guidance stays identical across images.
+RUN groupadd --gid 65532 nonroot \
+    && useradd --uid 65532 --gid 65532 --home-dir /home/nonroot --create-home nonroot
+USER 65532:65532
+
+ENTRYPOINT ["/usr/local/bin/jammi-server"]
+CMD ["--config", "/etc/jammi/jammi.toml"]
+
 # ---- final ----
 # Resolve the variant chosen by the global `RUNTIME_VARIANT` arg at the top of this file
-# (`--build-arg RUNTIME_VARIANT=runtime-selfcontained` to bake config + encoder).
+# (`--build-arg RUNTIME_VARIANT=runtime-selfcontained` to bake config + encoder;
+#  `--build-arg RUNTIME_VARIANT=runtime-cuda` for the GPU server image).
 FROM ${RUNTIME_VARIANT}

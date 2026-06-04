@@ -116,9 +116,9 @@ def test_get_server_info_shape_agrees_across_transports(tmp_path):
     wire (client `RemoteDatabase`) or came from the in-process engine (embed
     `Database`). The embedded dict is the whole `jammi_db::ServerInfo` struct;
     the client projects the `jammi.v1.ServerInfo` message field-by-field. Both
-    are pinned to the proto's field set here so a forgotten projection (e.g.
-    dropping `services`, the runtime tier handshake a remote caller most needs)
-    fails — the very embedded-vs-remote drift M2 §2 removes.
+    are pinned to the proto's field set here so a forgotten projection (a field
+    present in the proto but dropped by one transport) fails — the very
+    embedded-vs-remote drift M2 §2 removes.
 
     Hermetic: the embedded side opens a real local engine; the remote side reads
     the generated proto descriptor, never dialing a server.

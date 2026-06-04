@@ -6,6 +6,25 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.21.0 — 2026-06-04
+
+### Added
+- **Authenticated channels in `jammi-client`.** `connect(target, credentials=…)`
+  attaches credentials to the channel — composite call-credentials on TLS, a
+  metadata interceptor on plaintext — so the client can reach a bearer-protected
+  endpoint. A typed `ChannelCredentials` / `BearerCredentials` abstraction; the
+  per-connection session-id header continues to ride alongside.
+- **`SigningKeyStore` port for audit signing.** The audit-HMAC master key flows
+  through an `Arc<dyn SigningKeyStore>` owned by the session; `EnvSigningKeyStore`
+  reads `JAMMI_AUDIT_MASTER_KEY` (the default, byte-for-byte identical signatures).
+  `JammiSession`/`InferenceSession` accept a caller-supplied store at construction,
+  so a host can route both the sign and verify paths through its own key store.
+
+### CI
+- **Open-core boundary fitness functions.** A dependency-direction guard fails the
+  build if any engine crate's resolved closure contains a consumer/proprietary
+  crate; an OSS-only build guard proves the workspace builds hermetically.
+
 ## v0.20.0 — 2026-06-04
 
 ### Added

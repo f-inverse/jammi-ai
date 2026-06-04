@@ -69,11 +69,14 @@ pub async fn log_records(
         }
     }
 
-    // 3. Inject tenant + sign each record.
+    // 3. Inject tenant + sign each record. The master key comes from the
+    //    session's signing-key store, read once for the batch like the broker /
+    //    publisher / registry handles below.
+    let store = session.signing_key_store();
     let mut signed = Vec::with_capacity(records.len());
     for mut rec in records {
         rec.tenant_id = Some(tenant_str.clone());
-        signature::sign_record(&mut rec)?;
+        signature::sign_record(&mut rec, store.as_ref())?;
         signed.push(rec);
     }
 

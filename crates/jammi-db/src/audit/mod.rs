@@ -15,13 +15,14 @@
 //! - `top_k_result_ids.len() == retrieval_scores.len()` (checked at construction).
 //! - `query_lineage` JSON is capped (default 8 KiB, see
 //!   [`log::max_lineage_bytes`]) — store hashes/ids, not raw payloads.
-//! - Records are signed with a per-tenant HMAC-SHA256 secret derived from
-//!   `JAMMI_AUDIT_MASTER_KEY`; signatures verify deterministically across
-//!   restarts.
+//! - Records are signed with a per-tenant HMAC-SHA256 secret derived from a
+//!   master key supplied by the session's [`SigningKeyStore`] (env-backed by
+//!   default); signatures verify deterministically across restarts.
 //! - The backing table `_jammi_search_audit` is reserved; users cannot create
 //!   or directly write it.
 
 mod error;
+mod key_store;
 mod log;
 mod query;
 mod record;
@@ -29,12 +30,13 @@ mod signature;
 mod table;
 
 pub use error::AuditError;
+pub use key_store::{EnvSigningKeyStore, SigningKeyStore, MASTER_KEY_ENV};
 pub use log::{log_records, max_lineage_bytes, DEFAULT_MAX_LINEAGE_BYTES, MAX_LINEAGE_BYTES_ENV};
 pub use query::{fetch_by_query_id, fetch_recent};
 pub use record::{canonical_serialize, PerQueryAudit};
 pub use signature::{
-    derive_tenant_secret, ensure_master_key_present, hmac_sign, master_key_from_env, sign_record,
-    verify, verify_with_env, MASTER_KEY_ENV,
+    derive_tenant_secret, ensure_master_key_present, hmac_sign, sign_record, verify,
+    verify_with_store,
 };
 pub use table::{
     audit_schema, ensure_table_exists, is_reserved_table_name, AUDIT_TABLE_NAME, AUDIT_TOPIC,

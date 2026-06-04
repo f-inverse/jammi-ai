@@ -22,6 +22,7 @@ import grpc
 import pyarrow as pa
 import pyarrow.flight  # noqa: F401  (registers the `pa.flight` submodule)
 
+from ._credentials import AnonymousCredentials, ChannelCredentials
 from ._generated.jammi.v1 import embedding_pb2, embedding_pb2_grpc
 from ._generated.jammi.v1 import session_pb2, session_pb2_grpc
 
@@ -390,6 +391,11 @@ class RemoteDatabase:
         return reader.read_all()
 
     def _flight_client(self):
+        # The Flight SQL lane is a separate pyarrow.flight transport that does
+        # not flow through the gRPC channel credentials, so a channel-level
+        # bearer does not reach it yet; tracked at
+        # https://github.com/f-inverse/jammi-ai/issues/96. It still carries the
+        # session header below.
         if self._flight is None:
             scheme = "grpc+tls" if self._tls else "grpc+tcp"
             self._flight = pa.flight.FlightClient(f"{scheme}://{self._endpoint}")
@@ -418,18 +424,28 @@ class RemoteDatabase:
         self.close()
 
 
-def open_remote(endpoint: str, *, tls: bool) -> RemoteDatabase:
+def open_remote(
+    endpoint: str,
+    *,
+    tls: bool,
+    credentials: Optional[ChannelCredentials],
+) -> RemoteDatabase:
     """Open a :class:`RemoteDatabase` against a `host[:port]` authority.
 
     `tls` selects a secure (`https`/`grpcs`) versus plaintext (`http`/`grpc`)
-    channel. Mints a fresh per-connection session id, mirroring the Rust
-    `RemoteSession::connect` (each connection tenant-isolated).
+    channel; `credentials` decides what identity rides that channel — ``None``
+    yields an anonymous channel, a :class:`BearerCredentials` attaches the
+    bearer to every call. The secure-vs-plaintext channel construction lives in
+    the credential, not here. Mints a fresh per-connection session id, mirroring
+    the Rust `RemoteSession::connect` (each connection tenant-isolated).
+
+    The channel-level bearer covers the typed gRPC verbs. The Flight SQL lane
+    (:meth:`RemoteDatabase.sql`) is a separate `pyarrow.flight` transport that
+    does not yet carry the channel-level bearer — see
+    https://github.com/f-inverse/jammi-ai/issues/96.
     """
     session_id = str(uuid.uuid4())
-    if tls:
-        channel = grpc.secure_channel(endpoint, grpc.ssl_channel_credentials())
-    else:
-        channel = grpc.insecure_channel(endpoint)
+    channel = (credentials or AnonymousCredentials()).open_channel(endpoint, tls=tls)
     return RemoteDatabase(channel, session_id=session_id, endpoint=endpoint, tls=tls)
 
 

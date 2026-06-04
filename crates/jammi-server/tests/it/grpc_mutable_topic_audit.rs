@@ -19,7 +19,7 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use jammi_ai::audit::{verify_with_env, MASTER_KEY_ENV};
+use jammi_ai::audit::{verify_with_store, EnvSigningKeyStore, MASTER_KEY_ENV};
 use jammi_ai::session::InferenceSession;
 use jammi_db::TenantId;
 use jammi_server::grpc::proto::audit::audit_service_client::AuditServiceClient;
@@ -467,7 +467,7 @@ async fn audit_log_then_fetch_and_signature_verifies() {
             .expect("executed_at decodes"),
         signature: fetched.signature.clone(),
     };
-    verify_with_env(&engine_record).expect("signature verifies");
+    verify_with_store(&engine_record, &EnvSigningKeyStore).expect("signature verifies");
 
     // AuditFetchRecent surfaces the same record.
     let recent = client

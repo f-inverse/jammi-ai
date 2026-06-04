@@ -80,6 +80,22 @@ impl InferenceSession {
         Self::wrap(inner, None).await
     }
 
+    /// Create a session whose audit sign/verify path routes through a
+    /// caller-supplied [`jammi_db::audit::SigningKeyStore`]. The catalog
+    /// backend and trigger broker stay config-driven (the counterpart to
+    /// [`Self::with_broker`]); forwarded to
+    /// [`jammi_db::session::JammiSession::with_signing_key_store`]. Deployments
+    /// whose audit master key lives behind a secrets adapter inject it here so
+    /// both the engine's audit *sign* path (`scope.audit().log`) and any
+    /// out-of-band verify path share one store.
+    pub async fn with_signing_key_store(
+        config: JammiConfig,
+        signing_key_store: Arc<dyn jammi_db::audit::SigningKeyStore>,
+    ) -> Result<Self> {
+        let inner = JammiSession::with_signing_key_store(config, signing_key_store).await?;
+        Self::wrap(inner, None).await
+    }
+
     async fn wrap(
         inner: JammiSession,
         observer: Option<Arc<dyn InferenceObserver>>,

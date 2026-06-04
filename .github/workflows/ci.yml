@@ -133,6 +133,46 @@ jobs:
             exit 1
           fi
 
+  dep-direction:
+    name: Guard (engine dep-direction)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      # The open-core boundary is one-way: a consumer may depend on Jammi;
+      # Jammi depends on no consumer. This guard walks the resolved
+      # normal-dependency closure of the shippable OSS crates (the workspace
+      # default-members) and fails, naming the offender, if any crate is from
+      # an enterprise namespace or from a non-crates.io source (git / private
+      # registry). It reads `cargo metadata`'s resolved graph — the source of
+      # truth — so a transitive dep cannot slip past a text grep of Cargo.toml.
+      - name: Assert no proprietary crate in the OSS engine dep tree
+        run: cargo metadata --format-version 1 --locked | python3 ci/scripts/check_dep_direction.py
+
+  oss-only-build:
+    name: Guard (OSS-only build)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      # This guard's signal is HERMETICITY, not re-linking code the test lane
+      # already compiles. No private registry or source is configured, and
+      # `--locked` forbids resolving any crate not already in the committed
+      # Cargo.lock — so a green build proves the OSS edition is self-contained
+      # and its lockfile holds zero proprietary entries. `jammi-python` (a PyO3
+      # cdylib built via maturin, not `cargo build --workspace`) is excluded to
+      # match the existing build/test/docs lanes.
+      - name: Build OSS workspace hermetically with no private source
+        run: cargo build --workspace --exclude jammi-python --locked
+
   ts-client:
     name: TS client (@f-inverse/jammi-client)
     runs-on: ubuntu-latest

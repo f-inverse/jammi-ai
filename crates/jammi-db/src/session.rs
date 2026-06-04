@@ -5,10 +5,11 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_federation::{FederatedQueryPlanner, FederationOptimizerRule};
 
+use crate::audit::{EnvSigningKeyStore, SigningKeyStore};
 use crate::catalog::backend::BackendImpl;
 use crate::catalog::topic_repo::TopicRepo;
 use crate::catalog::Catalog;
-use crate::config::{BrokerConfig, CatalogConfig, JammiConfig};
+use crate::config::{BrokerConfig, CatalogConfig, JammiConfig, SigningKeyConfig};
 use crate::error::{JammiError, Result};
 use crate::source::mutable::MutableTableRegistry;
 use crate::source::registry::SourceCatalog;
@@ -51,6 +52,14 @@ pub struct JammiSession {
     topic_repo: Arc<TopicRepo>,
     publisher: Arc<Publisher>,
     subscriber: Arc<Subscriber>,
+    /// Source of the audit HMAC master key. Read via
+    /// [`JammiSession::signing_key_store`] by the audit write path. Either
+    /// derived from `config.signing_key` (defaulting to [`EnvSigningKeyStore`])
+    /// or supplied by the caller at construction via
+    /// [`JammiSession::with_backend_broker_and_signing_key`] /
+    /// [`JammiSession::with_signing_key_store`], so the sign path routes through
+    /// a caller-chosen store.
+    signing_key_store: Arc<dyn SigningKeyStore>,
 }
 
 impl JammiSession {
@@ -103,13 +112,36 @@ impl JammiSession {
     }
 
     /// Build a session around a caller-supplied catalog backend AND a
-    /// caller-supplied trigger broker. The composable constructor: server
+    /// caller-supplied trigger broker. The signing-key store is derived from
+    /// `config.signing_key` (defaulting to [`EnvSigningKeyStore`]). Server
     /// deployments combining a shared Postgres pool with a JetStream broker
     /// reach for this one.
     pub async fn with_backend_and_broker(
         config: JammiConfig,
         backend: BackendImpl,
         trigger_broker: Arc<dyn TriggerBroker>,
+    ) -> Result<Self> {
+        let signing_key_store = signing_key_store_from_config(&config);
+        Self::with_backend_broker_and_signing_key(
+            config,
+            backend,
+            trigger_broker,
+            signing_key_store,
+        )
+        .await
+    }
+
+    /// The most-composable constructor: caller-supplied catalog backend,
+    /// trigger broker, AND signing-key store. Every other backend constructor
+    /// delegates here, deriving the store from `config.signing_key`; callers
+    /// that need the audit sign/verify path to route through a custom store
+    /// (e.g. a deployment whose master key lives behind a secrets adapter)
+    /// inject it directly through this seam.
+    pub async fn with_backend_broker_and_signing_key(
+        config: JammiConfig,
+        backend: BackendImpl,
+        trigger_broker: Arc<dyn TriggerBroker>,
+        signing_key_store: Arc<dyn SigningKeyStore>,
     ) -> Result<Self> {
         let config = Arc::new(config);
         let tenant_binding = TenantBinding::unscoped();
@@ -118,7 +150,28 @@ impl JammiSession {
             backend,
             Some(tenant_binding.clone()),
         ));
-        Self::build(config, catalog, tenant_binding, trigger_broker).await
+        Self::build(
+            config,
+            catalog,
+            tenant_binding,
+            trigger_broker,
+            signing_key_store,
+        )
+        .await
+    }
+
+    /// Build a session with a caller-supplied signing-key store, resolving the
+    /// catalog backend and trigger broker from `config` (the config-driven
+    /// counterpart to [`Self::with_broker`]). Deployments that keep the
+    /// SQLite/Postgres + broker selection config-driven but need the audit
+    /// sign/verify path to route through a custom store reach for this one.
+    pub async fn with_signing_key_store(
+        config: JammiConfig,
+        signing_key_store: Arc<dyn SigningKeyStore>,
+    ) -> Result<Self> {
+        let backend = build_backend_from_config(&config).await?;
+        let broker = build_broker_from_config(&config).await?;
+        Self::with_backend_broker_and_signing_key(config, backend, broker, signing_key_store).await
     }
 
     async fn build(
@@ -126,6 +179,7 @@ impl JammiSession {
         catalog: Arc<Catalog>,
         tenant_binding: TenantBinding,
         trigger_broker: Arc<dyn TriggerBroker>,
+        signing_key_store: Arc<dyn SigningKeyStore>,
     ) -> Result<Self> {
         let session_config = SessionConfig::new()
             .with_target_partitions(config.engine.execution_threads)
@@ -220,6 +274,7 @@ impl JammiSession {
             topic_repo,
             publisher,
             subscriber,
+            signing_key_store,
         };
         session.reload_sources().await?;
         session.reload_mutable_tables().await?;
@@ -642,6 +697,12 @@ impl JammiSession {
         Arc::clone(&self.trigger_broker)
     }
 
+    /// Shared handle to the audit signing-key store the session was constructed
+    /// with. The audit write path reads this to obtain the HMAC master key.
+    pub fn signing_key_store(&self) -> Arc<dyn SigningKeyStore> {
+        Arc::clone(&self.signing_key_store)
+    }
+
     /// Shared handle to the topic-catalog repo.
     pub fn topic_repo(&self) -> Arc<TopicRepo> {
         Arc::clone(&self.topic_repo)
@@ -843,6 +904,17 @@ impl JammiSession {
                 table.table_name
             ))
         })
+    }
+}
+
+/// Resolve the signing-key store selected by `config.signing_key`. The single
+/// variant today resolves to [`EnvSigningKeyStore`]; callers that need a
+/// different store inject it through
+/// [`JammiSession::with_backend_broker_and_signing_key`] rather than extending
+/// this match.
+fn signing_key_store_from_config(config: &JammiConfig) -> Arc<dyn SigningKeyStore> {
+    match config.signing_key {
+        SigningKeyConfig::Env => Arc::new(EnvSigningKeyStore),
     }
 }
 

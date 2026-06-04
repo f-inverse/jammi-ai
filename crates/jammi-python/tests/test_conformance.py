@@ -109,3 +109,57 @@ def test_embedded_database_shares_the_unified_modality_verbs():
         "server_info",
     ):
         assert not hasattr(jammi_ai.Database, gone), f"{gone} should be hard-cut"
+
+
+def test_get_server_info_shape_agrees_across_transports(tmp_path):
+    """`get_server_info` returns the SAME key set whether it crossed the gRPC
+    wire (client `RemoteDatabase`) or came from the in-process engine (embed
+    `Database`). The embedded dict is the whole `jammi_db::ServerInfo` struct;
+    the client projects the `jammi.v1.ServerInfo` message field-by-field. Both
+    are pinned to the proto's field set here so a forgotten projection (e.g.
+    dropping `services`, the runtime tier handshake a remote caller most needs)
+    fails — the very embedded-vs-remote drift M2 §2 removes.
+
+    Hermetic: the embedded side opens a real local engine; the remote side reads
+    the generated proto descriptor, never dialing a server.
+    """
+    from jammi_client._generated.jammi.v1 import session_pb2
+
+    proto_fields = {f.name for f in session_pb2.ServerInfo.DESCRIPTOR.fields}
+
+    embedded = jammi_ai.connect(f"file://{tmp_path}").get_server_info()
+    assert set(embedded) == proto_fields, (
+        f"embedded get_server_info keys {set(embedded)} != proto ServerInfo "
+        f"fields {proto_fields}"
+    )
+
+    # The client builds its dict from exactly these keys; assert it maps every
+    # proto field so the remote dict matches the embedded one key-for-key.
+    client_keys = _client_server_info_keys()
+    assert client_keys == proto_fields, (
+        f"client get_server_info keys {client_keys} != proto ServerInfo "
+        f"fields {proto_fields} — a field is unmapped"
+    )
+
+
+def _client_server_info_keys() -> set:
+    """The key set `jammi_client.RemoteDatabase.get_server_info` returns, read
+    off a stub response so the assertion sees what the method actually builds —
+    no server contact."""
+
+    class _StubServerInfo:
+        version = "0.0.0"
+        features = []
+        storage_backends = []
+        services = []
+
+    class _StubSession:
+        def GetServerInfo(self, *_a, **_k):
+            return _StubServerInfo()
+
+    db = jammi_client.connect("grpc://127.0.0.1:8081")
+    try:
+        db._session = _StubSession()
+        return set(db.get_server_info())
+    finally:
+        db.close()

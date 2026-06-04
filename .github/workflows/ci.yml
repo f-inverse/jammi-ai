@@ -151,7 +151,7 @@ jobs:
       # registry). It reads `cargo metadata`'s resolved graph — the source of
       # truth — so a transitive dep cannot slip past a text grep of Cargo.toml.
       - name: Assert no proprietary crate in the OSS engine dep tree
-        run: cargo metadata --format-version 1 --offline | python3 ci/scripts/check_dep_direction.py
+        run: cargo metadata --format-version 1 --locked | python3 ci/scripts/check_dep_direction.py
 
   oss-only-build:
     name: Guard (OSS-only build)

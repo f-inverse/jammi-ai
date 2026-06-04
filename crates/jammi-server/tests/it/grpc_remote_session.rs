@@ -25,7 +25,7 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::StreamExt;
-use jammi_ai::audit::{verify_with_env, MASTER_KEY_ENV};
+use jammi_ai::audit::{verify_with_store, EnvSigningKeyStore, MASTER_KEY_ENV};
 use jammi_ai::{
     Jammi, LocalSession, Modality, PerQueryAudit, QueryInput, RemoteSession, SearchQuery,
     SearchRequest, Session, Target,
@@ -697,7 +697,8 @@ async fn remote_round_trips_audit_log_and_fetch_like_local() {
     assert_eq!(fetched.query_id, query_id);
     assert_eq!(fetched.tenant_id.as_deref(), Some(TENANT_A));
     assert!(!fetched.signature.is_empty(), "signature crossed the wire");
-    verify_with_env(&fetched).expect("remote-fetched record signature verifies");
+    verify_with_store(&fetched, &EnvSigningKeyStore)
+        .expect("remote-fetched record signature verifies");
 
     // The local fetch (same engine, same tenant scope) returns the identical
     // record — the remote read is byte-for-byte the local read.

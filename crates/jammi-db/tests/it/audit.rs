@@ -7,7 +7,9 @@
 use std::sync::OnceLock;
 
 use futures::StreamExt;
-use jammi_db::audit::{self, PerQueryAudit, AUDIT_TABLE_NAME, AUDIT_TOPIC, MASTER_KEY_ENV};
+use jammi_db::audit::{
+    self, EnvSigningKeyStore, PerQueryAudit, AUDIT_TABLE_NAME, AUDIT_TOPIC, MASTER_KEY_ENV,
+};
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::session::JammiSession;
 use jammi_db::trigger::Predicate;
@@ -79,7 +81,7 @@ async fn log_then_fetch_and_signature_verifies() {
 
     // Criterion 1 + 3: the row carries a signature and it verifies.
     assert!(!fetched.signature.is_empty());
-    audit::verify_with_env(&fetched).expect("signature verifies");
+    audit::verify_with_store(&fetched, &EnvSigningKeyStore).expect("signature verifies");
 
     // fetch_recent returns the same record.
     let recent = s.audit().fetch_recent(10).await.expect("recent");
@@ -235,11 +237,11 @@ async fn master_key_missing_is_fatal_for_writes() {
     std::env::remove_var(MASTER_KEY_ENV);
     let s = session().await.with_tenant(TENANT_A.parse().unwrap());
     // Criterion 8 (data path): with no master key, signing — and thus the log
-    // call — fails. The server-side startup gate is
-    // `audit::ensure_master_key_present`, asserted here too.
+    // call — fails. `audit::ensure_master_key_present` is the startup check a
+    // server can call to fail fast on the same condition, asserted here too.
     let err = s.audit().log(vec![sample("m")]).await.unwrap_err();
     assert!(matches!(err, audit::AuditError::MasterKey(_)));
-    assert!(audit::ensure_master_key_present().is_err());
+    assert!(audit::ensure_master_key_present(&EnvSigningKeyStore).is_err());
 }
 
 #[tokio::test]
@@ -286,7 +288,7 @@ async fn published_to_trigger_topic() {
     let payload: PerQueryAudit = serde_json::from_str(col.value(0)).unwrap();
     assert_eq!(payload.query_id, qid);
     assert_eq!(payload.tenant_id.as_deref(), Some(TENANT_A));
-    audit::verify_with_env(&payload).expect("published payload verifies");
+    audit::verify_with_store(&payload, &EnvSigningKeyStore).expect("published payload verifies");
 }
 
 #[tokio::test]

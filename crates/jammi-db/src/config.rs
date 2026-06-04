@@ -183,6 +183,9 @@ pub struct JammiConfig {
     pub catalog: CatalogConfig,
     /// Trigger broker selection. Default: in-process [`crate::trigger::InMemoryBroker`].
     pub broker: BrokerConfig,
+    /// Audit signing-key source. Default: env-backed
+    /// [`crate::audit::EnvSigningKeyStore`] reading `JAMMI_AUDIT_MASTER_KEY`.
+    pub signing_key: SigningKeyConfig,
     /// Object-storage selection for result tables and cloud sources. Default:
     /// empty — result tables live on local disk under `artifact_dir` and
     /// `r2://`/`s3://`/`gs://`/`azure://` sources resolve via the SDK's
@@ -343,6 +346,33 @@ impl Default for BrokerConfig {
 
 fn default_retention_secs() -> u64 {
     7 * 24 * 60 * 60
+}
+
+/// Audit signing-key source selection.
+///
+/// Selects the [`crate::audit::SigningKeyStore`] the session uses to obtain the
+/// audit HMAC master key. The self-host seam: a future deployment holding its
+/// master key in a key-management service selects a new variant here without
+/// touching the signing path.
+///
+/// # TOML
+///
+/// ```toml
+/// [signing_key]
+/// kind = "env"
+/// ```
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SigningKeyConfig {
+    /// Read the master key from `JAMMI_AUDIT_MASTER_KEY` via
+    /// [`crate::audit::EnvSigningKeyStore`]. The default.
+    Env,
+}
+
+impl Default for SigningKeyConfig {
+    fn default() -> Self {
+        Self::Env
+    }
 }
 
 /// DataFusion query-engine settings.
@@ -555,6 +585,7 @@ impl Default for JammiConfig {
             logging: LoggingConfig::default(),
             catalog: CatalogConfig::default(),
             broker: BrokerConfig::default(),
+            signing_key: SigningKeyConfig::default(),
             storage: StorageConfig::default(),
         }
     }
@@ -1031,6 +1062,29 @@ mod tests {
         let cfg = JammiConfig::default();
         assert_eq!(cfg.catalog, CatalogConfig::Sqlite { path: None });
         assert_eq!(cfg.broker, BrokerConfig::InMemory);
+    }
+
+    #[test]
+    fn signing_key_config_round_trip_env() {
+        let toml_src = r#"
+            [signing_key]
+            kind = "env"
+        "#;
+        let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.signing_key, SigningKeyConfig::Env);
+    }
+
+    #[test]
+    fn jammi_config_default_signing_key_is_env() {
+        assert_eq!(JammiConfig::default().signing_key, SigningKeyConfig::Env);
+    }
+
+    #[test]
+    fn signing_key_absent_defaults_to_env() {
+        // `JammiConfig` is `#[serde(default)]`, so TOML without `[signing_key]`
+        // parses to the env-backed default.
+        let cfg: JammiConfig = toml::from_str("artifact_dir = \"/tmp/jammi\"").unwrap();
+        assert_eq!(cfg.signing_key, SigningKeyConfig::Env);
     }
 
     #[test]

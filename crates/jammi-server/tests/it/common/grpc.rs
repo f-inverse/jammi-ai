@@ -68,34 +68,47 @@ pub struct EngineServer {
 }
 
 /// Spin up an in-process gRPC server hosting the chain *with* the engine-backed
-/// services (`EmbeddingService`, `InferenceService`, `EvalService`). These are
-/// the only services that need a real `InferenceSession`; the trigger/session
-/// surfaces are unmounted (`None`). Shared by the `grpc_inference` and
-/// `grpc_eval` suites so they drive the same wiring the embedding suite does.
+/// services, mounting every compiled-in tier **except** the event tier (no
+/// trigger handles). Shared by the `grpc_inference`, `grpc_eval`,
+/// `grpc_introspection`, and `grpc_fine_tune` suites so they drive the same
+/// wiring the embedding suite does.
 pub async fn start_engine_server() -> EngineServer {
-    start_engine_server_inner(false).await
+    // Every compiled-in optional tier except event — the engine-backed serve +
+    // eval + (when compiled) train surface, without the trigger stream.
+    let optional = jammi_server::tiers::ServiceTier::OPTIONAL
+        .into_iter()
+        .filter(|t| *t != jammi_server::tiers::ServiceTier::Event && t.compiled_in());
+    let tiers = jammi_server::tiers::TierSet::resolve(optional).expect("non-event tiers resolve");
+    start_engine_server_with_tiers(tiers).await
 }
 
-/// Like [`start_engine_server`] but also mounts the trigger handles, so the
-/// `TriggerService` (topics / publish / subscribe) and the audit service are
-/// reachable over the wire. Shared by the `RemoteSession` topic/subscribe/audit
-/// parity tests, which drive those surfaces against the same engine a
-/// `LocalSession` wraps.
+/// Like [`start_engine_server`] but also mounts the trigger handles (the event
+/// tier), so the `TriggerService` (topics / publish / subscribe) is reachable
+/// over the wire. Shared by the `RemoteSession` topic/subscribe/audit parity
+/// tests, which drive those surfaces against the same engine a `LocalSession`
+/// wraps.
 pub async fn start_engine_server_with_trigger() -> EngineServer {
-    start_engine_server_inner(true).await
+    start_engine_server_with_tiers(jammi_server::tiers::TierSet::all_compiled()).await
 }
 
-async fn start_engine_server_inner(with_trigger: bool) -> EngineServer {
+/// Spin up an in-process engine-backed gRPC server mounting exactly `tiers`.
+/// The trigger handles (event tier) are derived from `tiers.contains(Event)`,
+/// so what is mounted and what `GetServerInfo` advertises are one decision —
+/// no way to construct a fixture whose handshake lies about its mount set.
+/// Used by the tier-gating tests to stand up serve-only / serve+train / etc.
+pub async fn start_engine_server_with_tiers(tiers: jammi_server::tiers::TierSet) -> EngineServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg = test_config(dir.path());
     let session = Arc::new(InferenceSession::new(cfg).await.expect("session"));
 
     let store = SessionStore::new();
-    let trigger = with_trigger.then(|| jammi_server::TriggerHandles {
-        topic_repo: session.topic_repo(),
-        publisher: session.publisher(),
-        subscriber: session.subscriber(),
-    });
+    let trigger = tiers
+        .contains(jammi_server::tiers::ServiceTier::Event)
+        .then(|| jammi_server::TriggerHandles {
+            topic_repo: session.topic_repo(),
+            publisher: session.publisher(),
+            subscriber: session.subscriber(),
+        });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -107,12 +120,15 @@ async fn start_engine_server_inner(with_trigger: bool) -> EngineServer {
     let engine = Arc::clone(&session);
     let handle = tokio::spawn(async move {
         jammi_server::runtime::serve_grpc_chain(
-            addr,
-            flight_ctx,
-            binding,
-            store,
-            trigger,
-            Some(session),
+            jammi_server::runtime::GrpcChain {
+                addr,
+                flight_ctx,
+                flight_binding: binding,
+                store,
+                trigger,
+                engine: Some(session),
+                tiers,
+            },
             async move {
                 let _ = shutdown_rx.await;
             },

@@ -14,4 +14,5 @@ mod grpc_web;
 mod health;
 mod serve_e2e;
 mod server;
+mod service_tiers;
 mod uat_shapes;

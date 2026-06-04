@@ -103,12 +103,15 @@ async fn start_fixture() -> Fixture {
     let engine = Arc::clone(&session);
     let handle = tokio::spawn(async move {
         jammi_server::runtime::serve_grpc_chain(
-            addr,
-            flight_ctx,
-            binding,
-            store,
-            Some(trigger),
-            Some(session),
+            jammi_server::runtime::GrpcChain {
+                addr,
+                flight_ctx,
+                flight_binding: binding,
+                store,
+                trigger: Some(trigger),
+                engine: Some(session),
+                tiers: jammi_server::tiers::TierSet::all_compiled(),
+            },
             async move {
                 let _ = shutdown_rx.await;
             },

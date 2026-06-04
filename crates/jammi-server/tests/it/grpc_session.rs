@@ -80,12 +80,18 @@ async fn start_grpc_test_server() -> (
     let binding = session.tenant_binding_arc();
     let handle = tokio::spawn(async move {
         jammi_server::runtime::serve_grpc_chain(
-            addr,
-            flight_ctx,
-            binding,
-            store_for_server,
-            Some(trigger),
-            None,
+            jammi_server::runtime::GrpcChain {
+                addr,
+                flight_ctx,
+                flight_binding: binding,
+                store: store_for_server,
+                trigger: Some(trigger),
+                engine: None,
+                tiers: jammi_server::tiers::TierSet::resolve([
+                    jammi_server::tiers::ServiceTier::Event,
+                ])
+                .expect("event tier resolves"),
+            },
             async move {
                 let _ = shutdown_rx.await;
             },

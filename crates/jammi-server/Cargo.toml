@@ -50,7 +50,15 @@ uuid.workspace = true
 async-trait.workspace = true
 
 [features]
-default = []
+# `train` is on by default so the published image and every default build mount
+# the full tier set (all-in-one). It compiles the `FineTuneService` mount (the
+# `train` service tier); a `--no-default-features` serve-only build carries no
+# training surface and the tier mechanism honestly reports `train` as
+# uncompilable. The other optional tiers (`event` = TriggerService, `eval` =
+# EvalService) always compile — they carry no heavy dep beyond the engine — and
+# are gated at runtime via `[server] services`, not at compile time.
+default = ["train"]
+train = []
 cuda  = ["jammi-ai/cuda"]
 metal = ["jammi-ai/metal"]
 # Compiles the JetStream broker driver into the binary so production

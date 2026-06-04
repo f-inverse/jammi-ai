@@ -55,8 +55,12 @@ pub async fn serve_flight_with_session_service(
     let flight_svc = arrow_flight::flight_service_server::FlightServiceServer::new(flight);
 
     let interceptor = TenantInterceptor::new(store.clone());
-    let session_svc =
-        SessionServiceServer::with_interceptor(SessionServer::new(store), interceptor);
+    // This Flight-SQL-only path mounts just Flight + SessionService — the core
+    // handshake surface, no optional tiers — so it advertises core only.
+    let session_svc = SessionServiceServer::with_interceptor(
+        SessionServer::new(store, crate::tiers::TierSet::resolve(std::iter::empty())?),
+        interceptor,
+    );
 
     tracing::info!(
         "Flight SQL + SessionService listening on {addr} \

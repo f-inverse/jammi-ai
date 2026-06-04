@@ -16,9 +16,17 @@
 
 use serde::Serialize;
 
-/// The engine's self-description: version, compiled feature flags, and the
-/// storage backends this build can address. Built from [`ServerInfo::current`];
-/// the values are constant for a given binary.
+/// The engine's self-description: version, compiled feature flags, the storage
+/// backends this build can address, and the gRPC service tiers a deployment
+/// mounted.
+///
+/// The first three fields are compile-time facts and are filled by
+/// [`ServerInfo::current`]. `services` is a *runtime* fact — which gRPC service
+/// tiers the running deployment chose to mount — so it lives outside the
+/// engine's knowledge: [`ServerInfo::current`] leaves it empty (the embedded,
+/// in-process engine mounts no gRPC services) and the server layer overrides it
+/// with the actually-mounted tier set when answering `GetServerInfo` over the
+/// wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ServerInfo {
     /// The engine version — the lockstep workspace crate version.
@@ -30,6 +38,10 @@ pub struct ServerInfo {
     /// `"memory"`; cloud schemes appear when their driver feature is compiled
     /// in), sorted.
     pub storage_backends: Vec<String>,
+    /// The gRPC service tiers this deployment mounted, sorted. Empty for the
+    /// embedded engine (it serves no gRPC); the server layer fills it with the
+    /// runtime-resolved tier set. See `jammi-server`'s service-tier mechanism.
+    pub services: Vec<String>,
 }
 
 impl ServerInfo {
@@ -41,6 +53,11 @@ impl ServerInfo {
     /// appears only under its driver feature, and each federation backend only
     /// under its feature. R2 reuses the S3 driver, so `storage-r2` and
     /// `storage-s3` both contribute the `s3` backend.
+    ///
+    /// `services` is left empty: the mounted gRPC tier set is a runtime fact
+    /// the engine library does not know. The embedded engine serves no gRPC, so
+    /// empty is its truthful answer; the server layer overrides this field with
+    /// the tiers it actually mounted.
     pub fn current() -> Self {
         let mut features: Vec<String> = Vec::new();
         if cfg!(feature = "postgres") {
@@ -74,6 +91,7 @@ impl ServerInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
             features,
             storage_backends,
+            services: Vec::new(),
         }
     }
 }
@@ -99,5 +117,8 @@ mod tests {
         feats.sort();
         feats.dedup();
         assert_eq!(info.features, feats);
+        // The embedded engine mounts no gRPC services; the runtime tier set is
+        // the server layer's to fill.
+        assert!(info.services.is_empty());
     }
 }

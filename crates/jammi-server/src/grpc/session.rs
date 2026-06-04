@@ -21,6 +21,7 @@ use jammi_db::TenantId;
 
 use super::proto::session::session_service_server::SessionService;
 use super::proto::session::{GetTenantResponse, ServerInfo, SetTenantRequest, Tenant};
+use crate::tiers::TierSet;
 
 /// Opaque session identifier carried in the `jammi-session-id` request
 /// header. Clients mint a UUID for each connection / session; the server
@@ -87,14 +88,20 @@ impl SessionStore {
 pub use jammi_ai::wire::SESSION_HEADER;
 
 /// Tonic gRPC service impl backed by a shared [`SessionStore`].
+///
+/// Also carries the deployment's mounted [`TierSet`] so the `GetServerInfo`
+/// handshake reports the runtime tier set this server actually mounted — the
+/// `services` field of [`ServerInfo`]. The session service is in the always-on
+/// core tier, so it is the natural place to answer the handshake honestly.
 #[derive(Debug, Clone)]
 pub struct SessionServer {
     store: SessionStore,
+    tiers: TierSet,
 }
 
 impl SessionServer {
-    pub fn new(store: SessionStore) -> Self {
-        Self { store }
+    pub fn new(store: SessionStore, tiers: TierSet) -> Self {
+        Self { store, tiers }
     }
 }
 
@@ -131,13 +138,17 @@ impl SessionService for SessionServer {
     }
 
     async fn get_server_info(&self, _request: Request<()>) -> Result<Response<ServerInfo>, Status> {
-        // A compile-time fact about the running binary: no session, no tenant,
-        // no engine. Reads straight off the engine's `ServerInfo::current`.
+        // The build's compile-time self-description (`version` / `features` /
+        // `storage_backends`) plus this deployment's *runtime* tier handshake:
+        // `services` is the set of gRPC tiers this server actually mounted, not
+        // a compile-time fact — so it comes from the injected `TierSet`, not
+        // from `ServerInfo::current` (which leaves it empty).
         let info = jammi_db::ServerInfo::current();
         Ok(Response::new(ServerInfo {
             version: info.version,
             features: info.features,
             storage_backends: info.storage_backends,
+            services: self.tiers.as_wire(),
         }))
     }
 }
@@ -204,6 +215,13 @@ fn parse_tenant(t: &Tenant) -> Result<Option<TenantId>, Status> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tiers::{ServiceTier, TierSet};
+
+    /// A serve-only tier set (core only) for tests that don't exercise the
+    /// optional tiers.
+    fn core_only_tiers() -> TierSet {
+        TierSet::resolve(std::iter::empty()).expect("empty selection resolves")
+    }
 
     fn t_a() -> TenantId {
         TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap()
@@ -294,7 +312,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_tenant_requires_session_header() {
-        let server = SessionServer::new(SessionStore::new());
+        let server = SessionServer::new(SessionStore::new(), core_only_tiers());
         let req = Request::new(SetTenantRequest {
             tenant: Some(Tenant {
                 id: t_a().to_string(),
@@ -307,7 +325,7 @@ mod tests {
     #[tokio::test]
     async fn set_then_get_then_clear_round_trip() {
         let store = SessionStore::new();
-        let server = SessionServer::new(store.clone());
+        let server = SessionServer::new(store.clone(), core_only_tiers());
         let session_id = "conn-1";
 
         // Set
@@ -341,5 +359,32 @@ mod tests {
             .insert(SESSION_HEADER, session_id.parse().unwrap());
         let resp = server.get_tenant(req).await.unwrap().into_inner();
         assert!(resp.tenant.unwrap().id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_server_info_reports_the_mounted_tier_set() {
+        // A core-only deployment advertises exactly "core".
+        let core = SessionServer::new(SessionStore::new(), core_only_tiers());
+        let info = core
+            .get_server_info(Request::new(()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(info.services, vec!["core".to_string()]);
+        // The compile-time fields still come through.
+        assert!(!info.version.is_empty());
+        assert!(info.storage_backends.contains(&"file".to_string()));
+
+        // A deployment that also mounted the event tier advertises it too.
+        let with_event = SessionServer::new(
+            SessionStore::new(),
+            TierSet::resolve([ServiceTier::Event]).expect("event resolves"),
+        );
+        let info = with_event
+            .get_server_info(Request::new(()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(info.services, vec!["core".to_string(), "event".to_string()]);
     }
 }

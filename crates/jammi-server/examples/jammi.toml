@@ -14,10 +14,26 @@ artifact_dir = "/var/lib/jammi"
 [server]
 # HTTP side-channel: `/healthz`, `/readyz`, `/metrics`.
 health_listen = "0.0.0.0:8080"
-# gRPC + Flight SQL: SessionService, TriggerService, FlightService.
+# gRPC + Flight SQL surface. The core tier (SessionService, EmbeddingService,
+# InferenceService, MutableTableService, ChannelService, AuditService) and
+# Flight SQL are always mounted; the optional tiers below are runtime-selectable.
 flight_listen = "0.0.0.0:8081"
 # Models to preload into memory at startup. Empty by default.
 preload_models = []
+# Service tiers this deployment mounts, beyond the always-on core tier. One
+# binary scales to many shapes without a rebuild:
+#
+#   services = "all"             # all-in-one: every tier compiled in (default)
+#   services = ["event"]         # serve + event box (TriggerService)
+#   services = ["train"]         # serve + training box (FineTuneService)
+#   services = ["eval"]          # serve + eval tooling (EvalService)
+#   services = []                # serve-only: core tier only
+#
+# A tier requested here whose feature is compiled out (e.g. `train` on a
+# `--no-default-features` build) is a startup error, not a silent drop. The
+# mounted set is reported over the wire via `SessionService.GetServerInfo`
+# (`services`), so a client knows which verbs are reachable. Defaults to "all".
+services = "all"
 
 [logging]
 level = "info"

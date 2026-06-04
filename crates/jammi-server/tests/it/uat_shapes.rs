@@ -164,12 +164,18 @@ async fn shape_c_multi_tenant_server_isolates_two_tenants_across_primitives() {
     let binding = session.tenant_binding_arc();
     let grpc_handle = tokio::spawn(async move {
         jammi_server::runtime::serve_grpc_chain(
-            grpc_addr,
-            flight_ctx,
-            binding,
-            store_for_grpc,
-            Some(trigger),
-            None,
+            jammi_server::runtime::GrpcChain {
+                addr: grpc_addr,
+                flight_ctx,
+                flight_binding: binding,
+                store: store_for_grpc,
+                trigger: Some(trigger),
+                engine: None,
+                tiers: jammi_server::tiers::TierSet::resolve([
+                    jammi_server::tiers::ServiceTier::Event,
+                ])
+                .expect("event tier resolves"),
+            },
             async move {
                 let _ = shutdown_rx.await;
             },

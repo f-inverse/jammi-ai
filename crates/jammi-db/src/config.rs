@@ -447,6 +447,54 @@ pub struct ServerConfig {
     pub flight_listen: String,
     /// Model IDs to preload into memory at server startup.
     pub preload_models: Vec<String>,
+    /// Optional gRPC service tiers this deployment mounts, beyond the always-on
+    /// core tier. Tokens are `"train"`, `"event"`, `"eval"` (the `jammi-server`
+    /// service-tier mechanism owns their meaning and validation; this layer
+    /// only carries the raw selection so the engine config stays free of
+    /// server-tier types). An empty list means serve-only (core only); the
+    /// default mounts every tier compiled into the binary (all-in-one). A token
+    /// naming an unknown tier, or a tier whose feature is compiled out, is a
+    /// startup error surfaced by the server.
+    pub services: ServiceSelection,
+}
+
+/// The optional service-tier selection for a server deployment. `All` (the
+/// default) mounts every tier the binary compiled in; `Only` mounts core plus
+/// exactly the named optional tiers. Kept as raw tokens here so `jammi-db` does
+/// not depend on `jammi-server`'s tier vocabulary — the server resolves and
+/// validates them.
+///
+/// Untagged so the two natural TOML forms both parse:
+///
+/// ```toml
+/// services = "all"             # all-in-one (the default)
+/// services = ["event", "eval"] # core + these optional tiers
+/// services = []                # serve-only (core only)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum ServiceSelection {
+    /// The `"all"` sentinel: mount core plus every optional tier compiled into
+    /// this binary (all-in-one). The default deployment shape. Any other bare
+    /// string is rejected at resolution time by the server.
+    All(AllSentinel),
+    /// Mount core plus exactly these optional tiers (e.g. `["event"]` for an
+    /// event box, or `[]` for serve-only).
+    Only(Vec<String>),
+}
+
+/// The `"all"` literal, as its own one-variant enum so serde accepts exactly
+/// that string and nothing else in the sentinel position.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AllSentinel {
+    All,
+}
+
+impl Default for ServiceSelection {
+    fn default() -> Self {
+        ServiceSelection::All(AllSentinel::All)
+    }
 }
 
 impl ServerConfig {
@@ -592,6 +640,7 @@ impl Default for ServerConfig {
             health_listen: "0.0.0.0:8080".into(),
             flight_listen: "0.0.0.0:8081".into(),
             preload_models: Vec::new(),
+            services: ServiceSelection::default(),
         }
     }
 }
@@ -747,6 +796,23 @@ impl JammiConfig {
         }
         if let Ok(v) = std::env::var("JAMMI_SERVER__FLIGHT_LISTEN") {
             self.server.flight_listen = v;
+        }
+        if let Ok(v) = std::env::var("JAMMI_SERVER__SERVICES") {
+            // `all` selects every compiled-in tier; otherwise a comma-separated
+            // list of optional tier tokens (empty string → serve-only/core).
+            // The server resolves and validates the tokens; this layer only
+            // carries the selection.
+            self.server.services = if v.trim().eq_ignore_ascii_case("all") {
+                ServiceSelection::All(AllSentinel::All)
+            } else {
+                ServiceSelection::Only(
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                )
+            };
         }
     }
 }

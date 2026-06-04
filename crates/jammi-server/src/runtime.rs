@@ -40,6 +40,7 @@ use crate::grpc::audit::AuditServer;
 use crate::grpc::channel::ChannelServer;
 use crate::grpc::embedding::EmbeddingServer;
 use crate::grpc::eval::EvalServer;
+#[cfg(feature = "train")]
 use crate::grpc::fine_tune::FineTuneServer;
 use crate::grpc::inference::InferenceServer;
 use crate::grpc::mutable_table::MutableTableServer;
@@ -47,6 +48,7 @@ use crate::grpc::proto::audit::audit_service_server::AuditServiceServer;
 use crate::grpc::proto::channel::channel_service_server::ChannelServiceServer;
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingServiceServer;
 use crate::grpc::proto::eval::eval_service_server::EvalServiceServer;
+#[cfg(feature = "train")]
 use crate::grpc::proto::fine_tune::fine_tune_service_server::FineTuneServiceServer;
 use crate::grpc::proto::inference::inference_service_server::InferenceServiceServer;
 use crate::grpc::proto::mutable_table::mutable_table_service_server::MutableTableServiceServer;
@@ -56,12 +58,15 @@ use crate::grpc::session::{SessionServer, SessionStore, TenantInterceptor};
 use crate::grpc::trigger::TriggerServer;
 use crate::grpc_web_trailers::GrpcWebTrailersLayer;
 use crate::routes::health::{self, MetricsRegistry};
+use crate::tiers::{ServiceTier, TierSet};
 
 /// Errors `OssServer::run` can surface to the binary's `main`.
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
     #[error("config error: {0}")]
     Config(String),
+    #[error("service tier: {0}")]
+    Tier(#[from] crate::tiers::TierError),
     #[error("engine init: {0}")]
     Engine(#[from] jammi_db::error::JammiError),
     #[error("metrics registry: {0}")]
@@ -137,6 +142,7 @@ pub struct OssServer {
     session_store: SessionStore,
     metrics: Arc<MetricsRegistry>,
     readiness: Arc<ReadinessProbe>,
+    tiers: TierSet,
 }
 
 impl OssServer {
@@ -154,6 +160,11 @@ impl OssServer {
         let flight_addr: SocketAddr = config.server.flight_listen.parse()?;
         let health_addr: SocketAddr = config.server.health_listen.parse()?;
 
+        // Resolve the mounted tier set before constructing the engine: a config
+        // that names an unknown tier or one whose feature is compiled out is a
+        // startup error, not a silent degrade.
+        let tiers = TierSet::from_config(&config.server.services)?;
+
         let session = Arc::new(InferenceSession::new(config).await?);
         let session_store = SessionStore::new();
         let metrics = Arc::new(MetricsRegistry::new()?);
@@ -168,6 +179,7 @@ impl OssServer {
             session_store,
             metrics,
             readiness,
+            tiers,
         })
     }
 
@@ -287,18 +299,26 @@ impl OssServer {
         &self,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), ServerError> {
-        let trigger = crate::TriggerHandles {
-            topic_repo: self.session.topic_repo(),
-            publisher: self.session.publisher(),
-            subscriber: self.session.subscriber(),
-        };
+        // The event tier (`TriggerService`) is mounted only when the deployment
+        // selected it; the handles are derived from the same engine session.
+        let trigger = self
+            .tiers
+            .contains(ServiceTier::Event)
+            .then(|| crate::TriggerHandles {
+                topic_repo: self.session.topic_repo(),
+                publisher: self.session.publisher(),
+                subscriber: self.session.subscriber(),
+            });
         serve_grpc_chain(
-            self.flight_addr,
-            self.session.context().clone(),
-            self.session.tenant_binding_arc(),
-            self.session_store.clone(),
-            Some(trigger),
-            Some(Arc::clone(&self.session)),
+            GrpcChain {
+                addr: self.flight_addr,
+                flight_ctx: self.session.context().clone(),
+                flight_binding: self.session.tenant_binding_arc(),
+                store: self.session_store.clone(),
+                trigger,
+                engine: Some(Arc::clone(&self.session)),
+                tiers: self.tiers.clone(),
+            },
             shutdown,
         )
         .await
@@ -306,41 +326,81 @@ impl OssServer {
     }
 }
 
-/// Build and run the gRPC chain (Flight SQL + SessionService +
-/// TriggerService + EmbeddingService + InferenceService + EvalService +
-/// FineTuneService + MutableTableService + ChannelService + AuditService) on
-/// `addr`, sharing the supplied `SessionStore` between every service. Trigger
-/// handles and the engine session are optional — passing `None` keeps that
-/// surface unmounted, which is what the gRPC-Web and `JammiSession`-only
-/// fixtures need (the engine-backed services operate at the `InferenceSession`
-/// layer those fixtures don't construct).
+/// Everything [`serve_grpc_chain`] needs to mount the Tonic chain: the bind
+/// address, the Flight SQL context + tenant binding, the shared session store,
+/// the optional trigger handles and engine session, and the resolved tier set.
 ///
-/// The `engine` session backs all of the engine-layer services
-/// (`EmbeddingService`, `InferenceService`, `EvalService`, `FineTuneService`,
-/// `MutableTableService`, `ChannelService`, `AuditService`); they share one
-/// `Arc<InferenceSession>` and each wraps it in a per-call `LocalSession`.
+/// Grouped into one options object (rather than a long positional argument list)
+/// so callers name what they pass and the mount surface has one place to grow.
+/// `OssServer` builds this from the engine session; test fixtures construct it
+/// directly.
+pub struct GrpcChain {
+    /// Bind address for the combined gRPC + Flight SQL surface.
+    pub addr: SocketAddr,
+    /// Flight SQL session context.
+    pub flight_ctx: SessionContext,
+    /// Tenant binding the Flight SQL provider mutates per request.
+    pub flight_binding: jammi_db::tenant_scope::TenantBinding,
+    /// Session store shared between every service via the tenant interceptor.
+    pub store: SessionStore,
+    /// Trigger handles — `Some` iff the event tier is mounted.
+    pub trigger: Option<crate::TriggerHandles>,
+    /// Engine session backing the engine-layer services — `None` for the
+    /// transport-only fixtures.
+    pub engine: Option<Arc<InferenceSession>>,
+    /// The tier set this chain mounts and advertises over `GetServerInfo`.
+    pub tiers: TierSet,
+}
+
+/// Build and run the gRPC chain on `chain.addr`, mounting services per the
+/// resolved [`TierSet`], and sharing the supplied `SessionStore` between every
+/// service.
 ///
-/// This is the test-fixture entry-point. Production code goes
-/// through [`OssServer::run`] which derives every component from
-/// the engine session itself. Both paths build the same Tonic
-/// chain under the hood — there is no parallel API to drift.
+/// **Always mounted** (the core tier + the Flight SQL transport): Flight SQL and
+/// `SessionService`. When `engine` is `Some`, the core engine-backed services
+/// also mount: `EmbeddingService`, `InferenceService`, `MutableTableService`,
+/// `ChannelService`, `AuditService`. These are the serve-path primitives every
+/// deployment needs.
+///
+/// **Mounted by tier** (only when `tiers` selected them):
+/// - `EvalService` ← [`ServiceTier::Eval`]
+/// - `FineTuneService` ← [`ServiceTier::Train`] (and only when the `train`
+///   feature is compiled in — the mount code itself is `#[cfg]`-gated)
+/// - `TriggerService` ← [`ServiceTier::Event`], driven by `trigger` being
+///   `Some` (the caller derives the handles iff the event tier is mounted)
+///
+/// `engine` and `trigger` are `Option` so the gRPC-Web / `SessionService`-only
+/// fixtures (which construct no `InferenceSession`) can mount just the
+/// transport + core handshake. The `tiers` argument is what the
+/// `SessionService.GetServerInfo` handshake advertises, so it must agree with
+/// what is actually mounted — the caller is responsible for that agreement
+/// (production goes through [`OssServer`], which derives both from one config).
+///
+/// This is also the test-fixture entry-point. Both paths build the same Tonic
+/// chain — there is no parallel API to drift.
 pub async fn serve_grpc_chain(
-    addr: SocketAddr,
-    flight_ctx: SessionContext,
-    flight_binding: jammi_db::tenant_scope::TenantBinding,
-    store: SessionStore,
-    trigger: Option<crate::TriggerHandles>,
-    engine: Option<Arc<InferenceSession>>,
+    chain: GrpcChain,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
+    let GrpcChain {
+        addr,
+        flight_ctx,
+        flight_binding,
+        store,
+        trigger,
+        engine,
+        tiers,
+    } = chain;
     let interceptor = TenantInterceptor::new(store.clone());
 
     let provider = TenantBoundProvider::new(flight_ctx.state(), flight_binding, store.clone());
     let flight = FlightSqlService::new_with_provider(Box::new(provider));
     let flight_svc = FlightServiceServer::new(flight);
 
-    let session_svc =
-        SessionServiceServer::with_interceptor(SessionServer::new(store), interceptor.clone());
+    let session_svc = SessionServiceServer::with_interceptor(
+        SessionServer::new(store, tiers.clone()),
+        interceptor.clone(),
+    );
 
     // Layer order matters. `GrpcWebTrailersLayer` is added first, so in the
     // tower `ServiceBuilder` stack it wraps `GrpcWebLayer` and post-processes
@@ -359,6 +419,9 @@ pub async fn serve_grpc_chain(
         .add_service(session_svc);
 
     let mut mounted = vec!["Flight SQL", "SessionService"];
+
+    // Event tier: TriggerService. Driven by the caller having supplied handles
+    // (it does so iff the event tier is mounted).
     if let Some(handles) = trigger {
         let trigger_svc = TriggerServiceServer::with_interceptor(
             TriggerServer::new(handles.topic_repo, handles.publisher, handles.subscriber),
@@ -369,6 +432,7 @@ pub async fn serve_grpc_chain(
     }
 
     if let Some(session) = engine {
+        // Core tier engine services: always mounted when an engine is present.
         let embedding_svc = EmbeddingServiceServer::with_interceptor(
             EmbeddingServer::new(Arc::clone(&session)),
             interceptor.clone(),
@@ -382,20 +446,6 @@ pub async fn serve_grpc_chain(
         );
         builder = builder.add_service(inference_svc);
         mounted.push("InferenceService");
-
-        let eval_svc = EvalServiceServer::with_interceptor(
-            EvalServer::new(Arc::clone(&session)),
-            interceptor.clone(),
-        );
-        builder = builder.add_service(eval_svc);
-        mounted.push("EvalService");
-
-        let fine_tune_svc = FineTuneServiceServer::with_interceptor(
-            FineTuneServer::new(Arc::clone(&session)),
-            interceptor.clone(),
-        );
-        builder = builder.add_service(fine_tune_svc);
-        mounted.push("FineTuneService");
 
         let mutable_svc = MutableTableServiceServer::with_interceptor(
             MutableTableServer::new(Arc::clone(&session)),
@@ -411,10 +461,34 @@ pub async fn serve_grpc_chain(
         builder = builder.add_service(channel_svc);
         mounted.push("ChannelService");
 
-        let audit_svc =
-            AuditServiceServer::with_interceptor(AuditServer::new(session), interceptor);
+        let audit_svc = AuditServiceServer::with_interceptor(
+            AuditServer::new(Arc::clone(&session)),
+            interceptor.clone(),
+        );
         builder = builder.add_service(audit_svc);
         mounted.push("AuditService");
+
+        // Eval tier: EvalService.
+        if tiers.contains(ServiceTier::Eval) {
+            let eval_svc = EvalServiceServer::with_interceptor(
+                EvalServer::new(Arc::clone(&session)),
+                interceptor.clone(),
+            );
+            builder = builder.add_service(eval_svc);
+            mounted.push("EvalService");
+        }
+
+        // Train tier: FineTuneService. The mount code is `#[cfg]`-gated on the
+        // `train` feature, so a serve-only build carries no training surface;
+        // `TierSet::resolve` has already guaranteed the tier is not requested
+        // when the feature is compiled out.
+        #[cfg(feature = "train")]
+        if tiers.contains(ServiceTier::Train) {
+            let fine_tune_svc =
+                FineTuneServiceServer::with_interceptor(FineTuneServer::new(session), interceptor);
+            builder = builder.add_service(fine_tune_svc);
+            mounted.push("FineTuneService");
+        }
     }
 
     tracing::info!("gRPC chain ({}) listening on {addr}", mounted.join(" + "));

@@ -83,6 +83,52 @@ preload_models = [
 ]
 ```
 
+## Service tiers
+
+One server binary scales to many deployment shapes by mounting only the gRPC
+service tiers a deployment needs — no per-shape rebuild. The **core** tier is
+always mounted: `SessionService` (tenant binding + the `GetServerInfo`
+handshake), `EmbeddingService`, `InferenceService`, `MutableTableService`,
+`ChannelService`, `AuditService`, and the Flight SQL surface. Three optional
+tiers are runtime-selectable via `[server] services`:
+
+| Tier | Service | Role |
+|---|---|---|
+| `train` | `FineTuneService` | model training |
+| `event` | `TriggerService` | topic / publish / subscribe streams |
+| `eval`  | `EvalService` | per-query evaluation arrays |
+
+```toml
+[server]
+services = "all"             # all-in-one: every tier compiled in (the default)
+# services = ["event"]       # serve + event box
+# services = ["train"]       # serve + training box
+# services = []              # serve-only: core tier only
+```
+
+A deployment advertises exactly the tiers it mounted over the wire, so a client
+can negotiate capability before calling a verb:
+
+```python
+info = db.get_server_info()
+# {"version": "...", "features": [...], "storage_backends": [...],
+#  "services": ["core", "eval", "event", "train"]}
+if "train" in info["services"]:
+    db.fine_tune(...)
+```
+
+Reaching a verb whose tier was **not** mounted returns a truthful `Unimplemented`
+("not enabled on this deployment") rather than a misleading success — the
+service-mount analog of the client's build-by-capability `connect(target)`.
+
+**Runtime config vs. compile features.** The `train` tier additionally requires
+the `train` compile feature (on by default). A `--no-default-features`
+serve-only build carries no training surface at all; requesting `train` in
+config on such a build is a startup error, not a silent drop. The `event` and
+`eval` tiers always compile and are gated at runtime only. Override the
+selection with `JAMMI_SERVER__SERVICES` (`all`, or a comma-separated token
+list — empty for serve-only).
+
 ## GPU configuration
 
 For GPU-accelerated inference in production:

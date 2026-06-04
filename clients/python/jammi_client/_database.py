@@ -186,7 +186,15 @@ class RemoteDatabase:
 
     def get_server_info(self) -> Dict[str, Any]:
         """The engine's capabilities handshake: ``version`` / ``features`` /
-        ``storage_backends``. Maps to `SessionService.GetServerInfo`.
+        ``storage_backends`` / ``services``. Maps to
+        `SessionService.GetServerInfo`.
+
+        The first three fields are compile-time facts about the build;
+        ``services`` is the runtime tier handshake — the gRPC service tiers this
+        deployment mounted (``"core"`` is always present; ``"train"`` /
+        ``"event"`` / ``"eval"`` appear only when this server enabled them). A
+        client reads ``services`` to know which verbs are reachable here before
+        calling them.
 
         The same keys the embedded `Database.get_server_info` returns, so the
         handshake shape agrees across transports.
@@ -196,6 +204,7 @@ class RemoteDatabase:
             "version": resp.version,
             "features": list(resp.features),
             "storage_backends": list(resp.storage_backends),
+            "services": list(resp.services),
         }
 
     # --- Sources -----------------------------------------------------------------

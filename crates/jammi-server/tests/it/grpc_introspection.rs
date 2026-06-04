@@ -179,12 +179,22 @@ async fn remote_server_info_like_local() {
     let remote_info = remote.server_info().await.expect("remote server_info");
     let local_info = local.server_info().await.expect("local server_info");
 
+    // The compile-time facts (version / features / storage_backends) are the
+    // same through either transport — they describe the build, not the
+    // deployment.
     assert_eq!(
-        remote_info, local_info,
-        "server_info is the same through either transport"
+        (
+            &remote_info.version,
+            &remote_info.features,
+            &remote_info.storage_backends
+        ),
+        (
+            &local_info.version,
+            &local_info.features,
+            &local_info.storage_backends
+        ),
+        "the compile-time self-description is identical across transports"
     );
-    // It is the build's own self-description.
-    assert_eq!(local_info, ServerInfo::current());
     assert!(!local_info.version.is_empty(), "version is reported");
     // file + memory are always-present backends, regardless of feature set.
     assert!(local_info.storage_backends.contains(&"file".to_string()));
@@ -194,6 +204,35 @@ async fn remote_server_info_like_local() {
     sorted.sort();
     sorted.dedup();
     assert_eq!(local_info.storage_backends, sorted);
+
+    // `services` is the runtime tier handshake and legitimately differs by
+    // transport: the in-process `LocalSession` mounts no gRPC services, so it
+    // reports an empty set and equals the engine's compile-time self-description
+    // (which leaves `services` empty); the remote server reports the tiers it
+    // actually mounted. `start_engine_server` mounts the engine core + the
+    // engine-backed optional tiers (eval, and train when compiled) but no
+    // trigger, so `event` is absent while `core`/`eval` are present.
+    assert_eq!(
+        local_info,
+        ServerInfo::current(),
+        "the local session's self-description carries no mounted services"
+    );
+    assert!(
+        local_info.services.is_empty(),
+        "in-process: no gRPC services"
+    );
+    assert!(
+        remote_info.services.contains(&"core".to_string()),
+        "remote always mounts the core tier"
+    );
+    assert!(
+        remote_info.services.contains(&"eval".to_string()),
+        "this engine fixture mounts the eval tier"
+    );
+    assert!(
+        !remote_info.services.contains(&"event".to_string()),
+        "this fixture mounts no trigger, so the event tier is absent"
+    );
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;

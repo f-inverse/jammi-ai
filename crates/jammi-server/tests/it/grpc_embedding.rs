@@ -133,12 +133,15 @@ async fn start_embedding_server() -> (
     let binding = session.tenant_binding_arc();
     let handle = tokio::spawn(async move {
         jammi_server::runtime::serve_grpc_chain(
-            addr,
-            flight_ctx,
-            binding,
-            store,
-            None,
-            Some(session),
+            jammi_server::runtime::GrpcChain {
+                addr,
+                flight_ctx,
+                flight_binding: binding,
+                store,
+                trigger: None,
+                engine: Some(session),
+                tiers: jammi_server::tiers::TierSet::all_compiled(),
+            },
             async move {
                 let _ = shutdown_rx.await;
             },

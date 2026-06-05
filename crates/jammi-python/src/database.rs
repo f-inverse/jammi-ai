@@ -850,6 +850,112 @@ impl PyDatabase {
             .map_err(to_pyerr)?;
         Ok(())
     }
+
+    /// Conformalize a classification predictor into prediction sets.
+    ///
+    /// Split (inductive) conformal: `calibration` holds one row of per-class
+    /// probabilities per held-out example and `true_labels[i]` is the realised
+    /// class for row `i`; the calibration scores yield the finite-sample
+    /// `⌈(n+1)(1-alpha)⌉` quantile, which is applied to every row of `test` to
+    /// emit a prediction set with marginal coverage `>= 1 - alpha`.
+    ///
+    /// `score` selects the nonconformity family: `"lac"`, `"aps"` (default), or
+    /// `"raps"` (regularized APS, parameterized by `raps_lambda` and the 1-based
+    /// `raps_k_reg`). The calibration set must be disjoint from both the
+    /// training set and `test` — reusing test points inflates coverage. Pure and
+    /// deterministic: identical inputs yield identical sets.
+    ///
+    /// Returns one list of admitted class indices per row of `test`.
+    #[pyo3(signature = (calibration, true_labels, test, *, alpha, score=None, raps_lambda=0.0, raps_k_reg=1))]
+    fn conformalize(
+        &self,
+        calibration: Vec<Vec<f64>>,
+        true_labels: Vec<usize>,
+        test: Vec<Vec<f64>>,
+        alpha: f64,
+        score: Option<&str>,
+        raps_lambda: f64,
+        raps_k_reg: usize,
+    ) -> PyResult<Vec<Vec<usize>>> {
+        let score = parse_class_score(score.unwrap_or("aps"), raps_lambda, raps_k_reg)?;
+        let model =
+            jammi_ai::predict::ConformalModel::classification(&calibration, &true_labels, score, alpha)
+                .map_err(to_pyerr)?;
+        test.iter()
+            .map(|row| model.predict_set(row, None).map_err(to_pyerr))
+            .collect()
+    }
+
+    /// Conformalize an absolute-residual regression predictor into
+    /// constant-width prediction intervals.
+    ///
+    /// The calibration nonconformity is `|y - ŷ|` over the `predictions`/
+    /// `observed` held-out pairs; the finite-sample quantile `q̂` then yields
+    /// `[ŷ - q̂, ŷ + q̂]` around each `test_predictions` point, with marginal
+    /// coverage `>= 1 - alpha`. The calibration set must be disjoint from the
+    /// training set and the test points.
+    ///
+    /// Returns one `(lower, upper)` tuple per test row.
+    #[pyo3(signature = (predictions, observed, test_predictions, *, alpha))]
+    fn conformalize_interval(
+        &self,
+        predictions: Vec<f64>,
+        observed: Vec<f64>,
+        test_predictions: Vec<f64>,
+        alpha: f64,
+    ) -> PyResult<Vec<(f64, f64)>> {
+        use jammi_ai::predict::{ConformalModel, IntervalScore};
+        let model = ConformalModel::regression(
+            &predictions,
+            &[],
+            &[],
+            &observed,
+            IntervalScore::AbsoluteResidual,
+            alpha,
+        )
+        .map_err(to_pyerr)?;
+        test_predictions
+            .iter()
+            .map(|&p| model.predict_interval(p, 0.0, 0.0, None).map_err(to_pyerr))
+            .collect()
+    }
+
+    /// Conformalize a Conformalized Quantile Regression (CQR) predictor into
+    /// adaptive-width prediction intervals.
+    ///
+    /// The calibration nonconformity is `max(q_lo - y, y - q_hi)` over the
+    /// `lower`/`upper` quantile estimates and `observed` targets; the
+    /// finite-sample quantile `q̂` then yields `[q_lo - q̂, q_hi + q̂]` around
+    /// each `test_lower`/`test_upper` band, so interval width tracks the
+    /// predictor's local uncertainty. The calibration set must be disjoint from
+    /// the training set and the test points.
+    ///
+    /// Returns one `(lower, upper)` tuple per test row.
+    #[pyo3(signature = (lower, upper, observed, test_lower, test_upper, *, alpha))]
+    fn conformalize_cqr(
+        &self,
+        lower: Vec<f64>,
+        upper: Vec<f64>,
+        observed: Vec<f64>,
+        test_lower: Vec<f64>,
+        test_upper: Vec<f64>,
+        alpha: f64,
+    ) -> PyResult<Vec<(f64, f64)>> {
+        use jammi_ai::predict::{ConformalModel, IntervalScore};
+        if test_lower.len() != test_upper.len() {
+            return Err(PyValueError::new_err(
+                "cqr conformal: 'test_lower' and 'test_upper' must have equal length",
+            ));
+        }
+        let model =
+            ConformalModel::regression(&[], &lower, &upper, &observed, IntervalScore::Cqr, alpha)
+                .map_err(to_pyerr)?;
+        test_lower
+            .iter()
+            .zip(test_upper.iter())
+            .map(|(&l, &u)| model.predict_interval(0.0, l, u, None).map_err(to_pyerr))
+            .collect()
+    }
 }
 
 /// Argument shim for every Python-facing `modality=` parameter: the snake-case
@@ -907,6 +1013,28 @@ fn parse_file_format(s: &str) -> PyResult<FileFormat> {
 
 fn parse_eval_task(s: &str) -> PyResult<jammi_ai::eval::EvalTask> {
     s.parse().map_err(to_pyerr)
+}
+
+/// Parse a classification conformal score family from its snake-case name.
+/// `"raps"` carries the regularization parameters; `"lac"` and `"aps"` ignore
+/// them.
+fn parse_class_score(
+    score: &str,
+    raps_lambda: f64,
+    raps_k_reg: usize,
+) -> PyResult<jammi_ai::predict::ClassScore> {
+    use jammi_ai::predict::ClassScore;
+    match score {
+        "lac" => Ok(ClassScore::Lac),
+        "aps" => Ok(ClassScore::Aps),
+        "raps" => Ok(ClassScore::Raps {
+            lambda: raps_lambda,
+            k_reg: raps_k_reg,
+        }),
+        other => Err(PyValueError::new_err(format!(
+            "unknown classification conformal score '{other}', expected 'lac', 'aps', or 'raps'"
+        ))),
+    }
 }
 
 fn parse_channel_columns(

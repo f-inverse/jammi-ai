@@ -19,6 +19,7 @@
 - [Search Text Against Images (Cross-Modal)](./cross-modal-search.md)
 - [Classify Text](./classify-text.md)
 - [Extract Entities (NER)](./extract-entities.md)
+- [Conformal Prediction (Distribution-Free Coverage)](./conformal-prediction.md)
 - [Semantic Search](./semantic-search.md)
 - [Enrich Results with Joins and Annotations](./enrich-results.md)
 - [Compound Retrieval and Inference over Flight SQL](./remote-compound-query.md)

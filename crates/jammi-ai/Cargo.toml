@@ -77,6 +77,9 @@ parquet.workspace = true
 wiremock = "0.6"
 serial_test = "3"
 jammi-test-utils.workspace = true
+# Synthetic exchangeable data generators for the conformal coverage tests.
+rand.workspace = true
+rand_distr.workspace = true
 
 [features]
 default = ["local"]

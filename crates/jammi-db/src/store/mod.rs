@@ -17,6 +17,7 @@ use crate::error::{JammiError, Result};
 use crate::index::sidecar::SidecarIndex;
 use crate::index::VectorIndex;
 use crate::model_task::ModelTask;
+use crate::storage::sidecar_layout::SidecarKind;
 use crate::storage::{
     self, JammiObjectStore, ObjectParquetWriter, Scheme, StorageRegistry, StorageUrl,
 };
@@ -244,7 +245,7 @@ impl ResultStore {
                 if let Some(ref idx) = table.index_path {
                     let idx_url = StorageUrl::parse(idx)?;
                     let idx_handle = self.open_index(&idx_url)?;
-                    storage::sidecar_layout::delete_sidecar(&idx_handle)
+                    storage::sidecar_layout::delete_sidecar(&idx_handle, SidecarKind::Ann)
                         .await
                         .ok();
                 }
@@ -382,7 +383,7 @@ impl ResultStore {
         if let Some(idx) = index_path {
             let idx_url = StorageUrl::parse(idx)?;
             let idx_handle = self.open_index(&idx_url)?;
-            storage::sidecar_layout::delete_sidecar(&idx_handle).await?;
+            storage::sidecar_layout::delete_sidecar(&idx_handle, SidecarKind::Ann).await?;
         }
         Ok(())
     }

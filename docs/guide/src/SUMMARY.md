@@ -20,6 +20,7 @@
 - [Classify Text](./classify-text.md)
 - [Extract Entities (NER)](./extract-entities.md)
 - [Semantic Search](./semantic-search.md)
+- [Assemble a Context Set for Conditioned Prediction](./assemble-context.md)
 - [Enrich Results with Joins and Annotations](./enrich-results.md)
 - [Compound Retrieval and Inference over Flight SQL](./remote-compound-query.md)
 - [Declare a Custom Provenance Channel](./declare-provenance-channel.md)

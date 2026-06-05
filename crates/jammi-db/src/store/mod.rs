@@ -442,6 +442,125 @@ impl ResultStore {
         }
         Ok(())
     }
+
+    /// Materialise pre-pooled per-key vectors into a normal embedding-shaped
+    /// result table — the `(_row_id, _source_id, _model_id, vector)` Parquet
+    /// plus the sidecar ANN index every embedding table carries.
+    ///
+    /// The table this writes is indistinguishable from one
+    /// [`crate::store::ResultStore::create_table`] produces for an embedding
+    /// task: an embedding [`ModelTask`], a dimensioned `vector` column, and a
+    /// sidecar index built from those vectors. Callers that pool a retrieval into
+    /// a per-target context vector (S16) land it here so the result is
+    /// searchable and joinable like any other embedding table. `model_id` is the
+    /// pooling provenance (e.g. the context-set encoder), not a foundation model.
+    pub async fn materialize_embedding_table(
+        &self,
+        ctx: &SessionContext,
+        source_id: &str,
+        model_id: &str,
+        rows: &[(String, Vec<f32>)],
+        dimensions: usize,
+    ) -> Result<ResultTableRecord> {
+        // A normal embedding result table (S9 vocabulary: kind='model'); the
+        // task is the embedding task that drives the sidecar-index sidecar URL.
+        let table_info = self
+            .create_table(
+                source_id,
+                ModelTask::TextEmbedding,
+                model_id,
+                Some(dimensions as i32),
+                Some("_row_id"),
+                None,
+            )
+            .await?;
+
+        let schema = crate::store::schema::embedding_table_schema(dimensions);
+        let batch = embedding_batch(&schema, source_id, model_id, rows, dimensions)?;
+
+        let mut writer = self.open_writer(&table_info.parquet_url, schema).await?;
+        let mut index = SidecarIndex::new(dimensions)?;
+        if !rows.is_empty() {
+            writer.write_batch(&batch).await?;
+            for (key, vector) in rows {
+                index.add(key, vector)?;
+            }
+        }
+        let row_count = writer.close().await?;
+
+        if index.len() > 0 {
+            index.build()?;
+            if let Some(ref index_url) = table_info.index_url {
+                self.save_sidecar(index_url, &index).await?;
+            }
+        }
+
+        self.finalize(
+            ctx,
+            &table_info.table_name,
+            &table_info.parquet_url,
+            row_count,
+        )
+        .await?;
+
+        self.catalog
+            .get_result_table(&table_info.table_name)
+            .await?
+            .ok_or_else(|| {
+                JammiError::Catalog(format!(
+                    "Result table '{}' not found after materialisation",
+                    table_info.table_name
+                ))
+            })
+    }
+}
+
+/// Build the `(_row_id, _source_id, _model_id, vector)` batch for a
+/// materialised embedding table from per-key vectors.
+fn embedding_batch(
+    schema: &arrow::datatypes::SchemaRef,
+    source_id: &str,
+    model_id: &str,
+    rows: &[(String, Vec<f32>)],
+    dimensions: usize,
+) -> Result<arrow::array::RecordBatch> {
+    use arrow::array::{FixedSizeListArray, Float32Array, StringArray};
+    use arrow::datatypes::{DataType, Field};
+
+    for (key, vector) in rows {
+        if vector.len() != dimensions {
+            return Err(JammiError::Schema {
+                table: model_id.to_string(),
+                column: "vector".into(),
+                expected: format!("FixedSizeList<Float32> width {dimensions}"),
+                actual: format!("row '{key}' has width {}", vector.len()),
+            });
+        }
+    }
+
+    let row_ids = StringArray::from_iter_values(rows.iter().map(|(k, _)| k.as_str()));
+    let source_ids = StringArray::from_iter_values(rows.iter().map(|_| source_id));
+    let model_ids = StringArray::from_iter_values(rows.iter().map(|_| model_id));
+    let flat: Vec<f32> = rows.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    let vectors = FixedSizeListArray::try_new(
+        item,
+        dimensions as i32,
+        Arc::new(Float32Array::from(flat)),
+        None,
+    )
+    .map_err(|e| JammiError::Other(format!("materialize: build vector column: {e}")))?;
+
+    arrow::array::RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![
+            Arc::new(row_ids),
+            Arc::new(source_ids),
+            Arc::new(model_ids),
+            Arc::new(vectors),
+        ],
+    )
+    .map_err(|e| JammiError::Other(format!("materialize: build batch: {e}")))
 }
 
 /// Register a Parquet URL as a DataFusion table under `jammi.{name}`.

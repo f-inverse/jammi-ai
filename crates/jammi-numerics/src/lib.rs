@@ -22,6 +22,7 @@
 //! (`jammi-db`, `jammi-ai`, and any downstream layers) depend on this crate,
 //! never the reverse.
 
+pub mod calibration;
 pub mod classification;
 pub mod distance;
 pub mod divergence;

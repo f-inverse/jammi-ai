@@ -17,9 +17,10 @@ use crate::storage::{self, JammiObjectStore};
 /// is folded into the error so the caller does not need to wrap.
 ///
 /// Hidden invariant: this helper is the only place in the engine that should
-/// downcast a vector column to `FixedSizeListArray<Float32>`. Both the
-/// brute-force ANN scan and the typed-read API call through here.
-pub(crate) fn extend_with_fixed_size_list_f32(
+/// downcast a vector column to `FixedSizeListArray<Float32>`. The brute-force
+/// ANN scan, the typed-read API, and the neighbor-graph node reader all call
+/// through here rather than re-implementing the downcast.
+pub fn extend_with_fixed_size_list_f32(
     batch: &RecordBatch,
     table: &str,
     column: &str,

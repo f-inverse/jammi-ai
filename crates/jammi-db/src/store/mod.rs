@@ -8,9 +8,10 @@ use std::sync::Arc;
 use arrow::array::Array;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::prelude::SessionContext;
+use datafusion::sql::TableReference;
 use tracing::warn;
 
-use crate::catalog::result_repo::{CreateResultTableParams, ResultTableRecord};
+use crate::catalog::result_repo::{CreateResultTableParams, ResultTableKind, ResultTableRecord};
 use crate::catalog::status::ResultTableStatus;
 use crate::catalog::Catalog;
 use crate::error::{JammiError, Result};
@@ -130,10 +131,19 @@ impl ResultStore {
 
     /// Generate URLs and register a new result table in the catalog with
     /// status = 'building'.
+    ///
+    /// `kind` discriminates a direct model output from a derivation of another
+    /// result table (e.g. a neighbor-graph edge relation); `derived_from` names
+    /// the source result table a derivation was computed from (`None` for a
+    /// `Model` table). A non-`Model` table gets `index_url = None` — no sidecar
+    /// index is built for it — regardless of its `task`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_table(
         &self,
         source_id: &str,
         task: ModelTask,
+        kind: ResultTableKind,
+        derived_from: Option<&str>,
         model_id: &str,
         dimensions: Option<i32>,
         key_column: Option<&str>,
@@ -149,7 +159,11 @@ impl ResultStore {
         let table_name = format!("{source_id}__{task_str}__{sanitized}__{timestamp}_{suffix}");
 
         let parquet_url = self.derive_url(&format!("{table_name}.parquet"))?;
-        let index_url = if task.is_embedding() {
+        // A sidecar index exists only for a model embedding table. A derived
+        // table (a neighbor-graph edge relation) is searched as a plain
+        // relation, never through an ANN sidecar — it maps to
+        // `SidecarKind::None` at the storage layer.
+        let index_url = if matches!(kind, ResultTableKind::Model) && task.is_embedding() {
             // Index base path has no extension — the sidecar layout helpers
             // append .usearch / .rowmap / .manifest.json.
             Some(self.derive_url(&format!("{table_name}.idx"))?)
@@ -163,6 +177,8 @@ impl ResultStore {
                 source_id,
                 model_id,
                 task,
+                kind,
+                derived_from,
                 parquet_path: parquet_url.as_str(),
                 index_path: index_url.as_ref().map(|u| u.as_str()),
                 dimensions,
@@ -454,7 +470,6 @@ pub(crate) async fn register_parquet_table(
     name: &str,
     url: &StorageUrl,
 ) -> Result<()> {
-    use datafusion::catalog::MemorySchemaProvider;
     use datafusion::datasource::file_format::options::ParquetReadOptions;
 
     // Make sure the engine's driver for this URL is the same one DataFusion
@@ -468,20 +483,20 @@ pub(crate) async fn register_parquet_table(
         ctx.runtime_env().register_object_store(&parsed, driver);
     }
 
-    // Ensure the "jammi" schema exists in the default catalog.
-    // DataFusion does not auto-create schemas for register_parquet.
-    let default_catalog_name = ctx.state().config_options().catalog.default_catalog.clone();
-    let default_catalog = ctx
-        .catalog(&default_catalog_name)
-        .ok_or_else(|| JammiError::Other("Default catalog not found".into()))?;
-    if default_catalog.schema("jammi").is_none() {
-        let _ = default_catalog.register_schema("jammi", Arc::new(MemorySchemaProvider::new()));
-    }
-
-    let table_ref = format!("jammi.{name}");
+    // Register under a single bare identifier `jammi.{name}` rather than a
+    // string DataFusion would re-parse as a multipart reference. A result
+    // table name embeds a UTC timestamp (`…T…`) and may carry characters
+    // (hyphens from a sanitized local model path) that the SQL tokenizer
+    // either rejects — falling back to a case-preserved bare literal — or
+    // splits on the dot into a lowercased `jammi` schema. That parser-routing
+    // is name-dependent and inconsistent. The query side reaches these tables
+    // through the quoted single identifier `"jammi.{name}"`, which is always a
+    // bare, case-preserved literal; matching that here makes every result
+    // table — embedding and edge alike — register and resolve identically.
+    let table_ref = TableReference::bare(format!("jammi.{name}"));
     // Validate the URL parses as a ListingTableUrl before handing to DF.
     let _ = ListingTableUrl::parse(url.as_str())?;
-    ctx.register_parquet(&table_ref, url.as_str(), ParquetReadOptions::default())
+    ctx.register_parquet(table_ref, url.as_str(), ParquetReadOptions::default())
         .await?;
     Ok(())
 }

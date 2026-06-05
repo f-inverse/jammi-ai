@@ -65,6 +65,8 @@ impl<'a> EmbeddingPipeline<'a> {
             .create_table(
                 source_id,
                 self.task,
+                jammi_db::catalog::result_repo::ResultTableKind::Model,
+                None,
                 &canonical_model_id,
                 Some(embedding_dim as i32),
                 Some(key_column),

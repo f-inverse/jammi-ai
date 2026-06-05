@@ -8,7 +8,7 @@ use jammi_db::catalog::status::EvalRunStatus;
 use jammi_db::error::{JammiError, Result};
 
 use crate::eval::report::{
-    AggregateDelta, CompareEvalReport, EmbeddingEvalReport, InferenceAggregate,
+    delta_significance, AggregateDelta, CompareEvalReport, EmbeddingEvalReport, InferenceAggregate,
     InferenceEvalReport, MetricDelta, PerQueryRecord, PerRecordPrediction, TableEvalReport,
     PER_QUERY_RECALL_KS,
 };
@@ -400,6 +400,7 @@ impl<'a> EvalRunner<'a> {
         }
 
         let baseline_agg = all_reports[0].1.aggregate.clone();
+        let baseline_per_query = all_reports[0].1.per_query.clone();
         let per_table: Vec<TableEvalReport> = all_reports
             .into_iter()
             .enumerate()
@@ -407,6 +408,9 @@ impl<'a> EvalRunner<'a> {
                 let delta = if i == 0 {
                     None
                 } else {
+                    // Significance pairs the baseline and treatment per-query
+                    // metric arrays by `query_id`; the delta numbers stay the
+                    // aggregate differences, untouched (purely additive).
                     Some(AggregateDelta {
                         recall_at_k: metric_delta(
                             baseline_agg.recall_at_k,
@@ -418,6 +422,10 @@ impl<'a> EvalRunner<'a> {
                         ),
                         mrr: metric_delta(baseline_agg.mrr, embedding_eval.aggregate.mrr),
                         ndcg: metric_delta(baseline_agg.ndcg, embedding_eval.aggregate.ndcg),
+                        significance: delta_significance(
+                            &baseline_per_query,
+                            &embedding_eval.per_query,
+                        ),
                     })
                 };
                 TableEvalReport {

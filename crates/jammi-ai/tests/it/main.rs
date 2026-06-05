@@ -2,6 +2,7 @@ mod backends;
 mod channel_contract;
 mod common;
 mod conformal;
+mod context_set;
 mod cookbook;
 mod e2e_inference;
 mod encoder_adapters;

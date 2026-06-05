@@ -23,6 +23,7 @@
 - [Semantic Search](./semantic-search.md)
 - [Build a Similarity Graph](./build-neighbor-graph.md)
 - [Hybrid Retrieval: Lexical (BM25) + Reciprocal-Rank Fusion](./hybrid-retrieval.md)
+- [Assemble a Context Set for Conditioned Prediction](./assemble-context.md)
 - [Enrich Results with Joins and Annotations](./enrich-results.md)
 - [Compound Retrieval and Inference over Flight SQL](./remote-compound-query.md)
 - [Declare a Custom Provenance Channel](./declare-provenance-channel.md)

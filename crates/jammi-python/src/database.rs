@@ -16,6 +16,7 @@ use jammi_ai::local_session::{
     LocalSession, Modality, QueryInput, SearchQuery, SearchRequest, Session,
 };
 use jammi_ai::model::{ModelSource, ModelTask};
+use jammi_ai::pipeline::context_set::{ContextRequest, SetAggregator};
 use jammi_ai::session::InferenceSession;
 use jammi_db::config::JammiConfig;
 use jammi_db::error::JammiError;
@@ -1054,6 +1055,75 @@ impl PyDatabase {
             .into_iter()
             .map(|h| (h.row_id, h.rrf_score))
             .collect())
+    }
+
+    /// Assemble and encode a target's context set: retrieve `source`'s `k`
+    /// nearest neighbours of `query`, pair them with `value_columns`, and pool
+    /// the neighbour vectors permutation-invariantly into one fixed-width
+    /// context vector — the encode-and-aggregate half of a Neural Process.
+    ///
+    /// `aggregator` selects the fixed pooling (`"mean"` / `"sum"` / `"max"`).
+    /// The leakage guards are on by default: `exclude_self=True` drops the
+    /// target's own row (pass its key as `exclude_key`), and `split` scopes the
+    /// context to a train split (a SQL predicate over the source's columns).
+    ///
+    /// Returns a dict: `context_vector` (list of floats, or `None` for an empty
+    /// context), `context_size` (count, carried separately from the vector),
+    /// `context_keys` (members in retrieval order), and `value_rows` (a
+    /// `pyarrow.Table` of the requested value columns in the same order).
+    #[pyo3(signature = (
+        source,
+        *,
+        query,
+        k,
+        value_columns = None,
+        aggregator = None,
+        exclude_self = true,
+        exclude_key = None,
+        split = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_context(
+        &self,
+        py: Python<'_>,
+        source: &str,
+        query: Vec<f32>,
+        k: usize,
+        value_columns: Option<Vec<String>>,
+        aggregator: Option<&str>,
+        exclude_self: bool,
+        exclude_key: Option<String>,
+        split: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        let aggregator = match aggregator {
+            None | Some("mean") => SetAggregator::Mean,
+            Some("sum") => SetAggregator::Sum,
+            Some("max") => SetAggregator::Max,
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "aggregator must be 'mean', 'sum', or 'max' (got '{other}')"
+                )))
+            }
+        };
+
+        let mut request = ContextRequest::new(source, query, k);
+        request.value_columns = value_columns.unwrap_or_default();
+        request.aggregator = aggregator;
+        request.exclude_self = exclude_self;
+        request.exclude_key = exclude_key;
+        request.split = split;
+
+        let context = self
+            .runtime
+            .block_on(self.session.assemble_context(&request))
+            .map_err(to_pyerr)?;
+
+        let out = PyDict::new(py);
+        out.set_item("context_vector", context.context_vector)?;
+        out.set_item("context_size", context.context_size)?;
+        out.set_item("context_keys", context.context_keys)?;
+        out.set_item("value_rows", batches_to_pyarrow(py, &context.value_rows)?)?;
+        Ok(out.unbind().into())
     }
 }
 

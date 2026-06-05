@@ -990,6 +990,27 @@ impl InferenceSession {
             .eval_compare(embedding_tables, source_id, golden_source, k)
             .await
     }
+
+    /// Evaluate whether a predictor's uncertainty is honest (spec R2).
+    ///
+    /// `golden_source` is a held-out set pairing a predictive distribution with
+    /// its realised `outcome`; `shape` selects the predictor's output family
+    /// (parametric Gaussian or ensemble) and the columns read. `cohorts` maps a
+    /// `record_id` to an opaque `{key: value}` segment map persisted alongside
+    /// that record's per-record scores, the same way `eval_embeddings` cohorts
+    /// work. Returns a report headlining a strictly proper score (CRPS) with the
+    /// PIT-calibration diagnostic, sharpness, coverage, and per-cohort slices.
+    pub async fn eval_calibration(
+        &self,
+        source_id: &str,
+        golden_source: &str,
+        shape: crate::eval::EvalCalibrationShape,
+        cohorts: &std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
+    ) -> Result<crate::eval::CalibrationEvalReport> {
+        EvalRunner { session: self }
+            .eval_calibration(source_id, golden_source, shape, cohorts)
+            .await
+    }
 }
 
 /// Construct the session's [`ResultStore`], honouring `config.storage`.

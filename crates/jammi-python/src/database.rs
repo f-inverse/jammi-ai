@@ -820,6 +820,39 @@ impl PyDatabase {
         serializable_to_pydict(py, &report)
     }
 
+    /// Evaluate whether a predictor's uncertainty is honest (spec R2). Returns a
+    /// dict with `aggregate` (the proper-score headline `crps`/`nll`, the
+    /// `adaptive_ece` PIT-calibration diagnostic, `sharpness`, `coverage`),
+    /// `per_cohort` (coverage + CRPS with n + CI per cohort), and `per_record`
+    /// keys.
+    ///
+    /// `golden_source` pairs a held-out predictive distribution with its
+    /// realised `outcome`. `shape` is `"gaussian"` (columns `record_id`, `mean`,
+    /// `sd`, `outcome`) or `"sample"` (columns `record_id`, `draws` as a JSON
+    /// array per row, `outcome`). `cohorts` optionally maps a `record_id` to an
+    /// opaque `{key: value}` segment map persisted with that record's per-record
+    /// scores (read back via `db.eval_per_query(...)`).
+    #[pyo3(signature = (*, source, golden_source, shape, cohorts=None))]
+    fn eval_calibration(
+        &self,
+        py: Python<'_>,
+        source: &str,
+        golden_source: &str,
+        shape: &str,
+        cohorts: Option<HashMap<String, BTreeMap<String, String>>>,
+    ) -> PyResult<Py<PyAny>> {
+        let shape = parse_calibration_shape(shape)?;
+        let cohorts = cohorts.unwrap_or_default();
+        let report = self
+            .runtime
+            .block_on(
+                self.session
+                    .eval_calibration(source, golden_source, shape, &cohorts),
+            )
+            .map_err(to_pyerr)?;
+        serializable_to_pydict(py, &report)
+    }
+
     /// Encode a single query into an embedding vector using the given model.
     /// `modality` selects the tower (`"text"`/`"image"`/`"audio"`); `query` is a
     /// string for the text tower or raw bytes for the image/audio tower. The
@@ -946,6 +979,10 @@ fn parse_file_format(s: &str) -> PyResult<FileFormat> {
 }
 
 fn parse_eval_task(s: &str) -> PyResult<jammi_ai::eval::EvalTask> {
+    s.parse().map_err(to_pyerr)
+}
+
+fn parse_calibration_shape(s: &str) -> PyResult<jammi_ai::eval::EvalCalibrationShape> {
     s.parse().map_err(to_pyerr)
 }
 

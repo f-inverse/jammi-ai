@@ -77,6 +77,10 @@ parquet.workspace = true
 wiremock = "0.6"
 serial_test = "3"
 jammi-test-utils.workspace = true
+# Standard-normal quantiles for generating calibrated/ensemble fixtures in the
+# calibration-eval unit tests (spec R2). Test-only — the engine routes all
+# production calibration math through `jammi-numerics`, never `statrs` directly.
+statrs.workspace = true
 
 [features]
 default = ["local"]

@@ -898,15 +898,28 @@ impl TrainingLoop {
         Ok(())
     }
 
-    /// Compute loss for a training batch. Uses cosine embedding loss (CoSENT)
-    /// for contrastive pairs, triplet loss for triplets.
+    /// Compute loss for a training batch.
+    ///
+    /// Contrastive pairs `(a, b, score)` dispatch on the configured
+    /// [`EmbeddingLoss`]: CoSENT (default), AnglE, or cosine-MSE — every
+    /// pair-shaped objective. Triplets use the triplet objective. The
+    /// triplet-margin and MNRL variants are not pair-shaped: a config naming
+    /// them while feeding contrastive pairs falls back to CoSENT, the standard
+    /// pairwise default, rather than erroring on a batch/loss mismatch the
+    /// trainer can still satisfy.
     fn compute_loss(&self, batch: &super::data::TrainingBatch) -> Result<Tensor> {
         match batch {
             super::data::TrainingBatch::Contrastive {
                 embeddings_a,
                 embeddings_b,
                 scores,
-            } => self.cosent_loss(embeddings_a, embeddings_b, scores),
+            } => match self.config.embedding_loss {
+                Some(super::EmbeddingLoss::AnglE) => angle_loss(embeddings_a, embeddings_b, scores),
+                Some(super::EmbeddingLoss::CosineMse) => {
+                    cosine_mse_loss(embeddings_a, embeddings_b, scores)
+                }
+                _ => self.cosent_loss(embeddings_a, embeddings_b, scores),
+            },
             super::data::TrainingBatch::Triplet {
                 anchor,
                 positive,
@@ -1103,6 +1116,183 @@ impl TrainingLoop {
     }
 }
 
+/// Temperature scaling the per-pair similarity before the pairwise log-sum-exp
+/// ordering. `20.0` is the standard CoSENT/AnglE convention; AnglE reuses it so
+/// the two objectives are directly comparable on the same data.
+const PAIRWISE_SCALE: f64 = 20.0;
+
+/// CoSENT-style pairwise ordering loss over a per-pair similarity vector.
+///
+/// Given a per-pair similarity `sim[k]` (already scaled) and the graded target
+/// `scores[k]`, penalises every ordered pair `(i, j)` whose targets say `i`
+/// should rank below `j` (`scores[i] < scores[j]`) but whose similarities say
+/// otherwise. The loss is `log(1 + Σ exp(sim[i] − sim[j]))` over those pairs,
+/// computed as a single `log_sum_exp` with a prepended zero (the `1`) and an
+/// additive `−∞` mask on the invalid pairs.
+///
+/// Shared by CoSENT (similarity = cosine) and AnglE (similarity = angle
+/// magnitude); only the per-pair similarity differs.
+fn pairwise_ordering_loss(sim: &Tensor, scores: &Tensor) -> Result<Tensor> {
+    let n = sim
+        .dim(0)
+        .map_err(|e| JammiError::FineTune(format!("pairwise dim: {e}")))?;
+
+    // Pairwise similarity differences `sim[i] − sim[j]` as an (n, n) matrix.
+    let sim_i = sim
+        .reshape((n, 1))
+        .map_err(|e| JammiError::FineTune(format!("pairwise sim_i: {e}")))?
+        .broadcast_as((n, n))
+        .map_err(|e| JammiError::FineTune(format!("pairwise sim_i bcast: {e}")))?;
+    let sim_j = sim
+        .reshape((1, n))
+        .map_err(|e| JammiError::FineTune(format!("pairwise sim_j: {e}")))?
+        .broadcast_as((n, n))
+        .map_err(|e| JammiError::FineTune(format!("pairwise sim_j bcast: {e}")))?;
+    let diff =
+        (&sim_i - &sim_j).map_err(|e| JammiError::FineTune(format!("pairwise diff: {e}")))?;
+
+    // Valid pairs are those the targets order as `scores[i] < scores[j]`. Build
+    // an additive mask: `0` on valid pairs, a large negative elsewhere, so the
+    // invalid terms vanish under `exp` inside the log-sum-exp.
+    let score_i = scores
+        .reshape((n, 1))
+        .map_err(|e| JammiError::FineTune(format!("pairwise score_i: {e}")))?
+        .broadcast_as((n, n))
+        .map_err(|e| JammiError::FineTune(format!("pairwise score_i bcast: {e}")))?;
+    let score_j = scores
+        .reshape((1, n))
+        .map_err(|e| JammiError::FineTune(format!("pairwise score_j: {e}")))?
+        .broadcast_as((n, n))
+        .map_err(|e| JammiError::FineTune(format!("pairwise score_j bcast: {e}")))?;
+    let valid = score_i
+        .lt(&score_j)
+        .map_err(|e| JammiError::FineTune(format!("pairwise valid: {e}")))?
+        .to_dtype(diff.dtype())
+        .map_err(|e| JammiError::FineTune(format!("pairwise valid dtype: {e}")))?;
+    // `(valid − 1) · 1e12` is `0` where valid, `−1e12` where not.
+    let mask = ((&valid - 1.0)
+        .map_err(|e| JammiError::FineTune(format!("pairwise mask sub: {e}")))?
+        * 1e12)
+        .map_err(|e| JammiError::FineTune(format!("pairwise mask scale: {e}")))?;
+    let masked = (&diff + &mask)
+        .map_err(|e| JammiError::FineTune(format!("pairwise masked: {e}")))?
+        .flatten_all()
+        .map_err(|e| JammiError::FineTune(format!("pairwise flatten: {e}")))?;
+
+    // Prepend a zero — the `1` inside `log(1 + Σ exp(·))` — then log-sum-exp the
+    // whole vector. With no valid pair, every entry is `≈ −∞` except the zero,
+    // so the loss is `log(1) = 0`.
+    let zero = Tensor::zeros(1, masked.dtype(), masked.device())
+        .map_err(|e| JammiError::FineTune(format!("pairwise zero: {e}")))?;
+    let stacked = Tensor::cat(&[&zero, &masked], 0)
+        .map_err(|e| JammiError::FineTune(format!("pairwise cat: {e}")))?;
+    stacked
+        .log_sum_exp(0)
+        .map_err(|e| JammiError::FineTune(format!("pairwise logsumexp: {e}")))
+}
+
+/// AnglE loss: optimise the angle difference between paired embeddings in
+/// complex space, applied through the CoSENT pairwise ordering.
+///
+/// Each embedding is split into real/imaginary halves. The complex quotient
+/// `z_a / z_b` has an imaginary component proportional to `sin(Δθ)` of the
+/// angle between the two complex vectors; its magnitude is the angle signal
+/// AnglE optimises. Crucially this signal does **not** saturate as the cosine
+/// similarity approaches ±1 — where a cosine objective's gradient vanishes,
+/// the angle gradient stays informative, which is the whole point of AnglE.
+///
+/// The per-pair angle magnitude is scaled by [`PAIRWISE_SCALE`] and fed to the
+/// same pairwise log-sum-exp ordering as CoSENT.
+fn angle_loss(emb_a: &Tensor, emb_b: &Tensor, scores: &Tensor) -> Result<Tensor> {
+    let (a_re, a_im) = split_complex(emb_a)?;
+    let (b_re, b_im) = split_complex(emb_b)?;
+
+    // Treat the two halves as complex vectors z_a, z_b and form the per-pair
+    // quotient z_a / z_b summed over the embedding dimension. With
+    // numerator = z_a · conj(z_b) and denominator = |z_b|²:
+    //   Re = Σ(a_re·b_re + a_im·b_im),  Im = Σ(a_im·b_re − a_re·b_im).
+    let num_re = ((&a_re * &b_re).map_err(|e| JammiError::FineTune(format!("angle re1: {e}")))?
+        + (&a_im * &b_im).map_err(|e| JammiError::FineTune(format!("angle re2: {e}")))?)
+    .map_err(|e| JammiError::FineTune(format!("angle re: {e}")))?
+    .sum(1)
+    .map_err(|e| JammiError::FineTune(format!("angle re sum: {e}")))?;
+    let num_im = ((&a_im * &b_re).map_err(|e| JammiError::FineTune(format!("angle im1: {e}")))?
+        - (&a_re * &b_im).map_err(|e| JammiError::FineTune(format!("angle im2: {e}")))?)
+    .map_err(|e| JammiError::FineTune(format!("angle im: {e}")))?
+    .sum(1)
+    .map_err(|e| JammiError::FineTune(format!("angle im sum: {e}")))?;
+
+    // Normalise the quotient to unit magnitude: with |z_a/z_b| = 1, its
+    // imaginary part is exactly sin(Δθ) of the angle between the vectors. That
+    // |sin(Δθ)| is the angle signal — and unlike cosine it does not flatten as
+    // the vectors align (the cosine objective's vanishing-gradient zone), since
+    // d|sin(Δθ)|/dθ = |cos(Δθ)| stays away from zero there. `num_re` is the
+    // partner component that defines the magnitude, so it is part of the graph.
+    let mag = ((&num_re
+        .sqr()
+        .map_err(|e| JammiError::FineTune(format!("angle re sqr: {e}")))?
+        + &num_im
+            .sqr()
+            .map_err(|e| JammiError::FineTune(format!("angle im sqr: {e}")))?)
+        .map_err(|e| JammiError::FineTune(format!("angle mag add: {e}")))?
+        .sqrt()
+        .map_err(|e| JammiError::FineTune(format!("angle mag sqrt: {e}")))?)
+    .clamp(1e-8, f64::MAX)
+    .map_err(|e| JammiError::FineTune(format!("angle mag clamp: {e}")))?;
+    let angle = (num_im
+        .abs()
+        .map_err(|e| JammiError::FineTune(format!("angle abs: {e}")))?
+        / &mag)
+        .map_err(|e| JammiError::FineTune(format!("angle div: {e}")))?;
+
+    let scaled =
+        (&angle * PAIRWISE_SCALE).map_err(|e| JammiError::FineTune(format!("angle scale: {e}")))?;
+    pairwise_ordering_loss(&scaled, scores)
+}
+
+/// Split a `[batch, hidden]` embedding into real and imaginary halves along the
+/// hidden dimension, as AnglE's complex-space representation requires. The
+/// hidden dimension must be even.
+fn split_complex(emb: &Tensor) -> Result<(Tensor, Tensor)> {
+    let hidden = emb
+        .dim(1)
+        .map_err(|e| JammiError::FineTune(format!("complex dim: {e}")))?;
+    if hidden % 2 != 0 {
+        return Err(JammiError::FineTune(format!(
+            "AnglE requires an even embedding dimension to split into real/imaginary halves, got {hidden}"
+        )));
+    }
+    let half = hidden / 2;
+    let re = emb
+        .narrow(1, 0, half)
+        .map_err(|e| JammiError::FineTune(format!("complex re: {e}")))?;
+    let im = emb
+        .narrow(1, half, half)
+        .map_err(|e| JammiError::FineTune(format!("complex im: {e}")))?;
+    Ok((re, im))
+}
+
+/// cosine-MSE loss: regress the scaled cosine similarity of each pair onto its
+/// graded target score with mean-squared error.
+///
+/// `MSE(scale · cos(a, b), score)`. The simplest objective for continuous
+/// similarity labels — distinct from CoSENT (pairwise ordering) and MNRL
+/// (ranking). Reuses [`PAIRWISE_SCALE`] so the predicted value lives on the
+/// same scale as the graded targets the other objectives consume.
+fn cosine_mse_loss(emb_a: &Tensor, emb_b: &Tensor, scores: &Tensor) -> Result<Tensor> {
+    let cos = cosine_similarity(emb_a, emb_b)?;
+    let pred = (&cos * PAIRWISE_SCALE)
+        .map_err(|e| JammiError::FineTune(format!("cosine-MSE scale: {e}")))?;
+    let target = (scores * PAIRWISE_SCALE)
+        .map_err(|e| JammiError::FineTune(format!("cosine-MSE target scale: {e}")))?;
+    let diff =
+        (&pred - &target).map_err(|e| JammiError::FineTune(format!("cosine-MSE diff: {e}")))?;
+    diff.sqr()
+        .map_err(|e| JammiError::FineTune(format!("cosine-MSE sqr: {e}")))?
+        .mean_all()
+        .map_err(|e| JammiError::FineTune(format!("cosine-MSE mean: {e}")))
+}
+
 /// Compute element-wise cosine similarity between two batches of vectors.
 fn cosine_similarity(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let dot = (a * b)
@@ -1134,4 +1324,151 @@ fn cosine_similarity(a: &Tensor, b: &Tensor) -> Result<Tensor> {
         (&norm_a * &norm_b).map_err(|e| JammiError::FineTune(format!("cos_sim denom: {e}")))?;
 
     (&dot / &denom).map_err(|e| JammiError::FineTune(format!("cos_sim div: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Var;
+
+    /// CoSENT objective expressed through the shared pieces: scaled cosine
+    /// similarity fed to the pairwise ordering. Used only to contrast its
+    /// gradient against AnglE's near cosine saturation.
+    fn cosent_reference(emb_a: &Tensor, emb_b: &Tensor, scores: &Tensor) -> Result<Tensor> {
+        let cos = cosine_similarity(emb_a, emb_b).unwrap();
+        let scaled = (&cos * PAIRWISE_SCALE).unwrap();
+        pairwise_ordering_loss(&scaled, scores)
+    }
+
+    /// L2 norm of a gradient tensor as an f64 scalar.
+    fn grad_norm(g: &Tensor) -> f64 {
+        let sq: f32 = g.sqr().unwrap().sum_all().unwrap().to_scalar().unwrap();
+        (sq as f64).sqrt()
+    }
+
+    /// Near cosine saturation — pairs whose embeddings are almost aligned, so
+    /// every cosine similarity sits at ≈1 — CoSENT's gradient w.r.t. the
+    /// embeddings collapses (the cosine surface is flat there), while AnglE's
+    /// angle objective keeps a meaningful gradient. This is the entire reason
+    /// AnglE exists, and the contract this test pins.
+    #[test]
+    fn angle_gradient_is_non_vanishing_at_cosine_saturation() {
+        let device = Device::Cpu;
+
+        // Two pairs whose targets disagree with their (saturated) similarities,
+        // so a valid ordering pair exists and both losses are non-trivial. Each
+        // `b` is its `a` plus a tiny perturbation → cosine ≈ 1 for both pairs.
+        let a = Var::from_tensor(
+            &Tensor::new(&[[1.0f32, 0.5, -0.3, 0.8], [0.2, 0.9, 0.4, -0.1]], &device).unwrap(),
+        )
+        .unwrap();
+        let b = Tensor::new(
+            &[
+                [1.0f32 + 1e-4, 0.5, -0.3, 0.8],
+                [0.2, 0.9 + 1e-4, 0.4, -0.1],
+            ],
+            &device,
+        )
+        .unwrap();
+        // Targets order pair 0 below pair 1.
+        let scores = Tensor::new(&[0.0f32, 1.0], &device).unwrap();
+
+        let a_t: &Tensor = &a;
+
+        let cosent = cosent_reference(a_t, &b, &scores).unwrap();
+        let cosent_grad = cosent.backward().unwrap();
+        let cosent_norm = grad_norm(cosent_grad.get(a_t).unwrap());
+
+        let angle = angle_loss(a_t, &b, &scores).unwrap();
+        let angle_grad = angle.backward().unwrap();
+        let angle_norm = grad_norm(angle_grad.get(a_t).unwrap());
+
+        // CoSENT's gradient has all but vanished at saturation.
+        assert!(
+            cosent_norm < 1e-3,
+            "expected CoSENT gradient to collapse near saturation, got {cosent_norm}"
+        );
+        // AnglE keeps an informative gradient there — orders of magnitude larger.
+        assert!(
+            angle_norm > 1e-2,
+            "expected AnglE gradient to stay non-vanishing near saturation, got {angle_norm}"
+        );
+        assert!(
+            angle_norm > cosent_norm * 100.0,
+            "AnglE gradient ({angle_norm}) should dominate CoSENT's ({cosent_norm}) at saturation"
+        );
+    }
+
+    /// cosine-MSE drives the predicted cosine toward the graded target: as the
+    /// pair's cosine moves from far below the target up to it, the loss
+    /// decreases monotonically and bottoms out near zero on a match.
+    #[test]
+    fn cosine_mse_tracks_graded_targets() {
+        let device = Device::Cpu;
+        // A single pair whose target is a graded score of 1.0 (perfectly
+        // similar). Cosine of identical vectors is 1.0 → scaled prediction
+        // matches the scaled target → loss ≈ 0.
+        let aligned = Tensor::new(&[[1.0f32, 0.0, 0.0, 1.0]], &device).unwrap();
+        let target_high = Tensor::new(&[1.0f32], &device).unwrap();
+        let loss_match = cosine_mse_loss(&aligned, &aligned, &target_high)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            loss_match < 1e-4,
+            "cosine-MSE should be ~0 when cosine equals the graded target, got {loss_match}"
+        );
+
+        // Orthogonal vectors (cosine 0) against a high target → large loss.
+        let ortho = Tensor::new(&[[0.0f32, 1.0, 0.0, 0.0]], &device).unwrap();
+        let base = Tensor::new(&[[1.0f32, 0.0, 0.0, 0.0]], &device).unwrap();
+        let loss_far = cosine_mse_loss(&base, &ortho, &target_high)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            loss_far > loss_match,
+            "cosine-MSE should penalise a mismatched pair ({loss_far}) more than a matched one ({loss_match})"
+        );
+
+        // Moving cosine partway toward the target lowers the loss versus
+        // orthogonal: the objective tracks the graded score continuously.
+        let partial = Tensor::new(&[[1.0f32, 1.0, 0.0, 0.0]], &device).unwrap();
+        let loss_partial = cosine_mse_loss(&base, &partial, &target_high)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            loss_partial < loss_far,
+            "raising cosine toward the target should lower cosine-MSE: partial {loss_partial} vs far {loss_far}"
+        );
+    }
+
+    /// AnglE requires an even hidden dimension to split into real/imaginary
+    /// halves; an odd dimension is a typed error, not a panic.
+    #[test]
+    fn angle_rejects_odd_embedding_dimension() {
+        let device = Device::Cpu;
+        let odd = Tensor::new(&[[1.0f32, 0.0, 0.5]], &device).unwrap();
+        let scores = Tensor::new(&[1.0f32], &device).unwrap();
+        let err = angle_loss(&odd, &odd, &scores).unwrap_err();
+        assert!(
+            matches!(err, JammiError::FineTune(ref m) if m.contains("even embedding dimension")),
+            "expected an even-dimension error, got {err:?}"
+        );
+    }
+
+    /// The pairwise ordering loss is zero when no target pair is mis-ordered:
+    /// with a single pair (no valid `i<j` ordering), `log(1) = 0`.
+    #[test]
+    fn pairwise_ordering_loss_is_zero_without_valid_pairs() {
+        let device = Device::Cpu;
+        let sim = Tensor::new(&[5.0f32], &device).unwrap();
+        let scores = Tensor::new(&[1.0f32], &device).unwrap();
+        let loss = pairwise_ordering_loss(&sim, &scores)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(loss.abs() < 1e-6, "expected zero loss, got {loss}");
+    }
 }

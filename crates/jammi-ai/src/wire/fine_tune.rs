@@ -97,6 +97,8 @@ fn embedding_loss_from_proto(loss: pb::EmbeddingLoss) -> Result<EmbeddingLoss, S
         Some(Loss::MultipleNegativesRanking(m)) => Ok(EmbeddingLoss::MultipleNegativesRanking {
             temperature: m.temperature,
         }),
+        Some(Loss::Angle(_)) => Ok(EmbeddingLoss::AnglE),
+        Some(Loss::CosineMse(_)) => Ok(EmbeddingLoss::CosineMse),
         None => Err(Status::invalid_argument(
             "embedding_loss is set but carries no variant",
         )),
@@ -233,6 +235,8 @@ fn embedding_loss_to_proto(loss: &EmbeddingLoss) -> pb::EmbeddingLoss {
                 temperature: *temperature,
             })
         }
+        EmbeddingLoss::AnglE => Loss::Angle(pb::embedding_loss::AnglE {}),
+        EmbeddingLoss::CosineMse => Loss::CosineMse(pb::embedding_loss::CosineMse {}),
     };
     pb::EmbeddingLoss { loss: Some(inner) }
 }

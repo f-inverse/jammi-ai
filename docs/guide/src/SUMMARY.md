@@ -25,6 +25,7 @@
 - [Declare a Custom Provenance Channel](./declare-provenance-channel.md)
 - [Fine-Tune for Your Domain](./fine-tuning.md)
 - [Evaluate and Compare Models](./evaluation.md)
+- [Evaluate Uncertainty and Calibration](./calibration-eval.md)
 - [Connect to PostgreSQL / MySQL](./external-sources.md)
 - [Store Sources and Results in Cloud Object Storage](./cloud-storage.md)
 - [Register a Mutable Companion Table](./register-mutable-table.md)

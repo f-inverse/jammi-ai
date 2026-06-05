@@ -379,6 +379,78 @@ pub fn pit_values(means: &[f64], sds: &[f64], observed: &[f64]) -> Result<Vec<f6
     Ok(out)
 }
 
+/// Adaptive (equal-mass), debiased calibration error of a probabilistic
+/// regression forecast from its PIT values — the regression analogue of the
+/// classification reliability gap.
+///
+/// Under calibration the probability-integral-transform values are uniform on
+/// `[0, 1]`: the empirical CDF of the PIT lies on the diagonal. This sorts the
+/// PIT values and partitions them into `n_bins` bins of (nearly) equal
+/// occupancy — adaptive binning, which adapts to where the PIT mass lies and
+/// avoids the bin-count sensitivity of fixed-width histograms ([Kumar et al.
+/// 2019]). Within each bin the reliability gap is
+///
+/// ```text
+/// | mean_PIT_in_bin - empirical_uniform_position_of_bin |,
+/// ```
+///
+/// where the empirical uniform position is the bin's central rank fraction
+/// `(start + end) / (2 n)` — the cumulative level a calibrated (uniform) PIT
+/// would sit at. Each gap is debiased by subtracting the finite-sample expected
+/// deviation `sqrt(p (1 - p) / m)` of a calibrated bin (clamped at zero), so a
+/// genuinely calibrated forecast is not penalised for sampling noise. Bins are
+/// averaged weighted by occupancy. A calibrated forecast scores `≈ 0.0`; a
+/// systematic over- or under-dispersion bows the PIT off the diagonal and the
+/// gap grows.
+///
+/// Returns `InvalidInput` when `pit` is empty, `n_bins` is zero, or any PIT
+/// value lies outside `[0, 1]`.
+pub fn pit_calibration_error(pit: &[f64], n_bins: usize) -> Result<f64> {
+    if pit.is_empty() {
+        return Err(NumericsError::InvalidInput(
+            "pit_calibration_error requires at least one PIT value".into(),
+        ));
+    }
+    if n_bins == 0 {
+        return Err(NumericsError::InvalidInput(
+            "pit_calibration_error requires at least one bin".into(),
+        ));
+    }
+    if pit.iter().any(|&p| !(0.0..=1.0).contains(&p)) {
+        return Err(NumericsError::InvalidInput(
+            "PIT values must lie in [0, 1]".into(),
+        ));
+    }
+    let mut sorted = pit.to_vec();
+    sorted.sort_by(f64::total_cmp);
+
+    let n = sorted.len();
+    let n_f = n as f64;
+    // Cap bins at the sample size so no bin is empty.
+    let effective_bins = n_bins.min(n);
+    let mut ece = 0.0;
+    for bin in 0..effective_bins {
+        let start = bin * n / effective_bins;
+        let end = (bin + 1) * n / effective_bins;
+        let slice = &sorted[start..end];
+        let m = slice.len();
+        if m == 0 {
+            continue;
+        }
+        let m_f = m as f64;
+        let mean_pit = slice.iter().sum::<f64>() / m_f;
+        // The uniform position a calibrated PIT would occupy at this bin's
+        // centre: the mean rank fraction over the bin's indices.
+        let expected = (start as f64 + end as f64) / (2.0 * n_f);
+        let gap = (mean_pit - expected).abs();
+        // Finite-sample deviation of a calibrated bin's empirical position from
+        // its mean PIT, subtracted to debias; never push a gap below zero.
+        let bias = (mean_pit * (1.0 - mean_pit) / m_f).sqrt();
+        ece += (m_f / n_f) * (gap - bias).max(0.0);
+    }
+    Ok(ece)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,5 +651,35 @@ mod tests {
     fn pit_values_reject_nonpositive_sd() {
         assert!(pit_values(&[0.0], &[0.0], &[0.0]).is_err());
         assert!(pit_values(&[0.0], &[1.0, 1.0], &[0.0]).is_err());
+    }
+
+    #[test]
+    fn pit_calibration_error_zero_for_uniform_pit() {
+        // A perfectly uniform PIT grid lies exactly on the diagonal: zero gap.
+        let n = 1000;
+        let pit: Vec<f64> = (0..n).map(|i| (i as f64 + 0.5) / n as f64).collect();
+        let err = pit_calibration_error(&pit, 10).unwrap();
+        assert!(err < 1e-2, "uniform PIT should score near zero: {err}");
+    }
+
+    #[test]
+    fn pit_calibration_error_detects_overdispersion() {
+        // Severely overdispersed forecasts collapse the PIT toward the centre
+        // (~0.5). The first equal-mass bins then carry mean PIT well above their
+        // low expected rank position (and the last bins well below), so the
+        // adaptive, debiased gap is large.
+        let n = 1000;
+        let pit: Vec<f64> = (0..n)
+            .map(|i| 0.45 + 0.1 * (i as f64 + 0.5) / n as f64)
+            .collect();
+        let err = pit_calibration_error(&pit, 10).unwrap();
+        assert!(err > 0.1, "clustered PIT should score a large gap: {err}");
+    }
+
+    #[test]
+    fn pit_calibration_error_rejects_bad_inputs() {
+        assert!(pit_calibration_error(&[], 10).is_err());
+        assert!(pit_calibration_error(&[0.5], 0).is_err());
+        assert!(pit_calibration_error(&[1.5], 10).is_err());
     }
 }

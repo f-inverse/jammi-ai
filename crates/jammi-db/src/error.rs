@@ -77,6 +77,10 @@ pub enum JammiError {
     #[error("Evidence channel error: {0}")]
     EvidenceChannel(String),
 
+    /// Lexical (BM25 / tantivy) sidecar build, persistence, or query failure.
+    #[error("Lexical retrieval error: {0}")]
+    Lexical(String),
+
     /// Mutable companion table error.
     #[error("Mutable table error: {0}")]
     MutableTable(#[from] crate::store::mutable::MutableTableError),

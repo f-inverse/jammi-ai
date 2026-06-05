@@ -28,6 +28,9 @@ candle-core = { workspace = true, optional = true }
 candle-nn = { workspace = true, optional = true }
 hf-hub = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
+# Lexical (BM25) retrieval sidecar — the tantivy inverted index, peer of the
+# USearch ANN sidecar. Embedded-engine-only, so it rides `local`.
+tantivy = { workspace = true, optional = true }
 # Image processing
 image = { workspace = true, optional = true }
 # Audio decode/demux for the audio-embedding path (bytes-in: WAV/FLAC/MP3/Ogg)
@@ -94,6 +97,7 @@ local = [
     "dep:candle-nn",
     "dep:hf-hub",
     "dep:tokenizers",
+    "dep:tantivy",
     "dep:image",
     "dep:symphonia",
     "dep:flate2",

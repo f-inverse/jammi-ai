@@ -36,6 +36,10 @@ pub enum SidecarKind {
     /// Approximate-nearest-neighbour table: a USearch graph plus its row-id
     /// map and manifest.
     Ann,
+    /// Lexical (BM25) table: a tantivy inverted index serialised as a
+    /// `.tantivy` directory beside the Parquet object. The lexical peer of
+    /// [`SidecarKind::Ann`].
+    Lexical,
     /// A table that carries no sidecar bundle (e.g. a plain derived/edge
     /// table whose state lives entirely in its Parquet object).
     None,
@@ -49,6 +53,7 @@ pub enum SidecarKind {
 pub fn sidecar_extensions(kind: SidecarKind) -> &'static [&'static str] {
     match kind {
         SidecarKind::Ann => &["usearch", "rowmap", "manifest.json"],
+        SidecarKind::Lexical => &["tantivy"],
         SidecarKind::None => &[],
     }
 }
@@ -178,6 +183,11 @@ mod tests {
             sidecar_extensions(SidecarKind::Ann),
             ["usearch", "rowmap", "manifest.json"],
         );
+    }
+
+    #[test]
+    fn lexical_kind_carries_the_tantivy_sibling() {
+        assert_eq!(sidecar_extensions(SidecarKind::Lexical), ["tantivy"]);
     }
 
     #[test]

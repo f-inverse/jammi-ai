@@ -73,6 +73,10 @@ candle-transformers = "0.9"
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["download-binaries"] }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 usearch = "2.25"
+# Pure-Rust Lucene-class full-text / BM25 engine backing the lexical-retrieval
+# sidecar. Fast-startup, no system libraries — fits the single-binary /
+# laptop-default invariant; rides the embedded engine's `local` feature.
+tantivy = "0.26"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Pure-Rust audio container demux + codec decode for the audio-embedding path

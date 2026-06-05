@@ -1033,6 +1033,28 @@ impl PyDatabase {
             .map(|(&l, &u)| model.predict_interval(0.0, l, u, None).map_err(to_pyerr))
             .collect()
     }
+
+    /// Fuse several ranked retrieval lists into one by reciprocal-rank fusion.
+    ///
+    /// `ranked_lists` is a list of best-first `_row_id` lists — typically the
+    /// dense (ANN) order and the lexical (BM25) order, plus any further ranked
+    /// channel. Fusion is on *rank*, never raw score, so the dense and lexical
+    /// scales never need reconciling. `k_rrf` damps deep ranks (default 60,
+    /// robust across 40–80). Returns `(row_id, rrf_score)` tuples sorted by
+    /// fused score descending, ties broken ascending by `row_id` — fully
+    /// deterministic and independent of the order the lists are supplied in.
+    #[pyo3(signature = (ranked_lists, *, k_rrf=None))]
+    fn rrf_fuse(
+        &self,
+        ranked_lists: Vec<Vec<String>>,
+        k_rrf: Option<u32>,
+    ) -> PyResult<Vec<(String, f64)>> {
+        let k = k_rrf.unwrap_or(jammi_ai::query::DEFAULT_K_RRF);
+        Ok(jammi_ai::query::rrf_fuse(&ranked_lists, k)
+            .into_iter()
+            .map(|h| (h.row_id, h.rrf_score))
+            .collect())
+    }
 }
 
 /// Argument shim for every Python-facing `modality=` parameter: the snake-case

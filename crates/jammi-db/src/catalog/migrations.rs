@@ -43,6 +43,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "013_result_table_kind",
         schema::MIGRATION_013_RESULT_TABLE_KIND,
     ),
+    ("014_bm25_channel", schema::MIGRATION_014_BM25_CHANNEL),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

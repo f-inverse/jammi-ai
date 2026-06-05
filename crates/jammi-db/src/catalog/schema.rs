@@ -358,3 +358,20 @@ ALTER TABLE topics_new RENAME TO topics;
 CREATE INDEX idx_topics_tenant ON topics(tenant_id);
 CREATE INDEX idx_topics_name ON topics(name);
 "#;
+
+/// Migration 014 — seed the `bm25` lexical-retrieval evidence channel.
+///
+/// The lexical (tantivy/BM25) sidecar contributes its rank and score on this
+/// channel, the lexical peer of the `vector` channel's `similarity`. It shares
+/// `inference`'s priority slot order only incidentally; what matters is that it
+/// sorts after `vector` (priority 1) so a fused result's dense column precedes
+/// its lexical columns. The channel carries the raw BM25 score plus the 0-based
+/// lexical rank RRF fuses on — both caller-supplied, exactly as
+/// `vector.similarity` is.
+pub(super) const MIGRATION_014_BM25_CHANNEL: &str = r#"
+INSERT INTO evidence_channels (channel_name, priority) VALUES ('bm25', 3);
+
+INSERT INTO evidence_channel_columns(channel_name, column_name, column_type, ordinal) VALUES
+    ('bm25', 'bm25_score', 'Float32', 0),
+    ('bm25', 'bm25_rank',  'Int64',   1);
+"#;

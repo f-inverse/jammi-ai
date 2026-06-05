@@ -18,6 +18,8 @@ pub mod eval;
 pub mod evidence;
 pub mod fine_tune;
 #[cfg(feature = "local")]
+pub mod index;
+#[cfg(feature = "local")]
 pub mod inference;
 pub mod jammi;
 pub mod local_session;

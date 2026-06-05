@@ -67,8 +67,8 @@ fn classification_coverage_meets_nominal_on_exchangeable_split() {
         let (cal_probs, cal_labels) = synthetic_classification(&mut rng, 3000, n_classes);
         let (test_probs, test_labels) = synthetic_classification(&mut rng, 5000, n_classes);
 
-        let model =
-            ConformalModel::classification(&cal_probs, &cal_labels, ClassScore::Aps, alpha).unwrap();
+        let model = ConformalModel::classification(&cal_probs, &cal_labels, ClassScore::Aps, alpha)
+            .unwrap();
 
         let hits: Vec<bool> = test_probs
             .iter()
@@ -108,8 +108,7 @@ fn absolute_residual_interval_coverage_meets_nominal() {
         .iter()
         .map(|_| model.predict_interval(0.0, 0.0, 0.0, None).unwrap())
         .unzip();
-    let cov =
-        jammi_numerics::calibration::interval_coverage(&lower, &upper, &test_obs).unwrap();
+    let cov = jammi_numerics::calibration::interval_coverage(&lower, &upper, &test_obs).unwrap();
     assert!(
         cov >= 1.0 - alpha - 0.02,
         "absolute-residual coverage {cov} below the 1 - alpha guarantee"
@@ -141,7 +140,11 @@ async fn conformal_channel_registers_and_merges_through_the_catalog() {
 
     // The conformal channel is not a built-in; registering its declared spec
     // is the additive substrate step (no new provenance machinery).
-    catalog.channels().register(&channel_spec().unwrap()).await.unwrap();
+    catalog
+        .channels()
+        .register(&channel_spec().unwrap())
+        .await
+        .unwrap();
     let conformal = ChannelId::new("conformal").unwrap();
 
     let batch = source_batch(3);

@@ -196,7 +196,11 @@ pub fn finite_sample_quantile_weighted(
     // cumulative weight. The test point's weight sits at +∞ in the mixture, so
     // the calibration mass alone need only reach 1 - alpha for a finite
     // threshold; otherwise the +∞ point mass carries the remainder.
-    let mut paired: Vec<(f64, f64)> = scores.iter().copied().zip(weights.iter().copied()).collect();
+    let mut paired: Vec<(f64, f64)> = scores
+        .iter()
+        .copied()
+        .zip(weights.iter().copied())
+        .collect();
     paired.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     let target = 1.0 - alpha;
@@ -489,7 +493,10 @@ fn mondrian_thresholds(
     }
     let mut thresholds = BTreeMap::new();
     for (group, group_scores) in by_group {
-        thresholds.insert(group.to_string(), finite_sample_quantile(&group_scores, alpha)?);
+        thresholds.insert(
+            group.to_string(),
+            finite_sample_quantile(&group_scores, alpha)?,
+        );
     }
     // Pooled fallback for groups unseen at calibration time.
     thresholds.insert(
@@ -536,7 +543,9 @@ fn true_label_score(probs: &[f64], label: usize, score: ClassScore) -> Result<f6
     Ok(match score {
         ClassScore::Lac => 1.0 - probs[label],
         ClassScore::Aps => aps_cumulative_mass(probs, label, None),
-        ClassScore::Raps { lambda, k_reg } => aps_cumulative_mass(probs, label, Some((lambda, k_reg))),
+        ClassScore::Raps { lambda, k_reg } => {
+            aps_cumulative_mass(probs, label, Some((lambda, k_reg)))
+        }
     })
 }
 
@@ -577,9 +586,7 @@ fn admit_classes(probs: &[f64], score: ClassScore, q: f64) -> Result<Vec<usize>>
         return Ok((0..probs.len()).collect());
     }
     match score {
-        ClassScore::Lac => Ok((0..probs.len())
-            .filter(|&c| 1.0 - probs[c] <= q)
-            .collect()),
+        ClassScore::Lac => Ok((0..probs.len()).filter(|&c| 1.0 - probs[c] <= q).collect()),
         // For APS/RAPS the candidate score is the cumulative mass up to and
         // including the candidate class — exactly `true_label_score` with the
         // candidate standing in for the true label.
@@ -864,7 +871,10 @@ mod tests {
         let raps = ConformalModel::classification(
             &cal_probs,
             &cal_labels,
-            ClassScore::Raps { lambda: 0.1, k_reg: 2 },
+            ClassScore::Raps {
+                lambda: 0.1,
+                k_reg: 2,
+            },
             0.1,
         )
         .unwrap();
@@ -908,8 +918,9 @@ mod tests {
             upper.push(band);
             observed.push(y);
         }
-        let model = ConformalModel::regression(&[], &lower, &upper, &observed, IntervalScore::Cqr, 0.1)
-            .unwrap();
+        let model =
+            ConformalModel::regression(&[], &lower, &upper, &observed, IntervalScore::Cqr, 0.1)
+                .unwrap();
 
         // Evaluate width in two regimes.
         for x in [1.0_f64, 9.0_f64] {
@@ -954,7 +965,10 @@ mod tests {
             .unzip();
         let cov =
             jammi_numerics::calibration::interval_coverage(&lower, &upper, &test_obs).unwrap();
-        assert!(cov >= 0.9 - 0.02, "absolute-residual coverage {cov} below nominal");
+        assert!(
+            cov >= 0.9 - 0.02,
+            "absolute-residual coverage {cov} below nominal"
+        );
     }
 
     #[test]
@@ -994,14 +1008,9 @@ mod tests {
             }
         }
 
-        let model = ConformalModel::classification_mondrian(
-            &probs,
-            &labels,
-            &groups,
-            ClassScore::Lac,
-            0.1,
-        )
-        .unwrap();
+        let model =
+            ConformalModel::classification_mondrian(&probs, &labels, &groups, ClassScore::Lac, 0.1)
+                .unwrap();
 
         // The hard cohort's threshold must exceed the easy cohort's.
         let test = vec![0.4, 0.2, 0.2, 0.1, 0.1];
@@ -1022,8 +1031,7 @@ mod tests {
         let scores: Vec<f64> = (1..=20).map(|i| i as f64).collect();
         let equal = vec![1.0; 20];
         let unweighted = finite_sample_quantile(&scores, 0.2).unwrap();
-        let weighted_equal =
-            finite_sample_quantile_weighted(&scores, &equal, 1.0, 0.2).unwrap();
+        let weighted_equal = finite_sample_quantile_weighted(&scores, &equal, 1.0, 0.2).unwrap();
         assert_eq!(unweighted, weighted_equal);
 
         // Up-weight the top half (the larger scores): the threshold rises.
@@ -1031,8 +1039,7 @@ mod tests {
         for w in shifted.iter_mut().skip(10) {
             *w = 5.0;
         }
-        let weighted_shift =
-            finite_sample_quantile_weighted(&scores, &shifted, 1.0, 0.2).unwrap();
+        let weighted_shift = finite_sample_quantile_weighted(&scores, &shifted, 1.0, 0.2).unwrap();
         assert!(
             weighted_shift >= weighted_equal,
             "up-weighting large scores should not lower the quantile: equal={weighted_equal} shifted={weighted_shift}"
@@ -1068,9 +1075,15 @@ mod tests {
 
     #[test]
     fn predict_rejects_cross_kind_calls() {
-        let model =
-            ConformalModel::regression(&[0.0, 1.0], &[], &[], &[0.1, 0.9], IntervalScore::AbsoluteResidual, 0.1)
-                .unwrap();
+        let model = ConformalModel::regression(
+            &[0.0, 1.0],
+            &[],
+            &[],
+            &[0.1, 0.9],
+            IntervalScore::AbsoluteResidual,
+            0.1,
+        )
+        .unwrap();
         assert!(model.predict_set(&[0.5, 0.5], None).is_err());
 
         let model = ConformalModel::classification(

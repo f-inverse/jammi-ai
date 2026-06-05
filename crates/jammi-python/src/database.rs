@@ -922,6 +922,8 @@ impl PyDatabase {
             )
             .map_err(to_pyerr)?;
         Ok(record.table_name)
+    }
+
     /// Conformalize a classification predictor into prediction sets.
     ///
     /// Split (inductive) conformal: `calibration` holds one row of per-class
@@ -949,9 +951,13 @@ impl PyDatabase {
         raps_k_reg: usize,
     ) -> PyResult<Vec<Vec<usize>>> {
         let score = parse_class_score(score.unwrap_or("aps"), raps_lambda, raps_k_reg)?;
-        let model =
-            jammi_ai::predict::ConformalModel::classification(&calibration, &true_labels, score, alpha)
-                .map_err(to_pyerr)?;
+        let model = jammi_ai::predict::ConformalModel::classification(
+            &calibration,
+            &true_labels,
+            score,
+            alpha,
+        )
+        .map_err(to_pyerr)?;
         test.iter()
             .map(|row| model.predict_set(row, None).map_err(to_pyerr))
             .collect()
@@ -1088,6 +1094,8 @@ fn parse_eval_task(s: &str) -> PyResult<jammi_ai::eval::EvalTask> {
 
 fn parse_calibration_shape(s: &str) -> PyResult<jammi_ai::eval::EvalCalibrationShape> {
     s.parse().map_err(to_pyerr)
+}
+
 /// Parse a classification conformal score family from its snake-case name.
 /// `"raps"` carries the regularization parameters; `"lac"` and `"aps"` ignore
 /// them.

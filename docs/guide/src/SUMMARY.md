@@ -19,6 +19,7 @@
 - [Search Text Against Images (Cross-Modal)](./cross-modal-search.md)
 - [Classify Text](./classify-text.md)
 - [Extract Entities (NER)](./extract-entities.md)
+- [Conformal Prediction (Distribution-Free Coverage)](./conformal-prediction.md)
 - [Semantic Search](./semantic-search.md)
 - [Build a Similarity Graph](./build-neighbor-graph.md)
 - [Enrich Results with Joins and Annotations](./enrich-results.md)

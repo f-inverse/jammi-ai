@@ -81,6 +81,9 @@ jammi-test-utils.workspace = true
 # calibration-eval unit tests (spec R2). Test-only — the engine routes all
 # production calibration math through `jammi-numerics`, never `statrs` directly.
 statrs.workspace = true
+# Synthetic exchangeable data generators for the conformal coverage tests.
+rand.workspace = true
+rand_distr.workspace = true
 
 [features]
 default = ["local"]

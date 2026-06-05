@@ -14,8 +14,9 @@ pub mod report;
 pub mod runner;
 
 pub use report::{
-    AggregateDelta, CompareEvalReport, EmbeddingEvalReport, InferenceAggregate,
-    InferenceEvalReport, MetricDelta, PerQueryRecord, PerRecordPrediction, TableEvalReport,
+    AggregateDelta, CompareEvalReport, DeltaSignificance, EmbeddingEvalReport, InferenceAggregate,
+    InferenceEvalReport, MetricDelta, MetricSignificance, PerQueryRecord, PerRecordPrediction,
+    TableEvalReport,
 };
 
 use serde::{Deserialize, Serialize};

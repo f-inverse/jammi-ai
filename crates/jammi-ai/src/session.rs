@@ -129,14 +129,16 @@ impl InferenceSession {
     /// `SessionContext`, so SQL — in-process (`sql`) and over the Flight SQL
     /// lane alike — can call them.
     ///
-    /// Currently this registers the `annotate(model, task, relation, key, col…)`
-    /// table function (model inference as a relation). It must be called once
-    /// per session, after the session is behind an `Arc`, because the function
-    /// holds a [`std::sync::Weak`] back-reference to the session it serves —
-    /// weak to avoid the cycle the strong handle would form (the session owns
-    /// the context the function registers on). The Flight SQL request path
-    /// clones this context's state, so registering here makes `annotate`
-    /// reachable on every Flight SQL session too.
+    /// This registers the `annotate(model, task, relation, key, col…)` table
+    /// function (model inference as a relation) and the vector-aggregation
+    /// UDAFs (`vector_mean`/`vector_sum`/`vector_max`, element-wise reduction
+    /// over a group of fixed-width vectors). It must be called once per session,
+    /// after the session is behind an `Arc`, because `annotate` holds a
+    /// [`std::sync::Weak`] back-reference to the session it serves — weak to
+    /// avoid the cycle the strong handle would form (the session owns the
+    /// context the function registers on). The Flight SQL request path clones
+    /// this context's state, so registering here makes every function reachable
+    /// on every Flight SQL session too.
     pub fn register_query_functions(self: &Arc<Self>) {
         self.context().register_udtf(
             crate::query::AnnotateTableFunction::NAME,
@@ -144,6 +146,7 @@ impl InferenceSession {
                 self,
             ))),
         );
+        crate::query::register_vector_agg_udafs(self.context());
     }
 
     /// Register a data source.

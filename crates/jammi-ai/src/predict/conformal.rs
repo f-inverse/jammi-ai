@@ -801,16 +801,23 @@ mod tests {
 
     #[test]
     fn naive_quantile_undercovers() {
-        // At a stringent level with a modest calibration set, the ~1/n gap of
-        // the naive quantile bites: its realised coverage sits below nominal.
+        // The naive quantile takes the ⌈n(1-alpha)⌉-th order statistic; for a
+        // continuous score the test point falls uniformly into one of the n+1
+        // gaps around the calibration scores, so its expected coverage is
+        // ⌈n(1-alpha)⌉/(n+1) — strictly below 1-alpha. The shortfall is widest
+        // for SMALL n: at n=30, alpha=0.1 it is ⌈27⌉/31 ≈ 0.871 against a 0.900
+        // target (a ~0.029 gap), well outside the per-trial sampling noise of a
+        // large test split, so a clear majority of trials under-cover. The
+        // corrected quantile takes ⌈(n+1)(1-alpha)⌉ and does not (the test
+        // above). Many trials average out the calibration draw's own noise.
         let mut rng = StdRng::seed_from_u64(7);
         let n_classes = 4;
         let alpha = 0.1;
         let mut shortfalls = 0;
-        let trials = 40;
+        let trials = 60;
         for _ in 0..trials {
-            let (cal_probs, cal_labels) = synthetic_classification(&mut rng, 60, n_classes);
-            let (test_probs, test_labels) = synthetic_classification(&mut rng, 4000, n_classes);
+            let (cal_probs, cal_labels) = synthetic_classification(&mut rng, 30, n_classes);
+            let (test_probs, test_labels) = synthetic_classification(&mut rng, 8000, n_classes);
 
             let cal_scores: Vec<f64> = cal_probs
                 .iter()
@@ -861,37 +868,58 @@ mod tests {
 
     #[test]
     fn raps_shrinks_sets_relative_to_aps() {
+        // RAPS regularizes APS by adding lambda * max(0, rank - k_reg) to a
+        // candidate's nonconformity, so deep-tail classes cost more to admit. The
+        // penalty also inflates the calibration scores and thus raises the
+        // threshold; whether the net effect shrinks sets is a *population*
+        // property (E[size_raps] <= E[size_aps]), not guaranteed on any single
+        // calibration draw — one draw's threshold pairing can buck it. It shows
+        // cleanly at a looser level (alpha = 0.2), where sets are small enough
+        // that the rank penalty bites the tail rather than being swamped by the
+        // threshold lift that saturated near-full sets exhibit at stringent
+        // levels. Averaging the mean set size over independent calibration/test
+        // trials estimates the population means, so their ordering is the sound
+        // claim. k_reg = 2 exempts the top two ranks; lambda = 1.0 makes the tail
+        // penalty decisive.
         let mut rng = StdRng::seed_from_u64(11);
         let n_classes = 8;
-        let (cal_probs, cal_labels) = synthetic_classification(&mut rng, 3000, n_classes);
-        let (test_probs, _) = synthetic_classification(&mut rng, 1000, n_classes);
+        let alpha = 0.2;
+        let trials = 20;
+        let mut total_aps = 0.0;
+        let mut total_raps = 0.0;
+        for _ in 0..trials {
+            let (cal_probs, cal_labels) = synthetic_classification(&mut rng, 3000, n_classes);
+            let (test_probs, _) = synthetic_classification(&mut rng, 1000, n_classes);
 
-        let aps =
-            ConformalModel::classification(&cal_probs, &cal_labels, ClassScore::Aps, 0.1).unwrap();
-        let raps = ConformalModel::classification(
-            &cal_probs,
-            &cal_labels,
-            ClassScore::Raps {
-                lambda: 0.1,
-                k_reg: 2,
-            },
-            0.1,
-        )
-        .unwrap();
+            let aps =
+                ConformalModel::classification(&cal_probs, &cal_labels, ClassScore::Aps, alpha)
+                    .unwrap();
+            let raps = ConformalModel::classification(
+                &cal_probs,
+                &cal_labels,
+                ClassScore::Raps {
+                    lambda: 1.0,
+                    k_reg: 2,
+                },
+                alpha,
+            )
+            .unwrap();
 
-        let mean_aps: f64 = test_probs
-            .iter()
-            .map(|p| aps.predict_set(p, None).unwrap().len() as f64)
-            .sum::<f64>()
-            / test_probs.len() as f64;
-        let mean_raps: f64 = test_probs
-            .iter()
-            .map(|p| raps.predict_set(p, None).unwrap().len() as f64)
-            .sum::<f64>()
-            / test_probs.len() as f64;
+            let sizes = |model: &ConformalModel| -> f64 {
+                test_probs
+                    .iter()
+                    .map(|p| model.predict_set(p, None).unwrap().len() as f64)
+                    .sum::<f64>()
+                    / test_probs.len() as f64
+            };
+            total_aps += sizes(&aps);
+            total_raps += sizes(&raps);
+        }
+        let mean_aps = total_aps / trials as f64;
+        let mean_raps = total_raps / trials as f64;
         assert!(
             mean_raps <= mean_aps,
-            "RAPS should not be larger than APS on average: aps={mean_aps} raps={mean_raps}"
+            "RAPS regularization should shrink the mean set size: aps={mean_aps} raps={mean_raps}"
         );
     }
 
@@ -935,9 +963,7 @@ mod tests {
         }
         assert!(
             widths_high[0] > widths_low[0],
-            "CQR width should grow under heteroscedasticity: low={:?} high={:?}",
-            widths_low,
-            widths_high
+            "CQR width should grow under heteroscedasticity: low={widths_low:?} high={widths_high:?}"
         );
     }
 

@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Float64Array, RecordBatch, StringArray};
+use arrow::array::{Array, ArrayRef, Float64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};

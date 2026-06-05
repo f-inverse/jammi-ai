@@ -234,6 +234,11 @@ pub fn result_table_from_proto(table: pb::ResultTable) -> Result<ResultTableReco
         source_id: table.source_id,
         model_id: table.model_id,
         task,
+        // `kind`/`derived_from` are server-internal bookkeeping, not carried on
+        // the wire — `GenerateEmbeddings` only ever returns a model output, so
+        // the reconstruction defaults to that kind.
+        kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
+        derived_from: None,
         parquet_path: String::new(),
         index_path: None,
         dimensions: (table.dimensions != 0).then_some(table.dimensions),

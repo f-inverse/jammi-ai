@@ -850,6 +850,46 @@ impl PyDatabase {
             .map_err(to_pyerr)?;
         Ok(())
     }
+
+    /// Materialize the k-nearest-neighbour graph of a source's embedding table
+    /// and return the new edge table's name.
+    ///
+    /// This is for *global-structure* work — clustering, near-duplicate
+    /// detection, training-data prep — where the whole edge set is consumed as
+    /// a durable artifact. For "neighbours of *these* rows", use `search`.
+    ///
+    /// The returned table has columns `(src, dst, rank, similarity)`, with
+    /// `src`/`dst` joining directly to the source on the key. The default
+    /// driver is index-assisted and produces an approximate, non-deterministic
+    /// graph; pass `exact=True` for a deterministic, complete one (gated by a
+    /// row-count ceiling). `min_similarity` floors weak edges; `mutual=True`
+    /// keeps only reciprocal edges.
+    #[pyo3(signature = (source, *, k, min_similarity=None, mutual=false, exact=false, table=None))]
+    fn build_neighbor_graph(
+        &self,
+        source: &str,
+        k: usize,
+        min_similarity: Option<f32>,
+        mutual: bool,
+        exact: bool,
+        table: Option<String>,
+    ) -> PyResult<String> {
+        let params = jammi_ai::pipeline::neighbor_graph::BuildNeighborGraph {
+            k,
+            min_similarity,
+            mutual,
+            exact,
+            ..Default::default()
+        };
+        let record = self
+            .runtime
+            .block_on(
+                self.session
+                    .build_neighbor_graph(source, table.as_deref(), &params),
+            )
+            .map_err(to_pyerr)?;
+        Ok(record.table_name)
+    }
 }
 
 /// Argument shim for every Python-facing `modality=` parameter: the snake-case

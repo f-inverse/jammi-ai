@@ -39,6 +39,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "012_topics_tenant_unique",
         schema::MIGRATION_012_TOPICS_TENANT_UNIQUE,
     ),
+    (
+        "013_result_table_kind",
+        schema::MIGRATION_013_RESULT_TABLE_KIND,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

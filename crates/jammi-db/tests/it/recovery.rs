@@ -33,6 +33,8 @@ async fn crash_recovery_cleans_up_stale_result_tables_and_fine_tune_jobs() {
         .create_table(
             "src1",
             ModelTask::TextEmbedding,
+            jammi_db::catalog::result_repo::ResultTableKind::Model,
+            None,
             "test-model",
             None,
             None,

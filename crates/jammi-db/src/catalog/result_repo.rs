@@ -3,6 +3,47 @@ use crate::catalog::Catalog;
 use crate::error::{JammiError, Result};
 use crate::model_task::ModelTask;
 
+/// Whether a result table is a direct model output or a derivation of another
+/// result table.
+///
+/// The discriminator is orthogonal to [`ModelTask`]: a [`Model`](Self::Model)
+/// row's `task` names a genuine model task and resolves as an embedding or
+/// inference output; a derivation row's `task` still names the source
+/// embedding's task (so it round-trips through the same column) but the kind
+/// excludes it from embedding-table resolution. Keeping the distinction here
+/// rather than in `ModelTask` leaves that enum a pristine catalogue of model
+/// tasks (S9 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum ResultTableKind {
+    /// An embedding or inference table produced by running a model.
+    Model,
+    /// A k-nearest-neighbour edge relation derived from an embedding table.
+    NeighborGraph,
+}
+
+impl ResultTableKind {
+    /// Canonical string stored in the `result_tables.kind` column. The single
+    /// source of truth — [`try_from_db_str`](Self::try_from_db_str) decodes it.
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::NeighborGraph => "neighbor_graph",
+        }
+    }
+
+    /// Decode the canonical string back into a [`ResultTableKind`]. Unknown
+    /// spellings raise [`JammiError::Catalog`] naming the offending value.
+    pub fn try_from_db_str(s: &str) -> Result<Self> {
+        match s {
+            "model" => Ok(Self::Model),
+            "neighbor_graph" => Ok(Self::NeighborGraph),
+            other => Err(JammiError::Catalog(format!(
+                "Unknown result-table kind '{other}'. Expected: model, neighbor_graph"
+            ))),
+        }
+    }
+}
+
 /// Parameters for creating a new result table entry.
 /// `status` defaults to `'building'` via SQL DEFAULT — not passed here.
 #[derive(Debug)]
@@ -11,6 +52,8 @@ pub struct CreateResultTableParams<'a> {
     pub source_id: &'a str,
     pub model_id: &'a str,
     pub task: ModelTask,
+    pub kind: ResultTableKind,
+    pub derived_from: Option<&'a str>,
     pub parquet_path: &'a str,
     pub index_path: Option<&'a str>,
     pub dimensions: Option<i32>,
@@ -25,6 +68,8 @@ pub struct ResultTableRecord {
     pub source_id: String,
     pub model_id: String,
     pub task: ModelTask,
+    pub kind: ResultTableKind,
+    pub derived_from: Option<String>,
     pub parquet_path: String,
     pub index_path: Option<String>,
     pub dimensions: Option<i32>,
@@ -43,11 +88,19 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendErr
         column: "task".into(),
         detail: e.to_string(),
     })?;
+    let kind_raw: String = row.get("kind")?;
+    let kind =
+        ResultTableKind::try_from_db_str(&kind_raw).map_err(|e| BackendError::TypeConversion {
+            column: "kind".into(),
+            detail: e.to_string(),
+        })?;
     Ok(ResultTableRecord {
         table_name: row.get("table_name")?,
         source_id: row.get("source_id")?,
         model_id: row.get("model_id")?,
         task,
+        kind,
+        derived_from: row.try_get("derived_from")?,
         parquet_path: row.get("parquet_path")?,
         index_path: row.try_get("index_path")?,
         dimensions: row.try_get("dimensions")?,
@@ -69,6 +122,8 @@ impl Catalog {
         let source_id = p.source_id.to_string();
         let model_id = p.model_id.to_string();
         let task = p.task.as_db_str();
+        let kind = p.kind.as_db_str();
+        let derived_from = p.derived_from.map(str::to_string);
         let parquet_path = p.parquet_path.to_string();
         let index_path = p.index_path.map(str::to_string);
         let dimensions = p.dimensions;
@@ -82,14 +137,17 @@ impl Catalog {
                     tx.set_tenant(tenant);
                     tx.assert_tenant_matches(tenant, "result_tables")?;
                     tx.execute(
-                        "INSERT INTO result_tables (table_name, source_id, model_id, task, parquet_path, \
-                         index_path, dimensions, key_column, text_columns, tenant_id) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                        "INSERT INTO result_tables (table_name, source_id, model_id, task, kind, \
+                         derived_from, parquet_path, index_path, dimensions, key_column, \
+                         text_columns, tenant_id) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
                         &[
                             SqlValue::TextOwned(table_name),
                             SqlValue::TextOwned(source_id),
                             SqlValue::TextOwned(model_id),
                             SqlValue::Text(task),
+                            SqlValue::Text(kind),
+                            SqlValue::from(derived_from),
                             SqlValue::TextOwned(parquet_path),
                             SqlValue::from(index_path),
                             SqlValue::from(dimensions.map(|d| d as i64)),
@@ -334,9 +392,13 @@ impl Catalog {
         let tenant_placeholder = format!("${}", params.len() + 1);
         params.push(SqlValue::from(tenant.map(|t| t.to_string())));
 
+        // `kind = 'model'` excludes derived tables (e.g. a neighbor-graph edge
+        // relation) whose `task` column still names the source embedding's
+        // task — only genuine model outputs resolve as an embedding source.
         let sql = format!(
             "SELECT * FROM result_tables \
              WHERE source_id = $1 AND task IN ({tasks}) \
+               AND kind = 'model' \
                AND status = 'ready' \
                AND (tenant_id = {tenant} OR tenant_id IS NULL) \
              ORDER BY created_at DESC, rowid DESC LIMIT 1",

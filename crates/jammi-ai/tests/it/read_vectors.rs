@@ -73,6 +73,8 @@ async fn inference_session_read_vectors_forwards_to_jammi_session() {
             source_id: "src",
             model_id: "model",
             task: ModelTask::TextEmbedding,
+            kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
+            derived_from: None,
             parquet_path: url.as_str(),
             index_path: None,
             dimensions: Some(dim),

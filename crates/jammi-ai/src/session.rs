@@ -656,7 +656,16 @@ impl InferenceSession {
         if !batches.is_empty() {
             let table_info = self
                 .result_store
-                .create_table(source_id, task, &source.to_string(), None, None, None)
+                .create_table(
+                    source_id,
+                    task,
+                    jammi_db::catalog::result_repo::ResultTableKind::Model,
+                    None,
+                    &source.to_string(),
+                    None,
+                    None,
+                    None,
+                )
                 .await?;
             let schema = batches[0].schema();
             let mut writer = self
@@ -712,6 +721,56 @@ impl InferenceSession {
         tables.into_iter().next().ok_or_else(|| {
             JammiError::Inference(format!("No tables found in source '{source_id}'"))
         })
+    }
+
+    /// Materialize the k-nearest-neighbour graph of a source's embedding table
+    /// as a queryable edge `result_table`.
+    ///
+    /// This is for *global-structure* work — clustering, near-duplicate
+    /// detection, connected components, graph-aware training-data generation —
+    /// where the whole edge set is consumed as a durable artifact. For
+    /// "neighbours of *these* rows", compose [`Self::search`] instead.
+    ///
+    /// The build resolves the input embedding table through the same
+    /// tenant-scoped catalog path `search` uses: when a tenant is bound it runs
+    /// inside that tenant's scope, so a caller cannot point the build at another
+    /// tenant's table. The returned edge table is `kind = neighbor_graph`,
+    /// derived from the resolved embedding table, with `src`/`dst` endpoints
+    /// that join directly to source data on the key.
+    ///
+    /// The default driver is index-assisted and produces an *approximate*,
+    /// *non-deterministic* graph; set [`BuildNeighborGraph::exact`] for a
+    /// deterministic, complete one (gated by a row-count ceiling).
+    pub async fn build_neighbor_graph(
+        &self,
+        source_id: &str,
+        embedding_table: Option<&str>,
+        params: &crate::pipeline::neighbor_graph::BuildNeighborGraph,
+    ) -> Result<ResultTableRecord> {
+        match self.tenant() {
+            // A bound tenant runs the build inside its scope, so the catalog
+            // resolves only that tenant's embedding table — a caller cannot
+            // point the build at another tenant's table.
+            Some(tenant) => {
+                self.with_tenant_scoped(tenant, |_scope| async move {
+                    crate::pipeline::neighbor_graph::NeighborGraphPipeline::new(
+                        self,
+                        self.result_store.as_ref(),
+                    )
+                    .run(source_id, embedding_table, params)
+                    .await
+                })
+                .await
+            }
+            None => {
+                crate::pipeline::neighbor_graph::NeighborGraphPipeline::new(
+                    self,
+                    self.result_store.as_ref(),
+                )
+                .run(source_id, embedding_table, params)
+                .await
+            }
+        }
     }
 
     // =====================================================================

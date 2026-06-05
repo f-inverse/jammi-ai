@@ -879,11 +879,16 @@ impl JammiSession {
         row_key: &str,
     ) -> Result<Vec<f32>> {
         use datafusion::prelude::{col, lit};
+        use datafusion::sql::TableReference;
 
-        let table_ref = format!("jammi.{}", table.table_name);
+        // Result tables register under the single bare identifier
+        // `jammi.{name}`; reach this one the same way rather than as a string
+        // DataFusion would re-parse into a `jammi` schema reference (see
+        // `register_parquet_table`).
+        let table_ref = TableReference::bare(format!("jammi.{}", table.table_name));
         let batches = self
             .ctx
-            .table(&table_ref)
+            .table(table_ref.clone())
             .await
             .map_err(|e| JammiError::Other(format!("Resolve embedding table '{table_ref}': {e}")))?
             .filter(col("_row_id").eq(lit(row_key)))

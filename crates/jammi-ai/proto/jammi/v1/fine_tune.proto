@@ -53,6 +53,10 @@ message EmbeddingLoss {
     Triplet triplet = 2;
     // InfoNCE with in-batch negatives at the given temperature.
     MultipleNegativesRanking multiple_negatives_ranking = 3;
+    // AnglE: angle-difference objective in complex space. No parameter.
+    AnglE angle = 4;
+    // cosine-MSE: regress scaled cosine onto a graded score. No parameter.
+    CosineMse cosine_mse = 5;
   }
 
   message CoSent {}
@@ -62,6 +66,8 @@ message EmbeddingLoss {
   message MultipleNegativesRanking {
     double temperature = 1;
   }
+  message AnglE {}
+  message CosineMse {}
 }
 
 // Classification-loss function. Mirrors the engine's `ClassificationLoss`.

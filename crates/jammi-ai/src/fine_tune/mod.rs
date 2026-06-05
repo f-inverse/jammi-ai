@@ -70,6 +70,17 @@ pub enum EmbeddingLoss {
     Triplet { margin: f64 },
     /// InfoNCE with in-batch negatives. `τ` is the temperature.
     MultipleNegativesRanking { temperature: f64 },
+    /// AnglE: optimises an angle difference in complex space, escaping the
+    /// vanishing-gradient saturation zones of cosine objectives near ±1.
+    /// Splits each embedding into real/imaginary halves and applies the same
+    /// pairwise log-sum-exp ordering as CoSENT over the angle magnitude.
+    /// CoSENT's successor for STS quality.
+    AnglE,
+    /// cosine-MSE: regress scaled cosine similarity onto a graded target score
+    /// with mean-squared error. The simplest objective for continuous
+    /// similarity labels; prefer it over CoSENT/MNRL when labels are graded
+    /// scores rather than pairs or rankings.
+    CosineMse,
 }
 
 impl Default for EmbeddingLoss {

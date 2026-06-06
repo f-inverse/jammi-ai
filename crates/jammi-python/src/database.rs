@@ -934,13 +934,15 @@ impl PyDatabase {
     /// emit a prediction set with marginal coverage `>= 1 - alpha`.
     ///
     /// `score` selects the nonconformity family: `"lac"`, `"aps"` (default), or
-    /// `"raps"` (regularized APS, parameterized by `raps_lambda` and the 1-based
-    /// `raps_k_reg`). The calibration set must be disjoint from both the
+    /// `"raps"` (regularized APS). For `"raps"`, `raps_params` is the
+    /// `(lambda, k_reg)` regularization pair — the penalty weight and the 1-based
+    /// rank past which it applies; it is ignored by `"lac"`/`"aps"` and defaults
+    /// to `(0.0, 1)`. The calibration set must be disjoint from both the
     /// training set and `test` — reusing test points inflates coverage. Pure and
     /// deterministic: identical inputs yield identical sets.
     ///
     /// Returns one list of admitted class indices per row of `test`.
-    #[pyo3(signature = (calibration, true_labels, test, *, alpha, score=None, raps_lambda=0.0, raps_k_reg=1))]
+    #[pyo3(signature = (calibration, true_labels, test, *, alpha, score=None, raps_params=None))]
     fn conformalize(
         &self,
         calibration: Vec<Vec<f64>>,
@@ -948,9 +950,9 @@ impl PyDatabase {
         test: Vec<Vec<f64>>,
         alpha: f64,
         score: Option<&str>,
-        raps_lambda: f64,
-        raps_k_reg: usize,
+        raps_params: Option<(f64, usize)>,
     ) -> PyResult<Vec<Vec<usize>>> {
+        let (raps_lambda, raps_k_reg) = raps_params.unwrap_or((0.0, 1));
         let score = parse_class_score(score.unwrap_or("aps"), raps_lambda, raps_k_reg)?;
         let model = jammi_ai::predict::ConformalModel::classification(
             &calibration,

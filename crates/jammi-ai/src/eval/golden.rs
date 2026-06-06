@@ -415,6 +415,7 @@ pub(crate) fn extract_string_column(
 /// outcome or distribution parameter as either an integer or a float.
 ///
 /// Returns `Eval` when the column is missing or not a numeric type.
+#[cfg(feature = "local")]
 pub(crate) fn extract_f64_column(
     batch: &arrow::array::RecordBatch,
     column: &str,

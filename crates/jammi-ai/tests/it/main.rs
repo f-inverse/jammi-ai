@@ -8,6 +8,7 @@ mod e2e_inference;
 mod encoder_adapters;
 mod evaluation;
 mod fine_tune;
+mod graph_finetune;
 mod inference;
 mod jammi;
 mod local_session;

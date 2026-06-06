@@ -791,6 +791,188 @@ impl PyDatabase {
         Ok(PyFineTuneJob::new(job, Arc::clone(&self.runtime)))
     }
 
+    /// Graph-supervised fine-tune (S11): learn an embedding metric that encodes
+    /// a graph's structure. Reads a node-text source and an edge source, samples
+    /// the graph into `(anchor, positive, [hard_negative])` pairs by biased
+    /// random walks (node2vec), and trains the existing in-batch-negative
+    /// (MNRL) / triplet objective — **no new loss**.
+    ///
+    /// Sources:
+    ///   node_source / id_column / text_column — the node text the encoder
+    ///     embeds, keyed by id.
+    ///   edge_source / src_column / dst_column — directed edges; endpoints join
+    ///     to id_column.
+    ///   edge_provenance — "declared" | "similarity". **The load-bearing
+    ///     distinction:** training on "similarity" (S9 k-NN) edges largely
+    ///     re-learns the base metric (a degenerate feedback loop), so genuine
+    ///     gain comes from "declared" external edges (hierarchy, crosswalk,
+    ///     citation, confirmed pairs). Similarity edges are a weak bootstrap,
+    ///     never the sole supervision.
+    ///
+    /// Walk / negative knobs (node2vec):
+    ///   walk_length (L) — positive reach; 1 is degenerate 1-hop. Default 4.
+    ///   walks_per_node — walks started per node. Default 2.
+    ///   return_p (p) / in_out_q (q) — node2vec bias. Defaults 1.0 / 1.0.
+    ///   graph_hard_negatives — structure-mined hard negatives per pair; 0 uses
+    ///     in-batch negatives only. Default 1.
+    ///   exclude_hops — hops of the anchor's neighbourhood excluded from its
+    ///     negative pool (the false-negative guard). Default 1.
+    ///   min_negatives — minimum negative pool (collapse guard). Default 1.
+    ///   sample_seed — walk/negative RNG seed. Default 0.
+    ///
+    /// Training knobs mirror `fine_tune` for the subset relevant to graph
+    /// supervision (loss, temperature, batch, epochs, lora, matryoshka).
+    #[pyo3(signature = (
+        *,
+        node_source,
+        id_column,
+        text_column,
+        edge_source,
+        src_column,
+        dst_column,
+        base_model,
+        edge_provenance = "declared",
+        walk_length = None,
+        walks_per_node = None,
+        return_p = None,
+        in_out_q = None,
+        graph_hard_negatives = None,
+        exclude_hops = None,
+        min_negatives = None,
+        sample_seed = None,
+        embedding_loss = None,
+        mnrl_temperature = None,
+        epochs = None,
+        batch_size = None,
+        learning_rate = None,
+        lora_rank = None,
+        matryoshka_dims = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn fine_tune_graph(
+        &self,
+        node_source: &str,
+        id_column: &str,
+        text_column: &str,
+        edge_source: &str,
+        src_column: &str,
+        dst_column: &str,
+        base_model: &str,
+        edge_provenance: &str,
+        walk_length: Option<usize>,
+        walks_per_node: Option<usize>,
+        return_p: Option<f64>,
+        in_out_q: Option<f64>,
+        graph_hard_negatives: Option<usize>,
+        exclude_hops: Option<usize>,
+        min_negatives: Option<usize>,
+        sample_seed: Option<u64>,
+        embedding_loss: Option<&str>,
+        mnrl_temperature: Option<f64>,
+        epochs: Option<usize>,
+        batch_size: Option<usize>,
+        learning_rate: Option<f64>,
+        lora_rank: Option<usize>,
+        matryoshka_dims: Option<Vec<usize>>,
+    ) -> PyResult<PyFineTuneJob> {
+        use jammi_ai::fine_tune::graph_sampler::{
+            EdgeProvenance, GraphFineTuneSources, GraphSampleConfig,
+        };
+        use jammi_ai::fine_tune::EmbeddingLoss;
+
+        let provenance = match edge_provenance {
+            "declared" => EdgeProvenance::Declared,
+            "similarity" => EdgeProvenance::Similarity,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown edge_provenance '{other}'. Use 'declared' or 'similarity'. \
+                     Note: 'similarity' (S9) edges largely re-learn the base metric — a \
+                     weak bootstrap, not the sole supervision."
+                )))
+            }
+        };
+
+        // Walk / negative sampling config — defaults match the Rust struct.
+        let mut sample = GraphSampleConfig::default();
+        if let Some(v) = walk_length {
+            sample.walk_length = v;
+        }
+        if let Some(v) = walks_per_node {
+            sample.walks_per_node = v;
+        }
+        if let Some(v) = return_p {
+            sample.return_p = v;
+        }
+        if let Some(v) = in_out_q {
+            sample.in_out_q = v;
+        }
+        if let Some(v) = graph_hard_negatives {
+            sample.hard_negatives = v;
+        }
+        if let Some(v) = exclude_hops {
+            sample.exclude_hops = v;
+        }
+        if let Some(v) = min_negatives {
+            sample.min_negatives = v;
+        }
+        if let Some(v) = sample_seed {
+            sample.seed = v;
+        }
+
+        // Training config — the graph-relevant subset of `fine_tune`'s knobs.
+        // The default embedding loss for graph supervision is MNRL (S10).
+        let loss = match embedding_loss {
+            None | Some("mnrl") => EmbeddingLoss::MultipleNegativesRanking {
+                temperature: mnrl_temperature.unwrap_or(20.0),
+            },
+            Some("triplet") => EmbeddingLoss::Triplet { margin: 0.3 },
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown embedding_loss '{other}' for graph fine-tune. Use 'mnrl' \
+                     (default) or 'triplet'."
+                )))
+            }
+        };
+        let mut cfg = FineTuneConfig {
+            embedding_loss: Some(loss),
+            ..FineTuneConfig::default()
+        };
+        if let Some(v) = epochs {
+            cfg.epochs = v;
+        }
+        if let Some(v) = batch_size {
+            cfg.batch_size = v;
+        }
+        if let Some(v) = learning_rate {
+            cfg.learning_rate = v;
+        }
+        if let Some(v) = lora_rank {
+            cfg.lora_rank = v;
+        }
+        if let Some(v) = matryoshka_dims {
+            cfg.matryoshka_dims = v;
+        }
+
+        let sources = GraphFineTuneSources {
+            node_source: node_source.to_string(),
+            id_column: id_column.to_string(),
+            text_column: text_column.to_string(),
+            edge_source: edge_source.to_string(),
+            src_column: src_column.to_string(),
+            dst_column: dst_column.to_string(),
+            provenance,
+        };
+
+        let job = self
+            .runtime
+            .block_on(
+                self.session
+                    .fine_tune_graph(&sources, base_model, sample, Some(cfg)),
+            )
+            .map_err(to_pyerr)?;
+        Ok(PyFineTuneJob::new(job, Arc::clone(&self.runtime)))
+    }
+
     /// Evaluate embedding quality. Returns a dict with `aggregate` (mean
     /// over all queries) and `per_query` (one record per golden-set query)
     /// keys.

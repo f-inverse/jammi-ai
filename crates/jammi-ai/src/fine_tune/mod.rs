@@ -16,6 +16,8 @@ pub mod data;
 #[cfg(feature = "local")]
 pub mod gradcache;
 #[cfg(feature = "local")]
+pub mod graph_sampler;
+#[cfg(feature = "local")]
 pub mod hard_negative_miner;
 #[cfg(feature = "local")]
 pub mod job;

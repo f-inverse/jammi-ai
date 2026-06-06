@@ -28,6 +28,7 @@
 - [Compound Retrieval and Inference over Flight SQL](./remote-compound-query.md)
 - [Declare a Custom Provenance Channel](./declare-provenance-channel.md)
 - [Fine-Tune for Your Domain](./fine-tuning.md)
+- [Fine-Tune from a Graph (Graph-Supervised)](./graph-supervised-finetune.md)
 - [Evaluate and Compare Models](./evaluation.md)
 - [Did Structure Help? A Graph-ML Evaluation Recipe](./graph-ml-eval.md)
 - [Evaluate Uncertainty and Calibration](./calibration-eval.md)

@@ -67,6 +67,55 @@ pub enum TrainingFormat {
     Classification { num_classes: usize },
     /// NER with BIO tag mapping.
     Ner { num_labels: usize },
+    /// Graph-supervised (S11): the rows were sampled from a graph (node text +
+    /// edge table) by biased random walks into `(anchor, positive,
+    /// [hard_negative])` pairs. It carries **no new loss** — it is a
+    /// data-loading shape that drives the existing in-batch-negative
+    /// (`Pairs`/MNRL) or `Triplet` path, selected by `has_negatives`:
+    /// `false` → `Pairs` (in-batch negatives only), `true` → `Triplet` (the
+    /// sampler mined structure-aware hard negatives). The variant is retained
+    /// for provenance — a consumer can see the supervision came from the graph —
+    /// while every downstream step reuses the Pairs/Triplet machinery.
+    Graph { has_negatives: bool },
+}
+
+/// The concrete batch/loss shape a [`TrainingFormat`] resolves to once the
+/// provenance-carrying `Graph` variant is mapped onto its in-batch-negative
+/// shape. There is no `Graph` here by construction — a graph loader trains as
+/// `Pairs` or `Triplet`, so the chunk/loss dispatch matches on this exhaustive
+/// set without a phantom arm.
+#[derive(Debug, Clone, Copy)]
+enum UnderlyingFormat {
+    Contrastive,
+    Pairs,
+    Triplet,
+    AudioTriplet,
+    Classification,
+    Ner,
+}
+
+impl TrainingFormat {
+    /// The concrete shape a format trains as: a graph with mined hard negatives
+    /// is a `Triplet`, one without is `Pairs`; every other format is itself.
+    /// This is the single place that maps the provenance-carrying `Graph`
+    /// variant onto the loss/batch machinery, so `text_chunks` /
+    /// `in_batch_negative_texts` stay DRY.
+    fn underlying(self) -> UnderlyingFormat {
+        match self {
+            TrainingFormat::Contrastive => UnderlyingFormat::Contrastive,
+            TrainingFormat::Pairs => UnderlyingFormat::Pairs,
+            TrainingFormat::Triplet => UnderlyingFormat::Triplet,
+            TrainingFormat::AudioTriplet => UnderlyingFormat::AudioTriplet,
+            TrainingFormat::Classification { .. } => UnderlyingFormat::Classification,
+            TrainingFormat::Ner { .. } => UnderlyingFormat::Ner,
+            TrainingFormat::Graph {
+                has_negatives: true,
+            } => UnderlyingFormat::Triplet,
+            TrainingFormat::Graph {
+                has_negatives: false,
+            } => UnderlyingFormat::Pairs,
+        }
+    }
 }
 
 /// A chunk of text data for one training batch. The training loop encodes
@@ -239,6 +288,60 @@ impl TrainingDataLoader {
         }
     }
 
+    /// Create a loader from a graph (S11): sample the node-text + edge-table
+    /// graph into `(anchor, positive, [hard_negative])` text rows by biased
+    /// random walks, then store them as the underlying `Pairs` (no mined
+    /// negatives) or `Triplet` (structure-mined hard negatives) rows. The loader
+    /// reports [`TrainingFormat::Graph`] for provenance, but the rows feed the
+    /// existing MNRL/Triplet path unchanged — S11 adds **no new loss**.
+    ///
+    /// The sampler enforces the text-bearing precondition (every edge endpoint
+    /// must resolve to a [`super::graph_sampler::TextNode`]) and the collapse /
+    /// false-negative guards, so any violation surfaces here as a typed error.
+    ///
+    /// **Circularity caveat:** if the edges are S9-similarity edges the
+    /// supervision largely re-learns the base metric; genuine gain comes from
+    /// declared / external edges (see [`super::graph_sampler`]).
+    pub fn from_graph(sampler: &super::graph_sampler::GraphSampler) -> Result<Self> {
+        let pairs = sampler.sample()?;
+        // The whole dataset shares one shape: if any pair carries mined hard
+        // negatives the format is Triplet, otherwise Pairs. The sampler emits a
+        // uniform shape (hard_negatives is a single config knob), so the first
+        // pair determines it; an empty dataset is already a sampler error.
+        let has_negatives = pairs.first().is_some_and(|p| !p.hard_negatives.is_empty());
+
+        let rows = pairs
+            .into_iter()
+            .map(|p| {
+                if has_negatives {
+                    // Use the first mined negative as the explicit triplet
+                    // negative; the rest still contribute via in-batch negatives
+                    // (MNRL appends the explicit one as an extra column).
+                    let negative = p.hard_negatives.into_iter().next().ok_or_else(|| {
+                        JammiError::FineTune(
+                            "graph pair declared hard negatives but supplied none".into(),
+                        )
+                    })?;
+                    Ok(TrainingRow::Triplet {
+                        anchor: p.anchor,
+                        positive: p.positive,
+                        negative,
+                    })
+                } else {
+                    Ok(TrainingRow::Pairs {
+                        anchor: p.anchor,
+                        positive: p.positive,
+                    })
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
+            format: TrainingFormat::Graph { has_negatives },
+            data: LoaderData::TextRows(rows),
+        })
+    }
+
     /// Create a loader from audio triplet rows. Each element is
     /// `(anchor_bytes, positive_bytes, negative_bytes)` where every field is
     /// one encoded audio clip. The trainer encodes these through the frozen
@@ -374,8 +477,11 @@ impl TrainingDataLoader {
         match &self.data {
             LoaderData::TextRows(rows) => rows
                 .chunks(batch_size)
-                .map(|chunk| match self.format {
-                    TrainingFormat::Contrastive => TextChunk::Contrastive {
+                // A `Graph` loader stores `Pairs`/`Triplet` rows, so it encodes
+                // through its underlying shape — the provenance variant carries
+                // no chunk shape of its own.
+                .map(|chunk| match self.format.underlying() {
+                    UnderlyingFormat::Contrastive => TextChunk::Contrastive {
                         texts_a: chunk
                             .iter()
                             .map(|r| match r {
@@ -398,7 +504,7 @@ impl TrainingDataLoader {
                             })
                             .collect(),
                     },
-                    TrainingFormat::Pairs => TextChunk::Pairs {
+                    UnderlyingFormat::Pairs => TextChunk::Pairs {
                         anchors: chunk
                             .iter()
                             .map(|r| match r {
@@ -414,7 +520,7 @@ impl TrainingDataLoader {
                             })
                             .collect(),
                     },
-                    TrainingFormat::Triplet => TextChunk::Triplet {
+                    UnderlyingFormat::Triplet => TextChunk::Triplet {
                         anchors: chunk
                             .iter()
                             .map(|r| match r {
@@ -437,7 +543,7 @@ impl TrainingDataLoader {
                             })
                             .collect(),
                     },
-                    TrainingFormat::AudioTriplet => TextChunk::AudioTriplet {
+                    UnderlyingFormat::AudioTriplet => TextChunk::AudioTriplet {
                         anchors: chunk
                             .iter()
                             .map(|r| match r {
@@ -460,7 +566,7 @@ impl TrainingDataLoader {
                             })
                             .collect(),
                     },
-                    TrainingFormat::Classification { .. } => TextChunk::Classification {
+                    UnderlyingFormat::Classification => TextChunk::Classification {
                         texts: chunk
                             .iter()
                             .map(|r| match r {
@@ -476,7 +582,7 @@ impl TrainingDataLoader {
                             })
                             .collect(),
                     },
-                    TrainingFormat::Ner { .. } => TextChunk::Ner {
+                    UnderlyingFormat::Ner => TextChunk::Ner {
                         texts: chunk
                             .iter()
                             .map(|r| match r {
@@ -517,8 +623,11 @@ impl TrainingDataLoader {
                 ))
             }
         };
-        match self.format {
-            TrainingFormat::Pairs => {
+        // A `Graph` loader is itself an in-batch-negative loader — it stores
+        // `Pairs`/`Triplet` rows — so it resolves through `underlying()` and
+        // flows into mining / GradCache exactly like a hand-built pair set.
+        match self.format.underlying() {
+            UnderlyingFormat::Pairs => {
                 let mut anchors = Vec::with_capacity(rows.len());
                 let mut positives = Vec::with_capacity(rows.len());
                 for row in rows {
@@ -529,7 +638,7 @@ impl TrainingDataLoader {
                 }
                 Ok((anchors, positives, None))
             }
-            TrainingFormat::Triplet => {
+            UnderlyingFormat::Triplet => {
                 let mut anchors = Vec::with_capacity(rows.len());
                 let mut positives = Vec::with_capacity(rows.len());
                 let mut negatives = Vec::with_capacity(rows.len());

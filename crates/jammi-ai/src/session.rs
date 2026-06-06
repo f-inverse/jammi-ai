@@ -793,6 +793,40 @@ impl InferenceSession {
     ) -> Result<FineTuneJob> {
         let config = config.unwrap_or_default();
         config.validate()?;
+
+        // Load training data from the source, then hand the loader to the shared
+        // job-creation + training-spawn path. The graph path
+        // ([`Self::fine_tune_graph`]) builds a different loader but shares that
+        // same tail.
+        let table_name = self.find_table_name(source)?;
+        let query = format!(
+            "SELECT {} FROM {source}.public.\"{table_name}\"",
+            columns
+                .iter()
+                .map(|c| format!("\"{c}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let batches = self.sql(&query).await?;
+        let data_loader = build_training_data_loader(&batches, columns, task)?;
+
+        self.spawn_fine_tune(source, base_model, task, config, data_loader)
+            .await
+    }
+
+    /// Create the catalog job record, load the base model, and spawn the
+    /// blocking training run for a pre-built [`TrainingDataLoader`]. Shared by
+    /// the column-source [`Self::fine_tune`] path and the graph
+    /// [`Self::fine_tune_graph`] path — the only thing that differs upstream is
+    /// how the loader is built.
+    async fn spawn_fine_tune(
+        &self,
+        source: &str,
+        base_model: &str,
+        task: ModelTask,
+        config: FineTuneConfig,
+        data_loader: crate::fine_tune::data::TrainingDataLoader,
+    ) -> Result<FineTuneJob> {
         let job_id = uuid::Uuid::new_v4().to_string();
         let output_model_id = format!("jammi:fine-tuned:{job_id}");
 
@@ -839,20 +873,6 @@ impl InferenceSession {
             .catalog()
             .create_fine_tune_job(&job_id, &base_model_pk, source, &loss_type, &hyperparams)
             .await?;
-
-        // Load training data from the source
-        let table_name = self.find_table_name(source)?;
-        let query = format!(
-            "SELECT {} FROM {source}.public.\"{table_name}\"",
-            columns
-                .iter()
-                .map(|c| format!("\"{c}\""))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let batches = self.sql(&query).await?;
-
-        let data_loader = build_training_data_loader(&batches, columns, task)?;
 
         // Load the base model under the task being fine-tuned so the right
         // tower (text vs audio) is materialised and `embedding_dim()` reports
@@ -922,6 +942,120 @@ impl InferenceSession {
             output_model_id,
             Arc::clone(self.inner.catalog()),
         ))
+    }
+
+    /// Graph-supervised fine-tune (S11): learn an embedding metric that encodes
+    /// a graph's structure. Reads a node-text source and an edge source, samples
+    /// the graph into `(anchor, positive, [hard_negative])` text pairs via biased
+    /// random walks (node2vec), and drives the existing in-batch-negative
+    /// (S10/MNRL) or triplet objective — **no new loss**.
+    ///
+    /// `node_source` supplies the text the encoder embeds, keyed by `id_column`,
+    /// with the text in `text_column`. `edge_source` supplies directed edges
+    /// (`src_column` → `dst_column`); endpoints join to `id_column`. Every
+    /// endpoint must resolve to a node (the text-bearing precondition) or this is
+    /// a typed error.
+    ///
+    /// `provenance` declares whether the edges are external/declared structure or
+    /// S9-similarity edges — **the load-bearing distinction**: training on
+    /// similarity edges largely re-learns the base metric (a degenerate feedback
+    /// loop), so genuine gain comes from declared edges. Similarity-only edges
+    /// are a weak bootstrap, never the sole supervision.
+    pub async fn fine_tune_graph(
+        &self,
+        sources: &crate::fine_tune::graph_sampler::GraphFineTuneSources,
+        base_model: &str,
+        sample_config: crate::fine_tune::graph_sampler::GraphSampleConfig,
+        config: Option<FineTuneConfig>,
+    ) -> Result<FineTuneJob> {
+        use crate::fine_tune::graph_sampler::{GraphEdge, GraphSampler, TextNode};
+
+        let config = config.unwrap_or_default();
+        config.validate()?;
+        sample_config.validate()?;
+
+        // Read node text (id, text) from the node source.
+        let node_table = self.find_table_name(&sources.node_source)?;
+        let node_query = format!(
+            "SELECT \"{}\", \"{}\" FROM {}.public.\"{node_table}\"",
+            sources.id_column, sources.text_column, sources.node_source
+        );
+        let node_batches = self.sql(&node_query).await?;
+        let mut nodes = Vec::new();
+        for batch in &node_batches {
+            let ids = batch
+                .column_by_name(&sources.id_column)
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "node id column '{}' is not text",
+                        sources.id_column
+                    ))
+                })?;
+            let texts = batch
+                .column_by_name(&sources.text_column)
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "node text column '{}' is not text",
+                        sources.text_column
+                    ))
+                })?;
+            for (id, text) in ids.into_iter().zip(texts) {
+                nodes.push(TextNode::new(id, text));
+            }
+        }
+
+        // Read edges (src, dst) from the edge source; the caller's `provenance`
+        // tags every edge (an edge source is homogeneous in origin).
+        let edge_table = self.find_table_name(&sources.edge_source)?;
+        let edge_query = format!(
+            "SELECT \"{}\", \"{}\" FROM {}.public.\"{edge_table}\"",
+            sources.src_column, sources.dst_column, sources.edge_source
+        );
+        let edge_batches = self.sql(&edge_query).await?;
+        let mut edges = Vec::new();
+        for batch in &edge_batches {
+            let srcs = batch
+                .column_by_name(&sources.src_column)
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "edge src column '{}' is not text",
+                        sources.src_column
+                    ))
+                })?;
+            let dsts = batch
+                .column_by_name(&sources.dst_column)
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "edge dst column '{}' is not text",
+                        sources.dst_column
+                    ))
+                })?;
+            for (src, dst) in srcs.into_iter().zip(dsts) {
+                edges.push(GraphEdge {
+                    src,
+                    dst,
+                    provenance: sources.provenance,
+                });
+            }
+        }
+
+        let sampler = GraphSampler::build(nodes, edges, sample_config)?;
+        let data_loader = crate::fine_tune::data::TrainingDataLoader::from_graph(&sampler)?;
+
+        // The job record's `source` field records the node source — the model is
+        // fine-tuned on that source's text, the edges only supervise the pairing.
+        self.spawn_fine_tune(
+            &sources.node_source,
+            base_model,
+            ModelTask::TextEmbedding,
+            config,
+            data_loader,
+        )
+        .await
     }
 
     // =====================================================================

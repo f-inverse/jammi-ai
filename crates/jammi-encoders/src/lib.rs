@@ -12,6 +12,7 @@
 //! closed-enum dispatchers that let a single caller hold any of the
 //! text / audio families respectively.
 
+pub mod aggregate;
 pub mod audio;
 pub mod bert;
 pub mod clip_text;
@@ -25,6 +26,7 @@ mod layer_norm;
 mod mask;
 mod pooling;
 
+pub use aggregate::{segment_aggregate, SegmentReduce};
 pub use any::AnyEncoder;
 pub use audio::{AnyAudioEncoder, AudioEncoder};
 pub use bert::{Bert, BertConfig};

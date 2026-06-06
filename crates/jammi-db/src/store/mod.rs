@@ -484,6 +484,8 @@ impl ResultStore {
             .create_table(
                 source_id,
                 ModelTask::TextEmbedding,
+                ResultTableKind::Model,
+                None,
                 model_id,
                 Some(dimensions as i32),
                 Some("_row_id"),

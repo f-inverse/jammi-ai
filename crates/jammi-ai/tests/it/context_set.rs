@@ -29,6 +29,11 @@ async fn session_with_embeddings() -> (Arc<InferenceSession>, TempDir) {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    // The set encoder pools through the vector-aggregation UDAFs; register the
+    // engine's compound-query SQL functions so `vector_mean`/`vector_sum`/
+    // `vector_max` resolve on this session, exactly as the canonical
+    // `InferenceSession::open` constructor does for a long-lived session.
+    session.register_query_functions();
     session
         .add_source(
             "patents",
@@ -67,7 +72,7 @@ async fn vector_for_key(session: &Arc<InferenceSession>, key: &str) -> Vec<f32> 
         .unwrap();
     let batches = session
         .sql(&format!(
-            "SELECT _row_id, vector FROM jammi.{} WHERE _row_id = '{key}'",
+            "SELECT _row_id, vector FROM \"jammi.{}\" WHERE _row_id = '{key}'",
             table.table_name
         ))
         .await

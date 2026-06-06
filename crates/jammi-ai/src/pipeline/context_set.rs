@@ -193,6 +193,18 @@ impl InferenceSession {
             .map(|(key, _similarity)| key)
             .filter(|key| Some(key.as_str()) != exclude)
             .collect();
+
+        // Split scope (the train/target leakage line): keep only the candidates
+        // whose source row satisfies the split predicate, before truncating to k.
+        // Applied here rather than during retrieval because the predicate is over
+        // the source's columns, which the ANN index does not carry. A predicate
+        // no candidate satisfies yields an empty context — defined, not a crash.
+        if let Some(split) = request.split.as_deref() {
+            context_keys = self
+                .filter_keys_by_split(&request.source_id, &context_keys, split)
+                .await?;
+        }
+
         context_keys.truncate(request.k);
 
         let context_vector = self
@@ -248,12 +260,18 @@ impl InferenceSession {
                 ))
             })?;
 
-        let table_ref = format!("jammi.{}", table.table_name);
+        // Result tables register under the single bare literal `jammi.{name}`
+        // (`register_parquet_table`), so reach this one through
+        // `TableReference::bare` — a `&str` would be re-parsed and split on the
+        // dot, missing the registered table whenever the name carries a hyphen
+        // from a sanitized local model path.
+        let table_ref =
+            datafusion::sql::TableReference::bare(format!("jammi.{}", table.table_name));
         let keys: Vec<datafusion::prelude::Expr> =
             context_keys.iter().map(|k| lit(k.as_str())).collect();
         let pooled = self
             .context()
-            .table(&table_ref)
+            .table(table_ref.clone())
             .await
             .map_err(|e| JammiError::Other(format!("Context pool: resolve '{table_ref}': {e}")))?
             // Typed IN-list over the keys — the arbitrary row keys are bound
@@ -267,6 +285,62 @@ impl InferenceSession {
             .map_err(|e| JammiError::Other(format!("Context pool: collect: {e}")))?;
 
         extract_single_vector(&pooled, &table.table_name)
+    }
+
+    /// Keep only the candidate keys whose source row satisfies `split`,
+    /// preserving retrieval order.
+    ///
+    /// Scans the source restricted to `split` (a predicate over the source's
+    /// columns, e.g. `split = 'train'`), projecting the key column, then retains
+    /// the candidates present in that qualifying set. The leakage line: when the
+    /// context feeds a train/eval target, the context rows come from the train
+    /// split with the target's own outcome held out.
+    async fn filter_keys_by_split(
+        &self,
+        source_id: &str,
+        context_keys: &[String],
+        split: &str,
+    ) -> Result<Vec<String>> {
+        if context_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let table = self
+            .catalog()
+            .resolve_embedding_table(source_id, None)
+            .await?;
+        let key_col = table.key_column.as_deref().ok_or_else(|| {
+            JammiError::Other(format!(
+                "Context split: source '{source_id}' embedding table has no key column"
+            ))
+        })?;
+        let source_table = self.find_table_name(source_id)?;
+
+        let keys: Vec<datafusion::prelude::Expr> =
+            context_keys.iter().map(|k| lit(k.as_str())).collect();
+
+        // The split predicate is the user's own SQL over the source columns, so
+        // it is applied as a `WHERE` clause inside the scan; the candidate keys
+        // stay bound values in a typed IN-list, never interpolated into text.
+        let batches = self
+            .context()
+            .sql(&format!(
+                "SELECT arrow_cast(\"{key_col}\", 'Utf8') AS _context_key \
+                 FROM \"{source_id}\".public.\"{source_table}\" WHERE {split}"
+            ))
+            .await
+            .map_err(|e| JammiError::Other(format!("Context split: scan: {e}")))?
+            .filter(col("_context_key").in_list(keys, false))
+            .map_err(|e| JammiError::Other(format!("Context split: filter: {e}")))?
+            .collect()
+            .await
+            .map_err(|e| JammiError::Other(format!("Context split: collect: {e}")))?;
+
+        let qualifying = collect_keys(&batches, "_context_key");
+        Ok(context_keys
+            .iter()
+            .filter(|k| qualifying.contains(*k))
+            .cloned()
+            .collect())
     }
 
     /// Hydrate the requested `value_columns` of `context_keys` from the source,
@@ -307,7 +381,7 @@ impl InferenceSession {
             .context()
             .sql(&format!(
                 "SELECT {select_list}, arrow_cast(\"{key_col}\", 'Utf8') AS _context_key \
-                 FROM {source_id}.public.\"{source_table}\""
+                 FROM \"{source_id}\".public.\"{source_table}\""
             ))
             .await
             .map_err(|e| JammiError::Other(format!("Context hydrate: scan: {e}")))?
@@ -319,6 +393,19 @@ impl InferenceSession {
 
         Ok(order_by_keys(batches, context_keys))
     }
+}
+
+/// Collect every value of a string column across `batches` into a set.
+fn collect_keys(batches: &[RecordBatch], column: &str) -> std::collections::HashSet<String> {
+    use arrow::array::StringArray;
+    batches
+        .iter()
+        .filter_map(|b| {
+            b.column_by_name(column)
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        })
+        .flat_map(|keys| (0..keys.len()).map(|i| keys.value(i).to_string()))
+        .collect()
 }
 
 /// Reorder hydrated `value_columns` rows to match `context_keys` (retrieval
@@ -420,8 +507,8 @@ impl InferenceSession {
     ///
     /// Delegates the write to [`jammi_db::store::ResultStore::materialize_embedding_table`],
     /// which builds the same `(_row_id, _source_id, _model_id, vector)` Parquet
-    /// + sidecar index every embedding table gets, so a materialised context set
-    /// is a first-class member of the same table family.
+    /// and sidecar index every embedding table gets, so a materialised context
+    /// set is a first-class member of the same table family.
     pub async fn materialize_context(
         &self,
         source_id: &str,

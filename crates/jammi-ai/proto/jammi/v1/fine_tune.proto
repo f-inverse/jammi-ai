@@ -76,6 +76,30 @@ enum ClassificationLoss {
   CROSS_ENTROPY = 1;
 }
 
+// Proper-scoring objective for a distributional regression head (S18). Mirrors
+// the engine's `RegressionLoss`; the β-NLL variant carries its weighting
+// exponent. Pinball trains the quantile head over `quantile_levels`; the others
+// train the parametric Gaussian head.
+message RegressionLoss {
+  oneof loss {
+    // Gaussian NLL — the plain heteroscedastic mean-variance objective.
+    GaussianNll gaussian_nll = 1;
+    // β-NLL with the given variance-weighting exponent (Seitzer 2022).
+    BetaNll beta_nll = 2;
+    // Closed-form Gaussian CRPS. No parameter.
+    Crps crps = 3;
+    // Pinball / quantile loss over the configured levels. No parameter.
+    Pinball pinball = 4;
+  }
+
+  message GaussianNll {}
+  message BetaNll {
+    double beta = 1;
+  }
+  message Crps {}
+  message Pinball {}
+}
+
 // Which loss signal drives early stopping. Mirrors `EarlyStoppingMetric`.
 enum EarlyStoppingMetric {
   EARLY_STOPPING_METRIC_UNSPECIFIED = 0;
@@ -167,6 +191,12 @@ message FineTuneConfig {
   optional HardNegativeConfig hard_negatives = 25;
   // Matryoshka prefix dimensions. Empty = full dimension only.
   repeated uint32 matryoshka_dims = 26;
+  // Unset = the engine default (β-NLL, β=0.5). The Pinball variant trains the
+  // quantile head over `quantile_levels`.
+  optional RegressionLoss regression_loss = 27;
+  // Quantile levels for a pinball-trained regression head, ascending in (0, 1).
+  // Empty for the parametric Gaussian objectives.
+  repeated double quantile_levels = 28;
 }
 
 message StartFineTuneRequest {

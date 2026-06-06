@@ -101,6 +101,69 @@ impl Default for EmbeddingLoss {
     }
 }
 
+/// Proper-scoring objective for a distributional regression head (S18).
+///
+/// Three of the four arms train the **parametric Gaussian** head — the head
+/// emits `(mean, raw_std)` per row and the loss reads a positive `σ` from
+/// `raw_std` via `floor + softplus(raw_std)` (a *learnable* floor, the
+/// [`RegressionHead::Gaussian`] `std_floor`). The fourth trains the **quantile**
+/// head (one output per level) with the pinball loss.
+///
+/// Every arm is a **proper score**: minimising it rewards a calibrated
+/// *distribution*, not merely an accurate mean. (Plain MSE on the mean is *not*
+/// proper for a distribution and is offered only as a secondary diagnostic, not
+/// a training objective.) The default is [`Self::BetaNll`] — Seitzer's
+/// variance-weighted NLL, which avoids the variance-collapse / mean-starvation
+/// pathology of the naive joint `μ,σ²` NLL ([Seitzer et al. 2022]; [Nix &
+/// Weigend 1994]); [`Self::Crps`] (closed-form Gaussian CRPS) is the other
+/// collapse-resistant choice.
+///
+/// A parametric Gaussian head models **aleatoric** (irreducible data) noise
+/// only. It does *not* know what it has not seen: off-distribution it can be
+/// confidently wrong. Epistemic uncertainty is NP4 (amortized posterior) or S17
+/// (distribution-free conformal) — pick along that spectrum; do not read this
+/// head's `σ` as epistemic.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegressionLoss {
+    /// Gaussian negative log-likelihood, `½(log σ² + (y−μ)²/σ²)` (+const). The
+    /// classic heteroscedastic mean-variance objective ([Nix & Weigend 1994]).
+    /// Strictly proper, but the joint `μ,σ²` gradient down-weights high-error
+    /// points by inflating their variance, starving the mean's gradient
+    /// (variance collapse / overconfidence). Provided for completeness and as
+    /// the pathology baseline; prefer `BetaNll` or `Crps`.
+    GaussianNll,
+    /// β-NLL ([Seitzer et al. 2022]): the per-row Gaussian NLL weighted by a
+    /// stop-gradient `σ^{2β}`, which restores the mean's gradient on
+    /// high-variance rows and removes the collapse. `beta ∈ [0, 1]`; `0`
+    /// recovers plain NLL, `1` recovers (up to a constant) the MSE-on-the-mean
+    /// gradient. The default `0.5` is Seitzer's recommended setting. This is the
+    /// default regression objective.
+    BetaNll {
+        /// Variance-weighting exponent. `0.5` is the recommended default.
+        beta: f64,
+    },
+    /// Closed-form Gaussian continuous ranked probability score (CRPS), from
+    /// [`jammi_numerics::calibration::crps_gaussian`] — the same primitive R2
+    /// headlines as a metric. Strictly proper and, unlike NLL, bounded in the
+    /// outcome's units and far more stable under joint `μ,σ²` training. The
+    /// recommended collapse-resistant alternative to `BetaNll`.
+    Crps,
+    /// Pinball / quantile loss ([Koenker & Bassett 1978]) for the quantile head.
+    /// Each predicted quantile is trained to its level by the asymmetric
+    /// absolute deviation `max(q·(y−ŷ), (q−1)·(y−ŷ))`, summed over levels. A
+    /// non-crossing penalty discourages quantile crossing during training; the
+    /// serving adapter additionally sorts post-hoc.
+    Pinball,
+}
+
+impl Default for RegressionLoss {
+    fn default() -> Self {
+        // β-NLL is the collapse-resistant default; β=0.5 is Seitzer's setting.
+        Self::BetaNll { beta: 0.5 }
+    }
+}
+
 /// Loss function for classification fine-tuning.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -213,6 +276,19 @@ pub struct FineTuneConfig {
     pub embedding_loss: Option<EmbeddingLoss>,
     /// Loss function for classification fine-tuning. Auto-selected if None.
     pub classification_loss: Option<ClassificationLoss>,
+    /// Proper-scoring objective for a distributional regression head (S18).
+    /// `None` selects the collapse-resistant default ([`RegressionLoss::default`],
+    /// β-NLL with β=0.5). A `Pinball` choice trains the quantile head over
+    /// [`Self::quantile_levels`]; the other arms train the parametric Gaussian
+    /// head.
+    #[serde(default)]
+    pub regression_loss: Option<RegressionLoss>,
+    /// Quantile levels for a pinball-trained regression head, ascending in
+    /// `(0, 1)` (e.g. `[0.05, 0.5, 0.95]`). Ignored by the Gaussian objectives.
+    /// Empty (default) is valid only for the parametric arms; the pinball arm
+    /// requires at least one level.
+    #[serde(default)]
+    pub quantile_levels: Vec<f64>,
     /// Gradient accumulation steps. Effective batch = batch_size × this. Default: 1.
     pub gradient_accumulation_steps: usize,
     /// Fraction of data held out for validation. Default: 0.1.
@@ -329,6 +405,8 @@ impl Default for FineTuneConfig {
             max_seq_length: 512,
             embedding_loss: None,
             classification_loss: None,
+            regression_loss: None,
+            quantile_levels: Vec::new(),
             gradient_accumulation_steps: 1,
             validation_fraction: 0.1,
             early_stopping_patience: 3,
@@ -406,6 +484,34 @@ impl FineTuneConfig {
             return Err(JammiError::FineTune(
                 "matryoshka_dims entries must all be > 0".into(),
             ));
+        }
+        if let Some(RegressionLoss::BetaNll { beta }) = self.regression_loss {
+            if !(0.0..=1.0).contains(&beta) {
+                return Err(JammiError::FineTune(
+                    "regression_loss BetaNll beta must be in [0.0, 1.0]".into(),
+                ));
+            }
+        }
+        if matches!(self.regression_loss, Some(RegressionLoss::Pinball)) {
+            if self.quantile_levels.is_empty() {
+                return Err(JammiError::FineTune(
+                    "Pinball regression loss requires at least one quantile level".into(),
+                ));
+            }
+            if self
+                .quantile_levels
+                .iter()
+                .any(|&q| !(0.0..1.0).contains(&q) || q <= 0.0)
+            {
+                return Err(JammiError::FineTune(
+                    "quantile_levels must lie strictly in (0, 1)".into(),
+                ));
+            }
+            if self.quantile_levels.windows(2).any(|w| w[1] <= w[0]) {
+                return Err(JammiError::FineTune(
+                    "quantile_levels must be strictly ascending".into(),
+                ));
+            }
         }
         Ok(())
     }

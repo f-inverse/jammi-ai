@@ -43,6 +43,14 @@ pub enum TrainingBatch {
         hidden_states: Tensor, // (batch, seq_len, hidden)
         labels: Tensor,        // (batch, seq_len) as i64, -100 for ignored tokens
     },
+    /// Regression (S18): the distributional head's raw output plus the observed
+    /// continuous targets. `input` is `(batch, k)` — the unconstrained head
+    /// parameters (`k = 2` `(mean, raw_std)` for the Gaussian objectives,
+    /// `k = levels` for the pinball objective); `target` is `(batch,)` the
+    /// observed `y`. The proper-scoring loss reads a positive `σ` from
+    /// `raw_std` via `floor + softplus`, so the head trains in the
+    /// unconstrained space.
+    Regression { input: Tensor, target: Tensor },
 }
 
 /// Format of training data, detected from column names.
@@ -67,6 +75,12 @@ pub enum TrainingFormat {
     Classification { num_classes: usize },
     /// NER with BIO tag mapping.
     Ner { num_labels: usize },
+    /// Regression (S18): `text, target` rows — one input text and one observed
+    /// continuous outcome. The trainer encodes the text through the frozen base
+    /// model + the distributional projection head, then scores the head's
+    /// parameters against the target with the configured proper-scoring
+    /// objective.
+    Regression,
     /// Graph-supervised (S11): the rows were sampled from a graph (node text +
     /// edge table) by biased random walks into `(anchor, positive,
     /// [hard_negative])` pairs. It carries **no new loss** — it is a
@@ -92,6 +106,7 @@ enum UnderlyingFormat {
     AudioTriplet,
     Classification,
     Ner,
+    Regression,
 }
 
 impl TrainingFormat {
@@ -108,6 +123,7 @@ impl TrainingFormat {
             TrainingFormat::AudioTriplet => UnderlyingFormat::AudioTriplet,
             TrainingFormat::Classification { .. } => UnderlyingFormat::Classification,
             TrainingFormat::Ner { .. } => UnderlyingFormat::Ner,
+            TrainingFormat::Regression => UnderlyingFormat::Regression,
             TrainingFormat::Graph {
                 has_negatives: true,
             } => UnderlyingFormat::Triplet,
@@ -152,6 +168,13 @@ pub enum TextChunk {
         texts: Vec<String>,
         /// Per-text entity spans as JSON strings (same format as inference output).
         entities_json: Vec<String>,
+    },
+    /// One batch of regression rows: input texts and their observed continuous
+    /// targets. The training loop encodes the texts through the base model + the
+    /// distributional head, then scores the head output against `targets`.
+    Regression {
+        texts: Vec<String>,
+        targets: Vec<f32>,
     },
 }
 
@@ -209,6 +232,10 @@ enum TrainingRow {
         /// JSON-serialized entity spans.
         entities_json: String,
     },
+    Regression {
+        text: String,
+        target: f32,
+    },
 }
 
 impl TrainingDataLoader {
@@ -250,6 +277,21 @@ impl TrainingDataLoader {
                         text,
                         entities_json,
                     })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Create a loader from regression rows (input text + observed continuous
+    /// target). The trainer encodes each text through the base model and the
+    /// distributional projection head, then scores the head's parameters against
+    /// the target with the configured proper-scoring objective (S18).
+    pub fn from_regression(rows: Vec<(String, f32)>) -> Self {
+        Self {
+            format: TrainingFormat::Regression,
+            data: LoaderData::TextRows(
+                rows.into_iter()
+                    .map(|(text, target)| TrainingRow::Regression { text, target })
                     .collect(),
             ),
         }
@@ -598,6 +640,22 @@ impl TrainingDataLoader {
                             })
                             .collect(),
                     },
+                    UnderlyingFormat::Regression => TextChunk::Regression {
+                        texts: chunk
+                            .iter()
+                            .map(|r| match r {
+                                TrainingRow::Regression { text, .. } => text.clone(),
+                                _ => String::new(),
+                            })
+                            .collect(),
+                        targets: chunk
+                            .iter()
+                            .map(|r| match r {
+                                TrainingRow::Regression { target, .. } => *target,
+                                _ => 0.0,
+                            })
+                            .collect(),
+                    },
                 })
                 .collect(),
             LoaderData::Precomputed(_) => Vec::new(),
@@ -667,5 +725,55 @@ impl TrainingDataLoader {
     /// encoded through a model.
     pub fn is_precomputed(&self) -> bool {
         matches!(self.data, LoaderData::Precomputed(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A regression loader carries `TrainingFormat::Regression` and chunks its
+    /// rows into `TextChunk::Regression { texts, targets }` — the shape the
+    /// trainer encodes through the distributional head. Pins the S18 data path
+    /// from constructor to chunk.
+    #[test]
+    fn regression_loader_chunks_into_regression_text_chunks() {
+        let loader = TrainingDataLoader::from_regression(vec![
+            ("cheap".into(), 0.1),
+            ("mid".into(), 0.5),
+            ("dear".into(), 0.9),
+        ]);
+        assert!(matches!(loader.format(), TrainingFormat::Regression));
+        assert_eq!(loader.len(), 3);
+
+        let chunks = loader.text_chunks(2);
+        assert_eq!(chunks.len(), 2, "3 rows at batch 2 → two chunks");
+        match &chunks[0] {
+            TextChunk::Regression { texts, targets } => {
+                assert_eq!(texts, &["cheap".to_string(), "mid".to_string()]);
+                assert_eq!(targets, &[0.1, 0.5]);
+            }
+            _ => panic!("regression loader must yield a Regression chunk"),
+        }
+        match &chunks[1] {
+            TextChunk::Regression { texts, targets } => {
+                assert_eq!(texts, &["dear".to_string()]);
+                assert_eq!(targets, &[0.9]);
+            }
+            _ => panic!("regression loader must yield a Regression chunk"),
+        }
+    }
+
+    /// The validation split preserves the regression format on both halves.
+    #[test]
+    fn regression_split_keeps_format() {
+        let loader = TrainingDataLoader::from_regression(
+            (0..10).map(|i| (format!("r{i}"), i as f32)).collect(),
+        );
+        let (train, val) = loader.split(0.2).unwrap();
+        assert!(matches!(train.format(), TrainingFormat::Regression));
+        assert!(matches!(val.format(), TrainingFormat::Regression));
+        assert_eq!(train.len(), 8);
+        assert_eq!(val.len(), 2);
     }
 }

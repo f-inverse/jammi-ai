@@ -71,6 +71,50 @@ pub fn build_classification_head(
     })
 }
 
+/// Build a projection-plus-distribution head for regression fine-tunes (S18).
+///
+/// Layer 0 (`projection`): LoRA-wrapped identity, `hidden → hidden`.
+/// Layer 1 (`distribution`): LoRA-wrapped zeros, `hidden → output_dim`, where
+/// `output_dim` is the number of distribution parameters — `2` for the
+/// parametric Gaussian head `(mean, raw_std)`, or one per level for the quantile
+/// head. The zeros base means the head starts emitting `0`s, so the served
+/// `σ = floor + softplus(0)` is a finite, non-collapsed default before training.
+pub fn build_distribution_head(
+    hidden_size: usize,
+    output_dim: usize,
+    config: &super::FineTuneConfig,
+    vb: &VarBuilder,
+) -> Result<LoraModel> {
+    let proj_base = Tensor::eye(hidden_size, DType::F32, vb.device())
+        .map_err(|e| JammiError::FineTune(format!("Regression projection identity: {e}")))?;
+    let proj_linear = Linear::new(proj_base, None);
+    let projection = LoraLinear::new_simple(
+        proj_linear,
+        config.lora_rank,
+        config.lora_alpha,
+        &vb.pp("projection"),
+    )
+    .map_err(|e| JammiError::FineTune(format!("Regression projection LoRA: {e}")))?;
+
+    let head_base = Tensor::zeros((output_dim, hidden_size), DType::F32, vb.device())
+        .map_err(|e| JammiError::FineTune(format!("Distribution head zeros: {e}")))?;
+    let head_linear = Linear::new(head_base, None);
+    let distribution = LoraLinear::new_simple(
+        head_linear,
+        config.lora_rank,
+        config.lora_alpha,
+        &vb.pp("distribution"),
+    )
+    .map_err(|e| JammiError::FineTune(format!("Distribution head LoRA: {e}")))?;
+
+    Ok(LoraModel {
+        layers: vec![
+            ("projection".to_string(), projection),
+            ("distribution".to_string(), distribution),
+        ],
+    })
+}
+
 /// Build a projection-plus-token-classifier head for NER fine-tunes.
 ///
 /// Layer 0 (`projection`): LoRA-wrapped identity, `hidden → hidden`, per token.

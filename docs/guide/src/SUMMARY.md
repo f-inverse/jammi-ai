@@ -20,6 +20,7 @@
 - [Classify Text](./classify-text.md)
 - [Extract Entities (NER)](./extract-entities.md)
 - [Conformal Prediction (Distribution-Free Coverage)](./conformal-prediction.md)
+- [Distributional Inference (Regression with Calibrated Uncertainty)](./distributional-inference.md)
 - [Semantic Search](./semantic-search.md)
 - [Build a Similarity Graph](./build-neighbor-graph.md)
 - [Hybrid Retrieval: Lexical (BM25) + Reciprocal-Rank Fusion](./hybrid-retrieval.md)

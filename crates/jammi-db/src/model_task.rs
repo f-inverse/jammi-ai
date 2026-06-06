@@ -29,6 +29,14 @@ pub enum ModelTask {
     Classification,
     /// Extract named entities (person, org, location, etc.) from text.
     Ner,
+    /// Predict a continuous outcome as a *distribution* — a Gaussian
+    /// `(mean, std)` or a set of quantiles — rather than a point. The
+    /// distributional decoder ([`DistributionAdapter`](../../jammi-ai/inference/adapter/distribution.rs))
+    /// and the proper-scoring objectives (NLL/CRPS/pinball) train and serve it.
+    /// Unlike S9's similarity edge — a *derivation* over embeddings that earned
+    /// no variant — this is a genuine model output type, so it belongs in
+    /// [`Self::ALL`] and the resolution path.
+    Regression,
 }
 
 impl ModelTask {
@@ -44,6 +52,7 @@ impl ModelTask {
         ModelTask::AudioEmbedding,
         ModelTask::Classification,
         ModelTask::Ner,
+        ModelTask::Regression,
     ];
 
     /// Canonical snake-case string stored in the catalog. The single source
@@ -55,6 +64,7 @@ impl ModelTask {
             Self::AudioEmbedding => "audio_embedding",
             Self::Classification => "classification",
             Self::Ner => "ner",
+            Self::Regression => "regression",
         }
     }
 
@@ -68,8 +78,9 @@ impl ModelTask {
             "audio_embedding" => Ok(Self::AudioEmbedding),
             "classification" => Ok(Self::Classification),
             "ner" => Ok(Self::Ner),
+            "regression" => Ok(Self::Regression),
             other => Err(JammiError::Other(format!(
-                "Unknown model task '{other}'. Expected: text_embedding, image_embedding, audio_embedding, classification, ner"
+                "Unknown model task '{other}'. Expected: text_embedding, image_embedding, audio_embedding, classification, ner, regression"
             ))),
         }
     }
@@ -138,7 +149,8 @@ mod tests {
                 | ModelTask::ImageEmbedding
                 | ModelTask::AudioEmbedding
                 | ModelTask::Classification
-                | ModelTask::Ner => {
+                | ModelTask::Ner
+                | ModelTask::Regression => {
                     assert!(
                         ModelTask::ALL.contains(&t),
                         "ModelTask::ALL is missing {t:?}"
@@ -167,6 +179,7 @@ mod tests {
         assert_eq!(format!("{}", ModelTask::AudioEmbedding), "audio_embedding");
         assert_eq!(format!("{}", ModelTask::Classification), "classification");
         assert_eq!(format!("{}", ModelTask::Ner), "ner");
+        assert_eq!(format!("{}", ModelTask::Regression), "regression");
     }
 
     #[test]
@@ -186,6 +199,7 @@ mod tests {
         assert!(ModelTask::AudioEmbedding.is_embedding());
         assert!(!ModelTask::Classification.is_embedding());
         assert!(!ModelTask::Ner.is_embedding());
+        assert!(!ModelTask::Regression.is_embedding());
     }
 
     #[test]

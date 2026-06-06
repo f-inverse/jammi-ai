@@ -1,4 +1,5 @@
 pub mod classification;
+pub mod distribution;
 pub mod embedding;
 pub mod ner;
 
@@ -7,6 +8,7 @@ use arrow::datatypes::Field;
 use jammi_db::error::Result;
 
 pub use classification::ClassificationAdapter;
+pub use distribution::{DistributionAdapter, DistributionForm};
 pub use embedding::EmbeddingAdapter;
 
 use crate::model::{LoadedModel, ModelTask};
@@ -46,6 +48,11 @@ pub fn create_adapter(task: ModelTask, model: &LoadedModel) -> Result<Box<dyn Ou
         }
         ModelTask::Classification => Ok(Box::new(ClassificationAdapter)),
         ModelTask::Ner => Ok(Box::new(ner::NerAdapter)),
+        // A regression model serves the parametric Gaussian head by default —
+        // the smooth, density-bearing core form. A quantile head is constructed
+        // explicitly (`DistributionAdapter::quantile`) by a caller that trained
+        // one, since its levels are model-specific.
+        ModelTask::Regression => Ok(Box::new(DistributionAdapter::gaussian())),
     }
 }
 
@@ -61,6 +68,7 @@ pub(crate) fn create_adapter_for_schema(
         }
         ModelTask::Classification => Box::new(ClassificationAdapter),
         ModelTask::Ner => Box::new(ner::NerAdapter),
+        ModelTask::Regression => Box::new(DistributionAdapter::gaussian()),
     }
 }
 
@@ -128,6 +136,9 @@ pub(crate) fn create_error_output(
             ],
         ),
         ModelTask::Ner => (vec![], vec![vec![String::new(); row_count]]),
+        // Gaussian head: two floats per row (mean, raw_std); every row is an
+        // error here, so the adapter nulls them out.
+        ModelTask::Regression => (vec![vec![0.0; row_count * 2]], vec![]),
     };
     BackendOutput {
         float_outputs,

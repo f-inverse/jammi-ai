@@ -861,6 +861,8 @@ impl InferenceSession {
                 .classification_loss
                 .map(|l| format!("{l:?}"))
                 .unwrap_or_else(|| "CrossEntropy".into())
+        } else if task == ModelTask::Regression {
+            format!("{:?}", config.regression_loss.unwrap_or_default())
         } else {
             config
                 .embedding_loss
@@ -1548,6 +1550,15 @@ fn run_fine_tune_blocking(
                 &config,
                 &vb,
             )?
+        } else if task == ModelTask::Regression {
+            // The distribution head's width is its parameter count: 2 for the
+            // parametric Gaussian objectives `(mean, raw_std)`, one per level for
+            // the pinball/quantile objective.
+            let output_dim = match config.regression_loss.unwrap_or_default() {
+                crate::fine_tune::RegressionLoss::Pinball => config.quantile_levels.len(),
+                _ => 2,
+            };
+            crate::fine_tune::lora::build_distribution_head(hidden_size, output_dim, &config, &vb)?
         } else {
             crate::fine_tune::lora::build_projection_head(hidden_size, &config, &vb)?
         };

@@ -81,6 +81,7 @@ pub fn model_task_from_proto(task: i32) -> Result<jammi_db::ModelTask, Status> {
         Ok(ProtoModelTask::AudioEmbedding) => Ok(ModelTask::AudioEmbedding),
         Ok(ProtoModelTask::Classification) => Ok(ModelTask::Classification),
         Ok(ProtoModelTask::Ner) => Ok(ModelTask::Ner),
+        Ok(ProtoModelTask::Regression) => Ok(ModelTask::Regression),
         Ok(ProtoModelTask::Unspecified) | Err(_) => {
             Err(Status::invalid_argument("task must be specified"))
         }
@@ -101,6 +102,7 @@ pub fn model_task_to_proto(task: jammi_db::ModelTask) -> proto::inference::Model
         ModelTask::AudioEmbedding => ProtoModelTask::AudioEmbedding,
         ModelTask::Classification => ProtoModelTask::Classification,
         ModelTask::Ner => ProtoModelTask::Ner,
+        ModelTask::Regression => ProtoModelTask::Regression,
     }
 }
 

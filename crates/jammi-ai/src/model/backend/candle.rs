@@ -348,7 +348,118 @@ impl CandleModel {
             ModelTask::AudioEmbedding => self.forward_audio_embedding(content),
             ModelTask::Classification => self.forward_classification(content),
             ModelTask::Ner => self.forward_ner(content),
+            ModelTask::Regression => self.forward_regression(content),
         }
+    }
+
+    /// Forward a regression model: pool the encoder output and apply the
+    /// fine-tuned distributional projection head, emitting the raw
+    /// `(mean, raw_std)` Gaussian parameters per row. The
+    /// [`DistributionAdapter`](crate::inference::adapter::DistributionAdapter)
+    /// maps `raw_std` through `softplus + floor` into the served `predicted_std`,
+    /// so the backend head stays in the unconstrained space the proper-scoring
+    /// objective trained it in.
+    ///
+    /// A regression head is a fine-tuned projection head over the frozen
+    /// encoder — the same serving shape classification fine-tunes use — so a
+    /// base checkpoint with no such head cannot serve this task. That is a typed
+    /// capability error, not a silent wrong output.
+    fn forward_regression(&self, content: &[arrow::array::ArrayRef]) -> Result<BackendOutput> {
+        let head = self.projection_head.as_ref().ok_or_else(|| {
+            JammiError::Inference(
+                "Regression inference needs a fine-tuned distributional projection head; \
+                 this model carries none. Fine-tune a ModelTask::Regression head first."
+                    .into(),
+            )
+        })?;
+
+        let texts = arrow_to_texts(content)?;
+        let num_rows = texts.len();
+        if num_rows == 0 {
+            return Ok(BackendOutput {
+                float_outputs: vec![vec![]],
+                string_outputs: vec![],
+                row_status: vec![],
+                row_errors: vec![],
+                shapes: vec![(0, 2)],
+            });
+        }
+
+        let mut row_status = vec![true; num_rows];
+        let mut row_errors = vec![String::new(); num_rows];
+        let mut valid_indices = Vec::new();
+        let mut valid_texts = Vec::new();
+        for (i, text) in texts.iter().enumerate() {
+            if text.is_empty() {
+                row_status[i] = false;
+                row_errors[i] = "Empty or null text input".into();
+            } else {
+                valid_indices.push(i);
+                valid_texts.push(text.as_str());
+            }
+        }
+
+        // An all-empty batch still produces a well-formed Gaussian-width head so
+        // the adapter sees the expected shape; the (failed) rows are nulled.
+        if valid_texts.is_empty() {
+            return Ok(BackendOutput {
+                float_outputs: vec![vec![0.0; num_rows * 2]],
+                string_outputs: vec![],
+                row_status,
+                row_errors,
+                shapes: vec![(num_rows, 2)],
+            });
+        }
+
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+            JammiError::Inference("No tokenizer loaded for regression model".into())
+        })?;
+        let encoding = tokenizer.encode_batch(&valid_texts, Some(512))?;
+        let input_ids = self.tokens_to_tensor(&encoding.input_ids)?;
+        let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
+
+        // Pool through the frozen encoder, then apply the distributional head —
+        // the same pooled-embedding → projection-head shape the embedding and
+        // classification fine-tunes use. The head emits the raw distribution
+        // parameters; the `DistributionAdapter` maps `raw_std` to a positive
+        // served std.
+        let pooled = self.text_forward()?.forward_pooled(
+            &input_ids,
+            &attention_mask,
+            &encoding,
+            &self.device,
+        )?;
+        let params = head
+            .forward(&pooled)
+            .map_err(|e| JammiError::Inference(format!("Regression head forward: {e}")))?;
+        let params = if params.dtype() == DType::F32 {
+            params
+        } else {
+            params
+                .to_dtype(DType::F32)
+                .map_err(|e| JammiError::Inference(format!("Regression head dtype cast: {e}")))?
+        };
+        let rows = params
+            .to_vec2::<f32>()
+            .map_err(|e| JammiError::Inference(format!("Regression head to vec: {e}")))?;
+
+        // The head output width is its number of distribution parameters (2 for
+        // the Gaussian form, one per level for the quantile form). Derive it
+        // from the tensor so the backend never hard-codes a head shape.
+        let head_width = rows.first().map_or(2, Vec::len);
+        let mut flat = vec![0.0_f32; num_rows * head_width];
+        for (batch_idx, &orig_idx) in valid_indices.iter().enumerate() {
+            let row = &rows[batch_idx];
+            flat[orig_idx * head_width..orig_idx * head_width + head_width].copy_from_slice(row);
+        }
+
+        Ok(BackendOutput {
+            float_outputs: vec![flat],
+            string_outputs: vec![],
+            row_status,
+            row_errors,
+            shapes: vec![(num_rows, head_width)],
+        })
     }
 
     fn forward_embedding(&self, content: &[arrow::array::ArrayRef]) -> Result<BackendOutput> {

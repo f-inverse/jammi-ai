@@ -4,6 +4,7 @@ mod common;
 mod conformal;
 mod context_set;
 mod cookbook;
+mod distributional;
 mod e2e_inference;
 mod encoder_adapters;
 mod evaluation;

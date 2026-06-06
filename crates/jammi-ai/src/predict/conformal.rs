@@ -12,7 +12,7 @@
 //!
 //! # The pieces
 //!
-//! * A [`NonconformityScore`] is the one task-specific piece: it maps a
+//! * A `NonconformityScore` is the one task-specific piece: it maps a
 //!   predictor output and a candidate label to a real number, larger when the
 //!   label conforms *less* to the prediction. Calibration scores its held-out
 //!   examples at their *true* label.

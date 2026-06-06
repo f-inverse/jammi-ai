@@ -739,7 +739,7 @@ impl InferenceSession {
     /// that join directly to source data on the key.
     ///
     /// The default driver is index-assisted and produces an *approximate*,
-    /// *non-deterministic* graph; set [`BuildNeighborGraph::exact`] for a
+    /// *non-deterministic* graph; set `BuildNeighborGraph::exact` for a
     /// deterministic, complete one (gated by a row-count ceiling).
     pub async fn build_neighbor_graph(
         &self,

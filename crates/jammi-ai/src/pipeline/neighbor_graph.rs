@@ -33,7 +33,7 @@
 //! # Cosine coupling
 //!
 //! `similarity = 1.0 - cosine_distance`, matching the ANN search path. This is
-//! valid because every Jammi index is cosine ([`SidecarIndex`] hardcodes
+//! valid because every Jammi index is cosine (`SidecarIndex` hardcodes
 //! `MetricKind::Cos`). If Jammi ever adds a non-cosine metric, this mapping
 //! must read the index's metric and map per-metric or refuse.
 

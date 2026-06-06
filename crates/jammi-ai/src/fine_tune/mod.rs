@@ -106,7 +106,7 @@ impl Default for EmbeddingLoss {
 /// Three of the four arms train the **parametric Gaussian** head — the head
 /// emits `(mean, raw_std)` per row and the loss reads a positive `σ` from
 /// `raw_std` via `floor + softplus(raw_std)` (a *learnable* floor, the
-/// [`RegressionHead::Gaussian`] `std_floor`). The fourth trains the **quantile**
+/// `RegressionHead::Gaussian` `std_floor`). The fourth trains the **quantile**
 /// head (one output per level) with the pinball loss.
 ///
 /// Every arm is a **proper score**: minimising it rewards a calibrated

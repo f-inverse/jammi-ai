@@ -21,7 +21,7 @@
 //! are used on, which keeps the output byte-identical under any shuffle.
 //!
 //! One reduction operator, three SQL names: the three functions share a single
-//! [`VectorAggAccumulator`] parameterised by [`VectorReduce`]. Adding a fourth
+//! `VectorAggAccumulator` parameterised by [`VectorReduce`]. Adding a fourth
 //! reduction is a new enum arm and a new registration, not a new accumulator.
 
 use std::any::Any;

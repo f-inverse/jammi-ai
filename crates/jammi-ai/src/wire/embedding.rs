@@ -191,7 +191,7 @@ fn file_format_from_proto(format: i32) -> Result<Option<FileFormat>, Status> {
     }
 }
 
-/// Map a [`Modality`] onto the embedding [`ModelTask`] its tower produces. The
+/// Map a [`Modality`] onto the embedding `ModelTask` its tower produces. The
 /// wire `ResultTable` carries its own `task` (the embedding tower), so the
 /// reconstruction recovers it faithfully from the message itself — never from a
 /// modality threaded in out of band, never a guess.

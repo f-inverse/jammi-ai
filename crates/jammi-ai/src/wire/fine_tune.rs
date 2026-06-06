@@ -12,7 +12,7 @@ use tonic::Status;
 
 use crate::fine_tune::{
     BackboneDtype, ClassificationLoss, EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig,
-    FineTuneMethod, LoraInitMode, LrSchedule,
+    FineTuneMethod, HardNegativeConfig, LoraInitMode, LrSchedule,
 };
 
 use crate::wire::proto::fine_tune as pb;
@@ -83,7 +83,24 @@ impl TryFrom<pb::FineTuneConfig> for FineTuneConfig {
             backbone_dtype: backbone_dtype_from_proto(c.backbone_dtype, defaults.backbone_dtype)?,
             weight_decay: c.weight_decay,
             max_grad_norm: c.max_grad_norm,
+            cached: c.cached,
+            hard_negatives: c
+                .hard_negatives
+                .map(hard_negatives_from_proto)
+                .unwrap_or_default(),
+            matryoshka_dims: c.matryoshka_dims.into_iter().map(|d| d as usize).collect(),
         })
+    }
+}
+
+/// Map the wire [`pb::HardNegativeConfig`] onto the engine's
+/// [`HardNegativeConfig`]. Absent on the wire = mining off (the engine default).
+fn hard_negatives_from_proto(h: pb::HardNegativeConfig) -> HardNegativeConfig {
+    HardNegativeConfig {
+        mine: h.mine,
+        k: h.k as usize,
+        exclude_hops: h.exclude_hops as usize,
+        refresh_every: h.refresh_every as usize,
     }
 }
 
@@ -220,6 +237,20 @@ pub fn config_to_proto(config: &FineTuneConfig) -> pb::FineTuneConfig {
         backbone_dtype: backbone_dtype_to_proto(config.backbone_dtype) as i32,
         weight_decay: config.weight_decay,
         max_grad_norm: config.max_grad_norm,
+        cached: config.cached,
+        // Always encoded so a round-trip preserves the k/hop/refresh knobs even
+        // when mining is off; the decode treats an absent message as "off".
+        hard_negatives: Some(hard_negatives_to_proto(&config.hard_negatives)),
+        matryoshka_dims: config.matryoshka_dims.iter().map(|d| *d as u32).collect(),
+    }
+}
+
+fn hard_negatives_to_proto(h: &HardNegativeConfig) -> pb::HardNegativeConfig {
+    pb::HardNegativeConfig {
+        mine: h.mine,
+        k: h.k as u32,
+        exclude_hops: h.exclude_hops as u32,
+        refresh_every: h.refresh_every as u32,
     }
 }
 

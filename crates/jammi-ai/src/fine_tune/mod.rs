@@ -14,6 +14,10 @@ pub mod classifier;
 #[cfg(feature = "local")]
 pub mod data;
 #[cfg(feature = "local")]
+pub mod gradcache;
+#[cfg(feature = "local")]
+pub mod hard_negative_miner;
+#[cfg(feature = "local")]
 pub mod job;
 #[cfg(feature = "local")]
 pub mod lora;
@@ -68,7 +72,13 @@ pub enum EmbeddingLoss {
     CoSent,
     /// Triplet loss: `max(0, cos(a,neg) - cos(a,pos) + margin)`.
     Triplet { margin: f64 },
-    /// InfoNCE with in-batch negatives. `τ` is the temperature.
+    /// Multiple-Negatives-Ranking (InfoNCE / NT-Xent): for a batch of
+    /// `(anchor, positive)` rows, every other row's positive is an in-batch
+    /// negative. The scaled cosine-similarity matrix `S = normalize(A) ·
+    /// normalize(P)ᵀ · temperature` is scored against its diagonal with a
+    /// symmetric (row + column) cross-entropy. A `Triplet` batch supplies
+    /// explicit hard negatives that are appended as extra similarity columns.
+    /// `temperature` is the similarity scale; `20.0` is the standard default.
     MultipleNegativesRanking { temperature: f64 },
     /// AnglE: optimises an angle difference in complex space, escaping the
     /// vanishing-gradient saturation zones of cosine objectives near ±1.
@@ -141,6 +151,42 @@ pub enum LrSchedule {
 impl Default for LrSchedule {
     fn default() -> Self {
         Self::CosineDecay
+    }
+}
+
+/// Hard-negative mining via jammi's own ANN index.
+///
+/// When `mine` is set, the trainer periodically embeds the training corpus,
+/// builds a cosine index over it, and retrieves the top-`k` nearest neighbours
+/// of each anchor as hard negatives — near-misses the current model ranks too
+/// highly. The anchor's own positive and the positive's `k`-hop neighbourhood
+/// are excluded from the candidate pool, because a true-but-unlabelled positive
+/// retrieved as a "negative" would supply a false-negative gradient.
+///
+/// Mined negatives go stale as the model moves, so re-mining every step is
+/// wasteful; `refresh_every` re-mines once per that many epochs (ANCE's
+/// asynchronous-index-refresh trade: fresher negatives cost more index builds).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct HardNegativeConfig {
+    /// Mine hard negatives from the model's own retrieval index. Default `false`.
+    pub mine: bool,
+    /// Number of hard negatives to retrieve per anchor. Default `1`.
+    pub k: usize,
+    /// Hops of the positive's neighbourhood to exclude from the negative pool,
+    /// guarding against false negatives on near-duplicate corpora. Default `1`.
+    pub exclude_hops: usize,
+    /// Re-mine once every this many epochs. `1` re-mines every epoch. Default `1`.
+    pub refresh_every: usize,
+}
+
+impl Default for HardNegativeConfig {
+    fn default() -> Self {
+        Self {
+            mine: false,
+            k: 1,
+            exclude_hops: 1,
+            refresh_every: 1,
+        }
     }
 }
 
@@ -229,6 +275,37 @@ pub struct FineTuneConfig {
     /// `torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)`.
     #[serde(default = "default_max_grad_norm")]
     pub max_grad_norm: f64,
+
+    /// GradCache: compute the in-batch-negative loss in two passes so the
+    /// effective negative pool is the whole batch without holding every
+    /// representation's activation graph at once. A no-grad pass embeds all
+    /// rows and caches each representation's loss-gradient; a second pass
+    /// re-embeds chunk by chunk with grad and backpropagates through the
+    /// cached gradient, freeing each chunk's graph before the next. The
+    /// optimiser sees the same gradient as a single-pass run (a tolerance test
+    /// pins this), but peak memory scales with the chunk, not the batch.
+    /// Distinct from `gradient_accumulation_steps`, which does *not* enlarge
+    /// the in-batch negative pool. Only applies to the in-batch-negative
+    /// objective (`MultipleNegativesRanking`). Default: `false`.
+    #[serde(default)]
+    pub cached: bool,
+
+    /// Hard-negative mining configuration. With `mine = true` the trainer
+    /// mines hard negatives from its own ANN index (see [`HardNegativeConfig`]).
+    /// Default: mining off.
+    #[serde(default)]
+    pub hard_negatives: HardNegativeConfig,
+
+    /// Matryoshka representation dimensions. When non-empty, the embedding
+    /// objective is evaluated at each listed prefix dimension and the losses
+    /// summed, so the leading coordinates of the embedding carry the most
+    /// information and a consumer can truncate the served vector to any listed
+    /// dimension with graceful quality decay. Importance-ordering is *created*
+    /// by training with this on, so truncation at serve time is only valid for
+    /// a model trained with these dims. Empty (default) trains the full
+    /// dimension only. Each entry must be `> 0` and `<=` the embedding width.
+    #[serde(default)]
+    pub matryoshka_dims: Vec<usize>,
 }
 
 fn default_weight_decay() -> f64 {
@@ -264,6 +341,9 @@ impl Default for FineTuneConfig {
             backbone_dtype: jammi_lora::BackboneDtype::F32,
             weight_decay: 0.01,
             max_grad_norm: 1.0,
+            cached: false,
+            hard_negatives: HardNegativeConfig::default(),
+            matryoshka_dims: Vec::new(),
         }
     }
 }
@@ -306,6 +386,23 @@ impl FineTuneConfig {
         if self.early_stopping_patience == 0 {
             return Err(JammiError::FineTune(
                 "early_stopping_patience must be > 0".into(),
+            ));
+        }
+        if self.hard_negatives.mine {
+            if self.hard_negatives.k == 0 {
+                return Err(JammiError::FineTune(
+                    "hard_negatives.k must be > 0 when mining is enabled".into(),
+                ));
+            }
+            if self.hard_negatives.refresh_every == 0 {
+                return Err(JammiError::FineTune(
+                    "hard_negatives.refresh_every must be > 0 when mining is enabled".into(),
+                ));
+            }
+        }
+        if self.matryoshka_dims.contains(&0) {
+            return Err(JammiError::FineTune(
+                "matryoshka_dims entries must all be > 0".into(),
             ));
         }
         Ok(())

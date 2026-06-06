@@ -1088,6 +1088,11 @@ fn build_training_data_loader(
     let has_triplet = col_names.contains(&"anchor")
         && col_names.contains(&"positive")
         && col_names.contains(&"negative");
+    // Pairs = anchor + positive with no negative column. In-batch negatives
+    // (MultipleNegativesRanking) supply the contrast, so `negative` is absent.
+    let has_pairs = col_names.contains(&"anchor")
+        && col_names.contains(&"positive")
+        && !col_names.contains(&"negative");
     let has_classification = col_names.contains(&"text") && col_names.contains(&"label");
 
     if has_triplet && task == ModelTask::AudioEmbedding {
@@ -1183,6 +1188,41 @@ fn build_training_data_loader(
         Ok(crate::fine_tune::data::TrainingDataLoader::from_triplets(
             rows,
         ))
+    } else if has_pairs {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let schema_info = || {
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| format!("{}:{}", f.name(), f.data_type()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let anchor_vals = batch
+                .column_by_name("anchor")
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "Missing/invalid 'anchor' column. Batch schema: [{}]",
+                        schema_info()
+                    ))
+                })?;
+            let pos_vals = batch
+                .column_by_name("positive")
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "Missing/invalid 'positive' column. Batch schema: [{}]",
+                        schema_info()
+                    ))
+                })?;
+            for i in 0..batch.num_rows() {
+                rows.push((anchor_vals[i].clone(), pos_vals[i].clone()));
+            }
+        }
+        Ok(crate::fine_tune::data::TrainingDataLoader::from_pairs(rows))
     } else if has_classification {
         let mut label_set = std::collections::BTreeSet::new();
         let mut rows = Vec::new();
@@ -1224,8 +1264,8 @@ fn build_training_data_loader(
         Err(JammiError::FineTune(format!(
             "Cannot detect training format from columns: {col_names:?}. \
              Expected contrastive (text_a, text_b, score), triplet (anchor, positive, negative), \
-             or classification (text, label). For audio triplets, use the same \
-             (anchor, positive, negative) columns with task=audio_embedding."
+             pairs (anchor, positive), or classification (text, label). For audio triplets, use \
+             the same (anchor, positive, negative) columns with task=audio_embedding."
         )))
     }
 }

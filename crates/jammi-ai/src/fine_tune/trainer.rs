@@ -315,6 +315,11 @@ impl TrainingLoop {
         // Collect trainable vars once; their TensorIds are stable for the run.
         let trainable_vars = self.varmap.all_vars();
 
+        // Hard negatives mined from the current model, re-mined every
+        // `refresh_every` epochs. Held across epochs so a non-refresh epoch
+        // reuses the last mining (the staleness/cost trade).
+        let mut mined_loader: Option<TrainingDataLoader> = None;
+
         for epoch in 0..self.config.epochs {
             let mut epoch_loss = 0.0;
             let mut batch_count = 0;
@@ -325,9 +330,24 @@ impl TrainingLoop {
             let mut epoch_neg_sim = 0.0f64;
             let mut triplet_batch_count = 0usize;
 
-            if train_loader.is_precomputed() {
+            // Re-mine hard negatives at refresh boundaries. Mining replaces the
+            // epoch's data with (anchor, positive, mined-negative) triplets fed
+            // through the MNRL hard-negative path.
+            if self.mining_eligible()
+                && super::hard_negative_miner::should_refresh(
+                    epoch,
+                    self.config.hard_negatives.refresh_every,
+                )
+            {
+                mined_loader = Some(self.mine_hard_negative_loader(&train_loader)?);
+            }
+            // The loader this epoch trains on: the freshly/last-mined triplets
+            // when mining is active, otherwise the original data.
+            let epoch_loader: &TrainingDataLoader = mined_loader.as_ref().unwrap_or(&train_loader);
+
+            if epoch_loader.is_precomputed() {
                 // Test path: direct tensor batches, no encoding.
-                let train_batches = train_loader.batches(self.config.batch_size)?;
+                let train_batches = epoch_loader.batches(self.config.batch_size)?;
                 for batch in train_batches {
                     let batch = batch?;
                     self.accumulate_sim_stats(
@@ -355,9 +375,28 @@ impl TrainingLoop {
                         },
                     )?;
                 }
+            } else if self.gradcache_eligible() {
+                // GradCache path: the whole dataset is one in-batch-negative
+                // batch, chunked at `batch_size` for memory. One optimiser step
+                // per epoch over the full negative pool.
+                let lr = compute_lr(&self.config, global_step, total_steps);
+                optimizer.set_learning_rate(lr);
+                let loss_val = self.run_gradcache_epoch(
+                    epoch_loader,
+                    &trainable_vars,
+                    &mut optimizer,
+                    total_steps,
+                    global_step,
+                )?;
+                epoch_loss += loss_val;
+                batch_count += 1;
+                global_step += 1;
+                if checkpoint_interval > 0 && global_step % checkpoint_interval == 0 {
+                    self.save_checkpoint(&checkpoint_dir, global_step)?;
+                }
             } else {
                 // Production path: encode text through the target, then compute loss.
-                let text_chunks = train_loader.text_chunks(self.config.batch_size);
+                let text_chunks = epoch_loader.text_chunks(self.config.batch_size);
                 for chunk in &text_chunks {
                     let batch = self.encode_chunk(chunk)?;
                     let loss = self.compute_loss(&batch)?;
@@ -535,6 +574,247 @@ impl TrainingLoop {
         })
     }
 
+    /// Whether this run should mine hard negatives: `mine` is on, the objective
+    /// is the in-batch-negative one (mining only feeds that path), and a base
+    /// model is present to embed the corpus. Mining replaces the epoch's data
+    /// with mined triplets, so it requires a text loader — the precomputed test
+    /// path skips it.
+    fn mining_eligible(&self) -> bool {
+        self.base_model.is_some()
+            && self.config.hard_negatives.mine
+            && matches!(
+                self.config.embedding_loss,
+                Some(super::EmbeddingLoss::MultipleNegativesRanking { .. })
+            )
+    }
+
+    /// Mine hard negatives from the current model and build a triplet loader of
+    /// `(anchor, positive, mined-negative)` rows.
+    ///
+    /// Embeds every anchor and positive with the current model (no grad),
+    /// indexes the positives as the candidate corpus (jammi's own cosine ANN),
+    /// and for each anchor retrieves its hardest non-excluded neighbour. The
+    /// positive and its `exclude_hops`-hop neighbourhood are excluded as the
+    /// false-negative guard. A row whose pool is entirely excluded is dropped;
+    /// if mining yields no usable rows the original loader is returned unchanged
+    /// rather than training on an empty set.
+    fn mine_hard_negative_loader(
+        &mut self,
+        loader: &TrainingDataLoader,
+    ) -> Result<TrainingDataLoader> {
+        use super::hard_negative_miner::{AnchorQuery, Candidate, HardNegativeMiner};
+
+        let (anchors, positives, _existing_neg) = loader.in_batch_negative_texts()?;
+        if anchors.is_empty() {
+            return Ok(TrainingDataLoader::from_triplets(Vec::new()));
+        }
+
+        // Embed anchors and positives once with dropout off — the model state
+        // the negatives are mined against.
+        self.target.set_training(false);
+        let embed = |this: &Self, texts: &[String]| -> Result<Vec<Vec<f32>>> {
+            let t = this.encode_texts(texts)?;
+            let t = if t.dtype() == DType::F32 {
+                t
+            } else {
+                t.to_dtype(DType::F32)
+                    .map_err(|e| JammiError::FineTune(format!("mine dtype: {e}")))?
+            };
+            t.to_vec2::<f32>()
+                .map_err(|e| JammiError::FineTune(format!("mine to_vec2: {e}")))
+        };
+        let result = (|| {
+            let anchor_vecs = embed(self, &anchors)?;
+            let positive_vecs = embed(self, &positives)?;
+
+            // Candidate corpus = the positives, keyed by row index so a mined id
+            // maps back to its positive text.
+            let candidates: Vec<Candidate> = positive_vecs
+                .iter()
+                .enumerate()
+                .map(|(i, v)| Candidate {
+                    id: i.to_string(),
+                    embedding: v.clone(),
+                })
+                .collect();
+            let miner = HardNegativeMiner::build(&candidates, self.config.hard_negatives)?;
+
+            let mut rows = Vec::with_capacity(anchors.len());
+            for (i, anchor_vec) in anchor_vecs.iter().enumerate() {
+                let query = AnchorQuery {
+                    embedding: anchor_vec.clone(),
+                    positive_id: i.to_string(),
+                };
+                let mined = miner.mine(&query)?;
+                if let Some(neg_id) = mined.first() {
+                    let neg_idx: usize = neg_id
+                        .parse()
+                        .map_err(|e| JammiError::FineTune(format!("mine id parse: {e}")))?;
+                    rows.push((
+                        anchors[i].clone(),
+                        positives[i].clone(),
+                        positives[neg_idx].clone(),
+                    ));
+                }
+            }
+            Ok::<_, JammiError>(rows)
+        })();
+        self.target.set_training(true);
+        let rows = result?;
+
+        if rows.is_empty() {
+            // Nothing minable (e.g. every candidate excluded) — fall back to the
+            // original data rather than train on an empty epoch.
+            tracing::warn!(
+                job_id = %self.job_id,
+                "hard-negative mining produced no rows; training on original data this epoch"
+            );
+            return Ok(self.clone_text_loader(loader));
+        }
+        Ok(TrainingDataLoader::from_triplets(rows))
+    }
+
+    /// Re-materialise a text loader's in-batch-negative rows as a fresh loader,
+    /// used as the mining fall-back. Pairs become a `Pairs` loader; triplets
+    /// keep their explicit negatives.
+    fn clone_text_loader(&self, loader: &TrainingDataLoader) -> TrainingDataLoader {
+        match loader.in_batch_negative_texts() {
+            Ok((anchors, positives, Some(negatives))) => {
+                let rows = anchors
+                    .into_iter()
+                    .zip(positives)
+                    .zip(negatives)
+                    .map(|((a, p), n)| (a, p, n))
+                    .collect();
+                TrainingDataLoader::from_triplets(rows)
+            }
+            Ok((anchors, positives, None)) => {
+                TrainingDataLoader::from_pairs(anchors.into_iter().zip(positives).collect())
+            }
+            Err(_) => TrainingDataLoader::from_triplets(Vec::new()),
+        }
+    }
+
+    /// Whether this run should take the GradCache path: `cached` is on, the
+    /// configured objective is the in-batch-negative one, and a base model is
+    /// present to re-encode chunks (the test/precomputed path has no encoder).
+    /// `cached` only enlarges an *in-batch-negative* pool, so it is a no-op for
+    /// graded-pair or triplet-margin objectives — those take the standard path.
+    fn gradcache_eligible(&self) -> bool {
+        self.base_model.is_some()
+            && self.config.cached
+            && matches!(
+                self.config.embedding_loss,
+                Some(super::EmbeddingLoss::MultipleNegativesRanking { .. })
+            )
+    }
+
+    /// Run one GradCache epoch: treat the whole training set as a single
+    /// in-batch-negative batch, compute the MNRL loss and its parameter
+    /// gradient in two memory-bounded passes, then take one optimiser step.
+    /// Returns the epoch's MNRL loss value for logging.
+    ///
+    /// The negative pool is the entire dataset — that is the point of GradCache
+    /// over plain gradient accumulation — so each anchor is contrasted against
+    /// every other positive (and every explicit hard negative). The per-chunk
+    /// re-encode keeps peak activation memory at one chunk regardless of the
+    /// pool size; the gradient equals the single-pass one (pinned by the
+    /// gradient-equivalence test in the `gradcache` module).
+    fn run_gradcache_epoch(
+        &mut self,
+        train_loader: &TrainingDataLoader,
+        trainable_vars: &[Var],
+        optimizer: &mut AdamW,
+        _total_steps: usize,
+        _global_step: usize,
+    ) -> Result<f64> {
+        use super::gradcache::{gradcache_backward, EncodeGroup};
+
+        let (anchors, positives, negatives) = train_loader.in_batch_negative_texts()?;
+        let scale = self.mnrl_scale();
+        let has_negatives = negatives.is_some();
+
+        // Dropout off for the whole GradCache region so the two encode passes
+        // (and the logging re-encode) agree. Toggled while no encode closure
+        // borrows `self`, so it does not collide with the immutable borrows
+        // below.
+        self.target.set_training(false);
+
+        // Immutable-borrow region: the encode closures borrow `self`, so no
+        // `&mut self` call may appear until they are dropped at the block end.
+        let outcome: Result<(GradStore, f64)> = (|| {
+            let enc = |texts: &[String], start: usize, len: usize| -> Result<Tensor> {
+                self.encode_texts(&texts[start..start + len])
+            };
+            let a_enc = |start: usize, len: usize| enc(&anchors, start, len);
+            let p_enc = |start: usize, len: usize| enc(&positives, start, len);
+
+            let mut groups = vec![
+                EncodeGroup {
+                    rows: anchors.len(),
+                    encode: &a_enc,
+                },
+                EncodeGroup {
+                    rows: positives.len(),
+                    encode: &p_enc,
+                },
+            ];
+            // A triplet GradCache run also embeds the explicit hard negatives as
+            // a third group so they join the row-direction candidate set.
+            let n_enc;
+            if let Some(ref negs) = negatives {
+                n_enc = move |start: usize, len: usize| enc(negs, start, len);
+                groups.push(EncodeGroup {
+                    rows: negs.len(),
+                    encode: &n_enc,
+                });
+            }
+
+            let loss_fn = |reps: &[Tensor]| -> Result<Tensor> {
+                let neg = if has_negatives { Some(&reps[2]) } else { None };
+                mnrl_loss(&reps[0], &reps[1], neg, scale, true)
+            };
+
+            let grads = gradcache_backward(
+                &groups,
+                self.config.batch_size.max(1),
+                &loss_fn,
+                trainable_vars,
+            )?;
+
+            // Loss value for logging from a no-grad re-encode of the full batch
+            // — cheap relative to the two-pass backward and outside its graph.
+            let a_rep = self.encode_texts(&anchors)?;
+            let p_rep = self.encode_texts(&positives)?;
+            let neg_rep = match &negatives {
+                Some(negs) => Some(self.encode_texts(negs)?),
+                None => None,
+            };
+            let loss = mnrl_loss(&a_rep, &p_rep, neg_rep.as_ref(), scale, true)?;
+            let loss = if loss.dtype() == DType::F32 {
+                loss
+            } else {
+                loss.to_dtype(DType::F32)
+                    .map_err(|e| JammiError::FineTune(format!("GradCache loss dtype: {e}")))?
+            };
+            let loss_val = loss
+                .to_scalar::<f32>()
+                .map_err(|e| JammiError::FineTune(format!("GradCache loss scalar: {e}")))?
+                as f64;
+            Ok((grads, loss_val))
+        })();
+
+        self.target.set_training(true);
+        let (mut grads, loss_val) = outcome?;
+
+        clip_gradients(trainable_vars, &mut grads, self.config.max_grad_norm)?;
+        optimizer
+            .step(&grads)
+            .map_err(|e| JammiError::FineTune(format!("GradCache optimizer step: {e}")))?;
+
+        Ok(loss_val)
+    }
+
     /// Encode a slice of texts into a `[batch, hidden]` embedding tensor,
     /// dispatched on the active [`TrainingTarget`]:
     ///
@@ -685,6 +965,14 @@ impl TrainingLoop {
                     embeddings_a: proj_a,
                     embeddings_b: proj_b,
                     scores: scores_tensor,
+                })
+            }
+            TextChunk::Pairs { anchors, positives } => {
+                let proj_a = encode(anchors)?;
+                let proj_p = encode(positives)?;
+                Ok(super::data::TrainingBatch::Pairs {
+                    anchors: proj_a,
+                    positives: proj_p,
                 })
             }
             TextChunk::Triplet {
@@ -902,29 +1190,51 @@ impl TrainingLoop {
     ///
     /// Contrastive pairs `(a, b, score)` dispatch on the configured
     /// [`EmbeddingLoss`]: CoSENT (default), AnglE, or cosine-MSE — every
-    /// pair-shaped objective. Triplets use the triplet objective. The
-    /// triplet-margin and MNRL variants are not pair-shaped: a config naming
-    /// them while feeding contrastive pairs falls back to CoSENT, the standard
-    /// pairwise default, rather than erroring on a batch/loss mismatch the
-    /// trainer can still satisfy.
+    /// graded-pair objective. `Pairs` rows `(anchor, positive)` always train
+    /// with [Multiple-Negatives-Ranking](mnrl_loss): the in-batch negatives
+    /// *are* the format's contrast. `Triplet` rows use the triplet-margin
+    /// objective unless `MultipleNegativesRanking` is selected, in which case
+    /// the explicit negatives are appended to the in-batch similarity matrix
+    /// (the DPR recipe).
+    ///
+    /// `MultipleNegativesRanking` is an in-batch-negative objective over
+    /// `(anchor, positive)` rows, not a graded-pair one. Selecting it for a
+    /// scored `Contrastive` batch is a batch/loss mismatch, so it is a typed
+    /// error rather than a silent fall-through to a different loss. The
+    /// triplet-margin variant on a graded `Contrastive` batch is the same
+    /// mismatch and is rejected the same way.
+    ///
+    /// When `matryoshka_dims` is set, the chosen embedding objective is
+    /// evaluated at each prefix dimension and the losses summed, so the leading
+    /// embedding coordinates carry the most information (truncatable at serve
+    /// time). The wrapper composes over the objective once — every embedding
+    /// loss inherits it.
     fn compute_loss(&self, batch: &super::data::TrainingBatch) -> Result<Tensor> {
         match batch {
             super::data::TrainingBatch::Contrastive {
                 embeddings_a,
                 embeddings_b,
                 scores,
-            } => match self.config.embedding_loss {
-                Some(super::EmbeddingLoss::AnglE) => angle_loss(embeddings_a, embeddings_b, scores),
-                Some(super::EmbeddingLoss::CosineMse) => {
-                    cosine_mse_loss(embeddings_a, embeddings_b, scores)
-                }
-                _ => self.cosent_loss(embeddings_a, embeddings_b, scores),
-            },
+            } => self.matryoshka_wrap(&[embeddings_a, embeddings_b], &|dims| {
+                self.contrastive_loss(&dims[0], &dims[1], scores)
+            }),
+            super::data::TrainingBatch::Pairs { anchors, positives } => self
+                .matryoshka_wrap(&[anchors, positives], &|dims| {
+                    mnrl_loss(&dims[0], &dims[1], None, self.mnrl_scale(), true)
+                }),
             super::data::TrainingBatch::Triplet {
                 anchor,
                 positive,
                 negative,
-            } => self.triplet_loss(anchor, positive, negative),
+            } => match self.config.embedding_loss {
+                Some(super::EmbeddingLoss::MultipleNegativesRanking { .. }) => self
+                    .matryoshka_wrap(&[anchor, positive, negative], &|dims| {
+                        mnrl_loss(&dims[0], &dims[1], Some(&dims[2]), self.mnrl_scale(), true)
+                    }),
+                _ => self.matryoshka_wrap(&[anchor, positive, negative], &|dims| {
+                    self.triplet_loss(&dims[0], &dims[1], &dims[2])
+                }),
+            },
             super::data::TrainingBatch::Classification { embeddings, labels } => {
                 let logits = self.classify(embeddings)?;
                 self.cross_entropy_loss(&logits, labels)
@@ -934,6 +1244,40 @@ impl TrainingLoop {
                 labels,
             } => self.ner_loss(hidden_states, labels),
         }
+    }
+
+    /// The graded-pair embedding objective for a `Contrastive` batch, dispatched
+    /// on the configured [`EmbeddingLoss`]. Thin wrapper over the free
+    /// [`dispatch_contrastive_loss`] — the CoSENT default is provided by
+    /// [`Self::cosent_loss`], the only graded objective that reads `self`.
+    fn contrastive_loss(&self, emb_a: &Tensor, emb_b: &Tensor, scores: &Tensor) -> Result<Tensor> {
+        dispatch_contrastive_loss(
+            self.config.embedding_loss,
+            emb_a,
+            emb_b,
+            scores,
+            &|a, b, s| self.cosent_loss(a, b, s),
+        )
+    }
+
+    /// The MNRL similarity scale (`temperature`). `20.0` is the standard
+    /// default; a `MultipleNegativesRanking { temperature }` config overrides it.
+    fn mnrl_scale(&self) -> f64 {
+        match self.config.embedding_loss {
+            Some(super::EmbeddingLoss::MultipleNegativesRanking { temperature }) => temperature,
+            _ => PAIRWISE_SCALE,
+        }
+    }
+
+    /// Evaluate `objective` at each configured Matryoshka prefix dimension and
+    /// sum the losses, or evaluate it once on the full embeddings when no dims
+    /// are set. Thin wrapper over the free [`matryoshka_sum`].
+    fn matryoshka_wrap(
+        &self,
+        embeddings: &[&Tensor],
+        objective: &dyn Fn(Vec<Tensor>) -> Result<Tensor>,
+    ) -> Result<Tensor> {
+        matryoshka_sum(&self.config.matryoshka_dims, embeddings, objective)
     }
 
     /// CoSENT loss: cross-entropy on cosine similarity ordering.
@@ -1293,6 +1637,205 @@ fn cosine_mse_loss(emb_a: &Tensor, emb_b: &Tensor, scores: &Tensor) -> Result<Te
         .map_err(|e| JammiError::FineTune(format!("cosine-MSE mean: {e}")))
 }
 
+/// L2-normalise every row of a `[n, d]` tensor to unit length, sharing the norm
+/// computation with [`cosine_similarity`] (sum of squares along dim 1, sqrt,
+/// clamped away from zero). The cosine-similarity *matrix* MNRL needs is then a
+/// plain matmul of two row-normalised batches — no new distance primitive.
+fn l2_normalize_rows(x: &Tensor) -> Result<Tensor> {
+    let norm = x
+        .sqr()
+        .map_err(|e| JammiError::FineTune(format!("l2norm sqr: {e}")))?
+        .sum_keepdim(1)
+        .map_err(|e| JammiError::FineTune(format!("l2norm sum: {e}")))?
+        .sqrt()
+        .map_err(|e| JammiError::FineTune(format!("l2norm sqrt: {e}")))?
+        .clamp(1e-8, f64::MAX)
+        .map_err(|e| JammiError::FineTune(format!("l2norm clamp: {e}")))?;
+    x.broadcast_div(&norm)
+        .map_err(|e| JammiError::FineTune(format!("l2norm div: {e}")))
+}
+
+/// Multiple-Negatives-Ranking loss (InfoNCE / NT-Xent) over a batch of
+/// `(anchor, positive)` rows.
+///
+/// Builds the scaled cosine-similarity matrix `S = normalize(A) ·
+/// normalize(P)ᵀ · scale`, an `(n, n)` matrix whose `[i, j]` entry is the
+/// scaled similarity of anchor `i` to positive `j`. The correct positive for
+/// each anchor sits on the diagonal, so the target labels are `0..n` and the
+/// loss is cross-entropy of each row against its diagonal index — every
+/// off-diagonal positive is an in-batch negative.
+///
+/// `symmetric` adds the column-direction cross-entropy (each positive against
+/// its anchor), the sentence-transformers default: it trains the embedding to
+/// retrieve in both directions. Pass `false` for an asymmetric query→document
+/// objective where only the anchor→positive direction is meaningful.
+///
+/// `hard_negatives`, when present, is an `(n, d)` batch of one explicit hard
+/// negative per anchor; its similarities are appended as extra columns of `S`
+/// (the DPR recipe), sharpening the contrast without changing the diagonal
+/// targets. The column direction only ranks the `n` positives, so the hard
+/// negatives participate in the row direction alone.
+fn mnrl_loss(
+    anchor: &Tensor,
+    positive: &Tensor,
+    hard_negatives: Option<&Tensor>,
+    scale: f64,
+    symmetric: bool,
+) -> Result<Tensor> {
+    let n = anchor
+        .dim(0)
+        .map_err(|e| JammiError::FineTune(format!("mnrl dim: {e}")))?;
+
+    let a_norm = l2_normalize_rows(anchor)?;
+    let p_norm = l2_normalize_rows(positive)?;
+    let p_t = p_norm
+        .t()
+        .map_err(|e| JammiError::FineTune(format!("mnrl transpose: {e}")))?;
+    // (n, n) anchor↔positive similarity, scaled.
+    let sim = (a_norm
+        .matmul(&p_t)
+        .map_err(|e| JammiError::FineTune(format!("mnrl matmul: {e}")))?
+        * scale)
+        .map_err(|e| JammiError::FineTune(format!("mnrl scale: {e}")))?;
+
+    // The positive for anchor i is column i: labels are the diagonal indices.
+    let labels = Tensor::arange(0u32, n as u32, anchor.device())
+        .map_err(|e| JammiError::FineTune(format!("mnrl labels: {e}")))?;
+
+    // Append explicit hard negatives as extra similarity columns. They extend
+    // the row-direction candidate set (more negatives per anchor) but not the
+    // positives, so the diagonal labels are unchanged.
+    let row_logits = match hard_negatives {
+        None => sim.clone(),
+        Some(neg) => {
+            let neg_norm = l2_normalize_rows(neg)?;
+            let neg_t = neg_norm
+                .t()
+                .map_err(|e| JammiError::FineTune(format!("mnrl neg transpose: {e}")))?;
+            let neg_sim = (a_norm
+                .matmul(&neg_t)
+                .map_err(|e| JammiError::FineTune(format!("mnrl neg matmul: {e}")))?
+                * scale)
+                .map_err(|e| JammiError::FineTune(format!("mnrl neg scale: {e}")))?;
+            Tensor::cat(&[&sim, &neg_sim], 1)
+                .map_err(|e| JammiError::FineTune(format!("mnrl neg cat: {e}")))?
+        }
+    };
+
+    let row_loss = candle_nn::loss::cross_entropy(&row_logits, &labels)
+        .map_err(|e| JammiError::FineTune(format!("mnrl row cross-entropy: {e}")))?;
+
+    if !symmetric {
+        return Ok(row_loss);
+    }
+
+    // Column direction: each positive against the anchors. Transpose the
+    // anchor↔positive block only (hard negatives have no anchor to rank
+    // against, so they stay out of this direction).
+    let col_logits = sim
+        .t()
+        .map_err(|e| JammiError::FineTune(format!("mnrl col transpose: {e}")))?;
+    let col_loss = candle_nn::loss::cross_entropy(&col_logits, &labels)
+        .map_err(|e| JammiError::FineTune(format!("mnrl col cross-entropy: {e}")))?;
+
+    ((&row_loss + &col_loss).map_err(|e| JammiError::FineTune(format!("mnrl sum: {e}")))? * 0.5)
+        .map_err(|e| JammiError::FineTune(format!("mnrl mean: {e}")))
+}
+
+/// Dispatch a graded-pair `(a, b, score)` batch onto the configured
+/// [`EmbeddingLoss`]. CoSENT (the default), AnglE, and cosine-MSE consume
+/// graded pairs. The in-batch-negative and triplet objectives are not
+/// graded-pair shaped, so naming one here is a typed error rather than a silent
+/// fall-through to a different loss. `cosent` supplies the CoSENT path (the
+/// only graded objective that reads trainer state).
+fn dispatch_contrastive_loss(
+    loss: Option<super::EmbeddingLoss>,
+    emb_a: &Tensor,
+    emb_b: &Tensor,
+    scores: &Tensor,
+    cosent: &dyn Fn(&Tensor, &Tensor, &Tensor) -> Result<Tensor>,
+) -> Result<Tensor> {
+    match loss {
+        Some(super::EmbeddingLoss::AnglE) => angle_loss(emb_a, emb_b, scores),
+        Some(super::EmbeddingLoss::CosineMse) => cosine_mse_loss(emb_a, emb_b, scores),
+        Some(super::EmbeddingLoss::MultipleNegativesRanking { .. }) => Err(JammiError::FineTune(
+            "MultipleNegativesRanking is an in-batch-negative objective over (anchor, positive) \
+             rows; it cannot score a graded (text_a, text_b, score) batch. Supply (anchor, \
+             positive) pairs, or choose CoSENT/AnglE/cosine-MSE."
+                .into(),
+        )),
+        Some(super::EmbeddingLoss::Triplet { .. }) => Err(JammiError::FineTune(
+            "Triplet loss needs (anchor, positive, negative) rows; it cannot score a graded \
+             (text_a, text_b, score) batch. Choose CoSENT/AnglE/cosine-MSE for graded pairs."
+                .into(),
+        )),
+        Some(super::EmbeddingLoss::CoSent) | None => cosent(emb_a, emb_b, scores),
+    }
+}
+
+/// Evaluate `objective` at each Matryoshka prefix dimension in `dims` and sum
+/// the losses, or evaluate it once on the full embeddings when `dims` is empty.
+///
+/// Every input tensor is `narrow`ed to the same prefix width before each call,
+/// so the objective sees a consistent reduced embedding. Summing over a nested
+/// set of prefixes is what *orders* the coordinates by importance — the leading
+/// dims must satisfy the objective at every truncation, so they carry the most
+/// signal, and a serve-time truncation to any listed dim stays valid. A dim
+/// wider than the embedding is a typed error, not a silent clamp.
+fn matryoshka_sum(
+    dims: &[usize],
+    embeddings: &[&Tensor],
+    objective: &dyn Fn(Vec<Tensor>) -> Result<Tensor>,
+) -> Result<Tensor> {
+    if dims.is_empty() {
+        return objective(embeddings.iter().map(|t| (*t).clone()).collect());
+    }
+
+    let full_dim = embeddings
+        .first()
+        .ok_or_else(|| JammiError::FineTune("matryoshka: no embeddings".into()))?
+        .dim(1)
+        .map_err(|e| JammiError::FineTune(format!("matryoshka dim: {e}")))?;
+
+    let mut total: Option<Tensor> = None;
+    for &dim in dims {
+        if dim > full_dim {
+            return Err(JammiError::FineTune(format!(
+                "matryoshka_dims entry {dim} exceeds the embedding width {full_dim}"
+            )));
+        }
+        let truncated: Vec<Tensor> = embeddings
+            .iter()
+            .map(|t| {
+                t.narrow(1, 0, dim)
+                    .map_err(|e| JammiError::FineTune(format!("matryoshka narrow: {e}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let loss = objective(truncated)?;
+        total = Some(match total {
+            None => loss,
+            Some(acc) => {
+                (&acc + &loss).map_err(|e| JammiError::FineTune(format!("matryoshka sum: {e}")))?
+            }
+        });
+    }
+    total.ok_or_else(|| JammiError::FineTune("matryoshka_dims was unexpectedly empty".into()))
+}
+
+/// Test-only handle to [`mnrl_loss`] for the GradCache gradient-equivalence
+/// test, which lives in the sibling `gradcache` module and needs the exact
+/// objective the trainer runs.
+#[cfg(test)]
+pub(crate) fn mnrl_loss_for_test(
+    anchor: &Tensor,
+    positive: &Tensor,
+    hard_negatives: Option<&Tensor>,
+    scale: f64,
+    symmetric: bool,
+) -> Result<Tensor> {
+    mnrl_loss(anchor, positive, hard_negatives, scale, symmetric)
+}
+
 /// Compute element-wise cosine similarity between two batches of vectors.
 fn cosine_similarity(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let dot = (a * b)
@@ -1455,6 +1998,218 @@ mod tests {
         assert!(
             matches!(err, JammiError::FineTune(ref m) if m.contains("even embedding dimension")),
             "expected an even-dimension error, got {err:?}"
+        );
+    }
+
+    /// MNRL drives each anchor toward its own positive and away from the other
+    /// rows' positives: a batch whose anchors already align with their matched
+    /// positives (the diagonal of the similarity matrix dominates) has a far
+    /// lower loss than one whose anchor↔positive matching is permuted.
+    #[test]
+    fn mnrl_rewards_diagonal_matching() {
+        let device = Device::Cpu;
+        // Three near-orthogonal directions; each anchor equals its positive, so
+        // the similarity matrix is diagonal-dominant — the easy case.
+        let anchor = Tensor::new(
+            &[[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            &device,
+        )
+        .unwrap();
+        let aligned = anchor.clone();
+        let matched_loss = mnrl_loss(&anchor, &aligned, None, 20.0, true)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+
+        // Permute the positives so each anchor's true positive sits off the
+        // diagonal: the objective now penalises the mismatch.
+        let permuted = Tensor::new(
+            &[[0.0f32, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
+            &device,
+        )
+        .unwrap();
+        let mismatched_loss = mnrl_loss(&anchor, &permuted, None, 20.0, true)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+
+        assert!(
+            matched_loss < mismatched_loss,
+            "diagonal-matched batch ({matched_loss}) should score below a permuted one ({mismatched_loss})"
+        );
+        assert!(
+            matched_loss < 0.05,
+            "an already-aligned batch should have near-zero MNRL loss, got {matched_loss}"
+        );
+    }
+
+    /// Appending an explicit hard negative that is *more* similar to the anchor
+    /// than the in-batch negatives raises the MNRL loss versus the same batch
+    /// without it: the hard negative is an extra, harder column to rank below
+    /// the positive. This is the DPR recipe the `Triplet`-with-MNRL path uses.
+    #[test]
+    fn mnrl_hard_negative_sharpens_contrast() {
+        let device = Device::Cpu;
+        // A single (anchor, positive) row — no in-batch negatives at all — so
+        // the loss without a hard negative is exactly zero (nothing to contrast
+        // a single diagonal against).
+        let anchor = Tensor::new(&[[1.0f32, 0.0, 0.0, 0.0]], &device).unwrap();
+        let positive = Tensor::new(&[[0.9f32, 0.1, 0.0, 0.0]], &device).unwrap();
+        let no_neg = mnrl_loss(&anchor, &positive, None, 20.0, false)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            no_neg.abs() < 1e-5,
+            "a lone (anchor, positive) row with no negatives has zero row loss, got {no_neg}"
+        );
+
+        // A hard negative very close to the anchor introduces a competing column
+        // the anchor must rank below its positive — a strictly positive loss.
+        let hard_neg = Tensor::new(&[[0.95f32, 0.05, 0.0, 0.0]], &device).unwrap();
+        let with_neg = mnrl_loss(&anchor, &positive, Some(&hard_neg), 20.0, false)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            with_neg > no_neg,
+            "a hard negative should raise the loss above the no-negative case: {with_neg} vs {no_neg}"
+        );
+    }
+
+    /// The asymmetric (one-directional) MNRL option ranks only anchor→positive.
+    /// On a batch whose anchor↔positive matching is symmetric, dropping the
+    /// column direction halves the contribution but keeps the loss finite and
+    /// non-negative — the asymmetric query→document objective the docstring
+    /// promises.
+    #[test]
+    fn mnrl_asymmetric_drops_column_direction() {
+        let device = Device::Cpu;
+        let anchor = Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0]], &device).unwrap();
+        let positive = Tensor::new(&[[0.3f32, 0.7], [0.7, 0.3]], &device).unwrap();
+        let symmetric = mnrl_loss(&anchor, &positive, None, 20.0, true)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let one_dir = mnrl_loss(&anchor, &positive, None, 20.0, false)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(one_dir >= 0.0, "MNRL loss is non-negative, got {one_dir}");
+        // For a similarity matrix that is its own transpose the two directions
+        // are equal, so the symmetric mean equals the one-directional loss.
+        assert!(
+            (symmetric - one_dir).abs() < 1e-4,
+            "with a symmetric similarity matrix both directions match: {symmetric} vs {one_dir}"
+        );
+    }
+
+    /// Matryoshka wrapping evaluates the objective at each prefix dimension and
+    /// sums — so a truncated-dim embedding still carries quality. The summed
+    /// loss equals the per-dim losses added by hand (a faithful sum, not an
+    /// approximation), which is what orders the leading coordinates by
+    /// importance for serve-time truncation.
+    #[test]
+    fn matryoshka_sums_per_dimension_losses() {
+        let device = Device::Cpu;
+        // 4-d embeddings whose first 2 coordinates already separate the two
+        // rows, so truncating to dim 2 keeps the diagonal dominant.
+        let anchor =
+            Tensor::new(&[[1.0f32, 0.0, 0.1, 0.2], [0.0, 1.0, 0.2, 0.1]], &device).unwrap();
+        let positive =
+            Tensor::new(&[[0.9f32, 0.1, 0.0, 0.3], [0.1, 0.9, 0.3, 0.0]], &device).unwrap();
+
+        let objective = |dims: Vec<Tensor>| mnrl_loss(&dims[0], &dims[1], None, 20.0, true);
+        let wrapped = matryoshka_sum(&[4, 2], &[&anchor, &positive], &objective)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+
+        // The same objective evaluated by hand at each prefix dim and summed.
+        let mut by_hand = 0.0f32;
+        for dim in [4usize, 2] {
+            let a = anchor.narrow(1, 0, dim).unwrap();
+            let p = positive.narrow(1, 0, dim).unwrap();
+            by_hand += mnrl_loss(&a, &p, None, 20.0, true)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+        }
+        assert!(
+            (wrapped - by_hand).abs() < 1e-4,
+            "matryoshka wrapper must sum the per-dim losses: {wrapped} vs {by_hand}"
+        );
+
+        // No dims = the objective applied once at full width.
+        let full = matryoshka_sum(&[], &[&anchor, &positive], &objective)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let direct = mnrl_loss(&anchor, &positive, None, 20.0, true)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            (full - direct).abs() < 1e-6,
+            "empty dims must be a no-op wrap"
+        );
+    }
+
+    /// A Matryoshka dim wider than the embedding is a typed error, not a silent
+    /// clamp — truncation must be a true prefix.
+    #[test]
+    fn matryoshka_rejects_oversized_dim() {
+        let device = Device::Cpu;
+        let anchor = Tensor::new(&[[1.0f32, 0.0, 0.0, 0.0]], &device).unwrap();
+        let positive = Tensor::new(&[[0.9f32, 0.1, 0.0, 0.0]], &device).unwrap();
+        let objective = |dims: Vec<Tensor>| mnrl_loss(&dims[0], &dims[1], None, 20.0, true);
+        let err = matryoshka_sum(&[8], &[&anchor, &positive], &objective).unwrap_err();
+        assert!(
+            matches!(err, JammiError::FineTune(ref m) if m.contains("exceeds the embedding width")),
+            "expected an oversized-dim error, got {err:?}"
+        );
+    }
+
+    /// Selecting MNRL for a graded `(text_a, text_b, score)` Contrastive batch
+    /// is a typed error rather than a silent fall-through to CoSENT — the
+    /// previously-latent silent-wrong-loss bug. The loss/batch mismatch is
+    /// surfaced, not quietly satisfied by a different objective.
+    #[test]
+    fn mnrl_on_graded_batch_is_a_typed_error() {
+        let device = Device::Cpu;
+        let a = Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0]], &device).unwrap();
+        let b = Tensor::new(&[[0.9f32, 0.1], [0.1, 0.9]], &device).unwrap();
+        let scores = Tensor::new(&[1.0f32, 0.5], &device).unwrap();
+        // The CoSENT fallback must never be reached for an MNRL config — assert
+        // the dispatch errors before invoking it.
+        let never = |_: &Tensor, _: &Tensor, _: &Tensor| -> Result<Tensor> {
+            panic!("CoSENT fallback must not run for an MNRL config — silent fall-through")
+        };
+        let err = dispatch_contrastive_loss(
+            Some(crate::fine_tune::EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
+            &a,
+            &b,
+            &scores,
+            &never,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, JammiError::FineTune(ref m) if m.contains("in-batch-negative objective")),
+            "MNRL on a graded batch must be a typed mismatch error, got {err:?}"
+        );
+
+        // The triplet-margin variant on a graded batch is the same mismatch.
+        let err2 = dispatch_contrastive_loss(
+            Some(crate::fine_tune::EmbeddingLoss::Triplet { margin: 0.3 }),
+            &a,
+            &b,
+            &scores,
+            &never,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err2, JammiError::FineTune(ref m) if m.contains("Triplet loss needs")),
+            "triplet on a graded batch must be a typed mismatch error, got {err2:?}"
         );
     }
 

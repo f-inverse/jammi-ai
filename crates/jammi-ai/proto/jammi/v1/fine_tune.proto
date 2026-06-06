@@ -113,6 +113,17 @@ message LayersToTransform {
   repeated uint32 layers = 1;
 }
 
+// Hard-negative mining configuration. Mirrors the engine's
+// `HardNegativeConfig`. When `mine` is set the trainer mines hard negatives
+// from its own ANN index, excluding the positive's `exclude_hops`-hop
+// neighbourhood and re-mining every `refresh_every` epochs.
+message HardNegativeConfig {
+  bool mine = 1;
+  uint32 k = 2;
+  uint32 exclude_hops = 3;
+  uint32 refresh_every = 4;
+}
+
 // Configuration for a fine-tuning job. Mirrors the engine's `FineTuneConfig`
 // field for field; every field is read by the trainer or the LoRA builder.
 // `embedding_loss`/`classification_loss` are unset to let the engine
@@ -149,6 +160,13 @@ message FineTuneConfig {
   BackboneDtype backbone_dtype = 21;
   double weight_decay = 22;
   double max_grad_norm = 23;
+  // GradCache: two-pass in-batch-negative training that enlarges the effective
+  // negative pool without the memory cost. Only affects MultipleNegativesRanking.
+  bool cached = 24;
+  // Hard-negative mining over jammi's own ANN index. Field absent = mining off.
+  optional HardNegativeConfig hard_negatives = 25;
+  // Matryoshka prefix dimensions. Empty = full dimension only.
+  repeated uint32 matryoshka_dims = 26;
 }
 
 message StartFineTuneRequest {

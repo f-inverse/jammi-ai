@@ -22,6 +22,11 @@ pub enum TrainingBatch {
         embeddings_b: Tensor,
         scores: Tensor,
     },
+    /// Pairs: anchor and positive embeddings only. In-batch negatives are the
+    /// other rows' positives, so no explicit negative column is carried — the
+    /// `MultipleNegativesRanking` objective scores each anchor against every
+    /// positive in the batch.
+    Pairs { anchors: Tensor, positives: Tensor },
     /// Triplet: anchor, positive, and negative embeddings.
     Triplet {
         anchor: Tensor,
@@ -45,6 +50,10 @@ pub enum TrainingBatch {
 pub enum TrainingFormat {
     /// `text_a, text_b, score` — contrastive pairs with scores.
     Contrastive,
+    /// `anchor, positive` — contrastive pairs with no explicit negatives. The
+    /// `MultipleNegativesRanking` objective draws negatives from the rest of
+    /// the batch.
+    Pairs,
     /// `anchor, positive, negative` — text triplet format.
     Triplet,
     /// `anchor, positive, negative` — audio triplet format. The three
@@ -67,6 +76,10 @@ pub enum TextChunk {
         texts_a: Vec<String>,
         texts_b: Vec<String>,
         scores: Vec<f32>,
+    },
+    Pairs {
+        anchors: Vec<String>,
+        positives: Vec<String>,
     },
     Triplet {
         anchors: Vec<String>,
@@ -93,6 +106,11 @@ pub enum TextChunk {
     },
 }
 
+/// The flattened in-batch-negative view of a text loader: `(anchors,
+/// positives, optional explicit negatives)`. Consumed by GradCache and
+/// hard-negative mining, which treat the dataset as one in-batch-negative batch.
+pub type InBatchNegativeTexts = (Vec<String>, Vec<String>, Option<Vec<String>>);
+
 /// Internal storage: either text rows (from source) or precomputed batches (for tests).
 enum LoaderData {
     TextRows(Vec<TrainingRow>),
@@ -118,6 +136,10 @@ enum TrainingRow {
         text_a: String,
         text_b: String,
         score: f32,
+    },
+    Pairs {
+        anchor: String,
+        positive: String,
     },
     Triplet {
         anchor: String,
@@ -194,6 +216,23 @@ impl TrainingDataLoader {
                         anchor: a,
                         positive: p,
                         negative: n,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Create a loader from contrastive pair rows `(anchor, positive)`. The
+    /// `MultipleNegativesRanking` objective draws negatives from the rest of
+    /// each batch, so no explicit negative column is needed.
+    pub fn from_pairs(rows: Vec<(String, String)>) -> Self {
+        Self {
+            format: TrainingFormat::Pairs,
+            data: LoaderData::TextRows(
+                rows.into_iter()
+                    .map(|(a, p)| TrainingRow::Pairs {
+                        anchor: a,
+                        positive: p,
                     })
                     .collect(),
             ),
@@ -359,6 +398,22 @@ impl TrainingDataLoader {
                             })
                             .collect(),
                     },
+                    TrainingFormat::Pairs => TextChunk::Pairs {
+                        anchors: chunk
+                            .iter()
+                            .map(|r| match r {
+                                TrainingRow::Pairs { anchor, .. } => anchor.clone(),
+                                _ => String::new(),
+                            })
+                            .collect(),
+                        positives: chunk
+                            .iter()
+                            .map(|r| match r {
+                                TrainingRow::Pairs { positive, .. } => positive.clone(),
+                                _ => String::new(),
+                            })
+                            .collect(),
+                    },
                     TrainingFormat::Triplet => TextChunk::Triplet {
                         anchors: chunk
                             .iter()
@@ -446,6 +501,56 @@ impl TrainingDataLoader {
     /// The detected training data format.
     pub fn format(&self) -> TrainingFormat {
         self.format
+    }
+
+    /// Flatten the in-batch-negative text rows into `(anchors, positives,
+    /// negatives)`, the whole-dataset view GradCache and hard-negative mining
+    /// consume. `negatives` is `Some` for a `Triplet` loader (explicit hard
+    /// negatives) and `None` for a `Pairs` loader. Returns an error for any
+    /// other format — only in-batch-negative training has this shape.
+    pub fn in_batch_negative_texts(&self) -> Result<InBatchNegativeTexts> {
+        let rows = match &self.data {
+            LoaderData::TextRows(rows) => rows,
+            LoaderData::Precomputed(_) => {
+                return Err(JammiError::FineTune(
+                    "GradCache requires text rows, not precomputed batches".into(),
+                ))
+            }
+        };
+        match self.format {
+            TrainingFormat::Pairs => {
+                let mut anchors = Vec::with_capacity(rows.len());
+                let mut positives = Vec::with_capacity(rows.len());
+                for row in rows {
+                    if let TrainingRow::Pairs { anchor, positive } = row {
+                        anchors.push(anchor.clone());
+                        positives.push(positive.clone());
+                    }
+                }
+                Ok((anchors, positives, None))
+            }
+            TrainingFormat::Triplet => {
+                let mut anchors = Vec::with_capacity(rows.len());
+                let mut positives = Vec::with_capacity(rows.len());
+                let mut negatives = Vec::with_capacity(rows.len());
+                for row in rows {
+                    if let TrainingRow::Triplet {
+                        anchor,
+                        positive,
+                        negative,
+                    } = row
+                    {
+                        anchors.push(anchor.clone());
+                        positives.push(positive.clone());
+                        negatives.push(negative.clone());
+                    }
+                }
+                Ok((anchors, positives, Some(negatives)))
+            }
+            other => Err(JammiError::FineTune(format!(
+                "GradCache applies only to in-batch-negative formats (pairs/triplet), not {other:?}"
+            ))),
+        }
     }
 
     /// Whether this loader was constructed from pre-built tensor batches

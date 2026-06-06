@@ -578,6 +578,20 @@ impl PyDatabase {
     ///     "bf16" cuts backbone VRAM by ~half; LoRA A/B always stay in f32.
     ///   weight_decay — AdamW L2 regularization. Default: 0.01 (matches train_embedding_model.py).
     ///   max_grad_norm — global gradient clipping norm. Default: 1.0. Pass 0.0 to disable.
+    ///   embedding_loss — "cosent" | "angle" | "cosine_mse" | "triplet" | "mnrl".
+    ///     "mnrl" (Multiple-Negatives-Ranking / in-batch negatives) trains
+    ///     (anchor, positive) pairs or (anchor, positive, negative) triplets;
+    ///     unset auto-selects from the data format. Setting "triplet" with a
+    ///     custom margin still uses triplet_margin.
+    ///   mnrl_temperature — MNRL similarity scale. Default: 20.0.
+    ///   cached — MNRL GradCache: enlarge the in-batch-negative pool to the whole
+    ///     dataset without the memory cost. Only affects embedding_loss="mnrl".
+    ///   mine_hard_negatives — mine hard negatives from jammi's own ANN index.
+    ///   hard_negative_k / hard_negative_exclude_hops / hard_negative_refresh_every —
+    ///     mining knobs (negatives per anchor; hops of the positive's
+    ///     neighbourhood excluded as false-negative guard; epochs between re-mines).
+    ///   matryoshka_dims — train truncatable embeddings at these prefix dims
+    ///     (e.g. [768, 512, 256, 128, 64]); empty trains the full dimension only.
     #[pyo3(signature = (
         *,
         source,
@@ -602,6 +616,14 @@ impl PyDatabase {
         backbone_dtype = None,
         weight_decay = None,
         max_grad_norm = None,
+        embedding_loss = None,
+        mnrl_temperature = None,
+        cached = None,
+        mine_hard_negatives = None,
+        hard_negative_k = None,
+        hard_negative_exclude_hops = None,
+        hard_negative_refresh_every = None,
+        matryoshka_dims = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn fine_tune(
@@ -628,6 +650,14 @@ impl PyDatabase {
         backbone_dtype: Option<&str>,
         weight_decay: Option<f64>,
         max_grad_norm: Option<f64>,
+        embedding_loss: Option<&str>,
+        mnrl_temperature: Option<f64>,
+        cached: Option<bool>,
+        mine_hard_negatives: Option<bool>,
+        hard_negative_k: Option<usize>,
+        hard_negative_exclude_hops: Option<usize>,
+        hard_negative_refresh_every: Option<usize>,
+        matryoshka_dims: Option<Vec<usize>>,
     ) -> PyResult<PyFineTuneJob> {
         let mut cfg = FineTuneConfig::default();
         if let Some(v) = lora_rank {
@@ -663,8 +693,55 @@ impl PyDatabase {
         if let Some(v) = gradient_accumulation_steps {
             cfg.gradient_accumulation_steps = v;
         }
-        if let Some(m) = triplet_margin {
-            cfg.embedding_loss = Some(jammi_ai::fine_tune::EmbeddingLoss::Triplet { margin: m });
+        // Embedding loss: the named objective parameterised by its scalar knob.
+        // `triplet_margin` / `mnrl_temperature` parameterise the triplet / MNRL
+        // variants; naming "triplet"/"mnrl" without the knob uses the default.
+        // An unnamed loss with only `triplet_margin` set keeps the historical
+        // shorthand (margin implies triplet).
+        use jammi_ai::fine_tune::EmbeddingLoss;
+        match embedding_loss {
+            Some("cosent") => cfg.embedding_loss = Some(EmbeddingLoss::CoSent),
+            Some("angle") => cfg.embedding_loss = Some(EmbeddingLoss::AnglE),
+            Some("cosine_mse") => cfg.embedding_loss = Some(EmbeddingLoss::CosineMse),
+            Some("triplet") => {
+                cfg.embedding_loss = Some(EmbeddingLoss::Triplet {
+                    margin: triplet_margin.unwrap_or(0.3),
+                });
+            }
+            Some("mnrl") => {
+                cfg.embedding_loss = Some(EmbeddingLoss::MultipleNegativesRanking {
+                    temperature: mnrl_temperature.unwrap_or(20.0),
+                });
+            }
+            Some(other) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown embedding_loss '{other}'. Use 'cosent', 'angle', \
+                     'cosine_mse', 'triplet', or 'mnrl'."
+                )))
+            }
+            None => {
+                if let Some(m) = triplet_margin {
+                    cfg.embedding_loss = Some(EmbeddingLoss::Triplet { margin: m });
+                }
+            }
+        }
+        if let Some(v) = cached {
+            cfg.cached = v;
+        }
+        if let Some(v) = mine_hard_negatives {
+            cfg.hard_negatives.mine = v;
+        }
+        if let Some(v) = hard_negative_k {
+            cfg.hard_negatives.k = v;
+        }
+        if let Some(v) = hard_negative_exclude_hops {
+            cfg.hard_negatives.exclude_hops = v;
+        }
+        if let Some(v) = hard_negative_refresh_every {
+            cfg.hard_negatives.refresh_every = v;
+        }
+        if let Some(v) = matryoshka_dims {
+            cfg.matryoshka_dims = v;
         }
         if let Some(v) = target_modules {
             cfg.target_modules = v;

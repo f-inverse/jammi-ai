@@ -24,6 +24,8 @@ pub mod job;
 #[cfg(feature = "local")]
 pub mod lora;
 #[cfg(feature = "local")]
+pub mod optimizer;
+#[cfg(feature = "local")]
 pub mod target;
 #[cfg(feature = "local")]
 pub mod trainer;

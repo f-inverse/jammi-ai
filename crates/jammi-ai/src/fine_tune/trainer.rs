@@ -11,6 +11,7 @@ use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 
 use super::data::{TextChunk, TrainingDataLoader};
+use super::optimizer::clip_and_step;
 use super::target::TrainingTarget;
 use super::{EarlyStoppingMetric, FineTuneConfig, LrSchedule};
 use crate::model::{LoadedModel, ModelTask};
@@ -53,57 +54,6 @@ pub fn compute_lr(config: &FineTuneConfig, step: usize, total_steps: usize) -> f
             base_lr * (1.0 - progress)
         }
     }
-}
-
-/// Clip gradients by global L2 norm in-place, matching
-/// `torch.nn.utils.clip_grad_norm_(params, max_norm)`.
-///
-/// Computes `total_norm = sqrt(sum ||g||² for all g)`.  If `total_norm > max_norm`,
-/// every gradient is scaled by `max_norm / total_norm`.  Pass `max_norm = 0.0` to
-/// disable clipping entirely.
-fn clip_gradients(trainable_vars: &[Var], grads: &mut GradStore, max_norm: f64) -> Result<()> {
-    if max_norm <= 0.0 {
-        return Ok(());
-    }
-
-    // Compute the global L2 norm.
-    let mut total_sq = 0.0f64;
-    for var in trainable_vars {
-        let t: &Tensor = var;
-        if let Some(g) = grads.get(t) {
-            let g_f32 = if g.dtype() == DType::F32 {
-                g.clone()
-            } else {
-                g.to_dtype(DType::F32)
-                    .map_err(|e| JammiError::FineTune(format!("GradClip dtype: {e}")))?
-            };
-            let sq: f32 = g_f32
-                .sqr()
-                .map_err(|e| JammiError::FineTune(format!("GradClip sqr: {e}")))?
-                .sum_all()
-                .map_err(|e| JammiError::FineTune(format!("GradClip sum: {e}")))?
-                .to_scalar::<f32>()
-                .map_err(|e| JammiError::FineTune(format!("GradClip scalar: {e}")))?;
-            total_sq += sq as f64;
-        }
-    }
-
-    let total_norm = total_sq.sqrt();
-    if total_norm <= max_norm {
-        return Ok(());
-    }
-
-    let clip_coef = max_norm / total_norm;
-    for var in trainable_vars {
-        let t: &Tensor = var;
-        if let Some(g) = grads.remove(t) {
-            let scaled = (&g * clip_coef)
-                .map_err(|e| JammiError::FineTune(format!("GradClip scale: {e}")))?;
-            grads.insert(t, scaled);
-        }
-    }
-
-    Ok(())
 }
 
 /// Mutable per-epoch state passed into [`TrainingLoop::process_batch_loss`].
@@ -431,10 +381,12 @@ impl TrainingLoop {
             if let Some(mut acc) = accumulated_grads.take() {
                 let lr = compute_lr(&self.config, global_step, total_steps);
                 optimizer.set_learning_rate(lr);
-                clip_gradients(&trainable_vars, &mut acc, self.config.max_grad_norm)?;
-                optimizer
-                    .step(&acc)
-                    .map_err(|e| JammiError::FineTune(format!("Backward flush: {e}")))?;
+                clip_and_step(
+                    &mut optimizer,
+                    &trainable_vars,
+                    &mut acc,
+                    self.config.max_grad_norm,
+                )?;
                 global_step += 1;
             }
 
@@ -807,10 +759,12 @@ impl TrainingLoop {
         self.target.set_training(true);
         let (mut grads, loss_val) = outcome?;
 
-        clip_gradients(trainable_vars, &mut grads, self.config.max_grad_norm)?;
-        optimizer
-            .step(&grads)
-            .map_err(|e| JammiError::FineTune(format!("GradCache optimizer step: {e}")))?;
+        clip_and_step(
+            optimizer,
+            trainable_vars,
+            &mut grads,
+            self.config.max_grad_norm,
+        )?;
 
         Ok(loss_val)
     }
@@ -1198,10 +1152,12 @@ impl TrainingLoop {
             ctx.optimizer.set_learning_rate(lr);
 
             if let Some(mut acc) = epoch.accumulated_grads.take() {
-                clip_gradients(ctx.trainable_vars, &mut acc, self.config.max_grad_norm)?;
-                ctx.optimizer
-                    .step(&acc)
-                    .map_err(|e| JammiError::FineTune(format!("Optimizer step: {e}")))?;
+                clip_and_step(
+                    ctx.optimizer,
+                    ctx.trainable_vars,
+                    &mut acc,
+                    self.config.max_grad_norm,
+                )?;
             }
 
             *epoch.global_step += 1;

@@ -16,6 +16,7 @@ mod local_session;
 mod merger;
 mod models;
 mod neighbor_graph;
+mod parallel_train;
 mod pipeline;
 mod read_vectors;
 mod scheduling;

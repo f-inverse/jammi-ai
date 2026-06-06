@@ -22,6 +22,11 @@ pub enum TrainingBatch {
         embeddings_b: Tensor,
         scores: Tensor,
     },
+    /// Pairs: anchor and positive embeddings only. In-batch negatives are the
+    /// other rows' positives, so no explicit negative column is carried — the
+    /// `MultipleNegativesRanking` objective scores each anchor against every
+    /// positive in the batch.
+    Pairs { anchors: Tensor, positives: Tensor },
     /// Triplet: anchor, positive, and negative embeddings.
     Triplet {
         anchor: Tensor,
@@ -38,6 +43,14 @@ pub enum TrainingBatch {
         hidden_states: Tensor, // (batch, seq_len, hidden)
         labels: Tensor,        // (batch, seq_len) as i64, -100 for ignored tokens
     },
+    /// Regression (S18): the distributional head's raw output plus the observed
+    /// continuous targets. `input` is `(batch, k)` — the unconstrained head
+    /// parameters (`k = 2` `(mean, raw_std)` for the Gaussian objectives,
+    /// `k = levels` for the pinball objective); `target` is `(batch,)` the
+    /// observed `y`. The proper-scoring loss reads a positive `σ` from
+    /// `raw_std` via `floor + softplus`, so the head trains in the
+    /// unconstrained space.
+    Regression { input: Tensor, target: Tensor },
 }
 
 /// Format of training data, detected from column names.
@@ -45,6 +58,10 @@ pub enum TrainingBatch {
 pub enum TrainingFormat {
     /// `text_a, text_b, score` — contrastive pairs with scores.
     Contrastive,
+    /// `anchor, positive` — contrastive pairs with no explicit negatives. The
+    /// `MultipleNegativesRanking` objective draws negatives from the rest of
+    /// the batch.
+    Pairs,
     /// `anchor, positive, negative` — text triplet format.
     Triplet,
     /// `anchor, positive, negative` — audio triplet format. The three
@@ -58,6 +75,63 @@ pub enum TrainingFormat {
     Classification { num_classes: usize },
     /// NER with BIO tag mapping.
     Ner { num_labels: usize },
+    /// Regression (S18): `text, target` rows — one input text and one observed
+    /// continuous outcome. The trainer encodes the text through the frozen base
+    /// model + the distributional projection head, then scores the head's
+    /// parameters against the target with the configured proper-scoring
+    /// objective.
+    Regression,
+    /// Graph-supervised (S11): the rows were sampled from a graph (node text +
+    /// edge table) by biased random walks into `(anchor, positive,
+    /// [hard_negative])` pairs. It carries **no new loss** — it is a
+    /// data-loading shape that drives the existing in-batch-negative
+    /// (`Pairs`/MNRL) or `Triplet` path, selected by `has_negatives`:
+    /// `false` → `Pairs` (in-batch negatives only), `true` → `Triplet` (the
+    /// sampler mined structure-aware hard negatives). The variant is retained
+    /// for provenance — a consumer can see the supervision came from the graph —
+    /// while every downstream step reuses the Pairs/Triplet machinery.
+    Graph { has_negatives: bool },
+}
+
+/// The concrete batch/loss shape a [`TrainingFormat`] resolves to once the
+/// provenance-carrying `Graph` variant is mapped onto its in-batch-negative
+/// shape. There is no `Graph` here by construction — a graph loader trains as
+/// `Pairs` or `Triplet`, so the chunk/loss dispatch matches on this exhaustive
+/// set without a phantom arm.
+#[derive(Debug, Clone, Copy)]
+enum UnderlyingFormat {
+    Contrastive,
+    Pairs,
+    Triplet,
+    AudioTriplet,
+    Classification,
+    Ner,
+    Regression,
+}
+
+impl TrainingFormat {
+    /// The concrete shape a format trains as: a graph with mined hard negatives
+    /// is a `Triplet`, one without is `Pairs`; every other format is itself.
+    /// This is the single place that maps the provenance-carrying `Graph`
+    /// variant onto the loss/batch machinery, so `text_chunks` /
+    /// `in_batch_negative_texts` stay DRY.
+    fn underlying(self) -> UnderlyingFormat {
+        match self {
+            TrainingFormat::Contrastive => UnderlyingFormat::Contrastive,
+            TrainingFormat::Pairs => UnderlyingFormat::Pairs,
+            TrainingFormat::Triplet => UnderlyingFormat::Triplet,
+            TrainingFormat::AudioTriplet => UnderlyingFormat::AudioTriplet,
+            TrainingFormat::Classification { .. } => UnderlyingFormat::Classification,
+            TrainingFormat::Ner { .. } => UnderlyingFormat::Ner,
+            TrainingFormat::Regression => UnderlyingFormat::Regression,
+            TrainingFormat::Graph {
+                has_negatives: true,
+            } => UnderlyingFormat::Triplet,
+            TrainingFormat::Graph {
+                has_negatives: false,
+            } => UnderlyingFormat::Pairs,
+        }
+    }
 }
 
 /// A chunk of text data for one training batch. The training loop encodes
@@ -67,6 +141,10 @@ pub enum TextChunk {
         texts_a: Vec<String>,
         texts_b: Vec<String>,
         scores: Vec<f32>,
+    },
+    Pairs {
+        anchors: Vec<String>,
+        positives: Vec<String>,
     },
     Triplet {
         anchors: Vec<String>,
@@ -91,7 +169,19 @@ pub enum TextChunk {
         /// Per-text entity spans as JSON strings (same format as inference output).
         entities_json: Vec<String>,
     },
+    /// One batch of regression rows: input texts and their observed continuous
+    /// targets. The training loop encodes the texts through the base model + the
+    /// distributional head, then scores the head output against `targets`.
+    Regression {
+        texts: Vec<String>,
+        targets: Vec<f32>,
+    },
 }
+
+/// The flattened in-batch-negative view of a text loader: `(anchors,
+/// positives, optional explicit negatives)`. Consumed by GradCache and
+/// hard-negative mining, which treat the dataset as one in-batch-negative batch.
+pub type InBatchNegativeTexts = (Vec<String>, Vec<String>, Option<Vec<String>>);
 
 /// Internal storage: either text rows (from source) or precomputed batches (for tests).
 enum LoaderData {
@@ -119,6 +209,10 @@ enum TrainingRow {
         text_b: String,
         score: f32,
     },
+    Pairs {
+        anchor: String,
+        positive: String,
+    },
     Triplet {
         anchor: String,
         positive: String,
@@ -137,6 +231,10 @@ enum TrainingRow {
         text: String,
         /// JSON-serialized entity spans.
         entities_json: String,
+    },
+    Regression {
+        text: String,
+        target: f32,
     },
 }
 
@@ -184,6 +282,21 @@ impl TrainingDataLoader {
         }
     }
 
+    /// Create a loader from regression rows (input text + observed continuous
+    /// target). The trainer encodes each text through the base model and the
+    /// distributional projection head, then scores the head's parameters against
+    /// the target with the configured proper-scoring objective (S18).
+    pub fn from_regression(rows: Vec<(String, f32)>) -> Self {
+        Self {
+            format: TrainingFormat::Regression,
+            data: LoaderData::TextRows(
+                rows.into_iter()
+                    .map(|(text, target)| TrainingRow::Regression { text, target })
+                    .collect(),
+            ),
+        }
+    }
+
     /// Create a loader from triplet rows.
     pub fn from_triplets(rows: Vec<(String, String, String)>) -> Self {
         Self {
@@ -198,6 +311,77 @@ impl TrainingDataLoader {
                     .collect(),
             ),
         }
+    }
+
+    /// Create a loader from contrastive pair rows `(anchor, positive)`. The
+    /// `MultipleNegativesRanking` objective draws negatives from the rest of
+    /// each batch, so no explicit negative column is needed.
+    pub fn from_pairs(rows: Vec<(String, String)>) -> Self {
+        Self {
+            format: TrainingFormat::Pairs,
+            data: LoaderData::TextRows(
+                rows.into_iter()
+                    .map(|(a, p)| TrainingRow::Pairs {
+                        anchor: a,
+                        positive: p,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Create a loader from a graph (S11): sample the node-text + edge-table
+    /// graph into `(anchor, positive, [hard_negative])` text rows by biased
+    /// random walks, then store them as the underlying `Pairs` (no mined
+    /// negatives) or `Triplet` (structure-mined hard negatives) rows. The loader
+    /// reports [`TrainingFormat::Graph`] for provenance, but the rows feed the
+    /// existing MNRL/Triplet path unchanged — S11 adds **no new loss**.
+    ///
+    /// The sampler enforces the text-bearing precondition (every edge endpoint
+    /// must resolve to a [`super::graph_sampler::TextNode`]) and the collapse /
+    /// false-negative guards, so any violation surfaces here as a typed error.
+    ///
+    /// **Circularity caveat:** if the edges are S9-similarity edges the
+    /// supervision largely re-learns the base metric; genuine gain comes from
+    /// declared / external edges (see [`super::graph_sampler`]).
+    pub fn from_graph(sampler: &super::graph_sampler::GraphSampler) -> Result<Self> {
+        let pairs = sampler.sample()?;
+        // The whole dataset shares one shape: if any pair carries mined hard
+        // negatives the format is Triplet, otherwise Pairs. The sampler emits a
+        // uniform shape (hard_negatives is a single config knob), so the first
+        // pair determines it; an empty dataset is already a sampler error.
+        let has_negatives = pairs.first().is_some_and(|p| !p.hard_negatives.is_empty());
+
+        let rows = pairs
+            .into_iter()
+            .map(|p| {
+                if has_negatives {
+                    // Use the first mined negative as the explicit triplet
+                    // negative; the rest still contribute via in-batch negatives
+                    // (MNRL appends the explicit one as an extra column).
+                    let negative = p.hard_negatives.into_iter().next().ok_or_else(|| {
+                        JammiError::FineTune(
+                            "graph pair declared hard negatives but supplied none".into(),
+                        )
+                    })?;
+                    Ok(TrainingRow::Triplet {
+                        anchor: p.anchor,
+                        positive: p.positive,
+                        negative,
+                    })
+                } else {
+                    Ok(TrainingRow::Pairs {
+                        anchor: p.anchor,
+                        positive: p.positive,
+                    })
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
+            format: TrainingFormat::Graph { has_negatives },
+            data: LoaderData::TextRows(rows),
+        })
     }
 
     /// Create a loader from audio triplet rows. Each element is
@@ -335,8 +519,11 @@ impl TrainingDataLoader {
         match &self.data {
             LoaderData::TextRows(rows) => rows
                 .chunks(batch_size)
-                .map(|chunk| match self.format {
-                    TrainingFormat::Contrastive => TextChunk::Contrastive {
+                // A `Graph` loader stores `Pairs`/`Triplet` rows, so it encodes
+                // through its underlying shape — the provenance variant carries
+                // no chunk shape of its own.
+                .map(|chunk| match self.format.underlying() {
+                    UnderlyingFormat::Contrastive => TextChunk::Contrastive {
                         texts_a: chunk
                             .iter()
                             .map(|r| match r {
@@ -359,7 +546,23 @@ impl TrainingDataLoader {
                             })
                             .collect(),
                     },
-                    TrainingFormat::Triplet => TextChunk::Triplet {
+                    UnderlyingFormat::Pairs => TextChunk::Pairs {
+                        anchors: chunk
+                            .iter()
+                            .map(|r| match r {
+                                TrainingRow::Pairs { anchor, .. } => anchor.clone(),
+                                _ => String::new(),
+                            })
+                            .collect(),
+                        positives: chunk
+                            .iter()
+                            .map(|r| match r {
+                                TrainingRow::Pairs { positive, .. } => positive.clone(),
+                                _ => String::new(),
+                            })
+                            .collect(),
+                    },
+                    UnderlyingFormat::Triplet => TextChunk::Triplet {
                         anchors: chunk
                             .iter()
                             .map(|r| match r {
@@ -382,7 +585,7 @@ impl TrainingDataLoader {
                             })
                             .collect(),
                     },
-                    TrainingFormat::AudioTriplet => TextChunk::AudioTriplet {
+                    UnderlyingFormat::AudioTriplet => TextChunk::AudioTriplet {
                         anchors: chunk
                             .iter()
                             .map(|r| match r {
@@ -405,7 +608,7 @@ impl TrainingDataLoader {
                             })
                             .collect(),
                     },
-                    TrainingFormat::Classification { .. } => TextChunk::Classification {
+                    UnderlyingFormat::Classification => TextChunk::Classification {
                         texts: chunk
                             .iter()
                             .map(|r| match r {
@@ -421,7 +624,7 @@ impl TrainingDataLoader {
                             })
                             .collect(),
                     },
-                    TrainingFormat::Ner { .. } => TextChunk::Ner {
+                    UnderlyingFormat::Ner => TextChunk::Ner {
                         texts: chunk
                             .iter()
                             .map(|r| match r {
@@ -437,6 +640,22 @@ impl TrainingDataLoader {
                             })
                             .collect(),
                     },
+                    UnderlyingFormat::Regression => TextChunk::Regression {
+                        texts: chunk
+                            .iter()
+                            .map(|r| match r {
+                                TrainingRow::Regression { text, .. } => text.clone(),
+                                _ => String::new(),
+                            })
+                            .collect(),
+                        targets: chunk
+                            .iter()
+                            .map(|r| match r {
+                                TrainingRow::Regression { target, .. } => *target,
+                                _ => 0.0,
+                            })
+                            .collect(),
+                    },
                 })
                 .collect(),
             LoaderData::Precomputed(_) => Vec::new(),
@@ -448,10 +667,113 @@ impl TrainingDataLoader {
         self.format
     }
 
+    /// Flatten the in-batch-negative text rows into `(anchors, positives,
+    /// negatives)`, the whole-dataset view GradCache and hard-negative mining
+    /// consume. `negatives` is `Some` for a `Triplet` loader (explicit hard
+    /// negatives) and `None` for a `Pairs` loader. Returns an error for any
+    /// other format — only in-batch-negative training has this shape.
+    pub fn in_batch_negative_texts(&self) -> Result<InBatchNegativeTexts> {
+        let rows = match &self.data {
+            LoaderData::TextRows(rows) => rows,
+            LoaderData::Precomputed(_) => {
+                return Err(JammiError::FineTune(
+                    "GradCache requires text rows, not precomputed batches".into(),
+                ))
+            }
+        };
+        // A `Graph` loader is itself an in-batch-negative loader — it stores
+        // `Pairs`/`Triplet` rows — so it resolves through `underlying()` and
+        // flows into mining / GradCache exactly like a hand-built pair set.
+        match self.format.underlying() {
+            UnderlyingFormat::Pairs => {
+                let mut anchors = Vec::with_capacity(rows.len());
+                let mut positives = Vec::with_capacity(rows.len());
+                for row in rows {
+                    if let TrainingRow::Pairs { anchor, positive } = row {
+                        anchors.push(anchor.clone());
+                        positives.push(positive.clone());
+                    }
+                }
+                Ok((anchors, positives, None))
+            }
+            UnderlyingFormat::Triplet => {
+                let mut anchors = Vec::with_capacity(rows.len());
+                let mut positives = Vec::with_capacity(rows.len());
+                let mut negatives = Vec::with_capacity(rows.len());
+                for row in rows {
+                    if let TrainingRow::Triplet {
+                        anchor,
+                        positive,
+                        negative,
+                    } = row
+                    {
+                        anchors.push(anchor.clone());
+                        positives.push(positive.clone());
+                        negatives.push(negative.clone());
+                    }
+                }
+                Ok((anchors, positives, Some(negatives)))
+            }
+            other => Err(JammiError::FineTune(format!(
+                "GradCache applies only to in-batch-negative formats (pairs/triplet), not {other:?}"
+            ))),
+        }
+    }
+
     /// Whether this loader was constructed from pre-built tensor batches
     /// (typically a test fixture) rather than text rows that must be
     /// encoded through a model.
     pub fn is_precomputed(&self) -> bool {
         matches!(self.data, LoaderData::Precomputed(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A regression loader carries `TrainingFormat::Regression` and chunks its
+    /// rows into `TextChunk::Regression { texts, targets }` — the shape the
+    /// trainer encodes through the distributional head. Pins the S18 data path
+    /// from constructor to chunk.
+    #[test]
+    fn regression_loader_chunks_into_regression_text_chunks() {
+        let loader = TrainingDataLoader::from_regression(vec![
+            ("cheap".into(), 0.1),
+            ("mid".into(), 0.5),
+            ("dear".into(), 0.9),
+        ]);
+        assert!(matches!(loader.format(), TrainingFormat::Regression));
+        assert_eq!(loader.len(), 3);
+
+        let chunks = loader.text_chunks(2);
+        assert_eq!(chunks.len(), 2, "3 rows at batch 2 → two chunks");
+        match &chunks[0] {
+            TextChunk::Regression { texts, targets } => {
+                assert_eq!(texts, &["cheap".to_string(), "mid".to_string()]);
+                assert_eq!(targets, &[0.1, 0.5]);
+            }
+            _ => panic!("regression loader must yield a Regression chunk"),
+        }
+        match &chunks[1] {
+            TextChunk::Regression { texts, targets } => {
+                assert_eq!(texts, &["dear".to_string()]);
+                assert_eq!(targets, &[0.9]);
+            }
+            _ => panic!("regression loader must yield a Regression chunk"),
+        }
+    }
+
+    /// The validation split preserves the regression format on both halves.
+    #[test]
+    fn regression_split_keeps_format() {
+        let loader = TrainingDataLoader::from_regression(
+            (0..10).map(|i| (format!("r{i}"), i as f32)).collect(),
+        );
+        let (train, val) = loader.split(0.2).unwrap();
+        assert!(matches!(train.format(), TrainingFormat::Regression));
+        assert!(matches!(val.format(), TrainingFormat::Regression));
+        assert_eq!(train.len(), 8);
+        assert_eq!(val.len(), 2);
     }
 }

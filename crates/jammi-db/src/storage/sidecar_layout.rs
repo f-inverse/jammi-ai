@@ -1,7 +1,13 @@
 //! Sidecar-index round-trip helpers.
 //!
-//! A sidecar index for a result table at `<root>/<table>.parquet` lives at
-//! three sibling objects:
+//! A result table at `<root>/<table>.parquet` may carry a *sidecar bundle*: a
+//! set of sibling objects that hold an out-of-band index. Which siblings exist
+//! is a function of the table's [`SidecarKind`] — the kind owns its extension
+//! set in [`sidecar_extensions`], so writer / reader / cleanup all discover the
+//! same files and a new kind adds one registry entry rather than editing shared
+//! control flow.
+//!
+//! The shipped ANN kind ([`SidecarKind::Ann`]) carries three siblings:
 //!
 //! - `<root>/<table>.usearch`        — serialised USearch graph
 //! - `<root>/<table>.rowmap`         — row-id mapping (Jammi-owned format)
@@ -20,9 +26,37 @@ use crate::index::sidecar::SidecarIndex;
 use super::object_store_handle::JammiObjectStore;
 use super::url::Scheme;
 
-/// Names of the three extensions that make up a sidecar bundle. Kept in
-/// one place so writer / reader / cleanup never drift.
-pub const SIDECAR_EXTENSIONS: [&str; 3] = ["usearch", "rowmap", "manifest.json"];
+/// The kind of sidecar bundle a result table carries.
+///
+/// A table's kind declares which sidecar extensions sit beside its Parquet
+/// object. Each variant owns its extension set in [`sidecar_extensions`], so a
+/// new derived-table shape is one variant plus one registry arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidecarKind {
+    /// Approximate-nearest-neighbour table: a USearch graph plus its row-id
+    /// map and manifest.
+    Ann,
+    /// Lexical (BM25) table: a tantivy inverted index serialised as a
+    /// `.tantivy` directory beside the Parquet object. The lexical peer of
+    /// [`SidecarKind::Ann`].
+    Lexical,
+    /// A table that carries no sidecar bundle (e.g. a plain derived/edge
+    /// table whose state lives entirely in its Parquet object).
+    None,
+}
+
+/// The sidecar extensions a [`SidecarKind`] carries, in a stable order.
+///
+/// This is the single registry the layout consults: writer, reader, and
+/// cleanup all enumerate a kind's siblings through here, so they never drift
+/// and a new kind is one match arm rather than an edit to every loop.
+pub fn sidecar_extensions(kind: SidecarKind) -> &'static [&'static str] {
+    match kind {
+        SidecarKind::Ann => &["usearch", "rowmap", "manifest.json"],
+        SidecarKind::Lexical => &["tantivy"],
+        SidecarKind::None => &[],
+    }
+}
 
 /// Persist a built [`SidecarIndex`] beside `handle`'s data object.
 ///
@@ -47,9 +81,9 @@ pub async fn load_sidecar(handle: &JammiObjectStore) -> Result<SidecarIndex> {
     }
 }
 
-/// Best-effort cleanup: delete every sidecar sibling that exists.
-pub async fn delete_sidecar(handle: &JammiObjectStore) -> Result<()> {
-    for ext in SIDECAR_EXTENSIONS {
+/// Best-effort cleanup: delete every sidecar sibling a `kind` carries.
+pub async fn delete_sidecar(handle: &JammiObjectStore, kind: SidecarKind) -> Result<()> {
+    for ext in sidecar_extensions(kind) {
         let path = handle.sibling_path(ext)?;
         handle.delete_if_exists(&path).await?;
     }
@@ -72,7 +106,7 @@ async fn save_sidecar_remote(handle: &JammiObjectStore, index: &SidecarIndex) ->
     let stem = tmp.path().join("sidecar");
     index.save(&stem)?;
 
-    for ext in SIDECAR_EXTENSIONS {
+    for ext in sidecar_extensions(SidecarKind::Ann) {
         let local_path = stem.with_extension(ext);
         if !local_path.exists() {
             continue;
@@ -88,7 +122,7 @@ async fn load_sidecar_remote(handle: &JammiObjectStore) -> Result<SidecarIndex> 
     let tmp = tempfile::tempdir()?;
     let stem = tmp.path().join("sidecar");
 
-    for ext in SIDECAR_EXTENSIONS {
+    for ext in sidecar_extensions(SidecarKind::Ann) {
         let remote = handle.sibling_path(ext)?;
         if !handle.exists(&remote).await? {
             continue;
@@ -138,8 +172,26 @@ mod tests {
         let hits = loaded.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(hits.first().map(|(id, _)| id.as_str()), Some("row-a"));
 
-        delete_sidecar(&handle).await.unwrap();
+        delete_sidecar(&handle, SidecarKind::Ann).await.unwrap();
         let path = handle.sibling_path("usearch").unwrap();
         assert!(!handle.exists(&path).await.unwrap());
+    }
+
+    #[test]
+    fn ann_kind_carries_todays_three_extensions() {
+        assert_eq!(
+            sidecar_extensions(SidecarKind::Ann),
+            ["usearch", "rowmap", "manifest.json"],
+        );
+    }
+
+    #[test]
+    fn lexical_kind_carries_the_tantivy_sibling() {
+        assert_eq!(sidecar_extensions(SidecarKind::Lexical), ["tantivy"]);
+    }
+
+    #[test]
+    fn none_kind_carries_no_extensions() {
+        assert!(sidecar_extensions(SidecarKind::None).is_empty());
     }
 }

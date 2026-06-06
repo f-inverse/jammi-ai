@@ -35,6 +35,8 @@ async fn inference_session_roots_result_tables_at_configured_memory_root() {
         .create_table(
             "patents",
             ModelTask::Classification,
+            jammi_db::catalog::result_repo::ResultTableKind::Model,
+            None,
             "model",
             None,
             None,

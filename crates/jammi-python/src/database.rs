@@ -16,6 +16,7 @@ use jammi_ai::local_session::{
     LocalSession, Modality, QueryInput, SearchQuery, SearchRequest, Session,
 };
 use jammi_ai::model::{ModelSource, ModelTask};
+use jammi_ai::pipeline::context_set::{ContextRequest, SetAggregator};
 use jammi_ai::session::InferenceSession;
 use jammi_db::config::JammiConfig;
 use jammi_db::error::JammiError;
@@ -577,6 +578,20 @@ impl PyDatabase {
     ///     "bf16" cuts backbone VRAM by ~half; LoRA A/B always stay in f32.
     ///   weight_decay — AdamW L2 regularization. Default: 0.01 (matches train_embedding_model.py).
     ///   max_grad_norm — global gradient clipping norm. Default: 1.0. Pass 0.0 to disable.
+    ///   embedding_loss — "cosent" | "angle" | "cosine_mse" | "triplet" | "mnrl".
+    ///     "mnrl" (Multiple-Negatives-Ranking / in-batch negatives) trains
+    ///     (anchor, positive) pairs or (anchor, positive, negative) triplets;
+    ///     unset auto-selects from the data format. Setting "triplet" with a
+    ///     custom margin still uses triplet_margin.
+    ///   mnrl_temperature — MNRL similarity scale. Default: 20.0.
+    ///   cached — MNRL GradCache: enlarge the in-batch-negative pool to the whole
+    ///     dataset without the memory cost. Only affects embedding_loss="mnrl".
+    ///   mine_hard_negatives — mine hard negatives from jammi's own ANN index.
+    ///   hard_negative_k / hard_negative_exclude_hops / hard_negative_refresh_every —
+    ///     mining knobs (negatives per anchor; hops of the positive's
+    ///     neighbourhood excluded as false-negative guard; epochs between re-mines).
+    ///   matryoshka_dims — train truncatable embeddings at these prefix dims
+    ///     (e.g. [768, 512, 256, 128, 64]); empty trains the full dimension only.
     #[pyo3(signature = (
         *,
         source,
@@ -601,6 +616,14 @@ impl PyDatabase {
         backbone_dtype = None,
         weight_decay = None,
         max_grad_norm = None,
+        embedding_loss = None,
+        mnrl_temperature = None,
+        cached = None,
+        mine_hard_negatives = None,
+        hard_negative_k = None,
+        hard_negative_exclude_hops = None,
+        hard_negative_refresh_every = None,
+        matryoshka_dims = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn fine_tune(
@@ -627,6 +650,14 @@ impl PyDatabase {
         backbone_dtype: Option<&str>,
         weight_decay: Option<f64>,
         max_grad_norm: Option<f64>,
+        embedding_loss: Option<&str>,
+        mnrl_temperature: Option<f64>,
+        cached: Option<bool>,
+        mine_hard_negatives: Option<bool>,
+        hard_negative_k: Option<usize>,
+        hard_negative_exclude_hops: Option<usize>,
+        hard_negative_refresh_every: Option<usize>,
+        matryoshka_dims: Option<Vec<usize>>,
     ) -> PyResult<PyFineTuneJob> {
         let mut cfg = FineTuneConfig::default();
         if let Some(v) = lora_rank {
@@ -662,8 +693,55 @@ impl PyDatabase {
         if let Some(v) = gradient_accumulation_steps {
             cfg.gradient_accumulation_steps = v;
         }
-        if let Some(m) = triplet_margin {
-            cfg.embedding_loss = Some(jammi_ai::fine_tune::EmbeddingLoss::Triplet { margin: m });
+        // Embedding loss: the named objective parameterised by its scalar knob.
+        // `triplet_margin` / `mnrl_temperature` parameterise the triplet / MNRL
+        // variants; naming "triplet"/"mnrl" without the knob uses the default.
+        // An unnamed loss with only `triplet_margin` set keeps the historical
+        // shorthand (margin implies triplet).
+        use jammi_ai::fine_tune::EmbeddingLoss;
+        match embedding_loss {
+            Some("cosent") => cfg.embedding_loss = Some(EmbeddingLoss::CoSent),
+            Some("angle") => cfg.embedding_loss = Some(EmbeddingLoss::AnglE),
+            Some("cosine_mse") => cfg.embedding_loss = Some(EmbeddingLoss::CosineMse),
+            Some("triplet") => {
+                cfg.embedding_loss = Some(EmbeddingLoss::Triplet {
+                    margin: triplet_margin.unwrap_or(0.3),
+                });
+            }
+            Some("mnrl") => {
+                cfg.embedding_loss = Some(EmbeddingLoss::MultipleNegativesRanking {
+                    temperature: mnrl_temperature.unwrap_or(20.0),
+                });
+            }
+            Some(other) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown embedding_loss '{other}'. Use 'cosent', 'angle', \
+                     'cosine_mse', 'triplet', or 'mnrl'."
+                )))
+            }
+            None => {
+                if let Some(m) = triplet_margin {
+                    cfg.embedding_loss = Some(EmbeddingLoss::Triplet { margin: m });
+                }
+            }
+        }
+        if let Some(v) = cached {
+            cfg.cached = v;
+        }
+        if let Some(v) = mine_hard_negatives {
+            cfg.hard_negatives.mine = v;
+        }
+        if let Some(v) = hard_negative_k {
+            cfg.hard_negatives.k = v;
+        }
+        if let Some(v) = hard_negative_exclude_hops {
+            cfg.hard_negatives.exclude_hops = v;
+        }
+        if let Some(v) = hard_negative_refresh_every {
+            cfg.hard_negatives.refresh_every = v;
+        }
+        if let Some(v) = matryoshka_dims {
+            cfg.matryoshka_dims = v;
         }
         if let Some(v) = target_modules {
             cfg.target_modules = v;
@@ -709,6 +787,188 @@ impl PyDatabase {
                 task,
                 Some(cfg),
             ))
+            .map_err(to_pyerr)?;
+        Ok(PyFineTuneJob::new(job, Arc::clone(&self.runtime)))
+    }
+
+    /// Graph-supervised fine-tune (S11): learn an embedding metric that encodes
+    /// a graph's structure. Reads a node-text source and an edge source, samples
+    /// the graph into `(anchor, positive, [hard_negative])` pairs by biased
+    /// random walks (node2vec), and trains the existing in-batch-negative
+    /// (MNRL) / triplet objective — **no new loss**.
+    ///
+    /// Sources:
+    ///   node_source / id_column / text_column — the node text the encoder
+    ///     embeds, keyed by id.
+    ///   edge_source / src_column / dst_column — directed edges; endpoints join
+    ///     to id_column.
+    ///   edge_provenance — "declared" | "similarity". **The load-bearing
+    ///     distinction:** training on "similarity" (S9 k-NN) edges largely
+    ///     re-learns the base metric (a degenerate feedback loop), so genuine
+    ///     gain comes from "declared" external edges (hierarchy, crosswalk,
+    ///     citation, confirmed pairs). Similarity edges are a weak bootstrap,
+    ///     never the sole supervision.
+    ///
+    /// Walk / negative knobs (node2vec):
+    ///   walk_length (L) — positive reach; 1 is degenerate 1-hop. Default 4.
+    ///   walks_per_node — walks started per node. Default 2.
+    ///   return_p (p) / in_out_q (q) — node2vec bias. Defaults 1.0 / 1.0.
+    ///   graph_hard_negatives — structure-mined hard negatives per pair; 0 uses
+    ///     in-batch negatives only. Default 1.
+    ///   exclude_hops — hops of the anchor's neighbourhood excluded from its
+    ///     negative pool (the false-negative guard). Default 1.
+    ///   min_negatives — minimum negative pool (collapse guard). Default 1.
+    ///   sample_seed — walk/negative RNG seed. Default 0.
+    ///
+    /// Training knobs mirror `fine_tune` for the subset relevant to graph
+    /// supervision (loss, temperature, batch, epochs, lora, matryoshka).
+    #[pyo3(signature = (
+        *,
+        node_source,
+        id_column,
+        text_column,
+        edge_source,
+        src_column,
+        dst_column,
+        base_model,
+        edge_provenance = "declared",
+        walk_length = None,
+        walks_per_node = None,
+        return_p = None,
+        in_out_q = None,
+        graph_hard_negatives = None,
+        exclude_hops = None,
+        min_negatives = None,
+        sample_seed = None,
+        embedding_loss = None,
+        mnrl_temperature = None,
+        epochs = None,
+        batch_size = None,
+        learning_rate = None,
+        lora_rank = None,
+        matryoshka_dims = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn fine_tune_graph(
+        &self,
+        node_source: &str,
+        id_column: &str,
+        text_column: &str,
+        edge_source: &str,
+        src_column: &str,
+        dst_column: &str,
+        base_model: &str,
+        edge_provenance: &str,
+        walk_length: Option<usize>,
+        walks_per_node: Option<usize>,
+        return_p: Option<f64>,
+        in_out_q: Option<f64>,
+        graph_hard_negatives: Option<usize>,
+        exclude_hops: Option<usize>,
+        min_negatives: Option<usize>,
+        sample_seed: Option<u64>,
+        embedding_loss: Option<&str>,
+        mnrl_temperature: Option<f64>,
+        epochs: Option<usize>,
+        batch_size: Option<usize>,
+        learning_rate: Option<f64>,
+        lora_rank: Option<usize>,
+        matryoshka_dims: Option<Vec<usize>>,
+    ) -> PyResult<PyFineTuneJob> {
+        use jammi_ai::fine_tune::graph_sampler::{
+            EdgeProvenance, GraphFineTuneSources, GraphSampleConfig,
+        };
+        use jammi_ai::fine_tune::EmbeddingLoss;
+
+        let provenance = match edge_provenance {
+            "declared" => EdgeProvenance::Declared,
+            "similarity" => EdgeProvenance::Similarity,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown edge_provenance '{other}'. Use 'declared' or 'similarity'. \
+                     Note: 'similarity' (S9) edges largely re-learn the base metric — a \
+                     weak bootstrap, not the sole supervision."
+                )))
+            }
+        };
+
+        // Walk / negative sampling config — defaults match the Rust struct.
+        let mut sample = GraphSampleConfig::default();
+        if let Some(v) = walk_length {
+            sample.walk_length = v;
+        }
+        if let Some(v) = walks_per_node {
+            sample.walks_per_node = v;
+        }
+        if let Some(v) = return_p {
+            sample.return_p = v;
+        }
+        if let Some(v) = in_out_q {
+            sample.in_out_q = v;
+        }
+        if let Some(v) = graph_hard_negatives {
+            sample.hard_negatives = v;
+        }
+        if let Some(v) = exclude_hops {
+            sample.exclude_hops = v;
+        }
+        if let Some(v) = min_negatives {
+            sample.min_negatives = v;
+        }
+        if let Some(v) = sample_seed {
+            sample.seed = v;
+        }
+
+        // Training config — the graph-relevant subset of `fine_tune`'s knobs.
+        // The default embedding loss for graph supervision is MNRL (S10).
+        let loss = match embedding_loss {
+            None | Some("mnrl") => EmbeddingLoss::MultipleNegativesRanking {
+                temperature: mnrl_temperature.unwrap_or(20.0),
+            },
+            Some("triplet") => EmbeddingLoss::Triplet { margin: 0.3 },
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown embedding_loss '{other}' for graph fine-tune. Use 'mnrl' \
+                     (default) or 'triplet'."
+                )))
+            }
+        };
+        let mut cfg = FineTuneConfig {
+            embedding_loss: Some(loss),
+            ..FineTuneConfig::default()
+        };
+        if let Some(v) = epochs {
+            cfg.epochs = v;
+        }
+        if let Some(v) = batch_size {
+            cfg.batch_size = v;
+        }
+        if let Some(v) = learning_rate {
+            cfg.learning_rate = v;
+        }
+        if let Some(v) = lora_rank {
+            cfg.lora_rank = v;
+        }
+        if let Some(v) = matryoshka_dims {
+            cfg.matryoshka_dims = v;
+        }
+
+        let sources = GraphFineTuneSources {
+            node_source: node_source.to_string(),
+            id_column: id_column.to_string(),
+            text_column: text_column.to_string(),
+            edge_source: edge_source.to_string(),
+            src_column: src_column.to_string(),
+            dst_column: dst_column.to_string(),
+            provenance,
+        };
+
+        let job = self
+            .runtime
+            .block_on(
+                self.session
+                    .fine_tune_graph(&sources, base_model, sample, Some(cfg)),
+            )
             .map_err(to_pyerr)?;
         Ok(PyFineTuneJob::new(job, Arc::clone(&self.runtime)))
     }
@@ -820,6 +1080,39 @@ impl PyDatabase {
         serializable_to_pydict(py, &report)
     }
 
+    /// Evaluate whether a predictor's uncertainty is honest (spec R2). Returns a
+    /// dict with `aggregate` (the proper-score headline `crps`/`nll`, the
+    /// `adaptive_ece` PIT-calibration diagnostic, `sharpness`, `coverage`),
+    /// `per_cohort` (coverage + CRPS with n + CI per cohort), and `per_record`
+    /// keys.
+    ///
+    /// `golden_source` pairs a held-out predictive distribution with its
+    /// realised `outcome`. `shape` is `"gaussian"` (columns `record_id`, `mean`,
+    /// `sd`, `outcome`) or `"sample"` (columns `record_id`, `draws` as a JSON
+    /// array per row, `outcome`). `cohorts` optionally maps a `record_id` to an
+    /// opaque `{key: value}` segment map persisted with that record's per-record
+    /// scores (read back via `db.eval_per_query(...)`).
+    #[pyo3(signature = (*, source, golden_source, shape, cohorts=None))]
+    fn eval_calibration(
+        &self,
+        py: Python<'_>,
+        source: &str,
+        golden_source: &str,
+        shape: &str,
+        cohorts: Option<HashMap<String, BTreeMap<String, String>>>,
+    ) -> PyResult<Py<PyAny>> {
+        let shape = parse_calibration_shape(shape)?;
+        let cohorts = cohorts.unwrap_or_default();
+        let report = self
+            .runtime
+            .block_on(
+                self.session
+                    .eval_calibration(source, golden_source, shape, &cohorts),
+            )
+            .map_err(to_pyerr)?;
+        serializable_to_pydict(py, &report)
+    }
+
     /// Encode a single query into an embedding vector using the given model.
     /// `modality` selects the tower (`"text"`/`"image"`/`"audio"`); `query` is a
     /// string for the text tower or raw bytes for the image/audio tower. The
@@ -849,6 +1142,249 @@ impl PyDatabase {
             ))
             .map_err(to_pyerr)?;
         Ok(())
+    }
+
+    /// Materialize the k-nearest-neighbour graph of a source's embedding table
+    /// and return the new edge table's name.
+    ///
+    /// This is for *global-structure* work — clustering, near-duplicate
+    /// detection, training-data prep — where the whole edge set is consumed as
+    /// a durable artifact. For "neighbours of *these* rows", use `search`.
+    ///
+    /// The returned table has columns `(src, dst, rank, similarity)`, with
+    /// `src`/`dst` joining directly to the source on the key. The default
+    /// driver is index-assisted and produces an approximate, non-deterministic
+    /// graph; pass `exact=True` for a deterministic, complete one (gated by a
+    /// row-count ceiling). `min_similarity` floors weak edges; `mutual=True`
+    /// keeps only reciprocal edges.
+    #[pyo3(signature = (source, *, k, min_similarity=None, mutual=false, exact=false, table=None))]
+    fn build_neighbor_graph(
+        &self,
+        source: &str,
+        k: usize,
+        min_similarity: Option<f32>,
+        mutual: bool,
+        exact: bool,
+        table: Option<String>,
+    ) -> PyResult<String> {
+        let params = jammi_ai::pipeline::neighbor_graph::BuildNeighborGraph {
+            k,
+            min_similarity,
+            mutual,
+            exact,
+            ..Default::default()
+        };
+        let record = self
+            .runtime
+            .block_on(
+                self.session
+                    .build_neighbor_graph(source, table.as_deref(), &params),
+            )
+            .map_err(to_pyerr)?;
+        Ok(record.table_name)
+    }
+
+    /// Conformalize a classification predictor into prediction sets.
+    ///
+    /// Split (inductive) conformal: `calibration` holds one row of per-class
+    /// probabilities per held-out example and `true_labels[i]` is the realised
+    /// class for row `i`; the calibration scores yield the finite-sample
+    /// `⌈(n+1)(1-alpha)⌉` quantile, which is applied to every row of `test` to
+    /// emit a prediction set with marginal coverage `>= 1 - alpha`.
+    ///
+    /// `score` selects the nonconformity family: `"lac"`, `"aps"` (default), or
+    /// `"raps"` (regularized APS). For `"raps"`, `raps_params` is the
+    /// `(lambda, k_reg)` regularization pair — the penalty weight and the 1-based
+    /// rank past which it applies; it is ignored by `"lac"`/`"aps"` and defaults
+    /// to `(0.0, 1)`. The calibration set must be disjoint from both the
+    /// training set and `test` — reusing test points inflates coverage. Pure and
+    /// deterministic: identical inputs yield identical sets.
+    ///
+    /// Returns one list of admitted class indices per row of `test`.
+    #[pyo3(signature = (calibration, true_labels, test, *, alpha, score=None, raps_params=None))]
+    fn conformalize(
+        &self,
+        calibration: Vec<Vec<f64>>,
+        true_labels: Vec<usize>,
+        test: Vec<Vec<f64>>,
+        alpha: f64,
+        score: Option<&str>,
+        raps_params: Option<(f64, usize)>,
+    ) -> PyResult<Vec<Vec<usize>>> {
+        let (raps_lambda, raps_k_reg) = raps_params.unwrap_or((0.0, 1));
+        let score = parse_class_score(score.unwrap_or("aps"), raps_lambda, raps_k_reg)?;
+        let model = jammi_ai::predict::ConformalModel::classification(
+            &calibration,
+            &true_labels,
+            score,
+            alpha,
+        )
+        .map_err(to_pyerr)?;
+        test.iter()
+            .map(|row| model.predict_set(row, None).map_err(to_pyerr))
+            .collect()
+    }
+
+    /// Conformalize an absolute-residual regression predictor into
+    /// constant-width prediction intervals.
+    ///
+    /// The calibration nonconformity is `|y - ŷ|` over the `predictions`/
+    /// `observed` held-out pairs; the finite-sample quantile `q̂` then yields
+    /// `[ŷ - q̂, ŷ + q̂]` around each `test_predictions` point, with marginal
+    /// coverage `>= 1 - alpha`. The calibration set must be disjoint from the
+    /// training set and the test points.
+    ///
+    /// Returns one `(lower, upper)` tuple per test row.
+    #[pyo3(signature = (predictions, observed, test_predictions, *, alpha))]
+    fn conformalize_interval(
+        &self,
+        predictions: Vec<f64>,
+        observed: Vec<f64>,
+        test_predictions: Vec<f64>,
+        alpha: f64,
+    ) -> PyResult<Vec<(f64, f64)>> {
+        use jammi_ai::predict::{ConformalModel, IntervalScore};
+        let model = ConformalModel::regression(
+            &predictions,
+            &[],
+            &[],
+            &observed,
+            IntervalScore::AbsoluteResidual,
+            alpha,
+        )
+        .map_err(to_pyerr)?;
+        test_predictions
+            .iter()
+            .map(|&p| model.predict_interval(p, 0.0, 0.0, None).map_err(to_pyerr))
+            .collect()
+    }
+
+    /// Conformalize a Conformalized Quantile Regression (CQR) predictor into
+    /// adaptive-width prediction intervals.
+    ///
+    /// The calibration nonconformity is `max(q_lo - y, y - q_hi)` over the
+    /// `lower`/`upper` quantile estimates and `observed` targets; the
+    /// finite-sample quantile `q̂` then yields `[q_lo - q̂, q_hi + q̂]` around
+    /// each `test_lower`/`test_upper` band, so interval width tracks the
+    /// predictor's local uncertainty. The calibration set must be disjoint from
+    /// the training set and the test points.
+    ///
+    /// Returns one `(lower, upper)` tuple per test row.
+    #[pyo3(signature = (lower, upper, observed, test_lower, test_upper, *, alpha))]
+    fn conformalize_cqr(
+        &self,
+        lower: Vec<f64>,
+        upper: Vec<f64>,
+        observed: Vec<f64>,
+        test_lower: Vec<f64>,
+        test_upper: Vec<f64>,
+        alpha: f64,
+    ) -> PyResult<Vec<(f64, f64)>> {
+        use jammi_ai::predict::{ConformalModel, IntervalScore};
+        if test_lower.len() != test_upper.len() {
+            return Err(PyValueError::new_err(
+                "cqr conformal: 'test_lower' and 'test_upper' must have equal length",
+            ));
+        }
+        let model =
+            ConformalModel::regression(&[], &lower, &upper, &observed, IntervalScore::Cqr, alpha)
+                .map_err(to_pyerr)?;
+        test_lower
+            .iter()
+            .zip(test_upper.iter())
+            .map(|(&l, &u)| model.predict_interval(0.0, l, u, None).map_err(to_pyerr))
+            .collect()
+    }
+
+    /// Fuse several ranked retrieval lists into one by reciprocal-rank fusion.
+    ///
+    /// `ranked_lists` is a list of best-first `_row_id` lists — typically the
+    /// dense (ANN) order and the lexical (BM25) order, plus any further ranked
+    /// channel. Fusion is on *rank*, never raw score, so the dense and lexical
+    /// scales never need reconciling. `k_rrf` damps deep ranks (default 60,
+    /// robust across 40–80). Returns `(row_id, rrf_score)` tuples sorted by
+    /// fused score descending, ties broken ascending by `row_id` — fully
+    /// deterministic and independent of the order the lists are supplied in.
+    #[pyo3(signature = (ranked_lists, *, k_rrf=None))]
+    fn rrf_fuse(
+        &self,
+        ranked_lists: Vec<Vec<String>>,
+        k_rrf: Option<u32>,
+    ) -> PyResult<Vec<(String, f64)>> {
+        let k = k_rrf.unwrap_or(jammi_ai::query::DEFAULT_K_RRF);
+        Ok(jammi_ai::query::rrf_fuse(&ranked_lists, k)
+            .into_iter()
+            .map(|h| (h.row_id, h.rrf_score))
+            .collect())
+    }
+
+    /// Assemble and encode a target's context set: retrieve `source`'s `k`
+    /// nearest neighbours of `query`, pair them with `value_columns`, and pool
+    /// the neighbour vectors permutation-invariantly into one fixed-width
+    /// context vector — the encode-and-aggregate half of a Neural Process.
+    ///
+    /// `aggregator` selects the fixed pooling (`"mean"` / `"sum"` / `"max"`).
+    /// The leakage guards are on by default: `exclude_self=True` drops the
+    /// target's own row (pass its key as `exclude_key`), and `split` scopes the
+    /// context to a train split (a SQL predicate over the source's columns).
+    ///
+    /// Returns a dict: `context_vector` (list of floats, or `None` for an empty
+    /// context), `context_size` (count, carried separately from the vector),
+    /// `context_keys` (members in retrieval order), and `value_rows` (a
+    /// `pyarrow.Table` of the requested value columns in the same order).
+    #[pyo3(signature = (
+        source,
+        *,
+        query,
+        k,
+        value_columns = None,
+        aggregator = None,
+        exclude_self = true,
+        exclude_key = None,
+        split = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_context(
+        &self,
+        py: Python<'_>,
+        source: &str,
+        query: Vec<f32>,
+        k: usize,
+        value_columns: Option<Vec<String>>,
+        aggregator: Option<&str>,
+        exclude_self: bool,
+        exclude_key: Option<String>,
+        split: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        let aggregator = match aggregator {
+            None | Some("mean") => SetAggregator::Mean,
+            Some("sum") => SetAggregator::Sum,
+            Some("max") => SetAggregator::Max,
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "aggregator must be 'mean', 'sum', or 'max' (got '{other}')"
+                )))
+            }
+        };
+
+        let mut request = ContextRequest::new(source, query, k);
+        request.value_columns = value_columns.unwrap_or_default();
+        request.aggregator = aggregator;
+        request.exclude_self = exclude_self;
+        request.exclude_key = exclude_key;
+        request.split = split;
+
+        let context = self
+            .runtime
+            .block_on(self.session.assemble_context(&request))
+            .map_err(to_pyerr)?;
+
+        let out = PyDict::new(py);
+        out.set_item("context_vector", context.context_vector)?;
+        out.set_item("context_size", context.context_size)?;
+        out.set_item("context_keys", context.context_keys)?;
+        out.set_item("value_rows", batches_to_pyarrow(py, &context.value_rows)?)?;
+        Ok(out.unbind().into())
     }
 }
 
@@ -907,6 +1443,32 @@ fn parse_file_format(s: &str) -> PyResult<FileFormat> {
 
 fn parse_eval_task(s: &str) -> PyResult<jammi_ai::eval::EvalTask> {
     s.parse().map_err(to_pyerr)
+}
+
+fn parse_calibration_shape(s: &str) -> PyResult<jammi_ai::eval::EvalCalibrationShape> {
+    s.parse().map_err(to_pyerr)
+}
+
+/// Parse a classification conformal score family from its snake-case name.
+/// `"raps"` carries the regularization parameters; `"lac"` and `"aps"` ignore
+/// them.
+fn parse_class_score(
+    score: &str,
+    raps_lambda: f64,
+    raps_k_reg: usize,
+) -> PyResult<jammi_ai::predict::ClassScore> {
+    use jammi_ai::predict::ClassScore;
+    match score {
+        "lac" => Ok(ClassScore::Lac),
+        "aps" => Ok(ClassScore::Aps),
+        "raps" => Ok(ClassScore::Raps {
+            lambda: raps_lambda,
+            k_reg: raps_k_reg,
+        }),
+        other => Err(PyValueError::new_err(format!(
+            "unknown classification conformal score '{other}', expected 'lac', 'aps', or 'raps'"
+        ))),
+    }
 }
 
 fn parse_channel_columns(

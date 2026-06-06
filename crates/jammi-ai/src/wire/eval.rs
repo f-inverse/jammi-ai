@@ -17,8 +17,9 @@ use jammi_numerics::retrieval::{AggregateMetrics, QueryMetrics};
 use tonic::Status;
 
 use crate::eval::report::{
-    AggregateDelta, CompareEvalReport, EmbeddingEvalReport, InferenceAggregate,
-    InferenceEvalReport, MetricDelta, PerQueryRecord, PerRecordPrediction, TableEvalReport,
+    AggregateDelta, CompareEvalReport, DeltaSignificance, EmbeddingEvalReport, InferenceAggregate,
+    InferenceEvalReport, MetricDelta, MetricSignificance, PerQueryRecord, PerRecordPrediction,
+    TableEvalReport,
 };
 use crate::eval::EvalTask;
 use crate::wire::proto::eval as pb;
@@ -275,6 +276,27 @@ impl From<&MetricDelta> for pb::MetricDelta {
     }
 }
 
+impl From<&MetricSignificance> for pb::MetricSignificance {
+    fn from(s: &MetricSignificance) -> Self {
+        pb::MetricSignificance {
+            p_value: s.p_value,
+            ci_lower: s.ci_lower,
+            ci_upper: s.ci_upper,
+        }
+    }
+}
+
+impl From<&DeltaSignificance> for pb::DeltaSignificance {
+    fn from(s: &DeltaSignificance) -> Self {
+        pb::DeltaSignificance {
+            recall_at_k: Some((&s.recall_at_k).into()),
+            precision_at_k: Some((&s.precision_at_k).into()),
+            mrr: Some((&s.mrr).into()),
+            ndcg: Some((&s.ndcg).into()),
+        }
+    }
+}
+
 impl From<&AggregateDelta> for pb::AggregateDelta {
     fn from(d: &AggregateDelta) -> Self {
         pb::AggregateDelta {
@@ -282,6 +304,7 @@ impl From<&AggregateDelta> for pb::AggregateDelta {
             precision_at_k: Some((&d.precision_at_k).into()),
             mrr: Some((&d.mrr).into()),
             ndcg: Some((&d.ndcg).into()),
+            significance: d.significance.as_ref().map(Into::into),
         }
     }
 }
@@ -526,6 +549,41 @@ impl From<pb::MetricDelta> for MetricDelta {
     }
 }
 
+impl From<pb::MetricSignificance> for MetricSignificance {
+    fn from(s: pb::MetricSignificance) -> Self {
+        MetricSignificance {
+            p_value: s.p_value,
+            ci_lower: s.ci_lower,
+            ci_upper: s.ci_upper,
+        }
+    }
+}
+
+impl TryFrom<pb::DeltaSignificance> for DeltaSignificance {
+    type Error = JammiError;
+
+    fn try_from(s: pb::DeltaSignificance) -> Result<Self, Self::Error> {
+        Ok(DeltaSignificance {
+            recall_at_k: s
+                .recall_at_k
+                .map(Into::into)
+                .ok_or_else(|| malformed("DeltaSignificance.recall_at_k"))?,
+            precision_at_k: s
+                .precision_at_k
+                .map(Into::into)
+                .ok_or_else(|| malformed("DeltaSignificance.precision_at_k"))?,
+            mrr: s
+                .mrr
+                .map(Into::into)
+                .ok_or_else(|| malformed("DeltaSignificance.mrr"))?,
+            ndcg: s
+                .ndcg
+                .map(Into::into)
+                .ok_or_else(|| malformed("DeltaSignificance.ndcg"))?,
+        })
+    }
+}
+
 impl TryFrom<pb::AggregateDelta> for AggregateDelta {
     type Error = JammiError;
 
@@ -547,6 +605,9 @@ impl TryFrom<pb::AggregateDelta> for AggregateDelta {
                 .ndcg
                 .map(Into::into)
                 .ok_or_else(|| malformed("AggregateDelta.ndcg"))?,
+            // `significance` is genuinely optional: `None` is "no shared query
+            // to pair on", not a corrupt payload.
+            significance: d.significance.map(TryInto::try_into).transpose()?,
         })
     }
 }
@@ -688,11 +749,70 @@ mod tests {
             precision_at_k: None,
             mrr: None,
             ndcg: None,
+            significance: None,
         };
         assert_missing(
             AggregateDelta::try_from(wire).expect_err("missing precision delta must reject"),
             "AggregateDelta.precision_at_k",
         );
+    }
+
+    #[test]
+    fn delta_significance_missing_metric_block_is_rejected() {
+        let wire = pb::DeltaSignificance {
+            recall_at_k: Some(pb::MetricSignificance {
+                p_value: 0.04,
+                ci_lower: 0.01,
+                ci_upper: 0.2,
+            }),
+            precision_at_k: None,
+            mrr: None,
+            ndcg: None,
+        };
+        assert_missing(
+            DeltaSignificance::try_from(wire).expect_err("missing precision significance rejects"),
+            "DeltaSignificance.precision_at_k",
+        );
+    }
+
+    #[test]
+    fn aggregate_delta_significance_round_trips() {
+        // A populated `significance` block survives encode → decode unchanged,
+        // and the genuinely-optional `None` decodes back to `None`.
+        let block = pb::MetricSignificance {
+            p_value: 0.03,
+            ci_lower: 0.05,
+            ci_upper: 0.4,
+        };
+        let domain = AggregateDelta {
+            recall_at_k: MetricDelta {
+                absolute: 0.1,
+                relative: 0.2,
+            },
+            precision_at_k: MetricDelta {
+                absolute: 0.1,
+                relative: 0.2,
+            },
+            mrr: MetricDelta {
+                absolute: 0.1,
+                relative: 0.2,
+            },
+            ndcg: MetricDelta {
+                absolute: 0.1,
+                relative: 0.2,
+            },
+            significance: Some(DeltaSignificance {
+                recall_at_k: MetricSignificance::from(block),
+                precision_at_k: MetricSignificance::from(block),
+                mrr: MetricSignificance::from(block),
+                ndcg: MetricSignificance::from(block),
+            }),
+        };
+        let wire: pb::AggregateDelta = (&domain).into();
+        let back = AggregateDelta::try_from(wire).expect("round-trip");
+        let sig = back.significance.expect("significance present");
+        assert_eq!(sig.recall_at_k.p_value, 0.03);
+        assert_eq!(sig.ndcg.ci_upper, 0.4);
     }
 
     #[test]

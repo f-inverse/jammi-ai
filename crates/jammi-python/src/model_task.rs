@@ -26,6 +26,7 @@ pub enum PyModelTask {
     AudioEmbedding,
     Classification,
     Ner,
+    Regression,
 }
 
 #[pymethods]
@@ -61,6 +62,7 @@ impl From<PyModelTask> for ModelTask {
             PyModelTask::AudioEmbedding => ModelTask::AudioEmbedding,
             PyModelTask::Classification => ModelTask::Classification,
             PyModelTask::Ner => ModelTask::Ner,
+            PyModelTask::Regression => ModelTask::Regression,
         }
     }
 }
@@ -73,6 +75,7 @@ impl From<ModelTask> for PyModelTask {
             ModelTask::AudioEmbedding => PyModelTask::AudioEmbedding,
             ModelTask::Classification => PyModelTask::Classification,
             ModelTask::Ner => PyModelTask::Ner,
+            ModelTask::Regression => PyModelTask::Regression,
         }
     }
 }
@@ -97,7 +100,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for ModelTaskArg {
         }
         Err(PyTypeError::new_err(
             "task must be a ModelTask enum value or its snake_case string \
-             (text_embedding, image_embedding, audio_embedding, classification, ner)",
+             (text_embedding, image_embedding, audio_embedding, classification, ner, regression)",
         ))
     }
 }

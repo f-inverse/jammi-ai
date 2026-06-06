@@ -8,11 +8,12 @@ use jammi_db::catalog::status::EvalRunStatus;
 use jammi_db::error::{JammiError, Result};
 
 use crate::eval::report::{
-    AggregateDelta, CompareEvalReport, EmbeddingEvalReport, InferenceAggregate,
-    InferenceEvalReport, MetricDelta, PerQueryRecord, PerRecordPrediction, TableEvalReport,
-    PER_QUERY_RECALL_KS,
+    compute_calibration, delta_significance, AggregateDelta, CalibrationEvalReport,
+    CalibrationPrediction, CompareEvalReport, EmbeddingEvalReport, InferenceAggregate,
+    InferenceEvalReport, MetricDelta, PerQueryRecord, PerRecordCalibration, PerRecordPrediction,
+    TableEvalReport, PER_QUERY_RECALL_KS,
 };
-use crate::eval::EvalTask;
+use crate::eval::{EvalCalibrationShape, EvalTask};
 use crate::model::ModelSource;
 use crate::session::InferenceSession;
 
@@ -373,6 +374,133 @@ impl<'a> EvalRunner<'a> {
         Ok(report)
     }
 
+    /// Evaluate whether a predictor's *uncertainty* is honest (spec R2).
+    ///
+    /// This is the orthogonal sibling to `eval_embeddings`/`eval_inference`:
+    /// they ask "is the prediction accurate?", this asks "does it know what it
+    /// doesn't know?". The two are independent — a model can be accurate and
+    /// badly calibrated, or calibrated and useless.
+    ///
+    /// `golden_source` is a held-out set pairing a predictive distribution with
+    /// its realised `outcome`. `shape` selects the predictor's output family and
+    /// the columns read:
+    /// - [`EvalCalibrationShape::Gaussian`] — `record_id`, `mean`, `sd`,
+    ///   `outcome` (a parametric predictive `Normal`).
+    /// - [`EvalCalibrationShape::Sample`] — `record_id`, `draws` (a JSON array
+    ///   of numbers per row), `outcome` (an ensemble of predictive draws).
+    ///
+    /// The held-out, three-way-split contract is the caller's: the predictions
+    /// here must come from a test set disjoint from both the training set and
+    /// any calibration set used to fit the predictor — re-using calibration
+    /// points to also test inflates coverage. The harness measures what it is
+    /// given; it cannot see the split.
+    ///
+    /// Returns a [`CalibrationEvalReport`] headlining a strictly proper score
+    /// (CRPS) with NLL, the adaptive debiased PIT-calibration diagnostic, and
+    /// sharpness/coverage — plus per-cohort slices and the per-record scores. As
+    /// with `eval_embeddings`, per-record scores are persisted to
+    /// `_jammi_eval_per_query` keyed by the run id, and `cohorts` maps a
+    /// `record_id` to opaque segment tags (a record with no entry stores `{}`).
+    pub async fn eval_calibration(
+        &self,
+        source_id: &str,
+        golden_source: &str,
+        shape: EvalCalibrationShape,
+        cohorts: &HashMap<String, BTreeMap<String, String>>,
+    ) -> Result<CalibrationEvalReport> {
+        let golden_schema = self.source_schema(golden_source).await?;
+        ensure_column(&golden_schema, "record_id", DataType::Utf8)?;
+
+        let predictions = match shape {
+            EvalCalibrationShape::Gaussian => {
+                let batches = self
+                    .session
+                    .sql(&format!(
+                        "SELECT \"record_id\", \"mean\", \"sd\", \"outcome\" FROM {golden_source}"
+                    ))
+                    .await?;
+                let mut predictions = Vec::new();
+                for batch in &batches {
+                    let ids = super::golden::extract_string_column(batch, "record_id")?;
+                    let means = super::golden::extract_f64_column(batch, "mean")?;
+                    let sds = super::golden::extract_f64_column(batch, "sd")?;
+                    let outcomes = super::golden::extract_f64_column(batch, "outcome")?;
+                    for (((id, &mean), &sd), &outcome) in
+                        ids.iter().zip(&means).zip(&sds).zip(&outcomes)
+                    {
+                        predictions.push(CalibrationPrediction::Gaussian {
+                            record_id: id.clone(),
+                            mean,
+                            sd,
+                            outcome,
+                            cohorts: cohorts.get(id).cloned().unwrap_or_default(),
+                        });
+                    }
+                }
+                predictions
+            }
+            EvalCalibrationShape::Sample => {
+                let batches = self
+                    .session
+                    .sql(&format!(
+                        "SELECT \"record_id\", \"draws\", \"outcome\" FROM {golden_source}"
+                    ))
+                    .await?;
+                let mut predictions = Vec::new();
+                for batch in &batches {
+                    let ids = super::golden::extract_string_column(batch, "record_id")?;
+                    let draws_col = super::golden::extract_string_column(batch, "draws")?;
+                    let outcomes = super::golden::extract_f64_column(batch, "outcome")?;
+                    for ((id, draws_json), &outcome) in ids.iter().zip(&draws_col).zip(&outcomes) {
+                        let draws: Vec<f64> = serde_json::from_str(draws_json).map_err(|e| {
+                            JammiError::Eval(format!(
+                                "calibration draws JSON parse failed for record {id}: {e}"
+                            ))
+                        })?;
+                        predictions.push(CalibrationPrediction::Sample {
+                            record_id: id.clone(),
+                            draws,
+                            outcome,
+                            cohorts: cohorts.get(id).cloned().unwrap_or_default(),
+                        });
+                    }
+                }
+                predictions
+            }
+        };
+
+        let eval_run_id = uuid::Uuid::new_v4().to_string();
+        let report = compute_calibration(eval_run_id.clone(), &predictions)?;
+
+        // Record the aggregate, then persist the per-record scores to
+        // `_jammi_eval_per_query` keyed by the same run id — the same shape the
+        // embedding eval reuses, so cohort slicing and significance read back
+        // through one path. Calibration has no `model_id`/`k`, so the catalog
+        // row records the shape as the model identifier and leaves `k` empty.
+        self.session
+            .catalog()
+            .record_eval_run(&EvalRunRecord {
+                eval_run_id: eval_run_id.clone(),
+                eval_type: shape.to_string(),
+                model_id: crate::model::to_catalog_pk(&shape.to_string(), 1),
+                source_id: source_id.into(),
+                golden_source: golden_source.into(),
+                k: None,
+                metrics_json: serde_json::to_string(&report.aggregate)?,
+                status: EvalRunStatus::Completed.to_string(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await?;
+
+        let per_record_rows = build_calibration_per_record_rows(&eval_run_id, &report.per_record)?;
+        self.session
+            .catalog()
+            .record_eval_per_query(&per_record_rows)
+            .await?;
+
+        Ok(report)
+    }
+
     /// Compare multiple embedding tables side-by-side.
     /// First table is the baseline; deltas are computed for all others.
     pub async fn eval_compare(
@@ -400,6 +528,7 @@ impl<'a> EvalRunner<'a> {
         }
 
         let baseline_agg = all_reports[0].1.aggregate.clone();
+        let baseline_per_query = all_reports[0].1.per_query.clone();
         let per_table: Vec<TableEvalReport> = all_reports
             .into_iter()
             .enumerate()
@@ -407,6 +536,9 @@ impl<'a> EvalRunner<'a> {
                 let delta = if i == 0 {
                     None
                 } else {
+                    // Significance pairs the baseline and treatment per-query
+                    // metric arrays by `query_id`; the delta numbers stay the
+                    // aggregate differences, untouched (purely additive).
                     Some(AggregateDelta {
                         recall_at_k: metric_delta(
                             baseline_agg.recall_at_k,
@@ -418,6 +550,10 @@ impl<'a> EvalRunner<'a> {
                         ),
                         mrr: metric_delta(baseline_agg.mrr, embedding_eval.aggregate.mrr),
                         ndcg: metric_delta(baseline_agg.ndcg, embedding_eval.aggregate.ndcg),
+                        significance: delta_significance(
+                            &baseline_per_query,
+                            &embedding_eval.per_query,
+                        ),
                     })
                 };
                 TableEvalReport {
@@ -477,6 +613,42 @@ fn build_per_query_rows(
             Ok(PerQueryEvalRecord {
                 eval_run_id: eval_run_id.to_string(),
                 query_id: rec.query_id.clone(),
+                cohorts_json: serde_json::to_string(&rec.cohorts)?,
+                metrics_json: serde_json::Value::Object(metrics).to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Serialize the per-record calibration scores into the `_jammi_eval_per_query`
+/// row shape — one row per held-out prediction, reusing the same table and
+/// keying the embedding eval uses (spec R2/J9). The `metrics` JSON carries the
+/// proper scores (`crps`, `nll`), the `pit` value, the nominal-interval
+/// `coverage` (0/1 per record) and `interval_width`; `cohorts` is the opaque
+/// segment map (`{}` when none). The `query_id` slot carries the `record_id`.
+fn build_calibration_per_record_rows(
+    eval_run_id: &str,
+    per_record: &[PerRecordCalibration],
+) -> Result<Vec<PerQueryEvalRecord>> {
+    per_record
+        .iter()
+        .map(|rec| {
+            let mut metrics = serde_json::Map::new();
+            metrics.insert("crps".into(), serde_json::Value::from(rec.crps));
+            metrics.insert("nll".into(), serde_json::Value::from(rec.nll));
+            metrics.insert("pit".into(), serde_json::Value::from(rec.pit));
+            metrics.insert(
+                "coverage".into(),
+                serde_json::Value::from(f64::from(u8::from(rec.covered))),
+            );
+            metrics.insert(
+                "interval_width".into(),
+                serde_json::Value::from(rec.interval_width),
+            );
+
+            Ok(PerQueryEvalRecord {
+                eval_run_id: eval_run_id.to_string(),
+                query_id: rec.record_id.clone(),
                 cohorts_json: serde_json::to_string(&rec.cohorts)?,
                 metrics_json: serde_json::Value::Object(metrics).to_string(),
             })

@@ -53,6 +53,10 @@ message EmbeddingLoss {
     Triplet triplet = 2;
     // InfoNCE with in-batch negatives at the given temperature.
     MultipleNegativesRanking multiple_negatives_ranking = 3;
+    // AnglE: angle-difference objective in complex space. No parameter.
+    AnglE angle = 4;
+    // cosine-MSE: regress scaled cosine onto a graded score. No parameter.
+    CosineMse cosine_mse = 5;
   }
 
   message CoSent {}
@@ -62,12 +66,38 @@ message EmbeddingLoss {
   message MultipleNegativesRanking {
     double temperature = 1;
   }
+  message AnglE {}
+  message CosineMse {}
 }
 
 // Classification-loss function. Mirrors the engine's `ClassificationLoss`.
 enum ClassificationLoss {
   CLASSIFICATION_LOSS_UNSPECIFIED = 0;
   CROSS_ENTROPY = 1;
+}
+
+// Proper-scoring objective for a distributional regression head (S18). Mirrors
+// the engine's `RegressionLoss`; the β-NLL variant carries its weighting
+// exponent. Pinball trains the quantile head over `quantile_levels`; the others
+// train the parametric Gaussian head.
+message RegressionLoss {
+  oneof loss {
+    // Gaussian NLL — the plain heteroscedastic mean-variance objective.
+    GaussianNll gaussian_nll = 1;
+    // β-NLL with the given variance-weighting exponent (Seitzer 2022).
+    BetaNll beta_nll = 2;
+    // Closed-form Gaussian CRPS. No parameter.
+    Crps crps = 3;
+    // Pinball / quantile loss over the configured levels. No parameter.
+    Pinball pinball = 4;
+  }
+
+  message GaussianNll {}
+  message BetaNll {
+    double beta = 1;
+  }
+  message Crps {}
+  message Pinball {}
 }
 
 // Which loss signal drives early stopping. Mirrors `EarlyStoppingMetric`.
@@ -107,6 +137,17 @@ message LayersToTransform {
   repeated uint32 layers = 1;
 }
 
+// Hard-negative mining configuration. Mirrors the engine's
+// `HardNegativeConfig`. When `mine` is set the trainer mines hard negatives
+// from its own ANN index, excluding the positive's `exclude_hops`-hop
+// neighbourhood and re-mining every `refresh_every` epochs.
+message HardNegativeConfig {
+  bool mine = 1;
+  uint32 k = 2;
+  uint32 exclude_hops = 3;
+  uint32 refresh_every = 4;
+}
+
 // Configuration for a fine-tuning job. Mirrors the engine's `FineTuneConfig`
 // field for field; every field is read by the trainer or the LoRA builder.
 // `embedding_loss`/`classification_loss` are unset to let the engine
@@ -143,6 +184,19 @@ message FineTuneConfig {
   BackboneDtype backbone_dtype = 21;
   double weight_decay = 22;
   double max_grad_norm = 23;
+  // GradCache: two-pass in-batch-negative training that enlarges the effective
+  // negative pool without the memory cost. Only affects MultipleNegativesRanking.
+  bool cached = 24;
+  // Hard-negative mining over jammi's own ANN index. Field absent = mining off.
+  optional HardNegativeConfig hard_negatives = 25;
+  // Matryoshka prefix dimensions. Empty = full dimension only.
+  repeated uint32 matryoshka_dims = 26;
+  // Unset = the engine default (β-NLL, β=0.5). The Pinball variant trains the
+  // quantile head over `quantile_levels`.
+  optional RegressionLoss regression_loss = 27;
+  // Quantile levels for a pinball-trained regression head, ascending in (0, 1).
+  // Empty for the parametric Gaussian objectives.
+  repeated double quantile_levels = 28;
 }
 
 message StartFineTuneRequest {

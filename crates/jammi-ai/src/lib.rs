@@ -18,6 +18,8 @@ pub mod eval;
 pub mod evidence;
 pub mod fine_tune;
 #[cfg(feature = "local")]
+pub mod index;
+#[cfg(feature = "local")]
 pub mod inference;
 pub mod jammi;
 pub mod local_session;
@@ -27,6 +29,11 @@ pub mod model;
 pub mod operator;
 #[cfg(feature = "local")]
 pub mod pipeline;
+/// Serving-time prediction wrappers (split conformal prediction). Pure math
+/// over predictor outputs — no model, no candle stack — so it rides every
+/// build, not just the `local` engine: a distribution-free coverage guarantee
+/// is a serving output that must work with a dead license.
+pub mod predict;
 #[cfg(feature = "local")]
 pub mod query;
 #[cfg(feature = "local")]

@@ -191,7 +191,7 @@ fn file_format_from_proto(format: i32) -> Result<Option<FileFormat>, Status> {
     }
 }
 
-/// Map a [`Modality`] onto the embedding [`ModelTask`] its tower produces. The
+/// Map a [`Modality`] onto the embedding `ModelTask` its tower produces. The
 /// wire `ResultTable` carries its own `task` (the embedding tower), so the
 /// reconstruction recovers it faithfully from the message itself — never from a
 /// modality threaded in out of band, never a guess.
@@ -234,6 +234,11 @@ pub fn result_table_from_proto(table: pb::ResultTable) -> Result<ResultTableReco
         source_id: table.source_id,
         model_id: table.model_id,
         task,
+        // `kind`/`derived_from` are server-internal bookkeeping, not carried on
+        // the wire — `GenerateEmbeddings` only ever returns a model output, so
+        // the reconstruction defaults to that kind.
+        kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
+        derived_from: None,
         parquet_path: String::new(),
         index_path: None,
         dimensions: (table.dimensions != 0).then_some(table.dimensions),

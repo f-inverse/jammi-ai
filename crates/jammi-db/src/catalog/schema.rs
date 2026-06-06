@@ -254,6 +254,31 @@ CREATE INDEX idx_topics_tenant ON topics(tenant_id);
 CREATE INDEX idx_topics_name ON topics(name);
 "#;
 
+/// Migration 013 — derived result tables (`kind` + `derived_from`).
+///
+/// A result table is either a *model output* (an embedding or inference table
+/// produced by running a model over a source) or a *derivation of* another
+/// result table. The similarity-graph edge table is the first derivation kind:
+/// it is computed from an existing embedding table, carries no model, and has
+/// no sidecar index.
+///
+/// `kind` is a discriminator orthogonal to `result_tables.task`: a `'model'`
+/// row is resolved as an embedding/inference output, while a non-`'model'` row
+/// is excluded from embedding-table resolution even though its `task` column
+/// still names the source embedding's task. This keeps the `ModelTask` enum a
+/// pristine catalogue of genuine model tasks — the kind, not a fake `ModelTask`
+/// variant, is what marks a row non-resolvable as an embedding source.
+///
+/// `derived_from` references the source result table the derivation was
+/// computed from (the embedding table for an edge table); it is `NULL` for
+/// `'model'` rows. Existing rows back-fill to `kind = 'model'`, `derived_from
+/// = NULL` via the column defaults.
+pub(super) const MIGRATION_013_RESULT_TABLE_KIND: &str = r#"
+ALTER TABLE result_tables ADD COLUMN kind TEXT NOT NULL DEFAULT 'model';
+ALTER TABLE result_tables ADD COLUMN derived_from TEXT REFERENCES result_tables(table_name);
+CREATE INDEX idx_result_tables_kind ON result_tables(kind);
+"#;
+
 /// Migration 011 — per-query eval persistence (spec J9).
 ///
 /// Companion to `eval_runs`: one row per (eval_run_id, query_id), carrying the
@@ -332,4 +357,21 @@ ALTER TABLE topics_new RENAME TO topics;
 
 CREATE INDEX idx_topics_tenant ON topics(tenant_id);
 CREATE INDEX idx_topics_name ON topics(name);
+"#;
+
+/// Migration 014 — seed the `bm25` lexical-retrieval evidence channel.
+///
+/// The lexical (tantivy/BM25) sidecar contributes its rank and score on this
+/// channel, the lexical peer of the `vector` channel's `similarity`. It shares
+/// `inference`'s priority slot order only incidentally; what matters is that it
+/// sorts after `vector` (priority 1) so a fused result's dense column precedes
+/// its lexical columns. The channel carries the raw BM25 score plus the 0-based
+/// lexical rank RRF fuses on — both caller-supplied, exactly as
+/// `vector.similarity` is.
+pub(super) const MIGRATION_014_BM25_CHANNEL: &str = r#"
+INSERT INTO evidence_channels (channel_name, priority) VALUES ('bm25', 3);
+
+INSERT INTO evidence_channel_columns(channel_name, column_name, column_type, ordinal) VALUES
+    ('bm25', 'bm25_score', 'Float32', 0),
+    ('bm25', 'bm25_rank',  'Int64',   1);
 "#;

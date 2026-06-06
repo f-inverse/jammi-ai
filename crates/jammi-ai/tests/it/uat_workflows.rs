@@ -53,20 +53,8 @@ async fn uat_workflow_a_search_attribution_chain() {
         .await
         .unwrap();
 
-    // Phase 1: register two non-default channels.
-    session
-        .catalog()
-        .channels()
-        .register(&ChannelSpec {
-            id: ChannelId::new("bm25").unwrap(),
-            priority: 3,
-            columns: vec![ChannelColumn {
-                name: "bm25_score".into(),
-                data_type: ChannelColumnType::Float32,
-            }],
-        })
-        .await
-        .unwrap();
+    // Phase 1: `bm25` is a seeded lexical channel (like `vector`), so only the
+    // genuinely custom `citation_graph` channel needs registering.
     session
         .catalog()
         .channels()
@@ -134,9 +122,14 @@ async fn uat_workflow_a_search_attribution_chain() {
         vector.clone(),
         Arc::new(Float32Array::from(vec![0.85_f32, 0.5, 0.6])) as ArrayRef,
     );
+    // The seeded `bm25` channel carries `bm25_score` (Float32) then `bm25_rank`
+    // (Int64), in that ordinal order.
     let bm25_contrib = ChannelContribution {
         channel: bm25.clone(),
-        columns: vec![Arc::new(Float32Array::from(vec![0.4_f32, 0.74, 0.5])) as ArrayRef],
+        columns: vec![
+            Arc::new(Float32Array::from(vec![0.4_f32, 0.74, 0.5])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![3_i64, 1, 2])) as ArrayRef,
+        ],
     };
 
     let merged = merge_channels(
@@ -156,6 +149,7 @@ async fn uat_workflow_a_search_attribution_chain() {
     for col in [
         "similarity",
         "bm25_score",
+        "bm25_rank",
         "citation_depth",
         "citation_path_score",
     ] {

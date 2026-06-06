@@ -12,7 +12,7 @@ use tonic::Status;
 
 use crate::fine_tune::{
     BackboneDtype, ClassificationLoss, EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig,
-    FineTuneMethod, LoraInitMode, LrSchedule,
+    FineTuneMethod, HardNegativeConfig, LoraInitMode, LrSchedule, RegressionLoss,
 };
 
 use crate::wire::proto::fine_tune as pb;
@@ -83,7 +83,44 @@ impl TryFrom<pb::FineTuneConfig> for FineTuneConfig {
             backbone_dtype: backbone_dtype_from_proto(c.backbone_dtype, defaults.backbone_dtype)?,
             weight_decay: c.weight_decay,
             max_grad_norm: c.max_grad_norm,
+            cached: c.cached,
+            hard_negatives: c
+                .hard_negatives
+                .map(hard_negatives_from_proto)
+                .unwrap_or_default(),
+            matryoshka_dims: c.matryoshka_dims.into_iter().map(|d| d as usize).collect(),
+            regression_loss: c
+                .regression_loss
+                .map(regression_loss_from_proto)
+                .transpose()?,
+            quantile_levels: c.quantile_levels,
         })
+    }
+}
+
+/// Map the wire regression-loss message onto the engine's [`RegressionLoss`]. A
+/// present message with no `loss` set is a malformed request.
+fn regression_loss_from_proto(loss: pb::RegressionLoss) -> Result<RegressionLoss, Status> {
+    use pb::regression_loss::Loss;
+    match loss.loss {
+        Some(Loss::GaussianNll(_)) => Ok(RegressionLoss::GaussianNll),
+        Some(Loss::BetaNll(b)) => Ok(RegressionLoss::BetaNll { beta: b.beta }),
+        Some(Loss::Crps(_)) => Ok(RegressionLoss::Crps),
+        Some(Loss::Pinball(_)) => Ok(RegressionLoss::Pinball),
+        None => Err(Status::invalid_argument(
+            "regression_loss is set but carries no variant",
+        )),
+    }
+}
+
+/// Map the wire [`pb::HardNegativeConfig`] onto the engine's
+/// [`HardNegativeConfig`]. Absent on the wire = mining off (the engine default).
+fn hard_negatives_from_proto(h: pb::HardNegativeConfig) -> HardNegativeConfig {
+    HardNegativeConfig {
+        mine: h.mine,
+        k: h.k as usize,
+        exclude_hops: h.exclude_hops as usize,
+        refresh_every: h.refresh_every as usize,
     }
 }
 
@@ -97,6 +134,8 @@ fn embedding_loss_from_proto(loss: pb::EmbeddingLoss) -> Result<EmbeddingLoss, S
         Some(Loss::MultipleNegativesRanking(m)) => Ok(EmbeddingLoss::MultipleNegativesRanking {
             temperature: m.temperature,
         }),
+        Some(Loss::Angle(_)) => Ok(EmbeddingLoss::AnglE),
+        Some(Loss::CosineMse(_)) => Ok(EmbeddingLoss::CosineMse),
         None => Err(Status::invalid_argument(
             "embedding_loss is set but carries no variant",
         )),
@@ -218,6 +257,38 @@ pub fn config_to_proto(config: &FineTuneConfig) -> pb::FineTuneConfig {
         backbone_dtype: backbone_dtype_to_proto(config.backbone_dtype) as i32,
         weight_decay: config.weight_decay,
         max_grad_norm: config.max_grad_norm,
+        cached: config.cached,
+        // Always encoded so a round-trip preserves the k/hop/refresh knobs even
+        // when mining is off; the decode treats an absent message as "off".
+        hard_negatives: Some(hard_negatives_to_proto(&config.hard_negatives)),
+        matryoshka_dims: config.matryoshka_dims.iter().map(|d| *d as u32).collect(),
+        regression_loss: config
+            .regression_loss
+            .as_ref()
+            .map(regression_loss_to_proto),
+        quantile_levels: config.quantile_levels.clone(),
+    }
+}
+
+fn regression_loss_to_proto(loss: &RegressionLoss) -> pb::RegressionLoss {
+    use pb::regression_loss::Loss;
+    let inner = match loss {
+        RegressionLoss::GaussianNll => Loss::GaussianNll(pb::regression_loss::GaussianNll {}),
+        RegressionLoss::BetaNll { beta } => {
+            Loss::BetaNll(pb::regression_loss::BetaNll { beta: *beta })
+        }
+        RegressionLoss::Crps => Loss::Crps(pb::regression_loss::Crps {}),
+        RegressionLoss::Pinball => Loss::Pinball(pb::regression_loss::Pinball {}),
+    };
+    pb::RegressionLoss { loss: Some(inner) }
+}
+
+fn hard_negatives_to_proto(h: &HardNegativeConfig) -> pb::HardNegativeConfig {
+    pb::HardNegativeConfig {
+        mine: h.mine,
+        k: h.k as u32,
+        exclude_hops: h.exclude_hops as u32,
+        refresh_every: h.refresh_every as u32,
     }
 }
 
@@ -233,6 +304,8 @@ fn embedding_loss_to_proto(loss: &EmbeddingLoss) -> pb::EmbeddingLoss {
                 temperature: *temperature,
             })
         }
+        EmbeddingLoss::AnglE => Loss::Angle(pb::embedding_loss::AnglE {}),
+        EmbeddingLoss::CosineMse => Loss::CosineMse(pb::embedding_loss::CosineMse {}),
     };
     pb::EmbeddingLoss { loss: Some(inner) }
 }

@@ -8,15 +8,17 @@ use std::sync::Arc;
 use arrow::array::Array;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::prelude::SessionContext;
+use datafusion::sql::TableReference;
 use tracing::warn;
 
-use crate::catalog::result_repo::{CreateResultTableParams, ResultTableRecord};
+use crate::catalog::result_repo::{CreateResultTableParams, ResultTableKind, ResultTableRecord};
 use crate::catalog::status::ResultTableStatus;
 use crate::catalog::Catalog;
 use crate::error::{JammiError, Result};
 use crate::index::sidecar::SidecarIndex;
 use crate::index::VectorIndex;
 use crate::model_task::ModelTask;
+use crate::storage::sidecar_layout::SidecarKind;
 use crate::storage::{
     self, JammiObjectStore, ObjectParquetWriter, Scheme, StorageRegistry, StorageUrl,
 };
@@ -129,10 +131,19 @@ impl ResultStore {
 
     /// Generate URLs and register a new result table in the catalog with
     /// status = 'building'.
+    ///
+    /// `kind` discriminates a direct model output from a derivation of another
+    /// result table (e.g. a neighbor-graph edge relation); `derived_from` names
+    /// the source result table a derivation was computed from (`None` for a
+    /// `Model` table). A non-`Model` table gets `index_url = None` — no sidecar
+    /// index is built for it — regardless of its `task`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_table(
         &self,
         source_id: &str,
         task: ModelTask,
+        kind: ResultTableKind,
+        derived_from: Option<&str>,
         model_id: &str,
         dimensions: Option<i32>,
         key_column: Option<&str>,
@@ -148,7 +159,11 @@ impl ResultStore {
         let table_name = format!("{source_id}__{task_str}__{sanitized}__{timestamp}_{suffix}");
 
         let parquet_url = self.derive_url(&format!("{table_name}.parquet"))?;
-        let index_url = if task.is_embedding() {
+        // A sidecar index exists only for a model embedding table. A derived
+        // table (a neighbor-graph edge relation) is searched as a plain
+        // relation, never through an ANN sidecar — it maps to
+        // `SidecarKind::None` at the storage layer.
+        let index_url = if matches!(kind, ResultTableKind::Model) && task.is_embedding() {
             // Index base path has no extension — the sidecar layout helpers
             // append .usearch / .rowmap / .manifest.json.
             Some(self.derive_url(&format!("{table_name}.idx"))?)
@@ -162,6 +177,8 @@ impl ResultStore {
                 source_id,
                 model_id,
                 task,
+                kind,
+                derived_from,
                 parquet_path: parquet_url.as_str(),
                 index_path: index_url.as_ref().map(|u| u.as_str()),
                 dimensions,
@@ -244,7 +261,7 @@ impl ResultStore {
                 if let Some(ref idx) = table.index_path {
                     let idx_url = StorageUrl::parse(idx)?;
                     let idx_handle = self.open_index(&idx_url)?;
-                    storage::sidecar_layout::delete_sidecar(&idx_handle)
+                    storage::sidecar_layout::delete_sidecar(&idx_handle, SidecarKind::Ann)
                         .await
                         .ok();
                 }
@@ -382,7 +399,7 @@ impl ResultStore {
         if let Some(idx) = index_path {
             let idx_url = StorageUrl::parse(idx)?;
             let idx_handle = self.open_index(&idx_url)?;
-            storage::sidecar_layout::delete_sidecar(&idx_handle).await?;
+            storage::sidecar_layout::delete_sidecar(&idx_handle, SidecarKind::Ann).await?;
         }
         Ok(())
     }
@@ -441,6 +458,127 @@ impl ResultStore {
         }
         Ok(())
     }
+
+    /// Materialise pre-pooled per-key vectors into a normal embedding-shaped
+    /// result table — the `(_row_id, _source_id, _model_id, vector)` Parquet
+    /// plus the sidecar ANN index every embedding table carries.
+    ///
+    /// The table this writes is indistinguishable from one
+    /// [`crate::store::ResultStore::create_table`] produces for an embedding
+    /// task: an embedding [`ModelTask`], a dimensioned `vector` column, and a
+    /// sidecar index built from those vectors. Callers that pool a retrieval into
+    /// a per-target context vector (S16) land it here so the result is
+    /// searchable and joinable like any other embedding table. `model_id` is the
+    /// pooling provenance (e.g. the context-set encoder), not a foundation model.
+    pub async fn materialize_embedding_table(
+        &self,
+        ctx: &SessionContext,
+        source_id: &str,
+        model_id: &str,
+        rows: &[(String, Vec<f32>)],
+        dimensions: usize,
+    ) -> Result<ResultTableRecord> {
+        // A normal embedding result table (S9 vocabulary: kind='model'); the
+        // task is the embedding task that drives the sidecar-index sidecar URL.
+        let table_info = self
+            .create_table(
+                source_id,
+                ModelTask::TextEmbedding,
+                ResultTableKind::Model,
+                None,
+                model_id,
+                Some(dimensions as i32),
+                Some("_row_id"),
+                None,
+            )
+            .await?;
+
+        let schema = crate::store::schema::embedding_table_schema(dimensions);
+        let batch = embedding_batch(&schema, source_id, model_id, rows, dimensions)?;
+
+        let mut writer = self.open_writer(&table_info.parquet_url, schema).await?;
+        let mut index = SidecarIndex::new(dimensions)?;
+        if !rows.is_empty() {
+            writer.write_batch(&batch).await?;
+            for (key, vector) in rows {
+                index.add(key, vector)?;
+            }
+        }
+        let row_count = writer.close().await?;
+
+        if index.len() > 0 {
+            index.build()?;
+            if let Some(ref index_url) = table_info.index_url {
+                self.save_sidecar(index_url, &index).await?;
+            }
+        }
+
+        self.finalize(
+            ctx,
+            &table_info.table_name,
+            &table_info.parquet_url,
+            row_count,
+        )
+        .await?;
+
+        self.catalog
+            .get_result_table(&table_info.table_name)
+            .await?
+            .ok_or_else(|| {
+                JammiError::Catalog(format!(
+                    "Result table '{}' not found after materialisation",
+                    table_info.table_name
+                ))
+            })
+    }
+}
+
+/// Build the `(_row_id, _source_id, _model_id, vector)` batch for a
+/// materialised embedding table from per-key vectors.
+fn embedding_batch(
+    schema: &arrow::datatypes::SchemaRef,
+    source_id: &str,
+    model_id: &str,
+    rows: &[(String, Vec<f32>)],
+    dimensions: usize,
+) -> Result<arrow::array::RecordBatch> {
+    use arrow::array::{FixedSizeListArray, Float32Array, StringArray};
+    use arrow::datatypes::{DataType, Field};
+
+    for (key, vector) in rows {
+        if vector.len() != dimensions {
+            return Err(JammiError::Schema {
+                table: model_id.to_string(),
+                column: "vector".into(),
+                expected: format!("FixedSizeList<Float32> width {dimensions}"),
+                actual: format!("row '{key}' has width {}", vector.len()),
+            });
+        }
+    }
+
+    let row_ids = StringArray::from_iter_values(rows.iter().map(|(k, _)| k.as_str()));
+    let source_ids = StringArray::from_iter_values(rows.iter().map(|_| source_id));
+    let model_ids = StringArray::from_iter_values(rows.iter().map(|_| model_id));
+    let flat: Vec<f32> = rows.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    let vectors = FixedSizeListArray::try_new(
+        item,
+        dimensions as i32,
+        Arc::new(Float32Array::from(flat)),
+        None,
+    )
+    .map_err(|e| JammiError::Other(format!("materialize: build vector column: {e}")))?;
+
+    arrow::array::RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![
+            Arc::new(row_ids),
+            Arc::new(source_ids),
+            Arc::new(model_ids),
+            Arc::new(vectors),
+        ],
+    )
+    .map_err(|e| JammiError::Other(format!("materialize: build batch: {e}")))
 }
 
 /// Register a Parquet URL as a DataFusion table under `jammi.{name}`.
@@ -453,7 +591,6 @@ pub(crate) async fn register_parquet_table(
     name: &str,
     url: &StorageUrl,
 ) -> Result<()> {
-    use datafusion::catalog::MemorySchemaProvider;
     use datafusion::datasource::file_format::options::ParquetReadOptions;
 
     // Make sure the engine's driver for this URL is the same one DataFusion
@@ -467,20 +604,20 @@ pub(crate) async fn register_parquet_table(
         ctx.runtime_env().register_object_store(&parsed, driver);
     }
 
-    // Ensure the "jammi" schema exists in the default catalog.
-    // DataFusion does not auto-create schemas for register_parquet.
-    let default_catalog_name = ctx.state().config_options().catalog.default_catalog.clone();
-    let default_catalog = ctx
-        .catalog(&default_catalog_name)
-        .ok_or_else(|| JammiError::Other("Default catalog not found".into()))?;
-    if default_catalog.schema("jammi").is_none() {
-        let _ = default_catalog.register_schema("jammi", Arc::new(MemorySchemaProvider::new()));
-    }
-
-    let table_ref = format!("jammi.{name}");
+    // Register under a single bare identifier `jammi.{name}` rather than a
+    // string DataFusion would re-parse as a multipart reference. A result
+    // table name embeds a UTC timestamp (`…T…`) and may carry characters
+    // (hyphens from a sanitized local model path) that the SQL tokenizer
+    // either rejects — falling back to a case-preserved bare literal — or
+    // splits on the dot into a lowercased `jammi` schema. That parser-routing
+    // is name-dependent and inconsistent. The query side reaches these tables
+    // through the quoted single identifier `"jammi.{name}"`, which is always a
+    // bare, case-preserved literal; matching that here makes every result
+    // table — embedding and edge alike — register and resolve identically.
+    let table_ref = TableReference::bare(format!("jammi.{name}"));
     // Validate the URL parses as a ListingTableUrl before handing to DF.
     let _ = ListingTableUrl::parse(url.as_str())?;
-    ctx.register_parquet(&table_ref, url.as_str(), ParquetReadOptions::default())
+    ctx.register_parquet(table_ref, url.as_str(), ParquetReadOptions::default())
         .await?;
     Ok(())
 }

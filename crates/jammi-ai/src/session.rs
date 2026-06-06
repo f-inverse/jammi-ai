@@ -129,14 +129,16 @@ impl InferenceSession {
     /// `SessionContext`, so SQL — in-process (`sql`) and over the Flight SQL
     /// lane alike — can call them.
     ///
-    /// Currently this registers the `annotate(model, task, relation, key, col…)`
-    /// table function (model inference as a relation). It must be called once
-    /// per session, after the session is behind an `Arc`, because the function
-    /// holds a [`std::sync::Weak`] back-reference to the session it serves —
-    /// weak to avoid the cycle the strong handle would form (the session owns
-    /// the context the function registers on). The Flight SQL request path
-    /// clones this context's state, so registering here makes `annotate`
-    /// reachable on every Flight SQL session too.
+    /// This registers the `annotate(model, task, relation, key, col…)` table
+    /// function (model inference as a relation) and the vector-aggregation
+    /// UDAFs (`vector_mean`/`vector_sum`/`vector_max`, element-wise reduction
+    /// over a group of fixed-width vectors). It must be called once per session,
+    /// after the session is behind an `Arc`, because `annotate` holds a
+    /// [`std::sync::Weak`] back-reference to the session it serves — weak to
+    /// avoid the cycle the strong handle would form (the session owns the
+    /// context the function registers on). The Flight SQL request path clones
+    /// this context's state, so registering here makes every function reachable
+    /// on every Flight SQL session too.
     pub fn register_query_functions(self: &Arc<Self>) {
         self.context().register_udtf(
             crate::query::AnnotateTableFunction::NAME,
@@ -144,6 +146,7 @@ impl InferenceSession {
                 self,
             ))),
         );
+        crate::query::register_vector_agg_udafs(self.context());
     }
 
     /// Register a data source.
@@ -653,7 +656,16 @@ impl InferenceSession {
         if !batches.is_empty() {
             let table_info = self
                 .result_store
-                .create_table(source_id, task, &source.to_string(), None, None, None)
+                .create_table(
+                    source_id,
+                    task,
+                    jammi_db::catalog::result_repo::ResultTableKind::Model,
+                    None,
+                    &source.to_string(),
+                    None,
+                    None,
+                    None,
+                )
                 .await?;
             let schema = batches[0].schema();
             let mut writer = self
@@ -711,6 +723,56 @@ impl InferenceSession {
         })
     }
 
+    /// Materialize the k-nearest-neighbour graph of a source's embedding table
+    /// as a queryable edge `result_table`.
+    ///
+    /// This is for *global-structure* work — clustering, near-duplicate
+    /// detection, connected components, graph-aware training-data generation —
+    /// where the whole edge set is consumed as a durable artifact. For
+    /// "neighbours of *these* rows", compose [`Self::search`] instead.
+    ///
+    /// The build resolves the input embedding table through the same
+    /// tenant-scoped catalog path `search` uses: when a tenant is bound it runs
+    /// inside that tenant's scope, so a caller cannot point the build at another
+    /// tenant's table. The returned edge table is `kind = neighbor_graph`,
+    /// derived from the resolved embedding table, with `src`/`dst` endpoints
+    /// that join directly to source data on the key.
+    ///
+    /// The default driver is index-assisted and produces an *approximate*,
+    /// *non-deterministic* graph; set `BuildNeighborGraph::exact` for a
+    /// deterministic, complete one (gated by a row-count ceiling).
+    pub async fn build_neighbor_graph(
+        &self,
+        source_id: &str,
+        embedding_table: Option<&str>,
+        params: &crate::pipeline::neighbor_graph::BuildNeighborGraph,
+    ) -> Result<ResultTableRecord> {
+        match self.tenant() {
+            // A bound tenant runs the build inside its scope, so the catalog
+            // resolves only that tenant's embedding table — a caller cannot
+            // point the build at another tenant's table.
+            Some(tenant) => {
+                self.with_tenant_scoped(tenant, |_scope| async move {
+                    crate::pipeline::neighbor_graph::NeighborGraphPipeline::new(
+                        self,
+                        self.result_store.as_ref(),
+                    )
+                    .run(source_id, embedding_table, params)
+                    .await
+                })
+                .await
+            }
+            None => {
+                crate::pipeline::neighbor_graph::NeighborGraphPipeline::new(
+                    self,
+                    self.result_store.as_ref(),
+                )
+                .run(source_id, embedding_table, params)
+                .await
+            }
+        }
+    }
+
     // =====================================================================
     // Fine-tuning
     // =====================================================================
@@ -731,6 +793,40 @@ impl InferenceSession {
     ) -> Result<FineTuneJob> {
         let config = config.unwrap_or_default();
         config.validate()?;
+
+        // Load training data from the source, then hand the loader to the shared
+        // job-creation + training-spawn path. The graph path
+        // ([`Self::fine_tune_graph`]) builds a different loader but shares that
+        // same tail.
+        let table_name = self.find_table_name(source)?;
+        let query = format!(
+            "SELECT {} FROM {source}.public.\"{table_name}\"",
+            columns
+                .iter()
+                .map(|c| format!("\"{c}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let batches = self.sql(&query).await?;
+        let data_loader = build_training_data_loader(&batches, columns, task)?;
+
+        self.spawn_fine_tune(source, base_model, task, config, data_loader)
+            .await
+    }
+
+    /// Create the catalog job record, load the base model, and spawn the
+    /// blocking training run for a pre-built [`TrainingDataLoader`]. Shared by
+    /// the column-source [`Self::fine_tune`] path and the graph
+    /// [`Self::fine_tune_graph`] path — the only thing that differs upstream is
+    /// how the loader is built.
+    async fn spawn_fine_tune(
+        &self,
+        source: &str,
+        base_model: &str,
+        task: ModelTask,
+        config: FineTuneConfig,
+        data_loader: crate::fine_tune::data::TrainingDataLoader,
+    ) -> Result<FineTuneJob> {
         let job_id = uuid::Uuid::new_v4().to_string();
         let output_model_id = format!("jammi:fine-tuned:{job_id}");
 
@@ -765,6 +861,8 @@ impl InferenceSession {
                 .classification_loss
                 .map(|l| format!("{l:?}"))
                 .unwrap_or_else(|| "CrossEntropy".into())
+        } else if task == ModelTask::Regression {
+            format!("{:?}", config.regression_loss.unwrap_or_default())
         } else {
             config
                 .embedding_loss
@@ -777,20 +875,6 @@ impl InferenceSession {
             .catalog()
             .create_fine_tune_job(&job_id, &base_model_pk, source, &loss_type, &hyperparams)
             .await?;
-
-        // Load training data from the source
-        let table_name = self.find_table_name(source)?;
-        let query = format!(
-            "SELECT {} FROM {source}.public.\"{table_name}\"",
-            columns
-                .iter()
-                .map(|c| format!("\"{c}\""))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let batches = self.sql(&query).await?;
-
-        let data_loader = build_training_data_loader(&batches, columns, task)?;
 
         // Load the base model under the task being fine-tuned so the right
         // tower (text vs audio) is materialised and `embedding_dim()` reports
@@ -862,6 +946,120 @@ impl InferenceSession {
         ))
     }
 
+    /// Graph-supervised fine-tune (S11): learn an embedding metric that encodes
+    /// a graph's structure. Reads a node-text source and an edge source, samples
+    /// the graph into `(anchor, positive, [hard_negative])` text pairs via biased
+    /// random walks (node2vec), and drives the existing in-batch-negative
+    /// (S10/MNRL) or triplet objective — **no new loss**.
+    ///
+    /// `node_source` supplies the text the encoder embeds, keyed by `id_column`,
+    /// with the text in `text_column`. `edge_source` supplies directed edges
+    /// (`src_column` → `dst_column`); endpoints join to `id_column`. Every
+    /// endpoint must resolve to a node (the text-bearing precondition) or this is
+    /// a typed error.
+    ///
+    /// `provenance` declares whether the edges are external/declared structure or
+    /// S9-similarity edges — **the load-bearing distinction**: training on
+    /// similarity edges largely re-learns the base metric (a degenerate feedback
+    /// loop), so genuine gain comes from declared edges. Similarity-only edges
+    /// are a weak bootstrap, never the sole supervision.
+    pub async fn fine_tune_graph(
+        &self,
+        sources: &crate::fine_tune::graph_sampler::GraphFineTuneSources,
+        base_model: &str,
+        sample_config: crate::fine_tune::graph_sampler::GraphSampleConfig,
+        config: Option<FineTuneConfig>,
+    ) -> Result<FineTuneJob> {
+        use crate::fine_tune::graph_sampler::{GraphEdge, GraphSampler, TextNode};
+
+        let config = config.unwrap_or_default();
+        config.validate()?;
+        sample_config.validate()?;
+
+        // Read node text (id, text) from the node source.
+        let node_table = self.find_table_name(&sources.node_source)?;
+        let node_query = format!(
+            "SELECT \"{}\", \"{}\" FROM {}.public.\"{node_table}\"",
+            sources.id_column, sources.text_column, sources.node_source
+        );
+        let node_batches = self.sql(&node_query).await?;
+        let mut nodes = Vec::new();
+        for batch in &node_batches {
+            let ids = batch
+                .column_by_name(&sources.id_column)
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "node id column '{}' is not text",
+                        sources.id_column
+                    ))
+                })?;
+            let texts = batch
+                .column_by_name(&sources.text_column)
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "node text column '{}' is not text",
+                        sources.text_column
+                    ))
+                })?;
+            for (id, text) in ids.into_iter().zip(texts) {
+                nodes.push(TextNode::new(id, text));
+            }
+        }
+
+        // Read edges (src, dst) from the edge source; the caller's `provenance`
+        // tags every edge (an edge source is homogeneous in origin).
+        let edge_table = self.find_table_name(&sources.edge_source)?;
+        let edge_query = format!(
+            "SELECT \"{}\", \"{}\" FROM {}.public.\"{edge_table}\"",
+            sources.src_column, sources.dst_column, sources.edge_source
+        );
+        let edge_batches = self.sql(&edge_query).await?;
+        let mut edges = Vec::new();
+        for batch in &edge_batches {
+            let srcs = batch
+                .column_by_name(&sources.src_column)
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "edge src column '{}' is not text",
+                        sources.src_column
+                    ))
+                })?;
+            let dsts = batch
+                .column_by_name(&sources.dst_column)
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "edge dst column '{}' is not text",
+                        sources.dst_column
+                    ))
+                })?;
+            for (src, dst) in srcs.into_iter().zip(dsts) {
+                edges.push(GraphEdge {
+                    src,
+                    dst,
+                    provenance: sources.provenance,
+                });
+            }
+        }
+
+        let sampler = GraphSampler::build(nodes, edges, sample_config)?;
+        let data_loader = crate::fine_tune::data::TrainingDataLoader::from_graph(&sampler)?;
+
+        // The job record's `source` field records the node source — the model is
+        // fine-tuned on that source's text, the edges only supervise the pairing.
+        self.spawn_fine_tune(
+            &sources.node_source,
+            base_model,
+            ModelTask::TextEmbedding,
+            config,
+            data_loader,
+        )
+        .await
+    }
+
     // =====================================================================
     // Evaluation
     // =====================================================================
@@ -926,6 +1124,27 @@ impl InferenceSession {
     ) -> Result<crate::eval::CompareEvalReport> {
         EvalRunner { session: self }
             .eval_compare(embedding_tables, source_id, golden_source, k)
+            .await
+    }
+
+    /// Evaluate whether a predictor's uncertainty is honest (spec R2).
+    ///
+    /// `golden_source` is a held-out set pairing a predictive distribution with
+    /// its realised `outcome`; `shape` selects the predictor's output family
+    /// (parametric Gaussian or ensemble) and the columns read. `cohorts` maps a
+    /// `record_id` to an opaque `{key: value}` segment map persisted alongside
+    /// that record's per-record scores, the same way `eval_embeddings` cohorts
+    /// work. Returns a report headlining a strictly proper score (CRPS) with the
+    /// PIT-calibration diagnostic, sharpness, coverage, and per-cohort slices.
+    pub async fn eval_calibration(
+        &self,
+        source_id: &str,
+        golden_source: &str,
+        shape: crate::eval::EvalCalibrationShape,
+        cohorts: &std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
+    ) -> Result<crate::eval::CalibrationEvalReport> {
+        EvalRunner { session: self }
+            .eval_calibration(source_id, golden_source, shape, cohorts)
             .await
     }
 }
@@ -1005,6 +1224,11 @@ fn build_training_data_loader(
     let has_triplet = col_names.contains(&"anchor")
         && col_names.contains(&"positive")
         && col_names.contains(&"negative");
+    // Pairs = anchor + positive with no negative column. In-batch negatives
+    // (MultipleNegativesRanking) supply the contrast, so `negative` is absent.
+    let has_pairs = col_names.contains(&"anchor")
+        && col_names.contains(&"positive")
+        && !col_names.contains(&"negative");
     let has_classification = col_names.contains(&"text") && col_names.contains(&"label");
 
     if has_triplet && task == ModelTask::AudioEmbedding {
@@ -1100,6 +1324,41 @@ fn build_training_data_loader(
         Ok(crate::fine_tune::data::TrainingDataLoader::from_triplets(
             rows,
         ))
+    } else if has_pairs {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let schema_info = || {
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| format!("{}:{}", f.name(), f.data_type()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let anchor_vals = batch
+                .column_by_name("anchor")
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "Missing/invalid 'anchor' column. Batch schema: [{}]",
+                        schema_info()
+                    ))
+                })?;
+            let pos_vals = batch
+                .column_by_name("positive")
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "Missing/invalid 'positive' column. Batch schema: [{}]",
+                        schema_info()
+                    ))
+                })?;
+            for i in 0..batch.num_rows() {
+                rows.push((anchor_vals[i].clone(), pos_vals[i].clone()));
+            }
+        }
+        Ok(crate::fine_tune::data::TrainingDataLoader::from_pairs(rows))
     } else if has_classification {
         let mut label_set = std::collections::BTreeSet::new();
         let mut rows = Vec::new();
@@ -1141,8 +1400,8 @@ fn build_training_data_loader(
         Err(JammiError::FineTune(format!(
             "Cannot detect training format from columns: {col_names:?}. \
              Expected contrastive (text_a, text_b, score), triplet (anchor, positive, negative), \
-             or classification (text, label). For audio triplets, use the same \
-             (anchor, positive, negative) columns with task=audio_embedding."
+             pairs (anchor, positive), or classification (text, label). For audio triplets, use \
+             the same (anchor, positive, negative) columns with task=audio_embedding."
         )))
     }
 }
@@ -1291,6 +1550,15 @@ fn run_fine_tune_blocking(
                 &config,
                 &vb,
             )?
+        } else if task == ModelTask::Regression {
+            // The distribution head's width is its parameter count: 2 for the
+            // parametric Gaussian objectives `(mean, raw_std)`, one per level for
+            // the pinball/quantile objective.
+            let output_dim = match config.regression_loss.unwrap_or_default() {
+                crate::fine_tune::RegressionLoss::Pinball => config.quantile_levels.len(),
+                _ => 2,
+            };
+            crate::fine_tune::lora::build_distribution_head(hidden_size, output_dim, &config, &vb)?
         } else {
             crate::fine_tune::lora::build_projection_head(hidden_size, &config, &vb)?
         };

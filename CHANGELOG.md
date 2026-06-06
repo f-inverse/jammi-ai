@@ -6,6 +6,42 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.22.0 — 2026-06-06
+
+The graph-ML and neural-process substrate: construct, propagate, learn, and
+retrieve over similarity graphs, and condition calibrated predictions on a
+retrieved context set. All data-plane primitives + offline eval — no governance.
+
+### Added
+- **Shared prep primitives.** Paired distribution-free significance (bootstrap
+  CI + Mann–Whitney U) on `eval_compare` per-metric deltas; `jammi_numerics::calibration`
+  (coverage, ECE, CRPS, NLL, sharpness, PIT — pure functions); a vector-aggregation
+  UDAF (element-wise mean/sum/max over `FixedSizeList<Float32>`, permutation-invariant);
+  a kind-conditional sidecar-extension registry.
+- **Similarity-graph materialization.** `build_neighbor_graph` writes the self-kNN
+  edge relation of an embedding table as a queryable `result_table` (migration 013
+  adds `kind`/`derived_from`); index-assisted + exact drivers; approximate-by-default
+  with an `exact` mode; endpoints are source keys.
+- **Lexical retrieval + RRF.** A tantivy BM25 sidecar (`bm25` evidence channel,
+  migration 014) and reciprocal-rank fusion that fuses on rank, not score scale.
+- **Conformal prediction** (OSS serving primitive): distribution-free prediction
+  sets/intervals (APS/RAPS/LAC/CQR/abs-residual, weighted + Mondrian) with the
+  finite-sample quantile and a `conformal` evidence channel.
+- **Context-set assembly.** `assemble_context` pools a retrieval into a permutation-invariant
+  context representation (the encode-and-aggregate half of a Neural Process), with
+  self-exclusion + train-split leakage guards.
+- **Distributional inference.** A genuine `ModelTask::Regression` with a
+  `DistributionAdapter` ((mean, std) or quantiles), proper-scoring objectives
+  (β-NLL, CRPS, pinball), monotone quantiles, and an `uncertainty` evidence channel.
+- **Contrastive fine-tuning.** Multiple-Negatives-Ranking (in-batch negatives /
+  InfoNCE) with GradCache, index-mined hard negatives (k-hop false-negative guard),
+  and Matryoshka multi-resolution embeddings; AnglE and cosine-MSE objectives.
+- **Graph-supervised fine-tuning.** A `TrainingFormat::Graph` that samples a graph
+  (node2vec biased walks) into contrastive pairs driving the existing objective —
+  genuine gain comes from declared/external edges, not self-similarity edges.
+- **Evaluation recipes.** A graph-ML "did structure help?" recipe and a calibration
+  eval harness (`eval_calibration`) headlining a proper score with coverage + sharpness.
+
 ## v0.21.0 — 2026-06-04
 
 ### Added

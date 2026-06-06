@@ -37,6 +37,7 @@ enum ModelTask {
   AUDIO_EMBEDDING = 3;
   CLASSIFICATION = 4;
   NER = 5;
+  REGRESSION = 6;
 }
 
 message InferRequest {

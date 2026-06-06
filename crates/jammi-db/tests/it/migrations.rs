@@ -119,8 +119,8 @@ async fn migration_005_back_fills_existing_rows_to_null() {
         .await
         .unwrap();
     assert_eq!(
-        nulls, 2,
-        "both seeded evidence_channels rows must have tenant_id NULL"
+        nulls, 3,
+        "the three seeded evidence_channels rows (vector, inference, bm25) must have tenant_id NULL"
     );
 }
 
@@ -172,6 +172,8 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "010_rename_source_type_local_to_file",
             "011_eval_per_query",
             "012_topics_tenant_unique",
+            "013_result_table_kind",
+            "014_bm25_channel",
         ]
     );
 }

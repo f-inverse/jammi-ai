@@ -410,6 +410,39 @@ pub(crate) fn extract_string_column(
     )))
 }
 
+/// Extract a real-valued column as `Vec<f64>`, widening the common numeric
+/// Arrow types (Float64/Float32, Int64/Int32) so a golden source may store an
+/// outcome or distribution parameter as either an integer or a float.
+///
+/// Returns `Eval` when the column is missing or not a numeric type.
+#[cfg(feature = "local")]
+pub(crate) fn extract_f64_column(
+    batch: &arrow::array::RecordBatch,
+    column: &str,
+) -> Result<Vec<f64>> {
+    let col = batch
+        .column_by_name(column)
+        .ok_or_else(|| JammiError::Eval(format!("Column '{column}' not found in batch")))?;
+
+    if let Some(arr) = col.as_any().downcast_ref::<arrow::array::Float64Array>() {
+        return Ok((0..arr.len()).map(|i| arr.value(i)).collect());
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<arrow::array::Float32Array>() {
+        return Ok((0..arr.len()).map(|i| arr.value(i) as f64).collect());
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<arrow::array::Int64Array>() {
+        return Ok((0..arr.len()).map(|i| arr.value(i) as f64).collect());
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<arrow::array::Int32Array>() {
+        return Ok((0..arr.len()).map(|i| arr.value(i) as f64).collect());
+    }
+
+    Err(JammiError::Eval(format!(
+        "Column '{column}' has unsupported type {:?} (expected a numeric type)",
+        col.data_type()
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

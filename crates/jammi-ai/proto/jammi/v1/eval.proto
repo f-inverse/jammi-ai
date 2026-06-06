@@ -253,13 +253,34 @@ message MetricDelta {
   double relative = 2;
 }
 
+// Distribution-free significance of one metric's delta, computed from the
+// paired per-query values: a Mann-Whitney U p-value plus a bootstrap CI on the
+// mean paired difference. Mirrors
+// `jammi_ai::eval::report::MetricSignificance`.
+message MetricSignificance {
+  double p_value = 1;
+  double ci_lower = 2;
+  double ci_upper = 3;
+}
+
+// Paired significance for each metric in an AggregateDelta, in the same metric
+// layout. Mirrors `jammi_ai::eval::report::DeltaSignificance`.
+message DeltaSignificance {
+  MetricSignificance recall_at_k = 1;
+  MetricSignificance precision_at_k = 2;
+  MetricSignificance mrr = 3;
+  MetricSignificance ndcg = 4;
+}
+
 // Per-metric deltas relative to the baseline. Mirrors
-// `jammi_ai::eval::report::AggregateDelta`.
+// `jammi_ai::eval::report::AggregateDelta`. `significance` is unset when the
+// baseline and treatment runs share no query to pair on.
 message AggregateDelta {
   MetricDelta recall_at_k = 1;
   MetricDelta precision_at_k = 2;
   MetricDelta mrr = 3;
   MetricDelta ndcg = 4;
+  optional DeltaSignificance significance = 5;
 }
 
 // One table's embedding eval plus its delta vs the baseline. Mirrors

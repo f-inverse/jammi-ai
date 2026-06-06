@@ -2,7 +2,7 @@
 
 Embeddable AI engine for inference, embeddings, vector search, and fine-tuning. Part of [Jammi AI](https://github.com/f-inverse/jammi-ai).
 
-`jammi-ai` builds on `jammi-db` to add model loading (HuggingFace Hub, local safetensors, ONNX), embedding generation with persistent Parquet + ANN indexes, semantic vector search plus a fluent `QueryBuilder` for compound retrieval (join / annotate / filter / select), LoRA fine-tuning, and evaluation (retrieval, classification, summarization).
+`jammi-ai` builds on `jammi-db` to add model loading (HuggingFace Hub, local safetensors, ONNX), embedding generation with persistent Parquet + ANN indexes, semantic vector search plus a fluent `QueryBuilder` for compound retrieval (join / annotate / filter / select), similarity-graph materialization (`build_neighbor_graph`), LoRA fine-tuning, and evaluation (retrieval, classification, summarization).
 
 ## Usage
 
@@ -32,6 +32,12 @@ let results = session.search("patents", query, 10).await?
     .sort("similarity", true)?
     .limit(5)
     .run().await?;
+
+// Materialize the whole k-nearest-neighbour edge set (dedup / clustering)
+use jammi_ai::pipeline::neighbor_graph::BuildNeighborGraph;
+let edges = session.build_neighbor_graph(
+    "patents", None, &BuildNeighborGraph { k: 5, ..Default::default() },
+).await?;
 ```
 
 ## Documentation

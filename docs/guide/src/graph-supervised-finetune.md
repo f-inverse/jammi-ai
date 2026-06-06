@@ -115,6 +115,7 @@ job.wait()
 
 ```rust,no_run
 # extern crate jammi_ai;
+# extern crate jammi_db;
 # use jammi_ai::session::InferenceSession;
 # use jammi_ai::fine_tune::FineTuneConfig;
 # use jammi_ai::fine_tune::graph_sampler::{EdgeProvenance, GraphFineTuneSources, GraphSampleConfig};

@@ -30,8 +30,8 @@ would mangle (codes, identifiers, non-English).
 
 ```rust,no_run
 # extern crate jammi_ai;
-# fn ex() -> jammi_db::error::Result<()> {
 # extern crate jammi_db;
+# fn ex() -> jammi_db::error::Result<()> {
 use jammi_ai::index::{Analyzer, LexicalIndex};
 
 let rows = vec![

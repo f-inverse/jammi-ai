@@ -58,8 +58,16 @@ to run on very large tables).
 
 ## Example: near-duplicate detection
 
-```rust
+```rust,no_run
+# extern crate jammi_db;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use std::sync::Arc;
+# use jammi_ai::session::InferenceSession;
+# use jammi_db::config::JammiConfig;
 use jammi_ai::pipeline::neighbor_graph::BuildNeighborGraph;
+# async fn ex(config: JammiConfig, model_id: &str) -> jammi_db::error::Result<()> {
+# let session = Arc::new(InferenceSession::new(config).await?);
 
 // Embed the corpus first (any embedding model).
 session
@@ -91,6 +99,7 @@ let dupes = session
         edges.table_name
     ))
     .await?;
+# Ok(()) }
 ```
 
 ## Example: graph traversal stays in SQL

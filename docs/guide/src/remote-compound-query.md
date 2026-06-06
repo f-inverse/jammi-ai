@@ -13,7 +13,7 @@ compound-search verb.
 
 ## The `annotate` table function
 
-```
+```text
 annotate(model, task, relation, key_column, content_column [, content_column…])
 ```
 

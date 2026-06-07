@@ -32,10 +32,9 @@ use super::{BackendOutput, OutputAdapter};
 /// scorable density rather than a zero-width spike.
 ///
 /// This is *the same* floor the training objective uses, not a second literal
-/// kept equal by prose: it references the trainer's [`STD_FLOOR`] (the single
-/// source of truth) so the trained `σ` and the served `σ` are one transform.
-///
-/// [`STD_FLOOR`]: crate::fine_tune::regression_loss::STD_FLOOR
+/// kept equal by prose: it references the trainer's crate-internal `STD_FLOOR`
+/// (the single source of truth) so the trained `σ` and the served `σ` are one
+/// transform.
 pub const SERVED_STD_FLOOR: f32 = crate::fine_tune::regression_loss::STD_FLOOR as f32;
 
 /// Map a raw real-valued head output to a positive standard deviation:

@@ -14,8 +14,8 @@
 //! Both reduce to one operation: multi-head scaled dot-product attention of a
 //! query set against a key/value set, with an additive key mask that drives the
 //! softmax weight of padded keys to zero. This module is that operation. The
-//! additive mask is produced by [`crate::mask::extended_attention_mask`] so a
-//! padded context member is never attended over — the softmax weight on it is
+//! additive mask is produced by the crate-internal `extended_attention_mask` so
+//! a padded context member is never attended over — the softmax weight on it is
 //! `softmax(… + (-10000))` ≈ 0, identical to the encoders' padding convention.
 
 use candle_core::{Tensor, D};
@@ -44,8 +44,8 @@ fn split_heads(x: &Tensor, num_heads: usize) -> Result<Tensor, EncoderError> {
 /// - `query`: `[B, q_len, hidden]`
 /// - `keys`, `values`: `[B, kv_len, hidden]`
 /// - `key_mask`: an *additive* `[B, 1, 1, kv_len]` mask (`0.0` at real keys,
-///   a large negative at padded keys), as built by
-///   [`crate::mask::extended_attention_mask`]. It broadcasts over the query and
+///   a large negative at padded keys), as built by the crate-internal
+///   `extended_attention_mask`. It broadcasts over the query and
 ///   head axes, so a padded key gets ≈ zero softmax weight for *every* query.
 ///   Pass `None` for unmasked attention (every key real).
 ///

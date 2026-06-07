@@ -281,9 +281,9 @@ fn train_loop_converges_on_synthetic_regression() {
         &varmap,
         &batches,
         &config,
-        |x| linear.forward(x).map_err(into_err),
-        |preds, tgts| {
-            let diff = (preds - tgts).map_err(into_err)?;
+        |batch: &TensorBatch| linear.forward(&batch.features).map_err(into_err),
+        |preds, batch: &TensorBatch| {
+            let diff = (preds - &batch.targets).map_err(into_err)?;
             diff.sqr().map_err(into_err)?.mean_all().map_err(into_err)
         },
     )
@@ -328,12 +328,12 @@ fn train_loop_signature_is_text_free() {
             weight_decay: 0.0,
             grad_clip: 0.0,
         },
-        move |x| {
+        move |batch: &TensorBatch| {
             let wt: &Tensor = &w_for_model;
-            x.broadcast_add(wt).map_err(into_err)
+            batch.features.broadcast_add(wt).map_err(into_err)
         },
-        |preds, tgts| {
-            let diff = (preds - tgts).map_err(into_err)?;
+        |preds, batch: &TensorBatch| {
+            let diff = (preds - &batch.targets).map_err(into_err)?;
             diff.sqr().map_err(into_err)?.mean_all().map_err(into_err)
         },
     )

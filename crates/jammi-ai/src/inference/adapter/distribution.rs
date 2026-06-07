@@ -30,7 +30,13 @@ use super::{BackendOutput, OutputAdapter};
 /// peer of the trainer's learnable variance floor. A served `σ` is never below
 /// this, so a row the model is (over)confident about still yields a finite,
 /// scorable density rather than a zero-width spike.
-pub const SERVED_STD_FLOOR: f32 = 1e-3;
+///
+/// This is *the same* floor the training objective uses, not a second literal
+/// kept equal by prose: it references the trainer's [`STD_FLOOR`] (the single
+/// source of truth) so the trained `σ` and the served `σ` are one transform.
+///
+/// [`STD_FLOOR`]: crate::fine_tune::regression_loss::STD_FLOOR
+pub const SERVED_STD_FLOOR: f32 = crate::fine_tune::regression_loss::STD_FLOOR as f32;
 
 /// Map a raw real-valued head output to a positive standard deviation:
 /// `floor + softplus(raw)`. `softplus(x) = ln(1 + e^x)` is smooth and positive
@@ -237,6 +243,60 @@ mod tests {
         let fields = DistributionAdapter::gaussian().output_schema();
         let names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["predicted_mean", "predicted_std"]);
+    }
+
+    #[test]
+    fn served_floor_is_the_single_trainer_floor() {
+        // The served floor is not a second literal kept equal by prose — it IS
+        // the trainer's STD_FLOOR, referenced. One constant, two views (f64 in
+        // the autodiff objective, f32 at serve time).
+        assert_eq!(
+            SERVED_STD_FLOOR,
+            crate::fine_tune::regression_loss::STD_FLOOR as f32
+        );
+    }
+
+    #[test]
+    fn served_sigma_matches_trained_sigma_across_raw_sweep() {
+        // The σ map must agree between training and serving for every raw scale,
+        // or a model would be scored under a different σ than it was trained on.
+        // Drive the adapter's full serve path (which applies the adapter-side
+        // `softplus_std`) and the trainer's `gaussian_params` (the autodiff σ
+        // map) on the same raw values and require the served σ to equal the
+        // trained σ. The two share the floor constant exactly (the single
+        // source of truth) and the same `floor + softplus(raw)` formula; they
+        // differ only by the last-bit rounding of two softplus spellings — the
+        // candle-native numerically-stable form vs the scalar `ln(1+e^x)` — so
+        // the agreement is to f32 round-off (≤ a few ULP), not a wider drift
+        // that would mean two different transforms.
+        use candle_core::{Device, Tensor};
+        let dev = Device::Cpu;
+        let mut raw = -5.0_f32;
+        while raw <= 5.0 {
+            // Adapter side: serve a one-row Gaussian head `(mean, raw)`.
+            let out = backend(vec![0.0, raw], 1, 2, vec![true]);
+            let cols = DistributionAdapter::gaussian().adapt(&out, 1).unwrap();
+            let served = cols[1]
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(0);
+
+            // Trainer side: the same raw through the autodiff σ map, read as f32.
+            let input = Tensor::from_vec(vec![0.0_f32, raw], (1, 2), &dev).unwrap();
+            let (_, sigma) = crate::fine_tune::regression_loss::gaussian_params(&input).unwrap();
+            let trained: f32 = sigma.squeeze(0).unwrap().to_scalar().unwrap();
+
+            // Tight relative tolerance: only f32 last-bit rounding may separate
+            // them. A real divergence (a changed floor or a different formula)
+            // is orders of magnitude larger and trips this guard.
+            let tol = 4.0 * f32::EPSILON * served.abs().max(1.0);
+            assert!(
+                (served - trained).abs() <= tol,
+                "served σ {served} and trained σ {trained} disagree for raw={raw} (tol {tol})"
+            );
+            raw += 0.5;
+        }
     }
 
     #[test]

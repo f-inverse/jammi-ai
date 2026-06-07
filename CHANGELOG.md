@@ -6,6 +6,30 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.23.0 — 2026-06-07
+
+The amortized in-context predictor (S19) and its training substrate (P5): a
+database-native prior-fitted network that conditions a calibrated predictive
+distribution on a retrieved context set in one forward pass, with no gradient
+updates at inference.
+
+### Added
+- **Parallel non-text training substrate (P5).** A `train_loop` over precomputed
+  feature/target batches that reuses the autograd/optimizer stack without the
+  token-coupled text trainer; a differentiable `segment_aggregate`
+  (`SegmentReduce::{Sum,Mean,Max}`) matching the data-plane vector-aggregation
+  UDAF, with a documented empty-segment-zero convention; an extracted, shared
+  clip→step optimizer seam.
+- **Amortized in-context predictor (S19).** `AnyContextPredictor` — a curated,
+  config-selectable `{Cnp, AttnCnp, Tnp}` family in `jammi-encoders` — trained by
+  an episodic meta-training pipeline (`train_context_predictor`): per-target
+  leakage-scoped context assembly (S16, `exclude_self` + same-task split),
+  per-member vector reads over the generic SQL surface, a held-out-**task** split
+  with a meta-overfitting guard, and S18's proper-scoring objectives (reused, no
+  new loss code). Served inference-only via the S18 distribution adapter, with a
+  composed S17 conformal wrap calibrated on a held-out-task split. Python
+  bindings + the `train-context-predictor` cookbook.
+
 ## v0.22.0 — 2026-06-06
 
 The graph-ML and neural-process substrate: construct, propagate, learn, and

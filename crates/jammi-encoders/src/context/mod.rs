@@ -29,8 +29,8 @@
 //! - a **dense** `[B, k, feature_dim]` / `[B, k, value_dim]` form with a
 //!   `[B, k]` presence mask, padded to the per-batch maximum `k`. AttnCnp and
 //!   Tnp attend over this with an additive mask (built from the presence mask
-//!   via [`crate::mask::extended_attention_mask`]) so a padded member receives
-//!   zero attention weight — never attended over.
+//!   via the crate-internal `extended_attention_mask`) so a padded member
+//!   receives zero attention weight — never attended over.
 //! - a **ragged** form — the masked-in members flattened to `[N, …]` with a
 //!   `[N]` segment-id mapping each to its episode `0..B`. [`Cnp`] derives this
 //!   from the dense form + presence mask and pools it via

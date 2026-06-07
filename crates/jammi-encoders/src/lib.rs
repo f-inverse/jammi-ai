@@ -11,11 +11,18 @@
 //! cross-modal text↔audio search. [`AnyEncoder`] / [`AnyAudioEncoder`] are the
 //! closed-enum dispatchers that let a single caller hold any of the
 //! text / audio families respectively.
+//!
+//! [`AnyContextPredictor`] is the amortized in-context predictor family
+//! ([`Cnp`] / [`AttnCnp`] / [`Tnp`]): given a target and its context set, it
+//! emits a predictive-distribution head in one differentiable forward pass —
+//! the learned-aggregation point of the neural-process spectrum, dispatched by
+//! the same closed-enum pattern as the encoder families.
 
 pub mod aggregate;
 pub mod audio;
 pub mod bert;
 pub mod clip_text;
+pub mod context;
 pub mod distilbert;
 pub mod htsat_audio;
 pub mod modernbert;
@@ -31,6 +38,10 @@ pub use any::AnyEncoder;
 pub use audio::{AnyAudioEncoder, AudioEncoder};
 pub use bert::{Bert, BertConfig};
 pub use clip_text::{ClipText, ClipTextConfig};
+pub use context::{
+    attention_weights, multi_head_attention, AnyContextPredictor, AttnCnp, Cnp,
+    ContextArchitecture, ContextEpisode, ContextPredictorConfig, Tnp,
+};
 pub use distilbert::{DistilBert, DistilBertConfig};
 pub use error::EncoderError;
 pub use htsat_audio::{HtsatAudio, HtsatAudioConfig};

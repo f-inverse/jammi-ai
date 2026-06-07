@@ -791,6 +791,186 @@ impl PyDatabase {
         Ok(PyFineTuneJob::new(job, Arc::clone(&self.runtime)))
     }
 
+    /// Train an amortized in-context predictor (S19) over a source: a
+    /// config-selectable CNP / Attentive-CNP / TNP that meta-learns to turn a
+    /// retrieved context set into a predictive distribution, adapting to a new
+    /// target without retraining. Returns the model id it registered under.
+    ///
+    /// The predictor is meta-trained episodically: each **task** (the distinct
+    /// values of `task_column`) is split into a context set and held-out targets,
+    /// tasks (not points) are partitioned into train/test, and the target's
+    /// outcome (`value_column`) is scored under the chosen S18 proper objective.
+    ///
+    /// - `architecture` — "cnp" | "attncnp" | "tnp".
+    /// - `output` — "gaussian" (a `(mean, std)` head) or "quantile".
+    /// - `objective` — for a Gaussian head: "crps" | "nll" | "betanll" (β via
+    ///   `beta`); ignored for a quantile head (always pinball over `levels`).
+    /// - `levels` — ascending quantile levels in (0, 1) for the quantile head.
+    #[pyo3(signature = (
+        source,
+        *,
+        key_column,
+        task_column,
+        value_column,
+        architecture = "attncnp",
+        output = "gaussian",
+        objective = "crps",
+        context_k = 32,
+        hidden_dim = 64,
+        num_heads = 4,
+        num_layers = 2,
+        levels = None,
+        beta = 0.5,
+        epochs = 100,
+        learning_rate = 0.005,
+        grad_clip = 1.0,
+        test_task_fraction = 0.2,
+        min_task_count = 4,
+        seed = 0,
+        model_id = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn train_context_predictor(
+        &self,
+        source: &str,
+        key_column: &str,
+        task_column: &str,
+        value_column: &str,
+        architecture: &str,
+        output: &str,
+        objective: &str,
+        context_k: usize,
+        hidden_dim: usize,
+        num_heads: usize,
+        num_layers: usize,
+        levels: Option<Vec<f64>>,
+        beta: f64,
+        epochs: usize,
+        learning_rate: f64,
+        grad_clip: f64,
+        test_task_fraction: f64,
+        min_task_count: usize,
+        seed: u64,
+        model_id: Option<&str>,
+    ) -> PyResult<String> {
+        use jammi_ai::pipeline::context_predictor::{
+            ContextArchitecture, ContextPredictorTrainConfig, GaussianObjective, PredictiveHead,
+        };
+
+        let architecture = match architecture {
+            "cnp" => ContextArchitecture::Cnp,
+            "attncnp" => ContextArchitecture::AttnCnp,
+            "tnp" => ContextArchitecture::Tnp,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown architecture '{other}'. Use 'cnp', 'attncnp', or 'tnp'."
+                )))
+            }
+        };
+        let head = match output {
+            "gaussian" => {
+                let objective = match objective {
+                    "crps" => GaussianObjective::Crps,
+                    "nll" => GaussianObjective::Nll { beta: 0.0 },
+                    "betanll" => GaussianObjective::Nll { beta },
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "Unknown gaussian objective '{other}'. Use 'crps', 'nll', or 'betanll'."
+                        )))
+                    }
+                };
+                PredictiveHead::Gaussian { objective }
+            }
+            "quantile" => {
+                let levels = levels.ok_or_else(|| {
+                    PyValueError::new_err(
+                        "output='quantile' requires `levels` (ascending levels in (0, 1))",
+                    )
+                })?;
+                PredictiveHead::Quantile { levels }
+            }
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown output '{other}'. Use 'gaussian' or 'quantile'."
+                )))
+            }
+        };
+
+        let spec = ContextPredictorTrainConfig {
+            model_id: model_id
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{source}-context-predictor")),
+            architecture,
+            key_column: key_column.to_string(),
+            task_column: task_column.to_string(),
+            value_column: value_column.to_string(),
+            context_k,
+            hidden_dim,
+            num_heads,
+            num_layers,
+            head,
+            epochs,
+            learning_rate,
+            grad_clip,
+            test_task_fraction,
+            min_task_count,
+            seed,
+        };
+        let record = self
+            .runtime
+            .block_on(self.session.train_context_predictor(source, &spec))
+            .map_err(to_pyerr)?;
+        Ok(record.model_id)
+    }
+
+    /// Predict a target's distribution with a trained context predictor (S19) by
+    /// assembling its live context and running one in-context forward — no
+    /// gradient update. Returns a dict: `{"kind": "gaussian", "mean", "std"}` or
+    /// `{"kind": "quantile", "levels": [[level, value], …]}`.
+    ///
+    /// `source` is the source whose embedding table the live context is drawn
+    /// from (it need not equal the training source — a predictor serves a target
+    /// in any corpus of the same shape); `split` optionally scopes the serving
+    /// context.
+    #[pyo3(signature = (model_id, *, source, target_key, split = None))]
+    fn predict_with_context_predictor(
+        &self,
+        py: Python<'_>,
+        model_id: &str,
+        source: &str,
+        target_key: &str,
+        split: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        use jammi_ai::pipeline::context_predictor::PredictedDistribution;
+
+        let served = self
+            .runtime
+            .block_on(self.session.load_context_predictor(model_id, source, split))
+            .map_err(to_pyerr)?;
+        let dist = self
+            .runtime
+            .block_on(
+                self.session
+                    .predict_with_context_predictor(&served, target_key),
+            )
+            .map_err(to_pyerr)?;
+
+        let out = PyDict::new(py);
+        match dist {
+            PredictedDistribution::Gaussian { mean, std } => {
+                out.set_item("kind", "gaussian")?;
+                out.set_item("mean", mean)?;
+                out.set_item("std", std)?;
+            }
+            PredictedDistribution::Quantile { levels } => {
+                out.set_item("kind", "quantile")?;
+                let pairs: Vec<(f64, f32)> = levels;
+                out.set_item("levels", pairs)?;
+            }
+        }
+        Ok(out.into_any().unbind())
+    }
+
     /// Graph-supervised fine-tune (S11): learn an embedding metric that encodes
     /// a graph's structure. Reads a node-text source and an edge source, samples
     /// the graph into `(anchor, positive, [hard_negative])` pairs by biased

@@ -23,9 +23,10 @@ use crate::fine_tune::optimizer::optimizer_step;
 /// should predict. Both are already tensors — there is no encode/tokenize step
 /// between the data and the model.
 ///
-/// A concrete struct, not a `BatchSource` trait: there is exactly one batch
-/// shape today. An episodic sampler is added by the consumer that needs one,
-/// driven by its actual shape rather than guessed here.
+/// The simplest batch shape [`train_loop`] drives: a flat feature/target pair.
+/// [`train_loop`] is generic over the batch type, so an episodic sampler over a
+/// richer batch (a context set plus its held-out target) is just another batch
+/// type the consumer passes — this struct is the one provided for the flat case.
 #[derive(Debug, Clone)]
 pub struct TensorBatch {
     /// Model inputs, `[batch, ..]` — whatever the caller's `model_fn` consumes.
@@ -70,8 +71,12 @@ pub struct ParallelTrainReport {
 
 /// Train the parameters held in `varmap` over `batches` for `config.epochs`.
 ///
-/// `model_fn(&features) -> predictions` runs the forward pass; `loss_fn(&preds,
-/// &targets) -> loss` scores it. Each batch is one forward → loss →
+/// Generic over the batch type `B`, so the loop owns only the
+/// autograd/optimizer mechanics and what a batch *is* stays the caller's
+/// concern: `model_fn(&batch) -> predictions` runs the forward pass over a whole
+/// batch (the [`TensorBatch`] flat case, an episodic context-set batch, or any
+/// other shape), and `loss_fn(&preds, &batch) -> loss` scores the predictions
+/// against the same batch's supervision. Each batch is one forward → loss →
 /// [`optimizer_step`] (backward + clip + AdamW). The optimizer is built once
 /// from the varmap's trainable variables and reused across every step so AdamW's
 /// moment estimates persist, exactly as the text trainer's does.
@@ -79,16 +84,16 @@ pub struct ParallelTrainReport {
 /// Neither argument nor return type names a tokenizer, a `LoadedModel`, or
 /// `input_ids`: the decoupling from the text path is structural, readable off
 /// this signature alone.
-pub fn train_loop<M, L>(
+pub fn train_loop<B, M, L>(
     varmap: &VarMap,
-    batches: &[TensorBatch],
+    batches: &[B],
     config: &ParallelTrainConfig,
     model_fn: M,
     loss_fn: L,
 ) -> Result<ParallelTrainReport>
 where
-    M: Fn(&Tensor) -> Result<Tensor>,
-    L: Fn(&Tensor, &Tensor) -> Result<Tensor>,
+    M: Fn(&B) -> Result<Tensor>,
+    L: Fn(&Tensor, &B) -> Result<Tensor>,
 {
     let trainable_vars: Vec<Var> = varmap.all_vars();
     let mut optimizer = AdamW::new(
@@ -109,8 +114,8 @@ where
         let mut batch_count = 0usize;
 
         for batch in batches {
-            let preds = model_fn(&batch.features)?;
-            let loss = loss_fn(&preds, &batch.targets)?;
+            let preds = model_fn(batch)?;
+            let loss = loss_fn(&preds, batch)?;
 
             epoch_loss += scalar_loss(&loss)?;
             batch_count += 1;

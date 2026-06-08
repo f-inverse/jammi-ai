@@ -951,6 +951,7 @@ async fn training_divergence_detection() {
         },
     )
     .job_id("div-job".into())
+    .worker_id("worker-test".into())
     .catalog(Arc::clone(&catalog))
     .artifact_dir(dir.path().to_path_buf())
     .build()
@@ -1069,6 +1070,7 @@ async fn training_early_stopping_triggers() {
         },
     )
     .job_id("es-job".into())
+    .worker_id("worker-test".into())
     .catalog(Arc::clone(&catalog))
     .artifact_dir(dir.path().to_path_buf())
     .build()
@@ -1519,6 +1521,141 @@ async fn worker_that_lost_lease_does_not_finalize() {
     );
 }
 
+// ─── Lease loss: a loser never writes the canonical artifact ─────────────────
+//
+// The data-integrity counterpart to `worker_that_lost_lease_does_not_finalize`:
+// that test pins the catalog row; this one pins the on-disk adapter. Both workers
+// train the *same* `job_id`, whose canonical adapter path is deterministic and
+// shared. The loser (worker-a, lost lease) must never touch that path — its
+// finalize CAS fails, so it discards its private staging and the canonical
+// adapter does not exist after its run. Only the winner (worker-b) promotes its
+// staged adapter into the canonical path on its CAS win.
+//
+// Pre-fix both workers wrote `models/{job_id}/adapter.safetensors` directly, so
+// worker-a (finishing after worker-b finalized) would clobber the canonical file
+// with its own — differently initialised — weights, leaving the catalog saying
+// `completed` (worker-b) while the bytes on disk are worker-a's. This test fails
+// against that code (canonical exists after worker-a, with the wrong bytes) and
+// passes against the stage-then-promote-on-CAS-win discipline.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn loser_never_writes_canonical_adapter() {
+    use jammi_ai::fine_tune::worker::TrainingWorker;
+    use std::time::Duration;
+
+    let (session, dir) = session_with_training_data().await;
+    let model = tiny_bert_model();
+
+    let job = session
+        .fine_tune(
+            "training",
+            &model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 1,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    let worker_a = TrainingWorker::new(&session);
+    let worker_b = TrainingWorker::new(&session);
+
+    // worker-a claims with a zero (already-expired) lease; worker-b reclaims and
+    // re-claims under a long lease, so worker-b owns the job.
+    let stale_claim = session
+        .catalog()
+        .claim_next_training_job(worker_a.worker_id(), Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("worker-a claims the queued job");
+    let actioned = session
+        .catalog()
+        .reclaim_expired_training_jobs(5)
+        .await
+        .unwrap();
+    assert_eq!(actioned, 1, "the expired lease is re-queued");
+    let owned = session
+        .catalog()
+        .claim_next_training_job(worker_b.worker_id(), Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("worker-b re-claims the requeued job");
+
+    let canonical_adapter = dir
+        .path()
+        .join("models")
+        .join(&job.job_id)
+        .join("adapter.safetensors");
+
+    // worker-a runs its stale claim to completion: its finalize CAS fails, so it
+    // discards its staging and never writes the canonical adapter.
+    worker_a.run_claimed_job(&session, stale_claim).await;
+    assert!(
+        !canonical_adapter.exists(),
+        "the loser must not write the canonical adapter (it discards its staging)"
+    );
+
+    // worker-a's private staging dir is cleaned up (no leak).
+    let staging_a = dir.path().join("models").join(".staging").join(format!(
+        "{}.{}",
+        job.job_id,
+        worker_a.worker_id()
+    ));
+    assert!(
+        !staging_a.exists(),
+        "the loser's staging dir is discarded, not left behind: {staging_a:?}"
+    );
+
+    // The winner runs and finalizes: it promotes its staged adapter into the
+    // canonical path, so the canonical adapter now exists.
+    worker_b.run_claimed_job(&session, owned).await;
+    job.wait().await.unwrap();
+    assert!(
+        canonical_adapter.exists(),
+        "the winner promotes its staged adapter into the canonical path"
+    );
+
+    // The bytes on disk are the winner's: re-load and confirm they are non-empty,
+    // well-formed safetensors. (Determinism is guaranteed by exactly-one-writer:
+    // the loser never reached this path, so no clobber/torn read is possible.)
+    let bytes = std::fs::read(&canonical_adapter).unwrap();
+    assert!(
+        !bytes.is_empty(),
+        "the promoted canonical adapter holds the winner's weights"
+    );
+    let loaded =
+        candle_core::safetensors::load(&canonical_adapter, &candle_core::Device::Cpu).unwrap();
+    assert!(
+        !loaded.is_empty(),
+        "the promoted canonical adapter is a well-formed safetensors tensor map"
+    );
+
+    // Neither worker left a staging dir behind.
+    let staging_root = dir.path().join("models").join(".staging");
+    if staging_root.exists() {
+        let leftover: Vec<_> = std::fs::read_dir(&staging_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "no worker leaves a staging dir behind, found: {leftover:?}"
+        );
+    }
+}
+
 // ─── Lease loss: cooperative cancellation bails the trainer at the boundary ──
 //
 // A `spawn_blocking` trainer cannot be force-aborted, so the worker's heartbeat
@@ -1602,6 +1739,7 @@ async fn training_bails_when_lease_lost_mid_run() {
         },
     )
     .job_id("lease-job".into())
+    .worker_id("worker-test".into())
     .catalog(Arc::clone(&catalog))
     .artifact_dir(dir.path().to_path_buf())
     .cancel(Arc::clone(&cancel))

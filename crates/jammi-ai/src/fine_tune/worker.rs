@@ -51,6 +51,7 @@ use crate::fine_tune::graph_sampler::{
     GraphEdge, GraphFineTuneSources, GraphSampleConfig, GraphSampler, TextNode,
 };
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
+use crate::fine_tune::staging::StagedArtifact;
 use crate::fine_tune::FineTuneConfig;
 use crate::model::backend::DeviceConfig;
 use crate::model::ModelSource;
@@ -221,26 +222,39 @@ impl TrainingWorker {
 
         match outcome {
             Ok(success) => {
-                // Single finalization for every kind: the run already persisted
-                // its artifact and registered the output-model row; the worker
-                // now performs the one lease-guarded compare-and-set that writes
-                // `output_model_id` + flips the job to `completed`. The CAS
-                // matches only while this worker still holds the lease
-                // (`claimed_by = worker_id AND status = 'running'`), so a worker
-                // that lost its lease in the window between the last epoch check
-                // and here affects zero rows and must NOT finalize — the job is
-                // left `running` for `reclaim` and the worker that re-claimed it.
+                // Single finalization for every kind: the run staged its artifact
+                // privately and registered the output-model row pointing at the
+                // (not-yet-written) canonical path; the worker now performs the
+                // one lease-guarded compare-and-set that writes `output_model_id`
+                // + flips the job to `completed`. The CAS matches only while this
+                // worker still holds the lease (`claimed_by = worker_id AND
+                // status = 'running'`), so a worker that lost its lease in the
+                // window between the last epoch check and here affects zero rows
+                // and must NOT finalize — the job is left `running` for `reclaim`
+                // and the worker that re-claimed it.
+                //
+                // The on-disk canonical artifact mirrors that discipline: only the
+                // CAS winner promotes its staging into the canonical path (an
+                // atomic same-filesystem rename); the loser discards its staging
+                // and never touches the shared canonical artifact. So a `wait()`
+                // observer that sees `completed` always finds the complete
+                // canonical artifact written by exactly one worker — the winner.
+                let RunSuccess {
+                    model_id,
+                    metrics,
+                    staged,
+                } = success;
                 match catalog
-                    .finalize_training_job(
-                        &job_id,
-                        &self.worker_id,
-                        &success.model_id,
-                        success.metrics.as_deref(),
-                    )
+                    .finalize_training_job(&job_id, &self.worker_id, &model_id, metrics.as_deref())
                     .await
                 {
-                    Ok(true) => {}
+                    Ok(true) => {
+                        if let Err(e) = staged.promote() {
+                            tracing::error!(job_id = %job_id, error = %e, "promote staged artifact failed");
+                        }
+                    }
                     Ok(false) => {
+                        staged.discard();
                         tracing::debug!(
                             job_id = %job_id,
                             worker = %self.worker_id,
@@ -248,6 +262,7 @@ impl TrainingWorker {
                         );
                     }
                     Err(e) => {
+                        staged.discard();
                         tracing::error!(job_id = %job_id, error = %e, "finalize_training_job failed");
                     }
                 }
@@ -360,13 +375,20 @@ impl TrainingWorker {
                 // tenant-pinned catalog (the same catalog the fine-tune kinds
                 // register through), so the model lands under the job's tenant
                 // rather than the worker session's sticky scope.
-                let record = session
-                    .run_context_predictor_training(catalog, &source, &predictor_spec, cancel)
+                let (record, staged) = session
+                    .run_context_predictor_training(
+                        catalog,
+                        &source,
+                        &predictor_spec,
+                        &self.worker_id,
+                        cancel,
+                    )
                     .await
                     .map_err(|e| classify(cancel, e))?;
                 Ok(RunSuccess {
                     model_id: record.model_id,
                     metrics: None,
+                    staged,
                 })
             }
         }
@@ -509,6 +531,7 @@ impl TrainingWorker {
             catalog: Arc::clone(catalog),
             artifact_dir: session.inner_config().artifact_dir.clone(),
             job_id: job_id.to_string(),
+            worker_id: self.worker_id.clone(),
             base_model: base_model.clone(),
             task,
             config: common.config,
@@ -548,10 +571,13 @@ impl TrainingWorker {
 
         // Register the fine-tuned model row before the worker's finalize CAS so
         // a `wait()` observer that sees `completed` always finds the model row.
-        // The id is deterministic (`jammi:fine-tuned:{job_id}`) and the catalog
-        // upserts, so a re-claiming worker re-registering after a lost lease is
-        // idempotent. Registration goes through the tenant-pinned catalog, so the
-        // row lands under the job's tenant.
+        // The row points at the canonical artifact path; that path is written
+        // (by promoting the staged artifact) only when the finalize CAS wins, so
+        // a `completed` job always has a complete canonical artifact. The id is
+        // deterministic (`jammi:fine-tuned:{job_id}`) and the catalog upserts, so
+        // a re-claiming worker re-registering after a lost lease is idempotent.
+        // Registration goes through the tenant-pinned catalog, so the row lands
+        // under the job's tenant.
         catalog
             .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
                 model_id: &output_model_id,
@@ -569,6 +595,7 @@ impl TrainingWorker {
         Ok(RunSuccess {
             model_id: output_model_id,
             metrics: Some(training.metrics_json),
+            staged: training.staged,
         })
     }
 }
@@ -624,17 +651,20 @@ struct FineTuneRun {
     loader: TrainingDataLoader,
 }
 
-/// A successful training run's result: the registered output-model id and the
-/// run metrics. The training path has already persisted its artifact and
-/// registered the model-output row (the worker for the fine-tune kinds, the
-/// predictor's own `persist_predictor` for the predictor kind); the worker then
-/// performs the single lease-guarded compare-and-set that records these and
-/// flips the job to `completed`. `metrics` is the run-metrics JSON the CAS
-/// writes (the fine-tune loop's loss/step/timing detail; `None` for a kind that
-/// records none beyond the terminal flip).
+/// A successful training run's result: the registered output-model id, the run
+/// metrics, and the worker-private staged artifact awaiting promotion. The
+/// training path has staged its artifact privately and registered the model-output
+/// row pointing at the (not-yet-written) canonical path (the worker for the
+/// fine-tune kinds, the predictor's own `persist_predictor` for the predictor
+/// kind); the worker then performs the single lease-guarded compare-and-set that
+/// records these and flips the job to `completed`, and only on a CAS win promotes
+/// `staged` into the canonical path (discarding it on a loss). `metrics` is the
+/// run-metrics JSON the CAS writes (the fine-tune loop's loss/step/timing detail;
+/// `None` for a kind that records none beyond the terminal flip).
 struct RunSuccess {
     model_id: String,
     metrics: Option<String>,
+    staged: StagedArtifact,
 }
 
 /// The terminal classification of a worker's run of one job.
@@ -1012,6 +1042,7 @@ struct RunFineTuneParams {
     catalog: Arc<Catalog>,
     artifact_dir: std::path::PathBuf,
     job_id: String,
+    worker_id: String,
     base_model: String,
     task: ModelTask,
     config: FineTuneConfig,
@@ -1039,6 +1070,7 @@ fn run_fine_tune_blocking(
         catalog,
         artifact_dir,
         job_id,
+        worker_id,
         base_model,
         task,
         config,
@@ -1096,6 +1128,7 @@ fn run_fine_tune_blocking(
         crate::fine_tune::trainer::TrainingLoopBuilder::new(target, varmap, config)
             .base_model(base_model_arc)
             .job_id(job_id)
+            .worker_id(worker_id)
             .catalog(Arc::clone(&catalog))
             .artifact_dir(artifact_dir)
             .device(device.clone())

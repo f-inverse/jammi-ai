@@ -28,6 +28,8 @@ pub(crate) mod regression_loss;
 #[cfg(feature = "local")]
 pub mod spec;
 #[cfg(feature = "local")]
+pub mod staging;
+#[cfg(feature = "local")]
 pub mod target;
 #[cfg(feature = "local")]
 pub mod trainer;

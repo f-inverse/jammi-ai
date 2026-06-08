@@ -61,6 +61,7 @@ pub use jammi_encoders::ContextArchitecture;
 
 use crate::fine_tune::regression_loss;
 use crate::fine_tune::spec::TrainingSpec;
+use crate::fine_tune::staging::StagedArtifact;
 use crate::inference::adapter::distribution::{DistributionAdapter, DistributionForm};
 use crate::inference::adapter::{BackendOutput, OutputAdapter};
 use crate::pipeline::context_set::{
@@ -485,8 +486,9 @@ impl InferenceSession {
         catalog: &Arc<jammi_db::catalog::Catalog>,
         source_id: &str,
         spec: &ContextPredictorTrainConfig,
+        worker_id: &str,
         cancel: &std::sync::atomic::AtomicBool,
-    ) -> Result<ModelRecord> {
+    ) -> Result<(ModelRecord, StagedArtifact)> {
         let sampled = self.sample_context_episodes(source_id, spec).await?;
         if sampled.train.is_empty() {
             return Err(JammiError::FineTune(
@@ -527,7 +529,8 @@ impl InferenceSession {
             |preds, batch: &EpisodeBatch| spec.head.score(preds, &batch.target_y),
         )?;
 
-        self.persist_predictor(catalog, spec, &table, &varmap).await
+        self.persist_predictor(catalog, spec, &table, &varmap, worker_id)
+            .await
     }
 
     /// Build one [`EpisodeBatch`] per task — every target row in the task, each
@@ -733,23 +736,31 @@ impl InferenceSession {
     /// land as a safetensors file under `{artifact_dir}/context_predictors/`, and
     /// a `ModelTask::Regression` model row points at the directory.
     ///
+    /// The weights are written to a worker-private staging dir, not the shared
+    /// canonical path, so two workers running the same predictor job never share
+    /// a training-time file. The returned [`StagedArtifact`] is promoted into the
+    /// canonical path by the worker only on a finalize-CAS win, and discarded on
+    /// a loss — the canonical artifact is written by exactly one worker.
+    ///
     /// The model row is registered through `catalog` (the worker's tenant-pinned
-    /// handle) so it lands under the job's tenant; the read-back `get_model` uses
-    /// the same handle so it is visible within that tenant scope.
+    /// handle) so it lands under the job's tenant, pointing at the canonical path;
+    /// the read-back `get_model` uses the same handle so it is visible within that
+    /// tenant scope.
     async fn persist_predictor(
         &self,
         catalog: &Arc<jammi_db::catalog::Catalog>,
         spec: &ContextPredictorTrainConfig,
         table: &ResultTableRecord,
         varmap: &VarMap,
-    ) -> Result<ModelRecord> {
-        let artifact_root = self
+        worker_id: &str,
+    ) -> Result<(ModelRecord, StagedArtifact)> {
+        let canonical_root = self
             .inner_config()
             .artifact_dir
             .join("context_predictors")
             .join(sanitize_id(&spec.model_id));
-        std::fs::create_dir_all(&artifact_root)
-            .map_err(|e| JammiError::FineTune(format!("create predictor artifact dir: {e}")))?;
+        let staged = StagedArtifact::stage(canonical_root, worker_id)?;
+        let artifact_root = staged.staging_dir().to_path_buf();
         let weights_path = artifact_root.join("model.safetensors");
 
         let named: HashMap<String, Tensor> = {
@@ -777,7 +788,7 @@ impl InferenceSession {
         })
         .to_string();
 
-        let artifact_path = artifact_root.to_str().ok_or_else(|| {
+        let artifact_path = staged.canonical_dir().to_str().ok_or_else(|| {
             JammiError::FineTune("predictor artifact path is not valid UTF-8".into())
         })?;
         catalog
@@ -793,12 +804,13 @@ impl InferenceSession {
             })
             .await?;
 
-        catalog.get_model(&spec.model_id).await?.ok_or_else(|| {
+        let record = catalog.get_model(&spec.model_id).await?.ok_or_else(|| {
             JammiError::Catalog(format!(
                 "context predictor '{}' not found after registration",
                 spec.model_id
             ))
-        })
+        })?;
+        Ok((record, staged))
     }
 }
 

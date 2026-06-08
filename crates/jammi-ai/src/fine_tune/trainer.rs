@@ -14,21 +14,30 @@ use jammi_db::error::{JammiError, Result};
 use super::data::{TextChunk, TrainingDataLoader};
 use super::optimizer::clip_and_step;
 use super::regression_loss::{crps_gaussian_loss, gaussian_nll_loss, pinball_loss};
+use super::staging::StagedArtifact;
 use super::target::TrainingTarget;
 use super::{EarlyStoppingMetric, FineTuneConfig, LrSchedule};
 use crate::model::{LoadedModel, ModelTask};
 
 /// Result of a completed training run.
 ///
-/// The loop trains and persists the adapter, but does **not** write the job's
-/// terminal status or register the output model — that is the worker's single
-/// lease-guarded finalization. The run metrics it computed (final loss, step
-/// count, timestamps) are returned here so the worker records them in the same
-/// compare-and-set that flips the job to `completed`.
+/// The loop trains and persists the adapter into a worker-private staging dir,
+/// but does **not** write the job's terminal status, register the output model,
+/// or promote the artifact into its canonical path — those are the worker's
+/// single lease-guarded finalization. The worker promotes [`Self::staged`] into
+/// [`Self::adapter_path`] only if its finalize compare-and-set wins, and
+/// discards it otherwise, so the canonical artifact is written by exactly one
+/// worker. The run metrics it computed (final loss, step count, timestamps) are
+/// returned here so the worker records them in that same compare-and-set.
 #[derive(Debug)]
 pub struct TrainingResult {
-    /// Path where the final adapter weights were saved.
+    /// Canonical path the final adapter is promoted to (the path the catalog
+    /// model row points at). It only holds the trained weights once
+    /// [`Self::staged`] has been promoted.
     pub adapter_path: PathBuf,
+    /// The worker-private staged adapter the worker promotes on a finalize CAS
+    /// win or discards on a loss.
+    pub staged: StagedArtifact,
     /// Best validation loss achieved.
     pub final_loss: f64,
     /// Total optimizer steps taken.
@@ -101,6 +110,10 @@ pub struct TrainingLoop {
     varmap: VarMap,
     config: FineTuneConfig,
     job_id: String,
+    /// Identifies the worker+attempt running this loop. Threaded into the
+    /// staging-path leaf so two workers training the same `job_id` never share a
+    /// training-time artifact path.
+    worker_id: String,
     catalog: Arc<Catalog>,
     artifact_dir: PathBuf,
     divergence_count: usize,
@@ -120,6 +133,7 @@ pub struct TrainingLoopBuilder {
     varmap: VarMap,
     config: FineTuneConfig,
     job_id: Option<String>,
+    worker_id: Option<String>,
     catalog: Option<Arc<Catalog>>,
     artifact_dir: Option<PathBuf>,
     device: Device,
@@ -139,6 +153,7 @@ impl TrainingLoopBuilder {
             varmap,
             config,
             job_id: None,
+            worker_id: None,
             catalog: None,
             artifact_dir: None,
             device: Device::Cpu,
@@ -175,6 +190,15 @@ impl TrainingLoopBuilder {
         self
     }
 
+    /// Set the worker+attempt identifier. Used to derive a worker-private
+    /// artifact-staging path so concurrent workers on the same job never share a
+    /// training-time file path; the staged artifact is promoted into the
+    /// canonical path only on the worker's finalize-CAS win.
+    pub fn worker_id(mut self, id: String) -> Self {
+        self.worker_id = Some(id);
+        self
+    }
+
     /// Set the catalog for status persistence.
     pub fn catalog(mut self, catalog: Arc<Catalog>) -> Self {
         self.catalog = Some(catalog);
@@ -192,6 +216,9 @@ impl TrainingLoopBuilder {
         let job_id = self
             .job_id
             .ok_or_else(|| JammiError::FineTune("TrainingLoopBuilder: job_id required".into()))?;
+        let worker_id = self.worker_id.ok_or_else(|| {
+            JammiError::FineTune("TrainingLoopBuilder: worker_id required".into())
+        })?;
         let catalog = self
             .catalog
             .ok_or_else(|| JammiError::FineTune("TrainingLoopBuilder: catalog required".into()))?;
@@ -204,6 +231,7 @@ impl TrainingLoopBuilder {
             varmap: self.varmap,
             config: self.config,
             job_id,
+            worker_id,
             catalog,
             artifact_dir,
             divergence_count: 0,
@@ -253,8 +281,13 @@ impl TrainingLoop {
         let mut global_step = 0;
         let mut best_val_loss = f64::MAX;
         let mut patience_counter = 0;
-        let checkpoint_dir = self.artifact_dir.join("models").join(&self.job_id);
-        std::fs::create_dir_all(&checkpoint_dir)?;
+        // Train into a worker-private staging dir, never the shared canonical
+        // path: two workers on the same `job_id` must not share a training-time
+        // file. The canonical `models/{job_id}` is written only when the worker's
+        // finalize CAS wins, by promoting this staging dir.
+        let canonical_dir = self.artifact_dir.join("models").join(&self.job_id);
+        let staged = StagedArtifact::stage(canonical_dir, &self.worker_id)?;
+        let checkpoint_dir = staged.staging_dir().to_path_buf();
 
         // Collect trainable vars once; their TensorIds are stable for the run.
         let trainable_vars = self.varmap.all_vars();
@@ -471,12 +504,14 @@ impl TrainingLoop {
         jammi_lora::save_adapter(&checkpoint_dir, &final_weights, &saved)
             .map_err(|e| JammiError::FineTune(format!("Save adapter: {e}")))?;
 
-        // The loop does not write the terminal status or register the output
-        // model. Both are the worker's single lease-guarded finalization: it
-        // registers the model row, then runs the compare-and-set that flips the
-        // job to `completed` only while it still holds the lease. Computing the
-        // run metrics here (and returning them) keeps the rich loss / step /
-        // timing detail the worker records in that same CAS.
+        // The loop does not write the terminal status, register the output
+        // model, or promote the staged artifact into its canonical path. All
+        // three are the worker's single lease-guarded finalization: it registers
+        // the model row (pointing at the canonical path), runs the compare-and-set
+        // that flips the job to `completed` only while it still holds the lease,
+        // and — only on a CAS win — promotes this staging into the canonical path.
+        // Computing the run metrics here (and returning them) keeps the rich loss
+        // / step / timing detail the worker records in that same CAS.
         let completed_at = chrono::Utc::now().to_rfc3339();
         let early_stopping_metric_label = match self.config.early_stopping_metric {
             EarlyStoppingMetric::TrainLoss => "train_loss",
@@ -492,7 +527,8 @@ impl TrainingLoop {
         .to_string();
 
         Ok(TrainingResult {
-            adapter_path: checkpoint_dir,
+            adapter_path: staged.canonical_dir().to_path_buf(),
+            staged,
             final_loss: best_val_loss,
             total_steps: global_step,
             metrics_json,

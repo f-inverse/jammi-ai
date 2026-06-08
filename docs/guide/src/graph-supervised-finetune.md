@@ -138,8 +138,8 @@ job.wait().await?;
 ```
 
 The output is a fine-tuned model; regenerate embeddings with it and they encode
-the graph's structure (`build_neighbor_graph`, search, and propagation all
-benefit).
+the graph's structure ([`build_neighbor_graph`](./build-neighbor-graph.md),
+search, and [propagation](./graph-propagation.md) all benefit).
 
 ## Tuning knobs
 
@@ -154,10 +154,11 @@ benefit).
 
 ## Compose with propagation
 
-Both graph fine-tune and embedding **propagation** encode homophily; stacking
-them naively double-counts the same smoothing. The recommended order is
-**propagate first, then fine-tune the head** (the SGC/APPNP decoupling) — not
-two independent smoothing passes.
+Both graph fine-tune and embedding
+[**propagation**](./graph-propagation.md) encode homophily; stacking them
+naively double-counts the same smoothing. The recommended order is **propagate
+first, then fine-tune the head** (the SGC/APPNP decoupling) — not two independent
+smoothing passes.
 
 ## Did it work? The circularity check
 

@@ -684,6 +684,11 @@ impl InferenceSession {
                 self.context(),
                 source_id,
                 "jammi:context-set",
+                // A pooled context set is keyed by *target* keys and pools each
+                // target's neighbours from the source's raw rows — there is no
+                // single source result table the whole batch derives from, so
+                // there is no FK-lineage anchor to record.
+                None,
                 context.rows,
                 context.dimensions,
             )

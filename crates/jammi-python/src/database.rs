@@ -21,6 +21,9 @@ use jammi_ai::pipeline::context_set::{
     ContextRequest, ContextSource, ContextSourceKind, HybridMerge, SetAggregator,
 };
 use jammi_ai::pipeline::graph_neighbourhood::{EdgeDirection, EdgeGather, EdgeSourceRef};
+use jammi_ai::pipeline::graph_propagation::{
+    PropagateRequest, PropagationOutput, PropagationWeighting,
+};
 use jammi_ai::session::InferenceSession;
 use jammi_db::config::JammiConfig;
 use jammi_db::error::JammiError;
@@ -1419,6 +1422,131 @@ impl PyDatabase {
                 self.session
                     .build_neighbor_graph(source, table.as_deref(), &params),
             )
+            .map_err(to_pyerr)?;
+        Ok(record.table_name)
+    }
+
+    /// Propagate an embedding table's features over a declared graph (the
+    /// decoupled-GNN forward pass) into a new, searchable embedding table.
+    ///
+    /// Each output row is its `hops`-hop neighbourhood aggregate of the input
+    /// embeddings, with self-loops (`Ã = A + I`) and an APPNP `alpha`-teleport
+    /// restart that anchors every node against over-smoothing. The graph is
+    /// either an S9 similarity graph (`edge_graph_table`, a `build_neighbor_graph`
+    /// output) or a registered external edge source (`edge_source` with
+    /// `edge_src_column`/`edge_dst_column`); pass exactly one.
+    ///
+    /// `weighting` selects the neighbour normalisation: `"degree_normalized"`
+    /// (the default, symmetric `Â`, the PageRank-decay form), `"uniform"`
+    /// (random-walk mean), or `"edge_similarity"` (edge-weighted mean, using the
+    /// edge weight as fixed attention). `output` is `"final"` (a `d`-dim table)
+    /// or `"jumping_knowledge"` (the L2-normalised per-hop concat, `(K+1)·d`-dim,
+    /// indexing in its own space). Deterministic: identical inputs yield a
+    /// byte-identical table.
+    ///
+    /// Returns the materialised embedding table's name.
+    #[pyo3(signature = (
+        source,
+        *,
+        embedding_table = None,
+        edge_graph_table = None,
+        edge_source = None,
+        edge_src_column = None,
+        edge_dst_column = None,
+        edge_weight_column = None,
+        direction = None,
+        hops = None,
+        weighting = None,
+        alpha = None,
+        output = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn propagate_embeddings(
+        &self,
+        source: &str,
+        embedding_table: Option<String>,
+        edge_graph_table: Option<String>,
+        edge_source: Option<String>,
+        edge_src_column: Option<String>,
+        edge_dst_column: Option<String>,
+        edge_weight_column: Option<String>,
+        direction: Option<&str>,
+        hops: Option<usize>,
+        weighting: Option<&str>,
+        alpha: Option<f64>,
+        output: Option<&str>,
+    ) -> PyResult<String> {
+        let edge_source_ref = match (edge_graph_table, edge_source) {
+            (Some(table_name), None) => EdgeSourceRef::NeighborGraph { table_name },
+            (None, Some(source_id)) => EdgeSourceRef::Registered {
+                source_id,
+                src_column: edge_src_column.unwrap_or_else(|| "src".into()),
+                dst_column: edge_dst_column.unwrap_or_else(|| "dst".into()),
+                type_column: None,
+                weight_column: edge_weight_column,
+                as_of_column: None,
+            },
+            (Some(_), Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "pass exactly one of edge_graph_table (S9 graph) or edge_source \
+                     (registered edges), not both",
+                ))
+            }
+            (None, None) => {
+                return Err(PyValueError::new_err(
+                    "propagate_embeddings requires a graph: edge_graph_table or edge_source",
+                ))
+            }
+        };
+
+        let direction = match direction {
+            None | Some("out") => EdgeDirection::Out,
+            Some("in") => EdgeDirection::In,
+            Some("undirected") => EdgeDirection::Undirected,
+            Some(o) => {
+                return Err(PyValueError::new_err(format!(
+                    "direction must be 'out', 'in', or 'undirected' (got '{o}')"
+                )))
+            }
+        };
+        let weighting = match weighting {
+            None | Some("degree_normalized") => PropagationWeighting::DegreeNormalized,
+            Some("uniform") => PropagationWeighting::Uniform,
+            Some("edge_similarity") => PropagationWeighting::EdgeSimilarity,
+            Some(o) => {
+                return Err(PyValueError::new_err(format!(
+                    "weighting must be 'degree_normalized', 'uniform', or 'edge_similarity' \
+                     (got '{o}')"
+                )))
+            }
+        };
+        let output = match output {
+            None | Some("final") => PropagationOutput::Final,
+            Some("jumping_knowledge") => PropagationOutput::JumpingKnowledge,
+            Some(o) => {
+                return Err(PyValueError::new_err(format!(
+                    "output must be 'final' or 'jumping_knowledge' (got '{o}')"
+                )))
+            }
+        };
+
+        let mut request = PropagateRequest::new(source, edge_source_ref)
+            .with_direction(direction)
+            .with_weighting(weighting)
+            .with_output(output);
+        if let Some(t) = embedding_table {
+            request = request.with_embedding_table(t);
+        }
+        if let Some(h) = hops {
+            request = request.with_hops(h);
+        }
+        if let Some(a) = alpha {
+            request = request.with_alpha(a);
+        }
+
+        let record = self
+            .runtime
+            .block_on(self.session.propagate_embeddings(&request))
             .map_err(to_pyerr)?;
         Ok(record.table_name)
     }

@@ -6,6 +6,29 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.25.0 — 2026-06-08
+
+Graph feature propagation (S12) — the **propagate** half of a decoupled GNN.
+
+### Added
+- **Graph feature propagation (S12).** `propagate_embeddings` runs the SGC/APPNP
+  forward pass `ÂᵏX` over a declared graph as a deterministic data-plane
+  operation (no autograd, no architecture), emitting a normal `kind=Model`
+  embedding table. Self-loops (`Ã = A + I`) so an isolated node propagates to its
+  own `X⁽⁰⁾`; the over-smoothing-safe default is degree-normalised `Â` with an
+  `α`-teleport restart (PageRank-decay), 2 hops capped at 3. A
+  `PropagationWeighting` enum (`Uniform` / `DegreeNormalized` / `EdgeSimilarity`,
+  the last clamping negative edge weights and folding `Σ(w·x)/Σw`), a typed
+  `PropagationOutput` (`Final` / `JumpingKnowledge` — the per-hop L2-normalised
+  `(K+1)·d` concat), a `PropagateRequest` builder, the tenant-scoped edge scan
+  (a cross-tenant endpoint is never aggregated), an `f64` deterministic fold
+  (byte-identical across thread counts), and a row-count ceiling. Python binding
+  + the `graph-propagation` cookbook page.
+
+### Changed
+- `ResultStore::materialize_embedding_table` now takes `derived_from` so a
+  propagated table records the FK lineage to its source embedding table.
+
 ## v0.23.0 — 2026-06-07
 
 The amortized in-context predictor (S19) and its training substrate (P5): a
@@ -32,9 +55,10 @@ updates at inference.
 
 ## v0.22.0 — 2026-06-06
 
-The graph-ML and neural-process substrate: construct, propagate, learn, and
-retrieve over similarity graphs, and condition calibrated predictions on a
-retrieved context set. All data-plane primitives + offline eval — no governance.
+The graph-ML and neural-process substrate: construct, learn over, and retrieve
+over similarity graphs, and condition calibrated predictions on a retrieved
+context set. All data-plane primitives + offline eval — no governance.
+(Feature **propagation** over the graph lands in v0.25.0.)
 
 ### Added
 - **Shared prep primitives.** Paired distribution-free significance (bootstrap

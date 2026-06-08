@@ -467,14 +467,22 @@ impl ResultStore {
     /// [`crate::store::ResultStore::create_table`] produces for an embedding
     /// task: an embedding [`ModelTask`], a dimensioned `vector` column, and a
     /// sidecar index built from those vectors. Callers that pool a retrieval into
-    /// a per-target context vector (S16) land it here so the result is
-    /// searchable and joinable like any other embedding table. `model_id` is the
-    /// pooling provenance (e.g. the context-set encoder), not a foundation model.
+    /// a per-target context vector (S16), or aggregate features over a graph
+    /// (S12), land it here so the result is searchable and joinable like any
+    /// other embedding table. `model_id` is the derivation provenance (e.g. the
+    /// context-set encoder, or the propagation kernel), not a foundation model.
+    ///
+    /// `derived_from` names the source embedding result table this output was
+    /// computed from — the FK-lineage anchor. A graph propagation passes its
+    /// input embedding table here so the catalog records the derivation; a caller
+    /// pooling from a source's *raw* rows (no single source result table) passes
+    /// `None`.
     pub async fn materialize_embedding_table(
         &self,
         ctx: &SessionContext,
         source_id: &str,
         model_id: &str,
+        derived_from: Option<&str>,
         rows: &[(String, Vec<f32>)],
         dimensions: usize,
     ) -> Result<ResultTableRecord> {
@@ -485,7 +493,7 @@ impl ResultStore {
                 source_id,
                 ModelTask::TextEmbedding,
                 ResultTableKind::Model,
-                None,
+                derived_from,
                 model_id,
                 Some(dimensions as i32),
                 Some("_row_id"),

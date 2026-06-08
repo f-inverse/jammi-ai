@@ -16,12 +16,13 @@ binds the same way regardless of which client speaks.
 from __future__ import annotations
 
 import uuid
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import grpc
 import pyarrow as pa
 import pyarrow.flight  # noqa: F401  (registers the `pa.flight` submodule)
 
+from . import _conformal
 from ._credentials import AnonymousCredentials, ChannelCredentials
 from ._generated.jammi.v1 import embedding_pb2, embedding_pb2_grpc
 from ._generated.jammi.v1 import session_pb2, session_pb2_grpc
@@ -356,6 +357,108 @@ class RemoteDatabase:
             request.filter = filter
         resp = self._embedding.Search(request, metadata=self._metadata)
         return _hits_to_table(list(resp.hits))
+
+    # --- Stateless conformal / RRF numerics (computed client-side) ---------------
+    #
+    # These four verbs are pure functions of caller-supplied arrays — the server
+    # holds none of their inputs, so they make NO gRPC hop. They run locally,
+    # delegating to `_conformal`, which reproduces the embedded engine's
+    # algorithm exactly so the verb surface agrees on both transports. Their
+    # signatures match the embedded `Database`'s verbs of the same names.
+
+    def conformalize(
+        self,
+        calibration: Sequence[Sequence[float]],
+        true_labels: Sequence[int],
+        test: Sequence[Sequence[float]],
+        *,
+        alpha: float,
+        score: Optional[str] = None,
+        raps_params: Optional[Tuple[float, int]] = None,
+    ) -> List[List[int]]:
+        """Conformalize a classification predictor into prediction sets.
+
+        Computed **client-side**: the calibration probabilities, ``true_labels``,
+        and ``test`` rows are caller-supplied arrays the engine never holds, so a
+        wire hop would only ship data the caller already has. The
+        finite-sample ``⌈(n+1)(1-alpha)⌉`` quantile over the calibration scores
+        is applied to every ``test`` row to emit a prediction set with marginal
+        coverage ``>= 1 - alpha``.
+
+        ``score`` selects the nonconformity family — ``"lac"``, ``"aps"``
+        (default), or ``"raps"``; for ``"raps"``, ``raps_params`` is the
+        ``(lambda, k_reg)`` pair (default ``(0.0, 1)``). Same algorithm and
+        output as the embedded engine's ``conformalize``.
+        """
+        return _conformal.conformalize(
+            calibration,
+            true_labels,
+            test,
+            alpha=alpha,
+            score=score,
+            raps_params=raps_params,
+        )
+
+    def conformalize_interval(
+        self,
+        predictions: Sequence[float],
+        observed: Sequence[float],
+        test_predictions: Sequence[float],
+        *,
+        alpha: float,
+    ) -> List[Tuple[float, float]]:
+        """Conformalize an absolute-residual regression predictor into intervals.
+
+        Computed **client-side**: ``predictions``, ``observed``, and
+        ``test_predictions`` are caller-supplied arrays not held by the engine,
+        so no gRPC hop is made. The calibration nonconformity ``|y - ŷ|`` yields
+        the finite-sample quantile ``q̂``, giving ``[ŷ - q̂, ŷ + q̂]`` per test
+        point. Same algorithm and output as the embedded engine's
+        ``conformalize_interval``.
+        """
+        return _conformal.conformalize_interval(
+            predictions, observed, test_predictions, alpha=alpha
+        )
+
+    def conformalize_cqr(
+        self,
+        lower: Sequence[float],
+        upper: Sequence[float],
+        observed: Sequence[float],
+        test_lower: Sequence[float],
+        test_upper: Sequence[float],
+        *,
+        alpha: float,
+    ) -> List[Tuple[float, float]]:
+        """Conformalize a Conformalized Quantile Regression predictor into intervals.
+
+        Computed **client-side**: the lower/upper quantile bands, ``observed``
+        targets, and test bands are caller-supplied arrays the engine never
+        holds, so no wire hop is made. The calibration nonconformity
+        ``max(q_lo - y, y - q_hi)`` yields the finite-sample quantile ``q̂``,
+        giving the adaptive-width ``[q_lo - q̂, q_hi + q̂]`` per test row. Same
+        algorithm and output as the embedded engine's ``conformalize_cqr``.
+        """
+        return _conformal.conformalize_cqr(
+            lower, upper, observed, test_lower, test_upper, alpha=alpha
+        )
+
+    def rrf_fuse(
+        self,
+        ranked_lists: Sequence[Sequence[str]],
+        *,
+        k_rrf: Optional[int] = None,
+    ) -> List[Tuple[str, float]]:
+        """Fuse several ranked retrieval lists by reciprocal-rank fusion.
+
+        Computed **client-side**: ``ranked_lists`` is caller-supplied — the
+        already-ranked id lists are in hand, so fusing them needs no engine
+        state and makes no gRPC hop. A row's fused score is
+        ``Σ 1 / (k_rrf + rank + 1)``; the result is sorted by score descending,
+        ties ascending by ``row_id``. ``k_rrf`` defaults to 60. Same algorithm
+        and output as the embedded engine's ``rrf_fuse``.
+        """
+        return _conformal.rrf_fuse(ranked_lists, k_rrf=k_rrf)
 
     # --- Compound query (Flight SQL) --------------------------------------------
 

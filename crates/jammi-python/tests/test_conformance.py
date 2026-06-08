@@ -71,11 +71,122 @@ _REMOTE_VERBS = {
 }
 
 
+# The stateless conformal / RRF numerics. These are NOT on the gRPC wire: their
+# inputs are caller-supplied arrays the engine never holds, so a wire hop would
+# only ship data the caller already has. The embedded `Database` computes them
+# in the compiled engine; the client's `RemoteDatabase` computes them locally in
+# pure Python from the SAME algorithm — so the verb surface agrees on both
+# transports without a server round-trip. Pinned here so the two stay in lockstep.
+_NUMERIC_VERBS = {
+    "conformalize",
+    "conformalize_interval",
+    "conformalize_cqr",
+    "rrf_fuse",
+}
+
+
 def test_remote_surface_has_every_verb():
     """The client's `RemoteDatabase` exposes the full transport-agnostic verb
     set — the same vocabulary the embedded `Database` carries."""
-    for verb in _REMOTE_VERBS:
+    for verb in _REMOTE_VERBS | _NUMERIC_VERBS:
         assert callable(getattr(jammi_client.RemoteDatabase, verb)), verb
+
+
+def _call_surface(fn) -> list:
+    """The (name, kind, default) of each parameter — the call surface, ignoring
+    type annotations (a native PyO3 method and a typed Python method differ
+    there by construction, but must agree on what a caller passes and how). A
+    leading `self` is dropped so an unbound pure-Python method (which lists it)
+    compares against the native method descriptor (which may not)."""
+    params = [
+        (p.name, p.kind, p.default)
+        for p in inspect.signature(fn).parameters.values()
+    ]
+    if params and params[0][0] == "self":
+        params = params[1:]
+    return params
+
+
+def test_numeric_verbs_have_identical_signatures_across_wheels():
+    """The conformal / RRF numerics carry the SAME call surface on the client's
+    `RemoteDatabase` as on the embedded engine's `jammi_ai.Database`. They are
+    computed locally on both wheels (no wire hop), so the verb surface must agree
+    name-for-name, kind-for-kind, and default-for-default — pinned here so a
+    divergence in either implementation is caught."""
+    for verb in _NUMERIC_VERBS:
+        client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
+        embed = _call_surface(getattr(jammi_ai.Database, verb))
+        assert client == embed, f"{verb}: {embed} != {client}"
+
+
+def test_numeric_verbs_compute_identically_across_wheels(tmp_path):
+    """The client's pure-Python conformal / RRF numerics produce output EQUAL to
+    the embedded engine's on shared fixtures. Both are computed locally (no
+    server), so this asserts the two implementations reproduce the same
+    finite-sample quantile, score families, interval construction, and fusion
+    order — the byte-identical agreement the compute-to-data split requires.
+
+    Hermetic: the embedded side opens a local engine (`file://`); the client side
+    runs entirely in process. No server is contacted by either."""
+    local = jammi_ai.connect(f"file://{tmp_path}")
+    remote = jammi_ai.connect("grpc://127.0.0.1:8081")
+    try:
+        assert type(remote) is jammi_client.RemoteDatabase
+
+        # Classification: one row per family, shared calibration / test fixtures.
+        calibration = [
+            [0.6, 0.3, 0.1],
+            [0.2, 0.7, 0.1],
+            [0.1, 0.2, 0.7],
+            [0.5, 0.3, 0.2],
+            [0.3, 0.4, 0.3],
+        ]
+        true_labels = [0, 1, 2, 0, 1]
+        test = [[0.5, 0.3, 0.2], [0.2, 0.3, 0.5], [0.34, 0.33, 0.33]]
+        for score, raps_params in (
+            ("lac", None),
+            ("aps", None),
+            ("raps", (0.5, 1)),
+        ):
+            assert local.conformalize(
+                calibration, true_labels, test,
+                alpha=0.2, score=score, raps_params=raps_params,
+            ) == remote.conformalize(
+                calibration, true_labels, test,
+                alpha=0.2, score=score, raps_params=raps_params,
+            ), score
+
+        # Absolute-residual regression interval.
+        predictions = [1.0, 2.0, 3.0, 4.0, 5.0]
+        observed = [1.2, 1.7, 3.4, 3.6, 5.5]
+        test_predictions = [2.5, 6.0]
+        assert local.conformalize_interval(
+            predictions, observed, test_predictions, alpha=0.25
+        ) == remote.conformalize_interval(
+            predictions, observed, test_predictions, alpha=0.25
+        )
+
+        # CQR regression interval.
+        lower = [-1.0, -2.0, -1.5, -1.0, -0.5]
+        upper = [1.0, 2.0, 1.5, 1.0, 0.5]
+        cqr_observed = [0.5, -2.5, 1.0, -1.5, 0.0]
+        test_lower = [-1.0, -3.0]
+        test_upper = [1.0, 3.0]
+        assert local.conformalize_cqr(
+            lower, upper, cqr_observed, test_lower, test_upper, alpha=0.25
+        ) == remote.conformalize_cqr(
+            lower, upper, cqr_observed, test_lower, test_upper, alpha=0.25
+        )
+
+        # Reciprocal-rank fusion, default and explicit k_rrf.
+        ranked_lists = [["a", "b", "c"], ["c", "a", "d"], ["b", "d", "a"]]
+        assert local.rrf_fuse(ranked_lists) == remote.rrf_fuse(ranked_lists)
+        assert local.rrf_fuse(ranked_lists, k_rrf=40) == remote.rrf_fuse(
+            ranked_lists, k_rrf=40
+        )
+    finally:
+        local.close()
+        remote.close()
 
 
 def test_embed_remote_and_client_share_identical_signatures():

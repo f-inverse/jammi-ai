@@ -12,17 +12,30 @@
 //! ```
 //!
 //! The argument is a `FixedSizeList<Float32>` column; the result is a
-//! `FixedSizeList<Float32>` of the same width. The reduction is
-//! permutation-invariant by construction — the accumulator folds each lane
-//! with a commutative, associative operator (`+` for sum/mean, `max` for max),
-//! so the output does not depend on the order rows arrive in, nor on how a
-//! parallel plan partitions the group across accumulators. Folding happens in
-//! `f64` so the partial state is exact across the value range these reductions
-//! are used on, which keeps the output byte-identical under any shuffle.
+//! `FixedSizeList<Float32>` of the same width. Each reduction folds every lane
+//! with a mathematically commutative operator (`+` for sum/mean, `max` for max)
+//! in `f64`, so the **value** is permutation-invariant: it does not depend on
+//! the order rows arrive in.
+//!
+//! It is **not** byte-identical across arbitrary parallel partitionings. `f64`
+//! addition is *not* associative — `(a + b) + c` can differ in the last bit from
+//! `a + (b + c)` — and a parallel plan is free to split a group across
+//! accumulators and merge their partial sums in an order the plan, not the
+//! caller, decides. So `vector_sum`/`vector_mean` over the same multiset can
+//! land on bit-for-bit different results under different `target_partitions`.
+//! (`vector_max` *is* exact and so byte-stable, but the additive arms are the
+//! ones callers reach for.) A caller that needs a reproducible, byte-identical
+//! reduction must fold over a *fixed* order it imposes itself — which the
+//! streaming SQL aggregate cannot guarantee. `fold_vectors_in_order` is that
+//! fixed-order reduction, exposed (crate-internal) for exactly such callers; the
+//! streaming accumulator below applies the identical per-lane operator without
+//! the order guarantee.
 //!
 //! One reduction operator, three SQL names: the three functions share a single
-//! `VectorAggAccumulator` parameterised by [`VectorReduce`]. Adding a fourth
-//! reduction is a new enum arm and a new registration, not a new accumulator.
+//! `VectorAggAccumulator` parameterised by [`VectorReduce`], and that
+//! accumulator folds through the same `fold_vectors_in_order` primitive a
+//! fixed-order caller uses. Adding a fourth reduction is a new enum arm and a
+//! new registration, not a new accumulator.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -68,13 +81,24 @@ impl VectorReduce {
         }
     }
 
-    /// Fold one lane value into the running per-lane accumulator. Commutative
-    /// and associative in every arm, which is what makes the aggregate
-    /// permutation-invariant.
+    /// Fold one lane value into the running per-lane accumulator. Mathematically
+    /// commutative in every arm, which makes the aggregate's *value*
+    /// permutation-invariant (the additive arms are not bit-associative, so the
+    /// result is byte-stable only over a fixed fold order — see the module doc).
     fn fold(self, acc: f64, value: f64) -> f64 {
         match self {
             VectorReduce::Mean | VectorReduce::Sum => acc + value,
             VectorReduce::Max => acc.max(value),
+        }
+    }
+
+    /// Fold one `width`-wide vector, read lane-by-lane from `value`, into the
+    /// running `lanes`. The single element-wise reduction loop both
+    /// [`fold_vectors_in_order`] and the streaming accumulator descend through,
+    /// so there is one lane operator across the fixed-order and streaming paths.
+    fn fold_lanes(self, lanes: &mut [f64], value: impl Fn(usize) -> f64) {
+        for (offset, acc) in lanes.iter_mut().enumerate() {
+            *acc = self.fold(*acc, value(offset));
         }
     }
 
@@ -86,6 +110,50 @@ impl VectorReduce {
             VectorReduce::Sum | VectorReduce::Max => acc,
         }
     }
+}
+
+/// Fold an **ordered** sequence of equal-width vectors into one `dimensions`-wide
+/// `f64` result under `reduce`, folding in iteration order. Lanes fold in `f64`
+/// regardless of the input lane type (`f32` for the SQL vector columns, `f64` for
+/// a caller that already works in `f64`), so an `f64`-precision caller stays
+/// lossless.
+///
+/// This is the single element-wise reduction in the engine: the streaming
+/// [`VectorAggAccumulator`] folds through the same lane operator (so the SQL UDAF
+/// and a direct caller apply the identical per-lane reduction), and a caller that
+/// needs a byte-identical reduction the streaming aggregate cannot guarantee
+/// (because a parallel plan fixes neither the fold nor the merge order, and `f64`
+/// `+` is non-associative) calls this directly over a canonical order it imposes
+/// itself.
+///
+/// `Mean` divides each lane by the number of vectors folded; an empty sequence
+/// yields the reduction's identity in every lane (and `Mean` of nothing is left
+/// at identity rather than dividing by zero). Every input vector must be exactly
+/// `dimensions` wide — equal width is the contract, the same one the SQL UDAF
+/// enforces at plan time.
+pub(crate) fn fold_vectors_in_order<V, T>(
+    vectors: impl IntoIterator<Item = V>,
+    reduce: VectorReduce,
+    dimensions: usize,
+) -> Vec<f64>
+where
+    V: AsRef<[T]>,
+    T: Copy + Into<f64>,
+{
+    let mut lanes = vec![reduce.identity(); dimensions];
+    let mut count: u64 = 0;
+    for vector in vectors {
+        let vector = vector.as_ref();
+        reduce.fold_lanes(&mut lanes, |offset| vector[offset].into());
+        count += 1;
+    }
+    if count == 0 {
+        return lanes;
+    }
+    lanes
+        .iter()
+        .map(|&acc| reduce.finalize(acc, count))
+        .collect()
 }
 
 /// Build the three vector-aggregation [`AggregateUDF`]s and register them on
@@ -260,9 +328,8 @@ impl VectorAggAccumulator {
                 continue;
             }
             let base = row * width;
-            for (offset, acc) in self.lanes.iter_mut().enumerate() {
-                *acc = self.reduce.fold(*acc, lane(values, base + offset));
-            }
+            self.reduce
+                .fold_lanes(&mut self.lanes, |offset| lane(values, base + offset));
             self.count += row_count(row);
         }
         Ok(())
@@ -437,8 +504,15 @@ mod tests {
         }
     }
 
+    /// A single sequential accumulator folds rows in arrival order. Shuffling the
+    /// rows of one batch under the *same* (single-partition) plan reorders that
+    /// one fold, and the result is byte-identical — `f64` `+` over a fixed fold
+    /// order is reproducible. This is the guarantee that actually holds; it does
+    /// NOT extend to splitting the group across partitions, where the plan
+    /// chooses the merge order and `f64` non-associativity can flip the last bit
+    /// (see `multi_partition_merge_is_approximately_equal`).
     #[tokio::test]
-    async fn permutation_invariant_byte_identical() {
+    async fn single_partition_row_shuffle_is_byte_identical() {
         let rows = sample_rows();
         let mut shuffled = rows.clone();
         shuffled.reverse();
@@ -451,7 +525,123 @@ mod tests {
             assert_eq!(
                 a.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
                 b.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
-                "{name} is not byte-identical under row shuffle"
+                "{name} is not byte-identical under a single-partition row shuffle"
+            );
+        }
+    }
+
+    /// Split a group across two accumulators and merge them in both orders. This
+    /// is what a parallel plan does, and it is the case the streaming aggregate
+    /// does NOT make byte-identical: `f64` `+` is non-associative, so the two
+    /// merge orders can disagree in the last bit. The guarantee is *value*
+    /// equality up to `f64` rounding (a tiny tolerance), not byte-identity — the
+    /// honest semantics the module doc states, and the reason a caller needing
+    /// reproducibility folds over a fixed order via [`fold_vectors_in_order`].
+    #[test]
+    fn multi_partition_merge_is_approximately_equal() {
+        // Magnitudes spread wide enough that summation order is observable in
+        // f64's last bits.
+        let left = vec![1e8_f32, -3.0, 2.5, 7.0];
+        let mid = vec![1.0_f32, 1e-3, -1e8, 0.25];
+        let right = vec![-7.5_f32, 5.0, 1e8, -2.0];
+
+        for reduce in [VectorReduce::Sum, VectorReduce::Mean] {
+            // One accumulator over all three (a fixed reference order).
+            let mut whole = VectorAggAccumulator::new(reduce, 4);
+            for v in [&left, &mid, &right] {
+                fold_one(&mut whole, v);
+            }
+            let reference = finalize(&mut whole);
+
+            // Two partitions merged in each order, simulating a parallel plan.
+            let forward = merge_partitions(reduce, &[&left], &[&mid, &right]);
+            let reverse = merge_partitions(reduce, &[&mid, &right], &[&left]);
+
+            for (label, got) in [("forward", &forward), ("reverse", &reverse)] {
+                for (r, g) in reference.iter().zip(got) {
+                    assert!(
+                        (r - g).abs() <= 1e-3 * r.abs().max(1.0),
+                        "{reduce:?} {label} merge drifted past tolerance: {r} vs {g}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Fold one f32 vector into `acc` as a one-row input batch.
+    fn fold_one(acc: &mut VectorAggAccumulator, vector: &[f32]) {
+        let list = vector_column(&[vector.to_vec()], vector.len() as i32);
+        acc.update_batch(&[list]).unwrap();
+    }
+
+    /// Finalise an accumulator to its `f32` output lanes.
+    fn finalize(acc: &mut VectorAggAccumulator) -> Vec<f32> {
+        match acc.evaluate().unwrap() {
+            ScalarValue::FixedSizeList(list) => list
+                .value(0)
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .values()
+                .to_vec(),
+            other => panic!("expected FixedSizeList output, got {other:?}"),
+        }
+    }
+
+    /// Fold each side into its own accumulator, then merge the second into the
+    /// first through the partial-state `merge_batch` path — the parallel plan's
+    /// two-partition reduction.
+    fn merge_partitions(reduce: VectorReduce, a: &[&Vec<f32>], b: &[&Vec<f32>]) -> Vec<f32> {
+        let width = a.first().or_else(|| b.first()).map_or(0, |v| v.len());
+        let mut left = VectorAggAccumulator::new(reduce, width);
+        for v in a {
+            fold_one(&mut left, v);
+        }
+        let mut right = VectorAggAccumulator::new(reduce, width);
+        for v in b {
+            fold_one(&mut right, v);
+        }
+        let state = right.state().unwrap();
+        let acc_state = state[0].to_array().unwrap();
+        let count_state = state[1].to_array().unwrap();
+        left.merge_batch(&[acc_state, count_state]).unwrap();
+        finalize(&mut left)
+    }
+
+    /// The exposed fixed-order primitive folds an ordered sequence to the same
+    /// value the streaming SQL aggregate produces over the same rows (they share
+    /// one lane operator) — and folding the SAME order twice is byte-identical,
+    /// which is the reproducibility a fixed-order caller relies on.
+    #[tokio::test]
+    async fn fold_vectors_in_order_matches_udaf_and_is_fixed_order_stable() {
+        let rows = sample_rows();
+        for (name, reduce) in [
+            ("vector_sum", VectorReduce::Sum),
+            ("vector_mean", VectorReduce::Mean),
+            ("vector_max", VectorReduce::Max),
+        ] {
+            let via_udaf = run_reduce(name, &rows, 4).await;
+            let via_primitive: Vec<f32> =
+                fold_vectors_in_order(rows.iter().map(Vec::as_slice), reduce, 4)
+                    .iter()
+                    .map(|&x| x as f32)
+                    .collect();
+            assert_eq!(
+                via_udaf, via_primitive,
+                "{name}: the shared primitive disagrees with the SQL aggregate"
+            );
+            // Folding the identical order again is bit-for-bit reproducible.
+            let again: Vec<f32> = fold_vectors_in_order(rows.iter().map(Vec::as_slice), reduce, 4)
+                .iter()
+                .map(|&x| x as f32)
+                .collect();
+            assert_eq!(
+                via_primitive
+                    .iter()
+                    .map(|f| f.to_bits())
+                    .collect::<Vec<_>>(),
+                again.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                "{name}: fixed-order fold is not byte-identical"
             );
         }
     }

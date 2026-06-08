@@ -465,6 +465,58 @@ fn jacobi_eigenvalues(mut a: Vec<Vec<f64>>) -> Vec<f64> {
 }
 
 #[tokio::test]
+async fn declared_self_edge_does_not_inflate_augmented_degree() {
+    // `Ã = A + I` injects exactly one canonical self-loop per node, giving the
+    // augmented degree d̃ = deg + 1. A user who also declares an explicit `(a, a)`
+    // edge must NOT push a's degree to deg + 2 (or deg + 3, doubled under
+    // `Undirected`) — the declared self-edge is deduped against the injected one.
+    //
+    // Proof by equivalence: propagating `a—b` is byte-identical to propagating
+    // `a—b` plus a declared `(a, a)`. If the declared self-edge were double-
+    // counted, a's degree fold and self-contribution would change and the two
+    // outputs would diverge.
+    let nodes = vec![
+        Node {
+            id: "a".into(),
+            class: 0,
+        },
+        Node {
+            id: "b".into(),
+            class: 1,
+        },
+    ];
+
+    let (plain_session, _d1) = graph_session(&nodes, &[Edge::plain("a", "b")], None).await;
+    let plain_table = plain_session
+        .propagate_embeddings(&registered_request(&plain_session).await)
+        .await
+        .unwrap();
+    let plain_out = read_table_vectors(&plain_session, &plain_table).await;
+
+    let (self_session, _d2) = graph_session(
+        &nodes,
+        // Same graph plus a redundant explicit self-edge on `a`.
+        &[Edge::plain("a", "b"), Edge::plain("a", "a")],
+        None,
+    )
+    .await;
+    let self_table = self_session
+        .propagate_embeddings(&registered_request(&self_session).await)
+        .await
+        .unwrap();
+    let self_out = read_table_vectors(&self_session, &self_table).await;
+
+    let plain_a = &plain_out["a"];
+    let self_a = &self_out["a"];
+    assert_eq!(
+        plain_a.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+        self_a.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+        "a declared self-edge must dedupe against the injected I self-loop \
+         (d̃ stays deg+1): {plain_a:?} vs {self_a:?}"
+    );
+}
+
+#[tokio::test]
 async fn isolated_node_propagates_to_its_own_x0() {
     // a—b connected; `lonely` has no edge. With the self-loop Ã = A + I, the
     // isolated node's only neighbour is itself, so it must propagate to exactly

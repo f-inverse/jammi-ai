@@ -386,10 +386,14 @@ impl InferenceSession {
     /// Parquet into one fixed-width vector via the vector-aggregation UDAF.
     ///
     /// Filters the registered embedding table to the context keys and runs
-    /// `vector_<agg>(vector)` over them — the aggregate is permutation-invariant
-    /// by construction, so the pooled vector is byte-identical regardless of the
-    /// order the keys arrive in. An empty key set yields `None` rather than a
-    /// pool over nothing.
+    /// `vector_<agg>(vector)` over them — the aggregate's *value* is
+    /// permutation-invariant by construction, so it does not depend on the order
+    /// the keys arrive in. Under a fixed execution plan the pooled vector is also
+    /// stable run-to-run; it is not byte-identical across arbitrary partitionings
+    /// (`f64` `+` is non-associative — see the vector-aggregation UDAF), which the
+    /// downstream conformal calibration tolerates (sub-rounding differences are
+    /// immaterial). An empty key set yields `None` rather than a pool over
+    /// nothing.
     async fn pool_context_vectors(
         &self,
         table: &ResultTableRecord,

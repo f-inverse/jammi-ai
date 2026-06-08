@@ -38,14 +38,18 @@
 //! into the per-node vectors as `O(nodes)` `f64` scaling, so the neighbour
 //! aggregation over the self-loop-augmented adjacency is a plain element-wise
 //! sum (symmetric) or mean ([`PropagationWeighting::Uniform`], the random-walk
-//! `D̃^{-1}Ã`) — the same element-wise reduction the P3 vector-aggregation UDAF
-//! computes, with no second normalisation pathway and no per-element
-//! `vector_scale` function. The aggregation runs in `f64` over the **bounded**
-//! collected adjacency in a fixed neighbour order (the determinism contract
-//! below requires a fixed fold order that the parallel UDAF cannot guarantee for
-//! arbitrary-magnitude `f64` sums); the edge set is bounded by
-//! [`PropagateRequest::max_rows`]. The `α`-teleport mix is then applied per node
-//! in Rust (`f64`). The only weighting that needs per-edge weights —
+//! `D̃^{-1}Ã`). That element-wise reduction is the P3 vector-aggregation
+//! *operator* — propagation reuses `fold_vectors_in_order`, the shared
+//! fixed-order reduction the UDAF accumulator also folds through, so
+//! there is one reduction implementation — with no second normalisation pathway
+//! and no per-element `vector_scale` function. It does **not** route the per-hop
+//! aggregation through the SQL UDAF: the streaming aggregate cannot guarantee a
+//! byte-identical result across partitionings (`f64` `+` is non-associative and a
+//! parallel plan fixes neither the fold nor the merge order), so propagation
+//! imposes its own fixed `(group, neighbour)` fold order over the **bounded**
+//! collected adjacency in `f64` (the determinism contract below); the edge set is
+//! bounded by [`PropagateRequest::max_rows`]. The `α`-teleport mix is then applied
+//! per node in Rust (`f64`). The only weighting that needs per-edge weights —
 //! [`PropagationWeighting::EdgeSimilarity`] — computes `Σ(w·x)/Σw` over the same
 //! bounded rows, clamping the S9 cosine similarity (which lives in `[−1, 1]`) to
 //! `max(sim, 0)`; a node whose neighbour weights sum to zero falls back to its
@@ -54,10 +58,12 @@
 //! # Determinism
 //!
 //! Every fold, teleport, and weighted sum runs in `f64` with a single final
-//! `f32` cast, over a total `(group, neighbour)` order. The output is therefore
-//! byte-identical regardless of how many execution threads the engine runs —
-//! the reproducible point on the propagate/learn spectrum (contrast S13's
-//! learned aggregation).
+//! `f32` cast, over a total `(group, neighbour)` order. Because that order is
+//! fixed and the whole pass runs in one Rust reduction (not the partition-split
+//! SQL aggregate), the output is byte-identical regardless of how many execution
+//! threads the engine runs — the reproducible point on the propagate/learn
+//! spectrum (contrast S13's learned aggregation, and the streaming UDAF, whose
+//! additive arms are only value-stable up to `f64` rounding across partitions).
 //!
 //! # Homophily
 //!
@@ -88,6 +94,7 @@ use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 
 use crate::pipeline::graph_neighbourhood::{EdgeDirection, EdgeSourceRef, DEFAULT_HOP_CAP};
+use crate::query::vector_agg_udaf::{fold_vectors_in_order, VectorReduce};
 use crate::session::InferenceSession;
 
 /// Default number of propagation hops. Two hops is the homophily sweet spot;
@@ -271,8 +278,11 @@ impl InferenceSession {
     /// Loads `X⁽⁰⁾` from the source's embedding table and the tenant-scoped edge
     /// relation, then iterates [`PropagateRequest::effective_hops`] hops of the
     /// configured weighting with the `α`-teleport restart. The grouped neighbour
-    /// aggregation reuses the engine's vector-aggregation UDAF (the degree
-    /// factors folded into the vectors in Rust); the teleport mix and any
+    /// aggregation reuses the engine's vector-aggregation *reduction operator*
+    /// over a fixed `(group, neighbour)` fold order (the degree factors folded
+    /// into the vectors in Rust) — it deliberately does not route the per-hop
+    /// aggregation through the streaming SQL UDAF, which cannot promise a
+    /// byte-identical result across partitionings; the teleport mix and any
     /// edge-weighting run per node in `f64`. The output is a normal `kind=Model`
     /// embedding table with a sidecar index, `derived_from` the source table.
     ///
@@ -521,9 +531,16 @@ impl InferenceSession {
         let edges = self.load_propagation_edges(request).await?;
         let mut pairs: Vec<AdjacencyPair> = Vec::with_capacity(edges.len() * 2 + initial.len());
         for (src, dst, _w) in &edges {
+            // A declared `(v, v)` edge is dropped here: the `Ã = A + I` self-loop
+            // injected below is the canonical one, so a declared self-edge must
+            // not add a second `(v, v)` pair (which would inflate v's augmented
+            // degree to deg+2, or deg+3 doubled under `Undirected`, skewing `Â`).
+            if src == dst {
+                continue;
+            }
             push_oriented_pairs(&mut pairs, src, dst, request.direction);
         }
-        // Ã = A + I: every node aggregates over itself.
+        // Ã = A + I: every node aggregates over itself, exactly once.
         for node in initial {
             pairs.push(AdjacencyPair {
                 group: node.row_id.clone(),
@@ -551,6 +568,12 @@ impl InferenceSession {
         let mut weighted: Vec<WeightedNeighbour> =
             Vec::with_capacity(edges.len() * 2 + initial.len());
         for (src, dst, w) in &edges {
+            // A declared `(v, v)` edge is dropped: the canonical weight-1 self-loop
+            // injected below is the only self-contribution, so a declared self-edge
+            // must not add a second (weighted) one that would double-count v.
+            if src == dst {
+                continue;
+            }
             // S9 cosine similarity lives in [−1, 1]; a negative-weight edge
             // carries anti-signal and is clamped to zero rather than subtracted.
             let weight = w.unwrap_or(1.0).max(0.0);
@@ -731,42 +754,49 @@ fn augmented_degrees(pairs: &[AdjacencyPair]) -> HashMap<String, f64> {
 
 /// Fold each group's neighbour vectors into one aggregate, in `f64`, over the
 /// fixed neighbour order the `pairs` slice already carries (sorted by
-/// `(group, neighbour)` at load time). This is the propagation's grouped
-/// `Σ`/mean — the same element-wise reduction the P3 vector-aggregation UDAF
-/// computes, run here over the **bounded** collected adjacency in a deterministic
-/// order so the result is byte-identical regardless of execution-thread count.
+/// `(group, neighbour)` at load time).
 ///
-/// `mean` divides each group's sum by its neighbour count (the random-walk
-/// `D̃^{-1}Ã`); otherwise the raw sum is returned for the caller's symmetric
-/// degree fold. A neighbour absent from `scaled` (null / unmatched) contributes
-/// nothing.
+/// The element-wise reduction is the engine's shared [`fold_vectors_in_order`]
+/// — the *same* operator the P3 vector-aggregation UDAF folds through, applied
+/// here over a canonical `(group, neighbour)` order. Propagation imposes that
+/// fixed order deliberately: it buys the byte-identical determinism the streaming
+/// SQL UDAF cannot guarantee across partitionings (`f64` `+` is non-associative
+/// and a parallel plan fixes neither the fold nor the merge order), so the per-hop
+/// aggregation runs in Rust over the **bounded** collected adjacency rather than
+/// routing through the SQL aggregate.
+///
+/// `mean` selects [`VectorReduce::Mean`] (the random-walk `D̃^{-1}Ã`, dividing by
+/// each group's neighbour count); otherwise [`VectorReduce::Sum`] returns the raw
+/// sum for the caller's symmetric degree fold. A neighbour absent from `scaled`
+/// (null / unmatched) contributes nothing.
 fn aggregate_neighbours(
     pairs: &[AdjacencyPair],
     scaled: &HashMap<String, Vec<f64>>,
     dimensions: usize,
     mean: bool,
 ) -> HashMap<String, Vec<f64>> {
-    let mut sums: HashMap<&str, (Vec<f64>, u64)> = HashMap::new();
+    let reduce = if mean {
+        VectorReduce::Mean
+    } else {
+        VectorReduce::Sum
+    };
+    // Gather each group's present-neighbour vectors in the fixed pair order, then
+    // reduce that ordered sequence through the shared lane operator. The pairs are
+    // pre-sorted by (group, neighbour), so consecutive pairs share a group and the
+    // per-group sequence is canonical.
+    let mut grouped: HashMap<&str, Vec<&[f64]>> = HashMap::new();
     for pair in pairs {
-        let Some(x) = scaled.get(&pair.neighbour) else {
-            continue;
-        };
-        let entry = sums
-            .entry(pair.group.as_str())
-            .or_insert_with(|| (vec![0.0; dimensions], 0));
-        for (acc, xi) in entry.0.iter_mut().zip(x) {
-            *acc += xi;
+        if let Some(x) = scaled.get(&pair.neighbour) {
+            grouped.entry(pair.group.as_str()).or_default().push(x);
         }
-        entry.1 += 1;
     }
-    sums.into_iter()
-        .map(|(group, (mut sum, count))| {
-            if mean && count > 0 {
-                for lane in &mut sum {
-                    *lane /= count as f64;
-                }
-            }
-            (group.to_string(), sum)
+    grouped
+        .into_iter()
+        .map(|(group, vectors)| {
+            (
+                group.to_string(),
+                fold_vectors_in_order(vectors, reduce, dimensions),
+            )
         })
         .collect()
 }

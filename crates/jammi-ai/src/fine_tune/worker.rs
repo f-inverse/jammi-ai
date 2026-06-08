@@ -119,7 +119,7 @@ impl TrainingWorker {
     /// Stack-safe: a bounded `loop`, never recursion. Each tick reclaims expired
     /// leases then attempts one claim; on a claim it runs the job to a terminal
     /// state inline (the next claim waits for it), on no claim it sleeps
-    /// [`IDLE_POLL`]. The catalog used for reclaim/claim is unscoped — a worker
+    /// `IDLE_POLL`. The catalog used for reclaim/claim is unscoped — a worker
     /// serves every tenant's queue.
     pub async fn run_until(&self, stop: Arc<AtomicBool>) {
         loop {

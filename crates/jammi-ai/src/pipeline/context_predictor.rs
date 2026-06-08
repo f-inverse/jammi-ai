@@ -390,8 +390,9 @@ impl InferenceSession {
     }
 
     /// Submit an episodic in-context-predictor meta-training job on
-    /// `source_id`'s embedding table per `spec`, returning a [`TrainingJob`]
-    /// handle immediately.
+    /// `source_id`'s embedding table per `spec`, returning a
+    /// [`TrainingJob`](crate::fine_tune::training_job::TrainingJob) handle
+    /// immediately.
     ///
     /// Like the fine-tune verbs, this persists a self-describing
     /// [`TrainingSpec::ContextPredictor`] into a `queued` catalog job and

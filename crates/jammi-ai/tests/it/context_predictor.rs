@@ -443,6 +443,34 @@ async fn train(session: &Arc<InferenceSession>, spec: &ContextPredictorTrainConf
         .model_id
 }
 
+/// Per-point coverage indicators of a conformal-wrapped predictor over a set of
+/// `(target_key, observed_y)` calibration/test pairs — `true` where the observed
+/// outcome lands inside the served interval. The marginal coverage guarantee is a
+/// property of these indicators *pooled*; returning them (rather than only their
+/// mean) lets a caller pool across runs into one low-variance estimate.
+async fn conformal_indicators(
+    session: &Arc<InferenceSession>,
+    served: &jammi_ai::pipeline::context_predictor::ServedContextPredictor,
+    wrap: &jammi_ai::pipeline::context_predictor::ConformalContextPredictor,
+    targets: &[(String, f64)],
+) -> Vec<bool> {
+    let mut covered = Vec::with_capacity(targets.len());
+    for (key, y) in targets {
+        let dist = session
+            .predict_with_context_predictor(served, key)
+            .await
+            .unwrap();
+        let (lo, hi) = wrap.interval(&dist, None).unwrap();
+        covered.push(*y >= lo && *y <= hi);
+    }
+    covered
+}
+
+/// The empirical coverage fraction of a set of indicators.
+fn coverage_fraction(indicators: &[bool]) -> f64 {
+    indicators.iter().filter(|c| **c).count() as f64 / indicators.len().max(1) as f64
+}
+
 /// Empirical interval coverage of a conformal-wrapped predictor over a set of
 /// `(target_key, observed_y)` calibration/test pairs — the fraction of observed
 /// outcomes that land inside the served interval.
@@ -452,18 +480,7 @@ async fn conformal_coverage(
     wrap: &jammi_ai::pipeline::context_predictor::ConformalContextPredictor,
     targets: &[(String, f64)],
 ) -> f64 {
-    let mut hits = 0usize;
-    for (key, y) in targets {
-        let dist = session
-            .predict_with_context_predictor(served, key)
-            .await
-            .unwrap();
-        let (lo, hi) = wrap.interval(&dist, None).unwrap();
-        if *y >= lo && *y <= hi {
-            hits += 1;
-        }
-    }
-    hits as f64 / targets.len().max(1) as f64
+    coverage_fraction(&conformal_indicators(session, served, wrap, targets).await)
 }
 
 /// No-retrain adaptation: a `predict` is one forward pass with **zero** gradient
@@ -535,11 +552,21 @@ async fn predict_is_inference_only_no_gradient_updates() {
 /// meta-trains on the train tasks, the conformal wrap calibrates on one disjoint
 /// held-out task, and coverage is measured on the *other* held-out tasks — three
 /// disjoint splits, the conformal contract.
+///
+/// Conformal's guarantee is **marginal** coverage `>= 1 - alpha` — an expectation
+/// over the exchangeable distribution, not a property every individual eval split
+/// satisfies. A single small held-out split is a high-variance estimate of that
+/// expectation, so asserting each seed clears the threshold individually tests a
+/// stronger claim than conformal makes and reddens on an unlucky split. Instead we
+/// **pool** every eval point's covered/not-covered indicator from all seeds into
+/// one sample and assert the pooled fraction clears `1 - alpha - slack`: pooling
+/// maximizes the sample size, giving the tightest, least-variance estimate of the
+/// marginal coverage the guarantee is actually about.
 #[tokio::test]
 async fn conformal_wrap_hits_nominal_coverage_across_seeds() {
     let alpha = 0.2_f64;
-    let mut covered_seeds = 0;
     let seeds = [11u64, 23, 37];
+    let mut pooled: Vec<bool> = Vec::new();
     for &seed in &seeds {
         // A larger meta-dataset so held-out tasks carry enough targets to
         // estimate coverage and calibrate a finite-sample quantile at alpha=0.2.
@@ -592,18 +619,27 @@ async fn conformal_wrap_hits_nominal_coverage_across_seeds() {
             .calibrate_context_predictor_conformal(&served, &cal, alpha, ConformalLevers::Marginal)
             .await
             .unwrap();
-        let cov = conformal_coverage(&session, &served, &wrap, &eval).await;
-
-        // The guarantee is coverage >= 1 - alpha under exchangeability; allow
-        // finite-sample slack on a small held-out split.
-        if cov >= 1.0 - alpha - 0.1 {
-            covered_seeds += 1;
-        }
+        // Pool this seed's per-point indicators into the cross-seed sample rather
+        // than collapsing to a per-seed fraction first — the pooled fraction is the
+        // direct estimate of marginal coverage.
+        pooled.extend(conformal_indicators(&session, &served, &wrap, &eval).await);
     }
+
+    assert!(!pooled.is_empty(), "no eval points collected across seeds");
+    let pooled_cov = coverage_fraction(&pooled);
+
+    // The guarantee is marginal coverage >= 1 - alpha under exchangeability. The
+    // slack is finite-sample only and kept tight — well below the gap between this
+    // conformal estimate and the under-covering raw band (see the sibling test),
+    // so a non-conformal/under-covering predictor still fails this threshold.
+    let slack = 0.05_f64;
     assert!(
-        covered_seeds >= seeds.len(),
-        "conformal coverage held on {covered_seeds}/{} seeds (expected all)",
-        seeds.len()
+        pooled_cov >= 1.0 - alpha - slack,
+        "pooled conformal coverage {pooled_cov} over {} eval points across {} seeds \
+         fell below the marginal floor {}",
+        pooled.len(),
+        seeds.len(),
+        1.0 - alpha - slack,
     );
 }
 

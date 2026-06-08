@@ -36,7 +36,7 @@ use jammi_lora::BackboneDtype;
 
 use crate::convert::{batches_to_pyarrow, serializable_to_pydict};
 use crate::error::to_pyerr;
-use crate::job::PyFineTuneJob;
+use crate::job::PyTrainingJob;
 use crate::model_task::ModelTaskArg;
 
 /// Python Database wrapping `Arc<InferenceSession>` with a shared tokio runtime.
@@ -567,7 +567,7 @@ impl PyDatabase {
         batches_to_pyarrow(py, &batches)
     }
 
-    /// Start a fine-tuning job. Returns a `FineTuneJob` handle.
+    /// Start a fine-tuning job. Returns a `TrainingJob` handle.
     ///
     /// All config kwargs are optional — omitting them uses the Jammi defaults:
     ///   lora_rank=8, lora_alpha=16.0, lora_dropout=0.05,
@@ -665,7 +665,7 @@ impl PyDatabase {
         hard_negative_exclude_hops: Option<usize>,
         hard_negative_refresh_every: Option<usize>,
         matryoshka_dims: Option<Vec<usize>>,
-    ) -> PyResult<PyFineTuneJob> {
+    ) -> PyResult<PyTrainingJob> {
         let mut cfg = FineTuneConfig::default();
         if let Some(v) = lora_rank {
             cfg.lora_rank = v;
@@ -795,7 +795,7 @@ impl PyDatabase {
                 Some(cfg),
             ))
             .map_err(to_pyerr)?;
-        Ok(PyFineTuneJob::new(job, Arc::clone(&self.runtime)))
+        Ok(PyTrainingJob::new(job, Arc::clone(&self.runtime)))
     }
 
     /// Train an amortized in-context predictor (S19) over a source: a
@@ -1116,7 +1116,7 @@ impl PyDatabase {
         learning_rate: Option<f64>,
         lora_rank: Option<usize>,
         matryoshka_dims: Option<Vec<usize>>,
-    ) -> PyResult<PyFineTuneJob> {
+    ) -> PyResult<PyTrainingJob> {
         use jammi_ai::fine_tune::graph_sampler::{
             EdgeProvenance, GraphFineTuneSources, GraphSampleConfig,
         };
@@ -1212,7 +1212,7 @@ impl PyDatabase {
                     .fine_tune_graph(&sources, base_model, sample, Some(cfg)),
             )
             .map_err(to_pyerr)?;
-        Ok(PyFineTuneJob::new(job, Arc::clone(&self.runtime)))
+        Ok(PyTrainingJob::new(job, Arc::clone(&self.runtime)))
     }
 
     /// Evaluate embedding quality. Returns a dict with `aggregate` (mean

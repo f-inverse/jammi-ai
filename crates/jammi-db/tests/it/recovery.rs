@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
 use jammi_db::catalog::model_repo::RegisterModelParams;
-use jammi_db::catalog::status::{FineTuneJobStatus, ResultTableStatus};
+use jammi_db::catalog::status::{ResultTableStatus, TrainingJobStatus};
 use jammi_db::catalog::Catalog;
 use jammi_db::model_task::ModelTask;
 use jammi_db::store::ResultStore;
 use tempfile::tempdir;
 
 /// Crash recovery: stale Building result tables → Failed, stale Running
-/// fine-tune jobs → Failed.
+/// training jobs → Failed.
 #[tokio::test]
-async fn crash_recovery_cleans_up_stale_result_tables_and_fine_tune_jobs() {
+async fn crash_recovery_cleans_up_stale_result_tables_and_training_jobs() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
 
@@ -44,7 +44,7 @@ async fn crash_recovery_cleans_up_stale_result_tables_and_fine_tune_jobs() {
         .unwrap();
 
     catalog
-        .create_fine_tune_job(
+        .create_training_job(
             "ft-crash-1",
             "test-model::1",
             "pairs.csv",
@@ -54,7 +54,7 @@ async fn crash_recovery_cleans_up_stale_result_tables_and_fine_tune_jobs() {
         .await
         .unwrap();
     catalog
-        .update_fine_tune_status("ft-crash-1", FineTuneJobStatus::Running, None)
+        .update_training_status("ft-crash-1", TrainingJobStatus::Running, None)
         .await
         .unwrap();
 
@@ -64,11 +64,11 @@ async fn crash_recovery_cleans_up_stale_result_tables_and_fine_tune_jobs() {
         .unwrap();
     assert_eq!(building.len(), 1);
 
-    let job = catalog.get_fine_tune_job("ft-crash-1").await.unwrap();
-    assert_eq!(job.status, FineTuneJobStatus::Running.to_string());
+    let job = catalog.get_training_job("ft-crash-1").await.unwrap();
+    assert_eq!(job.status, TrainingJobStatus::Running.to_string());
 
     result_store.recover().await.unwrap();
-    let cleaned = catalog.cleanup_stale_fine_tune_jobs().await.unwrap();
+    let cleaned = catalog.cleanup_stale_training_jobs().await.unwrap();
     assert_eq!(cleaned, 1);
 
     let building_after = catalog
@@ -84,6 +84,6 @@ async fn crash_recovery_cleans_up_stale_result_tables_and_fine_tune_jobs() {
         .expect("table should still exist");
     assert_eq!(table.status, ResultTableStatus::Failed.to_string());
 
-    let job_after = catalog.get_fine_tune_job("ft-crash-1").await.unwrap();
-    assert_eq!(job_after.status, FineTuneJobStatus::Failed.to_string());
+    let job_after = catalog.get_training_job("ft-crash-1").await.unwrap();
+    assert_eq!(job_after.status, TrainingJobStatus::Failed.to_string());
 }

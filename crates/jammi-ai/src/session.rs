@@ -11,7 +11,7 @@ use jammi_db::store::ResultStore;
 
 use crate::concurrency::GpuScheduler;
 use crate::eval::runner::EvalRunner;
-use crate::fine_tune::job::FineTuneJob;
+use crate::fine_tune::training_job::TrainingJob;
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
 use crate::inference::observer::InferenceObserver;
 use crate::model::backend::DeviceConfig;
@@ -108,7 +108,7 @@ impl InferenceSession {
         let model_cache = Arc::new(ModelCache::new(resolver, device_config.clone(), scheduler));
         let result_store = Arc::new(build_result_store(&inner, Arc::clone(&catalog))?);
         result_store.recover().await?;
-        catalog.cleanup_stale_fine_tune_jobs().await?;
+        catalog.cleanup_stale_training_jobs().await?;
         result_store.load_existing_tables(inner.context()).await?;
 
         let ann_cache_size = inner.config().cache.ann_cache_max_entries as u64;
@@ -802,7 +802,7 @@ impl InferenceSession {
 
     /// Start a LoRA fine-tuning job on a registered source.
     ///
-    /// Returns a [`FineTuneJob`] handle that can be used to poll or wait for
+    /// Returns a [`TrainingJob`] handle that can be used to poll or wait for
     /// completion. The job runs synchronously in a blocking task spawned on
     /// tokio's blocking pool — call `job.wait().await` to block until done.
     pub async fn fine_tune(
@@ -813,7 +813,7 @@ impl InferenceSession {
         _method: FineTuneMethod,
         task: ModelTask,
         config: Option<FineTuneConfig>,
-    ) -> Result<FineTuneJob> {
+    ) -> Result<TrainingJob> {
         let config = config.unwrap_or_default();
         config.validate()?;
 
@@ -849,7 +849,7 @@ impl InferenceSession {
         task: ModelTask,
         config: FineTuneConfig,
         data_loader: crate::fine_tune::data::TrainingDataLoader,
-    ) -> Result<FineTuneJob> {
+    ) -> Result<TrainingJob> {
         let job_id = uuid::Uuid::new_v4().to_string();
         let output_model_id = format!("jammi:fine-tuned:{job_id}");
 
@@ -857,7 +857,7 @@ impl InferenceSession {
         let model_source = ModelSource::parse(base_model);
         let canonical_name = model_source.to_string();
 
-        // Ensure base model is registered in catalog (FK constraint on fine_tune_jobs)
+        // Ensure base model is registered in catalog (FK constraint on training_jobs)
         if self.catalog().get_model(&canonical_name).await?.is_none() {
             if let Err(e) = self
                 .catalog()
@@ -896,7 +896,7 @@ impl InferenceSession {
         let base_model_pk = crate::model::to_catalog_pk(&canonical_name, 1);
         self.inner
             .catalog()
-            .create_fine_tune_job(&job_id, &base_model_pk, source, &loss_type, &hyperparams)
+            .create_training_job(&job_id, &base_model_pk, source, &loss_type, &hyperparams)
             .await?;
 
         // Load the base model under the task being fine-tuned so the right
@@ -931,7 +931,7 @@ impl InferenceSession {
         let job_id_for_err = job_id_clone.clone();
         tokio::task::spawn_blocking(move || {
             // Catch panics inside the training loop so a terminal status is
-            // always recorded — otherwise `FineTuneJob::wait()` polls forever.
+            // always recorded — otherwise `TrainingJob::wait()` polls forever.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_fine_tune_blocking(
                     catalog,
@@ -961,7 +961,7 @@ impl InferenceSession {
             }
         });
 
-        Ok(FineTuneJob::new(
+        Ok(TrainingJob::new(
             job_id,
             "queued".into(),
             output_model_id,
@@ -992,7 +992,7 @@ impl InferenceSession {
         base_model: &str,
         sample_config: crate::fine_tune::graph_sampler::GraphSampleConfig,
         config: Option<FineTuneConfig>,
-    ) -> Result<FineTuneJob> {
+    ) -> Result<TrainingJob> {
         use crate::fine_tune::graph_sampler::{GraphEdge, GraphSampler, TextNode};
 
         let config = config.unwrap_or_default();
@@ -1515,14 +1515,14 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// Record a terminal `Failed` status for a fine-tune job, surfacing the cause
-/// via the catalog metrics blob so callers polling `FineTuneJob::wait()` see
+/// Record a terminal `Failed` status for a training job, surfacing the cause
+/// via the catalog metrics blob so callers polling `TrainingJob::wait()` see
 /// the failure instead of an indefinite `Running` state.
 fn record_failed(catalog: &Arc<jammi_db::catalog::Catalog>, job_id: &str, msg: String) {
     let metrics = serde_json::json!({ "error_message": msg }).to_string();
-    if let Err(e) = tokio::runtime::Handle::current().block_on(catalog.update_fine_tune_status(
+    if let Err(e) = tokio::runtime::Handle::current().block_on(catalog.update_training_status(
         job_id,
-        jammi_db::catalog::status::FineTuneJobStatus::Failed,
+        jammi_db::catalog::status::TrainingJobStatus::Failed,
         Some(&metrics),
     )) {
         tracing::error!(job_id = %job_id, error = %e, "Failed to record terminal status");

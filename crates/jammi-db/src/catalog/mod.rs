@@ -3,7 +3,6 @@ pub mod backend_postgres;
 pub mod backend_sqlite;
 pub mod channel_repo;
 pub mod eval_repo;
-pub mod fine_tune_repo;
 pub mod migrations;
 pub mod model_repo;
 pub mod mutable_repo;
@@ -12,6 +11,7 @@ pub mod schema;
 pub mod source_repo;
 pub mod status;
 pub mod topic_repo;
+pub mod training_repo;
 
 use std::path::Path;
 use std::sync::Arc;

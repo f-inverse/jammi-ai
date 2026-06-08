@@ -91,7 +91,7 @@ python cookbook/recipes/audio_search/04-eval.py
 - `Database.encode_query(*, model, query, modality="audio")` → `list[float]`
 - `Database.search(source, *, query, k, filter=None, select=None)` → `pyarrow.Table`
 - `Database.eval_embeddings(*, source, golden_source, model=None, k=10)`
-- `Database.fine_tune(*, source, base_model, columns, method, task="audio_embedding", ...)` → `FineTuneJob`
+- `Database.fine_tune(*, source, base_model, columns, method, task="audio_embedding", ...)` → `TrainingJob`
 
 ### Audio triplet schema (fine-tune input)
 

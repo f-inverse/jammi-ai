@@ -66,7 +66,7 @@ jammi-cli
 | `EvidenceRow` / `RowProvenance` | Evidence model types for provenance tracking |
 | `OutputAdapter` | Trait that converts raw model output to Arrow arrays per task |
 | `GpuScheduler` | GPU memory permit system with budget-based admission control |
-| `FineTuneJob` | LoRA fine-tuning with contrastive loss, checkpointing, early stopping |
+| `TrainingJob` | LoRA fine-tuning with contrastive loss, checkpointing, early stopping |
 | `EvalRunner` | Retrieval and classification evaluation |
 
 ### Server layer (`jammi-server`)
@@ -82,7 +82,7 @@ jammi-cli
 | Type | Responsibility |
 |------|---------------|
 | `Database` | PyO3 class wrapping `Arc<InferenceSession>` with shared tokio runtime; `search` returns a table, `sql` runs compound SQL (with `annotate`) |
-| `FineTuneJob` | PyO3 class for monitoring fine-tuning jobs |
+| `TrainingJob` | PyO3 class for monitoring training jobs |
 | `connect()` | Module-level function to create a `Database` |
 
 ## Data flow
@@ -168,7 +168,7 @@ crates/jammi-cli/src/
 crates/jammi-python/src/
 |-- lib.rs              # PyO3 module, connect()
 |-- database.rs         # Database class (search -> table, sql -> compound query)
-|-- job.rs              # FineTuneJob class
+|-- job.rs              # TrainingJob class
 |-- convert.rs          # Arrow <-> PyArrow conversion
 '-- error.rs            # Error conversion
 ```

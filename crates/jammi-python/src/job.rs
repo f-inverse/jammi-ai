@@ -2,25 +2,25 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 
-use jammi_ai::fine_tune::job::FineTuneJob;
+use jammi_ai::fine_tune::training_job::TrainingJob;
 
 use crate::error::to_pyerr;
 
-/// Python FineTuneJob handle.
-#[pyclass(name = "FineTuneJob")]
-pub struct PyFineTuneJob {
-    inner: FineTuneJob,
+/// Python TrainingJob handle.
+#[pyclass(name = "TrainingJob")]
+pub struct PyTrainingJob {
+    inner: TrainingJob,
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
-impl PyFineTuneJob {
-    pub fn new(inner: FineTuneJob, runtime: Arc<tokio::runtime::Runtime>) -> Self {
+impl PyTrainingJob {
+    pub fn new(inner: TrainingJob, runtime: Arc<tokio::runtime::Runtime>) -> Self {
         Self { inner, runtime }
     }
 }
 
 #[pymethods]
-impl PyFineTuneJob {
+impl PyTrainingJob {
     /// The unique job ID.
     #[getter]
     fn job_id(&self) -> &str {

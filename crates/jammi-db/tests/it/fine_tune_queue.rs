@@ -1,17 +1,50 @@
 //! Lease-based training-job queue primitives on the `training_jobs` catalog
 //! table: atomic claim, lease heartbeat, and expired-lease reclaim.
+//!
+//! Every test is parameterised over [`BackendKind`] via `test_case` +
+//! `cfg_attr`. The SQLite lane is always generated; the Postgres lane is
+//! generated only when the `live-postgres-tests` feature is on, and skips at
+//! runtime when `JAMMI_TEST_PG_URL` is unset. The Postgres lane exercises the
+//! `FOR UPDATE SKIP LOCKED` claim path and the global expired-lease reclaim
+//! scan that the SQLite serialized-UPDATE path cannot.
+//!
+//! The claim and reclaim queries scan `training_jobs` globally (they are not
+//! tenant- or id-scoped — a worker takes the oldest queued job across the whole
+//! table, and reclaim sweeps every expired lease). On the Postgres lane that
+//! single table is shared across the whole test run, so each test first clears
+//! it via [`reset_queue`] to start from a known-empty queue. CI's `test-pg` job
+//! runs the Postgres lane with `--test-threads=1`, so the reset-then-populate
+//! sequence is serialised and cannot race a sibling test.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use jammi_db::catalog::backend::{BackendKind, TxOptions};
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::status::TrainingJobStatus;
 use jammi_db::catalog::training_repo::CreateTrainingJobParams;
 use jammi_db::catalog::Catalog;
 use jammi_db::model_task::ModelTask;
+use jammi_test_utils::make_test_session;
 use tempfile::tempdir;
+use test_case::test_case;
 
-/// A minimal queued fine-tune job over the `q-base` model with the given id.
+/// SAFETY note: the Postgres lane returns `None` when `JAMMI_TEST_PG_URL`
+/// is unset so the test can early-return rather than `#[ignore]`'ing
+/// (CLAUDE.md forbids `#[ignore]`).
+macro_rules! skip_if_no_backend {
+    ($backend:expr, $dir:expr) => {
+        match make_test_session($backend, $dir).await {
+            Some(s) => s,
+            None => {
+                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
+                return;
+            }
+        }
+    };
+}
+
+/// A minimal queued training job over the `q-base` model with the given id.
 fn job_params(job_id: &str) -> CreateTrainingJobParams<'_> {
     CreateTrainingJobParams {
         job_id,
@@ -41,14 +74,49 @@ async fn register_base_model(catalog: &Catalog) {
         .unwrap();
 }
 
-/// Two concurrent claims against a single queued job: exactly one wins; the
-/// loser sees an empty queue. The winner's record is `running`, leased to it,
-/// and `attempts` is incremented to 1.
+/// Clear every row from `training_jobs` so the global claim/reclaim scans see
+/// only the rows this test creates. Needed because the Postgres lane shares one
+/// catalog DB across the run; the SQLite lane has a fresh tempdir per test but
+/// running the reset there too keeps both lanes on one path. Run under
+/// `--test-threads=1` on the Postgres lane, so it cannot race a sibling test.
+async fn reset_queue(catalog: &Catalog) {
+    catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move { tx.execute("DELETE FROM training_jobs", &[]).await })
+        })
+        .await
+        .unwrap();
+}
+
+/// Open a backend-parameterised catalog with the FK base model registered and
+/// an empty queue. Returns `None` to signal the caller should skip (Postgres
+/// without `JAMMI_TEST_PG_URL`).
+macro_rules! queue_catalog {
+    ($backend:expr, $dir:expr) => {{
+        let session = skip_if_no_backend!($backend, $dir);
+        let catalog = Arc::clone(session.catalog());
+        reset_queue(&catalog).await;
+        register_base_model(&catalog).await;
+        (session, catalog)
+    }};
+}
+
+/// Two concurrent claims against a single queued job run on separate tasks of a
+/// multi-thread runtime: exactly one wins, the other sees an empty queue. The
+/// winner's record is `running`, leased to it, and `attempts` is incremented to
+/// 1. Spawning the claims as distinct tasks (rather than `tokio::join!`, which
+/// interleaves two futures on one task deterministically) puts the Postgres
+/// `FOR UPDATE SKIP LOCKED` path under real lock contention.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_claim_grants_one_winner() {
+async fn concurrent_claim_grants_one_winner(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    register_base_model(&catalog).await;
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
 
     catalog
         .create_training_job(job_params("q-1"))
@@ -58,10 +126,12 @@ async fn concurrent_claim_grants_one_winner() {
     let c1 = Arc::clone(&catalog);
     let c2 = Arc::clone(&catalog);
     let lease = Duration::from_secs(30);
-    let (a, b) = tokio::join!(
-        async move { c1.claim_next_training_job("worker-a", lease).await.unwrap() },
-        async move { c2.claim_next_training_job("worker-b", lease).await.unwrap() },
-    );
+    let h1 =
+        tokio::spawn(async move { c1.claim_next_training_job("worker-a", lease).await.unwrap() });
+    let h2 =
+        tokio::spawn(async move { c2.claim_next_training_job("worker-b", lease).await.unwrap() });
+    let a = h1.await.unwrap();
+    let b = h2.await.unwrap();
 
     let winners: Vec<_> = [a, b].into_iter().flatten().collect();
     assert_eq!(
@@ -89,11 +159,15 @@ async fn concurrent_claim_grants_one_winner() {
 }
 
 /// Claims hand out the oldest queued job first (FIFO by `created_at`).
-#[tokio::test]
-async fn claim_returns_oldest_queued_job_first() {
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claim_returns_oldest_queued_job_first(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = Catalog::open(dir.path()).await.unwrap();
-    register_base_model(&catalog).await;
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
 
     catalog
         .create_training_job(job_params("old"))
@@ -115,11 +189,15 @@ async fn claim_returns_oldest_queued_job_first() {
 }
 
 /// Heartbeat renews the lease for the owning worker and refuses everyone else.
-#[tokio::test]
-async fn heartbeat_renews_for_owner_only() {
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_renews_for_owner_only(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = Catalog::open(dir.path()).await.unwrap();
-    register_base_model(&catalog).await;
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
 
     catalog.create_training_job(job_params("hb")).await.unwrap();
     let claimed = catalog
@@ -166,11 +244,15 @@ async fn heartbeat_renews_for_owner_only() {
 
 /// An expired lease with attempts left re-queues the job (clearing the lease);
 /// once attempts are exhausted the job fails with the reason recorded.
-#[tokio::test]
-async fn reclaim_requeues_then_fails_when_attempts_exhausted() {
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclaim_requeues_then_fails_when_attempts_exhausted(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = Catalog::open(dir.path()).await.unwrap();
-    register_base_model(&catalog).await;
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
 
     catalog.create_training_job(job_params("rc")).await.unwrap();
 
@@ -226,11 +308,15 @@ async fn reclaim_requeues_then_fails_when_attempts_exhausted() {
 /// worker whose lease was reclaimed by another matches zero rows and does not
 /// write the output model or flip the status — the guard that stops two workers
 /// from both finalizing one job.
-#[tokio::test]
-async fn finalize_is_a_lease_guarded_compare_and_set() {
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finalize_is_a_lease_guarded_compare_and_set(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = Catalog::open(dir.path()).await.unwrap();
-    register_base_model(&catalog).await;
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
 
     catalog.create_training_job(job_params("fz")).await.unwrap();
 
@@ -308,11 +394,15 @@ async fn finalize_is_a_lease_guarded_compare_and_set() {
 /// the worker that still holds the lease can stamp `failed`. A stale worker
 /// cannot mark `failed` a job the re-claiming worker is running (which would
 /// otherwise block that worker's finalize).
-#[tokio::test]
-async fn fail_is_a_lease_guarded_compare_and_set() {
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fail_is_a_lease_guarded_compare_and_set(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = Catalog::open(dir.path()).await.unwrap();
-    register_base_model(&catalog).await;
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
 
     catalog.create_training_job(job_params("fl")).await.unwrap();
 
@@ -361,11 +451,15 @@ async fn fail_is_a_lease_guarded_compare_and_set() {
 }
 
 /// A live (unexpired) lease is left untouched by reclaim.
-#[tokio::test]
-async fn reclaim_leaves_live_leases_untouched() {
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclaim_leaves_live_leases_untouched(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = Catalog::open(dir.path()).await.unwrap();
-    register_base_model(&catalog).await;
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
 
     catalog
         .create_training_job(job_params("live"))

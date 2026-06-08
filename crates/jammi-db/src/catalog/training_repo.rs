@@ -210,7 +210,7 @@ impl Catalog {
                 },
             )
             .await?;
-        found.ok_or_else(|| JammiError::Catalog(format!("Fine-tune job '{id_for_err}' not found")))
+        found.ok_or_else(|| JammiError::Catalog(format!("Training job '{id_for_err}' not found")))
     }
 
     /// Update a training job's status and optional metrics JSON. Scoped.

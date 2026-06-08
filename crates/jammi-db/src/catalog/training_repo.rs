@@ -108,7 +108,7 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<TrainingJobRecord, BackendErr
         kind: row.get("kind")?,
         claimed_by: row.try_get("claimed_by")?,
         lease_expires_at: row.try_get("lease_expires_at")?,
-        attempts: row.get::<i64>("attempts")? as u32,
+        attempts: row.get::<i32>("attempts")? as u32,
         tenant_id,
         training_spec: row.try_get("training_spec")?,
     })
@@ -210,7 +210,7 @@ impl Catalog {
                 },
             )
             .await?;
-        found.ok_or_else(|| JammiError::Catalog(format!("Fine-tune job '{id_for_err}' not found")))
+        found.ok_or_else(|| JammiError::Catalog(format!("Training job '{id_for_err}' not found")))
     }
 
     /// Update a training job's status and optional metrics JSON. Scoped.

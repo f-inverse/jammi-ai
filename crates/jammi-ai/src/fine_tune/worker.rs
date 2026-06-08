@@ -26,15 +26,22 @@
 //! `heartbeat_training_job` returns `false` (the lease was lost — reclaimed by
 //! another worker, or expired) it sets a shared cancel flag the training loop
 //! checks at every epoch boundary. The loop then bails, leaving the job
-//! `running` for the next `reclaim_expired_training_jobs` to re-queue. A lost
-//! lease therefore never races a second worker's writes onto the same model.
+//! `running` for the next `reclaim_expired_training_jobs` to re-queue.
+//!
+//! Cancellation is checked only at epoch boundaries, so a worker can still lose
+//! its lease in the window between the last check and finalization. The terminal
+//! write is therefore a compare-and-set: [`Catalog::finalize_training_job`]
+//! writes the output model + flips the job to `completed` only while
+//! `claimed_by` is still this worker and the status is still `running`. A worker
+//! that lost its lease matches zero rows and does not finalize, so two workers
+//! never both finalize the same job — the re-claiming worker is the sole
+//! finalizer.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
-use jammi_db::catalog::status::TrainingJobStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::model_task::ModelTask;
@@ -152,12 +159,18 @@ impl TrainingWorker {
         }
     }
 
-    /// Run one claimed job to a terminal state. Deserialises the spec, pins the
-    /// catalog to the job's tenant (the claim is intentionally unscoped, so the
-    /// worker's writes must be re-scoped), runs the kind's reconstruction under
-    /// a heartbeat, and records `completed` + the output model or `failed` + the
-    /// error.
-    async fn run_claimed_job(
+    /// Run one already-claimed job to a terminal state. Deserialises the spec,
+    /// pins the catalog to the job's tenant (the claim is intentionally unscoped,
+    /// so the worker's writes must be re-scoped), runs the kind's reconstruction
+    /// under a heartbeat, then performs the single lease-guarded finalize —
+    /// `completed` + the output model when this worker still holds the lease, or
+    /// `failed` + the error on a genuine failure. A worker that lost its lease in
+    /// the run window does not finalize; the job is left for `reclaim`.
+    ///
+    /// `record` must be a row this worker claimed (its `claimed_by` is the
+    /// worker's id). The driving loop ([`Self::run_until`]) is the normal caller;
+    /// it is exposed so a test can drive one claimed job in isolation.
+    pub async fn run_claimed_job(
         &self,
         session: &Arc<InferenceSession>,
         record: jammi_db::catalog::training_repo::TrainingJobRecord,
@@ -168,7 +181,13 @@ impl TrainingWorker {
         let spec_json = match record.training_spec.as_deref() {
             Some(s) => s,
             None => {
-                record_failed(&catalog, &job_id, "job carries no training_spec".into()).await;
+                record_failed(
+                    &catalog,
+                    &job_id,
+                    &self.worker_id,
+                    "job carries no training_spec".into(),
+                )
+                .await;
                 return;
             }
         };
@@ -178,6 +197,7 @@ impl TrainingWorker {
                 record_failed(
                     &catalog,
                     &job_id,
+                    &self.worker_id,
                     format!("undeserialisable training_spec: {e}"),
                 )
                 .await;
@@ -201,30 +221,34 @@ impl TrainingWorker {
 
         match outcome {
             Ok(success) => {
-                // The fine-tune trainer finalizes its own job (output model +
-                // `completed` + the started/completed metrics), so re-writing
-                // here would clobber those metrics. The predictor path does not,
-                // so the worker finalizes it. `finalized` says which case this is.
-                if !success.finalized {
-                    if let Err(e) = catalog
-                        .set_training_output_model(&job_id, &success.model_id)
-                        .await
-                    {
-                        tracing::error!(job_id = %job_id, error = %e, "set_training_output_model failed");
+                // Single finalization for every kind: the run already persisted
+                // its artifact and registered the output-model row; the worker
+                // now performs the one lease-guarded compare-and-set that writes
+                // `output_model_id` + flips the job to `completed`. The CAS
+                // matches only while this worker still holds the lease
+                // (`claimed_by = worker_id AND status = 'running'`), so a worker
+                // that lost its lease in the window between the last epoch check
+                // and here affects zero rows and must NOT finalize — the job is
+                // left `running` for `reclaim` and the worker that re-claimed it.
+                match catalog
+                    .finalize_training_job(
+                        &job_id,
+                        &self.worker_id,
+                        &success.model_id,
+                        success.metrics.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::debug!(
+                            job_id = %job_id,
+                            worker = %self.worker_id,
+                            "lost lease before finalize; not finalizing (left for reclaim)"
+                        );
                     }
-                    let metrics = serde_json::json!({
-                        "completed_at": chrono::Utc::now().to_rfc3339(),
-                    })
-                    .to_string();
-                    if let Err(e) = catalog
-                        .update_training_status(
-                            &job_id,
-                            TrainingJobStatus::Completed,
-                            Some(&metrics),
-                        )
-                        .await
-                    {
-                        tracing::error!(job_id = %job_id, error = %e, "marking job completed failed");
+                    Err(e) => {
+                        tracing::error!(job_id = %job_id, error = %e, "finalize_training_job failed");
                     }
                 }
             }
@@ -236,7 +260,7 @@ impl TrainingWorker {
             }
             Err(WorkerJobError::Failed(msg)) => {
                 tracing::error!(job_id = %job_id, error = %msg, "training job failed");
-                record_failed(&catalog, &job_id, msg).await;
+                record_failed(&catalog, &job_id, &self.worker_id, msg).await;
             }
         }
     }
@@ -331,16 +355,18 @@ impl TrainingWorker {
                 predictor_spec,
             } => {
                 // The predictor training is async (it samples through the SQL
-                // surface). It checks `cancel` at every epoch boundary.
+                // surface). It checks `cancel` at every epoch boundary and
+                // registers the predictor's model row through the worker's
+                // tenant-pinned catalog (the same catalog the fine-tune kinds
+                // register through), so the model lands under the job's tenant
+                // rather than the worker session's sticky scope.
                 let record = session
-                    .run_context_predictor_training(&source, &predictor_spec, cancel)
+                    .run_context_predictor_training(catalog, &source, &predictor_spec, cancel)
                     .await
                     .map_err(|e| classify(cancel, e))?;
-                // The predictor path registers the model but does not finalize
-                // the job, so the worker records `completed` + the output model.
                 Ok(RunSuccess {
                     model_id: record.model_id,
-                    finalized: false,
+                    metrics: None,
                 })
             }
         }
@@ -442,9 +468,11 @@ impl TrainingWorker {
     }
 
     /// Load the base model, build the training target, and drive the blocking
-    /// LoRA trainer — the shared tail of the two fine-tune kinds. The trainer
-    /// registers the output model and flips the job to `completed`; on a clean
-    /// return the output model id is recovered for the worker's record-keeping.
+    /// LoRA trainer — the shared tail of the two fine-tune kinds. The loop trains
+    /// and persists the adapter but writes no terminal status; on a clean return
+    /// the worker registers the output-model row through the tenant-pinned
+    /// catalog and hands the model id + run metrics to the caller's single
+    /// lease-guarded finalization.
     async fn train_fine_tune(
         &self,
         session: &Arc<InferenceSession>,
@@ -475,15 +503,21 @@ impl TrainingWorker {
         })?;
         drop(guard);
 
-        let artifact_dir = session.inner_config().artifact_dir.clone();
-        let device_config = session.device_config().clone();
-        let catalog_for_run = Arc::clone(catalog);
-        let cancel_for_run = Arc::clone(cancel);
-        let cancel_for_classify = Arc::clone(cancel);
-        let job_id_owned = job_id.to_string();
-        let output_model_id_clone = output_model_id.clone();
         let base_model = common.base_model.clone();
-        let config = common.config;
+        let cancel_for_classify = Arc::clone(cancel);
+        let params = RunFineTuneParams {
+            catalog: Arc::clone(catalog),
+            artifact_dir: session.inner_config().artifact_dir.clone(),
+            job_id: job_id.to_string(),
+            base_model: base_model.clone(),
+            task,
+            config: common.config,
+            loader,
+            base_model_arc,
+            hidden_size,
+            device_config: session.device_config().clone(),
+            cancel: Arc::clone(cancel),
+        };
 
         // The blocking trainer runs on the blocking pool so it never starves the
         // heartbeat / poll tasks on the async runtime. Panics are caught so a
@@ -491,49 +525,66 @@ impl TrainingWorker {
         // a wedged `running` row.
         let result = tokio::task::spawn_blocking(move || {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_fine_tune_blocking(
-                    catalog_for_run,
-                    artifact_dir,
-                    job_id_owned,
-                    output_model_id_clone,
-                    base_model,
-                    task,
-                    config,
-                    loader,
-                    base_model_arc,
-                    hidden_size,
-                    device_config,
-                    cancel_for_run,
-                )
+                run_fine_tune_blocking(params)
             }))
         })
         .await;
 
-        match result {
-            // The trainer registered the output model and flipped the job to
-            // `completed` (with its started/completed metrics) itself, so the
-            // worker must not re-write the terminal state.
-            Ok(Ok(Ok(()))) => Ok(RunSuccess {
-                model_id: output_model_id,
-                finalized: true,
-            }),
-            Ok(Ok(Err(e))) => Err(classify(&cancel_for_classify, e)),
-            Ok(Err(payload)) => Err(WorkerJobError::Failed(format!(
-                "Panic: {}",
-                panic_message(payload.as_ref())
-            ))),
-            Err(join_err) => Err(WorkerJobError::Failed(format!(
-                "training task join error: {join_err}"
-            ))),
-        }
+        let training = match result {
+            Ok(Ok(Ok(training))) => training,
+            Ok(Ok(Err(e))) => return Err(classify(&cancel_for_classify, e)),
+            Ok(Err(payload)) => {
+                return Err(WorkerJobError::Failed(format!(
+                    "Panic: {}",
+                    panic_message(payload.as_ref())
+                )))
+            }
+            Err(join_err) => {
+                return Err(WorkerJobError::Failed(format!(
+                    "training task join error: {join_err}"
+                )))
+            }
+        };
+
+        // Register the fine-tuned model row before the worker's finalize CAS so
+        // a `wait()` observer that sees `completed` always finds the model row.
+        // The id is deterministic (`jammi:fine-tuned:{job_id}`) and the catalog
+        // upserts, so a re-claiming worker re-registering after a lost lease is
+        // idempotent. Registration goes through the tenant-pinned catalog, so the
+        // row lands under the job's tenant.
+        catalog
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: &output_model_id,
+                version: 1,
+                model_type: "fine-tuned",
+                backend: "candle",
+                task,
+                base_model_id: Some(&base_model),
+                artifact_path: training.adapter_path.to_str(),
+                config_json: None,
+            })
+            .await
+            .map_err(WorkerJobError::from)?;
+
+        Ok(RunSuccess {
+            model_id: output_model_id,
+            metrics: Some(training.metrics_json),
+        })
     }
 }
 
 /// An RAII guard owning an embedded [`TrainingWorker`]'s background task. On
-/// drop it sets the stop flag and aborts the task, so the worker stops when its
-/// owner (the embedded `LocalSession` or the Python `Database`) drops. Holding
-/// the worker through this guard — rather than detaching the task — keeps the
-/// stop deterministic and tied to the owner's lifetime.
+/// drop it sets the stop flag and aborts the task, so the worker stops claiming
+/// new jobs when its owner (the embedded `LocalSession` or the Python
+/// `Database`) drops.
+///
+/// Drop stops the *loop*, not in-flight training: a job already running inside
+/// `spawn_blocking` cannot be force-aborted, so aborting the loop task only
+/// cancels it at the next `.await` point. A run already on the blocking pool
+/// proceeds to completion and writes its terminal status (the lease-guarded
+/// finalize) *after* this guard has dropped — detached from the guard's
+/// lifetime. The guard therefore bounds when the worker stops taking new work,
+/// not when the current job finishes.
 pub struct EmbeddedWorker {
     handle: tokio::task::JoinHandle<()>,
     stop: Arc<AtomicBool>,
@@ -553,6 +604,10 @@ impl EmbeddedWorker {
 }
 
 impl Drop for EmbeddedWorker {
+    /// Signal the loop to stop and abort its task. This halts claiming of new
+    /// jobs; an in-flight `spawn_blocking` training run is not aborted by this —
+    /// it runs to completion and writes its terminal status post-drop (see the
+    /// type doc).
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         self.handle.abort();
@@ -569,14 +624,17 @@ struct FineTuneRun {
     loader: TrainingDataLoader,
 }
 
-/// A successful training run's result: the registered output model id, and
-/// whether the training path already finalized the job (wrote `completed` + the
-/// output model + the run metrics). The fine-tune trainer finalizes itself; the
-/// predictor path does not, so the worker finalizes it — `finalized` tells the
-/// worker which case it is so it never clobbers the trainer's metrics.
+/// A successful training run's result: the registered output-model id and the
+/// run metrics. The training path has already persisted its artifact and
+/// registered the model-output row (the worker for the fine-tune kinds, the
+/// predictor's own `persist_predictor` for the predictor kind); the worker then
+/// performs the single lease-guarded compare-and-set that records these and
+/// flips the job to `completed`. `metrics` is the run-metrics JSON the CAS
+/// writes (the fine-tune loop's loss/step/timing detail; `None` for a kind that
+/// records none beyond the terminal flip).
 struct RunSuccess {
     model_id: String,
-    finalized: bool,
+    metrics: Option<String>,
 }
 
 /// The terminal classification of a worker's run of one job.
@@ -918,40 +976,78 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// Record a terminal `Failed` status for a training job, surfacing the cause via
-/// the catalog metrics blob so a `TrainingJob::wait()` observer sees the failure
-/// instead of an indefinite `running` state.
-async fn record_failed(catalog: &Arc<Catalog>, job_id: &str, msg: String) {
+/// Record a terminal `Failed` status for a training job this worker owns,
+/// surfacing the cause via the catalog metrics blob so a `TrainingJob::wait()`
+/// observer sees the failure instead of an indefinite `running` state.
+///
+/// The write is lease-guarded (the failure peer of the finalize CAS): it lands
+/// only while this worker still holds the lease (`claimed_by = worker_id AND
+/// status = 'running'`). A worker that lost its lease before failing does not
+/// stamp `failed` over a job the re-claiming worker is running — that case is
+/// left for the new owner (logged at debug).
+async fn record_failed(catalog: &Arc<Catalog>, job_id: &str, worker_id: &str, msg: String) {
     let metrics = serde_json::json!({ "error_message": msg }).to_string();
-    if let Err(e) = catalog
-        .update_training_status(job_id, TrainingJobStatus::Failed, Some(&metrics))
+    match catalog
+        .fail_training_job(job_id, worker_id, Some(&metrics))
         .await
     {
-        tracing::error!(job_id = %job_id, error = %e, "Failed to record terminal status");
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::debug!(
+                job_id = %job_id,
+                worker = %worker_id,
+                "lost lease before recording failure; left for reclaim"
+            );
+        }
+        Err(e) => {
+            tracing::error!(job_id = %job_id, error = %e, "Failed to record terminal status");
+        }
     }
 }
 
-/// Run LoRA fine-tuning in a blocking context, checking `cancel` at every epoch
-/// boundary. Reconstructs the training target (projection head or encoder
-/// adapters) and drives the trainer, which registers the output model and flips
-/// the job to `completed` on success.
-#[allow(clippy::too_many_arguments)]
-fn run_fine_tune_blocking(
+/// The inputs to one blocking LoRA fine-tune run, grouped so the blocking call
+/// takes a single owned argument rather than a long positional list. Built on
+/// the async side and moved into the `spawn_blocking` closure.
+struct RunFineTuneParams {
     catalog: Arc<Catalog>,
     artifact_dir: std::path::PathBuf,
     job_id: String,
-    output_model_id: String,
     base_model: String,
     task: ModelTask,
     config: FineTuneConfig,
-    data_loader: TrainingDataLoader,
+    loader: TrainingDataLoader,
     base_model_arc: Arc<crate::model::LoadedModel>,
     hidden_size: usize,
     device_config: DeviceConfig,
     cancel: Arc<AtomicBool>,
-) -> Result<()> {
+}
+
+/// Run LoRA fine-tuning in a blocking context, checking `cancel` at every epoch
+/// boundary. Reconstructs the training target (projection head or encoder
+/// adapters) and drives the trainer. The loop trains and persists the adapter
+/// but writes no terminal status — the worker registers the output model and
+/// runs the lease-guarded finalize after this returns. Returns the
+/// [`crate::fine_tune::trainer::TrainingResult`] (adapter path + run metrics)
+/// the worker threads into that finalization.
+fn run_fine_tune_blocking(
+    params: RunFineTuneParams,
+) -> Result<crate::fine_tune::trainer::TrainingResult> {
     use candle_core::DType;
     use candle_nn::VarMap;
+
+    let RunFineTuneParams {
+        catalog,
+        artifact_dir,
+        job_id,
+        base_model,
+        task,
+        config,
+        loader: data_loader,
+        base_model_arc,
+        hidden_size,
+        device_config,
+        cancel,
+    } = params;
 
     let device = crate::model::backend::candle::select_device(&device_config);
     let varmap = VarMap::new();
@@ -999,20 +1095,14 @@ fn run_fine_tune_blocking(
     let mut training_loop =
         crate::fine_tune::trainer::TrainingLoopBuilder::new(target, varmap, config)
             .base_model(base_model_arc)
-            .job_id(job_id.clone())
+            .job_id(job_id)
             .catalog(Arc::clone(&catalog))
-            .artifact_dir(artifact_dir.clone())
-            .output_model(crate::fine_tune::trainer::OutputModelHandle {
-                output_model_id,
-                base_model_id: base_model,
-                task,
-            })
+            .artifact_dir(artifact_dir)
             .device(device.clone())
             .cancel(cancel)
             .build()?;
 
-    training_loop.run(&data_loader)?;
-    Ok(())
+    training_loop.run(&data_loader)
 }
 
 /// Construct an encoder-adapters target: load the frozen backbone weights from
@@ -1170,4 +1260,120 @@ fn build_encoder_adapters(
     };
 
     Ok((encoder, adapter_cfg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panicking blocking trainer drives the job to a terminal `failed` status
+    /// with the panic message recorded — never an uncaught unwind that wedges the
+    /// worker loop and leaves the job stuck `running`. This runs the exact
+    /// `catch_unwind` → `panic_message` → classify → `record_failed` pipeline the
+    /// worker runs around [`run_fine_tune_blocking`], over a closure that panics
+    /// in place of a candle/platform fault inside the trainer, and asserts on the
+    /// catalog row the worker writes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn panicking_training_job_lands_failed_with_recorded_error() {
+        use jammi_db::catalog::status::TrainingJobStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(dir.path()).await.unwrap());
+        catalog
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: "panic-base",
+                version: 1,
+                model_type: "embedding",
+                backend: "candle",
+                task: ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: None,
+                config_json: None,
+            })
+            .await
+            .unwrap();
+        catalog
+            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+                job_id: "panic-job",
+                base_model_id: "panic-base::1",
+                training_source: "src",
+                loss_type: "cosent",
+                hyperparams: "{}",
+                kind: "fine_tune",
+                training_spec: "{}",
+            })
+            .await
+            .unwrap();
+
+        // The worker claims the job (running, leased to it) before running it —
+        // the state in which a genuine failure is recorded under the lease guard.
+        catalog
+            .claim_next_training_job("worker-x", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("the queued job is claimable");
+
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // Run the worker's blocking wrapper over a trainer that panics, then take
+        // the same terminal-classification branch `train_fine_tune` does.
+        let result = tokio::task::spawn_blocking(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                panic!("simulated candle kernel fault");
+            }))
+        })
+        .await;
+        let outcome = match result {
+            Ok(Ok(Ok(()))) => panic!("the closure was supposed to panic"),
+            Ok(Ok(Err(e))) => classify(&cancel, e),
+            Ok(Err(payload)) => {
+                WorkerJobError::Failed(format!("Panic: {}", panic_message(payload.as_ref())))
+            }
+            Err(join_err) => {
+                WorkerJobError::Failed(format!("training task join error: {join_err}"))
+            }
+        };
+
+        let WorkerJobError::Failed(msg) = outcome else {
+            panic!("a genuine panic must classify as Failed, not Cancelled");
+        };
+        assert!(
+            msg.contains("Panic:") && msg.contains("simulated candle kernel fault"),
+            "a caught panic must carry its message into the failure, got: {msg}"
+        );
+
+        // The worker records the failure as the job's terminal status, under the
+        // lease guard (it still owns the job).
+        record_failed(&catalog, "panic-job", "worker-x", msg).await;
+
+        let job = catalog.get_training_job("panic-job").await.unwrap();
+        assert_eq!(
+            job.status,
+            TrainingJobStatus::Failed.to_string(),
+            "a panicking job lands `failed`, never wedged `running`"
+        );
+        assert!(
+            job.error_message
+                .as_deref()
+                .is_some_and(|m| m.contains("simulated candle kernel fault")),
+            "the panic cause is recorded on the job, got {:?}",
+            job.error_message
+        );
+    }
+
+    /// The panic-payload extractor handles the two common payload shapes
+    /// (`&'static str` from `panic!("…")`, `String` from `panic!("{}", x)`) and
+    /// falls back for anything else, so the recorded failure is always a
+    /// human-readable cause rather than an opaque type id.
+    #[test]
+    fn panic_message_reads_str_string_and_other_payloads() {
+        let s = std::panic::catch_unwind(|| panic!("static message")).unwrap_err();
+        assert_eq!(panic_message(s.as_ref()), "static message");
+
+        let owned = std::panic::catch_unwind(|| panic!("{}", "owned".to_string())).unwrap_err();
+        assert_eq!(panic_message(owned.as_ref()), "owned");
+
+        let other = std::panic::catch_unwind(|| std::panic::panic_any(42u8)).unwrap_err();
+        assert_eq!(panic_message(other.as_ref()), "<unknown panic payload>");
+    }
 }

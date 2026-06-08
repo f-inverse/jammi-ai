@@ -769,35 +769,44 @@ async fn fine_tune_job_catalog_crud() {
     assert_eq!(job.status, "queued");
     assert_eq!(job.base_model_id, "base-model::1");
 
-    // Update to running
-    let metrics = r#"{"started_at": "2026-01-01T00:00:00Z"}"#;
+    // A worker claims the job → running, leased to it, started_at recorded.
+    let claimed = catalog
+        .claim_next_training_job("worker-x", std::time::Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("the queued job is claimable");
+    assert_eq!(claimed.status, "running");
     catalog
-        .update_training_status("job-1", TrainingJobStatus::Running, Some(metrics))
+        .update_training_status(
+            "job-1",
+            TrainingJobStatus::Running,
+            Some(r#"{"started_at": "2026-01-01T00:00:00Z"}"#),
+        )
         .await
         .unwrap();
     let job2 = catalog.get_training_job("job-1").await.unwrap();
     assert_eq!(job2.status, "running");
     assert!(job2.started_at.is_some());
 
-    // Update to completed with output model
-    catalog
-        .update_training_status(
+    // The lease owner finalizes: the single compare-and-set writes the output
+    // model + flips to completed + records the run metrics.
+    let finalized = catalog
+        .finalize_training_job(
             "job-1",
-            TrainingJobStatus::Completed,
+            "worker-x",
+            "jammi:fine-tuned:job-1",
             Some(r#"{"completed_at": "2026-01-01T01:00:00Z"}"#),
         )
         .await
         .unwrap();
-    catalog
-        .set_training_output_model("job-1", "jammi:fine-tuned:job-1")
-        .await
-        .unwrap();
+    assert!(finalized, "the lease owner finalizes the job");
     let job3 = catalog.get_training_job("job-1").await.unwrap();
     assert_eq!(job3.status, "completed");
     assert_eq!(
         job3.output_model_id.as_deref(),
         Some("jammi:fine-tuned:job-1")
     );
+    assert_eq!(job3.completed_at.as_deref(), Some("2026-01-01T01:00:00Z"));
 
     // List jobs
     let jobs = catalog.list_training_jobs().await.unwrap();
@@ -957,10 +966,11 @@ async fn training_divergence_detection() {
         msg.to_lowercase().contains("diverge"),
         "Error should mention divergence, got: {msg}"
     );
-
-    // Catalog should record failure
-    let job = catalog.get_training_job("div-job").await.unwrap();
-    assert_eq!(job.status, "failed", "Job status should be 'failed'");
+    // The loop returns the typed divergence error; recording the terminal
+    // `failed` status is the worker's job (a single finalization authority), not
+    // the loop's, so this trainer-internals test asserts on the returned error
+    // rather than the catalog status. The worker-driven panic→failed path is
+    // covered end-to-end in `panicking_training_job_lands_failed`.
 }
 
 // ─── Early stopping: patience exhaustion stops training ─────────────────────
@@ -1076,10 +1086,11 @@ async fn training_early_stopping_triggers() {
         "Early stopping should trigger well before 100 epochs, got {} steps",
         result.total_steps
     );
-
-    // Job should be completed (not failed)
-    let job = catalog.get_training_job("es-job").await.unwrap();
-    assert_eq!(job.status, "completed");
+    // The loop persists the adapter and returns its result; flipping the job to
+    // `completed` is the worker's single lease-guarded finalization, not the
+    // loop's, so this trainer-internals test asserts on the returned result. The
+    // worker-driven completed path is covered end-to-end by the durability and
+    // lifecycle tests above.
 }
 
 // ─── Fine-tuned model produces measurably different search quality ───────────
@@ -1377,7 +1388,138 @@ async fn durable_job_runs_on_separately_started_worker() {
     assert!(adapter.exists(), "worker wrote the adapter at {adapter:?}");
 }
 
-// ─── Lease loss: cooperative cancellation bails the trainer; reclaim re-queues ─
+// ─── Lease loss: a worker that lost its lease must not finalize ──────────────
+//
+// The CRITICAL race: cancellation is checked only at epoch boundaries, so a
+// worker can finish a short run without ever noticing its lease was reclaimed,
+// then reach the terminal write. That terminal write is a compare-and-set gated
+// on `claimed_by = worker_id AND status = 'running'`, so the stale worker
+// matches zero rows and does NOT mark the job `completed` — the owner that
+// re-claimed it is the sole finalizer.
+//
+// This drives the real worker (`run_claimed_job`): worker-a's claim is stolen by
+// worker-b (a reclaim + re-claim) before worker-a runs. worker-a then runs its
+// (now stale) claim to completion — a 1-epoch tiny_bert run finishes well inside
+// the 10s heartbeat interval, so the cancel flag never fires and worker-a
+// reaches finalize believing it succeeded. Post-fix its finalize CAS fails and
+// the job stays `running` (owned by worker-b). Pre-fix worker-a finalized
+// unconditionally, so the job would (wrongly) be `completed` by the worker that
+// lost the lease — this test fails against that code and passes against the CAS.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_that_lost_lease_does_not_finalize() {
+    use jammi_ai::fine_tune::worker::TrainingWorker;
+    use std::time::Duration;
+
+    let (session, _dir) = session_with_training_data().await;
+    let model = tiny_bert_model();
+
+    // Submit with NO worker running so the job sits `queued` and carries a real
+    // reconstructable spec.
+    let job = session
+        .fine_tune(
+            "training",
+            &model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 1,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    let worker_a = TrainingWorker::new(&session);
+    let worker_b = TrainingWorker::new(&session);
+
+    // worker-a claims with a zero lease (immediately expired). The returned
+    // record carries `claimed_by = worker-a` — the stale claim it will later try
+    // to finalize.
+    let stale_claim = session
+        .catalog()
+        .claim_next_training_job(worker_a.worker_id(), Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("worker-a claims the queued job");
+
+    // worker-b reclaims (the zero lease is already expired → requeue) and
+    // re-claims under a long lease: worker-b now owns the job.
+    let actioned = session
+        .catalog()
+        .reclaim_expired_training_jobs(5)
+        .await
+        .unwrap();
+    assert_eq!(actioned, 1, "the expired lease is re-queued");
+    let owned = session
+        .catalog()
+        .claim_next_training_job(worker_b.worker_id(), Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("worker-b re-claims the requeued job");
+    assert_eq!(owned.claimed_by.as_deref(), Some(worker_b.worker_id()));
+
+    // worker-a runs its stale claim to completion. The 1-epoch run finishes
+    // before the 10s heartbeat fires, so the cancel flag never trips and
+    // worker-a reaches finalize — where the lease-guarded CAS blocks it.
+    worker_a.run_claimed_job(&session, stale_claim).await;
+
+    // The job is still `running`, owned by worker-b: worker-a did NOT finalize.
+    let after_a = session
+        .catalog()
+        .get_training_job(&job.job_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_a.status, "running",
+        "a worker that lost its lease must not finalize the job (CAS blocks it)"
+    );
+    assert_eq!(
+        after_a.claimed_by.as_deref(),
+        Some(worker_b.worker_id()),
+        "the job is still owned by the worker that re-claimed it"
+    );
+
+    // The legitimate owner runs and finalizes exactly once.
+    worker_b.run_claimed_job(&session, owned).await;
+    job.wait().await.unwrap();
+    let after_b = session
+        .catalog()
+        .get_training_job(&job.job_id)
+        .await
+        .unwrap();
+    assert_eq!(after_b.status, "completed", "the lease owner finalizes");
+    assert!(
+        after_b.output_model_id.is_some(),
+        "the owner records the output model"
+    );
+
+    // Exactly one fine-tuned model row exists (deterministic id, upserted), and
+    // it is the one the owner finalized against.
+    let ft: Vec<_> = session
+        .catalog()
+        .list_models()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.model_id.starts_with("jammi:fine-tuned:"))
+        .collect();
+    assert_eq!(
+        ft.len(),
+        1,
+        "the fine-tuned model is registered exactly once"
+    );
+}
+
+// ─── Lease loss: cooperative cancellation bails the trainer at the boundary ──
 //
 // A `spawn_blocking` trainer cannot be force-aborted, so the worker's heartbeat
 // sets a cancel flag the trainer checks at every epoch boundary. With the flag

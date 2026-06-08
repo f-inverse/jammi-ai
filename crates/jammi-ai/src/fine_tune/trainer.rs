@@ -19,6 +19,12 @@ use super::{EarlyStoppingMetric, FineTuneConfig, LrSchedule};
 use crate::model::{LoadedModel, ModelTask};
 
 /// Result of a completed training run.
+///
+/// The loop trains and persists the adapter, but does **not** write the job's
+/// terminal status or register the output model — that is the worker's single
+/// lease-guarded finalization. The run metrics it computed (final loss, step
+/// count, timestamps) are returned here so the worker records them in the same
+/// compare-and-set that flips the job to `completed`.
 #[derive(Debug)]
 pub struct TrainingResult {
     /// Path where the final adapter weights were saved.
@@ -27,6 +33,8 @@ pub struct TrainingResult {
     pub final_loss: f64,
     /// Total optimizer steps taken.
     pub total_steps: usize,
+    /// The run metrics JSON the worker writes alongside the terminal status.
+    pub metrics_json: String,
 }
 
 /// Compute the learning rate for a given step.
@@ -79,23 +87,6 @@ struct StepContext<'a> {
     checkpoint_dir: &'a Path,
     checkpoint_interval: usize,
     total_steps: usize,
-    started_at: &'a str,
-}
-
-/// Catalog handles a successful training run must register before flipping
-/// the job's status to `Completed`. Bundled into one struct so the caller's
-/// `wait()` observer never sees a completed job whose output model row is
-/// still missing.
-pub struct OutputModelHandle {
-    /// Canonical id of the fine-tuned model (e.g. `"jammi:fine-tuned:<uuid>"`).
-    pub output_model_id: String,
-    /// Canonical id of the base model used for training (e.g. `"local:..."`
-    /// or `"sentence-transformers/all-MiniLM-L6-v2"`). Stored on the output
-    /// model row so the resolver can reach the base config from the
-    /// fine-tuned id alone.
-    pub base_model_id: String,
-    /// Task the fine-tuned model performs.
-    pub task: ModelTask,
 }
 
 /// The training loop: runs LoRA fine-tuning with gradient accumulation,
@@ -112,7 +103,6 @@ pub struct TrainingLoop {
     job_id: String,
     catalog: Arc<Catalog>,
     artifact_dir: PathBuf,
-    output_model: Option<OutputModelHandle>,
     divergence_count: usize,
     device: Device,
     /// Cooperative-cancellation flag the worker's heartbeat task sets when the
@@ -132,7 +122,6 @@ pub struct TrainingLoopBuilder {
     job_id: Option<String>,
     catalog: Option<Arc<Catalog>>,
     artifact_dir: Option<PathBuf>,
-    output_model: Option<OutputModelHandle>,
     device: Device,
     cancel: Arc<AtomicBool>,
 }
@@ -152,7 +141,6 @@ impl TrainingLoopBuilder {
             job_id: None,
             catalog: None,
             artifact_dir: None,
-            output_model: None,
             device: Device::Cpu,
             cancel: Arc::new(AtomicBool::new(false)),
         }
@@ -199,19 +187,6 @@ impl TrainingLoopBuilder {
         self
     }
 
-    /// Set the output-model handle. Required when the loop is part of the
-    /// production fine-tune path: on successful completion the trainer
-    /// registers the output model in the catalog *before* flipping the
-    /// job to `Completed`, closing the wait/read race that would otherwise
-    /// let a caller observe a completed job with no model row.
-    ///
-    /// Omit only in trainer-internals tests that drive the loop directly
-    /// with precomputed batches and assert on the in-memory result alone.
-    pub fn output_model(mut self, handle: OutputModelHandle) -> Self {
-        self.output_model = Some(handle);
-        self
-    }
-
     /// Build the training loop. All infrastructure params must be set.
     pub fn build(self) -> Result<TrainingLoop> {
         let job_id = self
@@ -231,7 +206,6 @@ impl TrainingLoopBuilder {
             job_id,
             catalog,
             artifact_dir,
-            output_model: self.output_model,
             divergence_count: 0,
             device: self.device,
             cancel: self.cancel,
@@ -349,7 +323,6 @@ impl TrainingLoop {
                             checkpoint_dir: &checkpoint_dir,
                             checkpoint_interval,
                             total_steps,
-                            started_at: &started_at,
                         },
                     )?;
                 }
@@ -398,7 +371,6 @@ impl TrainingLoop {
                             checkpoint_dir: &checkpoint_dir,
                             checkpoint_interval,
                             total_steps,
-                            started_at: &started_at,
                         },
                     )?;
                 }
@@ -499,41 +471,18 @@ impl TrainingLoop {
         jammi_lora::save_adapter(&checkpoint_dir, &final_weights, &saved)
             .map_err(|e| JammiError::FineTune(format!("Save adapter: {e}")))?;
 
-        // Register the output model in the catalog BEFORE flipping the
-        // job's status to `Completed`. `TrainingJob::wait()` returns as
-        // soon as it sees `Completed`; if the model row landed after the
-        // flip, a caller doing `wait().await; encode_text_query(job.model_id())`
-        // would race and miss the row, falling through to the HF Hub
-        // resolver and hitting a 401 on a name that cannot exist there.
-        let handle = tokio::runtime::Handle::current();
-        if let Some(ref output) = self.output_model {
-            handle.block_on(
-                self.catalog
-                    .set_training_output_model(&self.job_id, &output.output_model_id),
-            )?;
-            handle.block_on(self.catalog.register_model(
-                jammi_db::catalog::model_repo::RegisterModelParams {
-                    model_id: &output.output_model_id,
-                    version: 1,
-                    model_type: "fine-tuned",
-                    backend: "candle",
-                    task: output.task,
-                    base_model_id: Some(&output.base_model_id),
-                    artifact_path: checkpoint_dir.to_str(),
-                    config_json: None,
-                },
-            ))?;
-        }
-
-        // Job status flips to Completed last — only after every artifact
-        // and catalog row is durable. `wait()` observers see a consistent
-        // post-state.
+        // The loop does not write the terminal status or register the output
+        // model. Both are the worker's single lease-guarded finalization: it
+        // registers the model row, then runs the compare-and-set that flips the
+        // job to `completed` only while it still holds the lease. Computing the
+        // run metrics here (and returning them) keeps the rich loss / step /
+        // timing detail the worker records in that same CAS.
         let completed_at = chrono::Utc::now().to_rfc3339();
         let early_stopping_metric_label = match self.config.early_stopping_metric {
             EarlyStoppingMetric::TrainLoss => "train_loss",
             EarlyStoppingMetric::ValLoss => "val_loss",
         };
-        let metrics = serde_json::json!({
+        let metrics_json = serde_json::json!({
             "final_loss": best_val_loss,
             "early_stopping_metric": early_stopping_metric_label,
             "total_steps": global_step,
@@ -541,16 +490,12 @@ impl TrainingLoop {
             "completed_at": completed_at,
         })
         .to_string();
-        handle.block_on(self.catalog.update_training_status(
-            &self.job_id,
-            TrainingJobStatus::Completed,
-            Some(&metrics),
-        ))?;
 
         Ok(TrainingResult {
             adapter_path: checkpoint_dir,
             final_loss: best_val_loss,
             total_steps: global_step,
+            metrics_json,
         })
     }
 
@@ -1113,26 +1058,15 @@ impl TrainingLoop {
             .map_err(|e| JammiError::FineTune(format!("Loss scalar: {e}")))?
             as f64;
 
-        // Divergence detection
+        // Divergence detection. A diverged run returns the typed error and the
+        // worker records the terminal `failed` status — terminal writes are the
+        // worker's single authority, never the loop's.
         if loss_val.is_nan() || loss_val > 100.0 {
             self.divergence_count += 1;
             if self.divergence_count >= 3 {
-                let err_msg = "Training diverged: loss was NaN or >100 for 3 consecutive batches";
-                let metrics = serde_json::json!({
-                    "error_message": err_msg,
-                    "started_at": ctx.started_at,
-                })
-                .to_string();
-                if let Err(e) =
-                    tokio::runtime::Handle::current().block_on(self.catalog.update_training_status(
-                        &self.job_id,
-                        TrainingJobStatus::Failed,
-                        Some(&metrics),
-                    ))
-                {
-                    tracing::error!(job_id = %self.job_id, error = %e, "Failed to record job status in catalog");
-                }
-                return Err(JammiError::FineTune(err_msg.into()));
+                return Err(JammiError::FineTune(
+                    "Training diverged: loss was NaN or >100 for 3 consecutive batches".into(),
+                ));
             }
             return Ok(());
         }

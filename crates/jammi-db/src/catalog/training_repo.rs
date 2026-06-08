@@ -247,35 +247,111 @@ impl Catalog {
         Ok(())
     }
 
-    /// Set the output model ID for a completed training job. Scoped.
-    pub async fn set_training_output_model(
+    /// Finalize a training job the caller still owns, as a single compare-and-set
+    /// gated on lease ownership. Atomically writes `output_model_id`, flips the
+    /// status to `completed`, and (when `metrics` is `Some`) records the run
+    /// metrics — but **only** while the row is still `running` and
+    /// `claimed_by == worker_id`. Returns `true` when the row was updated
+    /// (the caller held the lease and is the sole finalizer) and `false` when it
+    /// was not (the lease was lost — the row is no longer `running`, or another
+    /// worker reclaimed it). A `false` return means the caller must not register
+    /// the output model or otherwise act as the finalizer; the job is left for
+    /// [`Self::reclaim_expired_training_jobs`] and the worker that re-claims it.
+    ///
+    /// Not tenant-scoped, matching [`Self::claim_next_training_job`] and
+    /// [`Self::heartbeat_training_job`]: the lease identity (`claimed_by`) is the
+    /// authority, not the session tenant. The single `UPDATE … WHERE claimed_by
+    /// AND status = 'running'` is the same lease guard the heartbeat uses, so a
+    /// worker whose lease was reclaimed mid-run matches zero rows here and the
+    /// worker that now owns the job is the only one whose CAS succeeds.
+    pub async fn finalize_training_job(
         &self,
         job_id: &str,
+        worker_id: &str,
         output_model_id: &str,
-    ) -> Result<()> {
+        metrics: Option<&str>,
+    ) -> Result<bool> {
+        let completed = TrainingJobStatus::Completed.to_string();
+        let running = TrainingJobStatus::Running.to_string();
+        let job_id = job_id.to_string();
+        let worker_id = worker_id.to_string();
         let output_model_id = output_model_id.to_string();
-        let id = job_id.to_string();
-        let tenant = self.current_tenant();
-        self.backend()
+        let metrics = metrics.map(str::to_string);
+        let now = lease_now();
+
+        let updated = self
+            .backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
-                    tx.set_tenant(tenant);
                     tx.execute(
-                        "UPDATE training_jobs SET output_model_id = $1, \
-                         updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
-                         WHERE job_id = $2 AND (tenant_id = $3 OR tenant_id IS NULL)",
+                        "UPDATE training_jobs \
+                         SET output_model_id = $1, status = $2, \
+                             metrics = COALESCE($3, metrics), updated_at = $4 \
+                         WHERE job_id = $5 AND claimed_by = $6 AND status = $7",
                         &[
                             SqlValue::TextOwned(output_model_id),
-                            SqlValue::TextOwned(id),
-                            SqlValue::from(tenant.map(|t| t.to_string())),
+                            SqlValue::TextOwned(completed),
+                            SqlValue::from(metrics),
+                            SqlValue::TextOwned(now),
+                            SqlValue::TextOwned(job_id),
+                            SqlValue::TextOwned(worker_id),
+                            SqlValue::TextOwned(running),
                         ],
                     )
-                    .await?;
-                    Ok(())
+                    .await
                 })
             })
             .await?;
-        Ok(())
+        Ok(updated == 1)
+    }
+
+    /// Fail a training job the caller still owns, as a single compare-and-set
+    /// gated on lease ownership — the failure peer of [`Self::finalize_training_job`].
+    /// Flips the status to `failed` and records `metrics` (the error blob) only
+    /// while the row is still `running` and `claimed_by == worker_id`. Returns
+    /// `true` when the row was updated and `false` when the lease was lost (the
+    /// row is no longer `running`, or another worker reclaimed it).
+    ///
+    /// Guarding the failure write the same way as the finalize write keeps the
+    /// two terminal transitions symmetric: a worker that lost its lease mid-run
+    /// cannot stamp `failed` over a job the re-claiming worker is successfully
+    /// running (which would otherwise block that worker's finalize). Not
+    /// tenant-scoped, matching the other lease-identity operations.
+    pub async fn fail_training_job(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        metrics: Option<&str>,
+    ) -> Result<bool> {
+        let failed = TrainingJobStatus::Failed.to_string();
+        let running = TrainingJobStatus::Running.to_string();
+        let job_id = job_id.to_string();
+        let worker_id = worker_id.to_string();
+        let metrics = metrics.map(str::to_string);
+        let now = lease_now();
+
+        let updated = self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE training_jobs \
+                         SET status = $1, metrics = COALESCE($2, metrics), updated_at = $3 \
+                         WHERE job_id = $4 AND claimed_by = $5 AND status = $6",
+                        &[
+                            SqlValue::TextOwned(failed),
+                            SqlValue::from(metrics),
+                            SqlValue::TextOwned(now),
+                            SqlValue::TextOwned(job_id),
+                            SqlValue::TextOwned(worker_id),
+                            SqlValue::TextOwned(running),
+                        ],
+                    )
+                    .await
+                })
+            })
+            .await?;
+        Ok(updated == 1)
     }
 
     /// List training jobs visible to the session tenant, most recent first.

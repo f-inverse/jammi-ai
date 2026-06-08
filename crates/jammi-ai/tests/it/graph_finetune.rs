@@ -230,6 +230,78 @@ fn from_graph_loader_threads_pairs_and_triplet_shapes() {
     );
 }
 
+/// A graph job is durable: the submitter persists a `TrainingSpec::GraphFineTune`
+/// and a worker reconstructs the run from that JSON alone. The reconstruction
+/// must be deterministic — two runs from the *same persisted spec* re-sample the
+/// identical pairs (the seed lives in `sample_config`), or a re-claimed job after
+/// a lost lease would train on different data than the first attempt. This is the
+/// job-round-trip determinism contract: serialise the spec, deserialise it twice,
+/// and assert the rebuilt sampler yields byte-identical pairs both times.
+#[test]
+fn graph_spec_round_trip_resamples_identical_pairs() {
+    use jammi_ai::fine_tune::spec::TrainingSpec;
+
+    let sources = GraphFineTuneSources {
+        node_source: "nodes".into(),
+        id_column: "id".into(),
+        text_column: "text".into(),
+        edge_source: "edges".into(),
+        src_column: "src".into(),
+        dst_column: "dst".into(),
+        provenance: EdgeProvenance::Declared,
+    };
+    let sample_config = GraphSampleConfig {
+        walk_length: 4,
+        walks_per_node: 6,
+        hard_negatives: 2,
+        exclude_hops: 1,
+        seed: 4242,
+        ..GraphSampleConfig::default()
+    };
+    let spec = TrainingSpec::GraphFineTune {
+        sources,
+        sample_config,
+        common: jammi_ai::fine_tune::spec::TrainingCommon {
+            base_model: "local:tiny".into(),
+            config: jammi_ai::fine_tune::FineTuneConfig::default(),
+        },
+    };
+
+    // Persist exactly as the submit path does, then reconstruct twice — the two
+    // independent deserialisations stand in for two worker attempts at the job.
+    let json = serde_json::to_string(&spec).unwrap();
+    let resample = |json: &str| -> Vec<jammi_ai::fine_tune::graph_sampler::SampledPair> {
+        let TrainingSpec::GraphFineTune {
+            sources,
+            sample_config,
+            ..
+        } = serde_json::from_str(json).unwrap()
+        else {
+            panic!("round-trip must yield a GraphFineTune spec");
+        };
+        // The worker reads the sources from SQL; here the node/edge content is
+        // fixed by the fixture, so the sampler input is the same — the only
+        // variable across attempts is the seeded sampler, which the spec carries.
+        let _ = &sources;
+        let (nodes, edges) = two_communities(EdgeProvenance::Declared);
+        GraphSampler::build(nodes, edges, sample_config)
+            .unwrap()
+            .sample()
+            .unwrap()
+    };
+
+    let first = resample(&json);
+    let second = resample(&json);
+    assert!(
+        !first.is_empty(),
+        "the round-tripped spec must sample a non-empty pair set"
+    );
+    assert_eq!(
+        first, second,
+        "two runs from the same persisted spec must re-sample identical pairs"
+    );
+}
+
 /// The text-bearing precondition surfaces as a typed error end-to-end: an edge
 /// endpoint with no node text is rejected at sampler build, never silently
 /// dropped.

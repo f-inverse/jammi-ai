@@ -474,8 +474,15 @@ impl InferenceSession {
     /// This is the worker-side execution the [`Self::train_context_predictor`]
     /// submit path defers to; it reconstructs everything from `spec` alone, with
     /// no in-memory carryover from the submitting session.
+    ///
+    /// `catalog` is the worker's tenant-pinned catalog: the model row is
+    /// registered through it so the predictor lands under the job's tenant,
+    /// mirroring the fine-tune path. Reads off the session use the session's own
+    /// catalog (sampling is tenant-agnostic); only the registering write is
+    /// re-scoped.
     pub(crate) async fn run_context_predictor_training(
         self: &Arc<Self>,
+        catalog: &Arc<jammi_db::catalog::Catalog>,
         source_id: &str,
         spec: &ContextPredictorTrainConfig,
         cancel: &std::sync::atomic::AtomicBool,
@@ -520,7 +527,7 @@ impl InferenceSession {
             |preds, batch: &EpisodeBatch| spec.head.score(preds, &batch.target_y),
         )?;
 
-        self.persist_predictor(spec, &table, &varmap).await
+        self.persist_predictor(catalog, spec, &table, &varmap).await
     }
 
     /// Build one [`EpisodeBatch`] per task — every target row in the task, each
@@ -725,8 +732,13 @@ impl InferenceSession {
     /// catalog, mirroring the fine-tune trainer's model-output path: the weights
     /// land as a safetensors file under `{artifact_dir}/context_predictors/`, and
     /// a `ModelTask::Regression` model row points at the directory.
+    ///
+    /// The model row is registered through `catalog` (the worker's tenant-pinned
+    /// handle) so it lands under the job's tenant; the read-back `get_model` uses
+    /// the same handle so it is visible within that tenant scope.
     async fn persist_predictor(
         &self,
+        catalog: &Arc<jammi_db::catalog::Catalog>,
         spec: &ContextPredictorTrainConfig,
         table: &ResultTableRecord,
         varmap: &VarMap,
@@ -768,7 +780,7 @@ impl InferenceSession {
         let artifact_path = artifact_root.to_str().ok_or_else(|| {
             JammiError::FineTune("predictor artifact path is not valid UTF-8".into())
         })?;
-        self.catalog()
+        catalog
             .register_model(RegisterModelParams {
                 model_id: &spec.model_id,
                 version: 1,
@@ -781,15 +793,12 @@ impl InferenceSession {
             })
             .await?;
 
-        self.catalog()
-            .get_model(&spec.model_id)
-            .await?
-            .ok_or_else(|| {
-                JammiError::Catalog(format!(
-                    "context predictor '{}' not found after registration",
-                    spec.model_id
-                ))
-            })
+        catalog.get_model(&spec.model_id).await?.ok_or_else(|| {
+            JammiError::Catalog(format!(
+                "context predictor '{}' not found after registration",
+                spec.model_id
+            ))
+        })
     }
 }
 

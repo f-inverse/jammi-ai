@@ -158,7 +158,14 @@ async fn graph_session(
         .collect();
     session
         .result_store()
-        .materialize_embedding_table(session.context(), "nodes", "synthetic-embed", &pairs, DIM)
+        .materialize_embedding_table(
+            session.context(),
+            "nodes",
+            "synthetic-embed",
+            None,
+            &pairs,
+            DIM,
+        )
         .await
         .unwrap();
 

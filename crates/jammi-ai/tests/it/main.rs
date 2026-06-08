@@ -12,6 +12,7 @@ mod evaluation;
 mod fine_tune;
 mod graph_context;
 mod graph_finetune;
+mod graph_propagation;
 mod inference;
 mod jammi;
 mod local_session;

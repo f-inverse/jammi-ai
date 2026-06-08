@@ -148,6 +148,7 @@ async fn session_with_meta_dataset(rows: &[Row]) -> (Arc<InferenceSession>, Temp
             session.context(),
             "fns",
             "synthetic-embed",
+            None,
             &pairs,
             FEATURE_DIM,
         )

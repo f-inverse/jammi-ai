@@ -810,4 +810,209 @@ mod tests {
         let decoded = FineTuneConfig::try_from(proto).expect("round-trip decodes");
         assert_eq!(decoded, original);
     }
+
+    /// Re-encode a [`pb::StartTrainingRequest`] into the spec it decoded from —
+    /// `training_spec_to_proto` then `training_spec_from_proto` — so a remote
+    /// `GraphFineTune` job is byte-identical to the in-process one. Every field
+    /// of the source spec is a distinctive non-default value, and every field of
+    /// the decoded spec is asserted individually: a dropped or mis-mapped field
+    /// in either direction (proto missing it → the decode resolves a different
+    /// value; the encode dropping it → the assert below fires) fails the test.
+    #[cfg(feature = "local")]
+    #[test]
+    fn graph_fine_tune_spec_round_trips_field_for_field() {
+        let original = TrainingSpec::GraphFineTune {
+            sources: GraphFineTuneSources {
+                node_source: "nodes_src".into(),
+                id_column: "node_id".into(),
+                text_column: "node_text".into(),
+                edge_source: "edges_src".into(),
+                src_column: "edge_from".into(),
+                dst_column: "edge_to".into(),
+                provenance: EdgeProvenance::Similarity,
+            },
+            sample_config: GraphSampleConfig {
+                walk_length: 7,
+                walks_per_node: 3,
+                return_p: 0.25,
+                in_out_q: 4.0,
+                hard_negatives: 5,
+                exclude_hops: 2,
+                min_negatives: 9,
+                seed: 0xDEAD_BEEF,
+            },
+            common: TrainingCommon {
+                base_model: "graph-base".into(),
+                // A non-default config knob so the common config round-trips too.
+                config: FineTuneConfig {
+                    lora_rank: 32,
+                    ..FineTuneConfig::default()
+                },
+            },
+        };
+
+        let proto = training_spec_to_proto(&original);
+        let decoded =
+            training_spec_from_proto(proto).expect("graph spec round-trips through decode");
+
+        let TrainingSpec::GraphFineTune {
+            sources,
+            sample_config,
+            common,
+        } = decoded
+        else {
+            panic!("decoded spec is not GraphFineTune");
+        };
+
+        assert_eq!(sources.node_source, "nodes_src");
+        assert_eq!(sources.id_column, "node_id");
+        assert_eq!(sources.text_column, "node_text");
+        assert_eq!(sources.edge_source, "edges_src");
+        assert_eq!(sources.src_column, "edge_from");
+        assert_eq!(sources.dst_column, "edge_to");
+        assert_eq!(sources.provenance, EdgeProvenance::Similarity);
+
+        assert_eq!(sample_config.walk_length, 7);
+        assert_eq!(sample_config.walks_per_node, 3);
+        assert_eq!(sample_config.return_p, 0.25);
+        assert_eq!(sample_config.in_out_q, 4.0);
+        assert_eq!(sample_config.hard_negatives, 5);
+        assert_eq!(sample_config.exclude_hops, 2);
+        assert_eq!(sample_config.min_negatives, 9);
+        assert_eq!(sample_config.seed, 0xDEAD_BEEF);
+
+        assert_eq!(common.base_model, "graph-base");
+        assert_eq!(common.config.lora_rank, 32);
+    }
+
+    /// The `ContextPredictor` spec round-trips field-for-field through
+    /// `training_spec_to_proto` → `training_spec_from_proto`, with the Gaussian
+    /// `Nll { beta }` head. Every scalar / column / budget knob is a distinctive
+    /// non-default value asserted individually, so a dropped or mis-mapped field
+    /// in either conversion direction fails.
+    #[cfg(feature = "local")]
+    #[test]
+    fn context_predictor_spec_round_trips_gaussian_head() {
+        let original = TrainingSpec::ContextPredictor {
+            source: "episodes_src".into(),
+            predictor_spec: ContextPredictorTrainConfig {
+                model_id: "ctx-pred-1".into(),
+                architecture: ContextArchitecture::Tnp,
+                key_column: "row_key".into(),
+                task_column: "cohort".into(),
+                value_column: "outcome".into(),
+                context_k: 13,
+                hidden_dim: 256,
+                num_heads: 8,
+                num_layers: 6,
+                head: PredictiveHead::Gaussian {
+                    objective: GaussianObjective::Nll { beta: 0.5 },
+                },
+                epochs: 11,
+                learning_rate: 3e-4,
+                grad_clip: 2.5,
+                test_task_fraction: 0.3,
+                min_task_count: 7,
+                seed: 0xC0FF_EE42,
+            },
+        };
+
+        let proto = training_spec_to_proto(&original);
+        let decoded =
+            training_spec_from_proto(proto).expect("predictor spec round-trips through decode");
+
+        let TrainingSpec::ContextPredictor {
+            source,
+            predictor_spec,
+        } = decoded
+        else {
+            panic!("decoded spec is not ContextPredictor");
+        };
+
+        assert_eq!(source, "episodes_src");
+        assert_eq!(predictor_spec.model_id, "ctx-pred-1");
+        assert_eq!(predictor_spec.architecture, ContextArchitecture::Tnp);
+        assert_eq!(predictor_spec.key_column, "row_key");
+        assert_eq!(predictor_spec.task_column, "cohort");
+        assert_eq!(predictor_spec.value_column, "outcome");
+        assert_eq!(predictor_spec.context_k, 13);
+        assert_eq!(predictor_spec.hidden_dim, 256);
+        assert_eq!(predictor_spec.num_heads, 8);
+        assert_eq!(predictor_spec.num_layers, 6);
+        match predictor_spec.head {
+            PredictiveHead::Gaussian {
+                objective: GaussianObjective::Nll { beta },
+            } => assert_eq!(beta, 0.5),
+            other => panic!("expected Gaussian Nll head, got {other:?}"),
+        }
+        assert_eq!(predictor_spec.epochs, 11);
+        assert_eq!(predictor_spec.learning_rate, 3e-4);
+        assert_eq!(predictor_spec.grad_clip, 2.5);
+        assert_eq!(predictor_spec.test_task_fraction, 0.3);
+        assert_eq!(predictor_spec.min_task_count, 7);
+        assert_eq!(predictor_spec.seed, 0xC0FF_EE42);
+    }
+
+    /// The predictor spec's other two head shapes also round-trip: the Gaussian
+    /// `Crps` objective (no payload) and the `Quantile { levels }` head (a
+    /// distinctive non-default level vector). These exercise the head `oneof`
+    /// arms the Nll case above does not.
+    #[cfg(feature = "local")]
+    #[test]
+    fn context_predictor_spec_round_trips_crps_and_quantile_heads() {
+        for head in [
+            PredictiveHead::Gaussian {
+                objective: GaussianObjective::Crps,
+            },
+            PredictiveHead::Quantile {
+                levels: vec![0.1, 0.5, 0.9],
+            },
+        ] {
+            let original = TrainingSpec::ContextPredictor {
+                source: "episodes_src".into(),
+                predictor_spec: ContextPredictorTrainConfig {
+                    model_id: "ctx-pred-2".into(),
+                    architecture: ContextArchitecture::AttnCnp,
+                    key_column: "row_key".into(),
+                    task_column: "cohort".into(),
+                    value_column: "outcome".into(),
+                    context_k: 4,
+                    hidden_dim: 64,
+                    num_heads: 4,
+                    num_layers: 2,
+                    head: head.clone(),
+                    epochs: 2,
+                    learning_rate: 1e-3,
+                    grad_clip: 1.0,
+                    test_task_fraction: 0.2,
+                    min_task_count: 3,
+                    seed: 42,
+                },
+            };
+
+            let proto = training_spec_to_proto(&original);
+            let decoded =
+                training_spec_from_proto(proto).expect("predictor spec round-trips through decode");
+
+            let TrainingSpec::ContextPredictor { predictor_spec, .. } = decoded else {
+                panic!("decoded spec is not ContextPredictor");
+            };
+
+            match (&head, &predictor_spec.head) {
+                (
+                    PredictiveHead::Gaussian {
+                        objective: GaussianObjective::Crps,
+                    },
+                    PredictiveHead::Gaussian {
+                        objective: GaussianObjective::Crps,
+                    },
+                ) => {}
+                (
+                    PredictiveHead::Quantile { levels: want },
+                    PredictiveHead::Quantile { levels: got },
+                ) => assert_eq!(got, want),
+                (want, got) => panic!("head mismatch: wanted {want:?}, got {got:?}"),
+            }
+        }
+    }
 }

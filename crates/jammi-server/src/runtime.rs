@@ -40,21 +40,21 @@ use crate::grpc::audit::AuditServer;
 use crate::grpc::channel::ChannelServer;
 use crate::grpc::embedding::EmbeddingServer;
 use crate::grpc::eval::EvalServer;
-#[cfg(feature = "train")]
-use crate::grpc::fine_tune::FineTuneServer;
 use crate::grpc::inference::InferenceServer;
 use crate::grpc::mutable_table::MutableTableServer;
 use crate::grpc::proto::audit::audit_service_server::AuditServiceServer;
 use crate::grpc::proto::channel::channel_service_server::ChannelServiceServer;
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingServiceServer;
 use crate::grpc::proto::eval::eval_service_server::EvalServiceServer;
-#[cfg(feature = "train")]
-use crate::grpc::proto::fine_tune::fine_tune_service_server::FineTuneServiceServer;
 use crate::grpc::proto::inference::inference_service_server::InferenceServiceServer;
 use crate::grpc::proto::mutable_table::mutable_table_service_server::MutableTableServiceServer;
 use crate::grpc::proto::session::session_service_server::SessionServiceServer;
+#[cfg(feature = "train")]
+use crate::grpc::proto::training::training_service_server::TrainingServiceServer;
 use crate::grpc::proto::trigger::trigger_service_server::TriggerServiceServer;
 use crate::grpc::session::{SessionServer, SessionStore, TenantInterceptor};
+#[cfg(feature = "train")]
+use crate::grpc::training::TrainingServer;
 use crate::grpc::trigger::TriggerServer;
 use crate::grpc_web_trailers::GrpcWebTrailersLayer;
 use crate::routes::health::{self, MetricsRegistry};
@@ -367,7 +367,7 @@ pub struct GrpcChain {
 ///
 /// **Mounted by tier** (only when `tiers` selected them):
 /// - `EvalService` ← [`ServiceTier::Eval`]
-/// - `FineTuneService` ← [`ServiceTier::Train`] (and only when the `train`
+/// - `TrainingService` ← [`ServiceTier::Train`] (and only when the `train`
 ///   feature is compiled in — the mount code itself is `#[cfg]`-gated)
 /// - `TriggerService` ← [`ServiceTier::Event`], driven by `trigger` being
 ///   `Some` (the caller derives the handles iff the event tier is mounted)
@@ -488,10 +488,11 @@ pub async fn serve_grpc_chain(
             mounted.push("EvalService");
         }
 
-        // Train tier: FineTuneService. The mount code is `#[cfg]`-gated on the
-        // `train` feature, so a serve-only build carries no training surface;
-        // `TierSet::resolve` has already guaranteed the tier is not requested
-        // when the feature is compiled out.
+        // Train tier: TrainingService (all three training kinds — fine-tune,
+        // graph fine-tune, context-predictor). The mount code is `#[cfg]`-gated on
+        // the `train` feature, so a serve-only build carries no training surface;
+        // `TierSet::resolve` has already guaranteed the tier is not requested when
+        // the feature is compiled out.
         #[cfg(feature = "train")]
         if tiers.contains(ServiceTier::Train) {
             // Start the worker that runs submitted jobs: a "GPU worker pool" is
@@ -499,10 +500,10 @@ pub async fn serve_grpc_chain(
             // `train` tier runs one of them. It stops when this future resolves
             // on shutdown (the guard drops with the function frame).
             _train_worker = Some(jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session));
-            let fine_tune_svc =
-                FineTuneServiceServer::with_interceptor(FineTuneServer::new(session), interceptor);
-            builder = builder.add_service(fine_tune_svc);
-            mounted.push("FineTuneService");
+            let training_svc =
+                TrainingServiceServer::with_interceptor(TrainingServer::new(session), interceptor);
+            builder = builder.add_service(training_svc);
+            mounted.push("TrainingService");
         }
     }
 

@@ -1,10 +1,13 @@
-//! `FineTuneService` proto↔domain conversions.
+//! `TrainingService` proto↔domain conversions.
 //!
 //! The request `FineTuneConfig` mirrors the engine's [`FineTuneConfig`] field
 //! for field; decode maps it (and its nested loss / enum types) onto the engine
 //! struct, leaving the engine's defaults for any field left `UNSPECIFIED` (an
-//! absent `config` message → the engine default entirely). Validation stays in
-//! the engine (`FineTuneConfig::validate`, called inside `fine_tune`); this is a
+//! absent `config` message → the engine default entirely). The `StartTraining`
+//! spec `oneof` mirrors the engine's [`TrainingSpec`] enum variant-for-variant,
+//! field-for-field: a decoded request reconstructs the identical engine spec, so
+//! a remote-submitted job is byte-identical to one submitted in-process.
+//! Validation stays in the engine (the submit verbs call `validate`); this is a
 //! pure shape map. `task` reuses `jammi.v1.inference.ModelTask` via the shared
 //! [`super::model_task_from_proto`].
 
@@ -15,7 +18,22 @@ use crate::fine_tune::{
     FineTuneMethod, HardNegativeConfig, LoraInitMode, LrSchedule, RegressionLoss,
 };
 
-use crate::wire::proto::fine_tune as pb;
+// The spec oneof ↔ engine `TrainingSpec` conversions touch the engine-side spec
+// vocabulary (`TrainingSpec` / graph sampler / context-predictor config), which
+// lives behind the `local` feature; the `FineTuneConfig` config vocabulary below
+// stays transport-neutral so a thin wire-only client can still encode it.
+#[cfg(feature = "local")]
+use crate::fine_tune::graph_sampler::{EdgeProvenance, GraphFineTuneSources, GraphSampleConfig};
+#[cfg(feature = "local")]
+use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
+#[cfg(feature = "local")]
+use crate::pipeline::context_predictor::{
+    ContextArchitecture, ContextPredictorTrainConfig, GaussianObjective, PredictiveHead,
+};
+#[cfg(feature = "local")]
+use crate::wire::{model_task_from_proto, model_task_to_proto};
+
+use crate::wire::proto::training as pb;
 
 /// Map the wire [`pb::FineTuneMethod`] discriminant onto the engine's
 /// [`FineTuneMethod`]. An unspecified or unknown method is rejected — a request
@@ -26,6 +44,346 @@ pub fn method_from_proto(method: i32) -> Result<FineTuneMethod, Status> {
         Ok(pb::FineTuneMethod::Unspecified) | Err(_) => {
             Err(Status::invalid_argument("method must be specified"))
         }
+    }
+}
+
+// ─── StartTraining spec oneof ↔ engine TrainingSpec ──────────────────────────
+//
+// The `oneof` carries the verb that produced the job; decode reconstructs the
+// engine [`TrainingSpec`] field-for-field so a worker re-runs the identical job.
+// The two LoRA fine-tune kinds carry their base-model + config in the request's
+// common `base_model`/`config` fields (folded into [`TrainingCommon`]); the
+// context-predictor kind carries its full budget inside `predictor_spec`.
+
+/// Decode a [`pb::StartTrainingRequest`] into the engine [`TrainingSpec`]. The
+/// `oneof` selects the variant; `base_model`/`config` fold into the two LoRA
+/// kinds' [`TrainingCommon`]. A request with no spec set is malformed.
+#[cfg(feature = "local")]
+pub fn training_spec_from_proto(req: pb::StartTrainingRequest) -> Result<TrainingSpec, Status> {
+    let pb::StartTrainingRequest {
+        spec,
+        base_model,
+        config,
+    } = req;
+    let spec =
+        spec.ok_or_else(|| Status::invalid_argument("StartTraining request carries no spec"))?;
+    match spec {
+        pb::start_training_request::Spec::FineTune(ft) => {
+            let common = lora_common_from_proto(base_model, config)?;
+            if ft.source.is_empty() {
+                return Err(Status::invalid_argument("source is required"));
+            }
+            // A column-source fine-tune with no columns has no training data to
+            // detect a format from — a client error, rejected at decode rather
+            // than deferred to a failing worker.
+            if ft.columns.is_empty() {
+                return Err(Status::invalid_argument("columns is required"));
+            }
+            Ok(TrainingSpec::FineTune {
+                source: ft.source,
+                columns: ft.columns,
+                method: method_from_proto(ft.method)?,
+                task: model_task_from_proto(ft.task)?,
+                common,
+            })
+        }
+        pb::start_training_request::Spec::GraphFineTune(g) => {
+            let common = lora_common_from_proto(base_model, config)?;
+            let sources = g.sources.ok_or_else(|| {
+                Status::invalid_argument("graph_fine_tune spec carries no sources")
+            })?;
+            let sample_config = g.sample_config.ok_or_else(|| {
+                Status::invalid_argument("graph_fine_tune spec carries no sample_config")
+            })?;
+            Ok(TrainingSpec::GraphFineTune {
+                sources: graph_sources_from_proto(sources)?,
+                sample_config: graph_sample_config_from_proto(sample_config),
+                common,
+            })
+        }
+        pb::start_training_request::Spec::ContextPredictor(cp) => {
+            let predictor_spec = cp.predictor_spec.ok_or_else(|| {
+                Status::invalid_argument("context_predictor spec carries no predictor_spec")
+            })?;
+            Ok(TrainingSpec::ContextPredictor {
+                source: cp.source,
+                predictor_spec: predictor_config_from_proto(predictor_spec)?,
+            })
+        }
+    }
+}
+
+/// Encode the engine [`TrainingSpec`] (plus the common base-model + config the
+/// LoRA kinds carry) onto a [`pb::StartTrainingRequest`] — the inverse of
+/// [`training_spec_from_proto`], for the remote send side. The context-predictor
+/// kind ignores `base_model`/`config` (its budget rides in `predictor_spec`), so
+/// they are left empty there.
+#[cfg(feature = "local")]
+pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::StartTrainingRequest {
+    match spec {
+        TrainingSpec::FineTune {
+            source,
+            columns,
+            method,
+            task,
+            common,
+        } => pb::StartTrainingRequest {
+            spec: Some(pb::start_training_request::Spec::FineTune(
+                pb::FineTuneSpec {
+                    source: source.clone(),
+                    columns: columns.clone(),
+                    method: method_to_proto(*method) as i32,
+                    task: model_task_to_proto(*task) as i32,
+                },
+            )),
+            base_model: common.base_model.clone(),
+            config: Some(config_to_proto(&common.config)),
+        },
+        TrainingSpec::GraphFineTune {
+            sources,
+            sample_config,
+            common,
+        } => pb::StartTrainingRequest {
+            spec: Some(pb::start_training_request::Spec::GraphFineTune(
+                pb::GraphFineTuneSpec {
+                    sources: Some(graph_sources_to_proto(sources)),
+                    sample_config: Some(graph_sample_config_to_proto(sample_config)),
+                },
+            )),
+            base_model: common.base_model.clone(),
+            config: Some(config_to_proto(&common.config)),
+        },
+        TrainingSpec::ContextPredictor {
+            source,
+            predictor_spec,
+        } => pb::StartTrainingRequest {
+            spec: Some(pb::start_training_request::Spec::ContextPredictor(
+                pb::ContextPredictorSpec {
+                    source: source.clone(),
+                    predictor_spec: Some(predictor_config_to_proto(predictor_spec)),
+                },
+            )),
+            base_model: String::new(),
+            config: None,
+        },
+    }
+}
+
+/// Fold the request's common `base_model` + optional `config` into a
+/// [`TrainingCommon`] for the two LoRA fine-tune kinds. An empty base model is a
+/// client error (the worker has nothing to adapt).
+#[cfg(feature = "local")]
+fn lora_common_from_proto(
+    base_model: String,
+    config: Option<pb::FineTuneConfig>,
+) -> Result<TrainingCommon, Status> {
+    if base_model.is_empty() {
+        return Err(Status::invalid_argument("base_model is required"));
+    }
+    let config = config
+        .map(FineTuneConfig::try_from)
+        .transpose()?
+        .unwrap_or_default();
+    Ok(TrainingCommon { base_model, config })
+}
+
+#[cfg(feature = "local")]
+fn graph_sources_from_proto(s: pb::GraphFineTuneSources) -> Result<GraphFineTuneSources, Status> {
+    Ok(GraphFineTuneSources {
+        node_source: s.node_source,
+        id_column: s.id_column,
+        text_column: s.text_column,
+        edge_source: s.edge_source,
+        src_column: s.src_column,
+        dst_column: s.dst_column,
+        provenance: edge_provenance_from_proto(s.provenance)?,
+    })
+}
+
+#[cfg(feature = "local")]
+fn graph_sources_to_proto(s: &GraphFineTuneSources) -> pb::GraphFineTuneSources {
+    pb::GraphFineTuneSources {
+        node_source: s.node_source.clone(),
+        id_column: s.id_column.clone(),
+        text_column: s.text_column.clone(),
+        edge_source: s.edge_source.clone(),
+        src_column: s.src_column.clone(),
+        dst_column: s.dst_column.clone(),
+        provenance: edge_provenance_to_proto(s.provenance) as i32,
+    }
+}
+
+#[cfg(feature = "local")]
+fn edge_provenance_from_proto(p: i32) -> Result<EdgeProvenance, Status> {
+    match pb::EdgeProvenance::try_from(p) {
+        Ok(pb::EdgeProvenance::Declared) => Ok(EdgeProvenance::Declared),
+        Ok(pb::EdgeProvenance::Similarity) => Ok(EdgeProvenance::Similarity),
+        Ok(pb::EdgeProvenance::Unspecified) | Err(_) => Err(Status::invalid_argument(
+            "edge provenance must be DECLARED or SIMILARITY",
+        )),
+    }
+}
+
+#[cfg(feature = "local")]
+fn edge_provenance_to_proto(p: EdgeProvenance) -> pb::EdgeProvenance {
+    match p {
+        EdgeProvenance::Declared => pb::EdgeProvenance::Declared,
+        EdgeProvenance::Similarity => pb::EdgeProvenance::Similarity,
+    }
+}
+
+#[cfg(feature = "local")]
+fn graph_sample_config_from_proto(c: pb::GraphSampleConfig) -> GraphSampleConfig {
+    GraphSampleConfig {
+        walk_length: c.walk_length as usize,
+        walks_per_node: c.walks_per_node as usize,
+        return_p: c.return_p,
+        in_out_q: c.in_out_q,
+        hard_negatives: c.hard_negatives as usize,
+        exclude_hops: c.exclude_hops as usize,
+        min_negatives: c.min_negatives as usize,
+        seed: c.seed,
+    }
+}
+
+#[cfg(feature = "local")]
+fn graph_sample_config_to_proto(c: &GraphSampleConfig) -> pb::GraphSampleConfig {
+    pb::GraphSampleConfig {
+        walk_length: c.walk_length as u32,
+        walks_per_node: c.walks_per_node as u32,
+        return_p: c.return_p,
+        in_out_q: c.in_out_q,
+        hard_negatives: c.hard_negatives as u32,
+        exclude_hops: c.exclude_hops as u32,
+        min_negatives: c.min_negatives as u32,
+        seed: c.seed,
+    }
+}
+
+#[cfg(feature = "local")]
+fn predictor_config_from_proto(
+    c: pb::ContextPredictorTrainConfig,
+) -> Result<ContextPredictorTrainConfig, Status> {
+    let head = c
+        .head
+        .ok_or_else(|| Status::invalid_argument("context predictor spec carries no head"))?;
+    Ok(ContextPredictorTrainConfig {
+        model_id: c.model_id,
+        architecture: context_architecture_from_proto(c.architecture)?,
+        key_column: c.key_column,
+        task_column: c.task_column,
+        value_column: c.value_column,
+        context_k: c.context_k as usize,
+        hidden_dim: c.hidden_dim as usize,
+        num_heads: c.num_heads as usize,
+        num_layers: c.num_layers as usize,
+        head: predictive_head_from_proto(head)?,
+        epochs: c.epochs as usize,
+        learning_rate: c.learning_rate,
+        grad_clip: c.grad_clip,
+        test_task_fraction: c.test_task_fraction,
+        min_task_count: c.min_task_count as usize,
+        seed: c.seed,
+    })
+}
+
+#[cfg(feature = "local")]
+fn predictor_config_to_proto(c: &ContextPredictorTrainConfig) -> pb::ContextPredictorTrainConfig {
+    pb::ContextPredictorTrainConfig {
+        model_id: c.model_id.clone(),
+        architecture: context_architecture_to_proto(c.architecture) as i32,
+        key_column: c.key_column.clone(),
+        task_column: c.task_column.clone(),
+        value_column: c.value_column.clone(),
+        context_k: c.context_k as u32,
+        hidden_dim: c.hidden_dim as u32,
+        num_heads: c.num_heads as u32,
+        num_layers: c.num_layers as u32,
+        head: Some(predictive_head_to_proto(&c.head)),
+        epochs: c.epochs as u32,
+        learning_rate: c.learning_rate,
+        grad_clip: c.grad_clip,
+        test_task_fraction: c.test_task_fraction,
+        min_task_count: c.min_task_count as u32,
+        seed: c.seed,
+    }
+}
+
+#[cfg(feature = "local")]
+fn context_architecture_from_proto(a: i32) -> Result<ContextArchitecture, Status> {
+    match pb::ContextArchitecture::try_from(a) {
+        Ok(pb::ContextArchitecture::Cnp) => Ok(ContextArchitecture::Cnp),
+        Ok(pb::ContextArchitecture::AttnCnp) => Ok(ContextArchitecture::AttnCnp),
+        Ok(pb::ContextArchitecture::Tnp) => Ok(ContextArchitecture::Tnp),
+        Ok(pb::ContextArchitecture::Unspecified) | Err(_) => Err(Status::invalid_argument(
+            "context predictor architecture must be CNP, ATTN_CNP, or TNP",
+        )),
+    }
+}
+
+#[cfg(feature = "local")]
+fn context_architecture_to_proto(a: ContextArchitecture) -> pb::ContextArchitecture {
+    match a {
+        ContextArchitecture::Cnp => pb::ContextArchitecture::Cnp,
+        ContextArchitecture::AttnCnp => pb::ContextArchitecture::AttnCnp,
+        ContextArchitecture::Tnp => pb::ContextArchitecture::Tnp,
+    }
+}
+
+#[cfg(feature = "local")]
+fn predictive_head_from_proto(h: pb::PredictiveHead) -> Result<PredictiveHead, Status> {
+    use pb::predictive_head::Head;
+    match h.head {
+        Some(Head::Gaussian(g)) => {
+            let objective = g.objective.ok_or_else(|| {
+                Status::invalid_argument("gaussian predictive head carries no objective")
+            })?;
+            Ok(PredictiveHead::Gaussian {
+                objective: gaussian_objective_from_proto(objective)?,
+            })
+        }
+        Some(Head::Quantile(q)) => Ok(PredictiveHead::Quantile { levels: q.levels }),
+        None => Err(Status::invalid_argument(
+            "predictive head carries no gaussian or quantile variant",
+        )),
+    }
+}
+
+#[cfg(feature = "local")]
+fn predictive_head_to_proto(h: &PredictiveHead) -> pb::PredictiveHead {
+    use pb::predictive_head::Head;
+    let inner = match h {
+        PredictiveHead::Gaussian { objective } => Head::Gaussian(pb::predictive_head::Gaussian {
+            objective: Some(gaussian_objective_to_proto(*objective)),
+        }),
+        PredictiveHead::Quantile { levels } => Head::Quantile(pb::predictive_head::Quantile {
+            levels: levels.clone(),
+        }),
+    };
+    pb::PredictiveHead { head: Some(inner) }
+}
+
+#[cfg(feature = "local")]
+fn gaussian_objective_from_proto(o: pb::GaussianObjective) -> Result<GaussianObjective, Status> {
+    use pb::gaussian_objective::Objective;
+    match o.objective {
+        Some(Objective::Nll(n)) => Ok(GaussianObjective::Nll { beta: n.beta }),
+        Some(Objective::Crps(_)) => Ok(GaussianObjective::Crps),
+        None => Err(Status::invalid_argument(
+            "gaussian objective carries no nll or crps variant",
+        )),
+    }
+}
+
+#[cfg(feature = "local")]
+fn gaussian_objective_to_proto(o: GaussianObjective) -> pb::GaussianObjective {
+    use pb::gaussian_objective::Objective;
+    let inner = match o {
+        GaussianObjective::Nll { beta } => Objective::Nll(pb::gaussian_objective::Nll { beta }),
+        GaussianObjective::Crps => Objective::Crps(pb::gaussian_objective::Crps {}),
+    };
+    pb::GaussianObjective {
+        objective: Some(inner),
     }
 }
 

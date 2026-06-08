@@ -1,0 +1,401 @@
+syntax = "proto3";
+
+package jammi.v1.training;
+
+import "jammi/v1/inference.proto";
+
+// TrainingService — the wire surface for the engine's training verbs.
+//
+// `StartTraining` and `TrainingStatus` are imperative session methods, not SQL
+// queries, so they live as typed gRPC RPCs alongside SessionService /
+// TriggerService / EmbeddingService / InferenceService / EvalService rather
+// than on the Flight SQL surface (which carries query/result only, per ADR-01
+// §3.2). Training is a substrate primitive — meta-learning an adapter or a
+// predictor over a registered source — and names no tenant-domain concept.
+//
+// The service serves all three engine training kinds (`fine_tune`,
+// `graph_fine_tune`, `context_predictor`) behind one verb: `StartTraining`
+// carries a full `TrainingSpec` oneof and dispatches to the matching engine
+// submit verb, returning the durable job id and the (deterministic) output
+// model id. The job runs asynchronously inside the engine; the client polls
+// `TrainingStatus` by id until a terminal state. There is no progress stream —
+// the abstraction exposes none, so this surface invents none. The service
+// reimplements no training, LoRA, sampling, or scan logic; it is purely a wire
+// adapter.
+//
+// Tenant scope is read from the request's `SessionTenant` extension, set by the
+// shared TenantInterceptor from the `jammi-session-id` header — the same
+// mechanism every other gRPC service and Flight SQL already use.
+service TrainingService {
+  // Submit a training job over a registered source and return its id + output
+  // model id. The job trains asynchronously; poll `TrainingStatus` with the
+  // returned job id. Peer of the engine's `fine_tune` / `fine_tune_graph` /
+  // `train_context_predictor` submit verbs (the spec oneof selects which).
+  rpc StartTraining(StartTrainingRequest) returns (StartTrainingResponse);
+
+  // Read a training job's current status by id, plus its output model id and
+  // the failure message when it failed. Peer of reading back the engine's
+  // `TrainingJob` handle — the output model id and error are what let a remote
+  // `wait()` retrieve the result and a failure reason.
+  rpc TrainingStatus(TrainingStatusRequest) returns (TrainingStatusResponse);
+}
+
+// Fine-tuning method. Mirrors the engine's `FineTuneMethod`; LoRA is the only
+// method, trained as either an encoder-internal adapter or a projection head
+// over a frozen base model depending on `FineTuneConfig.target_modules`.
+enum FineTuneMethod {
+  FINE_TUNE_METHOD_UNSPECIFIED = 0;
+  LORA = 1;
+}
+
+// Embedding-loss function. Mirrors the engine's `EmbeddingLoss`; the two
+// margin/temperature-carrying variants carry their scalar parameter.
+message EmbeddingLoss {
+  oneof loss {
+    // CoSENT: cross-entropy over cosine-similarity ordering. No parameter.
+    CoSent co_sent = 1;
+    // Triplet loss with the given margin.
+    Triplet triplet = 2;
+    // InfoNCE with in-batch negatives at the given temperature.
+    MultipleNegativesRanking multiple_negatives_ranking = 3;
+    // AnglE: angle-difference objective in complex space. No parameter.
+    AnglE angle = 4;
+    // cosine-MSE: regress scaled cosine onto a graded score. No parameter.
+    CosineMse cosine_mse = 5;
+  }
+
+  message CoSent {}
+  message Triplet {
+    double margin = 1;
+  }
+  message MultipleNegativesRanking {
+    double temperature = 1;
+  }
+  message AnglE {}
+  message CosineMse {}
+}
+
+// Classification-loss function. Mirrors the engine's `ClassificationLoss`.
+enum ClassificationLoss {
+  CLASSIFICATION_LOSS_UNSPECIFIED = 0;
+  CROSS_ENTROPY = 1;
+}
+
+// Proper-scoring objective for a distributional regression head (S18). Mirrors
+// the engine's `RegressionLoss`; the β-NLL variant carries its weighting
+// exponent. Pinball trains the quantile head over `quantile_levels`; the others
+// train the parametric Gaussian head.
+message RegressionLoss {
+  oneof loss {
+    // Gaussian NLL — the plain heteroscedastic mean-variance objective.
+    GaussianNll gaussian_nll = 1;
+    // β-NLL with the given variance-weighting exponent (Seitzer 2022).
+    BetaNll beta_nll = 2;
+    // Closed-form Gaussian CRPS. No parameter.
+    Crps crps = 3;
+    // Pinball / quantile loss over the configured levels. No parameter.
+    Pinball pinball = 4;
+  }
+
+  message GaussianNll {}
+  message BetaNll {
+    double beta = 1;
+  }
+  message Crps {}
+  message Pinball {}
+}
+
+// Which loss signal drives early stopping. Mirrors `EarlyStoppingMetric`.
+enum EarlyStoppingMetric {
+  EARLY_STOPPING_METRIC_UNSPECIFIED = 0;
+  VAL_LOSS = 1;
+  TRAIN_LOSS = 2;
+}
+
+// Learning-rate schedule after warmup. Mirrors the engine's `LrSchedule`.
+enum LrSchedule {
+  LR_SCHEDULE_UNSPECIFIED = 0;
+  CONSTANT = 1;
+  COSINE_DECAY = 2;
+  LINEAR_DECAY = 3;
+}
+
+// LoRA A/B matrix initialisation. Mirrors `jammi_lora::LoraInitMode`.
+enum LoraInitMode {
+  LORA_INIT_MODE_UNSPECIFIED = 0;
+  ZEROS_B = 1;
+  GAUSSIAN = 2;
+}
+
+// Dtype for the frozen backbone weights. Mirrors `jammi_lora::BackboneDtype`.
+enum BackboneDtype {
+  BACKBONE_DTYPE_UNSPECIFIED = 0;
+  F32 = 1;
+  BF16 = 2;
+  F16 = 3;
+}
+
+// 0-based encoder layer indices that receive LoRA adapters. Wrapper message so
+// "no restriction" (field absent → all layers) is distinguishable from "an
+// empty restriction"; mirrors the engine's `Option<Vec<usize>>`.
+message LayersToTransform {
+  repeated uint32 layers = 1;
+}
+
+// Hard-negative mining configuration. Mirrors the engine's
+// `HardNegativeConfig`. When `mine` is set the trainer mines hard negatives
+// from its own ANN index, excluding the positive's `exclude_hops`-hop
+// neighbourhood and re-mining every `refresh_every` epochs.
+message HardNegativeConfig {
+  bool mine = 1;
+  uint32 k = 2;
+  uint32 exclude_hops = 3;
+  uint32 refresh_every = 4;
+}
+
+// Configuration for a fine-tuning job. Mirrors the engine's `FineTuneConfig`
+// field for field; every field is read by the trainer or the LoRA builder.
+// `embedding_loss`/`classification_loss` are unset to let the engine
+// auto-select from the data format; `layers_to_transform` is unset for "all
+// layers". The enum-typed fields default to the engine's default variant when
+// left UNSPECIFIED, matching `FineTuneConfig::default()`.
+message FineTuneConfig {
+  uint32 lora_rank = 1;
+  double lora_alpha = 2;
+  double lora_dropout = 3;
+  double learning_rate = 4;
+  uint32 epochs = 5;
+  uint32 batch_size = 6;
+  uint32 max_seq_length = 7;
+  // Unset = auto-select from the data format.
+  optional EmbeddingLoss embedding_loss = 8;
+  // Unset = auto-select from the data format.
+  optional ClassificationLoss classification_loss = 9;
+  uint32 gradient_accumulation_steps = 10;
+  double validation_fraction = 11;
+  uint32 early_stopping_patience = 12;
+  uint32 warmup_steps = 13;
+  LrSchedule lr_schedule = 14;
+  EarlyStoppingMetric early_stopping_metric = 15;
+  // Layer-name suffixes that receive LoRA adapters. Empty = projection head
+  // over the frozen base model; non-empty = LoRA inside the encoder.
+  repeated string target_modules = 16;
+  // Unset = all layers.
+  optional LayersToTransform layers_to_transform = 17;
+  bool use_rslora = 18;
+  // Per-module rank overrides keyed by module-name substring.
+  map<string, uint32> rank_pattern = 19;
+  LoraInitMode init_lora_weights = 20;
+  BackboneDtype backbone_dtype = 21;
+  double weight_decay = 22;
+  double max_grad_norm = 23;
+  // GradCache: two-pass in-batch-negative training that enlarges the effective
+  // negative pool without the memory cost. Only affects MultipleNegativesRanking.
+  bool cached = 24;
+  // Hard-negative mining over jammi's own ANN index. Field absent = mining off.
+  optional HardNegativeConfig hard_negatives = 25;
+  // Matryoshka prefix dimensions. Empty = full dimension only.
+  repeated uint32 matryoshka_dims = 26;
+  // Unset = the engine default (β-NLL, β=0.5). The Pinball variant trains the
+  // quantile head over `quantile_levels`.
+  optional RegressionLoss regression_loss = 27;
+  // Quantile levels for a pinball-trained regression head, ascending in (0, 1).
+  // Empty for the parametric Gaussian objectives.
+  repeated double quantile_levels = 28;
+}
+
+// Edge provenance for a graph fine-tune. Mirrors the engine's `EdgeProvenance`
+// — the load-bearing circularity distinction (declared edges teach the metric
+// something new; similarity edges largely re-learn it).
+enum EdgeProvenance {
+  EDGE_PROVENANCE_UNSPECIFIED = 0;
+  DECLARED = 1;
+  SIMILARITY = 2;
+}
+
+// The two sources and column bindings a graph fine-tune reads. Mirrors the
+// engine's `GraphFineTuneSources` field for field.
+message GraphFineTuneSources {
+  // Catalog source holding the node text.
+  string node_source = 1;
+  // Column in `node_source` holding the node id (edge endpoints join to it).
+  string id_column = 2;
+  // Column in `node_source` holding the text the encoder embeds.
+  string text_column = 3;
+  // Catalog source holding the edges.
+  string edge_source = 4;
+  // Column in `edge_source` holding the edge source endpoint.
+  string src_column = 5;
+  // Column in `edge_source` holding the edge destination endpoint.
+  string dst_column = 6;
+  // Provenance every edge in `edge_source` carries.
+  EdgeProvenance provenance = 7;
+}
+
+// node2vec walk + structure-aware negative-sampling knobs. Mirrors the engine's
+// `GraphSampleConfig` field for field, including the deterministic `seed`.
+message GraphSampleConfig {
+  uint32 walk_length = 1;
+  uint32 walks_per_node = 2;
+  double return_p = 3;
+  double in_out_q = 4;
+  uint32 hard_negatives = 5;
+  uint32 exclude_hops = 6;
+  uint32 min_negatives = 7;
+  uint64 seed = 8;
+}
+
+// Which curated in-context-predictor architecture to train. Mirrors the
+// engine's `ContextArchitecture`.
+enum ContextArchitecture {
+  CONTEXT_ARCHITECTURE_UNSPECIFIED = 0;
+  CNP = 1;
+  ATTN_CNP = 2;
+  TNP = 3;
+}
+
+// The predictive-distribution head + its proper-scoring objective. Mirrors the
+// engine's `PredictiveHead`: a Gaussian head trained against a Gaussian
+// objective, or a quantile head trained with pinball over its levels.
+message PredictiveHead {
+  oneof head {
+    Gaussian gaussian = 1;
+    Quantile quantile = 2;
+  }
+
+  // A `(mean, raw_std)` Gaussian head with its proper-scoring objective.
+  message Gaussian {
+    GaussianObjective objective = 1;
+  }
+  // A `levels`-wide quantile head trained with the pinball objective.
+  message Quantile {
+    // Ascending quantile levels in (0, 1); the head width is their count.
+    repeated double levels = 1;
+  }
+}
+
+// Which proper score a Gaussian predictive head trains against. Mirrors the
+// engine's `GaussianObjective`: (β-)NLL carrying its β, or closed-form CRPS.
+message GaussianObjective {
+  oneof objective {
+    // (β-)Gaussian NLL; `beta` in [0, 1], 0 the plain heteroscedastic NLL.
+    Nll nll = 1;
+    // Closed-form Gaussian CRPS — collapse-resistant, outcome-unit.
+    Crps crps = 2;
+  }
+
+  message Nll {
+    double beta = 1;
+  }
+  message Crps {}
+}
+
+// The episodic in-context-predictor meta-training specification. Mirrors the
+// engine's `ContextPredictorTrainConfig` field for field.
+message ContextPredictorTrainConfig {
+  // The model id the trained predictor registers under in the catalog.
+  string model_id = 1;
+  // Which curated architecture to train.
+  ContextArchitecture architecture = 2;
+  // The source's key column — the per-row identity episodes sample by.
+  string key_column = 3;
+  // The column whose distinct values are the tasks (the episodic partition).
+  string task_column = 4;
+  // The column carrying the scalar outcome `y` the predictor regresses.
+  string value_column = 5;
+  // Context size `k`: the retrieval over-fetches and pads the episode to this.
+  uint32 context_k = 6;
+  // Hidden width of the predictor's MLPs / transformer model dimension.
+  uint32 hidden_dim = 7;
+  // Attention heads (AttnCnp, Tnp). Must divide `hidden_dim`.
+  uint32 num_heads = 8;
+  // Transformer layers (Tnp).
+  uint32 num_layers = 9;
+  // The predictive-distribution head + its proper-scoring objective.
+  PredictiveHead head = 10;
+  // Passes over the sampled train episodes.
+  uint32 epochs = 11;
+  // AdamW learning rate.
+  double learning_rate = 12;
+  // Global-L2 gradient-clip norm; <= 0.0 disables clipping.
+  double grad_clip = 13;
+  // Fraction of the distinct tasks held out for the test split, in (0, 1).
+  double test_task_fraction = 14;
+  // Minimum distinct task count the meta-dataset must carry.
+  uint32 min_task_count = 15;
+  // Seed for the deterministic train/test task partition.
+  uint64 seed = 16;
+}
+
+// A column-source contrastive / classification / regression fine-tune. Mirrors
+// the engine's `TrainingSpec::FineTune` variant.
+message FineTuneSpec {
+  // Registered source whose rows the model is fine-tuned on.
+  string source = 1;
+  // Columns selected into the training loader (the format is detected from
+  // these names).
+  repeated string columns = 2;
+  // Adapter method.
+  FineTuneMethod method = 3;
+  // Task the fine-tuned model performs.
+  jammi.v1.inference.ModelTask task = 4;
+}
+
+// A graph-supervised fine-tune. Mirrors the engine's `TrainingSpec::GraphFineTune`.
+message GraphFineTuneSpec {
+  // Node-text + edge sources and their column bindings.
+  GraphFineTuneSources sources = 1;
+  // Walk / negative-sampling knobs, including the deterministic seed.
+  GraphSampleConfig sample_config = 2;
+}
+
+// An episodic in-context-predictor meta-training. Mirrors the engine's
+// `TrainingSpec::ContextPredictor`. The predictor carries its full budget inside
+// `predictor_spec`, so this variant needs no common base-model / config block.
+message ContextPredictorSpec {
+  // Source whose embedding table the episodic context is sampled from.
+  string source = 1;
+  // The architecture / objective / episodic / optimisation specification.
+  ContextPredictorTrainConfig predictor_spec = 2;
+}
+
+message StartTrainingRequest {
+  // The self-describing training spec — the verb that produces the job. Mirrors
+  // the engine's `TrainingSpec` enum: the variant selects the submit path, and
+  // its fields carry everything a worker reconstructs the run from.
+  oneof spec {
+    FineTuneSpec fine_tune = 1;
+    GraphFineTuneSpec graph_fine_tune = 2;
+    ContextPredictorSpec context_predictor = 3;
+  }
+  // Base encoder to adapt for the two LoRA fine-tune kinds (`local:<path>`, an
+  // HF repo id, or a fine-tuned id). Unused by the context-predictor kind (it
+  // names its source's embedding model implicitly), so it is empty there.
+  string base_model = 4;
+  // Optional fine-tune hyperparameters for the two LoRA fine-tune kinds; unset
+  // applies the engine's defaults. Unused by the context-predictor kind (its
+  // budget rides inside `predictor_spec`).
+  optional FineTuneConfig config = 5;
+}
+
+message StartTrainingResponse {
+  // Server-assigned job id. Poll `TrainingStatus` with it.
+  string job_id = 1;
+  // The deterministic output model id the trained artifact registers under —
+  // the same id the engine's `TrainingJob::model_id` carries at submit time.
+  string model_id = 2;
+}
+
+message TrainingStatusRequest {
+  // Job id returned by a prior StartTraining call.
+  string job_id = 1;
+}
+
+message TrainingStatusResponse {
+  // Current lifecycle status: "queued", "running", "completed", or "failed".
+  string status = 1;
+  // The output model id the trained artifact registers under.
+  string model_id = 2;
+  // The failure message when `status` is "failed"; empty otherwise.
+  string error = 3;
+}

@@ -24,3 +24,13 @@ class NoEmbeddedEngineError(RuntimeError):
             f"{artifact_dir!r} — `pip install jammi-ai` for the in-process engine, "
             f"or point connect() at a remote https:// / grpc:// target."
         )
+
+
+class TrainingError(RuntimeError):
+    """Raised when a remote training job reaches a ``failed`` terminal state.
+
+    Carries the worker's failure message read off ``TrainingStatus.error`` — the
+    same reason the embedded engine's :class:`jammi_ai.TrainingJob.wait` surfaces,
+    so a remote ``wait()`` fails for the same cause with the same message.
+    """
+

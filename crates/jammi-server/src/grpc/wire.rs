@@ -1,5 +1,5 @@
 //! Server-receive helpers shared by the engine-backed gRPC services
-//! (`EmbeddingService`, `InferenceService`, `EvalService`, `FineTuneService`,
+//! (`EmbeddingService`, `InferenceService`, `EvalService`, `TrainingService`,
 //! `MutableTableService`, `ChannelService`, `AuditService`, and the topic-admin
 //! verbs on `TriggerService`).
 //!

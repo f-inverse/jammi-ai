@@ -25,6 +25,15 @@ service InferenceService {
   // `infer`, which returns `Vec<RecordBatch>` — the batches are carried in one
   // `ArrowBatch` (the same Flight-IPC pairing TriggerService uses).
   rpc Infer(InferRequest) returns (InferResponse);
+
+  // Predict one target's distribution with a trained in-context predictor (S19)
+  // by assembling its live context and running one in-context forward — no
+  // gradient update. Peer of the engine's `predict_with_context_predictor`
+  // (the provenanced form): returns the predictive distribution plus the
+  // assembly `source` fact and the context member keys, so a graph-conditioned
+  // prediction is never unattributed. Lives on InferenceService because it is a
+  // serving verb — running a model over a source — not a training submission.
+  rpc Predict(PredictRequest) returns (PredictResponse);
 }
 
 // Which model task `Infer` runs over the columns. Mirrors the engine's
@@ -61,4 +70,89 @@ message InferResponse {
   // (schema + batches) in `data_body`. Mirrors the `Vec<RecordBatch>` the
   // engine's `infer` returns; reuses TriggerService's `ArrowBatch` shape.
   jammi.v1.trigger.ArrowBatch result = 1;
+}
+
+// Which direction a declared-edge gather follows an edge from the target's
+// perspective. Mirrors the engine's `EdgeDirection`.
+enum EdgeDirection {
+  EDGE_DIRECTION_UNSPECIFIED = 0;
+  OUT = 1;
+  IN = 2;
+  UNDIRECTED = 3;
+}
+
+// A registered declared-edge source + the bounded-gather knobs. Mirrors the
+// engine's `EdgeGather` over an `EdgeSourceRef::Registered` source — the
+// "bring your own graph" case the predict binding exposes. Absent on the
+// request = the ANN-only default (embedding-similarity context).
+message EdgeGather {
+  // The registered source id holding the edge rows.
+  string edge_source = 1;
+  // Column holding the edge's source endpoint.
+  string src_column = 2;
+  // Column holding the edge's destination endpoint.
+  string dst_column = 3;
+  // Optional column holding the edge type (for `edge_types` filtering).
+  optional string type_column = 4;
+  // Optional column holding the edge weight (for `min_weight` filtering).
+  optional string weight_column = 5;
+  // Hops of bounded BFS (clamped to the engine hop cap). 0 = the engine default.
+  uint32 hops = 6;
+  // Per-node per-hop neighbour sample cap (GraphSAGE). Unset = exact (no cap).
+  optional uint32 fanout = 7;
+  // Direction the walk follows from the target.
+  EdgeDirection direction = 8;
+  // Optional edge-type allow-list; empty = no type filter.
+  repeated string edge_types = 9;
+  // Optional minimum edge weight to traverse.
+  optional double min_weight = 10;
+}
+
+message PredictRequest {
+  // The trained context predictor's model id.
+  string model_id = 1;
+  // Source whose embedding table the live context is drawn from (need not equal
+  // the training source — a predictor serves a target in any corpus of the same
+  // shape).
+  string source = 2;
+  // The target row's key (the retrieval query is its stored vector).
+  string target_key = 3;
+  // Optional SQL predicate scoping the serving context; empty = whole table.
+  optional string split = 4;
+  // Optional declared-edge gather. Absent = ANN-only embedding-similarity
+  // context. Present with no `hybrid_ann_k` = declared-edge context only;
+  // present with `hybrid_ann_k` = the union of ANN and declared-edge context.
+  optional EdgeGather edges = 5;
+  // ANN neighbourhood size for the hybrid arm. Set only with `edges` to pool the
+  // embedding-similarity and declared-edge candidate sets.
+  optional uint32 hybrid_ann_k = 6;
+}
+
+message PredictResponse {
+  // The served predictive distribution. Mirrors the engine's
+  // `PredictedDistribution`.
+  oneof distribution {
+    Gaussian gaussian = 1;
+    Quantile quantile = 2;
+  }
+  // How the conditioning context was assembled ("ann" / "edges" / "hybrid").
+  string source = 3;
+  // The context member keys, in retrieval order — the neighbour provenance the
+  // coverage layer attributes the prediction by.
+  repeated string context_ref = 4;
+
+  // Parametric Gaussian: predictive mean + served standard deviation.
+  message Gaussian {
+    double mean = 1;
+    double std = 2;
+  }
+  // Quantile: one `(level, value)` per declared level, ascending.
+  message Quantile {
+    repeated QuantilePoint points = 1;
+  }
+  // One served quantile estimate.
+  message QuantilePoint {
+    double level = 1;
+    double value = 2;
+  }
 }

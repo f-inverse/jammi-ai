@@ -71,6 +71,21 @@ _REMOTE_VERBS = {
 }
 
 
+# The training + predict verbs. Unlike the conformal numerics, these DO hit the
+# wire: training is offloaded to the remote GPU server (`TrainingService`) and the
+# predict verb runs the trained predictor remotely (`InferenceService.Predict`).
+# The embedded `Database` submits/serves in the compiled engine; the client's
+# `RemoteDatabase` submits/serves over gRPC. The call surface must agree so a
+# caller swaps transports without changing the call — pinned here against the
+# embed `jammi_ai.Database`.
+_TRAINING_VERBS = {
+    "fine_tune",
+    "fine_tune_graph",
+    "train_context_predictor",
+    "predict_with_context_predictor",
+}
+
+
 # The stateless conformal / RRF numerics. These are NOT on the gRPC wire: their
 # inputs are caller-supplied arrays the engine never holds, so a wire hop would
 # only ship data the caller already has. The embedded `Database` computes them
@@ -88,8 +103,38 @@ _NUMERIC_VERBS = {
 def test_remote_surface_has_every_verb():
     """The client's `RemoteDatabase` exposes the full transport-agnostic verb
     set — the same vocabulary the embedded `Database` carries."""
-    for verb in _REMOTE_VERBS | _NUMERIC_VERBS:
+    for verb in _REMOTE_VERBS | _NUMERIC_VERBS | _TRAINING_VERBS:
         assert callable(getattr(jammi_client.RemoteDatabase, verb)), verb
+
+
+def test_training_verbs_have_identical_signatures_across_wheels():
+    """The training + predict verbs carry the SAME call surface on the client's
+    `RemoteDatabase` as on the embedded engine's `jammi_ai.Database`. Both submit
+    over the same verb vocabulary (the client over gRPC, the embed in-process), so
+    a caller swaps transports without changing the call — pinned name-for-name,
+    kind-for-kind, and default-for-default so a divergence in either is caught."""
+    for verb in _TRAINING_VERBS:
+        client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
+        embed = _call_surface(getattr(jammi_ai.Database, verb))
+        assert client == embed, f"{verb}: {embed} != {client}"
+
+
+def test_remote_training_job_matches_the_local_handle_shape():
+    """The client's `RemoteTrainingJob` carries the SAME handle surface as the
+    embedded engine's `TrainingJob`: the `job_id` / `model_id` properties and the
+    `status()` / `wait()` methods. A remote `wait()` polls `TrainingStatus` and
+    raises on a failed job with the wire error, mirroring the local handle, so a
+    caller treats the two interchangeably."""
+    local = jammi_ai.TrainingJob
+    remote = jammi_client.RemoteTrainingJob
+    for member in ("job_id", "model_id", "status", "wait"):
+        assert hasattr(remote, member), member
+        assert hasattr(local, member), member
+    # `job_id` / `model_id` are read-only attributes on both handles (a property
+    # on the pure client, a getter on the native handle); `status` / `wait` are
+    # callable methods on both.
+    assert callable(remote.status) and callable(remote.wait)
+    assert callable(local.status) and callable(local.wait)
 
 
 def _call_surface(fn) -> list:

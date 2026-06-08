@@ -3,7 +3,7 @@
 //! These pin the S8 contract that capability matches deployment:
 //!
 //! * A **serve-only** deployment (core tier only) mounts no train verbs and
-//!   advertises `services = ["core"]`; reaching `FineTuneService` is a truthful
+//!   advertises `services = ["core"]`; reaching `TrainingService` is a truthful
 //!   `Unimplemented`, never a misleading success.
 //! * An **all-in-one** deployment advertises every compiled-in tier and the
 //!   same train verb is reachable (it fails on its *arguments*, not because the
@@ -19,25 +19,28 @@
 //! `Unimplemented` (the verb is not mounted) — the two codes are exactly the
 //! "ran but bad input" vs "not enabled here" distinction the tier gate draws.
 
-use jammi_server::grpc::proto::fine_tune::fine_tune_service_client::FineTuneServiceClient;
-use jammi_server::grpc::proto::fine_tune::{FineTuneMethod, StartFineTuneRequest};
 use jammi_server::grpc::proto::inference::ModelTask;
 use jammi_server::grpc::proto::session::session_service_client::SessionServiceClient;
+use jammi_server::grpc::proto::training::start_training_request::Spec;
+use jammi_server::grpc::proto::training::training_service_client::TrainingServiceClient;
+use jammi_server::grpc::proto::training::{FineTuneMethod, FineTuneSpec, StartTrainingRequest};
 use jammi_server::tiers::{ServiceTier, TierSet};
 
 use super::common::grpc::{channel, start_engine_server_with_tiers};
 
-/// A StartFineTune request the *engine* rejects on its arguments (unspecified
+/// A StartTraining request the *engine* rejects on its arguments (unspecified
 /// method). On a server that mounts the train tier this returns
 /// `InvalidArgument` — the verb ran. On a serve-only server it returns
 /// `Unimplemented` — the verb is not mounted at all.
-fn probe_request() -> StartFineTuneRequest {
-    StartFineTuneRequest {
-        source_id: "training".into(),
+fn probe_request() -> StartTrainingRequest {
+    StartTrainingRequest {
+        spec: Some(Spec::FineTune(FineTuneSpec {
+            source: "training".into(),
+            columns: vec!["text_a".into(), "text_b".into(), "score".into()],
+            method: FineTuneMethod::Unspecified as i32,
+            task: ModelTask::TextEmbedding as i32,
+        })),
         base_model: "local:does-not-matter".into(),
-        columns: vec!["text_a".into(), "text_b".into(), "score".into()],
-        method: FineTuneMethod::Unspecified as i32,
-        task: ModelTask::TextEmbedding as i32,
         config: None,
     }
 }
@@ -67,9 +70,9 @@ async fn serve_only_advertises_core_and_rejects_train_verb_as_unimplemented() {
     );
 
     // Reaching the train verb is a truthful "not enabled on this deployment".
-    let mut client = FineTuneServiceClient::new(channel(server.addr).await);
+    let mut client = TrainingServiceClient::new(channel(server.addr).await);
     let err = client
-        .start_fine_tune(probe_request())
+        .start_training(probe_request())
         .await
         .expect_err("train verb is not mounted on a serve-only deployment");
     assert_eq!(
@@ -99,9 +102,9 @@ async fn serve_plus_train_advertises_train_and_mounts_the_verb() {
 
     // The verb is now mounted: the same probe that was Unimplemented on the
     // serve-only server runs and is rejected on its *arguments* instead.
-    let mut client = FineTuneServiceClient::new(channel(server.addr).await);
+    let mut client = TrainingServiceClient::new(channel(server.addr).await);
     let err = client
-        .start_fine_tune(probe_request())
+        .start_training(probe_request())
         .await
         .expect_err("the engine rejects the unspecified method");
     assert_eq!(

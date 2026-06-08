@@ -277,10 +277,16 @@ async fn remote_eval_reconstructs_the_exact_error_variant() {
 /// (deferred-error) contract: submit returns `Ok` from either transport, and
 /// the worker drives the job to `failed` whichever transport submitted it.
 ///
-/// NOTE: the rich `JammiError::FineTune` variant + message is not yet carried
-/// over the wire — `FineTuneStatus` returns only the status string. Faithful
-/// wire reconstruction of the typed training-failure error is a T3 deliverable;
-/// until then we assert the status reaches `failed`, not the exact variant.
+/// `TrainingStatus` now carries the worker's failure `error` (and the output
+/// `model_id`) alongside the status string, so a remote `wait()` can surface the
+/// failure reason — see the pure-Python `RemoteTrainingJob.wait`, which raises
+/// `TrainingError` with that wire message, and the verb-parity coverage in
+/// `crates/jammi-python/tests/test_conformance.py`. The `RemoteSession` arm
+/// exposed here reads back only the status string (its `fine_tune_status`
+/// signature is status-only), so this test asserts the deferred-failure contract
+/// — submit returns `Ok`, the worker drives the job to `failed` — over both
+/// transports; the error-message round-trip is exercised through the Python
+/// handle that consumes the new `error` field.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_fine_tune_start_defers_failure_to_the_worker() {
     let server = start_engine_server().await;

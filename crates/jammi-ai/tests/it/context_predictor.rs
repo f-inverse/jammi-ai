@@ -264,6 +264,7 @@ async fn held_out_task_score_improves(architecture: ContextArchitecture) {
         &varmap,
         &train,
         &config,
+        &std::sync::atomic::AtomicBool::new(false),
         |batch: &EpisodeBatch| {
             predictor
                 .forward(&batch.episode)
@@ -377,10 +378,11 @@ async fn too_few_tasks_is_rejected() {
 /// End-to-end: `train_context_predictor` trains, persists the weights, and
 /// registers the artifact as a `ModelTask::Regression` model — the PR2 success
 /// bar (a catalogued trained artifact through the model path).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn train_context_predictor_persists_a_catalogued_artifact() {
     let rows = synthetic_meta_dataset(8, 18, 321);
     let (session, _dir) = session_with_meta_dataset(&rows).await;
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
 
     let spec = spec(
         ContextArchitecture::Cnp,
@@ -389,8 +391,17 @@ async fn train_context_predictor_persists_a_catalogued_artifact() {
         },
     );
 
-    let record = session.train_context_predictor("fns", &spec).await.unwrap();
+    // Submit + run through the worker, then read the catalogued model row.
+    let job = session.train_context_predictor("fns", &spec).await.unwrap();
+    assert_eq!(job.model_id(), "ctx-predictor");
+    job.wait().await.unwrap();
 
+    let record = session
+        .catalog()
+        .get_model("ctx-predictor")
+        .await
+        .unwrap()
+        .expect("predictor registered in catalog");
     assert_eq!(record.model_id, "ctx-predictor");
     assert_eq!(record.task, ModelTask::Regression);
     let artifact = record.artifact_path.expect("artifact path catalogued");
@@ -435,12 +446,15 @@ fn held_out_tasks(mut tasks: Vec<String>, seed: u64, test_fraction: f64) -> Vec<
 }
 
 /// Train a predictor through the pipeline, returning the catalogued model id.
+///
+/// `train_context_predictor` now submits a durable job; a worker runs it. The
+/// helper starts a worker over the session, submits, waits for completion, and
+/// returns the model id the predictor registered under (the spec's `model_id`).
 async fn train(session: &Arc<InferenceSession>, spec: &ContextPredictorTrainConfig) -> String {
-    session
-        .train_context_predictor("fns", spec)
-        .await
-        .unwrap()
-        .model_id
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(session);
+    let job = session.train_context_predictor("fns", spec).await.unwrap();
+    job.wait().await.unwrap();
+    job.model_id().to_string()
 }
 
 /// Per-point coverage indicators of a conformal-wrapped predictor over a set of
@@ -488,7 +502,7 @@ async fn conformal_coverage(
 /// trainable tensors are byte-identical before and after a `predict`, and a
 /// repeated predict on the same target is byte-identical (deterministic), so the
 /// in-context adaptation lives entirely in the forward, never in a weight update.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn predict_is_inference_only_no_gradient_updates() {
     let rows = synthetic_meta_dataset(12, 16, 4242);
     let (session, _dir) = session_with_meta_dataset(&rows).await;
@@ -562,7 +576,7 @@ async fn predict_is_inference_only_no_gradient_updates() {
 /// one sample and assert the pooled fraction clears `1 - alpha - slack`: pooling
 /// maximizes the sample size, giving the tightest, least-variance estimate of the
 /// marginal coverage the guarantee is actually about.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn conformal_wrap_hits_nominal_coverage_across_seeds() {
     let alpha = 0.2_f64;
     let seeds = [11u64, 23, 37];
@@ -647,7 +661,7 @@ async fn conformal_wrap_hits_nominal_coverage_across_seeds() {
 /// held-out task (the amortized posterior is overconfident off its training
 /// tasks), and the conformal wrap restores coverage to ≥ nominal — the exact
 /// reason S19 is wrapped by S17 rather than shipped bare.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn conformal_restores_coverage_the_raw_band_loses() {
     let alpha = 0.2_f64;
     let rows = synthetic_meta_dataset(16, 24, 909);
@@ -734,7 +748,7 @@ async fn conformal_restores_coverage_the_raw_band_loses() {
 /// the carried context size. Asserted on AttnCNP, comparing a target served with
 /// a large context (`k` neighbours) against the same target served with a
 /// 1-member context — the thinner context's σ is wider.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn sparse_context_widens_sigma_attncnp() {
     let rows = synthetic_meta_dataset(14, 24, 7777);
     let (session, _dir) = session_with_meta_dataset(&rows).await;
@@ -851,6 +865,7 @@ fn generalized_train_loop_still_drives_tensor_batch() {
             weight_decay: 0.0,
             grad_clip: 1.0,
         },
+        &std::sync::atomic::AtomicBool::new(false),
         |batch: &TensorBatch| {
             candle_nn::Module::forward(&linear, &batch.features)
                 .map_err(|e| jammi_db::error::JammiError::FineTune(format!("{e}")))
@@ -877,7 +892,7 @@ fn generalized_train_loop_still_drives_tensor_batch() {
 /// coverage layer attributes a prediction by — a graph-conditioned (or any)
 /// prediction is never *unattributed*. The `source_kind()` accessor is the seam
 /// governance reads off the served state.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn predict_provenanced_carries_source_and_context_keys() {
     let rows = synthetic_meta_dataset(8, 16, 5);
     let (session, _dir) = session_with_meta_dataset(&rows).await;
@@ -927,7 +942,7 @@ async fn predict_provenanced_carries_source_and_context_keys() {
 /// group-conditional / weighted S17 constructors; and a cohort/point length
 /// mismatch is a typed error, never a silent misalignment. The engine never
 /// self-selects a cohort.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn conformal_levers_apply_and_never_self_select() {
     let alpha = 0.2_f64;
     let rows = synthetic_meta_dataset(16, 24, 31);

@@ -665,13 +665,41 @@ pub use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelSpec};
 #[cfg(feature = "local")]
 pub struct LocalSession {
     engine: Arc<InferenceSession>,
+    /// The embedded training worker, present only on the front-door session
+    /// (`Jammi::open`'s local arm) — the one drop point that owns the worker for
+    /// the process's lifetime. Per-request wrappers (gRPC handlers, the Python
+    /// `Database`'s internal `Session`) construct via [`Self::new`] and carry
+    /// `None`, so a worker is not spawned per call. Dropping the front-door
+    /// session stops the worker (RAII). Held for its `Drop`, not read.
+    _worker: Option<crate::fine_tune::worker::EmbeddedWorker>,
 }
 
 #[cfg(feature = "local")]
 impl LocalSession {
-    /// Wrap an existing engine session.
+    /// Wrap an existing engine session without an embedded worker. Used by the
+    /// per-request wrappers (gRPC handlers) and any caller that owns the training
+    /// worker elsewhere (the server `train` tier; the Python `Database`). The
+    /// transport-agnostic [`Session::fine_tune`] still submits jobs through this
+    /// — the worker that runs them just lives elsewhere.
     pub fn new(engine: Arc<InferenceSession>) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            _worker: None,
+        }
+    }
+
+    /// Wrap an engine session and spawn the embedded
+    /// [`crate::fine_tune::worker::TrainingWorker`] the resulting session owns.
+    /// This is the SDK front-door form ([`crate::Jammi::open`]'s local arm): the
+    /// embedded engine both submits training jobs and runs them, and the worker
+    /// stops when this session drops (RAII). Must be called inside a tokio
+    /// runtime context (the worker spawns a task).
+    pub fn with_embedded_worker(engine: Arc<InferenceSession>) -> Self {
+        let worker = crate::fine_tune::worker::EmbeddedWorker::spawn(&engine);
+        Self {
+            engine,
+            _worker: Some(worker),
+        }
     }
 
     /// The underlying engine session. The in-process affordances that are not

@@ -61,7 +61,7 @@ pub use tnp::Tnp;
 /// selects. A closed enum — the tier boundary. A novel neural-process
 /// architecture is authored in an external stack and its predictions registered
 /// back, never added here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ContextArchitecture {
     /// Conditional Neural Process: DeepSets encoder, segment-mean pooling.
     Cnp,

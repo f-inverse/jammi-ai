@@ -47,6 +47,10 @@ pub struct PyDatabase {
     /// Guards spawning the ephemeral timeout scanner exactly once per
     /// connection, on the first `ephemeral_session` call.
     ephemeral_scanner: std::sync::Once,
+    /// The embedded training worker this connection owns. An embedded `Database`
+    /// both submits training jobs and runs them; the worker stops when the
+    /// `Database` drops (RAII). Held for its `Drop`, not read.
+    _worker: jammi_ai::fine_tune::worker::EmbeddedWorker,
 }
 
 impl PyDatabase {
@@ -59,10 +63,18 @@ impl PyDatabase {
     pub fn open(config: JammiConfig) -> Result<Self, JammiError> {
         let runtime = Arc::new(tokio::runtime::Runtime::new()?);
         let session = runtime.block_on(InferenceSession::open(config))?;
+        // Spawn the embedded training worker on the shared runtime. The spawn
+        // must happen inside the runtime context; the worker holds a `Weak` to
+        // the session so it never keeps it alive, and the guard stops it on drop.
+        let worker = {
+            let _enter = runtime.enter();
+            jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        };
         Ok(Self {
             session,
             runtime,
             ephemeral_scanner: std::sync::Once::new(),
+            _worker: worker,
         })
     }
 
@@ -801,7 +813,9 @@ impl PyDatabase {
     /// Train an amortized in-context predictor (S19) over a source: a
     /// config-selectable CNP / Attentive-CNP / TNP that meta-learns to turn a
     /// retrieved context set into a predictive distribution, adapting to a new
-    /// target without retraining. Returns the model id it registered under.
+    /// target without retraining. Submits a durable training job and returns its
+    /// [`PyTrainingJob`] handle; the embedded worker runs it. Call `.wait()` to
+    /// block until completion, then read `.model_id` for the registered model.
     ///
     /// The predictor is meta-trained episodically: each **task** (the distinct
     /// values of `task_column`) is split into a context set and held-out targets,
@@ -859,7 +873,7 @@ impl PyDatabase {
         min_task_count: usize,
         seed: u64,
         model_id: Option<&str>,
-    ) -> PyResult<String> {
+    ) -> PyResult<PyTrainingJob> {
         use jammi_ai::pipeline::context_predictor::{
             ContextArchitecture, ContextPredictorTrainConfig, GaussianObjective, PredictiveHead,
         };
@@ -923,11 +937,11 @@ impl PyDatabase {
             min_task_count,
             seed,
         };
-        let record = self
+        let job = self
             .runtime
             .block_on(self.session.train_context_predictor(source, &spec))
             .map_err(to_pyerr)?;
-        Ok(record.model_id)
+        Ok(PyTrainingJob::new(job, Arc::clone(&self.runtime)))
     }
 
     /// Predict a target's distribution with a trained context predictor (S19) by

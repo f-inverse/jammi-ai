@@ -35,11 +35,16 @@ pub struct TrainingJobRecord {
     /// The tenant that owns the job, or `None` for unscoped rows. Carried so a
     /// worker that claims across tenants can re-scope subsequent work.
     pub tenant_id: Option<TenantId>,
+    /// The self-describing training specification as JSON, or `None` for a row
+    /// written without one. A worker deserialises this to reconstruct the run on
+    /// a fresh process — the catalog stores it opaquely (the typed shape lives in
+    /// the engine crate that produces and consumes it).
+    pub training_spec: Option<String>,
 }
 
 const SELECT_COLS: &str = "job_id, base_model_id, output_model_id, training_source, loss_type, \
      hyperparams, status, metrics, created_at, kind, claimed_by, lease_expires_at, attempts, \
-     tenant_id";
+     tenant_id, training_spec";
 
 /// Format leases write into `lease_expires_at`. Lexicographic ordering of two
 /// timestamps in this fixed-width UTC form matches chronological ordering, so
@@ -105,25 +110,44 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<TrainingJobRecord, BackendErr
         lease_expires_at: row.try_get("lease_expires_at")?,
         attempts: row.get::<i64>("attempts")? as u32,
         tenant_id,
+        training_spec: row.try_get("training_spec")?,
     })
+}
+
+/// Input parameters for [`Catalog::create_training_job`]. Grouped into one
+/// struct (the `RegisterModelParams` pattern) so the call site names each field
+/// and the insert surface has one place to grow.
+#[derive(Debug, Clone)]
+pub struct CreateTrainingJobParams<'a> {
+    /// Unique job id.
+    pub job_id: &'a str,
+    /// Base-model catalog PK the `base_model_id` FK references.
+    pub base_model_id: &'a str,
+    /// The source the run reads from (recorded for provenance).
+    pub training_source: &'a str,
+    /// Human-readable objective tag.
+    pub loss_type: &'a str,
+    /// Optimisation hyperparameters as JSON.
+    pub hyperparams: &'a str,
+    /// The verb that produced the job — the worker dispatches on it.
+    pub kind: &'a str,
+    /// The self-contained JSON specification a worker reconstructs the run from
+    /// on a fresh process. Stored opaquely — the typed shape lives in the engine
+    /// crate that produces and consumes it.
+    pub training_spec: &'a str,
 }
 
 impl Catalog {
     /// Create a new training job record with status = 'queued'. Tenant
     /// bound + asserted (SPEC-03 §7).
-    pub async fn create_training_job(
-        &self,
-        job_id: &str,
-        base_model_id: &str,
-        training_source: &str,
-        loss_type: &str,
-        hyperparams: &str,
-    ) -> Result<()> {
-        let job_id = job_id.to_string();
-        let base_model_id = base_model_id.to_string();
-        let training_source = training_source.to_string();
-        let loss_type = loss_type.to_string();
-        let hyperparams = hyperparams.to_string();
+    pub async fn create_training_job(&self, params: CreateTrainingJobParams<'_>) -> Result<()> {
+        let job_id = params.job_id.to_string();
+        let base_model_id = params.base_model_id.to_string();
+        let training_source = params.training_source.to_string();
+        let loss_type = params.loss_type.to_string();
+        let hyperparams = params.hyperparams.to_string();
+        let kind = params.kind.to_string();
+        let training_spec = params.training_spec.to_string();
         let tenant = self.current_tenant();
 
         self.backend()
@@ -133,14 +157,17 @@ impl Catalog {
                     tx.assert_tenant_matches(tenant, "training_jobs")?;
                     tx.execute(
                         "INSERT INTO training_jobs \
-                         (job_id, base_model_id, training_source, loss_type, hyperparams, status, tenant_id) \
-                         VALUES ($1, $2, $3, $4, $5, 'queued', $6)",
+                         (job_id, base_model_id, training_source, loss_type, hyperparams, status, \
+                          kind, training_spec, tenant_id) \
+                         VALUES ($1, $2, $3, $4, $5, 'queued', $6, $7, $8)",
                         &[
                             SqlValue::TextOwned(job_id),
                             SqlValue::TextOwned(base_model_id),
                             SqlValue::TextOwned(training_source),
                             SqlValue::TextOwned(loss_type),
                             SqlValue::TextOwned(hyperparams),
+                            SqlValue::TextOwned(kind),
+                            SqlValue::TextOwned(training_spec),
                             SqlValue::from(tenant.map(|t| t.to_string())),
                         ],
                     )
@@ -220,64 +247,111 @@ impl Catalog {
         Ok(())
     }
 
-    /// Set the output model ID for a completed training job. Scoped.
-    pub async fn set_training_output_model(
+    /// Finalize a training job the caller still owns, as a single compare-and-set
+    /// gated on lease ownership. Atomically writes `output_model_id`, flips the
+    /// status to `completed`, and (when `metrics` is `Some`) records the run
+    /// metrics — but **only** while the row is still `running` and
+    /// `claimed_by == worker_id`. Returns `true` when the row was updated
+    /// (the caller held the lease and is the sole finalizer) and `false` when it
+    /// was not (the lease was lost — the row is no longer `running`, or another
+    /// worker reclaimed it). A `false` return means the caller must not register
+    /// the output model or otherwise act as the finalizer; the job is left for
+    /// [`Self::reclaim_expired_training_jobs`] and the worker that re-claims it.
+    ///
+    /// Not tenant-scoped, matching [`Self::claim_next_training_job`] and
+    /// [`Self::heartbeat_training_job`]: the lease identity (`claimed_by`) is the
+    /// authority, not the session tenant. The single `UPDATE … WHERE claimed_by
+    /// AND status = 'running'` is the same lease guard the heartbeat uses, so a
+    /// worker whose lease was reclaimed mid-run matches zero rows here and the
+    /// worker that now owns the job is the only one whose CAS succeeds.
+    pub async fn finalize_training_job(
         &self,
         job_id: &str,
+        worker_id: &str,
         output_model_id: &str,
-    ) -> Result<()> {
+        metrics: Option<&str>,
+    ) -> Result<bool> {
+        let completed = TrainingJobStatus::Completed.to_string();
+        let running = TrainingJobStatus::Running.to_string();
+        let job_id = job_id.to_string();
+        let worker_id = worker_id.to_string();
         let output_model_id = output_model_id.to_string();
-        let id = job_id.to_string();
-        let tenant = self.current_tenant();
-        self.backend()
-            .transaction(TxOptions::default(), |tx| {
-                Box::pin(async move {
-                    tx.set_tenant(tenant);
-                    tx.execute(
-                        "UPDATE training_jobs SET output_model_id = $1, \
-                         updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
-                         WHERE job_id = $2 AND (tenant_id = $3 OR tenant_id IS NULL)",
-                        &[
-                            SqlValue::TextOwned(output_model_id),
-                            SqlValue::TextOwned(id),
-                            SqlValue::from(tenant.map(|t| t.to_string())),
-                        ],
-                    )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await?;
-        Ok(())
-    }
+        let metrics = metrics.map(str::to_string);
+        let now = lease_now();
 
-    /// Transition all training jobs with status Running to Failed.
-    /// Startup-recovery shim: a Running job at startup means the process
-    /// crashed mid-training. Scoped to the session tenant.
-    pub async fn cleanup_stale_training_jobs(&self) -> Result<usize> {
-        let running = super::status::TrainingJobStatus::Running.to_string();
-        let failed = super::status::TrainingJobStatus::Failed.to_string();
-        let tenant = self.current_tenant();
-        let count = self
+        let updated = self
             .backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
-                    tx.set_tenant(tenant);
                     tx.execute(
-                        "UPDATE training_jobs SET status = $1, \
-                         updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
-                         WHERE status = $2 AND (tenant_id = $3 OR tenant_id IS NULL)",
+                        "UPDATE training_jobs \
+                         SET output_model_id = $1, status = $2, \
+                             metrics = COALESCE($3, metrics), updated_at = $4 \
+                         WHERE job_id = $5 AND claimed_by = $6 AND status = $7",
                         &[
-                            SqlValue::TextOwned(failed),
+                            SqlValue::TextOwned(output_model_id),
+                            SqlValue::TextOwned(completed),
+                            SqlValue::from(metrics),
+                            SqlValue::TextOwned(now),
+                            SqlValue::TextOwned(job_id),
+                            SqlValue::TextOwned(worker_id),
                             SqlValue::TextOwned(running),
-                            SqlValue::from(tenant.map(|t| t.to_string())),
                         ],
                     )
                     .await
                 })
             })
             .await?;
-        Ok(count as usize)
+        Ok(updated == 1)
+    }
+
+    /// Fail a training job the caller still owns, as a single compare-and-set
+    /// gated on lease ownership — the failure peer of [`Self::finalize_training_job`].
+    /// Flips the status to `failed` and records `metrics` (the error blob) only
+    /// while the row is still `running` and `claimed_by == worker_id`. Returns
+    /// `true` when the row was updated and `false` when the lease was lost (the
+    /// row is no longer `running`, or another worker reclaimed it).
+    ///
+    /// Guarding the failure write the same way as the finalize write keeps the
+    /// two terminal transitions symmetric: a worker that lost its lease mid-run
+    /// cannot stamp `failed` over a job the re-claiming worker is successfully
+    /// running (which would otherwise block that worker's finalize). Not
+    /// tenant-scoped, matching the other lease-identity operations.
+    pub async fn fail_training_job(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        metrics: Option<&str>,
+    ) -> Result<bool> {
+        let failed = TrainingJobStatus::Failed.to_string();
+        let running = TrainingJobStatus::Running.to_string();
+        let job_id = job_id.to_string();
+        let worker_id = worker_id.to_string();
+        let metrics = metrics.map(str::to_string);
+        let now = lease_now();
+
+        let updated = self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE training_jobs \
+                         SET status = $1, metrics = COALESCE($2, metrics), updated_at = $3 \
+                         WHERE job_id = $4 AND claimed_by = $5 AND status = $6",
+                        &[
+                            SqlValue::TextOwned(failed),
+                            SqlValue::from(metrics),
+                            SqlValue::TextOwned(now),
+                            SqlValue::TextOwned(job_id),
+                            SqlValue::TextOwned(worker_id),
+                            SqlValue::TextOwned(running),
+                        ],
+                    )
+                    .await
+                })
+            })
+            .await?;
+        Ok(updated == 1)
     }
 
     /// List training jobs visible to the session tenant, most recent first.

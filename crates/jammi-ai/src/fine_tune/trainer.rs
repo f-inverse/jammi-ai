@@ -1,6 +1,7 @@
 //! Training loop: gradient descent with LR scheduling, early stopping, and checkpointing.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BinaryArray, StringArray};
@@ -13,19 +14,36 @@ use jammi_db::error::{JammiError, Result};
 use super::data::{TextChunk, TrainingDataLoader};
 use super::optimizer::clip_and_step;
 use super::regression_loss::{crps_gaussian_loss, gaussian_nll_loss, pinball_loss};
+use super::staging::StagedArtifact;
 use super::target::TrainingTarget;
 use super::{EarlyStoppingMetric, FineTuneConfig, LrSchedule};
 use crate::model::{LoadedModel, ModelTask};
 
 /// Result of a completed training run.
+///
+/// The loop trains and persists the adapter into a worker-private staging dir,
+/// but does **not** write the job's terminal status, register the output model,
+/// or promote the artifact into its canonical path — those are the worker's
+/// single lease-guarded finalization. The worker promotes [`Self::staged`] into
+/// [`Self::adapter_path`] only if its finalize compare-and-set wins, and
+/// discards it otherwise, so the canonical artifact is written by exactly one
+/// worker. The run metrics it computed (final loss, step count, timestamps) are
+/// returned here so the worker records them in that same compare-and-set.
 #[derive(Debug)]
 pub struct TrainingResult {
-    /// Path where the final adapter weights were saved.
+    /// Canonical path the final adapter is promoted to (the path the catalog
+    /// model row points at). It only holds the trained weights once
+    /// [`Self::staged`] has been promoted.
     pub adapter_path: PathBuf,
+    /// The worker-private staged adapter the worker promotes on a finalize CAS
+    /// win or discards on a loss.
+    pub staged: StagedArtifact,
     /// Best validation loss achieved.
     pub final_loss: f64,
     /// Total optimizer steps taken.
     pub total_steps: usize,
+    /// The run metrics JSON the worker writes alongside the terminal status.
+    pub metrics_json: String,
 }
 
 /// Compute the learning rate for a given step.
@@ -78,23 +96,6 @@ struct StepContext<'a> {
     checkpoint_dir: &'a Path,
     checkpoint_interval: usize,
     total_steps: usize,
-    started_at: &'a str,
-}
-
-/// Catalog handles a successful training run must register before flipping
-/// the job's status to `Completed`. Bundled into one struct so the caller's
-/// `wait()` observer never sees a completed job whose output model row is
-/// still missing.
-pub struct OutputModelHandle {
-    /// Canonical id of the fine-tuned model (e.g. `"jammi:fine-tuned:<uuid>"`).
-    pub output_model_id: String,
-    /// Canonical id of the base model used for training (e.g. `"local:..."`
-    /// or `"sentence-transformers/all-MiniLM-L6-v2"`). Stored on the output
-    /// model row so the resolver can reach the base config from the
-    /// fine-tuned id alone.
-    pub base_model_id: String,
-    /// Task the fine-tuned model performs.
-    pub task: ModelTask,
 }
 
 /// The training loop: runs LoRA fine-tuning with gradient accumulation,
@@ -109,11 +110,20 @@ pub struct TrainingLoop {
     varmap: VarMap,
     config: FineTuneConfig,
     job_id: String,
+    /// Identifies the worker+attempt running this loop. Threaded into the
+    /// staging-path leaf so two workers training the same `job_id` never share a
+    /// training-time artifact path.
+    worker_id: String,
     catalog: Arc<Catalog>,
     artifact_dir: PathBuf,
-    output_model: Option<OutputModelHandle>,
     divergence_count: usize,
     device: Device,
+    /// Cooperative-cancellation flag the worker's heartbeat task sets when the
+    /// lease is lost. Checked at every epoch boundary; once set the loop bails
+    /// without recording a terminal status, leaving the job for lease-based
+    /// reclaim. A `spawn_blocking` thread cannot be force-aborted, so this is the
+    /// coarsest safe interruption point.
+    cancel: Arc<AtomicBool>,
 }
 
 /// Builder for [`TrainingLoop`].
@@ -123,10 +133,11 @@ pub struct TrainingLoopBuilder {
     varmap: VarMap,
     config: FineTuneConfig,
     job_id: Option<String>,
+    worker_id: Option<String>,
     catalog: Option<Arc<Catalog>>,
     artifact_dir: Option<PathBuf>,
-    output_model: Option<OutputModelHandle>,
     device: Device,
+    cancel: Arc<AtomicBool>,
 }
 
 impl TrainingLoopBuilder {
@@ -142,16 +153,26 @@ impl TrainingLoopBuilder {
             varmap,
             config,
             job_id: None,
+            worker_id: None,
             catalog: None,
             artifact_dir: None,
-            output_model: None,
             device: Device::Cpu,
+            cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Set the device all training tensors should live on.
     pub fn device(mut self, device: Device) -> Self {
         self.device = device;
+        self
+    }
+
+    /// Set the cooperative-cancellation flag the loop checks at every epoch
+    /// boundary. The worker's heartbeat task sets it when the lease is lost so
+    /// the loop bails and the job is left for reclaim. Omit it for a run that
+    /// cannot be cancelled (the loop then uses a never-set flag).
+    pub fn cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = cancel;
         self
     }
 
@@ -169,6 +190,15 @@ impl TrainingLoopBuilder {
         self
     }
 
+    /// Set the worker+attempt identifier. Used to derive a worker-private
+    /// artifact-staging path so concurrent workers on the same job never share a
+    /// training-time file path; the staged artifact is promoted into the
+    /// canonical path only on the worker's finalize-CAS win.
+    pub fn worker_id(mut self, id: String) -> Self {
+        self.worker_id = Some(id);
+        self
+    }
+
     /// Set the catalog for status persistence.
     pub fn catalog(mut self, catalog: Arc<Catalog>) -> Self {
         self.catalog = Some(catalog);
@@ -181,24 +211,14 @@ impl TrainingLoopBuilder {
         self
     }
 
-    /// Set the output-model handle. Required when the loop is part of the
-    /// production fine-tune path: on successful completion the trainer
-    /// registers the output model in the catalog *before* flipping the
-    /// job to `Completed`, closing the wait/read race that would otherwise
-    /// let a caller observe a completed job with no model row.
-    ///
-    /// Omit only in trainer-internals tests that drive the loop directly
-    /// with precomputed batches and assert on the in-memory result alone.
-    pub fn output_model(mut self, handle: OutputModelHandle) -> Self {
-        self.output_model = Some(handle);
-        self
-    }
-
     /// Build the training loop. All infrastructure params must be set.
     pub fn build(self) -> Result<TrainingLoop> {
         let job_id = self
             .job_id
             .ok_or_else(|| JammiError::FineTune("TrainingLoopBuilder: job_id required".into()))?;
+        let worker_id = self.worker_id.ok_or_else(|| {
+            JammiError::FineTune("TrainingLoopBuilder: worker_id required".into())
+        })?;
         let catalog = self
             .catalog
             .ok_or_else(|| JammiError::FineTune("TrainingLoopBuilder: catalog required".into()))?;
@@ -211,11 +231,12 @@ impl TrainingLoopBuilder {
             varmap: self.varmap,
             config: self.config,
             job_id,
+            worker_id,
             catalog,
             artifact_dir,
-            output_model: self.output_model,
             divergence_count: 0,
             device: self.device,
+            cancel: self.cancel,
         })
     }
 }
@@ -260,8 +281,13 @@ impl TrainingLoop {
         let mut global_step = 0;
         let mut best_val_loss = f64::MAX;
         let mut patience_counter = 0;
-        let checkpoint_dir = self.artifact_dir.join("models").join(&self.job_id);
-        std::fs::create_dir_all(&checkpoint_dir)?;
+        // Train into a worker-private staging dir, never the shared canonical
+        // path: two workers on the same `job_id` must not share a training-time
+        // file. The canonical `models/{job_id}` is written only when the worker's
+        // finalize CAS wins, by promoting this staging dir.
+        let canonical_dir = self.artifact_dir.join("models").join(&self.job_id);
+        let staged = StagedArtifact::stage(canonical_dir, &self.worker_id)?;
+        let checkpoint_dir = staged.staging_dir().to_path_buf();
 
         // Collect trainable vars once; their TensorIds are stable for the run.
         let trainable_vars = self.varmap.all_vars();
@@ -272,6 +298,14 @@ impl TrainingLoop {
         let mut mined_loader: Option<TrainingDataLoader> = None;
 
         for epoch in 0..self.config.epochs {
+            // Cooperative cancellation: the worker's heartbeat sets this when the
+            // lease is lost. Bail at the epoch boundary, leaving the job for
+            // lease-based reclaim rather than recording a (wrong) terminal status.
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err(JammiError::FineTune(
+                    "training cancelled: lease lost before epoch boundary".into(),
+                ));
+            }
             let mut epoch_loss = 0.0;
             let mut batch_count = 0;
             // Accumulated gradients across micro-batches. Seeded from the first
@@ -322,7 +356,6 @@ impl TrainingLoop {
                             checkpoint_dir: &checkpoint_dir,
                             checkpoint_interval,
                             total_steps,
-                            started_at: &started_at,
                         },
                     )?;
                 }
@@ -371,7 +404,6 @@ impl TrainingLoop {
                             checkpoint_dir: &checkpoint_dir,
                             checkpoint_interval,
                             total_steps,
-                            started_at: &started_at,
                         },
                     )?;
                 }
@@ -472,41 +504,20 @@ impl TrainingLoop {
         jammi_lora::save_adapter(&checkpoint_dir, &final_weights, &saved)
             .map_err(|e| JammiError::FineTune(format!("Save adapter: {e}")))?;
 
-        // Register the output model in the catalog BEFORE flipping the
-        // job's status to `Completed`. `TrainingJob::wait()` returns as
-        // soon as it sees `Completed`; if the model row landed after the
-        // flip, a caller doing `wait().await; encode_text_query(job.model_id())`
-        // would race and miss the row, falling through to the HF Hub
-        // resolver and hitting a 401 on a name that cannot exist there.
-        let handle = tokio::runtime::Handle::current();
-        if let Some(ref output) = self.output_model {
-            handle.block_on(
-                self.catalog
-                    .set_training_output_model(&self.job_id, &output.output_model_id),
-            )?;
-            handle.block_on(self.catalog.register_model(
-                jammi_db::catalog::model_repo::RegisterModelParams {
-                    model_id: &output.output_model_id,
-                    version: 1,
-                    model_type: "fine-tuned",
-                    backend: "candle",
-                    task: output.task,
-                    base_model_id: Some(&output.base_model_id),
-                    artifact_path: checkpoint_dir.to_str(),
-                    config_json: None,
-                },
-            ))?;
-        }
-
-        // Job status flips to Completed last — only after every artifact
-        // and catalog row is durable. `wait()` observers see a consistent
-        // post-state.
+        // The loop does not write the terminal status, register the output
+        // model, or promote the staged artifact into its canonical path. All
+        // three are the worker's single lease-guarded finalization: it registers
+        // the model row (pointing at the canonical path), runs the compare-and-set
+        // that flips the job to `completed` only while it still holds the lease,
+        // and — only on a CAS win — promotes this staging into the canonical path.
+        // Computing the run metrics here (and returning them) keeps the rich loss
+        // / step / timing detail the worker records in that same CAS.
         let completed_at = chrono::Utc::now().to_rfc3339();
         let early_stopping_metric_label = match self.config.early_stopping_metric {
             EarlyStoppingMetric::TrainLoss => "train_loss",
             EarlyStoppingMetric::ValLoss => "val_loss",
         };
-        let metrics = serde_json::json!({
+        let metrics_json = serde_json::json!({
             "final_loss": best_val_loss,
             "early_stopping_metric": early_stopping_metric_label,
             "total_steps": global_step,
@@ -514,16 +525,13 @@ impl TrainingLoop {
             "completed_at": completed_at,
         })
         .to_string();
-        handle.block_on(self.catalog.update_training_status(
-            &self.job_id,
-            TrainingJobStatus::Completed,
-            Some(&metrics),
-        ))?;
 
         Ok(TrainingResult {
-            adapter_path: checkpoint_dir,
+            adapter_path: staged.canonical_dir().to_path_buf(),
+            staged,
             final_loss: best_val_loss,
             total_steps: global_step,
+            metrics_json,
         })
     }
 
@@ -1086,26 +1094,15 @@ impl TrainingLoop {
             .map_err(|e| JammiError::FineTune(format!("Loss scalar: {e}")))?
             as f64;
 
-        // Divergence detection
+        // Divergence detection. A diverged run returns the typed error and the
+        // worker records the terminal `failed` status — terminal writes are the
+        // worker's single authority, never the loop's.
         if loss_val.is_nan() || loss_val > 100.0 {
             self.divergence_count += 1;
             if self.divergence_count >= 3 {
-                let err_msg = "Training diverged: loss was NaN or >100 for 3 consecutive batches";
-                let metrics = serde_json::json!({
-                    "error_message": err_msg,
-                    "started_at": ctx.started_at,
-                })
-                .to_string();
-                if let Err(e) =
-                    tokio::runtime::Handle::current().block_on(self.catalog.update_training_status(
-                        &self.job_id,
-                        TrainingJobStatus::Failed,
-                        Some(&metrics),
-                    ))
-                {
-                    tracing::error!(job_id = %self.job_id, error = %e, "Failed to record job status in catalog");
-                }
-                return Err(JammiError::FineTune(err_msg.into()));
+                return Err(JammiError::FineTune(
+                    "Training diverged: loss was NaN or >100 for 3 consecutive batches".into(),
+                ));
             }
             return Ok(());
         }

@@ -230,6 +230,78 @@ fn from_graph_loader_threads_pairs_and_triplet_shapes() {
     );
 }
 
+/// A graph job is durable: the submitter persists a `TrainingSpec::GraphFineTune`
+/// and a worker reconstructs the run from that JSON alone. The reconstruction
+/// must be deterministic — two runs from the *same persisted spec* re-sample the
+/// identical pairs (the seed lives in `sample_config`), or a re-claimed job after
+/// a lost lease would train on different data than the first attempt. This is the
+/// job-round-trip determinism contract: serialise the spec, deserialise it twice,
+/// and assert the rebuilt sampler yields byte-identical pairs both times.
+#[test]
+fn graph_spec_round_trip_resamples_identical_pairs() {
+    use jammi_ai::fine_tune::spec::TrainingSpec;
+
+    let sources = GraphFineTuneSources {
+        node_source: "nodes".into(),
+        id_column: "id".into(),
+        text_column: "text".into(),
+        edge_source: "edges".into(),
+        src_column: "src".into(),
+        dst_column: "dst".into(),
+        provenance: EdgeProvenance::Declared,
+    };
+    let sample_config = GraphSampleConfig {
+        walk_length: 4,
+        walks_per_node: 6,
+        hard_negatives: 2,
+        exclude_hops: 1,
+        seed: 4242,
+        ..GraphSampleConfig::default()
+    };
+    let spec = TrainingSpec::GraphFineTune {
+        sources,
+        sample_config,
+        common: jammi_ai::fine_tune::spec::TrainingCommon {
+            base_model: "local:tiny".into(),
+            config: jammi_ai::fine_tune::FineTuneConfig::default(),
+        },
+    };
+
+    // Persist exactly as the submit path does, then reconstruct twice — the two
+    // independent deserialisations stand in for two worker attempts at the job.
+    let json = serde_json::to_string(&spec).unwrap();
+    let resample = |json: &str| -> Vec<jammi_ai::fine_tune::graph_sampler::SampledPair> {
+        let TrainingSpec::GraphFineTune {
+            sources,
+            sample_config,
+            ..
+        } = serde_json::from_str(json).unwrap()
+        else {
+            panic!("round-trip must yield a GraphFineTune spec");
+        };
+        // The worker reads the sources from SQL; here the node/edge content is
+        // fixed by the fixture, so the sampler input is the same — the only
+        // variable across attempts is the seeded sampler, which the spec carries.
+        let _ = &sources;
+        let (nodes, edges) = two_communities(EdgeProvenance::Declared);
+        GraphSampler::build(nodes, edges, sample_config)
+            .unwrap()
+            .sample()
+            .unwrap()
+    };
+
+    let first = resample(&json);
+    let second = resample(&json);
+    assert!(
+        !first.is_empty(),
+        "the round-tripped spec must sample a non-empty pair set"
+    );
+    assert_eq!(
+        first, second,
+        "two runs from the same persisted spec must re-sample identical pairs"
+    );
+}
+
 /// The text-bearing precondition surfaces as a typed error end-to-end: an edge
 /// endpoint with no node text is rejected at sampler build, never silently
 /// dropped.
@@ -264,11 +336,14 @@ fn write_csv(dir: &std::path::Path, name: &str, header: &str, rows: &[(String, S
 /// graph, and trains a real (tiny_bert) model to a completed job with a saved
 /// adapter — the integration proof that `TrainingFormat::Graph` threads through
 /// the existing trainer with no new loss.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn fine_tune_graph_end_to_end_completes() {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    // `fine_tune_graph` submits a queued job; the worker re-reads the sources,
+    // re-samples the graph from the seeded spec, and trains it.
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
 
     // Node text: two small communities.
     let node_rows: Vec<(String, String)> = ["a0", "a1", "a2", "b0", "b1", "b2"]
@@ -388,14 +463,17 @@ async fn fine_tune_graph_end_to_end_completes() {
     );
 }
 
-/// A node source with no edge source (isolated graph) is a typed failure end to
-/// end — a graph with no structure carries no supervision, surfaced as a failed
-/// job rather than a silent no-op.
-#[tokio::test]
+/// A node source with no edge source (isolated graph) is a failure end to end —
+/// a graph with no structure carries no supervision. Submit no longer reads the
+/// graph (it persists the spec), so the failure surfaces when the worker
+/// re-samples: the job lands `failed` and `wait()` returns the typed error,
+/// never a wedged job or a silent no-op.
+#[tokio::test(flavor = "multi_thread")]
 async fn fine_tune_graph_isolated_graph_fails() {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
 
     let node_rows: Vec<(String, String)> = ["n0", "n1", "n2"]
         .iter()
@@ -441,18 +519,27 @@ async fn fine_tune_graph_isolated_graph_fails() {
         provenance: EdgeProvenance::Declared,
     };
 
-    // The sampler refuses an edgeless graph, so the call fails synchronously
-    // (before a job is even spawned) — a typed error, not a wedged job.
-    let result = session
+    // Submit succeeds (it only persists the spec); the worker re-samples the
+    // graph, the sampler refuses an edgeless graph, and the job lands `failed`.
+    let job = session
         .fine_tune_graph(
             &sources,
             &model,
             GraphSampleConfig::default(),
             Some(jammi_ai::fine_tune::FineTuneConfig::default()),
         )
-        .await;
+        .await
+        .expect("submit persists the spec and returns a handle");
+
+    let result = job.wait().await;
     assert!(
         result.is_err(),
-        "an isolated graph (no edges) must be a typed error"
+        "an isolated graph (no edges) must drive the job to a typed failure"
     );
+    let record = session
+        .catalog()
+        .get_training_job(&job.job_id)
+        .await
+        .unwrap();
+    assert_eq!(record.status, "failed");
 }

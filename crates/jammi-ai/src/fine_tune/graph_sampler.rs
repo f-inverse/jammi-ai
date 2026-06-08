@@ -50,6 +50,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use jammi_db::error::{JammiError, Result};
 
 use crate::pipeline::graph_neighbourhood::{Adjacency, SplitMix64};
@@ -57,7 +59,7 @@ use crate::pipeline::graph_neighbourhood::{Adjacency, SplitMix64};
 /// Where an edge came from — the load-bearing distinction for the circularity
 /// contract. Tracked per edge so the sampler can report whether the supervision
 /// carries any signal the base metric does not already encode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EdgeProvenance {
     /// External / declared structure: hierarchy, crosswalk, citation, a
     /// coder-confirmed pair. Independent of the base embedding metric, so it can
@@ -131,7 +133,7 @@ impl GraphEdge {
 /// provenance every edge in the edge source carries. Bundled so the
 /// graph-fine-tune entry point takes one typed argument instead of a long
 /// positional list.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphFineTuneSources {
     /// Catalog source holding the node text.
     pub node_source: String,
@@ -152,7 +154,7 @@ pub struct GraphFineTuneSources {
 
 /// Sampling configuration: node2vec walk knobs plus the structure-aware
 /// negative-sampling knobs.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GraphSampleConfig {
     /// Walk length `L`. The positive for an anchor is drawn from the nodes the
     /// walk visits, so `L` controls how far up the graph the positive can be.

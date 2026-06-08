@@ -13,6 +13,8 @@
 //! [`crate::fine_tune::optimizer::optimizer_step`] — the two loops differ in
 //! how a batch becomes a loss, not in how a loss becomes a parameter update.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use candle_core::{Tensor, Var};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarMap};
 use jammi_db::error::{JammiError, Result};
@@ -84,10 +86,16 @@ pub struct ParallelTrainReport {
 /// Neither argument nor return type names a tokenizer, a `LoadedModel`, or
 /// `input_ids`: the decoupling from the text path is structural, readable off
 /// this signature alone.
+///
+/// `cancel` is the cooperative-cancellation flag the loop checks at every epoch
+/// boundary — the worker's heartbeat sets it when the lease is lost so the loop
+/// bails (a `spawn_blocking` thread cannot be force-aborted). Pass an
+/// always-false flag for a run that cannot be cancelled.
 pub fn train_loop<B, M, L>(
     varmap: &VarMap,
     batches: &[B],
     config: &ParallelTrainConfig,
+    cancel: &AtomicBool,
     model_fn: M,
     loss_fn: L,
 ) -> Result<ParallelTrainReport>
@@ -110,6 +118,11 @@ where
     let mut last_epoch_loss = 0.0f64;
 
     for _epoch in 0..config.epochs {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(JammiError::FineTune(
+                "training cancelled: lease lost before epoch boundary".into(),
+            ));
+        }
         let mut epoch_loss = 0.0f64;
         let mut batch_count = 0usize;
 

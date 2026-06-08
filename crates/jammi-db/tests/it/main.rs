@@ -5,6 +5,7 @@ mod channels;
 mod common;
 mod ephemeral;
 mod eval_per_query;
+mod fine_tune_queue;
 mod foundation;
 mod index;
 mod migrations;

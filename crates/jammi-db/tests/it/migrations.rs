@@ -174,7 +174,79 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "012_topics_tenant_unique",
             "013_result_table_kind",
             "014_bm25_channel",
+            "015_fine_tune_job_queue",
         ]
+    );
+}
+
+/// Migration 015 adds the lease-based job-queue columns to `fine_tune_jobs`
+/// and the `(status, lease_expires_at)` claim index. Asserted via
+/// `pragma_table_info` and `sqlite_master`.
+#[tokio::test]
+async fn migration_015_adds_job_queue_columns_and_claim_index() {
+    use jammi_db::catalog::backend::SqlValue;
+
+    let dir = tempdir().unwrap();
+    let _catalog = Catalog::open(dir.path()).await.unwrap();
+    let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
+
+    let columns = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query::<_, String>(
+                        "SELECT name FROM pragma_table_info('fine_tune_jobs')",
+                        &[],
+                        |row| row.get("name"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    for expected in [
+        "kind",
+        "claimed_by",
+        "lease_expires_at",
+        "attempts",
+        "training_spec",
+    ] {
+        assert!(
+            columns.iter().any(|c| c == expected),
+            "fine_tune_jobs must have '{expected}' after migration 015; got {columns:?}"
+        );
+    }
+
+    let index_exists = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    let rows: Vec<i64> = tx
+                        .query(
+                            "SELECT 1 AS one FROM sqlite_master \
+                             WHERE type='index' AND name=$1 AND tbl_name='fine_tune_jobs'",
+                            &[SqlValue::TextOwned("idx_fine_tune_jobs_claim".into())],
+                            |row| row.get::<i64>("one"),
+                        )
+                        .await?;
+                    Ok(!rows.is_empty())
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        index_exists,
+        "idx_fine_tune_jobs_claim must exist after migration 015"
     );
 }
 

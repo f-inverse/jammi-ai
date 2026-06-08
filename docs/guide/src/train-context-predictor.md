@@ -77,8 +77,13 @@ let spec = ContextPredictorTrainConfig {
     min_task_count: 4,                          // the meta-overfitting guard
     seed: 0,
 };
-let record = session.train_context_predictor("patents", &spec).await?;
-# let _ = record;
+// Training is a durable, lease-claimed job: `train_context_predictor` submits a
+// queued job and returns a handle immediately; a worker claims it, re-samples
+// the episodic meta-dataset from the spec, trains it, and registers the model.
+let job = session.train_context_predictor("patents", &spec).await?;
+job.wait().await?; // block until a worker drives the job to completion
+let model_id = job.model_id(); // the spec's `model_id`, now registered
+# let _ = model_id;
 # Ok(()) }
 ```
 
@@ -183,7 +188,9 @@ right tool.
 ## From Python
 
 ```python
-model_id = db.train_context_predictor(
+# Submits a durable training job and returns its handle; an embedded worker
+# runs it. Block on `.wait()`, then read `.model_id` for the registered model.
+job = db.train_context_predictor(
     "patents",
     key_column="_row_id",
     task_column="cohort",
@@ -193,6 +200,8 @@ model_id = db.train_context_predictor(
     objective="crps",         # "crps" | "nll" | "betanll"
     context_k=32,
 )
+job.wait()
+model_id = job.model_id
 
 dist = db.predict_with_context_predictor(
     model_id, source="patents", target_key="US-7654321"

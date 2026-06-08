@@ -1,16 +1,18 @@
 use std::sync::Arc;
 
 use jammi_db::catalog::model_repo::RegisterModelParams;
-use jammi_db::catalog::status::{ResultTableStatus, TrainingJobStatus};
+use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::model_task::ModelTask;
 use jammi_db::store::ResultStore;
 use tempfile::tempdir;
 
-/// Crash recovery: stale Building result tables → Failed, stale Running
-/// training jobs → Failed.
+/// Crash recovery: a stale `Building` result table is reconciled to `Failed` at
+/// startup. (Orphaned training jobs are recovered by the worker's lease-based
+/// `reclaim_expired_training_jobs`, not a startup sweep — that path is exercised
+/// in the engine crate's worker tests.)
 #[tokio::test]
-async fn crash_recovery_cleans_up_stale_result_tables_and_training_jobs() {
+async fn crash_recovery_cleans_up_stale_result_tables() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
 
@@ -43,33 +45,13 @@ async fn crash_recovery_cleans_up_stale_result_tables_and_training_jobs() {
         .await
         .unwrap();
 
-    catalog
-        .create_training_job(
-            "ft-crash-1",
-            "test-model::1",
-            "pairs.csv",
-            "contrastive",
-            "{}",
-        )
-        .await
-        .unwrap();
-    catalog
-        .update_training_status("ft-crash-1", TrainingJobStatus::Running, None)
-        .await
-        .unwrap();
-
     let building = catalog
         .list_result_tables_by_status(ResultTableStatus::Building)
         .await
         .unwrap();
     assert_eq!(building.len(), 1);
 
-    let job = catalog.get_training_job("ft-crash-1").await.unwrap();
-    assert_eq!(job.status, TrainingJobStatus::Running.to_string());
-
     result_store.recover().await.unwrap();
-    let cleaned = catalog.cleanup_stale_training_jobs().await.unwrap();
-    assert_eq!(cleaned, 1);
 
     let building_after = catalog
         .list_result_tables_by_status(ResultTableStatus::Building)
@@ -83,7 +65,4 @@ async fn crash_recovery_cleans_up_stale_result_tables_and_training_jobs() {
         .unwrap()
         .expect("table should still exist");
     assert_eq!(table.status, ResultTableStatus::Failed.to_string());
-
-    let job_after = catalog.get_training_job("ft-crash-1").await.unwrap();
-    assert_eq!(job_after.status, TrainingJobStatus::Failed.to_string());
 }

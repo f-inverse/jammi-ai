@@ -387,10 +387,11 @@ async fn recipe_enrich_results() {
 
 // ─── Recipe: Fine-Tune for Your Domain ────────────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn recipe_fine_tune() {
     let dir = TempDir::new().unwrap();
     let session = cookbook_session(&dir).await;
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
     let model_id = tiny_bert_id();
 
     // Register training data (cookbook recipe)

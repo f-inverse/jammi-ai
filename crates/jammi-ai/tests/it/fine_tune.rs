@@ -246,9 +246,12 @@ async fn session_with_training_data() -> (Arc<InferenceSession>, TempDir) {
     (session, dir)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn fine_tune_job_lifecycle_and_artifacts() {
     let (session, dir) = session_with_training_data().await;
+    // `fine_tune` submits a queued job; a worker runs it. Start one over this
+    // session (it holds a `Weak`, so the test's `Arc` keeps the session alive).
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
     let model = tiny_bert_model();
 
     let job = session
@@ -573,11 +576,12 @@ fn write_audio_triplets(dir: &std::path::Path) -> std::path::PathBuf {
     path
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn audio_projection_head_fine_tune_changes_embeddings() {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
     let model = htsat_clap_model();
 
     // Triplet source (audio bytes), corpus, and golden.
@@ -748,13 +752,15 @@ async fn fine_tune_job_catalog_crud() {
 
     // Create job
     catalog
-        .create_training_job(
-            "job-1",
-            "base-model::1",
-            "training_source",
-            "cosent",
-            r#"{"lora_rank": 8}"#,
-        )
+        .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+            job_id: "job-1",
+            base_model_id: "base-model::1",
+            training_source: "training_source",
+            loss_type: "cosent",
+            hyperparams: r#"{"lora_rank": 8}"#,
+            kind: "fine_tune",
+            training_spec: "{}",
+        })
         .await
         .unwrap();
 
@@ -912,7 +918,15 @@ async fn training_divergence_detection() {
         .await
         .unwrap();
     catalog
-        .create_training_job("div-job", "div-test-model::1", "src", "cosent", "{}")
+        .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+            job_id: "div-job",
+            base_model_id: "div-test-model::1",
+            training_source: "src",
+            loss_type: "cosent",
+            hyperparams: "{}",
+            kind: "fine_tune",
+            training_spec: "{}",
+        })
         .await
         .unwrap();
 
@@ -1019,7 +1033,15 @@ async fn training_early_stopping_triggers() {
         .await
         .unwrap();
     catalog
-        .create_training_job("es-job", "es-test-model::1", "src", "cosent", "{}")
+        .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+            job_id: "es-job",
+            base_model_id: "es-test-model::1",
+            training_source: "src",
+            loss_type: "cosent",
+            hyperparams: "{}",
+            kind: "fine_tune",
+            training_spec: "{}",
+        })
         .await
         .unwrap();
 
@@ -1066,9 +1088,10 @@ async fn training_early_stopping_triggers() {
 // fine-tuned models, run eval_embeddings on both, assert that retrieval
 // metrics differ. Proves the adapter actually alters search behavior.
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn fine_tuned_model_produces_measurably_different_search_quality() {
     let (session, _dir) = session_with_training_data().await;
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
     let model = tiny_bert_model();
 
     // Register patents source for embedding generation and eval
@@ -1276,4 +1299,198 @@ fn config_validation_rejects_invalid_values() {
 
     // Default config should be valid
     assert!(FineTuneConfig::default().validate().is_ok());
+}
+
+// ─── Durability: a job submitted by one session runs on a worker started later ─
+//
+// `fine_tune` only submits a queued job carrying a self-describing spec — no
+// in-memory data crosses the submit boundary. A `TrainingWorker` started
+// afterwards claims the job, reconstructs the loader from the persisted source +
+// columns, and trains it to completion. This is the durability contract: the
+// submitter need not be the runner.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_job_runs_on_separately_started_worker() {
+    let (session, dir) = session_with_training_data().await;
+    let model = tiny_bert_model();
+
+    // Submit with NO worker running: the job sits `queued`.
+    let job = session
+        .fine_tune(
+            "training",
+            &model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 1,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let queued = session
+        .catalog()
+        .get_training_job(&job.job_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        queued.status, "queued",
+        "job sits queued until a worker claims it"
+    );
+
+    // Start the worker separately — it reconstructs the run from the spec alone.
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
+    job.wait().await.unwrap();
+
+    let record = session
+        .catalog()
+        .get_training_job(&job.job_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        record.status, "completed",
+        "the separately-started worker ran the job"
+    );
+
+    // The fine-tuned model was registered by the worker's run.
+    let models = session.catalog().list_models().await.unwrap();
+    assert!(
+        models
+            .iter()
+            .any(|m| m.model_id.starts_with("jammi:fine-tuned:")),
+        "worker registered the fine-tuned model"
+    );
+
+    let adapter = dir
+        .path()
+        .join("models")
+        .join(&job.job_id)
+        .join("adapter.safetensors");
+    assert!(adapter.exists(), "worker wrote the adapter at {adapter:?}");
+}
+
+// ─── Lease loss: cooperative cancellation bails the trainer; reclaim re-queues ─
+//
+// A `spawn_blocking` trainer cannot be force-aborted, so the worker's heartbeat
+// sets a cancel flag the trainer checks at every epoch boundary. With the flag
+// pre-set, a multi-epoch run bails at the first boundary with a "lease lost"
+// error and never marks the job `completed`; the job is left `running` for
+// `reclaim_expired_training_jobs` to re-queue (bounded by the attempts cap).
+
+#[tokio::test(flavor = "multi_thread")]
+async fn training_bails_when_lease_lost_mid_run() {
+    use candle_nn::VarMap;
+    use jammi_ai::fine_tune::{
+        data::{TrainingBatch, TrainingDataLoader},
+        lora::build_projection_head,
+        trainer::TrainingLoopBuilder,
+    };
+    use std::sync::atomic::AtomicBool;
+
+    let device = Device::Cpu;
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let head = build_projection_head(32, &FineTuneConfig::default(), &vb).unwrap();
+
+    // A benign precomputed batch so a non-cancelled run would simply train.
+    let batch = TrainingBatch::Contrastive {
+        embeddings_a: Tensor::ones((2, 32), DType::F32, &device).unwrap(),
+        embeddings_b: Tensor::ones((2, 32), DType::F32, &device).unwrap(),
+        scores: Tensor::new(&[1.0f32, 0.0], &device).unwrap(),
+    };
+    let loader = TrainingDataLoader::from_precomputed(vec![batch]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = Arc::new(jammi_db::catalog::Catalog::open(dir.path()).await.unwrap());
+    catalog
+        .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+            model_id: "lease-model",
+            version: 1,
+            model_type: "embedding",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: None,
+            config_json: None,
+        })
+        .await
+        .unwrap();
+    catalog
+        .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+            job_id: "lease-job",
+            base_model_id: "lease-model::1",
+            training_source: "src",
+            loss_type: "cosent",
+            hyperparams: "{}",
+            kind: "fine_tune",
+            training_spec: "{}",
+        })
+        .await
+        .unwrap();
+    // Claim it so the row is `running` (the state a mid-run job is in). A zero
+    // lease means the lease is already expired by the time reclaim runs — a
+    // deterministic forced expiry, no sleep needed.
+    catalog
+        .claim_next_training_job("worker-a", std::time::Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("claimed the queued job");
+
+    // The lease is "lost" before training starts: the cancel flag is set, as the
+    // heartbeat would set it.
+    let cancel = Arc::new(AtomicBool::new(true));
+
+    let mut training_loop = TrainingLoopBuilder::new(
+        jammi_ai::fine_tune::target::TrainingTarget::ProjectionHead { head },
+        varmap,
+        FineTuneConfig {
+            epochs: 5,
+            batch_size: 2,
+            validation_fraction: 0.0,
+            warmup_steps: 0,
+            ..Default::default()
+        },
+    )
+    .job_id("lease-job".into())
+    .catalog(Arc::clone(&catalog))
+    .artifact_dir(dir.path().to_path_buf())
+    .cancel(Arc::clone(&cancel))
+    .build()
+    .unwrap();
+
+    let result = tokio::task::spawn_blocking(move || training_loop.run(&loader))
+        .await
+        .unwrap();
+
+    assert!(result.is_err(), "a lost lease must bail the training loop");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("training cancelled"),
+        "bail error should name the cancellation, got: {msg}"
+    );
+
+    // The job was NOT marked completed — it is left for reclaim.
+    let job = catalog.get_training_job("lease-job").await.unwrap();
+    assert_ne!(
+        job.status, "completed",
+        "a bailed job must not be completed"
+    );
+
+    // The job's lease is already expired (claimed with a zero lease), so reclaim
+    // re-queues it (attempts 1 < cap 3) — a dead worker's job is retried.
+    let actioned = catalog.reclaim_expired_training_jobs(3).await.unwrap();
+    assert!(actioned >= 1, "the expired-lease job is reclaimed");
+    let reclaimed = catalog.get_training_job("lease-job").await.unwrap();
+    assert_eq!(
+        reclaimed.status, "queued",
+        "a reclaimed job is re-queued for another worker"
+    );
 }

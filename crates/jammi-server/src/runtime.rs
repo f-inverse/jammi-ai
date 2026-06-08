@@ -434,6 +434,13 @@ pub async fn serve_grpc_chain(
         mounted.push("TriggerService");
     }
 
+    // The embedded training worker the `train` tier owns. Held for the lifetime
+    // of the serve loop (RAII): it is stopped when this future resolves on
+    // shutdown, just like every other server-owned resource. A serve-only build
+    // never sets it.
+    #[cfg(feature = "train")]
+    let mut _train_worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker> = None;
+
     if let Some(session) = engine {
         // Core tier engine services: always mounted when an engine is present.
         let embedding_svc = EmbeddingServiceServer::with_interceptor(
@@ -487,6 +494,11 @@ pub async fn serve_grpc_chain(
         // when the feature is compiled out.
         #[cfg(feature = "train")]
         if tiers.contains(ServiceTier::Train) {
+            // Start the worker that runs submitted jobs: a "GPU worker pool" is
+            // just N processes claiming from the shared catalog, and the server
+            // `train` tier runs one of them. It stops when this future resolves
+            // on shutdown (the guard drops with the function frame).
+            _train_worker = Some(jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session));
             let fine_tune_svc =
                 FineTuneServiceServer::with_interceptor(FineTuneServer::new(session), interceptor);
             builder = builder.add_service(fine_tune_svc);

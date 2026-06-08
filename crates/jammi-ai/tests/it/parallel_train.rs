@@ -281,6 +281,7 @@ fn train_loop_converges_on_synthetic_regression() {
         &varmap,
         &batches,
         &config,
+        &std::sync::atomic::AtomicBool::new(false),
         |batch: &TensorBatch| linear.forward(&batch.features).map_err(into_err),
         |preds, batch: &TensorBatch| {
             let diff = (preds - &batch.targets).map_err(into_err)?;
@@ -328,6 +329,7 @@ fn train_loop_signature_is_text_free() {
             weight_decay: 0.0,
             grad_clip: 0.0,
         },
+        &std::sync::atomic::AtomicBool::new(false),
         move |batch: &TensorBatch| {
             let wt: &Tensor = &w_for_model;
             batch.features.broadcast_add(wt).map_err(into_err)

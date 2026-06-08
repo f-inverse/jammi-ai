@@ -66,7 +66,10 @@ impl Jammi {
             #[cfg(feature = "local")]
             Target::Local(config) => {
                 let engine = InferenceSession::open(config).await?;
-                Ok(Session::Local(LocalSession::new(engine)))
+                // The front-door embedded session owns the training worker (RAII):
+                // it both submits training jobs and runs them, and the worker
+                // stops when the session drops.
+                Ok(Session::Local(LocalSession::with_embedded_worker(engine)))
             }
             #[cfg(feature = "wire")]
             Target::Remote(endpoint) => {

@@ -50,6 +50,8 @@ use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::model_task::ModelTask;
 
+use serde::{Deserialize, Serialize};
+
 use jammi_encoders::{AnyContextPredictor, ContextEpisode, ContextPredictorConfig};
 
 /// The curated in-context-predictor architecture a [`ContextPredictorTrainConfig`]
@@ -58,6 +60,7 @@ use jammi_encoders::{AnyContextPredictor, ContextEpisode, ContextPredictorConfig
 pub use jammi_encoders::ContextArchitecture;
 
 use crate::fine_tune::regression_loss;
+use crate::fine_tune::spec::TrainingSpec;
 use crate::inference::adapter::distribution::{DistributionAdapter, DistributionForm};
 use crate::inference::adapter::{BackendOutput, OutputAdapter};
 use crate::pipeline::context_set::{
@@ -71,7 +74,7 @@ use crate::session::InferenceSession;
 /// Shape of the predictive-distribution head the predictor emits and the
 /// objective scores — the S18 output families, selected by config rather than by
 /// a tensor op the caller writes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PredictiveHead {
     /// A 2-wide `(mean, raw_std)` Gaussian head.
     Gaussian {
@@ -88,7 +91,7 @@ pub enum PredictiveHead {
 
 /// Which proper score a [`PredictiveHead::Gaussian`] head trains against — the
 /// S18 objectives, reused, never reinvented here.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum GaussianObjective {
     /// (β-)Gaussian negative log-likelihood; `beta` in `[0, 1]`, `0` the plain
     /// heteroscedastic NLL.
@@ -206,7 +209,7 @@ impl PredictiveHead {
 /// fine-tune `TrainingFormat` is text-shaped, and a context-set→target episode
 /// is not a text row. The episodic knobs live here, with the pipeline that uses
 /// them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextPredictorTrainConfig {
     /// The model id the trained predictor registers under in the catalog.
     pub model_id: String,
@@ -385,20 +388,97 @@ impl InferenceSession {
         })
     }
 
-    /// Train an [`AnyContextPredictor`] on `source_id`'s embedding table per
-    /// `spec`, persist its weights, and register the artifact in the catalog.
+    /// Submit an episodic in-context-predictor meta-training job on
+    /// `source_id`'s embedding table per `spec`, returning a [`TrainingJob`]
+    /// handle immediately.
     ///
-    /// Samples the episodic meta-dataset (held-out-task split, leakage-scoped
-    /// context), builds the predictor the spec selects in a fresh [`VarMap`],
-    /// drives the generalized [`train_loop`] with the predictor's forward and
-    /// the S18 proper-scoring objective, writes the trained weights to the
-    /// session's artifact directory, and registers a `ModelTask::Regression`
-    /// model row pointing at them — the same model-artifact path the fine-tune
-    /// trainer registers its output through.
+    /// Like the fine-tune verbs, this persists a self-describing
+    /// [`TrainingSpec::ContextPredictor`] into a `queued` catalog job and
+    /// returns; a [`crate::fine_tune::worker::TrainingWorker`] later claims it,
+    /// re-samples the episodic meta-dataset from the persisted spec
+    /// (deterministic task split via the seed), drives the predictor train loop
+    /// while heartbeating, and registers the trained predictor. Call
+    /// `job.wait().await` to block until a worker drives it to completion;
+    /// `job.model_id()` is the model id the predictor registers under (the
+    /// spec's `model_id`).
     pub async fn train_context_predictor(
         self: &Arc<Self>,
         source_id: &str,
         spec: &ContextPredictorTrainConfig,
+    ) -> Result<crate::fine_tune::training_job::TrainingJob> {
+        spec.validate()?;
+
+        // The predictor registers under its own model id; the base-model FK on
+        // the job points at the source's embedding model so the row is valid.
+        // The table records the model's bare name; ensure a catalog row exists
+        // for it (an embedding table can be materialised without registering a
+        // model row) and use its PK (`name::version`) for the FK.
+        let table = self
+            .catalog()
+            .resolve_embedding_table(source_id, None)
+            .await?;
+        let base_model_pk = match self.catalog().get_model(&table.model_id).await? {
+            Some(m) => m.model_id,
+            None => {
+                self.catalog()
+                    .register_model(RegisterModelParams {
+                        model_id: &table.model_id,
+                        version: 1,
+                        model_type: "embedding",
+                        backend: "candle",
+                        task: ModelTask::TextEmbedding,
+                        base_model_id: None,
+                        artifact_path: None,
+                        config_json: None,
+                    })
+                    .await?;
+                crate::model::to_catalog_pk(&table.model_id, 1)
+            }
+        };
+        let loss_type = format!("{:?}", spec.head);
+        let hyperparams = serde_json::to_string(spec)?;
+
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let training_spec = TrainingSpec::ContextPredictor {
+            source: source_id.to_string(),
+            predictor_spec: spec.clone(),
+        };
+        let spec_json = serde_json::to_string(&training_spec)?;
+        self.catalog()
+            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+                job_id: &job_id,
+                base_model_id: &base_model_pk,
+                training_source: source_id,
+                loss_type: &loss_type,
+                hyperparams: &hyperparams,
+                kind: training_spec.kind(),
+                training_spec: &spec_json,
+            })
+            .await?;
+
+        Ok(crate::fine_tune::training_job::TrainingJob::new(
+            job_id,
+            "queued".into(),
+            spec.model_id.clone(),
+            Arc::clone(self.catalog_arc()),
+        ))
+    }
+
+    /// Run an in-context-predictor meta-training to completion: sample the
+    /// episodic meta-dataset, build the predictor the spec selects in a fresh
+    /// [`VarMap`], drive the generalized [`train_loop`] (checking `cancel` at
+    /// every epoch boundary), persist the trained weights, and register a
+    /// `ModelTask::Regression` model row — the same model-artifact path the
+    /// fine-tune trainer registers its output through.
+    ///
+    /// This is the worker-side execution the [`Self::train_context_predictor`]
+    /// submit path defers to; it reconstructs everything from `spec` alone, with
+    /// no in-memory carryover from the submitting session.
+    pub(crate) async fn run_context_predictor_training(
+        self: &Arc<Self>,
+        source_id: &str,
+        spec: &ContextPredictorTrainConfig,
+        cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<ModelRecord> {
         let sampled = self.sample_context_episodes(source_id, spec).await?;
         if sampled.train.is_empty() {
@@ -431,6 +511,7 @@ impl InferenceSession {
             &varmap,
             &sampled.train,
             &train_config,
+            cancel,
             |batch: &EpisodeBatch| {
                 predictor
                     .forward(&batch.episode)

@@ -35,11 +35,16 @@ pub struct TrainingJobRecord {
     /// The tenant that owns the job, or `None` for unscoped rows. Carried so a
     /// worker that claims across tenants can re-scope subsequent work.
     pub tenant_id: Option<TenantId>,
+    /// The self-describing training specification as JSON, or `None` for a row
+    /// written without one. A worker deserialises this to reconstruct the run on
+    /// a fresh process — the catalog stores it opaquely (the typed shape lives in
+    /// the engine crate that produces and consumes it).
+    pub training_spec: Option<String>,
 }
 
 const SELECT_COLS: &str = "job_id, base_model_id, output_model_id, training_source, loss_type, \
      hyperparams, status, metrics, created_at, kind, claimed_by, lease_expires_at, attempts, \
-     tenant_id";
+     tenant_id, training_spec";
 
 /// Format leases write into `lease_expires_at`. Lexicographic ordering of two
 /// timestamps in this fixed-width UTC form matches chronological ordering, so
@@ -105,25 +110,44 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<TrainingJobRecord, BackendErr
         lease_expires_at: row.try_get("lease_expires_at")?,
         attempts: row.get::<i64>("attempts")? as u32,
         tenant_id,
+        training_spec: row.try_get("training_spec")?,
     })
+}
+
+/// Input parameters for [`Catalog::create_training_job`]. Grouped into one
+/// struct (the `RegisterModelParams` pattern) so the call site names each field
+/// and the insert surface has one place to grow.
+#[derive(Debug, Clone)]
+pub struct CreateTrainingJobParams<'a> {
+    /// Unique job id.
+    pub job_id: &'a str,
+    /// Base-model catalog PK the `base_model_id` FK references.
+    pub base_model_id: &'a str,
+    /// The source the run reads from (recorded for provenance).
+    pub training_source: &'a str,
+    /// Human-readable objective tag.
+    pub loss_type: &'a str,
+    /// Optimisation hyperparameters as JSON.
+    pub hyperparams: &'a str,
+    /// The verb that produced the job — the worker dispatches on it.
+    pub kind: &'a str,
+    /// The self-contained JSON specification a worker reconstructs the run from
+    /// on a fresh process. Stored opaquely — the typed shape lives in the engine
+    /// crate that produces and consumes it.
+    pub training_spec: &'a str,
 }
 
 impl Catalog {
     /// Create a new training job record with status = 'queued'. Tenant
     /// bound + asserted (SPEC-03 §7).
-    pub async fn create_training_job(
-        &self,
-        job_id: &str,
-        base_model_id: &str,
-        training_source: &str,
-        loss_type: &str,
-        hyperparams: &str,
-    ) -> Result<()> {
-        let job_id = job_id.to_string();
-        let base_model_id = base_model_id.to_string();
-        let training_source = training_source.to_string();
-        let loss_type = loss_type.to_string();
-        let hyperparams = hyperparams.to_string();
+    pub async fn create_training_job(&self, params: CreateTrainingJobParams<'_>) -> Result<()> {
+        let job_id = params.job_id.to_string();
+        let base_model_id = params.base_model_id.to_string();
+        let training_source = params.training_source.to_string();
+        let loss_type = params.loss_type.to_string();
+        let hyperparams = params.hyperparams.to_string();
+        let kind = params.kind.to_string();
+        let training_spec = params.training_spec.to_string();
         let tenant = self.current_tenant();
 
         self.backend()
@@ -133,14 +157,17 @@ impl Catalog {
                     tx.assert_tenant_matches(tenant, "training_jobs")?;
                     tx.execute(
                         "INSERT INTO training_jobs \
-                         (job_id, base_model_id, training_source, loss_type, hyperparams, status, tenant_id) \
-                         VALUES ($1, $2, $3, $4, $5, 'queued', $6)",
+                         (job_id, base_model_id, training_source, loss_type, hyperparams, status, \
+                          kind, training_spec, tenant_id) \
+                         VALUES ($1, $2, $3, $4, $5, 'queued', $6, $7, $8)",
                         &[
                             SqlValue::TextOwned(job_id),
                             SqlValue::TextOwned(base_model_id),
                             SqlValue::TextOwned(training_source),
                             SqlValue::TextOwned(loss_type),
                             SqlValue::TextOwned(hyperparams),
+                            SqlValue::TextOwned(kind),
+                            SqlValue::TextOwned(training_spec),
                             SqlValue::from(tenant.map(|t| t.to_string())),
                         ],
                     )
@@ -249,35 +276,6 @@ impl Catalog {
             })
             .await?;
         Ok(())
-    }
-
-    /// Transition all training jobs with status Running to Failed.
-    /// Startup-recovery shim: a Running job at startup means the process
-    /// crashed mid-training. Scoped to the session tenant.
-    pub async fn cleanup_stale_training_jobs(&self) -> Result<usize> {
-        let running = super::status::TrainingJobStatus::Running.to_string();
-        let failed = super::status::TrainingJobStatus::Failed.to_string();
-        let tenant = self.current_tenant();
-        let count = self
-            .backend()
-            .transaction(TxOptions::default(), |tx| {
-                Box::pin(async move {
-                    tx.set_tenant(tenant);
-                    tx.execute(
-                        "UPDATE training_jobs SET status = $1, \
-                         updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
-                         WHERE status = $2 AND (tenant_id = $3 OR tenant_id IS NULL)",
-                        &[
-                            SqlValue::TextOwned(failed),
-                            SqlValue::TextOwned(running),
-                            SqlValue::from(tenant.map(|t| t.to_string())),
-                        ],
-                    )
-                    .await
-                })
-            })
-            .await?;
-        Ok(count as usize)
     }
 
     /// List training jobs visible to the session tenant, most recent first.

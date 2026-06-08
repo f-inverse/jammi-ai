@@ -11,6 +11,7 @@ use jammi_db::store::ResultStore;
 
 use crate::concurrency::GpuScheduler;
 use crate::eval::runner::EvalRunner;
+use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use crate::fine_tune::training_job::TrainingJob;
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
 use crate::inference::observer::InferenceObserver;
@@ -108,7 +109,6 @@ impl InferenceSession {
         let model_cache = Arc::new(ModelCache::new(resolver, device_config.clone(), scheduler));
         let result_store = Arc::new(build_result_store(&inner, Arc::clone(&catalog))?);
         result_store.recover().await?;
-        catalog.cleanup_stale_training_jobs().await?;
         result_store.load_existing_tables(inner.context()).await?;
 
         let ann_cache_size = inner.config().cache.ann_cache_max_entries as u64;
@@ -176,6 +176,12 @@ impl InferenceSession {
 
     /// Access the catalog.
     pub fn catalog(&self) -> &jammi_db::catalog::Catalog {
+        self.inner.catalog()
+    }
+
+    /// The shared catalog handle behind an `Arc` — the form a [`TrainingJob`]
+    /// handle clones to poll its job after the submitting call returns.
+    pub(crate) fn catalog_arc(&self) -> &Arc<jammi_db::catalog::Catalog> {
         self.inner.catalog()
     }
 
@@ -800,64 +806,66 @@ impl InferenceSession {
     // Fine-tuning
     // =====================================================================
 
-    /// Start a LoRA fine-tuning job on a registered source.
+    /// Submit a LoRA fine-tuning job on a registered source.
     ///
-    /// Returns a [`TrainingJob`] handle that can be used to poll or wait for
-    /// completion. The job runs synchronously in a blocking task spawned on
-    /// tokio's blocking pool — call `job.wait().await` to block until done.
+    /// Persists a self-describing [`TrainingSpec::FineTune`] into a `queued`
+    /// catalog job and returns a [`TrainingJob`] handle immediately — the
+    /// training runs later under a [`crate::fine_tune::worker::TrainingWorker`]
+    /// that claims the job under a lease, reconstructs the data loader from the
+    /// persisted source + columns, and trains while heartbeating. Call
+    /// `job.wait().await` to block until a worker drives the job to a terminal
+    /// state.
     pub async fn fine_tune(
         &self,
         source: &str,
         base_model: &str,
         columns: &[String],
-        _method: FineTuneMethod,
+        method: FineTuneMethod,
         task: ModelTask,
         config: Option<FineTuneConfig>,
     ) -> Result<TrainingJob> {
         let config = config.unwrap_or_default();
         config.validate()?;
 
-        // Load training data from the source, then hand the loader to the shared
-        // job-creation + training-spawn path. The graph path
-        // ([`Self::fine_tune_graph`]) builds a different loader but shares that
-        // same tail.
-        let table_name = self.find_table_name(source)?;
-        let query = format!(
-            "SELECT {} FROM {source}.public.\"{table_name}\"",
-            columns
-                .iter()
-                .map(|c| format!("\"{c}\""))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let batches = self.sql(&query).await?;
-        let data_loader = build_training_data_loader(&batches, columns, task)?;
-
-        self.spawn_fine_tune(source, base_model, task, config, data_loader)
+        let loss_type = fine_tune_loss_type(&config, task);
+        let spec = TrainingSpec::FineTune {
+            source: source.to_string(),
+            columns: columns.to_vec(),
+            method,
+            task,
+            common: TrainingCommon {
+                base_model: base_model.to_string(),
+                config: config.clone(),
+            },
+        };
+        self.submit_fine_tune_spec(source, base_model, task, &config, &loss_type, spec)
             .await
     }
 
-    /// Create the catalog job record, load the base model, and spawn the
-    /// blocking training run for a pre-built [`TrainingDataLoader`]. Shared by
-    /// the column-source [`Self::fine_tune`] path and the graph
-    /// [`Self::fine_tune_graph`] path — the only thing that differs upstream is
-    /// how the loader is built.
-    async fn spawn_fine_tune(
+    /// Submit a job carrying one of the two LoRA fine-tune specs. Shared by the
+    /// column-source [`Self::fine_tune`] and the graph [`Self::fine_tune_graph`]
+    /// paths — the only thing that differs upstream is which spec variant is
+    /// built. No data is read and no model is loaded here; the worker does both
+    /// from the persisted spec.
+    async fn submit_fine_tune_spec(
         &self,
-        source: &str,
+        training_source: &str,
         base_model: &str,
         task: ModelTask,
-        config: FineTuneConfig,
-        data_loader: crate::fine_tune::data::TrainingDataLoader,
+        config: &FineTuneConfig,
+        loss_type: &str,
+        spec: TrainingSpec,
     ) -> Result<TrainingJob> {
         let job_id = uuid::Uuid::new_v4().to_string();
         let output_model_id = format!("jammi:fine-tuned:{job_id}");
 
-        // Parse model source to get the canonical name (what ModelCache uses for registration).
+        // Parse model source to get the canonical name (what ModelCache uses for
+        // registration).
         let model_source = ModelSource::parse(base_model);
         let canonical_name = model_source.to_string();
 
-        // Ensure base model is registered in catalog (FK constraint on training_jobs)
+        // Ensure the base model is registered in the catalog (FK constraint on
+        // training_jobs). The worker resolves the same row when it loads weights.
         if self.catalog().get_model(&canonical_name).await?.is_none() {
             if let Err(e) = self
                 .catalog()
@@ -877,89 +885,21 @@ impl InferenceSession {
             }
         }
 
-        // Persist job in catalog. FK references models.model_id PK = "{name}::{version}".
-        let hyperparams = serde_json::to_string(&config)?;
-        let loss_type = if task == ModelTask::Classification {
-            config
-                .classification_loss
-                .map(|l| format!("{l:?}"))
-                .unwrap_or_else(|| "CrossEntropy".into())
-        } else if task == ModelTask::Regression {
-            format!("{:?}", config.regression_loss.unwrap_or_default())
-        } else {
-            config
-                .embedding_loss
-                .map(|l| format!("{l:?}"))
-                .unwrap_or_else(|| "auto".into())
-        };
-
+        let hyperparams = serde_json::to_string(config)?;
         let base_model_pk = crate::model::to_catalog_pk(&canonical_name, 1);
+        let spec_json = serde_json::to_string(&spec)?;
         self.inner
             .catalog()
-            .create_training_job(&job_id, &base_model_pk, source, &loss_type, &hyperparams)
+            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+                job_id: &job_id,
+                base_model_id: &base_model_pk,
+                training_source,
+                loss_type,
+                hyperparams: &hyperparams,
+                kind: spec.kind(),
+                training_spec: &spec_json,
+            })
             .await?;
-
-        // Load the base model under the task being fine-tuned so the right
-        // tower (text vs audio) is materialised and `embedding_dim()` reports
-        // the shared-latent width the projection head must match.
-        let guard = self
-            .model_cache
-            .get_or_load(&model_source, task, None)
-            .await?;
-        let base_model_arc = Arc::clone(&guard.model);
-        let hidden_size = guard
-            .model
-            .embedding_dim()
-            .ok_or_else(|| JammiError::FineTune("Base model does not support embeddings".into()))?;
-        drop(guard);
-
-        // Spawn training in a blocking task. The blocking thread carries no
-        // task-local tenant override (that lives only on the request task that
-        // called `fine_tune`), so its catalog writes would resolve `Unscoped`
-        // and miss a tenant-scoped job's rows. Pin a catalog handle to the
-        // tenant the job was created under so every background status update
-        // and model registration stays in scope.
-        let tenant = self.inner.catalog().current_tenant();
-        let catalog = Arc::new(self.inner.catalog().pinned_to_tenant(tenant));
-        let artifact_dir = self.inner.config().artifact_dir.clone();
-        let job_id_clone = job_id.clone();
-        let output_model_id_clone = output_model_id.clone();
-        let base_model_str = base_model.to_string();
-        let device_config = self.device_config.clone();
-
-        let catalog_for_err = Arc::clone(&catalog);
-        let job_id_for_err = job_id_clone.clone();
-        tokio::task::spawn_blocking(move || {
-            // Catch panics inside the training loop so a terminal status is
-            // always recorded — otherwise `TrainingJob::wait()` polls forever.
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_fine_tune_blocking(
-                    catalog,
-                    artifact_dir,
-                    job_id_clone,
-                    output_model_id_clone,
-                    base_model_str,
-                    task,
-                    config,
-                    data_loader,
-                    base_model_arc,
-                    hidden_size,
-                    device_config,
-                )
-            }));
-            match outcome {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::error!(job_id = %job_id_for_err, error = %e, "Fine-tune blocking task failed");
-                    record_failed(&catalog_for_err, &job_id_for_err, e.to_string());
-                }
-                Err(payload) => {
-                    let msg = panic_message(payload.as_ref());
-                    tracing::error!(job_id = %job_id_for_err, panic = %msg, "Fine-tune blocking task panicked");
-                    record_failed(&catalog_for_err, &job_id_for_err, format!("Panic: {msg}"));
-                }
-            }
-        });
 
         Ok(TrainingJob::new(
             job_id,
@@ -993,92 +933,32 @@ impl InferenceSession {
         sample_config: crate::fine_tune::graph_sampler::GraphSampleConfig,
         config: Option<FineTuneConfig>,
     ) -> Result<TrainingJob> {
-        use crate::fine_tune::graph_sampler::{GraphEdge, GraphSampler, TextNode};
-
         let config = config.unwrap_or_default();
         config.validate()?;
         sample_config.validate()?;
 
-        // Read node text (id, text) from the node source.
-        let node_table = self.find_table_name(&sources.node_source)?;
-        let node_query = format!(
-            "SELECT \"{}\", \"{}\" FROM {}.public.\"{node_table}\"",
-            sources.id_column, sources.text_column, sources.node_source
-        );
-        let node_batches = self.sql(&node_query).await?;
-        let mut nodes = Vec::new();
-        for batch in &node_batches {
-            let ids = batch
-                .column_by_name(&sources.id_column)
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "node id column '{}' is not text",
-                        sources.id_column
-                    ))
-                })?;
-            let texts = batch
-                .column_by_name(&sources.text_column)
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "node text column '{}' is not text",
-                        sources.text_column
-                    ))
-                })?;
-            for (id, text) in ids.into_iter().zip(texts) {
-                nodes.push(TextNode::new(id, text));
-            }
-        }
-
-        // Read edges (src, dst) from the edge source; the caller's `provenance`
-        // tags every edge (an edge source is homogeneous in origin).
-        let edge_table = self.find_table_name(&sources.edge_source)?;
-        let edge_query = format!(
-            "SELECT \"{}\", \"{}\" FROM {}.public.\"{edge_table}\"",
-            sources.src_column, sources.dst_column, sources.edge_source
-        );
-        let edge_batches = self.sql(&edge_query).await?;
-        let mut edges = Vec::new();
-        for batch in &edge_batches {
-            let srcs = batch
-                .column_by_name(&sources.src_column)
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "edge src column '{}' is not text",
-                        sources.src_column
-                    ))
-                })?;
-            let dsts = batch
-                .column_by_name(&sources.dst_column)
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "edge dst column '{}' is not text",
-                        sources.dst_column
-                    ))
-                })?;
-            for (src, dst) in srcs.into_iter().zip(dsts) {
-                edges.push(GraphEdge {
-                    src,
-                    dst,
-                    provenance: sources.provenance,
-                });
-            }
-        }
-
-        let sampler = GraphSampler::build(nodes, edges, sample_config)?;
-        let data_loader = crate::fine_tune::data::TrainingDataLoader::from_graph(&sampler)?;
-
         // The job record's `source` field records the node source — the model is
         // fine-tuned on that source's text, the edges only supervise the pairing.
-        self.spawn_fine_tune(
+        // The graph is read and re-sampled by the worker from the persisted
+        // sources + seeded sample_config (deterministic), never from in-memory
+        // batches carried across the submit boundary.
+        let task = ModelTask::TextEmbedding;
+        let loss_type = fine_tune_loss_type(&config, task);
+        let spec = TrainingSpec::GraphFineTune {
+            sources: sources.clone(),
+            sample_config,
+            common: TrainingCommon {
+                base_model: base_model.to_string(),
+                config: config.clone(),
+            },
+        };
+        self.submit_fine_tune_spec(
             &sources.node_source,
             base_model,
-            ModelTask::TextEmbedding,
-            config,
-            data_loader,
+            task,
+            &config,
+            &loss_type,
+            spec,
         )
         .await
     }
@@ -1193,600 +1073,22 @@ fn build_result_store(
     }
 }
 
-// =========================================================================
-// Fine-tuning helpers (outside impl block)
-// =========================================================================
-
-/// Extract all string values from an Arrow column.
-///
-/// DataFusion 52+ returns Parquet string columns as `Utf8View` by default;
-/// older versions returned `Utf8` or `LargeUtf8`. Dictionary-encoded variants
-/// are also possible. Fast paths cover the three common types; the `cast`
-/// fallback handles everything else.
-fn extract_string_column(col: &dyn arrow::array::Array) -> Option<Vec<String>> {
-    use arrow::array::{Array, LargeStringArray, StringArray, StringViewArray};
-    use arrow::datatypes::DataType;
-
-    // Fast path: Utf8View — DataFusion 52+ default for Parquet string columns
-    if let Some(a) = col.as_any().downcast_ref::<StringViewArray>() {
-        return Some((0..a.len()).map(|i| a.value(i).to_string()).collect());
-    }
-    // Fast path: Utf8
-    if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
-        return Some((0..a.len()).map(|i| a.value(i).to_string()).collect());
-    }
-    // Fast path: LargeUtf8
-    if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
-        return Some((0..a.len()).map(|i| a.value(i).to_string()).collect());
-    }
-    // General fallback: cast to Utf8 (handles Dictionary variants, etc.)
-    let casted = arrow::compute::cast(col, &DataType::Utf8).ok()?;
-    let a = casted.as_any().downcast_ref::<StringArray>()?;
-    Some((0..a.len()).map(|i| a.value(i).to_string()).collect())
-}
-
-/// Build a TrainingDataLoader from query result batches.
-///
-/// `task` selects how `anchor`/`positive`/`negative` triplet columns are
-/// read: an audio embedding task reads them as encoded-audio bytes; every
-/// other task reads them as text. The column names are identical across
-/// modalities (the triplet shape is the same) — only the cell decoding
-/// differs, so the caller's chosen task is the discriminator, not a parallel
-/// set of column names.
-fn build_training_data_loader(
-    batches: &[RecordBatch],
-    columns: &[String],
-    task: ModelTask,
-) -> Result<crate::fine_tune::data::TrainingDataLoader> {
-    // Detect format from column names
-    let col_names: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
-
-    let has_contrastive = col_names.contains(&"text_a")
-        && col_names.contains(&"text_b")
-        && col_names.contains(&"score");
-    let has_triplet = col_names.contains(&"anchor")
-        && col_names.contains(&"positive")
-        && col_names.contains(&"negative");
-    // Pairs = anchor + positive with no negative column. In-batch negatives
-    // (MultipleNegativesRanking) supply the contrast, so `negative` is absent.
-    let has_pairs = col_names.contains(&"anchor")
-        && col_names.contains(&"positive")
-        && !col_names.contains(&"negative");
-    let has_classification = col_names.contains(&"text") && col_names.contains(&"label");
-
-    if has_triplet && task == ModelTask::AudioEmbedding {
-        return build_audio_triplet_loader(batches);
-    }
-
-    if has_contrastive {
-        let mut rows = Vec::new();
-        for batch in batches {
-            let a_col = batch
-                .column_by_name("text_a")
-                .ok_or_else(|| JammiError::FineTune("Missing column 'text_a'".into()))?;
-            let b_col = batch
-                .column_by_name("text_b")
-                .ok_or_else(|| JammiError::FineTune("Missing column 'text_b'".into()))?;
-            let s_col = batch
-                .column_by_name("score")
-                .ok_or_else(|| JammiError::FineTune("Missing column 'score'".into()))?;
-
-            let a_vals = extract_string_column(a_col.as_ref())
-                .ok_or_else(|| JammiError::FineTune("'text_a' is not a string column".into()))?;
-            let b_vals = extract_string_column(b_col.as_ref())
-                .ok_or_else(|| JammiError::FineTune("'text_b' is not a string column".into()))?;
-            let s_arr = s_col
-                .as_any()
-                .downcast_ref::<arrow::array::Float64Array>()
-                .map(|arr| {
-                    (0..arr.len())
-                        .map(|i| arr.value(i) as f32)
-                        .collect::<Vec<_>>()
-                })
-                .or_else(|| {
-                    s_col
-                        .as_any()
-                        .downcast_ref::<arrow::array::Float32Array>()
-                        .map(|arr| (0..arr.len()).map(|i| arr.value(i)).collect())
-                })
-                .ok_or_else(|| JammiError::FineTune("'score' is not a float column".into()))?;
-
-            for (i, &score) in s_arr.iter().enumerate().take(batch.num_rows()) {
-                rows.push((a_vals[i].clone(), b_vals[i].clone(), score));
-            }
-        }
-        Ok(crate::fine_tune::data::TrainingDataLoader::from_contrastive(rows))
-    } else if has_triplet {
-        let mut rows = Vec::new();
-        for batch in batches {
-            let schema_info = || {
-                batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| format!("{}:{}", f.name(), f.data_type()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            let anchor_vals = batch
-                .column_by_name("anchor")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'anchor' column. Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            let pos_vals = batch
-                .column_by_name("positive")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'positive' column. Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            let neg_vals = batch
-                .column_by_name("negative")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'negative' column. Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-
-            for i in 0..batch.num_rows() {
-                rows.push((
-                    anchor_vals[i].clone(),
-                    pos_vals[i].clone(),
-                    neg_vals[i].clone(),
-                ));
-            }
-        }
-        Ok(crate::fine_tune::data::TrainingDataLoader::from_triplets(
-            rows,
-        ))
-    } else if has_pairs {
-        let mut rows = Vec::new();
-        for batch in batches {
-            let schema_info = || {
-                batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| format!("{}:{}", f.name(), f.data_type()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            let anchor_vals = batch
-                .column_by_name("anchor")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'anchor' column. Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            let pos_vals = batch
-                .column_by_name("positive")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| {
-                    JammiError::FineTune(format!(
-                        "Missing/invalid 'positive' column. Batch schema: [{}]",
-                        schema_info()
-                    ))
-                })?;
-            for i in 0..batch.num_rows() {
-                rows.push((anchor_vals[i].clone(), pos_vals[i].clone()));
-            }
-        }
-        Ok(crate::fine_tune::data::TrainingDataLoader::from_pairs(rows))
-    } else if has_classification {
-        let mut label_set = std::collections::BTreeSet::new();
-        let mut rows = Vec::new();
-        for batch in batches {
-            let text_vals = batch
-                .column_by_name("text")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
-            let label_vals = batch
-                .column_by_name("label")
-                .and_then(|c| extract_string_column(c.as_ref()))
-                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
-            for i in 0..batch.num_rows() {
-                label_set.insert(label_vals[i].clone());
-                rows.push((text_vals[i].clone(), label_vals[i].clone()));
-            }
-        }
-        // Build label → index mapping
-        let label_to_idx: std::collections::HashMap<String, u32> = label_set
-            .iter()
-            .enumerate()
-            .map(|(i, l)| (l.clone(), i as u32))
-            .collect();
-        let num_classes = label_to_idx.len();
-        let indexed_rows: Vec<(String, u32)> = rows
-            .into_iter()
-            .map(|(text, label)| {
-                let idx = label_to_idx[&label];
-                (text, idx)
-            })
-            .collect();
-        Ok(
-            crate::fine_tune::data::TrainingDataLoader::from_classification(
-                indexed_rows,
-                num_classes,
-            ),
-        )
+/// The `loss_type` string persisted on a fine-tune job — a human-readable tag of
+/// the objective selected by the task + config, recorded in the catalog
+/// alongside the spec. The task selects the family (classification / regression /
+/// embedding) and the config its specific loss.
+fn fine_tune_loss_type(config: &FineTuneConfig, task: ModelTask) -> String {
+    if task == ModelTask::Classification {
+        config
+            .classification_loss
+            .map(|l| format!("{l:?}"))
+            .unwrap_or_else(|| "CrossEntropy".into())
+    } else if task == ModelTask::Regression {
+        format!("{:?}", config.regression_loss.unwrap_or_default())
     } else {
-        Err(JammiError::FineTune(format!(
-            "Cannot detect training format from columns: {col_names:?}. \
-             Expected contrastive (text_a, text_b, score), triplet (anchor, positive, negative), \
-             pairs (anchor, positive), or classification (text, label). For audio triplets, use \
-             the same (anchor, positive, negative) columns with task=audio_embedding."
-        )))
+        config
+            .embedding_loss
+            .map(|l| format!("{l:?}"))
+            .unwrap_or_else(|| "auto".into())
     }
-}
-
-/// Build an audio-triplet loader: read `anchor`/`positive`/`negative` as
-/// encoded-audio byte columns. Shares the triplet column shape with the text
-/// path; only the cell type differs (binary clips vs strings).
-fn build_audio_triplet_loader(
-    batches: &[RecordBatch],
-) -> Result<crate::fine_tune::data::TrainingDataLoader> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        let schema_info = || {
-            batch
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| format!("{}:{}", f.name(), f.data_type()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let anchor_vals = batch
-            .column_by_name("anchor")
-            .and_then(|c| extract_binary_column(c.as_ref()))
-            .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "Missing/invalid binary 'anchor' column for audio triplets. Batch schema: [{}]",
-                    schema_info()
-                ))
-            })?;
-        let pos_vals = batch
-            .column_by_name("positive")
-            .and_then(|c| extract_binary_column(c.as_ref()))
-            .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "Missing/invalid binary 'positive' column for audio triplets. Batch schema: [{}]",
-                    schema_info()
-                ))
-            })?;
-        let neg_vals = batch
-            .column_by_name("negative")
-            .and_then(|c| extract_binary_column(c.as_ref()))
-            .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "Missing/invalid binary 'negative' column for audio triplets. Batch schema: [{}]",
-                    schema_info()
-                ))
-            })?;
-
-        for i in 0..batch.num_rows() {
-            rows.push((
-                anchor_vals[i].clone(),
-                pos_vals[i].clone(),
-                neg_vals[i].clone(),
-            ));
-        }
-    }
-    Ok(crate::fine_tune::data::TrainingDataLoader::from_audio_triplets(rows))
-}
-
-/// Extract a binary column into owned byte vectors, accepting the Arrow binary
-/// families DataFusion produces for an audio-bytes column
-/// (`Binary`/`LargeBinary`/`BinaryView`). Returns `None` for any other type so
-/// the caller can surface a typed schema error.
-fn extract_binary_column(col: &dyn arrow::array::Array) -> Option<Vec<Vec<u8>>> {
-    use arrow::array::{Array, BinaryArray, BinaryViewArray, LargeBinaryArray};
-
-    if let Some(a) = col.as_any().downcast_ref::<BinaryArray>() {
-        return Some((0..a.len()).map(|i| a.value(i).to_vec()).collect());
-    }
-    if let Some(a) = col.as_any().downcast_ref::<LargeBinaryArray>() {
-        return Some((0..a.len()).map(|i| a.value(i).to_vec()).collect());
-    }
-    if let Some(a) = col.as_any().downcast_ref::<BinaryViewArray>() {
-        return Some((0..a.len()).map(|i| a.value(i).to_vec()).collect());
-    }
-    None
-}
-
-/// Extract a human-readable message from a panic payload.
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "<unknown panic payload>".into()
-    }
-}
-
-/// Record a terminal `Failed` status for a training job, surfacing the cause
-/// via the catalog metrics blob so callers polling `TrainingJob::wait()` see
-/// the failure instead of an indefinite `Running` state.
-fn record_failed(catalog: &Arc<jammi_db::catalog::Catalog>, job_id: &str, msg: String) {
-    let metrics = serde_json::json!({ "error_message": msg }).to_string();
-    if let Err(e) = tokio::runtime::Handle::current().block_on(catalog.update_training_status(
-        job_id,
-        jammi_db::catalog::status::TrainingJobStatus::Failed,
-        Some(&metrics),
-    )) {
-        tracing::error!(job_id = %job_id, error = %e, "Failed to record terminal status");
-    }
-}
-
-/// Run fine-tuning in a blocking context.
-#[allow(clippy::too_many_arguments)]
-fn run_fine_tune_blocking(
-    catalog: Arc<jammi_db::catalog::Catalog>,
-    artifact_dir: std::path::PathBuf,
-    job_id: String,
-    output_model_id: String,
-    base_model: String,
-    task: ModelTask,
-    config: FineTuneConfig,
-    data_loader: crate::fine_tune::data::TrainingDataLoader,
-    base_model_arc: Arc<crate::model::LoadedModel>,
-    hidden_size: usize,
-    device_config: DeviceConfig,
-) -> Result<()> {
-    use candle_core::DType;
-    use candle_nn::VarMap;
-
-    let device = crate::model::backend::candle::select_device(&device_config);
-    let varmap = VarMap::new();
-    let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
-
-    // Choose between the two LoRA training shapes exactly once, based on
-    // whether the caller requested LoRA inside the encoder (non-empty
-    // `target_modules`) or a projection head over a frozen base model.
-    // No half-built state — only the chosen variant is materialised.
-    let target = if config.target_modules.is_empty() {
-        let head = if task == ModelTask::Classification {
-            let num_classes = match data_loader.format() {
-                crate::fine_tune::data::TrainingFormat::Classification { num_classes } => {
-                    num_classes
-                }
-                _ => {
-                    return Err(JammiError::FineTune(
-                        "Classification task requires classification training data format".into(),
-                    ))
-                }
-            };
-            crate::fine_tune::lora::build_classification_head(
-                hidden_size,
-                num_classes,
-                &config,
-                &vb,
-            )?
-        } else if task == ModelTask::Regression {
-            // The distribution head's width is its parameter count: 2 for the
-            // parametric Gaussian objectives `(mean, raw_std)`, one per level for
-            // the pinball/quantile objective.
-            let output_dim = match config.regression_loss.unwrap_or_default() {
-                crate::fine_tune::RegressionLoss::Pinball => config.quantile_levels.len(),
-                _ => 2,
-            };
-            crate::fine_tune::lora::build_distribution_head(hidden_size, output_dim, &config, &vb)?
-        } else {
-            crate::fine_tune::lora::build_projection_head(hidden_size, &config, &vb)?
-        };
-        crate::fine_tune::target::TrainingTarget::ProjectionHead { head }
-    } else {
-        let (encoder, adapter_cfg) =
-            build_encoder_adapters(&base_model, &catalog, &config, &varmap, &device)?;
-        crate::fine_tune::target::TrainingTarget::EncoderAdapters(Box::new(
-            crate::fine_tune::target::EncoderAdaptersTarget {
-                encoder,
-                adapter_cfg,
-            },
-        ))
-    };
-
-    let mut training_loop =
-        crate::fine_tune::trainer::TrainingLoopBuilder::new(target, varmap, config)
-            .base_model(base_model_arc)
-            .job_id(job_id.clone())
-            .catalog(Arc::clone(&catalog))
-            .artifact_dir(artifact_dir.clone())
-            .output_model(crate::fine_tune::trainer::OutputModelHandle {
-                output_model_id,
-                base_model_id: base_model,
-                task,
-            })
-            .device(device.clone())
-            .build()?;
-
-    // The trainer is responsible for registering the output model and
-    // flipping the job's status to `Completed` atomically with respect to
-    // the artifact write. Propagate any failure so the job lands in
-    // `Failed` (via the trainer's failure paths) and the caller's
-    // `wait()` observer sees a typed error rather than a wedged
-    // `Running` row.
-    training_loop.run(&data_loader)?;
-    Ok(())
-}
-
-/// Construct an encoder-adapters target: load the frozen backbone weights
-/// from the catalog artifact path, wrap the configured target modules with
-/// LoRA, and return both the resulting encoder and the persisted adapter
-/// metadata that pairs with the trained tensors on disk.
-fn build_encoder_adapters(
-    base_model_id: &str,
-    catalog: &Arc<jammi_db::catalog::Catalog>,
-    config: &FineTuneConfig,
-    varmap: &candle_nn::VarMap,
-    device: &candle_core::Device,
-) -> Result<(jammi_encoders::AnyEncoder, jammi_lora::AdapterConfig)> {
-    use std::path::Path;
-
-    // Strip URI scheme prefixes (e.g. "hf://", "local:") so the catalog
-    // lookup uses the bare model ID that was stored at download time.
-    let catalog_model_id = base_model_id
-        .strip_prefix("hf://")
-        .or_else(|| base_model_id.strip_prefix("local:"))
-        .unwrap_or(base_model_id);
-
-    // Resolve the artifact directory from the catalog.
-    // The catalog entry may have artifact_path = NULL (set before the model was
-    // downloaded for FK-constraint purposes) or may point to a weights file
-    // rather than a directory (older behavior in do_load).  Handle all cases.
-    let model_record = tokio::runtime::Handle::current()
-        .block_on(catalog.get_model(catalog_model_id))?
-        .ok_or_else(|| {
-            JammiError::FineTune(format!("Base model '{base_model_id}' not in catalog"))
-        })?;
-
-    let artifact_dir: std::path::PathBuf = match model_record.artifact_path.as_deref() {
-        Some(p) if !p.is_empty() => {
-            let path = std::path::PathBuf::from(p);
-            // Stored path may be a file (old do_load behavior); use its parent as dir.
-            if path.is_dir() {
-                path
-            } else {
-                path.parent()
-                    .ok_or_else(|| {
-                        JammiError::FineTune(format!(
-                            "Cannot determine model dir from artifact_path '{p}'"
-                        ))
-                    })?
-                    .to_path_buf()
-            }
-        }
-        // artifact_path is NULL — the model was pre-registered for the FK
-        // constraint before the weights were downloaded.  Fall back to the
-        // HF hub local cache, which does not re-download if files are present.
-        _ => {
-            let is_hf = base_model_id.starts_with("hf://")
-                || (!base_model_id.starts_with('/')
-                    && !std::path::Path::new(base_model_id).exists());
-            if is_hf {
-                let api = hf_hub::api::sync::Api::new()
-                    .map_err(|e| JammiError::FineTune(format!("HF hub init: {e}")))?;
-                let repo = api.model(catalog_model_id.to_string());
-                // repo.get() returns the cached path without re-downloading.
-                let weights = repo.get("model.safetensors").map_err(|e| {
-                    JammiError::FineTune(format!(
-                        "Cannot locate '{catalog_model_id}' in HF hub cache: {e}"
-                    ))
-                })?;
-                weights
-                    .parent()
-                    .ok_or_else(|| {
-                        JammiError::FineTune(
-                            "Cannot determine model dir from HF hub cache path".into(),
-                        )
-                    })?
-                    .to_path_buf()
-            } else {
-                return Err(JammiError::FineTune(format!(
-                    "Base model '{base_model_id}' has no artifact_path in catalog"
-                )));
-            }
-        }
-    };
-
-    // Read config.json
-    let config_path = artifact_dir.join("config.json");
-    let model_config: serde_json::Value = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .ok_or_else(|| {
-            JammiError::FineTune(format!(
-                "Cannot read config.json for base model at {config_path:?}"
-            ))
-        })?;
-
-    let model_type = model_config
-        .get("model_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("bert");
-
-    // Collect weights paths (standard single-shard safetensors)
-    let weights_path = artifact_dir.join("model.safetensors");
-    if !weights_path.exists() {
-        return Err(JammiError::FineTune(format!(
-            "model.safetensors not found at {weights_path:?}"
-        )));
-    }
-
-    let lora_dropout = if config.lora_dropout > 0.0 {
-        Some(config.lora_dropout as f32)
-    } else {
-        None
-    };
-
-    let lora = jammi_lora::LoraBuildConfig {
-        target_modules: &config.target_modules,
-        layers_to_transform: &config.layers_to_transform,
-        lora_rank: config.lora_rank,
-        lora_alpha: config.lora_alpha,
-        use_rslora: config.use_rslora,
-        lora_dropout,
-        rank_pattern: &config.rank_pattern,
-        init_mode: config.init_lora_weights,
-    };
-
-    let backbone_dtype: candle_core::DType = config.backbone_dtype.into();
-    let adapter_cfg =
-        jammi_lora::AdapterConfig::from_build(model_type, &lora, config.backbone_dtype);
-
-    let weights_paths: Vec<&Path> = vec![weights_path.as_path()];
-
-    let encoder = match model_type {
-        "distilbert" => {
-            let distilbert_config: jammi_encoders::DistilBertConfig =
-                serde_json::from_value(model_config.clone()).map_err(|e| {
-                    JammiError::FineTune(format!("Parse DistilBert config.json: {e}"))
-                })?;
-            jammi_encoders::AnyEncoder::DistilBert(
-                jammi_encoders::DistilBert::builder()
-                    .lora(lora)
-                    .backbone_dtype(backbone_dtype)
-                    .build(&weights_paths, &distilbert_config, device, varmap)
-                    .map_err(|e| JammiError::FineTune(format!("Build DistilBert encoder: {e}")))?,
-            )
-        }
-        "modernbert" => {
-            let modernbert_config: jammi_encoders::ModernBertConfig =
-                serde_json::from_value(model_config.clone()).map_err(|e| {
-                    JammiError::FineTune(format!("Parse ModernBert config.json: {e}"))
-                })?;
-            jammi_encoders::AnyEncoder::ModernBert(
-                jammi_encoders::ModernBert::builder()
-                    .lora(lora)
-                    .backbone_dtype(backbone_dtype)
-                    .build(&weights_paths, &modernbert_config, device, varmap)
-                    .map_err(|e| JammiError::FineTune(format!("Build ModernBert encoder: {e}")))?,
-            )
-        }
-        _ => {
-            let bert_config: jammi_encoders::BertConfig =
-                serde_json::from_value(model_config.clone())
-                    .map_err(|e| JammiError::FineTune(format!("Parse Bert config.json: {e}")))?;
-            jammi_encoders::AnyEncoder::Bert(
-                jammi_encoders::Bert::builder()
-                    .lora(lora)
-                    .backbone_dtype(backbone_dtype)
-                    .build(&weights_paths, &bert_config, device, varmap)
-                    .map_err(|e| JammiError::FineTune(format!("Build Bert encoder: {e}")))?,
-            )
-        }
-    };
-
-    Ok((encoder, adapter_cfg))
 }

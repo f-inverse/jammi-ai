@@ -264,11 +264,14 @@ fn write_csv(dir: &std::path::Path, name: &str, header: &str, rows: &[(String, S
 /// graph, and trains a real (tiny_bert) model to a completed job with a saved
 /// adapter — the integration proof that `TrainingFormat::Graph` threads through
 /// the existing trainer with no new loss.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn fine_tune_graph_end_to_end_completes() {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    // `fine_tune_graph` submits a queued job; the worker re-reads the sources,
+    // re-samples the graph from the seeded spec, and trains it.
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
 
     // Node text: two small communities.
     let node_rows: Vec<(String, String)> = ["a0", "a1", "a2", "b0", "b1", "b2"]
@@ -388,14 +391,17 @@ async fn fine_tune_graph_end_to_end_completes() {
     );
 }
 
-/// A node source with no edge source (isolated graph) is a typed failure end to
-/// end — a graph with no structure carries no supervision, surfaced as a failed
-/// job rather than a silent no-op.
-#[tokio::test]
+/// A node source with no edge source (isolated graph) is a failure end to end —
+/// a graph with no structure carries no supervision. Submit no longer reads the
+/// graph (it persists the spec), so the failure surfaces when the worker
+/// re-samples: the job lands `failed` and `wait()` returns the typed error,
+/// never a wedged job or a silent no-op.
+#[tokio::test(flavor = "multi_thread")]
 async fn fine_tune_graph_isolated_graph_fails() {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
 
     let node_rows: Vec<(String, String)> = ["n0", "n1", "n2"]
         .iter()
@@ -441,18 +447,27 @@ async fn fine_tune_graph_isolated_graph_fails() {
         provenance: EdgeProvenance::Declared,
     };
 
-    // The sampler refuses an edgeless graph, so the call fails synchronously
-    // (before a job is even spawned) — a typed error, not a wedged job.
-    let result = session
+    // Submit succeeds (it only persists the spec); the worker re-samples the
+    // graph, the sampler refuses an edgeless graph, and the job lands `failed`.
+    let job = session
         .fine_tune_graph(
             &sources,
             &model,
             GraphSampleConfig::default(),
             Some(jammi_ai::fine_tune::FineTuneConfig::default()),
         )
-        .await;
+        .await
+        .expect("submit persists the spec and returns a handle");
+
+    let result = job.wait().await;
     assert!(
         result.is_err(),
-        "an isolated graph (no edges) must be a typed error"
+        "an isolated graph (no edges) must drive the job to a typed failure"
     );
+    let record = session
+        .catalog()
+        .get_training_job(&job.job_id)
+        .await
+        .unwrap();
+    assert_eq!(record.status, "failed");
 }

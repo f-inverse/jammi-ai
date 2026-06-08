@@ -6,9 +6,23 @@ use std::time::Duration;
 
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::status::TrainingJobStatus;
+use jammi_db::catalog::training_repo::CreateTrainingJobParams;
 use jammi_db::catalog::Catalog;
 use jammi_db::model_task::ModelTask;
 use tempfile::tempdir;
+
+/// A minimal queued fine-tune job over the `q-base` model with the given id.
+fn job_params(job_id: &str) -> CreateTrainingJobParams<'_> {
+    CreateTrainingJobParams {
+        job_id,
+        base_model_id: "q-base::1",
+        training_source: "src.csv",
+        loss_type: "contrastive",
+        hyperparams: "{}",
+        kind: "fine_tune",
+        training_spec: "{}",
+    }
+}
 
 /// Register the FK target model `q-base` once per test catalog.
 async fn register_base_model(catalog: &Catalog) {
@@ -37,7 +51,7 @@ async fn concurrent_claim_grants_one_winner() {
     register_base_model(&catalog).await;
 
     catalog
-        .create_training_job("q-1", "q-base::1", "src.csv", "contrastive", "{}")
+        .create_training_job(job_params("q-1"))
         .await
         .unwrap();
 
@@ -82,13 +96,13 @@ async fn claim_returns_oldest_queued_job_first() {
     register_base_model(&catalog).await;
 
     catalog
-        .create_training_job("old", "q-base::1", "src.csv", "contrastive", "{}")
+        .create_training_job(job_params("old"))
         .await
         .unwrap();
     // A distinct, strictly-later created_at so ORDER BY is unambiguous.
     tokio::time::sleep(Duration::from_millis(1100)).await;
     catalog
-        .create_training_job("new", "q-base::1", "src.csv", "contrastive", "{}")
+        .create_training_job(job_params("new"))
         .await
         .unwrap();
 
@@ -107,10 +121,7 @@ async fn heartbeat_renews_for_owner_only() {
     let catalog = Catalog::open(dir.path()).await.unwrap();
     register_base_model(&catalog).await;
 
-    catalog
-        .create_training_job("hb", "q-base::1", "src.csv", "contrastive", "{}")
-        .await
-        .unwrap();
+    catalog.create_training_job(job_params("hb")).await.unwrap();
     let claimed = catalog
         .claim_next_training_job("owner", Duration::from_secs(5))
         .await
@@ -161,10 +172,7 @@ async fn reclaim_requeues_then_fails_when_attempts_exhausted() {
     let catalog = Catalog::open(dir.path()).await.unwrap();
     register_base_model(&catalog).await;
 
-    catalog
-        .create_training_job("rc", "q-base::1", "src.csv", "contrastive", "{}")
-        .await
-        .unwrap();
+    catalog.create_training_job(job_params("rc")).await.unwrap();
 
     // Claim with a zero lease so it is already expired by the time reclaim
     // runs — a deterministic forced expiry, no sleep needed.
@@ -221,7 +229,7 @@ async fn reclaim_leaves_live_leases_untouched() {
     register_base_model(&catalog).await;
 
     catalog
-        .create_training_job("live", "q-base::1", "src.csv", "contrastive", "{}")
+        .create_training_job(job_params("live"))
         .await
         .unwrap();
     catalog

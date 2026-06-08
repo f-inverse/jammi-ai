@@ -1,6 +1,7 @@
 //! Training loop: gradient descent with LR scheduling, early stopping, and checkpointing.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BinaryArray, StringArray};
@@ -114,6 +115,12 @@ pub struct TrainingLoop {
     output_model: Option<OutputModelHandle>,
     divergence_count: usize,
     device: Device,
+    /// Cooperative-cancellation flag the worker's heartbeat task sets when the
+    /// lease is lost. Checked at every epoch boundary; once set the loop bails
+    /// without recording a terminal status, leaving the job for lease-based
+    /// reclaim. A `spawn_blocking` thread cannot be force-aborted, so this is the
+    /// coarsest safe interruption point.
+    cancel: Arc<AtomicBool>,
 }
 
 /// Builder for [`TrainingLoop`].
@@ -127,6 +134,7 @@ pub struct TrainingLoopBuilder {
     artifact_dir: Option<PathBuf>,
     output_model: Option<OutputModelHandle>,
     device: Device,
+    cancel: Arc<AtomicBool>,
 }
 
 impl TrainingLoopBuilder {
@@ -146,12 +154,22 @@ impl TrainingLoopBuilder {
             artifact_dir: None,
             output_model: None,
             device: Device::Cpu,
+            cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Set the device all training tensors should live on.
     pub fn device(mut self, device: Device) -> Self {
         self.device = device;
+        self
+    }
+
+    /// Set the cooperative-cancellation flag the loop checks at every epoch
+    /// boundary. The worker's heartbeat task sets it when the lease is lost so
+    /// the loop bails and the job is left for reclaim. Omit it for a run that
+    /// cannot be cancelled (the loop then uses a never-set flag).
+    pub fn cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = cancel;
         self
     }
 
@@ -216,6 +234,7 @@ impl TrainingLoopBuilder {
             output_model: self.output_model,
             divergence_count: 0,
             device: self.device,
+            cancel: self.cancel,
         })
     }
 }
@@ -272,6 +291,14 @@ impl TrainingLoop {
         let mut mined_loader: Option<TrainingDataLoader> = None;
 
         for epoch in 0..self.config.epochs {
+            // Cooperative cancellation: the worker's heartbeat sets this when the
+            // lease is lost. Bail at the epoch boundary, leaving the job for
+            // lease-based reclaim rather than recording a (wrong) terminal status.
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err(JammiError::FineTune(
+                    "training cancelled: lease lost before epoch boundary".into(),
+                ));
+            }
             let mut epoch_loss = 0.0;
             let mut batch_count = 0;
             // Accumulated gradients across micro-batches. Seeded from the first

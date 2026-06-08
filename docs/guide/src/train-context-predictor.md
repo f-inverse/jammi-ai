@@ -99,11 +99,17 @@ weight update — the adaptation lives entirely in the forward.
 # extern crate tokio;
 # use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
-# use jammi_ai::pipeline::context_predictor::PredictedDistribution;
+# use jammi_ai::pipeline::context_predictor::{ContextServeOptions, PredictedDistribution};
 # async fn ex(session: &Arc<InferenceSession>) -> jammi_db::error::Result<()> {
 // Reload the trained predictor for inference, serving over a corpus.
+// `ContextServeOptions::default()` is embedding-similarity (ANN) context with no
+// serving split — pass an edge-bearing source to condition on declared edges.
 let served = session
-    .load_context_predictor("patents-context-predictor", "patents", None)
+    .load_context_predictor(
+        "patents-context-predictor",
+        "patents",
+        ContextServeOptions::default(),
+    )
     .await?;
 
 // One forward over the target's live context — no gradient update.
@@ -141,22 +147,24 @@ quantile head wraps with CQR over its lower/upper quantiles.
 # extern crate tokio;
 # use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
-# use jammi_ai::pipeline::context_predictor::ServedContextPredictor;
+# use jammi_ai::pipeline::context_predictor::{ConformalLevers, ServedContextPredictor};
 # async fn ex(
 #     session: &Arc<InferenceSession>,
 #     served: &ServedContextPredictor,
 #     held_out: &[(String, f64)], // (target_key, observed y), tasks disjoint from training
 # ) -> jammi_db::error::Result<()> {
-// Calibrate at 90% nominal coverage on the held-out set.
+// Calibrate at 90% nominal coverage on the held-out set. `Marginal` is plain
+// split-conformal; governance may instead supply a Mondrian cohort or weights.
 let wrap = session
-    .calibrate_context_predictor_conformal(served, held_out, 0.1)
+    .calibrate_context_predictor_conformal(served, held_out, 0.1, ConformalLevers::Marginal)
     .await?;
 
-// Serving: turn a prediction into a coverage-guaranteed interval.
+// Serving: turn a prediction into a coverage-guaranteed interval. The optional
+// group is the test point's Mondrian cohort (`None` for a marginal wrap).
 let dist = session
     .predict_with_context_predictor(served, "US-7654321")
     .await?;
-let (lower, upper) = wrap.interval(&dist)?;
+let (lower, upper) = wrap.interval(&dist, None)?;
 # let _ = (lower, upper);
 # Ok(()) }
 ```

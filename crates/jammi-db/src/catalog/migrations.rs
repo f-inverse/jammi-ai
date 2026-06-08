@@ -48,6 +48,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "015_fine_tune_job_queue",
         schema::MIGRATION_015_FINE_TUNE_JOB_QUEUE,
     ),
+    (
+        "016_rename_training_jobs",
+        schema::MIGRATION_016_RENAME_TRAINING_JOBS,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

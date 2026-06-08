@@ -411,3 +411,26 @@ ALTER TABLE fine_tune_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE fine_tune_jobs ADD COLUMN training_spec TEXT;
 CREATE INDEX idx_fine_tune_jobs_claim ON fine_tune_jobs(status, lease_expires_at);
 "#;
+
+/// Migration 016 — rename the job table to `training_jobs`.
+///
+/// The job machinery carries more than one training kind (the `kind`
+/// discriminator added in 015), so the table's name is generalised from
+/// `fine_tune_jobs` to `training_jobs`. A behaviour-preserving rename: the
+/// column set, constraints, and row contents are unchanged.
+///
+/// `ALTER TABLE … RENAME TO …` is portable across SQLite and Postgres. The
+/// three indexes are renamed by dropping and recreating them against the new
+/// table name — `DROP INDEX` / `CREATE INDEX` are portable, whereas SQLite has
+/// no `ALTER INDEX … RENAME`. After the table rename the indexes still exist
+/// under their old names (both backends carry indexes across a table rename),
+/// so each is dropped before being recreated with its new name.
+pub(super) const MIGRATION_016_RENAME_TRAINING_JOBS: &str = r#"
+ALTER TABLE fine_tune_jobs RENAME TO training_jobs;
+DROP INDEX idx_fine_tune_jobs_status;
+DROP INDEX idx_fine_tune_jobs_tenant;
+DROP INDEX idx_fine_tune_jobs_claim;
+CREATE INDEX idx_training_jobs_status ON training_jobs(status);
+CREATE INDEX idx_training_jobs_tenant ON training_jobs(tenant_id);
+CREATE INDEX idx_training_jobs_claim ON training_jobs(status, lease_expires_at);
+"#;

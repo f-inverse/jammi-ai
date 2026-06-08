@@ -44,9 +44,9 @@ impl FromStr for ResultTableStatus {
     }
 }
 
-/// Status of a fine-tune job.
+/// Status of a training job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FineTuneJobStatus {
+pub enum TrainingJobStatus {
     /// Job created, waiting to start.
     Queued,
     /// Training in progress.
@@ -57,7 +57,7 @@ pub enum FineTuneJobStatus {
     Failed,
 }
 
-impl fmt::Display for FineTuneJobStatus {
+impl fmt::Display for TrainingJobStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Queued => write!(f, "queued"),
@@ -68,7 +68,7 @@ impl fmt::Display for FineTuneJobStatus {
     }
 }
 
-impl FromStr for FineTuneJobStatus {
+impl FromStr for TrainingJobStatus {
     type Err = JammiError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
@@ -77,7 +77,7 @@ impl FromStr for FineTuneJobStatus {
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
             other => Err(JammiError::Catalog(format!(
-                "Unknown fine-tune job status: '{other}'"
+                "Unknown training job status: '{other}'"
             ))),
         }
     }

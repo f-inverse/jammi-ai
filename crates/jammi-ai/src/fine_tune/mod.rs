@@ -20,8 +20,6 @@ pub mod graph_sampler;
 #[cfg(feature = "local")]
 pub mod hard_negative_miner;
 #[cfg(feature = "local")]
-pub mod job;
-#[cfg(feature = "local")]
 pub mod lora;
 #[cfg(feature = "local")]
 pub mod optimizer;
@@ -31,6 +29,8 @@ pub(crate) mod regression_loss;
 pub mod target;
 #[cfg(feature = "local")]
 pub mod trainer;
+#[cfg(feature = "local")]
+pub mod training_job;
 
 use std::collections::HashMap;
 

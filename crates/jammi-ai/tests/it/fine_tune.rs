@@ -9,7 +9,7 @@ use jammi_ai::fine_tune::{
 };
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
-use jammi_db::catalog::status::FineTuneJobStatus;
+use jammi_db::catalog::status::TrainingJobStatus;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_lora::LoraLinear;
 
@@ -289,7 +289,7 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
     // UAT 4: job status transitions queued → running → completed
     let record = session
         .catalog()
-        .get_fine_tune_job(&job.job_id)
+        .get_training_job(&job.job_id)
         .await
         .unwrap();
     assert_eq!(record.status, "completed");
@@ -748,7 +748,7 @@ async fn fine_tune_job_catalog_crud() {
 
     // Create job
     catalog
-        .create_fine_tune_job(
+        .create_training_job(
             "job-1",
             "base-model::1",
             "training_source",
@@ -759,34 +759,34 @@ async fn fine_tune_job_catalog_crud() {
         .unwrap();
 
     // Get job — status should be "queued"
-    let job = catalog.get_fine_tune_job("job-1").await.unwrap();
+    let job = catalog.get_training_job("job-1").await.unwrap();
     assert_eq!(job.status, "queued");
     assert_eq!(job.base_model_id, "base-model::1");
 
     // Update to running
     let metrics = r#"{"started_at": "2026-01-01T00:00:00Z"}"#;
     catalog
-        .update_fine_tune_status("job-1", FineTuneJobStatus::Running, Some(metrics))
+        .update_training_status("job-1", TrainingJobStatus::Running, Some(metrics))
         .await
         .unwrap();
-    let job2 = catalog.get_fine_tune_job("job-1").await.unwrap();
+    let job2 = catalog.get_training_job("job-1").await.unwrap();
     assert_eq!(job2.status, "running");
     assert!(job2.started_at.is_some());
 
     // Update to completed with output model
     catalog
-        .update_fine_tune_status(
+        .update_training_status(
             "job-1",
-            FineTuneJobStatus::Completed,
+            TrainingJobStatus::Completed,
             Some(r#"{"completed_at": "2026-01-01T01:00:00Z"}"#),
         )
         .await
         .unwrap();
     catalog
-        .set_fine_tune_output_model("job-1", "jammi:fine-tuned:job-1")
+        .set_training_output_model("job-1", "jammi:fine-tuned:job-1")
         .await
         .unwrap();
-    let job3 = catalog.get_fine_tune_job("job-1").await.unwrap();
+    let job3 = catalog.get_training_job("job-1").await.unwrap();
     assert_eq!(job3.status, "completed");
     assert_eq!(
         job3.output_model_id.as_deref(),
@@ -794,7 +794,7 @@ async fn fine_tune_job_catalog_crud() {
     );
 
     // List jobs
-    let jobs = catalog.list_fine_tune_jobs().await.unwrap();
+    let jobs = catalog.list_training_jobs().await.unwrap();
     assert_eq!(jobs.len(), 1);
 }
 
@@ -912,7 +912,7 @@ async fn training_divergence_detection() {
         .await
         .unwrap();
     catalog
-        .create_fine_tune_job("div-job", "div-test-model::1", "src", "cosent", "{}")
+        .create_training_job("div-job", "div-test-model::1", "src", "cosent", "{}")
         .await
         .unwrap();
 
@@ -945,7 +945,7 @@ async fn training_divergence_detection() {
     );
 
     // Catalog should record failure
-    let job = catalog.get_fine_tune_job("div-job").await.unwrap();
+    let job = catalog.get_training_job("div-job").await.unwrap();
     assert_eq!(job.status, "failed", "Job status should be 'failed'");
 }
 
@@ -1019,7 +1019,7 @@ async fn training_early_stopping_triggers() {
         .await
         .unwrap();
     catalog
-        .create_fine_tune_job("es-job", "es-test-model::1", "src", "cosent", "{}")
+        .create_training_job("es-job", "es-test-model::1", "src", "cosent", "{}")
         .await
         .unwrap();
 
@@ -1056,7 +1056,7 @@ async fn training_early_stopping_triggers() {
     );
 
     // Job should be completed (not failed)
-    let job = catalog.get_fine_tune_job("es-job").await.unwrap();
+    let job = catalog.get_training_job("es-job").await.unwrap();
     assert_eq!(job.status, "completed");
 }
 

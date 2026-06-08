@@ -368,7 +368,7 @@ async fn fine_tune_graph_end_to_end_completes() {
 
     let record = session
         .catalog()
-        .get_fine_tune_job(&job.job_id)
+        .get_training_job(&job.job_id)
         .await
         .unwrap();
     assert_eq!(

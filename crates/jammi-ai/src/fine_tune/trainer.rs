@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, BinaryArray, StringArray};
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarMap};
-use jammi_db::catalog::status::FineTuneJobStatus;
+use jammi_db::catalog::status::TrainingJobStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 
@@ -231,9 +231,9 @@ impl TrainingLoop {
         // Update job status to running
         let started_at = chrono::Utc::now().to_rfc3339();
         let metrics_json = serde_json::json!({"started_at": started_at}).to_string();
-        tokio::runtime::Handle::current().block_on(self.catalog.update_fine_tune_status(
+        tokio::runtime::Handle::current().block_on(self.catalog.update_training_status(
             &self.job_id,
-            FineTuneJobStatus::Running,
+            TrainingJobStatus::Running,
             Some(&metrics_json),
         ))?;
 
@@ -473,7 +473,7 @@ impl TrainingLoop {
             .map_err(|e| JammiError::FineTune(format!("Save adapter: {e}")))?;
 
         // Register the output model in the catalog BEFORE flipping the
-        // job's status to `Completed`. `FineTuneJob::wait()` returns as
+        // job's status to `Completed`. `TrainingJob::wait()` returns as
         // soon as it sees `Completed`; if the model row landed after the
         // flip, a caller doing `wait().await; encode_text_query(job.model_id())`
         // would race and miss the row, falling through to the HF Hub
@@ -482,7 +482,7 @@ impl TrainingLoop {
         if let Some(ref output) = self.output_model {
             handle.block_on(
                 self.catalog
-                    .set_fine_tune_output_model(&self.job_id, &output.output_model_id),
+                    .set_training_output_model(&self.job_id, &output.output_model_id),
             )?;
             handle.block_on(self.catalog.register_model(
                 jammi_db::catalog::model_repo::RegisterModelParams {
@@ -514,9 +514,9 @@ impl TrainingLoop {
             "completed_at": completed_at,
         })
         .to_string();
-        handle.block_on(self.catalog.update_fine_tune_status(
+        handle.block_on(self.catalog.update_training_status(
             &self.job_id,
-            FineTuneJobStatus::Completed,
+            TrainingJobStatus::Completed,
             Some(&metrics),
         ))?;
 
@@ -1096,13 +1096,13 @@ impl TrainingLoop {
                     "started_at": ctx.started_at,
                 })
                 .to_string();
-                if let Err(e) = tokio::runtime::Handle::current().block_on(
-                    self.catalog.update_fine_tune_status(
+                if let Err(e) =
+                    tokio::runtime::Handle::current().block_on(self.catalog.update_training_status(
                         &self.job_id,
-                        FineTuneJobStatus::Failed,
+                        TrainingJobStatus::Failed,
                         Some(&metrics),
-                    ),
-                ) {
+                    ))
+                {
                     tracing::error!(job_id = %self.job_id, error = %e, "Failed to record job status in catalog");
                 }
                 return Err(JammiError::FineTune(err_msg.into()));

@@ -144,8 +144,8 @@ The fine-tuned model is automatically registered and can be used anywhere a mode
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# use jammi_ai::fine_tune::job::FineTuneJob;
-# async fn ex(session: &InferenceSession, job: &FineTuneJob) -> jammi_db::error::Result<()> {
+# use jammi_ai::fine_tune::training_job::TrainingJob;
+# async fn ex(session: &InferenceSession, job: &TrainingJob) -> jammi_db::error::Result<()> {
 let model_id = job.model_id();
 
 let embedding = session.encode_text_query(model_id, "quantum computing").await?;

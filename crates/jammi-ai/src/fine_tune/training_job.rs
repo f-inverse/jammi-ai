@@ -1,26 +1,26 @@
-//! Fine-tune job lifecycle management.
+//! Training job lifecycle management.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use jammi_db::catalog::status::FineTuneJobStatus;
+use jammi_db::catalog::status::TrainingJobStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 
-/// Handle to a fine-tune job. Can be used to poll status or wait for completion.
-pub struct FineTuneJob {
+/// Handle to a training job. Can be used to poll status or wait for completion.
+pub struct TrainingJob {
     /// Unique job identifier.
     pub job_id: String,
     /// Current status at creation time.
     pub status: String,
-    /// Model ID for the fine-tuned output (set after completion).
+    /// Model ID for the trained output (set after completion).
     pub model_id: String,
     catalog: Arc<Catalog>,
 }
 
-impl std::fmt::Debug for FineTuneJob {
+impl std::fmt::Debug for TrainingJob {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FineTuneJob")
+        f.debug_struct("TrainingJob")
             .field("job_id", &self.job_id)
             .field("status", &self.status)
             .field("model_id", &self.model_id)
@@ -28,7 +28,7 @@ impl std::fmt::Debug for FineTuneJob {
     }
 }
 
-impl FineTuneJob {
+impl TrainingJob {
     /// Create a new job handle.
     pub(crate) fn new(
         job_id: String,
@@ -47,14 +47,14 @@ impl FineTuneJob {
     /// Block until the job reaches a terminal state (completed or failed).
     pub async fn wait(&self) -> Result<()> {
         loop {
-            let record = self.catalog.get_fine_tune_job(&self.job_id).await?;
-            let status: FineTuneJobStatus = record
+            let record = self.catalog.get_training_job(&self.job_id).await?;
+            let status: TrainingJobStatus = record
                 .status
                 .parse()
                 .map_err(|e| JammiError::FineTune(format!("{e}")))?;
             match status {
-                FineTuneJobStatus::Completed => return Ok(()),
-                FineTuneJobStatus::Failed => {
+                TrainingJobStatus::Completed => return Ok(()),
+                TrainingJobStatus::Failed => {
                     let msg = record.error_message.unwrap_or_else(|| "Job failed".into());
                     return Err(JammiError::FineTune(msg));
                 }
@@ -65,11 +65,11 @@ impl FineTuneJob {
 
     /// Get the current status from the catalog.
     pub async fn status(&self) -> Result<String> {
-        let record = self.catalog.get_fine_tune_job(&self.job_id).await?;
+        let record = self.catalog.get_training_job(&self.job_id).await?;
         Ok(record.status)
     }
 
-    /// The model ID for the fine-tuned output.
+    /// The model ID for the trained output.
     pub fn model_id(&self) -> &str {
         &self.model_id
     }

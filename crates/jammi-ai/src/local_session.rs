@@ -28,7 +28,7 @@
 //!   `Vec<RecordBatch>` out. The fluent [`crate::query::QueryBuilder`] is an
 //!   internal mechanism `LocalSession` drives — never the return type.
 //! * **Fine-tune** returns a job **id**; status is polled by id through
-//!   [`Session::fine_tune_status`]. The in-process `FineTuneJob`
+//!   [`Session::fine_tune_status`]. The in-process `TrainingJob`
 //!   handle never escapes.
 //! * **Audit** is three flat methods rather than a borrow-scoped handle.
 //! * **Subscribe** returns a `Pin<Box<dyn Stream>>`, the transport-neutral
@@ -110,7 +110,7 @@ pub struct SearchRequest {
 }
 
 /// Identifier of a fine-tune job started through [`Session::fine_tune`].
-/// Returned in place of the in-process `FineTuneJob` handle
+/// Returned in place of the in-process `TrainingJob` handle
 /// so the job is addressable across a transport boundary; poll it with
 /// [`Session::fine_tune_status`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -833,7 +833,7 @@ impl LocalSession {
     }
 
     async fn fine_tune_status(&self, id: &FineTuneJobId) -> Result<String> {
-        let record = self.engine.catalog().get_fine_tune_job(&id.0).await?;
+        let record = self.engine.catalog().get_training_job(&id.0).await?;
         Ok(record.status)
     }
 

@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 use jammi_db::config::JammiConfig;
 
 use crate::error::to_pyerr;
-use crate::job::PyFineTuneJob;
+use crate::job::PyTrainingJob;
 use crate::model_task::PyModelTask;
 
 /// The `Database` pyclass. Re-exported so native Rust consumers (such as
@@ -39,7 +39,7 @@ pub use jammi_ai::session::InferenceSession;
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open_local, m)?)?;
     m.add_class::<PyDatabase>()?;
-    m.add_class::<PyFineTuneJob>()?;
+    m.add_class::<PyTrainingJob>()?;
     m.add_class::<PyModelTask>()?;
     m.add_class::<crate::audit::PyPerQueryAudit>()?;
     m.add_class::<crate::audit::PyAuditHandle>()?;

@@ -22,7 +22,7 @@ async fn migration_005_adds_tenant_id_to_every_table() {
     for table in [
         "sources",
         "models",
-        "fine_tune_jobs",
+        "training_jobs",
         "eval_runs",
         "result_tables",
         "evidence_channels",
@@ -61,7 +61,7 @@ async fn migration_005_creates_tenant_index_per_table() {
     for (table, idx) in [
         ("sources", "idx_sources_tenant"),
         ("models", "idx_models_tenant"),
-        ("fine_tune_jobs", "idx_fine_tune_jobs_tenant"),
+        ("training_jobs", "idx_training_jobs_tenant"),
         ("eval_runs", "idx_eval_runs_tenant"),
         ("result_tables", "idx_result_tables_tenant"),
         ("evidence_channels", "idx_evidence_channels_tenant"),
@@ -175,13 +175,15 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "013_result_table_kind",
             "014_bm25_channel",
             "015_fine_tune_job_queue",
+            "016_rename_training_jobs",
         ]
     );
 }
 
-/// Migration 015 adds the lease-based job-queue columns to `fine_tune_jobs`
-/// and the `(status, lease_expires_at)` claim index. Asserted via
-/// `pragma_table_info` and `sqlite_master`.
+/// Migration 015 adds the lease-based job-queue columns and the
+/// `(status, lease_expires_at)` claim index; migration 016 renames the table to
+/// `training_jobs` and the index to `idx_training_jobs_claim`. Asserted against
+/// the post-016 names via `pragma_table_info` and `sqlite_master`.
 #[tokio::test]
 async fn migration_015_adds_job_queue_columns_and_claim_index() {
     use jammi_db::catalog::backend::SqlValue;
@@ -199,7 +201,7 @@ async fn migration_015_adds_job_queue_columns_and_claim_index() {
             |tx| {
                 Box::pin(async move {
                     tx.query::<_, String>(
-                        "SELECT name FROM pragma_table_info('fine_tune_jobs')",
+                        "SELECT name FROM pragma_table_info('training_jobs')",
                         &[],
                         |row| row.get("name"),
                     )
@@ -218,7 +220,7 @@ async fn migration_015_adds_job_queue_columns_and_claim_index() {
     ] {
         assert!(
             columns.iter().any(|c| c == expected),
-            "fine_tune_jobs must have '{expected}' after migration 015; got {columns:?}"
+            "training_jobs must have '{expected}' after migrations 015+016; got {columns:?}"
         );
     }
 
@@ -233,8 +235,8 @@ async fn migration_015_adds_job_queue_columns_and_claim_index() {
                     let rows: Vec<i64> = tx
                         .query(
                             "SELECT 1 AS one FROM sqlite_master \
-                             WHERE type='index' AND name=$1 AND tbl_name='fine_tune_jobs'",
-                            &[SqlValue::TextOwned("idx_fine_tune_jobs_claim".into())],
+                             WHERE type='index' AND name=$1 AND tbl_name='training_jobs'",
+                            &[SqlValue::TextOwned("idx_training_jobs_claim".into())],
                             |row| row.get::<i64>("one"),
                         )
                         .await?;
@@ -246,8 +248,82 @@ async fn migration_015_adds_job_queue_columns_and_claim_index() {
         .unwrap();
     assert!(
         index_exists,
-        "idx_fine_tune_jobs_claim must exist after migration 015"
+        "idx_training_jobs_claim must exist after migrations 015+016"
     );
+}
+
+/// Migration 016 renames the job table `fine_tune_jobs → training_jobs` and its
+/// three indexes (`idx_fine_tune_jobs_{status,tenant,claim} →
+/// idx_training_jobs_{status,tenant,claim}`). After a full open the renamed
+/// table and indexes exist and the old names are gone. Asserted via
+/// `sqlite_master`.
+#[tokio::test]
+async fn migration_016_renames_job_table_and_indexes() {
+    use jammi_db::catalog::backend::SqlValue;
+
+    let dir = tempdir().unwrap();
+    let _catalog = Catalog::open(dir.path()).await.unwrap();
+    let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
+
+    let object_exists = |kind: &'static str, name: &'static str| {
+        let backend = &backend;
+        async move {
+            backend
+                .transaction(
+                    TxOptions {
+                        read_only: true,
+                        ..Default::default()
+                    },
+                    |tx| {
+                        Box::pin(async move {
+                            let rows: Vec<i64> = tx
+                                .query(
+                                    "SELECT 1 AS one FROM sqlite_master \
+                                     WHERE type=$1 AND name=$2",
+                                    &[
+                                        SqlValue::TextOwned(kind.into()),
+                                        SqlValue::TextOwned(name.into()),
+                                    ],
+                                    |row| row.get::<i64>("one"),
+                                )
+                                .await?;
+                            Ok(!rows.is_empty())
+                        })
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    assert!(
+        object_exists("table", "training_jobs").await,
+        "training_jobs table must exist after migration 016"
+    );
+    assert!(
+        !object_exists("table", "fine_tune_jobs").await,
+        "fine_tune_jobs table must be gone after migration 016"
+    );
+    for renamed in [
+        "idx_training_jobs_status",
+        "idx_training_jobs_tenant",
+        "idx_training_jobs_claim",
+    ] {
+        assert!(
+            object_exists("index", renamed).await,
+            "index '{renamed}' must exist after migration 016"
+        );
+    }
+    for old in [
+        "idx_fine_tune_jobs_status",
+        "idx_fine_tune_jobs_tenant",
+        "idx_fine_tune_jobs_claim",
+    ] {
+        assert!(
+            !object_exists("index", old).await,
+            "old index '{old}' must be gone after migration 016"
+        );
+    }
 }
 
 /// Migration 012 rebuilds `topics` so name uniqueness is scoped per tenant

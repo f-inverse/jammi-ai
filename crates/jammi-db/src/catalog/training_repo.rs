@@ -3,14 +3,14 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::backend::{BackendError, Row, SqlValue, TxOptions};
-use super::status::FineTuneJobStatus;
+use super::status::TrainingJobStatus;
 use super::Catalog;
 use crate::error::{JammiError, Result};
 use crate::tenant::TenantId;
 
-/// A row from the `fine_tune_jobs` catalog table.
+/// A row from the `training_jobs` catalog table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FineTuneJobRecord {
+pub struct TrainingJobRecord {
     pub job_id: String,
     pub base_model_id: String,
     pub output_model_id: Option<String>,
@@ -59,7 +59,7 @@ fn lease_deadline(lease: Duration) -> String {
     expiry.format(LEASE_TS_FORMAT).to_string()
 }
 
-fn parse_row(row: &Row<'_>) -> std::result::Result<FineTuneJobRecord, BackendError> {
+fn parse_row(row: &Row<'_>) -> std::result::Result<TrainingJobRecord, BackendError> {
     let metrics_raw: Option<String> = row.try_get("metrics")?;
     let error_message = metrics_raw.as_deref().and_then(|m| {
         serde_json::from_str::<serde_json::Value>(m)
@@ -87,7 +87,7 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<FineTuneJobRecord, BackendErr
         })
         .transpose()?;
 
-    Ok(FineTuneJobRecord {
+    Ok(TrainingJobRecord {
         job_id: row.get("job_id")?,
         base_model_id: row.get("base_model_id")?,
         output_model_id: row.try_get("output_model_id")?,
@@ -109,9 +109,9 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<FineTuneJobRecord, BackendErr
 }
 
 impl Catalog {
-    /// Create a new fine-tune job record with status = 'queued'. Tenant
+    /// Create a new training job record with status = 'queued'. Tenant
     /// bound + asserted (SPEC-03 §7).
-    pub async fn create_fine_tune_job(
+    pub async fn create_training_job(
         &self,
         job_id: &str,
         base_model_id: &str,
@@ -130,9 +130,9 @@ impl Catalog {
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.set_tenant(tenant);
-                    tx.assert_tenant_matches(tenant, "fine_tune_jobs")?;
+                    tx.assert_tenant_matches(tenant, "training_jobs")?;
                     tx.execute(
-                        "INSERT INTO fine_tune_jobs \
+                        "INSERT INTO training_jobs \
                          (job_id, base_model_id, training_source, loss_type, hyperparams, status, tenant_id) \
                          VALUES ($1, $2, $3, $4, $5, 'queued', $6)",
                         &[
@@ -152,10 +152,10 @@ impl Catalog {
         Ok(())
     }
 
-    /// Get a fine-tune job by ID. Tenant-filtered.
-    pub async fn get_fine_tune_job(&self, job_id: &str) -> Result<FineTuneJobRecord> {
+    /// Get a training job by ID. Tenant-filtered.
+    pub async fn get_training_job(&self, job_id: &str) -> Result<TrainingJobRecord> {
         let sql = format!(
-            "SELECT {SELECT_COLS} FROM fine_tune_jobs WHERE job_id = $1 \
+            "SELECT {SELECT_COLS} FROM training_jobs WHERE job_id = $1 \
                AND (tenant_id = $2 OR tenant_id IS NULL)"
         );
         let id = job_id.to_string();
@@ -186,11 +186,11 @@ impl Catalog {
         found.ok_or_else(|| JammiError::Catalog(format!("Fine-tune job '{id_for_err}' not found")))
     }
 
-    /// Update a fine-tune job's status and optional metrics JSON. Scoped.
-    pub async fn update_fine_tune_status(
+    /// Update a training job's status and optional metrics JSON. Scoped.
+    pub async fn update_training_status(
         &self,
         job_id: &str,
-        status: super::status::FineTuneJobStatus,
+        status: super::status::TrainingJobStatus,
         metrics: Option<&str>,
     ) -> Result<()> {
         let status_str = status.to_string();
@@ -202,7 +202,7 @@ impl Catalog {
                 Box::pin(async move {
                     tx.set_tenant(tenant);
                     tx.execute(
-                        "UPDATE fine_tune_jobs SET status = $1, metrics = $2, \
+                        "UPDATE training_jobs SET status = $1, metrics = $2, \
                          updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
                          WHERE job_id = $3 AND (tenant_id = $4 OR tenant_id IS NULL)",
                         &[
@@ -220,8 +220,8 @@ impl Catalog {
         Ok(())
     }
 
-    /// Set the output model ID for a completed fine-tune job. Scoped.
-    pub async fn set_fine_tune_output_model(
+    /// Set the output model ID for a completed training job. Scoped.
+    pub async fn set_training_output_model(
         &self,
         job_id: &str,
         output_model_id: &str,
@@ -234,7 +234,7 @@ impl Catalog {
                 Box::pin(async move {
                     tx.set_tenant(tenant);
                     tx.execute(
-                        "UPDATE fine_tune_jobs SET output_model_id = $1, \
+                        "UPDATE training_jobs SET output_model_id = $1, \
                          updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
                          WHERE job_id = $2 AND (tenant_id = $3 OR tenant_id IS NULL)",
                         &[
@@ -251,12 +251,12 @@ impl Catalog {
         Ok(())
     }
 
-    /// Transition all fine-tune jobs with status Running to Failed.
+    /// Transition all training jobs with status Running to Failed.
     /// Startup-recovery shim: a Running job at startup means the process
     /// crashed mid-training. Scoped to the session tenant.
-    pub async fn cleanup_stale_fine_tune_jobs(&self) -> Result<usize> {
-        let running = super::status::FineTuneJobStatus::Running.to_string();
-        let failed = super::status::FineTuneJobStatus::Failed.to_string();
+    pub async fn cleanup_stale_training_jobs(&self) -> Result<usize> {
+        let running = super::status::TrainingJobStatus::Running.to_string();
+        let failed = super::status::TrainingJobStatus::Failed.to_string();
         let tenant = self.current_tenant();
         let count = self
             .backend()
@@ -264,7 +264,7 @@ impl Catalog {
                 Box::pin(async move {
                     tx.set_tenant(tenant);
                     tx.execute(
-                        "UPDATE fine_tune_jobs SET status = $1, \
+                        "UPDATE training_jobs SET status = $1, \
                          updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
                          WHERE status = $2 AND (tenant_id = $3 OR tenant_id IS NULL)",
                         &[
@@ -280,10 +280,10 @@ impl Catalog {
         Ok(count as usize)
     }
 
-    /// List fine-tune jobs visible to the session tenant, most recent first.
-    pub async fn list_fine_tune_jobs(&self) -> Result<Vec<FineTuneJobRecord>> {
+    /// List training jobs visible to the session tenant, most recent first.
+    pub async fn list_training_jobs(&self) -> Result<Vec<TrainingJobRecord>> {
         let sql = format!(
-            "SELECT {SELECT_COLS} FROM fine_tune_jobs \
+            "SELECT {SELECT_COLS} FROM training_jobs \
              WHERE tenant_id = $1 OR tenant_id IS NULL \
              ORDER BY created_at DESC"
         );
@@ -332,25 +332,25 @@ impl Catalog {
         &self,
         worker_id: &str,
         lease: Duration,
-    ) -> Result<Option<FineTuneJobRecord>> {
-        let queued = FineTuneJobStatus::Queued.to_string();
-        let running = FineTuneJobStatus::Running.to_string();
+    ) -> Result<Option<TrainingJobRecord>> {
+        let queued = TrainingJobStatus::Queued.to_string();
+        let running = TrainingJobStatus::Running.to_string();
         let worker_id = worker_id.to_string();
         let now = lease_now();
         let deadline = lease_deadline(lease);
 
         let candidate = match self.backend().backend_kind() {
             super::backend::BackendKind::Postgres => {
-                "(SELECT job_id FROM fine_tune_jobs WHERE status = $3 \
+                "(SELECT job_id FROM training_jobs WHERE status = $3 \
                   ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED)"
             }
             super::backend::BackendKind::Sqlite => {
-                "(SELECT job_id FROM fine_tune_jobs WHERE status = $3 \
+                "(SELECT job_id FROM training_jobs WHERE status = $3 \
                   ORDER BY created_at LIMIT 1)"
             }
         };
         let sql = format!(
-            "UPDATE fine_tune_jobs \
+            "UPDATE training_jobs \
              SET status = $1, claimed_by = $2, lease_expires_at = $4, \
                  attempts = attempts + 1, updated_at = $5 \
              WHERE job_id = {candidate} AND status = $3 \
@@ -389,7 +389,7 @@ impl Catalog {
         worker_id: &str,
         lease: Duration,
     ) -> Result<bool> {
-        let running = FineTuneJobStatus::Running.to_string();
+        let running = TrainingJobStatus::Running.to_string();
         let job_id = job_id.to_string();
         let worker_id = worker_id.to_string();
         let now = lease_now();
@@ -400,7 +400,7 @@ impl Catalog {
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.execute(
-                        "UPDATE fine_tune_jobs \
+                        "UPDATE training_jobs \
                          SET lease_expires_at = $1, updated_at = $2 \
                          WHERE job_id = $3 AND status = $4 AND claimed_by = $5",
                         &[
@@ -425,9 +425,9 @@ impl Catalog {
     /// the number of jobs actioned across both branches. Not tenant-scoped —
     /// it sweeps every tenant's expired leases.
     pub async fn reclaim_expired_training_jobs(&self, max_attempts: u32) -> Result<usize> {
-        let queued = FineTuneJobStatus::Queued.to_string();
-        let running = FineTuneJobStatus::Running.to_string();
-        let failed = FineTuneJobStatus::Failed.to_string();
+        let queued = TrainingJobStatus::Queued.to_string();
+        let running = TrainingJobStatus::Running.to_string();
+        let failed = TrainingJobStatus::Failed.to_string();
         let max_attempts = max_attempts as i64;
         let now = lease_now();
         let failure_metrics = serde_json::json!({
@@ -441,7 +441,7 @@ impl Catalog {
                 Box::pin(async move {
                     let requeued = tx
                         .execute(
-                            "UPDATE fine_tune_jobs \
+                            "UPDATE training_jobs \
                              SET status = $1, claimed_by = NULL, lease_expires_at = NULL, \
                                  updated_at = $2 \
                              WHERE status = $3 AND lease_expires_at IS NOT NULL \
@@ -457,7 +457,7 @@ impl Catalog {
                         .await?;
                     let exhausted = tx
                         .execute(
-                            "UPDATE fine_tune_jobs \
+                            "UPDATE training_jobs \
                              SET status = $1, metrics = $2, lease_expires_at = NULL, \
                                  updated_at = $3 \
                              WHERE status = $4 AND lease_expires_at IS NOT NULL \

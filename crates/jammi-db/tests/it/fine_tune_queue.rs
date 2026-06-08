@@ -1,11 +1,11 @@
-//! Lease-based training-job queue primitives on the `fine_tune_jobs` catalog
+//! Lease-based training-job queue primitives on the `training_jobs` catalog
 //! table: atomic claim, lease heartbeat, and expired-lease reclaim.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use jammi_db::catalog::model_repo::RegisterModelParams;
-use jammi_db::catalog::status::FineTuneJobStatus;
+use jammi_db::catalog::status::TrainingJobStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::model_task::ModelTask;
 use tempfile::tempdir;
@@ -37,7 +37,7 @@ async fn concurrent_claim_grants_one_winner() {
     register_base_model(&catalog).await;
 
     catalog
-        .create_fine_tune_job("q-1", "q-base::1", "src.csv", "contrastive", "{}")
+        .create_training_job("q-1", "q-base::1", "src.csv", "contrastive", "{}")
         .await
         .unwrap();
 
@@ -57,7 +57,7 @@ async fn concurrent_claim_grants_one_winner() {
     );
     let claimed = &winners[0];
     assert_eq!(claimed.job_id, "q-1");
-    assert_eq!(claimed.status, FineTuneJobStatus::Running.to_string());
+    assert_eq!(claimed.status, TrainingJobStatus::Running.to_string());
     assert!(
         matches!(claimed.claimed_by.as_deref(), Some("worker-a" | "worker-b")),
         "claimed_by must name the winning worker, got {:?}",
@@ -82,13 +82,13 @@ async fn claim_returns_oldest_queued_job_first() {
     register_base_model(&catalog).await;
 
     catalog
-        .create_fine_tune_job("old", "q-base::1", "src.csv", "contrastive", "{}")
+        .create_training_job("old", "q-base::1", "src.csv", "contrastive", "{}")
         .await
         .unwrap();
     // A distinct, strictly-later created_at so ORDER BY is unambiguous.
     tokio::time::sleep(Duration::from_millis(1100)).await;
     catalog
-        .create_fine_tune_job("new", "q-base::1", "src.csv", "contrastive", "{}")
+        .create_training_job("new", "q-base::1", "src.csv", "contrastive", "{}")
         .await
         .unwrap();
 
@@ -108,7 +108,7 @@ async fn heartbeat_renews_for_owner_only() {
     register_base_model(&catalog).await;
 
     catalog
-        .create_fine_tune_job("hb", "q-base::1", "src.csv", "contrastive", "{}")
+        .create_training_job("hb", "q-base::1", "src.csv", "contrastive", "{}")
         .await
         .unwrap();
     let claimed = catalog
@@ -132,7 +132,7 @@ async fn heartbeat_renews_for_owner_only() {
         .await
         .unwrap();
     assert!(renewed, "the owner renews its own lease");
-    let after = catalog.get_fine_tune_job("hb").await.unwrap();
+    let after = catalog.get_training_job("hb").await.unwrap();
     assert!(
         after.lease_expires_at.as_deref().unwrap() > first_lease.as_str(),
         "renewed lease must extend past the original deadline"
@@ -140,7 +140,7 @@ async fn heartbeat_renews_for_owner_only() {
 
     // Once the job leaves `running`, even the owner cannot heartbeat it.
     catalog
-        .update_fine_tune_status("hb", FineTuneJobStatus::Completed, None)
+        .update_training_status("hb", TrainingJobStatus::Completed, None)
         .await
         .unwrap();
     let post_complete = catalog
@@ -162,7 +162,7 @@ async fn reclaim_requeues_then_fails_when_attempts_exhausted() {
     register_base_model(&catalog).await;
 
     catalog
-        .create_fine_tune_job("rc", "q-base::1", "src.csv", "contrastive", "{}")
+        .create_training_job("rc", "q-base::1", "src.csv", "contrastive", "{}")
         .await
         .unwrap();
 
@@ -178,8 +178,8 @@ async fn reclaim_requeues_then_fails_when_attempts_exhausted() {
     // attempts (1) < max (2): the job is re-queued and its lease cleared.
     let actioned = catalog.reclaim_expired_training_jobs(2).await.unwrap();
     assert_eq!(actioned, 1, "the one expired lease is re-queued");
-    let requeued = catalog.get_fine_tune_job("rc").await.unwrap();
-    assert_eq!(requeued.status, FineTuneJobStatus::Queued.to_string());
+    let requeued = catalog.get_training_job("rc").await.unwrap();
+    assert_eq!(requeued.status, TrainingJobStatus::Queued.to_string());
     assert!(requeued.claimed_by.is_none(), "re-queue clears claimed_by");
     assert!(
         requeued.lease_expires_at.is_none(),
@@ -197,8 +197,8 @@ async fn reclaim_requeues_then_fails_when_attempts_exhausted() {
 
     let actioned = catalog.reclaim_expired_training_jobs(2).await.unwrap();
     assert_eq!(actioned, 1, "the exhausted lease is actioned once");
-    let failed = catalog.get_fine_tune_job("rc").await.unwrap();
-    assert_eq!(failed.status, FineTuneJobStatus::Failed.to_string());
+    let failed = catalog.get_training_job("rc").await.unwrap();
+    assert_eq!(failed.status, TrainingJobStatus::Failed.to_string());
     assert!(
         failed.lease_expires_at.is_none(),
         "a failed job carries no live lease"
@@ -221,7 +221,7 @@ async fn reclaim_leaves_live_leases_untouched() {
     register_base_model(&catalog).await;
 
     catalog
-        .create_fine_tune_job("live", "q-base::1", "src.csv", "contrastive", "{}")
+        .create_training_job("live", "q-base::1", "src.csv", "contrastive", "{}")
         .await
         .unwrap();
     catalog
@@ -232,6 +232,6 @@ async fn reclaim_leaves_live_leases_untouched() {
 
     let actioned = catalog.reclaim_expired_training_jobs(5).await.unwrap();
     assert_eq!(actioned, 0, "a live lease is not reclaimed");
-    let still_running = catalog.get_fine_tune_job("live").await.unwrap();
-    assert_eq!(still_running.status, FineTuneJobStatus::Running.to_string());
+    let still_running = catalog.get_training_job("live").await.unwrap();
+    assert_eq!(still_running.status, TrainingJobStatus::Running.to_string());
 }

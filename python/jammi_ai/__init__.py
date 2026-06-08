@@ -27,7 +27,7 @@ from jammi_client import LocalTarget, RemoteDatabase, Target, parse_target
 from jammi_ai._native import (
     open_local,
     Database,
-    FineTuneJob,
+    TrainingJob,
     ModelTask,
     PerQueryAudit,
     AuditHandle,
@@ -38,7 +38,7 @@ __all__ = [
     "connect",
     "Database",
     "RemoteDatabase",
-    "FineTuneJob",
+    "TrainingJob",
     "ModelTask",
     "PerQueryAudit",
     "AuditHandle",

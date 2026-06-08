@@ -22,7 +22,7 @@
 //! drops every same-key neighbour before pooling. A `split` predicate scopes
 //! the context to a train split so a target's own outcome stays held out.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{Array, FixedSizeListArray, Float32Array, RecordBatch};
@@ -31,7 +31,81 @@ use datafusion::prelude::{col, lit};
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 
+use crate::pipeline::graph_neighbourhood::EdgeGather;
 use crate::session::InferenceSession;
+
+/// How a context set's candidate members were assembled — a *fact* about the
+/// assembly, carried on [`ContextRepresentation::source`]. It is **not** an
+/// exchangeability judgment: the engine records how the context was built and
+/// lets governance decide whether a marginal conformal claim over it is sound
+/// (the S16-G coverage doctrine — the engine surfaces the fact, governance
+/// chooses the lever).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextSourceKind {
+    /// Embedding-similarity neighbours (`search(target, k)`).
+    Ann,
+    /// Declared-edge neighbours (a bounded, target-anchored walk).
+    Edges,
+    /// The union of both, pooled once.
+    Hybrid,
+}
+
+/// How a [`Hybrid`](ContextSource::Hybrid) context merges its ANN and declared-
+/// edge candidate sets. An enum (not a bool) so per-edge-type channels can be
+/// added without a breaking reshape; v1 ships `Union`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HybridMerge {
+    /// Union the candidate key sets (ANN first, in similarity order; then the
+    /// declared-edge neighbours not already present), dedup, pool once.
+    #[default]
+    Union,
+}
+
+/// The candidate-set source for a target's context: embedding-similar rows, a
+/// declared-edge walk, or both. The source selects only how the candidate keys
+/// are produced; everything after the gather (exclude-self → split → pool →
+/// hydrate) is the same S16 pipeline.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContextSource {
+    /// S16 retrieval: `search(query, k)` over the source's embedding table.
+    Ann {
+        /// Neighbourhood size.
+        k: usize,
+    },
+    /// A declared-edge walk anchored at the target (the target's row key, passed
+    /// as [`ContextRequest::exclude_key`], is the gather anchor).
+    Edges(EdgeGather),
+    /// Union of the ANN and declared-edge candidate sets, pooled once.
+    Hybrid {
+        /// ANN neighbourhood size for the retrieval arm.
+        ann_k: usize,
+        /// The declared-edge gather for the edge arm.
+        edges: EdgeGather,
+        /// How the two candidate sets merge.
+        merge: HybridMerge,
+    },
+}
+
+impl ContextSource {
+    /// The assembly-fact tag for this source.
+    pub fn kind(&self) -> ContextSourceKind {
+        match self {
+            ContextSource::Ann { .. } => ContextSourceKind::Ann,
+            ContextSource::Edges(_) => ContextSourceKind::Edges,
+            ContextSource::Hybrid { .. } => ContextSourceKind::Hybrid,
+        }
+    }
+
+    /// The post-exclusion/-split key cap, if the source bounds it by count. ANN
+    /// is `k`-bounded; an edge walk is bounded by hops/fan-out, not a count, so
+    /// it (and a hybrid union) keeps every gathered member.
+    fn max_keys(&self) -> Option<usize> {
+        match self {
+            ContextSource::Ann { k } => Some(*k),
+            ContextSource::Edges(_) | ContextSource::Hybrid { .. } => None,
+        }
+    }
+}
 
 /// Which permutation-invariant reduction the set encoder folds the neighbour
 /// vectors with. Maps one-to-one onto the engine's vector-aggregation UDAF
@@ -71,13 +145,15 @@ impl SetAggregator {
 /// vectors with [`Self::aggregator`].
 #[derive(Debug, Clone)]
 pub struct ContextRequest {
-    /// Source whose embedding table is retrieved against.
+    /// Source whose embedding table is retrieved against and whose rows the
+    /// context members are pooled and hydrated from.
     pub source_id: String,
-    /// The target's query vector — the point whose neighbourhood is the context.
+    /// The target's query vector — the point whose neighbourhood is the ANN /
+    /// hybrid context. (A pure-edge context anchors on `exclude_key` instead.)
     pub query: Vec<f32>,
-    /// Neighbourhood size. The retrieval over-fetches by one when
-    /// `exclude_self` is set, so a self-hit never shrinks the context below `k`.
-    pub k: usize,
+    /// Where the candidate members come from: ANN retrieval, a declared-edge
+    /// walk, or both. The ANN neighbourhood size lives here ([`ContextSource::Ann`]).
+    pub source: ContextSource,
     /// Label / outcome columns hydrated from the source for each context row.
     pub value_columns: Vec<String>,
     /// The pooling reduction the set encoder applies.
@@ -102,7 +178,7 @@ impl ContextRequest {
         Self {
             source_id: source_id.into(),
             query,
-            k,
+            source: ContextSource::Ann { k },
             value_columns: Vec::new(),
             aggregator: SetAggregator::Mean,
             exclude_self: true,
@@ -134,6 +210,10 @@ pub struct ContextRepresentation {
     /// the requested label/outcome columns, in retrieval order. Empty batches
     /// when no `value_columns` were requested.
     pub value_rows: Vec<RecordBatch>,
+    /// How this context was assembled (ANN / declared-edge / hybrid). A *fact*
+    /// the decoder and governance read — never an exchangeability judgment the
+    /// engine makes.
+    pub source: ContextSourceKind,
 }
 
 impl ContextRepresentation {
@@ -167,45 +247,41 @@ impl InferenceSession {
             .resolve_embedding_table(&request.source_id, None)
             .await?;
 
-        // Over-fetch by one when excluding self so a self-hit (the query vector
-        // is the target's own stored vector — the nearest neighbour of itself)
-        // never shrinks the surviving context below k.
-        let fetch_k = if request.exclude_self {
-            request.k.saturating_add(1)
-        } else {
-            request.k
-        };
-
-        let neighbours = self
-            .result_store()
-            .search_vectors(self.context(), &table, &request.query, fetch_k)
-            .await?;
+        // The candidate set — the only part that differs by source. Everything
+        // after this is the one shared tail (exclude-self → split → truncate →
+        // pool → hydrate), so ANN, edge, and hybrid contexts are leakage-scoped
+        // and pooled identically.
+        let mut context_keys = self.gather_candidates(request, &table).await?;
 
         // Self-exclusion (the leakage guard): drop every neighbour whose key
-        // matches the target's own key, then truncate back to k. A free-vector
-        // query carries no key, so nothing is dropped.
+        // matches the target's own key. A free-vector query carries no key, so
+        // nothing is dropped; an edge walk already excludes its anchor.
         let exclude = request
             .exclude_self
             .then_some(request.exclude_key.as_deref())
             .flatten();
-        let mut context_keys: Vec<String> = neighbours
-            .into_iter()
-            .map(|(key, _similarity)| key)
-            .filter(|key| Some(key.as_str()) != exclude)
-            .collect();
+        if let Some(exclude) = exclude {
+            context_keys.retain(|key| key.as_str() != exclude);
+        }
 
         // Split scope (the train/target leakage line): keep only the candidates
-        // whose source row satisfies the split predicate, before truncating to k.
+        // whose source row satisfies the split predicate, before any count cap.
         // Applied here rather than during retrieval because the predicate is over
         // the source's columns, which the ANN index does not carry. A predicate
         // no candidate satisfies yields an empty context — defined, not a crash.
+        // Expressing the split by a graph-locality column (component/cohort)
+        // keeps graph-adjacent rows on one side of the train/eval line.
         if let Some(split) = request.split.as_deref() {
             context_keys = self
                 .filter_keys_by_split(&request.source_id, &context_keys, split)
                 .await?;
         }
 
-        context_keys.truncate(request.k);
+        // An ANN context is `k`-bounded (over-fetched, then capped here); an edge
+        // walk is bounded by hops/fan-out, so it keeps every gathered member.
+        if let Some(max) = request.source.max_keys() {
+            context_keys.truncate(max);
+        }
 
         let context_vector = self
             .pool_context_vectors(&table, &context_keys, request.aggregator)
@@ -223,6 +299,86 @@ impl InferenceSession {
             context_size: context_keys.len(),
             context_keys,
             value_rows,
+            source: request.source.kind(),
+        })
+    }
+
+    /// Produce the candidate member keys for a context, in retrieval order — the
+    /// only step that differs by [`ContextSource`]. ANN over-fetches and ranks by
+    /// similarity; an edge source runs the bounded, target-anchored walk; a
+    /// hybrid unions the two (ANN first, then declared-edge members not already
+    /// present). Self-exclusion / split / cap / pool / hydrate all follow in the
+    /// shared tail of [`assemble_context`].
+    async fn gather_candidates(
+        self: &Arc<Self>,
+        request: &ContextRequest,
+        table: &ResultTableRecord,
+    ) -> Result<Vec<String>> {
+        match &request.source {
+            ContextSource::Ann { k } => {
+                self.ann_candidates(table, &request.query, *k, request.exclude_self)
+                    .await
+            }
+            ContextSource::Edges(gather) => {
+                let target = self.edge_anchor(request)?;
+                Ok(self.gather_edge_candidates(gather, target).await?.keys)
+            }
+            ContextSource::Hybrid {
+                ann_k,
+                edges,
+                merge,
+            } => {
+                let mut keys = self
+                    .ann_candidates(table, &request.query, *ann_k, request.exclude_self)
+                    .await?;
+                let target = self.edge_anchor(request)?;
+                let edge_keys = self.gather_edge_candidates(edges, target).await?.keys;
+                match merge {
+                    HybridMerge::Union => {
+                        let existing: HashSet<&str> = keys.iter().map(String::as_str).collect();
+                        let extra: Vec<String> = edge_keys
+                            .into_iter()
+                            .filter(|k| !existing.contains(k.as_str()))
+                            .collect();
+                        keys.extend(extra);
+                    }
+                }
+                Ok(keys)
+            }
+        }
+    }
+
+    /// The ANN candidate keys: `search(query, k)` over the embedding table,
+    /// over-fetching by one under self-exclusion so a self-hit never shrinks the
+    /// surviving context below `k`.
+    async fn ann_candidates(
+        &self,
+        table: &ResultTableRecord,
+        query: &[f32],
+        k: usize,
+        exclude_self: bool,
+    ) -> Result<Vec<String>> {
+        let fetch_k = if exclude_self { k.saturating_add(1) } else { k };
+        let neighbours = self
+            .result_store()
+            .search_vectors(self.context(), table, query, fetch_k)
+            .await?;
+        Ok(neighbours
+            .into_iter()
+            .map(|(key, _similarity)| key)
+            .collect())
+    }
+
+    /// The target key an edge walk anchors on — the target's own row key, passed
+    /// through `exclude_key`. A pure-edge context over a free-vector query has no
+    /// anchor and is a typed error, not a silent empty gather.
+    fn edge_anchor<'a>(&self, request: &'a ContextRequest) -> Result<&'a str> {
+        request.exclude_key.as_deref().ok_or_else(|| {
+            JammiError::Other(
+                "declared-edge context requires the target's row key (exclude_key) as the \
+                 gather anchor"
+                    .into(),
+            )
         })
     }
 
@@ -555,6 +711,12 @@ mod tests {
         assert!(r.exclude_self, "self-exclusion must default on");
         assert_eq!(r.aggregator, SetAggregator::Mean);
         assert!(r.split.is_none());
+        assert_eq!(
+            r.source,
+            ContextSource::Ann { k: 5 },
+            "the three-arg constructor builds an ANN source"
+        );
+        assert_eq!(r.source.kind(), ContextSourceKind::Ann);
     }
 
     #[test]
@@ -564,6 +726,7 @@ mod tests {
             context_size: 0,
             context_keys: Vec::new(),
             value_rows: Vec::new(),
+            source: ContextSourceKind::Ann,
         };
         assert!(rep.is_empty());
     }

@@ -52,6 +52,8 @@ use std::collections::{HashMap, HashSet};
 
 use jammi_db::error::{JammiError, Result};
 
+use crate::pipeline::graph_neighbourhood::{Adjacency, SplitMix64};
+
 /// Where an edge came from — the load-bearing distinction for the circularity
 /// contract. Tracked per edge so the sampler can report whether the supervision
 /// carries any signal the base metric does not already encode.
@@ -247,37 +249,6 @@ pub struct SampledPair {
     pub hard_negatives: Vec<String>,
 }
 
-/// A small, fast, self-contained PRNG (SplitMix64) so the sampler is
-/// reproducible from a seed without pulling a dependency into the data path.
-struct SplitMix64 {
-    state: u64,
-}
-
-impl SplitMix64 {
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// A uniform `f64` in `[0, 1)`.
-    fn next_f64(&mut self) -> f64 {
-        // 53 mantissa bits → exact uniform in [0, 1).
-        (self.next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
-    }
-
-    /// A uniform index in `[0, n)`. `n` must be `> 0`.
-    fn below(&mut self, n: usize) -> usize {
-        (self.next_f64() * n as f64) as usize % n
-    }
-}
-
 /// Samples a graph into contrastive text pairs via biased random walks.
 ///
 /// Holds the resolved node texts and a directed adjacency (forward, for walks)
@@ -291,9 +262,11 @@ pub struct GraphSampler {
     node_ids: Vec<String>,
     /// Forward adjacency for walks: node → its out-neighbours.
     out_adj: HashMap<String, Vec<String>>,
-    /// Undirected adjacency for the k-hop false-negative guard: an edge in
-    /// either direction makes the endpoints neighbours for exclusion purposes.
-    undirected_adj: HashMap<String, Vec<String>>,
+    /// Undirected adjacency for the k-hop false-negative guard and the node2vec
+    /// p/q bias: an edge in either direction makes the endpoints neighbours. The
+    /// shared [`Adjacency`] whose bounded BFS the k-hop exclusion walks — one
+    /// bounded-expansion core, shared with context assembly (S16-G).
+    undirected: Adjacency,
     /// Whether any edge is declared (vs similarity-only) — the circularity
     /// signal, computed at build time.
     has_declared: bool,
@@ -344,7 +317,7 @@ impl GraphSampler {
         }
 
         let mut out_adj: HashMap<String, Vec<String>> = HashMap::new();
-        let mut undirected_adj: HashMap<String, Vec<String>> = HashMap::new();
+        let mut undirected = Adjacency::new();
         let mut has_declared = false;
         for edge in &edges {
             for (which, endpoint) in [("src", &edge.src), ("dst", &edge.dst)] {
@@ -365,21 +338,15 @@ impl GraphSampler {
                 .push(edge.dst.clone());
             // Undirected neighbourhood for the false-negative guard: both
             // directions count as adjacency.
-            undirected_adj
-                .entry(edge.src.clone())
-                .or_default()
-                .push(edge.dst.clone());
-            undirected_adj
-                .entry(edge.dst.clone())
-                .or_default()
-                .push(edge.src.clone());
+            undirected.add_edge(edge.src.clone(), edge.dst.clone());
+            undirected.add_edge(edge.dst.clone(), edge.src.clone());
         }
 
         Ok(Self {
             nodes: node_map,
             node_ids,
             out_adj,
-            undirected_adj,
+            undirected,
             has_declared,
             config,
         })
@@ -479,14 +446,14 @@ impl GraphSampler {
     /// the unnormalised `α(prev, next)`. Uses weighted reservoir-free roulette
     /// over the small neighbour list.
     fn biased_choice(&self, prev: &str, neighbours: &[String], rng: &mut SplitMix64) -> String {
-        let prev_neighbours = self.undirected_adj.get(prev);
+        let prev_neighbours = self.undirected.neighbours(prev);
         let weights: Vec<f64> = neighbours
             .iter()
             .map(|next| {
                 if next == prev {
                     // Return to the previous node.
                     1.0 / self.config.return_p
-                } else if prev_neighbours.is_some_and(|pn| pn.iter().any(|n| n == next)) {
+                } else if prev_neighbours.iter().any(|n| n == next) {
                     // `next` is also adjacent to `prev`: distance 1, stay local.
                     1.0
                 } else {
@@ -514,27 +481,17 @@ impl GraphSampler {
     /// because a sampled "non-neighbour" inside this radius is most likely a
     /// missing edge — a true positive that would supply a false-negative
     /// gradient if used as a negative.
+    ///
+    /// Delegates to the shared [`Adjacency::bounded_frontier`] with the
+    /// exclusion bounds (include the start, no fan-out so the whole
+    /// neighbourhood is enumerated exactly) — the same bounded BFS the context
+    /// gather drives, never a second implementation.
     fn k_hop_neighbourhood(&self, start: &str) -> HashSet<String> {
-        let mut visited = HashSet::new();
-        visited.insert(start.to_string());
-        let mut frontier = vec![start.to_string()];
-        for _ in 0..self.config.exclude_hops {
-            let mut next = Vec::new();
-            for id in &frontier {
-                if let Some(neighbours) = self.undirected_adj.get(id) {
-                    for n in neighbours {
-                        if visited.insert(n.clone()) {
-                            next.push(n.clone());
-                        }
-                    }
-                }
-            }
-            if next.is_empty() {
-                break;
-            }
-            frontier = next;
-        }
-        visited
+        self.undirected
+            .bounded_frontier(start, self.config.exclude_hops, None, true, 0)
+            .keys
+            .into_iter()
+            .collect()
     }
 
     /// Mine up to `hard_negatives` structure-aware negatives for the `(anchor,
@@ -850,6 +807,42 @@ mod tests {
             .sample()
             .unwrap();
         assert_eq!(s1, s2, "same seed must yield the same pairs");
+    }
+
+    #[test]
+    fn k_hop_uses_the_shared_bounded_frontier() {
+        // The fine-tune k-hop exclusion and the S16-G context gather share ONE
+        // bounded BFS (`graph_neighbourhood::Adjacency::bounded_frontier`). This
+        // asserts the sampler's `k_hop_neighbourhood` is exactly that shared core
+        // driven with the exclusion bounds (undirected, include-start, no
+        // fan-out) — the DRY guarantee, not a second implementation.
+        use crate::pipeline::graph_neighbourhood::Adjacency;
+
+        let (nodes, edges) = two_community_graph();
+        let cfg = GraphSampleConfig {
+            exclude_hops: 2,
+            ..GraphSampleConfig::default()
+        };
+        let sampler = GraphSampler::build(nodes, edges.clone(), cfg).unwrap();
+
+        // The same undirected adjacency, built directly, walked by the shared
+        // provider with the exclusion bounds.
+        let mut adj = Adjacency::new();
+        for e in &edges {
+            adj.add_edge(e.src.clone(), e.dst.clone());
+            adj.add_edge(e.dst.clone(), e.src.clone());
+        }
+        let via_provider: HashSet<String> = adj
+            .bounded_frontier("a0", 2, None, true, 0)
+            .keys
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            sampler.k_hop_neighbourhood("a0"),
+            via_provider,
+            "k_hop is the shared bounded_frontier with the exclusion bounds — one BFS, two callers"
+        );
     }
 
     #[test]

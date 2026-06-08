@@ -16,7 +16,11 @@ use jammi_ai::local_session::{
     LocalSession, Modality, QueryInput, SearchQuery, SearchRequest, Session,
 };
 use jammi_ai::model::{ModelSource, ModelTask};
-use jammi_ai::pipeline::context_set::{ContextRequest, SetAggregator};
+use jammi_ai::pipeline::context_predictor::{ContextServeOptions, ContextServeSource};
+use jammi_ai::pipeline::context_set::{
+    ContextRequest, ContextSource, ContextSourceKind, HybridMerge, SetAggregator,
+};
+use jammi_ai::pipeline::graph_neighbourhood::{EdgeDirection, EdgeGather, EdgeSourceRef};
 use jammi_ai::session::InferenceSession;
 use jammi_db::config::JammiConfig;
 use jammi_db::error::JammiError;
@@ -931,8 +935,21 @@ impl PyDatabase {
     /// `source` is the source whose embedding table the live context is drawn
     /// from (it need not equal the training source — a predictor serves a target
     /// in any corpus of the same shape); `split` optionally scopes the serving
-    /// context.
-    #[pyo3(signature = (model_id, *, source, target_key, split = None))]
+    /// context. Passing `edge_source` (a registered edge table) assembles a
+    /// declared-edge context anchored at `target_key` instead of (or, with
+    /// `hybrid_ann_k`, in union with) the embedding-similarity context.
+    ///
+    /// The returned dict also carries `"source"` (`"ann"`/`"edges"`/`"hybrid"` —
+    /// how the context was assembled) and `"context_ref"` (the context member
+    /// keys), so a graph-conditioned prediction is never unattributed.
+    #[pyo3(signature = (
+        model_id, *, source, target_key, split = None,
+        edge_source = None, edge_src_column = None, edge_dst_column = None,
+        edge_type_column = None, edge_weight_column = None, edge_hops = None,
+        edge_fanout = None, edge_direction = None, edge_types = None,
+        min_weight = None, hybrid_ann_k = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn predict_with_context_predictor(
         &self,
         py: Python<'_>,
@@ -940,23 +957,63 @@ impl PyDatabase {
         source: &str,
         target_key: &str,
         split: Option<String>,
+        edge_source: Option<String>,
+        edge_src_column: Option<String>,
+        edge_dst_column: Option<String>,
+        edge_type_column: Option<String>,
+        edge_weight_column: Option<String>,
+        edge_hops: Option<usize>,
+        edge_fanout: Option<usize>,
+        edge_direction: Option<String>,
+        edge_types: Option<Vec<String>>,
+        min_weight: Option<f64>,
+        hybrid_ann_k: Option<usize>,
     ) -> PyResult<Py<PyAny>> {
         use jammi_ai::pipeline::context_predictor::PredictedDistribution;
 
+        let gather = edge_gather_from_kwargs(
+            edge_source,
+            edge_src_column,
+            edge_dst_column,
+            edge_type_column,
+            edge_weight_column,
+            edge_hops,
+            edge_fanout,
+            edge_direction,
+            edge_types,
+            min_weight,
+        )?;
+        let serve_source = match (gather, hybrid_ann_k) {
+            (None, _) => ContextServeSource::Ann,
+            (Some(edges), None) => ContextServeSource::Edges(edges),
+            (Some(edges), Some(ann_k)) => ContextServeSource::Hybrid {
+                ann_k,
+                edges,
+                merge: HybridMerge::Union,
+            },
+        };
+        let options = ContextServeOptions {
+            source: serve_source,
+            split,
+        };
+
         let served = self
-            .runtime
-            .block_on(self.session.load_context_predictor(model_id, source, split))
-            .map_err(to_pyerr)?;
-        let dist = self
             .runtime
             .block_on(
                 self.session
-                    .predict_with_context_predictor(&served, target_key),
+                    .load_context_predictor(model_id, source, options),
+            )
+            .map_err(to_pyerr)?;
+        let prediction = self
+            .runtime
+            .block_on(
+                self.session
+                    .predict_with_context_predictor_provenanced(&served, target_key),
             )
             .map_err(to_pyerr)?;
 
         let out = PyDict::new(py);
-        match dist {
+        match prediction.distribution {
             PredictedDistribution::Gaussian { mean, std } => {
                 out.set_item("kind", "gaussian")?;
                 out.set_item("mean", mean)?;
@@ -968,6 +1025,8 @@ impl PyDatabase {
                 out.set_item("levels", pairs)?;
             }
         }
+        out.set_item("source", context_source_tag(prediction.source))?;
+        out.set_item("context_ref", prediction.context_keys)?;
         Ok(out.into_any().unbind())
     }
 
@@ -1522,6 +1581,17 @@ impl PyDatabase {
         exclude_self = true,
         exclude_key = None,
         split = None,
+        edge_source = None,
+        edge_src_column = None,
+        edge_dst_column = None,
+        edge_type_column = None,
+        edge_weight_column = None,
+        edge_hops = None,
+        edge_fanout = None,
+        edge_direction = None,
+        edge_types = None,
+        min_weight = None,
+        hybrid = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn assemble_context(
@@ -1535,6 +1605,17 @@ impl PyDatabase {
         exclude_self: bool,
         exclude_key: Option<String>,
         split: Option<String>,
+        edge_source: Option<String>,
+        edge_src_column: Option<String>,
+        edge_dst_column: Option<String>,
+        edge_type_column: Option<String>,
+        edge_weight_column: Option<String>,
+        edge_hops: Option<usize>,
+        edge_fanout: Option<usize>,
+        edge_direction: Option<String>,
+        edge_types: Option<Vec<String>>,
+        min_weight: Option<f64>,
+        hybrid: bool,
     ) -> PyResult<Py<PyAny>> {
         let aggregator = match aggregator {
             None | Some("mean") => SetAggregator::Mean,
@@ -1547,7 +1628,32 @@ impl PyDatabase {
             }
         };
 
+        let gather = edge_gather_from_kwargs(
+            edge_source,
+            edge_src_column,
+            edge_dst_column,
+            edge_type_column,
+            edge_weight_column,
+            edge_hops,
+            edge_fanout,
+            edge_direction,
+            edge_types,
+            min_weight,
+        )?;
+        // ANN by default; a declared edge source switches to an edge walk, or a
+        // union of both when `hybrid` is set.
+        let context_source = match gather {
+            None => ContextSource::Ann { k },
+            Some(edges) if hybrid => ContextSource::Hybrid {
+                ann_k: k,
+                edges,
+                merge: HybridMerge::Union,
+            },
+            Some(edges) => ContextSource::Edges(edges),
+        };
+
         let mut request = ContextRequest::new(source, query, k);
+        request.source = context_source;
         request.value_columns = value_columns.unwrap_or_default();
         request.aggregator = aggregator;
         request.exclude_self = exclude_self;
@@ -1564,7 +1670,68 @@ impl PyDatabase {
         out.set_item("context_size", context.context_size)?;
         out.set_item("context_keys", context.context_keys)?;
         out.set_item("value_rows", batches_to_pyarrow(py, &context.value_rows)?)?;
+        out.set_item("source", context_source_tag(context.source))?;
         Ok(out.unbind().into())
+    }
+}
+
+/// Build a declared-edge gather ([`EdgeGather`]) from the Python edge kwargs, or
+/// `None` when no `edge_source` was given (the ANN-only default). Covers the
+/// "bring your own graph" case: a registered external edge source with the
+/// common gather knobs. (The S9 `neighbor_graph` edge source and as-of pinning
+/// are reachable through the Rust surface; the governance / continual half is the
+/// enterprise SDK.)
+#[allow(clippy::too_many_arguments)]
+fn edge_gather_from_kwargs(
+    edge_source: Option<String>,
+    edge_src_column: Option<String>,
+    edge_dst_column: Option<String>,
+    edge_type_column: Option<String>,
+    edge_weight_column: Option<String>,
+    edge_hops: Option<usize>,
+    edge_fanout: Option<usize>,
+    edge_direction: Option<String>,
+    edge_types: Option<Vec<String>>,
+    min_weight: Option<f64>,
+) -> PyResult<Option<EdgeGather>> {
+    let Some(source_id) = edge_source else {
+        return Ok(None);
+    };
+    let direction = match edge_direction.as_deref() {
+        None | Some("out") => EdgeDirection::Out,
+        Some("in") => EdgeDirection::In,
+        Some("undirected") => EdgeDirection::Undirected,
+        Some(o) => {
+            return Err(PyValueError::new_err(format!(
+                "edge_direction must be 'out', 'in', or 'undirected' (got '{o}')"
+            )))
+        }
+    };
+    let mut gather = EdgeGather::new(EdgeSourceRef::Registered {
+        source_id,
+        src_column: edge_src_column.unwrap_or_else(|| "src".into()),
+        dst_column: edge_dst_column.unwrap_or_else(|| "dst".into()),
+        type_column: edge_type_column,
+        weight_column: edge_weight_column,
+        as_of_column: None,
+    });
+    if let Some(h) = edge_hops {
+        gather.hops = h;
+    }
+    gather.fanout = edge_fanout;
+    gather.direction = direction;
+    gather.edge_types = edge_types;
+    gather.min_weight = min_weight;
+    Ok(Some(gather))
+}
+
+/// The string tag for a context's assembly fact, surfaced on a prediction so a
+/// Python consumer can see how the context was assembled.
+fn context_source_tag(kind: ContextSourceKind) -> &'static str {
+    match kind {
+        ContextSourceKind::Ann => "ann",
+        ContextSourceKind::Edges => "edges",
+        ContextSourceKind::Hybrid => "hybrid",
     }
 }
 

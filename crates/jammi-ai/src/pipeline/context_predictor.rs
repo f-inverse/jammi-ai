@@ -60,7 +60,10 @@ pub use jammi_encoders::ContextArchitecture;
 use crate::fine_tune::regression_loss;
 use crate::inference::adapter::distribution::{DistributionAdapter, DistributionForm};
 use crate::inference::adapter::{BackendOutput, OutputAdapter};
-use crate::pipeline::context_set::{ContextRequest, SetAggregator};
+use crate::pipeline::context_set::{
+    ContextRequest, ContextSource, ContextSourceKind, HybridMerge, SetAggregator,
+};
+use crate::pipeline::graph_neighbourhood::EdgeGather;
 use crate::pipeline::parallel_train::{train_loop, ParallelTrainConfig};
 use crate::predict::conformal::{ConformalModel, IntervalScore};
 use crate::session::InferenceSession;
@@ -763,11 +766,79 @@ impl PredictedDistribution {
     }
 }
 
+/// The live-context source a served predictor assembles each target's context
+/// from. `Ann` reproduces S16 retrieval (using the trained `context_k`);
+/// `Edges`/`Hybrid` re-gather against a *pinned* declared-edge snapshot so a
+/// graph-conditioned predictor conditions on the consumer's declared relations.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum ContextServeSource {
+    /// Embedding-similarity context (`search`), the trained `context_k` wide.
+    #[default]
+    Ann,
+    /// Declared-edge context: a bounded, target-anchored walk over a pinned
+    /// edge snapshot.
+    Edges(EdgeGather),
+    /// The union of ANN and declared-edge context, pooled once.
+    Hybrid {
+        /// ANN neighbourhood size for the retrieval arm.
+        ann_k: usize,
+        /// The declared-edge gather for the edge arm.
+        edges: EdgeGather,
+        /// How the two candidate sets merge.
+        merge: HybridMerge,
+    },
+}
+
+impl ContextServeSource {
+    /// The assembly-fact tag this serve source produces — the seam governance
+    /// (E8) reads to attribute a coverage outcome's context.
+    pub fn kind(&self) -> ContextSourceKind {
+        match self {
+            ContextServeSource::Ann => ContextSourceKind::Ann,
+            ContextServeSource::Edges(_) => ContextSourceKind::Edges,
+            ContextServeSource::Hybrid { .. } => ContextSourceKind::Hybrid,
+        }
+    }
+
+    /// Build the per-target [`ContextSource`] the live context is assembled from.
+    /// `Ann` uses the trained `context_k`; the edge/hybrid forms carry their own
+    /// bounds.
+    fn to_context_source(&self, context_k: usize) -> ContextSource {
+        match self {
+            ContextServeSource::Ann => ContextSource::Ann { k: context_k },
+            ContextServeSource::Edges(gather) => ContextSource::Edges(gather.clone()),
+            ContextServeSource::Hybrid {
+                ann_k,
+                edges,
+                merge,
+            } => ContextSource::Hybrid {
+                ann_k: *ann_k,
+                edges: edges.clone(),
+                merge: *merge,
+            },
+        }
+    }
+}
+
+/// Serving-time context options for a reloaded predictor: which live-context
+/// source to assemble against (ANN or a pinned declared-edge snapshot) and an
+/// optional serving-split predicate. [`Default`] is `(Ann, no split)` — exactly
+/// the embedding-only behaviour a predictor without a declared edge source has.
+#[derive(Debug, Clone, Default)]
+pub struct ContextServeOptions {
+    /// The live-context source.
+    pub source: ContextServeSource,
+    /// Optional serving-split predicate scoping the live context (e.g. a
+    /// `split <> 'test'` corpus); `None` retrieves over the whole table.
+    pub split: Option<String>,
+}
+
 /// A trained context predictor reloaded for inference: the rebuilt
 /// [`AnyContextPredictor`] with its persisted weights, the served distribution
 /// form, the source whose embedding table its live context is assembled from,
-/// and the retrieval knobs (`context_k`, the serving split). Inference-only — it
-/// holds no optimizer and the forward never mutates its [`VarMap`].
+/// and the retrieval knobs (`context_k`, the serving context source + split).
+/// Inference-only — it holds no optimizer and the forward never mutates its
+/// [`VarMap`].
 pub struct ServedContextPredictor {
     predictor: AnyContextPredictor,
     form: DistributionForm,
@@ -779,9 +850,9 @@ pub struct ServedContextPredictor {
     /// conditioning label an NP reads off the context, hydrated at serving time
     /// exactly as the episodic sampler hydrated it at training time.
     value_column: String,
-    /// Optional serving-split predicate scoping the live context (e.g. a
-    /// `split <> 'test'` corpus); `None` retrieves over the whole table.
-    split: Option<String>,
+    /// How the live context is assembled (ANN, or a pinned declared-edge
+    /// snapshot) and the optional serving-split predicate.
+    serve: ContextServeOptions,
     device: Device,
 }
 
@@ -789,6 +860,19 @@ impl ServedContextPredictor {
     /// The served distribution form (Gaussian or the exact quantile levels).
     pub fn form(&self) -> &DistributionForm {
         &self.form
+    }
+
+    /// How this predictor's live context is assembled — the assembly *fact*
+    /// (ANN / declared-edge / hybrid). The seam governance reads to attribute a
+    /// served outcome's context and decide whether a marginal coverage claim over
+    /// it is sound (E8). A fact, not an exchangeability judgment.
+    pub fn source_kind(&self) -> ContextSourceKind {
+        self.serve.source.kind()
+    }
+
+    /// The full serving context source (incl. any pinned edge snapshot + as-of).
+    pub fn serve_source(&self) -> &ContextServeSource {
+        &self.serve.source
     }
 }
 
@@ -800,16 +884,18 @@ impl InferenceSession {
     /// optimizer, and a `predict` forward never writes to the loaded varmap.
     ///
     /// `source_id` is the source whose embedding table the *live* context is
-    /// assembled from at serving time; `split` is an optional serving-split
-    /// predicate (the predictor conditions on a serving corpus, with the target
-    /// itself always excluded). It need not equal the training source — a
-    /// predictor meta-trained on one corpus serves a target's neighbourhood in
-    /// another of the same shape (the PFN inductive property).
+    /// assembled from at serving time; `options` carries the live-context source
+    /// (ANN, or a pinned declared-edge snapshot — [`ContextServeOptions`]) and an
+    /// optional serving-split predicate (the predictor conditions on a serving
+    /// corpus, with the target itself always excluded). The source need not equal
+    /// the training source — a predictor meta-trained on one corpus serves a
+    /// target's neighbourhood in another of the same shape (the PFN inductive
+    /// property). [`ContextServeOptions::default`] is embedding-only ANN context.
     pub async fn load_context_predictor(
         self: &Arc<Self>,
         model_id: &str,
         source_id: &str,
-        split: Option<String>,
+        options: ContextServeOptions,
     ) -> Result<ServedContextPredictor> {
         let record = self.catalog().get_model(model_id).await?.ok_or_else(|| {
             JammiError::Catalog(format!("context predictor '{model_id}' not found"))
@@ -926,7 +1012,7 @@ impl InferenceSession {
             feature_dim,
             context_k,
             value_column,
-            split,
+            serve: options,
             device,
         })
     }
@@ -946,11 +1032,37 @@ impl InferenceSession {
     /// Inference-only: the predictor's [`VarMap`] is never handed to an
     /// optimizer and `forward` does not write to it, so the served weights are
     /// byte-identical before and after.
+    ///
+    /// This is the bare-distribution wrapper over
+    /// [`predict_with_context_predictor_provenanced`](Self::predict_with_context_predictor_provenanced);
+    /// reach for the provenanced form when the context member keys and the
+    /// assembly `source` fact matter (the never-unattributed coverage contract).
     pub async fn predict_with_context_predictor(
         self: &Arc<Self>,
         served: &ServedContextPredictor,
         target_key: &str,
     ) -> Result<PredictedDistribution> {
+        Ok(self
+            .predict_with_context_predictor_provenanced(served, target_key)
+            .await?
+            .distribution)
+    }
+
+    /// Predict a target's distribution **with its context provenance**: the
+    /// served distribution plus the assembly `source` fact (ANN / declared-edge /
+    /// hybrid) and the context member keys.
+    ///
+    /// A graph-conditioned prediction is therefore never *unattributed*: the
+    /// `source` fact and the neighbour keys ride out of the serving layer so
+    /// governance can see how the context was built and decide whether a marginal
+    /// coverage claim over it is sound — exactly the seam S16-G's coverage
+    /// doctrine requires (the engine surfaces the fact; governance chooses the
+    /// lever).
+    pub async fn predict_with_context_predictor_provenanced(
+        self: &Arc<Self>,
+        served: &ServedContextPredictor,
+        target_key: &str,
+    ) -> Result<PredictionWithProvenance> {
         let target_x = self
             .read_vector_by_key(&served.table, target_key)
             .await?
@@ -963,9 +1075,12 @@ impl InferenceSession {
 
         let mut request =
             ContextRequest::new(&served.source_id, target_x.clone(), served.context_k);
+        // The live context is assembled from the served source: ANN retrieval,
+        // or a pinned declared-edge snapshot, exactly as configured at load.
+        request.source = served.serve.source.to_context_source(served.context_k);
         request.exclude_self = true;
         request.exclude_key = Some(target_key.to_string());
-        request.split = served.split.clone();
+        request.split = served.serve.split.clone();
         request.aggregator = SetAggregator::Mean;
         // Hydrate the members' outcomes — the conditioning label an NP reads off
         // its context. Serving conditions on the same `(x, y)` members training
@@ -973,6 +1088,8 @@ impl InferenceSession {
         // episodic sampler did.
         request.value_columns = vec![served.value_column.clone()];
         let rep = self.assemble_context(&request).await?;
+        let source = rep.source;
+        let context_keys = rep.context_keys.clone();
         let member_x = self
             .read_member_vectors(&served.table, &rep.context_keys)
             .await?;
@@ -1007,8 +1124,28 @@ impl InferenceSession {
             .predictor
             .forward(&episode)
             .map_err(|e| JammiError::Inference(format!("context predictor forward: {e}")))?;
-        distribution_from_head(&head, &served.form)
+        let distribution = distribution_from_head(&head, &served.form)?;
+        Ok(PredictionWithProvenance {
+            distribution,
+            source,
+            context_keys,
+        })
     }
+}
+
+/// A served prediction with the provenance the coverage layer attributes it by:
+/// the predictive distribution, the assembly `source` fact, and the context
+/// member keys. The `source` fact and keys are what ride the uncertainty-channel
+/// `context_ref` provenance — so a marginal claim over a graph-assembled context
+/// is never unattributed (the S16-G coverage contract).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PredictionWithProvenance {
+    /// The served predictive distribution (Gaussian or quantiles).
+    pub distribution: PredictedDistribution,
+    /// How the conditioning context was assembled (ANN / declared-edge / hybrid).
+    pub source: ContextSourceKind,
+    /// The context member keys, in retrieval order — the neighbour provenance.
+    pub context_keys: Vec<String>,
 }
 
 /// Turn a `[1, head_width]` head tensor into a [`PredictedDistribution`] through
@@ -1083,12 +1220,18 @@ impl ConformalContextPredictor {
     ///
     /// A Gaussian head wraps with absolute-residual conformal centred on the
     /// predictive mean; a quantile head wraps with CQR over its lower/upper
-    /// served quantiles — the score family the calibration chose.
-    pub fn interval(&self, prediction: &PredictedDistribution) -> Result<(f64, f64)> {
+    /// served quantiles — the score family the calibration chose. `group` is the
+    /// test target's cohort for a Mondrian (group-conditional) wrap — supplied by
+    /// governance, `None` for a marginal wrap; the engine never derives it.
+    pub fn interval(
+        &self,
+        prediction: &PredictedDistribution,
+        group: Option<&str>,
+    ) -> Result<(f64, f64)> {
         match &self.form {
             DistributionForm::Gaussian => {
                 self.conformal
-                    .predict_interval(prediction.point_estimate() as f64, 0.0, 0.0, None)
+                    .predict_interval(prediction.point_estimate() as f64, 0.0, 0.0, group)
             }
             DistributionForm::Quantile { .. } => {
                 let (lo, hi) = prediction.quantile_bounds().ok_or_else(|| {
@@ -1097,10 +1240,37 @@ impl ConformalContextPredictor {
                     )
                 })?;
                 self.conformal
-                    .predict_interval(0.0, lo as f64, hi as f64, None)
+                    .predict_interval(0.0, lo as f64, hi as f64, group)
             }
         }
     }
+}
+
+/// The conformal calibration lever a caller / governance supplies. The engine
+/// **applies** the chosen lever; it never **chooses** one. `Marginal` is the
+/// default and always serves; `Mondrian`/`Weighted` route to the group-
+/// conditional / importance-weighted S17 constructors with caller-supplied
+/// cohorts / weights (one per calibration point).
+///
+/// Graph-assembled context can break the exchangeability split-conformal
+/// *marginal* coverage assumes; the levers are the honest repair — but *which*
+/// cohort or weights, and *whether* to apply them, is governance's call (the
+/// verbatim doctrine: "choosing the cohorts is governance, not a serving
+/// output"). The engine surfaces the `source` fact and applies what it is told.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConformalLevers {
+    /// Plain marginal split-conformal (the default; always serves).
+    Marginal,
+    /// Group-conditional (Mondrian): one cohort key per calibration point.
+    Mondrian {
+        /// Cohort key per calibration point, in calibration order.
+        groups: Vec<String>,
+    },
+    /// Importance-weighted: one weight per calibration point (NAPS / Barber).
+    Weighted {
+        /// Non-negative weight per calibration point, in calibration order.
+        weights: Vec<f64>,
+    },
 }
 
 impl InferenceSession {
@@ -1114,16 +1284,47 @@ impl InferenceSession {
     /// `max(q_lo - y, y - q_hi)` for a quantile head (CQR). The finite-sample
     /// quantile of those scores at `alpha` is the wrap's threshold. Composes S17
     /// — it does not modify the conformal primitive, only feeds it.
+    ///
+    /// `levers` is the caller / governance choice of marginal (the default,
+    /// which always serves), Mondrian (group-conditional), or weighted
+    /// (importance-weighted) calibration — *applied* here, never *chosen* here.
+    /// Graph-assembled context can break exchangeability; supplying a cohort or
+    /// weights is the honest repair, but the choice is governance's, not the
+    /// engine's (the verbatim conformal doctrine).
     pub async fn calibrate_context_predictor_conformal(
         self: &Arc<Self>,
         served: &ServedContextPredictor,
         calibration: &[(String, f64)],
         alpha: f64,
+        levers: ConformalLevers,
     ) -> Result<ConformalContextPredictor> {
         if calibration.is_empty() {
             return Err(JammiError::Inference(
                 "conformal calibration requires at least one held-out target".into(),
             ));
+        }
+        // A supplied lever carries one cohort / weight per calibration point;
+        // a length mismatch is a typed error, never a silent misalignment.
+        match &levers {
+            ConformalLevers::Marginal => {}
+            ConformalLevers::Mondrian { groups } if groups.len() == calibration.len() => {}
+            ConformalLevers::Weighted { weights } if weights.len() == calibration.len() => {}
+            ConformalLevers::Mondrian { groups } => {
+                return Err(JammiError::Inference(format!(
+                    "Mondrian conformal needs one cohort per calibration point: \
+                     {} cohorts vs {} points",
+                    groups.len(),
+                    calibration.len()
+                )))
+            }
+            ConformalLevers::Weighted { weights } => {
+                return Err(JammiError::Inference(format!(
+                    "weighted conformal needs one weight per calibration point: \
+                     {} weights vs {} points",
+                    weights.len(),
+                    calibration.len()
+                )))
+            }
         }
 
         let mut predictions = Vec::with_capacity(calibration.len());
@@ -1147,21 +1348,34 @@ impl InferenceSession {
             observed.push(*y);
         }
 
-        let conformal = match &served.form {
-            DistributionForm::Gaussian => ConformalModel::regression(
+        let score = match &served.form {
+            DistributionForm::Gaussian => IntervalScore::AbsoluteResidual,
+            DistributionForm::Quantile { .. } => IntervalScore::Cqr,
+        };
+        // The score family decides which arrays carry signal (point estimates for
+        // absolute-residual, quantile bounds for CQR); the lever decides which
+        // existing S17 constructor those feed. `Marginal` reproduces the plain
+        // split-conformal interval exactly.
+        let conformal = match &levers {
+            ConformalLevers::Marginal => {
+                ConformalModel::regression(&predictions, &lower, &upper, &observed, score, alpha)?
+            }
+            ConformalLevers::Mondrian { groups } => ConformalModel::regression_mondrian(
                 &predictions,
-                &[],
-                &[],
-                &observed,
-                IntervalScore::AbsoluteResidual,
-                alpha,
-            )?,
-            DistributionForm::Quantile { .. } => ConformalModel::regression(
-                &[],
                 &lower,
                 &upper,
                 &observed,
-                IntervalScore::Cqr,
+                groups,
+                score,
+                alpha,
+            )?,
+            ConformalLevers::Weighted { weights } => ConformalModel::regression_weighted(
+                &predictions,
+                &lower,
+                &upper,
+                &observed,
+                weights,
+                score,
                 alpha,
             )?,
         };

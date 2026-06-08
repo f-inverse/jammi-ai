@@ -951,10 +951,13 @@ class RemoteDatabase:
     ) -> training_pb2.FineTuneConfig:
         """Build the wire `FineTuneConfig` from the embed binding's flat kwargs.
 
-        An omitted scalar leaves the field at the proto default `0`, which the
-        engine's decode reads as "use the engine default" (the same as an absent
-        kwarg in the embed binding). Only fields a caller actually set are stamped
-        onto the message, so the engine fills the rest from `FineTuneConfig::default`.
+        Every scalar knob on the proto has explicit presence (`optional`), so an
+        omitted kwarg leaves its field UNSET on the wire — not stamped to a proto
+        default `0`. The server decode starts from `FineTuneConfig::default()` and
+        overrides a field only when it is present, so an unset field resolves to
+        the engine default (never a literal zero). Only the fields a caller
+        actually set are sent; the engine fills the rest. The engine is the single
+        source of default values, so this client duplicates none of them.
         """
         config = training_pb2.FineTuneConfig()
         loss = _embedding_loss_message(

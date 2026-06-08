@@ -155,26 +155,29 @@ message HardNegativeConfig {
 
 // Configuration for a fine-tuning job. Mirrors the engine's `FineTuneConfig`
 // field for field; every field is read by the trainer or the LoRA builder.
-// `embedding_loss`/`classification_loss` are unset to let the engine
-// auto-select from the data format; `layers_to_transform` is unset for "all
-// layers". The enum-typed fields default to the engine's default variant when
-// left UNSPECIFIED, matching `FineTuneConfig::default()`.
+// Every scalar knob is `optional` so an unset field is distinguishable from a
+// legal `0`/`false`: the server reads an unset field as "apply the engine
+// default" (`FineTuneConfig::default()`) and a present field as an override,
+// making the engine the single source of default values. `embedding_loss`/
+// `classification_loss` are unset to let the engine auto-select from the data
+// format; `layers_to_transform` is unset for "all layers". The enum-typed
+// fields default to the engine's default variant when left UNSPECIFIED.
 message FineTuneConfig {
-  uint32 lora_rank = 1;
-  double lora_alpha = 2;
-  double lora_dropout = 3;
-  double learning_rate = 4;
-  uint32 epochs = 5;
-  uint32 batch_size = 6;
-  uint32 max_seq_length = 7;
+  optional uint32 lora_rank = 1;
+  optional double lora_alpha = 2;
+  optional double lora_dropout = 3;
+  optional double learning_rate = 4;
+  optional uint32 epochs = 5;
+  optional uint32 batch_size = 6;
+  optional uint32 max_seq_length = 7;
   // Unset = auto-select from the data format.
   optional EmbeddingLoss embedding_loss = 8;
   // Unset = auto-select from the data format.
   optional ClassificationLoss classification_loss = 9;
-  uint32 gradient_accumulation_steps = 10;
-  double validation_fraction = 11;
-  uint32 early_stopping_patience = 12;
-  uint32 warmup_steps = 13;
+  optional uint32 gradient_accumulation_steps = 10;
+  optional double validation_fraction = 11;
+  optional uint32 early_stopping_patience = 12;
+  optional uint32 warmup_steps = 13;
   LrSchedule lr_schedule = 14;
   EarlyStoppingMetric early_stopping_metric = 15;
   // Layer-name suffixes that receive LoRA adapters. Empty = projection head
@@ -182,16 +185,16 @@ message FineTuneConfig {
   repeated string target_modules = 16;
   // Unset = all layers.
   optional LayersToTransform layers_to_transform = 17;
-  bool use_rslora = 18;
+  optional bool use_rslora = 18;
   // Per-module rank overrides keyed by module-name substring.
   map<string, uint32> rank_pattern = 19;
   LoraInitMode init_lora_weights = 20;
   BackboneDtype backbone_dtype = 21;
-  double weight_decay = 22;
-  double max_grad_norm = 23;
+  optional double weight_decay = 22;
+  optional double max_grad_norm = 23;
   // GradCache: two-pass in-batch-negative training that enlarges the effective
   // negative pool without the memory cost. Only affects MultipleNegativesRanking.
-  bool cached = 24;
+  optional bool cached = 24;
   // Hard-negative mining over jammi's own ANN index. Field absent = mining off.
   optional HardNegativeConfig hard_negatives = 25;
   // Matryoshka prefix dimensions. Empty = full dimension only.

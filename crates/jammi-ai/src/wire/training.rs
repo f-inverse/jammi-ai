@@ -1,9 +1,12 @@
 //! `TrainingService` proto↔domain conversions.
 //!
 //! The request `FineTuneConfig` mirrors the engine's [`FineTuneConfig`] field
-//! for field; decode maps it (and its nested loss / enum types) onto the engine
-//! struct, leaving the engine's defaults for any field left `UNSPECIFIED` (an
-//! absent `config` message → the engine default entirely). The `StartTraining`
+//! for field; decode starts from [`FineTuneConfig::default()`] and overrides a
+//! field only when the wire carries it — each scalar knob has explicit presence
+//! (`optional`), so an unset field resolves to the engine default rather than a
+//! literal zero, and an absent `config` message → the engine default entirely.
+//! The engine is thus the single source of default values for every client. The
+//! `StartTraining`
 //! spec `oneof` mirrors the engine's [`TrainingSpec`] enum variant-for-variant,
 //! field-for-field: a decoded request reconstructs the identical engine spec, so
 //! a remote-submitted job is byte-identical to one submitted in-process.
@@ -389,70 +392,105 @@ fn gaussian_objective_to_proto(o: GaussianObjective) -> pb::GaussianObjective {
 
 /// Map the wire [`pb::FineTuneConfig`] onto the engine's [`FineTuneConfig`].
 ///
-/// Every numeric field carries straight through. The optional loss messages map
-/// to `Option<…Loss>` (unset → engine auto-selects from the data format). The
+/// The engine is the single source of default values: decode starts from
+/// [`FineTuneConfig::default()`] and overrides a field only when the wire
+/// carries it. Each scalar knob has explicit presence (`optional`), so an unset
+/// field is distinguishable from a legal `0`/`false` and resolves to the engine
+/// default rather than a literal zero. The optional loss messages map to
+/// `Option<…Loss>` (unset → engine auto-selects from the data format). The
 /// enum-typed fields fall back to the engine default variant when left
-/// `UNSPECIFIED`, so a config that sets only the numeric knobs behaves exactly
+/// `UNSPECIFIED`. A config that sets only a handful of knobs behaves exactly
 /// like `FineTuneConfig::default()` for the rest.
 impl TryFrom<pb::FineTuneConfig> for FineTuneConfig {
     type Error = Status;
 
     fn try_from(c: pb::FineTuneConfig) -> Result<Self, Self::Error> {
-        let defaults = FineTuneConfig::default();
-        Ok(FineTuneConfig {
-            lora_rank: c.lora_rank as usize,
-            lora_alpha: c.lora_alpha,
-            lora_dropout: c.lora_dropout,
-            learning_rate: c.learning_rate,
-            epochs: c.epochs as usize,
-            batch_size: c.batch_size as usize,
-            max_seq_length: c.max_seq_length as usize,
-            embedding_loss: c
-                .embedding_loss
-                .map(embedding_loss_from_proto)
-                .transpose()?,
-            classification_loss: c
-                .classification_loss
-                .map(classification_loss_from_proto)
-                .transpose()?,
-            gradient_accumulation_steps: c.gradient_accumulation_steps as usize,
-            validation_fraction: c.validation_fraction,
-            early_stopping_patience: c.early_stopping_patience as usize,
-            warmup_steps: c.warmup_steps as usize,
-            lr_schedule: lr_schedule_from_proto(c.lr_schedule, defaults.lr_schedule)?,
-            early_stopping_metric: early_stopping_metric_from_proto(
-                c.early_stopping_metric,
-                defaults.early_stopping_metric,
-            )?,
-            target_modules: c.target_modules,
-            layers_to_transform: c
-                .layers_to_transform
-                .map(|l| l.layers.into_iter().map(|n| n as usize).collect()),
-            use_rslora: c.use_rslora,
-            rank_pattern: c
+        let mut cfg = FineTuneConfig::default();
+
+        if let Some(v) = c.lora_rank {
+            cfg.lora_rank = v as usize;
+        }
+        if let Some(v) = c.lora_alpha {
+            cfg.lora_alpha = v;
+        }
+        if let Some(v) = c.lora_dropout {
+            cfg.lora_dropout = v;
+        }
+        if let Some(v) = c.learning_rate {
+            cfg.learning_rate = v;
+        }
+        if let Some(v) = c.epochs {
+            cfg.epochs = v as usize;
+        }
+        if let Some(v) = c.batch_size {
+            cfg.batch_size = v as usize;
+        }
+        if let Some(v) = c.max_seq_length {
+            cfg.max_seq_length = v as usize;
+        }
+        if let Some(loss) = c.embedding_loss {
+            cfg.embedding_loss = Some(embedding_loss_from_proto(loss)?);
+        }
+        if let Some(loss) = c.classification_loss {
+            cfg.classification_loss = Some(classification_loss_from_proto(loss)?);
+        }
+        if let Some(v) = c.gradient_accumulation_steps {
+            cfg.gradient_accumulation_steps = v as usize;
+        }
+        if let Some(v) = c.validation_fraction {
+            cfg.validation_fraction = v;
+        }
+        if let Some(v) = c.early_stopping_patience {
+            cfg.early_stopping_patience = v as usize;
+        }
+        if let Some(v) = c.warmup_steps {
+            cfg.warmup_steps = v as usize;
+        }
+        cfg.lr_schedule = lr_schedule_from_proto(c.lr_schedule, cfg.lr_schedule)?;
+        cfg.early_stopping_metric =
+            early_stopping_metric_from_proto(c.early_stopping_metric, cfg.early_stopping_metric)?;
+        if !c.target_modules.is_empty() {
+            cfg.target_modules = c.target_modules;
+        }
+        if let Some(l) = c.layers_to_transform {
+            cfg.layers_to_transform = Some(l.layers.into_iter().map(|n| n as usize).collect());
+        }
+        if let Some(v) = c.use_rslora {
+            cfg.use_rslora = v;
+        }
+        if !c.rank_pattern.is_empty() {
+            cfg.rank_pattern = c
                 .rank_pattern
                 .into_iter()
                 .map(|(k, v)| (k, v as usize))
-                .collect(),
-            init_lora_weights: lora_init_mode_from_proto(
-                c.init_lora_weights,
-                defaults.init_lora_weights,
-            )?,
-            backbone_dtype: backbone_dtype_from_proto(c.backbone_dtype, defaults.backbone_dtype)?,
-            weight_decay: c.weight_decay,
-            max_grad_norm: c.max_grad_norm,
-            cached: c.cached,
-            hard_negatives: c
-                .hard_negatives
-                .map(hard_negatives_from_proto)
-                .unwrap_or_default(),
-            matryoshka_dims: c.matryoshka_dims.into_iter().map(|d| d as usize).collect(),
-            regression_loss: c
-                .regression_loss
-                .map(regression_loss_from_proto)
-                .transpose()?,
-            quantile_levels: c.quantile_levels,
-        })
+                .collect();
+        }
+        cfg.init_lora_weights =
+            lora_init_mode_from_proto(c.init_lora_weights, cfg.init_lora_weights)?;
+        cfg.backbone_dtype = backbone_dtype_from_proto(c.backbone_dtype, cfg.backbone_dtype)?;
+        if let Some(v) = c.weight_decay {
+            cfg.weight_decay = v;
+        }
+        if let Some(v) = c.max_grad_norm {
+            cfg.max_grad_norm = v;
+        }
+        if let Some(v) = c.cached {
+            cfg.cached = v;
+        }
+        if let Some(h) = c.hard_negatives {
+            cfg.hard_negatives = hard_negatives_from_proto(h);
+        }
+        if !c.matryoshka_dims.is_empty() {
+            cfg.matryoshka_dims = c.matryoshka_dims.into_iter().map(|d| d as usize).collect();
+        }
+        if let Some(loss) = c.regression_loss {
+            cfg.regression_loss = Some(regression_loss_from_proto(loss)?);
+        }
+        if !c.quantile_levels.is_empty() {
+            cfg.quantile_levels = c.quantile_levels;
+        }
+
+        Ok(cfg)
     }
 }
 
@@ -581,22 +619,22 @@ pub fn method_to_proto(method: FineTuneMethod) -> pb::FineTuneMethod {
 /// wire fields.
 pub fn config_to_proto(config: &FineTuneConfig) -> pb::FineTuneConfig {
     pb::FineTuneConfig {
-        lora_rank: config.lora_rank as u32,
-        lora_alpha: config.lora_alpha,
-        lora_dropout: config.lora_dropout,
-        learning_rate: config.learning_rate,
-        epochs: config.epochs as u32,
-        batch_size: config.batch_size as u32,
-        max_seq_length: config.max_seq_length as u32,
+        lora_rank: Some(config.lora_rank as u32),
+        lora_alpha: Some(config.lora_alpha),
+        lora_dropout: Some(config.lora_dropout),
+        learning_rate: Some(config.learning_rate),
+        epochs: Some(config.epochs as u32),
+        batch_size: Some(config.batch_size as u32),
+        max_seq_length: Some(config.max_seq_length as u32),
         embedding_loss: config.embedding_loss.as_ref().map(embedding_loss_to_proto),
         classification_loss: config
             .classification_loss
             .as_ref()
             .map(|l| classification_loss_to_proto(l) as i32),
-        gradient_accumulation_steps: config.gradient_accumulation_steps as u32,
-        validation_fraction: config.validation_fraction,
-        early_stopping_patience: config.early_stopping_patience as u32,
-        warmup_steps: config.warmup_steps as u32,
+        gradient_accumulation_steps: Some(config.gradient_accumulation_steps as u32),
+        validation_fraction: Some(config.validation_fraction),
+        early_stopping_patience: Some(config.early_stopping_patience as u32),
+        warmup_steps: Some(config.warmup_steps as u32),
         lr_schedule: lr_schedule_to_proto(config.lr_schedule) as i32,
         early_stopping_metric: early_stopping_metric_to_proto(config.early_stopping_metric) as i32,
         target_modules: config.target_modules.clone(),
@@ -605,7 +643,7 @@ pub fn config_to_proto(config: &FineTuneConfig) -> pb::FineTuneConfig {
                 layers: layers.iter().map(|n| *n as u32).collect(),
             }
         }),
-        use_rslora: config.use_rslora,
+        use_rslora: Some(config.use_rslora),
         rank_pattern: config
             .rank_pattern
             .iter()
@@ -613,9 +651,9 @@ pub fn config_to_proto(config: &FineTuneConfig) -> pb::FineTuneConfig {
             .collect(),
         init_lora_weights: lora_init_mode_to_proto(config.init_lora_weights) as i32,
         backbone_dtype: backbone_dtype_to_proto(config.backbone_dtype) as i32,
-        weight_decay: config.weight_decay,
-        max_grad_norm: config.max_grad_norm,
-        cached: config.cached,
+        weight_decay: Some(config.weight_decay),
+        max_grad_norm: Some(config.max_grad_norm),
+        cached: Some(config.cached),
         // Always encoded so a round-trip preserves the k/hop/refresh knobs even
         // when mining is off; the decode treats an absent message as "off".
         hard_negatives: Some(hard_negatives_to_proto(&config.hard_negatives)),
@@ -701,5 +739,75 @@ fn backbone_dtype_to_proto(dtype: BackboneDtype) -> pb::BackboneDtype {
         BackboneDtype::F32 => pb::BackboneDtype::F32,
         BackboneDtype::BF16 => pb::BackboneDtype::Bf16,
         BackboneDtype::F16 => pb::BackboneDtype::F16,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An all-unset wire config — the shape a remote client builds when the
+    /// caller omits every hyperparameter. With explicit presence on every
+    /// scalar, this decodes to exactly the engine default: an omitted field is
+    /// the engine default, never a literal `0`/`false`. This is the regression
+    /// the pre-fix raw-cast decode silently broke (it read each scalar as `0`,
+    /// disabling weight decay / clipping / dropout / warmup / val split, or
+    /// failing validation outright on the count knobs).
+    #[test]
+    fn all_unset_config_decodes_to_engine_default() {
+        let proto = pb::FineTuneConfig::default();
+        let decoded = FineTuneConfig::try_from(proto).expect("all-unset config decodes");
+        assert_eq!(decoded, FineTuneConfig::default());
+
+        // Spot-check the default-bearing scalars that a literal-zero decode
+        // would have silently zeroed out, training a materially different model.
+        assert_eq!(decoded.weight_decay, 0.01);
+        assert_eq!(decoded.max_grad_norm, 1.0);
+        assert_eq!(decoded.lora_dropout, 0.05);
+        assert_eq!(decoded.warmup_steps, 100);
+        assert_eq!(decoded.validation_fraction, 0.1);
+        // And the count knobs a literal-zero decode would have failed validation
+        // on resolve to their non-zero engine defaults instead.
+        assert_eq!(decoded.lora_rank, 8);
+        assert_eq!(decoded.epochs, 3);
+        assert_eq!(decoded.batch_size, 8);
+    }
+
+    /// A partially-set wire config overrides exactly the present fields and
+    /// leaves every other field at the engine default — including a legal `0`
+    /// override (`warmup_steps = 0` to disable warmup), which is now
+    /// distinguishable from an unset field.
+    #[test]
+    fn partial_config_overrides_only_present_fields() {
+        let proto = pb::FineTuneConfig {
+            lora_rank: Some(16),
+            learning_rate: Some(1e-3),
+            // A legal zero override: explicit "no warmup", distinct from unset.
+            warmup_steps: Some(0),
+            ..Default::default()
+        };
+        let decoded = FineTuneConfig::try_from(proto).expect("partial config decodes");
+
+        let defaults = FineTuneConfig::default();
+        assert_eq!(decoded.lora_rank, 16);
+        assert_eq!(decoded.learning_rate, 1e-3);
+        assert_eq!(decoded.warmup_steps, 0);
+        // Untouched fields stay at the engine default.
+        assert_eq!(decoded.weight_decay, defaults.weight_decay);
+        assert_eq!(decoded.max_grad_norm, defaults.max_grad_norm);
+        assert_eq!(decoded.epochs, defaults.epochs);
+        assert_eq!(decoded.batch_size, defaults.batch_size);
+        assert_eq!(decoded.lora_dropout, defaults.lora_dropout);
+    }
+
+    /// The full-config send side round-trips: encoding the engine default and
+    /// decoding it back yields the engine default. This pins the `RemoteSession`
+    /// path (which sends a full config) against the now-optional fields.
+    #[test]
+    fn config_to_proto_round_trips_through_decode() {
+        let original = FineTuneConfig::default();
+        let proto = config_to_proto(&original);
+        let decoded = FineTuneConfig::try_from(proto).expect("round-trip decodes");
+        assert_eq!(decoded, original);
     }
 }

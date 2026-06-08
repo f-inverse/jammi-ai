@@ -265,14 +265,24 @@ async fn remote_eval_reconstructs_the_exact_error_variant() {
 }
 
 /// Fine-tune `start` over the wire, exercising the full request encode
-/// (method + task + a populated `FineTuneConfig`). The patents corpus carries
-/// no training-format columns, so the engine rejects the request with a
-/// `JammiError::FineTune` format-detection error *before* any training runs —
-/// a real, deterministic, hermetic failure. Both transports must reconstruct
-/// the identical `FineTune` variant + message, proving the `fine_tune` request
-/// (config and all) crosses the wire and the typed error round-trips.
+/// (method + task + a populated `FineTuneConfig`). `fine_tune` is submit-only:
+/// it persists a `queued` job and returns a job id immediately — the format
+/// detection that the patents corpus (no training-format columns) fails now
+/// happens in the worker, surfacing as a *failed job*, not a synchronous error
+/// from the submit call. The engine-backed server mounts the train tier, which
+/// runs an embedded worker against the shared engine, so the submitted job is
+/// claimed, fails format detection, and lands `failed`.
+///
+/// Both transports submit against the same engine, so this pins the current
+/// (deferred-error) contract: submit returns `Ok` from either transport, and
+/// the worker drives the job to `failed` whichever transport submitted it.
+///
+/// NOTE: the rich `JammiError::FineTune` variant + message is not yet carried
+/// over the wire — `FineTuneStatus` returns only the status string. Faithful
+/// wire reconstruction of the typed training-failure error is a T3 deliverable;
+/// until then we assert the status reaches `failed`, not the exact variant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_fine_tune_start_reconstructs_the_exact_error_variant() {
+async fn remote_fine_tune_start_defers_failure_to_the_worker() {
     let server = start_engine_server().await;
     let remote = Session::Remote(remote(&server).await);
     let local = local(&server);
@@ -288,7 +298,9 @@ async fn remote_fine_tune_start_reconstructs_the_exact_error_variant() {
     let columns = ["abstract".to_string()];
     let model = tiny_bert_model_id();
 
-    let local_err = local
+    // Submit succeeds (Ok job id) from both transports — the format failure is
+    // deferred to the worker, not raised synchronously here.
+    let local_job = local
         .fine_tune(
             "patents",
             &model,
@@ -298,8 +310,8 @@ async fn remote_fine_tune_start_reconstructs_the_exact_error_variant() {
             config(),
         )
         .await
-        .expect_err("local fine_tune must fail");
-    let remote_err = remote
+        .expect("local fine_tune submit returns Ok (failure is deferred to the worker)");
+    let remote_job = remote
         .fine_tune(
             "patents",
             &model,
@@ -309,15 +321,32 @@ async fn remote_fine_tune_start_reconstructs_the_exact_error_variant() {
             config(),
         )
         .await
-        .expect_err("remote fine_tune must fail");
+        .expect("remote fine_tune submit returns Ok (failure is deferred to the worker)");
 
-    match (&local_err, &remote_err) {
-        (JammiError::FineTune(local_msg), JammiError::FineTune(remote_msg)) => assert_eq!(
-            local_msg, remote_msg,
-            "the FineTune format-detection message crosses the wire intact"
-        ),
-        other => panic!("expected a faithful FineTune error from both transports, got {other:?}"),
+    // The shared engine's embedded worker (train tier) claims each job and fails
+    // format detection on patents. Poll each transport's status until terminal;
+    // both must reach `failed`. (The rich variant/message is NOT carried over
+    // the wire yet — that lands in T3; here we assert only the failed status.)
+    async fn poll_until_failed(session: &Session, job: &jammi_ai::local_session::FineTuneJobId) {
+        for _ in 0..600 {
+            let status = session
+                .fine_tune_status(job)
+                .await
+                .expect("fine_tune_status");
+            if status == "failed" {
+                return;
+            }
+            assert_ne!(
+                status, "completed",
+                "patents has no training-format columns — the job must fail, not complete"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the fine-tune job did not reach a terminal `failed` state in time");
     }
+
+    poll_until_failed(&local, &local_job).await;
+    poll_until_failed(&remote, &remote_job).await;
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;

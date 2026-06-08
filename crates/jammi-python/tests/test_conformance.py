@@ -185,7 +185,8 @@ def test_numeric_verbs_compute_identically_across_wheels(tmp_path):
             ranked_lists, k_rrf=40
         )
     finally:
-        local.close()
+        # The embedded engine releases its resources on drop; only the remote
+        # client holds a gRPC channel that needs an explicit close.
         remote.close()
 
 

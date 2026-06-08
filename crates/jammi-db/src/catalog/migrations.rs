@@ -44,6 +44,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         schema::MIGRATION_013_RESULT_TABLE_KIND,
     ),
     ("014_bm25_channel", schema::MIGRATION_014_BM25_CHANNEL),
+    (
+        "015_fine_tune_job_queue",
+        schema::MIGRATION_015_FINE_TUNE_JOB_QUEUE,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

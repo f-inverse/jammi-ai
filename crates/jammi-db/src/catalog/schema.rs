@@ -375,3 +375,39 @@ INSERT INTO evidence_channel_columns(channel_name, column_name, column_type, ord
     ('bm25', 'bm25_score', 'Float32', 0),
     ('bm25', 'bm25_rank',  'Int64',   1);
 "#;
+
+/// Migration 015 — lease-based job-queue columns on `fine_tune_jobs`.
+///
+/// Turns the table into a durable work queue a worker can poll. A queued job
+/// is claimed by setting `status = 'running'`, stamping the claiming worker in
+/// `claimed_by`, and writing a `lease_expires_at` deadline; the worker renews
+/// the lease by heartbeating, and an expired lease lets the row be re-queued
+/// (or failed once `attempts` is exhausted).
+///
+///   * `kind` — the training-job kind. Discriminates which trainer drives the
+///     row (`'fine_tune'` for the contrastive-adapter path; future kinds add
+///     their own values). Existing rows back-fill to `'fine_tune'` via the
+///     column default.
+///   * `claimed_by` — id of the worker holding the lease; `NULL` while the job
+///     is queued or otherwise unclaimed.
+///   * `lease_expires_at` — the lease deadline. An engine-clock UTC timestamp
+///     stored in the canonical `%Y-%m-%dT%H:%M:%S%.6fZ` form (the same lexical
+///     shape the repo writes), so that `lease_expires_at < $now` is a correct
+///     text comparison on both SQLite and Postgres with no dialect-specific
+///     interval arithmetic. `NULL` when the job is not leased.
+///   * `attempts` — how many times the job has been claimed; incremented on
+///     each claim and bounding reclaim retries.
+///   * `training_spec` — reserved for a self-contained job specification a
+///     worker can execute without re-deriving it from session state. Nullable;
+///     no writer populates it yet.
+///
+/// `idx_fine_tune_jobs_claim` on `(status, lease_expires_at)` serves both the
+/// oldest-queued claim scan and the expired-lease reclaim scan.
+pub(super) const MIGRATION_015_FINE_TUNE_JOB_QUEUE: &str = r#"
+ALTER TABLE fine_tune_jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'fine_tune';
+ALTER TABLE fine_tune_jobs ADD COLUMN claimed_by TEXT;
+ALTER TABLE fine_tune_jobs ADD COLUMN lease_expires_at TEXT;
+ALTER TABLE fine_tune_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE fine_tune_jobs ADD COLUMN training_spec TEXT;
+CREATE INDEX idx_fine_tune_jobs_claim ON fine_tune_jobs(status, lease_expires_at);
+"#;

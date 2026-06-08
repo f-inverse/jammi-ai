@@ -24,8 +24,10 @@ use candle_nn::{VarBuilder, VarMap};
 use tempfile::TempDir;
 
 use jammi_ai::pipeline::context_predictor::{
-    ContextPredictorTrainConfig, EpisodeBatch, GaussianObjective, PredictiveHead, SampledEpisodes,
+    ConformalLevers, ContextPredictorTrainConfig, ContextServeOptions, EpisodeBatch,
+    GaussianObjective, PredictiveHead, SampledEpisodes,
 };
+use jammi_ai::pipeline::context_set::ContextSourceKind;
 use jammi_ai::pipeline::parallel_train::{train_loop, ParallelTrainConfig};
 use jammi_ai::session::InferenceSession;
 use jammi_db::model_task::ModelTask;
@@ -455,7 +457,7 @@ async fn conformal_coverage(
             .predict_with_context_predictor(served, key)
             .await
             .unwrap();
-        let (lo, hi) = wrap.interval(&dist).unwrap();
+        let (lo, hi) = wrap.interval(&dist, None).unwrap();
         if *y >= lo && *y <= hi {
             hits += 1;
         }
@@ -482,7 +484,7 @@ async fn predict_is_inference_only_no_gradient_updates() {
     let model_id = train(&session, &spec).await;
 
     let served = session
-        .load_context_predictor(&model_id, "fns", None)
+        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
         .await
         .unwrap();
 
@@ -555,7 +557,7 @@ async fn conformal_wrap_hits_nominal_coverage_across_seeds() {
         let model_id = train(&session, &spec).await;
 
         let served = session
-            .load_context_predictor(&model_id, "fns", None)
+            .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
             .await
             .unwrap();
 
@@ -586,7 +588,7 @@ async fn conformal_wrap_hits_nominal_coverage_across_seeds() {
         let eval = targets_of(eval_tasks);
 
         let wrap = session
-            .calibrate_context_predictor_conformal(&served, &cal, alpha)
+            .calibrate_context_predictor_conformal(&served, &cal, alpha, ConformalLevers::Marginal)
             .await
             .unwrap();
         let cov = conformal_coverage(&session, &served, &wrap, &eval).await;
@@ -623,7 +625,7 @@ async fn conformal_restores_coverage_the_raw_band_loses() {
     spec.test_task_fraction = 0.25;
     let model_id = train(&session, &spec).await;
     let served = session
-        .load_context_predictor(&model_id, "fns", None)
+        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
         .await
         .unwrap();
 
@@ -665,7 +667,7 @@ async fn conformal_restores_coverage_the_raw_band_loses() {
     let raw_cov = raw_hits as f64 / eval.len() as f64;
 
     let wrap = session
-        .calibrate_context_predictor_conformal(&served, &cal, alpha)
+        .calibrate_context_predictor_conformal(&served, &cal, alpha, ConformalLevers::Marginal)
         .await
         .unwrap();
     let conf_cov = conformal_coverage(&session, &served, &wrap, &eval).await;
@@ -710,7 +712,7 @@ async fn sparse_context_widens_sigma_attncnp() {
 
     // Dense: the full context_k. Sparse: a 1-member context (k = 1).
     let dense = session
-        .load_context_predictor(&model_id, "fns", None)
+        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
         .await
         .unwrap();
 
@@ -745,7 +747,14 @@ async fn sparse_context_widens_sigma_attncnp() {
             .unwrap();
         let split = format!("arrow_cast(\"_row_id\", 'Utf8') = '{}'", sibling.id);
         let sparse = session
-            .load_context_predictor(&model_id, "fns", Some(split))
+            .load_context_predictor(
+                &model_id,
+                "fns",
+                ContextServeOptions {
+                    split: Some(split),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let s = session
@@ -823,5 +832,156 @@ fn generalized_train_loop_still_drives_tensor_batch() {
         report.final_loss < 1e-2,
         "generic train_loop did not converge on the flat case: {}",
         report.final_loss
+    );
+}
+
+/// A served prediction always carries its provenance: the assembly `source` fact
+/// and the context member keys (never the target itself). This is the seam the
+/// coverage layer attributes a prediction by — a graph-conditioned (or any)
+/// prediction is never *unattributed*. The `source_kind()` accessor is the seam
+/// governance reads off the served state.
+#[tokio::test]
+async fn predict_provenanced_carries_source_and_context_keys() {
+    let rows = synthetic_meta_dataset(8, 16, 5);
+    let (session, _dir) = session_with_meta_dataset(&rows).await;
+    let spec = spec(
+        ContextArchitecture::Cnp,
+        PredictiveHead::Gaussian {
+            objective: GaussianObjective::Nll { beta: 0.5 },
+        },
+    );
+    let model_id = train(&session, &spec).await;
+    let served = session
+        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .await
+        .unwrap();
+
+    // The served state's source fact (the E8 seam).
+    assert_eq!(served.source_kind(), ContextSourceKind::Ann);
+
+    let target = &rows[0].id;
+    let prov = session
+        .predict_with_context_predictor_provenanced(&served, target)
+        .await
+        .unwrap();
+    assert_eq!(
+        prov.source,
+        ContextSourceKind::Ann,
+        "an ANN serve source produces the Ann assembly fact"
+    );
+    assert!(
+        !prov.context_keys.is_empty(),
+        "the prediction carries its context provenance — never unattributed"
+    );
+    assert!(
+        !prov.context_keys.iter().any(|k| k == target),
+        "the target is never in its own context provenance (the leakage guard)"
+    );
+    // The bare-distribution wrapper agrees with the provenanced distribution.
+    let bare = session
+        .predict_with_context_predictor(&served, target)
+        .await
+        .unwrap();
+    assert_eq!(bare, prov.distribution);
+}
+
+/// The conformal levers are *applied*, never *chosen*: marginal (the default)
+/// always serves; a caller-supplied Mondrian cohort or weights route to the
+/// group-conditional / weighted S17 constructors; and a cohort/point length
+/// mismatch is a typed error, never a silent misalignment. The engine never
+/// self-selects a cohort.
+#[tokio::test]
+async fn conformal_levers_apply_and_never_self_select() {
+    let alpha = 0.2_f64;
+    let rows = synthetic_meta_dataset(16, 24, 31);
+    let (session, _dir) = session_with_meta_dataset(&rows).await;
+    let mut spec = spec(
+        ContextArchitecture::AttnCnp,
+        PredictiveHead::Quantile {
+            levels: vec![0.1, 0.5, 0.9],
+        },
+    );
+    spec.test_task_fraction = 0.25;
+    let model_id = train(&session, &spec).await;
+    let served = session
+        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .await
+        .unwrap();
+
+    let distinct: Vec<String> = {
+        let mut t: Vec<String> = rows.iter().map(|r| r.task.clone()).collect();
+        t.sort();
+        t.dedup();
+        t
+    };
+    let test_tasks = held_out_tasks(distinct, spec.seed, spec.test_task_fraction);
+    let cal: Vec<(String, f64)> = rows
+        .iter()
+        .filter(|r| r.task == test_tasks[0])
+        .map(|r| (r.id.clone(), r.y))
+        .collect();
+    assert!(cal.len() >= 4, "need a few calibration points");
+    let probe = &cal[0].0;
+    let dist = session
+        .predict_with_context_predictor(&served, probe)
+        .await
+        .unwrap();
+
+    // Marginal: serves with no cohort (the engine self-selects nothing).
+    let marginal = session
+        .calibrate_context_predictor_conformal(&served, &cal, alpha, ConformalLevers::Marginal)
+        .await
+        .unwrap();
+    let (lo, hi) = marginal.interval(&dist, None).unwrap();
+    assert!(lo <= hi, "the marginal wrap always serves an interval");
+
+    // Mondrian: one caller-supplied cohort per calibration point; serves for a
+    // supplied cohort.
+    let groups: Vec<String> = (0..cal.len())
+        .map(|i| if i % 2 == 0 { "a" } else { "b" }.to_string())
+        .collect();
+    let mondrian = session
+        .calibrate_context_predictor_conformal(
+            &served,
+            &cal,
+            alpha,
+            ConformalLevers::Mondrian { groups },
+        )
+        .await
+        .unwrap();
+    let (lo_m, hi_m) = mondrian.interval(&dist, Some("a")).unwrap();
+    assert!(
+        lo_m <= hi_m,
+        "the Mondrian wrap serves an interval for a governance-supplied cohort"
+    );
+
+    // Weighted: one weight per calibration point.
+    let weights = vec![1.0_f64; cal.len()];
+    let weighted = session
+        .calibrate_context_predictor_conformal(
+            &served,
+            &cal,
+            alpha,
+            ConformalLevers::Weighted { weights },
+        )
+        .await
+        .unwrap();
+    let (lo_w, hi_w) = weighted.interval(&dist, None).unwrap();
+    assert!(lo_w <= hi_w, "the weighted wrap serves an interval");
+
+    // A cohort/point length mismatch is rejected, not silently misaligned.
+    let mismatch = session
+        .calibrate_context_predictor_conformal(
+            &served,
+            &cal,
+            alpha,
+            ConformalLevers::Mondrian {
+                groups: vec!["only-one".to_string()],
+            },
+        )
+        .await;
+    assert!(
+        mismatch.is_err(),
+        "one cohort for many calibration points must be a typed error"
     );
 }

@@ -68,7 +68,7 @@ impl PyDatabase {
         // the session so it never keeps it alive, and the guard stops it on drop.
         let worker = {
             let _enter = runtime.enter();
-            jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+            jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)?
         };
         Ok(Self {
             session,

@@ -694,12 +694,16 @@ impl LocalSession {
     /// embedded engine both submits training jobs and runs them, and the worker
     /// stops when this session drops (RAII). Must be called inside a tokio
     /// runtime context (the worker spawns a task).
-    pub fn with_embedded_worker(engine: Arc<InferenceSession>) -> Self {
-        let worker = crate::fine_tune::worker::EmbeddedWorker::spawn(&engine);
-        Self {
+    ///
+    /// Returns [`jammi_db::error::JammiError::Config`] if the session's
+    /// `[training]` timing violates the worker invariants; the engine's
+    /// `JammiConfig::load` already validated it for the normal front-door flow.
+    pub fn with_embedded_worker(engine: Arc<InferenceSession>) -> Result<Self> {
+        let worker = crate::fine_tune::worker::EmbeddedWorker::spawn(&engine)?;
+        Ok(Self {
             engine,
             _worker: Some(worker),
-        }
+        })
     }
 
     /// The underlying engine session. The in-process affordances that are not

@@ -382,7 +382,8 @@ async fn too_few_tasks_is_rejected() {
 async fn train_context_predictor_persists_a_catalogued_artifact() {
     let rows = synthetic_meta_dataset(8, 18, 321);
     let (session, _dir) = session_with_meta_dataset(&rows).await;
-    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
 
     let spec = spec(
         ContextArchitecture::Cnp,
@@ -492,7 +493,8 @@ async fn train_context_predictor_over_generated_embeddings() {
     // The catalogued model's bare name differs from its PK, so the previously
     // mis-resolving `Some` arm would submit a job whose `base_model_id` is the
     // bare name and trip the `training_jobs.base_model_id` foreign key.
-    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
     let spec = spec(
         ContextArchitecture::Cnp,
         PredictiveHead::Gaussian {
@@ -545,7 +547,8 @@ fn held_out_tasks(mut tasks: Vec<String>, seed: u64, test_fraction: f64) -> Vec<
 /// helper starts a worker over the session, submits, waits for completion, and
 /// returns the model id the predictor registered under (the spec's `model_id`).
 async fn train(session: &Arc<InferenceSession>, spec: &ContextPredictorTrainConfig) -> String {
-    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(session);
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(session)
+        .expect("default worker intervals are valid");
     let job = session.train_context_predictor("fns", spec).await.unwrap();
     job.wait().await.unwrap();
     job.model_id().to_string()

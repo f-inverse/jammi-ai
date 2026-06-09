@@ -69,7 +69,7 @@ impl Jammi {
                 // The front-door embedded session owns the training worker (RAII):
                 // it both submits training jobs and runs them, and the worker
                 // stops when the session drops.
-                Ok(Session::Local(LocalSession::with_embedded_worker(engine)))
+                Ok(Session::Local(LocalSession::with_embedded_worker(engine)?))
             }
             #[cfg(feature = "wire")]
             Target::Remote(endpoint) => {

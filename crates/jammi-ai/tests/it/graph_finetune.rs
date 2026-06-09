@@ -343,7 +343,8 @@ async fn fine_tune_graph_end_to_end_completes() {
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
     // `fine_tune_graph` submits a queued job; the worker re-reads the sources,
     // re-samples the graph from the seeded spec, and trains it.
-    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
 
     // Node text: two small communities.
     let node_rows: Vec<(String, String)> = ["a0", "a1", "a2", "b0", "b1", "b2"]
@@ -473,7 +474,8 @@ async fn fine_tune_graph_isolated_graph_fails() {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
-    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
 
     let node_rows: Vec<(String, String)> = ["n0", "n1", "n2"]
         .iter()

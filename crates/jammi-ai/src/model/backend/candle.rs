@@ -930,7 +930,7 @@ impl CandleModel {
 
 impl ModelBackend for CandleBackend {
     fn load(&self, resolved: &ResolvedModel, device_config: &DeviceConfig) -> Result<LoadedModel> {
-        let device = select_device(device_config);
+        let device = select_device(device_config)?;
 
         let model_type = resolved
             .model_config
@@ -1494,21 +1494,144 @@ fn normalize_distilbert_config(config: &serde_json::Value) -> serde_json::Value 
     normalized
 }
 
-pub(crate) fn select_device(config: &DeviceConfig) -> Device {
+/// Resolve the inference device from configuration.
+///
+/// - A negative `gpu_device` selects CPU unconditionally.
+/// - When a GPU is requested and present (the build's accelerator feature is
+///   compiled in and the device initializes), the accelerator device is used.
+/// - When a GPU is requested but unavailable — no accelerator feature in this
+///   build, or the device fails to initialize — the outcome depends on
+///   `require_gpu`: by default it degrades to CPU with a loud warning; if
+///   `require_gpu` is set it returns a [`JammiError::Gpu`] so the server fails
+///   fast rather than silently serving on CPU.
+///
+/// This relies on `Device::new_cuda` / `Device::new_metal` returning `Err` when
+/// no device is present; it never papers over a panic.
+pub(crate) fn select_device(config: &DeviceConfig) -> Result<Device> {
     if config.gpu_device < 0 {
-        return Device::Cpu;
+        return Ok(Device::Cpu);
     }
     #[cfg(feature = "cuda")]
     {
         if let Ok(dev) = Device::new_cuda(config.gpu_device as usize) {
-            return dev;
+            return Ok(dev);
         }
     }
     #[cfg(feature = "metal")]
     {
         if let Ok(dev) = Device::new_metal(config.gpu_device as usize) {
-            return dev;
+            return Ok(dev);
         }
     }
-    Device::Cpu
+    gpu_unavailable(config.gpu_device, config.require_gpu)
+}
+
+/// Decide what to do when a GPU was requested but could not be acquired.
+fn gpu_unavailable(gpu_device: i32, require_gpu: bool) -> Result<Device> {
+    if require_gpu {
+        return Err(JammiError::Gpu(format!(
+            "GPU required (gpu.device={gpu_device}, require_gpu=true) but no usable GPU was found"
+        )));
+    }
+    tracing::warn!(
+        gpu_device,
+        "CUDA requested (gpu.device={gpu_device}) but no usable GPU found; running on CPU"
+    );
+    Ok(Device::Cpu)
+}
+
+#[cfg(test)]
+mod device_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Level, Metadata, Subscriber};
+
+    use super::*;
+
+    /// Minimal subscriber that records whether a warn-level event carrying the
+    /// CPU-fallback message was emitted, so the "loud" fallback can be asserted
+    /// without depending on `tracing-subscriber`.
+    #[derive(Clone, Default)]
+    struct WarnCapture {
+        saw_fallback_warning: Arc<AtomicBool>,
+    }
+
+    impl Subscriber for WarnCapture {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() == Level::WARN
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            struct MsgVisitor {
+                hit: bool,
+            }
+            impl Visit for MsgVisitor {
+                fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                    if field.name() == "message" && format!("{value:?}").contains("running on CPU")
+                    {
+                        self.hit = true;
+                    }
+                }
+            }
+            let mut visitor = MsgVisitor { hit: false };
+            event.record(&mut visitor);
+            if visitor.hit {
+                self.saw_fallback_warning.store(true, Ordering::SeqCst);
+            }
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn require_gpu_without_device_fails_fast() {
+        let config = DeviceConfig {
+            gpu_device: 0,
+            memory_fraction: 0.9,
+            require_gpu: true,
+        };
+        // On a host with no usable GPU (and on the default non-accelerator
+        // build), selection must surface a typed GPU error rather than serving
+        // on CPU.
+        match select_device(&config) {
+            Err(JammiError::Gpu(msg)) => {
+                assert!(msg.contains("GPU required"), "unexpected message: {msg}");
+            }
+            other => panic!("expected JammiError::Gpu, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_without_device_falls_back_to_cpu_with_warning() {
+        let capture = WarnCapture::default();
+        let flag = Arc::clone(&capture.saw_fallback_warning);
+
+        let device = tracing::subscriber::with_default(capture, || {
+            let config = DeviceConfig {
+                gpu_device: 0,
+                memory_fraction: 0.9,
+                require_gpu: false,
+            };
+            select_device(&config).expect("default fallback must not error")
+        });
+
+        assert!(
+            matches!(device, Device::Cpu),
+            "expected CPU fallback, got {device:?}"
+        );
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "expected a loud warn-level CPU-fallback log"
+        );
+    }
 }

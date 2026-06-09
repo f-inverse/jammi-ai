@@ -138,13 +138,14 @@ For GPU-accelerated inference in production:
 device = 0            # CUDA device index
 memory_limit = "auto"
 memory_fraction = 0.9
+require_gpu = false   # fail fast if the GPU is unavailable instead of CPU fallback
 
 [inference]
 batch_size = 64
 max_loaded_models = 3
 ```
 
-Set `gpu.device = -1` for CPU-only deployment.
+Set `gpu.device = -1` for CPU-only deployment. On a GPU build, an unavailable device degrades to CPU with a warning by default; set `gpu.require_gpu = true` to fail fast instead.
 
 ## Environment variable overrides
 

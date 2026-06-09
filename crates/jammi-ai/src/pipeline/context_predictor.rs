@@ -372,7 +372,7 @@ impl InferenceSession {
         let test_tasks = tasks.split_off(task_count - n_test);
         let train_tasks = tasks;
 
-        let device = crate::model::backend::candle::select_device(self.device_config());
+        let device = crate::model::backend::candle::select_device(self.device_config())?;
 
         let train = self
             .episodes_for_tasks(source_id, &table, spec, &train_tasks, feature_dim, &device)
@@ -507,7 +507,7 @@ impl InferenceSession {
                 "source '{source_id}' embedding table carries no vector dimension"
             ))
         })? as usize;
-        let device = crate::model::backend::candle::select_device(self.device_config());
+        let device = crate::model::backend::candle::select_device(self.device_config())?;
 
         let varmap = VarMap::new();
         let predictor = build_predictor(spec, feature_dim, &varmap, &device)?;
@@ -1053,7 +1053,7 @@ impl InferenceSession {
             )));
         }
 
-        let device = crate::model::backend::candle::select_device(self.device_config());
+        let device = crate::model::backend::candle::select_device(self.device_config())?;
 
         // Build the predictor into a fresh varmap (which creates its variables),
         // then load the trained weights over them — the standard candle reload.

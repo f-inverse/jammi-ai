@@ -1,6 +1,9 @@
+pub mod artifact;
 pub mod mutable;
 pub mod schema;
 pub mod vectors;
+
+pub use artifact::{ArtifactStore, LocalArtifact};
 
 use std::path::Path;
 use std::sync::Arc;

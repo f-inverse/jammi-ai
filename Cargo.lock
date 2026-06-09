@@ -4066,6 +4066,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "async-trait",
+ "bytes",
  "candle-core",
  "candle-nn",
  "chrono",

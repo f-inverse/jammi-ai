@@ -105,7 +105,7 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendErr
         index_path: row.try_get("index_path")?,
         dimensions: row.try_get("dimensions")?,
         distance_metric: row.get("distance_metric")?,
-        row_count: row.get::<i64>("row_count")? as usize,
+        row_count: row.get::<i32>("row_count")? as usize,
         status: row.get("status")?,
         key_column: row.try_get("key_column")?,
         text_columns: row.try_get("text_columns")?,
@@ -451,7 +451,7 @@ impl Catalog {
     pub async fn get_checkpoint(&self, name: &str) -> Result<Option<usize>> {
         let name = name.to_string();
         let tenant = self.current_tenant();
-        let found: Option<Option<i64>> = self
+        let found: Option<Option<i32>> = self
             .backend()
             .transaction(
                 TxOptions {
@@ -467,7 +467,7 @@ impl Catalog {
                                 SqlValue::TextOwned(name),
                                 SqlValue::from(tenant.map(|t| t.to_string())),
                             ],
-                            |row| row.try_get::<i64>("checkpoint"),
+                            |row| row.try_get::<i32>("checkpoint"),
                         )
                         .await
                     })

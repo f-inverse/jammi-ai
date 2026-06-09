@@ -57,7 +57,7 @@ fn parse_eval_row(row: &Row<'_>) -> std::result::Result<EvalRunRecord, BackendEr
         model_id: row.get("model_id")?,
         source_id: row.get("source_id")?,
         golden_source: row.try_get("golden_source")?.unwrap_or_default(),
-        k: row.try_get::<i64>("k")?.map(|v| v as i32),
+        k: row.try_get::<i32>("k")?,
         metrics_json: row.get("metrics")?,
         status: row.try_get("status")?.unwrap_or_else(|| "completed".into()),
         created_at: row.get("created_at")?,

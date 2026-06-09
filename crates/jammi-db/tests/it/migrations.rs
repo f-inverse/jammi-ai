@@ -176,6 +176,7 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "014_bm25_channel",
             "015_fine_tune_job_queue",
             "016_rename_training_jobs",
+            "017_model_artifact_path_column",
         ]
     );
 }

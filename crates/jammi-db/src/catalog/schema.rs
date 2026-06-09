@@ -434,3 +434,19 @@ CREATE INDEX idx_training_jobs_status ON training_jobs(status);
 CREATE INDEX idx_training_jobs_tenant ON training_jobs(tenant_id);
 CREATE INDEX idx_training_jobs_claim ON training_jobs(status, lease_expires_at);
 "#;
+
+/// Migration 017 — the served `artifact_path` column on `models`.
+///
+/// `artifact_path` is the model's *commit pointer*: the path a reload resolves
+/// the model's bytes from. For a fine-tuned or context-predictor model it is
+/// written by exactly one writer — the worker whose lease-guarded finalize CAS
+/// wins — and by no one else. The finalize CAS sets it with a plain
+/// `UPDATE models SET artifact_path = …` in the same lease-guarded transaction
+/// as the job-row compare-and-set (no dialect-specific JSON mutation), so the
+/// served pointer is structurally single-writer: a loser's CAS matches no job
+/// row and writes neither the job status nor the served path. The descriptive
+/// `metadata` fields (`base_model_id`, `config_json`) stay in the JSON blob;
+/// the served path is its own column.
+pub(super) const MIGRATION_017_MODEL_ARTIFACT_PATH_COLUMN: &str = r#"
+ALTER TABLE models ADD COLUMN artifact_path TEXT;
+"#;

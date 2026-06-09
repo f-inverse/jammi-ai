@@ -116,7 +116,7 @@ fn read_column_row(row: &Row<'_>) -> std::result::Result<(String, String), Backe
 
 /// `(channel_name, priority, columns)` row as returned by `list()`'s catalog
 /// query. Aliased to keep the inner closure's local type readable.
-type ChannelListing = (String, i64, Vec<(String, String)>);
+type ChannelListing = (String, i32, Vec<(String, String)>);
 
 impl<'a> ChannelRepo<'a> {
     pub(super) fn new(catalog: &'a Catalog) -> Self {
@@ -194,7 +194,7 @@ impl<'a> ChannelRepo<'a> {
                         .query_opt(
                             "SELECT 1 AS one FROM evidence_channels WHERE channel_name = $1",
                             &[SqlValue::TextOwned(channel_name.clone())],
-                            |row| row.get::<i64>("one"),
+                            |row| row.get::<i32>("one"),
                         )
                         .await?
                         .is_some();
@@ -208,7 +208,7 @@ impl<'a> ChannelRepo<'a> {
                         .query_opt(
                             "SELECT MAX(ordinal) AS m FROM evidence_channel_columns WHERE channel_name = $1",
                             &[SqlValue::TextOwned(channel_name.clone())],
-                            |row| row.try_get::<i64>("m"),
+                            |row| row.try_get::<i32>("m"),
                         )
                         .await?
                         .flatten();
@@ -251,7 +251,7 @@ impl<'a> ChannelRepo<'a> {
                                 SqlValue::TextOwned(channel_name.clone()),
                                 SqlValue::TextOwned(name),
                                 SqlValue::Text(ty.as_str()),
-                                SqlValue::Int(next),
+                                SqlValue::Int(next as i64),
                             ],
                         )
                         .await?;
@@ -287,7 +287,7 @@ impl<'a> ChannelRepo<'a> {
                             .query_opt(
                                 "SELECT priority FROM evidence_channels WHERE channel_name = $1",
                                 &[SqlValue::TextOwned(channel_name.clone())],
-                                |row| row.get::<i64>("priority"),
+                                |row| row.get::<i32>("priority"),
                             )
                             .await?;
                         let Some(priority) = priority else {
@@ -321,7 +321,7 @@ impl<'a> ChannelRepo<'a> {
             .collect();
         Ok(Some(ChannelSpec {
             id,
-            priority: priority as i32,
+            priority,
             columns: columns?,
         }))
     }
@@ -338,7 +338,7 @@ impl<'a> ChannelRepo<'a> {
                 },
                 |tx| {
                     Box::pin(async move {
-                        let parents: Vec<(String, i64)> = tx
+                        let parents: Vec<(String, i32)> = tx
                             .query(
                                 "SELECT channel_name, priority FROM evidence_channels \
                              ORDER BY priority, channel_name",
@@ -346,7 +346,7 @@ impl<'a> ChannelRepo<'a> {
                                 |row| {
                                     Ok((
                                         row.get::<String>("channel_name")?,
-                                        row.get::<i64>("priority")?,
+                                        row.get::<i32>("priority")?,
                                     ))
                                 },
                             )
@@ -383,7 +383,7 @@ impl<'a> ChannelRepo<'a> {
                 .collect();
             specs.push(ChannelSpec {
                 id,
-                priority: priority as i32,
+                priority,
                 columns: columns?,
             });
         }

@@ -60,9 +60,10 @@ fn training_columns() -> Vec<String> {
 }
 
 /// Locate the saved adapter directory for a fine-tuned model id.
-/// Models registered via `fine_tune` carry their artifact path on the
-/// model record; the on-disk layout is `<artifact_path>/adapter.safetensors`
-/// alongside `adapter_config.json`.
+/// Models registered via `fine_tune` carry their artifact path on the model
+/// record as an object-store prefix; fetching it materialises the bundle into a
+/// local dir whose layout is `<dir>/adapter.safetensors` alongside
+/// `adapter_config.json`.
 async fn adapter_dir_for_model(session: &InferenceSession, model_id: &str) -> std::path::PathBuf {
     let record = session
         .catalog()
@@ -70,7 +71,15 @@ async fn adapter_dir_for_model(session: &InferenceSession, model_id: &str) -> st
         .await
         .expect("catalog lookup")
         .expect("fine-tuned model registered in catalog");
-    std::path::PathBuf::from(record.artifact_path.expect("artifact_path"))
+    let prefix = record.artifact_path.expect("artifact_path");
+    let prefix_url = jammi_db::storage::StorageUrl::parse(&prefix).unwrap();
+    session
+        .artifact_store()
+        .fetch_artifact(&prefix_url)
+        .await
+        .expect("published adapter fetches and verifies")
+        .dir()
+        .to_path_buf()
 }
 
 #[tokio::test(flavor = "multi_thread")]

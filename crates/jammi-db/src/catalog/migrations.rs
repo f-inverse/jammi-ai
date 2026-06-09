@@ -52,6 +52,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "016_rename_training_jobs",
         schema::MIGRATION_016_RENAME_TRAINING_JOBS,
     ),
+    (
+        "017_model_artifact_path_column",
+        schema::MIGRATION_017_MODEL_ARTIFACT_PATH_COLUMN,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

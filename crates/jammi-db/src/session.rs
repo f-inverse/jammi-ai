@@ -439,7 +439,7 @@ impl JammiSession {
     /// Called on startup so that sources added by previous sessions (e.g. a
     /// prior CLI invocation) are available for queries immediately.
     async fn reload_sources(&self) -> Result<()> {
-        let sources = self.catalog.list_sources().await?;
+        let sources = self.catalog.list_all_sources().await?;
         for record in sources {
             if let Err(e) = self
                 .register_source_tables(&record.source_id, &record.source_type, &record.connection)

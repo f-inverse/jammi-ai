@@ -285,6 +285,88 @@ async fn catalog_sources_isolated_by_tenant() {
     assert_eq!(ids_b, vec!["src_b"]);
 }
 
+/// `list_all_sources` enumerates sources across every tenant, while the
+/// tenant-scoped `list_sources` stays filtered to its own rows plus the
+/// globally-scoped (`tenant_id IS NULL`) rows. Session startup re-hydrates
+/// source providers through the cross-tenant view so a worker that later
+/// binds to any tenant can resolve that tenant's private sources.
+#[tokio::test]
+async fn catalog_list_all_sources_sees_across_tenants() {
+    use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+
+    let dir = tempdir().unwrap();
+    let cfg = common::test_config(dir.path());
+
+    let parquet = || SourceConnection {
+        url: Some(common::fixture_url("patents.parquet")),
+        format: Some(FileFormat::Parquet),
+        ..Default::default()
+    };
+
+    // One global source plus one private source per tenant.
+    let unscoped = JammiSession::new(cfg.clone()).await.unwrap();
+    unscoped
+        .add_source("global_src", SourceType::File, parquet())
+        .await
+        .unwrap();
+
+    let session_a = JammiSession::new(cfg.clone())
+        .await
+        .unwrap()
+        .with_tenant(tenant_a());
+    session_a
+        .add_source("src_a", SourceType::File, parquet())
+        .await
+        .unwrap();
+
+    let session_b = JammiSession::new(cfg.clone())
+        .await
+        .unwrap()
+        .with_tenant(tenant_b());
+    session_b
+        .add_source("src_b", SourceType::File, parquet())
+        .await
+        .unwrap();
+
+    // Cross-tenant enumeration sees every source regardless of binding.
+    // Sort for a registration-order-independent set comparison: the catalog
+    // orders by `created_at`, which ties across sub-millisecond inserts.
+    let mut all: Vec<String> = JammiSession::new(cfg.clone())
+        .await
+        .unwrap()
+        .catalog()
+        .list_all_sources()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.source_id)
+        .collect();
+    all.sort();
+    assert_eq!(
+        all,
+        vec![
+            "global_src".to_string(),
+            "src_a".to_string(),
+            "src_b".to_string()
+        ]
+    );
+
+    // The tenant-scoped API stays filtered to tenant A's own + global rows.
+    let mut scoped_a: Vec<String> = session_a
+        .catalog()
+        .list_sources()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.source_id)
+        .collect();
+    scoped_a.sort();
+    assert_eq!(
+        scoped_a,
+        vec!["global_src".to_string(), "src_a".to_string()]
+    );
+}
+
 /// An unscoped session sees globally-scoped (NULL) rows; a scoped session
 /// sees its own rows plus the NULL rows (consistent with the read-side
 /// predicate-injection rule).

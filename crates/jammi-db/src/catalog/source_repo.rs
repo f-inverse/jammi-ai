@@ -152,6 +152,38 @@ impl Catalog {
         raws.into_iter().map(parse_source_row).collect()
     }
 
+    /// List every registered source across all tenants, in registration
+    /// order. Used by session startup to re-register a `TableProvider` for
+    /// each persisted source so DataFusion can resolve the source's catalog
+    /// regardless of which tenant the session later binds to. Source provider
+    /// registration is tenant-agnostic; tenant isolation is enforced at query
+    /// time, not by which providers exist in the context.
+    pub async fn list_all_sources(&self) -> Result<Vec<SourceRecord>> {
+        let raws = self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query(
+                            "SELECT source_id, source_type, options, schema_json, \
+                                'active' AS status, created_at, updated_at \
+                             FROM sources \
+                             ORDER BY created_at",
+                            &[],
+                            read_source_row,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?;
+        raws.into_iter().map(parse_source_row).collect()
+    }
+
     /// Describe one registered source: its registry record joined with the
     /// embedding result tables produced from it. Tenant-scoped (own rows plus
     /// globally-scoped). Returns `None` when no source with that id is visible

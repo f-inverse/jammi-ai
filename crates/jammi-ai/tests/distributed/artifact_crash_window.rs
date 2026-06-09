@@ -54,6 +54,7 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
         &mut fleet,
         &session,
         &job_id,
+        None,
         "a worker claims and starts running before its lease window closes",
         |r| r.status == "running" && r.claimed_by.is_some(),
     )
@@ -67,6 +68,7 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
         &mut fleet,
         &session,
         &job_id,
+        None,
         "the survivor reclaims the crashed job and completes it",
         |r| r.status == "completed",
     )
@@ -153,6 +155,7 @@ async fn artifact_written_on_worker_is_readable_by_a_different_client() {
         &mut fleet,
         &session,
         &job_id,
+        None,
         "the single worker completes the job",
         |r| r.status == "completed",
     )

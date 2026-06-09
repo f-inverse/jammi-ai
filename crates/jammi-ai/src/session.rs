@@ -7,6 +7,7 @@ use jammi_db::config::JammiConfig;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::session::JammiSession;
 use jammi_db::source::{SourceConnection, SourceType};
+use jammi_db::sql::{quote_ident, source_relation};
 use jammi_db::store::{ArtifactStore, ResultStore};
 
 use crate::concurrency::GpuScheduler;
@@ -746,10 +747,13 @@ impl InferenceSession {
             .collect();
         let select_list = all_columns
             .iter()
-            .map(|c| format!("\"{c}\""))
+            .map(|c| quote_ident(c))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("SELECT {select_list} FROM {source_id}.public.\"{table_name}\"")
+        format!(
+            "SELECT {select_list} FROM {}",
+            source_relation(source_id, table_name)
+        )
     }
 
     /// Find the first table name registered under a source catalog.

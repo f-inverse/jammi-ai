@@ -15,6 +15,7 @@ use futures::TryStreamExt;
 
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
+use jammi_db::sql::source_relation;
 use jammi_db::ChannelId;
 
 use crate::evidence::{merge_channels, ChannelContribution};
@@ -79,17 +80,10 @@ impl QueryBuilder {
         // from the Parquet reader.
         if let Some(ref key_col) = table.key_column {
             let source_table_name = session.find_table_name(&table.source_id)?;
+            let relation = source_relation(&table.source_id, &source_table_name);
             // Build column list that casts string columns to VARCHAR for compatibility
-            let source_cols = build_hydration_select(
-                session.context(),
-                &format!("{}.public.{source_table_name}", table.source_id),
-                key_col,
-            )
-            .await?;
-            let sql = format!(
-                "SELECT {source_cols} FROM {}.public.{source_table_name}",
-                table.source_id
-            );
+            let source_cols = build_hydration_select(session.context(), &relation, key_col).await?;
+            let sql = format!("SELECT {source_cols} FROM {relation}");
             let df = session
                 .context()
                 .sql(&sql)
@@ -222,7 +216,7 @@ impl QueryBuilder {
         };
 
         let table_name = self.session.find_table_name(source)?;
-        let sql = format!("SELECT * FROM {source}.public.{table_name}");
+        let sql = format!("SELECT * FROM {}", source_relation(source, &table_name));
         let df = self
             .session
             .context()

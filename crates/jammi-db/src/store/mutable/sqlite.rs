@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 
 use crate::catalog::backend::BackendImpl;
+use crate::sql::quote_ident;
 
 use super::definition::{MutableIndexDef, MutableTableDefinition};
 use super::MutableBackend;
@@ -154,11 +155,6 @@ impl MutableBackend for SqliteMutableBackend {
     fn catalog_backend(&self) -> &BackendImpl {
         &self.backend
     }
-}
-
-/// Quote an identifier with ANSI double-quotes (SQLite + Postgres both accept).
-fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// Map an Arrow `DataType` to a SQLite column type name. Only the subset

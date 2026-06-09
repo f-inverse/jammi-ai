@@ -91,6 +91,16 @@ fn synthetic_meta_dataset(n_tasks: usize, rows_per_task: usize, seed: u64) -> Ve
 /// column is the row's feature `x`, keyed by `id`. The embedding table is
 /// registered + marked ready so `assemble_context` / vector search resolve it.
 async fn session_with_meta_dataset(rows: &[Row]) -> (Arc<InferenceSession>, TempDir) {
+    session_with_meta_dataset_named(rows, "fns").await
+}
+
+/// As [`session_with_meta_dataset`], but the source registers under `source_id`
+/// — so a test can exercise the read path with a hyphenated source name (a
+/// user's `patents-2024`), which an unquoted SQL interpolation would mis-parse.
+async fn session_with_meta_dataset_named(
+    rows: &[Row],
+    source_id: &str,
+) -> (Arc<InferenceSession>, TempDir) {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
@@ -126,7 +136,7 @@ async fn session_with_meta_dataset(rows: &[Row]) -> (Arc<InferenceSession>, Temp
     }
     session
         .add_source(
-            "fns",
+            source_id,
             SourceType::File,
             SourceConnection {
                 url: Some(format!("file://{}", source_path.to_str().unwrap())),
@@ -146,7 +156,7 @@ async fn session_with_meta_dataset(rows: &[Row]) -> (Arc<InferenceSession>, Temp
         .result_store()
         .materialize_embedding_table(
             session.context(),
-            "fns",
+            source_id,
             "synthetic-embed",
             None,
             &pairs,
@@ -346,6 +356,38 @@ async fn target_never_appears_in_its_own_context() {
             }
         }
     }
+}
+
+/// A hyphenated source name (a user's `patents-2024`) survives the generated
+/// read SQL end to end. `add_source` accepts arbitrary names, so the later read
+/// must quote the source/table identifier — an unquoted interpolation parses the
+/// `-` as a minus operator (`DataFusion ... ParserError(... found: -)`). Drives
+/// the public `search(...).run()` hydration path, which interpolates the source
+/// name into a `FROM <source>.public.<table>` clause.
+#[tokio::test]
+async fn hyphenated_source_name_survives_generated_read_sql() {
+    let rows = synthetic_meta_dataset(4, 8, 31);
+    // The hyphen is the bug trigger; the per-test names that surfaced it look
+    // exactly like this (`exactly_one_claim-<uuid>`, `patents-2024`).
+    let (session, _dir) = session_with_meta_dataset_named(&rows, "my-source-2024").await;
+
+    // The retrieval query is an existing row's stored vector; `search().run()`
+    // hydrates the ANN hits back against the source through the generated FROM
+    // clause that embeds the source name — the breaking site.
+    let query = rows[0].x.clone();
+    let results = session
+        .search("my-source-2024", query, 5)
+        .await
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+
+    let total: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert!(
+        total > 0,
+        "hydrated search over a hyphenated source returned no rows"
+    );
 }
 
 /// The [HIGH] meta-overfitting guard: a meta-dataset with too few distinct

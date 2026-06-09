@@ -420,7 +420,7 @@ impl InferenceSession {
             .resolve_embedding_table(source_id, None)
             .await?;
         let base_model_pk = match self.catalog().get_model(&table.model_id).await? {
-            Some(m) => m.model_id,
+            Some(m) => crate::model::to_catalog_pk(&m.model_id, m.version),
             None => {
                 self.catalog()
                     .register_model(RegisterModelParams {

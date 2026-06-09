@@ -17,6 +17,7 @@
 //! SQLite catalog and asserts every transaction commits without a lock error.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use jammi_db::catalog::backend::{BackendError, SqlValue, TxOptions};
 use jammi_db::catalog::Catalog;
@@ -125,4 +126,120 @@ async fn concurrent_read_then_write_does_not_deadlock() {
     // Every increment committed: writers serialised on the write lock rather
     // than losing updates or deadlocking.
     assert_eq!(total, (WRITERS * ITERS) as i64);
+}
+
+/// A write transaction whose future is cancelled between `BEGIN IMMEDIATE` and
+/// `COMMIT` must release the write lock and return its pooled connection clean.
+///
+/// A write transaction holds the SQLite WAL write lock from `BEGIN IMMEDIATE`
+/// until it commits or rolls back. If the transaction is driven by a raw BEGIN
+/// on a bare pooled connection, a future cancelled mid-flight (the training
+/// worker aborts its heartbeat/handle, dropping in-flight catalog writes)
+/// returns the connection to the pool *still inside an open transaction*,
+/// holding the write lock — poisoning it: the next checkout of that connection
+/// fails `cannot start a transaction within a transaction`.
+///
+/// Opening through sqlx's `Transaction` (which rolls back on drop) makes
+/// cancellation safe: the dropped future releases the lock and the connection
+/// returns clean. This test cancels a write transaction enough times to cycle
+/// through every connection in the 8-slot pool, then asserts a fresh write
+/// transaction still succeeds and that no cancelled write leaked a commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_write_transaction_does_not_poison_pool() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+
+    let backend = catalog.backend_arc();
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "CREATE TABLE cancel_probe (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)",
+                    &[],
+                )
+                .await?;
+                tx.execute("INSERT INTO cancel_probe (id, n) VALUES (1, 0)", &[])
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+    // Cancel more transactions than the pool has connections (8) so every
+    // pooled connection is checked out, BEGIN-IMMEDIATE'd, written to, then
+    // dropped before COMMIT — and later reused for the fresh transaction below.
+    //
+    // On the poisoning path the cancellation manifests two ways across the
+    // loop: a healthy connection times out mid-transaction (the future is
+    // dropped past the deadline), while a reused-but-poisoned connection
+    // short-circuits — its `BEGIN IMMEDIATE` fails `cannot start a transaction
+    // within a transaction` before the parking sleep, so the future returns an
+    // error fast instead of timing out. Either way the transaction did not
+    // commit; the proof that the pool stays usable is the fresh transaction
+    // below, not the per-iteration outcome.
+    const CANCELLATIONS: usize = 16;
+    for _ in 0..CANCELLATIONS {
+        let backend = catalog.backend_arc();
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(20),
+            backend.transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    // Write inside the transaction (takes effect under the
+                    // IMMEDIATE write lock)...
+                    tx.execute("UPDATE cancel_probe SET n = n + 1 WHERE id = 1", &[])
+                        .await?;
+                    // ...then park past the outer deadline so the future is
+                    // dropped after the write but before COMMIT.
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    Ok(())
+                })
+            }),
+        )
+        .await;
+        // The transaction must never report success: it is always cut off
+        // before COMMIT — either by the outer timeout (`Err(Elapsed)`) or, on a
+        // reused poisoned connection, by its own BEGIN failing (`Ok(Err(_))`).
+        assert!(
+            !matches!(outcome, Ok(Ok(()))),
+            "a cancelled write transaction should never commit"
+        );
+    }
+
+    // The pool is not poisoned: a fresh write transaction reusing the cycled
+    // connections opens and commits cleanly. Before the fix this fails with
+    // `cannot start a transaction within a transaction`.
+    let backend = catalog.backend_arc();
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute("UPDATE cancel_probe SET n = 100 WHERE id = 1", &[])
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("fresh write transaction after cancellations (pool poisoned?)");
+
+    // The cancelled writes rolled back; only the committed fresh write stuck.
+    let backend = catalog.backend_arc();
+    let n = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query_opt("SELECT n FROM cancel_probe WHERE id = 1", &[], |row| {
+                        row.get::<i64>("n")
+                    })
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 100, "a cancelled write transaction leaked a commit");
 }

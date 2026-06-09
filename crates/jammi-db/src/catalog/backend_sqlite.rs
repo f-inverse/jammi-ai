@@ -60,8 +60,10 @@ impl CatalogBackend for SqliteBackend {
             // SQLite has no SET TRANSACTION ISOLATION LEVEL; isolation is fixed
             // by the journal mode (WAL gives snapshot reads). The write/read
             // distinction is carried entirely by the BEGIN mode, which `sqlx`'s
-            // `Pool::begin` (always DEFERRED) cannot express — so we acquire a
-            // pooled connection and drive BEGIN/COMMIT/ROLLBACK ourselves.
+            // default `Pool::begin` (always DEFERRED) cannot express — so we
+            // open the transaction through `Pool::begin_with`, which runs our
+            // custom BEGIN yet still yields a sqlx `Transaction` that rolls back
+            // on drop/cancel.
             //
             // A write transaction MUST take the database write lock at BEGIN
             // time (`BEGIN IMMEDIATE`): under WAL, two DEFERRED transactions
@@ -70,38 +72,33 @@ impl CatalogBackend for SqliteBackend {
             // never resolves a snapshot-upgrade conflict). IMMEDIATE makes
             // concurrent writers serialise on `busy_timeout` instead. A
             // read-only transaction stays DEFERRED so reads take a snapshot
-            // without serialising against each other or against writers.
-            let _ = opts.isolation;
+            // without serialising against each other or against writers. The
+            // sqlx `Transaction` guards both modes: a future cancelled between
+            // BEGIN and COMMIT rolls back on drop, releasing any write lock so
+            // the pooled connection is returned clean.
             let begin = if opts.read_only {
                 "BEGIN DEFERRED"
             } else {
                 "BEGIN IMMEDIATE"
             };
+            let mut tx = self.pool.begin_with(begin).await.map_err(classify)?;
+            let _ = (opts.isolation, opts.read_only);
 
-            let mut conn = self.pool.acquire().await.map_err(classify)?;
-            sqlx::query(begin)
-                .execute(&mut *conn)
-                .await
-                .map_err(classify)?;
-
-            // Scope wrapper so its borrow of `conn` ends before we issue
-            // COMMIT/ROLLBACK. The HRTB on `f` makes the future borrow wrapper
-            // for `'tx = lifetime of wrapper`, so wrapper must drop first.
+            // Scope wrapper so its borrow of `tx` ends before we move `tx`
+            // into commit/rollback. The HRTB on `f` borrows wrapper for its
+            // entire lifetime, so wrapper must drop before tx moves.
             let outcome = {
-                let mut wrapper = Transaction::new_sqlite(&mut conn);
+                let mut wrapper = Transaction::new_sqlite(&mut tx);
                 f(&mut wrapper).await
             };
 
             match outcome {
                 Ok(value) => {
-                    sqlx::query("COMMIT")
-                        .execute(&mut *conn)
-                        .await
-                        .map_err(classify)?;
+                    tx.commit().await.map_err(classify)?;
                     Ok(value)
                 }
                 Err(err) => {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    let _ = tx.rollback().await;
                     Err(err)
                 }
             }

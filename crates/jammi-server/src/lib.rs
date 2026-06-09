@@ -12,6 +12,7 @@ pub mod grpc;
 pub mod grpc_web_trailers;
 pub mod routes;
 pub mod runtime;
+pub mod telemetry;
 pub mod tiers;
 
 use std::future::Future;

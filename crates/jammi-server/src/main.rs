@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use jammi_db::config::{JammiConfig, LogFormat};
+use jammi_db::config::JammiConfig;
 use jammi_server::runtime::OssServer;
-use tracing_subscriber::EnvFilter;
+use jammi_server::telemetry::init_tracing;
 
 /// CLI for the OSS `jammi-server`.
 ///
@@ -60,25 +60,4 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
-}
-
-/// Configure the global tracing subscriber from the engine config.
-/// Honours `RUST_LOG` when set; otherwise falls back to the config's
-/// `logging.level`. Format is JSON when `logging.format = "json"`,
-/// otherwise the default text layer.
-fn init_tracing(config: &JammiConfig) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(config.logging.level.clone()));
-
-    match config.logging.format {
-        LogFormat::Json => {
-            tracing_subscriber::fmt()
-                .json()
-                .with_env_filter(filter)
-                .init();
-        }
-        LogFormat::Text => {
-            tracing_subscriber::fmt().with_env_filter(filter).init();
-        }
-    }
 }

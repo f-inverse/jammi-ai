@@ -72,17 +72,36 @@ impl CatalogBackend for SqliteBackend {
             // never resolves a snapshot-upgrade conflict). IMMEDIATE makes
             // concurrent writers serialise on `busy_timeout` instead. A
             // read-only transaction stays DEFERRED so reads take a snapshot
-            // without serialising against each other or against writers. The
-            // sqlx `Transaction` guards both modes: a future cancelled between
-            // BEGIN and COMMIT rolls back on drop, releasing any write lock so
-            // the pooled connection is returned clean.
+            // without serialising against each other or against writers.
             let begin = if opts.read_only {
                 "BEGIN DEFERRED"
             } else {
                 "BEGIN IMMEDIATE"
             };
-            let mut tx = self.pool.begin_with(begin).await.map_err(classify)?;
             let _ = (opts.isolation, opts.read_only);
+
+            // The BEGIN itself must be uncancellable. `Pool::begin_with` issues
+            // the `BEGIN` statement and only then constructs the sqlx
+            // `Transaction` whose drop guard rolls back. If the caller's future
+            // is dropped *while that begin is in flight* — after the worker has
+            // run `BEGIN IMMEDIATE` and bumped its per-connection transaction
+            // depth, but before the `Transaction` exists — there is no guard to
+            // roll it back: the pooled connection returns to the pool still
+            // inside a transaction, holding the WAL write lock. Its next checkout
+            // then fails (`InvalidSavePointStatement`, because a custom `BEGIN`
+            // is illegal at depth > 0), and every other writer starves on the
+            // leaked write lock (`database is locked`). Running the begin on a
+            // detached task closes the window: a cancelled caller drops only the
+            // `JoinHandle`, the task still drives the begin to a fully-formed
+            // `Transaction`, and that `Transaction` then drops through its own
+            // guard — rolling back and returning the connection clean.
+            let pool = self.pool.clone();
+            let mut tx = tokio::spawn(async move { pool.begin_with(begin).await })
+                .await
+                .map_err(|join| {
+                    BackendError::Unavailable(format!("transaction begin task failed: {join}"))
+                })?
+                .map_err(classify)?;
 
             // Scope wrapper so its borrow of `tx` ends before we move `tx`
             // into commit/rollback. The HRTB on `f` borrows wrapper for its

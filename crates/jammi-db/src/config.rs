@@ -514,26 +514,22 @@ pub struct WorkerIntervals {
 }
 
 impl TrainingConfig {
-    /// The minimum lease-to-heartbeat ratio. A live worker must beat at least
-    /// twice within one lease, so a single missed beat (a GC pause, a slow tick)
-    /// still leaves one in-window renewal before the lease expires. A config that
-    /// does not clear this margin is a correctness bug — a healthy worker's lease
-    /// would expire between beats and its job would be spuriously reclaimed
-    /// mid-flight — so it is rejected, never clamped.
-    const MIN_LEASE_HEARTBEAT_RATIO: u64 = 2;
-
     /// Resolve the typed [`WorkerIntervals`] this timing implies, enforcing the
     /// two worker invariants:
     ///
-    /// - `heartbeat_interval_secs * 2 <= lease_duration_secs` — the heartbeat
-    ///   must leave a real margin under the lease (a live worker must beat at
-    ///   least twice within one lease, so a single missed beat still leaves one
-    ///   in-window renewal before the lease expires). A zero heartbeat is
-    ///   rejected here too (it never clears the margin against any finite lease).
+    /// - `heartbeat_interval_secs * 2 < lease_duration_secs` — the heartbeat
+    ///   must leave a real margin under the lease (a live worker beats at least
+    ///   twice within one lease, so a single missed beat still leaves one
+    ///   in-window renewal that lands strictly before the lease expires — never
+    ///   coincident with expiry, which would race an idle-polling worker's
+    ///   reclaim). A zero heartbeat is rejected here too (it never clears the
+    ///   margin against any finite lease).
     /// - `idle_poll_secs >= 1` — a zero idle poll is a busy-loop.
     ///
     /// Returns [`JammiError::Config`] with a clear message on a violation. The
-    /// engine never silently clamps a bad value.
+    /// engine never silently clamps a bad value, and no operator-supplied `u64`
+    /// can overflow the margin check — an absurd heartbeat is rejected, not
+    /// wrapped.
     pub fn worker_intervals(&self) -> Result<WorkerIntervals> {
         use std::time::Duration;
 
@@ -547,13 +543,19 @@ impl TrainingConfig {
                 "training.idle_poll_secs must be > 0 (a zero poll is a busy-loop)".into(),
             ));
         }
-        if self.heartbeat_interval_secs * Self::MIN_LEASE_HEARTBEAT_RATIO > self.lease_duration_secs
+        // Overflow-safe strict margin: `heartbeat * 2 < lease`. The doubled
+        // heartbeat overflowing `u64` is itself a rejection (any such value
+        // dwarfs any finite lease), so the multiply never wraps or panics.
+        if self
+            .heartbeat_interval_secs
+            .checked_mul(2)
+            .is_none_or(|hb2| hb2 >= self.lease_duration_secs)
         {
             return Err(JammiError::Config(format!(
-                "training.heartbeat_interval_secs ({}) must be at most half of \
+                "training.heartbeat_interval_secs ({}) must be strictly under half of \
                  training.lease_duration_secs ({}): the heartbeat must leave a real margin \
-                 under the lease, or a live worker's lease expires between beats and its job \
-                 is spuriously reclaimed mid-flight",
+                 under the lease so a live worker renews strictly before the lease expires, \
+                 or its job is spuriously reclaimed mid-flight",
                 self.heartbeat_interval_secs, self.lease_duration_secs
             )));
         }
@@ -1371,13 +1373,41 @@ mod tests {
             Err(JammiError::Config(_))
         ));
 
-        // The exact 2× margin is accepted (the boundary is inclusive).
-        let boundary = TrainingConfig {
+        // The exact 2× boundary (heartbeat * 2 == lease) is now REJECTED: a
+        // renewal coincident with expiry races an idle-polling worker's reclaim.
+        let exact = TrainingConfig {
             lease_duration_secs: 20,
             heartbeat_interval_secs: 10,
             idle_poll_secs: 1,
         };
-        assert!(boundary.worker_intervals().is_ok());
+        assert!(
+            matches!(exact.worker_intervals(), Err(JammiError::Config(_))),
+            "heartbeat * 2 == lease must be rejected under the strict margin"
+        );
+
+        // Strictly under half (heartbeat * 2 < lease) is accepted.
+        let strict = TrainingConfig {
+            lease_duration_secs: 21,
+            heartbeat_interval_secs: 10,
+            idle_poll_secs: 1,
+        };
+        assert!(strict.worker_intervals().is_ok());
+    }
+
+    #[test]
+    fn training_config_margin_check_is_overflow_safe() {
+        // An operator-controlled heartbeat whose doubling overflows `u64` must
+        // be rejected with a Config error — never a debug-build panic, never a
+        // release-build silent wrap-to-zero that accepts bogus timing.
+        let absurd = TrainingConfig {
+            lease_duration_secs: 30,
+            heartbeat_interval_secs: u64::MAX / 2 + 1,
+            idle_poll_secs: 1,
+        };
+        assert!(
+            matches!(absurd.worker_intervals(), Err(JammiError::Config(_))),
+            "a heartbeat whose doubling overflows u64 must be a Config error"
+        );
     }
 
     #[test]

@@ -42,8 +42,9 @@ format = "json"
 # Training-worker lease/heartbeat/poll timing (used by the `train` tier).
 # Defaults reproduce the engine's built-in timing, so this section is optional.
 # The heartbeat must leave a real margin under the lease
-# (heartbeat_interval_secs * 2 <= lease_duration_secs); a config that does not
-# is rejected at startup, never silently clamped. idle_poll_secs must be > 0.
+# (heartbeat_interval_secs * 2 < lease_duration_secs) so a live worker renews
+# strictly before the lease expires; a config that does not is rejected at
+# startup, never silently clamped. idle_poll_secs must be > 0.
 [training]
 # How long a claim leases a job before it is reclaimable.
 lease_duration_secs = 30

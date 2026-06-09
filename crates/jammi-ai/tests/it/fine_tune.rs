@@ -1542,11 +1542,11 @@ async fn configured_short_lease_drives_reclaim() {
 
     let dir = TempDir::new().unwrap();
     let mut config = common::test_config(dir.path());
-    // A short lease (4 s) with a real heartbeat margin (2 s heartbeat = lease/2,
-    // the inclusive boundary) and a 1 s poll — the kind of timing the
-    // distributed-validation lane uses to exercise expiry quickly.
+    // A short lease (6 s) with a real heartbeat margin (2 s heartbeat, so
+    // heartbeat * 2 < lease — strictly under half) and a 1 s poll — the kind of
+    // timing the distributed-validation lane uses to exercise expiry quickly.
     config.training = jammi_db::config::TrainingConfig {
-        lease_duration_secs: 4,
+        lease_duration_secs: 6,
         heartbeat_interval_secs: 2,
         idle_poll_secs: 1,
     };

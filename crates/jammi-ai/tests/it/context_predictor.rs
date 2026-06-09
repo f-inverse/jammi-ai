@@ -417,6 +417,100 @@ async fn train_context_predictor_persists_a_catalogued_artifact() {
     assert!(!loaded.is_empty(), "persisted weight map is non-empty");
 }
 
+/// End-to-end over the **real embedding path**: vectors are produced by
+/// `generate_text_embeddings` (the same call production uses), which registers
+/// the embedding model in the catalog and records the result table under the
+/// model's bare canonical name. `train_context_predictor` then resolves that
+/// catalogued model and uses its PK as the job's `base_model_id` FK — the arm
+/// the synthetic-table tests never reach, because a hand-materialised table has
+/// no model row. A job whose `base_model_id` does not name a real `models` PK
+/// is rejected by the `training_jobs.base_model_id` foreign key, so this drives
+/// the submit + worker run to completion as the proof the FK resolves.
+#[tokio::test(flavor = "multi_thread")]
+async fn train_context_predictor_over_generated_embeddings() {
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    session.register_query_functions();
+
+    // A meta-dataset shaped source: `_row_id` (key), `task`, `y`, and the `text`
+    // the embedding model encodes. Each task gets distinct, repeated text so the
+    // encoder produces same-task-clustered vectors, mirroring the real flow.
+    let rows = synthetic_meta_dataset(8, 18, 321);
+    let source_schema = Arc::new(Schema::new(vec![
+        Field::new("_row_id", DataType::Utf8, false),
+        Field::new("task", DataType::Utf8, false),
+        Field::new("y", DataType::Float64, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+    let tasks: Vec<&str> = rows.iter().map(|r| r.task.as_str()).collect();
+    let ys: Vec<f64> = rows.iter().map(|r| r.y).collect();
+    let texts: Vec<String> = rows
+        .iter()
+        .map(|r| format!("a description belonging to {}", r.task))
+        .collect();
+    let source_batch = RecordBatch::try_new(
+        Arc::clone(&source_schema),
+        vec![
+            Arc::new(StringArray::from(ids)) as ArrayRef,
+            Arc::new(StringArray::from(tasks)),
+            Arc::new(Float64Array::from(ys)),
+            Arc::new(StringArray::from(texts)),
+        ],
+    )
+    .unwrap();
+    let source_path = dir.path().join("source.parquet");
+    {
+        let file = std::fs::File::create(&source_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&source_schema), None).unwrap();
+        writer.write(&source_batch).unwrap();
+        writer.close().unwrap();
+    }
+    session
+        .add_source(
+            "fns",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", source_path.to_str().unwrap())),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // The real embedding path: encodes `text` with the tiny fixture model,
+    // auto-registers the embedding model row (PK `name::version`), and records
+    // the result table under the model's bare canonical name.
+    let model_id = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
+    session
+        .generate_text_embeddings("fns", &model_id, &["text".to_string()], "_row_id")
+        .await
+        .unwrap();
+
+    // The catalogued model's bare name differs from its PK, so the previously
+    // mis-resolving `Some` arm would submit a job whose `base_model_id` is the
+    // bare name and trip the `training_jobs.base_model_id` foreign key.
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
+    let spec = spec(
+        ContextArchitecture::Cnp,
+        PredictiveHead::Gaussian {
+            objective: GaussianObjective::Crps,
+        },
+    );
+    let job = session.train_context_predictor("fns", &spec).await.unwrap();
+    job.wait().await.unwrap();
+
+    let record = session
+        .catalog()
+        .get_model("ctx-predictor")
+        .await
+        .unwrap()
+        .expect("predictor registered after a completed run");
+    assert_eq!(record.task, ModelTask::Regression);
+}
+
 // ---------------------------------------------------------------------------
 // PR3: serving, the conformal calibration gate, epistemic widening.
 // ---------------------------------------------------------------------------

@@ -7,7 +7,6 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, BinaryArray, StringArray};
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarMap};
-use jammi_db::catalog::status::TrainingJobStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 
@@ -110,6 +109,11 @@ pub struct TrainingLoop {
     varmap: VarMap,
     config: FineTuneConfig,
     job_id: String,
+    /// The lease holder's id (`claimed_by`). The run-start metrics write is
+    /// gated on `claimed_by == worker_id AND status = 'running'`, so a worker
+    /// whose lease was reclaimed mid-run cannot stamp `running` metrics over a
+    /// job the winner already finalized.
+    worker_id: String,
     catalog: Arc<Catalog>,
     /// The local directory training scratch (the per-run tempdir holding
     /// checkpoints and the final adapter) is created under. The run owns a
@@ -134,6 +138,7 @@ pub struct TrainingLoopBuilder {
     varmap: VarMap,
     config: FineTuneConfig,
     job_id: Option<String>,
+    worker_id: Option<String>,
     catalog: Option<Arc<Catalog>>,
     artifact_dir: Option<PathBuf>,
     device: Device,
@@ -153,6 +158,7 @@ impl TrainingLoopBuilder {
             varmap,
             config,
             job_id: None,
+            worker_id: None,
             catalog: None,
             artifact_dir: None,
             device: Device::Cpu,
@@ -189,6 +195,13 @@ impl TrainingLoopBuilder {
         self
     }
 
+    /// Set the lease holder's id (`claimed_by`). The run-start metrics write is
+    /// gated on it so a reclaimed (zombie) worker cannot disturb the job row.
+    pub fn worker_id(mut self, id: String) -> Self {
+        self.worker_id = Some(id);
+        self
+    }
+
     /// Set the catalog for status persistence.
     pub fn catalog(mut self, catalog: Arc<Catalog>) -> Self {
         self.catalog = Some(catalog);
@@ -206,6 +219,9 @@ impl TrainingLoopBuilder {
         let job_id = self
             .job_id
             .ok_or_else(|| JammiError::FineTune("TrainingLoopBuilder: job_id required".into()))?;
+        let worker_id = self.worker_id.ok_or_else(|| {
+            JammiError::FineTune("TrainingLoopBuilder: worker_id required".into())
+        })?;
         let catalog = self
             .catalog
             .ok_or_else(|| JammiError::FineTune("TrainingLoopBuilder: catalog required".into()))?;
@@ -218,6 +234,7 @@ impl TrainingLoopBuilder {
             varmap: self.varmap,
             config: self.config,
             job_id,
+            worker_id,
             catalog,
             artifact_dir,
             divergence_count: 0,
@@ -235,12 +252,16 @@ impl TrainingLoop {
     ///   model, project through LoRA, and compute loss on the projected embeddings.
     /// - Without `base_model`: precomputed tensor batches go directly to loss.
     pub fn run(&mut self, data_loader: &TrainingDataLoader) -> Result<TrainingResult> {
-        // Update job status to running
+        // Stamp run-start metrics under the lease guard. The claim already set
+        // the status to `running`; this records `started_at` only while this
+        // worker still holds the lease (`claimed_by == worker_id AND status =
+        // 'running'`). A worker whose lease was reclaimed mid-run (a zombie) thus
+        // cannot regress a job the winner already finalized back to `running`.
         let started_at = chrono::Utc::now().to_rfc3339();
         let metrics_json = serde_json::json!({"started_at": started_at}).to_string();
-        tokio::runtime::Handle::current().block_on(self.catalog.update_training_status(
+        tokio::runtime::Handle::current().block_on(self.catalog.mark_training_running(
             &self.job_id,
-            TrainingJobStatus::Running,
+            &self.worker_id,
             Some(&metrics_json),
         ))?;
 

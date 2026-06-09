@@ -319,6 +319,22 @@ async fn finalize_is_a_lease_guarded_compare_and_set(backend: BackendKind) {
     let (_session, catalog) = queue_catalog!(backend, dir.path());
 
     catalog.create_training_job(job_params("fz")).await.unwrap();
+    // Register the output model row with no served path: the served
+    // `artifact_path` must be committed solely by the winning finalize CAS, so
+    // it starts NULL and only the live owner's finalize sets it.
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "jammi:fine-tuned:fz",
+            version: 1,
+            model_type: "fine-tuned",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: Some("q-base::1"),
+            artifact_path: None,
+            config_json: None,
+        })
+        .await
+        .unwrap();
 
     // worker-a claims with a zero lease (immediately expired), then worker-b
     // reclaims it via the requeue path and re-claims — worker-b now owns it.
@@ -339,7 +355,13 @@ async fn finalize_is_a_lease_guarded_compare_and_set(backend: BackendKind) {
     // worker-a (the stale owner) tries to finalize: zero rows match, so it does
     // not finalize and the job is untouched.
     let a_finalized = catalog
-        .finalize_training_job("fz", "worker-a", "jammi:fine-tuned:fz", Some(r#"{"k":1}"#))
+        .finalize_training_job(
+            "fz",
+            "worker-a",
+            "jammi:fine-tuned:fz",
+            "file:///artifacts/fz/worker-a/2",
+            Some(r#"{"k":1}"#),
+        )
         .await
         .unwrap();
     assert!(
@@ -356,6 +378,17 @@ async fn finalize_is_a_lease_guarded_compare_and_set(backend: BackendKind) {
         after_a.output_model_id.is_none(),
         "the stale worker writes no output model"
     );
+    let model_after_a = catalog
+        .get_model("jammi:fine-tuned:fz")
+        .await
+        .unwrap()
+        .expect("the output model row exists");
+    assert!(
+        model_after_a.artifact_path.is_none(),
+        "the stale worker's failed CAS commits no served path; it stays NULL, \
+         got {:?}",
+        model_after_a.artifact_path
+    );
 
     // worker-b (the live owner) finalizes: one row matches, the job completes
     // with the output model and the metrics recorded.
@@ -364,6 +397,7 @@ async fn finalize_is_a_lease_guarded_compare_and_set(backend: BackendKind) {
             "fz",
             "worker-b",
             "jammi:fine-tuned:fz",
+            "file:///artifacts/fz/worker-b/3",
             Some(r#"{"completed_at":"2026-01-01T00:00:00Z"}"#),
         )
         .await
@@ -380,11 +414,28 @@ async fn finalize_is_a_lease_guarded_compare_and_set(backend: BackendKind) {
         Some("2026-01-01T00:00:00Z"),
         "the finalize records the run metrics"
     );
+    let model_after_b = catalog
+        .get_model("jammi:fine-tuned:fz")
+        .await
+        .unwrap()
+        .expect("the output model row exists");
+    assert_eq!(
+        model_after_b.artifact_path.as_deref(),
+        Some("file:///artifacts/fz/worker-b/3"),
+        "the winning finalize CAS commits the live owner's prefix as the served \
+         path — the sole writer of the committed pointer"
+    );
 
     // A second finalize by the same owner is now a no-op (status is no longer
     // running), so finalize is not re-runnable once terminal.
     let again = catalog
-        .finalize_training_job("fz", "worker-b", "jammi:fine-tuned:fz", None)
+        .finalize_training_job(
+            "fz",
+            "worker-b",
+            "jammi:fine-tuned:fz",
+            "file:///artifacts/fz/worker-b/3",
+            None,
+        )
         .await
         .unwrap();
     assert!(!again, "a completed job cannot be finalized again");

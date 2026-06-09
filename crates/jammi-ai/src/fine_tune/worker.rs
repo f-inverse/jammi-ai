@@ -298,24 +298,29 @@ impl TrainingWorker {
     ///
     /// The worker writes the artifact files to the store under a **unique
     /// per-attempt prefix** (`{job_id}/{worker_id}/{attempt}`), registers the
-    /// output-model row pointing at that prefix, then runs the compare-and-set
-    /// that records `output_model_id` and flips the job to `completed`. Because
-    /// every attempt writes a fresh prefix, no object is ever overwritten or
-    /// moved: the catalog row update is the single atomic commit. The CAS matches
-    /// only while this worker still holds the lease (`claimed_by = worker_id AND
-    /// status = 'running'`), so a worker that lost its lease in the window
-    /// between the last epoch check and here affects zero rows and does not
-    /// finalize — the job is left `running` for `reclaim`, and this worker's
+    /// output-model row (with **no** served path yet), then runs the lease-guarded
+    /// compare-and-set that records `output_model_id`, flips the job to
+    /// `completed`, and — atomically, in the same transaction, gated on that CAS
+    /// matching — commits this worker's prefix as the model's served
+    /// `artifact_path`. Because every attempt writes a fresh prefix, no object is
+    /// ever overwritten or moved, and the served pointer is written by exactly
+    /// one writer: the finalize CAS. The CAS matches only while this worker still
+    /// holds the lease (`claimed_by = worker_id AND status = 'running'`), so a
+    /// worker that lost its lease in the window between the last epoch check and
+    /// here affects zero rows — it commits neither the job's terminal status nor
+    /// any served path — and the job is left `running` for `reclaim` while its
     /// prefix is orphaned (best-effort GC'd). A `wait()` observer that sees
-    /// `completed` therefore always finds a complete artifact at the recorded
-    /// prefix, written by exactly one worker — the winner.
+    /// `completed` therefore always finds the served `artifact_path` set to the
+    /// winner's complete artifact.
     ///
     /// The model row is registered through the tenant-pinned `catalog` so it
     /// lands under the job's tenant. Registration is idempotent (the catalog
-    /// upserts on the deterministic `model_id`), so a re-claiming worker
-    /// re-registering after a lost lease is safe; the recorded `artifact_path` is
-    /// overwritten by whichever worker's CAS ultimately wins, and a loser's prefix
-    /// is the one GC'd.
+    /// upserts on the deterministic `model_id`) and never sets the served path,
+    /// so a re-claiming worker (or a zombie loser) re-registering after a lost
+    /// lease is safe: its registration cannot touch the committed pointer, and
+    /// the served `artifact_path` is set only by whichever worker's finalize CAS
+    /// wins. A loser's prefix is therefore never the committed pointer and is the
+    /// one GC'd.
     async fn publish_and_finalize(
         &self,
         session: &Arc<InferenceSession>,
@@ -333,9 +338,10 @@ impl TrainingWorker {
         let model_id = register.model_id.clone();
 
         // Write the artifact under a unique per-attempt prefix, then register the
-        // model row pointing at it — both before the CAS, so a `completed`
-        // observer always finds a registered model row backed by a complete
-        // artifact.
+        // model row — both before the CAS, so a `completed` observer always finds
+        // a registered model row. The registration does NOT carry the served
+        // path: the finalize CAS is the sole writer of `artifact_path`, so a
+        // loser's (or zombie's) register can never set the served pointer.
         let attempt_str = attempt.to_string();
         let prefix =
             match publish_artifact(&store, job_id, &self.worker_id, &attempt_str, &dir).await {
@@ -346,10 +352,7 @@ impl TrainingWorker {
                 }
             };
 
-        if let Err(e) = catalog
-            .register_model(register.as_params(prefix.as_str()))
-            .await
-        {
+        if let Err(e) = catalog.register_model(register.as_params()).await {
             // The model row could not be registered; the prefix we wrote is
             // orphaned. Best-effort GC it and fail the job.
             store.delete_artifact_prefix(&prefix).await.ok();
@@ -358,14 +361,22 @@ impl TrainingWorker {
         }
 
         match catalog
-            .finalize_training_job(job_id, &self.worker_id, &model_id, metrics.as_deref())
+            .finalize_training_job(
+                job_id,
+                &self.worker_id,
+                &model_id,
+                prefix.as_str(),
+                metrics.as_deref(),
+            )
             .await
         {
             Ok(true) => {}
             Ok(false) => {
-                // Lost the lease before finalizing: our prefix is orphaned. GC it
-                // best-effort and leave the job for reclaim (the re-claiming
-                // worker writes its own prefix and wins the commit).
+                // Lost the lease before finalizing: our CAS matched zero rows, so
+                // we committed neither the job status nor any served path. Our
+                // prefix is never the committed pointer — GC it best-effort and
+                // leave the job for reclaim (the re-claiming worker writes its own
+                // prefix and its CAS commits it).
                 store.delete_artifact_prefix(&prefix).await.ok();
                 tracing::debug!(
                     job_id = %job_id,
@@ -626,6 +637,7 @@ impl TrainingWorker {
             artifact_store: session.artifact_store(),
             artifact_dir: session.inner_config().artifact_dir.clone(),
             job_id: job_id.to_string(),
+            worker_id: self.worker_id.clone(),
             base_model: base_model.clone(),
             task,
             config: common.config,
@@ -765,10 +777,12 @@ pub struct TrainedArtifact {
 
 /// The catalog model-row descriptor a training kind hands the worker's finalize.
 ///
-/// Holds everything `register_model` needs except the artifact path — that is
-/// the per-attempt prefix the worker derives only after publishing the files,
-/// supplied via [`Self::as_params`]. This keeps the artifact-path commit in one
-/// place (the worker), so no producer writes a path the worker has to override.
+/// Holds everything `register_model` needs to create the row *except* the served
+/// artifact path. The served path is committed solely by the lease-guarded
+/// finalize CAS (it takes the published prefix directly), never by this
+/// registration — so a loser's or zombie's pre-finalize register can never set
+/// the served pointer. The registration creates the row (so a `completed`
+/// observer finds it) with the served path left unset for the CAS to fill.
 pub struct ModelRegistration {
     /// Deterministic model id (`jammi:fine-tuned:{job_id}`, or the predictor's
     /// configured id) — the catalog upserts on it, so re-registration is
@@ -786,11 +800,9 @@ pub struct ModelRegistration {
 
 impl ModelRegistration {
     /// Build the [`jammi_db::catalog::model_repo::RegisterModelParams`] for this
-    /// row, pointing `artifact_path` at the published prefix.
-    pub fn as_params<'a>(
-        &'a self,
-        artifact_path: &'a str,
-    ) -> jammi_db::catalog::model_repo::RegisterModelParams<'a> {
+    /// row, leaving `artifact_path` unset — the served path is committed by the
+    /// finalize CAS, not by registration.
+    pub fn as_params(&self) -> jammi_db::catalog::model_repo::RegisterModelParams<'_> {
         jammi_db::catalog::model_repo::RegisterModelParams {
             model_id: &self.model_id,
             version: 1,
@@ -798,7 +810,7 @@ impl ModelRegistration {
             backend: "candle",
             task: self.task,
             base_model_id: self.base_model_id.as_deref(),
-            artifact_path: Some(artifact_path),
+            artifact_path: None,
             config_json: self.config_json.as_deref(),
         }
     }
@@ -1211,6 +1223,7 @@ struct RunFineTuneParams {
     artifact_store: Arc<ArtifactStore>,
     artifact_dir: std::path::PathBuf,
     job_id: String,
+    worker_id: String,
     base_model: String,
     task: ModelTask,
     config: FineTuneConfig,
@@ -1239,6 +1252,7 @@ fn run_fine_tune_blocking(
         artifact_store,
         artifact_dir,
         job_id,
+        worker_id,
         base_model,
         task,
         config,
@@ -1302,6 +1316,7 @@ fn run_fine_tune_blocking(
         crate::fine_tune::trainer::TrainingLoopBuilder::new(target, varmap, config)
             .base_model(base_model_arc)
             .job_id(job_id)
+            .worker_id(worker_id)
             .catalog(Arc::clone(&catalog))
             .artifact_dir(artifact_dir)
             .device(device.clone())

@@ -51,16 +51,29 @@ pub struct RegisterModelParams<'a> {
 }
 
 const SELECT_COLS: &str =
-    "model_id, name, model_type, task, backend, version, status, metadata, created_at";
+    "model_id, name, model_type, task, backend, version, status, metadata, artifact_path, \
+     created_at";
 
 impl Catalog {
     /// Register or refresh a model in the catalog. The session's bound
     /// tenant is written to `tenant_id` and asserted before INSERT.
+    ///
+    /// `artifact_path` is the served commit pointer a reload resolves the
+    /// model's bytes from. On a re-registration (`ON CONFLICT`) it is updated
+    /// with `COALESCE(excluded, existing)`: a `Some` path sets it, a `None`
+    /// leaves whatever is already committed in place. So this call can *set*
+    /// the path (a directly-registered base model) but can never *clear* nor
+    /// overwrite a committed path to `NULL` — the path a finalized training
+    /// job serves is written solely by the lease-guarded
+    /// [`Self::finalize_training_job`] CAS, never by a worker's pre-finalize
+    /// (or a zombie's late) `register_model`.
     pub async fn register_model(&self, params: RegisterModelParams<'_>) -> Result<()> {
         let pk = format!("{}::{}", params.model_id, params.version);
+        // The served path is a dedicated column (a single-writer commit
+        // pointer), not a `metadata` field; the blob carries only the
+        // descriptive bits.
         let metadata = serde_json::json!({
             "base_model_id": params.base_model_id,
-            "artifact_path": params.artifact_path,
             "config_json": params.config_json,
         })
         .to_string();
@@ -69,6 +82,7 @@ impl Catalog {
         let task = params.task.as_db_str();
         let backend = params.backend.to_string();
         let version = params.version as i64;
+        let artifact_path = params.artifact_path.map(str::to_string);
         let tenant = self.current_tenant();
 
         self.backend()
@@ -77,13 +91,14 @@ impl Catalog {
                     tx.set_tenant(tenant);
                     tx.assert_tenant_matches(tenant, "models")?;
                     tx.execute(
-                        "INSERT INTO models (model_id, name, model_type, task, backend, version, status, metadata, tenant_id) \
-                         VALUES ($1, $2, $3, $4, $5, $6, 'registered', $7, $8) \
+                        "INSERT INTO models (model_id, name, model_type, task, backend, version, status, metadata, artifact_path, tenant_id) \
+                         VALUES ($1, $2, $3, $4, $5, $6, 'registered', $7, $8, $9) \
                          ON CONFLICT(model_id) DO UPDATE SET \
                              metadata = excluded.metadata, \
                              backend = excluded.backend, \
                              task = excluded.task, \
                              model_type = excluded.model_type, \
+                             artifact_path = COALESCE(excluded.artifact_path, models.artifact_path), \
                              updated_at = CAST(CURRENT_TIMESTAMP AS TEXT)",
                         &[
                             SqlValue::TextOwned(pk),
@@ -93,6 +108,7 @@ impl Catalog {
                             SqlValue::TextOwned(backend),
                             SqlValue::Int(version),
                             SqlValue::TextOwned(metadata),
+                            SqlValue::from(artifact_path),
                             SqlValue::from(tenant.map(|t| t.to_string())),
                         ],
                     )
@@ -236,7 +252,8 @@ impl Catalog {
     }
 }
 
-/// Parse: model_id, name, model_type, task, backend, version, status, metadata, created_at
+/// Parse: model_id, name, model_type, task, backend, version, status, metadata,
+/// artifact_path, created_at
 fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendError> {
     let _pk: String = row.get("model_id")?;
     let name: String = row.get("name")?;
@@ -252,17 +269,19 @@ fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendErr
     let metadata: Option<String> = row.try_get("metadata")?;
     let created_at: String = row.try_get("created_at")?.unwrap_or_default();
 
-    let (base_model_id, artifact_path, config_json) = metadata
+    // The served path is its own column (the single-writer commit pointer); the
+    // `metadata` blob carries only the descriptive `base_model_id`/`config_json`.
+    let artifact_path: Option<String> = row.try_get("artifact_path")?;
+    let (base_model_id, config_json) = metadata
         .as_deref()
         .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
         .map(|v| {
             (
                 v["base_model_id"].as_str().map(String::from),
-                v["artifact_path"].as_str().map(String::from),
                 v["config_json"].as_str().map(String::from),
             )
         })
-        .unwrap_or((None, None, None));
+        .unwrap_or((None, None));
 
     Ok(ModelRecord {
         model_id: name,

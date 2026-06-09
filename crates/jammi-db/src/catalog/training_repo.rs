@@ -247,16 +247,32 @@ impl Catalog {
         Ok(())
     }
 
-    /// Finalize a training job the caller still owns, as a single compare-and-set
-    /// gated on lease ownership. Atomically writes `output_model_id`, flips the
-    /// status to `completed`, and (when `metrics` is `Some`) records the run
-    /// metrics — but **only** while the row is still `running` and
-    /// `claimed_by == worker_id`. Returns `true` when the row was updated
-    /// (the caller held the lease and is the sole finalizer) and `false` when it
-    /// was not (the lease was lost — the row is no longer `running`, or another
-    /// worker reclaimed it). A `false` return means the caller must not register
-    /// the output model or otherwise act as the finalizer; the job is left for
-    /// [`Self::reclaim_expired_training_jobs`] and the worker that re-claims it.
+    /// Finalize a training job the caller still owns, as a single lease-guarded
+    /// compare-and-set that also commits the output model's served artifact path.
+    /// In one transaction it flips the job row to `completed`, writes
+    /// `output_model_id`, records the run metrics (when `metrics` is `Some`), and
+    /// — only if that job-row CAS matched — records `artifact_path` on the output
+    /// model's row. The job-row CAS lands **only** while the row is still
+    /// `running` and `claimed_by == worker_id`. Returns `true` when the caller
+    /// held the lease and is the sole finalizer, `false` when it was not (the
+    /// lease was lost — the row is no longer `running`, or another worker
+    /// reclaimed it).
+    ///
+    /// `artifact_path` is the object-store prefix this worker published its
+    /// artifact under. The model-row update is gated on the job-row CAS matching
+    /// (it runs in the same transaction and is skipped when the CAS matched zero
+    /// rows), so the finalize CAS is the **sole writer** of the served path: a
+    /// loser's finalize matches no job row and therefore writes neither the job
+    /// status nor the model's served path, and its orphaned prefix is never the
+    /// committed pointer. A `false` return means the caller must not act as the
+    /// finalizer; the job is left for [`Self::reclaim_expired_training_jobs`] and
+    /// the worker that re-claims it.
+    ///
+    /// The model row is matched by `name = output_model_id` — the same key a
+    /// reload resolves a fine-tuned/predictor model by (its bare model id, a
+    /// single registered version). Recording the path on the model row (rather
+    /// than only the job row) keeps the reload path reading the served pointer
+    /// straight from `models`, unchanged.
     ///
     /// Not tenant-scoped, matching [`Self::claim_next_training_job`] and
     /// [`Self::heartbeat_training_job`]: the lease identity (`claimed_by`) is the
@@ -269,6 +285,7 @@ impl Catalog {
         job_id: &str,
         worker_id: &str,
         output_model_id: &str,
+        artifact_path: &str,
         metrics: Option<&str>,
     ) -> Result<bool> {
         let completed = TrainingJobStatus::Completed.to_string();
@@ -276,6 +293,7 @@ impl Catalog {
         let job_id = job_id.to_string();
         let worker_id = worker_id.to_string();
         let output_model_id = output_model_id.to_string();
+        let artifact_path = artifact_path.to_string();
         let metrics = metrics.map(str::to_string);
         let now = lease_now();
 
@@ -283,22 +301,42 @@ impl Catalog {
             .backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
-                    tx.execute(
-                        "UPDATE training_jobs \
-                         SET output_model_id = $1, status = $2, \
-                             metrics = COALESCE($3, metrics), updated_at = $4 \
-                         WHERE job_id = $5 AND claimed_by = $6 AND status = $7",
-                        &[
-                            SqlValue::TextOwned(output_model_id),
-                            SqlValue::TextOwned(completed),
-                            SqlValue::from(metrics),
-                            SqlValue::TextOwned(now),
-                            SqlValue::TextOwned(job_id),
-                            SqlValue::TextOwned(worker_id),
-                            SqlValue::TextOwned(running),
-                        ],
-                    )
-                    .await
+                    let job_updated = tx
+                        .execute(
+                            "UPDATE training_jobs \
+                             SET output_model_id = $1, status = $2, \
+                                 metrics = COALESCE($3, metrics), updated_at = $4 \
+                             WHERE job_id = $5 AND claimed_by = $6 AND status = $7",
+                            &[
+                                SqlValue::TextOwned(output_model_id.clone()),
+                                SqlValue::TextOwned(completed),
+                                SqlValue::from(metrics),
+                                SqlValue::TextOwned(now.clone()),
+                                SqlValue::TextOwned(job_id),
+                                SqlValue::TextOwned(worker_id),
+                                SqlValue::TextOwned(running),
+                            ],
+                        )
+                        .await?;
+                    // Commit the served path on the output model's row only when
+                    // this worker won the job-row CAS — in the same transaction,
+                    // so the served pointer is committed atomically with (and
+                    // never without) the job's terminal flip. A loser's CAS
+                    // matched zero rows and skips this entirely.
+                    if job_updated == 1 {
+                        tx.execute(
+                            "UPDATE models SET artifact_path = $1, \
+                                 updated_at = $2 \
+                             WHERE name = $3",
+                            &[
+                                SqlValue::TextOwned(artifact_path),
+                                SqlValue::TextOwned(now),
+                                SqlValue::TextOwned(output_model_id),
+                            ],
+                        )
+                        .await?;
+                    }
+                    Ok(job_updated)
                 })
             })
             .await?;
@@ -340,6 +378,57 @@ impl Catalog {
                          WHERE job_id = $4 AND claimed_by = $5 AND status = $6",
                         &[
                             SqlValue::TextOwned(failed),
+                            SqlValue::from(metrics),
+                            SqlValue::TextOwned(now),
+                            SqlValue::TextOwned(job_id),
+                            SqlValue::TextOwned(worker_id),
+                            SqlValue::TextOwned(running),
+                        ],
+                    )
+                    .await
+                })
+            })
+            .await?;
+        Ok(updated == 1)
+    }
+
+    /// Record run-start metrics on a job the caller still owns, gated on lease
+    /// ownership — the non-terminal peer of [`Self::finalize_training_job`] and
+    /// [`Self::fail_training_job`]. Replaces `metrics` (the run-start blob, e.g.
+    /// `started_at`) **only** while the row is still `running` and
+    /// `claimed_by == worker_id`; the status is already `running` from the claim,
+    /// so this never transitions it — it just stamps metrics under the same lease
+    /// guard. Returns `true` when the write landed and `false` when the lease was
+    /// lost.
+    ///
+    /// Every worker write to the job row is lease-guarded for the same reason the
+    /// finalize and fail writes are: a worker whose lease was reclaimed mid-run
+    /// (a zombie still executing its claimed run) must not be able to touch the
+    /// row. Without this guard a zombie's trainer start would stamp `running`
+    /// metrics over a job the winner already drove to `completed`, regressing the
+    /// terminal status. Not tenant-scoped, matching the other lease-identity
+    /// operations.
+    pub async fn mark_training_running(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        metrics: Option<&str>,
+    ) -> Result<bool> {
+        let running = TrainingJobStatus::Running.to_string();
+        let job_id = job_id.to_string();
+        let worker_id = worker_id.to_string();
+        let metrics = metrics.map(str::to_string);
+        let now = lease_now();
+
+        let updated = self
+            .backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE training_jobs \
+                         SET metrics = COALESCE($1, metrics), updated_at = $2 \
+                         WHERE job_id = $3 AND claimed_by = $4 AND status = $5",
+                        &[
                             SqlValue::from(metrics),
                             SqlValue::TextOwned(now),
                             SqlValue::TextOwned(job_id),

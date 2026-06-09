@@ -790,6 +790,7 @@ async fn fine_tune_job_catalog_crud() {
             "job-1",
             "worker-x",
             "jammi:fine-tuned:job-1",
+            "file:///artifacts/job-1/worker-x/1",
             Some(r#"{"completed_at": "2026-01-01T01:00:00Z"}"#),
         )
         .await
@@ -933,6 +934,13 @@ async fn training_divergence_detection() {
         })
         .await
         .unwrap();
+    // Claim it under the worker so the run-start stamp (lease-guarded on
+    // `claimed_by` + `running`) lands, matching the real worker flow.
+    catalog
+        .claim_next_training_job("worker-div", std::time::Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("the queued job is claimable");
 
     let mut training_loop = TrainingLoopBuilder::new(
         jammi_ai::fine_tune::target::TrainingTarget::ProjectionHead { head: model },
@@ -946,6 +954,7 @@ async fn training_divergence_detection() {
         },
     )
     .job_id("div-job".into())
+    .worker_id("worker-div".into())
     .catalog(Arc::clone(&catalog))
     .artifact_dir(dir.path().to_path_buf())
     .build()
@@ -1049,6 +1058,11 @@ async fn training_early_stopping_triggers() {
         })
         .await
         .unwrap();
+    catalog
+        .claim_next_training_job("worker-es", std::time::Duration::from_secs(60))
+        .await
+        .unwrap()
+        .expect("the queued job is claimable");
 
     let mut training_loop = TrainingLoopBuilder::new(
         jammi_ai::fine_tune::target::TrainingTarget::ProjectionHead { head: model },
@@ -1064,6 +1078,7 @@ async fn training_early_stopping_triggers() {
         },
     )
     .job_id("es-job".into())
+    .worker_id("worker-es".into())
     .catalog(Arc::clone(&catalog))
     .artifact_dir(dir.path().to_path_buf())
     .build()
@@ -1770,6 +1785,155 @@ async fn loser_prefix_is_never_the_committed_artifact() {
     );
 }
 
+// ─── Reclaim: a zombie loser running AFTER the winner cannot corrupt the commit ─
+//
+// The audit's exact ordering, and the one `loser_prefix_is_never_the_committed_
+// artifact` does NOT exercise: the WINNER runs and completes FIRST, THEN the
+// stale (zombie) loser runs to completion. The loser still holds an old claim
+// (its lease expired and was reclaimed), so when it finishes it registers its
+// own model row and runs its finalize. With the served path committed by an
+// unguarded last-writer-wins `register_model` (the pre-fix shape) the zombie's
+// late register would overwrite the committed `artifact_path` with its own
+// prefix, and its CAS-loss branch would then delete that prefix's bytes —
+// leaving the completed model pointing at deleted bytes (a `manifest.json
+// NotFound` on reload) and, separately, regressing the job's status back to
+// `running` via the unguarded run-start status write.
+//
+// Post-fix: the served path is committed solely by the winner's lease-guarded
+// finalize CAS, never by `register_model`; the zombie's finalize matches zero
+// rows and commits nothing, so it only GC's its OWN (never-committed) prefix;
+// and every job-row write the zombie makes is lease-guarded, so the terminal
+// `completed` status is undisturbed. The committed prefix is the winner's, its
+// bytes survive, and reload succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn zombie_loser_after_winner_cannot_corrupt_the_commit() {
+    use jammi_ai::fine_tune::worker::TrainingWorker;
+    use std::time::Duration;
+
+    let (session, _dir) = session_with_training_data().await;
+    let model = tiny_bert_model();
+
+    let job = session
+        .fine_tune(
+            "training",
+            &model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 1,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    let worker_a = TrainingWorker::new(&session).expect("default worker intervals are valid");
+    let worker_b = TrainingWorker::new(&session).expect("default worker intervals are valid");
+
+    // worker-a claims with a zero (already-expired) lease — this is the stale
+    // claim the zombie will later run. reclaim re-queues it; worker-b re-claims
+    // under a long lease and is the rightful owner.
+    let stale_claim = session
+        .catalog()
+        .claim_next_training_job(worker_a.worker_id(), Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("worker-a claims the queued job");
+    let actioned = session
+        .catalog()
+        .reclaim_expired_training_jobs(5)
+        .await
+        .unwrap();
+    assert_eq!(actioned, 1, "the expired lease is re-queued");
+    let owned = session
+        .catalog()
+        .claim_next_training_job(worker_b.worker_id(), Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("worker-b re-claims the requeued job");
+
+    // WINNER FIRST: worker-b trains, wins its finalize CAS, and completes the
+    // job — committing its prefix as the served artifact path.
+    worker_b.run_claimed_job(&session, owned).await;
+    job.wait().await.unwrap();
+
+    let ft = session
+        .catalog()
+        .list_models()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
+        .expect("the winner registered the fine-tuned model");
+    let winner_prefix = ft
+        .artifact_path
+        .clone()
+        .expect("the winner committed a served artifact_path");
+
+    // THEN the zombie loser runs its stale claim to completion: it registers its
+    // own model row and runs its finalize. Its lease was reclaimed, so its
+    // finalize CAS must match zero rows — committing nothing — and it only GC's
+    // its own (never-committed) prefix.
+    worker_a.run_claimed_job(&session, stale_claim).await;
+
+    // (1) The served path is still the WINNER's prefix — the zombie's late
+    // register never overwrote the committed pointer.
+    let ft_after = session
+        .catalog()
+        .list_models()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
+        .expect("the fine-tuned model row still exists");
+    assert_eq!(
+        ft_after.artifact_path.as_deref(),
+        Some(winner_prefix.as_str()),
+        "the committed served path is the winner's prefix; the zombie's late \
+         register did not overwrite it"
+    );
+
+    // (2) The committed prefix's bytes still exist and fetch_artifact succeeds —
+    // reload works (no `manifest.json NotFound`). The zombie GC'd its OWN prefix,
+    // never the committed one.
+    let prefix_url = jammi_db::storage::StorageUrl::parse(&winner_prefix).unwrap();
+    let local = session
+        .artifact_store()
+        .fetch_artifact(&prefix_url)
+        .await
+        .expect("the committed artifact still fetches and verifies after the zombie ran");
+    let adapter = local.dir().join("adapter.safetensors");
+    assert!(
+        adapter.exists(),
+        "the committed prefix still holds the winner's adapter at {adapter:?}"
+    );
+    let loaded = candle_core::safetensors::load(&adapter, &candle_core::Device::Cpu).unwrap();
+    assert!(
+        !loaded.is_empty(),
+        "the committed adapter remains a well-formed safetensors tensor map"
+    );
+
+    // (3) The job stays `completed` — the zombie's run-start status write is
+    // lease-guarded, so it could not regress the terminal status to `running`.
+    let after_zombie = session
+        .catalog()
+        .get_training_job(&job.job_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_zombie.status, "completed",
+        "the terminal status is undisturbed by the zombie (no completed → running regression)"
+    );
+}
+
 // ─── Lease loss: cooperative cancellation bails the trainer at the boundary ──
 //
 // A `spawn_blocking` trainer cannot be force-aborted, so the worker's heartbeat
@@ -1853,6 +2017,7 @@ async fn training_bails_when_lease_lost_mid_run() {
         },
     )
     .job_id("lease-job".into())
+    .worker_id("worker-a".into())
     .catalog(Arc::clone(&catalog))
     .artifact_dir(dir.path().to_path_buf())
     .cancel(Arc::clone(&cancel))

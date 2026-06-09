@@ -158,6 +158,13 @@ impl OssServer {
             .server
             .validate()
             .map_err(|e| ServerError::Config(e.to_string()))?;
+        // Reject training timing that violates the worker invariants (heartbeat
+        // margin / non-zero poll) at construction, before the train tier spawns
+        // its worker.
+        config
+            .training
+            .worker_intervals()
+            .map_err(|e| ServerError::Config(e.to_string()))?;
 
         let flight_addr: SocketAddr = config.server.flight_listen.parse()?;
         let health_addr: SocketAddr = config.server.health_listen.parse()?;
@@ -327,7 +334,6 @@ impl OssServer {
             shutdown,
         )
         .await
-        .map_err(ServerError::from)
     }
 }
 
@@ -386,7 +392,7 @@ pub struct GrpcChain {
 pub async fn serve_grpc_chain(
     chain: GrpcChain,
     shutdown: impl Future<Output = ()> + Send + 'static,
-) -> Result<(), tonic::transport::Error> {
+) -> Result<(), ServerError> {
     let GrpcChain {
         addr,
         flight_ctx,
@@ -508,7 +514,9 @@ pub async fn serve_grpc_chain(
             // just N processes claiming from the shared catalog, and the server
             // `train` tier runs one of them. It stops when this future resolves
             // on shutdown (the guard drops with the function frame).
-            _train_worker = Some(jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session));
+            _train_worker = Some(jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(
+                &session,
+            )?);
             let training_svc =
                 TrainingServiceServer::with_interceptor(TrainingServer::new(session), interceptor);
             builder = builder.add_service(training_svc);
@@ -517,7 +525,10 @@ pub async fn serve_grpc_chain(
     }
 
     tracing::info!("gRPC chain ({}) listening on {addr}", mounted.join(" + "));
-    builder.serve_with_shutdown(addr, shutdown).await
+    builder
+        .serve_with_shutdown(addr, shutdown)
+        .await
+        .map_err(ServerError::from)
 }
 
 /// Install OS shutdown handlers and resolve when SIGINT or SIGTERM

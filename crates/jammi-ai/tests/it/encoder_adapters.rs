@@ -76,7 +76,8 @@ async fn adapter_dir_for_model(session: &InferenceSession, model_id: &str) -> st
 #[tokio::test(flavor = "multi_thread")]
 async fn encoder_adapters_bert_writes_adapter_marker() {
     let (session, _dir) = session_with_training_data().await;
-    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
 
     let job = session
         .fine_tune(
@@ -133,7 +134,8 @@ async fn encoder_adapters_bert_writes_adapter_marker() {
 #[tokio::test(flavor = "multi_thread")]
 async fn encoder_adapters_modernbert_writes_adapter_marker() {
     let (session, _dir) = session_with_training_data().await;
-    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
 
     let job = session
         .fine_tune(
@@ -177,7 +179,8 @@ async fn encoder_adapters_modernbert_writes_adapter_marker() {
 #[tokio::test(flavor = "multi_thread")]
 async fn encoder_adapters_changes_embeddings_versus_base() {
     let (session, _dir) = session_with_training_data().await;
-    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
     let base = tiny_bert_model();
 
     // Base embedding for a known input.

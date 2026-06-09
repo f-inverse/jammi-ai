@@ -39,10 +39,10 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use jammi_db::catalog::Catalog;
+use jammi_db::config::WorkerIntervals;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::model_task::ModelTask;
 
@@ -57,19 +57,18 @@ use crate::model::backend::DeviceConfig;
 use crate::model::ModelSource;
 use crate::session::InferenceSession;
 
-// Lease timing. The lease is the window a claimed job is exclusively owned; the
-// heartbeat renews it well inside that window so a single missed beat (GC pause,
-// a slow tick) does not drop the lease. The 3× margin (30s lease / 10s beat)
-// tolerates one missed beat. The idle poll is how often an idle worker checks
-// for new work, and reclaim runs each idle tick so a dead worker's job is
-// recovered within roughly one poll + lease.
+// Lease timing is configured per deployment via `[training]` in `JammiConfig`
+// and resolved to a [`WorkerIntervals`] (see
+// [`jammi_db::config::TrainingConfig::worker_intervals`]). The lease is the
+// window a claimed job is exclusively owned; the heartbeat renews it well
+// inside that window so a single missed beat (a GC pause, a slow tick) does not
+// drop the lease — the config layer enforces a ≥2× margin between the lease and
+// the beat so that invariant holds for every deployment, never silently
+// clamped. The idle poll is how often an idle worker checks for new work, and
+// reclaim runs each idle tick so a dead worker's job is recovered within roughly
+// one poll + lease. The defaults reproduce the historical 30 s / 10 s / 1 s
+// timing; a short config drives lease-expiry and reclaim quickly.
 
-/// How long a claim leases a job before it is considered orphaned.
-const LEASE: Duration = Duration::from_secs(30);
-/// Heartbeat interval — renews the lease at 3× margin inside [`LEASE`].
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-/// How often an idle worker polls for a queued job (and reclaims expired leases).
-const IDLE_POLL: Duration = Duration::from_secs(1);
 /// Attempts cap before `reclaim_expired_training_jobs` fails a job for good.
 const MAX_ATTEMPTS: u32 = 3;
 
@@ -85,16 +84,37 @@ pub struct TrainingWorker {
     /// Stable id stamped into `claimed_by` so a heartbeat / reclaim can tell
     /// this worker's leases from another's.
     worker_id: String,
+    /// The validated lease/heartbeat/poll timing this worker drives its loop
+    /// with. `intervals.lease` is the single source of truth threaded to both
+    /// the claim and the heartbeat, so the renew always targets the same
+    /// deadline the reclaim path compares against.
+    intervals: WorkerIntervals,
 }
 
 impl TrainingWorker {
-    /// Build a worker over a session. The worker holds a [`Weak`] so it never
-    /// keeps the session alive; the caller owns the strong `Arc` and the worker
-    /// stops when that drops.
-    pub fn new(session: &Arc<InferenceSession>) -> Self {
+    /// Build a worker over a session, reading its lease/heartbeat/poll timing
+    /// from the session's `[training]` configuration. The worker holds a
+    /// [`Weak`] so it never keeps the session alive; the caller owns the strong
+    /// `Arc` and the worker stops when that drops.
+    ///
+    /// Returns [`JammiError::Config`] if the configured timing violates the
+    /// worker invariants (heartbeat margin / non-zero poll). In the normal flow
+    /// the same check already ran at config load, so this only fires for a
+    /// programmatically built config that bypassed `JammiConfig::load`.
+    pub fn new(session: &Arc<InferenceSession>) -> Result<Self> {
+        let intervals = session.inner_config().training.worker_intervals()?;
+        Ok(Self::with_intervals(session, intervals))
+    }
+
+    /// Build a worker over a session with explicit, already-validated timing.
+    /// The [`WorkerIntervals`] type can only be produced by
+    /// [`jammi_db::config::TrainingConfig::worker_intervals`], so its invariants
+    /// hold by construction.
+    pub fn with_intervals(session: &Arc<InferenceSession>, intervals: WorkerIntervals) -> Self {
         Self {
             session: Arc::downgrade(session),
             worker_id: format!("worker-{}", uuid::Uuid::new_v4()),
+            intervals,
         }
     }
 
@@ -118,8 +138,8 @@ impl TrainingWorker {
     ///
     /// Stack-safe: a bounded `loop`, never recursion. Each tick reclaims expired
     /// leases then attempts one claim; on a claim it runs the job to a terminal
-    /// state inline (the next claim waits for it), on no claim it sleeps
-    /// `IDLE_POLL`. The catalog used for reclaim/claim is unscoped — a worker
+    /// state inline (the next claim waits for it), on no claim it sleeps the
+    /// configured idle poll. The catalog used for reclaim/claim is unscoped — a worker
     /// serves every tenant's queue.
     pub async fn run_until(&self, stop: Arc<AtomicBool>) {
         loop {
@@ -138,7 +158,7 @@ impl TrainingWorker {
             }
 
             let claimed = match catalog
-                .claim_next_training_job(&self.worker_id, LEASE)
+                .claim_next_training_job(&self.worker_id, self.intervals.lease)
                 .await
             {
                 Ok(c) => c,
@@ -155,7 +175,7 @@ impl TrainingWorker {
                     // the run re-upgrades the Weak through the `Arc` it captures.
                     self.run_claimed_job(&session, record).await;
                 }
-                None => tokio::time::sleep(IDLE_POLL).await,
+                None => tokio::time::sleep(self.intervals.idle_poll).await,
             }
         }
     }
@@ -308,9 +328,11 @@ impl TrainingWorker {
         }
     }
 
-    /// Spawn the lease-renewing heartbeat task. It renews on [`HEARTBEAT_INTERVAL`]
-    /// and, the first time `heartbeat_training_job` reports the lease lost, sets
-    /// `cancel` and stops.
+    /// Spawn the lease-renewing heartbeat task. It renews on the configured
+    /// heartbeat interval and, the first time `heartbeat_training_job` reports
+    /// the lease lost, sets `cancel` and stops. The renewed lease window is the
+    /// same `intervals.lease` the claim used, so the heartbeat and the reclaim
+    /// path share one source of truth for the deadline.
     fn spawn_heartbeat(
         &self,
         catalog: Arc<Catalog>,
@@ -318,11 +340,13 @@ impl TrainingWorker {
         cancel: Arc<AtomicBool>,
     ) -> tokio::task::JoinHandle<()> {
         let worker_id = self.worker_id.clone();
+        let heartbeat = self.intervals.heartbeat;
+        let lease = self.intervals.lease;
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                tokio::time::sleep(heartbeat).await;
                 match catalog
-                    .heartbeat_training_job(&job_id, &worker_id, LEASE)
+                    .heartbeat_training_job(&job_id, &worker_id, lease)
                     .await
                 {
                     Ok(true) => {}
@@ -649,12 +673,17 @@ impl EmbeddedWorker {
     /// Spawn a worker over `session` onto the current runtime, returning the
     /// guard that owns its task. The worker holds a [`Weak`] to the session, so
     /// it never keeps `session` alive; this guard stops it when the owner drops.
-    pub fn spawn(session: &Arc<InferenceSession>) -> Self {
-        let worker = TrainingWorker::new(session);
+    ///
+    /// Reads the lease/heartbeat/poll timing from the session's `[training]`
+    /// configuration. Returns [`JammiError::Config`] if that timing violates the
+    /// worker invariants — in the normal flow `JammiConfig::load` already
+    /// validated it, so this only surfaces for a hand-built config.
+    pub fn spawn(session: &Arc<InferenceSession>) -> Result<Self> {
+        let worker = TrainingWorker::new(session)?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_task = Arc::clone(&stop);
         let handle = tokio::spawn(async move { worker.run_until(stop_for_task).await });
-        Self { handle, stop }
+        Ok(Self { handle, stop })
     }
 }
 
@@ -1325,6 +1354,8 @@ fn build_encoder_adapters(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     /// A panicking blocking trainer drives the job to a terminal `failed` status

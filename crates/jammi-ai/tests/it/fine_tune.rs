@@ -251,7 +251,8 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
     let (session, dir) = session_with_training_data().await;
     // `fine_tune` submits a queued job; a worker runs it. Start one over this
     // session (it holds a `Weak`, so the test's `Arc` keeps the session alive).
-    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
     let model = tiny_bert_model();
 
     let job = session
@@ -581,7 +582,8 @@ async fn audio_projection_head_fine_tune_changes_embeddings() {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
-    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
     let model = htsat_clap_model();
 
     // Triplet source (audio bytes), corpus, and golden.
@@ -1104,7 +1106,8 @@ async fn training_early_stopping_triggers() {
 #[tokio::test(flavor = "multi_thread")]
 async fn fine_tuned_model_produces_measurably_different_search_quality() {
     let (session, _dir) = session_with_training_data().await;
-    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
     let model = tiny_bert_model();
 
     // Register patents source for embedding generation and eval
@@ -1360,7 +1363,8 @@ async fn durable_job_runs_on_separately_started_worker() {
     );
 
     // Start the worker separately — it reconstructs the run from the spec alone.
-    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session);
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
     job.wait().await.unwrap();
 
     let record = session
@@ -1440,8 +1444,8 @@ async fn worker_that_lost_lease_does_not_finalize() {
         .await
         .unwrap();
 
-    let worker_a = TrainingWorker::new(&session);
-    let worker_b = TrainingWorker::new(&session);
+    let worker_a = TrainingWorker::new(&session).expect("default worker intervals are valid");
+    let worker_b = TrainingWorker::new(&session).expect("default worker intervals are valid");
 
     // worker-a claims with a zero lease (immediately expired). The returned
     // record carries `claimed_by = worker-a` — the stale claim it will later try
@@ -1521,6 +1525,127 @@ async fn worker_that_lost_lease_does_not_finalize() {
     );
 }
 
+// ─── Configurable lease drives reclaim ──────────────────────────────────────
+//
+// The prerequisite for the distributed-validation lane: a short configured
+// lease must actually expire and be reclaimed. This builds a session whose
+// `[training]` timing carries a 1 s lease, claims a real job under the exact
+// lease the worker derives from that config (the single source of truth —
+// `TrainingConfig::worker_intervals`), then stops heartbeating. After the lease
+// elapses, `reclaim_expired_training_jobs` re-queues the job — proving the
+// configured lease, not the historical 30 s constant, drives reclaim. A second
+// claim under the same short lease succeeds, confirming the job is back in the
+// queue.
+#[tokio::test(flavor = "multi_thread")]
+async fn configured_short_lease_drives_reclaim() {
+    use jammi_ai::fine_tune::worker::TrainingWorker;
+
+    let dir = TempDir::new().unwrap();
+    let mut config = common::test_config(dir.path());
+    // A short lease (4 s) with a real heartbeat margin (2 s heartbeat = lease/2,
+    // the inclusive boundary) and a 1 s poll — the kind of timing the
+    // distributed-validation lane uses to exercise expiry quickly.
+    config.training = jammi_db::config::TrainingConfig {
+        lease_duration_secs: 4,
+        heartbeat_interval_secs: 2,
+        idle_poll_secs: 1,
+    };
+
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    session
+        .add_source(
+            "training",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("training_pairs.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let model = tiny_bert_model();
+
+    // Submit with no worker loop running so the job sits queued.
+    let job = session
+        .fine_tune(
+            "training",
+            &model,
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 1,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    // The worker reads its lease from the session's `[training]` config. Build
+    // it the production way so the test exercises the configured value, then
+    // claim under that exact lease (the value the worker's loop would pass).
+    let worker = TrainingWorker::new(&session).expect("short timing clears the margin");
+    let lease = session
+        .inner_config()
+        .training
+        .worker_intervals()
+        .unwrap()
+        .lease;
+    let claimed = session
+        .catalog()
+        .claim_next_training_job(worker.worker_id(), lease)
+        .await
+        .unwrap()
+        .expect("the queued job is claimable");
+    assert_eq!(claimed.status, "running");
+    assert_eq!(claimed.claimed_by.as_deref(), Some(worker.worker_id()));
+
+    // The worker "stalls" — it never heartbeats. Before the lease elapses the
+    // job is NOT reclaimable.
+    let actioned = session
+        .catalog()
+        .reclaim_expired_training_jobs(5)
+        .await
+        .unwrap();
+    assert_eq!(actioned, 0, "a live lease is not reclaimed");
+
+    // Wait past the configured lease, then reclaim re-queues the orphaned job.
+    tokio::time::sleep(lease + std::time::Duration::from_secs(1)).await;
+    let actioned = session
+        .catalog()
+        .reclaim_expired_training_jobs(5)
+        .await
+        .unwrap();
+    assert_eq!(
+        actioned, 1,
+        "the configured short lease expired, so the orphaned job is reclaimed"
+    );
+
+    // The job is back queued and re-claimable — the reclaim genuinely returned
+    // it to the queue rather than failing it.
+    let job_after = session
+        .catalog()
+        .get_training_job(&job.job_id)
+        .await
+        .unwrap();
+    assert_eq!(job_after.status, "queued", "the reclaimed job is re-queued");
+    let reclaimed = session
+        .catalog()
+        .claim_next_training_job("worker-second", lease)
+        .await
+        .unwrap()
+        .expect("the re-queued job is claimable again");
+    assert_eq!(reclaimed.claimed_by.as_deref(), Some("worker-second"));
+}
+
 // ─── Lease loss: a loser never writes the canonical artifact ─────────────────
 //
 // The data-integrity counterpart to `worker_that_lost_lease_does_not_finalize`:
@@ -1568,8 +1693,8 @@ async fn loser_never_writes_canonical_adapter() {
         .await
         .unwrap();
 
-    let worker_a = TrainingWorker::new(&session);
-    let worker_b = TrainingWorker::new(&session);
+    let worker_a = TrainingWorker::new(&session).expect("default worker intervals are valid");
+    let worker_b = TrainingWorker::new(&session).expect("default worker intervals are valid");
 
     // worker-a claims with a zero (already-expired) lease; worker-b reclaims and
     // re-claims under a long lease, so worker-b owns the job.

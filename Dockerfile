@@ -29,14 +29,23 @@ COPY . .
 # a warm rebuild is ~3 minutes. The `target/` mount is sharded by
 # the workspace name so concurrent builds don't fight over the
 # same lock file.
+# Build both binaries the runtime needs: `jammi-server` (the long-running
+# server) and `jammi` (the CLI, whose `serve` subcommand is the turnkey
+# entrypoint and which also carries `sources`/`query`/… in the same image).
+# One `cargo build` compiles the workspace once for both.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/workspace/target,sharing=locked \
     cargo build --release \
-        --package jammi-server \
-        --bin jammi-server \
+        --package jammi-server --bin jammi-server \
+        --package jammi-cli --bin jammi \
         --features jetstream-broker,storage-cloud \
     && cp target/release/jammi-server /tmp/jammi-server \
-    && strip /tmp/jammi-server
+    && cp target/release/jammi /tmp/jammi \
+    && strip /tmp/jammi-server /tmp/jammi
+
+# An empty directory the distroless runtime can COPY --chown into place as the
+# writable artifact dir — distroless has no shell to `mkdir` at runtime.
+RUN mkdir -p /tmp/jammi-data
 
 # ---- builder: cuda ----
 # The CUDA CI base extends `jammi-ai-ci` with the CUDA 12.6 toolkit (nvcc), GCC 13
@@ -49,53 +58,72 @@ WORKDIR /workspace
 COPY . .
 
 # Same cache-mount strategy as the CPU builder. The only delta is `--features cuda`,
-# which pulls in candle's CUDA backend (compiled for compute capability 86).
+# which pulls in candle's CUDA backend (compiled for compute capability 86). Both
+# binaries are built so the GPU image carries the turnkey `jammi` CLI too.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/workspace/target,sharing=locked \
     cargo build --release \
-        --package jammi-server \
-        --bin jammi-server \
+        --package jammi-server --bin jammi-server \
+        --package jammi-cli --bin jammi \
         --features cuda,jetstream-broker,storage-cloud \
     && cp target/release/jammi-server /tmp/jammi-server \
-    && strip /tmp/jammi-server
+    && cp target/release/jammi /tmp/jammi \
+    && strip /tmp/jammi-server /tmp/jammi
 
 # ---- runtime base ----
 # Distroless `cc` ships glibc and libstdc++ (Rust binaries linked
 # against the system C++ runtime via tonic + tokio's syscall layer
 # expect both). Image size lands ~50MB with a stripped binary.
 #
-# This base is shared by the two CPU variants. The generic variant
-# (`runtime-generic`) expects an operator-supplied config at
-# `/etc/jammi/jammi.toml` and a mounted volume at `/var/lib/jammi`.
-# The self-contained variant (`runtime-selfcontained`) bakes both in
-# so it boots standalone on a runtime that provides neither (e.g.
-# Cloudflare Containers). The CUDA variant (`runtime-cuda`) has its
-# own NVIDIA runtime base below — distroless ships no CUDA libraries.
+# This base is shared by the two CPU variants and carries both binaries plus the
+# turnkey `jammi serve` entrypoint. The generic variant (`runtime-generic`)
+# boots zero-config (local SQLite catalog under `/var/lib/jammi`) and accepts an
+# operator config via `serve --config`. The self-contained variant
+# (`runtime-selfcontained`) bakes a config + encoder so it boots standalone on a
+# runtime that provides neither (e.g. Cloudflare Containers). The CUDA variant
+# (`runtime-cuda`) has its own NVIDIA runtime base below — distroless ships no
+# CUDA libraries.
 FROM gcr.io/distroless/cc-debian12 AS runtime-base
 
-# Bring just the stripped binary across — none of the source tree,
-# cargo registry, or toolchain follow into the final image.
+# Bring just the stripped binaries across — none of the source tree,
+# cargo registry, or toolchain follow into the final image. Both the
+# long-running `jammi-server` and the `jammi` CLI ship: the CLI's `serve`
+# subcommand is the turnkey entrypoint, and the other CLI verbs
+# (`sources`, `query`, …) are available in the same image.
 COPY --from=builder /tmp/jammi-server /usr/local/bin/jammi-server
+COPY --from=builder /tmp/jammi /usr/local/bin/jammi
 
 # Health side-channel on 8080, gRPC + Flight SQL on 8081.
 EXPOSE 8080 8081
 
-ENTRYPOINT ["/usr/local/bin/jammi-server"]
+# Turnkey: `docker run <image>` runs `jammi serve`. With no `--config`, the CLI
+# loads `JammiConfig::default()` (local SQLite catalog, in-memory broker, all
+# tiers) — zero-config. `docker run <image> serve --config /etc/jammi/jammi.toml`
+# (or any other CLI verb) overrides the default `CMD`.
+ENTRYPOINT ["/usr/local/bin/jammi"]
+CMD ["serve"]
 
 # ---- runtime: generic (default) ----
-# The image users `docker pull` and run with their own config +
-# volume. Behaviour is identical to before this variant existed.
+# The turnkey CPU server image: `docker run <image>` runs `jammi serve` with
+# zero config (inherits ENTRYPOINT/CMD from runtime-base). Operators can still
+# supply their own config — `docker run <image> serve --config /etc/jammi/jammi.toml`
+# — and mount a volume / bind mount at `/var/lib/jammi`.
 FROM runtime-base AS runtime-generic
 
-# Persistent state: catalog DB, model weights, indices.
-# Distroless's nonroot user is uid 65532 — a docker named volume
-# (rather than a bind mount) lets docker provision ownership
-# automatically. Bind-mount deploys must `chown 65532:65532` the
-# host directory.
+# Persistent state: catalog DB, model weights, indices. Zero-config `jammi serve`
+# writes its SQLite catalog here via JAMMI_ARTIFACT_DIR (set below), so the
+# directory must be writable by the nonroot user (uid 65532) even when no volume
+# is mounted — `--chown` makes the baked directory writable; a mounted named
+# volume inherits its ownership, and a bind mount must be `chown 65532:65532`.
+COPY --from=builder --chown=65532:65532 /tmp/jammi-data /var/lib/jammi
 VOLUME ["/var/lib/jammi"]
-USER nonroot:nonroot
 
-CMD ["--config", "/etc/jammi/jammi.toml"]
+# Point zero-config `jammi serve` at the declared volume rather than the user's
+# XDG data dir (which is unwritable for uid 65532 on this base). An operator
+# config's `artifact_dir` still wins when passed via `--config`.
+ENV JAMMI_ARTIFACT_DIR=/var/lib/jammi
+
+USER nonroot:nonroot
 
 # ---- runtime: self-contained ----
 # Boots with zero external config and no mounted volume: the baked
@@ -115,7 +143,8 @@ COPY cookbook/fixtures/htsat_clap_tiny /opt/jammi/models/htsat_clap_tiny
 
 USER nonroot:nonroot
 
-CMD ["--config", "/etc/jammi/jammi.toml"]
+# Boot the baked config through the CLI entrypoint inherited from runtime-base.
+CMD ["serve", "--config", "/etc/jammi/jammi.toml"]
 
 # ---- runtime: cuda ----
 # GPU runtime base. `nvidia/cuda:*-runtime-ubi8` ships `libcudart` (and the rest of the
@@ -130,23 +159,37 @@ CMD ["--config", "/etc/jammi/jammi.toml"]
 # Dockerfile compiling is the CI gate; GPU inference is verified out-of-band.
 FROM nvidia/cuda:12.6.3-runtime-ubi8 AS runtime-cuda
 
-# Bring just the stripped CUDA-enabled binary across from the CUDA builder.
+# Bring both stripped CUDA-build binaries across from the CUDA builder: the
+# long-running `jammi-server` and the `jammi` CLI (whose `serve` subcommand is
+# the turnkey entrypoint, plus the other CLI verbs).
 COPY --from=builder-cuda /tmp/jammi-server /usr/local/bin/jammi-server
+COPY --from=builder-cuda /tmp/jammi /usr/local/bin/jammi
 
 # Health side-channel on 8080, gRPC + Flight SQL on 8081.
 EXPOSE 8080 8081
 
-# Persistent state: catalog DB, model weights, indices.
-VOLUME ["/var/lib/jammi"]
-
 # UBI8 has no pre-provisioned `nonroot` user; create one with the same uid (65532) the
 # distroless variants use so volume-ownership guidance stays identical across images.
+# Provision `/var/lib/jammi` owned by that user so zero-config `jammi serve` can
+# write its SQLite catalog there even when no volume is mounted.
 RUN groupadd --gid 65532 nonroot \
-    && useradd --uid 65532 --gid 65532 --home-dir /home/nonroot --create-home nonroot
+    && useradd --uid 65532 --gid 65532 --home-dir /home/nonroot --create-home nonroot \
+    && mkdir -p /var/lib/jammi \
+    && chown 65532:65532 /var/lib/jammi
+
+# Persistent state: catalog DB, model weights, indices.
+VOLUME ["/var/lib/jammi"]
 USER 65532:65532
 
-ENTRYPOINT ["/usr/local/bin/jammi-server"]
-CMD ["--config", "/etc/jammi/jammi.toml"]
+# Point zero-config `jammi serve` at the declared volume rather than the user's
+# XDG data dir. An operator config's `artifact_dir` still wins via `--config`.
+ENV JAMMI_ARTIFACT_DIR=/var/lib/jammi
+
+# Turnkey: `docker run --gpus all <image>` runs `jammi serve` with zero config
+# (local SQLite catalog, in-memory broker, all tiers; GPU via the cuda build).
+# `docker run --gpus all <image> serve --config /etc/jammi/jammi.toml` overrides it.
+ENTRYPOINT ["/usr/local/bin/jammi"]
+CMD ["serve"]
 
 # ---- final ----
 # Resolve the variant chosen by the global `RUNTIME_VARIANT` arg at the top of this file

@@ -35,6 +35,13 @@ tracing-subscriber.workspace = true
 cuda  = ["jammi-ai/cuda"]
 metal = ["jammi-ai/metal"]
 
+# docs.rs builds with default features only. Pin the feature set to empty so a
+# future `default` change can never make the docs.rs builder invoke nvcc (the
+# `cuda` feature pulls candle's CUDA backend, which needs a CUDA toolchain
+# docs.rs does not provide).
+[package.metadata.docs.rs]
+features = []
+
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"

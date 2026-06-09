@@ -6,16 +6,55 @@ Add Jammi to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-jammi-db = "0.1"
-jammi-ai = "0.1"
+jammi-db = "0.25"
+jammi-ai = "0.25"
 tokio = { version = "1", features = ["full"] }
 ```
 
-Or install the CLI:
+## CLI
+
+The `jammi` CLI registers sources, runs SQL, and starts the server. There are
+three ways to get it.
+
+### `cargo install` (CPU)
+
+Builds from source on your machine. Needs the build dependencies below.
 
 ```bash
 cargo install jammi-cli
 ```
+
+The installed binary is `jammi`.
+
+### Prebuilt binary (CPU)
+
+Download a stripped, ready-to-run binary from the
+[GitHub releases](https://github.com/f-inverse/jammi-ai/releases). No build
+toolchain required. Assets are published per release:
+
+- `jammi-<version>-x86_64-unknown-linux-gnu.tar.gz` — Linux x86-64 (built on a
+  glibc 2.28 floor, so it runs on any newer Linux)
+- `jammi-<version>-aarch64-apple-darwin.tar.gz` — macOS on Apple silicon
+
+```bash
+tar -xzf jammi-0.25.0-x86_64-unknown-linux-gnu.tar.gz
+./jammi --help
+```
+
+### GPU (CUDA 12)
+
+GPU inference ships as a container image, not a bare binary. The
+`jammi-ai-server-cu12` image carries the same `jammi` CLI and is turnkey:
+
+```bash
+docker run --gpus all \
+  -p 8080:8080 -p 8081:8081 \
+  ghcr.io/f-inverse/jammi-ai-server-cu12:latest
+```
+
+That runs `jammi serve` with zero config. See
+[Deploy as a Server](./deploy-server.md#gpu-serving) for GPU configuration and
+persistence.
 
 ### Build dependencies (Linux)
 

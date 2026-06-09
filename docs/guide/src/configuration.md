@@ -41,6 +41,9 @@ device = -1
 memory_limit = "auto"
 # Fraction of GPU memory Jammi may use. Default: 0.9.
 memory_fraction = 0.9
+# Fail fast if the requested GPU is unavailable instead of falling back to CPU.
+# Default: false (degrade to CPU with a warning).
+require_gpu = false
 
 [inference]
 # Default backend selection strategy. Default: "auto".
@@ -113,6 +116,7 @@ Every config field can be overridden with an environment variable using the patt
 | `JAMMI_ARTIFACT_DIR` | `artifact_dir` |
 | `JAMMI_ENGINE__BATCH_SIZE` | `engine.batch_size` |
 | `JAMMI_GPU__DEVICE` | `gpu.device` |
+| `JAMMI_GPU__REQUIRE_GPU` | `gpu.require_gpu` |
 | `JAMMI_INFERENCE__BATCH_SIZE` | `inference.batch_size` |
 | `JAMMI_LOGGING__LEVEL` | `logging.level` |
 

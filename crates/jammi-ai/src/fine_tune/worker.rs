@@ -1286,7 +1286,7 @@ fn run_fine_tune_blocking(
         cancel,
     } = params;
 
-    let device = crate::model::backend::candle::select_device(&device_config);
+    let device = crate::model::backend::candle::select_device(&device_config)?;
     let varmap = VarMap::new();
     let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
 

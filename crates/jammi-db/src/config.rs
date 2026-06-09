@@ -399,6 +399,10 @@ pub struct GpuConfig {
     pub memory_limit: String,
     /// Fraction of GPU memory to allocate (0.0 - 1.0). Default: 0.9.
     pub memory_fraction: f64,
+    /// Require a usable GPU: when `true`, refuse to fall back to CPU and fail
+    /// fast if the requested device is unavailable. Default: `false` (degrade
+    /// to CPU with a warning).
+    pub require_gpu: bool,
 }
 
 /// Model inference defaults.
@@ -723,6 +727,7 @@ impl Default for GpuConfig {
             device: 0,
             memory_limit: "auto".into(),
             memory_fraction: 0.9,
+            require_gpu: false,
         }
     }
 }
@@ -904,6 +909,11 @@ impl JammiConfig {
         if let Ok(v) = std::env::var("JAMMI_GPU__MEMORY_FRACTION") {
             if let Ok(n) = v.parse() {
                 self.gpu.memory_fraction = n;
+            }
+        }
+        if let Ok(v) = std::env::var("JAMMI_GPU__REQUIRE_GPU") {
+            if let Ok(b) = v.parse() {
+                self.gpu.require_gpu = b;
             }
         }
 

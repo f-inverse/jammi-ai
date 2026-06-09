@@ -24,6 +24,11 @@ pub struct DeviceConfig {
     pub gpu_device: i32,
     /// Fraction of GPU memory available for model loading.
     pub memory_fraction: f64,
+    /// When `true`, refuse to fall back to CPU if the requested GPU is
+    /// unavailable: device selection returns an error so the server fails
+    /// fast instead of silently serving on CPU. When `false` (the default),
+    /// an unavailable GPU degrades to CPU with a loud warning.
+    pub require_gpu: bool,
 }
 
 impl DeviceConfig {
@@ -32,6 +37,7 @@ impl DeviceConfig {
         Self {
             gpu_device: config.gpu.device,
             memory_fraction: config.gpu.memory_fraction,
+            require_gpu: config.gpu.require_gpu,
         }
     }
 }

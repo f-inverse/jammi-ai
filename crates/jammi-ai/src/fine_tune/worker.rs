@@ -73,6 +73,25 @@ use crate::session::InferenceSession;
 /// Attempts cap before `reclaim_expired_training_jobs` fails a job for good.
 const MAX_ATTEMPTS: u32 = 3;
 
+/// Environment override for the worker's stable `claimed_by` identity. When set
+/// (and non-empty), a worker adopts this exact id instead of minting a random
+/// per-process uuid. A fleet operator uses it for stable identity in logs and
+/// lease ownership across restarts; a multi-process test harness uses it to
+/// assert which worker ran a given job. Unset (or empty) → the random-uuid
+/// default, so a plain single-process deployment is byte-unchanged.
+const WORKER_ID_ENV: &str = "JAMMI_WORKER_ID";
+
+/// Resolve the worker's stable id: the trimmed `JAMMI_WORKER_ID` when set and
+/// non-empty, otherwise a fresh `worker-{uuid}`. An all-whitespace value is
+/// treated as unset — it would be a useless `claimed_by` and silently break
+/// ownership assertions, so it falls back rather than seeding a blank id.
+fn resolve_worker_id() -> String {
+    match std::env::var(WORKER_ID_ENV) {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => format!("worker-{}", uuid::Uuid::new_v4()),
+    }
+}
+
 /// A training worker bound to a session. Claims and runs durable training jobs
 /// from the shared catalog under a lease. Construct one per process (or N for a
 /// pool); [`Self::run`] is the long-lived loop the embedded engine and the
@@ -83,7 +102,8 @@ pub struct TrainingWorker {
     /// the session alive).
     session: Weak<InferenceSession>,
     /// Stable id stamped into `claimed_by` so a heartbeat / reclaim can tell
-    /// this worker's leases from another's.
+    /// this worker's leases from another's. Seeded from `JAMMI_WORKER_ID` when
+    /// set, else a fresh random `worker-{uuid}` (see [`resolve_worker_id`]).
     worker_id: String,
     /// The validated lease/heartbeat/poll timing this worker drives its loop
     /// with. `intervals.lease` is the single source of truth threaded to both
@@ -111,10 +131,13 @@ impl TrainingWorker {
     /// The [`WorkerIntervals`] type can only be produced by
     /// [`jammi_db::config::TrainingConfig::worker_intervals`], so its invariants
     /// hold by construction.
+    ///
+    /// The worker's `claimed_by` identity is seeded from `JAMMI_WORKER_ID` when
+    /// that env var is set and non-empty, else a fresh random `worker-{uuid}`.
     pub fn with_intervals(session: &Arc<InferenceSession>, intervals: WorkerIntervals) -> Self {
         Self {
             session: Arc::downgrade(session),
-            worker_id: format!("worker-{}", uuid::Uuid::new_v4()),
+            worker_id: resolve_worker_id(),
             intervals,
         }
     }
@@ -1612,5 +1635,34 @@ mod tests {
 
         let other = std::panic::catch_unwind(|| std::panic::panic_any(42u8)).unwrap_err();
         assert_eq!(panic_message(other.as_ref()), "<unknown panic payload>");
+    }
+
+    /// `resolve_worker_id` honours a set, non-empty `JAMMI_WORKER_ID` verbatim
+    /// (trimmed) and otherwise mints a fresh random `worker-{uuid}`. An empty /
+    /// all-whitespace value falls back rather than seeding a blank `claimed_by`.
+    ///
+    /// `JAMMI_WORKER_ID` is process-global, so the three cases run in one test
+    /// (parallel tests must not race the same env var) and the var is removed at
+    /// the end to leave the environment clean for the rest of the suite.
+    #[test]
+    fn resolve_worker_id_honours_seed_else_random() {
+        // Set + non-empty → adopted verbatim (after trimming).
+        std::env::set_var(WORKER_ID_ENV, "  worker-7  ");
+        assert_eq!(resolve_worker_id(), "worker-7");
+
+        // Empty / all-whitespace → treated as unset (a blank claimed_by is useless).
+        std::env::set_var(WORKER_ID_ENV, "   ");
+        let blank_fallback = resolve_worker_id();
+        assert!(
+            blank_fallback.starts_with("worker-") && blank_fallback.len() > "worker-".len(),
+            "an all-whitespace seed must fall back to a random id, got {blank_fallback:?}"
+        );
+
+        // Unset → a fresh random uuid id, and two calls differ.
+        std::env::remove_var(WORKER_ID_ENV);
+        let a = resolve_worker_id();
+        let b = resolve_worker_id();
+        assert!(a.starts_with("worker-"), "default id is worker-prefixed");
+        assert_ne!(a, b, "the random default mints a distinct id per call");
     }
 }

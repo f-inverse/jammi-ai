@@ -4080,6 +4080,7 @@ dependencies = [
  "jammi-lora",
  "jammi-numerics",
  "jammi-test-utils",
+ "libc",
  "parquet",
  "prost",
  "prost-types",

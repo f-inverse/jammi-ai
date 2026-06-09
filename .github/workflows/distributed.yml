@@ -1,0 +1,113 @@
+name: Distributed validation
+
+# The multi-process distributed-validation lane: N `jammi serve` worker
+# processes claiming from a shared Postgres catalog + a shared object store
+# (MinIO), proving the durable-worker fleet-safety properties (exactly-one
+# claim, kill-9 reclaim, the artifact crash-window on real object storage,
+# cross-tenant isolation) under real distribution.
+#
+# This is the heaviest lane (process spawn + a real object store), so it is NOT
+# on the default hermetic PR path and is advisory, not merge-blocking. Process
+# spawn lanes earn promotion to required only after a flake-free streak; until
+# then `continue-on-error: true` surfaces a red result without blocking a merge.
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly at 04:17 UTC — off-peak, and offset from round hours to avoid the
+    # cron stampede when many repos fire at :00.
+    - cron: "17 4 * * *"
+
+concurrency:
+  group: distributed-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=mold"
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  distributed:
+    name: Distributed validation (Postgres + MinIO)
+    runs-on: ubuntu-latest
+    # Advisory: a red result is visible but does not block a merge or fail the
+    # required check set. Promote to required after a flake-free streak.
+    continue-on-error: true
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: jammi
+          POSTGRES_PASSWORD: jammi
+          POSTGRES_DB: jammi_test
+        options: >-
+          --health-cmd "pg_isready -U jammi -d jammi_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+        ports:
+          - 5432:5432
+    env:
+      # Service container is reachable at `postgres` from the job container
+      # (same Docker network); the catalog connects via sqlx::PgPool.
+      JAMMI_TEST_PG_URL: postgres://jammi:jammi@postgres:5432/jammi_test
+      # MinIO runs in-job (see the setup step) and binds 127.0.0.1:9000 inside
+      # the job container, so the harness and the spawned workers all reach it
+      # on localhost. `allow_http` is on for the plain-HTTP endpoint.
+      JAMMI_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      JAMMI_TEST_S3_BUCKET: jammi-dist
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Install and start MinIO + create the bucket
+        # GHA `services:` cannot pass `server /data` to the MinIO image's
+        # entrypoint, so — mirroring how `test-broker` runs the NATS tarball
+        # directly — we run the MinIO release binary in the background, wait for
+        # its readiness probe, then `mc mb` the bucket the lane roots artifacts
+        # under. Both binaries come from the official MinIO download host.
+        run: |
+          curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio -o /usr/local/bin/minio
+          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc
+          chmod +x /usr/local/bin/minio /usr/local/bin/mc
+          mkdir -p /tmp/minio-data
+          MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
+            minio server /tmp/minio-data --address 127.0.0.1:9000 >/tmp/minio.log 2>&1 &
+          # Readiness wait on the MinIO health endpoint (mirrors the NATS lane's
+          # health-poll loop).
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
+              echo "minio ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:9000/minio/health/live
+          mc alias set local http://127.0.0.1:9000 "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"
+          mc mb --ignore-existing "local/${JAMMI_TEST_S3_BUCKET}"
+
+      - name: Build the `jammi` server binary
+        # The harness spawns `jammi serve` worker processes and resolves the
+        # binary next to the test executable under `{target}/{profile}/`. Build
+        # it explicitly so it exists before the harness runs.
+        run: cargo build -p jammi-cli --bin jammi
+
+      - name: Compile-check the distributed harness
+        run: cargo test -p jammi-ai --features live-distributed-tests --test distributed --no-run
+
+      - name: Run the distributed-validation lane
+        # Serialise: every test spawns its own worker fleet and races on the
+        # shared catalog + bucket; one test at a time keeps the (already
+        # generous) terminal-state timeouts honest and the per-run unique
+        # prefixes the sole isolation needed.
+        run: cargo test -p jammi-ai --features live-distributed-tests --test distributed -- --test-threads=1
+
+      - name: MinIO log (on failure)
+        if: failure()
+        run: cat /tmp/minio.log || true

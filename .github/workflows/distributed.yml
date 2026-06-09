@@ -95,8 +95,12 @@ jobs:
       - name: Build the `jammi` server binary
         # The harness spawns `jammi serve` worker processes and resolves the
         # binary next to the test executable under `{target}/{profile}/`. Build
-        # it explicitly so it exists before the harness runs.
-        run: cargo build -p jammi-cli --bin jammi
+        # it explicitly so it exists before the harness runs. `storage-s3` is
+        # required: each worker writes its trained-model artifact to the shared
+        # `s3://` MinIO root, which needs the S3 object-store driver compiled in —
+        # without it a worker claims the job, trains, then fails the publish with
+        # `SchemeNotEnabled`, and the job never reaches `completed`.
+        run: cargo build -p jammi-cli --bin jammi --features storage-s3
 
       - name: Compile-check the distributed harness
         run: cargo test -p jammi-ai --features live-distributed-tests --test distributed --no-run

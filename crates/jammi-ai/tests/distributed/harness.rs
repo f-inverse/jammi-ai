@@ -10,7 +10,7 @@
 //! writes. This mirrors the production split where a submitting client and the
 //! GPU worker fleet are different processes against one catalog.
 
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;
@@ -163,6 +163,14 @@ fn shared_config(backends: &Backends, result_root: &str, artifact_dir: &Path) ->
 struct WorkerProc {
     worker_id: String,
     child: Child,
+    /// The effective `jammi.toml` this worker was launched with. Held verbatim
+    /// so a failure dump shows exactly the catalog / storage / tier / timing the
+    /// worker was configured with — no re-deriving it from the scratch dir.
+    config_toml: String,
+    /// Path to the worker's captured stdout+stderr log under its scratch dir.
+    /// Surfaced on a failure so a CI-only lane can see the worker's own view
+    /// (device selection, claim attempts, the publish error, a panic).
+    log_path: PathBuf,
     /// Per-worker scratch (its `jammi.toml`, artifact_dir, stdout/stderr log).
     /// Kept so it outlives the child and survives until [`Fleet`] teardown.
     _scratch: TempDir,
@@ -205,6 +213,56 @@ impl Fleet {
         };
         sigkill(&mut w.child);
         true
+    }
+
+    /// The id and exit status of the first worker that has exited on its own —
+    /// i.e. NOT one a test deliberately `kill9`'d. A worker we crashed exits with
+    /// a SIGKILL-shaped status (`signal() == Some(SIGKILL)`); any other exit (a
+    /// config rejection, a panic, a missing-feature `SchemeNotEnabled`, a clean
+    /// `0`) means the worker died for a reason the lane did not intend, and the
+    /// poll should fail loudly with that worker's log rather than wait out the
+    /// full terminal timeout. `None` means every worker is still running (or was
+    /// intentionally killed).
+    ///
+    /// `try_wait` is non-blocking; a still-running child returns `Ok(None)` and
+    /// is skipped. A reaped child (we already `wait`'d it) also yields no status.
+    fn first_unexpected_exit(&mut self) -> Option<(String, std::process::ExitStatus)> {
+        for w in &mut self.workers {
+            if let Ok(Some(status)) = w.child.try_wait() {
+                if status.signal() == Some(libc::SIGKILL) {
+                    // A worker a property deliberately crashed — expected.
+                    continue;
+                }
+                return Some((w.worker_id.clone(), status));
+            }
+        }
+        None
+    }
+
+    /// Dump every worker's effective config and captured stdout+stderr to the
+    /// test's stderr, tagged with `context`. The CI-only diagnosability surface:
+    /// this is the sole place a failed dispatch can see the workers' own view, so
+    /// it dumps unconditionally (a passing run never calls it). Best-effort — a
+    /// log we cannot read is reported as such rather than masking the original
+    /// failure.
+    pub fn dump_diagnostics(&self, context: &str) {
+        eprintln!("\n========== distributed lane diagnostics: {context} ==========");
+        eprintln!("fleet of {} worker process(es)", self.workers.len());
+        for w in &self.workers {
+            eprintln!("\n----- worker {} -----", w.worker_id);
+            eprintln!("[effective jammi.toml]\n{}", w.config_toml);
+            match std::fs::read_to_string(&w.log_path) {
+                Ok(log) if log.trim().is_empty() => {
+                    eprintln!("[worker stdout+stderr] <empty> ({})", w.log_path.display())
+                }
+                Ok(log) => eprintln!("[worker stdout+stderr {}]\n{log}", w.log_path.display()),
+                Err(e) => eprintln!(
+                    "[worker stdout+stderr] <unreadable: {e}> ({})",
+                    w.log_path.display()
+                ),
+            }
+        }
+        eprintln!("========== end diagnostics: {context} ==========\n");
     }
 }
 
@@ -256,21 +314,19 @@ fn spawn_worker(
     let health_port = 50200 + index;
 
     let config_path = scratch.path().join("jammi.toml");
-    std::fs::write(
-        &config_path,
-        worker_toml(
-            result_root,
-            &backends.pg_url,
-            &backends.s3_endpoint,
-            &backends.region,
-            artifact_dir.to_str().expect("utf8 artifact_dir"),
-            flight_port,
-            health_port,
-        ),
-    )
-    .expect("write worker config");
+    let config_toml = worker_toml(
+        result_root,
+        &backends.pg_url,
+        &backends.s3_endpoint,
+        &backends.region,
+        artifact_dir.to_str().expect("utf8 artifact_dir"),
+        flight_port,
+        health_port,
+    );
+    std::fs::write(&config_path, &config_toml).expect("write worker config");
 
-    let log = std::fs::File::create(scratch.path().join("worker.log")).expect("worker log file");
+    let log_path = scratch.path().join("worker.log");
+    let log = std::fs::File::create(&log_path).expect("worker log file");
     let log_err = log.try_clone().expect("clone worker log fd");
 
     let child = Command::new(exe)
@@ -298,6 +354,8 @@ fn spawn_worker(
     WorkerProc {
         worker_id: worker_id.to_string(),
         child,
+        config_toml,
+        log_path,
         _scratch: scratch,
     }
 }
@@ -374,28 +432,6 @@ fn jammi_serve_binary() -> PathBuf {
     bin
 }
 
-/// Poll `probe` every `interval` until it returns `Some(value)` or `timeout`
-/// elapses, returning the value or `None` on timeout. The lane's de-flake
-/// discipline: terminal state is reached by *workers running concurrently with
-/// the harness*, so the harness waits on a *condition* (a catalog read), never a
-/// fixed sleep that would either flake (too short) or waste CI time (too long).
-pub async fn poll_until<T, F, Fut>(timeout: Duration, interval: Duration, mut probe: F) -> Option<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Option<T>>,
-{
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(v) = probe().await {
-            return Some(v);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(interval).await;
-    }
-}
-
 /// The generous terminal-state timeout: spawned workers must boot (process
 /// start + Postgres connect + migrate + tier mount), poll, claim, run a tiny
 /// CPU LoRA fine-tune, publish to MinIO, and finalize — all under a 3 s lease
@@ -403,9 +439,91 @@ where
 /// still failing fast on a genuinely stuck fleet.
 pub const TERMINAL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Tight poll interval for [`poll_until`] — 250 ms keeps the harness responsive
-/// to a terminal write without hammering the shared catalog.
+/// Tight poll interval for [`await_job`] — 250 ms keeps the harness responsive
+/// to a terminal write (and to an early worker exit) without hammering the
+/// shared catalog.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Poll the shared catalog for `job_id` until `want(&record)` holds, returning
+/// the matching record. This is the lane's single observation primitive, and it
+/// fails *loudly and diagnosably* — the discipline a CI-only lane needs:
+///
+/// - **Early worker exit:** each tick checks the fleet for a worker that exited
+///   on its own (a config rejection, a panic, a `SchemeNotEnabled` publish
+///   failure, a clean `0` — anything other than a deliberate `kill9`). The
+///   instant one is seen, the helper dumps full fleet diagnostics and panics
+///   naming that worker — never silently waiting out the 120 s timeout on a
+///   fleet that is already dead.
+/// - **Timeout:** if `want` never holds within [`TERMINAL_TIMEOUT`], the helper
+///   dumps full fleet diagnostics (every worker's effective config + captured
+///   stdout/stderr) and the job's FINAL catalog row (status / claimed_by /
+///   attempts / output_model_id / error_message), then panics with `label`.
+///
+/// `label` describes the awaited condition (e.g. `"job reaches completed"`) so
+/// the panic message and the diagnostics header read as one story.
+pub async fn await_job(
+    fleet: &mut Fleet,
+    session: &Arc<InferenceSession>,
+    job_id: &str,
+    label: &str,
+    mut want: impl FnMut(&jammi_db::catalog::training_repo::TrainingJobRecord) -> bool,
+) -> jammi_db::catalog::training_repo::TrainingJobRecord {
+    let deadline = Instant::now() + TERMINAL_TIMEOUT;
+    loop {
+        if let Ok(record) = session.catalog().get_training_job(job_id).await {
+            if want(&record) {
+                return record;
+            }
+        }
+
+        // A worker that died unprompted will never satisfy `want`; fail now with
+        // its log rather than wait out the full terminal timeout.
+        if let Some((worker, status)) = fleet.first_unexpected_exit() {
+            fleet.dump_diagnostics(&format!(
+                "worker {worker} exited unexpectedly ({status}) while awaiting: {label}"
+            ));
+            panic!(
+                "distributed lane: worker {worker} exited unexpectedly ({status}) before \
+                 the fleet could satisfy: {label}. See the dumped worker config + log above."
+            );
+        }
+
+        if Instant::now() >= deadline {
+            fleet.dump_diagnostics(&format!(
+                "timed out after {TERMINAL_TIMEOUT:?} awaiting: {label}"
+            ));
+            dump_final_job_row(session, job_id, label).await;
+            panic!(
+                "distributed lane: timed out after {TERMINAL_TIMEOUT:?} awaiting: {label}. \
+                 See the dumped worker configs/logs and final job row above."
+            );
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Dump the job's final catalog row to the test's stderr — the submitter's view
+/// of where the job got stuck (e.g. `status="failed"` with an
+/// `error_message` naming a `SchemeNotEnabled` publish failure). Pairs with
+/// [`Fleet::dump_diagnostics`] (the workers' view) to make a failed dispatch
+/// fully diagnosable from the CI log alone.
+async fn dump_final_job_row(session: &Arc<InferenceSession>, job_id: &str, label: &str) {
+    eprintln!("\n----- final catalog row for job {job_id} (awaiting: {label}) -----");
+    match session.catalog().get_training_job(job_id).await {
+        Ok(r) => eprintln!(
+            "status={:?} claimed_by={:?} attempts={} output_model_id={:?} \
+             tenant_id={:?} lease_expires_at={:?} error_message={:?}",
+            r.status,
+            r.claimed_by,
+            r.attempts,
+            r.output_model_id,
+            r.tenant_id,
+            r.lease_expires_at,
+            r.error_message,
+        ),
+        Err(e) => eprintln!("<job row unreadable: {e}>"),
+    }
+}
 
 /// Path to the lane's standard text fine-tune fixture (`training_pairs.csv`,
 /// columns `text_a,text_b,score`) — a generic, consumer-free synthetic triplet

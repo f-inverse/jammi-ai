@@ -31,22 +31,22 @@ async fn one_job_n_workers_exactly_one_wins() {
         harness::submit_fine_tune(&session, &source, JobSize::Quick).await;
 
     // Spawn a fleet of 4 workers that all race to claim the single job.
-    let fleet = Fleet::spawn(&backends, &result_root, 4);
-    let worker_ids = fleet.worker_ids();
+    let mut fleet = Fleet::spawn(&backends, &result_root, 4);
+    let worker_ids: Vec<String> = fleet.worker_ids().into_iter().map(str::to_string).collect();
 
     // Poll for the terminal `completed` state. Only the lease-guarded finalize
     // CAS by the sole claimer flips the job to `completed`; a worker that did not
-    // win the claim never reaches finalize.
-    let record = harness::poll_until(harness::TERMINAL_TIMEOUT, harness::POLL_INTERVAL, || {
-        let session = &session;
-        let job_id = &job_id;
-        async move {
-            let r = session.catalog().get_training_job(job_id).await.ok()?;
-            (r.status == "completed").then_some(r)
-        }
-    })
-    .await
-    .expect("the single job reaches `completed` under one of the racing workers");
+    // win the claim never reaches finalize. `await_job` dumps every worker's
+    // config + log (and the final job row) and panics loudly if the fleet dies or
+    // stalls, so a CI-only failure is diagnosable rather than a bare timeout.
+    let record = harness::await_job(
+        &mut fleet,
+        &session,
+        &job_id,
+        "the single job reaches `completed` under one of the racing workers",
+        |r| r.status == "completed",
+    )
+    .await;
 
     // Exactly one claimer, and it is one of the spawned workers.
     let claimed_by = record
@@ -54,7 +54,7 @@ async fn one_job_n_workers_exactly_one_wins() {
         .as_deref()
         .expect("a completed job records its claimer");
     assert!(
-        worker_ids.contains(&claimed_by),
+        worker_ids.iter().any(|w| w == claimed_by),
         "claimed_by {claimed_by:?} must be one of the spawned workers {worker_ids:?}"
     );
 

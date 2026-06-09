@@ -426,10 +426,27 @@ pub fn tiny_bert_model() -> String {
     )
 }
 
+/// A source name unique to this test run, carrying the test name for
+/// log-archaeology and a fresh UUID for collision-freedom. The lane runs every
+/// property sequentially against ONE shared, persistent Postgres catalog whose
+/// `sources` table keys on a global `source_id` PRIMARY KEY, so a fixed name
+/// would collide with a prior test's still-present row (`Source already
+/// registered`). A per-test-unique name is the catalog-namespace isolation that
+/// lets sequential tests share the persistent catalog without ever colliding.
+///
+/// `role` distinguishes multiple sources within one test (e.g. the two tenants'
+/// private sources in cross-tenant isolation); a test with a single source
+/// passes its own name.
+pub fn unique_source_name(role: &str) -> String {
+    format!("{role}-{}", uuid::Uuid::new_v4().simple())
+}
+
 /// Register the `training_pairs.csv` triplet source on `session` under `name`.
 /// Source registration is catalog state, so a source the harness registers is
 /// visible to the spawned workers when they reconstruct the job's loader from
-/// its persisted spec.
+/// its persisted spec. `name` must be unique to this test run (see
+/// [`unique_source_name`]) so a registration never collides with a prior test's
+/// row on the shared persistent catalog.
 pub async fn register_training_source(session: &Arc<InferenceSession>, name: &str) {
     session
         .add_source(

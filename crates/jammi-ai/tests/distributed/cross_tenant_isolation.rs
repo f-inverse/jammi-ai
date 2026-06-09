@@ -51,9 +51,15 @@ async fn mixed_tenant_queue_completes_each_under_its_own_scope() {
     let tenant_a = TenantId::from_uuid(uuid::Uuid::new_v4()).unwrap();
     let tenant_b = TenantId::from_uuid(uuid::Uuid::new_v4()).unwrap();
 
-    // One job per tenant, each over its own tenant-private source.
-    let (job_a, model_a) = submit_for_tenant(&session, tenant_a, "training_a").await;
-    let (job_b, model_b) = submit_for_tenant(&session, tenant_b, "training_b").await;
+    // One job per tenant, each over its own tenant-private source. The source
+    // names are per-test-unique: the catalog's `sources` table keys on a global
+    // `source_id` PRIMARY KEY (the tenant scope governs visibility, not key
+    // uniqueness), so a fixed name would collide with a prior run's row on the
+    // shared persistent catalog even across distinct tenants.
+    let source_a = harness::unique_source_name(&format!("{TEST}-a"));
+    let source_b = harness::unique_source_name(&format!("{TEST}-b"));
+    let (job_a, model_a) = submit_for_tenant(&session, tenant_a, &source_a).await;
+    let (job_b, model_b) = submit_for_tenant(&session, tenant_b, &source_b).await;
 
     // A SINGLE worker drains the mixed queue, running each job under its own
     // tenant scope back-to-back — the cross-tenant scenario on one process.

@@ -243,3 +243,111 @@ async fn cancelled_write_transaction_does_not_poison_pool() {
         .unwrap();
     assert_eq!(n, 100, "a cancelled write transaction leaked a commit");
 }
+
+/// A write transaction whose future is cancelled *during `BEGIN IMMEDIATE`
+/// itself* — after the connection's worker has issued the BEGIN and bumped its
+/// transaction depth, but before the sqlx `Transaction` (whose drop guard rolls
+/// back) is constructed — must not poison its pooled connection.
+///
+/// This is the narrow-window sibling of
+/// [`cancelled_write_transaction_does_not_poison_pool`], which cancels *after*
+/// `BEGIN` returns (where the drop guard already exists). Here the cancellation
+/// lands inside the begin: `Pool::begin_with` runs the `BEGIN` statement and
+/// only then wraps the connection in a `Transaction`. A future dropped in that
+/// gap leaves the connection in the pool still inside a transaction, holding the
+/// WAL write lock with no guard to release it — so its next checkout fails
+/// `InvalidSavePointStatement` (a custom `BEGIN` is illegal at depth > 0) and
+/// every other writer starves on the leaked lock (`database is locked`). The
+/// backend closes the window by driving the begin on a detached task, so a
+/// cancelled caller drops only the join handle while the begin still completes
+/// into a fully-guarded `Transaction` that rolls back on drop.
+///
+/// Many short-deadline `timeout`s race steady writers against one catalog on a
+/// multi-thread runtime — the deadlines are spread across microseconds so some
+/// land squarely in the begin window. After each round a fresh write must still
+/// commit; before the fix this panics within a few rounds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn begin_window_cancellation_does_not_poison_pool() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+
+    let backend = catalog.backend_arc();
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "CREATE TABLE begin_probe (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)",
+                    &[],
+                )
+                .await?;
+                tx.execute("INSERT INTO begin_probe (id, n) VALUES (1, 0)", &[])
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+    const ROUNDS: usize = 200;
+    for round in 0..ROUNDS {
+        let mut handles = Vec::new();
+
+        // Steady writers: contend for the IMMEDIATE write lock so a cancelled
+        // begin lands while the worker is mid-BEGIN.
+        for _ in 0..6 {
+            let catalog = Arc::clone(&catalog);
+            handles.push(tokio::spawn(async move {
+                let backend = catalog.backend_arc();
+                let _ = backend
+                    .transaction(TxOptions::default(), |tx| {
+                        Box::pin(async move {
+                            tx.execute("UPDATE begin_probe SET n = n + 1 WHERE id = 1", &[])
+                                .await?;
+                            Ok(())
+                        })
+                    })
+                    .await;
+            }));
+        }
+
+        // Cancelled writers at micro-deadlines spread across the begin window.
+        for k in 0..6 {
+            let catalog = Arc::clone(&catalog);
+            let micros = 1 + (k as u64) * 37 + (round as u64 % 13);
+            handles.push(tokio::spawn(async move {
+                let backend = catalog.backend_arc();
+                let _ = tokio::time::timeout(
+                    Duration::from_micros(micros),
+                    backend.transaction(TxOptions::default(), |tx| {
+                        Box::pin(async move {
+                            tx.execute("UPDATE begin_probe SET n = n + 1 WHERE id = 1", &[])
+                                .await?;
+                            Ok(())
+                        })
+                    }),
+                )
+                .await;
+            }));
+        }
+
+        for handle in handles {
+            handle.await.expect("writer task panicked");
+        }
+
+        // The pool survived the round: a fresh write opens and commits. Before
+        // the fix this fails with `InvalidSavePointStatement` or `database is
+        // locked` once a poisoned connection is recycled.
+        backend
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute("UPDATE begin_probe SET n = n WHERE id = 1", &[])
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap_or_else(|e| {
+                panic!("round {round}: pool poisoned by begin-window cancel: {e:?}")
+            });
+    }
+}

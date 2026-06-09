@@ -87,6 +87,9 @@ parquet.workspace = true
 wiremock = "0.6"
 serial_test = "3"
 jammi-test-utils.workspace = true
+# SIGKILL of a spawned worker process in the distributed-validation harness
+# (the kill-9 reclaim / artifact-crash-window properties). Test-only.
+libc.workspace = true
 # Standard-normal quantiles for generating calibrated/ensemble fixtures in the
 # calibration-eval unit tests (spec R2). Test-only — the engine routes all
 # production calibration math through `jammi-numerics`, never `statrs` directly.
@@ -122,6 +125,15 @@ local = [
     "jammi-lora/candle",
 ]
 live-hub-tests = []
+# A gated, multi-process distributed-validation lane: spawns N `jammi serve`
+# worker processes against a shared Postgres catalog + shared object store
+# (MinIO) and asserts the durable-worker fleet-safety properties (exactly-one
+# claim, kill-9 reclaim, the artifact crash-window on real object storage,
+# cross-tenant isolation) under real distribution. Off by default — the harness
+# needs `JAMMI_TEST_PG_URL` + a MinIO S3 endpoint and is not part of the hermetic
+# `cargo test` lane. The `it` engine suite is still required for the shared
+# session/fixture machinery, so this feature implies `local`.
+live-distributed-tests = ["local"]
 # CUDA / Metal acceleration of the embedded engine — only meaningful with `local`.
 cuda = ["local", "candle-core/cuda", "candle-nn/cuda"]
 metal = ["local", "candle-core/metal", "candle-nn/metal"]
@@ -151,3 +163,13 @@ wire = [
 name = "it"
 path = "tests/it/main.rs"
 required-features = ["local"]
+
+# The multi-process distributed-validation harness. Its own target (not part of
+# the hermetic `it` suite) so it compiles and runs only under
+# `live-distributed-tests`, and so the gated CI lane can target it by name with
+# `--test distributed`. Spawns `jammi serve` worker processes against a shared
+# Postgres + MinIO; never compiled or run on the default `cargo test` lane.
+[[test]]
+name = "distributed"
+path = "tests/distributed/main.rs"
+required-features = ["live-distributed-tests"]

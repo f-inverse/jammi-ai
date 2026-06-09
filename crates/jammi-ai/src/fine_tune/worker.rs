@@ -46,6 +46,7 @@ use jammi_db::catalog::Catalog;
 use jammi_db::config::WorkerIntervals;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::model_task::ModelTask;
+use jammi_db::sql::{quote_ident, source_relation};
 use jammi_db::store::ArtifactStore;
 
 use crate::fine_tune::data::TrainingDataLoader;
@@ -532,10 +533,13 @@ impl TrainingWorker {
         let table_name = session.find_table_name(source)?;
         let select = columns
             .iter()
-            .map(|c| format!("\"{c}\""))
+            .map(|c| quote_ident(c))
             .collect::<Vec<_>>()
             .join(", ");
-        let query = format!("SELECT {select} FROM {source}.public.\"{table_name}\"");
+        let query = format!(
+            "SELECT {select} FROM {}",
+            source_relation(source, &table_name)
+        );
         session.sql(&query).await
     }
 
@@ -549,8 +553,10 @@ impl TrainingWorker {
     ) -> Result<TrainingDataLoader> {
         let node_table = session.find_table_name(&sources.node_source)?;
         let node_query = format!(
-            "SELECT \"{}\", \"{}\" FROM {}.public.\"{node_table}\"",
-            sources.id_column, sources.text_column, sources.node_source
+            "SELECT {}, {} FROM {}",
+            quote_ident(&sources.id_column),
+            quote_ident(&sources.text_column),
+            source_relation(&sources.node_source, &node_table)
         );
         let node_batches = session.sql(&node_query).await?;
         let mut nodes = Vec::new();
@@ -580,8 +586,10 @@ impl TrainingWorker {
 
         let edge_table = session.find_table_name(&sources.edge_source)?;
         let edge_query = format!(
-            "SELECT \"{}\", \"{}\" FROM {}.public.\"{edge_table}\"",
-            sources.src_column, sources.dst_column, sources.edge_source
+            "SELECT {}, {} FROM {}",
+            quote_ident(&sources.src_column),
+            quote_ident(&sources.dst_column),
+            source_relation(&sources.edge_source, &edge_table)
         );
         let edge_batches = session.sql(&edge_query).await?;
         let mut edges = Vec::new();

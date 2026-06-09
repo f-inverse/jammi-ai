@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 
 use crate::catalog::backend::BackendImpl;
+use crate::sql::quote_ident;
 
 use super::definition::{MutableIndexDef, MutableTableDefinition};
 use super::MutableBackend;
@@ -158,10 +159,6 @@ impl MutableBackend for PostgresMutableBackend {
     fn catalog_backend(&self) -> &BackendImpl {
         &self.backend
     }
-}
-
-fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 fn pg_type(ty: &DataType) -> &'static str {

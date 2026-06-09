@@ -6,4 +6,7 @@
 //! DataFusion `SessionContext`, routing the trigger-stream DDL to the
 //! engine's [`crate::catalog::topic_repo::TopicRepo`].
 
+pub mod ident;
 pub mod topic_ddl;
+
+pub use ident::{quote_ident, source_relation};

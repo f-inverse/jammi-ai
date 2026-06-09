@@ -47,6 +47,7 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::scalar::ScalarValue;
 
+use jammi_db::sql::quote_ident;
 use jammi_db::ModelTask;
 
 use crate::inference::schema::build_output_schema;
@@ -284,10 +285,4 @@ fn project_plan(
         })
         .collect::<datafusion::error::Result<Vec<_>>>()?;
     Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
-}
-
-/// Double-quote a SQL identifier so a column name with mixed case or reserved
-/// spelling resolves verbatim.
-fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
 }

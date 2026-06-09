@@ -17,13 +17,20 @@
 
 use std::sync::Arc;
 
+use jammi_ai::pipeline::context_predictor::{
+    ContextServeOptions, ContextServeSource, PredictionWithProvenance,
+};
+use jammi_ai::pipeline::context_set::HybridMerge;
 use jammi_ai::session::InferenceSession;
-use jammi_ai::wire::{infer_result_to_proto, model_task_from_proto};
+use jammi_ai::wire::{
+    edge_gather_from_proto, infer_result_to_proto, model_task_from_proto,
+    predicted_distribution_to_proto,
+};
 use jammi_ai::{LocalSession, Session};
 use tonic::{Request, Response, Status};
 
 use crate::grpc::proto::inference::inference_service_server::InferenceService;
-use crate::grpc::proto::inference::{InferRequest, InferResponse};
+use crate::grpc::proto::inference::{InferRequest, InferResponse, PredictRequest, PredictResponse};
 use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant};
 
 /// Server-side handler for the inference gRPC surface. Holds a shared engine
@@ -79,5 +86,64 @@ impl InferenceService for InferenceServer {
         Ok(Response::new(InferResponse {
             result: Some(infer_result_to_proto(batches)?),
         }))
+    }
+
+    async fn predict(
+        &self,
+        request: Request<PredictRequest>,
+    ) -> Result<Response<PredictResponse>, Status> {
+        let tenant = session_tenant(&request);
+        let req = request.into_inner();
+        require_nonempty(&req.model_id, "model_id")?;
+        require_nonempty(&req.source, "source")?;
+        require_nonempty(&req.target_key, "target_key")?;
+
+        // Reconstruct the live-context source the embed binding builds: an absent
+        // edge gather is ANN-only; a gather with no `hybrid_ann_k` is declared-edge
+        // only; a gather with `hybrid_ann_k` is the union of the two.
+        let gather = edge_gather_from_proto(req.edges)?;
+        let serve_source = match (gather, req.hybrid_ann_k) {
+            (None, _) => ContextServeSource::Ann,
+            (Some(edges), None) => ContextServeSource::Edges(edges),
+            (Some(edges), Some(ann_k)) => ContextServeSource::Hybrid {
+                ann_k: ann_k as usize,
+                edges,
+                merge: HybridMerge::Union,
+            },
+        };
+        let options = ContextServeOptions {
+            source: serve_source,
+            split: req.split,
+        };
+
+        let prediction: PredictionWithProvenance = scoped(&self.session, tenant, || async {
+            let served = self
+                .session
+                .load_context_predictor(&req.model_id, &req.source, options)
+                .await?;
+            self.session
+                .predict_with_context_predictor_provenanced(&served, &req.target_key)
+                .await
+        })
+        .await
+        .map_err(map_engine_error)?;
+
+        Ok(Response::new(PredictResponse {
+            distribution: Some(predicted_distribution_to_proto(&prediction.distribution)),
+            source: context_source_tag(prediction.source).to_string(),
+            context_ref: prediction.context_keys,
+        }))
+    }
+}
+
+/// The string tag for a context's assembly fact ("ann" / "edges" / "hybrid"),
+/// surfaced on a prediction so a remote consumer can see how the context was
+/// assembled — the same vocabulary the embed binding's dict exposes.
+fn context_source_tag(kind: jammi_ai::pipeline::context_set::ContextSourceKind) -> &'static str {
+    use jammi_ai::pipeline::context_set::ContextSourceKind;
+    match kind {
+        ContextSourceKind::Ann => "ann",
+        ContextSourceKind::Edges => "edges",
+        ContextSourceKind::Hybrid => "hybrid",
     }
 }

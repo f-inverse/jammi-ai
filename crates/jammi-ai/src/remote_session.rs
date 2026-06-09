@@ -71,14 +71,17 @@ use crate::wire::proto::embedding::{
 };
 use crate::wire::proto::eval as eval_pb;
 use crate::wire::proto::eval::eval_service_client::EvalServiceClient;
-use crate::wire::proto::fine_tune::fine_tune_service_client::FineTuneServiceClient;
-use crate::wire::proto::fine_tune::{FineTuneStatusRequest, StartFineTuneRequest};
 use crate::wire::proto::inference::inference_service_client::InferenceServiceClient;
 use crate::wire::proto::inference::InferRequest;
 use crate::wire::proto::mutable_table::mutable_table_service_client::MutableTableServiceClient;
 use crate::wire::proto::mutable_table::{CreateMutableTableRequest, DropMutableTableRequest};
 use crate::wire::proto::session::session_service_client::SessionServiceClient;
 use crate::wire::proto::session::{SetTenantRequest, Tenant};
+use crate::wire::proto::training::training_service_client::TrainingServiceClient;
+use crate::wire::proto::training::{
+    start_training_request::Spec as ProtoTrainingSpec, FineTuneSpec, StartTrainingRequest,
+    TrainingStatusRequest,
+};
 use crate::wire::proto::trigger::trigger_service_client::TriggerServiceClient;
 use crate::wire::proto::trigger::{
     DropTopicRequest, ListTopicsRequest, PublishRequest, RegisterTopicRequest, SubscribeRequest,
@@ -174,10 +177,8 @@ impl RemoteSession {
         EvalServiceClient::with_interceptor(self.channel.clone(), self.header.clone())
     }
 
-    fn fine_tune_client(
-        &self,
-    ) -> FineTuneServiceClient<InterceptedService<Channel, SessionHeader>> {
-        FineTuneServiceClient::with_interceptor(self.channel.clone(), self.header.clone())
+    fn training_client(&self) -> TrainingServiceClient<InterceptedService<Channel, SessionHeader>> {
+        TrainingServiceClient::with_interceptor(self.channel.clone(), self.header.clone())
     }
 
     fn mutable_table_client(
@@ -399,14 +400,19 @@ impl RemoteSession {
         task: ModelTask,
         config: Option<FineTuneConfig>,
     ) -> Result<FineTuneJobId> {
+        // The column-source fine-tune is the `FineTuneSpec` arm of the spec
+        // oneof; built inline from the transport-neutral config vocabulary so a
+        // thin wire-only client (no engine `TrainingSpec`) can still submit it.
         let resp = self
-            .fine_tune_client()
-            .start_fine_tune(StartFineTuneRequest {
-                source_id: source.to_string(),
+            .training_client()
+            .start_training(StartTrainingRequest {
+                spec: Some(ProtoTrainingSpec::FineTune(FineTuneSpec {
+                    source: source.to_string(),
+                    columns: columns.to_vec(),
+                    method: method_to_proto(method) as i32,
+                    task: model_task_to_proto(task) as i32,
+                })),
                 base_model: base_model.to_string(),
-                columns: columns.to_vec(),
-                method: method_to_proto(method) as i32,
-                task: model_task_to_proto(task) as i32,
                 config: config.as_ref().map(config_to_proto),
             })
             .await
@@ -417,8 +423,8 @@ impl RemoteSession {
 
     pub(crate) async fn fine_tune_status(&self, id: &FineTuneJobId) -> Result<String> {
         let resp = self
-            .fine_tune_client()
-            .fine_tune_status(FineTuneStatusRequest {
+            .training_client()
+            .training_status(TrainingStatusRequest {
                 job_id: id.0.clone(),
             })
             .await

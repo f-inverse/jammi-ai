@@ -24,7 +24,7 @@ import {
   Modality,
   type InferResponse,
   type EmbeddingEvalReport,
-  type StartFineTuneResponse,
+  type StartTrainingResponse,
   type CreateMutableTableResponse,
   type RegisterTopicResponse,
   type SubscribedBatch,
@@ -39,7 +39,7 @@ describe("connect()", () => {
     expect(client.embedding).toBeDefined();
     expect(client.inference).toBeDefined();
     expect(client.eval).toBeDefined();
-    expect(client.fineTune).toBeDefined();
+    expect(client.training).toBeDefined();
     expect(client.mutableTable).toBeDefined();
     expect(client.channel).toBeDefined();
     expect(client.trigger).toBeDefined();
@@ -118,12 +118,15 @@ async function verbSurface(c: JammiClient): Promise<void> {
     await c.eval.evalInference({ modelId: "m", sourceId: "s1", goldenSource: "gold" });
     await c.eval.evalCompare({ sourceId: "s1", goldenSource: "gold" });
 
-    // ── FineTuneService: start + status ───────────────────────────────────
-    const ft: StartFineTuneResponse = await c.fineTune.startFineTune({
-      sourceId: "s1",
+    // ── TrainingService: start (the spec oneof) + status ──────────────────
+    const ft: StartTrainingResponse = await c.training.startTraining({
       baseModel: "local:/m",
+      spec: {
+        case: "fineTune",
+        value: { source: "s1", columns: ["text"] },
+      },
     });
-    await c.fineTune.fineTuneStatus({ jobId: ft.jobId });
+    await c.training.trainingStatus({ jobId: ft.jobId });
 
     // ── MutableTableService: create + drop ────────────────────────────────
     const mt: CreateMutableTableResponse = await c.mutableTable.createMutableTable({});

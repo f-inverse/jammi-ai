@@ -18,8 +18,8 @@ from importlib.metadata import version
 from typing import Optional, Union
 
 from ._credentials import BearerCredentials, ChannelCredentials
-from ._database import RemoteDatabase
-from ._errors import NoEmbeddedEngineError
+from ._database import RemoteDatabase, RemoteTrainingJob
+from ._errors import NoEmbeddedEngineError, TrainingError
 from ._target import LocalTarget, RemoteTarget, Target, parse_target
 
 __version__ = version("jammi-client")
@@ -27,7 +27,9 @@ __version__ = version("jammi-client")
 __all__ = [
     "connect",
     "RemoteDatabase",
+    "RemoteTrainingJob",
     "NoEmbeddedEngineError",
+    "TrainingError",
     "ChannelCredentials",
     "BearerCredentials",
     "LocalTarget",

@@ -94,7 +94,7 @@ tiers are runtime-selectable via `[server] services`:
 
 | Tier | Service | Role |
 |---|---|---|
-| `train` | `FineTuneService` | model training |
+| `train` | `TrainingService` | model training (fine-tune, graph fine-tune, context predictor) |
 | `event` | `TriggerService` | topic / publish / subscribe streams |
 | `eval`  | `EvalService` | per-query evaluation arrays |
 
@@ -186,19 +186,21 @@ latency histogram.
 
 ## What the server can and cannot do
 
-| Operation | Available over Flight SQL? |
-|-----------|--------------------------|
-| SQL queries on source tables | Yes |
-| SQL queries on embedding tables | Yes |
-| Joins, aggregations, filters | Yes |
-| Generate embeddings | No — use library or CLI |
-| Semantic vector search | No — use library or CLI |
-| Fine-tuning | No — use library or CLI |
-| Evaluation | No — use library or CLI |
+| Operation | Available over Flight SQL? | Available over typed gRPC? |
+|-----------|--------------------------|----------------------------|
+| SQL queries on source tables | Yes | — (use Flight SQL) |
+| SQL queries on embedding tables | Yes | — (use Flight SQL) |
+| Joins, aggregations, filters | Yes | — (use Flight SQL) |
+| Generate embeddings | No — use library or Python package | Yes — `EmbeddingService.GenerateEmbeddings` |
+| Semantic vector search | No — use library or Python package | Yes — `EmbeddingService.Search` |
+| Inference | No — use library or Python package | Yes — `InferenceService.Infer` |
+| Fine-tuning (and graph / context-predictor training) | No — use library or Python package | Yes — `TrainingService.StartTraining` (train tier) |
+| Context-predictor prediction | No — use library or Python package | Yes — `InferenceService.Predict` |
+| Evaluation | No — use library or Python package | Yes — `EvalService` (eval tier) |
 
-The server is a query interface. ML operations (embeddings, search, fine-tuning) are done through the Rust library, Python package, or CLI — then the results are queryable over Flight SQL.
+The Flight SQL surface is a **query** interface (read path); the ML operations are not SQL, so they ride the **typed gRPC** surface instead. Set up your data and run training/inference through the Rust library, the `jammi-ai` / `jammi-client` Python package, or — for a remote engine — those same verbs over gRPC, then query the results over Flight SQL. The CLI registers sources and starts the server; it carries no ML verbs.
 
-The typed gRPC surface is the exception for the embedding path. `EmbeddingService` serves `AddSource`, `GenerateAudioEmbeddings`, `EncodeAudioQuery`, and `Search` over plain gRPC — and, since tonic-web is mounted, over **gRPC-web**. That is the transport an edge runtime can speak (it has no HTTP/2 client for Flight SQL's bidirectional streaming), so an edge function running the engine as a sidecar can ingest, encode, **and** search without the library or CLI. `Search` accepts a precomputed vector or an existing `row_key` (query-by-example, with the vector resolved inside the engine); see [Semantic Search](./semantic-search.md#search-over-grpc-edge-runtimes).
+The typed gRPC surface is what an edge runtime speaks (it has no HTTP/2 client for Flight SQL's bidirectional streaming). `EmbeddingService` serves `AddSource`, `GenerateEmbeddings`, `EncodeQuery`, and `Search` over plain gRPC — and, since tonic-web is mounted, over **gRPC-web** — so an edge function running the engine as a sidecar can ingest, encode, **and** search without the library. `Search` accepts a precomputed vector or an existing `row_key` (query-by-example, with the vector resolved inside the engine); see [Semantic Search](./semantic-search.md#search-over-grpc-edge-runtimes). With the **train** tier mounted, `TrainingService` serves all three training kinds over gRPC and `InferenceService.Predict` serves a trained context predictor — so a client can offload training and prediction to a GPU server with the same verb surface the embedded engine exposes.
 
 ## Graceful shutdown
 

@@ -77,7 +77,7 @@ impl std::str::FromStr for FineTuneMethod {
 }
 
 /// Loss function for embedding fine-tuning.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EmbeddingLoss {
     /// CoSENT: sorts pairs by score, applies cross-entropy on cosine similarity ordering.
@@ -133,7 +133,7 @@ impl Default for EmbeddingLoss {
 /// confidently wrong. Epistemic uncertainty is NP4 (amortized posterior) or S17
 /// (distribution-free conformal) — pick along that spectrum; do not read this
 /// head's `σ` as epistemic.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RegressionLoss {
     /// Gaussian negative log-likelihood, `½(log σ² + (y−μ)²/σ²)` (+const). The
@@ -175,7 +175,7 @@ impl Default for RegressionLoss {
 }
 
 /// Loss function for classification fine-tuning.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClassificationLoss {
     /// Standard cross-entropy loss.
@@ -212,7 +212,7 @@ impl Default for EarlyStoppingMetric {
 }
 
 /// Learning rate schedule applied after warmup.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LrSchedule {
     /// Fixed learning rate throughout.
@@ -241,7 +241,7 @@ impl Default for LrSchedule {
 /// Mined negatives go stale as the model moves, so re-mining every step is
 /// wasteful; `refresh_every` re-mines once per that many epochs (ANCE's
 /// asynchronous-index-refresh trade: fresher negatives cost more index builds).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HardNegativeConfig {
     /// Mine hard negatives from the model's own retrieval index. Default `false`.
     pub mine: bool,
@@ -266,7 +266,7 @@ impl Default for HardNegativeConfig {
 }
 
 /// Configuration for a fine-tuning job.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FineTuneConfig {
     /// LoRA rank (number of low-rank dimensions). Default: 8.
     pub lora_rank: usize,

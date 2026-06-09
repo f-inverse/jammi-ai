@@ -16,10 +16,10 @@ pub mod audit;
 pub mod channel;
 pub mod embedding;
 pub mod eval;
-pub mod fine_tune;
 pub mod inference;
 pub mod mutable_table;
 pub mod session;
+pub mod training;
 pub mod trigger;
 pub mod wire;
 

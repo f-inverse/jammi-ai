@@ -24,7 +24,7 @@ fn generate() {
         proto_root.join("jammi/v1/embedding.proto"),
         proto_root.join("jammi/v1/inference.proto"),
         proto_root.join("jammi/v1/eval.proto"),
-        proto_root.join("jammi/v1/fine_tune.proto"),
+        proto_root.join("jammi/v1/training.proto"),
         proto_root.join("jammi/v1/mutable_table.proto"),
         proto_root.join("jammi/v1/channel.proto"),
         proto_root.join("jammi/v1/audit.proto"),

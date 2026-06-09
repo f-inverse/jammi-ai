@@ -35,9 +35,9 @@ mod channel;
 mod embedding;
 mod error;
 mod eval;
-mod fine_tune;
 mod inference;
 mod mutable_table;
+mod training;
 mod trigger;
 
 pub use audit::{parse_query_id, record_from_wire};
@@ -51,9 +51,21 @@ pub use error::{
     error_from_status, trigger_error_from_status,
 };
 pub use eval::{cohorts_from_proto, cohorts_to_proto, eval_task_to_proto, EvalTaskFromWire};
-pub use fine_tune::{config_to_proto, method_from_proto, method_to_proto};
 pub use inference::infer_result_to_proto;
+// The spec / predict / edge-gather conversions touch the engine-side
+// `TrainingSpec` / `ContextPredictorTrainConfig` / `EdgeGather` / `PredictedDistribution`
+// types, which live behind the `local` feature (the engine vocabulary, as opposed
+// to the always-on `FineTuneConfig` config vocabulary). They are therefore only
+// reachable in a `local + wire` build (the server and the embedded SDK); a thin
+// wire-only client carries no engine spec to encode.
+#[cfg(feature = "local")]
+pub use inference::{
+    edge_gather_from_proto, edge_gather_to_proto, predicted_distribution_to_proto,
+};
 pub use mutable_table::{definition_from_proto, definition_to_proto, parse_table_id};
+pub use training::{config_to_proto, method_from_proto, method_to_proto};
+#[cfg(feature = "local")]
+pub use training::{training_spec_from_proto, training_spec_to_proto};
 pub use trigger::{
     decode_publish_batch, decode_subscribed_batch, encode_delivered_batch, encode_publish_batch,
     from_proto_timestamp, to_proto_timestamp, topic_from_proto, topic_to_proto,

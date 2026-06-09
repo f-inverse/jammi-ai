@@ -70,7 +70,7 @@ pub struct EngineServer {
 /// Spin up an in-process gRPC server hosting the chain *with* the engine-backed
 /// services, mounting every compiled-in tier **except** the event tier (no
 /// trigger handles). Shared by the `grpc_inference`, `grpc_eval`,
-/// `grpc_introspection`, and `grpc_fine_tune` suites so they drive the same
+/// `grpc_introspection`, and `grpc_training` suites so they drive the same
 /// wiring the embedding suite does.
 pub async fn start_engine_server() -> EngineServer {
     // Every compiled-in optional tier except event — the engine-backed serve +

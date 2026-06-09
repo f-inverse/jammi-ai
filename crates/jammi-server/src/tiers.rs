@@ -12,8 +12,8 @@
 //!   `AuditService`. These are the serve-path primitives every deployment
 //!   needs: embed, infer, read result/mutable tables, observe channel state,
 //!   and read audit records. There is no useful Jammi server without them.
-//! - [`ServiceTier::Train`] — `FineTuneService` (`StartFineTune` /
-//!   `FineTuneStatus`). A serve-only box does not train.
+//! - [`ServiceTier::Train`] — `TrainingService` (`StartTraining` /
+//!   `TrainingStatus`). A serve-only box does not train.
 //! - [`ServiceTier::Event`] — `TriggerService` (topics / publish / subscribe).
 //!   The enterprise tier builds on this trigger stream.
 //! - [`ServiceTier::Eval`] — `EvalService` (per-query eval arrays). A tooling
@@ -23,7 +23,7 @@
 //! own: they are read/write data primitives the serve path depends on (a
 //! serve-only box that embeds and queries result tables needs mutable-table
 //! reads; audit is introspection every surface emits), so splitting them out
-//! would leave a "serve" deployment unable to serve. Only `FineTune`,
+//! would leave a "serve" deployment unable to serve. Only `Train`,
 //! `Trigger`, and `Eval` are role-specific enough to gate.
 //!
 //! ## Capability matches deployment
@@ -43,7 +43,7 @@
 //!    no matter what config says; requesting it is a startup error
 //!    ([`TierError::FeatureNotCompiled`]). Today only `Train` carries such a
 //!    gate (the server `train` feature, default-on, which compiles the
-//!    `FineTuneService` mount). The mechanism is general: adding a `#[cfg]` to
+//!    `TrainingService` mount). The mechanism is general: adding a `#[cfg]` to
 //!    any tier's `compiled_in` arm makes a config request for the compiled-out
 //!    tier a truthful error with no other change.
 //! 2. **Runtime config** ([`crate::config`-driven `TierSelection`]) — the
@@ -68,7 +68,7 @@ pub enum ServiceTier {
     /// Always mounted: session/embedding/inference + mutable-table/channel/audit
     /// + the `GetServerInfo` handshake. Cannot be disabled.
     Core,
-    /// `FineTuneService` — model training.
+    /// `TrainingService` — model training (fine-tune, graph fine-tune, context predictor).
     Train,
     /// `TriggerService` — topic / publish / subscribe event streams.
     Event,
@@ -97,7 +97,7 @@ impl ServiceTier {
     /// This is the hard ceiling the runtime config cannot exceed. `Core`,
     /// `Event`, and `Eval` are always compiled in the OSS build; `Train` is
     /// gated on the server `train` feature (default-on), so a `--no-default-
-    /// features` serve-only build genuinely carries no `FineTuneService` mount
+    /// features` serve-only build genuinely carries no `TrainingService` mount
     /// and honestly reports `train` as uncompilable.
     pub fn compiled_in(self) -> bool {
         match self {

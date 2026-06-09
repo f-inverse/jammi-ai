@@ -24,6 +24,9 @@ pub mod inference {
 pub mod eval {
     tonic::include_proto!("jammi.v1.eval");
 }
+pub mod pipeline {
+    tonic::include_proto!("jammi.v1.pipeline");
+}
 pub mod training {
     tonic::include_proto!("jammi.v1.training");
 }

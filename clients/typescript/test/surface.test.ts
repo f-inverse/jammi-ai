@@ -24,6 +24,10 @@ import {
   Modality,
   type InferResponse,
   type EmbeddingEvalReport,
+  type CalibrationEvalReport,
+  CalibrationShape,
+  type ResultTable,
+  type AssembleContextResponse,
   type StartTrainingResponse,
   type CreateMutableTableResponse,
   type RegisterTopicResponse,
@@ -39,6 +43,7 @@ describe("connect()", () => {
     expect(client.embedding).toBeDefined();
     expect(client.inference).toBeDefined();
     expect(client.eval).toBeDefined();
+    expect(client.pipeline).toBeDefined();
     expect(client.training).toBeDefined();
     expect(client.mutableTable).toBeDefined();
     expect(client.channel).toBeDefined();
@@ -107,7 +112,7 @@ async function verbSurface(c: JammiClient): Promise<void> {
     });
     expectTypeOf(inf).toMatchTypeOf<InferResponse>();
 
-    // ── EvalService: the four eval verbs ──────────────────────────────────
+    // ── EvalService: the five eval verbs ──────────────────────────────────
     const embEval: EmbeddingEvalReport = await c.eval.evalEmbeddings({
       sourceId: "s1",
       embeddingTable: "emb_s1",
@@ -117,6 +122,30 @@ async function verbSurface(c: JammiClient): Promise<void> {
     await c.eval.evalPerQuery({ evalRunId: "run-1" });
     await c.eval.evalInference({ modelId: "m", sourceId: "s1", goldenSource: "gold" });
     await c.eval.evalCompare({ sourceId: "s1", goldenSource: "gold" });
+    const calib: CalibrationEvalReport = await c.eval.evalCalibration({
+      sourceId: "s1",
+      goldenSource: "gold",
+      shape: CalibrationShape.GAUSSIAN,
+    });
+    expectTypeOf(calib.evalRunId).toBeString();
+
+    // ── PipelineService: build / propagate / assemble ─────────────────────
+    const graph: ResultTable = await c.pipeline.buildNeighborGraph({
+      sourceId: "s1",
+      k: 10,
+    });
+    expectTypeOf(graph.tableName).toBeString();
+    const propagated: ResultTable = await c.pipeline.propagateEmbeddings({
+      sourceId: "s1",
+      graph: { case: "edgeGraphTable", value: graph.tableName },
+    });
+    expectTypeOf(propagated.tableName).toBeString();
+    const ctx: AssembleContextResponse = await c.pipeline.assembleContext({
+      sourceId: "s1",
+      query: [0.1, 0.2],
+      k: 5,
+    });
+    expectTypeOf(ctx.contextSize).toEqualTypeOf<bigint>();
 
     // ── TrainingService: start (the spec oneof) + status ──────────────────
     const ft: StartTrainingResponse = await c.training.startTraining({

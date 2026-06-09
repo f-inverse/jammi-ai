@@ -1,10 +1,13 @@
 //! `EvalService` gRPC implementation.
 //!
-//! Four verbs land on the wire: `EvalEmbeddings`, `EvalPerQuery`,
-//! `EvalInference`, `EvalCompare`. Each is a thin adapter over the
-//! transport-agnostic [`Session`]/[`LocalSession`] abstraction (never raw
-//! [`InferenceSession`] calls): proto in, one `Session::eval_*` call, proto
-//! out. The service reimplements no metric or retrieval logic.
+//! Five verbs land on the wire: `EvalEmbeddings`, `EvalPerQuery`,
+//! `EvalInference`, `EvalCompare`, `EvalCalibration`. Each is a thin adapter
+//! over the engine session: proto in, one engine eval call inside the request's
+//! tenant scope, proto out. The service reimplements no metric or retrieval
+//! logic. The retrieval/inference/compare verbs route through the
+//! transport-agnostic [`Session`]/[`LocalSession`] abstraction;
+//! `EvalCalibration` calls the [`InferenceSession`] verb directly (the
+//! calibration runner is not on the unified transport surface).
 //!
 //! The response messages mirror the Rust report structs the abstraction
 //! returns — [`jammi_ai::eval::EmbeddingEvalReport`],
@@ -23,7 +26,7 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
-use jammi_ai::wire::{cohorts_from_proto, EvalTaskFromWire};
+use jammi_ai::wire::{calibration_shape_from_proto, cohorts_from_proto, EvalTaskFromWire};
 use jammi_ai::{LocalSession, Session};
 use tonic::{Request, Response, Status};
 
@@ -153,6 +156,28 @@ impl EvalService for EvalServer {
                 &req.golden_source,
                 req.k as usize,
             )
+        })
+        .await
+        .map_err(map_engine_error)?;
+
+        Ok(Response::new(report.into()))
+    }
+
+    async fn eval_calibration(
+        &self,
+        request: Request<pb::EvalCalibrationRequest>,
+    ) -> Result<Response<pb::CalibrationEvalReport>, Status> {
+        let tenant = session_tenant(&request);
+        let req = request.into_inner();
+        require_nonempty(&req.source_id, "source_id")?;
+        require_nonempty(&req.golden_source, "golden_source")?;
+        let shape = calibration_shape_from_proto(req.shape)?;
+        let cohorts = cohorts_from_proto(req.cohorts);
+
+        let report = scoped(&self.session, tenant, || async {
+            self.session
+                .eval_calibration(&req.source_id, &req.golden_source, shape, &cohorts)
+                .await
         })
         .await
         .map_err(map_engine_error)?;

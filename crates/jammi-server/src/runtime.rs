@@ -42,12 +42,14 @@ use crate::grpc::embedding::EmbeddingServer;
 use crate::grpc::eval::EvalServer;
 use crate::grpc::inference::InferenceServer;
 use crate::grpc::mutable_table::MutableTableServer;
+use crate::grpc::pipeline::PipelineServer;
 use crate::grpc::proto::audit::audit_service_server::AuditServiceServer;
 use crate::grpc::proto::channel::channel_service_server::ChannelServiceServer;
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingServiceServer;
 use crate::grpc::proto::eval::eval_service_server::EvalServiceServer;
 use crate::grpc::proto::inference::inference_service_server::InferenceServiceServer;
 use crate::grpc::proto::mutable_table::mutable_table_service_server::MutableTableServiceServer;
+use crate::grpc::proto::pipeline::pipeline_service_server::PipelineServiceServer;
 use crate::grpc::proto::session::session_service_server::SessionServiceServer;
 #[cfg(feature = "train")]
 use crate::grpc::proto::training::training_service_server::TrainingServiceServer;
@@ -456,6 +458,13 @@ pub async fn serve_grpc_chain(
         );
         builder = builder.add_service(inference_svc);
         mounted.push("InferenceService");
+
+        let pipeline_svc = PipelineServiceServer::with_interceptor(
+            PipelineServer::new(Arc::clone(&session)),
+            interceptor.clone(),
+        );
+        builder = builder.add_service(pipeline_svc);
+        mounted.push("PipelineService");
 
         let mutable_svc = MutableTableServiceServer::with_interceptor(
             MutableTableServer::new(Arc::clone(&session)),

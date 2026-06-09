@@ -26,6 +26,7 @@ import { SessionService } from "./gen/jammi/v1/session_pb.js";
 import { EmbeddingService } from "./gen/jammi/v1/embedding_pb.js";
 import { InferenceService } from "./gen/jammi/v1/inference_pb.js";
 import { EvalService } from "./gen/jammi/v1/eval_pb.js";
+import { PipelineService } from "./gen/jammi/v1/pipeline_pb.js";
 import { TrainingService } from "./gen/jammi/v1/training_pb.js";
 import { MutableTableService } from "./gen/jammi/v1/mutable_table_pb.js";
 import { ChannelService } from "./gen/jammi/v1/channel_pb.js";
@@ -37,6 +38,7 @@ export * from "./gen/jammi/v1/session_pb.js";
 export * from "./gen/jammi/v1/embedding_pb.js";
 export * from "./gen/jammi/v1/inference_pb.js";
 export * from "./gen/jammi/v1/eval_pb.js";
+export * from "./gen/jammi/v1/pipeline_pb.js";
 export * from "./gen/jammi/v1/training_pb.js";
 export * from "./gen/jammi/v1/mutable_table_pb.js";
 export * from "./gen/jammi/v1/channel_pb.js";
@@ -79,6 +81,7 @@ export interface JammiClient {
   readonly embedding: Client<typeof EmbeddingService>;
   readonly inference: Client<typeof InferenceService>;
   readonly eval: Client<typeof EvalService>;
+  readonly pipeline: Client<typeof PipelineService>;
   readonly training: Client<typeof TrainingService>;
   readonly mutableTable: Client<typeof MutableTableService>;
   readonly channel: Client<typeof ChannelService>;
@@ -122,6 +125,7 @@ export function connect(endpoint: string, opts: ConnectOptions = {}): JammiClien
     embedding: createClient(EmbeddingService, transport),
     inference: createClient(InferenceService, transport),
     eval: createClient(EvalService, transport),
+    pipeline: createClient(PipelineService, transport),
     training: createClient(TrainingService, transport),
     mutableTable: createClient(MutableTableService, transport),
     channel: createClient(ChannelService, transport),

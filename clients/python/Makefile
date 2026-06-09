@@ -15,6 +15,7 @@ PROTO_FILES := \
 	$(PROTO_ROOT)/jammi/v1/embedding.proto \
 	$(PROTO_ROOT)/jammi/v1/inference.proto \
 	$(PROTO_ROOT)/jammi/v1/eval.proto \
+	$(PROTO_ROOT)/jammi/v1/pipeline.proto \
 	$(PROTO_ROOT)/jammi/v1/training.proto \
 	$(PROTO_ROOT)/jammi/v1/mutable_table.proto \
 	$(PROTO_ROOT)/jammi/v1/channel.proto \

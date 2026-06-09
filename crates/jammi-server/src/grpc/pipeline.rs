@@ -1,0 +1,106 @@
+//! `PipelineService` gRPC implementation.
+//!
+//! Three verbs land on the wire: `BuildNeighborGraph`, `PropagateEmbeddings`,
+//! and `AssembleContext`. Each is a thin adapter over the engine
+//! [`InferenceSession`]: proto in, one engine call inside the request's tenant
+//! scope, proto out. The service reimplements no retrieval, graph, or
+//! aggregation logic.
+//!
+//! The two graph-build verbs return the engine's result-table record as the
+//! shared [`jammi.v1.embedding.ResultTable`] (the same handle `GenerateEmbeddings`
+//! returns) — the compute stays server-side and the client reads the table via
+//! SQL. `AssembleContext` returns its pooled context vector and carried metadata
+//! inline: the vector as IEEE-754 `float` (bit-exact for the engine's
+//! `Vec<f32>`), the hydrated value rows as one Arrow IPC stream.
+//!
+//! Tenant scope is read from the request's [`crate::grpc::session::
+//! SessionTenant`] extension (set upstream by the shared `TenantInterceptor`)
+//! and applied via [`scoped`], matching every other engine-backed gRPC surface.
+//! `build_neighbor_graph` self-scopes internally too; calling it inside [`scoped`]
+//! is an idempotent same-tenant re-scope, not a special case.
+
+use std::sync::Arc;
+
+use jammi_ai::session::InferenceSession;
+use jammi_ai::wire::{
+    assemble_context_request_from_proto, assemble_context_to_proto,
+    build_neighbor_graph_from_proto, propagate_request_from_proto,
+};
+use tonic::{Request, Response, Status};
+
+use crate::grpc::proto::embedding::ResultTable;
+use crate::grpc::proto::pipeline::pipeline_service_server::PipelineService;
+use crate::grpc::proto::pipeline::{
+    AssembleContextRequest, AssembleContextResponse, BuildNeighborGraphRequest,
+    PropagateEmbeddingsRequest,
+};
+use crate::grpc::wire::{map_engine_error, scoped, session_tenant};
+
+/// Server-side handler for the pipeline gRPC surface. Holds the shared engine
+/// session it drives directly inside the request's tenant scope.
+pub struct PipelineServer {
+    session: Arc<InferenceSession>,
+}
+
+impl PipelineServer {
+    pub fn new(session: Arc<InferenceSession>) -> Self {
+        Self { session }
+    }
+}
+
+#[tonic::async_trait]
+impl PipelineService for PipelineServer {
+    async fn build_neighbor_graph(
+        &self,
+        request: Request<BuildNeighborGraphRequest>,
+    ) -> Result<Response<ResultTable>, Status> {
+        let tenant = session_tenant(&request);
+        let args = build_neighbor_graph_from_proto(request.into_inner())?;
+
+        let record = scoped(&self.session, tenant, || async {
+            self.session
+                .build_neighbor_graph(
+                    &args.source_id,
+                    args.embedding_table.as_deref(),
+                    &args.params,
+                )
+                .await
+        })
+        .await
+        .map_err(map_engine_error)?;
+
+        Ok(Response::new(record.into()))
+    }
+
+    async fn propagate_embeddings(
+        &self,
+        request: Request<PropagateEmbeddingsRequest>,
+    ) -> Result<Response<ResultTable>, Status> {
+        let tenant = session_tenant(&request);
+        let req = propagate_request_from_proto(request.into_inner())?;
+
+        let record = scoped(&self.session, tenant, || async {
+            self.session.propagate_embeddings(&req).await
+        })
+        .await
+        .map_err(map_engine_error)?;
+
+        Ok(Response::new(record.into()))
+    }
+
+    async fn assemble_context(
+        &self,
+        request: Request<AssembleContextRequest>,
+    ) -> Result<Response<AssembleContextResponse>, Status> {
+        let tenant = session_tenant(&request);
+        let req = assemble_context_request_from_proto(request.into_inner())?;
+
+        let context = scoped(&self.session, tenant, || async {
+            self.session.assemble_context(&req).await
+        })
+        .await
+        .map_err(map_engine_error)?;
+
+        Ok(Response::new(assemble_context_to_proto(context)?))
+    }
+}

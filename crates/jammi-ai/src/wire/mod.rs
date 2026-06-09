@@ -37,6 +37,12 @@ mod error;
 mod eval;
 mod inference;
 mod mutable_table;
+// The pipeline conversions touch the engine-side pipeline vocabulary
+// (`BuildNeighborGraph` / `PropagateRequest` / `ContextRequest` /
+// `ContextRepresentation`), which lives behind the `local` feature — the whole
+// module is reachable only in a `local + wire` build (the server + embedded SDK).
+#[cfg(feature = "local")]
+mod pipeline;
 mod training;
 mod trigger;
 
@@ -50,8 +56,21 @@ pub use error::{
     attach_audit_detail, attach_error_detail, attach_trigger_detail, audit_error_from_status,
     error_from_status, trigger_error_from_status,
 };
-pub use eval::{cohorts_from_proto, cohorts_to_proto, eval_task_to_proto, EvalTaskFromWire};
+pub use eval::{
+    calibration_shape_from_proto, calibration_shape_to_proto, cohorts_from_proto, cohorts_to_proto,
+    eval_task_to_proto, EvalTaskFromWire,
+};
 pub use inference::infer_result_to_proto;
+// The pipeline conversions reconstruct / project the engine pipeline request +
+// response structs (`BuildNeighborGraph` / `PropagateRequest` / `ContextRequest`
+// / `ContextRepresentation`), which live behind the `local` feature — reachable
+// only in a `local + wire` build (the server and the embedded SDK).
+#[cfg(feature = "local")]
+pub use pipeline::{
+    assemble_context_from_proto, assemble_context_request_from_proto, assemble_context_to_proto,
+    build_neighbor_graph_from_proto, context_source_tag, propagate_request_from_proto,
+    BuildNeighborGraphArgs,
+};
 // The spec / predict / edge-gather conversions touch the engine-side
 // `TrainingSpec` / `ContextPredictorTrainConfig` / `EdgeGather` / `PredictedDistribution`
 // types, which live behind the `local` feature (the engine vocabulary, as opposed

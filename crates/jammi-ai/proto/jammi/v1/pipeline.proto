@@ -1,0 +1,211 @@
+syntax = "proto3";
+
+package jammi.v1.pipeline;
+
+import "jammi/v1/embedding.proto";
+import "jammi/v1/inference.proto";
+import "jammi/v1/trigger.proto";
+
+// PipelineService — the wire surface for the engine's compute-to-data engine-
+// state verbs that build durable graph/embedding artifacts or assemble a
+// target's conditioning context.
+//
+// `BuildNeighborGraph`, `PropagateEmbeddings`, and `AssembleContext` are
+// imperative session methods, not SQL queries, so they live as typed gRPC RPCs
+// alongside SessionService / EmbeddingService / InferenceService / EvalService
+// rather than on the Flight SQL surface (which carries query/result only, per
+// ADR-01 §3.2). They are substrate primitives — materialising a k-NN graph,
+// propagating features over a declared graph, or pooling a retrieval into a
+// fixed-width context vector — and name no tenant-domain concept.
+//
+// Each verb delegates 1:1 to the engine session; the service reimplements no
+// retrieval, graph, or aggregation logic — it is purely a wire adapter over the
+// in-process engine. The two graph-build verbs transport only a result-table
+// name (the compute stays server-side, so the materialised table is
+// byte-identical to one built in-process); `AssembleContext` carries its pooled
+// vector inline as IEEE-754 `float` (bit-exact for the engine's `Vec<f32>`).
+//
+// Tenant scope is read from the request's `SessionTenant` extension, set by the
+// shared TenantInterceptor from the `jammi-session-id` header — the same
+// mechanism every other gRPC service and Flight SQL already use.
+service PipelineService {
+  // Materialise the k-nearest-neighbour graph of a source's embedding table and
+  // return the new edge table. Peer of the engine's `build_neighbor_graph`; the
+  // client reads the table via `sql(...)`.
+  rpc BuildNeighborGraph(BuildNeighborGraphRequest) returns (jammi.v1.embedding.ResultTable);
+
+  // Propagate an embedding table's features over a declared graph (the
+  // decoupled-GNN forward pass) into a new, searchable embedding table. Peer of
+  // the engine's `propagate_embeddings`; the client reads the table via
+  // `sql(...)`.
+  rpc PropagateEmbeddings(PropagateEmbeddingsRequest) returns (jammi.v1.embedding.ResultTable);
+
+  // Assemble and encode a target's context set: retrieve `k` nearest neighbours
+  // (or a declared-edge walk / their union), pair them with `value_columns`, and
+  // pool the neighbour vectors permutation-invariantly into one fixed-width
+  // context vector. Peer of the engine's `assemble_context`; returns the pooled
+  // vector and the carried metadata inline (no durable handle).
+  rpc AssembleContext(AssembleContextRequest) returns (AssembleContextResponse);
+}
+
+// Materialise a source's k-NN similarity graph. Mirrors the engine's
+// `build_neighbor_graph` binding: the count `k` is required; `min_similarity`,
+// `mutual`, `exact`, and `table` are optional with explicit presence so an unset
+// field resolves to the engine default rather than a literal `0`/`false`/`""`.
+// The engine-side build knobs `self_exclude` / `exact_max_rows` / `resolve_keys`
+// are not on the wire — the server applies the engine defaults, the single
+// source of those values.
+message BuildNeighborGraphRequest {
+  // Source whose embedding table the graph is built over.
+  string source_id = 1;
+  // Neighbourhood size `k` (required).
+  uint32 k = 2;
+  // Optional minimum cosine similarity floor for an edge.
+  optional float min_similarity = 3;
+  // Keep only reciprocal edges.
+  bool mutual = 4;
+  // Use the exact (deterministic, complete) driver, gated by a row-count
+  // ceiling; default false runs the approximate index-assisted driver.
+  bool exact = 5;
+  // Optional specific embedding table to build the graph over; unset resolves
+  // the source's default embedding table.
+  optional string table = 6;
+}
+
+// Which neighbour-contribution normalisation a propagation hop uses. Mirrors the
+// engine's `PropagationWeighting`; UNSPECIFIED maps to the engine default
+// (`DegreeNormalized`).
+enum PropagationWeighting {
+  PROPAGATION_WEIGHTING_UNSPECIFIED = 0;
+  PROPAGATION_WEIGHTING_DEGREE_NORMALIZED = 1;
+  PROPAGATION_WEIGHTING_UNIFORM = 2;
+  PROPAGATION_WEIGHTING_EDGE_SIMILARITY = 3;
+}
+
+// What a propagation emits. Mirrors the engine's `PropagationOutput`;
+// UNSPECIFIED maps to the engine default (`Final`).
+enum PropagationOutput {
+  PROPAGATION_OUTPUT_UNSPECIFIED = 0;
+  PROPAGATION_OUTPUT_FINAL = 1;
+  PROPAGATION_OUTPUT_JUMPING_KNOWLEDGE = 2;
+}
+
+// A registered external edge source and its column bindings, for the
+// `edge_source` arm of a propagation. The endpoints join to the source on the
+// key; `weight_column` feeds the `edge_similarity` weighting.
+message PropagateEdgeSource {
+  // Registered source id holding the edge rows.
+  string edge_source = 1;
+  // Column holding the edge's source endpoint (default "src" when empty).
+  string src_column = 2;
+  // Column holding the edge's destination endpoint (default "dst" when empty).
+  string dst_column = 3;
+  // Optional column holding the edge weight.
+  optional string weight_column = 4;
+}
+
+// Propagate an embedding table's features over a declared graph. Mirrors the
+// engine's `propagate_embeddings` binding. The graph is either an S9 similarity
+// graph (`edge_graph_table`, a `build_neighbor_graph` output) or a registered
+// external edge source (`edge_source`) — exactly one, modelled as a `oneof` so
+// both/neither is a decode error. The optional scalars carry explicit presence
+// so an unset field resolves to the engine default.
+message PropagateEmbeddingsRequest {
+  // Source whose embedding table holds the input features `X⁽⁰⁾`.
+  string source_id = 1;
+  // Optional specific embedding table; unset resolves the source's default.
+  optional string embedding_table = 2;
+  // The graph to propagate over — exactly one arm.
+  oneof graph {
+    // An S9 similarity graph (a `build_neighbor_graph` output table name).
+    string edge_graph_table = 3;
+    // A registered external edge source + its column bindings.
+    PropagateEdgeSource edge_source = 4;
+  }
+  // Edge direction read when building the neighbourhood. UNSPECIFIED maps to the
+  // engine default (`Out`).
+  jammi.v1.inference.EdgeDirection direction = 5;
+  // Optional hop count (clamped to the engine hop cap).
+  optional uint32 hops = 6;
+  // Neighbour-contribution weighting.
+  PropagationWeighting weighting = 7;
+  // Optional APPNP teleport probability.
+  optional double alpha = 8;
+  // What the propagation emits.
+  PropagationOutput output = 9;
+}
+
+// Which permutation-invariant reduction the context-set encoder pools with.
+// Mirrors the engine's `SetAggregator`; UNSPECIFIED maps to the engine default
+// (`Mean`).
+enum SetAggregator {
+  SET_AGGREGATOR_UNSPECIFIED = 0;
+  SET_AGGREGATOR_MEAN = 1;
+  SET_AGGREGATOR_SUM = 2;
+  SET_AGGREGATOR_MAX = 3;
+}
+
+// Assemble and encode a target's context set. Mirrors the engine's
+// `assemble_context` binding. `query` is the target's vector; an absent
+// `edges` block is the ANN-only default, a present block (without `hybrid`) is a
+// declared-edge walk, and a present block with `hybrid` is the union of both.
+message AssembleContextRequest {
+  // Source whose embedding table the context is retrieved against and whose rows
+  // the members are pooled and hydrated from.
+  string source_id = 1;
+  // The target's query vector — the point whose neighbourhood is the context.
+  // IEEE-754 `float` (bit-exact for the engine's `Vec<f32>`).
+  repeated float query = 2;
+  // Neighbourhood size `k`.
+  uint32 k = 3;
+  // Optional label/outcome columns hydrated for each context member.
+  repeated string value_columns = 4;
+  // The pooling reduction.
+  SetAggregator aggregator = 5;
+  // Drop the target's own row (`exclude_key`) before pooling — the leakage
+  // guard. Explicit presence: an unset field resolves to the engine default
+  // (`true`), the single source of that value, so a client that omits it keeps
+  // the leakage guard on rather than silently disabling it via the proto3 bare-
+  // bool wire default (`false`).
+  optional bool exclude_self = 6;
+  // Optional target row key dropped from the context when `exclude_self`.
+  optional string exclude_key = 7;
+  // Optional SQL predicate scoping the context to a split.
+  optional string split = 8;
+  // Optional declared-edge gather. Absent = ANN-only; present = declared-edge
+  // walk, or (with `hybrid`) the union with the ANN context.
+  optional jammi.v1.inference.EdgeGather edges = 9;
+  // Union the declared-edge and ANN candidate sets (only meaningful with
+  // `edges`).
+  bool hybrid = 10;
+}
+
+// The pooled fixed-width context vector. A wrapper message (carried as an
+// `optional` field) so a degenerate empty context (`None` — no neighbour
+// survived exclusion/split) is distinguishable from a present-but-empty vector:
+// the absence is a correctness signal a decoder reads as low-confidence, never
+// silently averaged into a representation.
+message ContextVector {
+  // The pooled vector `ρ(Σ φ(xᵢ))`, in IEEE-754 `float`.
+  repeated float values = 1;
+}
+
+// Result of one AssembleContext invocation. Mirrors the dict the engine binding
+// returns: the pooled vector (presence-wrapped), the carried set size + member
+// keys, the hydrated value rows, and the assembly-source fact.
+message AssembleContextResponse {
+  // The pooled context vector, or unset for a degenerate empty context.
+  optional ContextVector context_vector = 1;
+  // Number of neighbours that survived exclusion and entered the pool — carried
+  // separately from the vector so a decoder uses the count without it corrupting
+  // the pooled representation.
+  uint64 context_size = 2;
+  // Keys of the context members, in retrieval (descending-similarity) order.
+  repeated string context_keys = 3;
+  // The hydrated `value_columns` of the context members, as one Arrow IPC stream
+  // (schema + batches) in `data_body`. Empty when no value columns were
+  // requested. Reuses TriggerService's `ArrowBatch` shape.
+  jammi.v1.trigger.ArrowBatch value_rows = 4;
+  // How the context was assembled ("ann" / "edges" / "hybrid").
+  string source = 5;
+}

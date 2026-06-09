@@ -20,11 +20,14 @@ async fn killed_worker_job_is_reclaimed_and_completed_once() {
     let result_root = backends.unique_result_root(TEST);
     let (session, _dir) = harness::harness_session(&backends, &result_root).await;
 
-    harness::register_training_source(&session, "training").await;
+    // Per-test-unique source so this test's registration never collides with a
+    // prior test's row on the shared persistent catalog.
+    let source = harness::unique_source_name(TEST);
+    harness::register_training_source(&session, &source).await;
     // Crashable: the run must reliably still be `running` when we detect the
     // claimer and SIGKILL it, so the crash lands mid-flight, not after finish.
     let (job_id, expected_model) =
-        harness::submit_fine_tune(&session, "training", JobSize::Crashable).await;
+        harness::submit_fine_tune(&session, &source, JobSize::Crashable).await;
 
     // Two workers: whichever claims first will be killed; the other reclaims.
     let mut fleet = Fleet::spawn(&backends, &result_root, 2);

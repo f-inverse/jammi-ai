@@ -37,10 +37,13 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
     let result_root = backends.unique_result_root(TEST);
     let (session, _dir) = harness::harness_session(&backends, &result_root).await;
 
-    harness::register_training_source(&session, "training").await;
+    // Per-test-unique source so this test's registration never collides with a
+    // prior test's row on the shared persistent catalog.
+    let source = harness::unique_source_name(TEST);
+    harness::register_training_source(&session, &source).await;
     // Crashable: the claimer must still be running when we crash it mid-publish.
     let (job_id, expected_model) =
-        harness::submit_fine_tune(&session, "training", JobSize::Crashable).await;
+        harness::submit_fine_tune(&session, &source, JobSize::Crashable).await;
 
     let mut fleet = Fleet::spawn(&backends, &result_root, 2);
 
@@ -138,10 +141,14 @@ async fn artifact_written_on_worker_is_readable_by_a_different_client() {
     let result_root = backends.unique_result_root(&format!("{TEST}-roundtrip"));
     let (session, _dir) = harness::harness_session(&backends, &result_root).await;
 
-    harness::register_training_source(&session, "training").await;
+    // Per-test-unique source so this round-trip facet's registration never
+    // collides with the crash-window test above (or any prior test) on the
+    // shared persistent catalog.
+    let source = harness::unique_source_name(&format!("{TEST}-roundtrip"));
+    harness::register_training_source(&session, &source).await;
     // Quick: no crash here — this facet only needs a clean completion to reload.
     let (job_id, expected_model) =
-        harness::submit_fine_tune(&session, "training", JobSize::Quick).await;
+        harness::submit_fine_tune(&session, &source, JobSize::Quick).await;
 
     let fleet = Fleet::spawn(&backends, &result_root, 1);
 

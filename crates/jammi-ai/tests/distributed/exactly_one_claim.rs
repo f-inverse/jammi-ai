@@ -22,10 +22,13 @@ async fn one_job_n_workers_exactly_one_wins() {
     let result_root = backends.unique_result_root(TEST);
     let (session, _dir) = harness::harness_session(&backends, &result_root).await;
 
-    // Register the source and submit ONE queued job before any worker can claim.
-    harness::register_training_source(&session, "training").await;
+    // Register a per-test-unique source and submit ONE queued job before any
+    // worker can claim. The unique name keeps this test's source registration
+    // from colliding with a prior test's row on the shared persistent catalog.
+    let source = harness::unique_source_name(TEST);
+    harness::register_training_source(&session, &source).await;
     let (job_id, expected_model) =
-        harness::submit_fine_tune(&session, "training", JobSize::Quick).await;
+        harness::submit_fine_tune(&session, &source, JobSize::Quick).await;
 
     // Spawn a fleet of 4 workers that all race to claim the single job.
     let fleet = Fleet::spawn(&backends, &result_root, 4);

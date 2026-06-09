@@ -45,7 +45,7 @@ use arrow::record_batch::RecordBatch;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 
-use jammi_db::catalog::model_repo::{ModelRecord, RegisterModelParams};
+use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::model_task::ModelTask;
@@ -61,7 +61,6 @@ pub use jammi_encoders::ContextArchitecture;
 
 use crate::fine_tune::regression_loss;
 use crate::fine_tune::spec::TrainingSpec;
-use crate::fine_tune::staging::StagedArtifact;
 use crate::inference::adapter::distribution::{DistributionAdapter, DistributionForm};
 use crate::inference::adapter::{BackendOutput, OutputAdapter};
 use crate::pipeline::context_set::{
@@ -469,30 +468,29 @@ impl InferenceSession {
     /// Run an in-context-predictor meta-training to completion: sample the
     /// episodic meta-dataset, build the predictor the spec selects in a fresh
     /// [`VarMap`], drive the generalized [`train_loop`] (checking `cancel` at
-    /// every epoch boundary), persist the trained weights, and register a
-    /// `ModelTask::Regression` model row — the same model-artifact path the
-    /// fine-tune trainer registers its output through.
+    /// every epoch boundary), and write the trained weights into a local tempdir
+    /// described by a `ModelTask::Regression` registration — the same
+    /// model-artifact path the fine-tune trainer produces its output through.
     ///
     /// This is the worker-side execution the [`Self::train_context_predictor`]
     /// submit path defers to; it reconstructs everything from `spec` alone, with
     /// no in-memory carryover from the submitting session.
     ///
-    /// `catalog` is the worker's tenant-pinned catalog: the model row is
-    /// registered through it so the predictor lands under the job's tenant,
-    /// mirroring the fine-tune path. The sampling reads off the session
-    /// (`resolve_embedding_table`, the SQL-surface context assembly and
-    /// per-member vector reads) are tenant-scoped too — the worker runs this
-    /// whole call inside the job's tenant scope, so the session's shared tenant
-    /// binding (consulted by both its catalog and its DataFusion analyzer rule)
-    /// resolves to the job's tenant rather than the worker's unbound default.
+    /// It does **not** publish the artifact or register the catalog row — the
+    /// worker's unified finalize does both (publishing under a unique per-attempt
+    /// prefix, registering through its tenant-pinned catalog), so the predictor
+    /// path takes the same catalog-pointer-as-commit route as the fine-tune
+    /// kinds. The sampling reads off the session (`resolve_embedding_table`, the
+    /// SQL-surface context assembly and per-member vector reads) are
+    /// tenant-scoped: the worker runs this whole call inside the job's tenant
+    /// scope, so the session's shared tenant binding resolves to the job's tenant
+    /// rather than the worker's unbound default.
     pub(crate) async fn run_context_predictor_training(
         self: &Arc<Self>,
-        catalog: &Arc<jammi_db::catalog::Catalog>,
         source_id: &str,
         spec: &ContextPredictorTrainConfig,
-        worker_id: &str,
         cancel: &std::sync::atomic::AtomicBool,
-    ) -> Result<(ModelRecord, StagedArtifact)> {
+    ) -> Result<crate::fine_tune::worker::TrainedArtifact> {
         let sampled = self.sample_context_episodes(source_id, spec).await?;
         if sampled.train.is_empty() {
             return Err(JammiError::FineTune(
@@ -533,8 +531,7 @@ impl InferenceSession {
             |preds, batch: &EpisodeBatch| spec.head.score(preds, &batch.target_y),
         )?;
 
-        self.persist_predictor(catalog, spec, &table, &varmap, worker_id)
-            .await
+        self.persist_predictor(spec, &table, &varmap)
     }
 
     /// Build one [`EpisodeBatch`] per task — every target row in the task, each
@@ -735,37 +732,30 @@ impl InferenceSession {
         Ok(collect_key_value(&batches))
     }
 
-    /// Persist the trained predictor's weights and register the artifact in the
-    /// catalog, mirroring the fine-tune trainer's model-output path: the weights
-    /// land as a safetensors file under `{artifact_dir}/context_predictors/`, and
-    /// a `ModelTask::Regression` model row points at the directory.
+    /// Write the trained predictor's weights into a local tempdir and describe
+    /// the catalog model row, mirroring the fine-tune trainer's model-output
+    /// path: the weights land as `model.safetensors`, and a
+    /// `ModelTask::Regression` registration points the row at the artifact.
     ///
-    /// The weights are written to a worker-private staging dir, not the shared
-    /// canonical path, so two workers running the same predictor job never share
-    /// a training-time file. The returned [`StagedArtifact`] is promoted into the
-    /// canonical path by the worker only on a finalize-CAS win, and discarded on
-    /// a loss — the canonical artifact is written by exactly one worker.
-    ///
-    /// The model row is registered through `catalog` (the worker's tenant-pinned
-    /// handle) so it lands under the job's tenant, pointing at the canonical path;
-    /// the read-back `get_model` uses the same handle so it is visible within that
-    /// tenant scope.
-    async fn persist_predictor(
+    /// The weights are written to a fresh worker-private tempdir (under the
+    /// deployment's training scratch dir), so two workers running the same
+    /// predictor job never share a training-time file. The returned
+    /// [`crate::fine_tune::worker::TrainedArtifact`] is published to the artifact
+    /// store under a unique per-attempt prefix and registered by the worker's
+    /// unified finalize — the catalog-pointer-as-commit, identical to the
+    /// fine-tune kinds.
+    fn persist_predictor(
         &self,
-        catalog: &Arc<jammi_db::catalog::Catalog>,
         spec: &ContextPredictorTrainConfig,
         table: &ResultTableRecord,
         varmap: &VarMap,
-        worker_id: &str,
-    ) -> Result<(ModelRecord, StagedArtifact)> {
-        let canonical_root = self
-            .inner_config()
-            .artifact_dir
-            .join("context_predictors")
-            .join(sanitize_id(&spec.model_id));
-        let staged = StagedArtifact::stage(canonical_root, worker_id)?;
-        let artifact_root = staged.staging_dir().to_path_buf();
-        let weights_path = artifact_root.join("model.safetensors");
+    ) -> Result<crate::fine_tune::worker::TrainedArtifact> {
+        let scratch = self.inner_config().artifact_dir.join("context_predictors");
+        std::fs::create_dir_all(&scratch)?;
+        let dir = tempfile::Builder::new()
+            .prefix("predictor-")
+            .tempdir_in(&scratch)?;
+        let weights_path = dir.path().join("model.safetensors");
 
         let named: HashMap<String, Tensor> = {
             let data = varmap
@@ -792,29 +782,17 @@ impl InferenceSession {
         })
         .to_string();
 
-        let artifact_path = staged.canonical_dir().to_str().ok_or_else(|| {
-            JammiError::FineTune("predictor artifact path is not valid UTF-8".into())
-        })?;
-        catalog
-            .register_model(RegisterModelParams {
-                model_id: &spec.model_id,
-                version: 1,
+        Ok(crate::fine_tune::worker::TrainedArtifact {
+            dir,
+            register: crate::fine_tune::worker::ModelRegistration {
+                model_id: spec.model_id.clone(),
                 model_type: "context-predictor",
-                backend: "candle",
                 task: ModelTask::Regression,
-                base_model_id: Some(&table.model_id),
-                artifact_path: Some(artifact_path),
-                config_json: Some(&config_json),
-            })
-            .await?;
-
-        let record = catalog.get_model(&spec.model_id).await?.ok_or_else(|| {
-            JammiError::Catalog(format!(
-                "context predictor '{}' not found after registration",
-                spec.model_id
-            ))
-        })?;
-        Ok((record, staged))
+                base_model_id: Some(table.model_id.clone()),
+                config_json: Some(config_json),
+            },
+            metrics: None,
+        })
     }
 }
 
@@ -1097,15 +1075,18 @@ impl InferenceSession {
             AnyContextPredictor::new(&cfg, vb)
                 .map_err(|e| JammiError::Inference(format!("rebuild context predictor: {e}")))?
         };
-        let weights_path = record
-            .artifact_path
-            .as_deref()
-            .map(|p| std::path::Path::new(p).join("model.safetensors"))
-            .ok_or_else(|| {
-                JammiError::Inference(format!(
-                    "context predictor '{model_id}' has no artifact path"
-                ))
-            })?;
+        // The recorded `artifact_path` is the object-store prefix the training
+        // worker wrote the weights under. Fetch the bundle into a local cache
+        // dir (a no-op copy for a `file://` root) and load `model.safetensors`
+        // from there — so a predictor trained on one host reloads on another.
+        let prefix = record.artifact_path.as_deref().ok_or_else(|| {
+            JammiError::Inference(format!(
+                "context predictor '{model_id}' has no artifact path"
+            ))
+        })?;
+        let prefix_url = jammi_db::storage::StorageUrl::parse(prefix)?;
+        let local = self.artifact_store().fetch_artifact(&prefix_url).await?;
+        let weights_path = local.dir().join("model.safetensors");
         varmap
             .load(&weights_path)
             .map_err(|e| JammiError::Inference(format!("load predictor weights: {e}")))?;
@@ -1498,19 +1479,6 @@ impl InferenceSession {
 /// the caller's own configured identifiers (quoted), not data.
 fn escape_sql_literal(s: &str) -> String {
     s.replace('\'', "''")
-}
-
-/// Sanitise a model id into a filesystem-safe artifact directory name.
-fn sanitize_id(id: &str) -> String {
-    id.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 /// In-place Fisher-Yates over a splitmix64 stream: deterministic given `seed`,

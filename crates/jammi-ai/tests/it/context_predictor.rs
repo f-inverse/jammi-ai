@@ -406,14 +406,22 @@ async fn train_context_predictor_persists_a_catalogued_artifact() {
     assert_eq!(record.model_id, "ctx-predictor");
     assert_eq!(record.task, ModelTask::Regression);
     let artifact = record.artifact_path.expect("artifact path catalogued");
-    let weights = std::path::Path::new(&artifact).join("model.safetensors");
+
+    // The recorded `artifact_path` is the object-store prefix the worker
+    // published the weights under. Fetch the bundle (an in-place read for the
+    // default `file://` root) and confirm the weights reload as a real tensor
+    // map — usable, not an empty file.
+    let prefix_url = jammi_db::storage::StorageUrl::parse(&artifact).unwrap();
+    let local = session
+        .artifact_store()
+        .fetch_artifact(&prefix_url)
+        .await
+        .expect("published predictor weights fetch and verify");
+    let weights = local.dir().join("model.safetensors");
     assert!(
         weights.exists(),
         "trained predictor weights persisted at {weights:?}"
     );
-
-    // The artifact reloads as a real tensor map — the persisted weights are
-    // usable, not an empty file.
     let loaded = candle_core::safetensors::load(&weights, &Device::Cpu).unwrap();
     assert!(!loaded.is_empty(), "persisted weight map is non-empty");
 }
@@ -617,7 +625,8 @@ async fn predict_is_inference_only_no_gradient_updates() {
         .await
         .unwrap();
 
-    // The served predictor's weights on disk, before any predict.
+    // The served predictor's weights, before any predict — fetched from the
+    // artifact store under the recorded prefix.
     let artifact = session
         .catalog()
         .get_model(&model_id)
@@ -626,7 +635,13 @@ async fn predict_is_inference_only_no_gradient_updates() {
         .unwrap()
         .artifact_path
         .unwrap();
-    let weights = std::path::Path::new(&artifact).join("model.safetensors");
+    let prefix_url = jammi_db::storage::StorageUrl::parse(&artifact).unwrap();
+    let local = session
+        .artifact_store()
+        .fetch_artifact(&prefix_url)
+        .await
+        .unwrap();
+    let weights = local.dir().join("model.safetensors");
     let before = candle_core::safetensors::load(&weights, &Device::Cpu).unwrap();
 
     let target = &rows[0].id;

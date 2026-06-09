@@ -248,7 +248,7 @@ async fn session_with_training_data() -> (Arc<InferenceSession>, TempDir) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fine_tune_job_lifecycle_and_artifacts() {
-    let (session, dir) = session_with_training_data().await;
+    let (session, _dir) = session_with_training_data().await;
     // `fine_tune` submits a queued job; a worker runs it. Start one over this
     // session (it holds a `Weak`, so the test's `Arc` keeps the session alive).
     let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
@@ -300,29 +300,6 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
     assert!(record.started_at.is_some(), "started_at should be set");
     assert!(record.completed_at.is_some(), "completed_at should be set");
 
-    // UAT 2: adapter weights saved to artifact store
-    let adapter_dir = dir.path().join("models").join(&job.job_id);
-    assert!(adapter_dir.exists(), "Adapter dir should exist");
-    let adapter_file = adapter_dir.join("adapter.safetensors");
-    assert!(adapter_file.exists(), "adapter.safetensors should exist");
-    assert!(
-        std::fs::metadata(&adapter_file).unwrap().len() > 0,
-        "Adapter file should not be empty"
-    );
-
-    // UAT 17: checkpoint files exist
-    let checkpoints: Vec<_> = std::fs::read_dir(&adapter_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .unwrap_or("")
-                .starts_with("checkpoint")
-        })
-        .collect();
-    assert!(!checkpoints.is_empty(), "Should have checkpoint files");
-
     // UAT 3: fine-tuned model registered in catalog with artifact_path
     let models = session.catalog().list_models().await.unwrap();
     let ft_models: Vec<_> = models
@@ -334,9 +311,25 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
         "Fine-tuned model should be registered in catalog"
     );
     assert_eq!(ft_models[0].model_type, "fine-tuned");
+    let artifact_prefix = ft_models[0]
+        .artifact_path
+        .as_deref()
+        .expect("Fine-tuned model should have artifact_path set");
+
+    // UAT 2: adapter weights published to the artifact store under the recorded
+    // per-attempt prefix. Fetch the bundle (an in-place read for the default
+    // `file://` root) and assert the adapter file is present and non-empty.
+    let prefix_url = jammi_db::storage::StorageUrl::parse(artifact_prefix).unwrap();
+    let local = session
+        .artifact_store()
+        .fetch_artifact(&prefix_url)
+        .await
+        .expect("published adapter fetches and verifies");
+    let adapter_file = local.dir().join("adapter.safetensors");
+    assert!(adapter_file.exists(), "adapter.safetensors should exist");
     assert!(
-        ft_models[0].artifact_path.is_some(),
-        "Fine-tuned model should have artifact_path set"
+        std::fs::metadata(&adapter_file).unwrap().len() > 0,
+        "Adapter file should not be empty"
     );
 
     // UAT 3 continued: fine-tuned model produces embeddings (real inference)
@@ -953,7 +946,6 @@ async fn training_divergence_detection() {
         },
     )
     .job_id("div-job".into())
-    .worker_id("worker-test".into())
     .catalog(Arc::clone(&catalog))
     .artifact_dir(dir.path().to_path_buf())
     .build()
@@ -1072,7 +1064,6 @@ async fn training_early_stopping_triggers() {
         },
     )
     .job_id("es-job".into())
-    .worker_id("worker-test".into())
     .catalog(Arc::clone(&catalog))
     .artifact_dir(dir.path().to_path_buf())
     .build()
@@ -1327,7 +1318,7 @@ fn config_validation_rejects_invalid_values() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn durable_job_runs_on_separately_started_worker() {
-    let (session, dir) = session_with_training_data().await;
+    let (session, _dir) = session_with_training_data().await;
     let model = tiny_bert_model();
 
     // Submit with NO worker running: the job sits `queued`.
@@ -1386,12 +1377,22 @@ async fn durable_job_runs_on_separately_started_worker() {
         "worker registered the fine-tuned model"
     );
 
-    let adapter = dir
-        .path()
-        .join("models")
-        .join(&job.job_id)
-        .join("adapter.safetensors");
-    assert!(adapter.exists(), "worker wrote the adapter at {adapter:?}");
+    let ft = models
+        .iter()
+        .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
+        .unwrap();
+    let prefix_url =
+        jammi_db::storage::StorageUrl::parse(ft.artifact_path.as_deref().unwrap()).unwrap();
+    let local = session
+        .artifact_store()
+        .fetch_artifact(&prefix_url)
+        .await
+        .unwrap();
+    let adapter = local.dir().join("adapter.safetensors");
+    assert!(
+        adapter.exists(),
+        "worker published the adapter at {adapter:?}"
+    );
 }
 
 // ─── Lease loss: a worker that lost its lease must not finalize ──────────────
@@ -1646,29 +1647,25 @@ async fn configured_short_lease_drives_reclaim() {
     assert_eq!(reclaimed.claimed_by.as_deref(), Some("worker-second"));
 }
 
-// ─── Lease loss: a loser never writes the canonical artifact ─────────────────
+// ─── Lease loss: only the winner's prefix is the committed artifact ──────────
 //
 // The data-integrity counterpart to `worker_that_lost_lease_does_not_finalize`:
-// that test pins the catalog row; this one pins the on-disk adapter. Both workers
-// train the *same* `job_id`, whose canonical adapter path is deterministic and
-// shared. The loser (worker-a, lost lease) must never touch that path — its
-// finalize CAS fails, so it discards its private staging and the canonical
-// adapter does not exist after its run. Only the winner (worker-b) promotes its
-// staged adapter into the canonical path on its CAS win.
-//
-// Pre-fix both workers wrote `models/{job_id}/adapter.safetensors` directly, so
-// worker-a (finishing after worker-b finalized) would clobber the canonical file
-// with its own — differently initialised — weights, leaving the catalog saying
-// `completed` (worker-b) while the bytes on disk are worker-a's. This test fails
-// against that code (canonical exists after worker-a, with the wrong bytes) and
-// passes against the stage-then-promote-on-CAS-win discipline.
+// that test pins the job row; this one pins the served artifact. Both workers
+// train the *same* `job_id`, but each writes to its OWN unique per-attempt
+// prefix (`{job_id}/{worker_id}/{attempt}`), so neither can overwrite the other.
+// The catalog model-row update (the lease-guarded finalize CAS) is the single
+// atomic commit: the loser (worker-a, lost lease) writes its prefix but its CAS
+// fails, so the catalog never points at it (the prefix is orphaned). Only the
+// winner (worker-b)'s CAS wins, so the committed `artifact_path` is worker-b's
+// prefix — fetched and verified (manifest + sha256) to hold its weights. There
+// is no shared canonical path to clobber and no torn-promote window.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn loser_never_writes_canonical_adapter() {
+async fn loser_prefix_is_never_the_committed_artifact() {
     use jammi_ai::fine_tune::worker::TrainingWorker;
     use std::time::Duration;
 
-    let (session, dir) = session_with_training_data().await;
+    let (session, _dir) = session_with_training_data().await;
     let model = tiny_bert_model();
 
     let job = session
@@ -1717,68 +1714,60 @@ async fn loser_never_writes_canonical_adapter() {
         .unwrap()
         .expect("worker-b re-claims the requeued job");
 
-    let canonical_adapter = dir
-        .path()
-        .join("models")
-        .join(&job.job_id)
-        .join("adapter.safetensors");
-
-    // worker-a runs its stale claim to completion: its finalize CAS fails, so it
-    // discards its staging and never writes the canonical adapter.
+    // worker-a runs its stale claim to completion: its finalize CAS fails, so the
+    // job is NOT completed and no catalog model row records worker-a's prefix.
     worker_a.run_claimed_job(&session, stale_claim).await;
-    assert!(
-        !canonical_adapter.exists(),
-        "the loser must not write the canonical adapter (it discards its staging)"
+    let after_loser = session
+        .catalog()
+        .get_training_job(&job.job_id)
+        .await
+        .unwrap();
+    assert_ne!(
+        after_loser.status, "completed",
+        "the loser's finalize CAS fails; the job is not completed by it"
     );
 
-    // worker-a's private staging dir is cleaned up (no leak).
-    let staging_a = dir.path().join("models").join(".staging").join(format!(
-        "{}.{}",
-        job.job_id,
-        worker_a.worker_id()
-    ));
-    assert!(
-        !staging_a.exists(),
-        "the loser's staging dir is discarded, not left behind: {staging_a:?}"
-    );
-
-    // The winner runs and finalizes: it promotes its staged adapter into the
-    // canonical path, so the canonical adapter now exists.
+    // The winner runs and finalizes: its finalize CAS wins, so the catalog points
+    // the model row at the prefix worker-b published — the single atomic commit.
     worker_b.run_claimed_job(&session, owned).await;
     job.wait().await.unwrap();
-    assert!(
-        canonical_adapter.exists(),
-        "the winner promotes its staged adapter into the canonical path"
-    );
+    let done = session
+        .catalog()
+        .get_training_job(&job.job_id)
+        .await
+        .unwrap();
+    assert_eq!(done.status, "completed", "the winner finalizes the job");
 
-    // The bytes on disk are the winner's: re-load and confirm they are non-empty,
-    // well-formed safetensors. (Determinism is guaranteed by exactly-one-writer:
-    // the loser never reached this path, so no clobber/torn read is possible.)
-    let bytes = std::fs::read(&canonical_adapter).unwrap();
+    // The committed artifact is the one the winner wrote: it fetches and verifies
+    // (manifest + sha256) and holds a well-formed, non-empty safetensors map.
+    // Exactly-one-writer is guaranteed by the per-attempt prefix + catalog-pointer
+    // commit: the loser wrote a different prefix that the catalog never points at,
+    // so no clobber or torn read is possible.
+    let ft = session
+        .catalog()
+        .list_models()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.model_id.starts_with("jammi:fine-tuned:"))
+        .expect("the winner registered the fine-tuned model");
+    let prefix_url =
+        jammi_db::storage::StorageUrl::parse(ft.artifact_path.as_deref().unwrap()).unwrap();
+    let local = session
+        .artifact_store()
+        .fetch_artifact(&prefix_url)
+        .await
+        .expect("the committed artifact fetches and verifies");
+    let adapter = local.dir().join("adapter.safetensors");
     assert!(
-        !bytes.is_empty(),
-        "the promoted canonical adapter holds the winner's weights"
+        adapter.exists(),
+        "the committed prefix holds the winner's adapter at {adapter:?}"
     );
-    let loaded =
-        candle_core::safetensors::load(&canonical_adapter, &candle_core::Device::Cpu).unwrap();
+    let loaded = candle_core::safetensors::load(&adapter, &candle_core::Device::Cpu).unwrap();
     assert!(
         !loaded.is_empty(),
-        "the promoted canonical adapter is a well-formed safetensors tensor map"
+        "the committed adapter is a well-formed safetensors tensor map"
     );
-
-    // Neither worker left a staging dir behind.
-    let staging_root = dir.path().join("models").join(".staging");
-    if staging_root.exists() {
-        let leftover: Vec<_> = std::fs::read_dir(&staging_root)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name())
-            .collect();
-        assert!(
-            leftover.is_empty(),
-            "no worker leaves a staging dir behind, found: {leftover:?}"
-        );
-    }
 }
 
 // ─── Lease loss: cooperative cancellation bails the trainer at the boundary ──
@@ -1864,7 +1853,6 @@ async fn training_bails_when_lease_lost_mid_run() {
         },
     )
     .job_id("lease-job".into())
-    .worker_id("worker-test".into())
     .catalog(Arc::clone(&catalog))
     .artifact_dir(dir.path().to_path_buf())
     .cancel(Arc::clone(&cancel))

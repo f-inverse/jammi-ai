@@ -17,7 +17,7 @@ use jammi_ai::model::{
 async fn resolve_hf_hub_sentence_transformer() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog).unwrap();
+    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
 
     let source = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");
     let resolved = resolver
@@ -50,7 +50,7 @@ async fn resolve_hf_hub_sentence_transformer() {
 async fn resolve_hf_hub_selects_candle_for_safetensors_model() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog).unwrap();
+    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
 
     let source = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");
     let resolved = resolver
@@ -74,7 +74,7 @@ async fn resolve_local_path_with_safetensors() {
     std::fs::write(model_dir.join("tokenizer.json"), r#"{"version":"1.0"}"#).unwrap();
 
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog).unwrap();
+    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
 
     let source = ModelSource::local(&model_dir);
     let resolved = resolver
@@ -99,7 +99,7 @@ async fn resolve_local_path_with_onnx() {
     std::fs::write(model_dir.join("model.onnx"), b"fake-onnx").unwrap();
 
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog).unwrap();
+    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
 
     let source = ModelSource::local(&model_dir);
     let resolved = resolver
@@ -127,7 +127,7 @@ async fn backend_hint_overrides_heuristic() {
     std::fs::write(model_dir.join("model.onnx"), b"fake-onnx").unwrap();
 
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog).unwrap();
+    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
 
     let source = ModelSource::local(&model_dir);
     let resolved = resolver
@@ -203,7 +203,8 @@ async fn tokenizer_encode_batch_with_truncation() {
 async fn cache_get_or_load_returns_guard_with_ref_count() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
+    let resolver =
+        ModelResolver::new(Arc::clone(&catalog), crate::common::test_artifact_store()).unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
         memory_fraction: 1.0,
@@ -239,7 +240,8 @@ async fn cache_get_or_load_returns_guard_with_ref_count() {
 async fn cache_ref_count_decrements_on_guard_drop() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
+    let resolver =
+        ModelResolver::new(Arc::clone(&catalog), crate::common::test_artifact_store()).unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
         memory_fraction: 1.0,
@@ -317,7 +319,8 @@ fn activation_memory_scaling() {
 async fn preload_loads_model_into_cache_without_returning_guard() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
+    let resolver =
+        ModelResolver::new(Arc::clone(&catalog), crate::common::test_artifact_store()).unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
         memory_fraction: 1.0,
@@ -353,7 +356,8 @@ async fn preload_loads_model_into_cache_without_returning_guard() {
 async fn single_flight_concurrent_loads_coalesce() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
+    let resolver =
+        ModelResolver::new(Arc::clone(&catalog), crate::common::test_artifact_store()).unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
         memory_fraction: 1.0,
@@ -397,7 +401,8 @@ async fn single_flight_concurrent_loads_coalesce() {
 async fn eviction_skips_model_with_active_guard() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
+    let resolver =
+        ModelResolver::new(Arc::clone(&catalog), crate::common::test_artifact_store()).unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
         memory_fraction: 1.0,
@@ -428,7 +433,7 @@ async fn resolve_local_missing_config_returns_error() {
     std::fs::write(model_dir.join("model.safetensors"), b"fake-weights").unwrap();
 
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog).unwrap();
+    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
 
     let source = ModelSource::local(&model_dir);
     let result = resolver
@@ -447,7 +452,7 @@ async fn resolve_local_empty_directory_returns_error() {
     std::fs::create_dir_all(&model_dir).unwrap();
 
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog).unwrap();
+    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
 
     let source = ModelSource::local(&model_dir);
     let result = resolver
@@ -460,7 +465,7 @@ async fn resolve_local_empty_directory_returns_error() {
 async fn resolve_nonexistent_local_path_returns_error() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(catalog).unwrap();
+    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
 
     let source = ModelSource::local("/nonexistent/path/to/model");
     let result = resolver
@@ -474,7 +479,8 @@ async fn resolve_nonexistent_local_path_returns_error() {
 async fn cache_load_failure_clears_in_flight_state() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(Arc::clone(&catalog)).unwrap();
+    let resolver =
+        ModelResolver::new(Arc::clone(&catalog), crate::common::test_artifact_store()).unwrap();
     let device_config = DeviceConfig {
         gpu_device: -1,
         memory_fraction: 1.0,

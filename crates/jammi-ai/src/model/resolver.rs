@@ -3,21 +3,31 @@ use std::sync::Arc;
 
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
+use jammi_db::store::ArtifactStore;
 
 use super::{BackendType, ModelId, ModelSource, ModelTask, ResolvedModel, TokenizerSource};
 
 /// Resolves a `ModelSource` to file paths and backend selection.
 pub struct ModelResolver {
     catalog: Arc<Catalog>,
+    /// Reloads a fine-tuned model's adapter: its catalog `artifact_path` is the
+    /// object-store prefix the training worker wrote, fetched into a local cache
+    /// dir candle loads from — so a cross-host worker fleet shares adapters.
+    artifact_store: Arc<ArtifactStore>,
     hf_api: hf_hub::api::sync::Api,
 }
 
 impl ModelResolver {
-    /// Create a resolver backed by the given catalog and HuggingFace Hub API.
-    pub fn new(catalog: Arc<Catalog>) -> Result<Self> {
+    /// Create a resolver backed by the given catalog, artifact store, and
+    /// HuggingFace Hub API.
+    pub fn new(catalog: Arc<Catalog>, artifact_store: Arc<ArtifactStore>) -> Result<Self> {
         let hf_api = hf_hub::api::sync::Api::new()
             .map_err(|e| JammiError::Config(format!("HF Hub init failed: {e}")))?;
-        Ok(Self { catalog, hf_api })
+        Ok(Self {
+            catalog,
+            artifact_store,
+            hf_api,
+        })
     }
 
     /// Access the catalog (for model registration after loading).
@@ -63,13 +73,30 @@ impl ModelResolver {
         };
 
         // For fine-tuned models: resolve via the base model, set adapter_path.
-        // The artifact_path for fine-tuned models points to the adapter directory,
-        // not a full model directory — skip the config.json/weights checks.
+        // The artifact_path for a fine-tuned model is the object-store prefix the
+        // training worker wrote the adapter under — fetch it into a local cache
+        // dir candle can mmap (an in-place no-op for a `file://` root), and point
+        // `adapter_path` at that dir. The base model resolves through its own
+        // path, so this only routes the *adapter* through the artifact store.
         if record.model_type == "fine-tuned" {
             if let Some(ref base_id) = record.base_model_id {
                 let base_source = ModelSource::parse(base_id);
                 let base_resolved =
                     Box::pin(self.resolve(&base_source, task, backend_hint)).await?;
+
+                let adapter_path = match &record.artifact_path {
+                    Some(prefix) => {
+                        let prefix_url = jammi_db::storage::StorageUrl::parse(prefix)?;
+                        Some(
+                            self.artifact_store
+                                .fetch_artifact(&prefix_url)
+                                .await?
+                                .dir()
+                                .to_path_buf(),
+                        )
+                    }
+                    None => None,
+                };
 
                 return Ok(Some(ResolvedModel {
                     model_id,
@@ -81,7 +108,7 @@ impl ModelResolver {
                     model_config: base_resolved.model_config,
                     preprocessor_config: base_resolved.preprocessor_config,
                     base_model_id: Some(ModelId(base_id.clone())),
-                    adapter_path: record.artifact_path.map(PathBuf::from),
+                    adapter_path,
                     estimated_memory: base_resolved.estimated_memory,
                 }));
             }

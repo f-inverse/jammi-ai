@@ -7,7 +7,7 @@ use jammi_db::config::JammiConfig;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::session::JammiSession;
 use jammi_db::source::{SourceConnection, SourceType};
-use jammi_db::store::ResultStore;
+use jammi_db::store::{ArtifactStore, ResultStore};
 
 use crate::concurrency::GpuScheduler;
 use crate::eval::runner::EvalRunner;
@@ -30,6 +30,7 @@ pub struct InferenceSession {
     inner: Arc<JammiSession>,
     model_cache: Arc<ModelCache>,
     result_store: Arc<ResultStore>,
+    artifact_store: Arc<ArtifactStore>,
     observer: Option<Arc<dyn InferenceObserver>>,
     ann_cache: Arc<AnnCache>,
     device_config: DeviceConfig,
@@ -103,7 +104,13 @@ impl InferenceSession {
     ) -> Result<Self> {
         let inner = Arc::new(inner);
         let catalog = Arc::clone(inner.catalog());
-        let resolver = ModelResolver::new(catalog.clone())?;
+        // The artifact store is built first so the resolver can reload
+        // fine-tuned adapters through it: a fine-tuned model's catalog
+        // `artifact_path` is an object-store prefix, fetched into a local cache
+        // before candle loads it, so an adapter trained on one host serves on
+        // another.
+        let artifact_store = Arc::new(build_artifact_store(&inner)?);
+        let resolver = ModelResolver::new(catalog.clone(), Arc::clone(&artifact_store))?;
         let device_config = DeviceConfig::from_config(inner.config());
         let scheduler = Arc::new(GpuScheduler::new_unlimited());
         let model_cache = Arc::new(ModelCache::new(resolver, device_config.clone(), scheduler));
@@ -118,6 +125,7 @@ impl InferenceSession {
             inner,
             model_cache,
             result_store,
+            artifact_store,
             observer,
             ann_cache,
             device_config,
@@ -350,6 +358,13 @@ impl InferenceSession {
     /// Access the result store.
     pub fn result_store(&self) -> Arc<ResultStore> {
         Arc::clone(&self.result_store)
+    }
+
+    /// Access the artifact store — the object-store surface model artifacts
+    /// (fine-tune adapters, context-predictor weights) are written to and
+    /// reloaded through, so a cross-host worker fleet shares trained models.
+    pub fn artifact_store(&self) -> Arc<ArtifactStore> {
+        Arc::clone(&self.artifact_store)
     }
 
     /// The device configuration the session resolves candle tensors onto — the
@@ -1071,6 +1086,39 @@ fn build_result_store(
         }
         None => ResultStore::new(inner.config().artifact_dir.as_path(), catalog),
     }
+}
+
+/// Construct the session's [`ArtifactStore`], rooting model artifacts under the
+/// same storage as result tables.
+///
+/// Model artifacts live under a `models/` sub-prefix of the configured
+/// `storage.result_root` — one storage knob serves both result tables and
+/// trained models, so an `s3://` / `r2://` root gives a worker fleet a shared
+/// place to write and reload models across hosts. When `result_root` is unset,
+/// artifacts root at `{artifact_dir}/jammi_db/models/`, mirroring the result
+/// store's local fallback. The registry is shared with the session so cloud
+/// credentials are registered once. The local fetch cache (where cloud
+/// artifacts are materialised for candle to mmap) lives under
+/// `{artifact_dir}/jammi_db/artifact_cache`.
+fn build_artifact_store(inner: &JammiSession) -> Result<ArtifactStore> {
+    let models_root = match inner.config().storage.result_root.as_deref() {
+        Some(root) => {
+            let trimmed = root.trim_end_matches('/');
+            jammi_db::storage::StorageUrl::parse(&format!("{trimmed}/models"))?
+        }
+        None => {
+            let local = inner.config().artifact_dir.join("jammi_db").join("models");
+            jammi_db::storage::StorageUrl::parse(local.to_str().ok_or_else(|| {
+                JammiError::Config("Non-UTF8 artifact_dir for artifact store".into())
+            })?)?
+        }
+    };
+    let cache_root = inner
+        .config()
+        .artifact_dir
+        .join("jammi_db")
+        .join("artifact_cache");
+    ArtifactStore::with_root(models_root, inner.storage_registry(), cache_root)
 }
 
 /// The `loss_type` string persisted on a fine-tune job — a human-readable tag of

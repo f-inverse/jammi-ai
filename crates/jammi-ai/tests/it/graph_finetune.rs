@@ -453,14 +453,23 @@ async fn fine_tune_graph_end_to_end_completes() {
         record.status
     );
 
-    let adapter = dir
-        .path()
-        .join("models")
-        .join(&job.job_id)
-        .join("adapter.safetensors");
+    let ft = session
+        .catalog()
+        .get_model(job.model_id())
+        .await
+        .unwrap()
+        .expect("graph fine-tune registered the model");
+    let prefix_url =
+        jammi_db::storage::StorageUrl::parse(ft.artifact_path.as_deref().unwrap()).unwrap();
+    let local = session
+        .artifact_store()
+        .fetch_artifact(&prefix_url)
+        .await
+        .expect("published graph adapter fetches and verifies");
+    let adapter = local.dir().join("adapter.safetensors");
     assert!(
         adapter.exists(),
-        "graph fine-tune should write an adapter, missing at {adapter:?}"
+        "graph fine-tune should publish an adapter, missing at {adapter:?}"
     );
 }
 

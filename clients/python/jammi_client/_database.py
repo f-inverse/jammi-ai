@@ -27,7 +27,9 @@ from . import _conformal
 from ._credentials import AnonymousCredentials, ChannelCredentials
 from ._errors import TrainingError
 from ._generated.jammi.v1 import embedding_pb2, embedding_pb2_grpc
+from ._generated.jammi.v1 import eval_pb2, eval_pb2_grpc
 from ._generated.jammi.v1 import inference_pb2, inference_pb2_grpc
+from ._generated.jammi.v1 import pipeline_pb2, pipeline_pb2_grpc
 from ._generated.jammi.v1 import session_pb2, session_pb2_grpc
 from ._generated.jammi.v1 import training_pb2, training_pb2_grpc
 
@@ -145,6 +147,71 @@ def _hits_to_table(hits: List[embedding_pb2.SearchHit]) -> pa.Table:
     return pa.table(columns)
 
 
+def _arrow_batch_to_table(batch: Any) -> pa.Table:
+    """Decode an `ArrowBatch` (one self-describing IPC stream in `data_body`)
+    into a `pyarrow.Table`.
+
+    An empty batch (no value columns requested) carries no schema, so it decodes
+    to an empty table — matching the embed binding, which returns an empty
+    `pyarrow.Table` for an empty `value_rows`.
+    """
+    body = bytes(batch.data_header) + bytes(batch.data_body)
+    if not body:
+        return pa.table({})
+    reader = pa.ipc.open_stream(body)
+    return reader.read_all()
+
+
+def _calibration_report_to_dict(
+    report: eval_pb2.CalibrationEvalReport,
+) -> Dict[str, Any]:
+    """Project a wire `CalibrationEvalReport` into the embed wheel's nested dict.
+
+    The shape matches the embed `Database.eval_calibration` (which serializes the
+    engine's `CalibrationEvalReport` to a dict): ``eval_run_id`` plus an
+    ``aggregate`` block, the ``per_cohort`` slices (with optional CI bounds), and
+    the ``per_record`` scores — so a caller reads the same keys on both transports.
+    """
+    aggregate = report.aggregate
+    return {
+        "eval_run_id": report.eval_run_id,
+        "aggregate": {
+            "n": aggregate.n,
+            "crps": aggregate.crps,
+            "nll": aggregate.nll,
+            "adaptive_ece": aggregate.adaptive_ece,
+            "sharpness": aggregate.sharpness,
+            "coverage": aggregate.coverage,
+        },
+        "per_cohort": [
+            {
+                "key": c.key,
+                "value": c.value,
+                "n": c.n,
+                "crps": c.crps,
+                # Presence-wrapped on the wire: a singleton cohort has no CI, so
+                # the embed dict carries `None` there rather than a fabricated 0.
+                "crps_ci_lower": c.crps_ci_lower if c.HasField("crps_ci_lower") else None,
+                "crps_ci_upper": c.crps_ci_upper if c.HasField("crps_ci_upper") else None,
+                "coverage": c.coverage,
+            }
+            for c in report.per_cohort
+        ],
+        "per_record": [
+            {
+                "record_id": r.record_id,
+                "crps": r.crps,
+                "nll": r.nll,
+                "pit": r.pit,
+                "covered": r.covered,
+                "interval_width": r.interval_width,
+                "cohorts": dict(r.cohorts),
+            }
+            for r in report.per_record
+        ],
+    }
+
+
 # Fine-tune method string → the wire `FineTuneMethod` enum. LoRA is the only
 # method, matching the embed binding's `method` argument.
 _FINE_TUNE_METHOD = {"lora": training_pb2.FineTuneMethod.LORA}
@@ -191,6 +258,32 @@ _EDGE_DIRECTION = {
     "out": inference_pb2.EdgeDirection.OUT,
     "in": inference_pb2.EdgeDirection.IN,
     "undirected": inference_pb2.EdgeDirection.UNDIRECTED,
+}
+
+# Neighbour-contribution weightings, matching the engine's `PropagationWeighting`.
+_PROPAGATION_WEIGHTING = {
+    "degree_normalized": pipeline_pb2.PropagationWeighting.PROPAGATION_WEIGHTING_DEGREE_NORMALIZED,
+    "uniform": pipeline_pb2.PropagationWeighting.PROPAGATION_WEIGHTING_UNIFORM,
+    "edge_similarity": pipeline_pb2.PropagationWeighting.PROPAGATION_WEIGHTING_EDGE_SIMILARITY,
+}
+
+# Propagation output modes, matching the engine's `PropagationOutput`.
+_PROPAGATION_OUTPUT = {
+    "final": pipeline_pb2.PropagationOutput.PROPAGATION_OUTPUT_FINAL,
+    "jumping_knowledge": pipeline_pb2.PropagationOutput.PROPAGATION_OUTPUT_JUMPING_KNOWLEDGE,
+}
+
+# Context-set pooling reductions, matching the engine's `SetAggregator`.
+_SET_AGGREGATOR = {
+    "mean": pipeline_pb2.SetAggregator.SET_AGGREGATOR_MEAN,
+    "sum": pipeline_pb2.SetAggregator.SET_AGGREGATOR_SUM,
+    "max": pipeline_pb2.SetAggregator.SET_AGGREGATOR_MAX,
+}
+
+# Calibration predictive shapes, matching the engine's `EvalCalibrationShape`.
+_CALIBRATION_SHAPE = {
+    "gaussian": eval_pb2.CalibrationShape.CALIBRATION_SHAPE_GAUSSIAN,
+    "sample": eval_pb2.CalibrationShape.CALIBRATION_SHAPE_SAMPLE,
 }
 
 # Terminal training-job states, matching the engine's `TrainingJobStatus`.
@@ -332,6 +425,8 @@ class RemoteDatabase:
         self._session = session_pb2_grpc.SessionServiceStub(channel)
         self._training = training_pb2_grpc.TrainingServiceStub(channel)
         self._inference = inference_pb2_grpc.InferenceServiceStub(channel)
+        self._pipeline = pipeline_pb2_grpc.PipelineServiceStub(channel)
+        self._eval = eval_pb2_grpc.EvalServiceStub(channel)
         # The Flight SQL client shares the gRPC endpoint (the server co-mounts
         # Flight SQL and the typed gRPC services on one Tonic port); built lazily
         # on first `sql` so a connection that never queries SQL pays nothing.
@@ -907,6 +1002,259 @@ class RemoteDatabase:
         out["source"] = resp.source
         out["context_ref"] = list(resp.context_ref)
         return out
+
+    # --- Engine-state pipeline verbs (PipelineService / EvalService) -------------
+    #
+    # These build durable graph/embedding artifacts or assemble a target's
+    # conditioning context on the remote engine. The two graph-build verbs return
+    # the materialised table name (the caller reads it via `sql(...)`); the
+    # compute stays server-side, so the table is byte-identical to one built in
+    # the embedded engine. `assemble_context` returns the pooled vector inline,
+    # and `eval_calibration` the typed calibration report. The signatures mirror
+    # the embed `Database`'s so a caller swaps transports without changing the
+    # call.
+
+    def build_neighbor_graph(
+        self,
+        source: str,
+        *,
+        k: int,
+        min_similarity: Optional[float] = None,
+        mutual: bool = False,
+        exact: bool = False,
+        table: Optional[str] = None,
+    ) -> str:
+        """Materialise the k-NN graph of a source's embedding table and return the
+        new edge table's name.
+
+        The returned table has columns ``(src, dst, rank, similarity)``. The
+        default driver is index-assisted and approximate; pass ``exact=True`` for
+        a deterministic, complete graph. ``min_similarity`` floors weak edges;
+        ``mutual=True`` keeps only reciprocal edges. Maps to
+        `PipelineService.BuildNeighborGraph`; read the table via :meth:`sql`.
+        """
+        request = pipeline_pb2.BuildNeighborGraphRequest(
+            source_id=source,
+            k=k,
+            mutual=mutual,
+            exact=exact,
+        )
+        if min_similarity is not None:
+            request.min_similarity = min_similarity
+        if table is not None:
+            request.table = table
+        resp = self._pipeline.BuildNeighborGraph(request, metadata=self._metadata)
+        return resp.table_name
+
+    def propagate_embeddings(
+        self,
+        source: str,
+        *,
+        embedding_table: Optional[str] = None,
+        edge_graph_table: Optional[str] = None,
+        edge_source: Optional[str] = None,
+        edge_src_column: Optional[str] = None,
+        edge_dst_column: Optional[str] = None,
+        edge_weight_column: Optional[str] = None,
+        direction: Optional[str] = None,
+        hops: Optional[int] = None,
+        weighting: Optional[str] = None,
+        alpha: Optional[float] = None,
+        output: Optional[str] = None,
+    ) -> str:
+        """Propagate an embedding table's features over a declared graph (the
+        decoupled-GNN forward pass) into a new, searchable embedding table.
+
+        The graph is either an S9 similarity graph (``edge_graph_table``, a
+        :meth:`build_neighbor_graph` output) or a registered external edge source
+        (``edge_source``) — pass exactly one. ``weighting`` selects the neighbour
+        normalisation; ``output`` is ``"final"`` or ``"jumping_knowledge"``.
+        Returns the materialised table's name. Maps to
+        `PipelineService.PropagateEmbeddings`; read the table via :meth:`sql`.
+        """
+        if edge_graph_table is not None and edge_source is not None:
+            raise ValueError(
+                "pass exactly one of edge_graph_table (S9 graph) or edge_source "
+                "(registered edges), not both"
+            )
+        request = pipeline_pb2.PropagateEmbeddingsRequest(source_id=source)
+        if edge_graph_table is not None:
+            request.edge_graph_table = edge_graph_table
+        elif edge_source is not None:
+            request.edge_source.CopyFrom(
+                pipeline_pb2.PropagateEdgeSource(
+                    edge_source=edge_source,
+                    src_column=edge_src_column if edge_src_column is not None else "src",
+                    dst_column=edge_dst_column if edge_dst_column is not None else "dst",
+                )
+            )
+            if edge_weight_column is not None:
+                request.edge_source.weight_column = edge_weight_column
+        else:
+            raise ValueError(
+                "propagate_embeddings requires a graph: edge_graph_table or edge_source"
+            )
+        if embedding_table is not None:
+            request.embedding_table = embedding_table
+        if direction is not None:
+            try:
+                request.direction = _EDGE_DIRECTION[direction]
+            except KeyError:
+                raise ValueError(
+                    f"direction must be 'out', 'in', or 'undirected' (got {direction!r})"
+                ) from None
+        if hops is not None:
+            request.hops = hops
+        if weighting is not None:
+            try:
+                request.weighting = _PROPAGATION_WEIGHTING[weighting]
+            except KeyError:
+                raise ValueError(
+                    "weighting must be 'degree_normalized', 'uniform', or "
+                    f"'edge_similarity' (got {weighting!r})"
+                ) from None
+        if alpha is not None:
+            request.alpha = alpha
+        if output is not None:
+            try:
+                request.output = _PROPAGATION_OUTPUT[output]
+            except KeyError:
+                raise ValueError(
+                    f"output must be 'final' or 'jumping_knowledge' (got {output!r})"
+                ) from None
+        resp = self._pipeline.PropagateEmbeddings(request, metadata=self._metadata)
+        return resp.table_name
+
+    def assemble_context(
+        self,
+        source: str,
+        *,
+        query: List[float],
+        k: int,
+        value_columns: Optional[List[str]] = None,
+        aggregator: Optional[str] = None,
+        exclude_self: bool = True,
+        exclude_key: Optional[str] = None,
+        split: Optional[str] = None,
+        edge_source: Optional[str] = None,
+        edge_src_column: Optional[str] = None,
+        edge_dst_column: Optional[str] = None,
+        edge_type_column: Optional[str] = None,
+        edge_weight_column: Optional[str] = None,
+        edge_hops: Optional[int] = None,
+        edge_fanout: Optional[int] = None,
+        edge_direction: Optional[str] = None,
+        edge_types: Optional[List[str]] = None,
+        min_weight: Optional[float] = None,
+        hybrid: bool = False,
+    ) -> Dict[str, Any]:
+        """Assemble and encode a target's context set: retrieve `k` nearest
+        neighbours of `query` (or a declared-edge walk / their union), pair them
+        with `value_columns`, and pool the neighbour vectors into one fixed-width
+        context vector.
+
+        Returns the same dict shape as the embed `Database`: ``context_vector``
+        (list of floats, or ``None`` for a degenerate empty context),
+        ``context_size``, ``context_keys``, ``value_rows`` (a ``pyarrow.Table``),
+        and ``source`` (the assembly fact). Maps to
+        `PipelineService.AssembleContext`.
+        """
+        request = pipeline_pb2.AssembleContextRequest(
+            source_id=source,
+            query=list(query),
+            k=k,
+            value_columns=list(value_columns or []),
+            exclude_self=exclude_self,
+            hybrid=hybrid,
+        )
+        if aggregator is not None:
+            try:
+                request.aggregator = _SET_AGGREGATOR[aggregator]
+            except KeyError:
+                raise ValueError(
+                    f"aggregator must be 'mean', 'sum', or 'max' (got {aggregator!r})"
+                ) from None
+        if exclude_key is not None:
+            request.exclude_key = exclude_key
+        if split is not None:
+            request.split = split
+        if edge_source is not None:
+            gather = inference_pb2.EdgeGather(
+                edge_source=edge_source,
+                src_column=edge_src_column if edge_src_column is not None else "src",
+                dst_column=edge_dst_column if edge_dst_column is not None else "dst",
+            )
+            if edge_type_column is not None:
+                gather.type_column = edge_type_column
+            if edge_weight_column is not None:
+                gather.weight_column = edge_weight_column
+            if edge_hops is not None:
+                gather.hops = edge_hops
+            if edge_fanout is not None:
+                gather.fanout = edge_fanout
+            if edge_direction is not None:
+                try:
+                    gather.direction = _EDGE_DIRECTION[edge_direction]
+                except KeyError:
+                    raise ValueError(
+                        f"edge_direction must be 'out', 'in', or 'undirected' "
+                        f"(got {edge_direction!r})"
+                    ) from None
+            if edge_types is not None:
+                gather.edge_types.extend(edge_types)
+            if min_weight is not None:
+                gather.min_weight = min_weight
+            request.edges.CopyFrom(gather)
+
+        resp = self._pipeline.AssembleContext(request, metadata=self._metadata)
+        # The pooled vector is presence-wrapped so a degenerate empty context
+        # (`None`) stays distinguishable from a present-but-empty vector — the
+        # same correctness signal the embed binding's `None` carries.
+        context_vector = (
+            list(resp.context_vector.values)
+            if resp.HasField("context_vector")
+            else None
+        )
+        value_rows = _arrow_batch_to_table(resp.value_rows)
+        return {
+            "context_vector": context_vector,
+            "context_size": resp.context_size,
+            "context_keys": list(resp.context_keys),
+            "value_rows": value_rows,
+            "source": resp.source,
+        }
+
+    def eval_calibration(
+        self,
+        *,
+        source: str,
+        golden_source: str,
+        shape: str,
+        cohorts: Optional[Dict[str, Dict[str, str]]] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate whether a predictor's uncertainty is honest against a held-out
+        golden set pairing a predictive distribution with its realised outcome.
+
+        Returns the same nested dict the embed `Database` produces: ``aggregate``
+        (``crps`` / ``nll`` / ``adaptive_ece`` / ``sharpness`` / ``coverage`` /
+        ``n``), ``per_cohort``, ``per_record``, and ``eval_run_id``. ``shape`` is
+        ``"gaussian"`` or ``"sample"``. Maps to `EvalService.EvalCalibration`.
+        """
+        try:
+            shape_value = _CALIBRATION_SHAPE[shape]
+        except KeyError:
+            raise ValueError(
+                f"shape must be 'gaussian' or 'sample' (got {shape!r})"
+            ) from None
+        request = eval_pb2.EvalCalibrationRequest(
+            source_id=source,
+            golden_source=golden_source,
+            shape=shape_value,
+        )
+        for record_id, tags in (cohorts or {}).items():
+            request.cohorts[record_id].tags.update(tags)
+        resp = self._eval.EvalCalibration(request, metadata=self._metadata)
+        return _calibration_report_to_dict(resp)
 
     def _start_training(
         self, request: training_pb2.StartTrainingRequest

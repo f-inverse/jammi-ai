@@ -17,11 +17,12 @@ use jammi_numerics::retrieval::{AggregateMetrics, QueryMetrics};
 use tonic::Status;
 
 use crate::eval::report::{
-    AggregateDelta, CompareEvalReport, DeltaSignificance, EmbeddingEvalReport, InferenceAggregate,
-    InferenceEvalReport, MetricDelta, MetricSignificance, PerQueryRecord, PerRecordPrediction,
-    TableEvalReport,
+    AggregateDelta, CalibrationAggregate, CalibrationEvalReport, CohortCalibration,
+    CompareEvalReport, DeltaSignificance, EmbeddingEvalReport, InferenceAggregate,
+    InferenceEvalReport, MetricDelta, MetricSignificance, PerQueryRecord, PerRecordCalibration,
+    PerRecordPrediction, TableEvalReport,
 };
-use crate::eval::EvalTask;
+use crate::eval::{EvalCalibrationShape, EvalTask};
 use crate::wire::proto::eval as pb;
 
 /// Map the proto [`EvalTask`] discriminant onto the engine's [`EvalTask`]. An
@@ -56,6 +57,30 @@ pub fn eval_task_to_proto(task: EvalTask) -> pb::EvalTask {
     match task {
         EvalTask::Classification => pb::EvalTask::Classification,
         EvalTask::Ner => pb::EvalTask::Ner,
+    }
+}
+
+/// Map the proto [`pb::CalibrationShape`] discriminant onto the engine's
+/// [`EvalCalibrationShape`]. An unspecified or unknown shape is rejected — a
+/// request that names no predictive shape cannot select the columns or scoring
+/// family, so it is a client error rather than a silent default.
+pub fn calibration_shape_from_proto(shape: i32) -> Result<EvalCalibrationShape, Status> {
+    match pb::CalibrationShape::try_from(shape) {
+        Ok(pb::CalibrationShape::Gaussian) => Ok(EvalCalibrationShape::Gaussian),
+        Ok(pb::CalibrationShape::Sample) => Ok(EvalCalibrationShape::Sample),
+        Ok(pb::CalibrationShape::Unspecified) | Err(_) => Err(Status::invalid_argument(
+            "calibration shape must be GAUSSIAN or SAMPLE",
+        )),
+    }
+}
+
+/// Encode the engine's [`EvalCalibrationShape`] onto the wire enum — the inverse
+/// of [`calibration_shape_from_proto`], for the [`crate::RemoteSession`] send
+/// side. Total: every engine shape maps to a concrete wire variant.
+pub fn calibration_shape_to_proto(shape: EvalCalibrationShape) -> pb::CalibrationShape {
+    match shape {
+        EvalCalibrationShape::Gaussian => pb::CalibrationShape::Gaussian,
+        EvalCalibrationShape::Sample => pb::CalibrationShape::Sample,
     }
 }
 
@@ -323,6 +348,58 @@ impl From<CompareEvalReport> for pb::CompareEvalReport {
     fn from(report: CompareEvalReport) -> Self {
         pb::CompareEvalReport {
             per_table: report.per_table.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<&CalibrationAggregate> for pb::CalibrationAggregate {
+    fn from(a: &CalibrationAggregate) -> Self {
+        pb::CalibrationAggregate {
+            n: a.n as u64,
+            crps: a.crps,
+            nll: a.nll,
+            adaptive_ece: a.adaptive_ece,
+            sharpness: a.sharpness,
+            coverage: a.coverage,
+        }
+    }
+}
+
+impl From<CohortCalibration> for pb::CohortCalibration {
+    fn from(c: CohortCalibration) -> Self {
+        pb::CohortCalibration {
+            key: c.key,
+            value: c.value,
+            n: c.n as u64,
+            crps: c.crps,
+            crps_ci_lower: c.crps_ci_lower,
+            crps_ci_upper: c.crps_ci_upper,
+            coverage: c.coverage,
+        }
+    }
+}
+
+impl From<PerRecordCalibration> for pb::PerRecordCalibration {
+    fn from(r: PerRecordCalibration) -> Self {
+        pb::PerRecordCalibration {
+            record_id: r.record_id,
+            crps: r.crps,
+            nll: r.nll,
+            pit: r.pit,
+            covered: r.covered,
+            interval_width: r.interval_width,
+            cohorts: r.cohorts.into_iter().collect(),
+        }
+    }
+}
+
+impl From<CalibrationEvalReport> for pb::CalibrationEvalReport {
+    fn from(report: CalibrationEvalReport) -> Self {
+        pb::CalibrationEvalReport {
+            eval_run_id: report.eval_run_id,
+            aggregate: Some((&report.aggregate).into()),
+            per_cohort: report.per_cohort.into_iter().map(Into::into).collect(),
+            per_record: report.per_record.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -639,6 +716,66 @@ impl TryFrom<pb::CompareEvalReport> for CompareEvalReport {
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+impl From<pb::CalibrationAggregate> for CalibrationAggregate {
+    fn from(a: pb::CalibrationAggregate) -> Self {
+        CalibrationAggregate {
+            n: a.n as usize,
+            crps: a.crps,
+            nll: a.nll,
+            adaptive_ece: a.adaptive_ece,
+            sharpness: a.sharpness,
+            coverage: a.coverage,
+        }
+    }
+}
+
+impl From<pb::CohortCalibration> for CohortCalibration {
+    fn from(c: pb::CohortCalibration) -> Self {
+        CohortCalibration {
+            key: c.key,
+            value: c.value,
+            n: c.n as usize,
+            crps: c.crps,
+            crps_ci_lower: c.crps_ci_lower,
+            crps_ci_upper: c.crps_ci_upper,
+            coverage: c.coverage,
+        }
+    }
+}
+
+impl From<pb::PerRecordCalibration> for PerRecordCalibration {
+    fn from(r: pb::PerRecordCalibration) -> Self {
+        PerRecordCalibration {
+            record_id: r.record_id,
+            crps: r.crps,
+            nll: r.nll,
+            pit: r.pit,
+            covered: r.covered,
+            interval_width: r.interval_width,
+            cohorts: r.cohorts.into_iter().collect(),
+        }
+    }
+}
+
+impl TryFrom<pb::CalibrationEvalReport> for CalibrationEvalReport {
+    type Error = JammiError;
+
+    fn try_from(report: pb::CalibrationEvalReport) -> Result<Self, Self::Error> {
+        Ok(CalibrationEvalReport {
+            eval_run_id: report.eval_run_id,
+            // The engine always populates the aggregate block; a `None` here is
+            // only reachable on a corrupt payload, and a fabricated zero report
+            // would read as a real (perfect) calibration score.
+            aggregate: report
+                .aggregate
+                .map(Into::into)
+                .ok_or_else(|| malformed("CalibrationEvalReport.aggregate"))?,
+            per_cohort: report.per_cohort.into_iter().map(Into::into).collect(),
+            per_record: report.per_record.into_iter().map(Into::into).collect(),
         })
     }
 }

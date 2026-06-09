@@ -18,6 +18,7 @@ pub mod embedding;
 pub mod eval;
 pub mod inference;
 pub mod mutable_table;
+pub mod pipeline;
 pub mod session;
 pub mod training;
 pub mod trigger;

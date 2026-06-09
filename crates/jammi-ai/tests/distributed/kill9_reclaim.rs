@@ -41,6 +41,7 @@ async fn killed_worker_job_is_reclaimed_and_completed_once() {
         &mut fleet,
         &session,
         &job_id,
+        None,
         "a worker claims the job and marks it running before the lease window closes",
         |r| r.status == "running" && r.claimed_by.is_some(),
     )
@@ -62,6 +63,7 @@ async fn killed_worker_job_is_reclaimed_and_completed_once() {
         &mut fleet,
         &session,
         &job_id,
+        None,
         "the killed worker's job is reclaimed by a survivor and completed",
         |r| r.status == "completed",
     )

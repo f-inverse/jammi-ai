@@ -465,12 +465,14 @@ pub async fn await_job(
     fleet: &mut Fleet,
     session: &Arc<InferenceSession>,
     job_id: &str,
+    tenant: Option<jammi_db::TenantId>,
     label: &str,
     mut want: impl FnMut(&jammi_db::catalog::training_repo::TrainingJobRecord) -> bool,
 ) -> jammi_db::catalog::training_repo::TrainingJobRecord {
+    let catalog = session.catalog().pinned_to_tenant(tenant);
     let deadline = Instant::now() + TERMINAL_TIMEOUT;
     loop {
-        if let Ok(record) = session.catalog().get_training_job(job_id).await {
+        if let Ok(record) = catalog.get_training_job(job_id).await {
             if want(&record) {
                 return record;
             }
@@ -492,7 +494,7 @@ pub async fn await_job(
             fleet.dump_diagnostics(&format!(
                 "timed out after {TERMINAL_TIMEOUT:?} awaiting: {label}"
             ));
-            dump_final_job_row(session, job_id, label).await;
+            dump_final_job_row(session, job_id, tenant, label).await;
             panic!(
                 "distributed lane: timed out after {TERMINAL_TIMEOUT:?} awaiting: {label}. \
                  See the dumped worker configs/logs and final job row above."
@@ -507,9 +509,19 @@ pub async fn await_job(
 /// `error_message` naming a `SchemeNotEnabled` publish failure). Pairs with
 /// [`Fleet::dump_diagnostics`] (the workers' view) to make a failed dispatch
 /// fully diagnosable from the CI log alone.
-async fn dump_final_job_row(session: &Arc<InferenceSession>, job_id: &str, label: &str) {
+async fn dump_final_job_row(
+    session: &Arc<InferenceSession>,
+    job_id: &str,
+    tenant: Option<jammi_db::TenantId>,
+    label: &str,
+) {
     eprintln!("\n----- final catalog row for job {job_id} (awaiting: {label}) -----");
-    match session.catalog().get_training_job(job_id).await {
+    match session
+        .catalog()
+        .pinned_to_tenant(tenant)
+        .get_training_job(job_id)
+        .await
+    {
         Ok(r) => eprintln!(
             "status={:?} claimed_by={:?} attempts={} output_model_id={:?} \
              tenant_id={:?} lease_expires_at={:?} error_message={:?}",

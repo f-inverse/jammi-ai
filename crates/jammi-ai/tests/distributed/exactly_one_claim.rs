@@ -43,6 +43,7 @@ async fn one_job_n_workers_exactly_one_wins() {
         &mut fleet,
         &session,
         &job_id,
+        None,
         "the single job reaches `completed` under one of the racing workers",
         |r| r.status == "completed",
     )

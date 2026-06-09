@@ -3,6 +3,7 @@ mod caching;
 mod catalog_ping;
 mod channels;
 mod common;
+mod concurrent_writers;
 mod ephemeral;
 mod eval_per_query;
 mod fine_tune_queue;

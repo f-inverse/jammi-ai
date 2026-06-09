@@ -57,19 +57,36 @@ impl CatalogBackend for SqliteBackend {
         R: Send + 'a,
     {
         Box::pin(async move {
-            let mut tx = self.pool.begin().await.map_err(classify)?;
-
-            // SQLite has no SET TRANSACTION ISOLATION LEVEL. WAL mode gives
-            // snapshot isolation for readers; stronger isolation requires
-            // BEGIN IMMEDIATE which sqlx's Pool::begin doesn't expose. For
-            // RepeatableRead/Serializable on SQLite we accept the default
-            // BEGIN DEFERRED — sufficient for the catalog's workload. The
-            // read_only flag is advisory on SQLite.
+            // SQLite has no SET TRANSACTION ISOLATION LEVEL; isolation is fixed
+            // by the journal mode (WAL gives snapshot reads). The write/read
+            // distinction is carried entirely by the BEGIN mode, which `sqlx`'s
+            // default `Pool::begin` (always DEFERRED) cannot express — so we
+            // open the transaction through `Pool::begin_with`, which runs our
+            // custom BEGIN yet still yields a sqlx `Transaction` that rolls back
+            // on drop/cancel.
+            //
+            // A write transaction MUST take the database write lock at BEGIN
+            // time (`BEGIN IMMEDIATE`): under WAL, two DEFERRED transactions
+            // that each read then upgrade to a write deadlock with
+            // SQLITE_BUSY_SNAPSHOT, which `busy_timeout` cannot break (waiting
+            // never resolves a snapshot-upgrade conflict). IMMEDIATE makes
+            // concurrent writers serialise on `busy_timeout` instead. A
+            // read-only transaction stays DEFERRED so reads take a snapshot
+            // without serialising against each other or against writers. The
+            // sqlx `Transaction` guards both modes: a future cancelled between
+            // BEGIN and COMMIT rolls back on drop, releasing any write lock so
+            // the pooled connection is returned clean.
+            let begin = if opts.read_only {
+                "BEGIN DEFERRED"
+            } else {
+                "BEGIN IMMEDIATE"
+            };
+            let mut tx = self.pool.begin_with(begin).await.map_err(classify)?;
             let _ = (opts.isolation, opts.read_only);
 
             // Scope wrapper so its borrow of `tx` ends before we move `tx`
-            // into commit/rollback. The HRTB on `f` makes the future borrow
-            // wrapper for `'tx = lifetime of wrapper`, so wrapper must drop.
+            // into commit/rollback. The HRTB on `f` borrows wrapper for its
+            // entire lifetime, so wrapper must drop before tx moves.
             let outcome = {
                 let mut wrapper = Transaction::new_sqlite(&mut tx);
                 f(&mut wrapper).await

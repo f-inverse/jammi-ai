@@ -264,7 +264,7 @@ fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendErr
         detail: e.to_string(),
     })?;
     let backend: String = row.try_get("backend")?.unwrap_or_default();
-    let version: i64 = row.try_get("version")?.unwrap_or(1);
+    let version: i32 = row.try_get("version")?.unwrap_or(1);
     let status: String = row.try_get("status")?.unwrap_or_default();
     let metadata: Option<String> = row.try_get("metadata")?;
     let created_at: String = row.try_get("created_at")?.unwrap_or_default();
@@ -285,7 +285,7 @@ fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendErr
 
     Ok(ModelRecord {
         model_id: name,
-        version: version as i32,
+        version,
         model_type,
         base_model_id,
         backend,

@@ -9,7 +9,6 @@ use jammi_ai::fine_tune::{
 };
 use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
-use jammi_db::catalog::status::TrainingJobStatus;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_lora::LoraLinear;
 
@@ -771,14 +770,15 @@ async fn fine_tune_job_catalog_crud() {
         .unwrap()
         .expect("the queued job is claimable");
     assert_eq!(claimed.status, "running");
-    catalog
-        .update_training_status(
+    let marked = catalog
+        .mark_training_running(
             "job-1",
-            TrainingJobStatus::Running,
+            "worker-x",
             Some(r#"{"started_at": "2026-01-01T00:00:00Z"}"#),
         )
         .await
         .unwrap();
+    assert!(marked, "the lease owner records its run-start metrics");
     let job2 = catalog.get_training_job("job-1").await.unwrap();
     assert_eq!(job2.status, "running");
     assert!(job2.started_at.is_some());

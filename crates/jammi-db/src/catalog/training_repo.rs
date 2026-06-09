@@ -213,40 +213,6 @@ impl Catalog {
         found.ok_or_else(|| JammiError::Catalog(format!("Training job '{id_for_err}' not found")))
     }
 
-    /// Update a training job's status and optional metrics JSON. Scoped.
-    pub async fn update_training_status(
-        &self,
-        job_id: &str,
-        status: super::status::TrainingJobStatus,
-        metrics: Option<&str>,
-    ) -> Result<()> {
-        let status_str = status.to_string();
-        let metrics = metrics.map(str::to_string);
-        let id = job_id.to_string();
-        let tenant = self.current_tenant();
-        self.backend()
-            .transaction(TxOptions::default(), |tx| {
-                Box::pin(async move {
-                    tx.set_tenant(tenant);
-                    tx.execute(
-                        "UPDATE training_jobs SET status = $1, metrics = $2, \
-                         updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
-                         WHERE job_id = $3 AND (tenant_id = $4 OR tenant_id IS NULL)",
-                        &[
-                            SqlValue::TextOwned(status_str),
-                            SqlValue::from(metrics),
-                            SqlValue::TextOwned(id),
-                            SqlValue::from(tenant.map(|t| t.to_string())),
-                        ],
-                    )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await?;
-        Ok(())
-    }
-
     /// Finalize a training job the caller still owns, as a single lease-guarded
     /// compare-and-set that also commits the output model's served artifact path.
     /// In one transaction it flips the job row to `completed`, writes

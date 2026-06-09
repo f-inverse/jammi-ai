@@ -228,10 +228,13 @@ async fn heartbeat_renews_for_owner_only(backend: BackendKind) {
     );
 
     // Once the job leaves `running`, even the owner cannot heartbeat it.
-    catalog
-        .update_training_status("hb", TrainingJobStatus::Completed, None)
+    // The owner drives it out of `running` through the lease-guarded terminal
+    // transition.
+    let failed = catalog
+        .fail_training_job("hb", "owner", None)
         .await
         .unwrap();
+    assert!(failed, "the owner ends its own running job");
     let post_complete = catalog
         .heartbeat_training_job("hb", "owner", Duration::from_secs(60))
         .await

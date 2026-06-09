@@ -11,14 +11,15 @@
 //! * `AssembleContext` → a pooled context vector + carried metadata for a target
 //!   query.
 //!
-//! The tenant test drives `PropagateEmbeddings` under a `with_tenant`-set
-//! connection: the propagation's edge load runs through the generic SQL surface,
-//! so the tenant-scope analyzer rule scopes the scan — a cross-tenant endpoint is
-//! filtered before it reaches the adjacency. The test asserts the verb succeeds
+//! The tenant test drives the verbs under a `with_tenant`-set connection: each
+//! resolves the source's embedding table through the generic SQL surface, so the
+//! tenant-scope analyzer rule scopes the scan — a cross-tenant endpoint is
+//! filtered before it reaches the adjacency. The test asserts the verbs succeed
 //! under the bound tenant (resolving that tenant's own embedding table + graph)
 //! and that the propagated table is reachable + non-empty under the same scope;
-//! a second tenant that registered nothing cannot resolve the same source, so a
-//! propagate there is rejected — the scoping is observable over the wire, not
+//! a second tenant that registered nothing cannot resolve the same source, so
+//! `build_neighbor_graph`, `propagate_embeddings`, and `assemble_context` are all
+//! rejected there — the scoping is observable over the wire for every verb, not
 //! merely a signature-parity claim.
 //!
 //! Hermetic: the encoder is a local fixture and the corpus is a shipped fixture.
@@ -134,7 +135,7 @@ async fn build_propagate_assemble_over_the_wire() {
             source_id: "patents".into(),
             query: vec![0.0_f32; dim.max(1)],
             k: 3,
-            exclude_self: true,
+            exclude_self: Some(true),
             ..Default::default()
         })
         .await
@@ -220,7 +221,7 @@ async fn propagate_embeddings_is_tenant_scoped_over_the_wire() {
         .expect("set_tenant B");
     let mut pipeline_b =
         PipelineServiceClient::with_interceptor(channel(server.addr).await, session_b);
-    let cross_tenant = pipeline_b
+    let propagate_cross_tenant = pipeline_b
         .propagate_embeddings(PropagateEmbeddingsRequest {
             source_id: "patents".into(),
             graph: Some(Graph::EdgeGraphTable("anything".into())),
@@ -228,8 +229,37 @@ async fn propagate_embeddings_is_tenant_scoped_over_the_wire() {
         })
         .await;
     assert!(
-        cross_tenant.is_err(),
+        propagate_cross_tenant.is_err(),
         "TENANT_B cannot resolve TENANT_A's source — propagate is rejected"
+    );
+
+    // The other two verbs are scoped by the same interceptor + analyzer rule;
+    // assert their cross-tenant rejection over the wire too, closing the
+    // coverage gap left by testing only propagate.
+    let build_cross_tenant = pipeline_b
+        .build_neighbor_graph(BuildNeighborGraphRequest {
+            source_id: "patents".into(),
+            k: 5,
+            exact: true,
+            ..Default::default()
+        })
+        .await;
+    assert!(
+        build_cross_tenant.is_err(),
+        "TENANT_B cannot resolve TENANT_A's source — build_neighbor_graph is rejected"
+    );
+
+    let assemble_cross_tenant = pipeline_b
+        .assemble_context(AssembleContextRequest {
+            source_id: "patents".into(),
+            query: vec![0.0_f32; 8],
+            k: 3,
+            ..Default::default()
+        })
+        .await;
+    assert!(
+        assemble_cross_tenant.is_err(),
+        "TENANT_B cannot resolve TENANT_A's source — assemble_context is rejected"
     );
 
     let _ = server.shutdown.send(());

@@ -163,8 +163,11 @@ message AssembleContextRequest {
   // The pooling reduction.
   SetAggregator aggregator = 5;
   // Drop the target's own row (`exclude_key`) before pooling — the leakage
-  // guard, on by default in the binding.
-  bool exclude_self = 6;
+  // guard. Explicit presence: an unset field resolves to the engine default
+  // (`true`), the single source of that value, so a client that omits it keeps
+  // the leakage guard on rather than silently disabling it via the proto3 bare-
+  // bool wire default (`false`).
+  optional bool exclude_self = 6;
   // Optional target row key dropped from the context when `exclude_self`.
   optional string exclude_key = 7;
   // Optional SQL predicate scoping the context to a split.

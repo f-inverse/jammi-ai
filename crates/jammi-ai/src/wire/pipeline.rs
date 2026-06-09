@@ -208,7 +208,13 @@ pub fn assemble_context_request_from_proto(
     request.source = context_source;
     request.value_columns = req.value_columns;
     request.aggregator = aggregator;
-    request.exclude_self = req.exclude_self;
+    // `exclude_self` carries explicit presence: an unset field keeps the
+    // leakage-safe `ContextRequest::new` default (`true`), the engine's single
+    // source of that value, so a client that omits it never silently disables
+    // the self-exclusion guard via the proto3 bare-bool wire default (`false`).
+    if let Some(exclude_self) = req.exclude_self {
+        request.exclude_self = exclude_self;
+    }
     request.exclude_key = req.exclude_key;
     request.split = req.split;
     Ok(request)
@@ -364,6 +370,52 @@ mod tests {
         );
         assert_eq!(decoded.context_size, 0);
         assert_eq!(decoded.source, ContextSourceKind::Edges);
+    }
+
+    /// A minimal `AssembleContextRequest` carrying just the required identity +
+    /// query + `k`, with every optional field left at its proto default. The
+    /// helper isolates the `exclude_self` decode from the rest of the surface.
+    fn minimal_assemble_request(exclude_self: Option<bool>) -> pb::AssembleContextRequest {
+        pb::AssembleContextRequest {
+            source_id: "src".into(),
+            query: vec![0.1, 0.2],
+            k: 5,
+            value_columns: Vec::new(),
+            aggregator: pb::SetAggregator::Unspecified as i32,
+            exclude_self,
+            exclude_key: None,
+            split: None,
+            edges: None,
+            hybrid: false,
+        }
+    }
+
+    /// `exclude_self` is presence-carried: an **unset** wire field must decode to
+    /// the engine's leakage-safe default (`true`), never the proto3 bare-bool
+    /// wire default (`false`) that would silently pool the target's own row into
+    /// its context (train/serve leakage). An explicit `false`/`true` is honoured.
+    ///
+    /// Pre-fix (bare `bool exclude_self`) the unset case decoded to `false`, so
+    /// this test fails on the first assertion; post-fix (`optional bool`,
+    /// override-only-when-present) it passes.
+    #[test]
+    fn exclude_self_unset_decodes_to_engine_default_true() {
+        let unset = assemble_context_request_from_proto(minimal_assemble_request(None))
+            .expect("decode unset");
+        assert!(
+            unset.exclude_self,
+            "an omitted exclude_self must keep the engine default (true), not the \
+             proto3 bare-bool wire default (false) — omitting it must not disable \
+             the self-exclusion leakage guard"
+        );
+
+        let off = assemble_context_request_from_proto(minimal_assemble_request(Some(false)))
+            .expect("decode false");
+        assert!(!off.exclude_self, "explicit false is honoured");
+
+        let on = assemble_context_request_from_proto(minimal_assemble_request(Some(true)))
+            .expect("decode true");
+        assert!(on.exclude_self, "explicit true is honoured");
     }
 
     /// The hydrated value rows cross the wire as an Arrow IPC stream and decode

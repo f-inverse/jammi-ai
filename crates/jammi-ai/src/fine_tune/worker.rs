@@ -162,8 +162,11 @@ impl TrainingWorker {
 
     /// Run one already-claimed job to a terminal state. Deserialises the spec,
     /// pins the catalog to the job's tenant (the claim is intentionally unscoped,
-    /// so the worker's writes must be re-scoped), runs the kind's reconstruction
-    /// under a heartbeat, then performs the single lease-guarded finalize —
+    /// so the worker's writes must be re-scoped) and runs the kind's
+    /// reconstruction under that tenant's scope and a heartbeat — every catalog
+    /// read and SQL-surface read inside the run observes the job's tenant, not
+    /// the worker session's unbound default — then performs the single
+    /// lease-guarded finalize —
     /// `completed` + the output model when this worker still holds the lease, or
     /// `failed` + the error on a genuine failure. A worker that lost its lease in
     /// the run window does not finalize; the job is left for `reclaim`.
@@ -213,9 +216,34 @@ impl TrainingWorker {
         let heartbeat =
             self.spawn_heartbeat(Arc::clone(&catalog), job_id.clone(), Arc::clone(&cancel));
 
-        let outcome = self
-            .run_spec(session, &catalog, &job_id, spec, &cancel)
-            .await;
+        // Run the whole job in its own tenant scope. The claim is intentionally
+        // unscoped (one worker drains every tenant's queue), so inside the run
+        // the session's tenant binding is `None` — and the reconstruction's
+        // catalog reads (`resolve_embedding_table`) and SQL-surface reads
+        // (`assemble_context`, the per-member vector reads) would otherwise
+        // resolve `Unscoped` and miss a tenant's rows. The session shares one
+        // `TenantBinding` between its catalog and its DataFusion analyzer rule,
+        // so installing the job's tenant as the task-local override for the
+        // duration of the run makes every async read and write observe it.
+        //
+        // The write path additionally uses the sticky `pinned_to_tenant`
+        // catalog (above) because a fine-tune's `register_model` /
+        // `get_model` runs inside (or after) a `spawn_blocking` thread, which
+        // does not inherit the task-local; the predictor's async reads are
+        // covered by this scope.
+        let outcome = match record.tenant_id {
+            Some(tenant) => {
+                session
+                    .with_tenant_scoped(tenant, |_scope| {
+                        self.run_spec(session, &catalog, &job_id, spec, &cancel)
+                    })
+                    .await
+            }
+            None => {
+                self.run_spec(session, &catalog, &job_id, spec, &cancel)
+                    .await
+            }
+        };
 
         // Stop the heartbeat regardless of outcome.
         heartbeat.abort();

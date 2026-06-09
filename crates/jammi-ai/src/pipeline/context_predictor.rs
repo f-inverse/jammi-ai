@@ -479,9 +479,12 @@ impl InferenceSession {
     ///
     /// `catalog` is the worker's tenant-pinned catalog: the model row is
     /// registered through it so the predictor lands under the job's tenant,
-    /// mirroring the fine-tune path. Reads off the session use the session's own
-    /// catalog (sampling is tenant-agnostic); only the registering write is
-    /// re-scoped.
+    /// mirroring the fine-tune path. The sampling reads off the session
+    /// (`resolve_embedding_table`, the SQL-surface context assembly and
+    /// per-member vector reads) are tenant-scoped too — the worker runs this
+    /// whole call inside the job's tenant scope, so the session's shared tenant
+    /// binding (consulted by both its catalog and its DataFusion analyzer rule)
+    /// resolves to the job's tenant rather than the worker's unbound default.
     pub(crate) async fn run_context_predictor_training(
         self: &Arc<Self>,
         catalog: &Arc<jammi_db::catalog::Catalog>,

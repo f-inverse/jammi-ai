@@ -63,19 +63,20 @@ async fn mixed_tenant_queue_completes_each_under_its_own_scope() {
 
     // A SINGLE worker drains the mixed queue, running each job under its own
     // tenant scope back-to-back — the cross-tenant scenario on one process.
-    let fleet = Fleet::spawn(&backends, &result_root, 1);
+    let mut fleet = Fleet::spawn(&backends, &result_root, 1);
 
     // Both jobs reach `completed`, each stamped with its submitting tenant.
+    // `await_job` dumps the worker's config/log + the final job row and panics
+    // loudly if the worker dies or a job never completes.
     for (job_id, tenant) in [(&job_a, tenant_a), (&job_b, tenant_b)] {
-        let record = harness::poll_until(harness::TERMINAL_TIMEOUT, harness::POLL_INTERVAL, || {
-            let session = &session;
-            async move {
-                let r = session.catalog().get_training_job(job_id).await.ok()?;
-                (r.status == "completed").then_some(r)
-            }
-        })
-        .await
-        .unwrap_or_else(|| panic!("job {job_id} completes"));
+        let record = harness::await_job(
+            &mut fleet,
+            &session,
+            job_id,
+            "the tenant's job reaches `completed`",
+            |r| r.status == "completed",
+        )
+        .await;
         assert_eq!(
             record.tenant_id,
             Some(tenant),

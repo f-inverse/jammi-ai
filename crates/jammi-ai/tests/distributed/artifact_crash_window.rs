@@ -48,32 +48,29 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
     let mut fleet = Fleet::spawn(&backends, &result_root, 2);
 
     // Detect and crash the first claimer mid-run — the publish/finalize window.
-    let first_claimer =
-        harness::poll_until(harness::TERMINAL_TIMEOUT, harness::POLL_INTERVAL, || {
-            let session = &session;
-            let job_id = &job_id;
-            async move {
-                let r = session.catalog().get_training_job(job_id).await.ok()?;
-                (r.status == "running")
-                    .then(|| r.claimed_by.clone())
-                    .flatten()
-            }
-        })
-        .await
-        .expect("a worker claims and starts running before its lease window closes");
+    // `await_job` dumps the fleet's configs/logs + the final job row and panics
+    // loudly if a worker dies on its own or the claim never lands.
+    let first_claimer = harness::await_job(
+        &mut fleet,
+        &session,
+        &job_id,
+        "a worker claims and starts running before its lease window closes",
+        |r| r.status == "running" && r.claimed_by.is_some(),
+    )
+    .await
+    .claimed_by
+    .expect("a running job records its claimer");
     assert!(fleet.kill9(&first_claimer), "claimer is a spawned worker");
 
     // The survivor reclaims and completes; the committed pointer is the winner's.
-    let record = harness::poll_until(harness::TERMINAL_TIMEOUT, harness::POLL_INTERVAL, || {
-        let session = &session;
-        let job_id = &job_id;
-        async move {
-            let r = session.catalog().get_training_job(job_id).await.ok()?;
-            (r.status == "completed").then_some(r)
-        }
-    })
-    .await
-    .expect("the survivor reclaims the crashed job and completes it");
+    let record = harness::await_job(
+        &mut fleet,
+        &session,
+        &job_id,
+        "the survivor reclaims the crashed job and completes it",
+        |r| r.status == "completed",
+    )
+    .await;
 
     let winner = record
         .claimed_by
@@ -150,18 +147,16 @@ async fn artifact_written_on_worker_is_readable_by_a_different_client() {
     let (job_id, expected_model) =
         harness::submit_fine_tune(&session, &source, JobSize::Quick).await;
 
-    let fleet = Fleet::spawn(&backends, &result_root, 1);
+    let mut fleet = Fleet::spawn(&backends, &result_root, 1);
 
-    let record = harness::poll_until(harness::TERMINAL_TIMEOUT, harness::POLL_INTERVAL, || {
-        let session = &session;
-        let job_id = &job_id;
-        async move {
-            let r = session.catalog().get_training_job(job_id).await.ok()?;
-            (r.status == "completed").then_some(r)
-        }
-    })
-    .await
-    .expect("the single worker completes the job");
+    let record = harness::await_job(
+        &mut fleet,
+        &session,
+        &job_id,
+        "the single worker completes the job",
+        |r| r.status == "completed",
+    )
+    .await;
     assert_eq!(
         record.output_model_id.as_deref(),
         Some(expected_model.as_str())

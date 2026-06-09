@@ -33,6 +33,18 @@ serde_json.workspace = true
 cuda  = ["jammi-ai/cuda"]
 metal = ["jammi-ai/metal"]
 
+# Cloud object-store backends, forwarded to `jammi-server` (and onward to
+# `jammi-db`). The shipped `jammi` binary that reads `s3://` / `r2://` / `gs://` /
+# `azure://` result roots and writes trained-model artifacts to them needs the
+# matching driver compiled in; a build without these carries no cloud driver and
+# fails closed with `SchemeNotEnabled` on the first cloud object-store request.
+# Individual features let a build compile in only the cloud it targets.
+storage-s3 = ["jammi-server/storage-s3"]
+storage-gcs = ["jammi-server/storage-gcs"]
+storage-azure = ["jammi-server/storage-azure"]
+storage-r2 = ["jammi-server/storage-r2"]
+storage-cloud = ["jammi-server/storage-cloud"]
+
 # docs.rs builds with default features only. Pin the feature set to empty so a
 # future `default` change can never make the docs.rs builder invoke nvcc (the
 # `cuda` feature pulls candle's CUDA backend, which needs a CUDA toolchain

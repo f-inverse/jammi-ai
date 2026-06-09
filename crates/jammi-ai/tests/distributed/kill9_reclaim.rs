@@ -35,19 +35,18 @@ async fn killed_worker_job_is_reclaimed_and_completed_once() {
     // Detect the claimer: poll until the job is `running` and stamped with a
     // `claimed_by`. The run is long enough (6 epochs over the tiny model) to
     // outlive this detection + the kill, so we crash a worker genuinely mid-job.
-    let first_claimer =
-        harness::poll_until(harness::TERMINAL_TIMEOUT, harness::POLL_INTERVAL, || {
-            let session = &session;
-            let job_id = &job_id;
-            async move {
-                let r = session.catalog().get_training_job(job_id).await.ok()?;
-                (r.status == "running")
-                    .then(|| r.claimed_by.clone())
-                    .flatten()
-            }
-        })
-        .await
-        .expect("a worker claims the job and marks it running before the lease window closes");
+    // `await_job` dumps the fleet's configs/logs + the final job row and panics
+    // loudly if a worker dies on its own or the claim never lands.
+    let first_claimer = harness::await_job(
+        &mut fleet,
+        &session,
+        &job_id,
+        "a worker claims the job and marks it running before the lease window closes",
+        |r| r.status == "running" && r.claimed_by.is_some(),
+    )
+    .await
+    .claimed_by
+    .expect("a running job records its claimer");
 
     // SIGKILL the claimer mid-run — no terminal write, the lease just dies.
     assert!(
@@ -59,16 +58,14 @@ async fn killed_worker_job_is_reclaimed_and_completed_once() {
     // re-queues the expired lease (so a re-run bumps `attempts` to ≥ 2) and the
     // surviving worker finalizes — the committed `claimed_by` is the reclaimer,
     // not the corpse.
-    let record = harness::poll_until(harness::TERMINAL_TIMEOUT, harness::POLL_INTERVAL, || {
-        let session = &session;
-        let job_id = &job_id;
-        async move {
-            let r = session.catalog().get_training_job(job_id).await.ok()?;
-            (r.status == "completed").then_some(r)
-        }
-    })
-    .await
-    .expect("the killed worker's job is reclaimed by a survivor and completed");
+    let record = harness::await_job(
+        &mut fleet,
+        &session,
+        &job_id,
+        "the killed worker's job is reclaimed by a survivor and completed",
+        |r| r.status == "completed",
+    )
+    .await;
 
     let final_claimer = record
         .claimed_by

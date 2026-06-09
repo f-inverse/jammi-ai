@@ -213,14 +213,25 @@ The OSS server ships as two public Docker images on GHCR:
 - `ghcr.io/f-inverse/jammi-ai-server` — **CPU**, built from a distroless base.
 - `ghcr.io/f-inverse/jammi-ai-server-cu12` — **CUDA**, for GPU-accelerated inference (see [GPU serving](#gpu-serving)).
 
-Both run as the nonroot user (uid `65532`), expose the same `8080` / `8081` ports the local binary listens on, and share the same tag scheme (`:latest`, `:vX.Y.Z`, `:vX.Y`). The examples below use the CPU image.
+Both run as the nonroot user (uid `65532`), expose the same `8080` / `8081` ports the local binary listens on, and share the same tag scheme (`:latest`, `:vX.Y.Z`, `:vX.Y`). Both carry the `jammi` CLI and are **turnkey**: the image entrypoint is `jammi serve`, so `docker run <image>` brings up the server with **zero config** — a local SQLite catalog, the in-memory broker, and every service tier, no TOML required. The examples below use the CPU image.
+
+```bash
+# Turnkey: zero config, no TOML.
+docker run --rm \
+  -p 8080:8080 -p 8081:8081 \
+  -v jammi_data:/var/lib/jammi \
+  ghcr.io/f-inverse/jammi-ai-server:latest
+```
+
+To supply your own config, pass it to the `serve` subcommand (the image
+entrypoint is the CLI, so any `jammi` verb works):
 
 ```bash
 docker run --rm \
   -p 8080:8080 -p 8081:8081 \
   -v jammi_data:/var/lib/jammi \
   -v $(pwd)/jammi.toml:/etc/jammi/jammi.toml:ro \
-  ghcr.io/f-inverse/jammi-ai-server:latest
+  ghcr.io/f-inverse/jammi-ai-server:latest serve --config /etc/jammi/jammi.toml
 ```
 
 A minimal compose file lives in the workspace at `examples/docker-compose/oss-server.yml`:
@@ -232,7 +243,7 @@ docker compose -f oss-server.yml up
 
 ### Persistence
 
-`/var/lib/jammi` holds the catalog DB, model weights, and indices. The Dockerfile declares it as a `VOLUME` — bind mounts work, but the host directory must be writable by uid `65532`:
+`/var/lib/jammi` holds the catalog DB, model weights, and indices. Zero-config `jammi serve` writes its SQLite catalog there (the image sets `JAMMI_ARTIFACT_DIR=/var/lib/jammi`). The Dockerfile declares it as a `VOLUME` owned by uid `65532` — a named Docker volume or no mount at all just works; a bind mount must have the host directory writable by uid `65532`:
 
 ```bash
 # Bind mount on the host.
@@ -244,13 +255,14 @@ A named Docker volume (the compose default) sidesteps that step because Docker p
 
 ### Configuration
 
-The container's entrypoint expects `/etc/jammi/jammi.toml`. Bind-mount your config there:
+The image needs no config — it boots zero-config. To override defaults, bind-mount a TOML and point `serve` at it with a `command:`. The `[gpu]`, `[server]`, and `services` knobs documented above (and `JAMMI_*` env overrides) all apply:
 
 ```yaml
 # oss-server.yml
 services:
   jammi-server:
     image: ghcr.io/f-inverse/jammi-ai-server:latest
+    command: ["serve", "--config", "/etc/jammi/jammi.toml"]
     volumes:
       - ./jammi.toml:/etc/jammi/jammi.toml:ro
       - jammi_data:/var/lib/jammi
@@ -259,16 +271,42 @@ services:
       - "8081:8081"
 ```
 
+Or skip the TOML entirely and tune via environment variables:
+
+```yaml
+services:
+  jammi-server:
+    image: ghcr.io/f-inverse/jammi-ai-server:latest
+    environment:
+      JAMMI_SERVER__SERVICES: "event"      # serve + event tier only
+      JAMMI_LOGGING__FORMAT: "json"
+    volumes:
+      - jammi_data:/var/lib/jammi
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+```
+
 ### GPU serving
 
-The `jammi-ai-server-cu12` image builds `jammi-server --features cuda` (candle's CUDA backend) on an NVIDIA CUDA 12.6 runtime base, so `libcudart` and the rest of the CUDA runtime libraries are present in the image. Run it on a host with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) and pass `--gpus all`:
+The `jammi-ai-server-cu12` image builds with candle's CUDA backend on an NVIDIA CUDA 12.6 runtime base, so `libcudart` and the rest of the CUDA runtime libraries are present in the image. It carries the same turnkey `jammi` CLI as the CPU image. Run it on a host with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) and pass `--gpus all`:
+
+```bash
+# Turnkey: zero config, GPU inference.
+docker run --rm --gpus all \
+  -p 8080:8080 -p 8081:8081 \
+  -v jammi_data:/var/lib/jammi \
+  ghcr.io/f-inverse/jammi-ai-server-cu12:latest
+```
+
+With no TOML the server selects GPU device `0` by default. To override the device or any other knob, pass a config to `serve`:
 
 ```bash
 docker run --rm --gpus all \
   -p 8080:8080 -p 8081:8081 \
   -v jammi_data:/var/lib/jammi \
   -v $(pwd)/jammi.toml:/etc/jammi/jammi.toml:ro \
-  ghcr.io/f-inverse/jammi-ai-server-cu12:latest
+  ghcr.io/f-inverse/jammi-ai-server-cu12:latest serve --config /etc/jammi/jammi.toml
 ```
 
 Set `gpu.device = 0` in `jammi.toml` (or `JAMMI_GPU__DEVICE=0`) to select the CUDA device; see [GPU configuration](#gpu-configuration). The image is compiled for compute capability `8.6`. The CPU image ignores GPU config and runs inference on the CPU.

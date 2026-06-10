@@ -3,6 +3,11 @@ name: PyPI
 on:
   push:
     tags: ["py-v*"]
+  # Manual re-run to finish a release whose embed-wheel publish was interrupted.
+  # The wheel version comes from the checked-out source (maturin reads
+  # Cargo.toml), so dispatch from the release commit / `main` at the release
+  # version; PyPI rejects a re-upload of an existing version, so this is safe.
+  workflow_dispatch:
 
 jobs:
   build-linux:

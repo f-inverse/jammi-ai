@@ -94,6 +94,10 @@ statrs.workspace = true
 # Synthetic exchangeable data generators for the conformal coverage tests.
 rand.workspace = true
 rand_distr.workspace = true
+# The gated GPU-capability suite captures the fine-tune trainer's per-epoch
+# `avg_train_loss` off its `tracing` events (a `Layer` over the in-process
+# worker) to prove on-device learning — the loss-decrease property. Test-only.
+tracing-subscriber.workspace = true
 
 [features]
 default = ["local"]
@@ -135,6 +139,18 @@ live-hub-tests = []
 # adapter back from the shared MinIO bucket (the cross-host artifact round-trip),
 # which needs the S3 object-store driver compiled into the test binary.
 live-distributed-tests = ["local", "jammi-db/storage-s3"]
+# A gated GPU-capability lane: proves the embedded engine's ML *correctness* on a
+# real CUDA device — CPU↔GPU output parity for the deterministic verbs
+# (`generate_embeddings`, `encode_query`, `propagate_embeddings`, context-predictor
+# `predict`) and that `fine_tune` / `fine_tune_graph` actually *learn* on-device
+# (loss decreases, adapter changes embeddings). Off by default and not part of the
+# hermetic `cargo test` lane: the suite skips cleanly (no failure) without this
+# feature, and a meaningful run also needs `--features cuda` plus a visible GPU
+# (it pins `require_gpu=true`, so a GPU-less or CPU-only build *fails fast* rather
+# than silently degrading to CPU and faking parity). The engine surface it drives
+# is the embedded one, so it implies `local`. CI compile-checks it (`--no-run`);
+# the live run is a GPU-host (A10G) gate.
+live-gpu-tests = ["local"]
 # CUDA / Metal acceleration of the embedded engine — only meaningful with `local`.
 cuda = ["local", "candle-core/cuda", "candle-nn/cuda"]
 metal = ["local", "candle-core/metal", "candle-nn/metal"]
@@ -157,3 +173,12 @@ required-features = ["local"]
 name = "distributed"
 path = "tests/distributed/main.rs"
 required-features = ["live-distributed-tests"]
+
+# The gated GPU-capability suite. Its own target (not part of the hermetic `it`
+# suite) so it compiles and runs only under `live-gpu-tests`. A meaningful run
+# also needs `--features cuda` and a visible GPU; without `cuda` (or without a
+# GPU) every test early-returns with a `tracing::warn` skip — no `#[ignore]`.
+[[test]]
+name = "gpu_capability"
+path = "tests/gpu_capability/main.rs"
+required-features = ["live-gpu-tests"]

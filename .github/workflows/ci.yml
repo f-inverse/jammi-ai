@@ -56,6 +56,16 @@ jobs:
       - name: Compile-check live tests
         run: cargo test --workspace --exclude jammi-python --features live-hub-tests --no-run
 
+      # The gated GPU-capability suite needs a CUDA build and a real GPU, so it
+      # cannot run on this CPU runner — like the distributed lane, compile-check
+      # it here so it can't bit-rot. The live run is a GPU-host (A10G) gate: see
+      # `cargo test -p jammi-ai --features cuda,live-gpu-tests gpu_capability`.
+      # Compile-checked without `cuda` (the suite is feature-gated config only;
+      # the CUDA symbols it drives are cfg-gated inside the engine), so this
+      # stays a CPU-runner step.
+      - name: Compile-check GPU-capability suite
+        run: cargo test -p jammi-ai --features live-gpu-tests --test gpu_capability --no-run
+
       - name: Run tests
         run: cargo test --workspace --exclude jammi-python
 

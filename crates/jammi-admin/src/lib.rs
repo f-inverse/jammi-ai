@@ -9,7 +9,7 @@
 //!
 //! Every failure decodes the structured [`jammi_wire`] error detail the server
 //! attaches, so a control verb returns the exact
-//! the exact [`jammi_db::error::JammiError`] variant the in-process path would
+//! [`jammi_db::error::JammiError`] variant the in-process path would return
 //! — never a lossy gRPC-code-category guess. Tenant scope rides on the session
 //! header the transport stamps, never in a request body.
 

@@ -536,7 +536,7 @@ async fn remote_round_trips_the_topic_lifecycle_like_local() {
 
 /// Subscribe streaming over the wire. The data-plane client opens a server-streaming
 /// subscription from offset 0; after a publish, the stream yields the SAME
-/// `DeliveredBatch` a local `Session`. subscription yields against the same
+/// `DeliveredBatch` a local `Session` subscription yields against the same
 /// engine — same offset, same rows. Proves the streaming verb (not just the
 /// unary ones) is faithful end to end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -6,6 +6,46 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.26.0 — 2026-06-10
+
+The client redesign and server packaging: a candle-free client substrate, a
+control/data-plane split, and prebuilt server distributions (CPU + GPU).
+
+### Added
+- **Candle-free client substrate.** Three new crates — `jammi-wire` (the
+  `jammi.v1` gRPC tonic stubs, the proto↔domain conversions, the IPC helpers,
+  and the shared session transport), `jammi-admin` (the control-plane
+  `CatalogService` client), and `jammi-client` (the data-plane typed-RPC +
+  Flight SQL client). None pull the embedded ML/candle stack.
+- **Strict-client CLI.** `jammi` is now a control-plane-only client built on
+  `jammi-admin`; it no longer depends on `jammi-ai` and links no embedded ML —
+  enforced by a CI guard on its compile graph.
+- **Server distributions.** `jammi-server` (CPU, `manylinux_2_28_x86_64`) and
+  `jammi-server-cu12` (CUDA 12, bundling the `nvidia-*-cu12` runtime wheels with
+  an `LD_LIBRARY_PATH` entrypoint shim) PyPI wheels, prebuilt CPU/GPU server +
+  CLI tarballs, and CPU/cu12 container images entrypointed at `jammi-server`.
+- **GPU capability-correctness suite** (`live-gpu-tests`, proven on an A10G):
+  CPU↔GPU output parity for embeddings / encode / predict, and on-device
+  learning for fine-tune and graph fine-tune. Device selection gained a
+  `require_gpu` knob — loud CPU-fallback by default, fail-fast when set.
+- **Object-store model artifacts** and a gated multi-process
+  distributed-validation lane (exactly-once claim, kill-9 reclaim, artifact
+  crash-window, cross-tenant isolation), with a hollow-green CI guard.
+- **Trusted-network security-posture documentation** for the server.
+
+### Changed
+- **Control/data-plane split.** Catalog/metadata administration moves to a
+  single control-plane `CatalogService` gRPC surface; Flight SQL is now
+  query + data-DML only (catalog DDL such as `CREATE TOPIC` goes through the
+  typed control RPCs). Source providers hydrate across all tenants at startup.
+
+### Fixed
+- Quote source/table identifiers in generated read SQL (hyphenated names).
+- SQLite `BEGIN` cancellation-safety and `BEGIN DEFERRED` write-deadlock under
+  the always-on worker; typed `RegisterTopic` now registers the broker driver
+  as well as the catalog.
+- Context-predictor `base_model_id` foreign key; non-TTY server logging.
+
 ## v0.25.0 — 2026-06-08
 
 Graph feature propagation (S12) — the **propagate** half of a decoupled GNN.

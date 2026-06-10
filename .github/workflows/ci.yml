@@ -53,6 +53,27 @@ jobs:
       # crate is exercised end-to-end by the `Test (Python)` job below,
       # which also runs `cargo test -p jammi-python` against the venv's
       # interpreter to cover the Rust integration test.
+      - name: Run tests
+        run: cargo test --workspace --exclude jammi-python
+
+  # The gated-lane compile-checks live in their OWN job, not in `test` above.
+  # Each `--no-run` builds a full-workspace test-binary graph; accumulating all
+  # of them plus the run-tests graph in one job's `target/` exhausted the
+  # runner's disk at link time (`mold: … Disk full?` linking the jammi-server
+  # `it` binary). One large graph per job keeps every link within the disk
+  # budget. These only compile-check — the live runs are gated elsewhere.
+  compile-check-gated:
+    name: Compile-check (gated lanes)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      # Live (hub) tests reach the network, so they only compile here; the live
+      # run is gated behind `live-hub-tests`. Compile-checking guards bit-rot.
       - name: Compile-check live tests
         run: cargo test --workspace --exclude jammi-python --features live-hub-tests --no-run
 
@@ -65,9 +86,6 @@ jobs:
       # stays a CPU-runner step.
       - name: Compile-check GPU-capability suite
         run: cargo test -p jammi-ai --features live-gpu-tests --test gpu_capability --no-run
-
-      - name: Run tests
-        run: cargo test --workspace --exclude jammi-python
 
   test-live:
     name: Test (live)

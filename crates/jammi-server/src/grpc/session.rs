@@ -79,9 +79,9 @@ impl SessionStore {
 
 /// Header name carrying the session identifier. Clients must include this on
 /// every request that needs tenant-scoped semantics. Defined once in
-/// [`jammi_ai::wire`] (shared with the remote client) and re-exported here so
+/// [`jammi_wire`] (shared with the client crates) and re-exported here so
 /// server-side callers and the integration tests keep their existing path.
-pub use jammi_ai::wire::SESSION_HEADER;
+pub use jammi_wire::SESSION_HEADER;
 
 /// Tonic interceptor that resolves the request's session and attaches the
 /// bound tenant to the request extensions. Apply to every Tonic service

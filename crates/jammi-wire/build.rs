@@ -1,19 +1,10 @@
 //! Codegen for the gRPC wire surface.
 //!
-//! Gated behind the default-off `wire` feature so a default `jammi-ai` build
-//! (and every embedded / PyO3 consumer) invokes no protoc, reads no `.proto`,
-//! and links none of the tonic build-deps. Cargo compiles this whole script in
-//! every build, so the `tonic_prost_build` reference is itself behind
-//! `#[cfg(feature = "wire")]` — without the feature the script is an empty
-//! `main`.
+//! `jammi-wire` is the candle-free wire substrate; codegen always runs (there is
+//! no feature gate), so every consumer that depends on this crate gets the
+//! generated `jammi.v1` tonic stubs (client + server) without naming a feature.
 
 fn main() {
-    #[cfg(feature = "wire")]
-    generate();
-}
-
-#[cfg(feature = "wire")]
-fn generate() {
     use std::path::PathBuf;
 
     let proto_root = PathBuf::from("proto");
@@ -47,9 +38,9 @@ fn generate() {
 
     tonic_prost_build::configure()
         // Both client and server stubs are built: the server stubs back
-        // `jammi-server`'s service impls; the client stubs back the integration-
-        // test harness (crates/jammi-server/tests/it/*) that drives an in-process
-        // server, and a future `RemoteSession` in this crate.
+        // `jammi-server`'s service impls; the client stubs back `jammi-admin` /
+        // `jammi-client` and the integration-test harness that drives an
+        // in-process server.
         .build_client(true)
         .build_server(true)
         .compile_with_config(

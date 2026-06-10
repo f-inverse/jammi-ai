@@ -15,7 +15,6 @@ use jammi_numerics::retrieval::{AggregateMetrics, QueryMetrics};
 // The bootstrap / rank-sum kernels are pulled in only where significance is
 // *computed* — the local engine's `eval_compare`. The significance *types*
 // below stay transport-neutral so the thin wire client round-trips them.
-#[cfg(feature = "local")]
 use jammi_numerics::stats::{bootstrap_ci, mann_whitney_u, Interval};
 use serde::{Deserialize, Serialize};
 
@@ -165,7 +164,6 @@ pub enum CalibrationPrediction {
 // The accessors are consumed only by the local scoring path; gating the impl
 // keeps a `wire`-only build free of dead-code warnings (mirroring the
 // significance helpers below).
-#[cfg(feature = "local")]
 impl CalibrationPrediction {
     fn record_id(&self) -> &str {
         match self {
@@ -282,7 +280,6 @@ pub struct CalibrationEvalReport {
     pub per_record: Vec<PerRecordCalibration>,
 }
 
-#[cfg(feature = "local")]
 impl CalibrationEvalReport {
     /// Distribution-free paired significance of this run's CRPS against a
     /// `baseline` run (spec R2 §4): the per-record proper scores are paired by
@@ -374,20 +371,16 @@ pub struct MetricSignificance {
 
 /// Bootstrap resamples for the paired confidence interval. Fixed so the CI is
 /// a deterministic function of its inputs.
-#[cfg(feature = "local")]
 pub const BOOTSTRAP_ITERATIONS: usize = 10_000;
 
 /// Two-tailed significance level for the bootstrap CI (a 95% interval).
-#[cfg(feature = "local")]
 pub const BOOTSTRAP_ALPHA: f64 = 0.05;
 
 /// Pinned RNG seed for the paired bootstrap. The seed is part of the
 /// significance contract — it is what makes the CI reproducible across runs.
-#[cfg(feature = "local")]
 pub const BOOTSTRAP_SEED: u64 = 0x6a616d6d695f7031; // "jammi_p1"
 
 /// One per-query metric value paired between baseline and treatment.
-#[cfg(feature = "local")]
 struct PairedMetric {
     baseline: f64,
     treatment: f64,
@@ -397,7 +390,6 @@ struct PairedMetric {
 /// values for one metric (selected by `extract`) in ascending `query_id`
 /// order. Queries present in only one table are dropped — significance is a
 /// paired test and an unpaired query carries no difference to resample.
-#[cfg(feature = "local")]
 fn paired_metric<F>(
     baseline: &[PerQueryRecord],
     treatment: &[PerQueryRecord],
@@ -427,7 +419,6 @@ where
 /// a bootstrap CI on the mean paired difference plus a Mann–Whitney U p-value
 /// between the baseline and treatment distributions. Returns `None` when the
 /// pairing is empty (no shared `query_id`).
-#[cfg(feature = "local")]
 fn metric_significance(paired: &[PairedMetric]) -> Option<MetricSignificance> {
     if paired.is_empty() {
         return None;
@@ -456,8 +447,7 @@ fn metric_significance(paired: &[PairedMetric]) -> Option<MetricSignificance> {
 /// Compute paired significance for all four metrics between a baseline and a
 /// treatment run's per-query records. Returns `None` when the two runs share
 /// no `query_id` (nothing to pair).
-#[cfg(feature = "local")]
-pub(crate) fn delta_significance(
+pub fn delta_significance(
     baseline: &[PerQueryRecord],
     treatment: &[PerQueryRecord],
 ) -> Option<DeltaSignificance> {
@@ -472,7 +462,6 @@ pub(crate) fn delta_significance(
 /// The z-multiplier for the two-sided central interval at
 /// [`CALIBRATION_INTERVAL_LEVEL`] under a Gaussian predictive (the 0.95 normal
 /// quantile for a 90% interval).
-#[cfg(feature = "local")]
 const CALIBRATION_INTERVAL_Z: f64 = 1.6448536269514722;
 
 /// Score one held-out prediction against its outcome: CRPS and NLL (proper
@@ -480,7 +469,6 @@ const CALIBRATION_INTERVAL_Z: f64 = 1.6448536269514722;
 /// central interval (for coverage + sharpness). All math is the numerics
 /// crate's — this only selects the family that matches the prediction's shape
 /// and assembles the per-record row.
-#[cfg(feature = "local")]
 fn score_prediction(
     prediction: &CalibrationPrediction,
 ) -> jammi_db::error::Result<PerRecordCalibration> {
@@ -532,7 +520,6 @@ fn score_prediction(
 /// The empirical central [`CALIBRATION_INTERVAL_LEVEL`] interval of a draw
 /// ensemble: the `(alpha/2, 1 - alpha/2)` empirical quantiles via linear
 /// interpolation between order statistics.
-#[cfg(feature = "local")]
 fn empirical_central_interval(draws: &[f64]) -> (f64, f64) {
     let mut sorted = draws.to_vec();
     sorted.sort_by(f64::total_cmp);
@@ -544,7 +531,6 @@ fn empirical_central_interval(draws: &[f64]) -> (f64, f64) {
 }
 
 /// Linear-interpolated empirical quantile of an already-sorted slice.
-#[cfg(feature = "local")]
 fn empirical_quantile(sorted: &[f64], q: f64) -> f64 {
     let n = sorted.len();
     if n == 1 {
@@ -568,8 +554,7 @@ fn empirical_quantile(sorted: &[f64], q: f64) -> f64 {
 /// Returns an error when `predictions` is empty (a proper score is undefined
 /// over no trials) or when a prediction is malformed for its family (e.g. a
 /// non-positive `sd`, surfaced by the numerics scorer).
-#[cfg(feature = "local")]
-pub(crate) fn compute_calibration(
+pub fn compute_calibration(
     eval_run_id: String,
     predictions: &[CalibrationPrediction],
 ) -> jammi_db::error::Result<CalibrationEvalReport> {
@@ -624,7 +609,6 @@ pub(crate) fn compute_calibration(
 /// Slice per-record scores by every `(cohort_key, cohort_value)` pair present,
 /// reporting each slice's n, mean CRPS with a bootstrap CI, and coverage. A
 /// record contributes to one slice per cohort tag it carries.
-#[cfg(feature = "local")]
 fn compute_cohort_calibration(per_record: &[PerRecordCalibration]) -> Vec<CohortCalibration> {
     // Group record indices by the cohort tag they carry. BTreeMap keeps the
     // output in ascending (key, value) order — deterministic across runs.
@@ -684,7 +668,6 @@ fn compute_cohort_calibration(per_record: &[PerRecordCalibration]) -> Vec<Cohort
 /// present in only one run are dropped. Returns `None` when no `record_id` is
 /// shared. The CRPS is the proper-score headline, so its paired test is what
 /// turns "B is better-calibrated than A" into a p-value.
-#[cfg(feature = "local")]
 pub(crate) fn calibration_significance(
     baseline: &[PerRecordCalibration],
     treatment: &[PerRecordCalibration],
@@ -724,7 +707,7 @@ pub(crate) fn calibration_significance(
     })
 }
 
-#[cfg(all(test, feature = "local"))]
+#[cfg(test)]
 mod calibration_tests {
     use super::*;
 
@@ -969,7 +952,7 @@ mod calibration_tests {
     }
 }
 
-#[cfg(all(test, feature = "local"))]
+#[cfg(test)]
 mod significance_tests {
     use super::*;
 

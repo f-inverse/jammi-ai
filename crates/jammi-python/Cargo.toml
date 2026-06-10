@@ -17,12 +17,12 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 jammi-db.workspace = true
-# LOCAL-ONLY. The embed wheel is the in-process engine; its remote arm is the
-# bundled pure-Python `jammi-client` (composition, dispatched in
-# `jammi_ai/__init__.py`), NOT a second Rust gRPC client. So `wire` stays OFF
-# here and the built wheel links no tonic/prost. The Rust `RemoteSession` lives
-# on in the `jammi-ai` *crate* under `wire` for Rust consumers + `jammi-server`;
-# it is simply not compiled into this wheel.
+# LOCAL-ONLY. The embed wheel is the in-process engine (default = `local`); its
+# remote arm is the bundled pure-Python `jammi-client` (composition, dispatched
+# in `jammi_ai/__init__.py`), NOT a second Rust gRPC client. The Rust wire
+# client lives in the separate `jammi-wire` / `jammi-admin` / `jammi-client`
+# crates for Rust consumers + `jammi-server`; none is compiled into this wheel,
+# so the built wheel links no tonic/prost.
 jammi-ai = { workspace = true }
 jammi-lora.workspace = true
 pyo3.workspace = true

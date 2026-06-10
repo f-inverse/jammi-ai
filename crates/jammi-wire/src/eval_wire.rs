@@ -16,14 +16,14 @@ use jammi_numerics::ner::{Entity, NerMetrics, TypeMetrics};
 use jammi_numerics::retrieval::{AggregateMetrics, QueryMetrics};
 use tonic::Status;
 
-use crate::eval::report::{
+use crate::eval::{
     AggregateDelta, CalibrationAggregate, CalibrationEvalReport, CohortCalibration,
     CompareEvalReport, DeltaSignificance, EmbeddingEvalReport, InferenceAggregate,
     InferenceEvalReport, MetricDelta, MetricSignificance, PerQueryRecord, PerRecordCalibration,
     PerRecordPrediction, TableEvalReport,
 };
 use crate::eval::{EvalCalibrationShape, EvalTask};
-use crate::wire::proto::eval as pb;
+use crate::proto::eval as pb;
 
 /// Map the proto [`EvalTask`] discriminant onto the engine's [`EvalTask`]. An
 /// unspecified or unknown task is rejected — a request that names no task is a
@@ -50,7 +50,7 @@ impl TryFrom<i32> for EvalTaskFromWire {
 pub struct EvalTaskFromWire(pub EvalTask);
 
 /// Encode the engine's [`EvalTask`] onto the wire enum — the inverse of the
-/// [`EvalTaskFromWire`] decode, for the [`crate::RemoteSession`] send side.
+/// [`EvalTaskFromWire`] decode, for the the remote client send side.
 /// Total: both inference tasks map to a concrete wire variant (the engine type
 /// has no unspecified state).
 pub fn eval_task_to_proto(task: EvalTask) -> pb::EvalTask {
@@ -75,7 +75,7 @@ pub fn calibration_shape_from_proto(shape: i32) -> Result<EvalCalibrationShape, 
 }
 
 /// Encode the engine's [`EvalCalibrationShape`] onto the wire enum — the inverse
-/// of [`calibration_shape_from_proto`], for the [`crate::RemoteSession`] send
+/// of [`calibration_shape_from_proto`], for the the remote client send
 /// side. Total: every engine shape maps to a concrete wire variant.
 pub fn calibration_shape_to_proto(shape: EvalCalibrationShape) -> pb::CalibrationShape {
     match shape {
@@ -97,7 +97,7 @@ pub fn cohorts_from_proto(
 
 /// Encode the engine's `query_id → {key: value}` cohort map onto the proto
 /// `map<string, CohortTags>` — the inverse of [`cohorts_from_proto`], for the
-/// [`crate::RemoteSession`] send side. The substrate never interprets the tags.
+/// the remote client send side. The substrate never interprets the tags.
 pub fn cohorts_to_proto(
     cohorts: &HashMap<String, BTreeMap<String, String>>,
 ) -> HashMap<String, pb::CohortTags> {
@@ -404,12 +404,12 @@ impl From<CalibrationEvalReport> for pb::CalibrationEvalReport {
     }
 }
 
-// ─── proto → report (the RemoteSession decode side) ──────────────────────────
+// ─── proto → report (the remote client decode side) ──────────────────────────
 //
 // The inverse of the encodes above. A remote client reads a report message off
-// the wire and rebuilds the engine report struct so `Session::Remote` returns
-// the identical type `Session::Local` does. Each decode mirrors its encode
-// field for field; the report structs and the metric structs are local crates,
+// the wire and rebuilds the engine report struct so the data-plane client
+// returns the identical type the local `Session` does. Each decode mirrors its
+// encode field for field; the report structs and the metric structs are local crates,
 // so these impls are orphan-rule-clean without a newtype.
 //
 // A field that proto3 represents as a nested *message* but the engine domain
@@ -419,7 +419,7 @@ impl From<CalibrationEvalReport> for pb::CalibrationEvalReport {
 // would hand a consumer plausible-wrong result data it cannot distinguish from
 // a real score. At the network boundary the right idiom is to propagate the
 // error as a value — [`malformed`] builds a [`JammiError::Eval`] naming the
-// missing field, and the [`crate::RemoteSession`] eval verb returns it as the
+// missing field, and the the remote client eval verb returns it as the
 // call's `Err`. Scalar proto3 primitives keep their proto-default (0 / "");
 // only required nested messages reject. Genuinely-optional fields
 // ([`TableEvalReport::delta`], `None` for the compare baseline) stay `Option`.

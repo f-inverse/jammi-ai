@@ -425,7 +425,7 @@ pub async fn serve_grpc_chain(
     // `GrpcWebLayer` passes through untouched, leaving a gRPC-Web client with no
     // in-body trailer frame to read. The repair layer rewrites that into the
     // in-body `0x80` trailer frame the gRPC-Web wire format requires. Raw gRPC
-    // over HTTP/2 (the Rust `RemoteSession`) is unaffected — those responses are
+    // over HTTP/2 (the Rust data-plane client) is unaffected — those responses are
     // not gRPC-Web and the layer skips them.
     let mut builder = Server::builder()
         .accept_http1(true)

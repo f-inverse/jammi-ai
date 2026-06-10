@@ -7,10 +7,10 @@
 
 // The embedded engine: model loading, inference execution, fine-tune training,
 // and the embedding/search pipelines that run on the candle stack. Gated behind
-// the default-on `local` feature so a remote-only `wire` build pulls none of it.
-// `eval` and `fine_tune` keep their candle-free config / report vocabulary
-// (`EvalTask`, the eval reports, `FineTuneConfig`/`FineTuneMethod`) available
-// either way — only their engine-running submodules ride `local`.
+// the default-on `local` feature. `eval` and `fine_tune` keep their candle-free
+// config / report vocabulary (`EvalTask`, the eval reports,
+// `FineTuneConfig`/`FineTuneMethod`) available either way — re-exported from the
+// wire substrate — while only their engine-running submodules ride `local`.
 #[cfg(feature = "local")]
 pub mod concurrency;
 pub mod eval;
@@ -21,7 +21,9 @@ pub mod fine_tune;
 pub mod index;
 #[cfg(feature = "local")]
 pub mod inference;
+#[cfg(feature = "local")]
 pub mod jammi;
+#[cfg(feature = "local")]
 pub mod local_session;
 #[cfg(feature = "local")]
 pub mod model;
@@ -39,26 +41,20 @@ pub mod query;
 #[cfg(feature = "local")]
 pub mod session;
 
-/// The gRPC wire surface: generated `jammi.v1` tonic stubs plus the
-/// proto↔domain conversions. Gated behind the default-off `wire` feature so a
-/// default / embedded build pulls no transport stack. `jammi-server` enables
-/// it for the server stubs + conversions; a future `RemoteSession` will reuse
-/// the same module's client stubs.
-#[cfg(feature = "wire")]
+/// The engine's residual wire surface: the engine-spec proto↔domain conversions
+/// the candle-free `jammi-wire` substrate cannot home (`TrainingSpec`, the
+/// declared-edge gather, the served distribution, the pipeline request/response
+/// structs). Built on `jammi_wire`'s `proto` + helpers, so `jammi-server`
+/// consumes these conversions alongside the candle-free ones it gets straight
+/// from `jammi-wire`. Engine-spec, so it rides the `local` feature.
+#[cfg(feature = "local")]
 pub mod wire;
 
-/// The remote [`local_session::Session`] transport: a gRPC client peer of
-/// [`local_session::LocalSession`]. Gated behind `wire` alongside the stubs it
-/// drives; a default / embedded build has no remote transport and the
-/// [`local_session::Session`] enum is the one-arm `Local` shape.
-#[cfg(feature = "wire")]
-pub mod remote_session;
-
-/// The transport-agnostic consumer surface: a closed `enum` over session
-/// transports. The in-process [`local_session::LocalSession`] behind the
-/// `Local` arm rides the `local` feature alongside the engine it drives; the
-/// request/result vocabulary ([`Modality`], the query and search shapes) is
-/// transport-neutral and always present.
+/// The in-process consumer surface: a [`Session`] over the embedded engine. It
+/// rides the `local` feature alongside the engine it drives; the request/result
+/// vocabulary ([`Modality`], the query and search shapes) lives on the
+/// `jammi-wire` substrate and is re-exported through it.
+#[cfg(feature = "local")]
 pub use local_session::{Modality, QueryInput, SearchQuery, SearchRequest, Session};
 
 /// Engine introspection shapes the [`Session`] surface returns: a per-source
@@ -69,20 +65,11 @@ pub use local_session::{Modality, QueryInput, SearchQuery, SearchRequest, Sessio
 pub use jammi_db::catalog::source_repo::SourceDescriptor;
 pub use jammi_db::ServerInfo;
 
-/// The in-process [`Session`] transport, behind the `local` feature with the
-/// embedded engine it drives.
+/// The SDK front door: [`jammi::Jammi::open`] opens an embedded [`Session`] from
+/// a [`jammi::Target`] config in one call. Rides the `local` feature with the
+/// embedded engine it builds.
 #[cfg(feature = "local")]
-pub use local_session::LocalSession;
-
-/// The SDK front door: [`jammi::Jammi::open`] opens a [`Session`] against a
-/// [`jammi::Target`], selecting the embedded (`Local`) or — under `wire` — the
-/// remote (`Remote`) transport in one call.
 pub use jammi::{Jammi, Target};
-
-/// The remote transport behind the [`Session`] enum's `wire`-gated `Remote`
-/// arm.
-#[cfg(feature = "wire")]
-pub use remote_session::RemoteSession;
 
 /// The per-query audit primitive lives in the `jammi-db` substrate (it composes
 /// mutable tables, tenant scope, and the trigger stream). It is re-exported here

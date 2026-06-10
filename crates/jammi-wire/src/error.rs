@@ -47,7 +47,7 @@ use prost_types::Any;
 use tonic::{Code, Status};
 use uuid::Uuid;
 
-use crate::wire::proto::error as pb;
+use crate::proto::error as pb;
 
 /// Build the structured wire detail for an engine error. One match over every
 /// `JammiError` variant so the server's `map_engine_error` emits a faithful

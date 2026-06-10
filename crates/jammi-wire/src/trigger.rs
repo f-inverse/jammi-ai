@@ -13,8 +13,8 @@ use jammi_db::trigger::{DeliveredBatch, Offset, TopicDefinition};
 use prost_types::Timestamp;
 use tonic::Status;
 
-use crate::wire::proto::trigger::{ArrowBatch, SubscribedBatch};
-use crate::wire::{decode_ipc_stream, encode_ipc_stream};
+use crate::proto::trigger::{ArrowBatch, SubscribedBatch};
+use crate::{decode_ipc_stream, encode_ipc_stream};
 
 /// Decode the single record batch a `Publish` carries, checking it against the
 /// topic schema. Per ADR-01 §5.1 the wire pairing is `data_header` +

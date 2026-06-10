@@ -1,11 +1,11 @@
 //! `jammi sources` subcommand.
 //!
-//! Register and list data sources over the remote `Session`. `list` prints
+//! Register and list data sources over the remote `CatalogClient`. `list` prints
 //! each `SourceDescriptor`: its registry identity plus how many embedding
 //! result tables have been produced from it.
 
 use clap::Subcommand;
-use jammi_ai::Session;
+use jammi_admin::CatalogClient;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
 #[derive(Subcommand)]
@@ -29,7 +29,7 @@ pub enum SourceAction {
 }
 
 pub async fn run(
-    session: &Session,
+    session: &CatalogClient,
     action: SourceAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {

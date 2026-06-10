@@ -2,7 +2,7 @@
 
 The official TypeScript gRPC-web client for the Jammi engine.
 
-It is **generated from the canonical proto** at `crates/jammi-ai/proto/jammi/v1`
+It is **generated from the canonical proto** at `crates/jammi-wire/proto/jammi/v1`
 (the single codegen source for every language binding — Rust, Python, and this
 one) using [buf] + [protobuf-es] (`protoc-gen-es`) + [Connect-ES]. The transport
 is gRPC-web over `fetch`, so the client runs unchanged in a browser, a
@@ -45,7 +45,7 @@ The generated code lives in `src/gen/` and is **never committed** — it is
 emitted at build time from the repo proto, so it cannot drift. One command:
 
 ```sh
-npm run generate   # == buf generate ../../crates/jammi-ai/proto
+npm run generate   # == buf generate ../../crates/jammi-wire/proto
 ```
 
 `npm run build` (and `typecheck` / `test`) regenerate first, so you rarely call

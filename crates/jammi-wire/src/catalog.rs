@@ -32,9 +32,9 @@ use jammi_db::trigger::TopicDefinition;
 use jammi_db::TenantId;
 use tonic::Status;
 
-use crate::wire::proto::catalog as pb;
-use crate::wire::proto::embedding as embedding_pb;
-use crate::wire::{decode_ipc_schema, encode_ipc_stream, result_table_from_proto};
+use crate::proto::catalog as pb;
+use crate::proto::embedding as embedding_pb;
+use crate::{decode_ipc_schema, encode_ipc_stream, result_table_from_proto};
 
 // === sources / models =====================================================
 
@@ -58,7 +58,7 @@ pub fn source_type_from_proto(kind: i32) -> Result<SourceType, Status> {
 }
 
 /// Encode the engine's [`SourceType`] onto the proto `SourceKind` discriminant —
-/// the inverse of [`source_type_from_proto`], for the [`crate::RemoteSession`]
+/// the inverse of [`source_type_from_proto`], for the the remote client
 /// send side. Total: every engine source type maps to a concrete wire variant
 /// (the engine type has no unspecified state). Mirrors
 /// [`super::model_task_to_proto`].
@@ -92,7 +92,7 @@ impl TryFrom<pb::SourceConnection> for SourceConnection {
 
 /// Encode the engine's [`SourceConnection`] into the proto message for an
 /// `AddSource` request — the inverse of the decode above, for the
-/// [`crate::RemoteSession`] send side. Only the URL + format cross the wire
+/// the remote client send side. Only the URL + format cross the wire
 /// (matching what the decode reads back): cloud credentials, file-extension
 /// overrides, and driver options are server-side and have no wire field, so the
 /// send side does not carry them. A `None` URL encodes as the empty string the
@@ -154,7 +154,7 @@ impl From<SourceDescriptor> for pb::SourceDescriptor {
 }
 
 /// Reconstruct the engine's [`SourceDescriptor`] from the wire message — the
-/// inverse of the encode above, for the [`crate::RemoteSession`] receive side.
+/// inverse of the encode above, for the the remote client receive side.
 /// The kind decodes through the shared [`source_type_from_proto`] (an
 /// unspecified/unknown backend is the faithful `invalid_argument`), and each
 /// result table through [`result_table_from_proto`], so a remote
@@ -194,7 +194,7 @@ pub fn model_to_proto(record: &ModelRecord) -> pb::Model {
 }
 
 /// Reconstruct the engine's [`ModelRecord`] from the wire `Model` — the inverse
-/// of [`model_to_proto`], for the [`crate::RemoteSession`] receive side. The
+/// of [`model_to_proto`], for the the remote client receive side. The
 /// fields not carried on the wire are server-internal bookkeeping, so they
 /// reconstruct at their "not carried" values (`version = 1` default, `None`,
 /// `String::new`), exactly as [`result_table_from_proto`] does for a result
@@ -235,7 +235,7 @@ pub fn topic_to_proto(topic: &TopicDefinition) -> Result<pb::Topic, Status> {
 }
 
 /// Reconstruct the [`TopicDefinition`] from the wire `Topic` — the inverse of
-/// [`topic_to_proto`], for the [`crate::RemoteSession`] `list_topics` read side.
+/// [`topic_to_proto`], for the the remote client `list_topics` read side.
 /// Fallible: the id and (non-empty) tenant are re-parsed and the schema is
 /// decoded from its IPC framing, so a corrupt page surfaces as a `Status` rather
 /// than a fabricated definition.

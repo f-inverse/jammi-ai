@@ -1,10 +1,10 @@
 //! `jammi models` subcommand.
 //!
 //! List or describe the models registered to the session's tenant over the
-//! remote [`Session`].
+//! remote [`CatalogClient`].
 
 use clap::Subcommand;
-use jammi_ai::Session;
+use jammi_admin::CatalogClient;
 use jammi_db::catalog::model_repo::ModelRecord;
 
 #[derive(Subcommand)]
@@ -18,7 +18,10 @@ pub enum ModelAction {
     },
 }
 
-pub async fn run(session: &Session, action: ModelAction) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    session: &CatalogClient,
+    action: ModelAction,
+) -> Result<(), Box<dyn std::error::Error>> {
     match action {
         ModelAction::List => {
             let models = session.list_models().await?;

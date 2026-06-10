@@ -1,5 +1,5 @@
 //! The transport-agnostic [`Session`] abstraction must be a behavior-preserving
-//! seam: driving the in-process [`LocalSession`] yields the same results as
+//! seam: driving the in-process [`Session`] yields the same results as
 //! calling [`InferenceSession`] directly. These tests run the real
 //! source → generate-embeddings → search pipeline over the patents fixture and
 //! the tiny BERT cookbook model through both paths and compare.
@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, StringArray};
-use jammi_ai::local_session::{LocalSession, Modality, QueryInput, SearchQuery, SearchRequest};
+use jammi_ai::local_session::{Modality, QueryInput, SearchQuery, SearchRequest};
 use jammi_ai::session::InferenceSession;
 use jammi_ai::Session;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
@@ -49,7 +49,7 @@ async fn local_session_matches_engine_for_embed_and_search() {
     );
     seed(&engine).await;
 
-    let session = Session::Local(LocalSession::new(Arc::clone(&engine)));
+    let session = Session::new(Arc::clone(&engine));
 
     let record = session
         .generate_embeddings(
@@ -101,7 +101,7 @@ async fn local_session_encode_and_search_by_row_key_match_engine() {
             .unwrap(),
     );
     seed(&engine).await;
-    let session = Session::Local(LocalSession::new(Arc::clone(&engine)));
+    let session = Session::new(Arc::clone(&engine));
 
     session
         .generate_embeddings(
@@ -178,7 +178,7 @@ async fn encode_query_rejects_modality_input_mismatch() {
             .await
             .unwrap(),
     );
-    let session = Session::Local(LocalSession::new(engine));
+    let session = Session::new(engine);
 
     let err = session
         .encode_query(

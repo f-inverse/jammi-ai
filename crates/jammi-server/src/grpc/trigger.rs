@@ -34,10 +34,10 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use jammi_ai::wire::{decode_publish_batch, encode_delivered_batch, to_proto_timestamp};
 use jammi_db::catalog::topic_repo::TopicRepo;
 use jammi_db::trigger::{Offset, Predicate, Publisher, Subscriber, TopicDefinition};
 use jammi_db::TenantId;
+use jammi_wire::{decode_publish_batch, encode_delivered_batch, to_proto_timestamp};
 
 use crate::grpc::proto::trigger::trigger_service_server::TriggerService;
 use crate::grpc::proto::trigger::{

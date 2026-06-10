@@ -11,7 +11,7 @@
 //!   in-process [`SessionStore`] and report compile-time + runtime tier facts.
 //!   They need no engine, so they answer even on an engine-light deployment.
 //! * **Engine-backed** — sources / models / channels / mutable tables / topics
-//!   delegate 1:1 to the transport-agnostic [`Session`]/[`LocalSession`]
+//!   delegate 1:1 to the transport-agnostic [`Session`]
 //!   abstraction (`session_tenant(&request)` → [`scoped`] → [`map_engine_error`]
 //!   / [`map_trigger_error`]), exactly mirroring the handlers they were lifted
 //!   from. These require an engine; an engine-light deployment returns a
@@ -27,16 +27,16 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
-use jammi_ai::wire::{
-    channel_to_proto, columns_from_proto, definition_from_proto, definition_to_proto,
-    model_to_proto, parse_channel_id, parse_table_id, source_type_from_proto, topic_to_proto,
-};
-use jammi_ai::{LocalSession, Session};
+use jammi_ai::Session;
 use jammi_db::catalog::channel_repo::ChannelSpec;
 use jammi_db::source::SourceConnection;
 use jammi_db::trigger::ids::TopicId;
 use jammi_db::trigger::{TopicDefinition, TriggerError};
 use jammi_db::TenantId;
+use jammi_wire::{
+    channel_to_proto, columns_from_proto, definition_from_proto, definition_to_proto,
+    model_to_proto, parse_channel_id, parse_table_id, source_type_from_proto, topic_to_proto,
+};
 use tonic::{Request, Response, Status};
 
 use crate::grpc::proto::catalog as pb;
@@ -84,9 +84,7 @@ impl CatalogServer {
     /// A [`Session`] over the shared engine; see [`crate::grpc::inference`] for
     /// the tenant-scope wiring rationale.
     fn local(&self) -> Result<Session, Status> {
-        Ok(Session::Local(LocalSession::new(Arc::clone(
-            self.engine()?,
-        ))))
+        Ok(Session::new(Arc::clone(self.engine()?)))
     }
 }
 
@@ -391,7 +389,7 @@ impl CatalogService for CatalogServer {
         if req.name.is_empty() {
             return Err(Status::invalid_argument("name is required"));
         }
-        let schema = jammi_ai::wire::decode_ipc_schema(&req.schema)?;
+        let schema = jammi_wire::decode_ipc_schema(&req.schema)?;
         let broker_metadata = req.broker_metadata.into_iter().collect();
         // Honor a caller-supplied id (the `Session::register_topic` surface
         // carries the `TopicDefinition.id` the caller minted) so the topic's

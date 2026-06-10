@@ -12,9 +12,7 @@ use pyo3::Borrowed;
 use pyo3_arrow::{PySchema, PyTable};
 
 use jammi_ai::fine_tune::{EarlyStoppingMetric, FineTuneConfig, FineTuneMethod};
-use jammi_ai::local_session::{
-    LocalSession, Modality, QueryInput, SearchQuery, SearchRequest, Session,
-};
+use jammi_ai::local_session::{Modality, QueryInput, SearchQuery, SearchRequest, Session};
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::pipeline::context_predictor::{ContextServeOptions, ContextServeSource};
 use jammi_ai::pipeline::context_set::{
@@ -105,7 +103,7 @@ impl PyDatabase {
     /// remotely, so the embedded and remote verb vocabularies agree by sharing
     /// the `Session` abstraction rather than by a parallel reimplementation.
     fn local_session(&self) -> Session {
-        Session::Local(LocalSession::new(Arc::clone(&self.session)))
+        Session::new(Arc::clone(&self.session))
     }
 }
 

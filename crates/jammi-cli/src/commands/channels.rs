@@ -1,11 +1,11 @@
 //! `jammi channels` subcommand.
 //!
 //! Manage the catalog-backed evidence channels that gate which provenance
-//! columns merge into a search result, over the remote [`Session`]. Mirrors
+//! columns merge into a search result, over the remote [`CatalogClient`]. Mirrors
 //! `sources` / `models` shape — one subcommand enum, one `run` dispatcher.
 
 use clap::Subcommand;
-use jammi_ai::Session;
+use jammi_admin::CatalogClient;
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
 use jammi_db::evidence_channel::ChannelId;
 
@@ -44,7 +44,7 @@ pub enum ChannelAction {
 }
 
 pub async fn run(
-    session: &Session,
+    session: &CatalogClient,
     action: ChannelAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {

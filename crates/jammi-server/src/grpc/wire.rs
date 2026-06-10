@@ -6,7 +6,7 @@
 //!
 //! These are transport concerns that belong on the receive side, not wire
 //! conversions: the proto↔domain conversions and Arrow-IPC body helpers live in
-//! [`jammi_ai::wire`] (shared with a future remote client). What stays here is
+//! [`jammi_wire`] + the engine-spec converters here (shared with the client crates). What stays here is
 //! everything that touches a tonic [`Request`] extension or maps an engine error
 //! to a tonic [`Status`]:
 //!
@@ -21,10 +21,10 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
-use jammi_ai::wire::{attach_error_detail, attach_trigger_detail};
 use jammi_db::error::JammiError;
 use jammi_db::trigger::TriggerError;
 use jammi_db::TenantId;
+use jammi_wire::{attach_error_detail, attach_trigger_detail};
 use tonic::{Code, Request, Status};
 
 use crate::grpc::session::SessionTenant;
@@ -45,7 +45,7 @@ pub fn session_tenant<T>(request: &Request<T>) -> Option<TenantId> {
 /// the gRPC handlers must use, since they share one `Arc<InferenceSession>`
 /// and the sticky `bind_tenant` would race across concurrent requests. The
 /// `TenantScope` handle the closure receives is the marker that the scope is
-/// active on this task; `f` calls the verb on the [`jammi_ai::LocalSession`]
+/// active on this task; `f` calls the verb on the [`jammi_ai::Session`]
 /// (which delegates to the same engine) and observes the same task-local. An
 /// unscoped session runs the call directly.
 ///
@@ -83,8 +83,8 @@ pub fn require_nonempty(value: &str, field: &str) -> Result<(), Status> {
 ///
 /// The `code` + `message` are the idiomatic gRPC surface (a client that does
 /// not decode the structured detail still sees a sensible status). On top of
-/// that, every status carries a faithful [`jammi_ai::wire`] error detail so a
-/// remote client (`RemoteSession`) reconstructs the *exact* `JammiError` the
+/// that, every status carries a faithful [`jammi_wire`] error detail so a
+/// data-plane client reconstructs the *exact* `JammiError` the
 /// in-process [`jammi_ai::Session`] returns — the standard gRPC code set is too
 /// coarse to distinguish Source / Model / Tenant / Config / Schema / Eval, all
 /// of which collapse onto `invalid_argument`. The detail is built centrally
@@ -114,8 +114,8 @@ pub fn map_engine_error(err: JammiError) -> Status {
 ///
 /// The `code` + `message` are the idiomatic gRPC surface (a client that does not
 /// decode the structured detail still sees a sensible status). On top of that,
-/// every status carries a faithful [`jammi_ai::wire`] trigger-error detail so a
-/// remote `RemoteSession` reconstructs the *exact* [`TriggerError`] the
+/// every status carries a faithful [`jammi_wire`] trigger-error detail so a
+/// remote the data-plane client reconstructs the *exact* [`TriggerError`] the
 /// in-process path returns — the standard gRPC code set is too coarse to
 /// distinguish, e.g., `PredicateParse` from `PredicateUnsupported`, or the two
 /// engine-owned `#[from]` nests. The detail is built centrally here so the

@@ -5,7 +5,7 @@
 //! source and calls `Infer` over its `abstract` column with the local
 //! `tiny_bert` cookbook encoder, then decodes the returned `ArrowBatch` and
 //! asserts the inference output rows round-trip. This pins the wire adapter's
-//! contract: the verb routes through the `Session`/`LocalSession` abstraction
+//! contract: the verb routes through the `Session` abstraction
 //! and carries the engine's `Vec<RecordBatch>` back as Arrow IPC.
 //!
 //! Hermetic: the encoder is a local fixture (no network, no download), the

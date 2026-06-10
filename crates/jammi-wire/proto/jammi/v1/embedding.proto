@@ -12,7 +12,7 @@ import "jammi/v1/inference.proto";
 // The surface is modality-agnostic: one GenerateEmbeddings / EncodeQuery pair
 // keyed by a `Modality` selects the text, image, or audio tower, rather than a
 // verb per modality. Each verb delegates 1:1 to the consumer-facing
-// `Session`/`LocalSession` abstraction, which dispatches the modality onto the
+// `Session` abstraction, which dispatches the modality onto the
 // engine's concrete tower method — the service reimplements no decode,
 // feature-extraction, or forward logic; it is purely a wire adapter over the
 // in-process engine. Jammi stays non-generative: these encode input → vector,

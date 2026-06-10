@@ -13,7 +13,7 @@
 //!
 //! Both are hermetic: the audio corpus is built in-process and both encoders
 //! are local fixtures (no network, no download). This pins the wire adapter's
-//! contract: the verbs route through the `Session`/`LocalSession` abstraction
+//! contract: the verbs route through the `Session` abstraction
 //! and round-trip its results to a remote client. `RemoveSource` and the
 //! modality/input validation at the wire edge are covered too.
 

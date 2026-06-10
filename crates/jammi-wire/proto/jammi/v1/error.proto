@@ -164,7 +164,7 @@ message SchemaError {
 
 // TriggerErrorDetail — the structured wire detail for `jammi_db::TriggerError`,
 // attached to a `tonic::Status` by the server's `map_trigger_error` so a remote
-// `RemoteSession` reconstructs the EXACT `TriggerError` the in-process path
+// the data-plane client reconstructs the EXACT `TriggerError` the in-process path
 // returns (the standard gRPC code set collapses several variants onto one code).
 //
 // The contract is complete and faithful over `TriggerError`. Every owned-shape
@@ -217,7 +217,7 @@ message PublishTenantMismatch {
 
 // AuditErrorDetail — the structured wire detail for `jammi_db::AuditError`,
 // attached to a `tonic::Status` by the server's `map_audit_error` so a remote
-// `RemoteSession` reconstructs the EXACT `AuditError` the in-process path
+// the data-plane client reconstructs the EXACT `AuditError` the in-process path
 // returns.
 //
 // Every owned-shape variant has its own typed arm and reconstructs faithfully.

@@ -1,0 +1,18 @@
+[package]
+name = "jammi-admin"
+description = "The Jammi control-plane client: a candle-free CatalogService client over the gRPC wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+jammi-wire.workspace = true
+jammi-db.workspace = true
+tonic.workspace = true
+arrow.workspace = true
+arrow-schema.workspace = true
+uuid.workspace = true
+futures.workspace = true

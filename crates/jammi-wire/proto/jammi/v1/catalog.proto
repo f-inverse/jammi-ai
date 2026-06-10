@@ -14,7 +14,7 @@ import "jammi/v1/embedding.proto";
 // §3.2) and the compute/stream data-plane services (embedding / inference /
 // training / eval / pipeline / trigger / audit).
 //
-// Each verb delegates 1:1 to the consumer-facing `Session`/`LocalSession`
+// Each verb delegates 1:1 to the consumer-facing `Session`
 // abstraction; the service reimplements no catalog or lifecycle logic. The
 // service spans five control concerns. Session: `SetTenant` / `GetTenant` /
 // `ClearTenant` bind, read, and clear the calling session's tenant, and

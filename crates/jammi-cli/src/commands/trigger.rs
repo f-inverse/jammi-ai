@@ -1,7 +1,7 @@
 //! `jammi trigger` subcommand.
 //!
 //! Drive the server's trigger-stream topic-admin surface over the remote
-//! [`Session`]: register / drop / list topics. These are the control-plane
+//! [`CatalogClient`]: register / drop / list topics. These are the control-plane
 //! lifecycle verbs; the data-plane `publish` / `subscribe` compute verbs are not
 //! exposed on the strict client CLI. Every verb runs on the server — the CLI
 //! only builds the topic schema from its inline spec and hands the work to the
@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 use clap::Subcommand;
-use jammi_ai::Session;
+use jammi_admin::CatalogClient;
 use jammi_db::trigger::{TopicDefinition, TopicId};
 
 /// Subcommands under `jammi trigger`.
@@ -49,7 +49,7 @@ pub enum TriggerAction {
 }
 
 pub async fn run(
-    session: &Session,
+    session: &CatalogClient,
     action: TriggerAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {
@@ -63,7 +63,7 @@ pub async fn run(
     }
 }
 
-async fn list_topics(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
+async fn list_topics(session: &CatalogClient) -> Result<(), Box<dyn std::error::Error>> {
     let topics = session.list_topics().await?;
     if topics.is_empty() {
         println!("No topics registered.");
@@ -91,7 +91,7 @@ async fn list_topics(session: &Session) -> Result<(), Box<dyn std::error::Error>
 }
 
 async fn register_topic(
-    session: &Session,
+    session: &CatalogClient,
     name: &str,
     schema_spec: &str,
     broker_metadata: &str,
@@ -114,12 +114,12 @@ async fn register_topic(
 }
 
 async fn drop_topic(
-    session: &Session,
+    session: &CatalogClient,
     name: &str,
     if_exists: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Resolve the topic by name to its server-minted id, then drop by id (the
-    // identity the `Session::drop_topic` surface is keyed on). A missing topic
+    // identity the `CatalogClient::drop_topic` surface is keyed on). A missing topic
     // is a no-op under `--if-exists` and an error otherwise.
     let topic = session
         .list_topics()

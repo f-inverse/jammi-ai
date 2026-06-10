@@ -7,15 +7,15 @@ use jammi_db::catalog::eval_repo::{EvalRunRecord, PerQueryEvalRecord};
 use jammi_db::catalog::status::EvalRunStatus;
 use jammi_db::error::{JammiError, Result};
 
-use crate::eval::report::{
+use crate::eval::{EvalCalibrationShape, EvalTask};
+use crate::model::ModelSource;
+use crate::session::InferenceSession;
+use jammi_wire::eval::report::{
     compute_calibration, delta_significance, AggregateDelta, CalibrationEvalReport,
     CalibrationPrediction, CompareEvalReport, EmbeddingEvalReport, InferenceAggregate,
     InferenceEvalReport, MetricDelta, PerQueryRecord, PerRecordCalibration, PerRecordPrediction,
     TableEvalReport, PER_QUERY_RECALL_KS,
 };
-use crate::eval::{EvalCalibrationShape, EvalTask};
-use crate::model::ModelSource;
-use crate::session::InferenceSession;
 
 use jammi_numerics::classification::ClassificationMetrics;
 use jammi_numerics::ner::{Entity, NerMetrics};

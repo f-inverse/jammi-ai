@@ -4,7 +4,7 @@
 //! below mounts the matching package. Both client and server stubs are built
 //! (`build.rs` sets `.build_client(true).build_server(true)`): the server stubs
 //! back `jammi-server`'s service impls, the client stubs back the integration-
-//! test harness and a future `RemoteSession`.
+//! test harness and a future `remote client`.
 
 pub mod error {
     tonic::include_proto!("jammi.v1.error");

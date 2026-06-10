@@ -18,8 +18,8 @@ use uuid::Uuid;
 
 use jammi_db::AuditError;
 
-use crate::wire::proto::audit as pb;
-use crate::PerQueryAudit;
+use crate::proto::audit as pb;
+use jammi_db::PerQueryAudit;
 
 /// Parse a wire query-id string into a [`Uuid`]. A missing or malformed id is a
 /// client error. Shared by the audit-log decode and `AuditFetchByQueryId`.
@@ -49,7 +49,7 @@ impl From<PerQueryAudit> for pb::PerQueryAudit {
 }
 
 /// Reconstruct a stored [`PerQueryAudit`] from the wire message a fetch verb
-/// returns — the inverse of the encode above, for the [`crate::RemoteSession`]
+/// returns — the inverse of the encode above, for the the remote client
 /// read side.
 ///
 /// Unlike the receive-side `record_from_proto` in `jammi-server` (which rebuilds

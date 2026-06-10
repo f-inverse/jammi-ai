@@ -3,7 +3,7 @@
 # The canonical jammi.v1 proto tree. `jammi-client` is generated from the
 # SAME protos the Rust engine, npm client, and embed wheel speak — one source,
 # no parallel schema.
-PROTO_ROOT := ../../crates/jammi-ai/proto
+PROTO_ROOT := ../../crates/jammi-wire/proto
 OUT_DIR    := jammi_client/_generated
 
 # Every jammi.v1 service proto. Compiling the whole tree (not just the

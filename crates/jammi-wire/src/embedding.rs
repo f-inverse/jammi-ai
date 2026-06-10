@@ -13,8 +13,8 @@
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use tonic::Status;
 
-use crate::wire::proto::embedding as pb;
-use crate::{Modality, QueryInput};
+use crate::proto::embedding as pb;
+use crate::request::{Modality, QueryInput};
 
 /// Map the proto [`Modality`] onto the engine's [`Modality`]. An unspecified
 /// modality is rejected — a request that names no tower is a client error, not

@@ -1,7 +1,7 @@
 //! `EmbeddingService` gRPC implementation.
 //!
 //! Each verb is a thin wire adapter over the transport-agnostic
-//! [`Session`]/[`LocalSession`] abstraction (never raw [`InferenceSession`]
+//! [`Session`] abstraction (never raw [`InferenceSession`]
 //! calls): proto in, one `Session` method, proto out.
 //!
 //! * `GenerateEmbeddings` — scan a source's `columns`, run the modality's
@@ -26,7 +26,7 @@
 //! Tenant scope is read from the request's [`SessionTenant`] extension (set
 //! upstream by [`crate::grpc::session::TenantInterceptor`]) and applied to the
 //! call via [`crate::grpc::wire::scoped`] — the same task-local the engine the
-//! [`LocalSession`] wraps observes — matching how the Flight SQL and Trigger
+//! [`Session`] wraps observes — matching how the Flight SQL and Trigger
 //! surfaces resolve their tenant.
 //!
 //! [`SessionTenant`]: crate::grpc::session::SessionTenant
@@ -34,8 +34,8 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
-use jammi_ai::wire::ProtoQueryInput;
-use jammi_ai::{LocalSession, Modality, SearchQuery, SearchRequest as SessionSearch, Session};
+use jammi_ai::{Modality, SearchQuery, SearchRequest as SessionSearch, Session};
+use jammi_wire::ProtoQueryInput;
 use tonic::{Request, Response, Status};
 
 use std::collections::HashMap;
@@ -51,7 +51,7 @@ use crate::grpc::proto::embedding::{
 use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant};
 
 /// Server-side handler for the embedding gRPC surface. Holds a shared engine
-/// session it wraps in a [`LocalSession`] per call to reach the unified
+/// session it wraps in a [`Session`] per call to reach the unified
 /// transport surface.
 pub struct EmbeddingServer {
     session: Arc<InferenceSession>,
@@ -63,11 +63,11 @@ impl EmbeddingServer {
     }
 
     /// A [`Session`] over the shared engine. Wrapping is an `Arc` clone; the
-    /// resulting `LocalSession` delegates to the same engine, so a tenant scope
+    /// resulting `Session` delegates to the same engine, so a tenant scope
     /// installed by [`scoped`] (a task-local on this task) is observed by the
     /// call made through it.
     fn local(&self) -> Session {
-        Session::Local(LocalSession::new(Arc::clone(&self.session)))
+        Session::new(Arc::clone(&self.session))
     }
 }
 

@@ -1,6 +1,6 @@
 //! `jammi mutable` subcommand.
 //!
-//! Drive the remote [`Session`]'s `create_mutable_table` /
+//! Drive the remote [`CatalogClient`]'s `create_mutable_table` /
 //! `drop_mutable_table` / `list_mutable_tables` verbs from the CLI. Schema is
 //! supplied via a JSON file so the same fixture can drive Rust, Python, and CLI
 //! tests without duplicating the column definitions. Index specs are inline
@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use clap::Subcommand;
-use jammi_ai::Session;
+use jammi_admin::CatalogClient;
 use jammi_db::store::mutable::definition::{
     MutableIndexDef, MutableTableDefinitionBuilder, MutableTableId,
 };
@@ -55,7 +55,7 @@ pub enum MutableAction {
 }
 
 pub async fn run(
-    session: &Session,
+    session: &CatalogClient,
     action: MutableAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {

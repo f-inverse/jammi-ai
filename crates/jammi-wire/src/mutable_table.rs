@@ -16,8 +16,8 @@ use jammi_db::store::mutable::{
 use jammi_db::TenantId;
 use tonic::Status;
 
-use crate::wire::encode_ipc_stream;
-use crate::wire::proto::catalog as pb;
+use crate::encode_ipc_stream;
+use crate::proto::catalog as pb;
 
 /// Build the engine [`MutableTableDefinition`] from the wire message, stamping
 /// the resolved session `tenant` onto it (the wire body is tenant-free).
@@ -57,7 +57,7 @@ pub fn definition_from_proto(
 }
 
 /// Encode the engine [`MutableTableDefinition`] onto its wire message — the
-/// inverse of [`definition_from_proto`], for the [`crate::RemoteSession`] send
+/// inverse of [`definition_from_proto`], for the the remote client send
 /// side. The schema rides as a schema-only Arrow IPC stream (the framing
 /// [`super::decode_ipc_schema`] reads back). The `tenant` field is intentionally
 /// dropped: the wire body stays tenant-free and the server stamps the session's
@@ -89,7 +89,7 @@ pub fn definition_to_proto(
 
 /// Reconstruct an engine [`MutableTableDefinition`] from a wire message that
 /// carries no tenant — the receive side of a `ListMutableTables` response, for
-/// the [`crate::RemoteSession`]. The wire body is tenant-free (a list entry's
+/// the the remote client. The wire body is tenant-free (a list entry's
 /// tenant rides the session scope, not the message), so the engine definition
 /// reconstructs with `tenant = None`; a list consumer keys off the id / schema /
 /// primary key / indexes, not the catalog row's tenant. Defers all schema /

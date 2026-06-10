@@ -11,7 +11,7 @@ use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelS
 use jammi_db::ChannelId;
 use tonic::Status;
 
-use crate::wire::proto::catalog as pb;
+use crate::proto::catalog as pb;
 
 /// Parse a wire channel id into the validated [`ChannelId`] newtype.
 pub fn parse_channel_id(id: &str) -> Result<ChannelId, Status> {
@@ -34,7 +34,7 @@ pub fn channel_to_proto(spec: &ChannelSpec) -> pb::Channel {
 }
 
 /// Reconstruct the engine's [`ChannelSpec`] from the wire `Channel` — the
-/// inverse of [`channel_to_proto`], for the [`crate::RemoteSession`] receive
+/// inverse of [`channel_to_proto`], for the the remote client receive
 /// side. The id parses through [`parse_channel_id`] and the columns through
 /// [`columns_from_proto`], so a remote `list_channels` rebuilds the same spec a
 /// local one returns.
@@ -65,7 +65,7 @@ pub fn columns_from_proto(columns: Vec<pb::ChannelColumn>) -> Result<Vec<Channel
 }
 
 /// Encode the engine's [`ChannelColumn`] list onto the wire — the inverse of
-/// [`columns_from_proto`], for the [`crate::RemoteSession`] send side. Total:
+/// [`columns_from_proto`], for the the remote client send side. Total:
 /// every engine column maps to a fully-specified wire column (the engine's
 /// `ChannelColumnType` is a closed enum with no unspecified state).
 pub fn columns_to_proto(columns: &[ChannelColumn]) -> Vec<pb::ChannelColumn> {

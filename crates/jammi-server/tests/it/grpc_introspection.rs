@@ -3,9 +3,9 @@
 //! (`CatalogService.ListSources` / `DescribeSource` / `GetServerInfo`).
 //!
 //! An in-process gRPC chain hosts a real `InferenceSession`; a
-//! `jammi_ai::RemoteSession` connects over a real HTTP/2 channel and a
-//! `jammi_ai::LocalSession` wraps the *same* engine `Arc`, so any divergence is
-//! the transport's fault, not the engine's. The three properties this pins:
+//! `jammi_admin::CatalogClient` connects over a real HTTP/2 channel and a
+//! `jammi_ai::Session` wraps the *same* engine `Arc`, so any divergence is the
+//! transport's fault, not the engine's. The three properties this pins:
 //!
 //! * **Descriptor parity** — after a real source is registered and embedded
 //!   (realistic `tiny_bert` text embeddings over the bundled `patents` corpus,
@@ -25,7 +25,8 @@
 
 use std::sync::Arc;
 
-use jammi_ai::{LocalSession, Modality, RemoteSession, ServerInfo, Session, SourceDescriptor};
+use jammi_admin::CatalogClient;
+use jammi_ai::{Modality, ServerInfo, Session, SourceDescriptor};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_test_utils::{cookbook_fixture, fixture};
 use tonic::transport::Endpoint;
@@ -44,15 +45,15 @@ fn patents_connection() -> SourceConnection {
     }
 }
 
-async fn remote(server: &EngineServer) -> RemoteSession {
+async fn remote(server: &EngineServer) -> CatalogClient {
     let endpoint = Endpoint::from_shared(format!("http://{}", server.addr)).expect("endpoint");
-    RemoteSession::connect(endpoint)
+    CatalogClient::connect(endpoint)
         .await
-        .expect("remote session connect")
+        .expect("catalog client connect")
 }
 
 fn local(server: &EngineServer) -> Session {
-    Session::Local(LocalSession::new(Arc::clone(&server.engine)))
+    Session::new(Arc::clone(&server.engine))
 }
 
 /// A comparable projection of a descriptor: the registry identity plus, per
@@ -90,7 +91,7 @@ fn descriptor_shape(d: &SourceDescriptor) -> DescriptorShape {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_list_and_describe_sources_like_local() {
     let server = start_engine_server().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let local = local(&server);
 
     // Register + embed the corpus on the shared engine through the local
@@ -173,7 +174,7 @@ async fn remote_list_and_describe_sources_like_local() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_server_info_like_local() {
     let server = start_engine_server().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let local = local(&server);
 
     let remote_info = remote.server_info().await.expect("remote server_info");
@@ -206,7 +207,7 @@ async fn remote_server_info_like_local() {
     assert_eq!(local_info.storage_backends, sorted);
 
     // `services` is the runtime tier handshake and legitimately differs by
-    // transport: the in-process `LocalSession` mounts no gRPC services, so it
+    // transport: the in-process `Session` mounts no gRPC services, so it
     // reports an empty set and equals the engine's compile-time self-description
     // (which leaves `services` empty); the remote server reports the tiers it
     // actually mounted. `start_engine_server` mounts the engine core + the

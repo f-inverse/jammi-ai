@@ -12,7 +12,7 @@ import "jammi/v1/trigger.proto";
 // ADR-01 §3.2). The verb is a substrate primitive: it names the act of running
 // a model over a source, not any tenant-domain concept.
 //
-// The verb delegates 1:1 to the consumer-facing `Session`/`LocalSession`
+// The verb delegates 1:1 to the consumer-facing `Session`
 // abstraction; the service reimplements no model loading, scan, or forward
 // logic — it is purely a wire adapter over the in-process engine.
 //

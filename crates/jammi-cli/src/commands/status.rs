@@ -2,12 +2,12 @@
 //!
 //! Reports the server's capabilities handshake — version, compiled feature
 //! flags, addressable storage backends, and mounted gRPC service tiers — by
-//! reading [`Session::server_info`]. Reachability is implicit: the RPC
+//! reading [`CatalogClient::server_info`]. Reachability is implicit: the RPC
 //! succeeding means the server answered, so there is no separate ping.
 
-use jammi_ai::Session;
+use jammi_admin::CatalogClient;
 
-pub async fn run(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(session: &CatalogClient) -> Result<(), Box<dyn std::error::Error>> {
     let info = session.server_info().await?;
     println!("version:          {}", info.version);
     println!("features:         {}", join_or_dash(&info.features));

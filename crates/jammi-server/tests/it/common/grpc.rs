@@ -62,8 +62,9 @@ pub struct EngineServer {
     pub _dir: TempDir,
     pub handle: tokio::task::JoinHandle<()>,
     /// The same `Arc<InferenceSession>` the server task drives. Shared so a
-    /// test can wrap it in a `LocalSession` and assert a `RemoteSession` over
-    /// the wire returns identical results / errors against the *same* engine.
+    /// test can wrap it in a local `Session` and assert the data-plane client
+    /// over the wire returns identical results / errors against the *same*
+    /// engine.
     pub engine: Arc<InferenceSession>,
 }
 
@@ -84,8 +85,8 @@ pub async fn start_engine_server() -> EngineServer {
 
 /// Like [`start_engine_server`] but also mounts the trigger handles (the event
 /// tier), so the `TriggerService` (topics / publish / subscribe) is reachable
-/// over the wire. Shared by the `RemoteSession` topic/subscribe/audit parity
-/// tests, which drive those surfaces against the same engine a `LocalSession`
+/// over the wire. Shared by the data-plane client topic/subscribe/audit parity
+/// tests, which drive those surfaces against the same engine a local `Session`
 /// wraps.
 pub async fn start_engine_server_with_trigger() -> EngineServer {
     start_engine_server_with_tiers(jammi_server::tiers::TierSet::all_compiled()).await

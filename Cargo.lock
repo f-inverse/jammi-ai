@@ -4058,13 +4058,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jammi-admin"
+version = "0.25.0"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "futures",
+ "jammi-db",
+ "jammi-wire",
+ "tonic",
+ "uuid",
+]
+
+[[package]]
 name = "jammi-ai"
 version = "0.25.0"
 dependencies = [
  "arrow",
  "arrow-array",
- "arrow-flight",
- "arrow-ipc",
  "arrow-schema",
  "async-trait",
  "bytes",
@@ -4081,10 +4092,9 @@ dependencies = [
  "jammi-lora",
  "jammi-numerics",
  "jammi-test-utils",
+ "jammi-wire",
  "libc",
  "parquet",
- "prost",
- "prost-types",
  "rand 0.8.5",
  "rand_distr 0.4.3",
  "reqwest",
@@ -4098,11 +4108,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokenizers",
  "tokio",
- "tokio-stream",
  "tonic",
- "tonic-build",
- "tonic-prost",
- "tonic-prost-build",
  "tracing",
  "uuid",
  "wiremock",
@@ -4115,7 +4121,7 @@ dependencies = [
  "arrow-schema",
  "assert_cmd",
  "clap",
- "jammi-ai",
+ "jammi-admin",
  "jammi-db",
  "predicates",
  "serde",
@@ -4123,6 +4129,23 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic",
+]
+
+[[package]]
+name = "jammi-client"
+version = "0.25.0"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-flight",
+ "arrow-schema",
+ "futures",
+ "jammi-admin",
+ "jammi-db",
+ "jammi-wire",
+ "tokio-stream",
+ "tonic",
+ "uuid",
 ]
 
 [[package]]
@@ -4252,10 +4275,13 @@ dependencies = [
  "datafusion-flight-sql-server",
  "futures",
  "http-body",
+ "jammi-admin",
  "jammi-ai",
+ "jammi-client",
  "jammi-db",
  "jammi-numerics",
  "jammi-test-utils",
+ "jammi-wire",
  "parquet",
  "pin-project",
  "prometheus",
@@ -4282,6 +4308,36 @@ name = "jammi-test-utils"
 version = "0.25.0"
 dependencies = [
  "jammi-db",
+]
+
+[[package]]
+name = "jammi-wire"
+version = "0.25.0"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-flight",
+ "arrow-ipc",
+ "arrow-schema",
+ "chrono",
+ "jammi-db",
+ "jammi-lora",
+ "jammi-numerics",
+ "prost",
+ "prost-types",
+ "rand 0.8.5",
+ "rand_distr 0.4.3",
+ "serde",
+ "serde_json",
+ "statrs",
+ "thiserror 2.0.18",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -1,15 +1,17 @@
-//! `jammi` — the strict gRPC client CLI.
+//! `jammi` — the strict gRPC control-plane client CLI.
 //!
 //! The CLI talks to a running `jammi-server` over the `jammi.v1` wire surface
-//! and never touches the catalog or storage in-process: it opens a remote
-//! [`Session`] against a `--target` endpoint and dispatches
-//! each subcommand to one or more session verbs. There is no embedded engine
-//! here — `jammi serve` lives in the `jammi-server` binary, not this CLI.
+//! and never touches the catalog or storage in-process: it opens a
+//! [`CatalogClient`] against a `--target` endpoint and dispatches each
+//! subcommand to one or more control verbs. There is no embedded engine here —
+//! `jammi serve` lives in the `jammi-server` binary, not this CLI — and the
+//! crate depends on `jammi-admin`, not `jammi-ai`, so the candle stack never
+//! reaches the `jammi` binary.
 
 mod commands;
 
 use clap::{Parser, Subcommand};
-use jammi_ai::{Jammi, Session, Target};
+use jammi_admin::CatalogClient;
 
 /// Default endpoint: the server's Flight-SQL + gRPC listener
 /// (`flight_listen = "0.0.0.0:8081"`).
@@ -70,9 +72,9 @@ enum Commands {
 async fn main() {
     let cli = Cli::parse();
 
-    // `--help` / `--version` / no-subcommand must not connect: `Jammi::open`
-    // eagerly dials the endpoint, so the no-verb path prints help and returns
-    // before any connection is attempted.
+    // `--help` / `--version` / no-subcommand must not connect: `CatalogClient
+    // ::connect` eagerly dials the endpoint, so the no-verb path prints help and
+    // returns before any connection is attempted.
     let Some(command) = cli.command else {
         use clap::CommandFactory;
         let mut cmd = Cli::command();
@@ -93,31 +95,32 @@ async fn run(
     tenant: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = endpoint_from_target(target)?;
-    let session = Jammi::open(Target::Remote(endpoint)).await?;
+    let client = CatalogClient::connect(endpoint).await?;
 
     // Bind the tenant before any verb. An unbound/unknown session id maps to an
     // *unscoped* (all-tenants) view server-side with no error, so a `--tenant`
     // query that skipped this bind would silently read across tenants. Binding
     // first stamps the session's tenant against the same session id every verb
-    // (gRPC header / Flight SQL header) carries.
+    // (gRPC header) carries.
     if let Some(t) = tenant {
         use std::str::FromStr;
-        session
-            .bind_tenant(jammi_db::TenantId::from_str(t)?)
-            .await?;
+        client.bind_tenant(jammi_db::TenantId::from_str(t)?).await?;
     }
 
-    dispatch(&session, command).await
+    dispatch(&client, command).await
 }
 
-async fn dispatch(session: &Session, command: Commands) -> Result<(), Box<dyn std::error::Error>> {
+async fn dispatch(
+    client: &CatalogClient,
+    command: Commands,
+) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        Commands::Status => commands::status::run(session).await,
-        Commands::Sources { action } => commands::sources::run(session, action).await,
-        Commands::Models { action } => commands::models::run(session, action).await,
-        Commands::Trigger { action } => commands::trigger::run(session, action).await,
-        Commands::Channels { action } => commands::channels::run(session, action).await,
-        Commands::Mutable { action } => commands::mutable::run(session, action).await,
+        Commands::Status => commands::status::run(client).await,
+        Commands::Sources { action } => commands::sources::run(client, action).await,
+        Commands::Models { action } => commands::models::run(client, action).await,
+        Commands::Trigger { action } => commands::trigger::run(client, action).await,
+        Commands::Channels { action } => commands::channels::run(client, action).await,
+        Commands::Mutable { action } => commands::mutable::run(client, action).await,
     }
 }
 

@@ -3,6 +3,9 @@ resolver = "2"
 members = [
     "crates/jammi-db",
     "crates/jammi-numerics",
+    "crates/jammi-wire",
+    "crates/jammi-admin",
+    "crates/jammi-client",
     "crates/jammi-ai",
     "crates/jammi-server",
     "crates/jammi-python",
@@ -15,6 +18,9 @@ members = [
 default-members = [
     "crates/jammi-db",
     "crates/jammi-numerics",
+    "crates/jammi-wire",
+    "crates/jammi-admin",
+    "crates/jammi-client",
     "crates/jammi-ai",
     "crates/jammi-server",
     "crates/jammi-cli",
@@ -33,6 +39,13 @@ repository = "https://github.com/f-inverse/jammi-ai"
 # Internal crates
 jammi-db = { version = "0.25.0", path = "crates/jammi-db" }
 jammi-numerics = { version = "0.25.0", path = "crates/jammi-numerics" }
+# The candle-free client substrate: the wire transport (`jammi-wire`), the
+# control-plane client (`jammi-admin`), and the data-plane client
+# (`jammi-client`). None pull the embedded ML stack — they speak the gRPC /
+# Flight SQL wire only.
+jammi-wire = { version = "0.25.0", path = "crates/jammi-wire" }
+jammi-admin = { version = "0.25.0", path = "crates/jammi-admin" }
+jammi-client = { version = "0.25.0", path = "crates/jammi-client" }
 jammi-ai = { version = "0.25.0", path = "crates/jammi-ai" }
 jammi-server = { version = "0.25.0", path = "crates/jammi-server" }
 # Default features OFF at the workspace root so a consumer can pull jammi-lora's

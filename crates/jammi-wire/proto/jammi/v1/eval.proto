@@ -11,7 +11,7 @@ package jammi.v1.eval;
 // only, per ADR-01 §3.2). The verbs are substrate primitives — measuring model
 // quality against golden data — and name no tenant-domain concept.
 //
-// Each verb delegates 1:1 to the consumer-facing `Session`/`LocalSession`
+// Each verb delegates 1:1 to the consumer-facing `Session`
 // abstraction; the service reimplements no metric, retrieval, or scan logic.
 // The response messages mirror the Rust report structs the abstraction returns
 // (`EmbeddingEvalReport`, `InferenceEvalReport`, `CompareEvalReport`, and the

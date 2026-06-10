@@ -13,7 +13,7 @@ import "google/protobuf/empty.proto";
 // only, per ADR-01 §3.2). The verbs name a substrate primitive — a signed
 // per-query audit log — and carry no tenant-domain concept.
 //
-// Each verb delegates 1:1 to the consumer-facing `Session`/`LocalSession`
+// Each verb delegates 1:1 to the consumer-facing `Session`
 // abstraction (`audit_log` / `audit_fetch_by_query_id` / `audit_fetch_recent`);
 // the service reimplements no signing, storage, or query logic. The
 // `PerQueryAudit` message mirrors the Rust record field for field, including

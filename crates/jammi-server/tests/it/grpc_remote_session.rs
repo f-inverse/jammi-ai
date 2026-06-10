@@ -1,8 +1,8 @@
-//! `RemoteSession` over the wire, proven interchangeable with `LocalSession`.
+//! The data-plane client over the wire, proven interchangeable with a local `Session`.
 //!
 //! An in-process gRPC chain (`runtime::serve_grpc_chain`) hosts a real
-//! `InferenceSession`. A `jammi_ai::RemoteSession` connects to it over a real
-//! HTTP/2 channel and a `jammi_ai::LocalSession` wraps the *same* engine `Arc`.
+//! `InferenceSession`. A `jammi_client::DataClient` connects to it over a real
+//! HTTP/2 channel and a `jammi_ai::Session` wraps the *same* engine `Arc`.
 //! The three properties Stage 3b-1 must establish are each pinned here:
 //!
 //! * **Round-trip parity** — `generate_embeddings` → `search` → `remove_source`
@@ -11,7 +11,7 @@
 //!   embeddings over the `patents` corpus, never dummy vectors).
 //! * **Error parity (the #1 proof)** — a real failure on this path (searching a
 //!   source with no embedding table) returns the *same `JammiError` variant*
-//!   from `RemoteSession` as from `LocalSession`, not merely the same gRPC code.
+//!   from the data-plane client as from a local `Session`, not merely the same gRPC code.
 //!   This is what the typed-error wire detail buys; a heuristic reverse-map
 //!   could not satisfy it.
 //! * **Tenant** — `bind_tenant` (async) over the wire is observed by a later
@@ -27,9 +27,9 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::StreamExt;
 use jammi_ai::audit::{verify_with_store, EnvSigningKeyStore, MASTER_KEY_ENV};
 use jammi_ai::{
-    Jammi, LocalSession, Modality, PerQueryAudit, QueryInput, RemoteSession, SearchQuery,
-    SearchRequest, Session, Target,
+    Jammi, Modality, PerQueryAudit, QueryInput, SearchQuery, SearchRequest, Session, Target,
 };
+use jammi_client::DataClient;
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::trigger::{DeliveredBatch, Predicate, TopicDefinition, TopicId, TriggerError};
@@ -70,7 +70,7 @@ fn events_batch() -> RecordBatch {
 /// A global (tenant-`None`) topic with a freshly-minted id. The trigger
 /// round-trip tests use an unscoped session on both transports, so a global
 /// topic keeps the publish/subscribe tenant scope identical (`None`) across
-/// `LocalSession` and `RemoteSession` without a sticky-vs-task-local binding
+/// a local `Session` and the data-plane client without a sticky-vs-task-local binding
 /// mismatch on the shared engine; the minted id lets a later
 /// `drop_topic(topic.id)` resolve on either transport.
 fn events_topic() -> TopicDefinition {
@@ -95,25 +95,25 @@ fn patents_connection() -> SourceConnection {
     }
 }
 
-/// Connect a `RemoteSession` to the in-process server.
-async fn remote(server: &EngineServer) -> RemoteSession {
+/// Connect a `DataClient` to the in-process server.
+async fn remote(server: &EngineServer) -> DataClient {
     let endpoint = Endpoint::from_shared(format!("http://{}", server.addr)).expect("endpoint");
-    RemoteSession::connect(endpoint)
+    DataClient::connect(endpoint)
         .await
-        .expect("remote session connect")
+        .expect("data client connect")
 }
 
 /// Wrap the server's engine `Arc` in a local session — the same engine the
 /// remote calls reach, so any divergence is the transport's fault, not the
 /// engine's.
 fn local(server: &EngineServer) -> Session {
-    Session::Local(LocalSession::new(Arc::clone(&server.engine)))
+    Session::new(Arc::clone(&server.engine))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_round_trips_embeddings_and_search_like_local() {
     let server = start_engine_server().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let model_id = tiny_bert_model_id();
 
     // The local session registers + embeds the corpus directly on the shared
@@ -204,6 +204,7 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
     // remove_source parity: after the remote drops the source, a search fails
     // on both transports (the source no longer resolves).
     remote
+        .catalog()
         .remove_source("patents")
         .await
         .expect("remote remove_source");
@@ -225,7 +226,7 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
     let _ = server.handle.await;
 }
 
-/// `add_source` over the wire, proven interchangeable with `LocalSession`. The
+/// `add_source` over the wire, proven interchangeable with a local `Session`. The
 /// remote transport registers the `patents` corpus through
 /// `EmbeddingService.AddSource` (the typed RPC the server and the TS gRPC-web
 /// client already drive); the registration must reach the shared engine, so a
@@ -236,13 +237,14 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_add_source_round_trips_like_local() {
     let server = start_engine_server().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let local = local(&server);
 
     // Register the corpus over the REMOTE transport. Before this call the engine
     // has no `patents` source; the registration must cross the wire and land on
     // the shared engine.
     remote
+        .catalog()
         .add_source("patents", SourceType::File, patents_connection())
         .await
         .expect("remote add_source");
@@ -292,6 +294,7 @@ async fn remote_add_source_round_trips_like_local() {
         .await
         .expect_err("local re-add of an existing source must fail");
     let remote_err = remote
+        .catalog()
         .add_source("patents", SourceType::File, patents_connection())
         .await
         .expect_err("remote re-add of an existing source must fail");
@@ -319,7 +322,7 @@ async fn remote_add_source_round_trips_like_local() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_reconstructs_the_exact_error_variant_local_returns() {
     let server = start_engine_server().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let local = local(&server);
 
     // Register the corpus but never generate embeddings: a search-by-row-key
@@ -375,7 +378,7 @@ async fn remote_reconstructs_the_exact_error_variant_local_returns() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_reconstructs_a_model_error_from_an_inference_failure() {
     let server = start_engine_server().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let local = local(&server);
 
     // A syntactically valid `local:` model id pointing at a directory that does
@@ -435,8 +438,8 @@ async fn remote_reconstructs_a_model_error_from_an_inference_failure() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_binds_and_reads_tenant_over_the_wire() {
     let server = start_engine_server().await;
-    let bound = Session::Remote(remote(&server).await);
-    let other = Session::Remote(remote(&server).await);
+    let bound = remote(&server).await;
+    let other = remote(&server).await;
 
     assert_eq!(bound.tenant().await.expect("get tenant"), None);
 
@@ -463,20 +466,21 @@ async fn remote_binds_and_reads_tenant_over_the_wire() {
     let _ = server.handle.await;
 }
 
-/// Topics over the wire: a `RemoteSession` registers a topic, publishes a
-/// batch, lists it, and drops it — and a `LocalSession` over the same engine
+/// Topics over the wire: the data-plane client registers a topic, publishes a
+/// batch, lists it, and drops it — and a local `Session` over the same engine
 /// observes every effect identically. Proves the register → publish → list →
 /// drop lifecycle is faithful across transports (the publish offset and the
 /// listed `TopicDefinition` match what the in-process path produces).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_round_trips_the_topic_lifecycle_like_local() {
     let server = start_engine_server_with_trigger().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let local = local(&server);
     let topic = events_topic();
 
     // Register over the wire; the local session (same engine) must see it.
     remote
+        .catalog()
         .register_topic(&topic)
         .await
         .expect("remote register");
@@ -490,7 +494,7 @@ async fn remote_round_trips_the_topic_lifecycle_like_local() {
 
     // The remote `list_topics` reconstructs the SAME full definitions the local
     // one returns — id, name, schema, tenant — not just names.
-    let listed_remote = remote.list_topics().await.expect("remote list");
+    let listed_remote = remote.catalog().list_topics().await.expect("remote list");
     let remote_ours = listed_remote
         .iter()
         .find(|t| t.id == topic.id)
@@ -515,7 +519,11 @@ async fn remote_round_trips_the_topic_lifecycle_like_local() {
     );
 
     // Drop over the wire by the topic id; the local session no longer sees it.
-    remote.drop_topic(topic.id).await.expect("remote drop");
+    remote
+        .catalog()
+        .drop_topic(topic.id)
+        .await
+        .expect("remote drop");
     let after = local.list_topics().await.expect("local list after drop");
     assert!(
         !after.iter().any(|t| t.id == topic.id),
@@ -526,15 +534,15 @@ async fn remote_round_trips_the_topic_lifecycle_like_local() {
     let _ = server.handle.await;
 }
 
-/// Subscribe streaming over the wire. A `RemoteSession` opens a server-streaming
+/// Subscribe streaming over the wire. The data-plane client opens a server-streaming
 /// subscription from offset 0; after a publish, the stream yields the SAME
-/// `DeliveredBatch` a `LocalSession`'s subscription yields against the same
+/// `DeliveredBatch` a local `Session`. subscription yields against the same
 /// engine — same offset, same rows. Proves the streaming verb (not just the
 /// unary ones) is faithful end to end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remote_subscribe_stream_yields_the_same_batches_as_local() {
     let server = start_engine_server_with_trigger().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let local = local(&server);
     let topic = events_topic();
 
@@ -599,7 +607,7 @@ async fn remote_subscribe_stream_yields_the_same_batches_as_local() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_reconstructs_the_exact_trigger_error_variant_local_returns() {
     let server = start_engine_server_with_trigger().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let local = local(&server);
     let topic = events_topic();
     local.register_topic(&topic).await.expect("register topic");
@@ -648,21 +656,21 @@ async fn remote_reconstructs_the_exact_trigger_error_variant_local_returns() {
     let _ = server.handle.await;
 }
 
-/// Audit over the wire: a `RemoteSession` (tenant-bound) logs a record, fetches
+/// Audit over the wire: the data-plane client (tenant-bound) logs a record, fetches
 /// it by id and via recent, and the fetched record's engine-computed signature
 /// verifies — proving every field crossed the wire byte-for-byte. The fetched
-/// record matches the one a `LocalSession` fetch returns for the same query id.
+/// record matches the one a local `Session` fetch returns for the same query id.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_round_trips_audit_log_and_fetch_like_local() {
     let _g = audit_env_lock().lock().await;
     std::env::set_var(MASTER_KEY_ENV, AUDIT_TEST_KEY);
 
     let server = start_engine_server_with_trigger().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let local = local(&server);
 
     // The audit primitive requires a bound tenant. Bind the remote session over
-    // the wire; the LocalSession reads back through the same engine, so scope it
+    // the wire; the local Session reads back through the same engine, so scope it
     // identically via the engine's sticky binding for the fetch comparison.
     remote.bind_tenant(tenant_a()).await.expect("remote bind");
 
@@ -732,7 +740,7 @@ async fn remote_reconstructs_the_exact_audit_error_variant_local_returns() {
     std::env::set_var(MASTER_KEY_ENV, AUDIT_TEST_KEY);
 
     let server = start_engine_server_with_trigger().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let local = local(&server);
 
     let record = || {
@@ -774,33 +782,26 @@ async fn remote_reconstructs_the_exact_audit_error_variant_local_returns() {
     let _ = server.handle.await;
 }
 
-/// The SDK front door selects the transport. `Jammi::open(Target::Remote(_))`
-/// connects to the in-process server and yields a `Session::Remote`;
-/// `Jammi::open(Target::Local(_))` builds an embedded engine and yields a
-/// `Session::Local`. Both are the same `Session` type, and a verb run through
-/// either returns the same shape — so the two transports are interchangeable
-/// through the `Session` the factory returns. The remote arm is compared to a
-/// `LocalSession` over the *same* engine the server drives (so any divergence is
-/// the transport's, not the engine's); the local-front-door arm proves
-/// `Target::Local` independently opens a live embedded session that runs the
-/// same verb.
+/// The two front doors run the same verb interchangeably. `DataClient::connect`
+/// dials the in-process server and runs `encode_query` over the wire;
+/// `Jammi::open(Target::Local(_))` builds an embedded engine and runs the same
+/// verb in-process. The remote client is compared to a local `Session` over the
+/// *same* engine the server drives (so any divergence is the transport's, not
+/// the engine's); the embedded-front-door arm proves `Jammi::open` independently
+/// opens a live engine that runs the same verb. The control / data plane split
+/// is now a crate boundary — `jammi-admin` / `jammi-client` for the wire,
+/// `jammi-ai` for the embedded engine — and both speak the same request/result
+/// vocabulary, which is what this verb-parity check pins.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn front_door_opens_interchangeable_local_and_remote_sessions() {
+async fn front_doors_run_the_same_verb_over_either_transport() {
     let server = start_engine_server().await;
     let model_id = tiny_bert_model_id();
     let query = "quantum computing applications";
 
-    // Front door, remote arm: Target::Remote → Session::Remote against the server.
-    let endpoint = Endpoint::from_shared(format!("http://{}", server.addr)).expect("endpoint");
-    let remote = Jammi::open(Target::Remote(endpoint))
-        .await
-        .expect("open remote session");
-    assert!(
-        matches!(remote, Session::Remote(_)),
-        "Target::Remote opens a Session::Remote"
-    );
+    // Wire front door: connect a data-plane client to the server.
+    let remote = remote(&server).await;
 
-    // A LocalSession over the SAME engine the server drives — the parity peer.
+    // A local `Session` over the SAME engine the server drives — the parity peer.
     let local_same_engine = local(&server);
 
     let remote_vec = remote
@@ -821,22 +822,18 @@ async fn front_door_opens_interchangeable_local_and_remote_sessions() {
         .expect("local encode_query");
     assert_eq!(
         remote_vec, local_vec,
-        "the factory's remote Session and a local Session over the same engine \
-         encode the same query identically — interchangeable through Session"
+        "the data-plane client and a local Session over the same engine encode \
+         the same query identically — interchangeable across the crate boundary"
     );
 
-    // Front door, local arm: Target::Local → Session::Local over a fresh
-    // embedded engine, proving the same verb runs end to end through the
-    // factory-opened embedded session (its own engine, so dimensionality — not
-    // the exact vector — is the cross-engine-stable invariant).
+    // Embedded front door: Jammi::open(Target::Local) over a fresh embedded
+    // engine, proving the same verb runs end to end through the factory-opened
+    // embedded session (its own engine, so dimensionality — not the exact vector
+    // — is the cross-engine-stable invariant).
     let dir = tempfile::tempdir().expect("tempdir");
-    let embedded = Jammi::open(Target::Local(test_config(dir.path())))
+    let embedded: Session = Jammi::open(Target::Local(test_config(dir.path())))
         .await
         .expect("open local session");
-    assert!(
-        matches!(embedded, Session::Local(_)),
-        "Target::Local opens a Session::Local"
-    );
     let embedded_vec = embedded
         .encode_query(
             &model_id,
@@ -849,7 +846,7 @@ async fn front_door_opens_interchangeable_local_and_remote_sessions() {
         embedded_vec.len(),
         remote_vec.len(),
         "a verb through the factory-opened embedded Session yields the same \
-         vector shape the remote Session does — same surface, either transport"
+         vector shape the data-plane client does — same surface, either transport"
     );
 
     let _ = server.shutdown.send(());

@@ -35,9 +35,10 @@ use crate::pipeline::graph_propagation::{
     PropagateRequest, PropagationOutput, PropagationWeighting,
 };
 use crate::pipeline::neighbor_graph::BuildNeighborGraph;
-use crate::wire::proto::pipeline as pb;
-use crate::wire::proto::trigger::ArrowBatch;
-use crate::wire::{decode_ipc_stream, edge_gather_from_proto, encode_ipc_stream};
+use crate::wire::edge_gather_from_proto;
+use jammi_wire::proto::pipeline as pb;
+use jammi_wire::proto::trigger::ArrowBatch;
+use jammi_wire::{decode_ipc_stream, encode_ipc_stream};
 
 // ─── BuildNeighborGraph ──────────────────────────────────────────────────────
 
@@ -144,7 +145,7 @@ fn empty_or(value: String, default: &str) -> String {
 /// Map the propagation edge direction (reusing the shared inference
 /// [`EdgeDirection`] enum); `UNSPECIFIED` keeps the engine default (`Out`).
 fn propagation_direction_from_proto(direction: i32) -> Result<EdgeDirection, Status> {
-    use crate::wire::proto::inference::EdgeDirection as ProtoDir;
+    use jammi_wire::proto::inference::EdgeDirection as ProtoDir;
     match ProtoDir::try_from(direction) {
         Ok(ProtoDir::Unspecified) | Ok(ProtoDir::Out) => Ok(EdgeDirection::Out),
         Ok(ProtoDir::In) => Ok(EdgeDirection::In),
@@ -273,7 +274,7 @@ pub fn assemble_context_to_proto(
 }
 
 /// Decode a [`pb::AssembleContextResponse`] into the engine
-/// [`ContextRepresentation`] — the [`crate::RemoteSession`] receive side. The
+/// [`ContextRepresentation`] — the the remote client receive side. The
 /// presence-wrapped vector decodes back to `Option<Vec<f32>>` (an absent wrapper
 /// is the degenerate empty context), and the value rows decode from their IPC
 /// stream. The assembly-source tag rejects an unknown value rather than guess.

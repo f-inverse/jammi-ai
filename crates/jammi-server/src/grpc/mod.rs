@@ -11,10 +11,11 @@
 //! bound through `CatalogService.SetTenant` is observable on any downstream
 //! request — including SQL queries issued against Flight SQL.
 //!
-//! The generated `jammi.v1` stubs and the proto↔domain conversions live in
-//! [`jammi_ai::wire`]; this module re-exports the stubs as [`proto`] (so the
-//! service impls and the integration-test harness keep their existing paths)
-//! and adds the server-receive helpers in [`wire`].
+//! The generated `jammi.v1` stubs and the candle-free proto↔domain conversions
+//! live in [`jammi_wire`]; the engine-spec converters (`TrainingSpec`,
+//! edge-gather, pipeline) live in [`jammi_ai::wire`]. This module re-exports the
+//! stubs as [`proto`] (so the service impls and the integration-test harness
+//! keep their existing paths) and adds the server-receive helpers in [`wire`].
 
 pub mod audit;
 pub mod catalog;
@@ -28,5 +29,5 @@ pub mod trigger;
 pub mod wire;
 
 /// Proto-generated types for the `jammi.v1` API surface, re-exported from
-/// [`jammi_ai::wire::proto`] — the single home for the generated stubs.
-pub use jammi_ai::wire::proto;
+/// [`jammi_wire::proto`] — the single home for the generated stubs.
+pub use jammi_wire::proto;

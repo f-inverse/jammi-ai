@@ -1,17 +1,17 @@
-//! `RemoteSession` registry-listing parity and the Flight-SQL tenant-scope
+//! Data-plane client registry-listing parity and the Flight-SQL tenant-scope
 //! proof.
 //!
 //! These cover the wire surface added with the strict-client CLI:
 //!
-//! * **`sql` tenant scope (the #1 correctness proof)** — a `RemoteSession` that
+//! * **`sql` tenant scope (the #1 correctness proof)** — a `DataClient` that
 //!   binds tenant A and runs a `SELECT` over the Flight SQL lane sees *only*
 //!   tenant A's rows; a second session bound to tenant B sees only B's. This is
 //!   the test that catches the silent-unscoped-exposure failure: `bind_tenant`
 //!   and `sql` must stamp the *same* session id so the server resolves the query
 //!   to the bound tenant rather than the unscoped (all-tenants) default.
 //! * **`list_models` / `list_channels` / `list_mutable_tables` parity** — each
-//!   remote listing returns the same records a `LocalSession` over the same
-//!   engine returns.
+//!   remote listing (through the data client's composed `CatalogClient`) returns
+//!   the same records a local `Session` over the same engine returns.
 //!
 //! Hermetic: a small `tenant_id`-columned Parquet fixture is written per test
 //! (the analyzer scopes on the schema's own `tenant_id` column, so no
@@ -21,7 +21,8 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use jammi_ai::{LocalSession, Session};
+use jammi_ai::Session;
+use jammi_client::DataClient;
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
@@ -34,16 +35,15 @@ use tonic::transport::Endpoint;
 
 use super::common::grpc::{start_engine_server, tenant_a, tenant_b, EngineServer, TENANT_A};
 
-async fn remote(server: &EngineServer) -> Session {
+async fn remote(server: &EngineServer) -> DataClient {
     let endpoint = Endpoint::from_shared(format!("http://{}", server.addr)).expect("endpoint");
-    let session = jammi_ai::RemoteSession::connect(endpoint)
+    DataClient::connect(endpoint)
         .await
-        .expect("remote session connect");
-    Session::Remote(session)
+        .expect("data client connect")
 }
 
 fn local(server: &EngineServer) -> Session {
-    Session::Local(LocalSession::new(Arc::clone(&server.engine)))
+    Session::new(Arc::clone(&server.engine))
 }
 
 /// Write a Parquet file with 10 rows split 6 (tenant A) + 4 (tenant B), keyed
@@ -101,7 +101,7 @@ async fn count_via_remote(server: &EngineServer, tenant: &str) -> i64 {
     total
 }
 
-/// The mandatory tenant-scope proof: a `--tenant A` query over `RemoteSession`
+/// The mandatory tenant-scope proof: a `--tenant A` query over a `DataClient`
 /// returns only tenant A's rows, and a `--tenant B` session sees a different
 /// (B-only) count — over the Flight SQL lane, where `bind_tenant` and `sql`
 /// stamp the same session id.
@@ -115,6 +115,7 @@ async fn remote_sql_is_tenant_scoped() {
     // source registry is global here; the tenant scope applies to the *query*).
     let admin = remote(&server).await;
     admin
+        .catalog()
         .add_source(
             "notes",
             SourceType::File,
@@ -132,11 +133,11 @@ async fn remote_sql_is_tenant_scoped() {
 
     assert_eq!(
         count_a, 6,
-        "a RemoteSession bound to tenant A must see only A's 6 rows over Flight SQL"
+        "a DataClient bound to tenant A must see only A's 6 rows over Flight SQL"
     );
     assert_eq!(
         count_b, 4,
-        "a RemoteSession bound to tenant B must see only B's 4 rows over Flight SQL"
+        "a DataClient bound to tenant B must see only B's 4 rows over Flight SQL"
     );
 
     server.shutdown.send(()).ok();
@@ -161,7 +162,12 @@ async fn remote_list_models_matches_local() {
         .await
         .expect("register_model");
 
-    let remote_models = remote(&server).await.list_models().await.expect("remote");
+    let remote_models = remote(&server)
+        .await
+        .catalog()
+        .list_models()
+        .await
+        .expect("remote");
     let local_models = local(&server).list_models().await.expect("local");
 
     let remote_ids: Vec<&str> = remote_models.iter().map(|m| m.model_id.as_str()).collect();
@@ -206,7 +212,12 @@ async fn remote_list_channels_matches_local() {
         .await
         .expect("register channel");
 
-    let remote_channels = remote(&server).await.list_channels().await.expect("remote");
+    let remote_channels = remote(&server)
+        .await
+        .catalog()
+        .list_channels()
+        .await
+        .expect("remote");
     let local_channels = local(&server).list_channels().await.expect("local");
 
     assert_eq!(
@@ -247,6 +258,7 @@ async fn remote_list_mutable_tables_matches_local() {
 
     let remote_tables = remote(&server)
         .await
+        .catalog()
         .list_mutable_tables()
         .await
         .expect("remote");

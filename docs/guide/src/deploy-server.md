@@ -90,10 +90,11 @@ preload_models = [
 
 One server binary scales to many deployment shapes by mounting only the gRPC
 service tiers a deployment needs — no per-shape rebuild. The **core** tier is
-always mounted: `SessionService` (tenant binding + the `GetServerInfo`
-handshake), `EmbeddingService`, `InferenceService`, `MutableTableService`,
-`ChannelService`, `AuditService`, and the Flight SQL surface. Three optional
-tiers are runtime-selectable via `[server] services`:
+always mounted: `CatalogService` (the control plane — tenant binding, the
+`GetServerInfo` handshake, and source / model / channel / mutable-table /
+topic administration), `EmbeddingService`, `InferenceService`,
+`AuditService`, and the Flight SQL surface. Three optional tiers are
+runtime-selectable via `[server] services`:
 
 | Tier | Service | Role |
 |---|---|---|

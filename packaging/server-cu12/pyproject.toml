@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+# The `-cu12` lives in the PROJECT NAME only — NOT as a `+cu12` local version
+# segment, which PyPI rejects. This package ships at the same lockstep version as
+# the CPU `jammi-server` package and the rest of the workspace.
+name = "jammi-server-cu12"
+version = "0.25.0"
+description = "CUDA (cu12) build of the Jammi engine server — GPU-accelerated `jammi-server` binary, pip-installable"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+authors = [{ name = "F-Inverse" }]
+keywords = ["embeddings", "vector-search", "inference", "fine-tune", "server", "cuda", "gpu"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: GPU :: NVIDIA CUDA :: 12",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Database",
+]
+# candle-core 0.9.2 pins cudarc with `dynamic-linking`, so the binary carries
+# hard DT_NEEDED entries for libcudart / libcublas / libcublasLt / libcurand /
+# libnvrtc. These wheels deliver those libraries (12.6 lineage, matching the
+# CUDA 12.6 toolkit the binary is built against) so no system CUDA install is
+# needed — only an NVIDIA driver. The four packages cover cudarc 0.19.3's
+# cuda_runtime / cublas+cublasLt / curand / nvrtc feature set.
+dependencies = [
+    "nvidia-cuda-runtime-cu12==12.6.*",
+    "nvidia-cublas-cu12==12.6.*",
+    "nvidia-curand-cu12==12.6.*",
+    "nvidia-cuda-nvrtc-cu12==12.6.*",
+]
+
+[project.scripts]
+# Same command name as the CPU package — the two conflict by design; install one.
+jammi-server = "jammi_server._entry:main"
+
+[project.urls]
+Homepage = "https://github.com/f-inverse/jammi-ai"
+Documentation = "https://f-inverse.github.io/jammi-ai/"
+Repository = "https://github.com/f-inverse/jammi-ai"
+"Bug Tracker" = "https://github.com/f-inverse/jammi-ai/issues"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["jammi_server"]
+artifacts = ["jammi_server/bin/jammi-server"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["*"]

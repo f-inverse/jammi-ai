@@ -1,18 +1,23 @@
 name: Release Binaries
 
-# Publishes prebuilt CPU `jammi` CLI binaries for direct download. Triggered on
-# every `v*` tag (the workspace's release tagging scheme), alongside the
-# crates.io publish (`crates.yml`) and the server image build (`server-image.yml`).
-# This is an independent job set: a failure here cannot wedge the crates.io
-# publish, and vice versa.
+# Publishes prebuilt binaries for direct download. Triggered on every `v*` tag
+# (the workspace's release tagging scheme), alongside the crates.io publish
+# (`crates.yml`) and the server image build (`server-image.yml`). This is an
+# independent job set: a failure here cannot wedge the crates.io publish, and vice
+# versa.
 #
-# These are CPU binaries (default features — no CUDA). GPU ships via the
-# `jammi-ai-server-cu12` container image (`server-image.yml`), not as a bare
-# binary, so there is deliberately no CUDA asset here.
+# Three asset families ship:
+#   - the CPU `jammi` CLI (the `build` matrix: x86_64-linux + aarch64-darwin),
+#   - the CPU `jammi-server` tarball (`server-cpu`, x86_64-linux), and
+#   - the CUDA `jammi-server` tarball (`server-cu12`, x86_64-linux) — the binary
+#     plus the CUDA runtime `.so`s it links and an `LD_LIBRARY_PATH` launcher,
+#     so it runs on any host with an NVIDIA driver and no system CUDA install.
+# The same GPU build also ships as the `jammi-ai-server-cu12` container image
+# (`server-image.yml`) and the `jammi-server-cu12` PyPI wheel (`pypi-server-cuda.yml`).
 #
-# `workflow_dispatch` makes the build safely exercisable on a branch without
-# cutting a release: on dispatch the binaries are uploaded as workflow
-# artifacts only; the `gh release upload` step runs solely on a tag push.
+# `workflow_dispatch` makes every job safely exercisable on a branch without
+# cutting a release: on dispatch the assets are uploaded as workflow artifacts
+# only; the `gh release upload` step runs solely on a tag push.
 
 on:
   push:
@@ -94,6 +99,120 @@ jobs:
 
       # On a manual dispatch (branch exercise), publish the built artifact to the
       # workflow run instead — no release is touched.
+      - name: Upload artifact (dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.asset }}
+          path: ${{ steps.package.outputs.asset }}
+
+  # ---- CPU jammi-server tarball ----
+  # Mirrors the CPU `jammi` CLI job above: x86_64-linux, built in the CI base
+  # image (glibc 2.28 floor), with the broker + cloud-storage features that match
+  # the published server image and PyPI wheel.
+  server-cpu:
+    name: Build jammi-server (CPU)
+    runs-on: ubuntu-latest
+    container: ghcr.io/f-inverse/jammi-ai-ci:latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Build jammi-server (CPU, release)
+        run: cargo build --release -p jammi-server --bin jammi-server --features jetstream-broker,storage-cloud
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          asset="jammi-server-${version}-x86_64-unknown-linux-gnu.tar.gz"
+          strip target/release/jammi-server
+          tar -C target/release -czf "$asset" jammi-server
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release (tag push)
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" "${{ steps.package.outputs.asset }}" --clobber
+
+      - name: Upload artifact (dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.asset }}
+          path: ${{ steps.package.outputs.asset }}
+
+  # ---- CUDA jammi-server tarball ----
+  # Built in the CUDA CI base image (CUDA 12.6 toolkit). The tarball is
+  # self-sufficient: it bundles the CUDA-enabled binary, the CUDA runtime `.so`s
+  # the binary links dynamically (libcudart / libcublas / libcublasLt / libcurand
+  # / libnvrtc), and a `jammi-server` launcher that prepends the bundled `lib/`
+  # to LD_LIBRARY_PATH then execs the binary. The candle/cudarc binary has hard
+  # DT_NEEDED entries for those libraries, so it will not exec without them on the
+  # loader path; bundling makes the tarball run on any host with only an NVIDIA
+  # driver. A GPU-less runner is fine — nothing runs the binary here.
+  server-cu12:
+    name: Build jammi-server (CUDA)
+    runs-on: ubuntu-latest
+    container: ghcr.io/f-inverse/jammi-ai-ci-cuda:latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Build jammi-server (CUDA, release)
+        run: cargo build --release -p jammi-server --bin jammi-server --features cuda,jetstream-broker,storage-cloud
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          asset="jammi-server-cu12-${version}-x86_64-unknown-linux-gnu.tar.gz"
+
+          stage="jammi-server-cu12"
+          mkdir -p "${stage}/lib"
+          strip target/release/jammi-server
+          cp target/release/jammi-server "${stage}/bin-jammi-server"
+
+          # Source the exact CUDA runtime `.so`s the binary links from the
+          # toolkit baked into the CUDA CI base (CUDA 12.6 lives at
+          # /usr/local/cuda-12.6/lib64). Copy the SONAME-versioned files so the
+          # binary's DT_NEEDED entries resolve. `cp -L` follows the dev symlinks
+          # to the real versioned object.
+          cuda_lib="/usr/local/cuda-12.6/lib64"
+          for soname in libcudart libcublas libcublasLt libcurand libnvrtc; do
+            # Grab every matching versioned object (e.g. libcudart.so.12,
+            # libcudart.so.12.6.x) so the loader finds the SONAME it wants.
+            for so in "${cuda_lib}/${soname}.so".*; do
+              [ -e "$so" ] && cp -L "$so" "${stage}/lib/"
+            done
+          done
+
+          # The launcher: a host with only an NVIDIA driver has no system CUDA,
+          # so put the bundled libs on the loader path before exec. `exec`
+          # replaces the shell so signals and the exit code pass through.
+          cat > "${stage}/jammi-server" <<'LAUNCH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export LD_LIBRARY_PATH="${here}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          exec "${here}/bin-jammi-server" "$@"
+          LAUNCH
+          chmod +x "${stage}/jammi-server"
+
+          tar -czf "$asset" "$stage"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release (tag push)
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" "${{ steps.package.outputs.asset }}" --clobber
+
       - name: Upload artifact (dispatch)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4

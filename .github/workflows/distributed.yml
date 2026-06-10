@@ -92,6 +92,24 @@ jobs:
           mc alias set local http://127.0.0.1:9000 "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"
           mc mb --ignore-existing "local/${JAMMI_TEST_S3_BUCKET}"
 
+      - name: Require the distributed backends (no hollow green)
+        # The harness early-returns to a silent pass when any of these is unset
+        # (`Backends::from_env_or_skip` → None, harness.rs). On this lane the
+        # backends are always provisioned (Postgres service + in-job MinIO), so a
+        # missing var means the lane is misconfigured, not legitimately skipped —
+        # fail loudly instead of reporting a green run that exercised nothing.
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for var in JAMMI_TEST_PG_URL JAMMI_TEST_S3_ENDPOINT JAMMI_TEST_S3_BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::${var} is empty — the distributed lane would skip silently (hollow green)"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
       - name: Build the `jammi-server` binary
         # The harness spawns `jammi-server` worker processes and resolves the
         # binary next to the test executable under `{target}/{profile}/`. Build

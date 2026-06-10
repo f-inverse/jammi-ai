@@ -1,0 +1,93 @@
+name: PyPI (jammi-server, CPU)
+
+# Publishes the CPU `jammi-server` wheel to PyPI on a `py-v*` tag — the SAME tag
+# that publishes the `jammi-ai` embed wheel and the `jammi-client` wheel, so the
+# whole Python surface ships in LOCKSTEP at one version. The wheel bundles the
+# prebuilt `jammi-server` binary (compiled here in the CI base image) behind a
+# `jammi-server` console script; it is therefore a platform wheel
+# (manylinux_2_28_x86_64), not the universal py3-none-any the pure-Python clients
+# ship. Uses PyPI Trusted Publishing (OIDC) — no API token; the repo / workflow /
+# `pypi` environment is registered as a trusted publisher (a pending publisher for
+# the first release of the `jammi-server` project name) on pypi.org.
+
+on:
+  push:
+    tags: ["py-v*"]
+  workflow_dispatch:
+  # PR gate: build-only (no publish) when the packaging or the build inputs
+  # change, so a broken wheel is caught before a tag is cut.
+  pull_request:
+    paths:
+      - "packaging/server-cpu/**"
+      - ".github/workflows/pypi-server.yml"
+      - "crates/jammi-server/**"
+
+env:
+  CARGO_TERM_COLOR: always
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  build:
+    name: Build wheel (manylinux_2_28_x86_64)
+    runs-on: ubuntu-latest
+    # The CI base image (manylinux_2_28 / AlmaLinux 8) carries the Rust toolchain,
+    # protoc, and mold, and sets the glibc 2.28 floor the wheel's platform tag
+    # promises.
+    container: ghcr.io/f-inverse/jammi-ai-ci:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      # Match the Dockerfile CPU build features (Dockerfile §builder): the broker
+      # driver + the cloud object-store backends, so the published binary is
+      # deployment-agnostic without a rebuild.
+      - name: Build jammi-server (CPU, release)
+        run: cargo build --release -p jammi-server --bin jammi-server --features jetstream-broker,storage-cloud
+
+      # Inject the stripped binary into the wheel package tree. The binary is
+      # gitignored and never committed; this is the build-time source of the
+      # force-included `jammi_server/bin/jammi-server` artifact.
+      - name: Stage the binary into the wheel package
+        run: |
+          set -euo pipefail
+          strip target/release/jammi-server
+          cp target/release/jammi-server packaging/server-cpu/jammi_server/bin/jammi-server
+          chmod +x packaging/server-cpu/jammi_server/bin/jammi-server
+
+      - name: Build the wheel
+        working-directory: packaging/server-cpu
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install build wheel
+          python -m build --wheel --outdir dist
+          # A bin-bearing wheel is NOT py3-none-any. hatchling tags it
+          # py3-none-any (it sees only Python sources); relabel to the platform
+          # tag the manylinux_2_28 binary actually requires so pip installs it
+          # only on a compatible host.
+          python -m wheel tags --platform-tag manylinux_2_28_x86_64 --remove dist/*.whl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-cpu-dist
+          path: packaging/server-cpu/dist/
+
+  publish:
+    name: Publish to PyPI
+    # Tag push only — a workflow_dispatch or PR is an artifact-only dry run.
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-cpu-dist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

@@ -45,6 +45,13 @@ impl Backends {
     /// Discover the shared backends, or `None` (with a `tracing::warn` naming the
     /// first missing variable) when the lane is unconfigured. A test calls this
     /// first and early-returns on `None` — the no-`#[ignore]` skip discipline.
+    ///
+    /// On CI this skip path can never fire silently: the distributed workflow
+    /// hard-requires every one of these variables (`JAMMI_TEST_PG_URL`,
+    /// `JAMMI_TEST_S3_ENDPOINT`, `JAMMI_TEST_S3_BUCKET`, `AWS_ACCESS_KEY_ID`,
+    /// `AWS_SECRET_ACCESS_KEY`) before the test step and fails the job loudly if
+    /// any is empty, so a configured lane that skips would be a red run, not a
+    /// hollow green. The skip path stays for ad-hoc local runs without backends.
     pub fn from_env_or_skip(test: &str) -> Option<Self> {
         fn var(name: &str) -> Option<String> {
             std::env::var(name).ok().filter(|s| !s.is_empty())

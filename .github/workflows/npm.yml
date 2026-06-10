@@ -28,9 +28,11 @@ jobs:
       run:
         working-directory: clients/typescript
     permissions:
-      # `id-token: write` lets `npm publish --provenance` mint a signed
-      # provenance attestation (and sets up the later OIDC trusted-publishing
-      # migration); `contents: read` is the checkout default.
+      # `id-token: write` authenticates the publish via npm OIDC Trusted
+      # Publishing (no stored `NPM_TOKEN`) and mints the signed provenance
+      # attestation; `contents: read` is the checkout default. The npm package
+      # `@f-inverse/jammi-client` registers this repo + workflow as a trusted
+      # publisher (the npm analogue of the PyPI/crates.io trusted publishers).
       contents: read
       id-token: write
     steps:
@@ -40,6 +42,12 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
+
+      # Trusted Publishing (OIDC) auto-auth needs a recent npm; Node 22 ships an
+      # older npm. Upgrade so `npm publish` exchanges the GitHub OIDC token for a
+      # short-lived publish credential — no long-lived secret to expire.
+      - name: Upgrade npm (OIDC trusted publishing)
+        run: npm install -g npm@latest
 
       - name: Verify tag matches package version
         if: github.event_name == 'push'
@@ -64,9 +72,12 @@ jobs:
       - name: Test (hermetic)
         run: npm run test
 
+      # Publishes via OIDC Trusted Publishing — no `NODE_AUTH_TOKEN` / `NPM_TOKEN`.
+      # `npm publish` detects the GitHub Actions OIDC environment (`id-token:
+      # write`) and exchanges it for a short-lived publish credential, and emits
+      # provenance automatically. Requires the npm package to register this repo
+      # + workflow as a trusted publisher.
       - name: Publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           # On a tag push, derive the version from the tag (v0.13.0 -> 0.13.0);

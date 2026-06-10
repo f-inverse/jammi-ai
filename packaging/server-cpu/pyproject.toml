@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jammi-server"
+version = "0.25.0"
+description = "CPU build of the Jammi engine server — `jammi-server` console binary, pip-installable"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+authors = [{ name = "F-Inverse" }]
+keywords = ["embeddings", "vector-search", "inference", "fine-tune", "server"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Database",
+]
+
+[project.scripts]
+jammi-server = "jammi_server._entry:main"
+
+[project.urls]
+Homepage = "https://github.com/f-inverse/jammi-ai"
+Documentation = "https://f-inverse.github.io/jammi-ai/"
+Repository = "https://github.com/f-inverse/jammi-ai"
+"Bug Tracker" = "https://github.com/f-inverse/jammi-ai/issues"
+
+[tool.hatch.build.targets.wheel]
+# The wheel carries the Python launch shim AND the compiled `jammi-server`
+# binary. `only-include` keeps the package tree tight; `artifacts` force-includes
+# the binary, which hatchling otherwise drops because it is not a `.py` file (and
+# is gitignored — CI injects it under `jammi_server/bin/` before the build).
+only-include = ["jammi_server"]
+artifacts = ["jammi_server/bin/jammi-server"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["*"]

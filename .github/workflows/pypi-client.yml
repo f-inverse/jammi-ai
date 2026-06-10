@@ -48,6 +48,8 @@ jobs:
 
   publish:
     name: Publish to PyPI
+    # Tag push only — a workflow_dispatch is an artifact-only dry run.
+    if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-latest
     environment: pypi

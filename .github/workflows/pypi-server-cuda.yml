@@ -1,0 +1,123 @@
+name: PyPI (jammi-server-cu12, CUDA)
+
+# Publishes the CUDA (cu12) `jammi-server-cu12` wheel to PyPI on a `py-v*` tag —
+# the SAME lockstep tag as the CPU `jammi-server`, `jammi-ai`, and `jammi-client`
+# wheels. The wheel bundles the CUDA-enabled `jammi-server` binary behind a
+# `jammi-server` console script and depends on `nvidia-*-cu12` wheels for the CUDA
+# runtime libraries; the console-script shim puts them on `LD_LIBRARY_PATH` before
+# exec. It is a platform wheel (manylinux_2_28_x86_64), not py3-none-any.
+#
+# The build is two jobs. The binary is compiled in the CUDA CI base image (CUDA
+# 12.6 toolkit) because cudarc's `cuda-version-from-build-system` needs nvcc / the
+# toolkit at compile time, and the manylinux_2_28 base sets the glibc 2.28 floor
+# the platform tag promises; a GPU-less runner is fine — nothing runs the binary
+# here. The wheel is then packaged on a plain python runner (the CI image carries
+# no bare `python` on PATH); the manylinux_2_28 tag stays honest because the
+# BINARY came out of the manylinux container. auditwheel is deliberately SKIPPED:
+# it would vendor the CUDA `.so`s into the wheel and break the `nvidia-*-cu12`
+# dependency model (and reject the unvendorable DT_NEEDED); the platform tag is
+# relabelled by hand instead. Uses PyPI Trusted Publishing (OIDC) — no API token;
+# the `pypi` environment is a registered trusted publisher (pending for the first
+# `jammi-server-cu12` release).
+
+on:
+  push:
+    tags: ["py-v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "packaging/server-cu12/**"
+      - ".github/workflows/pypi-server-cuda.yml"
+      - "crates/jammi-server/**"
+
+env:
+  CARGO_TERM_COLOR: always
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  build-binary:
+    name: Build jammi-server binary (CUDA, manylinux_2_28)
+    runs-on: ubuntu-latest
+    # The CUDA CI base extends jammi-ai-ci with the CUDA 12.6 toolkit (nvcc),
+    # GCC 13, and CUDA_COMPUTE_CAP=86 — what candle's CUDA backend needs to
+    # compile. No GPU is required to build.
+    container: ghcr.io/f-inverse/jammi-ai-ci-cuda:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      # `cuda` pulls in candle's CUDA backend (compute capability 86); the broker
+      # + cloud-storage features match the CPU build so the GPU binary is equally
+      # deployment-agnostic.
+      - name: Build jammi-server (CUDA, release)
+        run: cargo build --release -p jammi-server --bin jammi-server --features cuda,jetstream-broker,storage-cloud
+
+      - name: Strip the binary
+        run: strip target/release/jammi-server
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-cu12-binary
+          path: target/release/jammi-server
+
+  build-wheel:
+    name: Package wheel (manylinux_2_28_x86_64)
+    needs: build-binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-cu12-binary
+          path: artifact
+
+      # Stage the prebuilt binary into the wheel package tree. GitHub artifacts
+      # do not preserve the exec bit, so re-apply it.
+      - name: Stage the binary into the wheel package
+        run: |
+          set -euo pipefail
+          cp artifact/jammi-server packaging/server-cu12/jammi_server/bin/jammi-server
+          chmod +x packaging/server-cu12/jammi_server/bin/jammi-server
+
+      - name: Build the wheel
+        working-directory: packaging/server-cu12
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install build wheel
+          python -m build --wheel --outdir dist
+          # Relabel to the platform tag only — NO auditwheel. The binary links
+          # the CUDA `.so`s dynamically and they arrive via the `nvidia-*-cu12`
+          # dependency wheels at install time; vendoring them here would break
+          # that model.
+          python -m wheel tags --platform-tag manylinux_2_28_x86_64 --remove dist/*.whl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-cu12-dist
+          path: packaging/server-cu12/dist/
+
+  publish:
+    name: Publish to PyPI
+    # Tag push only — a workflow_dispatch or PR is an artifact-only dry run.
+    if: github.event_name == 'push'
+    needs: build-wheel
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-cu12-dist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

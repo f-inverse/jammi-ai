@@ -47,6 +47,13 @@ clients/python/dist/
 clients/python/build/
 clients/python/*.egg-info/
 
+# Server wheels (jammi-server / jammi-server-cu12) — the compiled `jammi-server`
+# binary is injected under `jammi_server/bin/` by CI at build time, never
+# committed. The `.gitkeep` keeps the directory; the binary itself is ignored.
+packaging/*/jammi_server/bin/jammi-server
+packaging/*/dist/
+packaging/*/build/
+
 # In-repo cargo target + tmp dirs (CARGO_TARGET_DIR / TMPDIR for local gating)
 .cargo-target/
 .target/

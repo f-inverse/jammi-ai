@@ -309,9 +309,9 @@ def test_get_server_info_shape_agrees_across_transports(tmp_path):
     Hermetic: the embedded side opens a real local engine; the remote side reads
     the generated proto descriptor, never dialing a server.
     """
-    from jammi_client._generated.jammi.v1 import session_pb2
+    from jammi_client._generated.jammi.v1 import catalog_pb2
 
-    proto_fields = {f.name for f in session_pb2.ServerInfo.DESCRIPTOR.fields}
+    proto_fields = {f.name for f in catalog_pb2.ServerInfo.DESCRIPTOR.fields}
 
     embedded = jammi_ai.connect(f"file://{tmp_path}").get_server_info()
     assert set(embedded) == proto_fields, (

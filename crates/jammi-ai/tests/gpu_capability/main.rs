@@ -8,13 +8,17 @@
 //! (the cookbook `tiny_bert` encoder, `patents.parquet`, and the synthetic
 //! graph / meta-dataset fixtures the CPU suites already use):
 //!
-//! - **P1 — CPU↔GPU parity** for the deterministic verbs. The *same* input runs
-//!   through a `gpu.device=0` session and a `gpu.device=-1` (CPU) session
-//!   against the *same* fixtures, and the outputs must agree within an explicit
-//!   tolerance. Parity is the decisive proof: a wrong GPU kernel or a dtype bug
-//!   breaks it. Verbs: `generate_text_embeddings`, `encode_text_query`,
-//!   `propagate_embeddings` (SGC / APPNP), and the context-predictor `predict`
-//!   forward pass (over one trained predictor, served on each device).
+//! - **P1 — CPU↔GPU parity** for the verbs with a real GPU kernel. The *same*
+//!   input runs through a `gpu.device=0` session and a `gpu.device=-1` (CPU)
+//!   session against the *same* fixtures, and the outputs must agree within an
+//!   explicit tolerance. Parity is the decisive proof: a wrong GPU kernel or a
+//!   dtype bug breaks it. Verbs: `generate_text_embeddings`, `encode_text_query`,
+//!   and the context-predictor `predict` forward pass (over one trained
+//!   predictor, served on each device).
+//!   `propagate_embeddings` (SGC / APPNP) is also exercised on both devices, but
+//!   propagation has **no GPU kernel** — it is a deterministic CPU `f64` fold —
+//!   so its test asserts *device-independence* (bit-identical output regardless
+//!   of `gpu.device`), not GPU-kernel parity. See `graph_propagation_parity`.
 //! - **P2 — `fine_tune` learns on GPU.** A tiny real LoRA run on `gpu.device=0`
 //!   completes, its training loss decreases first→last epoch, and the resulting
 //!   adapter changes embeddings vs the base model (the on-device training math

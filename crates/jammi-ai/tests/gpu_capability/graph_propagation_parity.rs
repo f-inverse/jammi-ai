@@ -1,11 +1,19 @@
-//! P1 — CPU↔GPU parity for `propagate_embeddings` (the decoupled-GNN forward
-//! pass, SGC and APPNP).
+//! P1 — `propagate_embeddings` is device-independent (SGC and APPNP).
+//!
+//! Unlike the embedding / encode / predict verbs, graph propagation has **no
+//! GPU kernel**: it is a fixed-order `f64` fold in Rust with a single final
+//! `f32` cast (see `pipeline::graph_propagation`), deterministic and identical
+//! regardless of the session's `gpu.device`. So this is not a GPU-kernel parity
+//! proof (there is nothing on the GPU to diverge) — it is a **device-independence
+//! + determinism guard**: the GPU-pinned session (which really holds CUDA, via
+//! `require_gpu`) and the CPU-pinned session run the same propagation over the
+//! same fixture and must produce **bit-identical** per-node vectors. A
+//! regression that routed propagation through a device-sensitive path, or made
+//! it non-deterministic, would break the exact equality.
 //!
 //! A synthetic homophilous two-class graph (a neutral citation-/co-purchase-style
 //! fixture, mirroring the CPU `it::graph_propagation` setup) carries one feature
-//! vector per node. The same propagation request runs on a CPU-pinned and a
-//! GPU-pinned session; the propagated per-node vectors (keyed by `_row_id`) must
-//! match within the parity tolerance, for both the SGC weighting (`α = 0`,
+//! vector per node, propagated under both the SGC weighting (`α = 0`,
 //! degree-normalised, multi-hop) and the APPNP weighting (`α`-restart).
 
 use std::collections::HashMap;
@@ -240,9 +248,17 @@ async fn read_table_vectors(
     out
 }
 
-/// Run the same propagation request, built by `tune`, on a CPU and a GPU session
-/// and assert per-node parity.
-async fn parity_for(label: &str, tune: impl Fn(PropagateRequest) -> PropagateRequest) {
+/// Run the same propagation request, built by `tune`, on a CPU-pinned and a
+/// GPU-pinned session and assert the per-node vectors are **bit-identical**.
+///
+/// Propagation has no GPU kernel (a deterministic `f64` fold), so the invariant
+/// is exact equality, not a tolerance: the GPU-pinned session — which genuinely
+/// holds CUDA (`require_gpu`) — must route propagation through the same
+/// device-independent CPU path and produce the same bytes as the CPU session.
+async fn device_independence_for(
+    label: &str,
+    tune: impl Fn(PropagateRequest) -> PropagateRequest,
+) {
     let (nodes, edges) = two_class_homophilous(6);
 
     let (cpu, _cd) = graph_session(&nodes, &edges, true).await;
@@ -262,23 +278,23 @@ async fn parity_for(label: &str, tune: impl Fn(PropagateRequest) -> PropagateReq
     assert_eq!(cpu_vecs.len(), nodes.len(), "all nodes present (CPU)");
     assert_eq!(gpu_vecs.len(), nodes.len(), "all nodes present (GPU)");
 
-    let mut worst_cos = 1.0f64;
-    let mut worst_abs = 0.0f64;
     for (id, cpu_v) in &cpu_vecs {
         let gpu_v = gpu_vecs.get(id).expect("matching node on GPU");
-        let (cos, abs) = harness::assert_parity(&format!("{label}[{id}]"), cpu_v, gpu_v);
-        worst_cos = worst_cos.min(cos);
-        worst_abs = worst_abs.max(abs);
+        assert_eq!(
+            cpu_v, gpu_v,
+            "{label}[{id}]: propagation is device-independent, so the GPU-pinned \
+             and CPU-pinned sessions must produce bit-identical vectors"
+        );
     }
-    tracing::info!(label, worst_cos, worst_abs, "propagate parity");
+    tracing::info!(label, nodes = nodes.len(), "propagate device-independence (Δ = 0)");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn propagate_sgc_cpu_gpu_parity() {
+async fn propagate_sgc_is_device_independent() {
     skip_without_gpu!();
     harness::loss_capture::install();
     // SGC: no restart, degree-normalised Â, three hops.
-    parity_for("propagate_sgc", |r| {
+    device_independence_for("propagate_sgc", |r| {
         r.with_weighting(PropagationWeighting::DegreeNormalized)
             .with_alpha(0.0)
             .with_hops(3)
@@ -287,11 +303,11 @@ async fn propagate_sgc_cpu_gpu_parity() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn propagate_appnp_cpu_gpu_parity() {
+async fn propagate_appnp_is_device_independent() {
     skip_without_gpu!();
     harness::loss_capture::install();
     // APPNP: personalised-PageRank restart (α = 0.3), degree-normalised, three hops.
-    parity_for("propagate_appnp", |r| {
+    device_independence_for("propagate_appnp", |r| {
         r.with_weighting(PropagationWeighting::DegreeNormalized)
             .with_alpha(0.3)
             .with_hops(3)

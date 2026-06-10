@@ -255,10 +255,7 @@ async fn read_table_vectors(
 /// is exact equality, not a tolerance: the GPU-pinned session — which genuinely
 /// holds CUDA (`require_gpu`) — must route propagation through the same
 /// device-independent CPU path and produce the same bytes as the CPU session.
-async fn device_independence_for(
-    label: &str,
-    tune: impl Fn(PropagateRequest) -> PropagateRequest,
-) {
+async fn device_independence_for(label: &str, tune: impl Fn(PropagateRequest) -> PropagateRequest) {
     let (nodes, edges) = two_class_homophilous(6);
 
     let (cpu, _cd) = graph_session(&nodes, &edges, true).await;
@@ -286,7 +283,11 @@ async fn device_independence_for(
              and CPU-pinned sessions must produce bit-identical vectors"
         );
     }
-    tracing::info!(label, nodes = nodes.len(), "propagate device-independence (Δ = 0)");
+    tracing::info!(
+        label,
+        nodes = nodes.len(),
+        "propagate device-independence (Δ = 0)"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -184,7 +184,7 @@ jobs:
           # binary's DT_NEEDED entries resolve. `cp -L` follows the dev symlinks
           # to the real versioned object.
           cuda_lib="/usr/local/cuda-12.6/lib64"
-          for soname in libcudart libcublas libcublasLt libcurand libnvrtc; do
+          for soname in libcudart libcublas libcublasLt libcurand libnvrtc libnvrtc-builtins; do
             # Grab every matching versioned object (e.g. libcudart.so.12,
             # libcudart.so.12.6.x) so the loader finds the SONAME it wants.
             for so in "${cuda_lib}/${soname}.so".*; do

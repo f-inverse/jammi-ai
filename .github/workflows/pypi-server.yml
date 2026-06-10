@@ -3,12 +3,19 @@ name: PyPI (jammi-server, CPU)
 # Publishes the CPU `jammi-server` wheel to PyPI on a `py-v*` tag — the SAME tag
 # that publishes the `jammi-ai` embed wheel and the `jammi-client` wheel, so the
 # whole Python surface ships in LOCKSTEP at one version. The wheel bundles the
-# prebuilt `jammi-server` binary (compiled here in the CI base image) behind a
-# `jammi-server` console script; it is therefore a platform wheel
-# (manylinux_2_28_x86_64), not the universal py3-none-any the pure-Python clients
-# ship. Uses PyPI Trusted Publishing (OIDC) — no API token; the repo / workflow /
-# `pypi` environment is registered as a trusted publisher (a pending publisher for
-# the first release of the `jammi-server` project name) on pypi.org.
+# prebuilt `jammi-server` binary behind a `jammi-server` console script; it is
+# therefore a platform wheel (manylinux_2_28_x86_64), not the universal
+# py3-none-any the pure-Python clients ship.
+#
+# The build is two jobs: the binary is compiled in the CI base image
+# (manylinux_2_28 / AlmaLinux 8) so it inherits the glibc 2.28 floor the platform
+# tag promises; the wheel is then packaged on a plain python runner (the CI image
+# carries no bare `python` on PATH). The manylinux_2_28 tag stays honest because
+# the BINARY came out of the manylinux container — packaging the surrounding zip
+# elsewhere does not change what the binary requires. Uses PyPI Trusted Publishing
+# (OIDC) — no API token; the repo / workflow / `pypi` environment is registered as
+# a trusted publisher (a pending publisher for the first release of the
+# `jammi-server` project name) on pypi.org.
 
 on:
   push:
@@ -27,8 +34,8 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
-  build:
-    name: Build wheel (manylinux_2_28_x86_64)
+  build-binary:
+    name: Build jammi-server binary (manylinux_2_28)
     runs-on: ubuntu-latest
     # The CI base image (manylinux_2_28 / AlmaLinux 8) carries the Rust toolchain,
     # protoc, and mold, and sets the glibc 2.28 floor the wheel's platform tag
@@ -45,14 +52,38 @@ jobs:
       - name: Build jammi-server (CPU, release)
         run: cargo build --release -p jammi-server --bin jammi-server --features jetstream-broker,storage-cloud
 
-      # Inject the stripped binary into the wheel package tree. The binary is
+      - name: Strip the binary
+        run: strip target/release/jammi-server
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-cpu-binary
+          path: target/release/jammi-server
+
+  build-wheel:
+    name: Package wheel (manylinux_2_28_x86_64)
+    needs: build-binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-cpu-binary
+          path: artifact
+
+      # Stage the prebuilt binary into the wheel package tree. The binary is
       # gitignored and never committed; this is the build-time source of the
-      # force-included `jammi_server/bin/jammi-server` artifact.
+      # force-included `jammi_server/bin/jammi-server` artifact. GitHub artifacts
+      # do not preserve the exec bit, so re-apply it.
       - name: Stage the binary into the wheel package
         run: |
           set -euo pipefail
-          strip target/release/jammi-server
-          cp target/release/jammi-server packaging/server-cpu/jammi_server/bin/jammi-server
+          cp artifact/jammi-server packaging/server-cpu/jammi_server/bin/jammi-server
           chmod +x packaging/server-cpu/jammi_server/bin/jammi-server
 
       - name: Build the wheel
@@ -77,7 +108,7 @@ jobs:
     name: Publish to PyPI
     # Tag push only — a workflow_dispatch or PR is an artifact-only dry run.
     if: github.event_name == 'push'
-    needs: build
+    needs: build-wheel
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

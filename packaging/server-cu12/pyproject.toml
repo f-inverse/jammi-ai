@@ -28,14 +28,18 @@ classifiers = [
 ]
 # candle-core 0.9.2 pins cudarc with `dynamic-linking`, so the binary carries
 # hard DT_NEEDED entries for libcudart / libcublas / libcublasLt / libcurand /
-# libnvrtc. These wheels deliver those libraries (12.6 lineage, matching the
-# CUDA 12.6 toolkit the binary is built against) so no system CUDA install is
+# libnvrtc. These wheels deliver those libraries so no system CUDA install is
 # needed — only an NVIDIA driver. The four packages cover cudarc 0.19.3's
 # cuda_runtime / cublas+cublasLt / curand / nvrtc feature set.
+#
+# Each pin tracks that library's OWN release lineage, not a single CUDA version
+# string. cuda-runtime / cublas / nvrtc follow the CUDA 12.6 line (==12.6.*), but
+# cuRAND ships on its own SONAME-10 versioning — the CUDA-12.6-generation cuRAND
+# is the 10.3.x line (10.3.7.77), so its pin is ==10.3.7.*, not 12.6.*.
 dependencies = [
     "nvidia-cuda-runtime-cu12==12.6.*",
     "nvidia-cublas-cu12==12.6.*",
-    "nvidia-curand-cu12==12.6.*",
+    "nvidia-curand-cu12==10.3.7.*",
     "nvidia-cuda-nvrtc-cu12==12.6.*",
 ]
 

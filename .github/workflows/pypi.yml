@@ -3,6 +3,11 @@ name: PyPI
 on:
   push:
     tags: ["py-v*"]
+  # Manual re-run to finish a release whose embed-wheel publish was interrupted.
+  # The wheel version comes from the checked-out source (maturin reads
+  # Cargo.toml), so dispatch from the release commit / `main` at the release
+  # version; PyPI rejects a re-upload of an existing version, so this is safe.
+  workflow_dispatch:
 
 jobs:
   build-linux:
@@ -44,10 +49,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      # The embed wheel is local-only — `jammi-python` no longer enables
-      # `jammi-ai/wire`, so nothing here compiles the gRPC proto and no protoc
-      # is needed. (The remote arm is the pure-Python `jammi-client`, published
-      # in lockstep by pypi-client.yml on the same `py-v*` tag.)
+      # The embed wheel depends on `jammi-wire`, whose `build.rs` compiles the
+      # `jammi.v1` protos with `protoc` on every build (it is the proto/stub
+      # owner). The Linux leg gets `protoc` from the CI base image; the macOS
+      # runners do not ship it, so install it here. (The remote arm is still the
+      # pure-Python `jammi-client`, published in lockstep by pypi-client.yml.)
+      - name: Install protoc (macOS)
+        run: brew install protobuf
+
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:

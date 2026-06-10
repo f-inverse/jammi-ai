@@ -211,6 +211,32 @@ The typed gRPC surface is what an edge runtime speaks (it has no HTTP/2 client f
 
 The server drains active connections on SIGTERM / Ctrl+C before exiting. In-flight queries complete; long-running operations started via the library are unaffected.
 
+## Security posture: trusted-network
+
+The server performs **no authentication**. There is no token, bearer, or
+credential check on the gRPC or Flight SQL surfaces, and `SetTenant` binds
+whatever tenant a caller asks for — so **any client that can reach the
+endpoint can claim any tenant and invoke any mounted verb**. Tenant scope is an
+isolation boundary *within* a trusted caller's traffic (it keeps one tenant's
+rows out of another's results), **not** an access-control boundary against an
+untrusted one. This holds for both surfaces equally: the `jammi` admin CLI
+(control plane) and the SDK data plane.
+
+Treat the server as **trusted-network**: run it where only trusted clients can
+reach it, and supply access control with your own infrastructure —
+
+- a private network / VPC with the gRPC + health ports (`8081` / `8080`) closed
+  to the public internet;
+- network policy, security groups, or a firewall restricting who may connect;
+- or an authenticating reverse proxy / gateway in front (e.g. mTLS, or a proxy
+  that validates identity and injects the tenant), terminating untrusted traffic
+  before it reaches the engine.
+
+Do not expose the endpoint directly to an untrusted network. The engine does
+not invent or verify identities — that is a deployment concern layered above it
+([ADR-00](https://github.com/f-inverse/jammi-ai/blob/main/docs/plans/cp9-substrate-primitives/ADR-00-tenant-identifier.md),
+*Engine does not invent tenants*).
+
 ## Deploying as a container
 
 The OSS server ships as two public Docker images on GHCR:

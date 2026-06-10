@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
-use jammi_ai::wire::{definition_from_proto, parse_table_id};
+use jammi_ai::wire::{definition_from_proto, definition_to_proto, parse_table_id};
 use jammi_ai::{LocalSession, Session};
 use tonic::{Request, Response, Status};
 
@@ -87,5 +87,26 @@ impl MutableTableService for MutableTableServer {
             .map_err(map_engine_error)?;
 
         Ok(Response::new(()))
+    }
+
+    async fn list_mutable_tables(
+        &self,
+        request: Request<pb::ListMutableTablesRequest>,
+    ) -> Result<Response<pb::ListMutableTablesResponse>, Status> {
+        let tenant = session_tenant(&request);
+        let session = self.local();
+
+        let defs = scoped(&self.session, tenant, || session.list_mutable_tables())
+            .await
+            .map_err(map_engine_error)?;
+
+        // The wire body stays tenant-free (the catalog row's tenant is the
+        // session scope, not a message field), so each definition encodes the
+        // same projection the create path carries.
+        let definitions = defs
+            .iter()
+            .map(definition_to_proto)
+            .collect::<Result<Vec<_>, Status>>()?;
+        Ok(Response::new(pb::ListMutableTablesResponse { definitions }))
     }
 }

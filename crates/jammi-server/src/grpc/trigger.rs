@@ -12,7 +12,10 @@
 //!   returns the assigned offset and commit timestamp.
 //! * `Subscribe` — server-streaming; builds an engine `Subscription` and
 //!   forwards every `DeliveredBatch` as a `SubscribedBatch` until the
-//!   client cancels.
+//!   client cancels. With `replay_only` set, it instead drives the engine's
+//!   finite `replay_only` drain and closes the stream after the retained
+//!   replay window — the bounded primitive a one-shot `--no-follow` drain needs,
+//!   since the open-ended subscribe stream cannot terminate on its own.
 //! * `ListTopics` — unary; pages through the `topics` catalog row set.
 //!
 //! Tenant scope is read from the request's `SessionTenant` extension (set
@@ -172,6 +175,27 @@ impl TriggerService for TriggerServer {
             Predicate::from_sql(&self.session_ctx, Arc::clone(&topic.schema), &req.predicate)
                 .map_err(map_trigger_error)?;
         let from_offset = req.from_offset.map(|v| Offset::new(v, chrono::Utc::now()));
+        let topic_schema = Arc::clone(&topic.schema);
+
+        if req.replay_only {
+            // The finite-drain primitive: the open-ended `subscribe` stream
+            // cannot terminate on its own, so a bounded `--no-follow` drain
+            // drives the engine's `replay_only` path instead. It returns the
+            // retained replay window as a `Vec`, which encodes into a finite
+            // stream that yields those batches and ends — the wire-side analogue
+            // of the local arm's `Subscriber::replay_only`.
+            let drained = self
+                .subscriber
+                .replay_only_scoped(&topic, tenant, predicate, from_offset)
+                .await
+                .map_err(map_trigger_error)?;
+            let encoded: Vec<Result<SubscribedBatch, Status>> = drained
+                .into_iter()
+                .map(|delivered| encode_delivered_batch(&topic_schema, delivered))
+                .collect();
+            let out_stream = futures::stream::iter(encoded);
+            return Ok(Response::new(Box::pin(out_stream) as Self::SubscribeStream));
+        }
 
         let mut inner = self
             .subscriber
@@ -180,7 +204,6 @@ impl TriggerService for TriggerServer {
             .map_err(map_trigger_error)?;
 
         let (tx, rx) = mpsc::channel::<Result<SubscribedBatch, Status>>(SUBSCRIBE_BUFFER);
-        let topic_schema = Arc::clone(&topic.schema);
         tokio::spawn(async move {
             while let Some(item) = inner.next().await {
                 let result = item

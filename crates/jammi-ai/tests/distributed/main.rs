@@ -2,7 +2,7 @@
 //! training-worker fleet.
 //!
 //! This harness proves the fleet-safety claims under *real* distribution: N
-//! worker **processes** (`jammi serve`, train tier) claiming from a **shared**
+//! worker **processes** (`jammi-server`, train tier) claiming from a **shared**
 //! Postgres catalog and a **shared** object store (MinIO) under lease-based
 //! reclaim. Unlike the in-process `it::fine_tune` durability tests — which drive
 //! one `TrainingWorker` per `tokio` task against a local SQLite catalog and a

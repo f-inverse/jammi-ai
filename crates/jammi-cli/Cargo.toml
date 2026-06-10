@@ -16,9 +16,20 @@ name = "jammi"
 path = "src/main.rs"
 
 [dependencies]
+# The CLI is a strict gRPC client: it talks to a running `jammi-server` over the
+# wire and never touches the catalog/DB in-process. It depends on `jammi-ai` for
+# the thin `wire`-only transport surface (the `Session` / `Target` / request
+# shapes) and pulls no embedded ML stack — `default-features = false` drops the
+# `local` feature, `wire` turns on `RemoteSession` + `Jammi::open(Remote)`.
 jammi-db.workspace = true
-jammi-ai.workspace = true
-jammi-server.workspace = true
+jammi-ai = { workspace = true, default-features = false, features = ["wire"] }
+# Building the `tonic::transport::Endpoint` that `Target::Remote` carries from
+# the translated `--target` URL. Part of the transport stack the wire surface
+# already pulls; candle-free.
+tonic.workspace = true
+# The trigger publish path builds Arrow `RecordBatch`es from `--row` / JSON, and
+# the trigger predicate is parsed to SQL through a local empty `SessionContext`
+# (parsing only — no catalog), so the CLI keeps arrow + datafusion.
 arrow.workspace = true
 arrow-schema.workspace = true
 chrono.workspace = true
@@ -29,26 +40,8 @@ tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
-[features]
-cuda  = ["jammi-ai/cuda"]
-metal = ["jammi-ai/metal"]
-
-# Cloud object-store backends, forwarded to `jammi-server` (and onward to
-# `jammi-db`). The shipped `jammi` binary that reads `s3://` / `r2://` / `gs://` /
-# `azure://` result roots and writes trained-model artifacts to them needs the
-# matching driver compiled in; a build without these carries no cloud driver and
-# fails closed with `SchemeNotEnabled` on the first cloud object-store request.
-# Individual features let a build compile in only the cloud it targets.
-storage-s3 = ["jammi-server/storage-s3"]
-storage-gcs = ["jammi-server/storage-gcs"]
-storage-azure = ["jammi-server/storage-azure"]
-storage-r2 = ["jammi-server/storage-r2"]
-storage-cloud = ["jammi-server/storage-cloud"]
-
-# docs.rs builds with default features only. Pin the feature set to empty so a
-# future `default` change can never make the docs.rs builder invoke nvcc (the
-# `cuda` feature pulls candle's CUDA backend, which needs a CUDA toolchain
-# docs.rs does not provide).
+# docs.rs builds with default features only. The thin client carries no feature
+# flags, so this pins the empty set explicitly.
 [package.metadata.docs.rs]
 features = []
 

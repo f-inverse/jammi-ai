@@ -36,7 +36,8 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use futures::{Stream, StreamExt};
+use arrow_flight::sql::client::FlightSqlServiceClient;
+use futures::{Stream, StreamExt, TryStreamExt};
 use tonic::codegen::InterceptedService;
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
@@ -46,6 +47,7 @@ use tonic::{Request, Status};
 use std::collections::{BTreeMap, HashMap};
 
 use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
+use jammi_db::catalog::model_repo::ModelRecord;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::error::{JammiError, Result};
@@ -62,19 +64,24 @@ use crate::wire::proto::audit::{
     AuditFetchByQueryIdRequest, AuditFetchRecentRequest, AuditLogRequest,
 };
 use crate::wire::proto::channel::channel_service_client::ChannelServiceClient;
-use crate::wire::proto::channel::{AddChannelColumnsRequest, RegisterChannelRequest};
+use crate::wire::proto::channel::{
+    AddChannelColumnsRequest, ListChannelsRequest, RegisterChannelRequest,
+};
 use crate::wire::proto::embedding::embedding_service_client::EmbeddingServiceClient;
 use crate::wire::proto::embedding::{
     encode_query_request::Input as ProtoEncodeInput, search_request::Query as ProtoSearchQuery,
     AddSourceRequest, DescribeSourceRequest, EncodeQueryRequest, GenerateEmbeddingsRequest,
-    ListSourcesRequest, QueryVector, RemoveSourceRequest, SearchRequest, SearchResponse,
+    ListModelsRequest, ListSourcesRequest, QueryVector, RemoveSourceRequest, SearchRequest,
+    SearchResponse,
 };
 use crate::wire::proto::eval as eval_pb;
 use crate::wire::proto::eval::eval_service_client::EvalServiceClient;
 use crate::wire::proto::inference::inference_service_client::InferenceServiceClient;
 use crate::wire::proto::inference::InferRequest;
 use crate::wire::proto::mutable_table::mutable_table_service_client::MutableTableServiceClient;
-use crate::wire::proto::mutable_table::{CreateMutableTableRequest, DropMutableTableRequest};
+use crate::wire::proto::mutable_table::{
+    CreateMutableTableRequest, DropMutableTableRequest, ListMutableTablesRequest,
+};
 use crate::wire::proto::session::session_service_client::SessionServiceClient;
 use crate::wire::proto::session::{SetTenantRequest, Tenant};
 use crate::wire::proto::training::training_service_client::TrainingServiceClient;
@@ -88,11 +95,12 @@ use crate::wire::proto::trigger::{
     TopicName,
 };
 use crate::wire::{
-    audit_error_from_status, cohorts_to_proto, columns_to_proto, config_to_proto,
-    decode_ipc_stream, decode_subscribed_batch, definition_to_proto, encode_ipc_stream,
-    encode_publish_batch, error_from_status, eval_task_to_proto, method_to_proto,
-    model_task_to_proto, record_from_wire, result_table_from_proto, source_descriptor_from_proto,
-    source_type_to_proto, topic_from_proto, trigger_error_from_status, SESSION_HEADER,
+    audit_error_from_status, channel_from_proto, cohorts_to_proto, columns_to_proto,
+    config_to_proto, decode_ipc_stream, decode_subscribed_batch, definition_list_from_proto,
+    definition_to_proto, encode_ipc_stream, encode_publish_batch, error_from_status,
+    eval_task_to_proto, method_to_proto, model_from_proto, model_task_to_proto, record_from_wire,
+    result_table_from_proto, source_descriptor_from_proto, source_type_to_proto, topic_from_proto,
+    trigger_error_from_status, SESSION_HEADER,
 };
 use crate::{Modality, QueryInput, SearchQuery, SearchRequest as SessionSearch};
 
@@ -243,6 +251,22 @@ impl RemoteSession {
             .collect()
     }
 
+    pub(crate) async fn list_models(&self) -> Result<Vec<ModelRecord>> {
+        let resp = self
+            .embedding_client()
+            .list_models(ListModelsRequest {})
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        // Each entry rebuilds the same record the in-process path returns; a
+        // corrupt task on an entry surfaces as the faithful status the decoder
+        // builds.
+        resp.models
+            .into_iter()
+            .map(|m| model_from_proto(m).map_err(|s| error_from_status(&s)))
+            .collect()
+    }
+
     pub(crate) async fn describe_source(
         &self,
         source_id: &str,
@@ -280,6 +304,53 @@ impl RemoteSession {
             storage_backends: resp.storage_backends,
             services: resp.services,
         })
+    }
+
+    // --- sql -------------------------------------------------------------
+
+    /// Execute a SQL query over the Flight SQL lane and collect the terminal
+    /// batches.
+    ///
+    /// `sql` does not ride a typed gRPC verb — per ADR-01 §3.2 the Flight SQL
+    /// surface carries query/result. So this opens a [`FlightSqlServiceClient`]
+    /// over the *same* tonic [`Channel`] the typed-RPC verbs use, stamps the
+    /// [`SESSION_HEADER`] with [`Self::session_id`] — the identical id
+    /// `set_tenant`/`bind_tenant` bound the tenant scope against — so the
+    /// server's `TenantBoundProvider` resolves this query to that bound tenant,
+    /// then runs `execute` → `do_get(ticket)` per endpoint and concatenates the
+    /// streamed batches. Stamping the bound session id (not a fresh one) is what
+    /// keeps a `--tenant A` query scoped to tenant A rather than silently
+    /// unscoped.
+    ///
+    /// This is the supported single-session bind-then-query Flight path: one
+    /// `RemoteSession` binds its tenant once and issues queries on its own
+    /// session id, sidestepping the shared-binding race the multi-tenant
+    /// concurrent Flight path carries (see
+    /// [`jammi-server`'s `TenantBoundProvider`](https://docs.rs/jammi-server)).
+    pub(crate) async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
+        let mut client = FlightSqlServiceClient::new(self.channel.clone());
+        client.set_header(SESSION_HEADER, self.session_id().to_string());
+        let info = client
+            .execute(query.to_string(), None)
+            .await
+            .map_err(|e| JammiError::Other(format!("flight sql execute: {e}")))?;
+
+        let mut batches = Vec::new();
+        for endpoint in info.endpoint {
+            let ticket = endpoint
+                .ticket
+                .ok_or_else(|| JammiError::Other("flight sql endpoint carried no ticket".into()))?;
+            let stream = client
+                .do_get(ticket)
+                .await
+                .map_err(|e| JammiError::Other(format!("flight sql do_get: {e}")))?;
+            let endpoint_batches: Vec<RecordBatch> = stream
+                .try_collect()
+                .await
+                .map_err(|e| JammiError::Other(format!("flight sql stream: {e}")))?;
+            batches.extend(endpoint_batches);
+        }
+        Ok(batches)
     }
 
     // --- embeddings ------------------------------------------------------
@@ -551,6 +622,22 @@ impl RemoteSession {
         Ok(())
     }
 
+    pub(crate) async fn list_mutable_tables(&self) -> Result<Vec<MutableTableDefinition>> {
+        let resp = self
+            .mutable_table_client()
+            .list_mutable_tables(ListMutableTablesRequest {})
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        // Each entry rebuilds the same tenant-free definition the in-process
+        // path returns; a corrupt entry surfaces as the faithful status the
+        // decoder builds.
+        resp.definitions
+            .into_iter()
+            .map(|d| definition_list_from_proto(d).map_err(|s| error_from_status(&s)))
+            .collect()
+    }
+
     // --- channels --------------------------------------------------------
 
     pub(crate) async fn register_channel(&self, spec: &ChannelSpec) -> Result<()> {
@@ -578,6 +665,21 @@ impl RemoteSession {
             .await
             .map_err(|s| error_from_status(&s))?;
         Ok(())
+    }
+
+    pub(crate) async fn list_channels(&self) -> Result<Vec<ChannelSpec>> {
+        let resp = self
+            .channel_client()
+            .list_channels(ListChannelsRequest {})
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        // Each entry rebuilds the same spec the in-process path returns; a
+        // corrupt entry surfaces as the faithful status the decoder builds.
+        resp.channels
+            .into_iter()
+            .map(|c| channel_from_proto(c).map_err(|s| error_from_status(&s)))
+            .collect()
     }
 
     // --- tenant ----------------------------------------------------------
@@ -710,6 +812,7 @@ impl RemoteSession {
         topic: &TopicDefinition,
         predicate: Predicate,
         from_offset: Option<Offset>,
+        replay_only: bool,
     ) -> std::result::Result<
         Pin<Box<dyn Stream<Item = std::result::Result<DeliveredBatch, TriggerError>> + Send>>,
         TriggerError,
@@ -726,6 +829,10 @@ impl RemoteSession {
                 predicate: predicate.source_sql().unwrap_or("").to_string(),
                 from_offset: from_offset.map(|o| o.value()),
                 tenant_id: String::new(),
+                // When set, the server drives its finite replay-only drain and
+                // closes the stream, so the bounded `--no-follow` path reads a
+                // subscription that terminates rather than the live tail.
+                replay_only,
             })
             .await
             .map_err(|s| trigger_error_from_status(&s))?

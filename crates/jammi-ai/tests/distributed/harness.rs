@@ -1,6 +1,6 @@
 //! Shared machinery for the distributed-validation lane: backend discovery, a
 //! shared-backend [`InferenceSession`] for the harness itself, a [`Fleet`] of
-//! spawned `jammi serve` worker processes with RAII teardown, and a
+//! spawned `jammi-server` worker processes with RAII teardown, and a
 //! fixed-sleep-free catalog poller.
 //!
 //! The harness is the *submitter and observer*; the spawned child processes are
@@ -158,7 +158,7 @@ fn shared_config(backends: &Backends, result_root: &str, artifact_dir: &Path) ->
     }
 }
 
-/// One spawned `jammi serve` worker process and the scratch dir backing its
+/// One spawned `jammi-server` worker process and the scratch dir backing its
 /// config + log. Killed on drop via the owning [`Fleet`].
 struct WorkerProc {
     worker_id: String,
@@ -176,7 +176,7 @@ struct WorkerProc {
     _scratch: TempDir,
 }
 
-/// An RAII fleet of spawned `jammi serve` worker processes against the shared
+/// An RAII fleet of spawned `jammi-server` worker processes against the shared
 /// catalog + object store. Dropping the fleet SIGKILLs every still-running child
 /// (even on a test panic, via `Drop`), so a failed assertion never leaks a
 /// worker process holding a lease on the shared catalog.
@@ -185,13 +185,13 @@ pub struct Fleet {
 }
 
 impl Fleet {
-    /// Spawn `n` `jammi serve` workers, each with a distinct `JAMMI_WORKER_ID`
+    /// Spawn `n` `jammi-server` workers, each with a distinct `JAMMI_WORKER_ID`
     /// (`worker-1`..`worker-n`), distinct gRPC + health ports, the shared
     /// catalog + `result_root`, the short worker timing, and the train tier
     /// mounted. The MinIO credentials are passed through the child env so the
     /// worker's S3 driver authenticates exactly as the harness session does.
     pub fn spawn(backends: &Backends, result_root: &str, n: usize) -> Self {
-        let exe = jammi_serve_binary();
+        let exe = jammi_server_binary();
         let workers = (1..=n)
             .map(|i| spawn_worker(&exe, backends, result_root, &format!("worker-{i}"), i))
             .collect();
@@ -332,7 +332,6 @@ fn spawn_worker(
     let child = Command::new(exe)
         .arg("--config")
         .arg(&config_path)
-        .arg("serve")
         .env("JAMMI_WORKER_ID", worker_id)
         // The S3 driver authenticates from these (MinIO creds). The harness
         // session reads the same root with the same creds, so write-on-worker /
@@ -349,7 +348,7 @@ fn spawn_worker(
         // a worker we mean to kill deterministically (and vice versa).
         .process_group(0)
         .spawn()
-        .unwrap_or_else(|e| panic!("spawn `jammi serve` worker {worker_id}: {e}"));
+        .unwrap_or_else(|e| panic!("spawn `jammi-server` worker {worker_id}: {e}"));
 
     WorkerProc {
         worker_id: worker_id.to_string(),
@@ -409,24 +408,28 @@ services = ["train"]
     )
 }
 
-/// Resolve the `jammi` server binary the lane spawns. The test binary lives in
-/// `{target}/{profile}/deps/`, and `cargo build -p jammi-cli` places `jammi`
-/// alongside it in `{target}/{profile}/`. We walk up from the running test exe
-/// to that sibling — robust to a custom `CARGO_TARGET_DIR` (the lane sets one)
-/// without depending on `CARGO_BIN_EXE_*`, which Cargo only sets for binaries in
-/// the *same* package as the test.
-fn jammi_serve_binary() -> PathBuf {
+/// Resolve the `jammi-server` binary the lane spawns. The test binary lives in
+/// `{target}/{profile}/deps/`, and `cargo build -p jammi-server` places
+/// `jammi-server` alongside it in `{target}/{profile}/`. We walk up from the
+/// running test exe to that sibling — robust to a custom `CARGO_TARGET_DIR` (the
+/// lane sets one) without depending on `CARGO_BIN_EXE_*`, which Cargo only sets
+/// for binaries in the *same* package as the test.
+fn jammi_server_binary() -> PathBuf {
     let test_exe = std::env::current_exe().expect("current_exe for binary resolution");
-    // .../{profile}/deps/distributed-<hash>  →  .../{profile}/jammi
+    // .../{profile}/deps/distributed-<hash>  →  .../{profile}/jammi-server
     let profile_dir = test_exe
         .parent() // deps/
         .and_then(Path::parent) // {profile}/
         .expect("test exe under {profile}/deps/");
-    let bin = profile_dir.join(if cfg!(windows) { "jammi.exe" } else { "jammi" });
+    let bin = profile_dir.join(if cfg!(windows) {
+        "jammi-server.exe"
+    } else {
+        "jammi-server"
+    });
     assert!(
         bin.is_file(),
-        "`jammi` server binary not found at {}. The distributed lane requires it: \
-         `cargo build -p jammi-cli` before running this harness.",
+        "`jammi-server` binary not found at {}. The distributed lane requires it: \
+         `cargo build -p jammi-server` before running this harness.",
         bin.display()
     );
     bin

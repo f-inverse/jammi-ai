@@ -1,11 +1,10 @@
 //! `jammi trigger` subcommand.
 //!
-//! Opens the same catalog the rest of the CLI uses, wires an in-memory
-//! broker on top of it, and exposes register / list / publish / subscribe
-//! against the engine's trigger-stream surface. Long-running deployments
-//! talk to the server's gRPC `TriggerService` directly; this subcommand is
-//! the one-shot ergonomic for scripts and the equivalent of the cookbook
-//! recipes' Python / CLI tabs.
+//! Drive the server's trigger-stream surface over the remote [`Session`]:
+//! register / list topics, publish a batch, and subscribe. Every verb runs on
+//! the server — the CLI builds the Arrow `RecordBatch` for a publish and parses
+//! the subscribe predicate to SQL locally (a parse against an empty
+//! `SessionContext`, no catalog), then hands the work to the session.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -16,20 +15,8 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use clap::{ArgGroup, Subcommand};
 use datafusion::execution::context::SessionContext;
 use futures::StreamExt;
-use jammi_db::catalog::backend::BackendImpl;
-use jammi_db::catalog::backend_sqlite::SqliteBackend;
-use jammi_db::catalog::topic_repo::TopicRepo;
-use jammi_db::catalog::Catalog;
-use jammi_db::config::JammiConfig;
-use jammi_db::source::mutable::MutableTableRegistry;
-use jammi_db::store::mutable::sqlite::SqliteMutableBackend;
-use jammi_db::store::mutable::MutableBackend;
-use jammi_db::tenant::TenantContext;
-use jammi_db::tenant_scope::TenantBinding;
-use jammi_db::trigger::{
-    DeliveredBatch, InMemoryBroker, Offset, Predicate, Publisher, Subscriber, TopicDefinition,
-    TopicId, TriggerBroker,
-};
+use jammi_ai::Session;
+use jammi_db::trigger::{DeliveredBatch, Offset, Predicate, TopicDefinition, TopicId};
 
 /// Subcommands under `jammi trigger`.
 #[derive(Subcommand)]
@@ -77,9 +64,8 @@ pub enum TriggerAction {
     },
 
     /// Subscribe and print every delivered batch as one JSON object per
-    /// row. With `--no-follow`, drains only the replay window from the
-    /// backing table and exits; otherwise runs until interrupted with
-    /// Ctrl-C.
+    /// row. With `--no-follow`, the server drains only the replay window and
+    /// closes the stream; otherwise runs until interrupted with Ctrl-C.
     Subscribe {
         /// Topic name to subscribe to.
         #[arg(long)]
@@ -91,104 +77,40 @@ pub enum TriggerAction {
         /// retained event; omit to start at the live tail.
         #[arg(long)]
         from_offset: Option<u64>,
-        /// Drain only the replay window from the backing table and exit
-        /// instead of attaching to the live broker tail.
+        /// Drain only the replay window from the server and exit instead of
+        /// attaching to the live broker tail.
         #[arg(long)]
         no_follow: bool,
     },
 }
 
-/// Carries the engine handles a single CLI invocation needs. Each command
-/// builds one from scratch — the CLI is one-shot and does not retain
-/// state across invocations.
-struct Handles {
-    topic_repo: TopicRepo,
-    publisher: Publisher,
-    subscriber: Subscriber,
-    broker: Arc<dyn TriggerBroker>,
-    session_ctx: SessionContext,
-}
-
-async fn build_handles(
-    config: JammiConfig,
-    tenant: Option<jammi_db::TenantId>,
-) -> Result<Handles, Box<dyn std::error::Error>> {
-    std::fs::create_dir_all(&config.artifact_dir)?;
-    let db_path = config.artifact_dir.join("catalog.db");
-    let sqlite = SqliteBackend::open(&db_path).await?;
-    let backend_impl = BackendImpl::Sqlite(sqlite);
-    backend_impl.migrate().await?;
-    let catalog = Arc::new(Catalog::from_backend(backend_impl));
-    let backend = catalog.backend_arc();
-
-    let tenant_binding = TenantBinding::unscoped();
-    tenant_binding.set_shared(match tenant {
-        Some(t) => TenantContext::Scoped(t),
-        None => TenantContext::Unscoped,
-    });
-    let mutable_backend: Arc<dyn MutableBackend> =
-        Arc::new(SqliteMutableBackend::new(Arc::clone(&backend)));
-    let registry = Arc::new(MutableTableRegistry::new(
-        Arc::clone(&catalog),
-        mutable_backend,
-        tenant_binding,
-    ));
-
-    // The CLI is one-shot: each invocation builds fresh handles, talks to
-    // the catalog, then exits. Spinning up a JetStream connection per
-    // invocation would dwarf the work the command itself does, so the CLI
-    // intentionally uses the in-process broker even when the workspace
-    // config selects JetStream. Long-running consumers should talk to the
-    // server's gRPC `TriggerService`, which uses the config-driven broker.
-    let broker: Arc<dyn TriggerBroker> = Arc::new(InMemoryBroker::new());
-    let topic_repo = TopicRepo::new(Arc::clone(&catalog), Arc::clone(&registry));
-    let publisher = Publisher::new(
-        Arc::clone(&broker),
-        Arc::clone(&backend),
-        Arc::clone(&registry),
-    );
-    let subscriber = Subscriber::new(Arc::clone(&broker), Arc::clone(&registry));
-    Ok(Handles {
-        topic_repo,
-        publisher,
-        subscriber,
-        broker,
-        session_ctx: SessionContext::new(),
-    })
-}
-
 pub async fn run(
-    config: JammiConfig,
-    tenant: Option<jammi_db::TenantId>,
+    session: &Session,
     action: TriggerAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let handles = build_handles(config, tenant).await?;
     match action {
-        TriggerAction::List => list_topics(&handles, tenant).await,
+        TriggerAction::List => list_topics(session).await,
         TriggerAction::Register {
             name,
             schema,
             broker_metadata,
-        } => register_topic(&handles, tenant, &name, &schema, &broker_metadata).await,
+        } => register_topic(session, &name, &schema, &broker_metadata).await,
         TriggerAction::Publish {
             topic,
             rows,
             json_file,
-        } => publish_rows(&handles, tenant, &topic, &rows, json_file.as_deref()).await,
+        } => publish_rows(session, &topic, &rows, json_file.as_deref()).await,
         TriggerAction::Subscribe {
             topic,
             predicate,
             from_offset,
             no_follow,
-        } => subscribe_topic(&handles, tenant, &topic, &predicate, from_offset, no_follow).await,
+        } => subscribe_topic(session, &topic, &predicate, from_offset, no_follow).await,
     }
 }
 
-async fn list_topics(
-    handles: &Handles,
-    tenant: Option<jammi_db::TenantId>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let topics = handles.topic_repo.list_topics(tenant).await?;
+async fn list_topics(session: &Session) -> Result<(), Box<dyn std::error::Error>> {
+    let topics = session.list_topics().await?;
     if topics.is_empty() {
         println!("No topics registered.");
         return Ok(());
@@ -215,8 +137,7 @@ async fn list_topics(
 }
 
 async fn register_topic(
-    handles: &Handles,
-    tenant: Option<jammi_db::TenantId>,
+    session: &Session,
     name: &str,
     schema_spec: &str,
     broker_metadata: &str,
@@ -228,28 +149,39 @@ async fn register_topic(
         id: TopicId::new(),
         name: name.to_string(),
         schema: Arc::new(schema),
-        tenant,
+        // The wire body stays tenant-free: the server stamps the session's
+        // tenant onto the topic under its tenant scope.
+        tenant: None,
         broker_metadata,
     };
-    handles.broker.register_topic(&topic).await?;
-    handles.topic_repo.register_topic(&topic).await?;
+    session.register_topic(&topic).await?;
     println!("Topic '{name}' registered (id={}).", topic.id);
     Ok(())
 }
 
+/// Resolve a topic by name from the server's `list_topics`, erroring when no
+/// topic with that name is visible to the session's tenant. Publish and
+/// subscribe both key off the same resolution so the schema they build a batch
+/// against (or filter with) is the server's registered schema.
+async fn resolve_topic(
+    session: &Session,
+    name: &str,
+) -> Result<TopicDefinition, Box<dyn std::error::Error>> {
+    session
+        .list_topics()
+        .await?
+        .into_iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| format!("topic '{name}' not found").into())
+}
+
 async fn publish_rows(
-    handles: &Handles,
-    tenant: Option<jammi_db::TenantId>,
+    session: &Session,
     name: &str,
     rows: &[String],
     json_file: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let topic = handles
-        .topic_repo
-        .lookup_by_name(name, tenant)
-        .await?
-        .ok_or_else(|| format!("topic '{name}' not found"))?;
-    handles.broker.register_topic(&topic).await?;
+    let topic = resolve_topic(session, name).await?;
 
     let batch = match json_file {
         Some(path) => load_rows_from_file(path, &topic.schema)?,
@@ -265,41 +197,33 @@ async fn publish_rows(
         }
     };
 
-    let offset = handles
-        .publisher
-        .publish_scoped(&topic, tenant, batch)
-        .await?;
+    let offset = session.publish(&topic, batch).await?;
     println!("Published offset {}.", offset.value());
     Ok(())
 }
 
 async fn subscribe_topic(
-    handles: &Handles,
-    tenant: Option<jammi_db::TenantId>,
+    session: &Session,
     name: &str,
     predicate: &str,
     from_offset: Option<u64>,
     no_follow: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let topic = handles
-        .topic_repo
-        .lookup_by_name(name, tenant)
-        .await?
-        .ok_or_else(|| format!("topic '{name}' not found"))?;
-    handles.broker.register_topic(&topic).await?;
-    let pred = Predicate::from_sql(&handles.session_ctx, Arc::clone(&topic.schema), predicate)?;
+    let topic = resolve_topic(session, name).await?;
+    // The predicate is parsed to SQL against the topic schema using a local
+    // empty `SessionContext` — a parse, not a catalog touch — then crosses the
+    // wire as that SQL; the server re-parses it against the same schema.
+    let ctx = SessionContext::new();
+    let pred = Predicate::from_sql(&ctx, Arc::clone(&topic.schema), predicate)?;
     let start = from_offset.map(|v| Offset::new(v, chrono::Utc::now()));
 
-    if no_follow {
-        let drained = handles.subscriber.replay_only(&topic, pred, start).await?;
-        for delivered in drained {
-            emit_delivered(&delivered)?;
-        }
-        return Ok(());
+    if !no_follow {
+        eprintln!("Listening on topic '{}'. Ctrl-C to exit.", topic.name);
     }
-
-    let mut stream = handles.subscriber.subscribe(&topic, pred, start).await?;
-    eprintln!("Listening on topic '{}'. Ctrl-C to exit.", topic.name);
+    // `no_follow` selects the server's finite replay-only drain: the stream
+    // yields the retained replay window and then ends, so the loop terminates.
+    // Without it the stream tails live until the process is interrupted.
+    let mut stream = session.subscribe(&topic, pred, start, no_follow).await?;
     while let Some(item) = stream.next().await {
         let delivered = item?;
         emit_delivered(&delivered)?;

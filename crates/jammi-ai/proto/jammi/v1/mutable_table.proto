@@ -32,6 +32,12 @@ service MutableTableService {
   // Drop a mutable companion table. Peer of the abstraction's
   // `drop_mutable_table`.
   rpc DropMutableTable(DropMutableTableRequest) returns (google.protobuf.Empty);
+
+  // List every mutable companion table registered to the calling tenant. Peer
+  // of the abstraction's `list_mutable_tables`; registry introspection, not a
+  // SQL query. Each entry is the same `MutableTableDefinition` the create path
+  // carries (minus tenant, which rides the session scope).
+  rpc ListMutableTables(ListMutableTablesRequest) returns (ListMutableTablesResponse);
 }
 
 // One secondary-index declaration. Mirrors the engine's `MutableIndexDef`.
@@ -75,4 +81,12 @@ message CreateMutableTableResponse {
 
 message DropMutableTableRequest {
   string mutable_table_id = 1;
+}
+
+message ListMutableTablesRequest {}
+
+message ListMutableTablesResponse {
+  // One definition per mutable table registered to the calling tenant. Each is
+  // the same tenant-free `MutableTableDefinition` shape the create path carries.
+  repeated MutableTableDefinition definitions = 1;
 }

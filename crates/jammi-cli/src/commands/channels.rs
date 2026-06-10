@@ -1,14 +1,12 @@
 //! `jammi channels` subcommand.
 //!
 //! Manage the catalog-backed evidence channels that gate which provenance
-//! columns merge into a search result. Mirrors `sources` / `models` shape —
-//! one subcommand enum, one `run` dispatcher, no shared state across
-//! invocations.
+//! columns merge into a search result, over the remote [`Session`]. Mirrors
+//! `sources` / `models` shape — one subcommand enum, one `run` dispatcher.
 
 use clap::Subcommand;
-use jammi_ai::session::InferenceSession;
+use jammi_ai::Session;
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
-use jammi_db::config::JammiConfig;
 use jammi_db::evidence_channel::ChannelId;
 
 #[derive(Subcommand)]
@@ -46,15 +44,9 @@ pub enum ChannelAction {
 }
 
 pub async fn run(
-    config: JammiConfig,
-    tenant: Option<jammi_db::TenantId>,
+    session: &Session,
     action: ChannelAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let session = InferenceSession::new(config).await?;
-    if let Some(t) = tenant {
-        session.bind_tenant(t);
-    }
-
     match action {
         ChannelAction::Register {
             name,
@@ -71,7 +63,7 @@ pub async fn run(
                 priority,
                 columns: parsed,
             };
-            session.catalog().channels().register(&spec).await?;
+            session.register_channel(&spec).await?;
             println!("Channel '{name}' registered (priority={priority}).");
         }
         ChannelAction::AddColumn { name, columns } => {
@@ -80,15 +72,11 @@ pub async fn run(
             }
             let id = ChannelId::new(&name)?;
             let parsed = parse_column_specs(&columns)?;
-            session
-                .catalog()
-                .channels()
-                .add_columns(&id, &parsed)
-                .await?;
+            session.add_channel_columns(&id, &parsed).await?;
             println!("Channel '{name}' extended with {} column(s).", parsed.len());
         }
         ChannelAction::List => {
-            let specs = session.catalog().channels().list().await?;
+            let specs = session.list_channels().await?;
             if specs.is_empty() {
                 println!("No channels registered.");
             } else {

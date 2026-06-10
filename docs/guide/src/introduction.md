@@ -28,7 +28,7 @@ Jammi is an embeddable AI engine that brings model inference into your data pipe
 
 All three interfaces share the same engine, configuration, and storage format. Embeddings generated from Python are queryable from the CLI, and vice versa.
 
-For multi-language access or BI tool integration, `jammi serve` starts an Arrow Flight SQL server — any Arrow client can connect and query via standard SQL.
+For multi-language access or BI tool integration, the `jammi-server` binary starts an Arrow Flight SQL server — any Arrow client can connect and query via standard SQL. The `jammi` CLI is a strict gRPC client of that server.
 
 ## Crates
 

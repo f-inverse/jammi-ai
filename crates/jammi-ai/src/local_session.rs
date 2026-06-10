@@ -42,6 +42,7 @@ use arrow::array::RecordBatch;
 use futures::Stream;
 
 use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
+use jammi_db::catalog::model_repo::ModelRecord;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::error::Result;
@@ -132,18 +133,20 @@ pub enum Session {
     Remote(crate::remote_session::RemoteSession),
 }
 
-/// The two Flight-SQL-shaped verbs a [`Session::Remote`] does not drive over
-/// the typed-RPC surface (`sql` / `read_vectors`) return this — a real,
-/// propagated value, never a panic. Every other verb on the [`Session`] surface
-/// is wire-reachable: the embeddings / encode-query / search / add-source /
-/// remove-source verbs, the tenant trio, the `JammiError`-returning compute
-/// verbs (inference, eval, fine-tune, mutable-table create/drop, channel
-/// register / add-columns), the topics + subscribe-streaming surface, and the
-/// audit surface. A caller that reaches one of the two unwired verbs on a
-/// remote session gets a typed error naming the verb — the truthful answer to
-/// "is this verb available on this transport yet?", not a stand-in for a domain
-/// failure. (These two carry SQL / raw-vector payloads that ride the Flight
-/// SQL surface, not a typed gRPC verb, so they are wired in that lane, not here.)
+/// The one raw-vector verb a [`Session::Remote`] does not drive (`read_vectors`)
+/// returns this — a real, propagated value, never a panic. The CLI never calls
+/// it (it reads vectors through `search`), so it is honestly absent on the
+/// remote transport rather than carrying a half-wired raw-vector read. Every
+/// other verb on the [`Session`] surface is wire-reachable: `sql` rides the
+/// Flight SQL lane ([`crate::RemoteSession::sql`]); the embeddings /
+/// encode-query / search / add-source / remove-source verbs, the registry
+/// listings (sources / models / channels / mutable tables), the tenant trio, the
+/// `JammiError`-returning compute verbs (inference, eval, fine-tune,
+/// mutable-table create/drop, channel register / add-columns), the topics +
+/// subscribe-streaming surface, and the audit surface all ride the typed gRPC
+/// surface. A caller that reaches the one unwired verb on a remote session gets
+/// a typed error naming it — the truthful answer to "is this verb available on
+/// this transport yet?", not a stand-in for a domain failure.
 #[cfg(feature = "wire")]
 fn remote_verb_pending(verb: &str) -> jammi_db::error::JammiError {
     jammi_db::error::JammiError::Other(format!(
@@ -191,6 +194,18 @@ impl Session {
         }
     }
 
+    /// Describe every model registered to the session's tenant. Registry
+    /// introspection (the peer of [`Self::list_sources`] on the model catalog),
+    /// not a SQL query.
+    pub async fn list_models(&self) -> Result<Vec<ModelRecord>> {
+        match self {
+            #[cfg(feature = "local")]
+            Session::Local(s) => s.list_models().await,
+            #[cfg(feature = "wire")]
+            Session::Remote(s) => s.list_models().await,
+        }
+    }
+
     /// Describe one registered source by id, or `None` when no source with
     /// that id is visible to the session's tenant. The embedding
     /// `status`/`row_count`/`dimensions` ride on the descriptor's result
@@ -219,13 +234,12 @@ impl Session {
     // --- sql -------------------------------------------------------------
 
     /// Execute a SQL query.
-    #[cfg_attr(not(feature = "local"), allow(unused_variables))]
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
         match self {
             #[cfg(feature = "local")]
             Session::Local(s) => s.sql(query).await,
             #[cfg(feature = "wire")]
-            Session::Remote(_) => Err(remote_verb_pending("sql")),
+            Session::Remote(s) => s.sql(query).await,
         }
     }
 
@@ -479,6 +493,17 @@ impl Session {
         }
     }
 
+    /// List every mutable companion table registered to the session's tenant.
+    /// Registry introspection, not a SQL query.
+    pub async fn list_mutable_tables(&self) -> Result<Vec<MutableTableDefinition>> {
+        match self {
+            #[cfg(feature = "local")]
+            Session::Local(s) => s.list_mutable_tables().await,
+            #[cfg(feature = "wire")]
+            Session::Remote(s) => s.list_mutable_tables().await,
+        }
+    }
+
     // --- trigger ---------------------------------------------------------
 
     /// Register a topic (creates its backing table) for the trigger stream.
@@ -532,20 +557,36 @@ impl Session {
     /// Subscribe to a topic, returning a transport-neutral stream of delivered
     /// batches. The stream replays from `from_offset` (or the live tail when
     /// `None`) and then tails live, scoped to the session's tenant.
+    ///
+    /// `replay_only` selects the finite-drain primitive: when set, the stream
+    /// yields exactly the retained batches the predicate accepts from
+    /// `from_offset` onward and then *terminates*, rather than holding open to
+    /// tail live batches. This is a different engine primitive
+    /// ([`jammi_db::trigger::Subscriber::replay_only`]) from the open-ended
+    /// subscribe, surfaced through the same stream return so a bounded drain
+    /// (`jammi trigger subscribe --no-follow`) reads it the same way it reads a
+    /// live subscription — it just sees the stream end.
     pub async fn subscribe(
         &self,
         topic: &TopicDefinition,
         predicate: Predicate,
         from_offset: Option<Offset>,
+        replay_only: bool,
     ) -> std::result::Result<
         Pin<Box<dyn Stream<Item = std::result::Result<DeliveredBatch, TriggerError>> + Send>>,
         TriggerError,
     > {
         match self {
             #[cfg(feature = "local")]
-            Session::Local(s) => s.subscribe(topic, predicate, from_offset).await,
+            Session::Local(s) => {
+                s.subscribe(topic, predicate, from_offset, replay_only)
+                    .await
+            }
             #[cfg(feature = "wire")]
-            Session::Remote(s) => s.subscribe(topic, predicate, from_offset).await,
+            Session::Remote(s) => {
+                s.subscribe(topic, predicate, from_offset, replay_only)
+                    .await
+            }
         }
     }
 
@@ -572,6 +613,17 @@ impl Session {
             Session::Local(s) => s.add_channel_columns(channel, new_columns).await,
             #[cfg(feature = "wire")]
             Session::Remote(s) => s.add_channel_columns(channel, new_columns).await,
+        }
+    }
+
+    /// List every evidence channel registered to the session's tenant, ordered
+    /// by `(priority, channel_id)`. Registry introspection, not a SQL query.
+    pub async fn list_channels(&self) -> Result<Vec<ChannelSpec>> {
+        match self {
+            #[cfg(feature = "local")]
+            Session::Local(s) => s.list_channels().await,
+            #[cfg(feature = "wire")]
+            Session::Remote(s) => s.list_channels().await,
         }
     }
 
@@ -731,6 +783,10 @@ impl LocalSession {
 
     async fn list_sources(&self) -> Result<Vec<SourceDescriptor>> {
         self.engine.catalog().list_source_descriptors().await
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelRecord>> {
+        self.engine.catalog().list_models().await
     }
 
     async fn describe_source(&self, source_id: &str) -> Result<Option<SourceDescriptor>> {
@@ -927,6 +983,14 @@ impl LocalSession {
         self.engine.drop_mutable_table(id).await
     }
 
+    async fn list_mutable_tables(&self) -> Result<Vec<MutableTableDefinition>> {
+        Ok(self
+            .engine
+            .mutable_tables()
+            .list(self.engine.tenant())
+            .await?)
+    }
+
     async fn register_topic(
         &self,
         topic: &TopicDefinition,
@@ -964,14 +1028,28 @@ impl LocalSession {
         topic: &TopicDefinition,
         predicate: Predicate,
         from_offset: Option<Offset>,
+        replay_only: bool,
     ) -> std::result::Result<
         Pin<Box<dyn Stream<Item = std::result::Result<DeliveredBatch, TriggerError>> + Send>>,
         TriggerError,
     > {
+        let tenant = self.engine.tenant();
+        if replay_only {
+            // The finite-drain primitive: collect the retained replay window and
+            // hand it back as a stream that yields those batches and ends, so the
+            // bounded `--no-follow` path reads a subscription that simply
+            // terminates — never the open-ended live tail (which cannot end).
+            let drained = self
+                .engine
+                .subscriber()
+                .replay_only_scoped(topic, tenant, predicate, from_offset)
+                .await?;
+            return Ok(Box::pin(futures::stream::iter(drained.into_iter().map(Ok))));
+        }
         let subscription = self
             .engine
             .subscriber()
-            .subscribe_scoped(topic, self.engine.tenant(), predicate, from_offset)
+            .subscribe_scoped(topic, tenant, predicate, from_offset)
             .await?;
         Ok(Box::pin(subscription))
     }
@@ -990,6 +1068,10 @@ impl LocalSession {
             .channels()
             .add_columns(channel, new_columns)
             .await
+    }
+
+    async fn list_channels(&self) -> Result<Vec<ChannelSpec>> {
+        self.engine.catalog().channels().list().await
     }
 
     /// `async` to match the [`Session`] surface (a remote transport's tenant

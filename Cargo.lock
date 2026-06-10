@@ -4063,6 +4063,7 @@ version = "0.25.0"
 dependencies = [
  "arrow",
  "arrow-array",
+ "arrow-flight",
  "arrow-ipc",
  "arrow-schema",
  "async-trait",
@@ -4120,12 +4121,12 @@ dependencies = [
  "futures",
  "jammi-ai",
  "jammi-db",
- "jammi-server",
  "predicates",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tonic",
 ]
 
 [[package]]

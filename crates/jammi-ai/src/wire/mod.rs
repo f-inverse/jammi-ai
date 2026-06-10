@@ -47,10 +47,12 @@ mod training;
 mod trigger;
 
 pub use audit::{parse_query_id, record_from_wire};
-pub use channel::{columns_from_proto, columns_to_proto, parse_channel_id};
+pub use channel::{
+    channel_from_proto, channel_to_proto, columns_from_proto, columns_to_proto, parse_channel_id,
+};
 pub use embedding::{
-    result_table_from_proto, source_descriptor_from_proto, source_type_from_proto,
-    source_type_to_proto, ProtoQueryInput,
+    model_from_proto, model_to_proto, result_table_from_proto, source_descriptor_from_proto,
+    source_type_from_proto, source_type_to_proto, ProtoQueryInput,
 };
 pub use error::{
     attach_audit_detail, attach_error_detail, attach_trigger_detail, audit_error_from_status,
@@ -81,7 +83,9 @@ pub use pipeline::{
 pub use inference::{
     edge_gather_from_proto, edge_gather_to_proto, predicted_distribution_to_proto,
 };
-pub use mutable_table::{definition_from_proto, definition_to_proto, parse_table_id};
+pub use mutable_table::{
+    definition_from_proto, definition_list_from_proto, definition_to_proto, parse_table_id,
+};
 pub use training::{config_to_proto, method_from_proto, method_to_proto};
 #[cfg(feature = "local")]
 pub use training::{training_spec_from_proto, training_spec_to_proto};

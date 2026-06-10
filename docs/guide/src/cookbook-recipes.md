@@ -17,7 +17,7 @@ The recipes shipped at MVP:
 | [`eval_inference`](#evaluate-inference-classification) | Accuracy + macro F1 against gold labels |
 | [`eval_inference_ner`](#evaluate-inference-ner) | Entity-level precision / recall / F1 against gold spans |
 | [`fine_tune`](#fine-tune-an-encoder) | LoRA fine-tune end-to-end |
-| [`flight_sql`](#connect-via-flight-sql) | Query a remote `jammi serve` over Arrow Flight SQL |
+| [`flight_sql`](#connect-via-flight-sql) | Query a remote `jammi-server` over Arrow Flight SQL |
 
 ---
 

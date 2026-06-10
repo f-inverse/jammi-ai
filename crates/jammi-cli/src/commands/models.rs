@@ -1,6 +1,10 @@
+//! `jammi models` subcommand.
+//!
+//! List the models registered to the session's tenant over the remote
+//! [`Session`].
+
 use clap::Subcommand;
-use jammi_ai::session::InferenceSession;
-use jammi_db::config::JammiConfig;
+use jammi_ai::Session;
 
 #[derive(Subcommand)]
 pub enum ModelAction {
@@ -8,28 +12,22 @@ pub enum ModelAction {
     List,
 }
 
-pub async fn run(
-    config: JammiConfig,
-    tenant: Option<jammi_db::TenantId>,
-    action: ModelAction,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let session = InferenceSession::new(config).await?;
-    if let Some(t) = tenant {
-        session.bind_tenant(t);
-    }
-
+pub async fn run(session: &Session, action: ModelAction) -> Result<(), Box<dyn std::error::Error>> {
     match action {
         ModelAction::List => {
-            let models = session.catalog().list_models().await?;
+            let models = session.list_models().await?;
             if models.is_empty() {
                 println!("No models registered.");
             } else {
-                println!("{:<40} {:<12} {:<10} Status", "Model ID", "Backend", "Task");
-                println!("{}", "-".repeat(75));
+                println!("{:<40} {:<12} {:<14} Status", "Model ID", "Backend", "Task");
+                println!("{}", "-".repeat(78));
                 for m in models {
                     println!(
-                        "{:<40} {:<12} {:<10} {}",
-                        m.model_id, m.backend, m.task, m.status
+                        "{:<40} {:<12} {:<14} {}",
+                        m.model_id,
+                        m.backend,
+                        format!("{:?}", m.task),
+                        m.status
                     );
                 }
             }

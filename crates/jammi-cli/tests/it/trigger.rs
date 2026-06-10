@@ -1,25 +1,18 @@
 //! CLI integration tests for `jammi trigger`.
 //!
-//! Drive the rewritten surface end-to-end through the binary boundary —
-//! `--topic` rename, `--json-file` / `--row` mutual exclusion, and
-//! `--no-follow` replay. Catalog state lives in a per-test `TempDir` via
-//! `JAMMI_ARTIFACT_DIR`; the in-memory broker means everything fits in one
-//! process with zero ports.
+//! Drive the trigger surface end-to-end through the binary boundary against a
+//! hermetic `jammi-server` (default SQLite catalog + in-memory broker) reached
+//! over `--target`: the `--topic` flag, `--json-file` / `--row` mutual
+//! exclusion, and the `--no-follow` replay-only drain (which rides the server's
+//! finite replay path so the stream terminates).
 
-use std::path::Path;
-
-use assert_cmd::Command;
 use tempfile::TempDir;
 
-fn jammi_cmd(artifact_dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("jammi").expect("jammi-cli binary built");
-    cmd.env("JAMMI_ARTIFACT_DIR", artifact_dir)
-        .env_remove("JAMMI_CONFIG");
-    cmd
-}
+use crate::server_harness::TestServer;
 
-fn register_topic(dir: &Path, name: &str) {
-    jammi_cmd(dir)
+fn register_topic(server: &TestServer, name: &str) {
+    server
+        .cli()
         .args([
             "trigger",
             "register",
@@ -34,10 +27,11 @@ fn register_topic(dir: &Path, name: &str) {
 
 #[test]
 fn cli_trigger_publish_uses_topic_flag() {
-    let dir = TempDir::new().expect("tempdir");
-    register_topic(dir.path(), "events.changes");
+    let server = TestServer::spawn();
+    register_topic(&server, "events.changes");
 
-    jammi_cmd(dir.path())
+    server
+        .cli()
         .args([
             "trigger",
             "publish",
@@ -54,10 +48,11 @@ fn cli_trigger_publish_uses_topic_flag() {
 #[test]
 fn cli_trigger_publish_rejects_topic_legacy_alias() {
     // `--name` was the pre-cp9 flag; the rename is intentionally clean.
-    let dir = TempDir::new().expect("tempdir");
-    register_topic(dir.path(), "events.changes");
+    let server = TestServer::spawn();
+    register_topic(&server, "events.changes");
 
-    let out = jammi_cmd(dir.path())
+    let out = server
+        .cli()
         .args([
             "trigger",
             "publish",
@@ -76,8 +71,9 @@ fn cli_trigger_publish_rejects_topic_legacy_alias() {
 
 #[test]
 fn cli_trigger_publish_accepts_json_file() {
+    let server = TestServer::spawn();
+    register_topic(&server, "events.changes");
     let dir = TempDir::new().expect("tempdir");
-    register_topic(dir.path(), "events.changes");
     let payload = dir.path().join("rows.json");
     std::fs::write(
         &payload,
@@ -88,7 +84,8 @@ fn cli_trigger_publish_accepts_json_file() {
     )
     .unwrap();
 
-    jammi_cmd(dir.path())
+    server
+        .cli()
         .args([
             "trigger",
             "publish",
@@ -104,12 +101,14 @@ fn cli_trigger_publish_accepts_json_file() {
 
 #[test]
 fn cli_trigger_publish_rejects_row_and_json_file_together() {
+    let server = TestServer::spawn();
+    register_topic(&server, "events.changes");
     let dir = TempDir::new().expect("tempdir");
-    register_topic(dir.path(), "events.changes");
     let payload = dir.path().join("rows.json");
     std::fs::write(&payload, r#"[{"op":"c","ts_ms":1,"key":"a"}]"#).unwrap();
 
-    let out = jammi_cmd(dir.path())
+    let out = server
+        .cli()
         .args([
             "trigger",
             "publish",
@@ -138,10 +137,11 @@ fn cli_trigger_publish_rejects_row_and_json_file_together() {
 
 #[test]
 fn cli_trigger_publish_rejects_neither_input() {
-    let dir = TempDir::new().expect("tempdir");
-    register_topic(dir.path(), "events.changes");
+    let server = TestServer::spawn();
+    register_topic(&server, "events.changes");
 
-    let out = jammi_cmd(dir.path())
+    let out = server
+        .cli()
         .args(["trigger", "publish", "--topic", "events.changes"])
         .output()
         .expect("run publish");
@@ -153,12 +153,14 @@ fn cli_trigger_publish_rejects_neither_input() {
 
 #[test]
 fn cli_trigger_publish_rejects_malformed_json_file() {
+    let server = TestServer::spawn();
+    register_topic(&server, "events.changes");
     let dir = TempDir::new().expect("tempdir");
-    register_topic(dir.path(), "events.changes");
     let payload = dir.path().join("rows.json");
     std::fs::write(&payload, "not json").unwrap();
 
-    let out = jammi_cmd(dir.path())
+    let out = server
+        .cli()
         .args([
             "trigger",
             "publish",
@@ -179,11 +181,12 @@ fn cli_trigger_publish_rejects_malformed_json_file() {
 
 #[test]
 fn cli_trigger_subscribe_uses_topic_flag() {
-    let dir = TempDir::new().expect("tempdir");
-    register_topic(dir.path(), "events.changes");
+    let server = TestServer::spawn();
+    register_topic(&server, "events.changes");
 
     // Legacy --name flag must be rejected (clean rename).
-    let out = jammi_cmd(dir.path())
+    let out = server
+        .cli()
         .args([
             "trigger",
             "subscribe",
@@ -201,11 +204,12 @@ fn cli_trigger_subscribe_uses_topic_flag() {
 
 #[test]
 fn cli_trigger_subscribe_no_follow_drains_replay() {
-    let dir = TempDir::new().expect("tempdir");
-    register_topic(dir.path(), "events.changes");
+    let server = TestServer::spawn();
+    register_topic(&server, "events.changes");
 
     // Publish two batches so the replay window is non-empty.
-    jammi_cmd(dir.path())
+    server
+        .cli()
         .args([
             "trigger",
             "publish",
@@ -216,7 +220,8 @@ fn cli_trigger_subscribe_no_follow_drains_replay() {
         ])
         .assert()
         .success();
-    jammi_cmd(dir.path())
+    server
+        .cli()
         .args([
             "trigger",
             "publish",
@@ -228,7 +233,8 @@ fn cli_trigger_subscribe_no_follow_drains_replay() {
         .assert()
         .success();
 
-    let out = jammi_cmd(dir.path())
+    let out = server
+        .cli()
         .args([
             "trigger",
             "subscribe",
@@ -265,10 +271,11 @@ fn cli_trigger_subscribe_no_follow_drains_replay() {
 
 #[test]
 fn cli_trigger_subscribe_no_follow_empty_topic() {
-    let dir = TempDir::new().expect("tempdir");
-    register_topic(dir.path(), "events.changes");
+    let server = TestServer::spawn();
+    register_topic(&server, "events.changes");
 
-    let out = jammi_cmd(dir.path())
+    let out = server
+        .cli()
         .args([
             "trigger",
             "subscribe",

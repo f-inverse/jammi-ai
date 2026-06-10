@@ -1,27 +1,17 @@
 //! CLI integration tests for `jammi channels`.
 //!
-//! Each test spawns the `jammi-cli` binary as a subprocess via `assert_cmd`,
-//! redirecting catalog and artifact state to a per-test `TempDir` via
-//! `JAMMI_ARTIFACT_DIR`. Channels are global (per SPEC-01 §11) so these
-//! tests do not bind a tenant.
+//! Each test spawns a hermetic `jammi-server` (default SQLite catalog +
+//! in-memory broker) and drives the `jammi` CLI against it with `--target`.
+//! Channels are global (per SPEC-01 §11) so these tests do not bind a tenant.
 
-use std::path::Path;
-
-use assert_cmd::Command;
-use tempfile::TempDir;
-
-fn jammi_cmd(artifact_dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("jammi").expect("jammi-cli binary built");
-    cmd.env("JAMMI_ARTIFACT_DIR", artifact_dir)
-        .env_remove("JAMMI_CONFIG");
-    cmd
-}
+use crate::server_harness::TestServer;
 
 #[test]
 fn cli_channels_register_and_list() {
-    let dir = TempDir::new().expect("tempdir");
+    let server = TestServer::spawn();
 
-    jammi_cmd(dir.path())
+    server
+        .cli()
         .args([
             "channels",
             "register",
@@ -38,7 +28,8 @@ fn cli_channels_register_and_list() {
         .success()
         .stdout(predicates::str::contains("registered"));
 
-    let out = jammi_cmd(dir.path())
+    let out = server
+        .cli()
         .args(["channels", "list"])
         .output()
         .expect("run channels list");
@@ -56,8 +47,9 @@ fn cli_channels_register_and_list() {
 
 #[test]
 fn cli_channels_register_rejects_unknown_type() {
-    let dir = TempDir::new().expect("tempdir");
-    let out = jammi_cmd(dir.path())
+    let server = TestServer::spawn();
+    let out = server
+        .cli()
         .args([
             "channels",
             "register",
@@ -80,8 +72,9 @@ fn cli_channels_register_rejects_unknown_type() {
 
 #[test]
 fn cli_channels_register_rejects_missing_column() {
-    let dir = TempDir::new().expect("tempdir");
-    let out = jammi_cmd(dir.path())
+    let server = TestServer::spawn();
+    let out = server
+        .cli()
         .args(["channels", "register", "--name", "empty", "--priority", "1"])
         .output()
         .expect("run register without column");
@@ -93,9 +86,10 @@ fn cli_channels_register_rejects_missing_column() {
 
 #[test]
 fn cli_channels_add_column_rejects_retype() {
-    let dir = TempDir::new().expect("tempdir");
+    let server = TestServer::spawn();
 
-    jammi_cmd(dir.path())
+    server
+        .cli()
         .args([
             "channels",
             "register",
@@ -110,7 +104,8 @@ fn cli_channels_add_column_rejects_retype() {
         .success();
 
     // Append-only: re-declaring `ranker` with a different type must fail.
-    let out = jammi_cmd(dir.path())
+    let out = server
+        .cli()
         .args([
             "channels",
             "add-column",
@@ -130,9 +125,10 @@ fn cli_channels_add_column_rejects_retype() {
 
 #[test]
 fn cli_channels_add_column_extends_existing() {
-    let dir = TempDir::new().expect("tempdir");
+    let server = TestServer::spawn();
 
-    jammi_cmd(dir.path())
+    server
+        .cli()
         .args([
             "channels",
             "register",
@@ -146,7 +142,8 @@ fn cli_channels_add_column_extends_existing() {
         .assert()
         .success();
 
-    jammi_cmd(dir.path())
+    server
+        .cli()
         .args([
             "channels",
             "add-column",
@@ -158,7 +155,8 @@ fn cli_channels_add_column_extends_existing() {
         .success()
         .stdout(predicates::str::contains("extended"));
 
-    let out = jammi_cmd(dir.path())
+    let out = server
+        .cli()
         .args(["channels", "list"])
         .output()
         .expect("run channels list");

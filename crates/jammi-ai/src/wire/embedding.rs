@@ -16,6 +16,7 @@
 //! [`source_type_to_proto`] for the kind and `From<SourceConnection>` for the
 //! connection message, carrying the same URL + format the decode reads back.
 
+use jammi_db::catalog::model_repo::ModelRecord;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
@@ -289,5 +290,46 @@ pub fn source_descriptor_from_proto(
             .into_iter()
             .map(result_table_from_proto)
             .collect::<Result<_, Status>>()?,
+    })
+}
+
+/// Encode the engine's [`ModelRecord`] into the wire `Model` — the client-
+/// observable projection a `ListModels` response carries. Only the registry-
+/// identity fields cross the wire (`model_id` / `backend` / `task` / `status`);
+/// the version counter, derived-from lineage, artifact path, config blob, and
+/// registration timestamp are server-internal bookkeeping a list consumer does
+/// not key off, mirroring how [`ResultTableRecord`] projects onto
+/// [`pb::ResultTable`]. The `task` rides the shared
+/// [`super::model_task_to_proto`] vocabulary.
+pub fn model_to_proto(record: &ModelRecord) -> pb::Model {
+    pb::Model {
+        model_id: record.model_id.clone(),
+        backend: record.backend.clone(),
+        task: super::model_task_to_proto(record.task) as i32,
+        status: record.status.clone(),
+    }
+}
+
+/// Reconstruct the engine's [`ModelRecord`] from the wire `Model` — the inverse
+/// of [`model_to_proto`], for the [`crate::RemoteSession`] receive side. The
+/// fields not carried on the wire are server-internal bookkeeping, so they
+/// reconstruct at their "not carried" values (`version = 1` default, `None`,
+/// `String::new`), exactly as [`result_table_from_proto`] does for a result
+/// table. The message is self-describing in `task`, so an out-of-range /
+/// unspecified task surfaces as the faithful `invalid_argument` the shared
+/// decoder builds.
+pub fn model_from_proto(model: pb::Model) -> Result<ModelRecord, Status> {
+    let task = super::model_task_from_proto(model.task)?;
+    Ok(ModelRecord {
+        model_id: model.model_id,
+        version: 1,
+        model_type: String::new(),
+        base_model_id: None,
+        backend: model.backend,
+        task,
+        artifact_path: None,
+        config_json: None,
+        status: model.status,
+        created_at: String::new(),
     })
 }

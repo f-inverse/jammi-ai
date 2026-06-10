@@ -86,6 +86,19 @@ pub fn definition_to_proto(
     })
 }
 
+/// Reconstruct an engine [`MutableTableDefinition`] from a wire message that
+/// carries no tenant — the receive side of a `ListMutableTables` response, for
+/// the [`crate::RemoteSession`]. The wire body is tenant-free (a list entry's
+/// tenant rides the session scope, not the message), so the engine definition
+/// reconstructs with `tenant = None`; a list consumer keys off the id / schema /
+/// primary key / indexes, not the catalog row's tenant. Defers all schema /
+/// primary-key validation to the shared [`definition_from_proto`].
+pub fn definition_list_from_proto(
+    def: pb::MutableTableDefinition,
+) -> Result<MutableTableDefinition, Status> {
+    definition_from_proto(def, None)
+}
+
 /// Parse a wire id string into a validated [`MutableTableId`]. Shared by the
 /// create path (definition decode) and the drop path (which carries only the
 /// id), so the id-shape check lives in one place.

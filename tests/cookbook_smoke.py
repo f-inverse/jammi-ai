@@ -5,8 +5,8 @@ recipe exits non-zero, if quickstart wall-clock exceeds 60 seconds, or if
 the smoke runner itself errors.
 
 Set `JAMMI_COOKBOOK_SLOW=1` to additionally run `fine_tune` (slow on CPU)
-and `flight_sql` (requires `cargo build --release -p jammi-cli` to have
-produced `target/release/jammi`). The nightly CI cron sets this flag.
+and `flight_sql` (requires `cargo build --release -p jammi-server` to have
+produced `target/release/jammi-server`). The nightly CI cron sets this flag.
 
 Run with `python tests/cookbook_smoke.py`.
 """

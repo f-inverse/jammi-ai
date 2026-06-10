@@ -133,6 +133,25 @@ jobs:
             exit 1
           fi
 
+      # The `jammi` CLI is a strict gRPC client: it depends on `jammi-ai` with
+      # `default-features = false, features = ["wire"]`, so a standalone build
+      # must stay candle-free. The workspace build feature-unifies `local` on via
+      # jammi-server / jammi-python, so this isolated `-p jammi-cli` lane is the
+      # only place the thin client is exercised — without it a re-coupling of the
+      # engine into the CLI would compile everywhere else and regress only here.
+      #
+      # `cargo tree` reports the workspace-unified feature set (where another
+      # member turns `local` on), so it would falsely flag candle. The real
+      # per-package build set is what `cargo build -p jammi-cli` compiles, so the
+      # guard inspects the compiler-artifact stream of the actual isolated build.
+      - name: Assert the standalone CLI build pulls no ML deps
+        run: |
+          cargo build -p jammi-cli --message-format=json \
+            | grep '"compiler-artifact"' \
+            | grep -iE '"package_id":[^,]*(candle|hf-hub|hf_hub|symphonia|tokenizers)' \
+            && { echo "::error::the jammi CLI compiled an embedded-engine ML dep — the strict-client boundary regressed"; exit 1; } \
+            || echo "jammi-cli build set is candle-free"
+
   dep-direction:
     name: Guard (engine dep-direction)
     runs-on: ubuntu-latest

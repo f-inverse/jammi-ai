@@ -560,11 +560,11 @@ async fn remote_subscribe_stream_yields_the_same_batches_as_local() {
         .expect("publish");
 
     let mut remote_stream = remote
-        .subscribe(&topic, Predicate::match_all(), Some(offset_zero()))
+        .subscribe(&topic, Predicate::match_all(), Some(offset_zero()), false)
         .await
         .expect("remote subscribe");
     let mut local_stream = local
-        .subscribe(&topic, Predicate::match_all(), Some(offset_zero()))
+        .subscribe(&topic, Predicate::match_all(), Some(offset_zero()), false)
         .await
         .expect("local subscribe");
 
@@ -636,6 +636,7 @@ async fn remote_reconstructs_the_exact_trigger_error_variant_local_returns() {
             &topic,
             predicate_referencing_unknown_column(unknown_col),
             None,
+            false,
         )
         .await
     {

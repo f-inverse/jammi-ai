@@ -6,7 +6,7 @@
 //! decodes are free functions taking the raw wire shapes rather than orphan-
 //! rule-blocked `TryFrom<i32>` impls.
 
-use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType};
+use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
 use jammi_db::ChannelId;
 use tonic::Status;
 
@@ -18,6 +18,31 @@ pub fn parse_channel_id(id: &str) -> Result<ChannelId, Status> {
         return Err(Status::invalid_argument("channel_id is required"));
     }
     ChannelId::new(id).map_err(|e| Status::invalid_argument(e.to_string()))
+}
+
+/// Encode the engine's [`ChannelSpec`] into the wire `Channel` a `ListChannels`
+/// response carries — the inverse of [`channel_from_proto`], for the server send
+/// side. Reuses [`columns_to_proto`] for the declared columns, so the column
+/// encoding lives in one place.
+pub fn channel_to_proto(spec: &ChannelSpec) -> pb::Channel {
+    pb::Channel {
+        channel_id: spec.id.as_str().to_string(),
+        priority: spec.priority,
+        columns: columns_to_proto(&spec.columns),
+    }
+}
+
+/// Reconstruct the engine's [`ChannelSpec`] from the wire `Channel` — the
+/// inverse of [`channel_to_proto`], for the [`crate::RemoteSession`] receive
+/// side. The id parses through [`parse_channel_id`] and the columns through
+/// [`columns_from_proto`], so a remote `list_channels` rebuilds the same spec a
+/// local one returns.
+pub fn channel_from_proto(channel: pb::Channel) -> Result<ChannelSpec, Status> {
+    Ok(ChannelSpec {
+        id: parse_channel_id(&channel.channel_id)?,
+        priority: channel.priority,
+        columns: columns_from_proto(channel.columns)?,
+    })
 }
 
 /// Map the wire columns onto the engine's [`ChannelColumn`], rejecting a missing

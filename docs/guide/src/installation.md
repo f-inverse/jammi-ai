@@ -44,7 +44,8 @@ tar -xzf jammi-0.25.0-x86_64-unknown-linux-gnu.tar.gz
 ### GPU (CUDA 12)
 
 GPU inference ships as a container image, not a bare binary. The
-`jammi-ai-server-cu12` image carries the same `jammi` CLI and is turnkey:
+`jammi-ai-server-cu12` image runs `jammi-server` as its entrypoint and also
+carries the `jammi` admin CLI; it is turnkey:
 
 ```bash
 docker run --gpus all \
@@ -52,7 +53,7 @@ docker run --gpus all \
   ghcr.io/f-inverse/jammi-ai-server-cu12:latest
 ```
 
-That runs `jammi serve` with zero config. See
+That runs `jammi-server` with zero config. See
 [Deploy as a Server](./deploy-server.md#gpu-serving) for GPU configuration and
 persistence.
 
@@ -86,7 +87,8 @@ cd jammi-ai
 cargo build --release
 ```
 
-The CLI binary is at `target/release/jammi`.
+The CLI binary is at `target/release/jammi` (a strict gRPC client) and the
+server binary at `target/release/jammi-server`.
 
 For the Python package from source:
 

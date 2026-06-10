@@ -107,6 +107,13 @@ message SubscribeRequest {
   optional uint64 from_offset = 3;
   // Optional tenant scope; same semantics as PublishRequest.tenant_id.
   string tenant_id = 4;
+  // When true, the server drains the backing table's finite replay window
+  // (every retained batch the predicate accepts from `from_offset` onward) and
+  // then closes the stream, instead of holding it open to tail live batches.
+  // This is the bounded `replay_only` primitive a one-shot drain
+  // (`jammi trigger subscribe --no-follow`) needs — the open-ended `subscribe`
+  // stream cannot terminate on its own, so a finite drain requires this flag.
+  bool replay_only = 5;
 }
 
 message SubscribedBatch {

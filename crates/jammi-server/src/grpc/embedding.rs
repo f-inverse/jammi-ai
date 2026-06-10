@@ -42,12 +42,14 @@ use std::collections::HashMap;
 use arrow::array::{Array, Float32Array, RecordBatch, StringArray};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 
+use jammi_ai::wire::model_to_proto;
+
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingService;
 use crate::grpc::proto::embedding::{
     search_request::Query as ProtoQuery, AddSourceRequest, DescribeSourceRequest,
-    EncodeQueryRequest, EncodeQueryResponse, GenerateEmbeddingsRequest, ListSourcesRequest,
-    ListSourcesResponse, RemoveSourceRequest, ResultTable, SearchHit, SearchRequest,
-    SearchResponse, SourceDescriptor,
+    EncodeQueryRequest, EncodeQueryResponse, GenerateEmbeddingsRequest, ListModelsRequest,
+    ListModelsResponse, ListSourcesRequest, ListSourcesResponse, RemoveSourceRequest, ResultTable,
+    SearchHit, SearchRequest, SearchResponse, SourceDescriptor,
 };
 use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant};
 
@@ -126,6 +128,21 @@ impl EmbeddingService for EmbeddingServer {
             .map(SourceDescriptor::from)
             .collect();
         Ok(Response::new(ListSourcesResponse { sources }))
+    }
+
+    async fn list_models(
+        &self,
+        request: Request<ListModelsRequest>,
+    ) -> Result<Response<ListModelsResponse>, Status> {
+        let tenant = session_tenant(&request);
+        let session = self.local();
+
+        let records = scoped(&self.session, tenant, || session.list_models())
+            .await
+            .map_err(map_engine_error)?;
+
+        let models = records.iter().map(model_to_proto).collect();
+        Ok(Response::new(ListModelsResponse { models }))
     }
 
     async fn describe_source(

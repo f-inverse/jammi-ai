@@ -1,12 +1,12 @@
-"""Run a `SELECT` against a `jammi serve` subprocess over Arrow Flight SQL.
+"""Run a `SELECT` against a `jammi-server` subprocess over Arrow Flight SQL.
 
 Run with `python cookbook/recipes/flight_sql/example.py`. Exits 0 on
 success. Excluded from the default smoke matrix because it shells out to
-the `jammi` binary; gated behind `JAMMI_COOKBOOK_SLOW=1` in
+the `jammi-server` binary; gated behind `JAMMI_COOKBOOK_SLOW=1` in
 `tests/cookbook_smoke.py` and the nightly CI cron.
 
-Requires the OSS server binary at `target/release/jammi` (or whatever
-`JAMMI_BIN` points to). Build it with `cargo build --release -p jammi-cli`.
+Requires the OSS server binary at `target/release/jammi-server` (or whatever
+`JAMMI_BIN` points to). Build it with `cargo build --release -p jammi-server`.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from pathlib import Path
 import pyarrow.flight as flight
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-DEFAULT_BIN = REPO_ROOT / "target" / "release" / "jammi"
+DEFAULT_BIN = REPO_ROOT / "target" / "release" / "jammi-server"
 
 HEALTH_URL = "http://127.0.0.1:8080/healthz"
 FLIGHT_URL = "grpc://127.0.0.1:8081"
@@ -97,8 +97,8 @@ def main() -> int:
     binary = Path(os.environ.get("JAMMI_BIN", DEFAULT_BIN))
     if not binary.exists():
         print(
-            f"jammi binary not found at {binary}. Build it with "
-            "`cargo build --release -p jammi-cli` or set JAMMI_BIN.",
+            f"jammi-server binary not found at {binary}. Build it with "
+            "`cargo build --release -p jammi-server` or set JAMMI_BIN.",
             file=sys.stderr,
         )
         return 1
@@ -115,7 +115,7 @@ def main() -> int:
         env["JAMMI_ARTIFACT_DIR"] = tmp
 
         proc = subprocess.Popen(
-            [str(binary), "serve"],
+            [str(binary)],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

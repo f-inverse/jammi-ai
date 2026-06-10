@@ -73,6 +73,11 @@ prost = { workspace = true, optional = true }
 prost-types = { workspace = true, optional = true }
 tokio-stream = { workspace = true, optional = true }
 arrow-ipc = { workspace = true, optional = true }
+# Flight SQL client. The remote `Session::sql` rides the Flight SQL lane (per
+# ADR-01 §3.2 Flight SQL carries query/result), so a `RemoteSession` speaks
+# Flight SQL over the same tonic channel its typed-RPC verbs use. Wire-only;
+# pulls no candle.
+arrow-flight = { workspace = true, optional = true }
 
 [build-dependencies]
 # Built only under the `wire` feature; `build.rs` returns early without
@@ -125,7 +130,7 @@ local = [
     "jammi-lora/candle",
 ]
 live-hub-tests = []
-# A gated, multi-process distributed-validation lane: spawns N `jammi serve`
+# A gated, multi-process distributed-validation lane: spawns N `jammi-server`
 # worker processes against a shared Postgres catalog + shared object store
 # (MinIO) and asserts the durable-worker fleet-safety properties (exactly-one
 # claim, kill-9 reclaim, the artifact crash-window on real object storage,
@@ -152,6 +157,7 @@ wire = [
     "dep:prost-types",
     "dep:tokio-stream",
     "dep:arrow-ipc",
+    "dep:arrow-flight",
     "dep:tonic-build",
     "dep:tonic-prost-build",
 ]
@@ -170,7 +176,7 @@ required-features = ["local"]
 # The multi-process distributed-validation harness. Its own target (not part of
 # the hermetic `it` suite) so it compiles and runs only under
 # `live-distributed-tests`, and so the gated CI lane can target it by name with
-# `--test distributed`. Spawns `jammi serve` worker processes against a shared
+# `--test distributed`. Spawns `jammi-server` worker processes against a shared
 # Postgres + MinIO; never compiled or run on the default `cargo test` lane.
 [[test]]
 name = "distributed"

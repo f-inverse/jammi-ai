@@ -28,6 +28,11 @@ service ChannelService {
   // Append columns to an already-registered channel (append-only). Peer of the
   // abstraction's `add_channel_columns`.
   rpc AddChannelColumns(AddChannelColumnsRequest) returns (google.protobuf.Empty);
+
+  // List every channel registered to the calling tenant, ordered by
+  // `(priority, channel_id)`. Peer of the abstraction's `list_channels`;
+  // registry introspection, not a SQL query.
+  rpc ListChannels(ListChannelsRequest) returns (ListChannelsResponse);
 }
 
 // The closed set of Arrow types a channel column may declare. Mirrors the
@@ -60,4 +65,25 @@ message RegisterChannelRequest {
 message AddChannelColumnsRequest {
   string channel_id = 1;
   repeated ChannelColumn columns = 2;
+}
+
+message ListChannelsRequest {}
+
+message ListChannelsResponse {
+  // One entry per channel registered to the calling tenant, ordered by
+  // `(priority, channel_id)`.
+  repeated Channel channels = 1;
+}
+
+// A fully-materialized channel in a `ListChannels` response. Carries everything
+// the engine's `ChannelSpec` holds (id / priority / declared columns) so a
+// remote `list_channels` reconstructs the identical value the in-process path
+// returns.
+message Channel {
+  // Channel id: ASCII slug `[a-z][a-z0-9_]{0,63}`.
+  string channel_id = 1;
+  // Resolution priority among channels.
+  int32 priority = 2;
+  // Declared columns, in declaration order.
+  repeated ChannelColumn columns = 3;
 }

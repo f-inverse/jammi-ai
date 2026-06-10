@@ -41,6 +41,12 @@ service EmbeddingService {
   // special-casing.
   rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
 
+  // List a `Model` record for every model registered to the calling tenant.
+  // Peer of the abstraction's `list_models`; registry introspection, not a SQL
+  // query. The model registry is the embedding tier's catalog surface (the
+  // peer of the source registry `ListSources` reads), so it lives here.
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+
   // Describe one registered source: its registry identity (id / kind /
   // lifecycle status) plus the result tables embedded out of it (each carrying
   // its own status / row_count / dimensions). Peer of the abstraction's
@@ -128,6 +134,31 @@ message ListSourcesResponse {
   // One descriptor per source registered to the calling tenant, in the
   // engine's registration order.
   repeated SourceDescriptor sources = 1;
+}
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  // One record per model registered to the calling tenant, in the catalog's
+  // registration order.
+  repeated Model models = 1;
+}
+
+// The client-observable projection of the engine's `ModelRecord`. Carries the
+// fields a client needs to identify a registered model — its id, the inference
+// backend, the task it performs, and its lifecycle status. Server-internal
+// bookkeeping (version counter, derived-from lineage, artifact path, config
+// blob, registration timestamp) stays server-side, mirroring how `ResultTable`
+// is the client projection of the engine's result-table record.
+message Model {
+  // Unique model name (e.g. an HF repo id or a fine-tuned id).
+  string model_id = 1;
+  // Inference backend (e.g. "candle", "vllm", "http").
+  string backend = 2;
+  // The task this model performs.
+  jammi.v1.inference.ModelTask task = 3;
+  // Lifecycle status (e.g. "registered", "loaded", "failed").
+  string status = 4;
 }
 
 message DescribeSourceRequest {

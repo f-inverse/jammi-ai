@@ -339,6 +339,7 @@ async fn grpc_publish_round_trips_batch_to_backing_table() {
             predicate: String::new(),
             from_offset: Some(0),
             tenant_id: String::new(),
+            replay_only: false,
         })
         .await
         .expect("subscribe")
@@ -498,6 +499,7 @@ async fn grpc_subscribe_receives_subsequent_publishes_in_order() {
             predicate: String::new(),
             from_offset: None,
             tenant_id: String::new(),
+            replay_only: false,
         })
         .await
         .expect("subscribe")
@@ -564,6 +566,7 @@ async fn grpc_subscribe_with_from_offset_zero_replays_history() {
             predicate: String::new(),
             from_offset: Some(0),
             tenant_id: String::new(),
+            replay_only: false,
         })
         .await
         .expect("subscribe")
@@ -594,6 +597,7 @@ async fn grpc_subscribe_predicate_filters_batches_server_side() {
             predicate: "kind = 'X'".into(),
             from_offset: None,
             tenant_id: String::new(),
+            replay_only: false,
         })
         .await
         .expect("subscribe")
@@ -652,6 +656,7 @@ async fn grpc_subscribe_invalid_predicate_returns_invalid_argument() {
             predicate: "SUM(id) > 0".into(),
             from_offset: None,
             tenant_id: String::new(),
+            replay_only: false,
         })
         .await
         .expect_err("aggregate predicate must be rejected");
@@ -710,6 +715,7 @@ async fn grpc_subscribe_client_drop_does_not_corrupt_broker_state() {
             predicate: String::new(),
             from_offset: None,
             tenant_id: String::new(),
+            replay_only: false,
         })
         .await
         .expect("subscribe")
@@ -759,6 +765,7 @@ async fn grpc_subscribe_client_drop_does_not_corrupt_broker_state() {
             predicate: String::new(),
             from_offset: Some(0),
             tenant_id: String::new(),
+            replay_only: false,
         })
         .await
         .expect("replay subscribe")
@@ -805,6 +812,7 @@ async fn grpc_publish_subscribe_round_trip_preserves_order() {
             predicate: String::new(),
             from_offset: None,
             tenant_id: String::new(),
+            replay_only: false,
         })
         .await
         .expect("subscribe")

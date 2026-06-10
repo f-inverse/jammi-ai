@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
-use jammi_ai::wire::{columns_from_proto, parse_channel_id};
+use jammi_ai::wire::{channel_to_proto, columns_from_proto, parse_channel_id};
 use jammi_ai::{LocalSession, Session};
 use jammi_db::catalog::channel_repo::ChannelSpec;
 use tonic::{Request, Response, Status};
@@ -88,5 +88,20 @@ impl ChannelService for ChannelServer {
         .map_err(map_engine_error)?;
 
         Ok(Response::new(()))
+    }
+
+    async fn list_channels(
+        &self,
+        request: Request<pb::ListChannelsRequest>,
+    ) -> Result<Response<pb::ListChannelsResponse>, Status> {
+        let tenant = session_tenant(&request);
+        let session = self.local();
+
+        let specs = scoped(&self.session, tenant, || session.list_channels())
+            .await
+            .map_err(map_engine_error)?;
+
+        let channels = specs.iter().map(channel_to_proto).collect();
+        Ok(Response::new(pb::ListChannelsResponse { channels }))
     }
 }

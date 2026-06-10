@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use jammi_db::session::JammiSession;
 use jammi_db::TenantId;
-use jammi_server::grpc::proto::session::{SetTenantRequest, Tenant};
+use jammi_server::grpc::proto::catalog::{SetTenantRequest, Tenant};
 use jammi_server::grpc::session::{SessionId, SessionStore};
 use jammi_test_utils::test_config;
 use prost::Message;
@@ -23,7 +23,7 @@ use tokio::sync::oneshot;
 
 use super::common::grpc::TENANT_A;
 
-/// Spin up an in-process gRPC server hosting `SessionService` (no
+/// Spin up an in-process gRPC server hosting `CatalogService` (no
 /// trigger handles — this test does not need them). The Flight SQL
 /// service is mounted on the same chain as in production so the
 /// gRPC-Web routing assertion exercises the real binary's surface;
@@ -283,7 +283,7 @@ async fn grpc_web_set_tenant_round_trip() {
     let session_id = "grpc-web-session";
     let response = client
         .post(format!(
-            "http://{addr}/jammi.v1.session.SessionService/SetTenant"
+            "http://{addr}/jammi.v1.catalog.CatalogService/SetTenant"
         ))
         .header("content-type", "application/grpc-web+proto")
         .header("accept", "application/grpc-web+proto")

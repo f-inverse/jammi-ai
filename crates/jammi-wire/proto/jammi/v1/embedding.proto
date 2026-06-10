@@ -1,0 +1,153 @@
+syntax = "proto3";
+
+package jammi.v1.embedding;
+
+import "jammi/v1/inference.proto";
+
+// EmbeddingService — the wire surface for the engine's embedding compute
+// verbs. These are imperative session methods, not SQL queries, so they live
+// as typed gRPC RPCs alongside InferenceService / TriggerService rather than on
+// the Flight SQL surface (which carries query/result only, per ADR-01 §3.2).
+//
+// The surface is modality-agnostic: one GenerateEmbeddings / EncodeQuery pair
+// keyed by a `Modality` selects the text, image, or audio tower, rather than a
+// verb per modality. Each verb delegates 1:1 to the consumer-facing
+// `Session` abstraction, which dispatches the modality onto the
+// engine's concrete tower method — the service reimplements no decode,
+// feature-extraction, or forward logic; it is purely a wire adapter over the
+// in-process engine. Jammi stays non-generative: these encode input → vector,
+// never generate.
+//
+// Source registration and model introspection — the control-plane catalog
+// surface this compute lane reads — live on CatalogService, not here. This
+// service carries the data-plane compute verbs only.
+//
+// Tenant scope is read from the request's `SessionTenant` extension, set by
+// the shared TenantInterceptor from the `jammi-session-id` header — the same
+// mechanism CatalogService / TriggerService / Flight SQL already use.
+service EmbeddingService {
+  // Scan `columns` on a registered source, run the modality's tower over
+  // every row (decode/feature-extraction as the modality requires → forward
+  // pass), persist one L2-normalized vector per row keyed by `key_column`,
+  // and return the result-table record. The `modality` selects which tower.
+  // Peer of the abstraction's `generate_embeddings`.
+  rpc GenerateEmbeddings(GenerateEmbeddingsRequest) returns (ResultTable);
+
+  // Encode a single query into one L2-normalized embedding with the modality's
+  // tower. The `modality` selects the tower; the `input` oneof must match it —
+  // `text` for TEXT, `data` (raw encoded bytes) for IMAGE/AUDIO. Peer of the
+  // abstraction's `encode_query`.
+  rpc EncodeQuery(EncodeQueryRequest) returns (EncodeQueryResponse);
+
+  // Nearest-neighbor search over a source's embedding table. The query is
+  // either a precomputed vector (encode-then-search) or an existing row's key
+  // (query-by-example; the engine resolves that row's stored vector
+  // internally — the vector never crosses the wire). Peer of the
+  // abstraction's flat `search`. This is the embedding-consumption verb on the
+  // gRPC surface edge runtimes reach (gRPC-web); it adds no new consumption
+  // model, only an additional transport for the existing capability.
+  rpc Search(SearchRequest) returns (SearchResponse);
+}
+
+// Which embedding tower a GenerateEmbeddings / EncodeQuery call targets.
+// Mirrors the abstraction's `Modality`; unifying the three per-modality verbs
+// into one parameter is what lets the service carry one embedding verb pair.
+enum Modality {
+  MODALITY_UNSPECIFIED = 0;
+  TEXT = 1;
+  IMAGE = 2;
+  AUDIO = 3;
+}
+
+message GenerateEmbeddingsRequest {
+  // Registered source to scan.
+  string source_id = 1;
+  // Encoder model. `local:<path>`, an HF repo id, or a fine-tuned id.
+  string model_id = 2;
+  // Content columns to embed. The TEXT tower embeds the listed columns; the
+  // IMAGE and AUDIO towers take exactly one content column.
+  repeated string columns = 3;
+  // Column whose value becomes each embedding row's key.
+  string key_column = 4;
+  // Which tower to run over the columns.
+  Modality modality = 5;
+}
+
+// Subset of the engine's `ResultTableRecord` a client needs to locate and
+// query the persisted embedding table. Internal bookkeeping columns
+// (parquet/index paths, timestamps) stay server-side. The record is
+// self-describing — it carries its own `task` — so it reconstructs without the
+// caller supplying the modality out of band; this is the one shape both
+// GenerateEmbeddings and the catalog's DescribeSource return.
+message ResultTable {
+  string table_name = 1;
+  string source_id = 2;
+  string model_id = 3;
+  // Embedding dimensionality; unset on the wire as 0 when the engine did
+  // not record one (an empty source produces no vectors).
+  int32 dimensions = 4;
+  uint64 row_count = 5;
+  // Lifecycle status reported by the engine ("ready" on success).
+  string status = 6;
+  // The task that produced this table (the embedding tower: text / image /
+  // audio). Carried so the record reconstructs its `ModelTask` faithfully on
+  // the wire rather than from a guessed default.
+  jammi.v1.inference.ModelTask task = 7;
+}
+
+message EncodeQueryRequest {
+  string model_id = 1;
+  // Which tower to encode the input with.
+  Modality modality = 2;
+  // The query input. `text` for TEXT; `data` (raw encoded bytes — an image
+  // file or an audio clip) for IMAGE/AUDIO. Must match `modality`.
+  oneof input {
+    string text = 3;
+    bytes data = 4;
+  }
+}
+
+message EncodeQueryResponse {
+  // The L2-normalized embedding for the query.
+  repeated float embedding = 1;
+}
+
+// A packed f32 query vector — the output of `EncodeQuery` (or any client-side
+// encoder) fed back as a search query.
+message QueryVector {
+  repeated float values = 1;
+}
+
+message SearchRequest {
+  // Source whose embedding table is searched.
+  string source_id = 1;
+  // Either a precomputed query vector or an existing row's key. A row_key
+  // resolves that row's stored vector inside the engine (query-by-example);
+  // the vector is never carried on the wire.
+  oneof query {
+    QueryVector query_vector = 2;
+    string row_key = 3;
+  }
+  // Number of nearest neighbors to return.
+  uint32 k = 4;
+  // Optional SQL predicate pushed into the search (predicate pushdown). The
+  // engine treats it as an opaque expression over the result columns; it
+  // carries no domain semantics.
+  optional string filter = 5;
+  // Columns to project into each hit's `columns` map. Empty = key + score
+  // only (no projected columns).
+  repeated string select = 6;
+}
+
+message SearchResponse {
+  repeated SearchHit hits = 1;
+}
+
+message SearchHit {
+  // The matched row's key (the source's key-column value).
+  string key = 1;
+  // Similarity score from the ANN search.
+  float score = 2;
+  // Projected scalar columns, stringified, when `select` is non-empty.
+  map<string, string> columns = 3;
+}

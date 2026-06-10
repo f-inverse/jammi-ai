@@ -1,6 +1,11 @@
+//! `jammi sources` subcommand.
+//!
+//! Register and list data sources over the remote `CatalogClient`. `list` prints
+//! each `SourceDescriptor`: its registry identity plus how many embedding
+//! result tables have been produced from it.
+
 use clap::Subcommand;
-use jammi_ai::session::InferenceSession;
-use jammi_db::config::JammiConfig;
+use jammi_admin::CatalogClient;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
 #[derive(Subcommand)]
@@ -8,7 +13,7 @@ pub enum SourceAction {
     /// List registered sources
     List,
     /// Add a file-shaped data source. `--url` accepts a local path
-    /// (parsed into `file://...`) or any storage URL the build was
+    /// (parsed into `file://...`) or any storage URL the server was
     /// compiled with: `s3://bucket/key`, `gs://bucket/key`,
     /// `azure://container/blob`.
     Add {
@@ -24,28 +29,24 @@ pub enum SourceAction {
 }
 
 pub async fn run(
-    config: JammiConfig,
-    tenant: Option<jammi_db::TenantId>,
+    session: &CatalogClient,
     action: SourceAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {
         SourceAction::List => {
-            let session = InferenceSession::new(config).await?;
-            if let Some(t) = tenant {
-                session.bind_tenant(t);
-            }
-            let sources = session.catalog().list_sources().await?;
+            let sources = session.list_sources().await?;
             if sources.is_empty() {
                 println!("No sources registered.");
             } else {
-                println!("{:<20} {:<15} Created", "Name", "Type");
-                println!("{}", "-".repeat(55));
+                println!("{:<20} {:<12} {:<10} Embeddings", "Name", "Type", "Status");
+                println!("{}", "-".repeat(60));
                 for s in sources {
                     println!(
-                        "{:<20} {:<15} {}",
+                        "{:<20} {:<12} {:<10} {}",
                         s.source_id,
                         format!("{:?}", s.source_type),
-                        s.created_at
+                        s.status,
+                        s.result_tables.len()
                     );
                 }
             }
@@ -55,10 +56,6 @@ pub async fn run(
                 .parse()
                 .map_err(|e: jammi_db::error::JammiError| e.to_string())?;
             let connection = SourceConnection::parse(&url, file_format)?;
-            let session = InferenceSession::new(config).await?;
-            if let Some(t) = tenant {
-                session.bind_tenant(t);
-            }
             session
                 .add_source(&name, SourceType::File, connection)
                 .await?;

@@ -62,11 +62,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Build wheel + jammi binary
-        # `flight_sql` shells out to `target/release/jammi`; build it before
-        # invoking the smoke runner. The embed wheel hard-deps `jammi-client`
-        # (not on PyPI for an unreleased commit) — install it from the in-repo
-        # source before `maturin develop`.
+      - name: Build wheel + jammi-server binary
+        # `flight_sql` shells out to `target/release/jammi-server`; build it
+        # before invoking the smoke runner. The embed wheel hard-deps
+        # `jammi-client` (not on PyPI for an unreleased commit) — install it from
+        # the in-repo source before `maturin develop`.
         run: |
           python3 -m venv .venv
           . .venv/bin/activate
@@ -75,7 +75,7 @@ jobs:
           make -C clients/python generate
           pip install -e clients/python
           maturin develop --release
-          cargo build --release -p jammi-cli
+          cargo build --release -p jammi-server
 
       - name: Run cookbook smoke (all recipes)
         env:

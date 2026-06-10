@@ -13,7 +13,7 @@ After this recipe you can:
 
 1. Bind a tenant to a session in Rust, Python, and on the CLI.
 2. Verify that two sessions on the same process see disjoint rows.
-3. Bind a tenant on a remote client via the gRPC `SessionService` so
+3. Bind a tenant on a remote client via the gRPC `CatalogService` so
    subsequent Flight SQL queries from the same connection observe the
    tenant.
 
@@ -70,31 +70,32 @@ The `--tenant` flag is global; it applies to every subcommand.
 
 ```bash
 jammi --tenant 018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9a sources list
-jammi --tenant 018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9b query "SELECT * FROM models"
+jammi --tenant 018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9b models list
 ```
 
 ## Remote clients (gRPC + Flight SQL)
 
 A programmatic client (Python, Go, Java) binds the tenant once per
-connection via the `jammi.v1.session.SessionService.SetTenant` RPC. The
+connection via the `jammi.v1.catalog.CatalogService.SetTenant` RPC. The
 server records the tenant against the `jammi-session-id` request metadata
 header; every Flight SQL query the same connection issues afterwards
 inherits the binding through the `TenantInterceptor` that fronts both
-services. Browser clients reach the same `SessionService` over HTTP/1.1
+services. Browser clients reach the same `CatalogService` over HTTP/1.1
 via the gRPC-Web shim (`application/grpc-web+proto`) — no separate REST
 surface, same `jammi-session-id` header semantics.
 
 ```python
 import grpc
-from jammi.v1.session.session_pb2 import SetTenantRequest, Tenant
-from jammi.v1.session.session_pb2_grpc import SessionServiceStub
+from jammi.v1 import catalog_pb2, catalog_pb2_grpc
 
 channel = grpc.insecure_channel("jammi.example.com:50051")
 metadata = [("jammi-session-id", "my-client-uuid")]
 
-session = SessionServiceStub(channel)
-session.SetTenant(
-    SetTenantRequest(tenant=Tenant(id="018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9a")),
+client = catalog_pb2_grpc.CatalogServiceStub(channel)
+client.SetTenant(
+    catalog_pb2.SetTenantRequest(
+        tenant=catalog_pb2.Tenant(id="018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9a")
+    ),
     metadata=metadata,
 )
 # Subsequent Flight SQL queries on the same channel + jammi-session-id

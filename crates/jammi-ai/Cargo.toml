@@ -18,11 +18,18 @@ jammi-numerics.workspace = true
 # engine.
 jammi-lora.workspace = true
 
+# The candle-free wire substrate: the generated `jammi.v1` stubs, the
+# proto↔domain conversions, and the moved request / eval / fine-tune vocabulary.
+# The engine re-exports that vocabulary at its original paths and builds its
+# residual engine-spec converters (`jammi_ai::wire`) on top of jammi-wire's
+# `proto` + helpers. Pulled at all times (it is candle-free).
+jammi-wire.workspace = true
+
 # ── The embedded ML engine. Every dep below pulls a heavy ML / decode stack and
 # is needed only by the in-process engine (the `model` / `inference` / `session`
 # / engine-`fine_tune` / `eval::runner` modules). They are gated behind the
-# default-on `local` feature so a remote-only `wire` build pulls none of them and
-# stays a thin wire-speaker. A default / embedded / PyO3 build keeps them all.
+# default-on `local` feature so a thin build pulls none of them and stays a thin
+# wire-speaker. A default / embedded / PyO3 build keeps them all.
 jammi-encoders = { workspace = true, optional = true }
 candle-core = { workspace = true, optional = true }
 candle-nn = { workspace = true, optional = true }
@@ -63,22 +70,12 @@ thiserror.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 
-# gRPC wire surface (default-off `wire` feature). These pull the transport
-# stack only when a consumer that speaks gRPC — `jammi-server`, a future
-# `RemoteSession` — opts in; a default / embedded / PyO3 build pulls none of
-# them, keeping the embeddable engine tonic/prost-free.
+# The residual engine-spec converters (`jammi_ai::wire`, under `local`) encode /
+# decode the engine `TrainingSpec` / predictor / edge-gather shapes against
+# jammi-wire's `proto` and return a `tonic::Status` on a malformed wire body, so
+# `tonic` rides the `local` feature as a runtime dep. The transport stack itself
+# (prost / Flight SQL / IPC) lives in jammi-wire, not here.
 tonic = { workspace = true, optional = true }
-tonic-prost = { workspace = true, optional = true }
-prost = { workspace = true, optional = true }
-prost-types = { workspace = true, optional = true }
-tokio-stream = { workspace = true, optional = true }
-arrow-ipc = { workspace = true, optional = true }
-
-[build-dependencies]
-# Built only under the `wire` feature; `build.rs` returns early without
-# `CARGO_FEATURE_WIRE`, so a default build neither links nor runs these.
-tonic-build = { workspace = true, optional = true }
-tonic-prost-build = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -103,11 +100,11 @@ default = ["local"]
 # The embedded in-process engine: model loading + inference + fine-tune training
 # + embedding/search pipelines, and the candle / hf-hub / symphonia / tokenizers
 # / image stack they run on. Default-on, so a plain / embedded / PyO3 build is
-# byte-unchanged. Turning it OFF (with `wire` ON) yields a thin remote-only client
-# — `RemoteSession` + `Session::Remote` + `Jammi::open(Target::Remote)` — that
-# pulls no ML stack. The `Session` / `Target` enums gain their `Local` arm only
-# under this feature, mirroring how `Remote` rides `wire`: the buildable surface
-# equals the runtime capability.
+# byte-unchanged. It also gates the residual engine-spec converters
+# (`jammi_ai::wire`, which return a `tonic::Status` on a malformed wire body), so
+# `dep:tonic` rides here. The candle-free wire substrate and the client crates
+# live outside this crate, so a consumer that wants a thin client depends on
+# `jammi-wire` / `jammi-admin` / `jammi-client`, not a feature-stripped `jammi-ai`.
 local = [
     "dep:jammi-encoders",
     "dep:candle-core",
@@ -122,10 +119,11 @@ local = [
     "dep:async-trait",
     "dep:tempfile",
     "dep:bytes",
+    "dep:tonic",
     "jammi-lora/candle",
 ]
 live-hub-tests = []
-# A gated, multi-process distributed-validation lane: spawns N `jammi serve`
+# A gated, multi-process distributed-validation lane: spawns N `jammi-server`
 # worker processes against a shared Postgres catalog + shared object store
 # (MinIO) and asserts the durable-worker fleet-safety properties (exactly-one
 # claim, kill-9 reclaim, the artifact crash-window on real object storage,
@@ -140,28 +138,11 @@ live-distributed-tests = ["local", "jammi-db/storage-s3"]
 # CUDA / Metal acceleration of the embedded engine — only meaningful with `local`.
 cuda = ["local", "candle-core/cuda", "candle-nn/cuda"]
 metal = ["local", "candle-core/metal", "candle-nn/metal"]
-# The gRPC wire surface: generated tonic stubs (build.rs codegen) plus the
-# proto↔domain conversions in `src/wire`. Default-off so the embeddable engine
-# pulls no transport stack; `jammi-server` and a future `RemoteSession` enable
-# it. Pulls the tonic/prost runtime deps and the tonic build-deps that drive
-# `build.rs`.
-wire = [
-    "dep:tonic",
-    "dep:tonic-prost",
-    "dep:prost",
-    "dep:prost-types",
-    "dep:tokio-stream",
-    "dep:arrow-ipc",
-    "dep:tonic-build",
-    "dep:tonic-prost-build",
-]
 
 # The `it` integration suite drives the embedded engine end-to-end (model loading,
 # inference, fine-tune, search), so it requires the `local` feature. Declaring the
-# requirement here lets `--all-targets` skip it cleanly in the thin `wire`-only
-# build rather than fail to compile an engine test with no engine. The wire
-# proto↔domain conversions keep their own in-lib `#[cfg(test)]` unit tests, which
-# the thin build still compiles and runs.
+# requirement here lets `--all-targets` skip it cleanly in a non-`local` build
+# rather than fail to compile an engine test with no engine.
 [[test]]
 name = "it"
 path = "tests/it/main.rs"
@@ -170,7 +151,7 @@ required-features = ["local"]
 # The multi-process distributed-validation harness. Its own target (not part of
 # the hermetic `it` suite) so it compiles and runs only under
 # `live-distributed-tests`, and so the gated CI lane can target it by name with
-# `--test distributed`. Spawns `jammi serve` worker processes against a shared
+# `--test distributed`. Spawns `jammi-server` worker processes against a shared
 # Postgres + MinIO; never compiled or run on the default `cargo test` lane.
 [[test]]
 name = "distributed"

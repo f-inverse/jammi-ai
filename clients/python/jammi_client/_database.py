@@ -26,11 +26,11 @@ import pyarrow.flight  # noqa: F401  (registers the `pa.flight` submodule)
 from . import _conformal
 from ._credentials import AnonymousCredentials, ChannelCredentials
 from ._errors import TrainingError
+from ._generated.jammi.v1 import catalog_pb2, catalog_pb2_grpc
 from ._generated.jammi.v1 import embedding_pb2, embedding_pb2_grpc
 from ._generated.jammi.v1 import eval_pb2, eval_pb2_grpc
 from ._generated.jammi.v1 import inference_pb2, inference_pb2_grpc
 from ._generated.jammi.v1 import pipeline_pb2, pipeline_pb2_grpc
-from ._generated.jammi.v1 import session_pb2, session_pb2_grpc
 from ._generated.jammi.v1 import training_pb2, training_pb2_grpc
 
 # The header carrying a connection's opaque session id. The server's tenant
@@ -53,19 +53,19 @@ _MODALITY = {
 # `SourceType` serialises to, so a descriptor dict is shaped identically whether
 # it crossed the gRPC wire or came back from the in-process engine.
 _SOURCE_KIND_NAME = {
-    embedding_pb2.SourceKind.SOURCE_KIND_FILE: "File",
-    embedding_pb2.SourceKind.SOURCE_KIND_POSTGRES: "Postgres",
-    embedding_pb2.SourceKind.SOURCE_KIND_MYSQL: "MySql",
+    catalog_pb2.SourceKind.SOURCE_KIND_FILE: "File",
+    catalog_pb2.SourceKind.SOURCE_KIND_POSTGRES: "Postgres",
+    catalog_pb2.SourceKind.SOURCE_KIND_MYSQL: "MySql",
 }
 
 # File-format string → wire `FileFormat` enum. Mirrors the engine's `FileFormat`
 # parse so `add_source(format=...)` accepts the same vocabulary as the embed
 # wheel's local path.
 _FILE_FORMAT = {
-    "parquet": embedding_pb2.FileFormat.FILE_FORMAT_PARQUET,
-    "csv": embedding_pb2.FileFormat.FILE_FORMAT_CSV,
-    "json": embedding_pb2.FileFormat.FILE_FORMAT_JSON,
-    "avro": embedding_pb2.FileFormat.FILE_FORMAT_AVRO,
+    "parquet": catalog_pb2.FileFormat.FILE_FORMAT_PARQUET,
+    "csv": catalog_pb2.FileFormat.FILE_FORMAT_CSV,
+    "json": catalog_pb2.FileFormat.FILE_FORMAT_JSON,
+    "avro": catalog_pb2.FileFormat.FILE_FORMAT_AVRO,
 }
 
 
@@ -108,7 +108,7 @@ def _result_table_to_dict(rt: embedding_pb2.ResultTable) -> Dict[str, Any]:
     }
 
 
-def _source_descriptor_to_dict(d: embedding_pb2.SourceDescriptor) -> Dict[str, Any]:
+def _source_descriptor_to_dict(d: catalog_pb2.SourceDescriptor) -> Dict[str, Any]:
     """Project a wire `SourceDescriptor` into the embed wheel's descriptor dict.
 
     The descriptor shape matches the embed wheel's `list_sources` /
@@ -422,7 +422,7 @@ class RemoteDatabase:
         self._tls = tls
         self._metadata = ((SESSION_HEADER, session_id),)
         self._embedding = embedding_pb2_grpc.EmbeddingServiceStub(channel)
-        self._session = session_pb2_grpc.SessionServiceStub(channel)
+        self._catalog = catalog_pb2_grpc.CatalogServiceStub(channel)
         self._training = training_pb2_grpc.TrainingServiceStub(channel)
         self._inference = inference_pb2_grpc.InferenceServiceStub(channel)
         self._pipeline = pipeline_pb2_grpc.PipelineServiceStub(channel)
@@ -437,36 +437,36 @@ class RemoteDatabase:
         """The opaque session id the server keys this connection's tenant by."""
         return self._session_id
 
-    # --- Session / tenant trio + handshake --------------------------------------
+    # --- Catalog: tenant trio + handshake ---------------------------------------
 
     def with_tenant(self, tenant_id: str) -> None:
         """Bind a tenant scope to this connection. Pass an empty string to clear.
 
-        Maps to `SessionService.SetTenant` / `ClearTenant`, keyed by this
+        Maps to `CatalogService.SetTenant` / `ClearTenant`, keyed by this
         connection's session id.
         """
         if tenant_id == "":
-            self._session.ClearTenant(
+            self._catalog.ClearTenant(
                 _empty(), metadata=self._metadata
             )
             return
-        self._session.SetTenant(
-            session_pb2.SetTenantRequest(tenant=session_pb2.Tenant(id=tenant_id)),
+        self._catalog.SetTenant(
+            catalog_pb2.SetTenantRequest(tenant=catalog_pb2.Tenant(id=tenant_id)),
             metadata=self._metadata,
         )
 
     def tenant(self) -> Optional[str]:
         """The tenant currently bound to this connection, or ``None``.
 
-        Maps to `SessionService.GetTenant`.
+        Maps to `CatalogService.GetTenant`.
         """
-        resp = self._session.GetTenant(_empty(), metadata=self._metadata)
+        resp = self._catalog.GetTenant(_empty(), metadata=self._metadata)
         return resp.tenant.id or None
 
     def get_server_info(self) -> Dict[str, Any]:
         """The engine's capabilities handshake: ``version`` / ``features`` /
         ``storage_backends`` / ``services``. Maps to
-        `SessionService.GetServerInfo`.
+        `CatalogService.GetServerInfo`.
 
         The first three fields are compile-time facts about the build;
         ``services`` is the runtime tier handshake — the gRPC service tiers this
@@ -478,7 +478,7 @@ class RemoteDatabase:
         The same keys the embedded `Database.get_server_info` returns, so the
         handshake shape agrees across transports.
         """
-        resp = self._session.GetServerInfo(_empty(), metadata=self._metadata)
+        resp = self._catalog.GetServerInfo(_empty(), metadata=self._metadata)
         return {
             "version": resp.version,
             "features": list(resp.features),
@@ -493,7 +493,7 @@ class RemoteDatabase:
 
         `url` accepts a local path (wrapped into `file://...` server-side) or any
         storage URL the server was compiled with (`s3://`, `gs://`, `azure://`).
-        Maps to `EmbeddingService.AddSource`.
+        Maps to `CatalogService.AddSource`.
         """
         try:
             file_format = _FILE_FORMAT[format]
@@ -501,11 +501,11 @@ class RemoteDatabase:
             raise ValueError(
                 f"format must be one of {sorted(_FILE_FORMAT)} (got {format!r})"
             ) from None
-        self._embedding.AddSource(
-            embedding_pb2.AddSourceRequest(
+        self._catalog.AddSource(
+            catalog_pb2.AddSourceRequest(
                 source_id=name,
-                source_kind=embedding_pb2.SourceKind.SOURCE_KIND_FILE,
-                connection=embedding_pb2.SourceConnection(
+                source_kind=catalog_pb2.SourceKind.SOURCE_KIND_FILE,
+                connection=catalog_pb2.SourceConnection(
                     url=_local_source_url(url),
                     format=file_format,
                 ),
@@ -516,27 +516,29 @@ class RemoteDatabase:
     def list_sources(self) -> List[Dict[str, Any]]:
         """A descriptor for every source registered to the current tenant.
 
-        Maps to `EmbeddingService.ListSources`; same dict shape per entry as
+        Maps to `CatalogService.ListSources`; same dict shape per entry as
         :meth:`describe_source`.
         """
-        resp = self._embedding.ListSources(
-            embedding_pb2.ListSourcesRequest(), metadata=self._metadata
+        resp = self._catalog.ListSources(
+            catalog_pb2.ListSourcesRequest(), metadata=self._metadata
         )
         return [_source_descriptor_to_dict(d) for d in resp.sources]
 
     def describe_source(self, source_id: str) -> Optional[Dict[str, Any]]:
         """Describe one registered source by id, or ``None`` if not visible.
 
-        Maps to `EmbeddingService.DescribeSource`. The engine returns an
-        unpopulated descriptor (empty `source_id`) when no such source exists;
-        that is surfaced here as ``None``.
+        Maps to `CatalogService.DescribeSource`. The engine returns a NotFound
+        status when no such source exists; that is surfaced here as ``None``.
         """
-        d = self._embedding.DescribeSource(
-            embedding_pb2.DescribeSourceRequest(source_id=source_id),
-            metadata=self._metadata,
-        )
-        if not d.source_id:
-            return None
+        try:
+            d = self._catalog.DescribeSource(
+                catalog_pb2.DescribeSourceRequest(source_id=source_id),
+                metadata=self._metadata,
+            )
+        except grpc.RpcError as exc:
+            if exc.code() == grpc.StatusCode.NOT_FOUND:
+                return None
+            raise
         return _source_descriptor_to_dict(d)
 
     # --- Embeddings + search -----------------------------------------------------

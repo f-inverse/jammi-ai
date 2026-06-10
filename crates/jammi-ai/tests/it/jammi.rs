@@ -16,20 +16,14 @@ fn tiny_bert() -> String {
     "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
 }
 
-/// `Jammi::open(Target::Local(_))` returns a `Session::Local` that drives the
-/// full embed → search pipeline end to end against the patents corpus.
+/// `Jammi::open(Target::Local(_))` returns an embedded [`Session`] that drives
+/// the full embed → search pipeline end to end against the patents corpus.
 #[tokio::test]
 async fn open_local_yields_a_working_embedded_session() {
     let dir = TempDir::new().unwrap();
-    let session = Jammi::open(Target::Local(common::test_config(dir.path())))
+    let session: Session = Jammi::open(Target::Local(common::test_config(dir.path())))
         .await
         .expect("open local session");
-
-    // The front door selected the embedded transport.
-    assert!(
-        matches!(session, Session::Local(_)),
-        "Target::Local opens a Session::Local"
-    );
 
     session
         .add_source(

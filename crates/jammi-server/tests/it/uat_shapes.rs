@@ -47,6 +47,7 @@ fn widget_def() -> jammi_db::store::mutable::definition::MutableTableDefinition 
 }
 
 async fn exercise_all_primitives(session: &JammiSession) {
+    use arrow_schema::{DataType, Field, Schema};
     // Phase 1: register a channel.
     session
         .catalog()
@@ -69,11 +70,21 @@ async fn exercise_all_primitives(session: &JammiSession) {
         .await
         .unwrap();
 
-    // Phase 4: register a topic via the SQL DDL surface.
+    // Phase 4: register a topic via the typed dual-registration path (broker
+    // driver + catalog) the `register_topic` verb runs.
+    let topic = jammi_db::trigger::TopicDefinition {
+        id: jammi_db::trigger::TopicId::new(),
+        name: "shape_events".to_string(),
+        schema: Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, false)])),
+        tenant: session.tenant(),
+        broker_metadata: std::collections::BTreeMap::new(),
+    };
     session
-        .sql("CREATE TOPIC shape_events (msg TEXT NOT NULL)")
+        .trigger_broker()
+        .register_topic(&topic)
         .await
         .unwrap();
+    session.topic_repo().register_topic(&topic).await.unwrap();
 }
 
 // ─── Shape A: embedded library ────────────────────────────────────────────────

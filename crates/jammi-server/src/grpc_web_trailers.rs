@@ -15,12 +15,12 @@
 //! the *wire-format* a compliant client must still read in-body). Connect-ES
 //! enforces this strictly and has no opt-out, so without the in-body frame it
 //! reports `ConnectError [unimplemented] "missing message"` for every
-//! detail-bearing engine error — the structured [`jammi_ai::wire`] detail is
+//! detail-bearing engine error — the structured [`jammi_wire`] detail is
 //! lost to the TypeScript / Workers edge.
 //!
 //! This layer only moves the status into the body; the *content* of the
 //! `grpc-status-details-bin` trailer must independently be a spec-compliant
-//! `google.rpc.Status` envelope (built in [`jammi_ai::wire`]) for a gRPC-web
+//! `google.rpc.Status` envelope (built in [`jammi_wire`]) for a gRPC-web
 //! client to surface the typed error rather than read `code == 0` and still
 //! fail the unary read.
 //!
@@ -35,7 +35,7 @@
 //! It is a no-op for every other response:
 //!
 //! * non-gRPC-Web responses (raw gRPC over HTTP/2, Flight SQL, health) — the
-//!   content-type gate skips them, so the raw-gRPC `RemoteSession` path is
+//!   content-type gate skips them, so the raw-gRPC client path is
 //!   untouched (an HTTP/2 client reads the status from real trailers natively).
 //! * gRPC-Web *data* responses and mid-stream errors — these already carry an
 //!   in-body trailer frame from `GrpcWebLayer`; they have no `grpc-status`

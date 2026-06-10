@@ -17,7 +17,7 @@
 //!
 //! The remote transport is NOT exercised here: the embed wheel is local-only,
 //! and its remote arm is the bundled pure-Python `jammi-client`. The remote
-//! wire surface is proven by the `jammi-ai` crate's own `RemoteSession` tests
+//! wire surface is proven by the `jammi-server` crate's own data-plane client tests
 //! (under `--features wire`) plus the `jammi-client` conformance test.
 
 use std::str::FromStr;

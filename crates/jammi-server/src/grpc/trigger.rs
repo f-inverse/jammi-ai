@@ -1,27 +1,27 @@
 //! `TriggerService` gRPC implementation.
 //!
-//! Five methods land on the wire surface (ADR-01 §5.1, extended with the
-//! topic-admin verbs):
+//! Two methods land on the wire surface — the data-plane pub/sub compute verbs
+//! (the topic-admin lifecycle is control-plane and lives on
+//! [`CatalogService`](crate::grpc::catalog)):
 //!
-//! * `RegisterTopic` — unary; decodes the Arrow IPC schema, mints a topic id,
-//!   and registers the topic (and its backing table) via the `TopicRepo`.
-//! * `DropTopic` — unary; resolves the topic by name (tenant-scoped) and drops
-//!   it; `if_exists` turns a missing topic into a no-op.
 //! * `Publish` — unary; encodes the request batch through Arrow IPC,
 //!   delegates to the engine's `Publisher` (transactional outbox), and
 //!   returns the assigned offset and commit timestamp.
 //! * `Subscribe` — server-streaming; builds an engine `Subscription` and
 //!   forwards every `DeliveredBatch` as a `SubscribedBatch` until the
-//!   client cancels.
-//! * `ListTopics` — unary; pages through the `topics` catalog row set.
+//!   client cancels. With `replay_only` set, it instead drives the engine's
+//!   finite `replay_only` drain and closes the stream after the retained
+//!   replay window — the bounded primitive a one-shot `--no-follow` drain needs,
+//!   since the open-ended subscribe stream cannot terminate on its own.
 //!
-//! Tenant scope is read from the request's `SessionTenant` extension (set
-//! upstream by [`crate::grpc::session::TenantInterceptor`]). Per-request
-//! tenant overrides on the proto messages are accepted but only honoured
-//! when the session tenant is unset — a session-bound tenant cannot
-//! sidestep its scope by setting `tenant_id` on the body.
+//! Both verbs resolve the topic by name against the `TopicRepo` (a read), then
+//! act on the engine's publisher / subscriber. Tenant scope is read from the
+//! request's `SessionTenant` extension (set upstream by
+//! [`crate::grpc::session::TenantInterceptor`]). Per-request tenant overrides on
+//! the proto messages are accepted but only honoured when the session tenant is
+//! unset — a session-bound tenant cannot sidestep its scope by setting
+//! `tenant_id` on the body.
 
-use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -34,21 +34,17 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use jammi_ai::wire::{
-    attach_trigger_detail, decode_ipc_schema, decode_publish_batch, encode_delivered_batch,
-    to_proto_timestamp, topic_to_proto,
-};
 use jammi_db::catalog::topic_repo::TopicRepo;
-use jammi_db::trigger::ids::TopicId;
-use jammi_db::trigger::{Offset, Predicate, Publisher, Subscriber, TopicDefinition, TriggerError};
+use jammi_db::trigger::{Offset, Predicate, Publisher, Subscriber, TopicDefinition};
 use jammi_db::TenantId;
+use jammi_wire::{decode_publish_batch, encode_delivered_batch, to_proto_timestamp};
 
 use crate::grpc::proto::trigger::trigger_service_server::TriggerService;
 use crate::grpc::proto::trigger::{
-    DropTopicRequest, ListTopicsRequest, ListTopicsResponse, PublishRequest, PublishResponse,
-    RegisterTopicRequest, RegisterTopicResponse, SubscribeRequest, SubscribedBatch, TopicName,
+    PublishRequest, PublishResponse, SubscribeRequest, SubscribedBatch, TopicName,
 };
 use crate::grpc::session::SessionTenant;
+use crate::grpc::wire::map_trigger_error;
 
 /// Server-side handler for the trigger-stream gRPC surface. Holds shared
 /// references to the engine-side publisher, subscriber, topic catalog repo,
@@ -85,60 +81,6 @@ impl TriggerService for TriggerServer {
     type SubscribeStream =
         Pin<Box<dyn Stream<Item = Result<SubscribedBatch, Status>> + Send + 'static>>;
 
-    async fn register_topic(
-        &self,
-        request: Request<RegisterTopicRequest>,
-    ) -> Result<Response<RegisterTopicResponse>, Status> {
-        let tenant = resolve_tenant(&request, None)?;
-        let req = request.into_inner();
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument("name is required"));
-        }
-        let schema = decode_ipc_schema(&req.schema)?;
-        let broker_metadata: BTreeMap<String, String> = req.broker_metadata.into_iter().collect();
-        // Honor a caller-supplied id (the `Session::register_topic` surface
-        // carries the `TopicDefinition.id` the caller minted) so the topic's
-        // identity is consistent across transports; the DDL / CLI path leaves it
-        // empty and the server mints a fresh UUIDv7.
-        let id = if req.topic_id.is_empty() {
-            TopicId::new()
-        } else {
-            TopicId::from_str(&req.topic_id)
-                .map_err(|e| Status::invalid_argument(format!("invalid topic_id: {e}")))?
-        };
-        let topic = TopicDefinition {
-            id,
-            name: req.name,
-            schema,
-            tenant,
-            broker_metadata,
-        };
-        self.topic_repo
-            .register_topic(&topic)
-            .await
-            .map_err(map_trigger_error)?;
-        Ok(Response::new(RegisterTopicResponse {
-            topic_id: topic.id.to_string(),
-        }))
-    }
-
-    async fn drop_topic(&self, request: Request<DropTopicRequest>) -> Result<Response<()>, Status> {
-        let tenant = resolve_tenant(&request, None)?;
-        let req = request.into_inner();
-        if req.topic_id.is_empty() {
-            return Err(Status::invalid_argument("topic_id is required"));
-        }
-        let topic_id = TopicId::from_str(&req.topic_id)
-            .map_err(|e| Status::invalid_argument(format!("invalid topic_id: {e}")))?;
-        // The repo resolves the topic by id (tenant-scoped) and returns
-        // `TopicNotFound` when it is absent; `if_exists` turns that into a no-op.
-        match self.topic_repo.drop_topic(topic_id, tenant).await {
-            Ok(()) => Ok(Response::new(())),
-            Err(TriggerError::TopicNotFound(_)) if req.if_exists => Ok(Response::new(())),
-            Err(e) => Err(map_trigger_error(e)),
-        }
-    }
-
     async fn publish(
         &self,
         request: Request<PublishRequest>,
@@ -172,6 +114,27 @@ impl TriggerService for TriggerServer {
             Predicate::from_sql(&self.session_ctx, Arc::clone(&topic.schema), &req.predicate)
                 .map_err(map_trigger_error)?;
         let from_offset = req.from_offset.map(|v| Offset::new(v, chrono::Utc::now()));
+        let topic_schema = Arc::clone(&topic.schema);
+
+        if req.replay_only {
+            // The finite-drain primitive: the open-ended `subscribe` stream
+            // cannot terminate on its own, so a bounded `--no-follow` drain
+            // drives the engine's `replay_only` path instead. It returns the
+            // retained replay window as a `Vec`, which encodes into a finite
+            // stream that yields those batches and ends — the wire-side analogue
+            // of the local arm's `Subscriber::replay_only`.
+            let drained = self
+                .subscriber
+                .replay_only_scoped(&topic, tenant, predicate, from_offset)
+                .await
+                .map_err(map_trigger_error)?;
+            let encoded: Vec<Result<SubscribedBatch, Status>> = drained
+                .into_iter()
+                .map(|delivered| encode_delivered_batch(&topic_schema, delivered))
+                .collect();
+            let out_stream = futures::stream::iter(encoded);
+            return Ok(Response::new(Box::pin(out_stream) as Self::SubscribeStream));
+        }
 
         let mut inner = self
             .subscriber
@@ -180,7 +143,6 @@ impl TriggerService for TriggerServer {
             .map_err(map_trigger_error)?;
 
         let (tx, rx) = mpsc::channel::<Result<SubscribedBatch, Status>>(SUBSCRIBE_BUFFER);
-        let topic_schema = Arc::clone(&topic.schema);
         tokio::spawn(async move {
             while let Some(item) = inner.next().await {
                 let result = item
@@ -193,29 +155,6 @@ impl TriggerService for TriggerServer {
         });
         let out_stream = ReceiverStream::new(rx);
         Ok(Response::new(Box::pin(out_stream) as Self::SubscribeStream))
-    }
-
-    async fn list_topics(
-        &self,
-        request: Request<ListTopicsRequest>,
-    ) -> Result<Response<ListTopicsResponse>, Status> {
-        let req_tenant = parse_optional_tenant(&request.get_ref().tenant_id)?;
-        let tenant = resolve_tenant(&request, req_tenant)?;
-        let topics = self
-            .topic_repo
-            .list_topics(tenant)
-            .await
-            .map_err(map_trigger_error)?;
-        let topics = topics
-            .iter()
-            .map(topic_to_proto)
-            .collect::<Result<Vec<_>, Status>>()?;
-        Ok(Response::new(ListTopicsResponse {
-            topics,
-            // Pagination is not yet implemented — `next_page_token` empty
-            // means "this is the complete result set."
-            next_page_token: String::new(),
-        }))
     }
 }
 
@@ -262,12 +201,6 @@ impl HasTenantId for SubscribeRequest {
     }
 }
 
-impl HasTenantId for ListTopicsRequest {
-    fn tenant_id(&self) -> &str {
-        &self.tenant_id
-    }
-}
-
 fn parse_optional_tenant(id: &str) -> Result<Option<TenantId>, Status> {
     if id.is_empty() {
         return Ok(None);
@@ -289,59 +222,6 @@ fn resolve_tenant<T>(
         .get::<SessionTenant>()
         .and_then(|s| s.0);
     Ok(session_tenant.or(body_override))
-}
-
-/// Map a [`TriggerError`] onto a gRPC [`Status`], preserving the failure kind so
-/// a client can distinguish a bad request from an internal fault.
-///
-/// The `code` + `message` are the idiomatic gRPC surface (a client that does not
-/// decode the structured detail still sees a sensible status). On top of that,
-/// every status carries a faithful [`jammi_ai::wire`] trigger-error detail so a
-/// remote `RemoteSession` reconstructs the *exact* [`TriggerError`] the
-/// in-process path returns — the standard gRPC code set is too coarse to
-/// distinguish, e.g., `PredicateParse` from `PredicateUnsupported`, or the two
-/// engine-owned `#[from]` nests. The detail is built centrally here so the
-/// faithful path covers the whole `TriggerError` enum from one place — the
-/// trigger analogue of `map_engine_error`.
-fn map_trigger_error(err: TriggerError) -> Status {
-    let (code, message) = match &err {
-        TriggerError::TopicNotFound(name) => (tonic::Code::NotFound, name.clone()),
-        TriggerError::BatchSchemaMismatch(detail) => {
-            (tonic::Code::InvalidArgument, detail.clone())
-        }
-        TriggerError::SchemaConflict { topic, detail } => (
-            tonic::Code::FailedPrecondition,
-            format!("schema conflict on {topic}: {detail}"),
-        ),
-        TriggerError::UnsupportedSchemaType { column, data_type } => (
-            tonic::Code::InvalidArgument,
-            format!("unsupported topic schema type for '{column}': {data_type}"),
-        ),
-        TriggerError::PublishTenantMismatch {
-            topic,
-            topic_tenant,
-            publish_tenant,
-        } => (
-            tonic::Code::PermissionDenied,
-            format!(
-                "publish tenant mismatch on topic '{topic}': topic_tenant={topic_tenant:?}, publish_tenant={publish_tenant:?}"
-            ),
-        ),
-        TriggerError::PredicateParse(detail) | TriggerError::PredicateUnsupported(detail) => {
-            (tonic::Code::InvalidArgument, format!("predicate: {detail}"))
-        }
-        TriggerError::PredicateEval(detail) => {
-            (tonic::Code::Internal, format!("predicate: {detail}"))
-        }
-        TriggerError::OffsetEvicted(n) => {
-            (tonic::Code::FailedPrecondition, format!("offset {n} evicted"))
-        }
-        TriggerError::BackingTable(e) => (tonic::Code::Internal, format!("backing table: {e}")),
-        TriggerError::Backend(e) => (tonic::Code::Internal, format!("backend: {e}")),
-        TriggerError::Driver(detail) => (tonic::Code::Unavailable, format!("broker: {detail}")),
-        TriggerError::Catalog(detail) => (tonic::Code::Internal, format!("catalog: {detail}")),
-    };
-    attach_trigger_detail(code, message, &err)
 }
 
 // Re-export `Duration` so the `Subscribe` test future can clamp its wait

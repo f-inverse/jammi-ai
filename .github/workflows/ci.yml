@@ -79,8 +79,8 @@ jobs:
         # only the maturin-managed build (Test (Python) job) provides.
         run: cargo test --workspace --exclude jammi-python --features live-hub-tests
 
-  test-wire:
-    name: Test (jammi-ai wire)
+  test-clients:
+    name: Test (wire / admin / client)
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/f-inverse/jammi-ai-ci:latest
@@ -89,49 +89,50 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mozilla-actions/sccache-action@v0.0.9
 
-      # The wire-gated unit tests in `jammi-ai` (the faithful typed-error
-      # round-trips in `src/wire/`) otherwise run only incidentally — when
-      # `jammi-server` pulls `jammi-ai/wire` and Cargo feature-unifies it into
-      # the workspace test build. That edge is a latent silent-skip: if it ever
-      # changes, the wire tests + lints stop running with no signal. Run them
-      # deterministically in their own right.
-      - name: Clippy (jammi-ai wire)
-        run: cargo clippy -p jammi-ai --features wire --all-targets -- -D warnings
+      # The candle-free client substrate: the wire transport (`jammi-wire`,
+      # holding the generated stubs, the proto↔domain converters, and the moved
+      # request / eval / fine-tune vocabulary), the control-plane client
+      # (`jammi-admin`), and the data-plane client (`jammi-client`). The moved
+      # wire-converter + config-round-trip unit tests live here, so run their
+      # lints + tests deterministically in their own right.
+      - name: Clippy (wire / admin / client)
+        run: cargo clippy -p jammi-wire -p jammi-admin -p jammi-client --all-targets -- -D warnings
 
-      - name: Test (jammi-ai wire)
-        run: cargo test -p jammi-ai --features wire
+      - name: Test (wire / admin / client)
+        run: cargo test -p jammi-wire -p jammi-admin -p jammi-client
 
-  test-thin-wire:
-    name: Test (jammi-ai thin wire)
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/f-inverse/jammi-ai-ci:latest
-    needs: check
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mozilla-actions/sccache-action@v0.0.9
-
-      # The remote-only client: `local` OFF, `wire` ON. This build must stay a
-      # thin wire-speaker — `RemoteSession` + `Session::Remote` + the wire
-      # conversions — pulling NO candle / hf-hub / symphonia / tokenizers ML
-      # stack. Without its own lane the thin build is never exercised in CI (the
-      # workspace build always feature-unifies `local` on via jammi-server /
-      # jammi-python / jammi-cli), so a change that re-couples the engine into the
-      # wire surface would compile everywhere else and silently regress only here.
-      # Build + clippy + the wire unit tests, then assert the ML deps are absent.
-      - name: Clippy (jammi-ai thin wire)
-        run: cargo clippy -p jammi-ai --no-default-features --features wire --all-targets -- -D warnings
-
-      - name: Test (jammi-ai thin wire)
-        run: cargo test -p jammi-ai --no-default-features --features wire
-
-      - name: Assert no ML deps in the thin tree
+      # The client substrate must stay candle-free — NO candle / hf-hub /
+      # symphonia / tokenizers ML stack. The workspace build feature-unifies
+      # `local` on via jammi-server / jammi-python, so `cargo tree` would falsely
+      # flag candle; the real per-package build set is what `cargo build -p X`
+      # compiles, so the guard inspects the compiler-artifact stream of the
+      # actual isolated build.
+      - name: Assert the client substrate pulls no ML deps
         run: |
-          if cargo tree -p jammi-ai --no-default-features --features wire -e normal \
-              | grep -iE 'candle|hf-hub|symphonia|tokenizers'; then
-            echo "::error::thin wire build pulled an embedded-engine ML dep — the local feature gate regressed"
-            exit 1
-          fi
+          cargo build -p jammi-wire -p jammi-admin -p jammi-client --message-format=json \
+            | grep '"reason":"compiler-artifact"' \
+            | grep -iE '"name":"(candle[^"]*|hf-hub|hf_hub|symphonia|tokenizers)"' \
+            && { echo "::error::the client substrate compiled an embedded-engine ML dep — the candle-free boundary regressed"; exit 1; } \
+            || echo "wire / admin / client build set is candle-free"
+
+      # The `jammi` CLI is a strict control-plane client: it depends on
+      # `jammi-admin`, NOT `jammi-ai`, so it must stay candle-free AND carry no
+      # `jammi-ai` edge at all. The workspace build feature-unifies `local` on
+      # via jammi-server / jammi-python, so this isolated `-p jammi-cli` lane is
+      # the only place the strict client is exercised — without it a re-coupling
+      # of the engine into the CLI would compile everywhere else and regress only
+      # here.
+      - name: Assert the standalone CLI build pulls no ML deps and no jammi-ai
+        run: |
+          ARTIFACTS=$(cargo build -p jammi-cli --message-format=json \
+            | grep '"reason":"compiler-artifact"' \
+            | grep -oE '"name":"[^"]*"')
+          echo "$ARTIFACTS" | grep -iE '"name":"(candle[^"]*|hf-hub|hf_hub|symphonia|tokenizers)"' \
+            && { echo "::error::the jammi CLI compiled an embedded-engine ML dep — the strict-client boundary regressed"; exit 1; } \
+            || echo "jammi-cli build set is candle-free"
+          echo "$ARTIFACTS" | grep -iE '"name":"jammi[-_]ai"' \
+            && { echo "::error::the jammi CLI compiled jammi-ai — the strict-client boundary regressed"; exit 1; } \
+            || echo "jammi-cli build set carries no jammi-ai edge"
 
   dep-direction:
     name: Guard (engine dep-direction)
@@ -187,7 +188,7 @@ jobs:
           node-version: "22"
 
       # `@f-inverse/jammi-client` is generated from the canonical proto at
-      # `crates/jammi-ai/proto` by `buf generate` (run inside `npm run build`),
+      # `crates/jammi-wire/proto` by `buf generate` (run inside `npm run build`),
       # then type-checked and smoke-tested. Running it on every PR catches a
       # proto change that breaks TS codegen — or a regression in the thin
       # hand-written wrapper — here, not only at the release-tag publish in
@@ -219,7 +220,7 @@ jobs:
           python-version: "3.12"
 
       # `jammi-client` is the pure-Python (no-Rust) deploy half: generated from
-      # the canonical `crates/jammi-ai/proto` by `make generate`, then installed
+      # the canonical `crates/jammi-wire/proto` by `make generate`, then installed
       # and tested. Running it on every PR catches a proto change that breaks the
       # Python codegen — or a regression in the hand-written `connect` /
       # `RemoteDatabase` seam — here, not only at the `py-v*` publish in

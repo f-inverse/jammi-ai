@@ -64,8 +64,8 @@ async fn add_training_source(
         impl Fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Clone,
     >,
 ) {
-    use jammi_server::grpc::proto::embedding::embedding_service_client::EmbeddingServiceClient;
-    use jammi_server::grpc::proto::embedding::{
+    use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
+    use jammi_server::grpc::proto::catalog::{
         AddSourceRequest, FileFormat, SourceConnection, SourceKind,
     };
     let request = AddSourceRequest {
@@ -78,13 +78,12 @@ async fn add_training_source(
     };
     match session {
         Some(interceptor) => {
-            let mut embedding =
-                EmbeddingServiceClient::with_interceptor(client_channel, interceptor);
-            embedding.add_source(request).await.expect("add_source");
+            let mut catalog = CatalogServiceClient::with_interceptor(client_channel, interceptor);
+            catalog.add_source(request).await.expect("add_source");
         }
         None => {
-            let mut embedding = EmbeddingServiceClient::new(client_channel);
-            embedding.add_source(request).await.expect("add_source");
+            let mut catalog = CatalogServiceClient::new(client_channel);
+            catalog.add_source(request).await.expect("add_source");
         }
     }
 }
@@ -183,8 +182,8 @@ async fn start_training_runs_to_completion_over_the_wire() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn training_under_a_tenant_scope_succeeds_over_the_wire() {
-    use jammi_server::grpc::proto::session::session_service_client::SessionServiceClient;
-    use jammi_server::grpc::proto::session::{SetTenantRequest, Tenant};
+    use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
+    use jammi_server::grpc::proto::catalog::{SetTenantRequest, Tenant};
 
     let server = start_engine_server().await;
 
@@ -195,7 +194,7 @@ async fn training_under_a_tenant_scope_succeeds_over_the_wire() {
     // TrainingStatus reads it back under the same scope).
     let session_iface = with_session("training-tenant-a");
     let mut session_client =
-        SessionServiceClient::with_interceptor(channel(server.addr).await, session_iface.clone());
+        CatalogServiceClient::with_interceptor(channel(server.addr).await, session_iface.clone());
     session_client
         .set_tenant(SetTenantRequest {
             tenant: Some(Tenant {
@@ -395,8 +394,8 @@ fn predictor_start_request() -> StartTrainingRequest {
 /// the predictor is registered under A.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn context_predictor_under_a_tenant_scope_completes_over_the_wire() {
-    use jammi_server::grpc::proto::session::session_service_client::SessionServiceClient;
-    use jammi_server::grpc::proto::session::{SetTenantRequest, Tenant};
+    use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
+    use jammi_server::grpc::proto::catalog::{SetTenantRequest, Tenant};
 
     let server = start_engine_server().await;
     seed_predictor_dataset_under_tenant_a(&server).await;
@@ -404,7 +403,7 @@ async fn context_predictor_under_a_tenant_scope_completes_over_the_wire() {
     // Bind a session id to TENANT_A so every wire call carries that scope.
     let session_iface = with_session("predictor-tenant-a");
     let mut session_client =
-        SessionServiceClient::with_interceptor(channel(server.addr).await, session_iface.clone());
+        CatalogServiceClient::with_interceptor(channel(server.addr).await, session_iface.clone());
     session_client
         .set_tenant(SetTenantRequest {
             tenant: Some(Tenant {
@@ -465,8 +464,8 @@ async fn context_predictor_under_a_tenant_scope_completes_over_the_wire() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn graph_fine_tune_under_a_tenant_scope_completes_over_the_wire() {
     use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-    use jammi_server::grpc::proto::session::session_service_client::SessionServiceClient;
-    use jammi_server::grpc::proto::session::{SetTenantRequest, Tenant};
+    use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
+    use jammi_server::grpc::proto::catalog::{SetTenantRequest, Tenant};
 
     let server = start_engine_server().await;
 
@@ -526,7 +525,7 @@ async fn graph_fine_tune_under_a_tenant_scope_completes_over_the_wire() {
 
     let session_iface = with_session("graph-tenant-a");
     let mut session_client =
-        SessionServiceClient::with_interceptor(channel(server.addr).await, session_iface.clone());
+        CatalogServiceClient::with_interceptor(channel(server.addr).await, session_iface.clone());
     session_client
         .set_tenant(SetTenantRequest {
             tenant: Some(Tenant {

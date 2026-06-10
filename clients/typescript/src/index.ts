@@ -13,7 +13,7 @@
 //   3. Centralize tenant scoping: like the Rust `RemoteSession::connect`, it
 //      mints one opaque session id per connection and injects it on every
 //      outbound request as the `jammi-session-id` header — the key the server's
-//      tenant interceptor binds tenant state against (set via the SessionService
+//      tenant interceptor binds tenant state against (set via the CatalogService
 //      tenant trio). No per-call header plumbing leaks to consumers.
 //
 // Encoding/decoding is entirely the generated code's job; this file holds no
@@ -22,26 +22,22 @@
 import { createClient, type Client, type Interceptor } from "@connectrpc/connect";
 import { createGrpcWebTransport } from "@connectrpc/connect-web";
 
-import { SessionService } from "./gen/jammi/v1/session_pb.js";
+import { CatalogService } from "./gen/jammi/v1/catalog_pb.js";
 import { EmbeddingService } from "./gen/jammi/v1/embedding_pb.js";
 import { InferenceService } from "./gen/jammi/v1/inference_pb.js";
 import { EvalService } from "./gen/jammi/v1/eval_pb.js";
 import { PipelineService } from "./gen/jammi/v1/pipeline_pb.js";
 import { TrainingService } from "./gen/jammi/v1/training_pb.js";
-import { MutableTableService } from "./gen/jammi/v1/mutable_table_pb.js";
-import { ChannelService } from "./gen/jammi/v1/channel_pb.js";
 import { TriggerService } from "./gen/jammi/v1/trigger_pb.js";
 import { AuditService } from "./gen/jammi/v1/audit_pb.js";
 
 // Re-export the full generated surface (messages, enums, service descriptors).
-export * from "./gen/jammi/v1/session_pb.js";
+export * from "./gen/jammi/v1/catalog_pb.js";
 export * from "./gen/jammi/v1/embedding_pb.js";
 export * from "./gen/jammi/v1/inference_pb.js";
 export * from "./gen/jammi/v1/eval_pb.js";
 export * from "./gen/jammi/v1/pipeline_pb.js";
 export * from "./gen/jammi/v1/training_pb.js";
-export * from "./gen/jammi/v1/mutable_table_pb.js";
-export * from "./gen/jammi/v1/channel_pb.js";
 export * from "./gen/jammi/v1/trigger_pb.js";
 export * from "./gen/jammi/v1/audit_pb.js";
 export * from "./gen/jammi/v1/error_pb.js";
@@ -77,14 +73,14 @@ export interface ConnectOptions {
 export interface JammiClient {
   /** The session id this connection scopes its tenant binding by. */
   readonly sessionId: string;
-  readonly session: Client<typeof SessionService>;
+  /** The control plane: catalog / metadata / lifecycle / observability verbs,
+   *  including the tenant trio and server-info handshake. */
+  readonly catalog: Client<typeof CatalogService>;
   readonly embedding: Client<typeof EmbeddingService>;
   readonly inference: Client<typeof InferenceService>;
   readonly eval: Client<typeof EvalService>;
   readonly pipeline: Client<typeof PipelineService>;
   readonly training: Client<typeof TrainingService>;
-  readonly mutableTable: Client<typeof MutableTableService>;
-  readonly channel: Client<typeof ChannelService>;
   readonly trigger: Client<typeof TriggerService>;
   readonly audit: Client<typeof AuditService>;
 }
@@ -121,14 +117,12 @@ export function connect(endpoint: string, opts: ConnectOptions = {}): JammiClien
 
   return {
     sessionId,
-    session: createClient(SessionService, transport),
+    catalog: createClient(CatalogService, transport),
     embedding: createClient(EmbeddingService, transport),
     inference: createClient(InferenceService, transport),
     eval: createClient(EvalService, transport),
     pipeline: createClient(PipelineService, transport),
     training: createClient(TrainingService, transport),
-    mutableTable: createClient(MutableTableService, transport),
-    channel: createClient(ChannelService, transport),
     trigger: createClient(TriggerService, transport),
     audit: createClient(AuditService, transport),
   };

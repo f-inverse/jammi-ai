@@ -309,9 +309,9 @@ def test_get_server_info_shape_agrees_across_transports(tmp_path):
     Hermetic: the embedded side opens a real local engine; the remote side reads
     the generated proto descriptor, never dialing a server.
     """
-    from jammi_client._generated.jammi.v1 import session_pb2
+    from jammi_client._generated.jammi.v1 import catalog_pb2
 
-    proto_fields = {f.name for f in session_pb2.ServerInfo.DESCRIPTOR.fields}
+    proto_fields = {f.name for f in catalog_pb2.ServerInfo.DESCRIPTOR.fields}
 
     embedded = jammi_ai.connect(f"file://{tmp_path}").get_server_info()
     assert set(embedded) == proto_fields, (
@@ -339,13 +339,13 @@ def _client_server_info_keys() -> set:
         storage_backends = []
         services = []
 
-    class _StubSession:
+    class _StubCatalog:
         def GetServerInfo(self, *_a, **_k):
             return _StubServerInfo()
 
     db = jammi_client.connect("grpc://127.0.0.1:8081")
     try:
-        db._session = _StubSession()
+        db._catalog = _StubCatalog()
         return set(db.get_server_info())
     finally:
         db.close()

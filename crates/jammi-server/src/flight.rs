@@ -4,13 +4,16 @@
 //!
 //! - [`serve_flight`] — minimal single-tenant deployment. Flight SQL listens
 //!   alone on `addr`; queries observe the engine's session as configured.
-//! - [`serve_flight_with_session_service`] — multi-tenant deployment. The
-//!   gRPC `SessionService` and Flight SQL coexist on one Tonic server
+//! - [`serve_flight_with_catalog_service`] — multi-tenant deployment. The
+//!   gRPC `CatalogService` and Flight SQL coexist on one Tonic server
 //!   behind a shared [`crate::grpc::session::TenantInterceptor`] +
 //!   [`crate::grpc::session::SessionStore`]. Clients call
-//!   `SessionService.SetTenant` to bind their tenant; subsequent Flight SQL
+//!   `CatalogService.SetTenant` to bind their tenant; subsequent Flight SQL
 //!   queries on the same `jammi-session-id` header run scoped to that tenant
-//!   via the [`TenantBoundProvider`].
+//!   via the [`TenantBoundProvider`]. This Flight-only path mounts no engine,
+//!   so only the engine-free control verbs (the tenant trio + `GetServerInfo`)
+//!   answer here; the engine-backed catalog verbs are reached on the full gRPC
+//!   chain instead.
 
 use std::net::SocketAddr;
 
@@ -23,10 +26,9 @@ use jammi_db::tenant_scope::TenantBinding;
 use tonic::transport::Server;
 use tonic::{Request, Status};
 
-use crate::grpc::proto::session::session_service_server::SessionServiceServer;
-use crate::grpc::session::{
-    SessionId, SessionServer, SessionStore, TenantInterceptor, SESSION_HEADER,
-};
+use crate::grpc::catalog::CatalogServer;
+use crate::grpc::proto::catalog::catalog_service_server::CatalogServiceServer;
+use crate::grpc::session::{SessionId, SessionStore, TenantInterceptor, SESSION_HEADER};
 
 /// Start an Arrow Flight SQL server alone on `addr`. Single-tenant or
 /// in-process embedding shape.
@@ -39,11 +41,11 @@ pub async fn serve_flight(
     service.serve(addr.to_string()).await
 }
 
-/// Start Flight SQL + `SessionService` on one Tonic server, sharing a single
+/// Start Flight SQL + `CatalogService` on one Tonic server, sharing a single
 /// [`SessionStore`]. The Flight SQL service uses a [`TenantBoundProvider`]
 /// that reads `SessionTenant` from request metadata and updates the shared
 /// `TenantBinding` for the duration of the query.
-pub async fn serve_flight_with_session_service(
+pub async fn serve_flight_with_catalog_service(
     base_ctx: &SessionContext,
     base_tenant_binding: TenantBinding,
     addr: SocketAddr,
@@ -55,20 +57,26 @@ pub async fn serve_flight_with_session_service(
     let flight_svc = arrow_flight::flight_service_server::FlightServiceServer::new(flight);
 
     let interceptor = TenantInterceptor::new(store.clone());
-    // This Flight-SQL-only path mounts just Flight + SessionService — the core
-    // handshake surface, no optional tiers — so it advertises core only.
-    let session_svc = SessionServiceServer::with_interceptor(
-        SessionServer::new(store, crate::tiers::TierSet::resolve(std::iter::empty())?),
+    // This Flight-SQL-only path mounts just Flight + CatalogService — the core
+    // handshake surface, no optional tiers, no engine — so it advertises core
+    // only and answers the engine-free control verbs (the tenant trio +
+    // `GetServerInfo`).
+    let catalog_svc = CatalogServiceServer::with_interceptor(
+        CatalogServer::new(
+            store,
+            crate::tiers::TierSet::resolve(std::iter::empty())?,
+            None,
+        ),
         interceptor,
     );
 
     tracing::info!(
-        "Flight SQL + SessionService listening on {addr} \
+        "Flight SQL + CatalogService listening on {addr} \
          (tenant binding via jammi-session-id header)"
     );
     Server::builder()
         .add_service(flight_svc)
-        .add_service(session_svc)
+        .add_service(catalog_svc)
         .serve(addr)
         .await?;
     Ok(())
@@ -82,7 +90,7 @@ pub async fn serve_flight_with_session_service(
 /// **Concurrency caveat:** if a deployment serves more than one tenant
 /// concurrently through Flight SQL (rather than gRPC + per-statement
 /// session bindings), the race window between binding mutation and SQL
-/// execution can return rows under a stale binding. The gRPC `SessionService`
+/// execution can return rows under a stale binding. The gRPC `CatalogService`
 /// surface is the supported multi-tenant Flight SQL path for now; a future
 /// refactor moves the binding off the shared `SessionContext` into per-plan
 /// `ConfigExtension` state (SPEC-03 §13 OQ#3). Downstream gRPC consumers

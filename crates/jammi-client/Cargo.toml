@@ -1,0 +1,22 @@
+[package]
+name = "jammi-client"
+description = "The Jammi data-plane client: a candle-free typed-RPC + Flight SQL client over the gRPC wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+jammi-wire.workspace = true
+jammi-admin.workspace = true
+jammi-db.workspace = true
+arrow.workspace = true
+arrow-schema.workspace = true
+arrow-array.workspace = true
+arrow-flight.workspace = true
+tonic.workspace = true
+futures.workspace = true
+tokio-stream.workspace = true
+uuid.workspace = true

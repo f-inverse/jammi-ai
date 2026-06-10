@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package jammi.v1.trigger;
+
+import "google/protobuf/timestamp.proto";
+
+// TriggerService — primitive pub/sub over Arrow record batches.
+//
+// Verb vocabulary is closed: Publish, Subscribe. These are the data-plane
+// compute/stream verbs; the topic-admin lifecycle (RegisterTopic / DropTopic /
+// ListTopics) is control-plane and lives on CatalogService.
+service TriggerService {
+  // Publish a single batch to a topic. Unary RPC.
+  rpc Publish(PublishRequest) returns (PublishResponse);
+
+  // Subscribe to a topic with an optional SQL predicate filter applied
+  // server-side. Server-streaming RPC; the stream stays open until the
+  // client cancels or the deadline expires.
+  rpc Subscribe(SubscribeRequest) returns (stream SubscribedBatch);
+}
+
+// Topic identifier. Topics are catalog-registered; the name is a
+// fully-qualified catalog path (e.g. "default.events.changes"). The
+// engine does not interpret the path beyond catalog lookup.
+message TopicName {
+  string name = 1;
+}
+
+// Arrow record batch encoded as Flight IPC payload, mirroring
+// arrow_flight::FlightData (data_header + data_body are both bytes).
+message ArrowBatch {
+  // IPC message header (Schema or RecordBatch) per Arrow's Message.fbs.
+  bytes data_header = 1;
+  // The actual batch of Arrow data (FlightData::data_body convention).
+  bytes data_body = 2;
+  // Optional application metadata; not interpreted by the engine.
+  bytes app_metadata = 3;
+}
+
+message PublishRequest {
+  TopicName topic = 1;
+  ArrowBatch batch = 2;
+  // Optional tenant scope override; if unset, the session's tenant
+  // (set via CatalogService.SetTenant) applies. See ADR-00 for TenantId.
+  string tenant_id = 3;
+}
+
+message PublishResponse {
+  // Server-assigned monotonically increasing offset within the topic.
+  uint64 offset = 1;
+  google.protobuf.Timestamp committed_at = 2;
+}
+
+message SubscribeRequest {
+  TopicName topic = 1;
+  // SQL predicate evaluated server-side against the batch schema.
+  // Empty string == no filter.
+  string predicate = 2;
+  // Optional starting offset; 0 == from the earliest retained batch,
+  // unset == from "now" (only future batches).
+  optional uint64 from_offset = 3;
+  // Optional tenant scope; same semantics as PublishRequest.tenant_id.
+  string tenant_id = 4;
+  // When true, the server drains the backing table's finite replay window
+  // (every retained batch the predicate accepts from `from_offset` onward) and
+  // then closes the stream, instead of holding it open to tail live batches.
+  // This is the bounded `replay_only` primitive a one-shot drain
+  // (`jammi trigger subscribe --no-follow`) needs — the open-ended `subscribe`
+  // stream cannot terminate on its own, so a finite drain requires this flag.
+  bool replay_only = 5;
+}
+
+message SubscribedBatch {
+  uint64 offset = 1;
+  google.protobuf.Timestamp produced_at = 2;
+  ArrowBatch batch = 3;
+}

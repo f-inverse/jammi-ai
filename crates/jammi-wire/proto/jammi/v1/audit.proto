@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package jammi.v1.audit;
+
+import "google/protobuf/empty.proto";
+
+// AuditService — the wire surface for the engine's per-query audit verbs.
+//
+// `AuditLog`, `AuditFetchByQueryId`, and `AuditFetchRecent` are imperative
+// session methods — signing, tenant-injection, and signature-verified decode
+// are non-SQL logic — so they live as typed gRPC RPCs alongside the other
+// engine-backed services rather than on the Flight SQL surface (query/result
+// only, per ADR-01 §3.2). The verbs name a substrate primitive — a signed
+// per-query audit log — and carry no tenant-domain concept.
+//
+// Each verb delegates 1:1 to the consumer-facing `Session`
+// abstraction (`audit_log` / `audit_fetch_by_query_id` / `audit_fetch_recent`);
+// the service reimplements no signing, storage, or query logic. The
+// `PerQueryAudit` message mirrors the Rust record field for field, including
+// its server-computed `signature`.
+//
+// Tenant scope is read from the request's `SessionTenant` extension, set by the
+// shared TenantInterceptor. The audit primitive requires a bound tenant — an
+// unscoped call is rejected by the engine.
+service AuditService {
+  // Sign and persist a batch of audit records under the session's tenant,
+  // publishing them to the audit topic. Peer of the abstraction's `audit_log`.
+  rpc AuditLog(AuditLogRequest) returns (google.protobuf.Empty);
+
+  // Fetch one audit record by query id (tenant-scoped). Peer of the
+  // abstraction's `audit_fetch_by_query_id`.
+  rpc AuditFetchByQueryId(AuditFetchByQueryIdRequest) returns (AuditFetchByQueryIdResponse);
+
+  // Fetch the most recent audit records (tenant-scoped), newest first. Peer of
+  // the abstraction's `audit_fetch_recent`.
+  rpc AuditFetchRecent(AuditFetchRecentRequest) returns (AuditFetchRecentResponse);
+}
+
+// One per-query audit record. Mirrors the Rust `jammi_db::PerQueryAudit`.
+//
+// On `AuditLog` the caller leaves `tenant_id` and `signature` empty — the
+// engine stamps the session tenant and computes the HMAC signature on write.
+// Both fields are populated on every record returned by a fetch verb.
+message PerQueryAudit {
+  // Unique identifier for this query invocation (UUID string).
+  string query_id = 1;
+  // Tenant scope, the tenant's canonical string form. Auto-injected on write;
+  // present on reads. Callers leave it empty when logging.
+  string tenant_id = 2;
+  // Model identifier (e.g. a HuggingFace repo id).
+  string model_id = 3;
+  // Specific model version/revision (commit SHA, HF revision, etc.).
+  string model_version = 4;
+  // Open-ended tenant-defined query metadata as a JSON value string. The engine
+  // stores it verbatim and never interprets it.
+  string query_lineage = 5;
+  // Top-K result identifiers (whatever stable key the tenant uses).
+  repeated string top_k_result_ids = 6;
+  // Distance/similarity scores, parallel to `top_k_result_ids`.
+  repeated float retrieval_scores = 7;
+  // When the query executed, as epoch microseconds (the audit table's storage
+  // form). Server-side timestamp; ignored on write, present on reads.
+  int64 executed_at_micros = 8;
+  // HMAC-SHA256 signature over the canonical serialization. Computed by the
+  // engine on write; never caller-supplied. Present on reads.
+  string signature = 9;
+}
+
+message AuditLogRequest {
+  repeated PerQueryAudit records = 1;
+}
+
+message AuditFetchByQueryIdRequest {
+  string query_id = 1;
+}
+
+message AuditFetchByQueryIdResponse {
+  // The record, or unset if no record with that id is visible to the tenant.
+  optional PerQueryAudit record = 1;
+}
+
+message AuditFetchRecentRequest {
+  // Maximum number of records to return, newest first.
+  uint32 limit = 1;
+}
+
+message AuditFetchRecentResponse {
+  repeated PerQueryAudit records = 1;
+}

@@ -1,20 +1,18 @@
 //! `jammi mutable` subcommand.
 //!
-//! Drive [`InferenceSession::create_mutable_table`] /
-//! [`InferenceSession::drop_mutable_table`] /
-//! [`InferenceSession::mutable_tables`] from the CLI. Schema is supplied via a
-//! JSON file so the same fixture can drive Rust, Python, and CLI tests
-//! without duplicating the column definitions. Index specs are inline
-//! (`name=X,columns=A+B,unique=false`) to mirror the existing `trigger`
-//! subcommand's style.
+//! Drive the remote [`CatalogClient`]'s `create_mutable_table` /
+//! `drop_mutable_table` / `list_mutable_tables` verbs from the CLI. Schema is
+//! supplied via a JSON file so the same fixture can drive Rust, Python, and CLI
+//! tests without duplicating the column definitions. Index specs are inline
+//! (`name=X,columns=A+B,unique=false`) to mirror the `trigger` subcommand's
+//! style.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use clap::Subcommand;
-use jammi_ai::session::InferenceSession;
-use jammi_db::config::JammiConfig;
+use jammi_admin::CatalogClient;
 use jammi_db::store::mutable::definition::{
     MutableIndexDef, MutableTableDefinitionBuilder, MutableTableId,
 };
@@ -57,15 +55,9 @@ pub enum MutableAction {
 }
 
 pub async fn run(
-    config: JammiConfig,
-    tenant: Option<jammi_db::TenantId>,
+    session: &CatalogClient,
     action: MutableAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let session = InferenceSession::new(config).await?;
-    if let Some(t) = tenant {
-        session.bind_tenant(t);
-    }
-
     match action {
         MutableAction::Create {
             name,
@@ -85,9 +77,12 @@ pub async fn run(
             if pk_cols.is_empty() {
                 return Err("--primary-key must list at least one column".into());
             }
+            // The wire body stays tenant-free: the server stamps the session's
+            // bound tenant onto the catalog row under its tenant scope, so the
+            // definition the client builds carries no tenant.
             let mut builder = MutableTableDefinitionBuilder::new(id.clone(), arrow_schema)
                 .primary_key(pk_cols)
-                .tenant(session.tenant());
+                .tenant(None);
             for spec in &indexes {
                 builder = builder.index(parse_index_spec(spec)?);
             }
@@ -116,7 +111,7 @@ pub async fn run(
             println!("Mutable table '{name}' dropped.");
         }
         MutableAction::List => {
-            let tables = session.mutable_tables().list(session.tenant()).await?;
+            let tables = session.list_mutable_tables().await?;
             if tables.is_empty() {
                 println!("No mutable tables registered.");
             } else {

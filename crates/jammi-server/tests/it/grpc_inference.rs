@@ -5,7 +5,7 @@
 //! source and calls `Infer` over its `abstract` column with the local
 //! `tiny_bert` cookbook encoder, then decodes the returned `ArrowBatch` and
 //! asserts the inference output rows round-trip. This pins the wire adapter's
-//! contract: the verb routes through the `Session`/`LocalSession` abstraction
+//! contract: the verb routes through the `Session` abstraction
 //! and carries the engine's `Vec<RecordBatch>` back as Arrow IPC.
 //!
 //! Hermetic: the encoder is a local fixture (no network, no download), the
@@ -35,12 +35,12 @@ fn patents_url() -> String {
 /// (both services back onto the same engine session, so a source registered on
 /// one is visible to the other).
 async fn add_patents(client_channel: tonic::transport::Channel) {
-    use jammi_server::grpc::proto::embedding::embedding_service_client::EmbeddingServiceClient;
-    use jammi_server::grpc::proto::embedding::{
+    use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
+    use jammi_server::grpc::proto::catalog::{
         AddSourceRequest, FileFormat, SourceConnection, SourceKind,
     };
-    let mut embedding = EmbeddingServiceClient::new(client_channel);
-    embedding
+    let mut catalog = CatalogServiceClient::new(client_channel);
+    catalog
         .add_source(AddSourceRequest {
             source_id: "patents".into(),
             source_kind: SourceKind::File as i32,
@@ -115,18 +115,18 @@ async fn infer_returns_arrow_rows_over_the_wire() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn infer_under_a_tenant_scope_succeeds_over_the_wire() {
-    use jammi_server::grpc::proto::session::session_service_client::SessionServiceClient;
-    use jammi_server::grpc::proto::session::{SetTenantRequest, Tenant};
+    use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
+    use jammi_server::grpc::proto::catalog::{SetTenantRequest, Tenant};
 
     let server = start_engine_server().await;
 
     // Bind the session (keyed by the `jammi-session-id` header) to TENANT_A via
-    // SessionService, then register the source and infer under the same
+    // CatalogService, then register the source and infer under the same
     // session id — every call carries that header through `with_session`, so
     // the interceptor scopes them all to TENANT_A.
     let session_iface = with_session("infer-tenant-a");
     let mut session_client =
-        SessionServiceClient::with_interceptor(channel(server.addr).await, session_iface.clone());
+        CatalogServiceClient::with_interceptor(channel(server.addr).await, session_iface.clone());
     session_client
         .set_tenant(SetTenantRequest {
             tenant: Some(Tenant {
@@ -136,17 +136,12 @@ async fn infer_under_a_tenant_scope_succeeds_over_the_wire() {
         .await
         .expect("set_tenant");
 
-    // AddSource under TENANT_A's scope.
+    // AddSource under TENANT_A's scope, on the same control-plane client.
     {
-        use jammi_server::grpc::proto::embedding::embedding_service_client::EmbeddingServiceClient;
-        use jammi_server::grpc::proto::embedding::{
+        use jammi_server::grpc::proto::catalog::{
             AddSourceRequest, FileFormat, SourceConnection, SourceKind,
         };
-        let mut embedding = EmbeddingServiceClient::with_interceptor(
-            channel(server.addr).await,
-            session_iface.clone(),
-        );
-        embedding
+        session_client
             .add_source(AddSourceRequest {
                 source_id: "patents".into(),
                 source_kind: SourceKind::File as i32,

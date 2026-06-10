@@ -730,7 +730,7 @@ impl TrainingWorker {
 
 /// An RAII guard owning an embedded [`TrainingWorker`]'s background task. On
 /// drop it sets the stop flag and aborts the task, so the worker stops claiming
-/// new jobs when its owner (the embedded `LocalSession` or the Python
+/// new jobs when its owner (the embedded `Session` or the Python
 /// `Database`) drops.
 ///
 /// Drop stops the *loop*, not in-flight training: a job already running inside

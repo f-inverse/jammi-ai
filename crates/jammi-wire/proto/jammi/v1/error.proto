@@ -1,0 +1,256 @@
+syntax = "proto3";
+
+package jammi.v1.error;
+
+import "google/protobuf/any.proto";
+
+// RpcStatus — the canonical `google.rpc.Status` wire shape (field numbers and
+// types identical to `google/rpc/status.proto`), defined here so the engine
+// emits a *spec-compliant* `grpc-status-details-bin` without taking a
+// `tonic-types` / `googleapis` dependency for one three-field message.
+//
+// The gRPC rich-error contract — which every gRPC-web client (Connect-ES,
+// grpc-web) and the canonical spec assume — requires `grpc-status-details-bin`
+// to carry a serialized `google.rpc.Status` whose `code` mirrors the
+// `grpc-status` trailer and whose `details` is a list of `Any`. tonic's
+// `Status::with_details` writes the raw `details` bytes verbatim into the
+// header, so the engine must construct this envelope itself: a bare
+// `JammiErrorDetail` in the header has no `code` field, and a gRPC-web client
+// reading it as a `google.rpc.Status` sees `code == 0` (success) and then fails
+// the unary read with "missing message". The engine packs its typed detail
+// (`JammiErrorDetail` / `TriggerErrorDetail` / `AuditErrorDetail`) as the single
+// `Any` in `details`, so both the spec-compliant code/message AND the faithful
+// typed detail cross the wire.
+message RpcStatus {
+  int32 code = 1;
+  string message = 2;
+  repeated google.protobuf.Any details = 3;
+}
+
+// JammiErrorDetail — the structured domain-error payload a server attaches to
+// a `tonic::Status` so a remote client can reconstruct the EXACT engine
+// `JammiError` the in-process path returns, not a lossy gRPC-code-category
+// guess. Carried in the Status `details` bytes (the gRPC richer-error model);
+// the Status `code` + `message` still hold the idiomatic gRPC surface for
+// clients that do not decode the detail.
+//
+// The standard gRPC code set is insufficient to distinguish the engine's
+// failure modes — `invalid_argument` alone collapses Source / Model / Tenant /
+// Config / Schema / Eval into one code — so a typed detail payload is the
+// ADR-01 §5.3-sanctioned mechanism for "structured error information when the
+// standard gRPC code set is insufficient". A typed `oneof` (not a
+// `google.rpc.Any`) keeps it type-driven: each engine variant reachable on the
+// embedding/search verb surface has its own message carrying exactly the
+// fields needed to reconstruct it.
+//
+// The contract is complete over `JammiError`: every owned-shape variant — the
+// String- and struct-carrying ones whose fields fully reconstruct the variant —
+// has its own typed arm here. `MutableTable` is NOT folded: its inner
+// `MutableTableError` is engine-owned (every field reconstructs), so it carries
+// its own structured `MutableTableErrorDetail` and reconstructs faithfully —
+// the same standard the owned-shape variants meet. The only variants folded
+// into `other` are the genuinely-foreign `#[from]` ones whose inner error
+// cannot cross a process boundary (`Io`/`std::io::Error`,
+// `BackendDriver`/`Toml`/`Json`/`DataFusion`/`Trigger`/`Storage`): they
+// reconstruct as `JammiError::Other` carrying the faithful `Display` string —
+// the genuine fidelity limit, not a lossy guess. Faithfulness is a property of
+// the error type, so the mapping covers the whole enum, not only one verb
+// surface.
+message JammiErrorDetail {
+  oneof variant {
+    SourceError source = 1;
+    ModelError model = 2;
+    StringError inference = 3;
+    StringError catalog = 4;
+    SchemaError schema = 5;
+    StringError config = 6;
+    StringError eval = 7;
+    StringError tenant = 8;
+    StringError other = 9;
+    StringError fine_tune = 10;
+    StringError gpu = 11;
+    StringError backend = 12;
+    StringError evidence_channel = 13;
+    MutableTableErrorDetail mutable_table = 14;
+  }
+}
+
+// `JammiError::MutableTable(MutableTableError)`. The inner taxonomy is
+// engine-owned and every variant's fields reconstruct, so it crosses the wire
+// faithfully rather than folding to `other`. Each arm carries exactly the
+// fields the matching `MutableTableError` variant holds; the id-carrying
+// variants (`not_found`/`already_exists`) carry the table id string, and
+// `backend` nests the engine-owned `BackendErrorDetail`.
+message MutableTableErrorDetail {
+  oneof variant {
+    string invalid_id = 1;
+    string schema = 2;
+    string missing_primary_key = 3;
+    string reserved_column = 4;
+    string not_found = 5;
+    string already_exists = 6;
+    // `MutableTableError::NoOrderColumn` carries no payload.
+    bool no_order_column = 7;
+    BackendErrorDetail backend = 8;
+  }
+}
+
+// `MutableTableError::Backend(BackendError)`. The backend taxonomy is
+// engine-owned; every variant but `Sqlx` reconstructs field-for-field. A raw
+// `sqlx::Error` cannot cross a process boundary, so `Sqlx` is the one arm that
+// folds to a faithful `Display` string — the genuine fidelity limit, mirroring
+// how `JammiErrorDetail` folds its own foreign `#[from]` variants.
+message BackendErrorDetail {
+  oneof variant {
+    string execution = 1;
+    ConstraintViolation constraint = 2;
+    string unavailable = 3;
+    string retry = 4;
+    string migration = 5;
+    TypeConversion type_conversion = 6;
+    TenantMismatch tenant_mismatch = 7;
+    // `BackendError::Sqlx` — the lone genuinely-foreign arm; its `Display`
+    // string is carried because a `sqlx::Error` does not cross the wire.
+    string sqlx = 8;
+  }
+}
+
+// `BackendError::Constraint { table, detail }`.
+message ConstraintViolation {
+  string table = 1;
+  string detail = 2;
+}
+
+// `BackendError::TypeConversion { column, detail }`.
+message TypeConversion {
+  string column = 1;
+  string detail = 2;
+}
+
+// `BackendError::TenantMismatch { table, expected, got }`. The tenant ids are
+// UUID strings; an empty string means `None` (no tenant on that side).
+message TenantMismatch {
+  string table = 1;
+  string expected = 2;
+  string got = 3;
+}
+
+// A `JammiError` variant carrying a single human-readable string (`Inference`,
+// `Catalog`, `Config`, `Eval`, `Tenant`, `FineTune`, `Gpu`, `Backend`,
+// `EvidenceChannel`, `Other`).
+message StringError {
+  string message = 1;
+}
+
+// `JammiError::Source { source_id, message }`.
+message SourceError {
+  string source_id = 1;
+  string message = 2;
+}
+
+// `JammiError::Model { model_id, message }`.
+message ModelError {
+  string model_id = 1;
+  string message = 2;
+}
+
+// `JammiError::Schema { table, column, expected, actual }`.
+message SchemaError {
+  string table = 1;
+  string column = 2;
+  string expected = 3;
+  string actual = 4;
+}
+
+// TriggerErrorDetail — the structured wire detail for `jammi_db::TriggerError`,
+// attached to a `tonic::Status` by the server's `map_trigger_error` so a remote
+// the data-plane client reconstructs the EXACT `TriggerError` the in-process path
+// returns (the standard gRPC code set collapses several variants onto one code).
+//
+// The contract is complete and faithful over `TriggerError`. Every owned-shape
+// variant has its own typed arm. The two `#[from]` variants do NOT fold: their
+// inner errors are engine-owned and fully reconstructable, so `backing_table`
+// nests the shared `MutableTableErrorDetail` and `backend` nests the shared
+// `BackendErrorDetail` — the same faithful taxonomies `JammiErrorDetail` reuses.
+// No `TriggerError` variant degrades to a lossy string.
+message TriggerErrorDetail {
+  oneof variant {
+    string topic_not_found = 1;
+    SchemaConflict schema_conflict = 2;
+    UnsupportedSchemaType unsupported_schema_type = 3;
+    string batch_schema_mismatch = 4;
+    PublishTenantMismatch publish_tenant_mismatch = 5;
+    string predicate_parse = 6;
+    string predicate_eval = 7;
+    string predicate_unsupported = 8;
+    uint64 offset_evicted = 9;
+    // `TriggerError::BackingTable(MutableTableError)` — engine-owned, nested
+    // faithfully (never folded to a string).
+    MutableTableErrorDetail backing_table = 10;
+    // `TriggerError::Backend(BackendError)` — engine-owned, nested faithfully.
+    BackendErrorDetail backend = 11;
+    string driver = 12;
+    string catalog = 13;
+  }
+}
+
+// `TriggerError::SchemaConflict { topic, detail }`.
+message SchemaConflict {
+  string topic = 1;
+  string detail = 2;
+}
+
+// `TriggerError::UnsupportedSchemaType { column, data_type }`.
+message UnsupportedSchemaType {
+  string column = 1;
+  string data_type = 2;
+}
+
+// `TriggerError::PublishTenantMismatch { topic, topic_tenant, publish_tenant }`.
+// The tenant ids are UUID strings; an empty string means `None` (an unscoped
+// publish or a global topic).
+message PublishTenantMismatch {
+  string topic = 1;
+  string topic_tenant = 2;
+  string publish_tenant = 3;
+}
+
+// AuditErrorDetail — the structured wire detail for `jammi_db::AuditError`,
+// attached to a `tonic::Status` by the server's `map_audit_error` so a remote
+// the data-plane client reconstructs the EXACT `AuditError` the in-process path
+// returns.
+//
+// Every owned-shape variant has its own typed arm and reconstructs faithfully.
+// The only fold is `serde` — `AuditError::Serde(#[from] serde_json::Error)`
+// wraps a foreign error that cannot cross a process boundary, so it carries its
+// faithful `Display` string (the genuine fidelity limit, mirroring how
+// `JammiErrorDetail` folds its own foreign `#[from]` variants).
+message AuditErrorDetail {
+  oneof variant {
+    LengthMismatch length_mismatch = 1;
+    LineageTooLarge lineage_too_large = 2;
+    // `AuditError::NoTenantBinding` carries no payload.
+    bool no_tenant_binding = 3;
+    // `AuditError::SignatureMismatch(Uuid)` — the offending query id (UUID
+    // string).
+    string signature_mismatch = 4;
+    string master_key = 5;
+    // `AuditError::Serde` — the lone genuinely-foreign arm; its `Display`
+    // string is carried because a `serde_json::Error` does not cross the wire.
+    string serde = 6;
+    string storage = 7;
+    string broker = 8;
+  }
+}
+
+// `AuditError::LengthMismatch { ids, scores }`. Both are element counts.
+message LengthMismatch {
+  uint64 ids = 1;
+  uint64 scores = 2;
+}
+
+// `AuditError::LineageTooLarge { actual, max }`. Both are byte counts.
+message LineageTooLarge {
+  uint64 actual = 1;
+  uint64 max = 2;
+}

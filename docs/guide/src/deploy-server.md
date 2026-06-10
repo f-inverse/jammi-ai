@@ -4,21 +4,24 @@ Jammi can run as an Arrow Flight SQL server, making all registered sources and e
 
 ## The workflow
 
-The server is a **read path**. Set up your data with the library or CLI, then deploy the server so other systems can query it:
+The server is a **read path**. Deploy the server, then set up your data through
+it — with the `jammi` CLI (a strict gRPC client) or the library — so other
+systems can query it:
 
 ```bash
-# 1. Register sources and generate embeddings (CLI or library)
-jammi sources add patents --path /data/patents.parquet --format parquet
+# 1. Start the server
+jammi-server
 
-# 2. Generate embeddings (library or Python — not available over Flight SQL)
+# 2. Register sources against the running server with the CLI
+jammi --target grpc://127.0.0.1:8081 \
+  sources add patents --url /data/patents.parquet --format parquet
+
+# 3. Generate embeddings (library or Python — not available over Flight SQL)
 python3 -c '
 import jammi_ai
 db = jammi_ai.connect("file:///var/lib/jammi")
 db.generate_embeddings(source="patents", model="sentence-transformers/all-MiniLM-L6-v2", columns=["abstract"], key="id", modality="text")
 '
-
-# 3. Start the server
-jammi serve
 ```
 
 ## Connecting with Arrow Flight SQL
@@ -87,10 +90,11 @@ preload_models = [
 
 One server binary scales to many deployment shapes by mounting only the gRPC
 service tiers a deployment needs — no per-shape rebuild. The **core** tier is
-always mounted: `SessionService` (tenant binding + the `GetServerInfo`
-handshake), `EmbeddingService`, `InferenceService`, `MutableTableService`,
-`ChannelService`, `AuditService`, and the Flight SQL surface. Three optional
-tiers are runtime-selectable via `[server] services`:
+always mounted: `CatalogService` (the control plane — tenant binding, the
+`GetServerInfo` handshake, and source / model / channel / mutable-table /
+topic administration), `EmbeddingService`, `InferenceService`,
+`AuditService`, and the Flight SQL surface. Three optional tiers are
+runtime-selectable via `[server] services`:
 
 | Tier | Service | Role |
 |---|---|---|
@@ -155,7 +159,7 @@ Every config field can be overridden with environment variables, useful for cont
 JAMMI_SERVER__FLIGHT_LISTEN=0.0.0.0:9081 \
 JAMMI_GPU__DEVICE=-1 \
 JAMMI_LOGGING__FORMAT=json \
-jammi serve
+jammi-server
 ```
 
 ## Health, readiness, and metrics
@@ -199,7 +203,7 @@ latency histogram.
 | Context-predictor prediction | No — use library or Python package | Yes — `InferenceService.Predict` |
 | Evaluation | No — use library or Python package | Yes — `EvalService` (eval tier) |
 
-The Flight SQL surface is a **query** interface (read path); the ML operations are not SQL, so they ride the **typed gRPC** surface instead. Set up your data and run training/inference through the Rust library, the `jammi-ai` / `jammi-client` Python package, or — for a remote engine — those same verbs over gRPC, then query the results over Flight SQL. The CLI registers sources and starts the server; it carries no ML verbs.
+The Flight SQL surface is a **query** interface (read path); the ML operations are not SQL, so they ride the **typed gRPC** surface instead. Set up your data and run training/inference through the Rust library, the `jammi-ai` / `jammi-client` Python package, or — for a remote engine — those same verbs over gRPC, then query the results over Flight SQL. The CLI is a strict gRPC client that registers sources and drives the admin surfaces against a running server; it carries no ML verbs and does not run the engine in-process.
 
 The typed gRPC surface is what an edge runtime speaks (it has no HTTP/2 client for Flight SQL's bidirectional streaming). `EmbeddingService` serves `AddSource`, `GenerateEmbeddings`, `EncodeQuery`, and `Search` over plain gRPC — and, since tonic-web is mounted, over **gRPC-web** — so an edge function running the engine as a sidecar can ingest, encode, **and** search without the library. `Search` accepts a precomputed vector or an existing `row_key` (query-by-example, with the vector resolved inside the engine); see [Semantic Search](./semantic-search.md#search-over-grpc-edge-runtimes). With the **train** tier mounted, `TrainingService` serves all three training kinds over gRPC and `InferenceService.Predict` serves a trained context predictor — so a client can offload training and prediction to a GPU server with the same verb surface the embedded engine exposes.
 
@@ -214,7 +218,7 @@ The OSS server ships as two public Docker images on GHCR:
 - `ghcr.io/f-inverse/jammi-ai-server` — **CPU**, built from a distroless base.
 - `ghcr.io/f-inverse/jammi-ai-server-cu12` — **CUDA**, for GPU-accelerated inference (see [GPU serving](#gpu-serving)).
 
-Both run as the nonroot user (uid `65532`), expose the same `8080` / `8081` ports the local binary listens on, and share the same tag scheme (`:latest`, `:vX.Y.Z`, `:vX.Y`). Both carry the `jammi` CLI and are **turnkey**: the image entrypoint is `jammi serve`, so `docker run <image>` brings up the server with **zero config** — a local SQLite catalog, the in-memory broker, and every service tier, no TOML required. The examples below use the CPU image.
+Both run as the nonroot user (uid `65532`), expose the same `8080` / `8081` ports the local binary listens on, and share the same tag scheme (`:latest`, `:vX.Y.Z`, `:vX.Y`). The image entrypoint is `jammi-server`, so `docker run <image>` brings up the server with **zero config** — a local SQLite catalog, the in-memory broker, and every service tier, no TOML required. The `jammi` admin CLI also ships in the image for running verbs against the server. The examples below use the CPU image.
 
 ```bash
 # Turnkey: zero config, no TOML.
@@ -224,15 +228,14 @@ docker run --rm \
   ghcr.io/f-inverse/jammi-ai-server:latest
 ```
 
-To supply your own config, pass it to the `serve` subcommand (the image
-entrypoint is the CLI, so any `jammi` verb works):
+To supply your own config, pass `--config` to the `jammi-server` entrypoint:
 
 ```bash
 docker run --rm \
   -p 8080:8080 -p 8081:8081 \
   -v jammi_data:/var/lib/jammi \
   -v $(pwd)/jammi.toml:/etc/jammi/jammi.toml:ro \
-  ghcr.io/f-inverse/jammi-ai-server:latest serve --config /etc/jammi/jammi.toml
+  ghcr.io/f-inverse/jammi-ai-server:latest --config /etc/jammi/jammi.toml
 ```
 
 A minimal compose file lives in the workspace at `examples/docker-compose/oss-server.yml`:
@@ -244,7 +247,7 @@ docker compose -f oss-server.yml up
 
 ### Persistence
 
-`/var/lib/jammi` holds the catalog DB, model weights, and indices. Zero-config `jammi serve` writes its SQLite catalog there (the image sets `JAMMI_ARTIFACT_DIR=/var/lib/jammi`). The Dockerfile declares it as a `VOLUME` owned by uid `65532` — a named Docker volume or no mount at all just works; a bind mount must have the host directory writable by uid `65532`:
+`/var/lib/jammi` holds the catalog DB, model weights, and indices. Zero-config `jammi-server` writes its SQLite catalog there (the image sets `JAMMI_ARTIFACT_DIR=/var/lib/jammi`). The Dockerfile declares it as a `VOLUME` owned by uid `65532` — a named Docker volume or no mount at all just works; a bind mount must have the host directory writable by uid `65532`:
 
 ```bash
 # Bind mount on the host.
@@ -256,14 +259,14 @@ A named Docker volume (the compose default) sidesteps that step because Docker p
 
 ### Configuration
 
-The image needs no config — it boots zero-config. To override defaults, bind-mount a TOML and point `serve` at it with a `command:`. The `[gpu]`, `[server]`, and `services` knobs documented above (and `JAMMI_*` env overrides) all apply:
+The image needs no config — it boots zero-config. To override defaults, bind-mount a TOML and point the `jammi-server` entrypoint at it with a `command:`. The `[gpu]`, `[server]`, and `services` knobs documented above (and `JAMMI_*` env overrides) all apply:
 
 ```yaml
 # oss-server.yml
 services:
   jammi-server:
     image: ghcr.io/f-inverse/jammi-ai-server:latest
-    command: ["serve", "--config", "/etc/jammi/jammi.toml"]
+    command: ["--config", "/etc/jammi/jammi.toml"]
     volumes:
       - ./jammi.toml:/etc/jammi/jammi.toml:ro
       - jammi_data:/var/lib/jammi

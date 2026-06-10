@@ -5,7 +5,7 @@
 //! over the engine session: proto in, one engine eval call inside the request's
 //! tenant scope, proto out. The service reimplements no metric or retrieval
 //! logic. The retrieval/inference/compare verbs route through the
-//! transport-agnostic [`Session`]/[`LocalSession`] abstraction;
+//! transport-agnostic [`Session`] abstraction;
 //! `EvalCalibration` calls the [`InferenceSession`] verb directly (the
 //! calibration runner is not on the unified transport surface).
 //!
@@ -26,8 +26,8 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
-use jammi_ai::wire::{calibration_shape_from_proto, cohorts_from_proto, EvalTaskFromWire};
-use jammi_ai::{LocalSession, Session};
+use jammi_ai::Session;
+use jammi_wire::{calibration_shape_from_proto, cohorts_from_proto, EvalTaskFromWire};
 use tonic::{Request, Response, Status};
 
 use crate::grpc::proto::eval as pb;
@@ -35,7 +35,7 @@ use crate::grpc::proto::eval::eval_service_server::EvalService;
 use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant};
 
 /// Server-side handler for the eval gRPC surface. Holds a shared engine session
-/// it wraps in a [`LocalSession`] per call to reach the unified transport
+/// it wraps in a [`Session`] per call to reach the unified transport
 /// surface.
 pub struct EvalServer {
     session: Arc<InferenceSession>,
@@ -49,7 +49,7 @@ impl EvalServer {
     /// A [`Session`] over the shared engine; see [`crate::grpc::inference`] for
     /// the tenant-scope wiring rationale.
     fn local(&self) -> Session {
-        Session::Local(LocalSession::new(Arc::clone(&self.session)))
+        Session::new(Arc::clone(&self.session))
     }
 }
 

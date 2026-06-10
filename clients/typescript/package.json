@@ -22,7 +22,7 @@
     }
   },
   "scripts": {
-    "generate": "buf generate ../../crates/jammi-ai/proto",
+    "generate": "buf generate ../../crates/jammi-wire/proto",
     "clean": "rm -rf dist src/gen",
     "prebuild": "npm run clean && npm run generate",
     "build": "tsc -p tsconfig.build.json",

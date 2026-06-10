@@ -1,11 +1,12 @@
-//! `RemoteSession` over the `JammiError`-returning compute verbs, proven
-//! interchangeable with `LocalSession`: inference, eval (the four verbs),
+//! The data-plane client over the `JammiError`-returning compute verbs, proven
+//! interchangeable with a local `Session`: inference, eval (the four verbs),
 //! fine-tune (start + status), the mutable-table create/drop lifecycle, and the
-//! channel register / add-columns verbs.
+//! channel register / add-columns verbs (the latter through the data client's
+//! composed `CatalogClient`).
 //!
 //! An in-process gRPC chain (`runtime::serve_grpc_chain`) hosts a real
-//! `InferenceSession`. A `jammi_ai::RemoteSession` connects over a real HTTP/2
-//! channel and a `jammi_ai::LocalSession` wraps the *same* engine `Arc`, so any
+//! `InferenceSession`. A `jammi_client::DataClient` connects over a real HTTP/2
+//! channel and a `jammi_ai::Session` wraps the *same* engine `Arc`, so any
 //! divergence is the transport's fault, not the engine's. Two properties are
 //! pinned per verb group:
 //!
@@ -29,7 +30,8 @@ use arrow::array::StringArray;
 use arrow_schema::{DataType, Field, Schema};
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::local_session::{ChannelColumn, ChannelSpec};
-use jammi_ai::{LocalSession, Modality, RemoteSession, Session};
+use jammi_ai::{Modality, Session};
+use jammi_client::DataClient;
 use jammi_db::catalog::channel_repo::ChannelColumnType;
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
@@ -54,18 +56,18 @@ fn file_connection(name: &str, format: FileFormat) -> SourceConnection {
 
 const GOLDEN_SOURCE: &str = "golden_rel.public.golden_relevance";
 
-/// Connect a `RemoteSession` to the in-process server.
-async fn remote(server: &EngineServer) -> RemoteSession {
+/// Connect a `DataClient` to the in-process server.
+async fn remote(server: &EngineServer) -> DataClient {
     let endpoint = Endpoint::from_shared(format!("http://{}", server.addr)).expect("endpoint");
-    RemoteSession::connect(endpoint)
+    DataClient::connect(endpoint)
         .await
-        .expect("remote session connect")
+        .expect("data client connect")
 }
 
 /// Wrap the server's engine `Arc` in a local session — the same engine the
 /// remote calls reach.
 fn local(server: &EngineServer) -> Session {
-    Session::Local(LocalSession::new(Arc::clone(&server.engine)))
+    Session::new(Arc::clone(&server.engine))
 }
 
 /// Register the patents corpus on the shared engine (AddSource is not a remote
@@ -110,7 +112,7 @@ async fn embed_patents_and_golden(session: &Session) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_infer_round_trips_like_local() {
     let server = start_engine_server().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let local = local(&server);
     add_patents(&local).await;
 
@@ -166,7 +168,7 @@ async fn remote_infer_round_trips_like_local() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_eval_round_trips_like_local() {
     let server = start_engine_server().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let local = local(&server);
     let table = embed_patents_and_golden(&local).await;
 
@@ -235,7 +237,7 @@ async fn remote_eval_round_trips_like_local() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_eval_reconstructs_the_exact_error_variant() {
     let server = start_engine_server().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let local = local(&server);
     add_patents(&local).await; // no embeddings generated
 
@@ -281,7 +283,7 @@ async fn remote_eval_reconstructs_the_exact_error_variant() {
 /// `model_id`) alongside the status string, so a remote `wait()` can surface the
 /// failure reason — see the pure-Python `RemoteTrainingJob.wait`, which raises
 /// `TrainingError` with that wire message, and the verb-parity coverage in
-/// `crates/jammi-python/tests/test_conformance.py`. The `RemoteSession` arm
+/// `crates/jammi-python/tests/test_conformance.py`. The data-plane client
 /// exposed here reads back only the status string (its `fine_tune_status`
 /// signature is status-only), so this test asserts the deferred-failure contract
 /// — submit returns `Ok`, the worker drives the job to `failed` — over both
@@ -290,7 +292,7 @@ async fn remote_eval_reconstructs_the_exact_error_variant() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_fine_tune_start_defers_failure_to_the_worker() {
     let server = start_engine_server().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let local = local(&server);
     add_patents(&local).await;
 
@@ -333,12 +335,38 @@ async fn remote_fine_tune_start_defers_failure_to_the_worker() {
     // format detection on patents. Poll each transport's status until terminal;
     // both must reach `failed`. (The rich variant/message is NOT carried over
     // the wire yet — that lands in T3; here we assert only the failed status.)
-    async fn poll_until_failed(session: &Session, job: &jammi_ai::local_session::FineTuneJobId) {
+    // Both transports expose `fine_tune_status(&id) -> Result<String>`, but on
+    // distinct types (the local `Session` and the remote `DataClient`); a tiny
+    // local trait lets the one poll loop drive either without duplicating it.
+    trait FineTuneStatus {
+        async fn status(
+            &self,
+            job: &jammi_ai::local_session::FineTuneJobId,
+        ) -> jammi_db::error::Result<String>;
+    }
+    impl FineTuneStatus for Session {
+        async fn status(
+            &self,
+            job: &jammi_ai::local_session::FineTuneJobId,
+        ) -> jammi_db::error::Result<String> {
+            self.fine_tune_status(job).await
+        }
+    }
+    impl FineTuneStatus for DataClient {
+        async fn status(
+            &self,
+            job: &jammi_ai::local_session::FineTuneJobId,
+        ) -> jammi_db::error::Result<String> {
+            self.fine_tune_status(job).await
+        }
+    }
+
+    async fn poll_until_failed(
+        session: &impl FineTuneStatus,
+        job: &jammi_ai::local_session::FineTuneJobId,
+    ) {
         for _ in 0..600 {
-            let status = session
-                .fine_tune_status(job)
-                .await
-                .expect("fine_tune_status");
+            let status = session.status(job).await.expect("fine_tune_status");
             if status == "failed" {
                 return;
             }
@@ -363,7 +391,7 @@ async fn remote_fine_tune_start_defers_failure_to_the_worker() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_fine_tune_status_reconstructs_the_exact_error_variant() {
     let server = start_engine_server().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let local = local(&server);
 
     let unknown = jammi_ai::local_session::FineTuneJobId("no-such-job-id".to_string());
@@ -404,11 +432,12 @@ fn patents_dim_definition() -> jammi_db::store::mutable::MutableTableDefinition 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_create_and_drop_mutable_table_round_trips_like_local() {
     let server = start_engine_server().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let local = local(&server);
 
     // The remote creates the table; the id echoes the request id.
     let id = remote
+        .catalog()
         .create_mutable_table(patents_dim_definition())
         .await
         .expect("remote create_mutable_table");
@@ -425,6 +454,7 @@ async fn remote_create_and_drop_mutable_table_round_trips_like_local() {
         .await
         .expect_err("local re-create must fail");
     let remote_dup = remote
+        .catalog()
         .create_mutable_table(patents_dim_definition())
         .await
         .expect_err("remote re-create must fail");
@@ -448,6 +478,7 @@ async fn remote_create_and_drop_mutable_table_round_trips_like_local() {
     // The remote drops it; afterwards the local session can recreate it,
     // proving the drop reached the shared engine.
     remote
+        .catalog()
         .drop_mutable_table(&id)
         .await
         .expect("remote drop_mutable_table");
@@ -470,7 +501,7 @@ async fn remote_create_and_drop_mutable_table_round_trips_like_local() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_mutable_table_reserved_name_reconstructs_faithfully_not_as_other() {
     let server = start_engine_server().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let local = local(&server);
 
     let reserved = || {
@@ -487,6 +518,7 @@ async fn remote_mutable_table_reserved_name_reconstructs_faithfully_not_as_other
         .await
         .expect_err("a reserved name must be rejected locally");
     let remote_err = remote
+        .catalog()
         .create_mutable_table(reserved())
         .await
         .expect_err("a reserved name must be rejected remotely");
@@ -522,7 +554,7 @@ async fn remote_mutable_table_reserved_name_reconstructs_faithfully_not_as_other
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_register_and_add_channel_columns_round_trips_like_local() {
     let server = start_engine_server().await;
-    let remote = Session::Remote(remote(&server).await);
+    let remote = remote(&server).await;
     let local = local(&server);
 
     let channel_id = ChannelId::new("evidence").expect("valid channel id");
@@ -535,6 +567,7 @@ async fn remote_register_and_add_channel_columns_round_trips_like_local() {
         }],
     };
     remote
+        .catalog()
         .register_channel(&spec)
         .await
         .expect("remote register_channel");
@@ -542,6 +575,7 @@ async fn remote_register_and_add_channel_columns_round_trips_like_local() {
     // Re-registering the same channel fails identically on both transports —
     // a faithful `EvidenceChannel` error over the wire.
     let remote_dup = remote
+        .catalog()
         .register_channel(&spec)
         .await
         .expect_err("re-registering a channel must fail");
@@ -553,6 +587,7 @@ async fn remote_register_and_add_channel_columns_round_trips_like_local() {
     // The remote appends a column; the local session sees the same channel
     // (shared engine), so its append of a *different* column also succeeds.
     remote
+        .catalog()
         .add_channel_columns(
             &channel_id,
             &[ChannelColumn {

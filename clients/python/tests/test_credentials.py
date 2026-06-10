@@ -1,6 +1,6 @@
 """Hermetic tests for the channel-credentials layer.
 
-Each test stands up a real in-process `SessionService` that records the inbound
+Each test stands up a real in-process `CatalogService` that records the inbound
 metadata of every call, drives a real :class:`RemoteDatabase` through
 `open_remote`, and asserts on what reached the server. No network, no
 certificate file, nothing that expires:
@@ -22,10 +22,10 @@ import pytest
 from jammi_client import BearerCredentials
 from jammi_client._credentials import AUTHORIZATION_HEADER
 from jammi_client._database import SESSION_HEADER, open_remote
-from jammi_client._generated.jammi.v1 import session_pb2, session_pb2_grpc
+from jammi_client._generated.jammi.v1 import catalog_pb2, catalog_pb2_grpc
 
 
-class _RecordingSessionService(session_pb2_grpc.SessionServiceServicer):
+class _RecordingCatalogService(catalog_pb2_grpc.CatalogServiceServicer):
     """Records each call's inbound metadata and answers `GetServerInfo`."""
 
     def __init__(self) -> None:
@@ -33,7 +33,7 @@ class _RecordingSessionService(session_pb2_grpc.SessionServiceServicer):
 
     def GetServerInfo(self, request, context):
         self.calls.append(dict(context.invocation_metadata()))
-        return session_pb2.ServerInfo(
+        return catalog_pb2.ServerInfo(
             version="0.20.0",
             features=["postgres"],
             storage_backends=["file", "memory"],
@@ -43,14 +43,14 @@ class _RecordingSessionService(session_pb2_grpc.SessionServiceServicer):
 
 @contextmanager
 def _server(server_credentials=None):
-    """Run a recording `SessionService` on an ephemeral loopback port.
+    """Run a recording `CatalogService` on an ephemeral loopback port.
 
     Yields ``(endpoint, recorder)``. With `server_credentials` the port is
     secure; without, it is plaintext insecure.
     """
-    recorder = _RecordingSessionService()
+    recorder = _RecordingCatalogService()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
-    session_pb2_grpc.add_SessionServiceServicer_to_server(recorder, server)
+    catalog_pb2_grpc.add_CatalogServiceServicer_to_server(recorder, server)
     if server_credentials is None:
         port = server.add_insecure_port("127.0.0.1:0")
     else:

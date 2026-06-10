@@ -24,17 +24,17 @@
 //!
 //! Hermetic: the encoder is a local fixture and the corpus is a shipped fixture.
 
-use jammi_server::grpc::proto::embedding::embedding_service_client::EmbeddingServiceClient;
-use jammi_server::grpc::proto::embedding::{
-    AddSourceRequest, FileFormat, GenerateEmbeddingsRequest, Modality, SourceConnection, SourceKind,
+use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
+use jammi_server::grpc::proto::catalog::{
+    AddSourceRequest, FileFormat, SetTenantRequest, SourceConnection, SourceKind, Tenant,
 };
+use jammi_server::grpc::proto::embedding::embedding_service_client::EmbeddingServiceClient;
+use jammi_server::grpc::proto::embedding::{GenerateEmbeddingsRequest, Modality};
 use jammi_server::grpc::proto::pipeline::pipeline_service_client::PipelineServiceClient;
 use jammi_server::grpc::proto::pipeline::{
     propagate_embeddings_request::Graph, AssembleContextRequest, BuildNeighborGraphRequest,
     PropagateEmbeddingsRequest,
 };
-use jammi_server::grpc::proto::session::session_service_client::SessionServiceClient;
-use jammi_server::grpc::proto::session::{SetTenantRequest, Tenant};
 use jammi_test_utils::{cookbook_fixture, fixture};
 use tonic::codegen::Body;
 
@@ -50,18 +50,23 @@ fn patents_url() -> String {
     format!("file://{}", fixture("patents.parquet").display())
 }
 
-/// Register the patents corpus and generate one embedding table over `abstract`
-/// through the supplied embedding client. Returns the generated table name.
+/// Register the patents corpus (control plane) and generate one embedding table
+/// over `abstract` (data plane). Returns the generated table name. Both clients
+/// share one transport (and, for the tenant-scoped test, one session-header
+/// interceptor), so registration and compute run under the same tenant scope.
 /// Generic over the client transport so the plain-channel test and the
 /// interceptor-wrapped tenant test share one body.
-async fn embed_patents<T>(mut embedding: EmbeddingServiceClient<T>) -> String
+async fn embed_patents<T>(
+    mut catalog: CatalogServiceClient<T>,
+    mut embedding: EmbeddingServiceClient<T>,
+) -> String
 where
-    T: tonic::client::GrpcService<tonic::body::Body>,
+    T: tonic::client::GrpcService<tonic::body::Body> + Clone,
     T::Error: Into<tonic::codegen::StdError>,
     T::ResponseBody: Body<Data = tonic::codegen::Bytes> + std::marker::Send + 'static,
     <T::ResponseBody as Body>::Error: Into<tonic::codegen::StdError> + std::marker::Send,
 {
-    embedding
+    catalog
         .add_source(AddSourceRequest {
             source_id: "patents".into(),
             source_kind: SourceKind::File as i32,
@@ -89,7 +94,11 @@ where
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn build_propagate_assemble_over_the_wire() {
     let server: EngineServer = start_engine_server().await;
-    embed_patents(EmbeddingServiceClient::new(channel(server.addr).await)).await;
+    embed_patents(
+        CatalogServiceClient::new(channel(server.addr).await),
+        EmbeddingServiceClient::new(channel(server.addr).await),
+    )
+    .await;
 
     let mut pipeline = PipelineServiceClient::new(channel(server.addr).await);
 
@@ -167,7 +176,7 @@ async fn propagate_embeddings_is_tenant_scoped_over_the_wire() {
     // interceptor scopes every call. The graph build, embedding generation, and
     // propagation all resolve TENANT_A's own catalog rows.
     let session_a = with_session("pipeline-tenant-a");
-    SessionServiceClient::with_interceptor(channel(server.addr).await, session_a.clone())
+    CatalogServiceClient::with_interceptor(channel(server.addr).await, session_a.clone())
         .set_tenant(SetTenantRequest {
             tenant: Some(Tenant {
                 id: TENANT_A.into(),
@@ -176,9 +185,11 @@ async fn propagate_embeddings_is_tenant_scoped_over_the_wire() {
         .await
         .expect("set_tenant A");
 
+    let catalog_a =
+        CatalogServiceClient::with_interceptor(channel(server.addr).await, session_a.clone());
     let embedding_a =
         EmbeddingServiceClient::with_interceptor(channel(server.addr).await, session_a.clone());
-    embed_patents(embedding_a).await;
+    embed_patents(catalog_a, embedding_a).await;
 
     let mut pipeline_a =
         PipelineServiceClient::with_interceptor(channel(server.addr).await, session_a.clone());
@@ -211,7 +222,7 @@ async fn propagate_embeddings_is_tenant_scoped_over_the_wire() {
     // scope — the propagate is rejected. This is the cross-tenant boundary the
     // analyzer rule enforces, observed over the wire (not a signature claim).
     let session_b = with_session("pipeline-tenant-b");
-    SessionServiceClient::with_interceptor(channel(server.addr).await, session_b.clone())
+    CatalogServiceClient::with_interceptor(channel(server.addr).await, session_b.clone())
         .set_tenant(SetTenantRequest {
             tenant: Some(Tenant {
                 id: TENANT_B.into(),

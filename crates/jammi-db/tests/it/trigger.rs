@@ -427,7 +427,7 @@ async fn empty_predicate_matches_every_batch() {
 }
 
 #[tokio::test]
-async fn session_create_topic_ddl_round_trip() {
+async fn session_topic_register_drop_round_trip() {
     use jammi_db::config::JammiConfig;
     use jammi_db::session::JammiSession;
     let dir = tempfile::tempdir().unwrap();
@@ -437,14 +437,29 @@ async fn session_create_topic_ddl_round_trip() {
     };
     let session = JammiSession::new(cfg).await.unwrap();
 
-    // CREATE TOPIC inserts a topics row + provisions the backing table.
+    // Registering a topic dual-registers the broker driver (so a later publish
+    // resolves it) and the catalog (the system of record a lookup reads). The
+    // session always carries a broker (defaulting to the in-memory broker), so
+    // both registrations succeed.
+    let mut broker_metadata = BTreeMap::new();
+    broker_metadata.insert("retention_seconds".to_string(), "3600".to_string());
+    let topic = TopicDefinition {
+        id: TopicId::new(),
+        name: "orders.changes".to_string(),
+        schema: Arc::new(Schema::new(vec![
+            Field::new("op", DataType::Utf8, false),
+            Field::new("ts_ms", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, true),
+        ])),
+        tenant: None,
+        broker_metadata,
+    };
     session
-        .sql(
-            "CREATE TOPIC orders.changes (op TEXT NOT NULL, ts_ms BIGINT NOT NULL, payload TEXT) \
-             WITH (retention_seconds = '3600')",
-        )
+        .trigger_broker()
+        .register_topic(&topic)
         .await
         .unwrap();
+    session.topic_repo().register_topic(&topic).await.unwrap();
 
     let topics = session.topic_repo().list_topics(None).await.unwrap();
     assert_eq!(topics.len(), 1);
@@ -455,19 +470,19 @@ async fn session_create_topic_ddl_round_trip() {
         Some(&"3600".to_string())
     );
 
-    // DROP TOPIC removes it; DROP TOPIC IF EXISTS on a missing name is a no-op.
-    session.sql("DROP TOPIC orders.changes").await.unwrap();
-    let topics = session.topic_repo().list_topics(None).await.unwrap();
-    assert!(topics.is_empty());
-
+    // Dropping removes the catalog row; the broker drop is best-effort.
     session
-        .sql("DROP TOPIC IF EXISTS orders.changes")
+        .topic_repo()
+        .drop_topic(topic.id, None)
         .await
         .unwrap();
+    session.trigger_broker().drop_topic(topic.id).await.unwrap();
+    let topics = session.topic_repo().list_topics(None).await.unwrap();
+    assert!(topics.is_empty());
 }
 
 #[tokio::test]
-async fn session_drop_topic_missing_errors_without_if_exists() {
+async fn session_drop_missing_topic_is_not_found() {
     use jammi_db::config::JammiConfig;
     use jammi_db::session::JammiSession;
     let dir = tempfile::tempdir().unwrap();
@@ -476,8 +491,12 @@ async fn session_drop_topic_missing_errors_without_if_exists() {
         ..Default::default()
     };
     let session = JammiSession::new(cfg).await.unwrap();
-    let err = session.sql("DROP TOPIC missing.topic").await.unwrap_err();
-    assert!(err.to_string().contains("not found"));
+    let err = session
+        .topic_repo()
+        .drop_topic(TopicId::new(), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TriggerError::TopicNotFound(_)));
 }
 
 #[tokio::test]

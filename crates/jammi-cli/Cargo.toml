@@ -16,39 +16,29 @@ name = "jammi"
 path = "src/main.rs"
 
 [dependencies]
+# The CLI is a strict control-plane client: it talks to a running `jammi-server`
+# over the wire and never touches the catalog/DB in-process. It depends on
+# `jammi-admin` (the candle-free `CatalogClient`) for every verb it drives — the
+# CLI is a control-plane tool, so it needs no data-plane (`jammi-client`) surface
+# — and pulls no embedded ML stack. It does NOT depend on `jammi-ai`, so the
+# candle / tokenizers / symphonia / hf-hub stack never reaches the `jammi` binary.
 jammi-db.workspace = true
-jammi-ai.workspace = true
-jammi-server.workspace = true
-arrow.workspace = true
+jammi-admin.workspace = true
+# Building the `tonic::transport::Endpoint` the connect path carries from the
+# translated `--target` URL. Part of the transport stack `jammi-admin` already
+# pulls; candle-free.
+tonic.workspace = true
+# The trigger-register and mutable-create paths build an Arrow `Schema` from the
+# CLI's inline column spec; `arrow-schema` carries that type alone (no array /
+# compute / datafusion stack — the strict client builds no record batches).
 arrow-schema.workspace = true
-chrono.workspace = true
 clap.workspace = true
-datafusion.workspace = true
-futures.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
-[features]
-cuda  = ["jammi-ai/cuda"]
-metal = ["jammi-ai/metal"]
-
-# Cloud object-store backends, forwarded to `jammi-server` (and onward to
-# `jammi-db`). The shipped `jammi` binary that reads `s3://` / `r2://` / `gs://` /
-# `azure://` result roots and writes trained-model artifacts to them needs the
-# matching driver compiled in; a build without these carries no cloud driver and
-# fails closed with `SchemeNotEnabled` on the first cloud object-store request.
-# Individual features let a build compile in only the cloud it targets.
-storage-s3 = ["jammi-server/storage-s3"]
-storage-gcs = ["jammi-server/storage-gcs"]
-storage-azure = ["jammi-server/storage-azure"]
-storage-r2 = ["jammi-server/storage-r2"]
-storage-cloud = ["jammi-server/storage-cloud"]
-
-# docs.rs builds with default features only. Pin the feature set to empty so a
-# future `default` change can never make the docs.rs builder invoke nvcc (the
-# `cuda` feature pulls candle's CUDA backend, which needs a CUDA toolchain
-# docs.rs does not provide).
+# docs.rs builds with default features only. The thin client carries no feature
+# flags, so this pins the empty set explicitly.
 [package.metadata.docs.rs]
 features = []
 

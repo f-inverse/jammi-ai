@@ -1,17 +1,34 @@
+//! `jammi` — the strict gRPC control-plane client CLI.
+//!
+//! The CLI talks to a running `jammi-server` over the `jammi.v1` wire surface
+//! and never touches the catalog or storage in-process: it opens a
+//! [`CatalogClient`] against a `--target` endpoint and dispatches each
+//! subcommand to one or more control verbs. There is no embedded engine here —
+//! `jammi serve` lives in the `jammi-server` binary, not this CLI — and the
+//! crate depends on `jammi-admin`, not `jammi-ai`, so the candle stack never
+//! reaches the `jammi` binary.
+
 mod commands;
 
 use clap::{Parser, Subcommand};
+use jammi_admin::CatalogClient;
+
+/// Default endpoint: the server's Flight-SQL + gRPC listener
+/// (`flight_listen = "0.0.0.0:8081"`).
+const DEFAULT_TARGET: &str = "grpc://127.0.0.1:8081";
 
 #[derive(Parser)]
-#[command(name = "jammi", version, about = "Jammi AI — inference engine CLI")]
+#[command(name = "jammi", version, about = "Jammi AI — gRPC client CLI")]
 struct Cli {
-    /// Path to config file
-    #[arg(long, global = true)]
-    config: Option<String>,
+    /// Server endpoint. Accepts `grpc://host:port` (plaintext h2),
+    /// `grpcs://host:port` (TLS), `http(s)://host:port`, or a bare `host:port`
+    /// (treated as plaintext). The CLI is a strict client — every verb runs on
+    /// the server reached here, never in-process.
+    #[arg(long, global = true, default_value = DEFAULT_TARGET)]
+    target: String,
 
-    /// Bind a tenant scope (UUID v4 / v7). Every catalog read and write
-    /// observes `tenant_id = <UUID> OR tenant_id IS NULL`; writes record
-    /// `tenant_id = <UUID>`. Omit for an unscoped (single-tenant) session.
+    /// Bind a tenant scope (UUID v4 / v7) for the session. Every verb then runs
+    /// scoped to that tenant; omit for an unscoped session.
     #[arg(long, global = true)]
     tenant: Option<String>,
 
@@ -21,8 +38,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the HTTP + Flight SQL server
-    Serve,
+    /// Report the server's capabilities (version, features, storage backends,
+    /// mounted services). Reachability is confirmed by the RPC succeeding.
+    Status,
     /// Manage data sources
     Sources {
         #[command(subcommand)]
@@ -32,16 +50,6 @@ enum Commands {
     Models {
         #[command(subcommand)]
         action: commands::models::ModelAction,
-    },
-    /// Run a SQL query
-    Query {
-        /// SQL query string
-        sql: String,
-    },
-    /// Show the execution plan for a query
-    Explain {
-        /// SQL query string
-        sql: String,
     },
     /// Manage trigger-stream topics
     Trigger {
@@ -63,46 +71,119 @@ enum Commands {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let config_path = cli.config.as_deref();
-    let tenant = cli.tenant.as_deref();
 
-    if let Err(e) = run(cli.command, config_path, tenant).await {
+    // `--help` / `--version` / no-subcommand must not connect: `CatalogClient
+    // ::connect` eagerly dials the endpoint, so the no-verb path prints help and
+    // returns before any connection is attempted.
+    let Some(command) = cli.command else {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        cmd.print_help().expect("print help");
+        println!();
+        return;
+    };
+
+    if let Err(e) = run(command, &cli.target, cli.tenant.as_deref()).await {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
 async fn run(
-    command: Option<Commands>,
-    config_path: Option<&str>,
+    command: Commands,
+    target: &str,
     tenant: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config = jammi_db::config::JammiConfig::load(config_path.map(std::path::Path::new))?;
-    let tenant = match tenant {
-        None => None,
-        Some(s) => {
-            use std::str::FromStr;
-            Some(jammi_db::TenantId::from_str(s)?)
-        }
-    };
+    let endpoint = endpoint_from_target(target)?;
+    let client = CatalogClient::connect(endpoint).await?;
 
+    // Bind the tenant before any verb. An unbound/unknown session id maps to an
+    // *unscoped* (all-tenants) view server-side with no error, so a `--tenant`
+    // query that skipped this bind would silently read across tenants. Binding
+    // first stamps the session's tenant against the same session id every verb
+    // (gRPC header) carries.
+    if let Some(t) = tenant {
+        use std::str::FromStr;
+        client.bind_tenant(jammi_db::TenantId::from_str(t)?).await?;
+    }
+
+    dispatch(&client, command).await
+}
+
+async fn dispatch(
+    client: &CatalogClient,
+    command: Commands,
+) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        Some(Commands::Serve) => commands::serve::run(config).await,
-        Some(Commands::Sources { action }) => commands::sources::run(config, tenant, action).await,
-        Some(Commands::Models { action }) => commands::models::run(config, tenant, action).await,
-        Some(Commands::Query { sql }) => commands::query::run(config, tenant, &sql).await,
-        Some(Commands::Explain { sql }) => commands::query::explain(config, tenant, &sql).await,
-        Some(Commands::Trigger { action }) => commands::trigger::run(config, tenant, action).await,
-        Some(Commands::Channels { action }) => {
-            commands::channels::run(config, tenant, action).await
+        Commands::Status => commands::status::run(client).await,
+        Commands::Sources { action } => commands::sources::run(client, action).await,
+        Commands::Models { action } => commands::models::run(client, action).await,
+        Commands::Trigger { action } => commands::trigger::run(client, action).await,
+        Commands::Channels { action } => commands::channels::run(client, action).await,
+        Commands::Mutable { action } => commands::mutable::run(client, action).await,
+    }
+}
+
+/// Translate a `--target` value into a [`tonic::transport::Endpoint`].
+///
+/// `grpc://` and a bare `host:port` are plaintext h2 (`http://`); `grpcs://` is
+/// TLS (`https://`); `http://` / `https://` pass through. An unrecognised scheme
+/// is rejected with a typed error rather than silently coerced — a misspelled
+/// scheme should fail loudly, not connect somewhere unexpected.
+fn endpoint_from_target(
+    target: &str,
+) -> Result<tonic::transport::Endpoint, Box<dyn std::error::Error>> {
+    let url = match target.split_once("://") {
+        Some(("grpc", rest)) => format!("http://{rest}"),
+        Some(("grpcs", rest)) => format!("https://{rest}"),
+        Some(("http", _)) | Some(("https", _)) => target.to_string(),
+        Some((scheme, _)) => {
+            return Err(format!(
+                "unsupported --target scheme '{scheme}://'; use grpc://, grpcs://, \
+                 http://, https://, or a bare host:port"
+            )
+            .into());
         }
-        Some(Commands::Mutable { action }) => commands::mutable::run(config, tenant, action).await,
-        None => {
-            // No subcommand — print help
-            use clap::CommandFactory;
-            Cli::command().print_help()?;
-            println!();
-            Ok(())
-        }
+        // No scheme: a bare `host:port` is plaintext h2.
+        None => format!("http://{target}"),
+    };
+    Ok(tonic::transport::Endpoint::try_from(url)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_grpc_becomes_http() {
+        let ep = endpoint_from_target("grpc://127.0.0.1:8081").unwrap();
+        assert_eq!(ep.uri().scheme_str(), Some("http"));
+        assert_eq!(ep.uri().host(), Some("127.0.0.1"));
+        assert_eq!(ep.uri().port_u16(), Some(8081));
+    }
+
+    #[test]
+    fn endpoint_grpcs_becomes_https() {
+        let ep = endpoint_from_target("grpcs://host.example:443").unwrap();
+        assert_eq!(ep.uri().scheme_str(), Some("https"));
+    }
+
+    #[test]
+    fn endpoint_bare_host_is_plaintext() {
+        let ep = endpoint_from_target("localhost:9000").unwrap();
+        assert_eq!(ep.uri().scheme_str(), Some("http"));
+        assert_eq!(ep.uri().port_u16(), Some(9000));
+    }
+
+    #[test]
+    fn endpoint_http_passthrough() {
+        let ep = endpoint_from_target("http://127.0.0.1:8081").unwrap();
+        assert_eq!(ep.uri().scheme_str(), Some("http"));
+    }
+
+    #[test]
+    fn endpoint_rejects_unknown_scheme() {
+        let err = endpoint_from_target("ftp://host:21").unwrap_err();
+        assert!(err.to_string().contains("unsupported --target scheme"));
     }
 }

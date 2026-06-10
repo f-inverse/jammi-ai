@@ -1,22 +1,16 @@
 //! CLI integration tests for `jammi mutable`.
 //!
-//! Catalog state is redirected to a per-test `TempDir` via the
-//! `JAMMI_ARTIFACT_DIR` env var. The shipped fixtures under
-//! `tests/fixtures/cp9/` provide tenant-neutral schemas; tests reach for
-//! `feature_schema.json` directly so a regression in either the fixture or
-//! the CLI surfaces immediately.
+//! Each test spawns a hermetic `jammi-server` (default SQLite catalog +
+//! in-memory broker) and drives the `jammi` CLI against it with `--target`. The
+//! shipped fixtures under `tests/fixtures/cp9/` provide tenant-neutral schemas;
+//! tests reach for `feature_schema.json` directly so a regression in either the
+//! fixture or the CLI surfaces immediately.
 
 use std::path::{Path, PathBuf};
 
-use assert_cmd::Command;
 use tempfile::TempDir;
 
-fn jammi_cmd(artifact_dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("jammi").expect("jammi-cli binary built");
-    cmd.env("JAMMI_ARTIFACT_DIR", artifact_dir)
-        .env_remove("JAMMI_CONFIG");
-    cmd
-}
+use crate::server_harness::TestServer;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -35,14 +29,15 @@ fn write_schema(tmp: &TempDir, body: &str) -> PathBuf {
 
 #[test]
 fn cli_mutable_create_list_drop_happy_path() {
-    let dir = TempDir::new().expect("tempdir");
+    let server = TestServer::spawn();
     let schema = fixture("feature_schema.json");
     assert!(
         schema.exists(),
         "expected fixture {schema:?} to exist (run from workspace)"
     );
 
-    jammi_cmd(dir.path())
+    server
+        .cli()
         .args([
             "mutable",
             "create",
@@ -60,7 +55,8 @@ fn cli_mutable_create_list_drop_happy_path() {
         .stdout(predicates::str::contains("registered"))
         .stdout(predicates::str::contains("idx_active"));
 
-    let out = jammi_cmd(dir.path())
+    let out = server
+        .cli()
         .args(["mutable", "list"])
         .output()
         .expect("run mutable list");
@@ -75,13 +71,15 @@ fn cli_mutable_create_list_drop_happy_path() {
         "list missing primary key:\n{stdout}"
     );
 
-    jammi_cmd(dir.path())
+    server
+        .cli()
         .args(["mutable", "drop", "feature_store_dimensions"])
         .assert()
         .success()
         .stdout(predicates::str::contains("dropped"));
 
-    let out = jammi_cmd(dir.path())
+    let out = server
+        .cli()
         .args(["mutable", "list"])
         .output()
         .expect("run mutable list after drop");
@@ -95,7 +93,7 @@ fn cli_mutable_create_list_drop_happy_path() {
 
 #[test]
 fn cli_mutable_create_rejects_reserved_tenant_id_column() {
-    let dir = TempDir::new().expect("tempdir");
+    let server = TestServer::spawn();
     let schema_dir = TempDir::new().expect("schema tempdir");
     let schema = write_schema(
         &schema_dir,
@@ -104,7 +102,8 @@ fn cli_mutable_create_rejects_reserved_tenant_id_column() {
             {"name":"tenant_id","type":"Utf8","nullable":false}
         ]"#,
     );
-    let out = jammi_cmd(dir.path())
+    let out = server
+        .cli()
         .args([
             "mutable",
             "create",
@@ -127,9 +126,10 @@ fn cli_mutable_create_rejects_reserved_tenant_id_column() {
 
 #[test]
 fn cli_mutable_create_rejects_missing_primary_key() {
-    let dir = TempDir::new().expect("tempdir");
+    let server = TestServer::spawn();
     let schema = fixture("feature_schema.json");
-    let out = jammi_cmd(dir.path())
+    let out = server
+        .cli()
         .args([
             "mutable",
             "create",
@@ -152,8 +152,9 @@ fn cli_mutable_create_rejects_missing_primary_key() {
 
 #[test]
 fn cli_mutable_drop_rejects_unknown_table() {
-    let dir = TempDir::new().expect("tempdir");
-    let out = jammi_cmd(dir.path())
+    let server = TestServer::spawn();
+    let out = server
+        .cli()
         .args(["mutable", "drop", "never_registered"])
         .output()
         .expect("run drop");
@@ -167,13 +168,14 @@ fn cli_mutable_drop_rejects_unknown_table() {
 
 #[test]
 fn cli_mutable_create_rejects_unknown_schema_type() {
-    let dir = TempDir::new().expect("tempdir");
+    let server = TestServer::spawn();
     let schema_dir = TempDir::new().expect("schema tempdir");
     let schema = write_schema(
         &schema_dir,
         r#"[{"name":"x","type":"Decimal","nullable":false}]"#,
     );
-    let out = jammi_cmd(dir.path())
+    let out = server
+        .cli()
         .args([
             "mutable",
             "create",

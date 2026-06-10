@@ -1,6 +1,7 @@
-//! Stage 2C — wire coverage for the remaining `Session`-abstraction verbs:
-//! `MutableTableService`, `ChannelService`, `AuditService`, and the topic-admin
-//! verbs (`RegisterTopic` / `DropTopic`) on `TriggerService`.
+//! Stage 2C — wire coverage for the remaining `Session`-abstraction verbs: the
+//! mutable-table lifecycle, the channel-declaration verbs, and the topic-admin
+//! verbs (`RegisterTopic` / `DropTopic`) — all on the control-plane
+//! `CatalogService` — plus the `AuditService` data-plane verbs.
 //!
 //! Each test drives an in-process Tonic server hosting the engine-backed chain
 //! behind the shared `TenantInterceptor`, exercises the wire path through the
@@ -26,17 +27,11 @@ use jammi_server::grpc::proto::audit::audit_service_client::AuditServiceClient;
 use jammi_server::grpc::proto::audit::{
     AuditFetchByQueryIdRequest, AuditFetchRecentRequest, AuditLogRequest, PerQueryAudit,
 };
-use jammi_server::grpc::proto::channel::channel_service_client::ChannelServiceClient;
-use jammi_server::grpc::proto::channel::{
-    AddChannelColumnsRequest, ChannelColumn, ChannelColumnType, RegisterChannelRequest,
-};
-use jammi_server::grpc::proto::mutable_table::mutable_table_service_client::MutableTableServiceClient;
-use jammi_server::grpc::proto::mutable_table::{
-    CreateMutableTableRequest, DropMutableTableRequest, MutableTableDefinition,
-};
-use jammi_server::grpc::proto::trigger::trigger_service_client::TriggerServiceClient;
-use jammi_server::grpc::proto::trigger::{
-    DropTopicRequest, ListTopicsRequest, RegisterTopicRequest,
+use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
+use jammi_server::grpc::proto::catalog::{
+    AddChannelColumnsRequest, ChannelColumn, ChannelColumnType, CreateMutableTableRequest,
+    DropMutableTableRequest, DropTopicRequest, ListTopicsRequest, MutableTableDefinition,
+    RegisterChannelRequest, RegisterTopicRequest,
 };
 use jammi_server::grpc::session::SessionStore;
 use jammi_server::TriggerHandles;
@@ -159,7 +154,7 @@ fn encode_schema_ipc(schema: &SchemaRef) -> Vec<u8> {
 async fn create_then_read_then_drop_mutable_table() {
     let fixture = start_fixture().await;
     let ch = channel(fixture.addr).await;
-    let mut client = MutableTableServiceClient::with_interceptor(ch, with_session("session-mut"));
+    let mut client = CatalogServiceClient::with_interceptor(ch, with_session("session-mut"));
 
     let schema = dim_schema();
     let response = client
@@ -212,8 +207,7 @@ async fn create_mutable_table_rejects_primary_key_not_in_schema() {
     // key naming a column absent from the schema is a client error.
     let fixture = start_fixture().await;
     let ch = channel(fixture.addr).await;
-    let mut client =
-        MutableTableServiceClient::with_interceptor(ch, with_session("session-mut-bad"));
+    let mut client = CatalogServiceClient::with_interceptor(ch, with_session("session-mut-bad"));
 
     let schema = dim_schema();
     let err = client
@@ -239,7 +233,7 @@ async fn create_mutable_table_rejects_primary_key_not_in_schema() {
 async fn register_topic_then_list_then_drop() {
     let fixture = start_fixture().await;
     let ch = channel(fixture.addr).await;
-    let mut client = TriggerServiceClient::with_interceptor(ch, with_session("session-topic"));
+    let mut client = CatalogServiceClient::with_interceptor(ch, with_session("session-topic"));
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -306,7 +300,7 @@ async fn drop_topic_if_exists_is_noop_for_missing_topic() {
     let fixture = start_fixture().await;
     let ch = channel(fixture.addr).await;
     let mut client =
-        TriggerServiceClient::with_interceptor(ch, with_session("session-topic-missing"));
+        CatalogServiceClient::with_interceptor(ch, with_session("session-topic-missing"));
 
     // A syntactically valid UUID that was never registered.
     let missing = Uuid::now_v7().to_string();
@@ -337,7 +331,7 @@ async fn drop_topic_if_exists_is_noop_for_missing_topic() {
 async fn register_channel_then_add_columns_visible_in_catalog() {
     let fixture = start_fixture().await;
     let ch = channel(fixture.addr).await;
-    let mut client = ChannelServiceClient::with_interceptor(ch, with_session("session-channel"));
+    let mut client = CatalogServiceClient::with_interceptor(ch, with_session("session-channel"));
 
     client
         .register_channel(RegisterChannelRequest {
@@ -388,7 +382,7 @@ async fn register_channel_rejects_unspecified_column_type() {
     let fixture = start_fixture().await;
     let ch = channel(fixture.addr).await;
     let mut client =
-        ChannelServiceClient::with_interceptor(ch, with_session("session-channel-bad"));
+        CatalogServiceClient::with_interceptor(ch, with_session("session-channel-bad"));
 
     let err = client
         .register_channel(RegisterChannelRequest {
@@ -514,12 +508,11 @@ async fn audit_log_without_tenant_is_failed_precondition() {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 }
 
-/// Bind a tenant to a session via `SessionService.SetTenant` (shared store).
+/// Bind a tenant to a session via `CatalogService.SetTenant` (shared store).
 async fn set_tenant(addr: SocketAddr, session_id: &str, tenant: &str) {
-    use jammi_server::grpc::proto::session::session_service_client::SessionServiceClient;
-    use jammi_server::grpc::proto::session::{SetTenantRequest, Tenant};
+    use jammi_server::grpc::proto::catalog::{SetTenantRequest, Tenant};
     let mut client =
-        SessionServiceClient::with_interceptor(channel(addr).await, with_session(session_id));
+        CatalogServiceClient::with_interceptor(channel(addr).await, with_session(session_id));
     // Confirm the tenant string parses (a malformed fixture is a test bug).
     let _typed: TenantId = tenant.parse().expect("valid tenant uuid");
     client

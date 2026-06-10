@@ -1,19 +1,17 @@
-//! SPEC-03 §12 #7 — `cargo test -p jammi-cli` exercise that runs
-//! `jammi --tenant <uuid> sources list` and confirms tenant scoping
-//! is observable at the CLI surface.
+//! CLI integration test for tenant-scoped `sources list` over the wire.
 //!
-//! The CLI binary is spawned as a subprocess via `assert_cmd`. The
-//! catalog is redirected to a per-test tempdir via the
-//! `JAMMI_ARTIFACT_DIR` env var so the test never touches the
-//! developer's real Jammi data directory. Bootstrap (registering
-//! sources) is done through the CLI's own `sources add` subcommand,
-//! keeping the test purely at the CLI boundary — it never reaches
-//! into the engine or AI crate's Rust API.
+//! The `jammi` CLI is a strict gRPC client, so this spawns a hermetic
+//! `jammi-server` (default SQLite catalog + in-memory broker) and drives the
+//! CLI against it with `--target`. Bootstrap (registering sources) goes through
+//! the CLI's own `sources add` subcommand, keeping the test purely at the CLI
+//! boundary. The intent is unchanged from the in-process version: confirm that
+//! a `--tenant` binding receives a disjoint view of the `sources` catalog —
+//! now end-to-end over the gRPC wire, where the CLI binds its tenant and the
+//! server scopes the read to it.
 
 use std::path::{Path, PathBuf};
 
-use assert_cmd::Command;
-use tempfile::TempDir;
+use crate::server_harness::TestServer;
 
 const TENANT_A: &str = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a";
 const TENANT_B: &str = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b";
@@ -27,43 +25,36 @@ fn workspace_fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn jammi_cmd(artifact_dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("jammi").expect("jammi-cli binary built");
-    cmd.env("JAMMI_ARTIFACT_DIR", artifact_dir)
-        .env_remove("JAMMI_CONFIG");
-    cmd
-}
-
-fn add_source(artifact_dir: &Path, tenant: Option<&str>, name: &str, fixture: &Path) {
+fn add_source(server: &TestServer, tenant: &str, name: &str, fixture: &Path) {
     let path = fixture.to_str().expect("fixture path is utf-8");
-    let mut cmd = jammi_cmd(artifact_dir);
-    if let Some(t) = tenant {
-        cmd.args(["--tenant", t]);
-    }
-    cmd.args(["sources", "add", name, "--url", path, "--format", "parquet"])
+    server
+        .cli()
+        .args(["--tenant", tenant])
+        .args(["sources", "add", name, "--url", path, "--format", "parquet"])
         .assert()
         .success();
 }
 
-/// SPEC-03 §12 #7 — every tenant binding receives a disjoint view of
-/// the `sources` catalog table at the CLI surface. Two sources are
-/// registered, one per tenant, then `sources list` is invoked with
-/// each tenant binding (and once unscoped) to confirm the engine's
-/// tenant predicate-injection is observable end-to-end through the
-/// CLI binary.
+/// Every tenant binding receives a disjoint view of the `sources` catalog at
+/// the CLI surface. Two sources are registered, one per tenant, then
+/// `sources list` is invoked with each tenant binding (and once unscoped) to
+/// confirm the server's tenant predicate-injection is observable end-to-end
+/// through the CLI binary talking to a real server.
 #[test]
 fn cli_sources_list_filters_by_tenant_binding() {
-    let dir = TempDir::new().expect("tempdir");
     let fixture = workspace_fixture("patents.parquet");
     assert!(
         fixture.exists(),
         "expected fixture {fixture:?} to exist (run from workspace)"
     );
 
-    add_source(dir.path(), Some(TENANT_A), "src_a", &fixture);
-    add_source(dir.path(), Some(TENANT_B), "src_b", &fixture);
+    let server = TestServer::spawn();
 
-    let out_a = jammi_cmd(dir.path())
+    add_source(&server, TENANT_A, "src_a", &fixture);
+    add_source(&server, TENANT_B, "src_b", &fixture);
+
+    let out_a = server
+        .cli()
         .args(["--tenant", TENANT_A, "sources", "list"])
         .output()
         .expect("run sources list for tenant A");
@@ -83,7 +74,8 @@ fn cli_sources_list_filters_by_tenant_binding() {
         "tenant A must NOT see tenant B's source 'src_b'; got:\n{stdout_a}"
     );
 
-    let out_b = jammi_cmd(dir.path())
+    let out_b = server
+        .cli()
         .args(["--tenant", TENANT_B, "sources", "list"])
         .output()
         .expect("run sources list for tenant B");
@@ -103,10 +95,10 @@ fn cli_sources_list_filters_by_tenant_binding() {
         "tenant B must NOT see tenant A's source 'src_a'; got:\n{stdout_b}"
     );
 
-    // The unscoped binding sees only rows with `tenant_id IS NULL`
-    // per the analyzer rule. Both seeded sources are tenant-bound,
-    // so the listing must be empty.
-    let out_u = jammi_cmd(dir.path())
+    // The unscoped binding sees only rows with `tenant_id IS NULL`. Both seeded
+    // sources are tenant-bound, so the listing must be empty.
+    let out_u = server
+        .cli()
         .args(["sources", "list"])
         .output()
         .expect("run sources list unscoped");

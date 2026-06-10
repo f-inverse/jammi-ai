@@ -2,7 +2,7 @@
 //!
 //! Three verbs land on the wire: `AuditLog`, `AuditFetchByQueryId`, and
 //! `AuditFetchRecent`. Each is a thin adapter over the transport-agnostic
-//! [`Session`]/[`LocalSession`] abstraction (never raw [`InferenceSession`]
+//! [`Session`] abstraction (never raw [`InferenceSession`]
 //! calls): proto in, one flat `Session::audit_*` call, proto out. The service
 //! reimplements no signing, storage, or query logic.
 //!
@@ -22,8 +22,8 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
-use jammi_ai::wire::{attach_audit_detail, parse_query_id};
-use jammi_ai::{AuditError, LocalSession, PerQueryAudit, Session};
+use jammi_ai::{AuditError, PerQueryAudit, Session};
+use jammi_wire::{attach_audit_detail, parse_query_id};
 use tonic::{Code, Request, Response, Status};
 
 use crate::grpc::proto::audit as pb;
@@ -31,7 +31,7 @@ use crate::grpc::proto::audit::audit_service_server::AuditService;
 use crate::grpc::wire::{scoped, session_tenant};
 
 /// Server-side handler for the audit gRPC surface. Holds a shared engine session
-/// it wraps in a [`LocalSession`] per call to reach the unified transport
+/// it wraps in a [`Session`] per call to reach the unified transport
 /// surface.
 pub struct AuditServer {
     session: Arc<InferenceSession>,
@@ -45,7 +45,7 @@ impl AuditServer {
     /// A [`Session`] over the shared engine; see [`crate::grpc::inference`] for
     /// the tenant-scope wiring rationale.
     fn local(&self) -> Session {
-        Session::Local(LocalSession::new(Arc::clone(&self.session)))
+        Session::new(Arc::clone(&self.session))
     }
 }
 
@@ -144,8 +144,8 @@ fn record_from_proto(p: pb::PerQueryAudit) -> Result<PerQueryAudit, Status> {
 /// a signature mismatch is data loss; size/length violations are bad arguments.
 ///
 /// The `code` + `message` are the idiomatic gRPC surface; on top of that every
-/// status carries a faithful [`jammi_ai::wire`] audit-error detail so a remote
-/// `RemoteSession` reconstructs the *exact* [`AuditError`] the in-process path
+/// status carries a faithful [`jammi_wire`] audit-error detail so a remote
+/// the data-plane client reconstructs the *exact* [`AuditError`] the in-process path
 /// returns. The detail is built centrally here so the faithful path covers the
 /// whole `AuditError` enum from one place — the audit analogue of
 /// `map_engine_error`.

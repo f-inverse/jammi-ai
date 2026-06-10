@@ -15,10 +15,12 @@
 //! Hermetic: the encoder is a local fixture and the corpus + golden set are
 //! shipped fixtures. A tenant-scoped `EvalEmbeddings` is covered too.
 
-use jammi_server::grpc::proto::embedding::embedding_service_client::EmbeddingServiceClient;
-use jammi_server::grpc::proto::embedding::{
-    AddSourceRequest, FileFormat, GenerateEmbeddingsRequest, Modality, SourceConnection, SourceKind,
+use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
+use jammi_server::grpc::proto::catalog::{
+    AddSourceRequest, FileFormat, SourceConnection, SourceKind,
 };
+use jammi_server::grpc::proto::embedding::embedding_service_client::EmbeddingServiceClient;
+use jammi_server::grpc::proto::embedding::{GenerateEmbeddingsRequest, Modality};
 use jammi_server::grpc::proto::eval::eval_service_client::EvalServiceClient;
 use jammi_server::grpc::proto::eval::{
     EvalCompareRequest, EvalEmbeddingsRequest, EvalPerQueryRequest,
@@ -43,18 +45,24 @@ fn golden_url() -> String {
     format!("file://{}", fixture("golden_relevance.csv").display())
 }
 
-/// Register the patents corpus + golden relevance CSV and generate one
-/// embedding table over `abstract` through the supplied embedding client.
-/// Returns the generated table name. Generic over the client transport so the
-/// plain-channel tests and the interceptor-wrapped tenant test share one body.
-async fn embed_patents_and_golden<T>(mut embedding: EmbeddingServiceClient<T>) -> String
+/// Register the patents corpus + golden relevance CSV (control plane) and
+/// generate one embedding table over `abstract` (data plane). Returns the
+/// generated table name. Both clients share one transport (and, for the
+/// tenant-scoped test, one session-header interceptor), so the source
+/// registration and the embedding compute run under the same tenant scope.
+/// Generic over the client transport so the plain-channel tests and the
+/// interceptor-wrapped tenant test share one body.
+async fn embed_patents_and_golden<T>(
+    mut catalog: CatalogServiceClient<T>,
+    mut embedding: EmbeddingServiceClient<T>,
+) -> String
 where
-    T: tonic::client::GrpcService<tonic::body::Body>,
+    T: tonic::client::GrpcService<tonic::body::Body> + Clone,
     T::Error: Into<tonic::codegen::StdError>,
     T::ResponseBody: Body<Data = tonic::codegen::Bytes> + std::marker::Send + 'static,
     <T::ResponseBody as Body>::Error: Into<tonic::codegen::StdError> + std::marker::Send,
 {
-    embedding
+    catalog
         .add_source(AddSourceRequest {
             source_id: "patents".into(),
             source_kind: SourceKind::File as i32,
@@ -65,7 +73,7 @@ where
         })
         .await
         .expect("add patents");
-    embedding
+    catalog
         .add_source(AddSourceRequest {
             source_id: "golden_rel".into(),
             source_kind: SourceKind::File as i32,
@@ -93,8 +101,11 @@ where
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eval_embeddings_and_per_query_over_the_wire() {
     let server: EngineServer = start_engine_server().await;
-    let table =
-        embed_patents_and_golden(EmbeddingServiceClient::new(channel(server.addr).await)).await;
+    let table = embed_patents_and_golden(
+        CatalogServiceClient::new(channel(server.addr).await),
+        EmbeddingServiceClient::new(channel(server.addr).await),
+    )
+    .await;
 
     let mut client = EvalServiceClient::new(channel(server.addr).await);
     let report = client
@@ -165,8 +176,11 @@ async fn eval_embeddings_and_per_query_over_the_wire() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eval_compare_self_comparison_has_zero_deltas_over_the_wire() {
     let server = start_engine_server().await;
-    let table =
-        embed_patents_and_golden(EmbeddingServiceClient::new(channel(server.addr).await)).await;
+    let table = embed_patents_and_golden(
+        CatalogServiceClient::new(channel(server.addr).await),
+        EmbeddingServiceClient::new(channel(server.addr).await),
+    )
+    .await;
 
     let mut client = EvalServiceClient::new(channel(server.addr).await);
     let report = client
@@ -216,15 +230,14 @@ async fn eval_compare_self_comparison_has_zero_deltas_over_the_wire() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eval_embeddings_under_a_tenant_scope_over_the_wire() {
-    use jammi_server::grpc::proto::session::session_service_client::SessionServiceClient;
-    use jammi_server::grpc::proto::session::{SetTenantRequest, Tenant};
+    use jammi_server::grpc::proto::catalog::{SetTenantRequest, Tenant};
 
     let server = start_engine_server().await;
     let session_iface = with_session("eval-tenant-a");
 
     // Bind the session to TENANT_A, then do all setup + the eval under the
     // same session id so the interceptor scopes every call.
-    SessionServiceClient::with_interceptor(channel(server.addr).await, session_iface.clone())
+    CatalogServiceClient::with_interceptor(channel(server.addr).await, session_iface.clone())
         .set_tenant(SetTenantRequest {
             tenant: Some(Tenant {
                 id: TENANT_A.into(),
@@ -233,9 +246,11 @@ async fn eval_embeddings_under_a_tenant_scope_over_the_wire() {
         .await
         .expect("set_tenant");
 
-    let scoped =
+    let scoped_catalog =
+        CatalogServiceClient::with_interceptor(channel(server.addr).await, session_iface.clone());
+    let scoped_embedding =
         EmbeddingServiceClient::with_interceptor(channel(server.addr).await, session_iface.clone());
-    let table = embed_patents_and_golden(scoped).await;
+    let table = embed_patents_and_golden(scoped_catalog, scoped_embedding).await;
 
     let mut client = EvalServiceClient::with_interceptor(channel(server.addr).await, session_iface);
     let report = client

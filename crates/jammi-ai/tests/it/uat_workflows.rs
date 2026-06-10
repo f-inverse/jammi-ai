@@ -260,20 +260,25 @@ async fn uat_workflow_c_cdc_pipeline_isolates_tenants_and_predicates() {
 
     // Tenant OPS scope.
     let session = session.with_tenant(tenant_x());
+    // Register the topic via the typed dual-registration path (broker + catalog),
+    // scoped to tenant OPS — the engine path the `register_topic` verb runs.
+    let topic = jammi_db::trigger::TopicDefinition {
+        id: jammi_db::trigger::TopicId::new(),
+        name: "cdc_orders".to_string(),
+        schema: Arc::new(Schema::new(vec![
+            Field::new("op", DataType::Utf8, false),
+            Field::new("ts_ms", DataType::Int64, false),
+            Field::new("key", DataType::Utf8, false),
+        ])),
+        tenant: session.tenant(),
+        broker_metadata: std::collections::BTreeMap::new(),
+    };
     session
-        .sql(
-            "CREATE TOPIC cdc_orders \
-             (op TEXT NOT NULL, ts_ms BIGINT NOT NULL, key TEXT NOT NULL)",
-        )
+        .trigger_broker()
+        .register_topic(&topic)
         .await
         .unwrap();
-
-    let topic = session
-        .topic_repo()
-        .lookup_by_name("cdc_orders", session.tenant())
-        .await
-        .unwrap()
-        .expect("topic registered under tenant OPS");
+    session.topic_repo().register_topic(&topic).await.unwrap();
 
     // Publish 10 events with mixed `op` values.
     let ops = vec!["c", "c", "c", "c", "c", "u", "u", "d", "c", "d"];

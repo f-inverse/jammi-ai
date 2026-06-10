@@ -95,7 +95,16 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" "${{ steps.package.outputs.asset }}" --clobber
+        run: |
+          set -euo pipefail
+          # The Linux/server jobs run in the manylinux CI container, which has no
+          # `gh` CLI; install it on demand (no-op on the native macOS runner).
+          if ! command -v gh >/dev/null 2>&1; then
+            GH_VER=2.63.2
+            curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VER}/gh_${GH_VER}_linux_amd64.tar.gz" | tar -xz -C /tmp
+            install "/tmp/gh_${GH_VER}_linux_amd64/bin/gh" /usr/local/bin/gh
+          fi
+          gh release upload "$GITHUB_REF_NAME" "${{ steps.package.outputs.asset }}" --clobber
 
       # On a manual dispatch (branch exercise), publish the built artifact to the
       # workflow run instead — no release is touched.
@@ -136,7 +145,16 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" "${{ steps.package.outputs.asset }}" --clobber
+        run: |
+          set -euo pipefail
+          # The Linux/server jobs run in the manylinux CI container, which has no
+          # `gh` CLI; install it on demand (no-op on the native macOS runner).
+          if ! command -v gh >/dev/null 2>&1; then
+            GH_VER=2.63.2
+            curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VER}/gh_${GH_VER}_linux_amd64.tar.gz" | tar -xz -C /tmp
+            install "/tmp/gh_${GH_VER}_linux_amd64/bin/gh" /usr/local/bin/gh
+          fi
+          gh release upload "$GITHUB_REF_NAME" "${{ steps.package.outputs.asset }}" --clobber
 
       - name: Upload artifact (dispatch)
         if: github.event_name == 'workflow_dispatch'
@@ -211,7 +229,16 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" "${{ steps.package.outputs.asset }}" --clobber
+        run: |
+          set -euo pipefail
+          # The Linux/server jobs run in the manylinux CI container, which has no
+          # `gh` CLI; install it on demand (no-op on the native macOS runner).
+          if ! command -v gh >/dev/null 2>&1; then
+            GH_VER=2.63.2
+            curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VER}/gh_${GH_VER}_linux_amd64.tar.gz" | tar -xz -C /tmp
+            install "/tmp/gh_${GH_VER}_linux_amd64/bin/gh" /usr/local/bin/gh
+          fi
+          gh release upload "$GITHUB_REF_NAME" "${{ steps.package.outputs.asset }}" --clobber
 
       - name: Upload artifact (dispatch)
         if: github.event_name == 'workflow_dispatch'

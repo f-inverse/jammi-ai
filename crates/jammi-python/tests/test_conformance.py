@@ -339,13 +339,13 @@ def _client_server_info_keys() -> set:
         storage_backends = []
         services = []
 
-    class _StubSession:
+    class _StubCatalog:
         def GetServerInfo(self, *_a, **_k):
             return _StubServerInfo()
 
     db = jammi_client.connect("grpc://127.0.0.1:8081")
     try:
-        db._session = _StubSession()
+        db._catalog = _StubCatalog()
         return set(db.get_server_info())
     finally:
         db.close()

@@ -206,6 +206,19 @@ impl Session {
         }
     }
 
+    /// Describe one registered model by id, or `None` when no model with that
+    /// id is visible to the session's tenant. Returns the latest registered
+    /// version's record — the peer of [`Self::describe_source`] on the model
+    /// catalog.
+    pub async fn describe_model(&self, model_id: &str) -> Result<Option<ModelRecord>> {
+        match self {
+            #[cfg(feature = "local")]
+            Session::Local(s) => s.describe_model(model_id).await,
+            #[cfg(feature = "wire")]
+            Session::Remote(s) => s.describe_model(model_id).await,
+        }
+    }
+
     /// Describe one registered source by id, or `None` when no source with
     /// that id is visible to the session's tenant. The embedding
     /// `status`/`row_count`/`dimensions` ride on the descriptor's result
@@ -789,6 +802,10 @@ impl LocalSession {
         self.engine.catalog().list_models().await
     }
 
+    async fn describe_model(&self, model_id: &str) -> Result<Option<ModelRecord>> {
+        self.engine.catalog().get_model(model_id).await
+    }
+
     async fn describe_source(&self, source_id: &str) -> Result<Option<SourceDescriptor>> {
         self.engine.catalog().describe_source(source_id).await
     }
@@ -995,6 +1012,13 @@ impl LocalSession {
         &self,
         topic: &TopicDefinition,
     ) -> std::result::Result<(), TriggerError> {
+        // Register with *both* the broker driver and the catalog, mirroring the
+        // Flight-SQL-DDL path: the catalog row is the system of record a later
+        // lookup reads, but a `publish` resolves the topic against the broker —
+        // so a catalog-only registration would make a publish to this topic fail
+        // with `TopicNotFound`. The session always carries a broker (defaulting
+        // to the in-memory broker), so this is total.
+        self.engine.trigger_broker().register_topic(topic).await?;
         self.engine.topic_repo().register_topic(topic).await
     }
 
@@ -1006,10 +1030,23 @@ impl LocalSession {
     }
 
     async fn drop_topic(&self, topic_id: TopicId) -> std::result::Result<(), TriggerError> {
+        // Drop the catalog row (the system of record) first, then the broker
+        // driver's view of the topic. The broker drop is best-effort: a driver
+        // failure after the catalog row is gone leaks driver resources, not
+        // catalog state, so it is surfaced via tracing rather than reverting the
+        // successful catalog drop — mirroring the Flight-SQL-DDL path.
         self.engine
             .topic_repo()
             .drop_topic(topic_id, self.engine.tenant())
-            .await
+            .await?;
+        if let Err(e) = self.engine.trigger_broker().drop_topic(topic_id).await {
+            tracing::warn!(
+                topic_id = %topic_id,
+                error = %e,
+                "trigger broker driver failed to drop topic after catalog row removal",
+            );
+        }
+        Ok(())
     }
 
     async fn publish(

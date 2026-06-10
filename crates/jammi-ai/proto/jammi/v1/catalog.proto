@@ -1,0 +1,458 @@
+syntax = "proto3";
+
+package jammi.v1.catalog;
+
+import "google/protobuf/empty.proto";
+import "jammi/v1/inference.proto";
+import "jammi/v1/embedding.proto";
+
+// CatalogService — the engine's single control-plane surface: every
+// catalog / metadata / lifecycle / observability RPC a remote client reaches.
+// The verbs are imperative session methods (registry reads + lifecycle
+// mutations), not SQL queries, so they live as typed gRPC RPCs distinct from
+// the Flight SQL data-plane (which carries query/result only, per ADR-01
+// §3.2) and the compute/stream data-plane services (embedding / inference /
+// training / eval / pipeline / trigger / audit).
+//
+// Each verb delegates 1:1 to the consumer-facing `Session`/`LocalSession`
+// abstraction; the service reimplements no catalog or lifecycle logic. The
+// service spans five control concerns. Session: `SetTenant` / `GetTenant` /
+// `ClearTenant` bind, read, and clear the calling session's tenant, and
+// `GetServerInfo` is the capability handshake — the tenant trio is stateless
+// w.r.t. the engine (it updates an in-process session table the
+// TenantInterceptor reads on every downstream request) and `GetServerInfo`
+// reports compile-time facts plus the runtime tier set, so both mount on the
+// always-present core tier. Sources / models: `AddSource` / `RemoveSource` /
+// `ListSources` / `DescribeSource` register and introspect data sources, and
+// `ListModels` / `DescribeModel` introspect the model catalog. Channels:
+// `RegisterChannel` / `AddChannelColumns` / `ListChannels` declare and
+// introspect provenance channels. Mutable tables: `CreateMutableTable` /
+// `DropMutableTable` / `ListMutableTables` register and introspect mutable
+// companion tables. Topics: `RegisterTopic` / `DropTopic` / `ListTopics`
+// register and introspect trigger-stream topics (the publish / subscribe
+// compute verbs stay on TriggerService).
+//
+// Tenant scope is read from the request's `SessionTenant` extension, set by
+// the shared TenantInterceptor from the `jammi-session-id` header — the same
+// mechanism every other gRPC service and Flight SQL use.
+service CatalogService {
+  // --- session -----------------------------------------------------------
+
+  // Bind a tenant for the calling session. Idempotent — calling twice with
+  // the same tenant is a no-op. Replacing an existing binding is allowed
+  // (the auth layer above the engine validates the caller is permitted).
+  rpc SetTenant(SetTenantRequest) returns (google.protobuf.Empty);
+
+  // Return the tenant currently bound to the calling session, or an unset
+  // tenant if none is bound.
+  rpc GetTenant(google.protobuf.Empty) returns (GetTenantResponse);
+
+  // Clear the tenant binding for the calling session. After this returns,
+  // subsequent requests on the same session see an unscoped tenant.
+  rpc ClearTenant(google.protobuf.Empty) returns (google.protobuf.Empty);
+
+  // Capabilities handshake: the engine's version, the feature flags this
+  // build was compiled with, and the storage backends it can address. Static
+  // per build, tenant-agnostic, and engine-independent.
+  rpc GetServerInfo(google.protobuf.Empty) returns (ServerInfo);
+
+  // --- sources / models --------------------------------------------------
+
+  // Register a data source so a later GenerateEmbeddings call can scan it.
+  // Peer of the abstraction's `add_source`. The source carries any modality
+  // the engine supports; the kind here is the storage backend, not the
+  // content modality. Idempotent only insofar as the engine allows —
+  // re-registering an id that already exists is an error.
+  rpc AddSource(AddSourceRequest) returns (google.protobuf.Empty);
+
+  // Remove a registered source and all associated state (embedding tables,
+  // indexes). Peer of the abstraction's `remove_source`.
+  rpc RemoveSource(RemoveSourceRequest) returns (google.protobuf.Empty);
+
+  // List a `SourceDescriptor` for every source registered to the calling
+  // tenant. Peer of the abstraction's `list_sources`; registry introspection,
+  // not a SQL query. `ListSources` is `DescribeSource` applied over every
+  // registered source — one descriptor shape, one operator, no per-source
+  // special-casing.
+  rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
+
+  // Describe one registered source: its registry identity (id / kind /
+  // lifecycle status) plus the result tables embedded out of it (each carrying
+  // its own status / row_count / dimensions). Peer of the abstraction's
+  // `describe_source`.
+  rpc DescribeSource(DescribeSourceRequest) returns (SourceDescriptor);
+
+  // List a `Model` record for every model registered to the calling tenant.
+  // Peer of the abstraction's `list_models`; registry introspection, not a SQL
+  // query.
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+
+  // Describe one registered model by id: the same `Model` projection
+  // `ListModels` carries, for the latest registered version. Peer of the
+  // abstraction's `describe_model`. An absent model returns NotFound.
+  rpc DescribeModel(DescribeModelRequest) returns (Model);
+
+  // --- channels ----------------------------------------------------------
+
+  // Register a provenance channel and its initial columns. Peer of the
+  // abstraction's `register_channel`.
+  rpc RegisterChannel(RegisterChannelRequest) returns (google.protobuf.Empty);
+
+  // Append columns to an already-registered channel (append-only). Peer of the
+  // abstraction's `add_channel_columns`.
+  rpc AddChannelColumns(AddChannelColumnsRequest) returns (google.protobuf.Empty);
+
+  // List every channel registered to the calling tenant, ordered by
+  // `(priority, channel_id)`. Peer of the abstraction's `list_channels`;
+  // registry introspection, not a SQL query.
+  rpc ListChannels(ListChannelsRequest) returns (ListChannelsResponse);
+
+  // --- mutable tables ----------------------------------------------------
+
+  // Register a mutable companion table. After this returns the table is
+  // queryable through Flight SQL. Peer of the abstraction's
+  // `create_mutable_table`.
+  rpc CreateMutableTable(CreateMutableTableRequest) returns (CreateMutableTableResponse);
+
+  // Drop a mutable companion table. Peer of the abstraction's
+  // `drop_mutable_table`.
+  rpc DropMutableTable(DropMutableTableRequest) returns (google.protobuf.Empty);
+
+  // List every mutable companion table registered to the calling tenant. Peer
+  // of the abstraction's `list_mutable_tables`; registry introspection, not a
+  // SQL query. Each entry is the same `MutableTableDefinition` the create path
+  // carries (minus tenant, which rides the session scope).
+  rpc ListMutableTables(ListMutableTablesRequest) returns (ListMutableTablesResponse);
+
+  // --- topics ------------------------------------------------------------
+
+  // Register a topic (provisions its backing table) for the trigger stream.
+  // Peer of the abstraction's `register_topic`. The schema is the contract
+  // every published batch must satisfy.
+  rpc RegisterTopic(RegisterTopicRequest) returns (RegisterTopicResponse);
+
+  // Drop a topic and its backing table. Peer of the abstraction's
+  // `drop_topic`. `if_exists` makes a missing topic a no-op rather than a
+  // NotFound error.
+  rpc DropTopic(DropTopicRequest) returns (google.protobuf.Empty);
+
+  // List topics registered in the catalog. Pagination follows AIP-132.
+  rpc ListTopics(ListTopicsRequest) returns (ListTopicsResponse);
+}
+
+// === session ==============================================================
+
+// The engine's self-description, returned by GetServerInfo. `version`,
+// `features`, and `storage_backends` are compile-time facts about the running
+// binary; `services` is the runtime tier handshake — which gRPC service tiers
+// this particular deployment actually mounted. Together they let a client
+// negotiate capability without probing each verb.
+message ServerInfo {
+  // The engine version (the `jammi` workspace version, e.g. "0.17.0").
+  string version = 1;
+  // Engine capability feature flags compiled into this build (e.g. "postgres",
+  // "mysql", "jetstream-broker"), sorted.
+  repeated string features = 2;
+  // Storage URL schemes this build can address (always "file" and "memory";
+  // cloud schemes appear when their driver feature is compiled in), sorted.
+  repeated string storage_backends = 3;
+  // The gRPC service tiers this deployment mounted, sorted. The core tier
+  // (catalog/embedding/inference + introspection) is always present; the
+  // optional tiers ("train", "event", "eval") appear only when both their
+  // compile feature is present and the deployment's config enabled them. A
+  // client reads this to know which verbs are reachable on *this* server —
+  // reaching an unmounted tier returns a truthful "not enabled" error. The
+  // embedded (in-process, `file://`) engine mounts no gRPC services, so it
+  // reports an empty list.
+  repeated string services = 4;
+}
+
+// A tenant identifier carried over the wire. UUID v4 / v7 string per ADR-00;
+// the nil UUID is invalid and the engine rejects it at the TenantId newtype
+// boundary.
+message Tenant {
+  // UUID string. Empty string means "no tenant bound".
+  string id = 1;
+}
+
+message SetTenantRequest {
+  Tenant tenant = 1;
+}
+
+message GetTenantResponse {
+  Tenant tenant = 1;
+}
+
+// === sources / models =====================================================
+
+// Source backend kind. Mirrors the engine's `SourceType`. The kind is the
+// storage backend, independent of the content modality embedded out of it.
+enum SourceKind {
+  SOURCE_KIND_UNSPECIFIED = 0;
+  SOURCE_KIND_FILE = 1;
+  SOURCE_KIND_POSTGRES = 2;
+  SOURCE_KIND_MYSQL = 3;
+}
+
+// File format for a file-shaped source. Mirrors the engine's `FileFormat`.
+enum FileFormat {
+  FILE_FORMAT_UNSPECIFIED = 0;
+  FILE_FORMAT_PARQUET = 1;
+  FILE_FORMAT_CSV = 2;
+  FILE_FORMAT_JSON = 3;
+  FILE_FORMAT_AVRO = 4;
+}
+
+// Connection parameters for a source. Maps onto the engine's
+// `SourceConnection`; only the fields a wire client needs to register a
+// file-shaped corpus are exposed (storage URL + format). Cloud credentials
+// are configured server-side, not carried on the wire.
+message SourceConnection {
+  // Storage URL (file://, s3://, gs://, azure://) or external-source
+  // connection string (postgres://, mysql://).
+  string url = 1;
+  // File format — required for a FILE source, ignored otherwise.
+  FileFormat format = 2;
+}
+
+message AddSourceRequest {
+  string source_id = 1;
+  SourceKind source_kind = 2;
+  SourceConnection connection = 3;
+}
+
+message RemoveSourceRequest {
+  string source_id = 1;
+}
+
+message ListSourcesRequest {}
+
+message ListSourcesResponse {
+  // One descriptor per source registered to the calling tenant, in the
+  // engine's registration order.
+  repeated SourceDescriptor sources = 1;
+}
+
+message DescribeSourceRequest {
+  string source_id = 1;
+}
+
+// Registry introspection for one source: its registration identity plus the
+// embedding result tables produced out of it. The embedding-side
+// status/row_count/dimensions are carried by the `ResultTable` records
+// (`result_tables`) — the same shape `GenerateEmbeddings` returns — rather than
+// duplicated as descriptor fields, so there is one source-of-truth for those
+// numbers. A freshly-registered source with no embeddings yet carries an empty
+// `result_tables`.
+message SourceDescriptor {
+  string source_id = 1;
+  // The storage backend the source was registered with.
+  SourceKind kind = 2;
+  // Registration lifecycle status from the source catalog (e.g. "active").
+  string status = 3;
+  // Every embedding result table produced from this source. Empty until a
+  // `GenerateEmbeddings` call persists one. Reuses the embedding service's
+  // self-describing `ResultTable` record — the same shape `GenerateEmbeddings`
+  // returns — so the descriptor carries one source-of-truth for those numbers.
+  repeated jammi.v1.embedding.ResultTable result_tables = 4;
+}
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  // One record per model registered to the calling tenant, in the catalog's
+  // registration order.
+  repeated Model models = 1;
+}
+
+message DescribeModelRequest {
+  string model_id = 1;
+}
+
+// The client-observable projection of the engine's `ModelRecord`. Carries the
+// fields a client needs to identify a registered model — its id, the inference
+// backend, the task it performs, and its lifecycle status. Server-internal
+// bookkeeping (version counter, derived-from lineage, artifact path, config
+// blob, registration timestamp) stays server-side, mirroring how `ResultTable`
+// is the client projection of the engine's result-table record.
+message Model {
+  // Unique model name (e.g. an HF repo id or a fine-tuned id).
+  string model_id = 1;
+  // Inference backend (e.g. "candle", "vllm", "http").
+  string backend = 2;
+  // The task this model performs.
+  jammi.v1.inference.ModelTask task = 3;
+  // Lifecycle status (e.g. "registered", "loaded", "failed").
+  string status = 4;
+}
+
+// === channels =============================================================
+
+// The closed set of Arrow types a channel column may declare. Mirrors the
+// engine's `ChannelColumnType`.
+enum ChannelColumnType {
+  CHANNEL_COLUMN_TYPE_UNSPECIFIED = 0;
+  CHANNEL_COLUMN_TYPE_FLOAT32 = 1;
+  CHANNEL_COLUMN_TYPE_FLOAT64 = 2;
+  CHANNEL_COLUMN_TYPE_INT32 = 3;
+  CHANNEL_COLUMN_TYPE_INT64 = 4;
+  CHANNEL_COLUMN_TYPE_UTF8 = 5;
+  CHANNEL_COLUMN_TYPE_BOOLEAN = 6;
+}
+
+// One declared column on a channel. Mirrors the engine's `ChannelColumn`.
+message ChannelColumn {
+  string name = 1;
+  ChannelColumnType data_type = 2;
+}
+
+message RegisterChannelRequest {
+  // Channel id: ASCII slug `[a-z][a-z0-9_]{0,63}`.
+  string channel_id = 1;
+  // Resolution priority among channels.
+  int32 priority = 2;
+  // Ordered columns declared on the channel.
+  repeated ChannelColumn columns = 3;
+}
+
+message AddChannelColumnsRequest {
+  string channel_id = 1;
+  repeated ChannelColumn columns = 2;
+}
+
+message ListChannelsRequest {}
+
+message ListChannelsResponse {
+  // One entry per channel registered to the calling tenant, ordered by
+  // `(priority, channel_id)`.
+  repeated Channel channels = 1;
+}
+
+// A fully-materialized channel in a `ListChannels` response. Carries everything
+// the engine's `ChannelSpec` holds (id / priority / declared columns) so a
+// remote `list_channels` reconstructs the identical value the in-process path
+// returns.
+message Channel {
+  // Channel id: ASCII slug `[a-z][a-z0-9_]{0,63}`.
+  string channel_id = 1;
+  // Resolution priority among channels.
+  int32 priority = 2;
+  // Declared columns, in declaration order.
+  repeated ChannelColumn columns = 3;
+}
+
+// === mutable tables =======================================================
+
+// One secondary-index declaration. Mirrors the engine's `MutableIndexDef`.
+message MutableIndex {
+  string name = 1;
+  repeated string columns = 2;
+  bool unique = 3;
+}
+
+// Registration descriptor for one mutable companion table. Mirrors the Rust
+// `MutableTableDefinition` (minus `tenant`, which the engine stamps from the
+// session scope — the wire body stays tenant-free).
+message MutableTableDefinition {
+  // Catalog-unique id: lowercase ASCII letters, digits, and `_`, length 1..=63.
+  string id = 1;
+  // Arrow schema for the table, encoded as an Arrow IPC schema message (the
+  // same self-describing IPC framing TriggerService uses for batch payloads).
+  bytes schema = 2;
+  // Column(s) forming the primary key. A non-empty subset of the schema.
+  repeated string primary_key = 3;
+  // Secondary indexes; one CREATE INDEX per entry.
+  repeated MutableIndex indexes = 4;
+  // Optional monotonic ordering column for streaming reads (`scan_after`).
+  // Empty == none.
+  string order_column = 5;
+  // Chunk size for streaming reads. 0 == the engine default (8192).
+  uint64 chunk_size = 6;
+  // Free-form tenant-owned metadata as a JSON object string; "{}" when none.
+  // The engine stores it verbatim and never parses it.
+  string user_metadata = 7;
+}
+
+message CreateMutableTableRequest {
+  MutableTableDefinition definition = 1;
+}
+
+message CreateMutableTableResponse {
+  // The id the table was registered under (echoes the validated request id).
+  string mutable_table_id = 1;
+}
+
+message DropMutableTableRequest {
+  string mutable_table_id = 1;
+}
+
+message ListMutableTablesRequest {}
+
+message ListMutableTablesResponse {
+  // One definition per mutable table registered to the calling tenant. Each is
+  // the same tenant-free `MutableTableDefinition` shape the create path carries.
+  repeated MutableTableDefinition definitions = 1;
+}
+
+// === topics ===============================================================
+
+message RegisterTopicRequest {
+  // Fully-qualified catalog name for the topic.
+  string name = 1;
+  // Arrow schema for batch payloads, encoded as an Arrow IPC schema message
+  // (the same self-describing IPC framing the batch payloads use).
+  bytes schema = 2;
+  // Broker-driver-specific configuration (retention, replication, etc.),
+  // opaque to the engine. Empty == no driver metadata.
+  map<string, string> broker_metadata = 3;
+  // Caller-supplied topic id (UUID string). The `Session::register_topic`
+  // surface takes a `TopicDefinition` whose `id` the caller already minted, so
+  // the wire carries it and the server persists *that* id — keeping the topic's
+  // identity (and a later `DropTopic` by id) consistent across the in-process
+  // and remote transports. Empty == server mints a fresh id.
+  string topic_id = 4;
+}
+
+message RegisterTopicResponse {
+  // The engine-minted topic id (UUID string).
+  string topic_id = 1;
+}
+
+message DropTopicRequest {
+  // Topic id (UUID string) to drop. The `Session::drop_topic` surface is keyed
+  // by `TopicId`, so the wire carries the id and the server resolves the topic
+  // (tenant-scoped) by it — the same identity the in-process path uses.
+  string topic_id = 1;
+  // When true, a missing topic is a no-op instead of a NotFound error.
+  bool if_exists = 2;
+}
+
+message ListTopicsRequest {
+  // AIP-132 pagination.
+  int32 page_size = 1;
+  string page_token = 2;
+  // Optional tenant scope filter.
+  string tenant_id = 3;
+}
+
+// A fully-materialized topic in a `ListTopics` page. Carries everything a
+// `TopicDefinition` holds so a remote `Session::list_topics` reconstructs the
+// identical value the in-process path returns — not just the name.
+message Topic {
+  // Engine-minted topic id (UUID string).
+  string topic_id = 1;
+  // Fully-qualified catalog name.
+  string name = 2;
+  // Arrow schema for batch payloads, encoded as a self-describing Arrow IPC
+  // schema message (the same framing `RegisterTopicRequest.schema` uses).
+  bytes schema = 3;
+  // Tenant scope (the tenant's canonical string form); empty == global topic.
+  string tenant_id = 4;
+  // Broker-driver-specific configuration, opaque to the engine.
+  map<string, string> broker_metadata = 5;
+}
+
+message ListTopicsResponse {
+  repeated Topic topics = 1;
+  string next_page_token = 2;
+}

@@ -1,25 +1,16 @@
 //! `EmbeddingService` proto↔domain conversions.
 //!
-//! Maps the embedding wire enums/messages onto the engine's [`Modality`],
-//! [`QueryInput`], [`SourceType`], [`FileFormat`], [`SourceConnection`], and the
-//! result-table record. Modality and input are validated at decode: an
-//! unspecified modality and a text/bytes-vs-modality mismatch are rejected with
-//! `invalid_argument`. Only the URL + format cross the wire on a connection —
-//! cloud credentials are server-side, so [`SourceConnection`] decode fills the
-//! rest from `Default`.
+//! Maps the embedding compute wire enums/messages onto the engine's
+//! [`Modality`], [`QueryInput`], and the result-table record. Modality and
+//! input are validated at decode: an unspecified modality and a
+//! text/bytes-vs-modality mismatch are rejected with `invalid_argument`.
 //!
-//! The engine's [`SourceType`] / [`SourceConnection`] are foreign types (they
-//! live in `jammi-db`), so their decodes take the **proto** message as the
-//! `From` side (a local generated type) rather than a raw `i32` — that is the
-//! orphan-rule-clean shape and the handler passes the proto enum directly. The
-//! send side (the remote `add_source` client) gets the inverse encodes:
-//! [`source_type_to_proto`] for the kind and `From<SourceConnection>` for the
-//! connection message, carrying the same URL + format the decode reads back.
+//! The source-registration and model-introspection conversions
+//! (`SourceType` / `SourceConnection` / `FileFormat` / `SourceDescriptor` /
+//! `Model`) live with the control-plane catalog wire surface
+//! ([`super::catalog`]); only the compute verbs' shapes are here.
 
-use jammi_db::catalog::model_repo::ModelRecord;
 use jammi_db::catalog::result_repo::ResultTableRecord;
-use jammi_db::catalog::source_repo::SourceDescriptor;
-use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use tonic::Status;
 
 use crate::wire::proto::embedding as pb;
@@ -97,110 +88,14 @@ impl TryFrom<ProtoQueryInput> for QueryInput {
     }
 }
 
-/// Map the proto `SourceKind` discriminant onto the engine's [`SourceType`].
-/// An unspecified or unknown kind is rejected — a registration with no backend
-/// is a client error, not a silent default.
-///
-/// The engine's `SourceType` lives in `jammi-db`, so this is a free function
-/// taking the raw `i32` rather than `impl TryFrom<i32> for SourceType` (both
-/// types would be foreign — orphan-rule-blocked); it mirrors
-/// [`super::model_task_from_proto`].
-pub fn source_type_from_proto(kind: i32) -> Result<SourceType, Status> {
-    match pb::SourceKind::try_from(kind) {
-        Ok(pb::SourceKind::File) => Ok(SourceType::File),
-        Ok(pb::SourceKind::Postgres) => Ok(SourceType::Postgres),
-        Ok(pb::SourceKind::Mysql) => Ok(SourceType::Mysql),
-        Ok(pb::SourceKind::Unspecified) | Err(_) => {
-            Err(Status::invalid_argument("source_kind must be specified"))
-        }
-    }
-}
-
-/// Encode the engine's [`SourceType`] onto the proto `SourceKind` discriminant —
-/// the inverse of [`source_type_from_proto`], for the [`crate::RemoteSession`]
-/// send side. Total: every engine source type maps to a concrete wire variant
-/// (the engine type has no unspecified state). Mirrors
-/// [`super::model_task_to_proto`].
-pub fn source_type_to_proto(source_type: SourceType) -> pb::SourceKind {
-    match source_type {
-        SourceType::File => pb::SourceKind::File,
-        SourceType::Postgres => pb::SourceKind::Postgres,
-        SourceType::Mysql => pb::SourceKind::Mysql,
-    }
-}
-
-/// Build the engine's [`SourceConnection`] from the proto message. Only the URL
-/// and format are carried on the wire; cloud credentials are server-side, so
-/// the rest comes from `Default`.
-impl TryFrom<pb::SourceConnection> for SourceConnection {
-    type Error = Status;
-
-    fn try_from(conn: pb::SourceConnection) -> Result<Self, Self::Error> {
-        let url = if conn.url.is_empty() {
-            None
-        } else {
-            Some(conn.url)
-        };
-        Ok(SourceConnection {
-            url,
-            format: file_format_from_proto(conn.format)?,
-            ..Default::default()
-        })
-    }
-}
-
-/// Encode the engine's [`SourceConnection`] into the proto message for an
-/// `AddSource` request — the inverse of the decode above, for the
-/// [`crate::RemoteSession`] send side. Only the URL + format cross the wire
-/// (matching what the decode reads back): cloud credentials, file-extension
-/// overrides, and driver options are server-side and have no wire field, so the
-/// send side does not carry them. A `None` URL encodes as the empty string the
-/// decode reads back as `None`; an unset format encodes as
-/// `FILE_FORMAT_UNSPECIFIED`, which the decode maps to "let the engine infer".
-impl From<SourceConnection> for pb::SourceConnection {
-    fn from(conn: SourceConnection) -> Self {
-        pb::SourceConnection {
-            url: conn.url.unwrap_or_default(),
-            format: file_format_to_proto(conn.format) as i32,
-        }
-    }
-}
-
-/// Map the engine's [`FileFormat`] onto the proto enum — the inverse of
-/// [`file_format_from_proto`]. An absent format encodes as
-/// `FILE_FORMAT_UNSPECIFIED` (the decode reads that back as "let the engine
-/// infer").
-fn file_format_to_proto(format: Option<FileFormat>) -> pb::FileFormat {
-    match format {
-        Some(FileFormat::Parquet) => pb::FileFormat::Parquet,
-        Some(FileFormat::Csv) => pb::FileFormat::Csv,
-        Some(FileFormat::Json) => pb::FileFormat::Json,
-        Some(FileFormat::Avro) => pb::FileFormat::Avro,
-        None => pb::FileFormat::Unspecified,
-    }
-}
-
-/// Map the proto [`FileFormat`] enum onto the engine's [`FileFormat`]; an
-/// unspecified/unknown format means "let the engine infer" → `None`.
-fn file_format_from_proto(format: i32) -> Result<Option<FileFormat>, Status> {
-    match pb::FileFormat::try_from(format) {
-        Ok(pb::FileFormat::Parquet) => Ok(Some(FileFormat::Parquet)),
-        Ok(pb::FileFormat::Csv) => Ok(Some(FileFormat::Csv)),
-        Ok(pb::FileFormat::Json) => Ok(Some(FileFormat::Json)),
-        Ok(pb::FileFormat::Avro) => Ok(Some(FileFormat::Avro)),
-        Ok(pb::FileFormat::Unspecified) | Err(_) => Ok(None),
-    }
-}
-
-/// Map a [`Modality`] onto the embedding `ModelTask` its tower produces. The
-/// wire `ResultTable` carries its own `task` (the embedding tower), so the
-/// reconstruction recovers it faithfully from the message itself — never from a
-/// modality threaded in out of band, never a guess.
-///
 /// Encode the engine's result-table record into the wire `ResultTable`. The
 /// engine's optional `dimensions` is flattened to `0` for a non-embedding /
 /// unset result, `row_count` widens to the wire's `u64`, and `task` rides the
 /// shared [`super::model_task_to_proto`] task vocabulary.
+///
+/// The wire `ResultTable` carries its own `task` (the embedding tower), so the
+/// reconstruction recovers it faithfully from the message itself — never from a
+/// modality threaded in out of band, never a guess.
 impl From<ResultTableRecord> for pb::ResultTable {
     fn from(record: ResultTableRecord) -> Self {
         pb::ResultTable {
@@ -250,86 +145,5 @@ pub fn result_table_from_proto(table: pb::ResultTable) -> Result<ResultTableReco
         text_columns: None,
         created_at: String::new(),
         completed_at: None,
-    })
-}
-
-/// Encode the engine's [`SourceDescriptor`] into the wire message: the registry
-/// identity (`source_id` / `kind` / `status`) plus each embedding result table
-/// in the same self-describing [`pb::ResultTable`] shape `GenerateEmbeddings`
-/// returns — one source-of-truth for the embedding numbers, not a parallel one.
-impl From<SourceDescriptor> for pb::SourceDescriptor {
-    fn from(descriptor: SourceDescriptor) -> Self {
-        pb::SourceDescriptor {
-            source_id: descriptor.source_id,
-            kind: source_type_to_proto(descriptor.source_type) as i32,
-            status: descriptor.status,
-            result_tables: descriptor
-                .result_tables
-                .into_iter()
-                .map(pb::ResultTable::from)
-                .collect(),
-        }
-    }
-}
-
-/// Reconstruct the engine's [`SourceDescriptor`] from the wire message — the
-/// inverse of the encode above, for the [`crate::RemoteSession`] receive side.
-/// The kind decodes through the shared [`source_type_from_proto`] (an
-/// unspecified/unknown backend is the faithful `invalid_argument`), and each
-/// result table through [`result_table_from_proto`], so a remote
-/// `describe_source` rebuilds the same descriptor a local one returns.
-pub fn source_descriptor_from_proto(
-    descriptor: pb::SourceDescriptor,
-) -> Result<SourceDescriptor, Status> {
-    Ok(SourceDescriptor {
-        source_id: descriptor.source_id,
-        source_type: source_type_from_proto(descriptor.kind)?,
-        status: descriptor.status,
-        result_tables: descriptor
-            .result_tables
-            .into_iter()
-            .map(result_table_from_proto)
-            .collect::<Result<_, Status>>()?,
-    })
-}
-
-/// Encode the engine's [`ModelRecord`] into the wire `Model` — the client-
-/// observable projection a `ListModels` response carries. Only the registry-
-/// identity fields cross the wire (`model_id` / `backend` / `task` / `status`);
-/// the version counter, derived-from lineage, artifact path, config blob, and
-/// registration timestamp are server-internal bookkeeping a list consumer does
-/// not key off, mirroring how [`ResultTableRecord`] projects onto
-/// [`pb::ResultTable`]. The `task` rides the shared
-/// [`super::model_task_to_proto`] vocabulary.
-pub fn model_to_proto(record: &ModelRecord) -> pb::Model {
-    pb::Model {
-        model_id: record.model_id.clone(),
-        backend: record.backend.clone(),
-        task: super::model_task_to_proto(record.task) as i32,
-        status: record.status.clone(),
-    }
-}
-
-/// Reconstruct the engine's [`ModelRecord`] from the wire `Model` — the inverse
-/// of [`model_to_proto`], for the [`crate::RemoteSession`] receive side. The
-/// fields not carried on the wire are server-internal bookkeeping, so they
-/// reconstruct at their "not carried" values (`version = 1` default, `None`,
-/// `String::new`), exactly as [`result_table_from_proto`] does for a result
-/// table. The message is self-describing in `task`, so an out-of-range /
-/// unspecified task surfaces as the faithful `invalid_argument` the shared
-/// decoder builds.
-pub fn model_from_proto(model: pb::Model) -> Result<ModelRecord, Status> {
-    let task = super::model_task_from_proto(model.task)?;
-    Ok(ModelRecord {
-        model_id: model.model_id,
-        version: 1,
-        model_type: String::new(),
-        base_model_id: None,
-        backend: model.backend,
-        task,
-        artifact_path: None,
-        config_json: None,
-        status: model.status,
-        created_at: String::new(),
     })
 }

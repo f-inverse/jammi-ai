@@ -1,4 +1,5 @@
-//! `MutableTableService` proto↔domain conversion.
+//! Mutable-table proto↔domain conversion (the `CatalogService`
+//! create/drop/list-mutable-table verbs).
 //!
 //! The request [`pb::MutableTableDefinition`] mirrors the engine's
 //! [`MutableTableDefinition`] field for field, minus `tenant`: the wire body is
@@ -16,7 +17,7 @@ use jammi_db::TenantId;
 use tonic::Status;
 
 use crate::wire::encode_ipc_stream;
-use crate::wire::proto::mutable_table as pb;
+use crate::wire::proto::catalog as pb;
 
 /// Build the engine [`MutableTableDefinition`] from the wire message, stamping
 /// the resolved session `tenant` onto it (the wire body is tenant-free).

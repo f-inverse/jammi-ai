@@ -7,18 +7,16 @@ PROTO_ROOT := ../../crates/jammi-ai/proto
 OUT_DIR    := jammi_client/_generated
 
 # Every jammi.v1 service proto. Compiling the whole tree (not just the
-# embedding + session verbs `connect` exposes today) keeps the generated
+# embedding + catalog verbs `connect` exposes today) keeps the generated
 # surface a faithful mirror of the npm client and lets the client grow new
 # verbs without a Makefile edit — the proto stays the single source.
 PROTO_FILES := \
-	$(PROTO_ROOT)/jammi/v1/session.proto \
+	$(PROTO_ROOT)/jammi/v1/catalog.proto \
 	$(PROTO_ROOT)/jammi/v1/embedding.proto \
 	$(PROTO_ROOT)/jammi/v1/inference.proto \
 	$(PROTO_ROOT)/jammi/v1/eval.proto \
 	$(PROTO_ROOT)/jammi/v1/pipeline.proto \
 	$(PROTO_ROOT)/jammi/v1/training.proto \
-	$(PROTO_ROOT)/jammi/v1/mutable_table.proto \
-	$(PROTO_ROOT)/jammi/v1/channel.proto \
 	$(PROTO_ROOT)/jammi/v1/trigger.proto \
 	$(PROTO_ROOT)/jammi/v1/audit.proto \
 	$(PROTO_ROOT)/jammi/v1/error.proto

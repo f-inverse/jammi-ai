@@ -19,8 +19,8 @@
 //! `Unimplemented` (the verb is not mounted) — the two codes are exactly the
 //! "ran but bad input" vs "not enabled here" distinction the tier gate draws.
 
+use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
 use jammi_server::grpc::proto::inference::ModelTask;
-use jammi_server::grpc::proto::session::session_service_client::SessionServiceClient;
 use jammi_server::grpc::proto::training::start_training_request::Spec;
 use jammi_server::grpc::proto::training::training_service_client::TrainingServiceClient;
 use jammi_server::grpc::proto::training::{FineTuneMethod, FineTuneSpec, StartTrainingRequest};
@@ -46,7 +46,7 @@ fn probe_request() -> StartTrainingRequest {
 }
 
 async fn server_info_services(addr: std::net::SocketAddr) -> Vec<String> {
-    let mut client = SessionServiceClient::new(channel(addr).await);
+    let mut client = CatalogServiceClient::new(channel(addr).await);
     client
         .get_server_info(())
         .await

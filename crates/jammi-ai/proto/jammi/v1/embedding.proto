@@ -2,12 +2,11 @@ syntax = "proto3";
 
 package jammi.v1.embedding;
 
-import "google/protobuf/empty.proto";
 import "jammi/v1/inference.proto";
 
-// EmbeddingService — the wire surface for the engine's embedding verbs.
-// These are imperative session methods, not SQL queries, so they live as
-// typed gRPC RPCs alongside SessionService / TriggerService rather than on
+// EmbeddingService — the wire surface for the engine's embedding compute
+// verbs. These are imperative session methods, not SQL queries, so they live
+// as typed gRPC RPCs alongside InferenceService / TriggerService rather than on
 // the Flight SQL surface (which carries query/result only, per ADR-01 §3.2).
 //
 // The surface is modality-agnostic: one GenerateEmbeddings / EncodeQuery pair
@@ -19,42 +18,14 @@ import "jammi/v1/inference.proto";
 // in-process engine. Jammi stays non-generative: these encode input → vector,
 // never generate.
 //
+// Source registration and model introspection — the control-plane catalog
+// surface this compute lane reads — live on CatalogService, not here. This
+// service carries the data-plane compute verbs only.
+//
 // Tenant scope is read from the request's `SessionTenant` extension, set by
 // the shared TenantInterceptor from the `jammi-session-id` header — the same
-// mechanism SessionService / TriggerService / Flight SQL already use.
+// mechanism CatalogService / TriggerService / Flight SQL already use.
 service EmbeddingService {
-  // Register a data source so a later GenerateEmbeddings call can scan it.
-  // Peer of the abstraction's `add_source`. The source carries any modality
-  // the engine supports; the kind here is the storage backend, not the
-  // content modality. Idempotent only insofar as the engine allows —
-  // re-registering an id that already exists is an error.
-  rpc AddSource(AddSourceRequest) returns (google.protobuf.Empty);
-
-  // Remove a registered source and all associated state (embedding tables,
-  // indexes). Peer of the abstraction's `remove_source`.
-  rpc RemoveSource(RemoveSourceRequest) returns (google.protobuf.Empty);
-
-  // List a `SourceDescriptor` for every source registered to the calling
-  // tenant. Peer of the abstraction's `list_sources`; registry introspection,
-  // not a SQL query. `ListSources` is `DescribeSource` applied over every
-  // registered source — one descriptor shape, one operator, no per-source
-  // special-casing.
-  rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
-
-  // List a `Model` record for every model registered to the calling tenant.
-  // Peer of the abstraction's `list_models`; registry introspection, not a SQL
-  // query. The model registry is the embedding tier's catalog surface (the
-  // peer of the source registry `ListSources` reads), so it lives here.
-  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
-
-  // Describe one registered source: its registry identity (id / kind /
-  // lifecycle status) plus the result tables embedded out of it (each carrying
-  // its own status / row_count / dimensions). Peer of the abstraction's
-  // `describe_source`. The embedding status / row_count / dimensions are read
-  // from the engine's result-table record — the same source-of-truth a
-  // `GenerateEmbeddings` response returns — never a parallel registry.
-  rpc DescribeSource(DescribeSourceRequest) returns (SourceDescriptor);
-
   // Scan `columns` on a registered source, run the modality's tower over
   // every row (decode/feature-extraction as the modality requires → forward
   // pass), persist one L2-normalized vector per row keyed by `key_column`,
@@ -88,101 +59,6 @@ enum Modality {
   AUDIO = 3;
 }
 
-// Source backend kind. Mirrors the engine's `SourceType`. The kind is the
-// storage backend, independent of the content modality embedded out of it.
-enum SourceKind {
-  SOURCE_KIND_UNSPECIFIED = 0;
-  SOURCE_KIND_FILE = 1;
-  SOURCE_KIND_POSTGRES = 2;
-  SOURCE_KIND_MYSQL = 3;
-}
-
-// File format for a file-shaped source. Mirrors the engine's `FileFormat`.
-enum FileFormat {
-  FILE_FORMAT_UNSPECIFIED = 0;
-  FILE_FORMAT_PARQUET = 1;
-  FILE_FORMAT_CSV = 2;
-  FILE_FORMAT_JSON = 3;
-  FILE_FORMAT_AVRO = 4;
-}
-
-// Connection parameters for a source. Maps onto the engine's
-// `SourceConnection`; only the fields a wire client needs to register a
-// file-shaped corpus are exposed (storage URL + format). Cloud credentials
-// are configured server-side, not carried on the wire.
-message SourceConnection {
-  // Storage URL (file://, s3://, gs://, azure://) or external-source
-  // connection string (postgres://, mysql://).
-  string url = 1;
-  // File format — required for a FILE source, ignored otherwise.
-  FileFormat format = 2;
-}
-
-message AddSourceRequest {
-  string source_id = 1;
-  SourceKind source_kind = 2;
-  SourceConnection connection = 3;
-}
-
-message RemoveSourceRequest {
-  string source_id = 1;
-}
-
-message ListSourcesRequest {}
-
-message ListSourcesResponse {
-  // One descriptor per source registered to the calling tenant, in the
-  // engine's registration order.
-  repeated SourceDescriptor sources = 1;
-}
-
-message ListModelsRequest {}
-
-message ListModelsResponse {
-  // One record per model registered to the calling tenant, in the catalog's
-  // registration order.
-  repeated Model models = 1;
-}
-
-// The client-observable projection of the engine's `ModelRecord`. Carries the
-// fields a client needs to identify a registered model — its id, the inference
-// backend, the task it performs, and its lifecycle status. Server-internal
-// bookkeeping (version counter, derived-from lineage, artifact path, config
-// blob, registration timestamp) stays server-side, mirroring how `ResultTable`
-// is the client projection of the engine's result-table record.
-message Model {
-  // Unique model name (e.g. an HF repo id or a fine-tuned id).
-  string model_id = 1;
-  // Inference backend (e.g. "candle", "vllm", "http").
-  string backend = 2;
-  // The task this model performs.
-  jammi.v1.inference.ModelTask task = 3;
-  // Lifecycle status (e.g. "registered", "loaded", "failed").
-  string status = 4;
-}
-
-message DescribeSourceRequest {
-  string source_id = 1;
-}
-
-// Registry introspection for one source: its registration identity plus the
-// embedding result tables produced out of it. The embedding-side
-// status/row_count/dimensions are carried by the `ResultTable` records
-// (`result_tables`) — the same shape `GenerateEmbeddings` returns — rather than
-// duplicated as descriptor fields, so there is one source-of-truth for those
-// numbers. A freshly-registered source with no embeddings yet carries an empty
-// `result_tables`.
-message SourceDescriptor {
-  string source_id = 1;
-  // The storage backend the source was registered with.
-  SourceKind kind = 2;
-  // Registration lifecycle status from the source catalog (e.g. "active").
-  string status = 3;
-  // Every embedding result table produced from this source. Empty until a
-  // `GenerateEmbeddings` call persists one.
-  repeated ResultTable result_tables = 4;
-}
-
 message GenerateEmbeddingsRequest {
   // Registered source to scan.
   string source_id = 1;
@@ -202,7 +78,7 @@ message GenerateEmbeddingsRequest {
 // (parquet/index paths, timestamps) stay server-side. The record is
 // self-describing — it carries its own `task` — so it reconstructs without the
 // caller supplying the modality out of band; this is the one shape both
-// GenerateEmbeddings and DescribeSource return.
+// GenerateEmbeddings and the catalog's DescribeSource return.
 message ResultTable {
   string table_name = 1;
   string source_id = 2;

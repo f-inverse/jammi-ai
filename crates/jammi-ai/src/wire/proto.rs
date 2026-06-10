@@ -9,8 +9,8 @@
 pub mod error {
     tonic::include_proto!("jammi.v1.error");
 }
-pub mod session {
-    tonic::include_proto!("jammi.v1.session");
+pub mod catalog {
+    tonic::include_proto!("jammi.v1.catalog");
 }
 pub mod trigger {
     tonic::include_proto!("jammi.v1.trigger");
@@ -29,12 +29,6 @@ pub mod pipeline {
 }
 pub mod training {
     tonic::include_proto!("jammi.v1.training");
-}
-pub mod mutable_table {
-    tonic::include_proto!("jammi.v1.mutable_table");
-}
-pub mod channel {
-    tonic::include_proto!("jammi.v1.channel");
 }
 pub mod audit {
     tonic::include_proto!("jammi.v1.audit");

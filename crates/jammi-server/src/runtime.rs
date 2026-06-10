@@ -6,7 +6,7 @@
 //! - the engine [`InferenceSession`] (catalog, mutable tables, broker)
 //! - a [`SessionStore`] shared between Flight SQL and the gRPC services
 //! - the Axum side-channel router (`/healthz`, `/readyz`, `/metrics`)
-//! - one Tonic server hosting `FlightSqlService + SessionService +
+//! - one Tonic server hosting `FlightSqlService + CatalogService +
 //!   TriggerService` on a single port
 //! - graceful shutdown wired to SIGINT/SIGTERM via a
 //!   [`tokio::sync::broadcast`] so every component drains in parallel
@@ -37,24 +37,21 @@ use tonic_web::GrpcWebLayer;
 use crate::error::fallback_handler;
 use crate::flight::TenantBoundProvider;
 use crate::grpc::audit::AuditServer;
-use crate::grpc::channel::ChannelServer;
+use crate::grpc::catalog::CatalogServer;
 use crate::grpc::embedding::EmbeddingServer;
 use crate::grpc::eval::EvalServer;
 use crate::grpc::inference::InferenceServer;
-use crate::grpc::mutable_table::MutableTableServer;
 use crate::grpc::pipeline::PipelineServer;
 use crate::grpc::proto::audit::audit_service_server::AuditServiceServer;
-use crate::grpc::proto::channel::channel_service_server::ChannelServiceServer;
+use crate::grpc::proto::catalog::catalog_service_server::CatalogServiceServer;
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingServiceServer;
 use crate::grpc::proto::eval::eval_service_server::EvalServiceServer;
 use crate::grpc::proto::inference::inference_service_server::InferenceServiceServer;
-use crate::grpc::proto::mutable_table::mutable_table_service_server::MutableTableServiceServer;
 use crate::grpc::proto::pipeline::pipeline_service_server::PipelineServiceServer;
-use crate::grpc::proto::session::session_service_server::SessionServiceServer;
 #[cfg(feature = "train")]
 use crate::grpc::proto::training::training_service_server::TrainingServiceServer;
 use crate::grpc::proto::trigger::trigger_service_server::TriggerServiceServer;
-use crate::grpc::session::{SessionServer, SessionStore, TenantInterceptor};
+use crate::grpc::session::{SessionStore, TenantInterceptor};
 #[cfg(feature = "train")]
 use crate::grpc::training::TrainingServer;
 use crate::grpc::trigger::TriggerServer;
@@ -368,9 +365,11 @@ pub struct GrpcChain {
 /// service.
 ///
 /// **Always mounted** (the core tier + the Flight SQL transport): Flight SQL and
-/// `SessionService`. When `engine` is `Some`, the core engine-backed services
-/// also mount: `EmbeddingService`, `InferenceService`, `MutableTableService`,
-/// `ChannelService`, `AuditService`. These are the serve-path primitives every
+/// the control-plane `CatalogService` (its engine-free tenant trio +
+/// `GetServerInfo` answer even when no engine is mounted; its catalog /
+/// lifecycle verbs are backed by `engine` when present). When `engine` is
+/// `Some`, the core data-plane services also mount: `EmbeddingService`,
+/// `InferenceService`, `AuditService`. These are the serve-path primitives every
 /// deployment needs.
 ///
 /// **Mounted by tier** (only when `tiers` selected them):
@@ -380,10 +379,10 @@ pub struct GrpcChain {
 /// - `TriggerService` ← [`ServiceTier::Event`], driven by `trigger` being
 ///   `Some` (the caller derives the handles iff the event tier is mounted)
 ///
-/// `engine` and `trigger` are `Option` so the gRPC-Web / `SessionService`-only
+/// `engine` and `trigger` are `Option` so the gRPC-Web / control-plane-only
 /// fixtures (which construct no `InferenceSession`) can mount just the
 /// transport + core handshake. The `tiers` argument is what the
-/// `SessionService.GetServerInfo` handshake advertises, so it must agree with
+/// `CatalogService.GetServerInfo` handshake advertises, so it must agree with
 /// what is actually mounted — the caller is responsible for that agreement
 /// (production goes through [`OssServer`], which derives both from one config).
 ///
@@ -408,8 +407,14 @@ pub async fn serve_grpc_chain(
     let flight = FlightSqlService::new_with_provider(Box::new(provider));
     let flight_svc = FlightServiceServer::new(flight);
 
-    let session_svc = SessionServiceServer::with_interceptor(
-        SessionServer::new(store, tiers.clone()),
+    // The control plane: one `CatalogService` on the always-present core tier.
+    // Its engine-free verbs (the tenant trio + `GetServerInfo`) ride the
+    // `SessionStore` + `TierSet`, so it mounts even on an engine-light
+    // deployment; its catalog / lifecycle verbs delegate to the shared engine
+    // when one is present (`engine.clone()` here, with the original moved into
+    // the engine-services block below).
+    let catalog_svc = CatalogServiceServer::with_interceptor(
+        CatalogServer::new(store, tiers.clone(), engine.clone()),
         interceptor.clone(),
     );
 
@@ -427,9 +432,9 @@ pub async fn serve_grpc_chain(
         .layer(GrpcWebTrailersLayer::new())
         .layer(GrpcWebLayer::new())
         .add_service(flight_svc)
-        .add_service(session_svc);
+        .add_service(catalog_svc);
 
-    let mut mounted = vec!["Flight SQL", "SessionService"];
+    let mut mounted = vec!["Flight SQL", "CatalogService"];
 
     // Event tier: TriggerService. Driven by the caller having supplied handles
     // (it does so iff the event tier is mounted).
@@ -471,20 +476,6 @@ pub async fn serve_grpc_chain(
         );
         builder = builder.add_service(pipeline_svc);
         mounted.push("PipelineService");
-
-        let mutable_svc = MutableTableServiceServer::with_interceptor(
-            MutableTableServer::new(Arc::clone(&session)),
-            interceptor.clone(),
-        );
-        builder = builder.add_service(mutable_svc);
-        mounted.push("MutableTableService");
-
-        let channel_svc = ChannelServiceServer::with_interceptor(
-            ChannelServer::new(Arc::clone(&session)),
-            interceptor.clone(),
-        );
-        builder = builder.add_service(channel_svc);
-        mounted.push("ChannelService");
 
         let audit_svc = AuditServiceServer::with_interceptor(
             AuditServer::new(Arc::clone(&session)),

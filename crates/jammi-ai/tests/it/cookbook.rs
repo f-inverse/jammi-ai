@@ -15,6 +15,31 @@ use tempfile::TempDir;
 
 use crate::common;
 
+/// Register the `cdc_orders` topic the publish/subscribe cookbook recipes use,
+/// via the typed dual-registration path (broker driver + catalog) the
+/// `register_topic` verb runs — the engine's topic-registration entry point now
+/// that the Flight-SQL `CREATE TOPIC` DDL is gone.
+async fn register_cdc_orders_topic(session: &jammi_db::session::JammiSession) {
+    use arrow_schema::{DataType, Field, Schema};
+    let topic = jammi_db::trigger::TopicDefinition {
+        id: jammi_db::trigger::TopicId::new(),
+        name: "cdc_orders".to_string(),
+        schema: Arc::new(Schema::new(vec![
+            Field::new("op", DataType::Utf8, false),
+            Field::new("ts_ms", DataType::Int64, false),
+            Field::new("key", DataType::Utf8, false),
+        ])),
+        tenant: session.tenant(),
+        broker_metadata: std::collections::BTreeMap::new(),
+    };
+    session
+        .trigger_broker()
+        .register_topic(&topic)
+        .await
+        .unwrap();
+    session.topic_repo().register_topic(&topic).await.unwrap();
+}
+
 fn tiny_bert_id() -> String {
     "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
 }
@@ -1683,11 +1708,8 @@ async fn cookbook_publish_events_recipe_runs_end_to_end() {
         .await
         .unwrap();
 
-    // Recipe §"Define + register the topic" — SQL DDL form.
-    session
-        .sql("CREATE TOPIC cdc_orders (op TEXT NOT NULL, ts_ms BIGINT NOT NULL, key TEXT NOT NULL)")
-        .await
-        .unwrap();
+    // Recipe §"Define + register the topic" — typed registration.
+    register_cdc_orders_topic(&session).await;
 
     // Recipe §"Publish a batch" — look up the topic, build a 3-row batch,
     // publish via the engine's publisher.
@@ -1754,10 +1776,7 @@ async fn cookbook_subscribe_with_filter_recipe_runs_end_to_end() {
         .await
         .unwrap();
 
-    session
-        .sql("CREATE TOPIC cdc_orders (op TEXT NOT NULL, ts_ms BIGINT NOT NULL, key TEXT NOT NULL)")
-        .await
-        .unwrap();
+    register_cdc_orders_topic(&session).await;
 
     let topic = session
         .topic_repo()
@@ -1840,10 +1859,7 @@ async fn cookbook_replay_from_backing_table_recipe_runs_end_to_end() {
         .await
         .unwrap();
 
-    session
-        .sql("CREATE TOPIC cdc_orders (op TEXT NOT NULL, ts_ms BIGINT NOT NULL, key TEXT NOT NULL)")
-        .await
-        .unwrap();
+    register_cdc_orders_topic(&session).await;
 
     let topic = session
         .topic_repo()

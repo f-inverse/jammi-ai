@@ -15,16 +15,13 @@ use crate::source::mutable::MutableTableRegistry;
 use crate::source::registry::SourceCatalog;
 use crate::source::schema_provider::JammiSchemaProvider;
 use crate::source::{file_format, table_name_from_url, SourceConnection, SourceType};
-use crate::sql::topic_ddl::{self, TopicDdl};
 use crate::storage::{StorageRegistry, StorageUrl};
 use crate::store::mutable::definition::{MutableTableDefinition, MutableTableId};
 use crate::store::mutable::sqlite::SqliteMutableBackend;
 use crate::store::mutable::MutableBackend;
 use crate::tenant::{TenantContext, TenantId};
 use crate::tenant_scope::{SourceTenantColumns, TenantBinding, TenantScopeAnalyzerRule};
-use crate::trigger::{
-    InMemoryBroker, Publisher, Subscriber, TopicDefinition, TopicId, TriggerBroker,
-};
+use crate::trigger::{InMemoryBroker, Publisher, Subscriber, TriggerBroker};
 
 /// Primary entry point for the Jammi query engine.
 ///
@@ -636,65 +633,12 @@ impl JammiSession {
 
     /// Execute a SQL query and collect results as Arrow `RecordBatch`es.
     ///
-    /// Inspects the input for trigger-stream DDL (`CREATE TOPIC` /
-    /// `DROP TOPIC`) before handing it to DataFusion: those statements are
-    /// routed to the engine's [`TopicRepo`] and return an empty result set.
+    /// The Flight SQL surface carries query + data-DML only (per ADR-01 §3.2);
+    /// topic lifecycle is the typed `register_topic` / `drop_topic` surface, not
+    /// a SQL statement.
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
-        match topic_ddl::maybe_parse(query).map_err(|e| JammiError::Catalog(e.to_string()))? {
-            Some(TopicDdl::Create(create)) => {
-                self.exec_create_topic(create).await?;
-                Ok(Vec::new())
-            }
-            Some(TopicDdl::Drop(drop_)) => {
-                self.exec_drop_topic(drop_).await?;
-                Ok(Vec::new())
-            }
-            None => {
-                let df = self.ctx.sql(query).await?;
-                Ok(df.collect().await?)
-            }
-        }
-    }
-
-    async fn exec_create_topic(&self, create: crate::sql::topic_ddl::CreateTopic) -> Result<()> {
-        let topic = TopicDefinition {
-            id: TopicId::new(),
-            name: create.name,
-            schema: Arc::new(create.schema),
-            tenant: self.tenant(),
-            broker_metadata: create.broker_metadata,
-        };
-        self.trigger_broker.register_topic(&topic).await?;
-        self.topic_repo.register_topic(&topic).await?;
-        Ok(())
-    }
-
-    async fn exec_drop_topic(&self, drop_: crate::sql::topic_ddl::DropTopic) -> Result<()> {
-        let tenant = self.tenant();
-        let topic = self.topic_repo.lookup_by_name(&drop_.name, tenant).await?;
-        match topic {
-            Some(t) => {
-                self.topic_repo.drop_topic(t.id, tenant).await?;
-                // The broker driver's view of the topic is best-effort: an
-                // in-memory broker has no durable state, and the catalog row
-                // (the system of record) is already gone. A driver-side
-                // failure here would leak driver resources, not catalog
-                // state, so surface it via tracing rather than reverting
-                // the successful catalog drop.
-                if let Err(e) = self.trigger_broker.drop_topic(t.id).await {
-                    tracing::warn!(
-                        topic_id = %t.id,
-                        error = %e,
-                        "trigger broker driver failed to drop topic after catalog row removal",
-                    );
-                }
-                Ok(())
-            }
-            None if drop_.if_exists => Ok(()),
-            None => Err(JammiError::Trigger(
-                crate::trigger::TriggerError::TopicNotFound(drop_.name),
-            )),
-        }
+        let df = self.ctx.sql(query).await?;
+        Ok(df.collect().await?)
     }
 
     /// Shared handle to the trigger broker the session was constructed with.

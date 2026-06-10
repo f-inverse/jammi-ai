@@ -6,30 +6,33 @@
 //! A *tier* is a named group of gRPC services that a deployment either mounts or
 //! does not. One tier is always present; the rest are opt-in:
 //!
-//! - [`ServiceTier::Core`] — **always** mounted: `SessionService` (the tenant
-//!   trio + the `GetServerInfo` handshake), `EmbeddingService`,
-//!   `InferenceService`, `MutableTableService`, `ChannelService`,
-//!   `AuditService`. These are the serve-path primitives every deployment
-//!   needs: embed, infer, read result/mutable tables, observe channel state,
-//!   and read audit records. There is no useful Jammi server without them.
+//! - [`ServiceTier::Core`] — **always** mounted: the control-plane
+//!   `CatalogService` (the tenant trio + the `GetServerInfo` handshake, plus the
+//!   sources / models / channels / mutable-tables / topic-admin catalog verbs),
+//!   `EmbeddingService`, `InferenceService`, and `AuditService`. These are the
+//!   serve-path primitives every deployment needs: bind a tenant, embed, infer,
+//!   read result/mutable tables, observe channel state, and read audit records.
+//!   There is no useful Jammi server without them.
 //! - [`ServiceTier::Train`] — `TrainingService` (`StartTraining` /
 //!   `TrainingStatus`). A serve-only box does not train.
-//! - [`ServiceTier::Event`] — `TriggerService` (topics / publish / subscribe).
-//!   The enterprise tier builds on this trigger stream.
+//! - [`ServiceTier::Event`] — `TriggerService` (publish / subscribe). The
+//!   enterprise tier builds on this trigger stream. (Topic *admin* is a
+//!   control-plane catalog verb, always present; only the publish/subscribe
+//!   compute stream is event-gated.)
 //! - [`ServiceTier::Eval`] — `EvalService` (per-query eval arrays). A tooling
 //!   surface, not part of the serve or train hot path.
 //!
-//! `MutableTable`/`Channel`/`Audit` sit in **core**, not in a tier of their
-//! own: they are read/write data primitives the serve path depends on (a
-//! serve-only box that embeds and queries result tables needs mutable-table
-//! reads; audit is introspection every surface emits), so splitting them out
-//! would leave a "serve" deployment unable to serve. Only `Train`,
-//! `Trigger`, and `Eval` are role-specific enough to gate.
+//! The catalog / mutable-table / channel / audit verbs sit in **core**, not in
+//! a tier of their own: they are the control-plane + read/write data primitives
+//! the serve path depends on (a serve-only box that embeds and queries result
+//! tables needs mutable-table reads; audit is introspection every surface
+//! emits), so splitting them out would leave a "serve" deployment unable to
+//! serve. Only `Train`, `Event`, and `Eval` are role-specific enough to gate.
 //!
 //! ## Capability matches deployment
 //!
 //! A deployment advertises exactly the tiers it mounted, over the wire, in
-//! [`crate::grpc::proto::session::ServerInfo::services`]. Reaching a verb whose
+//! [`crate::grpc::proto::catalog::ServerInfo::services`]. Reaching a verb whose
 //! tier was not mounted is a truthful tonic `Unimplemented` — the service-mount
 //! analog of the client `connect(target)` capability-by-build: the box that did
 //! not opt into `train` does not advertise or answer train verbs.

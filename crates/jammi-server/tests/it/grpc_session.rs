@@ -1,19 +1,20 @@
-//! SPEC-03 §12 #5 — gRPC `SessionService.SetTenant` + `TriggerService.ListTopics`
-//! end-to-end isolation. An in-process server hosts both services behind the
-//! shared [`SessionStore`] + [`TenantInterceptor`]. Two clients distinguished
-//! by `jammi-session-id` headers bind different tenants and observe the
+//! SPEC-03 §12 #5 — gRPC `CatalogService.SetTenant` + `CatalogService.ListTopics`
+//! end-to-end isolation. An in-process server hosts the control plane behind the
+//! shared [`SessionStore`] + [`TenantInterceptor`]. Two clients distinguished by
+//! `jammi-session-id` headers bind different tenants and observe the
 //! corresponding `ListTopics` filter; an unbound client sees only globally
 //! scoped topics; an invalid UUID is rejected with `InvalidArgument`.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use jammi_db::session::JammiSession;
-use jammi_server::grpc::proto::session::session_service_client::SessionServiceClient;
-use jammi_server::grpc::proto::session::{SetTenantRequest, Tenant};
-use jammi_server::grpc::proto::trigger::trigger_service_client::TriggerServiceClient;
-use jammi_server::grpc::proto::trigger::ListTopicsRequest;
+use arrow_schema::{DataType, Field, Schema};
+use jammi_ai::session::InferenceSession;
+use jammi_db::trigger::{TopicDefinition, TopicId};
+use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
+use jammi_server::grpc::proto::catalog::{ListTopicsRequest, SetTenantRequest, Tenant};
 use jammi_server::grpc::session::SessionStore;
 use jammi_server::TriggerHandles;
 use jammi_test_utils::test_config;
@@ -24,8 +25,31 @@ use tonic::transport::Channel;
 
 use super::common::grpc::{channel, tenant_a, tenant_b, with_session, TENANT_A, TENANT_B};
 
-/// Spin up an in-process gRPC server hosting `SessionService` + `TriggerService`
-/// behind the shared interceptor. Pre-seeds two topics — one bound to
+/// Register a single-column topic via the typed dual-registration path (broker
+/// driver + catalog), scoped to the engine's currently-bound tenant — the
+/// engine path the `register_topic` verb runs.
+async fn seed_topic(session: &InferenceSession, name: &str) {
+    let topic = TopicDefinition {
+        id: TopicId::new(),
+        name: name.to_string(),
+        schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+        tenant: session.tenant(),
+        broker_metadata: BTreeMap::new(),
+    };
+    session
+        .trigger_broker()
+        .register_topic(&topic)
+        .await
+        .expect("broker register");
+    session
+        .topic_repo()
+        .register_topic(&topic)
+        .await
+        .expect("catalog register");
+}
+
+/// Spin up an in-process gRPC server hosting the control plane + the trigger
+/// data plane behind the shared interceptor. Pre-seeds two topics — one bound to
 /// tenant A, one to tenant B — so `ListTopics` returns different results per
 /// session. Returns `(addr, store, shutdown)` plus the `TempDir` guard that
 /// keeps the catalog alive for the duration of the test.
@@ -39,26 +63,20 @@ async fn start_grpc_test_server() -> (
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg = test_config(dir.path());
 
-    // The server's catalog & engine state. Create the session, register one
-    // topic per tenant via the SQL DDL surface. The catalog row carries the
-    // tenant_id from the session binding at registration time.
-    let session = Arc::new(JammiSession::new(cfg).await.expect("session"));
+    // The server's catalog & engine state. Create the engine session, register
+    // one topic per tenant via the typed registration path. The catalog row
+    // carries the tenant_id from the session binding at registration time.
+    let session = Arc::new(InferenceSession::new(cfg).await.expect("session"));
 
     // Topic bound to tenant A.
     session.bind_tenant(tenant_a());
-    session
-        .sql("CREATE TOPIC tenant_a_topic (id BIGINT NOT NULL)")
-        .await
-        .expect("create topic A");
+    seed_topic(&session, "tenant_a_topic").await;
 
     // Topic bound to tenant B.
     session.bind_tenant(tenant_b());
-    session
-        .sql("CREATE TOPIC tenant_b_topic (id BIGINT NOT NULL)")
-        .await
-        .expect("create topic B");
+    seed_topic(&session, "tenant_b_topic").await;
 
-    // Restore unscoped binding so the trigger service uses the per-request
+    // Restore unscoped binding so the control plane uses the per-request
     // tenant from the interceptor, not the session's last value.
     session.unbind_tenant();
 
@@ -78,6 +96,9 @@ async fn start_grpc_test_server() -> (
     let store_for_server = store.clone();
     let flight_ctx = session.context().clone();
     let binding = session.tenant_binding_arc();
+    // The control plane's `ListTopics` is engine-backed, so the engine must be
+    // mounted: it carries the topic catalog + broker the typed verb resolves.
+    let engine = Arc::clone(&session);
     let handle = tokio::spawn(async move {
         jammi_server::runtime::serve_grpc_chain(
             jammi_server::runtime::GrpcChain {
@@ -86,7 +107,7 @@ async fn start_grpc_test_server() -> (
                 flight_binding: binding,
                 store: store_for_server,
                 trigger: Some(trigger),
-                engine: None,
+                engine: Some(engine),
                 tiers: jammi_server::tiers::TierSet::resolve([
                     jammi_server::tiers::ServiceTier::Event,
                 ])
@@ -111,7 +132,7 @@ async fn set_tenant(
     session_id: &str,
     tenant_id: &str,
 ) -> Result<(), tonic::Status> {
-    let mut client = SessionServiceClient::with_interceptor(channel, with_session(session_id));
+    let mut client = CatalogServiceClient::with_interceptor(channel, with_session(session_id));
     client
         .set_tenant(SetTenantRequest {
             tenant: Some(Tenant {
@@ -123,7 +144,7 @@ async fn set_tenant(
 }
 
 async fn list_topics(channel: Channel, session_id: &str) -> Vec<String> {
-    let mut client = TriggerServiceClient::with_interceptor(channel, with_session(session_id));
+    let mut client = CatalogServiceClient::with_interceptor(channel, with_session(session_id));
     let response = client
         .list_topics(ListTopicsRequest::default())
         .await
@@ -195,9 +216,9 @@ async fn grpc_unset_session_sees_only_global_topics() {
     let channel = channel(addr).await;
 
     // No SetTenant call. The interceptor sees no session and attaches a
-    // SessionTenant(None) extension; the TriggerService filters to topics
-    // whose tenant_id IS NULL. The fixture pre-seeds zero global topics,
-    // so the response is empty.
+    // SessionTenant(None) extension; the control plane filters to topics whose
+    // tenant_id IS NULL. The fixture pre-seeds zero global topics, so the
+    // response is empty.
     let topics = list_topics(channel, "session-c-unbound").await;
     assert!(
         topics.is_empty(),

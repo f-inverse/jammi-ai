@@ -1,12 +1,11 @@
 //! CLI integration tests for `jammi trigger`.
 //!
-//! Drive the trigger surface end-to-end through the binary boundary against a
-//! hermetic `jammi-server` (default SQLite catalog + in-memory broker) reached
-//! over `--target`: the `--topic` flag, `--json-file` / `--row` mutual
-//! exclusion, and the `--no-follow` replay-only drain (which rides the server's
-//! finite replay path so the stream terminates).
-
-use tempfile::TempDir;
+//! The strict client CLI exposes only the control-plane topic-admin verbs —
+//! `register` / `drop` / `list`. The data-plane `publish` / `subscribe` compute
+//! verbs are intentionally not on the CLI. These tests drive the admin surface
+//! end-to-end through the binary boundary against a hermetic `jammi-server`
+//! (default SQLite catalog + in-memory broker) reached over `--target`, and pin
+//! the absence of the data-plane subcommands.
 
 use crate::server_harness::TestServer;
 
@@ -26,275 +25,79 @@ fn register_topic(server: &TestServer, name: &str) {
 }
 
 #[test]
-fn cli_trigger_publish_uses_topic_flag() {
+fn cli_trigger_register_then_list_then_drop() {
     let server = TestServer::spawn();
     register_topic(&server, "events.changes");
 
+    // `list` shows the registered topic with its columns.
     server
         .cli()
-        .args([
-            "trigger",
-            "publish",
-            "--topic",
-            "events.changes",
-            "--row",
-            r#"{"op":"c","ts_ms":1,"key":"a"}"#,
-        ])
+        .args(["trigger", "list"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("Published offset"));
-}
+        .stdout(predicates::str::contains("events.changes"));
 
-#[test]
-fn cli_trigger_publish_rejects_topic_legacy_alias() {
-    // `--name` was the pre-cp9 flag; the rename is intentionally clean.
-    let server = TestServer::spawn();
-    register_topic(&server, "events.changes");
-
-    let out = server
-        .cli()
-        .args([
-            "trigger",
-            "publish",
-            "--name",
-            "events.changes",
-            "--row",
-            r#"{"op":"c","ts_ms":1,"key":"a"}"#,
-        ])
-        .output()
-        .expect("run publish");
-    assert!(
-        !out.status.success(),
-        "publish must not accept legacy --name flag"
-    );
-}
-
-#[test]
-fn cli_trigger_publish_accepts_json_file() {
-    let server = TestServer::spawn();
-    register_topic(&server, "events.changes");
-    let dir = TempDir::new().expect("tempdir");
-    let payload = dir.path().join("rows.json");
-    std::fs::write(
-        &payload,
-        r#"[
-            {"op":"c","ts_ms":1,"key":"a"},
-            {"op":"u","ts_ms":2,"key":"a"}
-        ]"#,
-    )
-    .unwrap();
-
+    // `drop` removes it; a subsequent `list` no longer shows it.
     server
         .cli()
-        .args([
-            "trigger",
-            "publish",
-            "--topic",
-            "events.changes",
-            "--json-file",
-            payload.to_str().unwrap(),
-        ])
+        .args(["trigger", "drop", "--name", "events.changes"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("Published offset"));
-}
-
-#[test]
-fn cli_trigger_publish_rejects_row_and_json_file_together() {
-    let server = TestServer::spawn();
-    register_topic(&server, "events.changes");
-    let dir = TempDir::new().expect("tempdir");
-    let payload = dir.path().join("rows.json");
-    std::fs::write(&payload, r#"[{"op":"c","ts_ms":1,"key":"a"}]"#).unwrap();
+        .stdout(predicates::str::contains("dropped"));
 
     let out = server
         .cli()
-        .args([
-            "trigger",
-            "publish",
-            "--topic",
-            "events.changes",
-            "--row",
-            r#"{"op":"c","ts_ms":1,"key":"a"}"#,
-            "--json-file",
-            payload.to_str().unwrap(),
-        ])
+        .args(["trigger", "list"])
         .output()
-        .expect("run publish");
-    assert!(
-        !out.status.success(),
-        "publish must reject --row and --json-file simultaneously"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.to_lowercase().contains("cannot be used")
-            || stderr.to_lowercase().contains("conflict")
-            || stderr.contains("--row")
-            || stderr.contains("--json-file"),
-        "stderr must explain the conflict:\n{stderr}"
-    );
-}
-
-#[test]
-fn cli_trigger_publish_rejects_neither_input() {
-    let server = TestServer::spawn();
-    register_topic(&server, "events.changes");
-
-    let out = server
-        .cli()
-        .args(["trigger", "publish", "--topic", "events.changes"])
-        .output()
-        .expect("run publish");
-    assert!(
-        !out.status.success(),
-        "publish must require one of --row / --json-file"
-    );
-}
-
-#[test]
-fn cli_trigger_publish_rejects_malformed_json_file() {
-    let server = TestServer::spawn();
-    register_topic(&server, "events.changes");
-    let dir = TempDir::new().expect("tempdir");
-    let payload = dir.path().join("rows.json");
-    std::fs::write(&payload, "not json").unwrap();
-
-    let out = server
-        .cli()
-        .args([
-            "trigger",
-            "publish",
-            "--topic",
-            "events.changes",
-            "--json-file",
-            payload.to_str().unwrap(),
-        ])
-        .output()
-        .expect("run publish");
-    assert!(!out.status.success(), "publish must reject malformed json");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("parse json file"),
-        "stderr must mention parse failure:\n{stderr}"
-    );
-}
-
-#[test]
-fn cli_trigger_subscribe_uses_topic_flag() {
-    let server = TestServer::spawn();
-    register_topic(&server, "events.changes");
-
-    // Legacy --name flag must be rejected (clean rename).
-    let out = server
-        .cli()
-        .args([
-            "trigger",
-            "subscribe",
-            "--name",
-            "events.changes",
-            "--no-follow",
-        ])
-        .output()
-        .expect("run subscribe");
-    assert!(
-        !out.status.success(),
-        "subscribe must not accept legacy --name flag"
-    );
-}
-
-#[test]
-fn cli_trigger_subscribe_no_follow_drains_replay() {
-    let server = TestServer::spawn();
-    register_topic(&server, "events.changes");
-
-    // Publish two batches so the replay window is non-empty.
-    server
-        .cli()
-        .args([
-            "trigger",
-            "publish",
-            "--topic",
-            "events.changes",
-            "--row",
-            r#"{"op":"c","ts_ms":1,"key":"row-1"}"#,
-        ])
-        .assert()
-        .success();
-    server
-        .cli()
-        .args([
-            "trigger",
-            "publish",
-            "--topic",
-            "events.changes",
-            "--row",
-            r#"{"op":"u","ts_ms":2,"key":"row-1"}"#,
-        ])
-        .assert()
-        .success();
-
-    let out = server
-        .cli()
-        .args([
-            "trigger",
-            "subscribe",
-            "--topic",
-            "events.changes",
-            "--from-offset",
-            "0",
-            "--no-follow",
-        ])
-        .output()
-        .expect("run subscribe --no-follow");
-    assert!(
-        out.status.success(),
-        "subscribe --no-follow should exit cleanly after draining replay; stderr={}",
-        String::from_utf8_lossy(&out.stderr),
-    );
+        .expect("run list");
+    assert!(out.status.success(), "list after drop must succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("\"op\":\"c\"") && stdout.contains("\"op\":\"u\""),
-        "replay should emit both rows:\n{stdout}"
-    );
-    // Exactly two delivered rows, exactly two offsets.
-    assert_eq!(
-        stdout.matches("\"offset\":0").count(),
-        1,
-        "offset 0 delivered exactly once:\n{stdout}"
-    );
-    assert_eq!(
-        stdout.matches("\"offset\":1").count(),
-        1,
-        "offset 1 delivered exactly once:\n{stdout}"
+        !stdout.contains("events.changes"),
+        "dropped topic must not appear in `trigger list`:\n{stdout}"
     );
 }
 
 #[test]
-fn cli_trigger_subscribe_no_follow_empty_topic() {
+fn cli_trigger_drop_missing_errors_without_if_exists() {
     let server = TestServer::spawn();
-    register_topic(&server, "events.changes");
 
     let out = server
         .cli()
-        .args([
-            "trigger",
-            "subscribe",
-            "--topic",
-            "events.changes",
-            "--from-offset",
-            "0",
-            "--no-follow",
-        ])
+        .args(["trigger", "drop", "--name", "no.such.topic"])
         .output()
-        .expect("run subscribe --no-follow on empty topic");
+        .expect("run drop");
     assert!(
-        out.status.success(),
-        "subscribe --no-follow on empty topic should exit cleanly; stderr={}",
-        String::from_utf8_lossy(&out.stderr),
+        !out.status.success(),
+        "dropping a missing topic without --if-exists must fail"
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.is_empty(),
-        "empty replay window must print zero rows; got:\n{stdout}"
-    );
+}
+
+#[test]
+fn cli_trigger_drop_missing_with_if_exists_is_noop() {
+    let server = TestServer::spawn();
+
+    server
+        .cli()
+        .args(["trigger", "drop", "--name", "no.such.topic", "--if-exists"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn cli_trigger_has_no_data_plane_subcommands() {
+    let server = TestServer::spawn();
+    register_topic(&server, "events.changes");
+
+    for verb in ["publish", "subscribe"] {
+        let out = server
+            .cli()
+            .args(["trigger", verb, "--topic", "events.changes"])
+            .output()
+            .expect("run removed trigger subcommand");
+        assert!(
+            !out.status.success(),
+            "`trigger {verb}` must not exist on the strict client CLI"
+        );
+    }
 }

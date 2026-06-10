@@ -11,7 +11,7 @@
 //!   call returns the *exact* [`JammiError`](jammi_db::error::JammiError)
 //!   variant the in-process path would — never a lossy gRPC-code-category guess.
 //! * **Tenant over the wire.** The tenant trio maps to
-//!   `SessionService.SetTenant` / `GetTenant` / `ClearTenant`; the binding is
+//!   `CatalogService.SetTenant` / `GetTenant` / `ClearTenant`; the binding is
 //!   keyed by an opaque per-session id carried in the
 //!   [`SESSION_HEADER`](crate::wire::SESSION_HEADER), never in a request body.
 //! * **Shared conversions.** Request encode / response decode reuse the
@@ -63,37 +63,29 @@ use crate::wire::proto::audit::audit_service_client::AuditServiceClient;
 use crate::wire::proto::audit::{
     AuditFetchByQueryIdRequest, AuditFetchRecentRequest, AuditLogRequest,
 };
-use crate::wire::proto::channel::channel_service_client::ChannelServiceClient;
-use crate::wire::proto::channel::{
-    AddChannelColumnsRequest, ListChannelsRequest, RegisterChannelRequest,
+use crate::wire::proto::catalog::catalog_service_client::CatalogServiceClient;
+use crate::wire::proto::catalog::{
+    AddChannelColumnsRequest, AddSourceRequest, CreateMutableTableRequest, DescribeModelRequest,
+    DescribeSourceRequest, DropMutableTableRequest, DropTopicRequest, ListChannelsRequest,
+    ListModelsRequest, ListMutableTablesRequest, ListSourcesRequest, ListTopicsRequest,
+    RegisterChannelRequest, RegisterTopicRequest, RemoveSourceRequest, SetTenantRequest, Tenant,
 };
 use crate::wire::proto::embedding::embedding_service_client::EmbeddingServiceClient;
 use crate::wire::proto::embedding::{
     encode_query_request::Input as ProtoEncodeInput, search_request::Query as ProtoSearchQuery,
-    AddSourceRequest, DescribeSourceRequest, EncodeQueryRequest, GenerateEmbeddingsRequest,
-    ListModelsRequest, ListSourcesRequest, QueryVector, RemoveSourceRequest, SearchRequest,
-    SearchResponse,
+    EncodeQueryRequest, GenerateEmbeddingsRequest, QueryVector, SearchRequest, SearchResponse,
 };
 use crate::wire::proto::eval as eval_pb;
 use crate::wire::proto::eval::eval_service_client::EvalServiceClient;
 use crate::wire::proto::inference::inference_service_client::InferenceServiceClient;
 use crate::wire::proto::inference::InferRequest;
-use crate::wire::proto::mutable_table::mutable_table_service_client::MutableTableServiceClient;
-use crate::wire::proto::mutable_table::{
-    CreateMutableTableRequest, DropMutableTableRequest, ListMutableTablesRequest,
-};
-use crate::wire::proto::session::session_service_client::SessionServiceClient;
-use crate::wire::proto::session::{SetTenantRequest, Tenant};
 use crate::wire::proto::training::training_service_client::TrainingServiceClient;
 use crate::wire::proto::training::{
     start_training_request::Spec as ProtoTrainingSpec, FineTuneSpec, StartTrainingRequest,
     TrainingStatusRequest,
 };
 use crate::wire::proto::trigger::trigger_service_client::TriggerServiceClient;
-use crate::wire::proto::trigger::{
-    DropTopicRequest, ListTopicsRequest, PublishRequest, RegisterTopicRequest, SubscribeRequest,
-    TopicName,
-};
+use crate::wire::proto::trigger::{PublishRequest, SubscribeRequest, TopicName};
 use crate::wire::{
     audit_error_from_status, channel_from_proto, cohorts_to_proto, columns_to_proto,
     config_to_proto, decode_ipc_stream, decode_subscribed_batch, definition_list_from_proto,
@@ -171,8 +163,12 @@ impl RemoteSession {
         EmbeddingServiceClient::with_interceptor(self.channel.clone(), self.header.clone())
     }
 
-    fn session_client(&self) -> SessionServiceClient<InterceptedService<Channel, SessionHeader>> {
-        SessionServiceClient::with_interceptor(self.channel.clone(), self.header.clone())
+    /// The control-plane client: the tenant trio + server-info handshake, the
+    /// source/model registry verbs, the channel-declaration verbs, the
+    /// mutable-table lifecycle, and the topic-admin verbs all land here, mirroring
+    /// the server's single [`CatalogService`].
+    fn catalog_client(&self) -> CatalogServiceClient<InterceptedService<Channel, SessionHeader>> {
+        CatalogServiceClient::with_interceptor(self.channel.clone(), self.header.clone())
     }
 
     fn inference_client(
@@ -187,16 +183,6 @@ impl RemoteSession {
 
     fn training_client(&self) -> TrainingServiceClient<InterceptedService<Channel, SessionHeader>> {
         TrainingServiceClient::with_interceptor(self.channel.clone(), self.header.clone())
-    }
-
-    fn mutable_table_client(
-        &self,
-    ) -> MutableTableServiceClient<InterceptedService<Channel, SessionHeader>> {
-        MutableTableServiceClient::with_interceptor(self.channel.clone(), self.header.clone())
-    }
-
-    fn channel_client(&self) -> ChannelServiceClient<InterceptedService<Channel, SessionHeader>> {
-        ChannelServiceClient::with_interceptor(self.channel.clone(), self.header.clone())
     }
 
     fn trigger_client(&self) -> TriggerServiceClient<InterceptedService<Channel, SessionHeader>> {
@@ -215,7 +201,7 @@ impl RemoteSession {
         source_type: SourceType,
         connection: SourceConnection,
     ) -> Result<()> {
-        self.embedding_client()
+        self.catalog_client()
             .add_source(AddSourceRequest {
                 source_id: source_id.to_string(),
                 source_kind: source_type_to_proto(source_type) as i32,
@@ -227,7 +213,7 @@ impl RemoteSession {
     }
 
     pub(crate) async fn remove_source(&self, source_id: &str) -> Result<()> {
-        self.embedding_client()
+        self.catalog_client()
             .remove_source(RemoveSourceRequest {
                 source_id: source_id.to_string(),
             })
@@ -238,7 +224,7 @@ impl RemoteSession {
 
     pub(crate) async fn list_sources(&self) -> Result<Vec<SourceDescriptor>> {
         let resp = self
-            .embedding_client()
+            .catalog_client()
             .list_sources(ListSourcesRequest {})
             .await
             .map_err(|s| error_from_status(&s))?
@@ -253,7 +239,7 @@ impl RemoteSession {
 
     pub(crate) async fn list_models(&self) -> Result<Vec<ModelRecord>> {
         let resp = self
-            .embedding_client()
+            .catalog_client()
             .list_models(ListModelsRequest {})
             .await
             .map_err(|s| error_from_status(&s))?
@@ -267,6 +253,26 @@ impl RemoteSession {
             .collect()
     }
 
+    pub(crate) async fn describe_model(&self, model_id: &str) -> Result<Option<ModelRecord>> {
+        // The wire verb returns a `Model` for a present model and a `NotFound`
+        // status for an absent one; the remote arm maps that one status code back
+        // to `None` so the verb's `Option` shape matches the in-process path,
+        // while any other failure decodes to its faithful `JammiError`.
+        match self
+            .catalog_client()
+            .describe_model(DescribeModelRequest {
+                model_id: model_id.to_string(),
+            })
+            .await
+        {
+            Ok(resp) => model_from_proto(resp.into_inner())
+                .map(Some)
+                .map_err(|s| error_from_status(&s)),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(status) => Err(error_from_status(&status)),
+        }
+    }
+
     pub(crate) async fn describe_source(
         &self,
         source_id: &str,
@@ -277,7 +283,7 @@ impl RemoteSession {
         // in-process path, while any other failure decodes to its faithful
         // `JammiError`.
         match self
-            .embedding_client()
+            .catalog_client()
             .describe_source(DescribeSourceRequest {
                 source_id: source_id.to_string(),
             })
@@ -293,7 +299,7 @@ impl RemoteSession {
 
     pub(crate) async fn server_info(&self) -> Result<ServerInfo> {
         let resp = self
-            .session_client()
+            .catalog_client()
             .get_server_info(())
             .await
             .map_err(|s| error_from_status(&s))?
@@ -602,7 +608,7 @@ impl RemoteSession {
     ) -> Result<MutableTableId> {
         let definition = definition_to_proto(&def).map_err(|s| error_from_status(&s))?;
         let resp = self
-            .mutable_table_client()
+            .catalog_client()
             .create_mutable_table(CreateMutableTableRequest {
                 definition: Some(definition),
             })
@@ -613,7 +619,7 @@ impl RemoteSession {
     }
 
     pub(crate) async fn drop_mutable_table(&self, id: &MutableTableId) -> Result<()> {
-        self.mutable_table_client()
+        self.catalog_client()
             .drop_mutable_table(DropMutableTableRequest {
                 mutable_table_id: id.to_string(),
             })
@@ -624,7 +630,7 @@ impl RemoteSession {
 
     pub(crate) async fn list_mutable_tables(&self) -> Result<Vec<MutableTableDefinition>> {
         let resp = self
-            .mutable_table_client()
+            .catalog_client()
             .list_mutable_tables(ListMutableTablesRequest {})
             .await
             .map_err(|s| error_from_status(&s))?
@@ -641,7 +647,7 @@ impl RemoteSession {
     // --- channels --------------------------------------------------------
 
     pub(crate) async fn register_channel(&self, spec: &ChannelSpec) -> Result<()> {
-        self.channel_client()
+        self.catalog_client()
             .register_channel(RegisterChannelRequest {
                 channel_id: spec.id.as_str().to_string(),
                 priority: spec.priority,
@@ -657,7 +663,7 @@ impl RemoteSession {
         channel: &ChannelId,
         new_columns: &[ChannelColumn],
     ) -> Result<()> {
-        self.channel_client()
+        self.catalog_client()
             .add_channel_columns(AddChannelColumnsRequest {
                 channel_id: channel.as_str().to_string(),
                 columns: columns_to_proto(new_columns),
@@ -669,7 +675,7 @@ impl RemoteSession {
 
     pub(crate) async fn list_channels(&self) -> Result<Vec<ChannelSpec>> {
         let resp = self
-            .channel_client()
+            .catalog_client()
             .list_channels(ListChannelsRequest {})
             .await
             .map_err(|s| error_from_status(&s))?
@@ -685,7 +691,7 @@ impl RemoteSession {
     // --- tenant ----------------------------------------------------------
 
     pub(crate) async fn bind_tenant(&self, t: TenantId) -> Result<()> {
-        self.session_client()
+        self.catalog_client()
             .set_tenant(SetTenantRequest {
                 tenant: Some(Tenant { id: t.to_string() }),
             })
@@ -695,7 +701,7 @@ impl RemoteSession {
     }
 
     pub(crate) async fn unbind_tenant(&self) -> Result<()> {
-        self.session_client()
+        self.catalog_client()
             .clear_tenant(())
             .await
             .map_err(|s| error_from_status(&s))?;
@@ -704,7 +710,7 @@ impl RemoteSession {
 
     pub(crate) async fn tenant(&self) -> Result<Option<TenantId>> {
         let resp = self
-            .session_client()
+            .catalog_client()
             .get_tenant(())
             .await
             .map_err(|s| error_from_status(&s))?
@@ -718,7 +724,7 @@ impl RemoteSession {
             .map_err(|e| JammiError::Tenant(format!("invalid tenant id from server: {e}")))
     }
 
-    // --- trigger ---------------------------------------------------------
+    // --- topics (control plane) ------------------------------------------
 
     pub(crate) async fn register_topic(
         &self,
@@ -726,7 +732,7 @@ impl RemoteSession {
     ) -> std::result::Result<(), TriggerError> {
         let schema =
             encode_ipc_stream(&topic.schema, &[]).map_err(|s| trigger_error_from_status(&s))?;
-        self.trigger_client()
+        self.catalog_client()
             .register_topic(RegisterTopicRequest {
                 name: topic.name.clone(),
                 schema,
@@ -744,7 +750,7 @@ impl RemoteSession {
         &self,
     ) -> std::result::Result<Vec<TopicDefinition>, TriggerError> {
         let resp = self
-            .trigger_client()
+            .catalog_client()
             .list_topics(ListTopicsRequest {
                 page_size: 0,
                 page_token: String::new(),
@@ -768,7 +774,7 @@ impl RemoteSession {
         &self,
         topic_id: TopicId,
     ) -> std::result::Result<(), TriggerError> {
-        self.trigger_client()
+        self.catalog_client()
             .drop_topic(DropTopicRequest {
                 topic_id: topic_id.to_string(),
                 if_exists: false,
@@ -777,6 +783,8 @@ impl RemoteSession {
             .map_err(|s| trigger_error_from_status(&s))?;
         Ok(())
     }
+
+    // --- trigger (publish / subscribe) -----------------------------------
 
     pub(crate) async fn publish(
         &self,

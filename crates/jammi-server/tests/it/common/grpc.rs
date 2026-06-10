@@ -153,6 +153,18 @@ pub async fn start_engine_server_with_tiers(tiers: jammi_server::tiers::TierSet)
     }
 }
 
+/// A control-plane client over `addr`. Source registration / model + topic /
+/// channel / mutable introspection all live on `CatalogService`, so the
+/// engine-backed test suites build one of these to register the sources their
+/// compute verbs then read.
+pub async fn catalog_client(
+    addr: SocketAddr,
+) -> jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient<Channel> {
+    jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient::new(
+        channel(addr).await,
+    )
+}
+
 /// Build a request-extending interceptor closure that injects the
 /// `jammi-session-id` header on every outgoing request. This is the test
 /// counterpart to [`jammi_server::grpc::session::TenantInterceptor`]: the

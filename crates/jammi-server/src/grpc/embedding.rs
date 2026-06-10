@@ -4,8 +4,6 @@
 //! [`Session`]/[`LocalSession`] abstraction (never raw [`InferenceSession`]
 //! calls): proto in, one `Session` method, proto out.
 //!
-//! * `AddSource` / `RemoveSource` — register / drop a data source (peers of
-//!   `Session::add_source` / `Session::remove_source`).
 //! * `GenerateEmbeddings` — scan a source's `columns`, run the modality's
 //!   tower, persist one vector per row (peer of `Session::generate_embeddings`,
 //!   keyed by [`Modality`]).
@@ -15,6 +13,10 @@
 //!   precomputed vector or an existing row's key (peer of the abstraction's
 //!   flat `Session::search`). This is the embedding-consumption verb on the
 //!   gRPC-web transport edge runtimes reach; it adds no new consumption model.
+//!
+//! These are the data-plane compute verbs; source registration and model
+//! introspection — the control-plane catalog surface this lane reads — live on
+//! [`CatalogService`](crate::grpc::catalog).
 //!
 //! The abstraction dispatches each [`Modality`] onto the engine's concrete
 //! tower method; this module reimplements no embedding logic. Modality and
@@ -32,9 +34,8 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
-use jammi_ai::wire::{source_type_from_proto, ProtoQueryInput};
+use jammi_ai::wire::ProtoQueryInput;
 use jammi_ai::{LocalSession, Modality, SearchQuery, SearchRequest as SessionSearch, Session};
-use jammi_db::source::SourceConnection;
 use tonic::{Request, Response, Status};
 
 use std::collections::HashMap;
@@ -42,14 +43,10 @@ use std::collections::HashMap;
 use arrow::array::{Array, Float32Array, RecordBatch, StringArray};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 
-use jammi_ai::wire::model_to_proto;
-
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingService;
 use crate::grpc::proto::embedding::{
-    search_request::Query as ProtoQuery, AddSourceRequest, DescribeSourceRequest,
-    EncodeQueryRequest, EncodeQueryResponse, GenerateEmbeddingsRequest, ListModelsRequest,
-    ListModelsResponse, ListSourcesRequest, ListSourcesResponse, RemoveSourceRequest, ResultTable,
-    SearchHit, SearchRequest, SearchResponse, SourceDescriptor,
+    search_request::Query as ProtoQuery, EncodeQueryRequest, EncodeQueryResponse,
+    GenerateEmbeddingsRequest, ResultTable, SearchHit, SearchRequest, SearchResponse,
 };
 use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant};
 
@@ -76,97 +73,6 @@ impl EmbeddingServer {
 
 #[tonic::async_trait]
 impl EmbeddingService for EmbeddingServer {
-    async fn add_source(&self, request: Request<AddSourceRequest>) -> Result<Response<()>, Status> {
-        let tenant = session_tenant(&request);
-        let req = request.into_inner();
-        require_nonempty(&req.source_id, "source_id")?;
-        let source_type = source_type_from_proto(req.source_kind)?;
-        let connection: SourceConnection = req
-            .connection
-            .ok_or_else(|| Status::invalid_argument("connection is required"))?
-            .try_into()?;
-        let session = self.local();
-
-        scoped(&self.session, tenant, || {
-            session.add_source(&req.source_id, source_type, connection)
-        })
-        .await
-        .map_err(map_engine_error)?;
-        Ok(Response::new(()))
-    }
-
-    async fn remove_source(
-        &self,
-        request: Request<RemoveSourceRequest>,
-    ) -> Result<Response<()>, Status> {
-        let tenant = session_tenant(&request);
-        let req = request.into_inner();
-        require_nonempty(&req.source_id, "source_id")?;
-        let session = self.local();
-
-        scoped(&self.session, tenant, || {
-            session.remove_source(&req.source_id)
-        })
-        .await
-        .map_err(map_engine_error)?;
-        Ok(Response::new(()))
-    }
-
-    async fn list_sources(
-        &self,
-        request: Request<ListSourcesRequest>,
-    ) -> Result<Response<ListSourcesResponse>, Status> {
-        let tenant = session_tenant(&request);
-        let session = self.local();
-
-        let descriptors = scoped(&self.session, tenant, || session.list_sources())
-            .await
-            .map_err(map_engine_error)?;
-
-        let sources = descriptors
-            .into_iter()
-            .map(SourceDescriptor::from)
-            .collect();
-        Ok(Response::new(ListSourcesResponse { sources }))
-    }
-
-    async fn list_models(
-        &self,
-        request: Request<ListModelsRequest>,
-    ) -> Result<Response<ListModelsResponse>, Status> {
-        let tenant = session_tenant(&request);
-        let session = self.local();
-
-        let records = scoped(&self.session, tenant, || session.list_models())
-            .await
-            .map_err(map_engine_error)?;
-
-        let models = records.iter().map(model_to_proto).collect();
-        Ok(Response::new(ListModelsResponse { models }))
-    }
-
-    async fn describe_source(
-        &self,
-        request: Request<DescribeSourceRequest>,
-    ) -> Result<Response<SourceDescriptor>, Status> {
-        let tenant = session_tenant(&request);
-        let req = request.into_inner();
-        require_nonempty(&req.source_id, "source_id")?;
-        let session = self.local();
-
-        // An absent source returns NotFound — the truthful "no such source for
-        // this tenant" the remote arm maps back to `None`, never a faked empty
-        // descriptor.
-        let descriptor = scoped(&self.session, tenant, || {
-            session.describe_source(&req.source_id)
-        })
-        .await
-        .map_err(map_engine_error)?
-        .ok_or_else(|| Status::not_found(format!("source '{}' not found", req.source_id)))?;
-
-        Ok(Response::new(SourceDescriptor::from(descriptor)))
-    }
-
     async fn generate_embeddings(
         &self,
         request: Request<GenerateEmbeddingsRequest>,

@@ -25,12 +25,14 @@ use arrow::array::{ArrayRef, BinaryArray, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use jammi_ai::session::InferenceSession;
+use jammi_server::grpc::proto::catalog::{
+    AddSourceRequest, FileFormat, RemoveSourceRequest, SourceConnection, SourceKind,
+};
 use jammi_server::grpc::proto::embedding::embedding_service_client::EmbeddingServiceClient;
 use jammi_server::grpc::proto::embedding::encode_query_request::Input as EncodeInput;
 use jammi_server::grpc::proto::embedding::search_request::Query as SearchQuery;
 use jammi_server::grpc::proto::embedding::{
-    AddSourceRequest, EncodeQueryRequest, FileFormat, GenerateEmbeddingsRequest, Modality,
-    QueryVector, RemoveSourceRequest, SearchRequest, SourceConnection, SourceKind,
+    EncodeQueryRequest, GenerateEmbeddingsRequest, Modality, QueryVector, SearchRequest,
 };
 use jammi_server::grpc::session::SessionStore;
 use jammi_test_utils::{cookbook_fixture, fixture, test_config};
@@ -39,7 +41,7 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-use super::common::grpc::channel;
+use super::common::grpc::{catalog_client, channel};
 
 fn htsat_clap_model_id() -> String {
     format!("local:{}", cookbook_fixture("htsat_clap_tiny").display())
@@ -165,7 +167,8 @@ async fn generate_and_encode_audio_modality_over_the_wire() {
     let mut client = EmbeddingServiceClient::new(channel(addr).await);
 
     // AddSource — register the synthetic corpus parquet.
-    client
+    catalog_client(addr)
+        .await
         .add_source(AddSourceRequest {
             source_id: "clips".into(),
             source_kind: SourceKind::File as i32,
@@ -234,7 +237,8 @@ async fn generate_and_encode_text_modality_over_the_wire() {
     let mut client = EmbeddingServiceClient::new(channel(addr).await);
 
     // AddSource — the patents fixture, embedded over its `abstract` column.
-    client
+    catalog_client(addr)
+        .await
         .add_source(AddSourceRequest {
             source_id: "patents".into(),
             source_kind: SourceKind::File as i32,
@@ -298,11 +302,13 @@ async fn generate_and_encode_text_modality_over_the_wire() {
 /// Register the synthetic corpus and embed it (AUDIO modality). Shared setup
 /// for the `Search` wire tests.
 async fn embed_corpus(
+    addr: SocketAddr,
     client: &mut EmbeddingServiceClient<tonic::transport::Channel>,
     dir: &TempDir,
 ) {
     let parquet_path = write_corpus_parquet(dir);
-    client
+    catalog_client(addr)
+        .await
         .add_source(AddSourceRequest {
             source_id: "clips".into(),
             source_kind: SourceKind::File as i32,
@@ -346,7 +352,7 @@ async fn encode_audio_query(
 async fn search_by_query_vector_ranks_self_match_first_over_the_wire() {
     let (addr, shutdown, dir, handle) = start_embedding_server().await;
     let mut client = EmbeddingServiceClient::new(channel(addr).await);
-    embed_corpus(&mut client, &dir).await;
+    embed_corpus(addr, &mut client, &dir).await;
 
     // Encode clip_1's tone and search by that vector: clip_1 must rank first
     // (a clip is its own nearest neighbor under cosine similarity).
@@ -384,7 +390,7 @@ async fn search_by_query_vector_ranks_self_match_first_over_the_wire() {
 async fn search_by_row_key_ranks_that_row_first_over_the_wire() {
     let (addr, shutdown, dir, handle) = start_embedding_server().await;
     let mut client = EmbeddingServiceClient::new(channel(addr).await);
-    embed_corpus(&mut client, &dir).await;
+    embed_corpus(addr, &mut client, &dir).await;
 
     // Query-by-example: the engine resolves clip_2's stored vector internally;
     // the vector never crosses the wire. clip_2 is its own top neighbor.
@@ -411,7 +417,7 @@ async fn search_by_row_key_ranks_that_row_first_over_the_wire() {
 async fn search_applies_filter_and_select_projection_over_the_wire() {
     let (addr, shutdown, dir, handle) = start_embedding_server().await;
     let mut client = EmbeddingServiceClient::new(channel(addr).await);
-    embed_corpus(&mut client, &dir).await;
+    embed_corpus(addr, &mut client, &dir).await;
 
     // Filter pushes a predicate over the hydrated source columns; select
     // projects `clip_id` into each hit's columns map.
@@ -448,11 +454,12 @@ async fn search_applies_filter_and_select_projection_over_the_wire() {
 async fn remove_source_drops_the_source_over_the_wire() {
     let (addr, shutdown, dir, handle) = start_embedding_server().await;
     let mut client = EmbeddingServiceClient::new(channel(addr).await);
-    embed_corpus(&mut client, &dir).await;
+    embed_corpus(addr, &mut client, &dir).await;
 
     // RemoveSource drops the registered source; a search against it then fails
     // because the source no longer resolves.
-    client
+    catalog_client(addr)
+        .await
         .remove_source(RemoveSourceRequest {
             source_id: "clips".into(),
         })
@@ -548,11 +555,11 @@ async fn encode_query_rejects_input_modality_mismatch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn embedding_service_rejects_unspecified_source_kind() {
+async fn catalog_service_rejects_unspecified_source_kind() {
     let (addr, shutdown, _dir, handle) = start_embedding_server().await;
-    let mut client = EmbeddingServiceClient::new(channel(addr).await);
 
-    let err = client
+    let err = catalog_client(addr)
+        .await
         .add_source(AddSourceRequest {
             source_id: "clips".into(),
             source_kind: SourceKind::Unspecified as i32,

@@ -27,15 +27,11 @@ jammi-ai = { workspace = true, default-features = false, features = ["wire"] }
 # the translated `--target` URL. Part of the transport stack the wire surface
 # already pulls; candle-free.
 tonic.workspace = true
-# The trigger publish path builds Arrow `RecordBatch`es from `--row` / JSON, and
-# the trigger predicate is parsed to SQL through a local empty `SessionContext`
-# (parsing only — no catalog), so the CLI keeps arrow + datafusion.
-arrow.workspace = true
+# The trigger-register and mutable-create paths build an Arrow `Schema` from the
+# CLI's inline column spec; `arrow-schema` carries that type alone (no array /
+# compute / datafusion stack — the strict client builds no record batches).
 arrow-schema.workspace = true
-chrono.workspace = true
 clap.workspace = true
-datafusion.workspace = true
-futures.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

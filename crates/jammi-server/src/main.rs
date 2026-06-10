@@ -22,7 +22,7 @@ use jammi_server::telemetry::init_tracing;
 #[command(
     name = "jammi-server",
     version,
-    about = "OSS Jammi server: Arrow Flight SQL, SessionService, TriggerService, and /healthz /readyz /metrics"
+    about = "OSS Jammi server: Arrow Flight SQL, CatalogService, TriggerService, and /healthz /readyz /metrics"
 )]
 struct Cli {
     /// Path to the configuration file. Falls back to `JAMMI_CONFIG`,

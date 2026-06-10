@@ -1,7 +1,7 @@
 //! `jammi sources` subcommand.
 //!
-//! Register and list data sources over the remote [`Session`]. `list` prints
-//! each [`SourceDescriptor`]: its registry identity plus how many embedding
+//! Register and list data sources over the remote `Session`. `list` prints
+//! each `SourceDescriptor`: its registry identity plus how many embedding
 //! result tables have been produced from it.
 
 use clap::Subcommand;

@@ -3,7 +3,7 @@
 //!
 //! The engine-level trigger tests in `crates/jammi-db/tests/it/trigger.rs`
 //! exercise the publisher/subscriber surface directly; this module verifies
-//! the wire path: an in-process Tonic server hosting `SessionService` +
+//! the wire path: an in-process Tonic server hosting `CatalogService` +
 //! `TriggerService` behind the shared `TenantInterceptor`, two client
 //! channels driven through the proto-generated stubs, and the IPC
 //! round-trip on the `ArrowBatch` payload.
@@ -24,10 +24,13 @@ use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::StreamExt;
+use std::collections::BTreeMap;
+
 use jammi_db::session::JammiSession;
+use jammi_db::trigger::{TopicDefinition, TopicId};
 use jammi_db::TenantId;
-use jammi_server::grpc::proto::session::session_service_client::SessionServiceClient;
-use jammi_server::grpc::proto::session::{SetTenantRequest, Tenant};
+use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
+use jammi_server::grpc::proto::catalog::{SetTenantRequest, Tenant};
 use jammi_server::grpc::proto::trigger::trigger_service_client::TriggerServiceClient;
 use jammi_server::grpc::proto::trigger::{
     ArrowBatch, PublishRequest, SubscribeRequest, SubscribedBatch, TopicName,
@@ -121,15 +124,15 @@ fn decode_subscribed_batch(s: &SubscribedBatch, expected: &SchemaRef) -> RecordB
 /// to a specific tenant so `lookup_by_name` filters it.
 struct TopicSeed {
     name: String,
-    schema_ddl: String,
     tenant: Option<TenantId>,
 }
 
 impl TopicSeed {
-    fn new(name: impl Into<String>, schema_ddl: impl Into<String>) -> Self {
+    /// A seed for a topic carrying the module's [`events_schema`] (every test
+    /// here publishes that two-column payload).
+    fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            schema_ddl: schema_ddl.into(),
             tenant: None,
         }
     }
@@ -165,12 +168,10 @@ impl Drop for ServerFixture {
     }
 }
 
-/// Spin up an in-process gRPC server hosting `SessionService` +
+/// Spin up an in-process gRPC server hosting the control plane +
 /// `TriggerService` behind the shared interceptor. Each `TopicSeed` is
-/// registered via the engine's `CREATE TOPIC` DDL path (which provisions
-/// the backing table and registers the broker channel atomically), so the
-/// fixture matches the production code path rather than poking the
-/// `TopicRepo` directly.
+/// registered via the typed dual-registration path (broker driver + catalog) the
+/// `register_topic` verb runs, so the fixture matches the production code path.
 async fn start_grpc_test_server(seeds: &[TopicSeed]) -> ServerFixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg = test_config(dir.path());
@@ -181,8 +182,23 @@ async fn start_grpc_test_server(seeds: &[TopicSeed]) -> ServerFixture {
             Some(t) => session.bind_tenant(t),
             None => session.unbind_tenant(),
         }
-        let ddl = format!("CREATE TOPIC {} ({})", seed.name, seed.schema_ddl);
-        session.sql(&ddl).await.expect("create topic");
+        let topic = TopicDefinition {
+            id: TopicId::new(),
+            name: seed.name.clone(),
+            schema: events_schema(),
+            tenant: session.tenant(),
+            broker_metadata: BTreeMap::new(),
+        };
+        session
+            .trigger_broker()
+            .register_topic(&topic)
+            .await
+            .expect("broker register");
+        session
+            .topic_repo()
+            .register_topic(&topic)
+            .await
+            .expect("catalog register");
     }
     // Restore unscoped binding so the gRPC handler uses the per-request
     // `SessionTenant` from the interceptor rather than whatever the seed
@@ -240,7 +256,7 @@ async fn start_grpc_test_server(seeds: &[TopicSeed]) -> ServerFixture {
     }
 }
 
-/// Bind a tenant to a session via `SessionService.SetTenant`. Returns the
+/// Bind a tenant to a session via `CatalogService.SetTenant`. Returns the
 /// raw tonic `Status` on failure so tests can assert error codes.
 async fn set_tenant_for_session(
     addr: SocketAddr,
@@ -248,7 +264,7 @@ async fn set_tenant_for_session(
     tenant: &str,
 ) -> Result<(), tonic::Status> {
     let mut client =
-        SessionServiceClient::with_interceptor(channel(addr).await, with_session(session_id));
+        CatalogServiceClient::with_interceptor(channel(addr).await, with_session(session_id));
     client
         .set_tenant(SetTenantRequest {
             tenant: Some(Tenant {
@@ -300,11 +316,7 @@ async fn grpc_publish_round_trips_batch_to_backing_table() {
     // replays from the backing table) and confirm the same payload comes
     // back. Together this proves the wire encode/decode + transactional
     // outbox path is round-tripping correctly.
-    let fixture = start_grpc_test_server(&[TopicSeed::new(
-        "events",
-        "id BIGINT NOT NULL, kind TEXT NOT NULL",
-    )])
-    .await;
+    let fixture = start_grpc_test_server(&[TopicSeed::new("events")]).await;
     let ch = channel(fixture.addr).await;
     let mut publish_client =
         TriggerServiceClient::with_interceptor(ch.clone(), with_session("session-rt"));
@@ -361,11 +373,7 @@ async fn grpc_publish_round_trips_batch_to_backing_table() {
 async fn grpc_publish_rejects_schema_mismatch_with_invalid_argument() {
     // Encode a batch whose schema does not match the topic; the server
     // must reject with `InvalidArgument` (per `decode_arrow_batch`).
-    let fixture = start_grpc_test_server(&[TopicSeed::new(
-        "events",
-        "id BIGINT NOT NULL, kind TEXT NOT NULL",
-    )])
-    .await;
+    let fixture = start_grpc_test_server(&[TopicSeed::new("events")]).await;
     let ch = channel(fixture.addr).await;
     let mut client = TriggerServiceClient::with_interceptor(ch, with_session("session-mismatch"));
 
@@ -394,11 +402,7 @@ async fn grpc_publish_rejects_schema_mismatch_with_invalid_argument() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grpc_publish_on_unknown_topic_returns_not_found() {
-    let fixture = start_grpc_test_server(&[TopicSeed::new(
-        "events",
-        "id BIGINT NOT NULL, kind TEXT NOT NULL",
-    )])
-    .await;
+    let fixture = start_grpc_test_server(&[TopicSeed::new("events")]).await;
     let ch = channel(fixture.addr).await;
     let mut client = TriggerServiceClient::with_interceptor(ch, with_session("session-missing"));
 
@@ -427,12 +431,8 @@ async fn grpc_publish_under_session_tenant_is_invisible_to_other_tenant() {
     // Tenant A registers `notifications`; tenant B should not be able to
     // publish or subscribe to that topic name — the catalog lookup is
     // filtered by tenant, so the server returns NotFound.
-    let fixture = start_grpc_test_server(&[TopicSeed::new(
-        "notifications",
-        "id BIGINT NOT NULL, kind TEXT NOT NULL",
-    )
-    .with_tenant(tenant_a())])
-    .await;
+    let fixture =
+        start_grpc_test_server(&[TopicSeed::new("notifications").with_tenant(tenant_a())]).await;
 
     // Tenant A binds, publishes — succeeds.
     set_tenant_for_session(fixture.addr, "session-a", TENANT_A)
@@ -481,11 +481,7 @@ async fn grpc_publish_under_session_tenant_is_invisible_to_other_tenant() {
 async fn grpc_subscribe_receives_subsequent_publishes_in_order() {
     // Attach the subscriber first (no from_offset → live-only), then
     // publish 5 batches, then assert offsets 0..5 arrived in order.
-    let fixture = start_grpc_test_server(&[TopicSeed::new(
-        "events",
-        "id BIGINT NOT NULL, kind TEXT NOT NULL",
-    )])
-    .await;
+    let fixture = start_grpc_test_server(&[TopicSeed::new("events")]).await;
     let ch = channel(fixture.addr).await;
     let mut subscriber =
         TriggerServiceClient::with_interceptor(ch.clone(), with_session("session-live"));
@@ -536,11 +532,7 @@ async fn grpc_subscribe_receives_subsequent_publishes_in_order() {
 async fn grpc_subscribe_with_from_offset_zero_replays_history() {
     // Publish 3 batches *before* subscribing; with from_offset=0 the
     // subscriber must see every one of them via backing-table replay.
-    let fixture = start_grpc_test_server(&[TopicSeed::new(
-        "events",
-        "id BIGINT NOT NULL, kind TEXT NOT NULL",
-    )])
-    .await;
+    let fixture = start_grpc_test_server(&[TopicSeed::new("events")]).await;
     let ch = channel(fixture.addr).await;
     let mut publisher =
         TriggerServiceClient::with_interceptor(ch.clone(), with_session("session-replay"));
@@ -581,11 +573,7 @@ async fn grpc_subscribe_with_from_offset_zero_replays_history() {
 async fn grpc_subscribe_predicate_filters_batches_server_side() {
     // Predicate `kind = 'X'` — odd-indexed publishes (`kind='Y'`) must
     // not arrive. Drives the server-side `Predicate::from_sql` path.
-    let fixture = start_grpc_test_server(&[TopicSeed::new(
-        "events",
-        "id BIGINT NOT NULL, kind TEXT NOT NULL",
-    )])
-    .await;
+    let fixture = start_grpc_test_server(&[TopicSeed::new("events")]).await;
     let ch = channel(fixture.addr).await;
     let mut subscriber =
         TriggerServiceClient::with_interceptor(ch.clone(), with_session("session-pred"));
@@ -640,11 +628,7 @@ async fn grpc_subscribe_predicate_filters_batches_server_side() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grpc_subscribe_invalid_predicate_returns_invalid_argument() {
-    let fixture = start_grpc_test_server(&[TopicSeed::new(
-        "events",
-        "id BIGINT NOT NULL, kind TEXT NOT NULL",
-    )])
-    .await;
+    let fixture = start_grpc_test_server(&[TopicSeed::new("events")]).await;
     let ch = channel(fixture.addr).await;
     let mut client = TriggerServiceClient::with_interceptor(ch, with_session("session-badpred"));
     let err = client
@@ -681,11 +665,7 @@ async fn grpc_subscribe_client_drop_does_not_corrupt_broker_state() {
     // the backing-table sink), the second subscribe would either fail,
     // miss batches, or return them out of order — all of which this
     // test detects deterministically.
-    let fixture = start_grpc_test_server(&[TopicSeed::new(
-        "events",
-        "id BIGINT NOT NULL, kind TEXT NOT NULL",
-    )])
-    .await;
+    let fixture = start_grpc_test_server(&[TopicSeed::new("events")]).await;
     let ch = channel(fixture.addr).await;
     let mut subscriber =
         TriggerServiceClient::with_interceptor(ch.clone(), with_session("session-drop"));
@@ -794,11 +774,7 @@ async fn grpc_subscribe_client_drop_does_not_corrupt_broker_state() {
 async fn grpc_publish_subscribe_round_trip_preserves_order() {
     // Publish 20 batches, drain 20 from the live subscription, assert
     // strict offset ordering 0..20 and matching ids.
-    let fixture = start_grpc_test_server(&[TopicSeed::new(
-        "audit_log_demo",
-        "id BIGINT NOT NULL, kind TEXT NOT NULL",
-    )])
-    .await;
+    let fixture = start_grpc_test_server(&[TopicSeed::new("audit_log_demo")]).await;
     let ch = channel(fixture.addr).await;
     let mut subscriber =
         TriggerServiceClient::with_interceptor(ch.clone(), with_session("session-rt20"));

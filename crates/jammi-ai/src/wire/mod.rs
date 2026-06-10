@@ -31,6 +31,7 @@ use tonic::Status;
 pub mod proto;
 
 mod audit;
+mod catalog;
 mod channel;
 mod embedding;
 mod error;
@@ -47,13 +48,14 @@ mod training;
 mod trigger;
 
 pub use audit::{parse_query_id, record_from_wire};
+pub use catalog::{
+    model_from_proto, model_to_proto, source_descriptor_from_proto, source_type_from_proto,
+    source_type_to_proto, topic_from_proto, topic_to_proto,
+};
 pub use channel::{
     channel_from_proto, channel_to_proto, columns_from_proto, columns_to_proto, parse_channel_id,
 };
-pub use embedding::{
-    model_from_proto, model_to_proto, result_table_from_proto, source_descriptor_from_proto,
-    source_type_from_proto, source_type_to_proto, ProtoQueryInput,
-};
+pub use embedding::{result_table_from_proto, ProtoQueryInput};
 pub use error::{
     attach_audit_detail, attach_error_detail, attach_trigger_detail, audit_error_from_status,
     error_from_status, trigger_error_from_status,
@@ -91,7 +93,7 @@ pub use training::{config_to_proto, method_from_proto, method_to_proto};
 pub use training::{training_spec_from_proto, training_spec_to_proto};
 pub use trigger::{
     decode_publish_batch, decode_subscribed_batch, encode_delivered_batch, encode_publish_batch,
-    from_proto_timestamp, to_proto_timestamp, topic_from_proto, topic_to_proto,
+    from_proto_timestamp, to_proto_timestamp,
 };
 
 /// Header name carrying the opaque session identifier. Clients mint a

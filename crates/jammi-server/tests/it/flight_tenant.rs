@@ -22,8 +22,8 @@ use arrow_flight::sql::client::FlightSqlServiceClient;
 use futures::TryStreamExt;
 use jammi_db::session::JammiSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_server::grpc::proto::session::session_service_client::SessionServiceClient;
-use jammi_server::grpc::proto::session::{SetTenantRequest, Tenant};
+use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
+use jammi_server::grpc::proto::catalog::{SetTenantRequest, Tenant};
 use jammi_server::grpc::session::{SessionStore, SESSION_HEADER};
 use jammi_test_utils::test_config;
 use tempfile::TempDir;
@@ -101,7 +101,7 @@ async fn start_flight_test_server() -> (SocketAddr, TempDir, tokio::task::JoinHa
     drop(listener);
 
     let handle = tokio::spawn(async move {
-        jammi_server::flight::serve_flight_with_session_service(&ctx_clone, binding, addr, store)
+        jammi_server::flight::serve_flight_with_catalog_service(&ctx_clone, binding, addr, store)
             .await
             .expect("flight + session server");
     });
@@ -114,7 +114,7 @@ async fn start_flight_test_server() -> (SocketAddr, TempDir, tokio::task::JoinHa
 
 async fn bind_tenant_via_session_service(addr: SocketAddr, session_id: &str, tenant: &str) {
     let mut client =
-        SessionServiceClient::with_interceptor(channel(addr).await, with_session(session_id));
+        CatalogServiceClient::with_interceptor(channel(addr).await, with_session(session_id));
     client
         .set_tenant(SetTenantRequest {
             tenant: Some(Tenant {
@@ -184,7 +184,7 @@ async fn flight_clearing_tenant_makes_query_unscoped() {
 
     // Clear the binding via the SessionService.
     let mut client =
-        SessionServiceClient::with_interceptor(channel(addr).await, with_session("session-c"));
+        CatalogServiceClient::with_interceptor(channel(addr).await, with_session("session-c"));
     client.clear_tenant(()).await.expect("clear_tenant");
 
     // Subsequent query runs unscoped (Unscoped → IS NULL only). The fixture
@@ -199,7 +199,7 @@ async fn flight_clearing_tenant_makes_query_unscoped() {
 async fn flight_set_tenant_invalid_uuid_returns_invalid_argument() {
     let (addr, _dir, handle) = start_flight_test_server().await;
 
-    let mut client = SessionServiceClient::with_interceptor(
+    let mut client = CatalogServiceClient::with_interceptor(
         channel(addr).await,
         with_session("session-bad-uuid"),
     );

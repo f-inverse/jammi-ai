@@ -538,17 +538,11 @@ async fn remote_subscribe_stream_yields_the_same_batches_as_local() {
     let local = local(&server);
     let topic = events_topic();
 
+    // `Session::register_topic` dual-registers the broker driver's live-tail
+    // channel and the catalog row + backing table, so the subscribe live tail
+    // attaches without a separate broker registration — both sessions share the
+    // same engine.
     local.register_topic(&topic).await.expect("register topic");
-    // `Session::register_topic` registers the catalog row + backing table; the
-    // broker's live-tail channel is provisioned separately (the CREATE TOPIC DDL
-    // path does both). Register it on the broker so the subscribe live tail
-    // attaches — the same engine both sessions share.
-    server
-        .engine
-        .trigger_broker()
-        .register_topic(&topic)
-        .await
-        .expect("broker register");
 
     // Publish one batch first (it lands at offset 0 in the backing table), then
     // open both subscriptions from offset 0. The deterministic backing-table

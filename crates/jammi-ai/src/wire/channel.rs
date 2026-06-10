@@ -1,4 +1,5 @@
-//! `ChannelService` proto↔domain conversions.
+//! Channel-declaration proto↔domain conversions (the `CatalogService`
+//! register/add-columns/list-channel verbs).
 //!
 //! The messages mirror the engine's [`ChannelColumn`] field for field; the
 //! proto [`pb::ChannelColumnType`] mirrors the engine's closed
@@ -10,7 +11,7 @@ use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelS
 use jammi_db::ChannelId;
 use tonic::Status;
 
-use crate::wire::proto::channel as pb;
+use crate::wire::proto::catalog as pb;
 
 /// Parse a wire channel id into the validated [`ChannelId`] newtype.
 pub fn parse_channel_id(id: &str) -> Result<ChannelId, Status> {

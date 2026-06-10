@@ -39,14 +39,12 @@ describe("connect()", () => {
   it("returns a client for every jammi.v1 service over one transport", () => {
     const client = connect("https://engine.invalid");
     // Every service arm is present.
-    expect(client.session).toBeDefined();
+    expect(client.catalog).toBeDefined();
     expect(client.embedding).toBeDefined();
     expect(client.inference).toBeDefined();
     expect(client.eval).toBeDefined();
     expect(client.pipeline).toBeDefined();
     expect(client.training).toBeDefined();
-    expect(client.mutableTable).toBeDefined();
-    expect(client.channel).toBeDefined();
     expect(client.trigger).toBeDefined();
     expect(client.audit).toBeDefined();
   });
@@ -75,14 +73,36 @@ describe("connect()", () => {
 // proving each RPC exists with the right request/response shape.
 async function verbSurface(c: JammiClient): Promise<void> {
   if (Math.random() < 0) {
-    // ── SessionService: the tenant trio ───────────────────────────────────
-    await c.session.setTenant({ tenant: { id: "t-1" } });
-    await c.session.getTenant({});
-    await c.session.clearTenant({});
+    // ── CatalogService: the control plane ─────────────────────────────────
+    // Tenant trio + server-info handshake.
+    await c.catalog.setTenant({ tenant: { id: "t-1" } });
+    await c.catalog.getTenant({});
+    await c.catalog.clearTenant({});
+    await c.catalog.getServerInfo({});
+    // Sources + models.
+    await c.catalog.addSource({ sourceId: "s1" });
+    await c.catalog.removeSource({ sourceId: "s1" });
+    await c.catalog.listSources({});
+    await c.catalog.describeSource({ sourceId: "s1" });
+    await c.catalog.listModels({});
+    await c.catalog.describeModel({ modelId: "m" });
+    // Channels.
+    await c.catalog.registerChannel({ channelId: "ch1" });
+    await c.catalog.addChannelColumns({ channelId: "ch1" });
+    await c.catalog.listChannels({});
+    // Mutable tables.
+    const mt: CreateMutableTableResponse = await c.catalog.createMutableTable({});
+    await c.catalog.dropMutableTable({ mutableTableId: mt.mutableTableId });
+    await c.catalog.listMutableTables({});
+    // Topic admin.
+    const topic: RegisterTopicResponse = await c.catalog.registerTopic({
+      name: "default.events",
+      schema: new Uint8Array(),
+    });
+    await c.catalog.listTopics({ pageSize: 10 });
+    await c.catalog.dropTopic({ topicId: topic.topicId, ifExists: true });
 
-    // ── EmbeddingService: add/remove source, generate, encode, search ─────
-    await c.embedding.addSource({ sourceId: "s1" });
-    await c.embedding.removeSource({ sourceId: "s1" });
+    // ── EmbeddingService: generate, encode, search ────────────────────────
     await c.embedding.generateEmbeddings({
       sourceId: "s1",
       modelId: "local:/m",
@@ -157,21 +177,8 @@ async function verbSurface(c: JammiClient): Promise<void> {
     });
     await c.training.trainingStatus({ jobId: ft.jobId });
 
-    // ── MutableTableService: create + drop ────────────────────────────────
-    const mt: CreateMutableTableResponse = await c.mutableTable.createMutableTable({});
-    await c.mutableTable.dropMutableTable({ mutableTableId: mt.mutableTableId });
-
-    // ── ChannelService: register + add columns ────────────────────────────
-    await c.channel.registerChannel({ channelId: "ch1" });
-    await c.channel.addChannelColumns({ channelId: "ch1" });
-
-    // ── TriggerService: register/drop/publish/list + server-streaming ─────
-    const topic: RegisterTopicResponse = await c.trigger.registerTopic({
-      name: "default.events",
-      schema: new Uint8Array(),
-    });
+    // ── TriggerService: publish + server-streaming subscribe ──────────────
     await c.trigger.publish({ topic: { name: "default.events" } });
-    await c.trigger.listTopics({ pageSize: 10 });
     // Subscribe is server-streaming: the client method yields an async iterable.
     for await (const batch of c.trigger.subscribe({
       topic: { name: "default.events" },
@@ -180,7 +187,6 @@ async function verbSurface(c: JammiClient): Promise<void> {
       const b: SubscribedBatch = batch;
       expectTypeOf(b.offset).toEqualTypeOf<bigint>();
     }
-    await c.trigger.dropTopic({ topicId: topic.topicId, ifExists: true });
 
     // ── AuditService: log + fetch ─────────────────────────────────────────
     await c.audit.auditLog({});

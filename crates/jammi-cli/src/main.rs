@@ -2,7 +2,7 @@
 //!
 //! The CLI talks to a running `jammi-server` over the `jammi.v1` wire surface
 //! and never touches the catalog or storage in-process: it opens a remote
-//! [`Session`](jammi_ai::Session) against a `--target` endpoint and dispatches
+//! [`Session`] against a `--target` endpoint and dispatches
 //! each subcommand to one or more session verbs. There is no embedded engine
 //! here — `jammi serve` lives in the `jammi-server` binary, not this CLI.
 
@@ -48,16 +48,6 @@ enum Commands {
     Models {
         #[command(subcommand)]
         action: commands::models::ModelAction,
-    },
-    /// Run a SQL query
-    Query {
-        /// SQL query string
-        sql: String,
-    },
-    /// Show the execution plan for a query
-    Explain {
-        /// SQL query string
-        sql: String,
     },
     /// Manage trigger-stream topics
     Trigger {
@@ -125,8 +115,6 @@ async fn dispatch(session: &Session, command: Commands) -> Result<(), Box<dyn st
         Commands::Status => commands::status::run(session).await,
         Commands::Sources { action } => commands::sources::run(session, action).await,
         Commands::Models { action } => commands::models::run(session, action).await,
-        Commands::Query { sql } => commands::query::run(session, &sql).await,
-        Commands::Explain { sql } => commands::query::explain(session, &sql).await,
         Commands::Trigger { action } => commands::trigger::run(session, action).await,
         Commands::Channels { action } => commands::channels::run(session, action).await,
         Commands::Mutable { action } => commands::mutable::run(session, action).await,

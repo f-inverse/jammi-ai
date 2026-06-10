@@ -1,6 +1,6 @@
 //! Engine introspection over the wire, proven interchangeable with the local
-//! transport: `list_sources` / `describe_source` (`EmbeddingService`) and
-//! `server_info` (`SessionService.GetServerInfo`).
+//! transport: `list_sources` / `describe_source` and `server_info`
+//! (`CatalogService.ListSources` / `DescribeSource` / `GetServerInfo`).
 //!
 //! An in-process gRPC chain hosts a real `InferenceSession`; a
 //! `jammi_ai::RemoteSession` connects over a real HTTP/2 channel and a

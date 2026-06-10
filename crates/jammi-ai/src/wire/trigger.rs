@@ -8,18 +8,13 @@
 //! up) and the `TriggerError` → `Status` mapping stay in the `jammi-server`
 //! handler — those are catalog and transport concerns, not conversions.
 
-use std::collections::BTreeMap;
-use std::str::FromStr;
-
 use arrow::record_batch::RecordBatch;
-use jammi_db::trigger::ids::TopicId;
 use jammi_db::trigger::{DeliveredBatch, Offset, TopicDefinition};
-use jammi_db::TenantId;
 use prost_types::Timestamp;
 use tonic::Status;
 
-use crate::wire::proto::trigger::{ArrowBatch, SubscribedBatch, Topic};
-use crate::wire::{decode_ipc_schema, decode_ipc_stream, encode_ipc_stream};
+use crate::wire::proto::trigger::{ArrowBatch, SubscribedBatch};
+use crate::wire::{decode_ipc_stream, encode_ipc_stream};
 
 /// Decode the single record batch a `Publish` carries, checking it against the
 /// topic schema. Per ADR-01 §5.1 the wire pairing is `data_header` +
@@ -70,48 +65,6 @@ pub fn encode_delivered_batch(
             data_body: buf,
             app_metadata: Vec::new(),
         }),
-    })
-}
-
-/// Encode a [`TopicDefinition`] onto the wire `Topic` a `ListTopics` page
-/// carries — the send side of the materialized listing. The schema rides as a
-/// schema-only Arrow IPC stream (the same framing `RegisterTopicRequest.schema`
-/// uses). Fallible only on the schema encode.
-pub fn topic_to_proto(topic: &TopicDefinition) -> Result<Topic, Status> {
-    let schema = encode_ipc_stream(&topic.schema, &[])?;
-    Ok(Topic {
-        topic_id: topic.id.to_string(),
-        name: topic.name.clone(),
-        schema,
-        tenant_id: topic.tenant.map(|t| t.to_string()).unwrap_or_default(),
-        broker_metadata: topic.broker_metadata.clone().into_iter().collect(),
-    })
-}
-
-/// Reconstruct the [`TopicDefinition`] from the wire `Topic` — the inverse of
-/// [`topic_to_proto`], for the [`crate::RemoteSession`] `list_topics` read side.
-/// Fallible: the id and (non-empty) tenant are re-parsed and the schema is
-/// decoded from its IPC framing, so a corrupt page surfaces as a `Status` rather
-/// than a fabricated definition.
-pub fn topic_from_proto(wire: Topic) -> Result<TopicDefinition, Status> {
-    let id = TopicId::from_str(&wire.topic_id)
-        .map_err(|e| Status::invalid_argument(format!("invalid topic_id: {e}")))?;
-    let schema = decode_ipc_schema(&wire.schema)?;
-    let tenant = if wire.tenant_id.is_empty() {
-        None
-    } else {
-        Some(
-            TenantId::from_str(&wire.tenant_id)
-                .map_err(|e| Status::invalid_argument(format!("invalid tenant id: {e}")))?,
-        )
-    };
-    let broker_metadata: BTreeMap<String, String> = wire.broker_metadata.into_iter().collect();
-    Ok(TopicDefinition {
-        id,
-        name: wire.name,
-        schema,
-        tenant,
-        broker_metadata,
     })
 }
 

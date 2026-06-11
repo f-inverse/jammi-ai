@@ -6,6 +6,38 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.26.1 — 2026-06-11
+
+A correctness patch from a deliberate adversarial sweep of the training, graph,
+search, and catalog surfaces. Each fix establishes a domain-validity invariant
+where the engine previously computed past its valid input domain.
+
+### Fixed
+- **Tenant model isolation.** The model catalog primary key is tenant-qualified,
+  so a model registered under one tenant can no longer be overwritten by another
+  tenant registering the same name; per-tenant models of the same name coexist.
+  (Read paths were already tenant-scoped.)
+- **Fine-tune learning-rate schedule.** The LR horizon counts the realised
+  optimizer steps — including each epoch's trailing gradient-accumulation flush —
+  and `compute_lr` clamps progress to `[0, 1]` and floors the rate at zero, so the
+  schedule can no longer return a negative learning rate past the horizon. The
+  trailing partial-accumulation window scales its loss by its actual micro-batch
+  count.
+- **Regression target standardization.** Distributional and quantile regression
+  heads learn in a standardized space and apply a persisted de-standardization
+  affine in their forward pass, so they fit high-offset, low-variance targets
+  (e.g. calendar years) instead of stalling near the zero-init mean. The served
+  distribution is de-standardized by its declared form, not by head width.
+- **Undirected graph propagation.** A symmetric edge list that declares both
+  directions of an edge no longer double-counts: redundant reverse edges collapse
+  to the same unordered-edge set the engine's other graph operators use.
+- **Exact vector search.** Tied distances break deterministically on `_row_id`,
+  and `_row_id` resolves under the engine's default schema (`Utf8View`), so exact
+  search works for tables without an ANN sidecar index.
+- **Calibration evaluation.** A calibration run records no model foreign key (it
+  scores a held-out predictive distribution, not a registered model);
+  `eval_runs.model_id` is nullable while keeping its foreign key.
+
 ## v0.26.0 — 2026-06-10
 
 The client redesign and server packaging: a candle-free client substrate, a

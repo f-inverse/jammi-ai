@@ -7,6 +7,16 @@
 fn main() {
     use std::path::PathBuf;
 
+    // Source builds (`cargo install jammi-cli`) have no guarantee of a system
+    // protoc on PATH. Point prost at the vendored binary when the env does not
+    // already name one — an explicit `PROTOC` (CI, dev shells) still wins, so
+    // those keep using the system toolchain.
+    if std::env::var_os("PROTOC").is_none() {
+        let protoc = protoc_bin_vendored::protoc_bin_path()
+            .expect("vendored protoc binary unavailable for this host target");
+        std::env::set_var("PROTOC", protoc);
+    }
+
     let proto_root = PathBuf::from("proto");
     let proto_files = vec![
         proto_root.join("jammi/v1/error.proto"),

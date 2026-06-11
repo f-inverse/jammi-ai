@@ -104,6 +104,23 @@ impl TargetScaler {
         })
     }
 
+    /// De-standardise a regression head's raw output according to its predictive
+    /// distribution form. This is the single gaussian-vs-quantile dispatch shared
+    /// by training and serving: the form is the authoritative signal (a 2-level
+    /// quantile head is also width 2, so head width cannot stand in for it), so
+    /// the trained and served de-standardisation can never disagree.
+    pub(crate) fn destandardize(
+        &self,
+        raw_head: &Tensor,
+        form: &crate::inference::adapter::DistributionForm,
+    ) -> Result<Tensor> {
+        use crate::inference::adapter::DistributionForm;
+        match form {
+            DistributionForm::Gaussian => self.destandardize_gaussian(raw_head),
+            DistributionForm::Quantile { .. } => self.destandardize_quantile(raw_head),
+        }
+    }
+
     /// De-standardise a Gaussian head's raw `(batch, 2)` output. The mean column
     /// (0) is mapped `μ_y + σ_y·z`; the raw-scale column (1) is passed through so
     /// the downstream `STD_FLOOR + softplus(raw)` σ map is unchanged. With `z`

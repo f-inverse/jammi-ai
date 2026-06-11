@@ -548,7 +548,13 @@ impl TrainingLoop {
         // Save the final adapter — both target variants persist their
         // trainable weights alongside a `SavedAdapter` metadata JSON.
         let final_weights = self.target.named_trainable_weights()?;
-        let saved = self.target.saved_adapter(&self.config, self.target_scaler);
+        // The form is persisted exactly when the scaler is — both are the
+        // regression head's de-standardisation state. A non-regression head has
+        // no scaler and no form, so its adapter config round-trips unchanged.
+        let regression_form = self.target_scaler.map(|_| self.regression_form());
+        let saved = self
+            .target
+            .saved_adapter(&self.config, self.target_scaler, regression_form);
         jammi_lora::save_adapter(&checkpoint_dir, &final_weights, &saved)
             .map_err(|e| JammiError::FineTune(format!("Save adapter: {e}")))?;
 
@@ -1044,6 +1050,22 @@ impl TrainingLoop {
         }
     }
 
+    /// The predictive distribution form this run's regression head emits, read
+    /// off the configured objective: `Pinball` trains the quantile head over the
+    /// configured levels; every other arm trains the parametric Gaussian head.
+    /// This is the single gaussian-vs-quantile dispatch — the de-standardisation
+    /// (here and at serving) and the persisted head metadata all derive from it,
+    /// so the served form can never disagree with the trained one.
+    fn regression_form(&self) -> crate::inference::adapter::DistributionForm {
+        use crate::inference::adapter::DistributionForm;
+        match self.config.regression_loss.unwrap_or_default() {
+            super::RegressionLoss::Pinball => DistributionForm::Quantile {
+                levels: self.config.quantile_levels.clone(),
+            },
+            _ => DistributionForm::Gaussian,
+        }
+    }
+
     /// Apply the distributional regression head to projected embeddings,
     /// producing the de-standardised `(batch, k)` head parameters. Mirrors
     /// [`Self::classify`]: only a `ProjectionHead` target with a second (head)
@@ -1080,10 +1102,7 @@ impl TrainingLoop {
                 "regression head reached without a target scaler (run did not set one)".into(),
             )
         })?;
-        match self.config.regression_loss.unwrap_or_default() {
-            super::RegressionLoss::Pinball => scaler.destandardize_quantile(&raw),
-            _ => scaler.destandardize_gaussian(&raw),
-        }
+        scaler.destandardize(&raw, &self.regression_form())
     }
 
     /// Accumulate cosine similarity stats from a triplet batch for epoch-level logging.

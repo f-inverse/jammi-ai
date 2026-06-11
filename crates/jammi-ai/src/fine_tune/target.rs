@@ -127,14 +127,18 @@ impl TrainingTarget {
 
     /// Build the persisted metadata for this target.
     ///
-    /// `target_scaler` is the regression head's de-standardising affine, present
-    /// only for a `ModelTask::Regression` projection head. It is persisted in the
-    /// adapter config so a reloaded head de-standardises identically — the head's
-    /// raw output is the one transform shared by training and serving.
+    /// `target_scaler` and `regression_form` are the regression head's persisted
+    /// de-standardisation state, present together only for a
+    /// `ModelTask::Regression` projection head. The scaler is the affine the
+    /// head's raw output carries; the form is the authoritative gaussian-vs-quantile
+    /// signal the serving de-standardisation dispatches on (a 2-level quantile head
+    /// is also width 2, so head width cannot stand in for it). Both are the one
+    /// transform shared by training and serving, so they are persisted with the head.
     pub(crate) fn saved_adapter(
         &self,
         config: &super::FineTuneConfig,
         target_scaler: Option<TargetScaler>,
+        regression_form: Option<crate::inference::adapter::DistributionForm>,
     ) -> SavedAdapter {
         match self {
             Self::ProjectionHead { head } => SavedAdapter::ProjectionHead(ProjectionHeadConfig {
@@ -142,6 +146,7 @@ impl TrainingTarget {
                 lora_alpha: config.lora_alpha,
                 head_layers: head.layers.iter().map(|(name, _)| name.clone()).collect(),
                 target_scaler,
+                regression_form,
             }),
             Self::EncoderAdapters(state) => {
                 SavedAdapter::EncoderAdapters(Box::new(state.adapter_cfg.clone()))
@@ -189,6 +194,16 @@ pub struct ProjectionHeadConfig {
     /// distribution parameters the trained head did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) target_scaler: Option<TargetScaler>,
+    /// Predictive distribution form of a regression head: `Gaussian` or
+    /// `Quantile { levels }`, set from the configured regression objective and
+    /// present exactly when [`Self::target_scaler`] is. Serving dispatches the
+    /// de-standardisation on this form (Gaussian de-standardises only the mean
+    /// column; quantile de-standardises every column), so a 2-level quantile head
+    /// — also width 2 — is de-standardised as a quantile head, not a Gaussian one.
+    /// `None`/absent for every non-regression head; existing non-regression
+    /// adapter configs round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) regression_form: Option<crate::inference::adapter::DistributionForm>,
 }
 
 #[cfg(test)]
@@ -198,65 +213,92 @@ mod tests {
 
     use super::super::regression_loss::TargetScaler;
     use super::{ProjectionHeadConfig, SavedAdapter};
+    use crate::inference::adapter::DistributionForm;
 
-    /// A regression head's de-standardising affine must survive the
-    /// save → reload round-trip through the adapter directory, so a served head
-    /// emits the target offset rather than the zero-init z-space value.
-    ///
-    /// This guards scaler persistence end to end: build a `ProjectionHeadConfig`
-    /// carrying a non-trivial `TargetScaler` (μ_y ≈ 2017, σ_y ≈ 2 — the
-    /// calendar-year shape), persist it with the real `save_adapter` writer,
-    /// reload it with the real `load_adapter` reader, then apply the reloaded
-    /// scaler's `destandardize_gaussian` — exactly what serving's
-    /// `forward_regression` does — to a ZERO z-space head. The served mean must
-    /// come back at μ_y (≈2017), NOT 0; a dropped scaler would serve ≈0.
-    #[test]
-    fn regression_target_scaler_survives_adapter_round_trip() {
-        let device = Device::Cpu;
-        // Calendar years 2014..=2020 — the high-offset, low-variance shape.
-        let years = Tensor::from_vec(
-            vec![2014.0f32, 2015.0, 2016.0, 2017.0, 2018.0, 2019.0, 2020.0],
-            (7,),
-            &device,
-        )
-        .unwrap();
-        let true_mean = 2017.0f32;
-        let scaler = TargetScaler::from_targets(&years).unwrap();
-
+    /// Persist a regression `ProjectionHeadConfig` (scaler + form) through the
+    /// real `save_adapter` writer, reload it through the real `load_adapter`
+    /// reader, and return the reloaded `(scaler, form)`. This is the exact
+    /// persistence path `forward_regression` reads on serve.
+    fn round_trip_regression_head(
+        scaler: TargetScaler,
+        form: DistributionForm,
+        head_width: usize,
+        device: &Device,
+    ) -> (TargetScaler, DistributionForm) {
         let saved = SavedAdapter::ProjectionHead(ProjectionHeadConfig {
             lora_rank: 4,
             lora_alpha: 8.0,
             head_layers: vec!["projection".into(), "distribution".into()],
             target_scaler: Some(scaler),
+            regression_form: Some(form),
         });
 
-        // A two-tensor weights map so `save_adapter` writes a valid safetensors.
+        // A two-tensor weights map so `save_adapter` writes a valid safetensors;
+        // the `lora_b` rows match the head width so the persisted head is coherent.
         let mut weights = std::collections::HashMap::new();
         weights.insert(
             "distribution.lora_a".to_string(),
-            Tensor::zeros((4, 8), candle_core::DType::F32, &device).unwrap(),
+            Tensor::zeros((4, 8), candle_core::DType::F32, device).unwrap(),
         );
         weights.insert(
             "distribution.lora_b".to_string(),
-            Tensor::zeros((2, 4), candle_core::DType::F32, &device).unwrap(),
+            Tensor::zeros((head_width, 4), candle_core::DType::F32, device).unwrap(),
         );
 
         let dir = tempdir().unwrap();
         jammi_lora::save_adapter(dir.path(), &weights, &saved).unwrap();
         let (reloaded, _tensors): (SavedAdapter, _) =
-            jammi_lora::load_adapter(dir.path(), &device).unwrap();
+            jammi_lora::load_adapter(dir.path(), device).unwrap();
 
-        let reloaded_scaler = match reloaded {
-            SavedAdapter::ProjectionHead(cfg) => cfg
-                .target_scaler
-                .expect("the reloaded regression head must carry its persisted target scaler"),
+        match reloaded {
+            SavedAdapter::ProjectionHead(cfg) => (
+                cfg.target_scaler
+                    .expect("the reloaded regression head must carry its persisted target scaler"),
+                cfg.regression_form
+                    .expect("the reloaded regression head must carry its persisted form"),
+            ),
             SavedAdapter::EncoderAdapters(_) => panic!("round-trip changed the adapter variant"),
-        };
+        }
+    }
+
+    /// The calendar-year scaler shape (μ_y ≈ 2017, σ_y ≈ 2): high offset, low
+    /// variance — the case where a dropped or mis-dispatched de-standardisation is
+    /// glaring (a raw column sits near 0, the de-standardised one near 2017).
+    fn calendar_year_scaler(device: &Device) -> TargetScaler {
+        let years = Tensor::from_vec(
+            vec![2014.0f32, 2015.0, 2016.0, 2017.0, 2018.0, 2019.0, 2020.0],
+            (7,),
+            device,
+        )
+        .unwrap();
+        TargetScaler::from_targets(&years).unwrap()
+    }
+
+    /// A regression head's de-standardising affine must survive the
+    /// save → reload round-trip through the adapter directory, so a served head
+    /// emits the target offset rather than the zero-init z-space value.
+    ///
+    /// Build a `ProjectionHeadConfig` carrying a non-trivial `TargetScaler`
+    /// (μ_y ≈ 2017 — the calendar-year shape) and the Gaussian form, persist and
+    /// reload it through the real adapter writer/reader, then de-standardise a
+    /// ZERO z-space head through the reloaded form exactly as `forward_regression`
+    /// does. The served mean must come back at μ_y (≈2017), NOT 0.
+    #[test]
+    fn regression_target_scaler_survives_adapter_round_trip() {
+        let device = Device::Cpu;
+        let true_mean = 2017.0f32;
+        let (scaler, form) = round_trip_regression_head(
+            calendar_year_scaler(&device),
+            DistributionForm::Gaussian,
+            2,
+            &device,
+        );
 
         // The served head: a ZERO z-space Gaussian head (mean column 0, raw_std 0),
-        // de-standardised exactly as `forward_regression` does on serve.
+        // de-standardised exactly as `forward_regression` does on serve — through
+        // the persisted form, not a head-width heuristic.
         let z_head = Tensor::zeros((1, 2), candle_core::DType::F32, &device).unwrap();
-        let served = reloaded_scaler.destandardize_gaussian(&z_head).unwrap();
+        let served = scaler.destandardize(&z_head, &form).unwrap();
         let served_mean = served.to_vec2::<f32>().unwrap()[0][0];
 
         assert!(
@@ -269,5 +311,80 @@ mod tests {
             "served mean {served_mean} collapsed toward the zero-init z-space value — \
              the persisted de-standardisation was lost"
         );
+    }
+
+    /// The defect: a 2-LEVEL quantile head (`quantile_levels = [0.25, 0.75]`) is
+    /// width 2, exactly like a Gaussian head. The old serving dispatch keyed
+    /// gaussian-vs-quantile on head WIDTH, so this head wrongly hit the Gaussian
+    /// branch — which de-standardises only column 0 and leaves column 1 (the 0.75
+    /// quantile) RAW (near 0), so the served upper quantile was wrong by ≈μ_y.
+    ///
+    /// With the dispatch on the persisted `DistributionForm`, a width-2 quantile
+    /// head de-standardises EVERY column. This test fails before the fix (column 1
+    /// served raw, ≈0) and passes after (both columns ≈μ_y).
+    #[test]
+    fn two_level_quantile_head_destandardises_both_columns_after_round_trip() {
+        let device = Device::Cpu;
+        let true_mean = 2017.0f32;
+        let (scaler, form) = round_trip_regression_head(
+            calendar_year_scaler(&device),
+            DistributionForm::Quantile {
+                levels: vec![0.25, 0.75],
+            },
+            2,
+            &device,
+        );
+        // The reloaded form must be the quantile form — the signal width alone
+        // could not recover.
+        assert!(
+            matches!(form, DistributionForm::Quantile { .. }),
+            "a 2-level quantile head must reload as the quantile form, not Gaussian"
+        );
+
+        // A ZERO z-space quantile head: both columns are z = 0, so both must
+        // de-standardise to μ_y. Dispatched through the persisted form exactly as
+        // `forward_regression` does.
+        let z_head = Tensor::zeros((1, 2), candle_core::DType::F32, &device).unwrap();
+        let served = scaler.destandardize(&z_head, &form).unwrap();
+        let row = &served.to_vec2::<f32>().unwrap()[0];
+
+        for (col, &q) in row.iter().enumerate() {
+            assert!(
+                (q - true_mean).abs() < 1.0,
+                "quantile column {col} must de-standardise to μ_y ≈ {true_mean}, got {q}; \
+                 the 0.75 column left RAW (≈0) is the width-heuristic defect"
+            );
+        }
+    }
+
+    /// A 3-level quantile head round-trips and de-standardises every column —
+    /// guards that the form-dispatch fix did not regress the wider quantile case.
+    #[test]
+    fn three_level_quantile_head_destandardises_all_columns_after_round_trip() {
+        let device = Device::Cpu;
+        let true_mean = 2017.0f32;
+        let (scaler, form) = round_trip_regression_head(
+            calendar_year_scaler(&device),
+            DistributionForm::Quantile {
+                levels: vec![0.1, 0.5, 0.9],
+            },
+            3,
+            &device,
+        );
+
+        let z_head = Tensor::zeros((1, 3), candle_core::DType::F32, &device).unwrap();
+        let served = scaler.destandardize(&z_head, &form).unwrap();
+        let row = &served.to_vec2::<f32>().unwrap()[0];
+        assert_eq!(
+            row.len(),
+            3,
+            "the served quantile head keeps all three levels"
+        );
+        for (col, &q) in row.iter().enumerate() {
+            assert!(
+                (q - true_mean).abs() < 1.0,
+                "quantile column {col} must de-standardise to μ_y ≈ {true_mean}, got {q}"
+            );
+        }
     }
 }

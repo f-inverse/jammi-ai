@@ -6,6 +6,25 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.26.2 — 2026-06-11
+
+Completes the regression target-standardization fix: 0.26.1 standardized the
+fine-tune projection head, but the amortized context predictor — a separate
+subsystem — was not covered and still collapsed on high-offset targets.
+
+### Fixed
+- **Context-predictor target standardization.** `train_context_predictor` /
+  `predict_with_context_predictor` now z-score the outcome — and the in-context
+  members' outcomes — in data space with one train-derived scaler, train the
+  Gaussian/quantile head in that space, and de-standardize the served
+  distribution (the scaler is persisted with the model and reloaded). The
+  amortized in-context regressor now fits high-offset, low-variance targets
+  (e.g. calendar years, prices) instead of collapsing to a far-off mean with a
+  floored variance. (0.26.1's standardization covered only the fine-tune
+  projection head; loss-space rescaling alone cannot fix this under Adam, so the
+  standardization is applied to the data the head conditions on and is scored
+  against.)
+
 ## v0.26.1 — 2026-06-11
 
 A correctness patch from a deliberate adversarial sweep of the training, graph,

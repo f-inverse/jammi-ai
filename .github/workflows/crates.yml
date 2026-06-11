@@ -134,7 +134,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Create release
+      # `release-binaries.yml`'s legs create the release themselves before
+      # uploading their assets, so by the time the crates.io publish finishes the
+      # release usually already exists. Create it only if missing — otherwise
+      # no-op — so whoever wins the race creates it and this job tolerates it.
+      - name: Create release if missing
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes
+        run: gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --generate-notes

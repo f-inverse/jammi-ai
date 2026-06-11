@@ -11,7 +11,9 @@ use crate::store::vectors::extend_with_fixed_size_list_f32;
 /// Brute-force vector search over a registered Parquet table via DataFusion.
 ///
 /// Computes cosine distance for every row, returns the `k` closest as
-/// `(row_id, cosine_distance)` sorted ascending.
+/// `(row_id, cosine_distance)` sorted by ascending distance, with ties broken
+/// by ascending `_row_id` so equidistant candidates resolve deterministically
+/// regardless of scan order.
 pub async fn exact_vector_search(
     ctx: &SessionContext,
     table_name: &str,
@@ -55,7 +57,11 @@ pub async fn exact_vector_search(
         }
     }
 
-    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     scored.truncate(k);
     Ok(scored)
 }

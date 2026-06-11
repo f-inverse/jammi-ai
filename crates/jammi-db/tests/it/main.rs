@@ -6,6 +6,7 @@ mod common;
 mod concurrent_writers;
 mod ephemeral;
 mod eval_per_query;
+mod exact_search;
 mod fine_tune_queue;
 mod foundation;
 mod index;

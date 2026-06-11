@@ -202,6 +202,33 @@ def test_tenant_scope_restores_on_exception(tmp_path):
     assert db.tenant() == TENANT_A
 
 
+def test_tenant_scope_reuse_is_rejected(tmp_path):
+    """One scope object enters once. Re-entering the same object would clobber
+    the captured prior and lose it on exit, so a second `__enter__` raises and
+    the live scope is left untouched. Nesting uses a fresh object per `with`."""
+    db = jammi_ai.connect(f"file://{tmp_path}")
+    db.set_tenant(TENANT_A)
+    scope = db.tenant_scope(TENANT_B)
+    with scope:
+        assert db.tenant() == TENANT_B
+        with pytest.raises(ValueError):
+            scope.__enter__()
+        # The failed re-entry changed nothing.
+        assert db.tenant() == TENANT_B
+    # The single legitimate exit restored the real prior.
+    assert db.tenant() == TENANT_A
+
+
+def test_tenant_scope_stray_exit_is_a_noop(tmp_path):
+    """`__exit__` on a never-entered scope is a no-op — it must not clear a live
+    scope. The two-level prior distinguishes 'not entered' from 'entered while
+    unscoped', so a stray exit cannot unbind the connection's current tenant."""
+    db = jammi_ai.connect(f"file://{tmp_path}")
+    db.set_tenant(TENANT_A)
+    db.tenant_scope(TENANT_B).__exit__(None, None, None)
+    assert db.tenant() == TENANT_A
+
+
 def test_register_channel_round_trips_through_python(tmp_path):
     """SPEC-01 §7 dual-language hook landed in this iteration: register
     a new evidence-provenance channel from Python; merging in the engine

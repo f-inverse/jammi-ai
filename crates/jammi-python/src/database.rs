@@ -1906,12 +1906,21 @@ pub struct PyTenantScope {
 impl PyTenantScope {
     fn __enter__(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<Self>> {
         let this = slf.borrow(py);
-        let prior = this.session.tenant();
-        *this
+        let mut slot = this
             .prior
             .lock()
-            .map_err(|_| PyValueError::new_err("tenant scope lock poisoned"))? = Some(prior);
+            .map_err(|_| PyValueError::new_err("tenant scope lock poisoned"))?;
+        // One scope object enters once: a second `__enter__` would clobber the
+        // captured prior and lose it on exit. Nesting uses a fresh object per
+        // `with`, matching the remote generator's raise-on-reenter semantics.
+        if slot.is_some() {
+            return Err(PyValueError::new_err(
+                "tenant scope already entered; use a fresh `tenant_scope(...)` per `with`",
+            ));
+        }
+        *slot = Some(this.session.tenant());
         this.session.bind_tenant(this.target);
+        drop(slot);
         drop(this);
         Ok(slf)
     }
@@ -1927,11 +1936,14 @@ impl PyTenantScope {
             .prior
             .lock()
             .map_err(|_| PyValueError::new_err("tenant scope lock poisoned"))?
-            .take()
-            .flatten();
+            .take();
+        // `Some(Some(t))` restores the prior tenant, `Some(None)` restores the
+        // unscoped state, and `None` (never entered) is a no-op — collapsing the
+        // last two would clear a live scope on a stray exit.
         match prior {
-            Some(t) => self.session.bind_tenant(t),
-            None => self.session.unbind_tenant(),
+            Some(Some(t)) => self.session.bind_tenant(t),
+            Some(None) => self.session.unbind_tenant(),
+            None => {}
         }
         Ok(false)
     }

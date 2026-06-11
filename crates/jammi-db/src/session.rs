@@ -446,7 +446,15 @@ impl JammiSession {
                     source_id = %record.source_id,
                     "Failed to reload source: {e}"
                 );
+                continue;
             }
+            // The tenant discriminator lives in the in-process
+            // `SourceTenantColumns` lookup, which a fresh session starts empty.
+            // Replay it from the persisted connection so a source's tenant
+            // scoping survives a restart — without this, a federated source
+            // registered with a `tenant_column` would reload with no scope.
+            self.source_tenant_columns
+                .set(&record.source_id, record.connection.tenant_column.clone());
         }
         Ok(())
     }
@@ -469,6 +477,12 @@ impl JammiSession {
         // Register tables in DataFusion.
         self.register_source_tables(source_id, &source_type, &connection)
             .await?;
+
+        // Register the tenant discriminator live so the analyzer scopes this
+        // source for the rest of this session, mirroring the value persisted in
+        // the connection below (which `reload_sources` replays on restart).
+        self.source_tenant_columns
+            .set(source_id, connection.tenant_column.clone());
 
         // Persist to catalog.
         self.catalog

@@ -82,12 +82,6 @@ impl std::fmt::Display for ModelSource {
     }
 }
 
-/// Construct the catalog PK for a model: `"{canonical_name}::{version}"`.
-/// The canonical name is `ModelSource::to_string()` output.
-pub fn to_catalog_pk(canonical_name: &str, version: i32) -> String {
-    format!("{canonical_name}::{version}")
-}
-
 impl From<&ModelSource> for ModelId {
     fn from(source: &ModelSource) -> Self {
         ModelId(source.to_string())

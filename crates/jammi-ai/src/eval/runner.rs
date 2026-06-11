@@ -32,6 +32,21 @@ pub struct EvalRunner<'a> {
 }
 
 impl<'a> EvalRunner<'a> {
+    /// Resolve a model name to the catalog PK an `eval_runs.model_id` FK binds
+    /// to. The PK is read off the resolved row — tenant-qualified for a
+    /// tenant-owned model, unqualified for a global one — never reconstructed,
+    /// so the FK matches the same row the rest of the session resolves.
+    async fn eval_model_fk(&self, model_name: &str) -> Result<String> {
+        self.session
+            .catalog()
+            .get_model(model_name)
+            .await?
+            .map(|m| m.catalog_pk)
+            .ok_or_else(|| {
+                JammiError::Eval(format!("Model '{model_name}' not registered in catalog"))
+            })
+    }
+
     /// Evaluate embedding quality against golden relevance judgments.
     ///
     /// Returns an [`EmbeddingEvalReport`] containing both the aggregate over
@@ -186,12 +201,13 @@ impl<'a> EvalRunner<'a> {
         //    historical path), then persist the per-query arrays to
         //    `_jammi_eval_per_query` keyed by the same `eval_run_id`. Per-query
         //    persistence is always-on (spec J9) — no opt-in flag.
+        let model_fk = self.eval_model_fk(canonical_model).await?;
         self.session
             .catalog()
             .record_eval_run(&EvalRunRecord {
                 eval_run_id: eval_run_id.clone(),
                 eval_type: "embedding".into(),
-                model_id: crate::model::to_catalog_pk(canonical_model, 1),
+                model_id: model_fk,
                 source_id: source_id.into(),
                 golden_source: golden_source.into(),
                 k: Some(k as i32),
@@ -356,12 +372,13 @@ impl<'a> EvalRunner<'a> {
 
         // Record in catalog
         let canonical = model_source.to_string();
+        let model_fk = self.eval_model_fk(&canonical).await?;
         self.session
             .catalog()
             .record_eval_run(&EvalRunRecord {
                 eval_run_id: uuid::Uuid::new_v4().to_string(),
                 eval_type: task.to_string(),
-                model_id: crate::model::to_catalog_pk(&canonical, 1),
+                model_id: model_fk,
                 source_id: source_id.into(),
                 golden_source: golden_source.into(),
                 k: None,
@@ -475,14 +492,16 @@ impl<'a> EvalRunner<'a> {
         // Record the aggregate, then persist the per-record scores to
         // `_jammi_eval_per_query` keyed by the same run id — the same shape the
         // embedding eval reuses, so cohort slicing and significance read back
-        // through one path. Calibration has no `model_id`/`k`, so the catalog
-        // row records the shape as the model identifier and leaves `k` empty.
+        // through one path. Calibration has no model, so the catalog row records
+        // the shape as a synthetic identifier (never a model PK) and leaves `k`
+        // empty.
+        let shape_id = format!("{shape}::1");
         self.session
             .catalog()
             .record_eval_run(&EvalRunRecord {
                 eval_run_id: eval_run_id.clone(),
                 eval_type: shape.to_string(),
-                model_id: crate::model::to_catalog_pk(&shape.to_string(), 1),
+                model_id: shape_id,
                 source_id: source_id.into(),
                 golden_source: golden_source.into(),
                 k: None,

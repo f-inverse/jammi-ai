@@ -419,7 +419,7 @@ impl InferenceSession {
             .resolve_embedding_table(source_id, None)
             .await?;
         let base_model_pk = match self.catalog().get_model(&table.model_id).await? {
-            Some(m) => crate::model::to_catalog_pk(&m.model_id, m.version),
+            Some(m) => m.catalog_pk,
             None => {
                 self.catalog()
                     .register_model(RegisterModelParams {
@@ -433,7 +433,16 @@ impl InferenceSession {
                         config_json: None,
                     })
                     .await?;
-                crate::model::to_catalog_pk(&table.model_id, 1)
+                self.catalog()
+                    .get_model(&table.model_id)
+                    .await?
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
+                            "Base model '{}' not registered in catalog",
+                            table.model_id
+                        ))
+                    })?
+                    .catalog_pk
             }
         };
         let loss_type = format!("{:?}", spec.head);

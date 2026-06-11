@@ -197,14 +197,16 @@ pub fn model_to_proto(record: &ModelRecord) -> pb::Model {
 /// of [`model_to_proto`], for the the remote client receive side. The
 /// fields not carried on the wire are server-internal bookkeeping, so they
 /// reconstruct at their "not carried" values (`version = 1` default, `None`,
-/// `String::new`), exactly as [`result_table_from_proto`] does for a result
-/// table. The message is self-describing in `task`, so an out-of-range /
+/// `String::new` — including `catalog_pk`, a server-side row key a list
+/// consumer never resolves against), exactly as [`result_table_from_proto`]
+/// does for a result table. The message is self-describing in `task`, so an out-of-range /
 /// unspecified task surfaces as the faithful `invalid_argument` the shared
 /// decoder builds.
 pub fn model_from_proto(model: pb::Model) -> Result<ModelRecord, Status> {
     let task = super::model_task_from_proto(model.task)?;
     Ok(ModelRecord {
         model_id: model.model_id,
+        catalog_pk: String::new(),
         version: 1,
         model_type: String::new(),
         base_model_id: None,

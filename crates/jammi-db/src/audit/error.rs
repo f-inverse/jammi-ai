@@ -17,7 +17,7 @@ pub enum AuditError {
     LineageTooLarge { actual: usize, max: usize },
 
     /// The session had no tenant binding when one was required.
-    #[error("no tenant binding on the current session — call with_tenant() first")]
+    #[error("no tenant binding on the current session — bind a tenant first")]
     NoTenantBinding,
 
     /// A record's signature did not match the expected HMAC.

@@ -109,12 +109,17 @@ impl PyDatabase {
 
 #[pymethods]
 impl PyDatabase {
-    /// Bind a tenant scope to this connection.
+    /// Set the sticky tenant scope on this connection.
     ///
     /// Subsequent reads return rows whose `tenant_id` matches `tenant_id`
     /// plus globally-scoped (`tenant_id IS NULL`) rows; writes carry the
-    /// bound tenant on every row. Pass an empty string to clear.
-    fn with_tenant(&self, tenant_id: &str) -> PyResult<()> {
+    /// bound tenant on every row. The scope stays in effect until the next
+    /// `set_tenant` call replaces it. Pass an empty string to clear.
+    ///
+    /// This mutates the connection in place and returns `None` — it is a
+    /// setter, not a builder. For a block-scoped binding that restores the
+    /// prior tenant on exit, use [`tenant_scope`](Self::tenant_scope).
+    fn set_tenant(&self, tenant_id: &str) -> PyResult<()> {
         if tenant_id.is_empty() {
             self.session.unbind_tenant();
             return Ok(());
@@ -122,6 +127,32 @@ impl PyDatabase {
         let t = jammi_db::TenantId::from_str(tenant_id).map_err(to_pyerr)?;
         self.session.bind_tenant(t);
         Ok(())
+    }
+
+    /// Scope this connection to `tenant_id` for the duration of a `with`
+    /// block, restoring the prior tenant on exit.
+    ///
+    /// ```python
+    /// with db.tenant_scope("a"):
+    ///     db.list_sources()          # sees tenant-a + global rows only
+    ///     db.sql("SELECT * FROM s")  # discriminator-column rows scoped to a
+    /// # prior scope restored here
+    /// ```
+    ///
+    /// Nesting restores correctly — after an inner `with db.tenant_scope("b")`
+    /// block exits, the outer `"a"` scope is back in effect. The block captures
+    /// the *prior* tenant on entry and rebinds it on exit, rather than blindly
+    /// clearing to unscoped.
+    fn tenant_scope(&self, tenant_id: &str) -> PyResult<PyTenantScope> {
+        // Validate eagerly so `db.tenant_scope("bad")` raises at the call site,
+        // not on `__enter__` — the bind happens on entry, but a malformed id is
+        // a programming error the caller should learn where they name it.
+        let target = jammi_db::TenantId::from_str(tenant_id).map_err(to_pyerr)?;
+        Ok(PyTenantScope {
+            session: Arc::clone(&self.session),
+            target,
+            prior: std::sync::Mutex::new(None),
+        })
     }
 
     /// The tenant currently bound to this connection, or `None`.
@@ -141,7 +172,7 @@ impl PyDatabase {
     }
 
     /// Open an ephemeral, session-scoped storage context bound to the tenant
-    /// currently set via `with_tenant`. Use as a context manager:
+    /// currently set via `set_tenant`. Use as a context manager:
     ///
     /// ```python
     /// with db.ephemeral_session(timeout_seconds=3600) as ephem:
@@ -426,7 +457,7 @@ impl PyDatabase {
     /// Register a mutable companion table.
     ///
     /// Tenant scope is inherited from the session's currently bound tenant
-    /// (set via `with_tenant`). `schema` is any object implementing the
+    /// (set via `set_tenant`). `schema` is any object implementing the
     /// Arrow PyCapsule schema interface (e.g. `pyarrow.Schema`,
     /// `arro3.Schema`). `primary_key` is a non-empty list of column names
     /// drawn from `schema`. `indexes` is an optional list of dicts of shape
@@ -1848,6 +1879,61 @@ impl PyDatabase {
         out.set_item("value_rows", batches_to_pyarrow(py, &context.value_rows)?)?;
         out.set_item("source", context_source_tag(context.source))?;
         Ok(out.unbind().into())
+    }
+}
+
+/// Block-scoped tenant binding for the embedded `Database`, returned by
+/// [`PyDatabase::tenant_scope`]. `__enter__` captures the connection's current
+/// tenant and binds `target`; `__exit__` restores the captured prior tenant.
+///
+/// The embedded engine is single-flight (one tokio runtime, sequential
+/// `block_on`), so binding and restoring the sticky session scope is correct
+/// here — there is no concurrent task whose read could observe an intermediate
+/// binding. (The engine's concurrent-safe `with_tenant_scoped` task-local form
+/// serves the multi-tenant server path, not this in-process surface.)
+#[pyclass(name = "TenantScope")]
+pub struct PyTenantScope {
+    session: Arc<InferenceSession>,
+    target: jammi_db::TenantId,
+    /// The tenant in effect when the block was entered, captured on
+    /// `__enter__` and restored on `__exit__`. `None` until entered, and
+    /// `Some(None)` when the prior scope was unscoped — the two-level option
+    /// distinguishes "not entered" from "entered while unscoped".
+    prior: std::sync::Mutex<Option<Option<jammi_db::TenantId>>>,
+}
+
+#[pymethods]
+impl PyTenantScope {
+    fn __enter__(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<Self>> {
+        let this = slf.borrow(py);
+        let prior = this.session.tenant();
+        *this
+            .prior
+            .lock()
+            .map_err(|_| PyValueError::new_err("tenant scope lock poisoned"))? = Some(prior);
+        this.session.bind_tenant(this.target);
+        drop(this);
+        Ok(slf)
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
+    fn __exit__(
+        &self,
+        _exc_type: Option<Py<PyAny>>,
+        _exc_value: Option<Py<PyAny>>,
+        _traceback: Option<Py<PyAny>>,
+    ) -> PyResult<bool> {
+        let prior = self
+            .prior
+            .lock()
+            .map_err(|_| PyValueError::new_err("tenant scope lock poisoned"))?
+            .take()
+            .flatten();
+        match prior {
+            Some(t) => self.session.bind_tenant(t),
+            None => self.session.unbind_tenant(),
+        }
+        Ok(false)
     }
 }
 

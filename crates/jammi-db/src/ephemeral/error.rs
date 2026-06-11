@@ -10,7 +10,7 @@ pub enum EphemeralError {
     /// Ephemeral sessions are always tenant-scoped: opening one without a bound
     /// tenant would create session-private tables nobody could read back under
     /// scope, so the open is refused up front.
-    #[error("no tenant binding on the current session — call with_tenant() first")]
+    #[error("no tenant binding on the current session — bind a tenant first")]
     NoTenantBinding,
 
     /// The user-supplied logical table name does not fit the ephemeral

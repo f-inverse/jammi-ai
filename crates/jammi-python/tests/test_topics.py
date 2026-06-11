@@ -87,15 +87,15 @@ def test_register_inherits_session_tenant(tmp_path):
     re-bound to tenant B, the same call excludes the A-scoped topic;
     re-bound back to A, the topic is visible again."""
     db = jammi_ai.connect(f"file://{tmp_path}")
-    db.with_tenant(TENANT_A)
+    db.set_tenant(TENANT_A)
     db.register_topic("events.demo", schema=_events_schema())
 
     assert "events.demo" in db.list_topics()
 
-    db.with_tenant(TENANT_B)
+    db.set_tenant(TENANT_B)
     assert "events.demo" not in db.list_topics()
 
-    db.with_tenant(TENANT_A)
+    db.set_tenant(TENANT_A)
     assert "events.demo" in db.list_topics()
 
 

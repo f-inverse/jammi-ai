@@ -55,14 +55,30 @@ across all references.
 import jammi_ai
 
 db = jammi_ai.connect("file:///tmp/jammi")
-db.with_tenant("018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9a")
+db.set_tenant("018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9a")
 
 # Subsequent calls observe Alice's tenant scope.
 db.add_source("inbox", path="/data/alice/inbox.parquet", format="parquet")
 db.sql("SELECT * FROM inbox.public.inbox")
 ```
 
-Pass an empty string to clear: `db.with_tenant("")`.
+`set_tenant` is a sticky setter — it mutates the connection in place and stays
+in effect until the next `set_tenant`. Pass an empty string to clear:
+`db.set_tenant("")`.
+
+For a binding scoped to a single block — the prior tenant restored on exit, and
+nesting handled — use `tenant_scope` as a context manager:
+
+```python
+with db.tenant_scope("018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9a"):
+    # Reads here observe Alice's tenant scope.
+    db.sql("SELECT * FROM inbox.public.inbox")
+# Prior scope restored here.
+```
+
+The same surface is available on a remote connection
+(`jammi_client.RemoteDatabase`), where the prior tenant is captured client-side
+and rebound on exit.
 
 ## CLI
 

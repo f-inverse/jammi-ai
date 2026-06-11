@@ -44,7 +44,7 @@ def _images_table(rows: list[tuple[str, str]]) -> pa.Table:
 def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         db = jammi_ai.connect(f"file://{tmp}")
-        db.with_tenant(TENANT)
+        db.set_tenant(TENANT)
 
         # A persistent table that will keep the *hash* lineage after the raw
         # working data is deleted — what NOT to put in ephemeral storage.

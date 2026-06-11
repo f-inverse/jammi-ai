@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import grpc
 import pyarrow as pa
@@ -500,8 +501,14 @@ class RemoteDatabase:
 
     # --- Catalog: tenant trio + handshake ---------------------------------------
 
-    def with_tenant(self, tenant_id: str) -> None:
-        """Bind a tenant scope to this connection. Pass an empty string to clear.
+    def set_tenant(self, tenant_id: str) -> None:
+        """Set the sticky tenant scope on this connection. Pass an empty string
+        to clear.
+
+        The scope stays in effect server-side until the next `set_tenant`
+        replaces it. This is a setter — it returns ``None``, not a fresh scoped
+        handle. For a block-scoped binding that restores the prior tenant on
+        exit, use :meth:`tenant_scope`.
 
         Maps to `CatalogService.SetTenant` / `ClearTenant`, keyed by this
         connection's session id.
@@ -515,6 +522,32 @@ class RemoteDatabase:
             catalog_pb2.SetTenantRequest(tenant=catalog_pb2.Tenant(id=tenant_id)),
             metadata=self._metadata,
         )
+
+    @contextmanager
+    def tenant_scope(self, tenant_id: str) -> Iterator["RemoteDatabase"]:
+        """Scope this connection to ``tenant_id`` for the duration of a ``with``
+        block, restoring the prior tenant on exit.
+
+        ::
+
+            with db.tenant_scope("a"):
+                db.list_sources()   # sees tenant-a + global rows only
+                db.sql("...")       # discriminator-column rows scoped to a
+            # prior scope restored here
+
+        Nesting restores correctly — after an inner ``with db.tenant_scope("b")``
+        block exits, the outer ``"a"`` scope is back in effect. The remote tenant
+        lives server-side (keyed by this session id); the client captures the
+        prior tenant locally via `CatalogService.GetTenant` on entry and rebinds
+        it (or clears, if the prior scope was unscoped) on exit, rather than
+        blindly clearing to unscoped.
+        """
+        prior = self.tenant()
+        self.set_tenant(tenant_id)
+        try:
+            yield self
+        finally:
+            self.set_tenant(prior or "")
 
     def tenant(self) -> Optional[str]:
         """The tenant currently bound to this connection, or ``None``.

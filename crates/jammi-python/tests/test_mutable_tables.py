@@ -109,7 +109,7 @@ def test_create_inherits_session_tenant(tmp_path):
     under A becomes invisible. Re-bound back to A: the row is visible
     again."""
     db = jammi_ai.connect(f"file://{tmp_path}")
-    db.with_tenant(TENANT_A)
+    db.set_tenant(TENANT_A)
     db.create_mutable_table(
         "notes_a",
         schema=_notes_schema(),
@@ -124,7 +124,7 @@ def test_create_inherits_session_tenant(tmp_path):
     )
     assert count_a == 1
 
-    db.with_tenant(TENANT_B)
+    db.set_tenant(TENANT_B)
     count_b = (
         db.sql("SELECT COUNT(*) AS n FROM mutable.public.notes_a")
         .column("n")
@@ -132,7 +132,7 @@ def test_create_inherits_session_tenant(tmp_path):
     )
     assert count_b == 0
 
-    db.with_tenant(TENANT_A)
+    db.set_tenant(TENANT_A)
     count_a_again = (
         db.sql("SELECT COUNT(*) AS n FROM mutable.public.notes_a")
         .column("n")

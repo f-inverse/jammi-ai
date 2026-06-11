@@ -54,7 +54,7 @@ def main() -> int:
         db = jammi_ai.connect(f"file://{artifact_dir}")
 
         # Tenant A: register both primitives and insert one row.
-        db.with_tenant(TENANT_A)
+        db.set_tenant(TENANT_A)
         db.create_mutable_table(
             "notes", schema=_notes_schema(), primary_key=["note_id"]
         )
@@ -71,7 +71,7 @@ def main() -> int:
 
         # Tenant B: same session, rebound. Row authored under A must be
         # invisible; topic registered under A must be excluded.
-        db.with_tenant(TENANT_B)
+        db.set_tenant(TENANT_B)
         count_b = (
             db.sql("SELECT COUNT(*) AS n FROM mutable.public.notes")
             .column("n")
@@ -81,7 +81,7 @@ def main() -> int:
         assert "events.a" not in db.list_topics(), "tenant B leaked tenant A's topic"
 
         # Rebinding back to tenant A restores visibility.
-        db.with_tenant(TENANT_A)
+        db.set_tenant(TENANT_A)
         count_a_again = (
             db.sql("SELECT COUNT(*) AS n FROM mutable.public.notes")
             .column("n")

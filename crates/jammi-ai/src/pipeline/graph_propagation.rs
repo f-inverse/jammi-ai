@@ -551,6 +551,15 @@ impl InferenceSession {
         // fixed order independent of the edge scan order — the byte-identical
         // determinism contract.
         pairs.sort_by(|a, b| (&a.group, &a.neighbour).cmp(&(&b.group, &b.neighbour)));
+        // Ã is a SET of unordered edges, augmented once by I. A logical undirected
+        // edge contributes exactly one `(group, neighbour)` pair per direction,
+        // regardless of whether the input declared it once or in both directions —
+        // a symmetric edge list carrying both `(a, b)` and `(b, a)` would otherwise
+        // emit each directed pair twice, doubling d̃ and skewing `Â`. This is the
+        // reverse-edge analogue of the `(v, v)` self-loop dedup above, and is a
+        // no-op for an already-minimal (one-directional or single-declaration)
+        // edge list.
+        pairs.dedup_by(|a, b| a.group == b.group && a.neighbour == b.neighbour);
         Ok(pairs)
     }
 
@@ -592,6 +601,16 @@ impl InferenceSession {
                 weight: 1.0,
             });
         }
+        // Same unordered-edge-set invariant as the unweighted path: total order on
+        // (group, neighbour) for a scan-order-independent f64 fold, then collapse a
+        // logical undirected edge declared in both directions to one weighted
+        // contribution per direction. A symmetric edge list carrying both `(a, b)`
+        // and `(b, a)` would otherwise add each direction's weight twice, doubling
+        // Σw and skewing the edge-similarity mean. Declared duplicates of one
+        // undirected edge carry the same weight, so first-wins keeps the right
+        // value; were the two rows ever to disagree, first-wins is the chosen rule.
+        weighted.sort_by(|a, b| (&a.group, &a.neighbour).cmp(&(&b.group, &b.neighbour)));
+        weighted.dedup_by(|a, b| a.group == b.group && a.neighbour == b.neighbour);
         Ok(weighted)
     }
 

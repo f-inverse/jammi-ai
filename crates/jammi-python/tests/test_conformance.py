@@ -116,11 +116,51 @@ _NUMERIC_VERBS = {
 }
 
 
+# The mutable-companion-table lifecycle and the trigger topic verbs. These DO hit
+# the wire: the create/drop/list-mutable-table and register/drop/list-topic verbs
+# are control-plane (`CatalogService`); `publish_topic` / `subscribe_collect` are
+# data-plane (`TriggerService`). The embedded `Database` registers/publishes in
+# the compiled engine; the client's `RemoteDatabase` drives them over gRPC. The
+# call surface must agree so a caller swaps transports without changing the call —
+# pinned here against the embed `jammi_ai.Database`. `subscribe_collect` mirrors
+# the embedded replay+live-tail collect (bounded by `max_batches`), not a
+# replay-only drain.
+_MUTABLE_TOPIC_VERBS = {
+    "create_mutable_table",
+    "drop_mutable_table",
+    "list_mutable_tables",
+    "register_topic",
+    "drop_topic",
+    "list_topics",
+    "publish_topic",
+    "subscribe_collect",
+}
+
+
 def test_remote_surface_has_every_verb():
     """The client's `RemoteDatabase` exposes the full transport-agnostic verb
     set — the same vocabulary the embedded `Database` carries."""
-    for verb in _REMOTE_VERBS | _NUMERIC_VERBS | _TRAINING_VERBS | _PIPELINE_VERBS:
+    for verb in (
+        _REMOTE_VERBS
+        | _NUMERIC_VERBS
+        | _TRAINING_VERBS
+        | _PIPELINE_VERBS
+        | _MUTABLE_TOPIC_VERBS
+    ):
         assert callable(getattr(jammi_client.RemoteDatabase, verb)), verb
+
+
+def test_mutable_topic_verbs_have_identical_signatures_across_wheels():
+    """The mutable-table + topic + pub/sub verbs carry the SAME call surface on the
+    client's `RemoteDatabase` as on the embedded engine's `jammi_ai.Database`. Both
+    drive over the same verb vocabulary (the client over gRPC, the embed
+    in-process), so a caller swaps transports without changing the call — pinned
+    name-for-name, kind-for-kind, and default-for-default so a divergence in either
+    is caught."""
+    for verb in _MUTABLE_TOPIC_VERBS:
+        client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
+        embed = _call_surface(getattr(jammi_ai.Database, verb))
+        assert client == embed, f"{verb}: {embed} != {client}"
 
 
 def test_pipeline_verbs_have_identical_signatures_across_wheels():

@@ -238,6 +238,18 @@ impl InferenceSession {
         self.inner.mutable_tables()
     }
 
+    /// List every mutable companion table registered to the session's tenant.
+    /// Registry introspection, not a SQL query.
+    pub async fn list_mutable_tables(
+        &self,
+    ) -> Result<Vec<jammi_db::store::mutable::MutableTableDefinition>> {
+        Ok(self
+            .inner
+            .mutable_tables()
+            .list(self.inner.tenant())
+            .await?)
+    }
+
     /// Bind a tenant scope to this session. Subsequent reads/writes filter
     /// to `tenant_id = t OR tenant_id IS NULL`; writes record `tenant_id = t`.
     ///

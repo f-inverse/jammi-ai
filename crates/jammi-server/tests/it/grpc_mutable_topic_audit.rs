@@ -227,6 +227,26 @@ async fn create_mutable_table_rejects_primary_key_not_in_schema() {
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_missing_mutable_table_is_not_found() {
+    // The wire status for a missing table is `NotFound`, not the coarse
+    // `Internal` the engine-error catch-all would yield. A remote client's
+    // `if_exists` drop reads this code to turn a missing-table drop into a no-op,
+    // mirroring the in-process `MutableTableError::NotFound` handling — so the
+    // mapping is asserted here at the wire seam.
+    let fixture = start_fixture().await;
+    let ch = channel(fixture.addr).await;
+    let mut client = CatalogServiceClient::with_interceptor(ch, with_session("session-mut-gone"));
+
+    let err = client
+        .drop_mutable_table(DropMutableTableRequest {
+            mutable_table_id: "never_created".into(),
+        })
+        .await
+        .expect_err("dropping a table that was never created must fail");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+}
+
 // ───────────────────────── Topics ─────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
 use jammi_db::error::JammiError;
+use jammi_db::store::mutable::MutableTableError;
 use jammi_db::trigger::TriggerError;
 use jammi_db::TenantId;
 use jammi_wire::{attach_error_detail, attach_trigger_detail};
@@ -108,6 +109,25 @@ pub fn map_engine_error(err: JammiError) -> Status {
         JammiError::Schema { .. } => (Code::InvalidArgument, err.to_string()),
         JammiError::Eval(detail) => (Code::InvalidArgument, format!("eval: {detail}")),
         JammiError::Inference(detail) => (Code::Internal, format!("inference: {detail}")),
+        // The mutable-table kind carries a typed failure the coarse gRPC code set
+        // must preserve so a remote client distinguishes a missing table (the
+        // `if_exists` no-op signal) and an id collision from a genuine fault — the
+        // mutable-table analogue of the `TopicNotFound` → `NotFound` mapping. The
+        // validation variants are caller errors (`InvalidArgument`); a backend
+        // fault falls through to `Internal`.
+        JammiError::MutableTable(mt) => {
+            let code = match mt {
+                MutableTableError::NotFound(_) => Code::NotFound,
+                MutableTableError::AlreadyExists(_) => Code::AlreadyExists,
+                MutableTableError::InvalidId(_)
+                | MutableTableError::Schema(_)
+                | MutableTableError::MissingPrimaryKey(_)
+                | MutableTableError::ReservedColumn(_)
+                | MutableTableError::NoOrderColumn => Code::InvalidArgument,
+                MutableTableError::Backend(_) => Code::Internal,
+            };
+            (code, mt.to_string())
+        }
         other => (Code::Internal, other.to_string()),
     };
     attach_error_detail(code, message, &err)

@@ -7,7 +7,7 @@ use datafusion::execution::context::SessionContext;
 use futures::StreamExt;
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyString};
+use pyo3::types::{PyDict, PyList, PyString};
 use pyo3::Borrowed;
 use pyo3_arrow::{PySchema, PyTable};
 
@@ -482,6 +482,42 @@ impl PyDatabase {
             Err(JammiError::MutableTable(MutableTableError::NotFound(_))) if if_exists => Ok(()),
             Err(e) => Err(to_pyerr(e)),
         }
+    }
+
+    /// List every mutable companion table registered to the current tenant
+    /// binding. Registry introspection, not a SQL query. Each entry is a dict
+    /// mirroring the table's `MutableTableDefinition`: `id` (str), `schema`
+    /// (`pyarrow.Schema`), `primary_key` (list of str), `indexes` (list of
+    /// `{"name", "columns", "unique"}` dicts), `order_column` (str — empty when
+    /// the table declares none), and `chunk_size` (int).
+    fn list_mutable_tables(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let defs = self
+            .runtime
+            .block_on(self.session.list_mutable_tables())
+            .map_err(to_pyerr)?;
+        let out = PyList::empty(py);
+        for def in &defs {
+            let entry = PyDict::new(py);
+            entry.set_item("id", def.id.as_str())?;
+            entry.set_item(
+                "schema",
+                PySchema::new(Arc::clone(&def.schema)).into_pyarrow(py)?,
+            )?;
+            entry.set_item("primary_key", def.primary_key.clone())?;
+            let indexes = PyList::empty(py);
+            for idx in &def.indexes {
+                let idx_dict = PyDict::new(py);
+                idx_dict.set_item("name", idx.name.as_str())?;
+                idx_dict.set_item("columns", idx.columns.clone())?;
+                idx_dict.set_item("unique", idx.unique)?;
+                indexes.append(idx_dict)?;
+            }
+            entry.set_item("indexes", indexes)?;
+            entry.set_item("order_column", def.order_column.clone().unwrap_or_default())?;
+            entry.set_item("chunk_size", def.chunk_size)?;
+            out.append(entry)?;
+        }
+        Ok(out.into_any().unbind())
     }
 
     /// Register a trigger-stream topic. The schema is the contract every

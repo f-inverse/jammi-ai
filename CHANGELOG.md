@@ -6,6 +6,34 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.26.3 — 2026-06-11
+
+Follow-up engine work: a model retire lifecycle, catalog/SQL hardening, and
+release-tooling fixes.
+
+### Added
+- **Model retire lifecycle.** `RetireModel` (a control-plane RPC + `jammi models
+  retire`) soft-retires a model: `list_models`/`describe_model` hide it and the
+  serve/load path refuses it, while `get_model` still resolves it so a training
+  job or eval that references it stays valid. Retire is tenant-strict — a tenant
+  can retire only its own model, never a global one.
+
+### Fixed
+- **Per-source tenant discriminator persists** across `reload_sources` (carried
+  in the source connection), so a federated source's row-level tenant scoping
+  survives a restart.
+- **Multi-part relation references are quoted part-wise** in the eval/annotate
+  SQL (`"catalog"."schema"."table"`), so hyphenated catalog/schema names resolve.
+- **`release-binaries` no longer races release creation** — each tarball-upload
+  leg creates the GitHub release if missing, so it succeeds on the tag push
+  without waiting on the crates publish.
+- **`jammi-wire` vendors `protoc`** — a source build (e.g. `cargo install
+  jammi-cli`) no longer requires a system `protoc`.
+
+### Changed
+- Documented the multi-threaded-runtime invariant of the SQLite catalog
+  `transaction()` path.
+
 ## v0.26.2 — 2026-06-11
 
 Completes the regression target-standardization fix: 0.26.1 standardized the

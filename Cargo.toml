@@ -29,7 +29,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.26.2"
+version = "0.26.3"
 edition = "2021"
 rust-version = "1.88.0"
 license = "Apache-2.0"
@@ -37,24 +37,24 @@ repository = "https://github.com/f-inverse/jammi-ai"
 
 [workspace.dependencies]
 # Internal crates
-jammi-db = { version = "0.26.2", path = "crates/jammi-db" }
-jammi-numerics = { version = "0.26.2", path = "crates/jammi-numerics" }
+jammi-db = { version = "0.26.3", path = "crates/jammi-db" }
+jammi-numerics = { version = "0.26.3", path = "crates/jammi-numerics" }
 # The candle-free client substrate: the wire transport (`jammi-wire`), the
 # control-plane client (`jammi-admin`), and the data-plane client
 # (`jammi-client`). None pull the embedded ML stack — they speak the gRPC /
 # Flight SQL wire only.
-jammi-wire = { version = "0.26.2", path = "crates/jammi-wire" }
-jammi-admin = { version = "0.26.2", path = "crates/jammi-admin" }
-jammi-client = { version = "0.26.2", path = "crates/jammi-client" }
-jammi-ai = { version = "0.26.2", path = "crates/jammi-ai" }
-jammi-server = { version = "0.26.2", path = "crates/jammi-server" }
+jammi-wire = { version = "0.26.3", path = "crates/jammi-wire" }
+jammi-admin = { version = "0.26.3", path = "crates/jammi-admin" }
+jammi-client = { version = "0.26.3", path = "crates/jammi-client" }
+jammi-ai = { version = "0.26.3", path = "crates/jammi-ai" }
+jammi-server = { version = "0.26.3", path = "crates/jammi-server" }
 # Default features OFF at the workspace root so a consumer can pull jammi-lora's
 # candle-free config vocabulary without the candle stack (jammi-ai's thin
 # `wire`-only build). Consumers that need the candle-backed primitives opt in with
 # `features = ["candle"]` (jammi-encoders) or via a feature that does (jammi-ai's
 # `local`).
-jammi-lora = { version = "0.26.2", path = "crates/jammi-lora", default-features = false }
-jammi-encoders = { version = "0.26.2", path = "crates/jammi-encoders" }
+jammi-lora = { version = "0.26.3", path = "crates/jammi-lora", default-features = false }
+jammi-encoders = { version = "0.26.3", path = "crates/jammi-encoders" }
 jammi-test-utils = { path = "crates/jammi-test-utils" }
 
 # Query engine

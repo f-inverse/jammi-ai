@@ -139,7 +139,7 @@ async fn aggregate_path_unaffected_by_per_query_rows() {
     let agg = EvalRunRecord {
         eval_run_id: "run-agg".into(),
         eval_type: "embedding".into(),
-        model_id: "model-x::1".into(),
+        model_id: Some("model-x::1".into()),
         source_id: "src".into(),
         golden_source: "golden".into(),
         k: Some(10),

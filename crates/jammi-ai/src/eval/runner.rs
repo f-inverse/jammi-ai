@@ -207,7 +207,7 @@ impl<'a> EvalRunner<'a> {
             .record_eval_run(&EvalRunRecord {
                 eval_run_id: eval_run_id.clone(),
                 eval_type: "embedding".into(),
-                model_id: model_fk,
+                model_id: Some(model_fk),
                 source_id: source_id.into(),
                 golden_source: golden_source.into(),
                 k: Some(k as i32),
@@ -378,7 +378,7 @@ impl<'a> EvalRunner<'a> {
             .record_eval_run(&EvalRunRecord {
                 eval_run_id: uuid::Uuid::new_v4().to_string(),
                 eval_type: task.to_string(),
-                model_id: model_fk,
+                model_id: Some(model_fk),
                 source_id: source_id.into(),
                 golden_source: golden_source.into(),
                 k: None,
@@ -492,16 +492,16 @@ impl<'a> EvalRunner<'a> {
         // Record the aggregate, then persist the per-record scores to
         // `_jammi_eval_per_query` keyed by the same run id — the same shape the
         // embedding eval reuses, so cohort slicing and significance read back
-        // through one path. Calibration has no model, so the catalog row records
-        // the shape as a synthetic identifier (never a model PK) and leaves `k`
-        // empty.
-        let shape_id = format!("{shape}::1");
+        // through one path. A calibration run is not model-scoped: it scores a
+        // held-out predictive distribution from the golden source, not a
+        // registered model, so `model_id` is `None` and `k` is empty. The
+        // predictor family is carried by `eval_type` (the shape's name).
         self.session
             .catalog()
             .record_eval_run(&EvalRunRecord {
                 eval_run_id: eval_run_id.clone(),
                 eval_type: shape.to_string(),
-                model_id: shape_id,
+                model_id: None,
                 source_id: source_id.into(),
                 golden_source: golden_source.into(),
                 k: None,

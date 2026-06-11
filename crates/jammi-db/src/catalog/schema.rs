@@ -450,3 +450,56 @@ CREATE INDEX idx_training_jobs_claim ON training_jobs(status, lease_expires_at);
 pub(super) const MIGRATION_017_MODEL_ARTIFACT_PATH_COLUMN: &str = r#"
 ALTER TABLE models ADD COLUMN artifact_path TEXT;
 "#;
+
+/// Migration 018 — make `eval_runs.model_id` nullable.
+///
+/// An eval run is only sometimes model-scoped. Embedding and inference evals
+/// score a registered model's output, so they carry the catalog PK of that
+/// model and the FK to `models(model_id)` is theirs to satisfy. A calibration
+/// eval is different in kind: it scores a held-out predictive *distribution*
+/// supplied in the golden source — `(mean, sd, outcome)` or `(draws, outcome)`
+/// — and never loads or names a model. Forcing it to put *something* in a
+/// `NOT NULL REFERENCES models(model_id)` column made it write a synthetic id
+/// (the calibration shape, e.g. `gaussian::1`) for which no `models` row
+/// exists, so the insert failed the foreign key at runtime — calibration eval
+/// could not record a single run.
+///
+/// The fix is to let `model_id` be `NULL`: a model-scoped run records its
+/// model's PK and the FK validates it; a calibration run records `NULL` and is
+/// simply not model-scoped. The FK is *kept* — when a value is present it must
+/// reference a real model — only the `NOT NULL` is dropped.
+///
+/// SQLite cannot drop a column-level `NOT NULL` in place, so this rebuilds
+/// `eval_runs` via the canonical create-new / copy / drop / rename dance (the
+/// same shape migration 012 uses for `topics`), preserving every other column,
+/// default, and the `model_id` FK. The secondary indexes
+/// (`model`, `type`, `created`, `tenant`) are recreated. `PRAGMA foreign_keys`
+/// is OFF inside the migration transaction, so the FK-less window during the
+/// swap does not trip referential checks.
+pub(super) const MIGRATION_018_EVAL_RUNS_MODEL_ID_NULLABLE: &str = r#"
+CREATE TABLE eval_runs_new (
+    run_id        TEXT PRIMARY KEY,
+    model_id      TEXT REFERENCES models(model_id),
+    eval_type     TEXT NOT NULL,
+    source_id     TEXT,
+    metrics       TEXT NOT NULL,
+    config        TEXT,
+    created_at    TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT)),
+    golden_source TEXT,
+    k             INTEGER,
+    status        TEXT NOT NULL DEFAULT 'completed',
+    tenant_id     TEXT
+);
+
+INSERT INTO eval_runs_new (run_id, model_id, eval_type, source_id, metrics, config, created_at, golden_source, k, status, tenant_id)
+    SELECT run_id, model_id, eval_type, source_id, metrics, config, created_at, golden_source, k, status, tenant_id FROM eval_runs;
+
+DROP TABLE eval_runs;
+
+ALTER TABLE eval_runs_new RENAME TO eval_runs;
+
+CREATE INDEX idx_eval_runs_model   ON eval_runs(model_id);
+CREATE INDEX idx_eval_runs_type    ON eval_runs(eval_type);
+CREATE INDEX idx_eval_runs_created ON eval_runs(created_at);
+CREATE INDEX idx_eval_runs_tenant  ON eval_runs(tenant_id);
+"#;

@@ -34,6 +34,14 @@ use crate::tenant::TenantId;
 pub trait CatalogBackend: Send + Sync {
     /// Run `f` inside one backend transaction. Commits on `Ok(_)`, rolls back
     /// on `Err(_)`. The `&mut Transaction<'_>` cannot escape `f`.
+    ///
+    /// An implementation may spawn a detached task internally: the SQLite
+    /// backend opens its uncancellable `BEGIN` on `tokio::spawn(...).await`. So
+    /// this future must be *driven by a live runtime that can poll that
+    /// spawned task* — never blocked on with `Handle::block_on` from inside a
+    /// runtime worker thread, which would pin the worker on the join handle
+    /// while the spawned begin starves. Awaiting it normally (multi- or
+    /// single-thread runtime) is fine.
     fn transaction<'a, F, R>(
         &'a self,
         opts: TxOptions,

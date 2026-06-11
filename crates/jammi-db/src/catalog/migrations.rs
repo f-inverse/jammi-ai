@@ -56,6 +56,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "017_model_artifact_path_column",
         schema::MIGRATION_017_MODEL_ARTIFACT_PATH_COLUMN,
     ),
+    (
+        "018_eval_runs_model_id_nullable",
+        schema::MIGRATION_018_EVAL_RUNS_MODEL_ID_NULLABLE,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

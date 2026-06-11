@@ -286,7 +286,7 @@ async fn catalog_eval_run_crud_and_latest() {
         .record_eval_run(&EvalRunRecord {
             eval_run_id: "er-1".into(),
             eval_type: "embedding".into(),
-            model_id: "model-a::1".into(),
+            model_id: Some("model-a::1".into()),
             source_id: "src".into(),
             golden_source: "golden".into(),
             k: Some(10),
@@ -300,7 +300,7 @@ async fn catalog_eval_run_crud_and_latest() {
         .record_eval_run(&EvalRunRecord {
             eval_run_id: "er-2".into(),
             eval_type: "embedding".into(),
-            model_id: "model-a::1".into(),
+            model_id: Some("model-a::1".into()),
             source_id: "src".into(),
             golden_source: "golden".into(),
             k: Some(10),
@@ -432,16 +432,103 @@ async fn eval_embeddings_end_to_end() {
     assert_eq!(run.k, Some(10));
     assert_eq!(run.status, "completed");
 
-    // UAT 16: latest_eval_run retrieves the run we just created
+    // UAT 16: latest_eval_run retrieves the run we just created. An embedding
+    // eval is model-scoped, so its `model_id` is present (a calibration run's
+    // would be `None`).
+    let model_id = run
+        .model_id
+        .as_deref()
+        .expect("embedding eval run is model-scoped");
     let latest = session
         .catalog()
-        .latest_eval_run(&run.model_id, "embedding")
+        .latest_eval_run(model_id, "embedding")
         .await
         .unwrap();
     assert!(latest.is_some());
     let latest = latest.unwrap();
     assert_eq!(latest.eval_type, "embedding");
     assert!(latest.k.is_some());
+}
+
+// ─── End-to-end: calibration eval is not model-scoped ────────────────────────
+//
+// A calibration eval scores a held-out predictive distribution supplied in the
+// golden source — never a registered model — so it loads no model and records
+// no `models` row. The recorded `eval_runs` row must therefore carry a NULL
+// `model_id`; forcing a synthetic id into the `NOT NULL REFERENCES
+// models(model_id)` column made the insert fail the foreign key at runtime,
+// so no calibration run could be recorded at all. This exercises the full
+// runner path against a real CSV golden and asserts the run persists with no
+// model scope and the per-record scores land in `_jammi_eval_per_query`.
+
+#[tokio::test]
+async fn eval_calibration_records_run_without_model_scope() {
+    use jammi_ai::eval::EvalCalibrationShape;
+
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+
+    // A Gaussian calibration golden: per-record predictive (mean, sd) paired
+    // with the realised outcome. No model is named or loaded anywhere here.
+    let golden_path = dir.path().join("calibration_golden.csv");
+    std::fs::write(
+        &golden_path,
+        "record_id,mean,sd,outcome\n\
+         r0,0.0,1.0,0.2\n\
+         r1,1.0,0.5,1.1\n\
+         r2,-1.0,2.0,-0.5\n\
+         r3,2.0,1.0,2.3\n",
+    )
+    .unwrap();
+
+    session
+        .add_source(
+            "cal_golden",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", golden_path.to_str().unwrap())),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let report = session
+        .eval_calibration(
+            "cal_golden",
+            "cal_golden.public.calibration_golden",
+            EvalCalibrationShape::Gaussian,
+            &Default::default(),
+        )
+        .await
+        .expect("calibration eval must record a run (no model FK to satisfy)");
+
+    // The aggregate run is recorded with the calibration shape as eval_type and
+    // no model scope — model_id is NULL because calibration scores a
+    // distribution, not a registered model.
+    let runs = session.catalog().list_eval_runs().await.unwrap();
+    let run = runs
+        .iter()
+        .find(|r| r.eval_run_id == report.eval_run_id)
+        .expect("calibration run recorded in catalog");
+    assert_eq!(run.eval_type, "calibration_gaussian");
+    assert!(
+        run.model_id.is_none(),
+        "calibration run must not be model-scoped, got {:?}",
+        run.model_id
+    );
+    assert!(run.k.is_none());
+
+    // The per-record scores landed in `_jammi_eval_per_query`, keyed by the run
+    // id with the record_id in the query_id slot.
+    let per_record = session
+        .catalog()
+        .get_eval_per_query(&report.eval_run_id)
+        .await
+        .unwrap();
+    assert_eq!(per_record.len(), 4, "one row per held-out prediction");
 }
 
 // ─── End-to-end: per-query eval persistence + cohorts (spec J9) ──────────────

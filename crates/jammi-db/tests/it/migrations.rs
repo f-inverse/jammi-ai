@@ -177,6 +177,7 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "015_fine_tune_job_queue",
             "016_rename_training_jobs",
             "017_model_artifact_path_column",
+            "018_eval_runs_model_id_nullable",
         ]
     );
 }

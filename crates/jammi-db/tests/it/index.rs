@@ -1,5 +1,15 @@
+use std::sync::Arc;
+
+use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field};
+use datafusion::common::TableReference;
+use datafusion::datasource::file_format::options::ParquetReadOptions;
+use datafusion::prelude::SessionContext;
+use jammi_db::index::exact::exact_vector_search;
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
+use jammi_db::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
+use jammi_db::store::schema::embedding_table_schema;
 use tempfile::tempdir;
 
 // ─── SidecarIndex: add, search, edge cases ───────────────────────────────────
@@ -91,4 +101,92 @@ fn sidecar_load_rejects_corrupted_rowmap() {
         SidecarIndex::load(&base_path).is_err(),
         "Should reject unknown rowmap version"
     );
+}
+
+// ─── exact_vector_search: the non-indexed fallback under default schema ───────
+//
+// `exact_vector_search` is the brute-force path the engine takes for any result
+// table WITHOUT an ANN sidecar index (`resolve_search_mode` → `None`). The scan
+// reads `_row_id`, a `Utf8` column. DataFusion's default
+// `schema_force_view_types` surfaces parquet `Utf8` as `Utf8View`
+// (`StringViewArray`), so a downcast that only accepts `StringArray` would
+// silently miss the column and fail with "Missing _row_id" — breaking the real
+// production fallback. This builds a real Parquet result table through the
+// engine's writer, registers it under `jammi.{name}` in a DEFAULT
+// `SessionContext` (force-view ON, exactly as production runs), and asserts
+// exact search resolves the row ids and ranks the nearest neighbour first.
+#[tokio::test]
+async fn exact_search_resolves_row_ids_under_default_schema() {
+    let dir = tempdir().unwrap();
+
+    let dim = 4_i32;
+    let schema = embedding_table_schema(dim as usize);
+    // Four rows; row "near" is closest to the query direction below.
+    let row_ids = vec![
+        "far".to_string(),
+        "near".to_string(),
+        "mid".to_string(),
+        "opp".to_string(),
+    ];
+    let vectors = [
+        [0.0_f32, 1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [0.7, 0.7, 0.0, 0.0],
+        [-1.0, 0.0, 0.0, 0.0],
+    ];
+    let n = row_ids.len();
+
+    let flat: Vec<f32> = vectors.iter().flat_map(|r| r.iter().copied()).collect();
+    let values = Arc::new(Float32Array::from(flat));
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    let vector_col = FixedSizeListArray::try_new(item, dim, values, None).unwrap();
+
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(row_ids.clone())) as ArrayRef,
+            Arc::new(StringArray::from(vec!["src"; n])),
+            Arc::new(StringArray::from(vec!["model"; n])),
+            Arc::new(vector_col),
+        ],
+    )
+    .unwrap();
+
+    // Write through the engine's Parquet writer so the on-disk encoding matches
+    // production — what the default reader then surfaces as `Utf8View`.
+    let parquet_path = dir.path().join("exact_table.parquet");
+    let url = StorageUrl::parse(parquet_path.to_str().unwrap()).unwrap();
+    let registry = StorageRegistry::new();
+    let driver = registry.driver_for(&url, None).unwrap();
+    let handle = JammiObjectStore::new(driver, url.clone());
+    let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema))
+        .await
+        .unwrap();
+    writer.write_batch(&batch).await.unwrap();
+    writer.close().await.unwrap();
+
+    // DEFAULT context: `schema_force_view_types` is ON, matching production.
+    let ctx = SessionContext::new();
+    let table_name = "exact_table";
+    let table_ref = TableReference::bare(format!("jammi.{table_name}"));
+    ctx.register_parquet(table_ref, url.as_str(), ParquetReadOptions::default())
+        .await
+        .unwrap();
+
+    // Query points along the "near" direction; expect "near" ranked first and
+    // every row id resolved (not lost to a failed downcast).
+    let results = exact_vector_search(&ctx, table_name, &[1.0, 0.0, 0.0, 0.0], 4)
+        .await
+        .expect("exact search must resolve _row_id under default schema");
+
+    assert_eq!(results.len(), n, "every row scored");
+    assert_eq!(results[0].0, "near", "nearest neighbour ranked first");
+    let resolved: std::collections::HashSet<&str> =
+        results.iter().map(|(id, _)| id.as_str()).collect();
+    for id in &row_ids {
+        assert!(
+            resolved.contains(id.as_str()),
+            "row id '{id}' must be resolved from the Utf8View column"
+        );
+    }
 }

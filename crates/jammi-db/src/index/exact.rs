@@ -1,4 +1,6 @@
 use arrow::array::{Array, StringArray};
+use arrow::compute::cast;
+use arrow::datatypes::DataType;
 use datafusion::prelude::SessionContext;
 
 use jammi_numerics::distance::cosine_distance;
@@ -26,10 +28,23 @@ pub async fn exact_vector_search(
     let mut scored: Vec<(String, f32)> = Vec::new();
     let mut vectors: Vec<Vec<f32>> = Vec::new();
     for batch in &batches {
-        let row_ids = batch
+        // `_row_id` is a Utf8 column, but the parquet reader surfaces it as
+        // `Utf8View` (`StringViewArray`) under DataFusion's default
+        // `schema_force_view_types`, and could be `LargeUtf8` for a wide table.
+        // Cast to `Utf8` so a single `StringArray` downcast covers every Utf8
+        // family the scan can produce.
+        let row_ids_col = batch
             .column_by_name("_row_id")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
             .ok_or_else(|| JammiError::Other("Missing _row_id in exact search".into()))?;
+        let row_ids_utf8 = cast(row_ids_col, &DataType::Utf8).map_err(|e| {
+            JammiError::Other(format!("_row_id column could not be cast to Utf8: {e}"))
+        })?;
+        let row_ids = row_ids_utf8
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                JammiError::Other("_row_id column is not a Utf8-castable string type".into())
+            })?;
         let before = vectors.len();
         extend_with_fixed_size_list_f32(batch, table_name, "vector", &mut vectors)?;
         // `extend_with_fixed_size_list_f32` appends exactly one Vec<f32> per

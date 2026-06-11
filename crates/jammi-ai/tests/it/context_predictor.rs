@@ -168,6 +168,40 @@ async fn session_with_meta_dataset_named(
     (session, dir)
 }
 
+/// A high-offset, low-variance meta-dataset: every outcome is a calendar year
+/// near `base_year`, the task's own mean year shifting it slightly. The feature
+/// `x` still clusters by task (a small per-task signal plus noise) so same-task
+/// retrieval works, but the *outcome* carries the high offset that collapses an
+/// un-standardised regressor. This is the engine-level peer of "predict the
+/// filing year" — the exact shape the amortized predictor failed on.
+fn high_offset_meta_dataset(
+    n_tasks: usize,
+    rows_per_task: usize,
+    base_year: f64,
+    seed: u64,
+) -> Vec<Row> {
+    let mut rng = Rng(seed);
+    let mut rows = Vec::with_capacity(n_tasks * rows_per_task);
+    for t in 0..n_tasks {
+        // A per-task feature centroid so same-task rows cluster in x-space.
+        let centroid: Vec<f32> = (0..FEATURE_DIM).map(|_| rng.next_f32()).collect();
+        let task_mean = base_year + (t as f64 - n_tasks as f64 / 2.0);
+        for r in 0..rows_per_task {
+            let x: Vec<f32> = centroid.iter().map(|c| c + rng.next_f32() * 0.1).collect();
+            // The outcome is a calendar year near the task's mean — a high-offset,
+            // low-variance target.
+            let y = task_mean + (rng.next_f32() as f64) * 2.0;
+            rows.push(Row {
+                id: format!("t{t}_r{r}"),
+                task: format!("task_{t}"),
+                x,
+                y,
+            });
+        }
+    }
+    rows
+}
+
 /// A spec over the synthetic dataset for the given architecture / objective.
 fn spec(architecture: ContextArchitecture, head: PredictiveHead) -> ContextPredictorTrainConfig {
     ContextPredictorTrainConfig {
@@ -1189,5 +1223,140 @@ async fn conformal_levers_apply_and_never_self_select() {
     assert!(
         mismatch.is_err(),
         "one cohort for many calibration points must be a typed error"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Target standardisation: a high-offset, low-variance outcome (calendar years)
+// must not collapse the amortized predictor. The served mean is de-standardised
+// back to raw units after a save → reload round trip, and the served σ is a real
+// spread — the bug the un-standardised path exhibited (mean far off, σ ≈ floor).
+// ---------------------------------------------------------------------------
+
+/// The Gaussian-head oracle, end to end through the real train → persist →
+/// reload → predict path: a calendar-year outcome (≈ `base_year`) is fitted, the
+/// predictor is reloaded from the catalogued artifact, and the served mean lands
+/// near the true year with a real σ. A predictor that did not standardise its
+/// target (and de-standardise on reload) serves a mean thousands off and a σ
+/// pinned at the floor — the exact collapse this guards.
+#[tokio::test(flavor = "multi_thread")]
+async fn gaussian_predictor_fits_high_offset_target_round_trip() {
+    let base_year = 2017.0_f64;
+    let rows = high_offset_meta_dataset(8, 18, base_year, 4242);
+    let (session, _dir) = session_with_meta_dataset(&rows).await;
+
+    let mut spec = spec(
+        ContextArchitecture::AttnCnp,
+        PredictiveHead::Gaussian {
+            objective: GaussianObjective::Crps,
+        },
+    );
+    spec.epochs = 120;
+    spec.learning_rate = 0.02;
+    let model_id = train(&session, &spec).await;
+
+    // Reload from the catalogued artifact — the served path de-standardises with
+    // the persisted scaler, so a high-offset mean survives the reload.
+    let served = session
+        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .await
+        .unwrap();
+
+    // Average over several targets: the population property, not one row's noise.
+    let mut mean_sum = 0.0;
+    let mut sigma_sum = 0.0;
+    let probe: Vec<&Row> = rows.iter().take(12).collect();
+    for row in &probe {
+        let dist = session
+            .predict_with_context_predictor(&served, &row.id)
+            .await
+            .unwrap();
+        if let jammi_ai::pipeline::context_predictor::PredictedDistribution::Gaussian {
+            mean,
+            std,
+        } = dist
+        {
+            mean_sum += mean as f64;
+            sigma_sum += std as f64;
+        } else {
+            panic!("a Gaussian spec must serve a Gaussian distribution");
+        }
+    }
+    let mean = mean_sum / probe.len() as f64;
+    let sigma = sigma_sum / probe.len() as f64;
+    assert!(
+        (mean - base_year).abs() < 50.0,
+        "served mean {mean} should land near the true year {base_year} after reload \
+         (off by {:.0}) — a de-standardisation that dropped on the reload path would \
+         serve a z-space mean near 0",
+        (mean - base_year).abs()
+    );
+    assert!(
+        sigma > 0.1,
+        "served σ {sigma} collapsed to the floor — the calendar-year spread is ≈ 2, \
+         so a calibrated σ must be well off 0.001"
+    );
+}
+
+/// The Quantile-head parity of the round-trip oracle: a calendar-year outcome is
+/// fitted with a pinball head, reloaded, and the served quantile band sits around
+/// the true year (de-standardised) and is ordered. Covers the quantile path the
+/// scaler de-standardises every column of, alongside the Gaussian arm.
+#[tokio::test(flavor = "multi_thread")]
+async fn quantile_predictor_fits_high_offset_target_round_trip() {
+    let base_year = 2017.0_f64;
+    let rows = high_offset_meta_dataset(8, 18, base_year, 909);
+    let (session, _dir) = session_with_meta_dataset(&rows).await;
+
+    let mut spec = spec(
+        ContextArchitecture::AttnCnp,
+        PredictiveHead::Quantile {
+            levels: vec![0.1, 0.5, 0.9],
+        },
+    );
+    spec.epochs = 120;
+    spec.learning_rate = 0.02;
+    let model_id = train(&session, &spec).await;
+
+    let served = session
+        .load_context_predictor(&model_id, "fns", ContextServeOptions::default())
+        .await
+        .unwrap();
+
+    let mut median_sum = 0.0;
+    let probe: Vec<&Row> = rows.iter().take(12).collect();
+    for row in &probe {
+        let dist = session
+            .predict_with_context_predictor(&served, &row.id)
+            .await
+            .unwrap();
+        if let jammi_ai::pipeline::context_predictor::PredictedDistribution::Quantile { levels } =
+            dist
+        {
+            // Ordered (non-crossing) and de-standardised to raw years.
+            let vals: Vec<f32> = levels.iter().map(|(_, v)| *v).collect();
+            for w in vals.windows(2) {
+                assert!(
+                    w[1] >= w[0] - 1.0,
+                    "served quantiles must be ~ordered after de-standardisation: {vals:?}"
+                );
+            }
+            // The median (0.5) is the central level.
+            let median = levels
+                .iter()
+                .min_by(|a, b| (a.0 - 0.5).abs().total_cmp(&(b.0 - 0.5).abs()))
+                .unwrap()
+                .1 as f64;
+            median_sum += median;
+        } else {
+            panic!("a quantile spec must serve a quantile distribution");
+        }
+    }
+    let median = median_sum / probe.len() as f64;
+    assert!(
+        (median - base_year).abs() < 50.0,
+        "served median {median} should land near the true year {base_year} after reload \
+         (off by {:.0}) — the quantile head must de-standardise every column",
+        (median - base_year).abs()
     );
 }

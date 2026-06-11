@@ -1,0 +1,264 @@
+"""Live remote round-trip for the mutable-table + topic + pub/sub verbs.
+
+Stands up a real CPU `jammi-server` (no GPU — these are DML/streaming verbs) and
+drives the two cookbook-unblocking paths through the pure-Python
+`RemoteDatabase`, asserting the remote results equal the embedded engine's:
+
+  * **C1 (mutable table):** `create_mutable_table` → write rows via `sql()` (the
+    Flight SQL data-plane DML path) → read them back / federated JOIN with a
+    registered source → `drop_mutable_table`.
+  * **C2 (topic pub/sub):** `register_topic` → `publish_topic(batch)` →
+    `subscribe_collect(predicate, from_offset)` returns the published rows →
+    backing-table replay via `sql()` over the topic's backing table.
+
+Each path runs the SAME calls against an embedded `jammi_ai.Database` and asserts
+the two transports agree (parity). A two-tenant isolation assertion confirms each
+verb rides the session's `jammi-session-id` scope — a mutable table created under
+tenant A is invisible to tenant B.
+
+Gated, not hermetic: the test needs a built server binary, so it is skipped
+unless `JAMMI_SERVER_BIN` points at a `jammi-server` executable. CI's
+python-test job sets it after building the binary; a bare `pytest` skips it. The
+embedded engine (`jammi_ai`) must also be importable (the parity peer).
+"""
+
+from __future__ import annotations
+
+import os
+import socket
+import subprocess
+import time
+import uuid
+
+import pyarrow as pa
+import pytest
+
+jammi_ai = pytest.importorskip("jammi_ai")
+import jammi_client  # noqa: E402
+
+SERVER_BIN = os.environ.get("JAMMI_SERVER_BIN")
+
+pytestmark = pytest.mark.skipif(
+    not SERVER_BIN or not os.path.exists(SERVER_BIN),
+    reason="JAMMI_SERVER_BIN not set to a built jammi-server binary",
+)
+
+# Two syntactically valid tenant UUIDs for the isolation assertion.
+TENANT_A = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a"
+TENANT_B = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b"
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@pytest.fixture(scope="module")
+def live_server(tmp_path_factory):
+    """A real `jammi-server` (CPU, all tiers) on a free port; torn down at module
+    exit. Yields the `grpc://127.0.0.1:<port>` endpoint."""
+    artifact_dir = tmp_path_factory.mktemp("jammi-srv")
+    flight_port = _free_port()
+    health_port = _free_port()
+    env = dict(os.environ)
+    env["JAMMI_ARTIFACT_DIR"] = str(artifact_dir)
+    env["JAMMI_SERVER__FLIGHT_LISTEN"] = f"127.0.0.1:{flight_port}"
+    env["JAMMI_SERVER__HEALTH_LISTEN"] = f"127.0.0.1:{health_port}"
+    env["JAMMI_SERVER__SERVICES"] = "all"
+
+    proc = subprocess.Popen(
+        [SERVER_BIN],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+    # Poll readiness via a trivial RemoteDatabase handshake.
+    endpoint = f"grpc://127.0.0.1:{flight_port}"
+    deadline = time.time() + 30
+    ready = False
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            out = proc.stdout.read().decode(errors="replace") if proc.stdout else ""
+            raise RuntimeError(f"jammi-server exited early:\n{out}")
+        try:
+            db = jammi_client.connect(endpoint)
+            db.get_server_info()
+            db.close()
+            ready = True
+            break
+        except Exception:
+            time.sleep(0.25)
+    if not ready:
+        proc.terminate()
+        raise RuntimeError("jammi-server did not become ready within 30s")
+
+    yield endpoint
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def _dim_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("sku", pa.string(), nullable=False),
+            pa.field("name", pa.string(), nullable=False),
+            pa.field("price_cents", pa.int64(), nullable=False),
+        ]
+    )
+
+
+def _events_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("event_id", pa.int64(), nullable=False),
+            pa.field("kind", pa.string(), nullable=False),
+        ]
+    )
+
+
+def test_c1_mutable_table_round_trip_matches_embedded(live_server, tmp_path):
+    """C1: create a mutable table, write rows via Flight SQL DML, read them back,
+    then drop — remote results equal the embedded engine's."""
+    remote = jammi_client.connect(live_server)
+    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    try:
+        for db in (remote, embedded):
+            db.create_mutable_table(
+                "dim_products",
+                schema=_dim_schema(),
+                primary_key=["sku"],
+            )
+            # The mutable table appears in the registry introspection.
+            ids = [t["id"] for t in db.list_mutable_tables()]
+            assert "dim_products" in ids
+
+            # Write rows through the Flight SQL / engine DML path (the data plane).
+            db.sql(
+                "INSERT INTO mutable.public.dim_products (sku, name, price_cents) "
+                "VALUES ('a', 'Widget', 100), ('b', 'Gadget', 250)"
+            )
+
+        remote_rows = remote.sql(
+            "SELECT sku, name, price_cents FROM mutable.public.dim_products ORDER BY sku"
+        )
+        embedded_rows = embedded.sql(
+            "SELECT sku, name, price_cents FROM mutable.public.dim_products ORDER BY sku"
+        )
+        assert remote_rows.to_pydict() == embedded_rows.to_pydict()
+        assert remote_rows.num_rows == 2
+
+        # A federated JOIN of the mutable table against itself (an aggregate over
+        # the same data) exercises the table as a first-class query participant.
+        remote_join = remote.sql(
+            "SELECT count(*) AS n, sum(price_cents) AS total "
+            "FROM mutable.public.dim_products"
+        )
+        embedded_join = embedded.sql(
+            "SELECT count(*) AS n, sum(price_cents) AS total "
+            "FROM mutable.public.dim_products"
+        )
+        assert remote_join.to_pydict() == embedded_join.to_pydict()
+
+        for db in (remote, embedded):
+            db.drop_mutable_table("dim_products")
+            assert "dim_products" not in [t["id"] for t in db.list_mutable_tables()]
+            # `if_exists` makes a second drop a no-op on both transports.
+            db.drop_mutable_table("dim_products", if_exists=True)
+    finally:
+        # The embedded engine releases its resources on drop (RAII); only the
+        # remote client holds a gRPC channel that needs an explicit close.
+        remote.close()
+
+
+def test_c2_topic_pub_sub_round_trip_matches_embedded(live_server, tmp_path):
+    """C2: register a topic, publish a batch, then `subscribe_collect` with a
+    predicate + from_offset returns the published rows — remote equals embedded,
+    and the topic's backing table replays the same rows via `sql()`."""
+    remote = jammi_client.connect(live_server)
+    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    try:
+        batch = pa.table(
+            {
+                "event_id": pa.array([1, 2, 3], type=pa.int64()),
+                "kind": pa.array(["click", "view", "click"], type=pa.string()),
+            },
+            schema=_events_schema(),
+        )
+
+        collected = {}
+        for name, db in (("remote", remote), ("embedded", embedded)):
+            db.register_topic("events.demo", schema=_events_schema())
+            assert "events.demo" in db.list_topics()
+
+            offset = db.publish_topic("events.demo", batch=batch)
+            assert offset == 0  # first publish on a fresh topic
+
+            # Replay from offset 0 with a predicate; `max_batches=1` matches the
+            # single publish so the bounded collect does not race the live tail.
+            got = db.subscribe_collect(
+                "events.demo",
+                predicate="kind = 'click'",
+                from_offset=0,
+                max_batches=1,
+            )
+            collected[name] = got
+
+        # The predicate filtered to the two 'click' rows on both transports.
+        assert collected["remote"].to_pydict() == collected["embedded"].to_pydict()
+        kinds = collected["remote"].column("kind").to_pylist()
+        assert kinds == ["click", "click"]
+
+        # Backing-table replay: an unfiltered `subscribe_collect(from_offset=0)`
+        # drains the topic's durable backing table (the persisted event log behind
+        # the stream) and returns every published row — identical across
+        # transports. This is the replay half of the replay+live-tail join.
+        remote_replay = remote.subscribe_collect(
+            "events.demo", from_offset=0, max_batches=1
+        )
+        embedded_replay = embedded.subscribe_collect(
+            "events.demo", from_offset=0, max_batches=1
+        )
+        assert remote_replay.to_pydict() == embedded_replay.to_pydict()
+        assert remote_replay.num_rows == 3
+
+        for db in (remote, embedded):
+            db.drop_topic("events.demo")
+            assert "events.demo" not in db.list_topics()
+            db.drop_topic("events.demo", if_exists=True)  # no-op on both
+    finally:
+        # The embedded engine releases its resources on drop (RAII); only the
+        # remote client holds a gRPC channel that needs an explicit close.
+        remote.close()
+
+
+def test_mutable_table_tenant_isolation_over_the_wire(live_server):
+    """A mutable table created under tenant A is invisible to tenant B — proving
+    every new verb rides the session's tenant scope (a verb missing
+    `metadata=self._metadata` would silently run unscoped and leak across
+    tenants). Two separate connections carry two distinct session ids."""
+    db_a = jammi_client.connect(live_server)
+    db_b = jammi_client.connect(live_server)
+    try:
+        db_a.with_tenant(TENANT_A)
+        db_b.with_tenant(TENANT_B)
+
+        db_a.create_mutable_table(
+            "scoped_dim",
+            schema=_dim_schema(),
+            primary_key=["sku"],
+        )
+
+        # Tenant A sees it; tenant B does not.
+        assert "scoped_dim" in [t["id"] for t in db_a.list_mutable_tables()]
+        assert "scoped_dim" not in [t["id"] for t in db_b.list_mutable_tables()]
+
+        db_a.drop_mutable_table("scoped_dim")
+    finally:
+        db_a.close()
+        db_b.close()

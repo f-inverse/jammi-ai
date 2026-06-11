@@ -32,6 +32,7 @@ from ._generated.jammi.v1 import eval_pb2, eval_pb2_grpc
 from ._generated.jammi.v1 import inference_pb2, inference_pb2_grpc
 from ._generated.jammi.v1 import pipeline_pb2, pipeline_pb2_grpc
 from ._generated.jammi.v1 import training_pb2, training_pb2_grpc
+from ._generated.jammi.v1 import trigger_pb2, trigger_pb2_grpc
 
 # The header carrying a connection's opaque session id. The server's tenant
 # interceptor reads it on every request and resolves the bound tenant; it is the
@@ -160,6 +161,61 @@ def _arrow_batch_to_table(batch: Any) -> pa.Table:
         return pa.table({})
     reader = pa.ipc.open_stream(body)
     return reader.read_all()
+
+
+def _encode_ipc_schema(schema: pa.Schema) -> bytes:
+    """Encode a `pyarrow.Schema` as a schema-only Arrow IPC stream — the framing
+    the engine's `decode_ipc_schema` reads back (a `StreamWriter` opened on the
+    schema and finished with no batches). This is the byte shape
+    `MutableTableDefinition.schema` and `RegisterTopicRequest.schema` carry, the
+    same self-describing IPC framing the trigger batch payloads use.
+    """
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, schema):
+        # No batches: a schema-only stream is the writer opened and closed, which
+        # emits the schema message the server decodes back into a `SchemaRef`.
+        pass
+    return sink.getvalue().to_pybytes()
+
+
+def _table_to_arrow_batch(batch: pa.Table) -> "trigger_pb2.ArrowBatch":
+    """Encode a `pyarrow.Table` into one `ArrowBatch` carrying a self-describing
+    Arrow IPC stream in `data_body` (schema header inline, `data_header` empty) —
+    the Flight-IPC framing the engine's `decode_ipc_stream` reads back, and the
+    inverse of :func:`_arrow_batch_to_table`. The whole table rides as one logical
+    event: the publish path concatenates multi-chunk tables server-side, so a
+    multi-batch stream publishes as one batch (matching the embedded
+    `publish_topic`, which concatenates the streamed chunks).
+    """
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, batch.schema) as writer:
+        writer.write_table(batch)
+    return trigger_pb2.ArrowBatch(data_header=b"", data_body=sink.getvalue().to_pybytes())
+
+
+def _mutable_table_definition_to_dict(
+    d: catalog_pb2.MutableTableDefinition,
+) -> Dict[str, Any]:
+    """Project a wire `MutableTableDefinition` into the embed wheel's dict shape.
+
+    Mirrors the embedded `Database.list_mutable_tables` entry — `id`, `schema`
+    (a `pyarrow.Schema` decoded from the IPC framing), `primary_key`, `indexes`
+    (each a `{"name", "columns", "unique"}` dict), `order_column` (empty string
+    when the table declares none, matching the embedded `unwrap_or_default`), and
+    `chunk_size` — so a caller reads the same keys regardless of transport.
+    """
+    schema = pa.ipc.open_stream(d.schema).schema
+    return {
+        "id": d.id,
+        "schema": schema,
+        "primary_key": list(d.primary_key),
+        "indexes": [
+            {"name": idx.name, "columns": list(idx.columns), "unique": idx.unique}
+            for idx in d.indexes
+        ],
+        "order_column": d.order_column,
+        "chunk_size": d.chunk_size,
+    }
 
 
 def _calibration_report_to_dict(
@@ -427,6 +483,10 @@ class RemoteDatabase:
         self._inference = inference_pb2_grpc.InferenceServiceStub(channel)
         self._pipeline = pipeline_pb2_grpc.PipelineServiceStub(channel)
         self._eval = eval_pb2_grpc.EvalServiceStub(channel)
+        # The trigger data-plane (`publish_topic` / `subscribe_collect`). The
+        # topic-admin lifecycle (register/drop/list) is control-plane and rides
+        # `self._catalog`; only the publish/subscribe compute verbs hit this stub.
+        self._trigger = trigger_pb2_grpc.TriggerServiceStub(channel)
         # The Flight SQL client shares the gRPC endpoint (the server co-mounts
         # Flight SQL and the typed gRPC services on one Tonic port); built lazily
         # on first `sql` so a connection that never queries SQL pays nothing.
@@ -540,6 +600,251 @@ class RemoteDatabase:
                 return None
             raise
         return _source_descriptor_to_dict(d)
+
+    # --- Mutable companion tables (control plane) --------------------------------
+    #
+    # The mutable-table lifecycle is control-plane: register / drop / introspect a
+    # mutable companion table against the remote catalog (`CatalogService`). The
+    # schema rides as a schema-only Arrow IPC stream (the framing the server's
+    # `decode_ipc_schema` reads back); the wire body is tenant-free — the server
+    # stamps the session's tenant from the `jammi-session-id` header. Data DML
+    # (INSERT / UPDATE / DELETE / SELECT over `mutable.public.<name>`) flows over
+    # the Flight SQL lane (:meth:`sql`), not these verbs. The signatures mirror the
+    # embed `Database`'s so a caller swaps transports without changing the call.
+
+    def create_mutable_table(
+        self,
+        name: str,
+        *,
+        schema: pa.Schema,
+        primary_key: List[str],
+        indexes: Optional[List[Dict[str, Any]]] = None,
+        order_column: Optional[str] = None,
+        chunk_size: Optional[int] = None,
+    ) -> str:
+        """Register a mutable companion table on the remote engine and return its
+        catalog id.
+
+        `schema` is the table's `pyarrow.Schema`; `primary_key` is a non-empty
+        list of column names drawn from it. `indexes` is an optional list of dicts
+        of shape ``{"name": str, "columns": [str, ...], "unique": bool=False}`` —
+        one secondary index per entry. `order_column` is an optional monotonic
+        column enabling streaming `scan_after` reads; `chunk_size` overrides the
+        engine's default scan chunk size. Tenant scope is the session's bound
+        tenant (the wire body is tenant-free). Maps to
+        `CatalogService.CreateMutableTable`.
+        """
+        wire_indexes = [
+            catalog_pb2.MutableIndex(
+                name=idx["name"],
+                columns=list(idx["columns"]),
+                unique=bool(idx.get("unique", False)),
+            )
+            for idx in (indexes or [])
+        ]
+        definition = catalog_pb2.MutableTableDefinition(
+            id=name,
+            schema=_encode_ipc_schema(schema),
+            primary_key=list(primary_key),
+            indexes=wire_indexes,
+        )
+        if order_column is not None:
+            definition.order_column = order_column
+        if chunk_size is not None:
+            definition.chunk_size = chunk_size
+        resp = self._catalog.CreateMutableTable(
+            catalog_pb2.CreateMutableTableRequest(definition=definition),
+            metadata=self._metadata,
+        )
+        return resp.mutable_table_id
+
+    def drop_mutable_table(self, name: str, *, if_exists: bool = False) -> None:
+        """Drop a mutable companion table by id. With ``if_exists=True``, dropping
+        a table that is not registered is a no-op; otherwise the engine's typed
+        NotFound is surfaced. Maps to `CatalogService.DropMutableTable`.
+        """
+        try:
+            self._catalog.DropMutableTable(
+                catalog_pb2.DropMutableTableRequest(mutable_table_id=name),
+                metadata=self._metadata,
+            )
+        except grpc.RpcError as exc:
+            if if_exists and exc.code() == grpc.StatusCode.NOT_FOUND:
+                return
+            raise
+
+    def list_mutable_tables(self) -> List[Dict[str, Any]]:
+        """A descriptor for every mutable companion table registered to the current
+        tenant. Each entry is the same dict shape as the embed
+        `Database.list_mutable_tables`: ``id``, ``schema`` (a `pyarrow.Schema`),
+        ``primary_key``, ``indexes``, ``order_column`` (empty when none), and
+        ``chunk_size``. Maps to `CatalogService.ListMutableTables`.
+        """
+        resp = self._catalog.ListMutableTables(
+            catalog_pb2.ListMutableTablesRequest(), metadata=self._metadata
+        )
+        return [_mutable_table_definition_to_dict(d) for d in resp.definitions]
+
+    # --- Topics: admin (control plane) ------------------------------------------
+    #
+    # The topic-admin lifecycle is control-plane (`CatalogService`): register /
+    # drop / list a trigger-stream topic. The publish/subscribe compute verbs are
+    # data-plane and ride `TriggerService` (below). The drop/list wire is id-keyed
+    # (the server resolves the topic by `TopicId`), while the embed surface is
+    # name-keyed — so :meth:`drop_topic` resolves the name → id via `ListTopics`
+    # first, matching the embedded tenant-scoped `lookup_by_name`.
+
+    def register_topic(
+        self,
+        name: str,
+        *,
+        schema: pa.Schema,
+        broker_metadata: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """Register a trigger-stream topic on the remote engine and return its
+        engine-minted topic id.
+
+        `schema` is the contract every published batch must satisfy (rides as a
+        schema-only Arrow IPC stream). `broker_metadata` is opaque driver-side
+        configuration (retention, replication, …). Tenant scope is the session's
+        bound tenant. Maps to `CatalogService.RegisterTopic`.
+        """
+        request = catalog_pb2.RegisterTopicRequest(
+            name=name,
+            schema=_encode_ipc_schema(schema),
+            broker_metadata=broker_metadata or {},
+        )
+        resp = self._catalog.RegisterTopic(request, metadata=self._metadata)
+        return resp.topic_id
+
+    def drop_topic(self, name: str, *, if_exists: bool = False) -> None:
+        """Drop a trigger-stream topic by name. With ``if_exists=True``, dropping a
+        topic that is not registered is a no-op; otherwise a missing topic raises.
+        Maps to `CatalogService.DropTopic`.
+
+        The wire drop is id-keyed, but the embed surface (and this verb) is
+        name-keyed — so the name is resolved to its id via :meth:`list_topics`
+        first, the same tenant-scoped lookup the embedded `drop_topic` does. A
+        name that resolves to no topic is the no-op (``if_exists``) or a
+        ``ValueError`` (matching the embedded NotFound), without a wire hop.
+        """
+        topic_id = self._resolve_topic_id(name)
+        if topic_id is None:
+            if if_exists:
+                return
+            raise ValueError(f"topic '{name}' not found")
+        try:
+            self._catalog.DropTopic(
+                catalog_pb2.DropTopicRequest(topic_id=topic_id, if_exists=if_exists),
+                metadata=self._metadata,
+            )
+        except grpc.RpcError as exc:
+            if if_exists and exc.code() == grpc.StatusCode.NOT_FOUND:
+                return
+            raise
+
+    def list_topics(self) -> List[str]:
+        """The name of every topic visible to the current tenant binding. Maps to
+        `CatalogService.ListTopics`; same list-of-names shape the embed
+        `Database.list_topics` returns.
+        """
+        return [t.name for t in self._list_topics_raw()]
+
+    def _list_topics_raw(self) -> List[catalog_pb2.Topic]:
+        """The full `Topic` messages for the current tenant — the shared read
+        backing both :meth:`list_topics` (names) and the name→id resolution
+        :meth:`drop_topic` needs."""
+        resp = self._catalog.ListTopics(
+            catalog_pb2.ListTopicsRequest(), metadata=self._metadata
+        )
+        return list(resp.topics)
+
+    def _resolve_topic_id(self, name: str) -> Optional[str]:
+        """Resolve a topic name to its id within the current tenant scope, or
+        ``None`` if no such topic exists — the client-side analogue of the engine's
+        tenant-scoped `lookup_by_name`."""
+        for topic in self._list_topics_raw():
+            if topic.name == name:
+                return topic.topic_id
+        return None
+
+    # --- Topics: pub/sub (data plane) -------------------------------------------
+    #
+    # The publish/subscribe compute verbs ride `TriggerService` (the data plane).
+    # Both resolve nothing client-side beyond the topic name the server looks up;
+    # the batch payloads ride as `ArrowBatch` (Flight IPC framing). The signatures
+    # mirror the embed `Database`'s so a caller swaps transports unchanged.
+
+    def publish_topic(self, topic: str, *, batch: pa.Table) -> int:
+        """Publish one batch of rows to a topic and return the engine-assigned
+        offset.
+
+        `batch` is a `pyarrow.Table` whose schema must match the topic's; it rides
+        as one `ArrowBatch` (a multi-chunk table publishes as one logical event,
+        concatenated server-side — matching the embedded `publish_topic`). The
+        publish is scoped to the session's bound tenant. Maps to
+        `TriggerService.Publish`.
+        """
+        request = trigger_pb2.PublishRequest(
+            topic=trigger_pb2.TopicName(name=topic),
+            batch=_table_to_arrow_batch(batch),
+        )
+        resp = self._trigger.Publish(request, metadata=self._metadata)
+        return resp.offset
+
+    def subscribe_collect(
+        self,
+        topic: str,
+        *,
+        predicate: Optional[str] = None,
+        from_offset: Optional[int] = None,
+        max_batches: int = 64,
+    ) -> pa.Table:
+        """Open a subscription, collect up to `max_batches` matching batches
+        (replay + live tail joined), then close — returning the concatenated
+        payload as a `pyarrow.Table`.
+
+        This mirrors the embedded `Database.subscribe_collect` exactly: it drives
+        the open-ended `Subscribe` stream (``replay_only`` unset — replay AND live
+        tail, NOT a bounded replay-only drain), accumulates up to `max_batches`
+        delivered batches, then cancels the gRPC call client-side so the server's
+        tail task stops (its send fails on the cancel and the spawned forwarder
+        breaks) rather than leaking. `predicate` is an optional SQL filter applied
+        server-side; `from_offset` starts the replay at an offset (unset == live
+        tail only). Maps to `TriggerService.Subscribe`.
+        """
+        request = trigger_pb2.SubscribeRequest(
+            topic=trigger_pb2.TopicName(name=topic),
+            predicate=predicate or "",
+        )
+        if from_offset is not None:
+            request.from_offset = from_offset
+
+        call = self._trigger.Subscribe(request, metadata=self._metadata)
+        collected: List[pa.Table] = []
+        try:
+            # Mirror the embedded `while out.len() < max_batches { next() }`: pull a
+            # batch only while under the bound, so a satisfied collect never blocks
+            # on one more read of the live tail. The stream ends on its own only if
+            # the server closes it (it does not for a live-tail subscription), so
+            # `max_batches` is the terminator — identical to the embedded contract.
+            stream = iter(call)
+            while len(collected) < max_batches:
+                try:
+                    delivered = next(stream)
+                except StopIteration:
+                    break
+                collected.append(_arrow_batch_to_table(delivered.batch))
+        finally:
+            # Cancel client-side so the server's tail task observes the closed
+            # stream and stops — the bounded collect leaves no live subscription
+            # leaking server-side, the same close the embedded `subscribe_collect`
+            # gets by dropping the engine stream.
+            call.cancel()
+
+        if not collected:
+            return pa.table({})
+        return pa.concat_tables(collected)
 
     # --- Embeddings + search -----------------------------------------------------
 

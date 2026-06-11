@@ -555,6 +555,180 @@ async fn federated_source_tenant_column_filters_split_6_4() {
     );
 }
 
+/// A source's tenant discriminator persists in the catalog and is replayed on
+/// reload. The `SourceTenantColumns` lookup is process-memory only, so without
+/// persistence a federated source registered with a `tenant_column` would
+/// reload after a restart with no scope — a latent cross-tenant read. Here the
+/// column is set on the `SourceConnection` at registration (never via the
+/// in-process setter), the session is dropped and rebuilt against the same
+/// catalog DB, and the rebuilt session must replay the discriminator and emit
+/// the scoping filter. A source registered with no discriminator reloads as
+/// `None`, emitting no filter.
+#[tokio::test]
+async fn source_tenant_column_persists_and_replays_on_reload() {
+    use arrow::array::{ArrayRef, RecordBatch};
+    use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let dir = tempdir().unwrap();
+
+    // Two parquet files: `notes` carries tenancy under `customer_id`
+    // (6 rows tenant A, 4 rows tenant B); `public_docs` carries no tenant
+    // discriminator at all.
+    let notes_path = dir.path().join("notes.parquet");
+    let docs_path = dir.path().join("public_docs.parquet");
+
+    let notes_schema = Arc::new(Schema::new(vec![
+        Field::new("note_id", DataType::Int64, false),
+        Field::new("customer_id", DataType::Utf8, true),
+    ]));
+    let a_str = tenant_a().to_string();
+    let b_str = tenant_b().to_string();
+    let customer_col: Vec<&str> = (0..10)
+        .map(|i| {
+            if i < 6 {
+                a_str.as_str()
+            } else {
+                b_str.as_str()
+            }
+        })
+        .collect();
+    let notes_batch = RecordBatch::try_new(
+        Arc::clone(&notes_schema),
+        vec![
+            Arc::new(Int64Array::from((0..10_i64).collect::<Vec<_>>())) as ArrayRef,
+            Arc::new(StringArray::from(customer_col)) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    {
+        let file = std::fs::File::create(&notes_path).unwrap();
+        let mut writer = ArrowWriter::try_new(
+            file,
+            Arc::clone(&notes_schema),
+            Some(WriterProperties::builder().build()),
+        )
+        .unwrap();
+        writer.write(&notes_batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    let docs_schema = Arc::new(Schema::new(vec![Field::new(
+        "doc_id",
+        DataType::Int64,
+        false,
+    )]));
+    let docs_batch = RecordBatch::try_new(
+        Arc::clone(&docs_schema),
+        vec![Arc::new(Int64Array::from((0..5_i64).collect::<Vec<_>>())) as ArrayRef],
+    )
+    .unwrap();
+    {
+        let file = std::fs::File::create(&docs_path).unwrap();
+        let mut writer = ArrowWriter::try_new(
+            file,
+            Arc::clone(&docs_schema),
+            Some(WriterProperties::builder().build()),
+        )
+        .unwrap();
+        writer.write(&docs_batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    let cfg = common::test_config(dir.path());
+
+    // Register both sources against the catalog, then drop the session. The
+    // discriminator is carried on the connection — never via
+    // `set_source_tenant_column` — so the persist path is what's exercised.
+    {
+        let registrar = JammiSession::new(cfg.clone()).await.unwrap();
+        registrar
+            .add_source(
+                "notes",
+                SourceType::File,
+                SourceConnection {
+                    url: Some(format!("file://{}", notes_path.display())),
+                    format: Some(FileFormat::Parquet),
+                    tenant_column: Some("customer_id".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        registrar
+            .add_source(
+                "public_docs",
+                SourceType::File,
+                SourceConnection {
+                    url: Some(format!("file://{}", docs_path.display())),
+                    format: Some(FileFormat::Parquet),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // Rebuild a fresh session against the SAME catalog DB. `reload_sources`
+    // runs at construction and must replay the persisted discriminator — no
+    // `set_source_tenant_column` call here.
+    let session_a = JammiSession::new(cfg.clone())
+        .await
+        .unwrap()
+        .with_tenant(tenant_a());
+    let session_b = JammiSession::new(cfg.clone())
+        .await
+        .unwrap()
+        .with_tenant(tenant_b());
+
+    async fn count(session: &JammiSession, sql: &str) -> i64 {
+        let rows = session.sql(sql).await.unwrap();
+        let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    }
+
+    // The replayed discriminator scopes `notes`: A sees its 6, B its 4.
+    assert_eq!(
+        count(&session_a, "SELECT COUNT(*) FROM notes.public.notes").await,
+        6,
+        "tenant A must see its 6 rows via the replayed customer_id filter"
+    );
+    assert_eq!(
+        count(&session_b, "SELECT COUNT(*) FROM notes.public.notes").await,
+        4,
+        "tenant B must see its 4 rows via the replayed customer_id filter"
+    );
+
+    // `public_docs` has no discriminator: every tenant sees all 5 rows, so the
+    // reload replayed `None` and injected no spurious filter. (A wrongly
+    // replayed filter would drop rows or fail to plan against the absent
+    // column.)
+    assert_eq!(
+        count(
+            &session_a,
+            "SELECT COUNT(*) FROM public_docs.public.public_docs"
+        )
+        .await,
+        5,
+        "an un-scoped source must reload as None — no spurious filter"
+    );
+    assert_eq!(
+        count(
+            &session_b,
+            "SELECT COUNT(*) FROM public_docs.public.public_docs"
+        )
+        .await,
+        5,
+        "the un-scoped source is visible in full to every tenant"
+    );
+}
+
 /// `JammiSession::with_tenant_scoped` installs a Tokio task-local for the
 /// duration of the closure that shadows the session's sticky shared
 /// binding. Two concurrent tasks invoking the helper with different

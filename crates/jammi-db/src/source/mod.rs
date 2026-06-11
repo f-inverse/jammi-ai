@@ -95,6 +95,16 @@ pub struct SourceConnection {
     /// Arbitrary key-value options passed to the source driver.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub options: HashMap<String, String>,
+
+    /// Name of the tenant-discriminator column on this federated source, when
+    /// its rows carry tenancy under a column other than `tenant_id`. Consulted
+    /// by the tenant-scope analyzer to inject the discriminator predicate on a
+    /// scan of this source. Persisted within the source's serialized options so
+    /// it round-trips across session restarts (`reload_sources` replays it into
+    /// the in-process [`crate::tenant_scope::SourceTenantColumns`] lookup); a
+    /// source with no tenant discriminator leaves this `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_column: Option<String>,
 }
 
 impl SourceConnection {

@@ -36,6 +36,7 @@ tracing.workspace = true
 [build-dependencies]
 tonic-build.workspace = true
 tonic-prost-build.workspace = true
+protoc-bin-vendored.workspace = true
 
 [dev-dependencies]
 statrs.workspace = true

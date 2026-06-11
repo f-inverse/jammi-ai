@@ -1077,6 +1077,184 @@ async fn evaluable_through_r1_eval_embeddings() {
     );
 }
 
+/// Independent f64 oracle: 2-hop symmetric APPNP `X⁽ᵏ⁾ = α·X⁰ + (1−α)·Â·X⁽ᵏ⁻¹⁾`
+/// over the path a—b—c (undirected), computed straight from the math (the dense
+/// `Â` matrix), not from the engine internals.
+fn appnp_two_hop_oracle(
+    xa: &[f32],
+    xb: &[f32],
+    xc: &[f32],
+    alpha: f64,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    // Augmented degrees with self-loops: d̃_a = 2, d̃_b = 3, d̃_c = 2.
+    let (da, db, dc) = (2.0_f64, 3.0_f64, 2.0_f64);
+    let p = 1.0 / (da.sqrt() * db.sqrt()); // a—b and b—c symmetric off-diagonal
+                                           // Âx applied to a triple of d-vectors (symmetric normalisation
+                                           // D̃^{-1/2}(A+I)D̃^{-1/2}).
+    let a_hat = |va: &[f64], vb: &[f64], vc: &[f64]| -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let dim = va.len();
+        let mut ra = vec![0.0; dim];
+        let mut rb = vec![0.0; dim];
+        let mut rc = vec![0.0; dim];
+        for i in 0..dim {
+            ra[i] = va[i] / da + vb[i] * p;
+            rb[i] = va[i] * p + vb[i] / db + vc[i] * p;
+            rc[i] = vb[i] * p + vc[i] / dc;
+        }
+        (ra, rb, rc)
+    };
+    let x0a: Vec<f64> = xa.iter().map(|&x| x as f64).collect();
+    let x0b: Vec<f64> = xb.iter().map(|&x| x as f64).collect();
+    let x0c: Vec<f64> = xc.iter().map(|&x| x as f64).collect();
+    let mix = |x0: &[f64], ax: &[f64]| -> Vec<f64> {
+        x0.iter()
+            .zip(ax)
+            .map(|(&z, &a)| alpha * z + (1.0 - alpha) * a)
+            .collect()
+    };
+
+    // Hop 1.
+    let (aa, ab, ac) = a_hat(&x0a, &x0b, &x0c);
+    let x1a = mix(&x0a, &aa);
+    let x1b = mix(&x0b, &ab);
+    let x1c = mix(&x0c, &ac);
+    // Hop 2.
+    let (ba, bb, bc) = a_hat(&x1a, &x1b, &x1c);
+    let x2a = mix(&x0a, &ba);
+    let x2b = mix(&x0b, &bb);
+    let x2c = mix(&x0c, &bc);
+    (x2a, x2b, x2c)
+}
+
+#[tokio::test]
+async fn two_hop_symmetric_appnp_hand_checked() {
+    // The richer oracle: TWO hops of the symmetric `Â` with an α-teleport restart,
+    // composed, on the path a—b—c. The single-hop test pins one matrix apply; this
+    // pins the *recurrence* (the teleport re-mixing X⁰ each hop). The expected
+    // vectors come from a dense-`Â` f64 reference, fully independent of the engine.
+    let nodes = vec![
+        Node {
+            id: "a".into(),
+            class: 0,
+        },
+        Node {
+            id: "b".into(),
+            class: 0,
+        },
+        Node {
+            id: "c".into(),
+            class: 0,
+        },
+    ];
+    let edges = vec![Edge::plain("a", "b"), Edge::plain("b", "c")];
+    let (session, _dir) = graph_session(&nodes, &edges, None).await;
+
+    let xa = node_vector("a", 0);
+    let xb = node_vector("b", 0);
+    let xc = node_vector("c", 0);
+    let alpha = 0.2;
+
+    let out = read_table_vectors(
+        &session,
+        &session
+            .propagate_embeddings(
+                &registered_request(&session)
+                    .await
+                    .with_weighting(PropagationWeighting::DegreeNormalized)
+                    .with_alpha(alpha)
+                    .with_hops(2),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    let (oa, ob, oc) = appnp_two_hop_oracle(&xa, &xb, &xc, alpha);
+    for (id, want) in [("a", &oa), ("b", &ob), ("c", &oc)] {
+        let got = &out[id];
+        for lane in 0..DIM {
+            assert!(
+                (got[lane] as f64 - want[lane]).abs() < 1e-4,
+                "2-hop APPNP node {id} lane {lane}: got {} want {}",
+                got[lane],
+                want[lane]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn undirected_redundant_reverse_edge_does_not_double_count() {
+    // The undirected analogue of the declared-self-edge dedup contract. The code
+    // dedupes a declared `(v, v)` against the injected `I` self-loop so d̃ stays
+    // deg+1. The same hazard exists for a SYMMETRIC edge list under `Undirected`:
+    // declaring both `(a, b)` and `(b, a)` must not push a's (and b's) augmented
+    // degree to 3 (b ×2 + self) when the single-declaration graph gives 2.
+    //
+    // Oracle by equivalence: under `Undirected`, propagating `a—b` declared ONCE
+    // must be byte-identical to propagating it declared BOTH ways — an undirected
+    // edge is one adjacency regardless of how many row directions encode it.
+    let nodes = vec![
+        Node {
+            id: "a".into(),
+            class: 0,
+        },
+        Node {
+            id: "b".into(),
+            class: 1,
+        },
+    ];
+
+    let (once_session, _d1) = graph_session(&nodes, &[Edge::plain("a", "b")], None).await;
+    let once = read_table_vectors(
+        &once_session,
+        &once_session
+            .propagate_embeddings(
+                &registered_request(&once_session)
+                    .await
+                    .with_weighting(PropagationWeighting::Uniform)
+                    .with_alpha(0.0)
+                    .with_hops(1),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    let (both_session, _d2) = graph_session(
+        &nodes,
+        // Same undirected edge, encoded as both directed rows.
+        &[Edge::plain("a", "b"), Edge::plain("b", "a")],
+        None,
+    )
+    .await;
+    let both = read_table_vectors(
+        &both_session,
+        &both_session
+            .propagate_embeddings(
+                &registered_request(&both_session)
+                    .await
+                    .with_weighting(PropagationWeighting::Uniform)
+                    .with_alpha(0.0)
+                    .with_hops(1),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    for id in ["a", "b"] {
+        let once_bits: Vec<u32> = once[id].iter().map(|f| f.to_bits()).collect();
+        let both_bits: Vec<u32> = both[id].iter().map(|f| f.to_bits()).collect();
+        assert_eq!(
+            once_bits, both_bits,
+            "an undirected edge declared both ways must not double-count: node {id} \
+             once={:?} both={:?}",
+            once[id], both[id]
+        );
+    }
+}
+
 #[tokio::test]
 async fn weighting_variants_hand_checked() {
     // A tiny path a—b—c, undirected, 1 hop, no teleport. Hand-check Uniform vs

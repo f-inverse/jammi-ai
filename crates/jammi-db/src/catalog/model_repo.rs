@@ -1,14 +1,44 @@
 use crate::catalog::backend::{BackendError, Row, SqlValue, TxOptions};
 use crate::error::Result;
 use crate::model_task::ModelTask;
+use crate::tenant::TenantId;
 
 use super::Catalog;
+
+/// Construct the catalog primary key for a model — the single source of truth
+/// for model identity in `models.model_id`.
+///
+/// The key is tenant-qualified so two tenants registering the same
+/// `name`/`version` occupy distinct rows instead of colliding on a global PK:
+///
+/// - global model (`tenant = None`): `"{name}::{version}"`. Left unqualified so
+///   a tenant's training job can carry a single-column `base_model_id` FK to a
+///   global base model, and so re-registering a global base model stays
+///   idempotent.
+/// - tenant-scoped model (`tenant = Some(t)`): `"{t}::{name}::{version}"`.
+///
+/// This is the *only* place a model PK is built; every reference site uses the
+/// PK off the resolved [`ModelRecord`] rather than reconstructing it.
+pub(crate) fn model_pk(tenant: Option<TenantId>, name: &str, version: i64) -> String {
+    match tenant {
+        Some(t) => format!("{t}::{name}::{version}"),
+        None => format!("{name}::{version}"),
+    }
+}
 
 /// Materialized row from the `models` catalog table.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelRecord {
-    /// Unique model name (e.g., `"sentence-transformers/all-MiniLM-L6-v2"`).
+    /// Model name (e.g., `"sentence-transformers/all-MiniLM-L6-v2"`). Tenants
+    /// may each own a row under the same name; the row identity is
+    /// [`Self::catalog_pk`], not this name.
     pub model_id: String,
+    /// Catalog primary key for this exact row (`models.model_id`). Reference
+    /// sites (a training job's `base_model_id`, an eval run's `model_id`) use
+    /// this PK so they bind to the resolved row — a global base model, or the
+    /// caller's own tenant-scoped row — rather than reconstructing
+    /// `name::version`.
+    pub catalog_pk: String,
     /// Monotonically increasing version number for this model name.
     pub version: i32,
     /// Model category (e.g., `"embedding"`, `"llm"`, `"lora"`).
@@ -68,7 +98,8 @@ impl Catalog {
     /// [`Self::finalize_training_job`] CAS, never by a worker's pre-finalize
     /// (or a zombie's late) `register_model`.
     pub async fn register_model(&self, params: RegisterModelParams<'_>) -> Result<()> {
-        let pk = format!("{}::{}", params.model_id, params.version);
+        let tenant = self.current_tenant();
+        let pk = model_pk(tenant, params.model_id, params.version as i64);
         // The served path is a dedicated column (a single-writer commit
         // pointer), not a `metadata` field; the blob carries only the
         // descriptive bits.
@@ -83,7 +114,6 @@ impl Catalog {
         let backend = params.backend.to_string();
         let version = params.version as i64;
         let artifact_path = params.artifact_path.map(str::to_string);
-        let tenant = self.current_tenant();
 
         self.backend()
             .transaction(TxOptions::default(), |tx| {
@@ -125,7 +155,7 @@ impl Catalog {
         let sql = format!(
             "SELECT {SELECT_COLS} FROM models \
              WHERE name = $1 AND (tenant_id = $2 OR tenant_id IS NULL) \
-             ORDER BY version DESC LIMIT 1"
+             ORDER BY (tenant_id IS NOT NULL) DESC, version DESC LIMIT 1"
         );
         let mid = model_id.to_string();
         let tenant = self.current_tenant();
@@ -162,7 +192,8 @@ impl Catalog {
         let sql = format!(
             "SELECT {SELECT_COLS} FROM models \
              WHERE name = $1 AND version = $2 \
-               AND (tenant_id = $3 OR tenant_id IS NULL)"
+               AND (tenant_id = $3 OR tenant_id IS NULL) \
+             ORDER BY (tenant_id IS NOT NULL) DESC LIMIT 1"
         );
         let mid = model_id.to_string();
         let v = version as i64;
@@ -255,7 +286,7 @@ impl Catalog {
 /// Parse: model_id, name, model_type, task, backend, version, status, metadata,
 /// artifact_path, created_at
 fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendError> {
-    let _pk: String = row.get("model_id")?;
+    let catalog_pk: String = row.get("model_id")?;
     let name: String = row.get("name")?;
     let model_type: String = row.get("model_type")?;
     let task_raw: String = row.get("task")?;
@@ -285,6 +316,7 @@ fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendErr
 
     Ok(ModelRecord {
         model_id: name,
+        catalog_pk,
         version,
         model_type,
         base_model_id,

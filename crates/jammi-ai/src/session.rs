@@ -905,7 +905,21 @@ impl InferenceSession {
         }
 
         let hyperparams = serde_json::to_string(config)?;
-        let base_model_pk = crate::model::to_catalog_pk(&canonical_name, 1);
+        // The base-model FK must bind to the resolved row's catalog PK, not a
+        // reconstructed `name::version`: a tenant fine-tuning a global base model
+        // references the global (unqualified) PK, and one fine-tuning its own
+        // model references its tenant-qualified PK — the resolved record's
+        // `catalog_pk` carries whichever applies.
+        let base_model_pk = self
+            .catalog()
+            .get_model(&canonical_name)
+            .await?
+            .ok_or_else(|| {
+                JammiError::FineTune(format!(
+                    "Base model '{canonical_name}' not registered in catalog"
+                ))
+            })?
+            .catalog_pk;
         let spec_json = serde_json::to_string(&spec)?;
         self.inner
             .catalog()

@@ -19,6 +19,7 @@ mod recovery;
 mod sources;
 mod storage_cloud;
 mod store;
+mod tenant_isolation_sweep;
 mod tenant_scope;
 mod trigger;
 #[cfg(feature = "live-broker-tests")]

@@ -42,6 +42,19 @@ impl SqliteBackend {
 }
 
 impl CatalogBackend for SqliteBackend {
+    /// Open a transaction and run `f` within it.
+    ///
+    /// **Invariant: this future must be driven by a live tokio runtime — never
+    /// blocked on from a runtime worker thread.** The uncancellable `BEGIN`
+    /// (see the body) runs on a detached `tokio::spawn(...).await`, so a
+    /// runtime must be free to poll that spawned task while this future awaits
+    /// its join handle. Awaiting this future normally (on either a
+    /// multi-thread or a single-thread runtime) is fine: the executor
+    /// interleaves the spawned begin with this await. What deadlocks is
+    /// `Handle::current().block_on(transaction(..))` *from inside* a runtime
+    /// worker — that pins the worker on the join handle and the spawned begin
+    /// never gets polled. The Postgres backend does not spawn and carries no
+    /// such constraint.
     fn transaction<'a, F, R>(
         &'a self,
         opts: TxOptions,

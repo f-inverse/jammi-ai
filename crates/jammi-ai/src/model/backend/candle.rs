@@ -275,6 +275,12 @@ pub struct CandleModel {
     /// models fine-tuned via the `EncoderAdapters` target (those carry
     /// their LoRA inside the encoder, not on top of it).
     pub projection_head: Option<jammi_lora::LoraLinear>,
+    /// De-standardising affine for a regression head, reloaded from the adapter
+    /// config. The regression head learns z-space parameters and emits a raw,
+    /// outcome-unit distribution after this affine; serving applies the same
+    /// affine the trainer did, so the served mean/quantiles carry the target
+    /// offset. `None` for every non-regression head.
+    regression_scaler: Option<crate::fine_tune::regression_loss::TargetScaler>,
     /// Label index → label string mapping for classification/NER models.
     id2label: Option<HashMap<u32, String>>,
     /// Token-level classifier for NER models (applied per token, no pooling).
@@ -438,6 +444,25 @@ impl CandleModel {
             params
                 .to_dtype(DType::F32)
                 .map_err(|e| JammiError::Inference(format!("Regression head dtype cast: {e}")))?
+        };
+        // De-standardise the raw head output with the affine the trainer carried
+        // on the head: the mean column (Gaussian) or every quantile column maps
+        // `μ_y + σ_y·z`, so the served distribution carries the target offset. A
+        // base/no-scaler head leaves the output untouched (the trained head, if
+        // any, already learnt in raw space). The σ column stays raw — the
+        // `DistributionAdapter` turns it into a positive served std via softplus.
+        let params = if let Some(scaler) = self.regression_scaler.as_ref() {
+            let width = params
+                .dim(1)
+                .map_err(|e| JammiError::Inference(format!("Regression head width: {e}")))?;
+            if width == 2 {
+                scaler.destandardize_gaussian(&params)
+            } else {
+                scaler.destandardize_quantile(&params)
+            }
+            .map_err(|e| JammiError::Inference(format!("Regression de-standardise: {e}")))?
+        } else {
+            params
         };
         let rows = params
             .to_vec2::<f32>()
@@ -1272,17 +1297,18 @@ impl ModelBackend for CandleBackend {
         // Load the post-pool projection head, if the saved adapter is one.
         // Encoder-adapters are installed inside `text` above via the encoder
         // builder's `.lora(...)` + `.adapter(Some(...))` calls.
-        let projection_head = match saved_adapter.as_ref() {
-            Some((crate::fine_tune::target::SavedAdapter::ProjectionHead(cfg), weights_path)) => {
+        let (projection_head, regression_scaler) = match saved_adapter.as_ref() {
+            Some((crate::fine_tune::target::SavedAdapter::ProjectionHead(cfg), weights_path)) => (
                 load_projection_head(
                     weights_path,
                     cfg.lora_alpha,
                     &device,
                     &dimensions,
                     &resolved.model_id.0,
-                )?
-            }
-            _ => None,
+                )?,
+                cfg.target_scaler,
+            ),
+            _ => (None, None),
         };
 
         // Load NER token classifier if this is a NER model
@@ -1340,6 +1366,7 @@ impl ModelBackend for CandleBackend {
             tokenizer,
             device,
             projection_head,
+            regression_scaler,
             id2label,
             ner_classifier,
         })))

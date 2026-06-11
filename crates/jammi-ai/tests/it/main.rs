@@ -10,6 +10,7 @@ mod e2e_inference;
 mod encoder_adapters;
 mod evaluation;
 mod fine_tune;
+mod ft_correctness_sweep;
 mod graph_context;
 mod graph_finetune;
 mod graph_propagation;

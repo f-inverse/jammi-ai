@@ -667,6 +667,28 @@ impl TrainingDataLoader {
         self.format
     }
 
+    /// Every regression target in this loader, in row order — the whole-dataset
+    /// view the trainer reduces into a fixed target scaler once before the
+    /// loop. `None` for any non-regression loader (no targets to standardise) and
+    /// for the precomputed test path (which supplies head/target tensors
+    /// directly, not text rows).
+    pub fn regression_targets(&self) -> Option<Vec<f32>> {
+        if !matches!(self.format, TrainingFormat::Regression) {
+            return None;
+        }
+        match &self.data {
+            LoaderData::TextRows(rows) => Some(
+                rows.iter()
+                    .filter_map(|row| match row {
+                        TrainingRow::Regression { target, .. } => Some(*target),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            LoaderData::Precomputed(_) => None,
+        }
+    }
+
     /// Flatten the in-batch-negative text rows into `(anchors, positives,
     /// negatives)`, the whole-dataset view GradCache and hard-negative mining
     /// consume. `negatives` is `Some` for a `Triplet` loader (explicit hard

@@ -38,25 +38,29 @@ use jammi_db::index::VectorIndex;
 
 use super::HardNegativeConfig;
 
-/// Ceiling on how many neighbours a single anchor query over-fetches.
+/// Ceiling on how many *excluded* neighbours the over-fetch budgets for.
 ///
 /// `mine` over-fetches `k + excluded.len() + 1` so that, after the excluded
-/// neighbourhood is dropped, `k` survivors remain. On a dense corpus the
-/// `exclude_hops`-hop expansion can grow `excluded` to a large fraction of the
-/// corpus, and an unbounded `fetch` would turn the ANN query into a near-full
-/// scan — defeating the index. The fetch is capped here; if the cap is hit and
-/// the excluded set genuinely swallows the survivors, the anchor falls through
-/// to the existing "no usable negative" drop path rather than returning a wrong
-/// negative. `k` itself is small (default 1), so the cap leaves ample headroom
-/// for the survivors in every non-pathological case.
-const MAX_FETCH: usize = 512;
+/// neighbourhood and the self-hit are dropped, `k` survivors remain. The term
+/// that can blow up is `excluded.len()`: on a dense corpus the
+/// `exclude_hops`-hop expansion can grow it to a large fraction of the corpus,
+/// and budgeting for all of it would turn the ANN query into a near-full scan —
+/// defeating the index. So the over-fetch budgets for at most this many excluded
+/// ids. The `k + 1` base is never capped, so the query always asks for at least
+/// `k` survivors plus the self-hit; the bound only limits headroom for an
+/// extreme excluded set. If that headroom is genuinely exhausted (the top
+/// `k + 1 + MAX_EXCLUDED_FETCH` neighbours are all excluded), the anchor falls
+/// through to the existing "no usable negative" drop path rather than returning
+/// a wrong (excluded) negative.
+const MAX_EXCLUDED_FETCH: usize = 512;
 
-/// How many neighbours to over-fetch for one anchor: enough to leave `k`
-/// survivors after dropping `excluded_len` excluded ids and the self-hit,
-/// capped at [`MAX_FETCH`] so a pathological excluded set cannot escalate the
-/// query toward a full scan.
+/// How many neighbours to over-fetch for one anchor: `k` survivors, the self-hit,
+/// and headroom for the excluded ids — the excluded headroom capped at
+/// [`MAX_EXCLUDED_FETCH`] so a pathological excluded set cannot escalate the
+/// query toward a full scan. The `k + 1` base is uncapped, so `k` itself is
+/// never the limiting factor regardless of how large it is set.
 fn capped_fetch(k: usize, excluded_len: usize) -> usize {
-    (k + excluded_len + 1).min(MAX_FETCH)
+    k + 1 + excluded_len.min(MAX_EXCLUDED_FETCH)
 }
 
 /// One candidate row available to be mined as a hard negative: a stable id and
@@ -134,11 +138,12 @@ impl HardNegativeMiner {
         let excluded = self.excluded_neighbourhood(&anchor.positive_id)?;
 
         // Over-fetch so that after removing the excluded neighbourhood (and any
-        // self/positive hit) at least `k` candidates remain when they exist,
-        // capped at `MAX_FETCH` so a pathologically large excluded set cannot
-        // turn the ANN query into a near-full scan. If the cap genuinely starves
-        // the survivors, the anchor falls through to the drop path below — it is
-        // never given a wrong (excluded) negative.
+        // self/positive hit) at least `k` candidates remain when they exist. The
+        // excluded headroom is capped (see `capped_fetch`) so a pathologically
+        // large excluded set cannot turn the ANN query into a near-full scan; the
+        // `k + 1` base is uncapped. If that headroom is genuinely exhausted, the
+        // anchor falls through to the drop path below — it is never given a wrong
+        // (excluded) negative.
         let fetch = capped_fetch(self.config.k, excluded.len());
         let neighbours = self.index.search(&anchor.embedding, fetch)?;
 
@@ -341,18 +346,25 @@ mod tests {
         );
     }
 
-    /// The over-fetch is capped at `MAX_FETCH` regardless of how large the
-    /// excluded set grows on a dense corpus, so the ANN query can never escalate
-    /// into a near-full scan; below the cap it is the exact over-fetch.
+    /// The excluded headroom is capped regardless of how large the excluded set
+    /// grows on a dense corpus, so the ANN query can never escalate into a
+    /// near-full scan; below the cap it is the exact over-fetch. The `k + 1` base
+    /// is never capped, so `k` survivors are always budgeted for even when `k`
+    /// itself is large.
     #[test]
     fn fetch_is_capped_under_dense_exclusion() {
         // Small excluded set: exact over-fetch (k + excluded + self-hit).
         assert_eq!(capped_fetch(1, 3), 5);
         assert_eq!(capped_fetch(5, 10), 16);
-        // A pathological excluded set (a large fraction of a dense corpus) is
-        // clamped to the ceiling instead of fetching the whole corpus.
-        assert_eq!(capped_fetch(1, 100_000), MAX_FETCH);
-        assert_eq!(capped_fetch(3, usize::MAX - 10), MAX_FETCH);
+        // A pathological excluded set (a large fraction of a dense corpus) caps
+        // the excluded headroom at the ceiling instead of fetching the corpus —
+        // but the k+1 base is still added on top, so survivors are budgeted for.
+        assert_eq!(capped_fetch(1, 100_000), 1 + 1 + MAX_EXCLUDED_FETCH);
+        assert_eq!(capped_fetch(3, usize::MAX - 10), 3 + 1 + MAX_EXCLUDED_FETCH);
+        // A large `k` is never the limiter: the base scales with k, uncapped, so
+        // the query always asks for at least `k` survivors plus the self-hit.
+        assert_eq!(capped_fetch(1000, 0), 1001);
+        assert_eq!(capped_fetch(1000, 100_000), 1000 + 1 + MAX_EXCLUDED_FETCH);
     }
 
     /// Correctness is unchanged by the working-set bounding: for a fixed

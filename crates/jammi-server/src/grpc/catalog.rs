@@ -29,6 +29,7 @@ use std::sync::Arc;
 use jammi_ai::session::InferenceSession;
 use jammi_ai::Session;
 use jammi_db::catalog::channel_repo::ChannelSpec;
+use jammi_db::error::JammiError;
 use jammi_db::source::SourceConnection;
 use jammi_db::trigger::ids::TopicId;
 use jammi_db::trigger::{TopicDefinition, TriggerError};
@@ -258,6 +259,33 @@ impl CatalogService for CatalogServer {
         .ok_or_else(|| Status::not_found(format!("model '{}' not found", req.model_id)))?;
 
         Ok(Response::new(model_to_proto(&record)))
+    }
+
+    async fn retire_model(
+        &self,
+        request: Request<pb::RetireModelRequest>,
+    ) -> Result<Response<()>, Status> {
+        let tenant = session_tenant(&request);
+        let req = request.into_inner();
+        require_nonempty(&req.model_id, "model_id")?;
+        let session = self.local()?;
+
+        // A model outside the caller's scope (absent, or a GLOBAL model a tenant
+        // session cannot retire) surfaces from the engine as `JammiError::Model`
+        // — the "no such model for this tenant" fault, which is a NotFound at the
+        // wire, mirroring `describe_model`. Every other engine fault keeps its
+        // faithful `map_engine_error` mapping.
+        scoped(self.engine()?, tenant, || {
+            session.retire_model(&req.model_id, req.version)
+        })
+        .await
+        .map_err(|e| match e {
+            JammiError::Model { model_id, .. } => {
+                Status::not_found(format!("model '{model_id}' not found"))
+            }
+            other => map_engine_error(other),
+        })?;
+        Ok(Response::new(()))
     }
 
     // --- channels ----------------------------------------------------------

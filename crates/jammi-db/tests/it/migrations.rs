@@ -178,7 +178,89 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "016_rename_training_jobs",
             "017_model_artifact_path_column",
             "018_eval_runs_model_id_nullable",
+            "019_normalize_model_status",
         ]
+    );
+}
+
+/// Migration 019 normalizes a stray `models.status = 'available'` (the frozen
+/// migration-001 DDL default, which the typed `ModelStatus` enum never names) to
+/// `'registered'`. The test inserts a legacy `'available'` row, runs the exact
+/// migration SQL the runner executes for 019, and verifies the rewrite — while a
+/// canonical `'registered'` row is left untouched so re-running is a no-op.
+#[tokio::test]
+async fn migration_019_normalizes_available_status_to_registered() {
+    use jammi_db::catalog::backend::SqlValue;
+
+    let dir = tempdir().unwrap();
+    let _catalog = Catalog::open(dir.path()).await.unwrap();
+    let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
+
+    // Seed one legacy 'available' row and one canonical 'registered' row.
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                for (id, status) in [("legacy::1", "available"), ("modern::1", "registered")] {
+                    tx.execute(
+                        "INSERT INTO models (model_id, name, model_type, task, version, status) \
+                         VALUES ($1, $2, 'embedding', 'text-embedding', 1, $3)",
+                        &[
+                            SqlValue::TextOwned(id.into()),
+                            SqlValue::TextOwned(id.into()),
+                            SqlValue::TextOwned(status.into()),
+                        ],
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+    // Manually invoke the same SQL the migration runner executes for 019 — the
+    // runner records 019 as applied on the first open, before the legacy row
+    // existed, so we apply it directly (mirroring the migration-010 test).
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE models SET status = 'registered' WHERE status = 'available'",
+                    &[],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+    let rows = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query::<_, (String, String)>(
+                        "SELECT model_id, status FROM models ORDER BY model_id",
+                        &[],
+                        |row| Ok((row.get("model_id")?, row.get("status")?)),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("legacy::1".to_string(), "registered".to_string()),
+            ("modern::1".to_string(), "registered".to_string()),
+        ],
+        "migration 019 rewrites 'available' to 'registered' and leaves 'registered' untouched"
     );
 }
 

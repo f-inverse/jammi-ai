@@ -27,7 +27,8 @@ use jammi_wire::proto::catalog::{
     AddChannelColumnsRequest, AddSourceRequest, CreateMutableTableRequest, DescribeModelRequest,
     DescribeSourceRequest, DropMutableTableRequest, DropTopicRequest, ListChannelsRequest,
     ListModelsRequest, ListMutableTablesRequest, ListSourcesRequest, ListTopicsRequest,
-    RegisterChannelRequest, RegisterTopicRequest, RemoveSourceRequest, SetTenantRequest, Tenant,
+    RegisterChannelRequest, RegisterTopicRequest, RemoveSourceRequest, RetireModelRequest,
+    SetTenantRequest, Tenant,
 };
 use jammi_wire::{
     channel_from_proto, columns_to_proto, definition_list_from_proto, definition_to_proto,
@@ -171,6 +172,19 @@ impl CatalogClient {
             Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
             Err(status) => Err(error_from_status(&status)),
         }
+    }
+
+    /// Soft-retire a model. When `version` is `None` the latest version is
+    /// retired. A model outside the caller's scope is rejected as NotFound.
+    pub async fn retire_model(&self, model_id: &str, version: Option<i32>) -> Result<()> {
+        self.client()
+            .retire_model(RetireModelRequest {
+                model_id: model_id.to_string(),
+                version,
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?;
+        Ok(())
     }
 
     // --- server info -----------------------------------------------------

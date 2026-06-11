@@ -194,6 +194,76 @@ async fn encode_query_rejects_modality_input_mismatch() {
     );
 }
 
+/// The serve/load path refuses a retired model with the typed `ModelRetired`
+/// error. The catalog read path (`get_model`) still returns the retired row —
+/// it is the reference-resolution path — but `model_cache().get_or_load`, the
+/// path `annotate_udtf` and eval reach, must not load it.
+#[tokio::test]
+async fn serve_load_refuses_a_retired_model() {
+    use jammi_ai::model::{ModelSource, ModelTask};
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+
+    let dir = TempDir::new().unwrap();
+    let engine = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+
+    let model_dir = common::cookbook_fixture("tiny_bert");
+    let source = ModelSource::parse(&format!("local:{}", model_dir.display()));
+    // The catalog identity the serve/load resolver looks the model up under is
+    // `ModelSource::to_string()` (the bare path for a local source) — register
+    // and retire under that exact id so the resolver's `get_model` hit is the
+    // retired row.
+    let model_id = source.to_string();
+
+    // Register the model in the catalog pointing at the on-disk fixture, then
+    // retire it — the serve/load path must refuse it without loading.
+    engine
+        .catalog()
+        .register_model(RegisterModelParams {
+            model_id: &model_id,
+            version: 1,
+            model_type: "local",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: Some(model_dir.to_str().unwrap()),
+            config_json: None,
+        })
+        .await
+        .unwrap();
+    engine
+        .catalog()
+        .retire_model(&model_id, None)
+        .await
+        .unwrap();
+
+    // get_model still resolves the retired row (the FK / provenance path).
+    let resolved = engine.catalog().get_model(&model_id).await.unwrap();
+    assert!(
+        resolved.is_some_and(|r| r.status == "retired"),
+        "get_model must still return the retired row"
+    );
+
+    // But the serve/load path refuses it with the typed error. `ModelGuard`
+    // is not `Debug`, so match on the result rather than `expect_err`.
+    match engine
+        .model_cache()
+        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .await
+    {
+        Err(jammi_db::error::JammiError::ModelRetired { model_id: id }) => {
+            assert_eq!(id, model_id, "the refusal names the retired model");
+        }
+        Err(other) => {
+            panic!("serve/load refusal must be the typed ModelRetired error, got: {other:?}")
+        }
+        Ok(_) => panic!("serve/load must refuse a retired model, but it loaded"),
+    }
+}
+
 /// Collect the `_row_id` provenance column across batches into one ordered
 /// vector, the stable identity of a search result set.
 fn row_ids(batches: &[arrow::array::RecordBatch]) -> Vec<String> {

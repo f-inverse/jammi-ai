@@ -64,6 +64,9 @@ impl From<&JammiError> for pb::JammiErrorDetail {
                 model_id: model_id.clone(),
                 message: message.clone(),
             }),
+            JammiError::ModelRetired { model_id } => Variant::ModelRetired(pb::ModelRetiredError {
+                model_id: model_id.clone(),
+            }),
             JammiError::Inference(message) => Variant::Inference(pb::StringError {
                 message: message.clone(),
             }),
@@ -135,6 +138,9 @@ impl From<pb::JammiErrorDetail> for JammiError {
             Some(Variant::Model(e)) => JammiError::Model {
                 model_id: e.model_id,
                 message: e.message,
+            },
+            Some(Variant::ModelRetired(e)) => JammiError::ModelRetired {
+                model_id: e.model_id,
             },
             Some(Variant::Inference(e)) => JammiError::Inference(e.message),
             Some(Variant::Catalog(e)) => JammiError::Catalog(e.message),

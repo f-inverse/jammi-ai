@@ -1,5 +1,5 @@
 use crate::catalog::backend::{BackendError, Row, SqlValue, TxOptions};
-use crate::error::Result;
+use crate::error::{JammiError, Result};
 use crate::model_task::ModelTask;
 use crate::tenant::TenantId;
 
@@ -151,6 +151,13 @@ impl Catalog {
     }
 
     /// Get the latest version of a model by name. Tenant-filtered.
+    ///
+    /// This is the reference-resolution path: a training job's base model, an
+    /// eval run's model, and the serve/load resolver all bind through it. It
+    /// returns RETIRED models too — a job or eval that references a since-retired
+    /// model must still resolve it, so excluding retired here would break
+    /// historical provenance. The active-listing sense (hiding retired) lives in
+    /// [`Self::list_models`]; the serve/load path refuses a retired model itself.
     pub async fn get_model(&self, model_id: &str) -> Result<Option<ModelRecord>> {
         let sql = format!(
             "SELECT {SELECT_COLS} FROM models \
@@ -223,41 +230,81 @@ impl Catalog {
             .await?)
     }
 
-    /// Update model status. Scoped to the session's tenant.
-    pub async fn update_model_status(
-        &self,
-        model_id: &str,
-        status: super::status::ModelStatus,
-    ) -> Result<()> {
-        let status_str = status.to_string();
-        let mid = model_id.to_string();
+    /// Soft-retire a model. Resolves the catalog PK off the read path
+    /// ([`Self::get_model`] for the latest version, or
+    /// [`Self::get_model_version`] when `version` is given), then flips that
+    /// row's `status` to [`ModelStatus::Retired`](super::status::ModelStatus).
+    ///
+    /// A tenant may retire ONLY a row it owns: the UPDATE is filtered on the
+    /// resolved PK AND `tenant_id = $current` strictly — not the read path's
+    /// `OR tenant_id IS NULL`. So a tenant session asking to retire a GLOBAL
+    /// (`tenant_id IS NULL`) model, or a model that does not exist for it, gets
+    /// [`JammiError::Model`] NotFound: retiring a model outside the caller's
+    /// own scope is forbidden, not silently applied to a shared row.
+    ///
+    /// Idempotent: retiring an already-retired model is a success no-op (the
+    /// row stays `'retired'`).
+    pub async fn retire_model(&self, model_id: &str, version: Option<i32>) -> Result<()> {
+        let record = match version {
+            Some(v) => self.get_model_version(model_id, v).await?,
+            None => self.get_model(model_id).await?,
+        };
+        let record = record.ok_or_else(|| JammiError::Model {
+            model_id: model_id.to_string(),
+            message: "no such model to retire for this tenant".into(),
+        })?;
+        let pk = record.catalog_pk;
         let tenant = self.current_tenant();
-        self.backend()
+        let retired = super::status::ModelStatus::Retired.to_string();
+        let affected = self
+            .backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.set_tenant(tenant);
+                    tx.assert_tenant_matches(tenant, "models")?;
+                    // Strict tenant predicate: a session retires only a row
+                    // whose owner equals its OWN tenant — never the read path's
+                    // `OR tenant_id IS NULL` leak. The `IS NULL AND $3 IS NULL`
+                    // arm matches `None == None` (a NULL `=` comparison is never
+                    // true in SQL), so an unscoped session retires its own
+                    // GLOBAL row while a tenant session (with a non-NULL `$3`)
+                    // matches only its own rows — a GLOBAL row's NULL tenant
+                    // fails both arms, so a tenant cannot retire a shared model.
+                    // A non-matching PK affects zero rows and surfaces NotFound
+                    // below.
                     tx.execute(
-                        "UPDATE models SET status = $1, updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
-                         WHERE name = $2 AND (tenant_id = $3 OR tenant_id IS NULL)",
+                        "UPDATE models \
+                         SET status = $1, updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
+                         WHERE model_id = $2 \
+                           AND (tenant_id = $3 OR (tenant_id IS NULL AND $3 IS NULL))",
                         &[
-                            SqlValue::TextOwned(status_str),
-                            SqlValue::TextOwned(mid),
+                            SqlValue::TextOwned(retired),
+                            SqlValue::TextOwned(pk),
                             SqlValue::from(tenant.map(|t| t.to_string())),
                         ],
                     )
-                    .await?;
-                    Ok(())
+                    .await
                 })
             })
             .await?;
+        if affected == 0 {
+            return Err(JammiError::Model {
+                model_id: model_id.to_string(),
+                message: "no such model to retire for this tenant".into(),
+            });
+        }
         Ok(())
     }
 
-    /// List models visible to the session's tenant.
+    /// List the *active* models visible to the session's tenant. Retired models
+    /// are hidden — this is the active-listing sense, the peer of
+    /// `list_sources`. A reference resolver that must still see a retired model
+    /// (provenance, a base-model FK) uses [`Self::get_model`], which returns
+    /// retired rows.
     pub async fn list_models(&self) -> Result<Vec<ModelRecord>> {
         let sql = format!(
             "SELECT {SELECT_COLS} FROM models \
-             WHERE tenant_id = $1 OR tenant_id IS NULL \
+             WHERE (tenant_id = $1 OR tenant_id IS NULL) AND status != 'retired' \
              ORDER BY created_at"
         );
         let tenant = self.current_tenant();

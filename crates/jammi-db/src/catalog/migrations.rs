@@ -60,6 +60,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "018_eval_runs_model_id_nullable",
         schema::MIGRATION_018_EVAL_RUNS_MODEL_ID_NULLABLE,
     ),
+    (
+        "019_normalize_model_status",
+        schema::MIGRATION_019_NORMALIZE_MODEL_STATUS,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

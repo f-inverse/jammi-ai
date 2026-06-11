@@ -117,6 +117,10 @@ pub enum ModelStatus {
     Registered,
     /// Model loaded into memory.
     Loaded,
+    /// Model soft-retired: hidden from active listings and refused by the
+    /// serve/load path, but still resolvable as a reference target (a training
+    /// job's base model, an eval run's model) so historical provenance holds.
+    Retired,
 }
 
 impl fmt::Display for ModelStatus {
@@ -124,6 +128,7 @@ impl fmt::Display for ModelStatus {
         match self {
             Self::Registered => write!(f, "registered"),
             Self::Loaded => write!(f, "loaded"),
+            Self::Retired => write!(f, "retired"),
         }
     }
 }
@@ -134,9 +139,30 @@ impl FromStr for ModelStatus {
         match s {
             "registered" => Ok(Self::Registered),
             "loaded" => Ok(Self::Loaded),
+            "retired" => Ok(Self::Retired),
             other => Err(JammiError::Catalog(format!(
                 "Unknown model status: '{other}'"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_status_round_trips_through_display_and_from_str() {
+        for status in [
+            ModelStatus::Registered,
+            ModelStatus::Loaded,
+            ModelStatus::Retired,
+        ] {
+            let rendered = status.to_string();
+            let parsed = ModelStatus::from_str(&rendered).expect("canonical status parses");
+            assert_eq!(parsed, status, "round-trip must be identity for {status:?}");
+        }
+        assert_eq!(ModelStatus::Retired.to_string(), "retired");
+        assert!(ModelStatus::from_str("available").is_err());
     }
 }

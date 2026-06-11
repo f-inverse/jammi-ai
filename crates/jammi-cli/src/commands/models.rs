@@ -16,6 +16,12 @@ pub enum ModelAction {
         /// Model id (e.g. an HF repo id or a fine-tuned id).
         model_id: String,
     },
+    /// Soft-retire a model: hide it from listings and refuse to serve it, while
+    /// keeping it resolvable as a reference target. Retires the latest version.
+    Retire {
+        /// Model id (e.g. an HF repo id or a fine-tuned id).
+        model_id: String,
+    },
 }
 
 pub async fn run(
@@ -41,6 +47,10 @@ pub async fn run(
             }
             None => println!("No model '{model_id}' registered."),
         },
+        ModelAction::Retire { model_id } => {
+            session.retire_model(&model_id, None).await?;
+            println!("Retired model '{model_id}'.");
+        }
     }
     Ok(())
 }

@@ -531,6 +531,69 @@ async fn eval_calibration_records_run_without_model_scope() {
     assert_eq!(per_record.len(), 4, "one row per held-out prediction");
 }
 
+// ─── Multi-part hyphenated golden reference resolves verbatim ────────────────
+//
+// A golden source whose name carries a hyphen produces a multi-part relation
+// reference (`"cal-golden-2024".public."calibration-golden"`). Each dotted
+// part must be quoted independently — quoting the whole string as one
+// identifier (literal dots) would fail to resolve, and leaving it raw would
+// parse the hyphen as subtraction. The runner must scope the eval against the
+// correct relation and record the run.
+
+#[tokio::test]
+async fn eval_calibration_resolves_multipart_hyphenated_golden() {
+    use jammi_ai::eval::EvalCalibrationShape;
+
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+
+    // The on-disk file is named with a hyphen so the registered table name is
+    // hyphenated too: the relation becomes a multi-part ref with hyphens in
+    // both the source and the table part.
+    let golden_path = dir.path().join("calibration-golden.csv");
+    std::fs::write(
+        &golden_path,
+        "record_id,mean,sd,outcome\n\
+         r0,0.0,1.0,0.2\n\
+         r1,1.0,0.5,1.1\n\
+         r2,-1.0,2.0,-0.5\n",
+    )
+    .unwrap();
+
+    session
+        .add_source(
+            "cal-golden-2024",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", golden_path.to_str().unwrap())),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // The third argument is the unquoted dotted reference — the runner quotes
+    // each part. A raw or whole-string quote here would fail to resolve.
+    let report = session
+        .eval_calibration(
+            "cal-golden-2024",
+            "cal-golden-2024.public.calibration-golden",
+            EvalCalibrationShape::Gaussian,
+            &Default::default(),
+        )
+        .await
+        .expect("multi-part hyphenated golden reference must resolve verbatim");
+
+    let per_record = session
+        .catalog()
+        .get_eval_per_query(&report.eval_run_id)
+        .await
+        .unwrap();
+    assert_eq!(per_record.len(), 3, "one row per held-out prediction");
+}
+
 // ─── End-to-end: per-query eval persistence + cohorts (spec J9) ──────────────
 //
 // Running an embedding eval persists one `_jammi_eval_per_query` row per query

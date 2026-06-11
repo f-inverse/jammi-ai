@@ -22,6 +22,27 @@ pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Quote each dot-separated part of a multi-part relation reference, joining
+/// the quoted parts back with `.`. A reference like `catalog.schema.table`
+/// becomes `"catalog"."schema"."table"` — each part is one identifier, so a
+/// hyphenated, mixed-case, or reserved part resolves verbatim while the dots
+/// stay structural. Quoting the whole string would instead yield one
+/// identifier carrying literal dots (`"catalog.schema.table"`), which is the
+/// wrong relation. A single-part reference is just `quote_ident`.
+///
+/// ```
+/// use jammi_db::sql::quote_relation;
+/// assert_eq!(quote_relation("catalog.schema.table"), r#""catalog"."schema"."table""#);
+/// assert_eq!(quote_relation("papers"), r#""papers""#);
+/// assert_eq!(quote_relation("my-cat.papers-2024"), r#""my-cat"."papers-2024""#);
+/// ```
+pub fn quote_relation(rel: &str) -> String {
+    rel.split('.')
+        .map(quote_ident)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 /// Quote a source-scoped table as the three-part relation a registered source's
 /// data is addressed by: `"<source>".public."<table>"`. Both the source name
 /// and the table name are quoted identifiers, so a hyphenated source (a user's
@@ -53,6 +74,33 @@ mod tests {
     #[test]
     fn doubles_embedded_quote() {
         assert_eq!(quote_ident(r#"a"b"#), r#""a""b""#);
+    }
+
+    #[test]
+    fn quote_relation_quotes_each_multipart_segment() {
+        assert_eq!(
+            quote_relation("catalog.schema.table"),
+            r#""catalog"."schema"."table""#
+        );
+    }
+
+    #[test]
+    fn quote_relation_single_part_is_one_identifier() {
+        assert_eq!(quote_relation("papers"), r#""papers""#);
+    }
+
+    #[test]
+    fn quote_relation_quotes_hyphenated_parts() {
+        // Each hyphenated part is one identifier; the dots stay structural.
+        assert_eq!(
+            quote_relation("my-cat.papers-2024"),
+            r#""my-cat"."papers-2024""#
+        );
+    }
+
+    #[test]
+    fn quote_relation_doubles_embedded_quote_per_part() {
+        assert_eq!(quote_relation(r#"cat.a"b"#), r#""cat"."a""b""#);
     }
 
     #[test]

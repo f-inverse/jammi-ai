@@ -69,6 +69,19 @@ pub(crate) const STD_FLOOR: f64 = 1e-3;
 /// (single-valued or constant) target set cannot produce a zero-multiplier
 /// scaler — the invalid `std = 0` state is unrepresentable, and a row's
 /// de-standardised mean still moves with `z` rather than collapsing onto μ_y.
+///
+/// # The amortized in-context regressor standardises the data, not the head
+///
+/// A fine-tune regression head carries a fixed encoder, so its reparameterisation
+/// lives in the head's forward ([`Self::destandardize`]). An amortized in-context
+/// predictor instead *conditions on* its context members' `y`-values, so the same
+/// reachability fix is applied in the **data** space: both the context members'
+/// `y` and the held-out target `y` are z-scored with one scaler
+/// ([`Self::standardize_value`]) before they enter the episode, so the head trains
+/// against an O(1) z-space target while conditioning on z-space context, and the
+/// served head output is de-standardised ([`Self::destandardize`]) back to raw
+/// units. The scaler is the one transform shared by both ends and is persisted
+/// with the predictor.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub(crate) struct TargetScaler {
     /// Mean of all training targets, μ_y. The zero-init head emits this.
@@ -78,6 +91,37 @@ pub(crate) struct TargetScaler {
 }
 
 impl TargetScaler {
+    /// Reconstruct a scaler from its persisted `(mean, std)` — the inverse of the
+    /// `(mean(), std())` a served head reads back from its config. The `std` is
+    /// re-floored at [`STD_FLOOR`] so a persisted-then-reloaded scaler can never
+    /// reintroduce a zero multiplier.
+    pub(crate) fn from_mean_std(mean: f64, std: f64) -> Self {
+        Self {
+            mean,
+            std: std.max(STD_FLOOR),
+        }
+    }
+
+    /// The dataset mean μ_y the scaler shifts by — persisted with a served head.
+    pub(crate) fn mean(&self) -> f64 {
+        self.mean
+    }
+
+    /// The (floored) dataset standard deviation σ_y the scaler scales by —
+    /// persisted with a served head.
+    pub(crate) fn std(&self) -> f64 {
+        self.std
+    }
+
+    /// Standardise a raw scalar outcome into z-space: `(y − μ_y) / σ_y`. The
+    /// inverse of the de-standardising affine, applied to the scalar `y`-values an
+    /// amortized in-context predictor conditions on (the context members' `y`) and
+    /// is scored against (the held-out target `y`), so both sit in the z-space the
+    /// zero-init head reaches.
+    pub(crate) fn standardize_value(&self, y: f64) -> f64 {
+        (y - self.mean) / self.std
+    }
+
     /// Build the scaler from all training targets: the population mean and
     /// standard deviation of `targets`, with `std` floored at [`STD_FLOOR`].
     pub(crate) fn from_targets(targets: &Tensor) -> Result<Self> {

@@ -60,6 +60,7 @@ use jammi_encoders::{AnyContextPredictor, ContextEpisode, ContextPredictorConfig
 pub use jammi_encoders::ContextArchitecture;
 
 use crate::fine_tune::regression_loss;
+use crate::fine_tune::regression_loss::TargetScaler;
 use crate::fine_tune::spec::TrainingSpec;
 use crate::inference::adapter::distribution::{DistributionAdapter, DistributionForm};
 use crate::inference::adapter::{BackendOutput, OutputAdapter};
@@ -303,24 +304,79 @@ pub struct EpisodeBatch {
 /// The sampled meta-dataset: the train episodes the predictor optimises over and
 /// the held-out **test** episodes a caller evaluates the generalisation gap on.
 /// Tasks are disjoint across the two — no task contributes to both.
+///
+/// Every episode's outcomes (the context members' `y` and the held-out target
+/// `y`) are already **z-scored** by the run's target standardiser, reduced from
+/// the *train* tasks' target distribution alone — so the predictor trains against
+/// an O(1) z-space target while conditioning on z-space context, and a high-offset
+/// outcome (calendar years, prices) is reachable under Adam. That standardiser is
+/// persisted with the predictor and applied in reverse on the served path.
 #[derive(Debug, Clone)]
 pub struct SampledEpisodes {
-    /// One [`EpisodeBatch`] per train task.
+    /// One [`EpisodeBatch`] per train task (outcomes z-scored).
     pub train: Vec<EpisodeBatch>,
-    /// One [`EpisodeBatch`] per held-out test task.
+    /// One [`EpisodeBatch`] per held-out test task (outcomes z-scored with the
+    /// same train-derived scaler — never refit on the held-out outcomes).
     pub test: Vec<EpisodeBatch>,
     /// Distinct task count the meta-dataset carried (train + test).
     pub task_count: usize,
+    /// The target standardiser reduced from the train tasks' outcomes — the one
+    /// transform that z-scores both ends of an episode and de-standardises the
+    /// served head. Engine-internal: a consumer reads the episodes, never the
+    /// scaler (the served predict de-standardises with the persisted copy).
+    pub(crate) scaler: TargetScaler,
+}
+
+/// The immutable sampling environment one episode is assembled in: the source
+/// and its resolved embedding table, the spec, the feature dim, the
+/// train-derived target standardiser the outcomes are z-scored with, and the
+/// device. Bundles the per-run-constant inputs so the per-task assembly carries
+/// one borrow rather than a long argument list.
+struct EpisodeSampling<'a> {
+    source_id: &'a str,
+    table: &'a ResultTableRecord,
+    spec: &'a ContextPredictorTrainConfig,
+    feature_dim: usize,
+    scaler: &'a TargetScaler,
+    device: &'a Device,
 }
 
 /// One target row's assembled, leakage-scoped context — the members' x-vectors
 /// and y-labels in retrieval order, plus the target's own `(x, y)`. The padded
 /// [`ContextEpisode`] tensors are built by stacking these across a task.
+///
+/// The outcome fields (`target_y`, `member_y`) are **z-space** values: the raw
+/// outcomes z-scored by the run's [`TargetScaler`] (see [`target_context_z`]). The
+/// x-vectors are the raw embedding features, untouched.
 struct TargetContext {
     target_x: Vec<f32>,
     target_y: f64,
     member_x: Vec<Vec<f32>>,
     member_y: Vec<f64>,
+}
+
+/// Assemble a [`TargetContext`] with its outcomes z-scored by `scaler`: the
+/// held-out target `y` and every context member's `y` are mapped to z-space, so
+/// the head conditions on and is scored against the standardised outcomes one
+/// scaler defines. The x-vectors pass through unchanged. The single seam both the
+/// episodic sampler and the served-predict path build a context through, so
+/// training and serving z-score identically.
+fn target_context_z(
+    target_x: Vec<f32>,
+    target_y: f64,
+    member_x: Vec<Vec<f32>>,
+    member_y: Vec<f64>,
+    scaler: &TargetScaler,
+) -> TargetContext {
+    TargetContext {
+        target_x,
+        target_y: scaler.standardize_value(target_y),
+        member_x,
+        member_y: member_y
+            .into_iter()
+            .map(|y| scaler.standardize_value(y))
+            .collect(),
+    }
 }
 
 impl InferenceSession {
@@ -374,18 +430,62 @@ impl InferenceSession {
 
         let device = crate::model::backend::candle::select_device(self.device_config())?;
 
-        let train = self
-            .episodes_for_tasks(source_id, &table, spec, &train_tasks, feature_dim, &device)
+        // The target standardiser is reduced from the TRAIN tasks' outcomes only —
+        // the held-out tasks are not seen, exactly as the fine-tune trainer fits
+        // its scaler on the train split. Both ends of every episode (the context
+        // members' `y` and the held-out target `y`) are then z-scored with it, so
+        // the zero-init head trains against an O(1) target and a high-offset
+        // outcome is reachable under Adam.
+        let scaler = self
+            .train_target_scaler(source_id, spec, &train_tasks, &device)
             .await?;
-        let test = self
-            .episodes_for_tasks(source_id, &table, spec, &test_tasks, feature_dim, &device)
-            .await?;
+
+        let env = EpisodeSampling {
+            source_id,
+            table: &table,
+            spec,
+            feature_dim,
+            scaler: &scaler,
+            device: &device,
+        };
+        let train = self.episodes_for_tasks(&env, &train_tasks).await?;
+        let test = self.episodes_for_tasks(&env, &test_tasks).await?;
 
         Ok(SampledEpisodes {
             train,
             test,
             task_count,
+            scaler,
         })
+    }
+
+    /// Reduce the target standardiser from the train tasks' raw outcomes: the
+    /// mean and (floored) standard deviation of every train-task row's `y`. The
+    /// held-out tasks contribute nothing, so the scaler is a property of the train
+    /// split alone — the standardisation peer of the fine-tune trainer's
+    /// train-split scaler.
+    async fn train_target_scaler(
+        &self,
+        source_id: &str,
+        spec: &ContextPredictorTrainConfig,
+        train_tasks: &[String],
+        device: &Device,
+    ) -> Result<TargetScaler> {
+        let mut ys = Vec::new();
+        for task in train_tasks {
+            for (_, y) in self.task_targets(source_id, spec, task).await? {
+                ys.push(y as f32);
+            }
+        }
+        if ys.is_empty() {
+            return Err(JammiError::FineTune(
+                "no train-task outcomes to reduce a target scaler from".into(),
+            ));
+        }
+        let n = ys.len();
+        let tensor = Tensor::from_vec(ys, (n,), device)
+            .map_err(|e| JammiError::FineTune(format!("scaler targets tensor: {e}")))?;
+        TargetScaler::from_targets(&tensor)
     }
 
     /// Submit an episodic in-context-predictor meta-training job on
@@ -540,26 +640,19 @@ impl InferenceSession {
             |preds, batch: &EpisodeBatch| spec.head.score(preds, &batch.target_y),
         )?;
 
-        self.persist_predictor(spec, &table, &varmap)
+        self.persist_predictor(spec, &table, &sampled.scaler, &varmap)
     }
 
     /// Build one [`EpisodeBatch`] per task — every target row in the task, each
     /// with its leakage-scoped context assembled and read back through SQL.
     async fn episodes_for_tasks(
         self: &Arc<Self>,
-        source_id: &str,
-        table: &ResultTableRecord,
-        spec: &ContextPredictorTrainConfig,
+        env: &EpisodeSampling<'_>,
         tasks: &[String],
-        feature_dim: usize,
-        device: &Device,
     ) -> Result<Vec<EpisodeBatch>> {
         let mut batches = Vec::with_capacity(tasks.len());
         for task in tasks {
-            batches.push(
-                self.episode_for_task(source_id, table, spec, task, feature_dim, device)
-                    .await?,
-            );
+            batches.push(self.episode_for_task(env, task).await?);
         }
         Ok(batches)
     }
@@ -567,20 +660,22 @@ impl InferenceSession {
     /// Build one task's [`EpisodeBatch`]: every target row in `task`, each with
     /// its leakage-scoped context assembled and read back through SQL, padded to
     /// the configured `context_k`.
+    ///
+    /// Both ends of every episode are z-scored with the run's train-derived
+    /// [`TargetScaler`]: the context members' `y` (carried in the episode's
+    /// `context_y` the predictor conditions on) and the held-out target `y` (the
+    /// scored supervision). The head therefore trains entirely in z-space, where
+    /// its zero-init output is O(1) from the target and reachable under Adam.
     async fn episode_for_task(
         self: &Arc<Self>,
-        source_id: &str,
-        table: &ResultTableRecord,
-        spec: &ContextPredictorTrainConfig,
+        env: &EpisodeSampling<'_>,
         task: &str,
-        feature_dim: usize,
-        device: &Device,
     ) -> Result<EpisodeBatch> {
-        let targets = self.task_targets(source_id, spec, task).await?;
+        let targets = self.task_targets(env.source_id, env.spec, task).await?;
         if targets.is_empty() {
             return Err(JammiError::FineTune(format!(
                 "task '{task}' in column '{}' has no rows",
-                spec.task_column
+                env.spec.task_column
             )));
         }
 
@@ -589,7 +684,7 @@ impl InferenceSession {
         // the train/test task boundary.
         let split = format!(
             "arrow_cast(\"{}\", 'Utf8') = '{}'",
-            spec.task_column,
+            env.spec.task_column,
             escape_sql_literal(task)
         );
 
@@ -598,12 +693,12 @@ impl InferenceSession {
             // The target's own stored vector is the retrieval query — an ordinary
             // SQL-surface read, not a raw-vector verb.
             let target_x = self
-                .read_vector_by_key(table, target_key)
+                .read_vector_by_key(env.table, target_key)
                 .await?
                 .ok_or_else(|| {
                     JammiError::FineTune(format!(
                         "target '{target_key}' has no stored vector in '{}'",
-                        table.table_name
+                        env.table.table_name
                     ))
                 })?;
 
@@ -611,19 +706,22 @@ impl InferenceSession {
             // key, the split keeps the context inside the same task — so the
             // target's outcome can never enter its own context, in or across
             // episodes. value_columns hydrates the members' y-labels in key order.
-            let mut request = ContextRequest::new(source_id, target_x.clone(), spec.context_k);
+            let mut request =
+                ContextRequest::new(env.source_id, target_x.clone(), env.spec.context_k);
             request.exclude_self = true;
             request.exclude_key = Some(target_key.clone());
             request.split = Some(split.clone());
             request.aggregator = SetAggregator::Mean;
-            request.value_columns = vec![spec.value_column.clone()];
+            request.value_columns = vec![env.spec.value_column.clone()];
             let rep = self.assemble_context(&request).await?;
 
             // Per-member x-vectors via the generic SQL surface, keyed by the
             // leakage-scoped member keys assemble_context surfaced (same order as
             // the hydrated y-labels).
-            let member_x = self.read_member_vectors(table, &rep.context_keys).await?;
-            let member_y = extract_value_column(&rep.value_rows, &spec.value_column)?;
+            let member_x = self
+                .read_member_vectors(env.table, &rep.context_keys)
+                .await?;
+            let member_y = extract_value_column(&rep.value_rows, &env.spec.value_column)?;
             if member_x.len() != member_y.len() {
                 return Err(JammiError::FineTune(format!(
                     "context member x/y count mismatch for target '{target_key}': \
@@ -633,22 +731,19 @@ impl InferenceSession {
                 )));
             }
 
-            contexts.push(TargetContext {
-                target_x,
-                target_y: *target_y,
-                member_x,
-                member_y,
-            });
+            contexts.push(target_context_z(
+                target_x, *target_y, member_x, member_y, env.scaler,
+            ));
         }
 
-        let episode = pad_episode(&contexts, feature_dim, spec.context_k, device)?;
+        let episode = pad_episode(&contexts, env.feature_dim, env.spec.context_k, env.device)?;
         let target_y = Tensor::from_vec(
             contexts
                 .iter()
                 .map(|c| c.target_y as f32)
                 .collect::<Vec<f32>>(),
             (contexts.len(),),
-            device,
+            env.device,
         )
         .map_err(|e| JammiError::FineTune(format!("target_y tensor: {e}")))?;
 
@@ -757,6 +852,7 @@ impl InferenceSession {
         &self,
         spec: &ContextPredictorTrainConfig,
         table: &ResultTableRecord,
+        scaler: &TargetScaler,
         varmap: &VarMap,
     ) -> Result<crate::fine_tune::worker::TrainedArtifact> {
         let scratch = self.inner_config().artifact_dir.join("context_predictors");
@@ -788,6 +884,10 @@ impl InferenceSession {
             "head_width": spec.head.head_width(),
             "head": spec.head.to_config_json(),
             "value_column": spec.value_column,
+            // The train-derived target standardiser: persisted so the served
+            // predict z-scores its live context with the same transform and
+            // de-standardises the head output back to raw outcome units.
+            "target_scaler": { "mean": scaler.mean(), "std": scaler.std() },
         })
         .to_string();
 
@@ -943,6 +1043,11 @@ pub struct ServedContextPredictor {
     /// conditioning label an NP reads off the context, hydrated at serving time
     /// exactly as the episodic sampler hydrated it at training time.
     value_column: String,
+    /// The train-derived target standardiser persisted with the predictor. The
+    /// served path z-scores its live context members' `y` with it (so the
+    /// conditioning matches the z-space the head trained in) and de-standardises
+    /// the head output back to raw outcome units.
+    scaler: TargetScaler,
     /// How the live context is assembled (ANN, or a pinned declared-edge
     /// snapshot) and the optional serving-split predicate.
     serve: ContextServeOptions,
@@ -1045,6 +1150,22 @@ impl InferenceSession {
                 ))
             })?
             .to_string();
+        // The train-derived target standardiser. A predictor without it in its
+        // config could only de-standardise to the identity, re-collapsing a
+        // high-offset target — so its absence is a typed reload error, not a
+        // silent untransformed serve.
+        let scaler = config
+            .get("target_scaler")
+            .and_then(|s| {
+                let mean = s.get("mean").and_then(|v| v.as_f64())?;
+                let std = s.get("std").and_then(|v| v.as_f64())?;
+                Some(TargetScaler::from_mean_std(mean, std))
+            })
+            .ok_or_else(|| {
+                JammiError::Inference(format!(
+                    "context predictor '{model_id}' config missing a 'target_scaler'"
+                ))
+            })?;
 
         let table = self
             .catalog()
@@ -1108,6 +1229,7 @@ impl InferenceSession {
             feature_dim,
             context_k,
             value_column,
+            scaler,
             serve: options,
             device,
         })
@@ -1199,16 +1321,13 @@ impl InferenceSession {
             )));
         }
 
-        let context = TargetContext {
-            target_x,
-            // The served target's own outcome is what we are predicting; the head
-            // is read off the target token / pooled context, not the target's own
-            // label, so a serving target carries a placeholder `y` the forward
-            // never consumes.
-            target_y: 0.0,
-            member_x,
-            member_y,
-        };
+        // Z-score the live context's outcomes with the persisted scaler — the
+        // conditioning the head trained against was in z-space, so the served
+        // context members' `y` must be too. The target's own outcome is what we
+        // are predicting; the head is read off the target token / pooled context,
+        // not the target's own label, so the placeholder `y` the forward never
+        // consumes goes through the same seam (its value is immaterial).
+        let context = target_context_z(target_x, 0.0, member_x, member_y, &served.scaler);
         let episode = pad_episode(
             std::slice::from_ref(&context),
             served.feature_dim,
@@ -1216,11 +1335,19 @@ impl InferenceSession {
             &served.device,
         )?;
 
+        // The head is in z-space (it trained against z-scored targets and σ). The
+        // S18 adapter turns the raw floats into a z-space distribution; that
+        // distribution is then de-standardised back to raw outcome units —
+        // `mean → μ_y + σ_y·z_mean`, `σ → σ_y·σ_z` (re-floored), quantiles
+        // `→ μ_y + σ_y·z_q`. De-standardising the *distribution* (not the raw
+        // head) is required because the served σ is a non-linear `softplus` of the
+        // raw scale, so the σ_y factor lands on the post-softplus σ, not the raw.
         let head = served
             .predictor
             .forward(&episode)
             .map_err(|e| JammiError::Inference(format!("context predictor forward: {e}")))?;
-        let distribution = distribution_from_head(&head, &served.form)?;
+        let z_distribution = distribution_from_head(&head, &served.form)?;
+        let distribution = destandardize_distribution(z_distribution, &served.scaler);
         Ok(PredictionWithProvenance {
             distribution,
             source,
@@ -1242,6 +1369,40 @@ pub struct PredictionWithProvenance {
     pub source: ContextSourceKind,
     /// The context member keys, in retrieval order — the neighbour provenance.
     pub context_keys: Vec<String>,
+}
+
+/// De-standardise a z-space served distribution back to raw outcome units with
+/// the predictor's [`TargetScaler`]: the Gaussian `mean → μ_y + σ_y·z_mean` and
+/// `σ → σ_y·σ_z` (re-floored at the σ floor so the positivity invariant survives
+/// the multiply), and every quantile value `→ μ_y + σ_y·z_q`. The σ_y > 0 affine
+/// is monotone, so a non-crossing z-space quantile set stays non-crossing.
+///
+/// Mirrors [`TargetScaler::destandardize`] on the tensor head, but applied to the
+/// *served distribution*: the served σ is a non-linear `softplus` of the raw
+/// scale, so the σ_y factor must land on the post-softplus σ, not the raw head.
+fn destandardize_distribution(
+    distribution: PredictedDistribution,
+    scaler: &TargetScaler,
+) -> PredictedDistribution {
+    let mean = scaler.mean() as f32;
+    let std = scaler.std() as f32;
+    match distribution {
+        PredictedDistribution::Gaussian {
+            mean: z_mean,
+            std: z_std,
+        } => PredictedDistribution::Gaussian {
+            mean: mean + std * z_mean,
+            // Re-floor after the multiply so the served σ keeps the positivity
+            // invariant the trained/served σ map guarantees.
+            std: (std * z_std).max(regression_loss::STD_FLOOR as f32),
+        },
+        PredictedDistribution::Quantile { levels } => PredictedDistribution::Quantile {
+            levels: levels
+                .into_iter()
+                .map(|(level, z_value)| (level, mean + std * z_value))
+                .collect(),
+        },
+    }
 }
 
 /// Turn a `[1, head_width]` head tensor into a [`PredictedDistribution`] through
@@ -1732,4 +1893,279 @@ fn build_predictor(
     let vb = VarBuilder::from_varmap(varmap, DType::F32, device);
     AnyContextPredictor::new(&cfg, vb)
         .map_err(|e| JammiError::FineTune(format!("build context predictor: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::parallel_train::{train_loop, ParallelTrainConfig};
+    use candle_nn::VarMap;
+    use std::sync::atomic::AtomicBool;
+
+    const FEATURE_DIM: usize = 4;
+
+    /// splitmix64 — a deterministic generator so the synthetic episode set is
+    /// reproducible without a test-only rng dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next_unit(&mut self) -> f32 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            ((z >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+        }
+    }
+
+    /// A calendar-year regression spec: a high-offset, low-variance outcome —
+    /// the exact shape the amortized predictor collapsed on. AttnCnp + Gaussian
+    /// CRPS, the same family the fine-tune head's high-offset oracle uses.
+    fn high_offset_spec() -> ContextPredictorTrainConfig {
+        ContextPredictorTrainConfig {
+            model_id: "oracle".into(),
+            architecture: ContextArchitecture::AttnCnp,
+            key_column: "_row_id".into(),
+            task_column: "task".into(),
+            value_column: "year".into(),
+            context_k: 6,
+            hidden_dim: 16,
+            num_heads: 2,
+            num_layers: 2,
+            head: PredictiveHead::Gaussian {
+                objective: GaussianObjective::Crps,
+            },
+            epochs: 200,
+            learning_rate: 0.02,
+            grad_clip: 1.0,
+            test_task_fraction: 0.25,
+            min_task_count: 2,
+            seed: 7,
+        }
+    }
+
+    /// Build a synthetic episode set whose outcomes are calendar years
+    /// (`true_mean ± spread`) — a high-offset, low-variance target. Each task is a
+    /// distinct mean year; every row's `x` is a small random feature, every
+    /// member's `y` is a year drawn around the task's mean. Returns the per-task
+    /// raw (un-standardised) contexts plus the flat list of every row's raw `y`
+    /// (the distribution the scaler is reduced from). This is the in-memory peer of
+    /// the SQL sampler's per-task assembly, built directly so the oracle is a fast
+    /// CPU unit test.
+    fn high_offset_episodes(k: usize, true_mean: f64) -> (Vec<Vec<TargetContext>>, Vec<f64>) {
+        let mut rng = Rng(99);
+        let n_tasks = 6;
+        let rows_per_task = 10;
+        let mut per_task = Vec::with_capacity(n_tasks);
+        let mut all_y = Vec::new();
+        for t in 0..n_tasks {
+            // A per-task year offset so tasks differ, but every year sits near the
+            // global high offset (low variance overall).
+            let task_mean = true_mean + (t as f64 - n_tasks as f64 / 2.0);
+            let raw_y: Vec<f64> = (0..rows_per_task)
+                .map(|_| task_mean + (rng.next_unit() as f64) * 2.0)
+                .collect();
+            let xs: Vec<Vec<f32>> = (0..rows_per_task)
+                .map(|_| (0..FEATURE_DIM).map(|_| rng.next_unit()).collect())
+                .collect();
+            let mut rows = Vec::with_capacity(rows_per_task);
+            for i in 0..rows_per_task {
+                // The context is every OTHER row of the same task (leakage-scoped:
+                // self excluded), capped at k — exactly the same-task split the
+                // sampler assembles.
+                let mut member_x = Vec::new();
+                let mut member_y = Vec::new();
+                for j in 0..rows_per_task {
+                    if j != i && member_x.len() < k {
+                        member_x.push(xs[j].clone());
+                        member_y.push(raw_y[j]);
+                    }
+                }
+                rows.push(TargetContext {
+                    target_x: xs[i].clone(),
+                    target_y: raw_y[i],
+                    member_x,
+                    member_y,
+                });
+            }
+            all_y.extend(raw_y.iter().copied());
+            per_task.push(rows);
+        }
+        (per_task, all_y)
+    }
+
+    /// Tensorise one task's raw contexts into an [`EpisodeBatch`], z-scoring both
+    /// the context members' `y` and the held-out target `y` with `scaler` when one
+    /// is supplied — the engine's standardised path. With `scaler = None` the raw
+    /// outcomes go in untouched: the pre-fix behaviour, kept so the oracle can show
+    /// the collapse the standardisation repairs.
+    fn batch_from_raw(
+        rows: &[TargetContext],
+        scaler: Option<&TargetScaler>,
+        k: usize,
+        device: &Device,
+    ) -> EpisodeBatch {
+        let contexts: Vec<TargetContext> = match scaler {
+            Some(s) => rows
+                .iter()
+                .map(|r| {
+                    target_context_z(
+                        r.target_x.clone(),
+                        r.target_y,
+                        r.member_x.clone(),
+                        r.member_y.clone(),
+                        s,
+                    )
+                })
+                .collect(),
+            None => rows
+                .iter()
+                .map(|r| TargetContext {
+                    target_x: r.target_x.clone(),
+                    target_y: r.target_y,
+                    member_x: r.member_x.clone(),
+                    member_y: r.member_y.clone(),
+                })
+                .collect(),
+        };
+        let episode = pad_episode(&contexts, FEATURE_DIM, k, device).unwrap();
+        // The target outcomes are z-scored to match the (z-scored) head the loss
+        // sees; raw when no scaler — the standardise(target) ↔ standardise(context)
+        // consistency the head trains under.
+        let target_vals: Vec<f32> = contexts.iter().map(|c| c.target_y as f32).collect();
+        let target_y = Tensor::from_vec(target_vals.clone(), (target_vals.len(),), device).unwrap();
+        EpisodeBatch { episode, target_y }
+    }
+
+    /// Train the spec's predictor over `batches` and return the served Gaussian
+    /// `(mean, σ)` at the first probe target after de-standardising the head with
+    /// `scaler` (the identity de-standardisation when `scaler` is `None`).
+    fn train_and_serve_first(
+        spec: &ContextPredictorTrainConfig,
+        batches: &[EpisodeBatch],
+        probe: &EpisodeBatch,
+        scaler: Option<&TargetScaler>,
+        device: &Device,
+    ) -> (f32, f32) {
+        let varmap = VarMap::new();
+        let predictor = build_predictor(spec, FEATURE_DIM, &varmap, device).unwrap();
+        // Randomise off the zero-init so the head is non-degenerate, the same as
+        // the pipeline trainer's fresh varmap.
+        {
+            let data = varmap.data().lock().unwrap();
+            let mut rng = Rng(1234);
+            for var in data.values() {
+                let n = var.shape().elem_count();
+                let vals: Vec<f32> = (0..n).map(|_| rng.next_unit() * 0.1).collect();
+                var.set(&Tensor::from_vec(vals, var.shape().clone(), device).unwrap())
+                    .unwrap();
+            }
+        }
+        let config = ParallelTrainConfig {
+            epochs: spec.epochs,
+            learning_rate: spec.learning_rate,
+            weight_decay: 0.0,
+            grad_clip: spec.grad_clip,
+        };
+        train_loop(
+            &varmap,
+            batches,
+            &config,
+            &AtomicBool::new(false),
+            |b: &EpisodeBatch| {
+                predictor
+                    .forward(&b.episode)
+                    .map_err(|e| JammiError::FineTune(format!("{e}")))
+            },
+            |preds, b: &EpisodeBatch| spec.head.score(preds, &b.target_y),
+        )
+        .unwrap();
+
+        // Serve the first probe target: one forward → the S18 distribution → the
+        // de-standardising affine (the served path's transform).
+        let head = predictor.forward(&probe.episode).unwrap();
+        let row0 = head.narrow(0, 0, 1).unwrap();
+        let z_dist = distribution_from_head(&row0, &DistributionForm::Gaussian).unwrap();
+        let dist = match scaler {
+            Some(s) => destandardize_distribution(z_dist, s),
+            None => z_dist,
+        };
+        match dist {
+            PredictedDistribution::Gaussian { mean, std } => (mean, std),
+            PredictedDistribution::Quantile { .. } => unreachable!("Gaussian spec"),
+        }
+    }
+
+    /// ORACLE: the amortized in-context Gaussian predictor must serve a mean ≈ the
+    /// true high-offset target mean (calendar years ≈ 2017) with a real,
+    /// non-collapsed σ — and the raw (un-standardised) path it replaced must
+    /// collapse (mean far off, σ pinned at the floor). This is the exact failure
+    /// the published `train_context_predictor(output="gaussian", value_column=
+    /// "year")` exhibited: mean ≈ 2163, σ ≈ 0.001 on every row.
+    ///
+    /// The standardised path z-scores both the context members' `y` and the
+    /// held-out target `y` with one train-derived scaler, trains the head in
+    /// z-space (where its zero-init output is O(1)-reachable under Adam), and
+    /// de-standardises the served mean/σ back to raw units. Loss-rescaling alone
+    /// would not fix this: Adam's per-step move is ≈ lr·sign(grad) regardless of
+    /// the loss scale, so a raw-space head crawls ≈ lr·steps units and stalls
+    /// thousands short of 2017 — which is the collapse arm of this oracle.
+    #[test]
+    fn gaussian_in_context_head_fits_high_offset_low_variance_target() {
+        let device = Device::Cpu;
+        let spec = high_offset_spec();
+        let k = spec.context_k;
+        let true_mean = 2017.0_f64;
+        let (raw_per_task, all_y) = high_offset_episodes(k, true_mean);
+
+        // The scaler reduced from the full outcome distribution, the train peer of
+        // the sampler's `train_target_scaler`.
+        let y_tensor = Tensor::from_vec(
+            all_y.iter().map(|y| *y as f32).collect::<Vec<f32>>(),
+            (all_y.len(),),
+            &device,
+        )
+        .unwrap();
+        let scaler = TargetScaler::from_targets(&y_tensor).unwrap();
+
+        let probe = batch_from_raw(&raw_per_task[0], Some(&scaler), k, &device);
+        let std_batches: Vec<EpisodeBatch> = raw_per_task
+            .iter()
+            .map(|r| batch_from_raw(r, Some(&scaler), k, &device))
+            .collect();
+
+        // The standardised (fixed) path: served mean lands near the true mean and
+        // σ is a real spread (well above the floor).
+        let (mean, sigma) =
+            train_and_serve_first(&spec, &std_batches, &probe, Some(&scaler), &device);
+        assert!(
+            (mean as f64 - true_mean).abs() < 50.0,
+            "standardised in-context head failed to fit the high-offset target: \
+             true mean {true_mean}, served mean {mean} (off by {:.0})",
+            (mean as f64 - true_mean).abs()
+        );
+        assert!(
+            sigma > 0.1,
+            "standardised in-context head served a collapsed σ {sigma} \
+             (the target spread is ≈ 2; a real σ must be well off the floor)"
+        );
+
+        // The pre-fix (raw, un-standardised) path collapses: the head cannot reach
+        // the high offset under Adam and the σ pins near the floor. This is the
+        // arm that fails on main (no standardisation), demonstrating the bug.
+        let raw_batches: Vec<EpisodeBatch> = raw_per_task
+            .iter()
+            .map(|r| batch_from_raw(r, None, k, &device))
+            .collect();
+        let raw_probe = batch_from_raw(&raw_per_task[0], None, k, &device);
+        let (raw_mean, raw_sigma) =
+            train_and_serve_first(&spec, &raw_batches, &raw_probe, None, &device);
+        assert!(
+            (raw_mean as f64 - true_mean).abs() > 100.0 || raw_sigma < 0.05,
+            "the un-standardised path was expected to collapse on a high-offset \
+             target (mean far off OR σ pinned at the floor), but served mean \
+             {raw_mean}, σ {raw_sigma} — if this no longer collapses the oracle is \
+             not exercising the bug"
+        );
+    }
 }

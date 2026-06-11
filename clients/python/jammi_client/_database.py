@@ -183,13 +183,14 @@ def _table_to_arrow_batch(batch: pa.Table) -> "trigger_pb2.ArrowBatch":
     Arrow IPC stream in `data_body` (schema header inline, `data_header` empty) —
     the Flight-IPC framing the engine's `decode_ipc_stream` reads back, and the
     inverse of :func:`_arrow_batch_to_table`. The whole table rides as one logical
-    event: the publish path concatenates multi-chunk tables server-side, so a
-    multi-batch stream publishes as one batch (matching the embedded
-    `publish_topic`, which concatenates the streamed chunks).
+    event: a multi-chunk table is collapsed to a single chunk first (mirroring the
+    embedded `publish_topic`, which `concat_batches` the streamed chunks), so the
+    stream carries exactly one RecordBatch message — the count the engine's
+    `decode_publish_batch` requires.
     """
     sink = pa.BufferOutputStream()
     with pa.ipc.new_stream(sink, batch.schema) as writer:
-        writer.write_table(batch)
+        writer.write_table(batch.combine_chunks())
     return trigger_pb2.ArrowBatch(data_header=b"", data_body=sink.getvalue().to_pybytes())
 
 

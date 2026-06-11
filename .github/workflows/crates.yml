@@ -84,6 +84,44 @@ jobs:
           # on a manual dispatch, take it from the input.
           VERSION="${{ github.event.inputs.version }}"
           VERSION="${VERSION:-${GITHUB_REF_NAME#v}}"
+
+          # The crates.io sparse index lags `cargo publish` by seconds-to-minutes:
+          # after publishing crate X, a dependent crate Y's publish reads the index
+          # to resolve `X = "=<version>"` and fails if X's new version isn't listed
+          # yet. The presence guard polls the *API* (a different surface) and only
+          # protects re-runs; first-run propagation needs an *index* wait. So after
+          # each publish, block until the exact name+version appears in the sparse
+          # index before moving to the next (dependent) crate — a deterministic
+          # signal, not a blind sleep.
+          #
+          # Index path layout: 1-char names live under `1/`, 2-char under `2/`,
+          # 3-char under `3/<c1>/`, 4-plus under `<c1c2>/<c3c4>/`.
+          index_dir_prefix() {
+            local name="$1"
+            case "${#name}" in
+              1) printf '1' ;;
+              2) printf '2' ;;
+              3) printf '3/%s' "${name:0:1}" ;;
+              *) printf '%s/%s' "${name:0:2}" "${name:2:2}" ;;
+            esac
+          }
+
+          wait_for_index() {
+            local crate="$1" version="$2"
+            local url="https://index.crates.io/$(index_dir_prefix "${crate}")/${crate}"
+            local deadline=$(( SECONDS + 300 ))  # bound: 5 minutes, then fail loudly
+            echo "Waiting for ${crate} ${version} to appear in the crates.io sparse index (${url})..."
+            while (( SECONDS < deadline )); do
+              if curl -sf -A "jammi-ai release CI (github.com/f-inverse/jammi-ai)" "${url}" \
+                | grep -q "\"vers\":\"${version}\""; then
+                echo "${crate} ${version} is visible in the sparse index"
+                return 0
+              fi
+              sleep 5
+            done
+            echo "::error::${crate} ${version} did not appear in the crates.io sparse index within 5 minutes"
+            return 1
+          }
           # Publish in topological dependency order. Each entry must come
           # after every crate it depends on, since `cargo publish` resolves
           # workspace deps against crates.io once the path = is stripped:
@@ -117,8 +155,10 @@ jobs:
               # redundant — and recompiling the full arrow/candle/datafusion tree
               # once per crate overflows the runner's disk on the last crate.
               cargo publish -p "${crate}" --no-verify
-              echo "Waiting 30s for crates.io index..."
-              sleep 30
+              # Block until this exact version is resolvable by the next crate's
+              # publish — only for crates this run actually published (the guard's
+              # skip branch needs no wait; it's already in the index).
+              wait_for_index "${crate}" "${VERSION}"
             fi
           done
 

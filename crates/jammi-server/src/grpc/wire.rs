@@ -99,6 +99,10 @@ pub fn map_engine_error(err: JammiError) -> Status {
             Code::InvalidArgument,
             format!("model {model_id}: {message}"),
         ),
+        JammiError::ModelRetired { model_id } => (
+            Code::FailedPrecondition,
+            format!("model {model_id} is retired"),
+        ),
         JammiError::Tenant(detail) => (Code::InvalidArgument, format!("tenant: {detail}")),
         JammiError::Config(detail) => (Code::InvalidArgument, format!("config: {detail}")),
         JammiError::Schema { .. } => (Code::InvalidArgument, err.to_string()),

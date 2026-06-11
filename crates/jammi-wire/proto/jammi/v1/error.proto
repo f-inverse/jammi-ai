@@ -72,7 +72,17 @@ message JammiErrorDetail {
     StringError backend = 12;
     StringError evidence_channel = 13;
     MutableTableErrorDetail mutable_table = 14;
+    ModelRetiredError model_retired = 15;
   }
+}
+
+// `JammiError::ModelRetired { model_id }`. The serve/load path was asked for a
+// model that has been retired. Distinct from `ModelError` (a bad-argument model
+// fault → `InvalidArgument`); this is a precondition failure →
+// `FailedPrecondition`, so it carries its own variant rather than folding onto
+// the generic model error.
+message ModelRetiredError {
+  string model_id = 1;
 }
 
 // `JammiError::MutableTable(MutableTableError)`. The inner taxonomy is

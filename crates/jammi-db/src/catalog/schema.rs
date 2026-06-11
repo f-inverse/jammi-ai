@@ -503,3 +503,19 @@ CREATE INDEX idx_eval_runs_type    ON eval_runs(eval_type);
 CREATE INDEX idx_eval_runs_created ON eval_runs(created_at);
 CREATE INDEX idx_eval_runs_tenant  ON eval_runs(tenant_id);
 "#;
+
+/// Migration 019 — normalize the `models.status` value set onto the canonical
+/// [`ModelStatus`](super::status::ModelStatus) variants.
+///
+/// Migration 001 created `models` with `status TEXT NOT NULL DEFAULT
+/// 'available'`, but `register_model` always writes an explicit `'registered'`
+/// and the typed `ModelStatus` enum carries no `'available'` variant — so the
+/// DDL default was a string the type system never names. A row could only carry
+/// `'available'` if it were inserted by some path that omitted the column and
+/// fell through to the default; no such path exists today, so this is defensive
+/// rather than corrective. It rewrites any stray `'available'` to `'registered'`
+/// (the canonical "registered, not loaded" state) so the on-disk value set is
+/// total over the enum without introducing an `'available'` alias variant.
+pub(super) const MIGRATION_019_NORMALIZE_MODEL_STATUS: &str = r#"
+UPDATE models SET status = 'registered' WHERE status = 'available';
+"#;

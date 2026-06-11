@@ -29,6 +29,16 @@ pub enum JammiError {
         message: String,
     },
 
+    /// The serve/load path was asked for a model that has been retired. A
+    /// retired model is still resolvable as a reference target (provenance,
+    /// FK), but it cannot be loaded or served — this is a precondition failure,
+    /// not a bad argument, so it maps to gRPC `FailedPrecondition`.
+    #[error("Model retired: {model_id}")]
+    ModelRetired {
+        /// Identifier of the retired model.
+        model_id: String,
+    },
+
     /// Inference execution failure.
     #[error("Inference error: {0}")]
     Inference(String),

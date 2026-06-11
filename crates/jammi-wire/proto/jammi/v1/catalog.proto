@@ -24,7 +24,8 @@ import "jammi/v1/embedding.proto";
 // reports compile-time facts plus the runtime tier set, so both mount on the
 // always-present core tier. Sources / models: `AddSource` / `RemoveSource` /
 // `ListSources` / `DescribeSource` register and introspect data sources, and
-// `ListModels` / `DescribeModel` introspect the model catalog. Channels:
+// `ListModels` / `DescribeModel` introspect the model catalog while
+// `RetireModel` soft-retires a model. Channels:
 // `RegisterChannel` / `AddChannelColumns` / `ListChannels` declare and
 // introspect provenance channels. Mutable tables: `CreateMutableTable` /
 // `DropMutableTable` / `ListMutableTables` register and introspect mutable
@@ -89,8 +90,19 @@ service CatalogService {
 
   // Describe one registered model by id: the same `Model` projection
   // `ListModels` carries, for the latest registered version. Peer of the
-  // abstraction's `describe_model`. An absent model returns NotFound.
+  // abstraction's `describe_model`. A retired model reads as absent here (the
+  // introspection sense hides retired), so an absent or retired model returns
+  // NotFound.
   rpc DescribeModel(DescribeModelRequest) returns (Model);
+
+  // Soft-retire a model. Peer of the abstraction's `retire_model`. The model is
+  // hidden from `ListModels` / `DescribeModel` and refused by the serve/load
+  // path, but stays resolvable as a reference target (a training job's base
+  // model, an eval run's model) so historical provenance holds. When `version`
+  // is unset the latest version is retired. A tenant may retire ONLY a model it
+  // owns; a model outside its scope (including a GLOBAL model) returns NotFound.
+  // Idempotent — retiring an already-retired model succeeds as a no-op.
+  rpc RetireModel(RetireModelRequest) returns (google.protobuf.Empty);
 
   // --- channels ----------------------------------------------------------
 
@@ -267,6 +279,12 @@ message ListModelsResponse {
 
 message DescribeModelRequest {
   string model_id = 1;
+}
+
+message RetireModelRequest {
+  string model_id = 1;
+  // The version to retire. Unset retires the latest version.
+  optional int32 version = 2;
 }
 
 // The client-observable projection of the engine's `ModelRecord`. Carries the

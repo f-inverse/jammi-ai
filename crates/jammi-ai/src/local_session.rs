@@ -39,6 +39,7 @@ use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
 use jammi_db::catalog::model_repo::ModelRecord;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::catalog::source_repo::SourceDescriptor;
+use jammi_db::catalog::status::ModelStatus;
 use jammi_db::error::Result;
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
@@ -145,10 +146,23 @@ impl Session {
         self.engine.catalog().list_models().await
     }
 
-    /// Describe one registered model by id, or `None` when no model with that
-    /// id is visible to the session's tenant.
+    /// Describe one registered model by id, or `None` when no *active* model
+    /// with that id is visible to the session's tenant. This is the
+    /// introspection sense (the per-model peer of [`Self::list_models`]), so a
+    /// retired model reads as absent here — even though the catalog's
+    /// reference-resolution path (`get_model`) still returns it for provenance.
     pub async fn describe_model(&self, model_id: &str) -> Result<Option<ModelRecord>> {
-        self.engine.catalog().get_model(model_id).await
+        let record = self.engine.catalog().get_model(model_id).await?;
+        Ok(record.filter(|r| r.status != ModelStatus::Retired.to_string()))
+    }
+
+    /// Soft-retire a model: hide it from active listings and refuse to serve it,
+    /// while keeping it resolvable as a reference target (provenance, a base
+    /// model FK). When `version` is `None` the latest version is retired. A
+    /// tenant may retire only a model it owns; a model outside its scope is
+    /// reported as absent.
+    pub async fn retire_model(&self, model_id: &str, version: Option<i32>) -> Result<()> {
+        self.engine.catalog().retire_model(model_id, version).await
     }
 
     /// Describe one registered source by id, or `None` when no source with that

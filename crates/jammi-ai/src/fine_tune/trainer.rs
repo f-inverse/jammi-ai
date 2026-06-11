@@ -12,7 +12,7 @@ use jammi_db::error::{JammiError, Result};
 
 use super::data::{TextChunk, TrainingDataLoader};
 use super::optimizer::clip_and_step;
-use super::regression_loss::{crps_gaussian_loss, gaussian_nll_loss, pinball_loss};
+use super::regression_loss::{crps_gaussian_loss, gaussian_nll_loss, pinball_loss, TargetScaler};
 use super::target::TrainingTarget;
 use super::{EarlyStoppingMetric, FineTuneConfig, LrSchedule};
 use crate::model::{LoadedModel, ModelTask};
@@ -57,21 +57,20 @@ pub fn compute_lr(config: &FineTuneConfig, step: usize, total_steps: usize) -> f
         return base_lr * (step as f64 / config.warmup_steps.max(1) as f64);
     }
 
-    // Decay phase
+    // Decay phase. `progress` is clamped to [0, 1] and the returned lr floored at
+    // 0 so the schedule is total-domain-valid for any step: stepping past the
+    // horizon holds the lr at its end-of-schedule value rather than continuing
+    // the curve into negative (gradient-ascent) territory.
     let decay_steps = total_steps.saturating_sub(config.warmup_steps);
     let decay_step = step - config.warmup_steps;
+    let progress = (decay_step as f64 / decay_steps.max(1) as f64).clamp(0.0, 1.0);
 
-    match config.lr_schedule {
+    let lr = match config.lr_schedule {
         LrSchedule::Constant => base_lr,
-        LrSchedule::CosineDecay => {
-            let progress = decay_step as f64 / decay_steps.max(1) as f64;
-            base_lr * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos())
-        }
-        LrSchedule::LinearDecay => {
-            let progress = decay_step as f64 / decay_steps.max(1) as f64;
-            base_lr * (1.0 - progress)
-        }
-    }
+        LrSchedule::CosineDecay => base_lr * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos()),
+        LrSchedule::LinearDecay => base_lr * (1.0 - progress),
+    };
+    lr.max(0.0)
 }
 
 /// Mutable per-epoch state passed into [`TrainingLoop::process_batch_loss`].
@@ -95,6 +94,11 @@ struct StepContext<'a> {
     checkpoint_dir: &'a Path,
     checkpoint_interval: usize,
     total_steps: usize,
+    /// Micro-batches this epoch's loader yields. Needed so the trailing partial
+    /// accumulation window divides its loss by its actual micro-batch count
+    /// (`batches_per_epoch % grad_accum`) rather than the full `grad_accum` — the
+    /// partial window averages over fewer micro-batches.
+    batches_per_epoch: usize,
 }
 
 /// The training loop: runs LoRA fine-tuning with gradient accumulation,
@@ -122,6 +126,12 @@ pub struct TrainingLoop {
     /// there to the artifact store under a unique per-attempt prefix.
     artifact_dir: PathBuf,
     divergence_count: usize,
+    /// Fixed, dataset-level target standardiser for the regression path, derived
+    /// once from all training targets at the start of [`Self::run`]. `None` until
+    /// the run computes it (and for every non-regression target). It maps each
+    /// regression loss into a z-space the zero-initialised head can reach, while
+    /// the head itself stays in raw space — so serving needs no de-standardisation.
+    target_scaler: Option<TargetScaler>,
     device: Device,
     /// Cooperative-cancellation flag the worker's heartbeat task sets when the
     /// lease is lost. Checked at every epoch boundary; once set the loop bails
@@ -238,6 +248,7 @@ impl TrainingLoopBuilder {
             catalog,
             artifact_dir,
             divergence_count: 0,
+            target_scaler: None,
             device: self.device,
             cancel: self.cancel,
         })
@@ -268,9 +279,33 @@ impl TrainingLoop {
         // Split training/validation
         let (train_loader, val_loader) = data_loader.split(self.config.validation_fraction)?;
 
+        // Reduce all training targets into one fixed standardiser before the loop
+        // (a regression run only). Computed from the train split — the val split
+        // is held out — so every regression-loss call scores in a z-space the
+        // zero-init head can reach, while the head stays in raw space.
+        self.target_scaler = match train_loader.regression_targets() {
+            Some(targets) if !targets.is_empty() => {
+                let n = targets.len();
+                let tensor = Tensor::from_vec(targets, (n,), &self.device)
+                    .map_err(|e| JammiError::FineTune(format!("scaler targets tensor: {e}")))?;
+                Some(TargetScaler::from_targets(&tensor)?)
+            }
+            _ => None,
+        };
+
+        // The LR-schedule horizon is the number of optimizer steps the run will
+        // actually take, not the floor of `batches / grad_accum`. Each epoch takes
+        // one step per full accumulation window plus one trailing step for the
+        // partial window when `batches_per_epoch` is not a multiple of
+        // `grad_accum`, i.e. `ceil(batches / grad_accum)` steps. Counting the
+        // realised steps keeps `compute_lr`'s `progress` within [0, 1] for every
+        // step the loop takes, and makes the reported `result.total_steps` equal
+        // this horizon. Computed after the train/validation split, since
+        // `validation_fraction` changes `train_batches_per_epoch`.
         let train_batches_per_epoch = train_loader.num_batches(self.config.batch_size);
-        let total_steps = (train_batches_per_epoch * self.config.epochs)
-            / self.config.gradient_accumulation_steps.max(1);
+        let total_steps = train_batches_per_epoch
+            .div_ceil(self.config.gradient_accumulation_steps.max(1))
+            * self.config.epochs;
         let checkpoint_interval = (total_steps as f64 * 0.1).ceil() as usize;
 
         // Create optimizer from VarMap's trainable variables.
@@ -367,6 +402,7 @@ impl TrainingLoop {
                             checkpoint_dir: &checkpoint_dir,
                             checkpoint_interval,
                             total_steps,
+                            batches_per_epoch: train_batches_per_epoch,
                         },
                     )?;
                 }
@@ -415,6 +451,7 @@ impl TrainingLoop {
                             checkpoint_dir: &checkpoint_dir,
                             checkpoint_interval,
                             total_steps,
+                            batches_per_epoch: train_batches_per_epoch,
                         },
                     )?;
                 }
@@ -511,7 +548,13 @@ impl TrainingLoop {
         // Save the final adapter — both target variants persist their
         // trainable weights alongside a `SavedAdapter` metadata JSON.
         let final_weights = self.target.named_trainable_weights()?;
-        let saved = self.target.saved_adapter(&self.config);
+        // The form is persisted exactly when the scaler is — both are the
+        // regression head's de-standardisation state. A non-regression head has
+        // no scaler and no form, so its adapter config round-trips unchanged.
+        let regression_form = self.target_scaler.map(|_| self.regression_form());
+        let saved = self
+            .target
+            .saved_adapter(&self.config, self.target_scaler, regression_form);
         jammi_lora::save_adapter(&checkpoint_dir, &final_weights, &saved)
             .map_err(|e| JammiError::FineTune(format!("Save adapter: {e}")))?;
 
@@ -1007,22 +1050,59 @@ impl TrainingLoop {
         }
     }
 
+    /// The predictive distribution form this run's regression head emits, read
+    /// off the configured objective: `Pinball` trains the quantile head over the
+    /// configured levels; every other arm trains the parametric Gaussian head.
+    /// This is the single gaussian-vs-quantile dispatch — the de-standardisation
+    /// (here and at serving) and the persisted head metadata all derive from it,
+    /// so the served form can never disagree with the trained one.
+    fn regression_form(&self) -> crate::inference::adapter::DistributionForm {
+        use crate::inference::adapter::DistributionForm;
+        match self.config.regression_loss.unwrap_or_default() {
+            super::RegressionLoss::Pinball => DistributionForm::Quantile {
+                levels: self.config.quantile_levels.clone(),
+            },
+            _ => DistributionForm::Gaussian,
+        }
+    }
+
     /// Apply the distributional regression head to projected embeddings,
-    /// producing the `(batch, k)` raw head parameters. Mirrors [`Self::classify`]:
-    /// only a `ProjectionHead` target with a second (head) layer can regress.
+    /// producing the de-standardised `(batch, k)` head parameters. Mirrors
+    /// [`Self::classify`]: only a `ProjectionHead` target with a second (head)
+    /// layer can regress.
+    ///
+    /// The LoRA layer learns a z-space parameter; this method maps its raw output
+    /// through the [`TargetScaler`]'s de-standardising affine (`μ_y + σ_y·z` on the
+    /// outcome-unit columns), so the returned head is raw-correct — the loss and
+    /// the serving adapter both read it directly with no further transform. With
+    /// the head zero-initialised the emitted mean is exactly μ_y, which is why a
+    /// high-offset target (calendar years, prices) is reachable under Adam.
     fn regress(&self, embeddings: &Tensor) -> Result<Tensor> {
-        match &self.target {
+        let raw = match &self.target {
             TrainingTarget::ProjectionHead { head } if head.layers.len() > 1 => head.layers[1]
                 .1
                 .forward(embeddings)
-                .map_err(|e| JammiError::FineTune(format!("LoRA regression head: {e}"))),
-            TrainingTarget::ProjectionHead { .. } => Err(JammiError::FineTune(
-                "No regression head in projection target".into(),
-            )),
-            TrainingTarget::EncoderAdapters(_) => Err(JammiError::FineTune(
-                "Regression with encoder adapters is not supported".into(),
-            )),
-        }
+                .map_err(|e| JammiError::FineTune(format!("LoRA regression head: {e}")))?,
+            TrainingTarget::ProjectionHead { .. } => {
+                return Err(JammiError::FineTune(
+                    "No regression head in projection target".into(),
+                ))
+            }
+            TrainingTarget::EncoderAdapters(_) => {
+                return Err(JammiError::FineTune(
+                    "Regression with encoder adapters is not supported".into(),
+                ))
+            }
+        };
+        // The scaler is reduced from all training targets at the top of `run`, so
+        // a regression batch always reaches here with one present; its absence is
+        // an internal invariant violation, not a recoverable input error.
+        let scaler = self.target_scaler.as_ref().ok_or_else(|| {
+            JammiError::FineTune(
+                "regression head reached without a target scaler (run did not set one)".into(),
+            )
+        })?;
+        scaler.destandardize(&raw, &self.regression_form())
     }
 
     /// Accumulate cosine similarity stats from a triplet batch for epoch-level logging.
@@ -1124,7 +1204,24 @@ impl TrainingLoop {
         // Scale the loss and immediately run backward, releasing the activation
         // graph so that `gradient_accumulation_steps > 1` doesn't grow memory
         // proportionally to the number of micro-batches.
-        let scale = self.config.gradient_accumulation_steps.max(1) as f64;
+        //
+        // A full accumulation window averages over `grad_accum` micro-batches, so
+        // each one's loss is divided by `grad_accum`. The epoch's trailing window
+        // — when `batches_per_epoch` is not a multiple of `grad_accum` — contains
+        // only `batches_per_epoch % grad_accum` micro-batches, so those divide by
+        // that smaller count to keep the window's gradient a true average rather
+        // than under-scaling it by the full `grad_accum`. `epoch.batch_count` has
+        // already been incremented for this micro-batch, so it is the 1-based
+        // index of the current micro-batch within the epoch.
+        let grad_accum = self.config.gradient_accumulation_steps.max(1);
+        let partial_window = ctx.batches_per_epoch % grad_accum;
+        let in_trailing_partial =
+            partial_window != 0 && *epoch.batch_count > ctx.batches_per_epoch - partial_window;
+        let scale = if in_trailing_partial {
+            partial_window as f64
+        } else {
+            grad_accum as f64
+        };
         let scaled_loss =
             (&loss / scale).map_err(|e| JammiError::FineTune(format!("Loss scale: {e}")))?;
         let new_grads = scaled_loss
@@ -1252,6 +1349,10 @@ impl TrainingLoop {
     /// with [`STD_FLOOR`] as the hard numerical guard against exact-zero variance
     /// (the overconfidence collapse). The pinball arm reads one quantile per
     /// head column and scores each against its level.
+    ///
+    /// `input` is already de-standardised by [`Self::regress`], so this loss is a
+    /// pure score of the head's raw, outcome-unit output against the raw target —
+    /// no scaler threads through here.
     fn regression_loss(&self, input: &Tensor, target: &Tensor) -> Result<Tensor> {
         match self.config.regression_loss.unwrap_or_default() {
             super::RegressionLoss::GaussianNll => gaussian_nll_loss(input, target, 0.0),
@@ -1888,7 +1989,9 @@ fn cosine_similarity(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::regression_loss::{gaussian_params, softplus_std_for_test, STD_FLOOR};
+    use super::super::regression_loss::{
+        gaussian_params, softplus_std_for_test, TargetScaler, STD_FLOOR,
+    };
     use super::*;
     use candle_core::Var;
 
@@ -2448,6 +2551,99 @@ mod tests {
         assert!(
             s >= STD_FLOOR as f32,
             "σ {s} fell below the floor {STD_FLOOR}"
+        );
+    }
+
+    /// Fit a Gaussian head — carrying the de-standardising affine the trainer
+    /// builds on it — to a REALISTIC, high-offset, low-variance regression target:
+    /// calendar years 2014..=2020 (true mean ≈ 2017, true std ≈ 2). This is
+    /// exactly the shape of a real "predict the filing year" regression. Same
+    /// optimiser budget the engine's own regression contract tests use (AdamW
+    /// lr=0.05, 2000 steps).
+    ///
+    /// The head's learnable column is a **z-space** parameter, zero-init; the
+    /// head's forward de-standardises it through the [`TargetScaler`]'s affine
+    /// (`μ_y + σ_y·z`), so the emitted mean starts at exactly μ_y and the loss
+    /// scores that raw-correct output against the raw target. Adam only has to
+    /// move the O(1) z-parameter, which is reachable in the budget.
+    ///
+    /// ORACLE: the fitted *served* mean (the de-standardised head output) must
+    /// land near the true mean (2017). A z-param scored through a head that did
+    /// NOT de-standardise — i.e. scoring the raw z-space output against the raw
+    /// 2017-offset target — is the failure mode this guards: Adam's per-step move
+    /// is ≈ lr regardless of loss scale, so an un-reparameterised mean travels at
+    /// most ~100 units and stalls thousands short of 2017.
+    #[test]
+    fn gaussian_head_fits_high_offset_low_variance_target() {
+        let device = Device::Cpu;
+        // Calendar years — a textbook low-variance, high-offset regression target.
+        let years: Vec<f32> = vec![2014.0, 2015.0, 2016.0, 2017.0, 2018.0, 2019.0, 2020.0];
+        let true_mean: f32 = years.iter().sum::<f32>() / years.len() as f32; // 2017.0
+        let n = years.len();
+        let targets = Tensor::from_vec(years, (n,), &device).unwrap();
+        // The affine the head carries, reduced from the same targets the trainer
+        // reduces — so the head emits μ_y at zero-init.
+        let scaler = TargetScaler::from_targets(&targets).unwrap();
+
+        // Two learnable z-space columns (z_mean, raw_std), both zero-init — the
+        // head's own parameterisation (build_distribution_head starts at 0).
+        let varmap = VarMap::new();
+        let z_mean = varmap
+            .get(
+                (1,),
+                "z_mean",
+                candle_nn::Init::Const(0.0),
+                DType::F32,
+                &device,
+            )
+            .unwrap();
+        let raw_std = varmap
+            .get(
+                (1,),
+                "raw_std",
+                candle_nn::Init::Const(0.0),
+                DType::F32,
+                &device,
+            )
+            .unwrap();
+        let mut opt = AdamW::new(
+            varmap.all_vars(),
+            ParamsAdamW {
+                lr: 0.05,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        for _ in 0..2000 {
+            let z_col = z_mean.broadcast_as((n, 1)).unwrap().contiguous().unwrap();
+            let raw_col = raw_std.broadcast_as((n, 1)).unwrap().contiguous().unwrap();
+            let z_head = Tensor::cat(&[&z_col, &raw_col], 1).unwrap();
+            // The head's forward: de-standardise the z-space output to raw units.
+            let head = scaler.destandardize_gaussian(&z_head).unwrap();
+            // β-NLL with β=0.5 — the engine's default regression loss — scores the
+            // raw head output against the raw target, no scaler in the loss.
+            let loss = gaussian_nll_loss(&head, &targets, 0.5).unwrap();
+            let grads = loss.backward().unwrap();
+            opt.step(&grads).unwrap();
+        }
+
+        // The SERVED mean is the de-standardised head output, exactly what the
+        // serving adapter reads. Reproduce the head forward at the fitted params.
+        let z_col = z_mean.broadcast_as((n, 1)).unwrap().contiguous().unwrap();
+        let raw_col = raw_std.broadcast_as((n, 1)).unwrap().contiguous().unwrap();
+        let z_head = Tensor::cat(&[&z_col, &raw_col], 1).unwrap();
+        let served = scaler.destandardize_gaussian(&z_head).unwrap();
+        let served_mean = served.to_vec2::<f32>().unwrap()[0][0];
+        // ORACLE: a calibrated regression head predicts ≈ the true target mean.
+        // Allow a generous ±50 (the true std is ~2, so ±50 is 25σ of slack).
+        assert!(
+            (served_mean - true_mean).abs() < 50.0,
+            "Gaussian head failed to fit a realistic high-offset target. \
+             true mean {true_mean}, served mean {served_mean} (off by {:.0}). \
+             The head's de-standardised mean must converge to the target mean \
+             under the z-space reparameterisation.",
+            (served_mean - true_mean).abs()
         );
     }
 

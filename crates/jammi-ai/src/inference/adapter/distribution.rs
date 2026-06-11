@@ -53,7 +53,14 @@ fn softplus_std(raw: f32, floor: f32) -> f32 {
 }
 
 /// Which predictive distribution shape a regression model emits.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// This is the authoritative gaussian-vs-quantile signal: it is set from the
+/// configured regression objective at fine-tune time, persisted with the head
+/// in the adapter config, and reloaded on serve so the de-standardisation
+/// dispatches on the *form* the head was trained for — never on a head-width
+/// heuristic (a 2-level quantile head is also width 2).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DistributionForm {
     /// Parametric Gaussian: the head emits `(mean, raw_std)`; the served
     /// columns are `predicted_mean` and `predicted_std = floor + softplus(raw_std)`.

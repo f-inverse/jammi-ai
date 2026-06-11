@@ -2,12 +2,25 @@
 //! peers of the R2 calibration metrics and the inference adapter's σ map.
 //!
 //! These are pure functions of a head output `(batch, k)` and a target — they
-//! read no training state. The trainer's `regression_loss` dispatches on the
-//! configured [`super::RegressionLoss`] to them; the inference adapter reads the
-//! single [`STD_FLOOR`] so the trained σ and the served σ are one constant.
+//! read no training state, and they score the head's **raw, outcome-unit**
+//! output against the **raw** target. The trainer's `regression_loss` dispatches
+//! on the configured [`super::RegressionLoss`] to them; the inference adapter
+//! reads the single [`STD_FLOOR`] so the trained σ and the served σ are one
+//! constant.
+//!
+//! Reachability of a high-offset target (calendar years, prices) is *not* a loss
+//! concern — scoring in a standardised space does not change how far Adam moves
+//! the raw head parameter, because Adam's per-step update is ≈`lr·sign(grad)`
+//! regardless of the gradient's magnitude. Reachability is solved inside the head
+//! by [`TargetScaler::destandardize_gaussian`] /
+//! [`TargetScaler::destandardize_quantile`], which reparameterise the head so its
+//! *optimised* parameter is O(1) from zero-init while its *output* is
+//! raw-correct. The loss only ever sees that raw-correct output, so it stays a
+//! pure function of `(head, target)`.
 
 use candle_core::Tensor;
 use jammi_db::error::{JammiError, Result};
+use serde::{Deserialize, Serialize};
 
 /// Hard numerical floor on the predictive standard deviation, the autodiff peer
 /// of the inference adapter's `SERVED_STD_FLOOR`. The *learnable* part of the
@@ -17,6 +30,137 @@ use jammi_db::error::{JammiError, Result};
 /// floor: the inference adapter's `SERVED_STD_FLOOR` references this constant,
 /// so the trained `σ` and the served `σ` are one transform.
 pub(crate) const STD_FLOOR: f64 = 1e-3;
+
+/// Dataset-level target standardiser carried *by the regression head*: the
+/// `mean` (μ_y) and `std` (σ_y) of all training targets, computed once before
+/// the loop and held fixed for the whole run.
+///
+/// # Why the head, not the loss
+///
+/// A distribution head is zero-initialised, so its predictive `mean` starts at
+/// 0. A high-offset target — calendar years, prices — sits thousands of units
+/// from 0. Adam's per-parameter update is ≈`lr·sign(grad)`: it normalises by the
+/// gradient's running RMS, so the *distance* the raw mean parameter travels is
+/// ≈`lr` per step **regardless of the loss's scale or units**. Scoring the loss
+/// in a standardised z-space therefore does *not* help — the raw mean still
+/// crawls ≈`lr·steps` units and stalls thousands of units short of the target.
+///
+/// The fix is a reparameterisation, applied inside the head's forward: the head
+/// learns a z-space parameter `z` (O(1) from zero-init, reachable by Adam) and
+/// its output is the **de-standardised** raw value `μ_y + σ_y·z`. With `z`
+/// zero-init the head already emits `μ_y`, and Adam only has to nudge `z` by
+/// O(1) to track each row. The loss then scores this raw-correct output against
+/// the raw target with no scaler in sight, and serving reads the same raw output
+/// directly. The scaler is the one transform shared by training and serving, so
+/// it is **persisted with the head** (in the adapter config) and reloaded on
+/// serve.
+///
+/// # The σ column stays in the existing softplus path
+///
+/// Only the *mean* (Gaussian) / quantile (pinball) columns carry the target
+/// offset and need de-standardisation. The Gaussian σ column is a *raw scale*
+/// the existing `STD_FLOOR + softplus(raw)` map already turns into a positive σ;
+/// its optimum (`σ_y`, an O(1) spread) is reachable from zero-init without any
+/// reparameterisation, so that column is passed through untouched — which is
+/// exactly what keeps `gaussian_params` and the serving adapter's σ map
+/// unchanged, and what keeps the served σ ≥ [`STD_FLOOR`].
+///
+/// `std` is floored at [`STD_FLOOR`] at construction, so a degenerate
+/// (single-valued or constant) target set cannot produce a zero-multiplier
+/// scaler — the invalid `std = 0` state is unrepresentable, and a row's
+/// de-standardised mean still moves with `z` rather than collapsing onto μ_y.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct TargetScaler {
+    /// Mean of all training targets, μ_y. The zero-init head emits this.
+    mean: f64,
+    /// Standard deviation of all training targets, σ_y, floored at [`STD_FLOOR`].
+    std: f64,
+}
+
+impl TargetScaler {
+    /// Build the scaler from all training targets: the population mean and
+    /// standard deviation of `targets`, with `std` floored at [`STD_FLOOR`].
+    pub(crate) fn from_targets(targets: &Tensor) -> Result<Self> {
+        let mean = targets
+            .mean_all()
+            .map_err(|e| JammiError::FineTune(format!("scaler mean: {e}")))?
+            .to_dtype(candle_core::DType::F64)
+            .map_err(|e| JammiError::FineTune(format!("scaler mean dtype: {e}")))?
+            .to_scalar::<f64>()
+            .map_err(|e| JammiError::FineTune(format!("scaler mean scalar: {e}")))?;
+        let var = (targets - mean)
+            .map_err(|e| JammiError::FineTune(format!("scaler centre: {e}")))?
+            .sqr()
+            .map_err(|e| JammiError::FineTune(format!("scaler sqr: {e}")))?
+            .mean_all()
+            .map_err(|e| JammiError::FineTune(format!("scaler var: {e}")))?
+            .to_dtype(candle_core::DType::F64)
+            .map_err(|e| JammiError::FineTune(format!("scaler var dtype: {e}")))?
+            .to_scalar::<f64>()
+            .map_err(|e| JammiError::FineTune(format!("scaler var scalar: {e}")))?;
+        Ok(Self {
+            mean,
+            std: var.sqrt().max(STD_FLOOR),
+        })
+    }
+
+    /// De-standardise a regression head's raw output according to its predictive
+    /// distribution form. This is the single gaussian-vs-quantile dispatch shared
+    /// by training and serving: the form is the authoritative signal (a 2-level
+    /// quantile head is also width 2, so head width cannot stand in for it), so
+    /// the trained and served de-standardisation can never disagree.
+    pub(crate) fn destandardize(
+        &self,
+        raw_head: &Tensor,
+        form: &crate::inference::adapter::DistributionForm,
+    ) -> Result<Tensor> {
+        use crate::inference::adapter::DistributionForm;
+        match form {
+            DistributionForm::Gaussian => self.destandardize_gaussian(raw_head),
+            DistributionForm::Quantile { .. } => self.destandardize_quantile(raw_head),
+        }
+    }
+
+    /// De-standardise a Gaussian head's raw `(batch, 2)` output. The mean column
+    /// (0) is mapped `μ_y + σ_y·z`; the raw-scale column (1) is passed through so
+    /// the downstream `STD_FLOOR + softplus(raw)` σ map is unchanged. With `z`
+    /// zero-init the emitted mean is exactly μ_y, so a high-offset target is
+    /// reachable; the emitted column-1 is the raw scale the loss and serving
+    /// adapter both already interpret.
+    pub(crate) fn destandardize_gaussian(&self, raw_head: &Tensor) -> Result<Tensor> {
+        let (_, k) = raw_head
+            .dims2()
+            .map_err(|e| JammiError::FineTune(format!("destandardize gaussian dims: {e}")))?;
+        if k != 2 {
+            return Err(JammiError::FineTune(format!(
+                "Gaussian head de-standardisation expects width 2 (mean, raw_std), got {k}"
+            )));
+        }
+        let z_mean = raw_head
+            .narrow(1, 0, 1)
+            .map_err(|e| JammiError::FineTune(format!("destd mean narrow: {e}")))?;
+        let raw_scale = raw_head
+            .narrow(1, 1, 1)
+            .map_err(|e| JammiError::FineTune(format!("destd scale narrow: {e}")))?;
+        let mean = self.affine(&z_mean)?;
+        Tensor::cat(&[&mean, &raw_scale], 1)
+            .map_err(|e| JammiError::FineTune(format!("destd gaussian cat: {e}")))
+    }
+
+    /// De-standardise a quantile head's raw `(batch, n_levels)` output. Every
+    /// column is an outcome-unit quantile, so the affine `μ_y + σ_y·z` is applied
+    /// to all of them. The map is monotone (σ_y > 0), so a non-crossing raw head
+    /// stays non-crossing after de-standardisation and the served set is coherent.
+    pub(crate) fn destandardize_quantile(&self, raw_head: &Tensor) -> Result<Tensor> {
+        self.affine(raw_head)
+    }
+
+    /// The de-standardising affine `μ_y + σ_y·z`, applied elementwise.
+    fn affine(&self, z: &Tensor) -> Result<Tensor> {
+        ((z * self.std).map_err(|e| JammiError::FineTune(format!("destd scale: {e}")))? + self.mean)
+            .map_err(|e| JammiError::FineTune(format!("destd shift: {e}")))
+    }
+}
 
 /// Numerically-stable `softplus(x) = ln(1 + e^x)`, computed as
 /// `relu(x) + ln(1 + e^{−|x|})` so a large positive `x` cannot overflow `exp`.

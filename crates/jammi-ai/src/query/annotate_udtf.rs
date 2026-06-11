@@ -47,7 +47,7 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::scalar::ScalarValue;
 
-use jammi_db::sql::quote_ident;
+use jammi_db::sql::{quote_ident, quote_relation};
 use jammi_db::ModelTask;
 
 use crate::inference::schema::build_output_schema;
@@ -231,7 +231,15 @@ impl TableProvider for AnnotateTable {
                 columns.push(quote_ident(c));
             }
         }
-        let sql = format!("SELECT {} FROM {}", columns.join(", "), self.relation);
+        // `self.relation` is the unquoted dotted reference passed as the 3rd
+        // `annotate(...)` argument (`<source>.public.<table>`); each part is
+        // quoted independently so a hyphenated or reserved source/table name
+        // resolves verbatim rather than being re-parsed.
+        let sql = format!(
+            "SELECT {} FROM {}",
+            columns.join(", "),
+            quote_relation(&self.relation)
+        );
 
         let session_state = state
             .as_any()

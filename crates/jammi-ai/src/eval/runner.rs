@@ -6,6 +6,7 @@ use arrow::datatypes::{DataType, Schema};
 use jammi_db::catalog::eval_repo::{EvalRunRecord, PerQueryEvalRecord};
 use jammi_db::catalog::status::EvalRunStatus;
 use jammi_db::error::{JammiError, Result};
+use jammi_db::sql::quote_relation;
 
 use crate::eval::{EvalCalibrationShape, EvalTask};
 use crate::model::ModelSource;
@@ -64,6 +65,10 @@ impl<'a> EvalRunner<'a> {
     ///
     /// Uses the same search infrastructure as `db.search()` — SidecarIndex for ANN
     /// when available, exact_vector_search as fallback.
+    ///
+    /// `golden_source` is an unquoted relation reference (a bare name or a
+    /// dotted `<source>.public.<table>`); each part is quoted independently
+    /// before interpolation, so a hyphenated or reserved name resolves verbatim.
     pub async fn eval_embeddings(
         &self,
         source_id: &str,
@@ -109,10 +114,11 @@ impl<'a> EvalRunner<'a> {
         } else {
             ""
         };
+        let golden_rel = quote_relation(golden_source);
         let batches = self
             .session
             .sql(&format!(
-                "SELECT \"query_id\", {query_col}, \"relevant_id\"{grade_select} FROM {golden_source}"
+                "SELECT \"query_id\", {query_col}, \"relevant_id\"{grade_select} FROM {golden_rel}"
             ))
             .await?;
 
@@ -231,6 +237,10 @@ impl<'a> EvalRunner<'a> {
     /// Returns an [`InferenceEvalReport`] carrying the task-shaped
     /// aggregate and the per-record predicted / gold pairs that
     /// sample-based statistical rules consume.
+    ///
+    /// `golden_source` is an unquoted relation reference (a bare name or a
+    /// dotted `<source>.public.<table>`); each part is quoted independently
+    /// before interpolation, so a hyphenated or reserved name resolves verbatim.
     pub async fn eval_inference(
         &self,
         model_id: &str,
@@ -246,6 +256,9 @@ impl<'a> EvalRunner<'a> {
         // the catalog (no `local:` prefix), which is not the shape callers pass here.
         let model_source = ModelSource::parse(model_id);
 
+        // `golden_source` is an unquoted source reference; quote each dotted
+        // part once so a hyphenated or reserved name resolves verbatim.
+        let golden_rel = quote_relation(golden_source);
         let (aggregate, per_record) = match task {
             EvalTask::Classification => {
                 let golden_schema = self.source_schema(golden_source).await?;
@@ -255,7 +268,7 @@ impl<'a> EvalRunner<'a> {
                 let batches = self
                     .session
                     .sql(&format!(
-                        "SELECT \"id\", \"{label_column}\" AS \"label\" FROM {golden_source}"
+                        "SELECT \"id\", \"{label_column}\" AS \"label\" FROM {golden_rel}"
                     ))
                     .await?;
                 let golden = load_classification_golden_from_batches(&batches)?;
@@ -307,7 +320,7 @@ impl<'a> EvalRunner<'a> {
                     .session
                     .sql(&format!(
                         "SELECT \"id\", \"{label_column}\" AS \"label\", \"start\", \"end\" \
-                         FROM {golden_source}"
+                         FROM {golden_rel}"
                     ))
                     .await?;
                 let golden = load_ner_golden_from_batches(&batches)?;
@@ -418,6 +431,10 @@ impl<'a> EvalRunner<'a> {
     /// with `eval_embeddings`, per-record scores are persisted to
     /// `_jammi_eval_per_query` keyed by the run id, and `cohorts` maps a
     /// `record_id` to opaque segment tags (a record with no entry stores `{}`).
+    ///
+    /// `golden_source` is an unquoted relation reference (a bare name or a
+    /// dotted `<source>.public.<table>`); each part is quoted independently
+    /// before interpolation, so a hyphenated or reserved name resolves verbatim.
     pub async fn eval_calibration(
         &self,
         source_id: &str,
@@ -428,12 +445,15 @@ impl<'a> EvalRunner<'a> {
         let golden_schema = self.source_schema(golden_source).await?;
         ensure_column(&golden_schema, "record_id", DataType::Utf8)?;
 
+        // `golden_source` is an unquoted source reference; quote each dotted
+        // part once so a hyphenated or reserved name resolves verbatim.
+        let golden_rel = quote_relation(golden_source);
         let predictions = match shape {
             EvalCalibrationShape::Gaussian => {
                 let batches = self
                     .session
                     .sql(&format!(
-                        "SELECT \"record_id\", \"mean\", \"sd\", \"outcome\" FROM {golden_source}"
+                        "SELECT \"record_id\", \"mean\", \"sd\", \"outcome\" FROM {golden_rel}"
                     ))
                     .await?;
                 let mut predictions = Vec::new();
@@ -460,7 +480,7 @@ impl<'a> EvalRunner<'a> {
                 let batches = self
                     .session
                     .sql(&format!(
-                        "SELECT \"record_id\", \"draws\", \"outcome\" FROM {golden_source}"
+                        "SELECT \"record_id\", \"draws\", \"outcome\" FROM {golden_rel}"
                     ))
                     .await?;
                 let mut predictions = Vec::new();
@@ -587,10 +607,15 @@ impl<'a> EvalRunner<'a> {
     }
 
     /// Get the schema of a registered golden source.
+    ///
+    /// `golden_source` is an unquoted source reference (`<source>.public.<table>`
+    /// or a bare name); each dotted part is quoted independently so a
+    /// hyphenated or reserved name resolves verbatim.
     async fn source_schema(&self, golden_source: &str) -> Result<Schema> {
+        let golden_rel = quote_relation(golden_source);
         let batches = self
             .session
-            .sql(&format!("SELECT * FROM {golden_source} LIMIT 0"))
+            .sql(&format!("SELECT * FROM {golden_rel} LIMIT 0"))
             .await?;
 
         if let Some(batch) = batches.first() {
@@ -599,7 +624,7 @@ impl<'a> EvalRunner<'a> {
             let df = self
                 .session
                 .context()
-                .sql(&format!("SELECT * FROM {golden_source} LIMIT 0"))
+                .sql(&format!("SELECT * FROM {golden_rel} LIMIT 0"))
                 .await
                 .map_err(|e| {
                     JammiError::Eval(format!("Failed to get schema for '{golden_source}': {e}"))

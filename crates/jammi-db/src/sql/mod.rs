@@ -2,4 +2,4 @@
 
 pub mod ident;
 
-pub use ident::{quote_ident, source_relation};
+pub use ident::{quote_ident, quote_relation, source_relation};

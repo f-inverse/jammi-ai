@@ -146,11 +146,18 @@ message LayersToTransform {
 // `HardNegativeConfig`. When `mine` is set the trainer mines hard negatives
 // from its own ANN index, excluding the positive's `exclude_hops`-hop
 // neighbourhood and re-mining every `refresh_every` epochs.
+//
+// As with `FineTuneConfig`, every scalar knob is `optional` so an unset field
+// is distinguishable from a legal `0`: the server reads an unset field as
+// "apply the engine default" (`HardNegativeConfig::default()`) and a present
+// field as an override. A caller that sets only `mine = true` therefore ships
+// the engine's `k`/`exclude_hops`/`refresh_every` defaults rather than zeros,
+// which `FineTuneConfig::validate` would otherwise reject.
 message HardNegativeConfig {
   bool mine = 1;
-  uint32 k = 2;
-  uint32 exclude_hops = 3;
-  uint32 refresh_every = 4;
+  optional uint32 k = 2;
+  optional uint32 exclude_hops = 3;
+  optional uint32 refresh_every = 4;
 }
 
 // Configuration for a fine-tuning job. Mirrors the engine's `FineTuneConfig`

@@ -605,13 +605,16 @@ impl TrainingLoop {
     /// Mine hard negatives from the current model and build a triplet loader of
     /// `(anchor, positive, mined-negative)` rows.
     ///
-    /// Embeds every anchor and positive with the current model (no grad),
-    /// indexes the positives as the candidate corpus (jammi's own cosine ANN),
-    /// and for each anchor retrieves its hardest non-excluded neighbour. The
-    /// positive and its `exclude_hops`-hop neighbourhood are excluded as the
-    /// false-negative guard. A row whose pool is entirely excluded is dropped;
-    /// if mining yields no usable rows the original loader is returned unchanged
-    /// rather than training on an empty set.
+    /// Indexes the positives as the candidate corpus (jammi's own cosine ANN),
+    /// then streams the anchors in `batch_size` chunks: each chunk is embedded,
+    /// mined against the index, and dropped before the next. Only one chunk of
+    /// anchor vectors is resident at a time, and the positive vectors live solely
+    /// in the index (no second copy) — peak working-set is bounded by the index
+    /// plus one batch, not by holding the whole anchor + positive corpora in RAM.
+    /// The positive and its `exclude_hops`-hop neighbourhood are excluded per
+    /// anchor as the false-negative guard. A row whose pool is entirely excluded
+    /// is dropped; if mining yields no usable rows the original loader is
+    /// returned unchanged rather than training on an empty set.
     fn mine_hard_negative_loader(
         &mut self,
         loader: &TrainingDataLoader,
@@ -623,8 +626,9 @@ impl TrainingLoop {
             return Ok(TrainingDataLoader::from_triplets(Vec::new()));
         }
 
-        // Embed anchors and positives once with dropout off — the model state
-        // the negatives are mined against.
+        // Embed with dropout off — the model state the negatives are mined
+        // against. Returns owned per-row vectors, consumed into the index or the
+        // per-batch anchor queries below.
         self.target.set_training(false);
         let embed = |this: &Self, texts: &[String]| -> Result<Vec<Vec<f32>>> {
             let t = this.encode_texts(texts)?;
@@ -637,38 +641,45 @@ impl TrainingLoop {
             t.to_vec2::<f32>()
                 .map_err(|e| JammiError::FineTune(format!("mine to_vec2: {e}")))
         };
+        let batch = self.config.batch_size.max(1);
         let result = (|| {
-            let anchor_vecs = embed(self, &anchors)?;
-            let positive_vecs = embed(self, &positives)?;
-
             // Candidate corpus = the positives, keyed by row index so a mined id
-            // maps back to its positive text.
-            let candidates: Vec<Candidate> = positive_vecs
-                .iter()
+            // maps back to its positive text. The positive vectors are moved into
+            // the index and dropped here — the index is their only owner.
+            let candidates: Vec<Candidate> = embed(self, &positives)?
+                .into_iter()
                 .enumerate()
-                .map(|(i, v)| Candidate {
+                .map(|(i, embedding)| Candidate {
                     id: i.to_string(),
-                    embedding: v.clone(),
+                    embedding,
                 })
                 .collect();
             let miner = HardNegativeMiner::build(&candidates, self.config.hard_negatives)?;
+            drop(candidates);
 
+            // Stream the anchors in batches: embed one chunk, mine it, drop it.
+            // Only one chunk of anchor vectors is resident at any moment.
             let mut rows = Vec::with_capacity(anchors.len());
-            for (i, anchor_vec) in anchor_vecs.iter().enumerate() {
-                let query = AnchorQuery {
-                    embedding: anchor_vec.clone(),
-                    positive_id: i.to_string(),
-                };
-                let mined = miner.mine(&query)?;
-                if let Some(neg_id) = mined.first() {
-                    let neg_idx: usize = neg_id
-                        .parse()
-                        .map_err(|e| JammiError::FineTune(format!("mine id parse: {e}")))?;
-                    rows.push((
-                        anchors[i].clone(),
-                        positives[i].clone(),
-                        positives[neg_idx].clone(),
-                    ));
+            for (chunk_idx, chunk) in anchors.chunks(batch).enumerate() {
+                let base = chunk_idx * batch;
+                let anchor_vecs = embed(self, chunk)?;
+                for (offset, anchor_vec) in anchor_vecs.into_iter().enumerate() {
+                    let i = base + offset;
+                    let query = AnchorQuery {
+                        embedding: anchor_vec,
+                        positive_id: i.to_string(),
+                    };
+                    let mined = miner.mine(&query)?;
+                    if let Some(neg_id) = mined.first() {
+                        let neg_idx: usize = neg_id
+                            .parse()
+                            .map_err(|e| JammiError::FineTune(format!("mine id parse: {e}")))?;
+                        rows.push((
+                            anchors[i].clone(),
+                            positives[i].clone(),
+                            positives[neg_idx].clone(),
+                        ));
+                    }
                 }
             }
             Ok::<_, JammiError>(rows)

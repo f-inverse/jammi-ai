@@ -135,6 +135,77 @@ async fn oracle_epochs_honored_exactly_precomputed() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// ORACLE 1b — the exact-epoch invariant under a non-trivial accumulation window.
+//
+// The trainer has exactly ONE epoch loop (`for epoch in 0..config.epochs`),
+// shared by the tabular and graph fine-tune paths alike; `epochs = E` runs
+// exactly E passes with no warm-up or zeroth epoch. ORACLE 1 pins this for
+// grad_accum=1 (one step per batch); ORACLE 2 pins the trailing-window flush for
+// epochs=1. This locks the *composite* invariant both factors non-trivial:
+//
+//   optimizer steps == epochs × ceil(batches_per_epoch / grad_accum)
+//
+// With N=5 batches, grad_accum=2, epochs=3:
+//   per-epoch steps = ceil(5/2) = 3   (steps at batch 2, 4, and the batch-5 flush)
+//   total           = 3 × 3 = 9
+// A regression that added a warm-up pass, dropped the trailing flush, or ran a
+// zeroth epoch would break this exact count.
+// ════════════════════════════════════════════════════════════════════════════
+#[tokio::test(flavor = "multi_thread")]
+async fn oracle_steps_equal_epochs_times_ceil_batches_over_grad_accum() {
+    let device = Device::Cpu;
+    const N: usize = 5; // batches per epoch
+    const GA: usize = 2; // accumulation window (N not a multiple of GA)
+    const EPOCHS: usize = 3;
+
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let head = build_projection_head(4, &FineTuneConfig::default(), &vb).unwrap();
+    let batches: Vec<_> = (0..N).map(|_| learnable_batch(&device)).collect();
+    let loader = TrainingDataLoader::from_precomputed(batches);
+
+    let tag = "steps-epochs-ceil";
+    let (catalog, dir) = claimed_loop_env(tag).await;
+
+    let mut tl = TrainingLoopBuilder::new(
+        TrainingTarget::ProjectionHead { head },
+        varmap,
+        FineTuneConfig {
+            epochs: EPOCHS,
+            batch_size: 1,
+            validation_fraction: 0.0,
+            warmup_steps: 0,
+            gradient_accumulation_steps: GA,
+            // Train-loss monitoring with huge patience → early stopping can't fire
+            // and truncate the epoch budget.
+            early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
+            early_stopping_patience: 10_000,
+            learning_rate: 1e-3,
+            ..Default::default()
+        },
+    )
+    .job_id(tag.into())
+    .worker_id(format!("{tag}-worker"))
+    .catalog(Arc::clone(&catalog))
+    .artifact_dir(dir.path().to_path_buf())
+    .build()
+    .unwrap();
+
+    let result = tokio::task::spawn_blocking(move || tl.run(&loader))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let expected = EPOCHS * N.div_ceil(GA);
+    assert_eq!(
+        result.total_steps, expected,
+        "optimizer steps must equal epochs × ceil(batches/grad_accum) = \
+         {EPOCHS} × ceil({N}/{GA}) = {expected}, got {}",
+        result.total_steps
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // ORACLE 2 — gradient_accumulation_steps step accounting vs the LR-schedule
 // horizon (total_steps).
 //

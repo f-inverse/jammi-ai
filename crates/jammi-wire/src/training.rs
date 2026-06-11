@@ -153,13 +153,28 @@ fn regression_loss_from_proto(loss: pb::RegressionLoss) -> Result<RegressionLoss
 
 /// Map the wire [`pb::HardNegativeConfig`] onto the engine's
 /// [`HardNegativeConfig`]. Absent on the wire = mining off (the engine default).
+///
+/// Mirrors the [`FineTuneConfig`] overlay: decode starts from
+/// [`HardNegativeConfig::default()`] and overrides a field only when the wire
+/// carries it. Each scalar knob has explicit presence (`optional`), so a caller
+/// that sets only `mine = true` resolves `k`/`exclude_hops`/`refresh_every` to
+/// the engine defaults rather than literal zeros — the engine is the single
+/// source of these defaults for both the remote and embedded surfaces.
 fn hard_negatives_from_proto(h: pb::HardNegativeConfig) -> HardNegativeConfig {
-    HardNegativeConfig {
+    let mut cfg = HardNegativeConfig {
         mine: h.mine,
-        k: h.k as usize,
-        exclude_hops: h.exclude_hops as usize,
-        refresh_every: h.refresh_every as usize,
+        ..HardNegativeConfig::default()
+    };
+    if let Some(k) = h.k {
+        cfg.k = k as usize;
     }
+    if let Some(exclude_hops) = h.exclude_hops {
+        cfg.exclude_hops = exclude_hops as usize;
+    }
+    if let Some(refresh_every) = h.refresh_every {
+        cfg.refresh_every = refresh_every as usize;
+    }
+    cfg
 }
 
 /// Map the wire embedding-loss message onto the engine's [`EmbeddingLoss`]. A
@@ -322,11 +337,14 @@ fn regression_loss_to_proto(loss: &RegressionLoss) -> pb::RegressionLoss {
 }
 
 fn hard_negatives_to_proto(h: &HardNegativeConfig) -> pb::HardNegativeConfig {
+    // The engine config is fully resolved, so every scalar encodes as present —
+    // a round-trip preserves the k/hop/refresh knobs. The decode overlay reads
+    // an absent scalar as "apply the engine default".
     pb::HardNegativeConfig {
         mine: h.mine,
-        k: h.k as u32,
-        exclude_hops: h.exclude_hops as u32,
-        refresh_every: h.refresh_every as u32,
+        k: Some(h.k as u32),
+        exclude_hops: Some(h.exclude_hops as u32),
+        refresh_every: Some(h.refresh_every as u32),
     }
 }
 
@@ -451,5 +469,59 @@ mod tests {
         let proto = config_to_proto(&original);
         let decoded = FineTuneConfig::try_from(proto).expect("round-trip decodes");
         assert_eq!(decoded, original);
+    }
+
+    /// A remote caller that enables mining but omits the count knobs ships a
+    /// `HardNegativeConfig{mine: true}` with every scalar unset. With explicit
+    /// presence on `k`/`exclude_hops`/`refresh_every`, this overlays onto the
+    /// engine default rather than decoding the scalars as `0` — so the resulting
+    /// config carries the engine's `k=1, exclude_hops=1, refresh_every=1` and
+    /// passes `validate`, instead of the pre-fix `refresh_every = 0` that
+    /// `validate` rejected for a knob the caller never set.
+    #[test]
+    fn hard_negatives_mine_only_overlays_engine_defaults() {
+        let proto = pb::HardNegativeConfig {
+            mine: true,
+            ..Default::default()
+        };
+        let decoded = hard_negatives_from_proto(proto);
+
+        assert_eq!(
+            decoded,
+            HardNegativeConfig {
+                mine: true,
+                ..HardNegativeConfig::default()
+            }
+        );
+        assert!(decoded.mine);
+        assert_eq!(decoded.k, 1);
+        assert_eq!(decoded.exclude_hops, 1);
+        assert_eq!(decoded.refresh_every, 1);
+
+        // The whole point: a mining-on config built from `mine` alone validates.
+        let cfg = FineTuneConfig {
+            hard_negatives: decoded,
+            ..FineTuneConfig::default()
+        };
+        cfg.validate()
+            .expect("mine-only hard-negative config validates");
+    }
+
+    /// A partially-set hard-negative config overrides exactly the present knobs
+    /// and leaves the rest at the engine default.
+    #[test]
+    fn hard_negatives_partial_overrides_only_present_fields() {
+        let proto = pb::HardNegativeConfig {
+            mine: true,
+            k: Some(5),
+            ..Default::default()
+        };
+        let decoded = hard_negatives_from_proto(proto);
+
+        assert!(decoded.mine);
+        assert_eq!(decoded.k, 5);
+        // Untouched knobs stay at the engine default.
+        assert_eq!(decoded.exclude_hops, 1);
+        assert_eq!(decoded.refresh_every, 1);
     }
 }

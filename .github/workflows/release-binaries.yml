@@ -15,14 +15,28 @@ name: Release Binaries
 # The same GPU build also ships as the `jammi-ai-server-cu12` container image
 # (`server-image.yml`) and the `jammi-server-cu12` PyPI wheel (`pypi-server-cuda.yml`).
 #
-# `workflow_dispatch` makes every job safely exercisable on a branch without
-# cutting a release: on dispatch the assets are uploaded as workflow artifacts
-# only; the `gh release upload` step runs solely on a tag push.
+# `workflow_dispatch` has two modes, keyed on the `release_tag` input:
+#   - empty (the default): every job is a no-release branch exercise — assets are
+#     uploaded as workflow artifacts only; no release is touched.
+#   - set to a tag (e.g. `v0.26.1`): every job uploads its asset to that existing
+#     release, identical to a tag push. This recovers a release whose assets are
+#     missing (e.g. a leg that failed its upload) by rebuilding in the same
+#     manylinux/macOS runners and re-attaching, without re-cutting the tag.
+# On a `v*` tag push the assets always go to the release named by the tag.
+#
+# The release itself is created by the `github-release` job in `crates.yml` on the
+# same tag. That job and this one race; the upload step retries briefly so a leg
+# that finishes first waits for the release to appear rather than failing.
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to upload assets to (e.g. v0.26.1). Leave empty to produce workflow artifacts only."
+        required: false
+        default: ""
 
 concurrency:
   group: release-binaries-${{ github.ref }}
@@ -88,13 +102,16 @@ jobs:
           tar -C target/release -czf "$asset" jammi
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
-      # On a tag push, attach the asset to the GitHub release (created by the
-      # `github-release` job in `crates.yml`). `gh release upload --clobber`
-      # is idempotent on re-run.
-      - name: Upload to release (tag push)
-        if: github.event_name == 'push'
+      # Attach the asset to the GitHub release on a tag push, or on a dispatch
+      # that names an existing release via `release_tag`. The release is created
+      # by the `github-release` job in `crates.yml`; the two race, so the upload
+      # retries briefly to wait the release into existence. `--clobber` makes the
+      # upload idempotent on re-run.
+      - name: Upload to release
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         env:
           GH_TOKEN: ${{ github.token }}
+          REL_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
         run: |
           set -euo pipefail
           # The Linux/server jobs run in the manylinux CI container, which has no
@@ -104,12 +121,26 @@ jobs:
             curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VER}/gh_${GH_VER}_linux_amd64.tar.gz" | tar -xz -C /tmp
             install "/tmp/gh_${GH_VER}_linux_amd64/bin/gh" /usr/local/bin/gh
           fi
-          gh release upload "$GITHUB_REF_NAME" "${{ steps.package.outputs.asset }}" --clobber
+          # `gh release upload` shells out to git to detect the repo; the container
+          # checkout is owned by a different uid, so mark it safe first.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # The release is created concurrently by `crates.yml`; retry to wait it in.
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$REL_TAG" "${{ steps.package.outputs.asset }}" --clobber; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "release upload failed after $attempt attempts" >&2
+              exit 1
+            fi
+            echo "release $REL_TAG not ready (attempt $attempt); retrying in 15s" >&2
+            sleep 15
+          done
 
-      # On a manual dispatch (branch exercise), publish the built artifact to the
-      # workflow run instead — no release is touched.
+      # A no-tag manual dispatch (branch exercise) publishes the built artifact to
+      # the workflow run instead — no release is touched.
       - name: Upload artifact (dispatch)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag == ''
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.asset }}
@@ -141,10 +172,11 @@ jobs:
           tar -C target/release -czf "$asset" jammi-server
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
-      - name: Upload to release (tag push)
-        if: github.event_name == 'push'
+      - name: Upload to release
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         env:
           GH_TOKEN: ${{ github.token }}
+          REL_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
         run: |
           set -euo pipefail
           # The Linux/server jobs run in the manylinux CI container, which has no
@@ -154,10 +186,24 @@ jobs:
             curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VER}/gh_${GH_VER}_linux_amd64.tar.gz" | tar -xz -C /tmp
             install "/tmp/gh_${GH_VER}_linux_amd64/bin/gh" /usr/local/bin/gh
           fi
-          gh release upload "$GITHUB_REF_NAME" "${{ steps.package.outputs.asset }}" --clobber
+          # `gh release upload` shells out to git to detect the repo; the container
+          # checkout is owned by a different uid, so mark it safe first.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # The release is created concurrently by `crates.yml`; retry to wait it in.
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$REL_TAG" "${{ steps.package.outputs.asset }}" --clobber; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "release upload failed after $attempt attempts" >&2
+              exit 1
+            fi
+            echo "release $REL_TAG not ready (attempt $attempt); retrying in 15s" >&2
+            sleep 15
+          done
 
       - name: Upload artifact (dispatch)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag == ''
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.asset }}
@@ -225,10 +271,11 @@ jobs:
           tar -czf "$asset" "$stage"
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
-      - name: Upload to release (tag push)
-        if: github.event_name == 'push'
+      - name: Upload to release
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         env:
           GH_TOKEN: ${{ github.token }}
+          REL_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
         run: |
           set -euo pipefail
           # The Linux/server jobs run in the manylinux CI container, which has no
@@ -238,10 +285,24 @@ jobs:
             curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VER}/gh_${GH_VER}_linux_amd64.tar.gz" | tar -xz -C /tmp
             install "/tmp/gh_${GH_VER}_linux_amd64/bin/gh" /usr/local/bin/gh
           fi
-          gh release upload "$GITHUB_REF_NAME" "${{ steps.package.outputs.asset }}" --clobber
+          # `gh release upload` shells out to git to detect the repo; the container
+          # checkout is owned by a different uid, so mark it safe first.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # The release is created concurrently by `crates.yml`; retry to wait it in.
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$REL_TAG" "${{ steps.package.outputs.asset }}" --clobber; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "release upload failed after $attempt attempts" >&2
+              exit 1
+            fi
+            echo "release $REL_TAG not ready (attempt $attempt); retrying in 15s" >&2
+            sleep 15
+          done
 
       - name: Upload artifact (dispatch)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag == ''
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.asset }}

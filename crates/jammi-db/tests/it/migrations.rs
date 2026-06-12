@@ -179,6 +179,7 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "017_model_artifact_path_column",
             "018_eval_runs_model_id_nullable",
             "019_normalize_model_status",
+            "020_channel_tenant_scope",
         ]
     );
 }
@@ -261,6 +262,197 @@ async fn migration_019_normalizes_available_status_to_registered() {
             ("modern::1".to_string(), "registered".to_string()),
         ],
         "migration 019 rewrites 'available' to 'registered' and leaves 'registered' untouched"
+    );
+}
+
+/// Migration 020 tenant-qualifies the evidence-channel identity. Asserts that
+/// `evidence_channel_columns` gained a `tenant_id` column, that the seed columns
+/// survived the table rebuild with `tenant_id IS NULL`, that the new per-tenant
+/// `UNIQUE (tenant_id, channel_name)` constraint on `evidence_channels` rejects
+/// a same-tenant duplicate while admitting the same name under a different
+/// tenant, and that the partial unique index
+/// `idx_evidence_channels_global_name` exists and atomically rejects a duplicate
+/// *global* (`tenant_id IS NULL`) channel name at the DB level. The concurrent
+/// Postgres race is closed by that DB-level index, so a serial duplicate insert
+/// is sufficient to pin the constraint here — no flaky concurrency test needed.
+#[tokio::test]
+async fn migration_020_tenant_qualifies_channels() {
+    let dir = tempdir().unwrap();
+    let _catalog = Catalog::open(dir.path()).await.unwrap();
+    let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
+
+    // `evidence_channel_columns` now carries `tenant_id`.
+    let cols = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query::<_, String>(
+                        "SELECT name FROM pragma_table_info('evidence_channel_columns')",
+                        &[],
+                        |row| row.get("name"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        cols.iter().any(|c| c == "tenant_id"),
+        "evidence_channel_columns must have a tenant_id column after migration 020; got {cols:?}"
+    );
+
+    // The seed columns survived the rebuild and are global (tenant_id IS NULL).
+    let null_seed_count = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query::<_, i64>(
+                        "SELECT COUNT(*) AS n FROM evidence_channel_columns \
+                         WHERE tenant_id IS NULL AND channel_name = 'vector'",
+                        &[],
+                        |row| row.get("n"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        null_seed_count.first().copied(),
+        Some(1),
+        "the 'vector' seed column must survive as a global (tenant_id IS NULL) row"
+    );
+
+    // The per-tenant UNIQUE constraint admits the same channel name under two
+    // different tenants.
+    let two_tenants = backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO evidence_channels (tenant_id, channel_name, priority) \
+                     VALUES ('a', 'dup', 1)",
+                    &[],
+                )
+                .await?;
+                tx.execute(
+                    "INSERT INTO evidence_channels (tenant_id, channel_name, priority) \
+                     VALUES ('b', 'dup', 1)",
+                    &[],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await;
+    assert!(
+        two_tenants.is_ok(),
+        "two tenants must be able to register the same channel name: {two_tenants:?}"
+    );
+
+    // ...but rejects a same-tenant duplicate.
+    let dup = backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO evidence_channels (tenant_id, channel_name, priority) \
+                     VALUES ('a', 'dup', 2)",
+                    &[],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await;
+    assert!(
+        matches!(
+            dup,
+            Err(jammi_db::catalog::backend::BackendError::Constraint { .. })
+        ),
+        "a same-tenant duplicate channel name must violate UNIQUE (tenant_id, channel_name); \
+         got {dup:?}"
+    );
+
+    // The partial unique index that enforces global-channel-name uniqueness
+    // exists in the post-migration schema.
+    let global_index = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query::<_, String>(
+                        "SELECT name FROM sqlite_master \
+                         WHERE type = 'index' AND name = 'idx_evidence_channels_global_name'",
+                        &[],
+                        |row| row.get("name"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        global_index.first().map(String::as_str),
+        Some("idx_evidence_channels_global_name"),
+        "migration 020 must create the partial unique index on the global namespace"
+    );
+
+    // Two global (tenant_id IS NULL) inserts of the same channel name: the first
+    // commits, the second is rejected by the partial unique index. This closes
+    // the global-namespace race the composite UNIQUE (tenant_id, channel_name)
+    // cannot — NULLs are distinct in that constraint on both backends. A serial
+    // pair is enough to pin the constraint+error path; the concurrent Postgres
+    // race is closed by the same DB-level index, so no concurrency test is run.
+    let first_global = backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO evidence_channels (tenant_id, channel_name, priority) \
+                     VALUES (NULL, 'global_dup', 1)",
+                    &[],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await;
+    assert!(
+        first_global.is_ok(),
+        "the first global channel insert must succeed: {first_global:?}"
+    );
+    let second_global = backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO evidence_channels (tenant_id, channel_name, priority) \
+                     VALUES (NULL, 'global_dup', 2)",
+                    &[],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await;
+    assert!(
+        matches!(
+            second_global,
+            Err(jammi_db::catalog::backend::BackendError::Constraint { .. })
+        ),
+        "a duplicate global channel name must violate the partial unique index; \
+         got {second_global:?}"
     );
 }
 

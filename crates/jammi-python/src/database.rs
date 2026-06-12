@@ -414,8 +414,10 @@ impl PyDatabase {
     /// `(name, dtype)` tuples where `dtype` is one of `"Float32"`, `"Float64"`,
     /// `"Int32"`, `"Int64"`, `"Utf8"`, `"Boolean"`. Priority orders the
     /// channel against others on the same row when several contribute the
-    /// same column. The channel id is unique across the catalog: passing
-    /// one that already exists raises `RuntimeError` carrying
+    /// same column. The channel id is unique PER TENANT, scoped to the
+    /// session's currently bound tenant: two tenants may each register a
+    /// channel of the same id without collision, but re-registering an id that
+    /// already exists for the bound tenant raises `RuntimeError` carrying
     /// `EvidenceChannel("channel '<id>': already exists")`.
     #[pyo3(signature = (channel_id, *, priority, columns))]
     fn register_channel(

@@ -10,10 +10,12 @@
 use std::str::FromStr;
 
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
+use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::Catalog;
+use jammi_db::error::JammiError;
 use jammi_db::model_task::ModelTask;
-use jammi_db::{BackendImpl, TenantId};
+use jammi_db::{BackendImpl, ChannelId, TenantId};
 use tempfile::tempdir;
 
 fn tenant_a() -> TenantId {
@@ -122,4 +124,167 @@ async fn same_model_id_yields_per_tenant_rows() {
         "tenant A must see its own model backend"
     );
     assert_eq!(b.backend, "vllm", "tenant B must see its own model backend");
+}
+
+// --- evidence channels (D1) -----------------------------------------------
+
+/// One Utf8 column named `marker`, carrying `value` so the two tenants'
+/// otherwise-identically-named channels are distinguishable.
+fn channel_spec(name: &str, priority: i32, column: &str) -> ChannelSpec {
+    ChannelSpec {
+        id: ChannelId::new(name).unwrap(),
+        priority,
+        columns: vec![ChannelColumn {
+            name: column.to_string(),
+            data_type: ChannelColumnType::Utf8,
+        }],
+    }
+}
+
+/// HEADLINE: the channel catalog is tenant-scoped. Tenant B must not see, nor
+/// collide with, tenant A's channel.
+///
+/// Before the D1 fix, `evidence_channels.channel_name` was a GLOBAL primary key
+/// and `register`/`list` carried no tenant predicate, so tenant A's channel "X"
+/// was visible to — and blocked registration by — every other tenant: a
+/// cross-tenant read leak plus a false "already exists" collision.
+#[tokio::test]
+async fn channel_namespace_is_per_tenant() {
+    let dir = tempdir().unwrap();
+    let base = shared_catalog(dir.path()).await;
+
+    let cat_a = base.pinned_to_tenant(Some(tenant_a()));
+    let cat_b = base.pinned_to_tenant(Some(tenant_b()));
+
+    // Tenant A registers channel "X".
+    cat_a
+        .channels()
+        .register(&channel_spec("chan_x", 10, "a_marker"))
+        .await
+        .unwrap();
+
+    // INVARIANT 1: tenant B's list() must NOT contain A's "chan_x". B sees only the
+    // global seed channels (vector/inference/bm25), never another tenant's row.
+    let b_names: Vec<String> = cat_b
+        .channels()
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id.as_str().to_string())
+        .collect();
+    assert!(
+        !b_names.contains(&"chan_x".to_string()),
+        "CROSS-TENANT READ LEAK: tenant B sees tenant A's channel 'chan_x' in list(): {b_names:?}"
+    );
+
+    // INVARIANT 2: tenant B registering "chan_x" must SUCCEED — separate namespace,
+    // no false "already exists" collision against A's row.
+    cat_b
+        .channels()
+        .register(&channel_spec("chan_x", 20, "b_marker"))
+        .await
+        .expect("tenant B must be able to register 'chan_x' despite tenant A owning one");
+
+    // INVARIANT 3: each tenant resolves ITS OWN "chan_x" (own column + priority).
+    let a_x = cat_a
+        .channels()
+        .get(&ChannelId::new("chan_x").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let b_x = cat_b
+        .channels()
+        .get(&ChannelId::new("chan_x").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(a_x.priority, 10);
+    assert_eq!(a_x.columns[0].name, "a_marker");
+    assert_eq!(b_x.priority, 20);
+    assert_eq!(b_x.columns[0].name, "b_marker");
+
+    // INVARIANT 4: re-registering "chan_x" under A still rejects as a duplicate
+    // (per-tenant uniqueness is enforced by the UNIQUE constraint even though
+    // both backends treat NULL tenants as distinct in that constraint).
+    let err = cat_a
+        .channels()
+        .register(&channel_spec("chan_x", 99, "dup"))
+        .await
+        .unwrap_err();
+    match err {
+        JammiError::EvidenceChannel(m) => assert!(
+            m.contains("already exists"),
+            "expected per-tenant duplicate reject, got: {m}"
+        ),
+        other => panic!("expected EvidenceChannel(already exists), got {other:?}"),
+    }
+}
+
+/// `tenant = None` (the global namespace) sees ONLY the global, `tenant_id IS
+/// NULL` rows — never any tenant's channel — and a tenant sees the global seed
+/// channels (own-shadows-global read precedence, #140).
+#[tokio::test]
+async fn global_namespace_sees_only_null_tenant_rows() {
+    let dir = tempdir().unwrap();
+    let base = shared_catalog(dir.path()).await;
+
+    let cat_global = base.pinned_to_tenant(None);
+    let cat_a = base.pinned_to_tenant(Some(tenant_a()));
+
+    // Tenant A registers a private channel.
+    cat_a
+        .channels()
+        .register(&channel_spec("private_a", 7, "marker"))
+        .await
+        .unwrap();
+
+    let global_names: Vec<String> = cat_global
+        .channels()
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id.as_str().to_string())
+        .collect();
+
+    // The global view shows the NULL-tenant seed channels and NOT A's private
+    // channel.
+    assert!(
+        global_names.contains(&"vector".to_string()),
+        "global list must include the seed 'vector' channel: {global_names:?}"
+    );
+    assert!(
+        !global_names.contains(&"private_a".to_string()),
+        "CROSS-TENANT READ LEAK: the global (tenant=None) view sees tenant A's \
+         private channel: {global_names:?}"
+    );
+
+    // Tenant A still resolves the global seed channels (own-shadows-global): a
+    // tenant-bound query merging the dense 'vector' channel must succeed.
+    let a_names: Vec<String> = cat_a
+        .channels()
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id.as_str().to_string())
+        .collect();
+    assert!(
+        a_names.contains(&"vector".to_string()),
+        "tenant A must resolve the global seed channels: {a_names:?}"
+    );
+    assert!(
+        a_names.contains(&"private_a".to_string()),
+        "tenant A must see its own channel: {a_names:?}"
+    );
+    assert!(
+        cat_a
+            .channels()
+            .get(&ChannelId::new("vector").unwrap())
+            .await
+            .unwrap()
+            .is_some(),
+        "tenant A must resolve the global 'vector' seed via get()"
+    );
 }

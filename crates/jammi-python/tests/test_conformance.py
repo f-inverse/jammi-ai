@@ -87,6 +87,18 @@ _TRAINING_VERBS = {
 }
 
 
+# The bulk inference verb. It DOES hit the wire: the model and the registered
+# source both live in the engine, so the compute runs where the data is
+# (`InferenceService.Infer`) and only the output rows cross the wire. The
+# embedded `Database` runs it in the compiled engine; the client's
+# `RemoteDatabase` drives it over gRPC. The call surface must agree so a caller
+# swaps transports without changing the call — pinned here against the embed
+# `jammi_ai.Database`.
+_INFERENCE_VERBS = {
+    "infer",
+}
+
+
 # The engine-state pipeline verbs. Like the training/predict verbs, these DO hit
 # the wire: they build durable graph/embedding artifacts or assemble a target's
 # conditioning context against the remote engine's state (`PipelineService` for
@@ -145,6 +157,7 @@ def test_remote_surface_has_every_verb():
         _REMOTE_VERBS
         | _NUMERIC_VERBS
         | _TRAINING_VERBS
+        | _INFERENCE_VERBS
         | _PIPELINE_VERBS
         | _MUTABLE_TOPIC_VERBS
     ):
@@ -159,6 +172,18 @@ def test_mutable_topic_verbs_have_identical_signatures_across_wheels():
     name-for-name, kind-for-kind, and default-for-default so a divergence in either
     is caught."""
     for verb in _MUTABLE_TOPIC_VERBS:
+        client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
+        embed = _call_surface(getattr(jammi_ai.Database, verb))
+        assert client == embed, f"{verb}: {embed} != {client}"
+
+
+def test_inference_verbs_have_identical_signatures_across_wheels():
+    """The bulk inference verb carries the SAME call surface on the client's
+    `RemoteDatabase` as on the embedded engine's `jammi_ai.Database`. Both drive
+    over the same verb vocabulary (the client over gRPC, the embed in-process), so
+    a caller swaps transports without changing the call — pinned name-for-name,
+    kind-for-kind, and default-for-default so a divergence in either is caught."""
+    for verb in _INFERENCE_VERBS:
         client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
         embed = _call_surface(getattr(jammi_ai.Database, verb))
         assert client == embed, f"{verb}: {embed} != {client}"

@@ -6,6 +6,16 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Added
+- **`RemoteDatabase` gains the bulk inference verb.** The published gRPC client's
+  `infer(source=…, model=…, columns=…, task=…, key=…)` runs a model over a
+  registered source server-side (`InferenceService.Infer`) and returns the output
+  rows as a `pyarrow.Table` — the same call surface as the embedded
+  `Database.infer`, so a caller swaps `connect("file://…")` for
+  `connect("grpc://…")` without changing the call. The result rides back as one
+  unary `ArrowBatch`, so gRPC's default 4 MB receive cap bounds the result size a
+  default channel can carry.
+
 ### Fixed
 - **`jammi-client`'s declared floors can no longer lie about its stubs.** The
   proto stubs are generated at wheel-build time, and an unpinned `grpcio-tools`

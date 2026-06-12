@@ -89,11 +89,15 @@ survives with a real consumer's name attached, it belongs in that consumer's rep
   gap is CLOSED for mutable/topic/pubsub as of 0.26.4** (#58/#158 — `RemoteDatabase`
   gains `create_mutable_table`, `drop_mutable_table`, `list_mutable_tables`,
   `register_topic`, `drop_topic`, `list_topics`, `publish_topic`, `subscribe_collect`
-  with a conformance guard; see CHANGELOG v0.26.4). Eval/infer client parity was
-  already closed by T4 (#119). The remaining gap is end-to-end cookbook chapters
-  driving these verbs against the published client (C1/C2 are authored in the
-  cookbook; CI drives them on CPU with the embedded engine — not yet at scale or
-  against a published `grpc://` server).
+  with a conformance guard; see CHANGELOG v0.26.4). **Eval/infer client parity is
+  NOT closed:** the embedded `Database` exposes `infer`, `eval_embeddings`,
+  `eval_per_query`, `eval_inference`, `eval_compare`, `register_channel`, and
+  `add_channel_columns`; of that family only `eval_calibration` (T4, #119) and
+  `predict_with_context_predictor` (T3, #115) are on `RemoteDatabase`. The other
+  remaining gap is end-to-end cookbook chapters driving the landed verbs against
+  the published client (C1/C2 are authored in the cookbook; CI drives them on CPU
+  with the embedded engine — not yet at scale or against a published `grpc://`
+  server).
 - **Scale is unproven** — all validation was at small scale (≤4k rows). The
   memory-scaling edge is now partially addressed (mining bounded) but the broader
   scale tier (3.1) remains the #1 gap.
@@ -175,17 +179,21 @@ expressed as a *measured* result.
   hard-negative OOM (#63) + a `hard_negative_refresh_every` default that silently
   requires `>0`; a graph fine-tune warmup-epoch question (#64); no documented
   determinism/resume story at scale.
-- **CLOSED (0.26.4) — hard-negative OOM + default anti-pattern (#63/#64/#160,
+- **CLOSED (0.26.4) — hard-negative OOM + default anti-pattern (#63/#160,
   CHANGELOG v0.26.4):** mining is memory-bounded; wire defaults overlay correctly
-  (zeros no longer ship as literal values that the engine rejects); graph fine-tune
-  epoch count is now locked to the caller's value. The `refresh_every` silent-default
-  anti-pattern (where a `None` default silently required a positive value at runtime)
-  is resolved — the default overlay now applies engine defaults unconditionally.
+  (zeros no longer ship as literal values that the engine rejects). The
+  `refresh_every` silent-default anti-pattern (where a `None` default silently
+  required a positive value at runtime) is resolved — the default overlay now applies
+  engine defaults unconditionally. The warmup-epoch question (#64) resolved as
+  **not a bug** (#160): there is exactly one `for epoch in 0..epochs` loop shared by
+  the tabular and graph paths (no warmup/zeroth epoch); the epoch count is verified
+  exact and pinned by a regression-guard oracle
+  (`optimizer steps == epochs × ⌈batches/grad_accum⌉`).
 - **Remaining open:** standardization/domain-contract property test for every
   trainable head (high-offset oracle in CI), checkpoint/resume story at scale.
 - **Approach.** A standardization/domain-contract property test for **every** trainable
-  head (high-offset, low-variance, large-magnitude oracle in CI). Confirm/document the
-  warmup epoch. Specify + test checkpoint/resume.
+  head (high-offset, low-variance, large-magnitude oracle in CI). Specify + test
+  checkpoint/resume.
 - **Acceptance.** Every head passes the high-offset oracle in CI; hard-negative mining
   runs at the scale tier; a documented, tested resume-after-crash path.
 
@@ -195,18 +203,30 @@ expressed as a *measured* result.
   server handlers but no client wrappers (now closing). Long-lived `subscribe` streaming
   semantics over gRPC (backpressure, reconnection, exactly-/at-least-once) are unproven
   at scale.
-- **CLOSED (partial, 0.26.4) — mutable/topic/pubsub + eval/infer/pipeline (#58/#119/#158,
-  CHANGELOG v0.26.4):** `RemoteDatabase` now carries the full verb surface: training
-  (T3), pipeline + eval (T4), and mutable-companion-table + topic + pub/sub (cp9
-  substrate). A conformance guard in `crates/jammi-python/tests/test_conformance.py`
-  pins the full set name-for-name + signature-for-signature across embedded and remote
-  transports. Cookbook chapters C1 (feature-store, mutable tables) and C2 (CDC,
-  trigger topics) author the end-to-end workflows on CPU with the embedded engine.
-  Multi-chunk publish parity is confirmed (#160 — the remote `publish_topic` collapses
-  multi-chunk tables before the wire hop, matching the embedded `concat_batches`).
-- **Remaining open:** subscribe stream semantics at scale (replay+tail bounds,
-  cancellation, reconnection under load); channels/eval/infer cookbook chapters against
-  a published `grpc://` server at the scale tier; delivery-semantics specification.
+- **CLOSED (partial) — training/pipeline wire parity (in by 0.26.0) +
+  mutable/topic/pubsub client parity (0.26.4):** T1–T4+N (#107–#119) landed the
+  training verbs (T3, #115), the pipeline verbs + `eval_calibration` (T4, #119), and
+  the shared conformal/RRF numerics (N, #110) on `RemoteDatabase` — all in by the
+  0.26.0 release. #58/#158 (0.26.4, CHANGELOG v0.26.4) added the cp9 substrate:
+  mutable-companion-table + topic + pub/sub verbs, including multi-chunk
+  `publish_topic` parity (#158 — the remote client collapses multi-chunk tables via
+  `combine_chunks` before the wire hop, matching the embedded `concat_batches`). The
+  conformance guard in `crates/jammi-python/tests/test_conformance.py` pins the
+  landed sets (`_TRAINING_VERBS`, `_PIPELINE_VERBS`, `_NUMERIC_VERBS`,
+  `_MUTABLE_TOPIC_VERBS`) name-for-name + signature-for-signature across embedded and
+  remote transports. Cookbook chapters C1 (feature-store, mutable tables) and C2
+  (CDC, trigger topics) author the end-to-end workflows on CPU with the embedded
+  engine.
+- **Remaining open — eval/infer/channel client parity (the H1 residual):** the
+  embedded `Database` exposes `infer`, `eval_embeddings`, `eval_per_query`,
+  `eval_inference`, `eval_compare`, `register_channel`, `add_channel_columns`; none
+  of these are on `RemoteDatabase` (the server-side RPCs exist in
+  `eval.proto`/`inference.proto`/`catalog.proto`, but the published client carries no
+  wrappers), they have no conformance-guard set, and no measured cookbook chapter
+  drives them. Also open: subscribe stream semantics at scale (replay+tail bounds,
+  cancellation, reconnection under load); channels/eval/infer cookbook chapters
+  against a published `grpc://` server at the scale tier; delivery-semantics
+  specification.
 - **Approach.** Specify subscribe stream semantics (replay+tail bounds, cancellation,
   reconnection) and test under load.
 - **Acceptance.** Conformance guard green; a CDC chapter that publishes → predicate-
@@ -259,7 +279,7 @@ expressed as a *measured* result.
 ### 3.8 API stability staging & error taxonomy
 - **Gap.** The surface is good but not yet *deliberate*; some confusing failures (the
   `refresh_every`-default-None error is the anti-pattern).
-- **CLOSED (partial, 0.26.4) — `refresh_every` silent-default anti-pattern (#63/#64/#160,
+- **CLOSED (partial, 0.26.4) — `refresh_every` silent-default anti-pattern (#63/#160,
   CHANGELOG v0.26.4):** the hard-negative config defaults now overlay at the engine
   level; the wire sends `optional` fields that fall back to `HardNegativeConfig::default()`
   rather than literal zeros that validation rejected with an opaque error. The
@@ -298,16 +318,22 @@ expressed as a *measured* result.
 
 ## 5. Sequencing
 
-- **H1 — CLOSED (landed in 0.26.4).** Remote client parity for mutable/topic/pubsub
-  (3.4 partial, #58/#158); T1–T4+N remote-ML-surface spec set (training, pipeline,
-  eval, conformal/RRF parity on the wire, conformance guard); `with_tenant` →
-  `set_tenant` + `tenant_scope` (3.5 partial, #60/#161); hard-negative OOM + default
-  anti-pattern (3.3 partial + 3.8 partial, #63/#64/#160); crates index-wait (CI fix,
-  #62). The cp9 cookbook chapters (C1 mutable feature-store, C2 CDC/triggers) authored
-  and merged in `jammi-cookbook`. **What remains open from H1's scope:** eval/infer/
-  channels cookbook chapters against a published `grpc://` server at scale; subscribe
-  stream semantics under load; BYO-auth seam documentation; scale tier (moves to H2).
-  See §3 workstreams for per-item status.
+- **H1 — landed except one residual.** Landed: the T1–T4+N remote-ML-surface spec
+  set (#107–#119 — training, pipeline + `eval_calibration`, conformal/RRF numerics on
+  the client, conformance guard), in by the 0.26.0 release; remote client parity for
+  mutable/topic/pubsub (3.4 partial, #58/#158), `with_tenant` → `set_tenant` +
+  `tenant_scope` (3.5 partial, #60/#161), hard-negative OOM + default anti-pattern +
+  the epoch-count oracle (3.3 partial + 3.8 partial, #63/#64/#160), and crates
+  index-wait (CI fix, #62), all in 0.26.4. The cp9 cookbook chapters (C1 mutable
+  feature-store, C2 CDC/triggers) authored and merged in `jammi-cookbook`.
+  **The H1 RESIDUAL — eval/infer/channel client parity:** `infer`,
+  `eval_embeddings`, `eval_per_query`, `eval_inference`, `eval_compare`,
+  `register_channel`, `add_channel_columns` are still embedded-only — no
+  `RemoteDatabase` wrappers, no conformance-guard coverage, no measured cookbook
+  chapters (see §3.4). **Also open from H1's scope:** eval/infer/channels cookbook
+  chapters against a published `grpc://` server at scale; subscribe stream semantics
+  under load; BYO-auth seam documentation; scale tier (moves to H2). See §3
+  workstreams for per-item status.
 - **H2 — scale & search (→ 0.27 / 0.28). _This is the M1 gate._** The scale tier
   (3.1), search completeness + ANN benchmarks (3.2), training memory-bounding (3.3).
   At the end of H2 the engine is **mainstream-ready for serious ML/Search on a trusted

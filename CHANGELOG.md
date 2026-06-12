@@ -6,6 +6,43 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.26.4 — 2026-06-12
+
+Wire-parity for the trigger/mutable-table substrate, tenant-scope ergonomics, and
+fine-tune robustness — the engine surfaces the cookbook's data-plane chapters
+exercise.
+
+### Added
+- **`RemoteDatabase` reaches the cp9 substrate.** The published gRPC client gains
+  the mutable-companion-table, trigger-topic, and publish/subscribe verbs
+  (`create_mutable_table`/`drop_mutable_table`/`list_mutable_tables`,
+  `register_topic`/`drop_topic`/`list_topics`, `publish_topic`,
+  `subscribe_collect`), so a caller swaps `connect("file://…")` for
+  `connect("grpc://…")` without changing the call. The embedded surface gains the
+  matching `list_mutable_tables` peer so the two vocabularies stay in lockstep.
+- **Scope-safe tenant context manager.** `with db.tenant_scope("t"): …` binds a
+  tenant for the block and restores the prior scope on exit (embedded and remote
+  alike). The in-place setter is now `set_tenant` — an unambiguous `-> None`
+  setter — replacing the `with_tenant` method whose `None` return read like a
+  builder.
+
+### Fixed
+- **Hard-negative mining defaults resolve on the wire.** A remote caller that
+  enables mining without setting the count knobs now picks up the engine defaults
+  (`k`/`exclude_hops`/`refresh_every` are `optional` in the proto and overlay onto
+  `HardNegativeConfig::default()`), instead of shipping literal zeros that
+  validation rejected.
+- **Hard-negative mining is memory-bounded.** The miner no longer keeps a second
+  full copy of the corpus embeddings (the sidecar index is their sole owner), and
+  anchors are scored in batches; the per-anchor over-fetch caps its excluded
+  headroom so a dense corpus cannot escalate the ANN query into a near-full scan.
+- **Publish parity for multi-chunk tables.** The remote `publish_topic` collapses
+  a multi-chunk `pyarrow.Table` to one batch before sending, matching the embedded
+  path and the wire's one-batch contract.
+- **Release tooling waits for crates.io index propagation** between dependent crate
+  publishes, so a fresh release no longer needs a manual re-run when the sparse
+  index lags an upload.
+
 ## v0.26.3 — 2026-06-11
 
 Follow-up engine work: a model retire lifecycle, catalog/SQL hardening, and

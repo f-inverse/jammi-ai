@@ -6,6 +6,8 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## v0.26.5 — 2026-06-12
+
 ### Added
 - **`RemoteDatabase` gains the eval family.** The published gRPC client's
   `eval_embeddings`, `eval_per_query`, `eval_inference`, and `eval_compare`

@@ -64,6 +64,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "019_normalize_model_status",
         schema::MIGRATION_019_NORMALIZE_MODEL_STATUS,
     ),
+    (
+        "020_channel_tenant_scope",
+        schema::MIGRATION_020_CHANNEL_TENANT_SCOPE,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

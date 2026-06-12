@@ -519,3 +519,104 @@ CREATE INDEX idx_eval_runs_tenant  ON eval_runs(tenant_id);
 pub(super) const MIGRATION_019_NORMALIZE_MODEL_STATUS: &str = r#"
 UPDATE models SET status = 'registered' WHERE status = 'available';
 "#;
+
+/// Migration 020 — tenant-qualify the evidence-channel identity.
+///
+/// Migration 005 added a `tenant_id` column to `evidence_channels` but no code
+/// ever wrote or read it, and the channel name stayed a *global* `TEXT PRIMARY
+/// KEY` (migration 001). `evidence_channel_columns` (migration 006) keyed on
+/// `(channel_name, column_name)` and FK-referenced `evidence_channels(channel_name)`
+/// — also tenant-blind. So two tenants registering a channel of the same name
+/// collided on one global PK slot: tenant B's `register("X")` hit tenant A's row
+/// (a cross-tenant collision, the same D1 class fixed for `models` in #140), and
+/// `list()` returned every tenant's channels regardless of the bound tenant — a
+/// cross-tenant read leak. The gRPC handlers already wrapped these calls in a
+/// tenant `scoped(...)`, so the scope was a lie the repo ignored.
+///
+/// This migration makes the channel name unique PER TENANT by reshaping the
+/// identity of both tables to carry `tenant_id`:
+///   * `evidence_channels` gains a `UNIQUE (tenant_id, channel_name)` constraint
+///     in place of the global `channel_name` PK.
+///   * `evidence_channel_columns` carries `tenant_id`, gains a
+///     `UNIQUE (tenant_id, channel_name, column_name)` constraint in place of
+///     its old `(channel_name, column_name)` PK, and its FK becomes a composite
+///     `REFERENCES evidence_channels(tenant_id, channel_name)` so the parent
+///     link holds *within* a tenant. The per-channel ordinal-uniqueness index is
+///     rebuilt as `(tenant_id, channel_name, ordinal)`.
+///
+/// `tenant_id` deliberately stays OUT of any PRIMARY KEY and is expressed as a
+/// UNIQUE constraint instead — exactly as migration 012 did for `topics`.
+/// Postgres (the CI-authoritative backend, which runs these same migration
+/// constants) makes every PRIMARY-KEY column implicitly `NOT NULL`, so a
+/// composite `PRIMARY KEY (tenant_id, …)` would reject the global
+/// (`tenant_id IS NULL`) seed channels on insert. A UNIQUE constraint admits
+/// NULLs (treated as distinct) on both backends, and Postgres accepts it as the
+/// composite FK target the child table references.
+///
+/// SQLite cannot alter a PK or a column-level FK in place, so each table is
+/// rebuilt via the canonical create-new / copy / drop / rename dance (the same
+/// shape migrations 012 and 018 use). Every pre-existing row's `tenant_id` is
+/// already `NULL` (no writer ever set it), so the copy carries that forward —
+/// the seed channels (`vector`, `inference`, `bm25`) and any rows present stay
+/// in the global (`tenant_id IS NULL`) namespace, preserving existing
+/// default-channel behaviour. The child rows are parked in a temporary table
+/// while the parent is swapped, then copied back with an explicit
+/// `tenant_id = NULL` (the old child table had no `tenant_id` column); the child
+/// is dropped *before* the parent and recreated *after* it, so the rebuild is
+/// FK-safe on both backends regardless of FK-enforcement state.
+///
+/// Note on NULL semantics: both backends treat NULLs as DISTINCT in a UNIQUE
+/// constraint, so the constraint alone does not reject a duplicate *global*
+/// (`tenant_id IS NULL`) channel. The repo's `register` therefore does an
+/// explicit tenant-scoped existence check before inserting; the UNIQUE
+/// constraint is the DB-level backstop for the non-NULL (tenant-scoped) case.
+/// Greenfield: no production rows to preserve beyond the seeds.
+pub(super) const MIGRATION_020_CHANNEL_TENANT_SCOPE: &str = r#"
+CREATE TABLE evidence_channel_columns_old (
+    channel_name    TEXT NOT NULL,
+    column_name     TEXT NOT NULL,
+    column_type     TEXT NOT NULL,
+    ordinal         INTEGER NOT NULL
+);
+
+INSERT INTO evidence_channel_columns_old (channel_name, column_name, column_type, ordinal)
+    SELECT channel_name, column_name, column_type, ordinal FROM evidence_channel_columns;
+
+DROP TABLE evidence_channel_columns;
+
+CREATE TABLE evidence_channels_new (
+    tenant_id       TEXT,
+    channel_name    TEXT NOT NULL,
+    priority        INTEGER NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT)),
+    UNIQUE (tenant_id, channel_name)
+);
+
+INSERT INTO evidence_channels_new (tenant_id, channel_name, priority, created_at)
+    SELECT tenant_id, channel_name, priority, created_at FROM evidence_channels;
+
+DROP TABLE evidence_channels;
+
+ALTER TABLE evidence_channels_new RENAME TO evidence_channels;
+
+CREATE INDEX idx_evidence_channels_tenant ON evidence_channels(tenant_id);
+
+CREATE TABLE evidence_channel_columns (
+    tenant_id       TEXT,
+    channel_name    TEXT NOT NULL,
+    column_name     TEXT NOT NULL,
+    column_type     TEXT NOT NULL,
+    ordinal         INTEGER NOT NULL,
+    declared_at     TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT)),
+    UNIQUE (tenant_id, channel_name, column_name),
+    FOREIGN KEY (tenant_id, channel_name)
+        REFERENCES evidence_channels(tenant_id, channel_name)
+);
+CREATE UNIQUE INDEX idx_channel_cols_ordinal
+    ON evidence_channel_columns(tenant_id, channel_name, ordinal);
+
+INSERT INTO evidence_channel_columns(tenant_id, channel_name, column_name, column_type, ordinal)
+    SELECT NULL, channel_name, column_name, column_type, ordinal FROM evidence_channel_columns_old;
+
+DROP TABLE evidence_channel_columns_old;
+"#;

@@ -37,6 +37,19 @@ workspace ships every publishable crate at the same
   name.
 
 ### Fixed
+- **The evidence-channel catalog is now tenant-scoped (cross-tenant data leak,
+  D1).** `evidence_channels.channel_name` was a global `TEXT PRIMARY KEY` and the
+  channel repo carried no tenant predicate, so one tenant's `register`/`list`
+  saw — and collided with — every other tenant's channels even though the gRPC
+  handlers already wrapped the calls in a tenant scope. The same D1 class fixed
+  for the model catalog (#140). The channel name is now unique *per tenant*:
+  migration 020 reshapes `evidence_channels` and `evidence_channel_columns` to
+  carry `tenant_id` with `UNIQUE (tenant_id, channel_name)` and a composite FK,
+  and `register`/`add_channel_columns`/`get`/`list` read and write `tenant_id`
+  (`tenant = None` → `IS NULL` only; a tenant sees its own channels plus the
+  unshadowed global seeds, never another tenant's). The embedded
+  `register_channel` docstring is corrected to say per-tenant. An adversarial
+  cross-tenant isolation test covers the leak.
 - **`jammi-client`'s declared floors can no longer lie about its stubs.** The
   proto stubs are generated at wheel-build time, and an unpinned `grpcio-tools`
   baked import-time guards (`GRPC_GENERATED_VERSION`,

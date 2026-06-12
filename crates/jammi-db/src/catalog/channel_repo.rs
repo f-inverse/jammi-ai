@@ -114,6 +114,101 @@ fn read_column_row(row: &Row<'_>) -> std::result::Result<(String, String), Backe
     Ok((row.get("column_name")?, row.get("column_type")?))
 }
 
+/// Does a parent `evidence_channels` row exist for `(tenant, channel)`?
+///
+/// Branches on the tenant to honour the `None -> IS NULL` semantics: SQL
+/// `tenant_id = NULL` never matches, so a global lookup must use `IS NULL`
+/// rather than binding `NULL` as a parameter (mirrors `mutable_repo`).
+async fn channel_exists(
+    tx: &mut super::backend::Transaction<'_>,
+    tenant: Option<&str>,
+    channel: &str,
+) -> std::result::Result<bool, BackendError> {
+    let found = if let Some(t) = tenant {
+        tx.query_opt(
+            "SELECT 1 AS one FROM evidence_channels \
+             WHERE tenant_id = $1 AND channel_name = $2",
+            &[
+                SqlValue::TextOwned(t.to_string()),
+                SqlValue::TextOwned(channel.to_string()),
+            ],
+            |row| row.get::<i32>("one"),
+        )
+        .await?
+    } else {
+        tx.query_opt(
+            "SELECT 1 AS one FROM evidence_channels \
+             WHERE tenant_id IS NULL AND channel_name = $1",
+            &[SqlValue::TextOwned(channel.to_string())],
+            |row| row.get::<i32>("one"),
+        )
+        .await?
+    };
+    Ok(found.is_some())
+}
+
+/// Highest declared ordinal on `(tenant, channel)`, or `None` if no columns.
+async fn max_ordinal(
+    tx: &mut super::backend::Transaction<'_>,
+    tenant: Option<&str>,
+    channel: &str,
+) -> std::result::Result<Option<i32>, BackendError> {
+    let found = if let Some(t) = tenant {
+        tx.query_opt(
+            "SELECT MAX(ordinal) AS m FROM evidence_channel_columns \
+             WHERE tenant_id = $1 AND channel_name = $2",
+            &[
+                SqlValue::TextOwned(t.to_string()),
+                SqlValue::TextOwned(channel.to_string()),
+            ],
+            |row| row.try_get::<i32>("m"),
+        )
+        .await?
+    } else {
+        tx.query_opt(
+            "SELECT MAX(ordinal) AS m FROM evidence_channel_columns \
+             WHERE tenant_id IS NULL AND channel_name = $1",
+            &[SqlValue::TextOwned(channel.to_string())],
+            |row| row.try_get::<i32>("m"),
+        )
+        .await?
+    };
+    Ok(found.flatten())
+}
+
+/// The stored `column_type` for `(tenant, channel, column)`, or `None`.
+async fn column_type(
+    tx: &mut super::backend::Transaction<'_>,
+    tenant: Option<&str>,
+    channel: &str,
+    column: &str,
+) -> std::result::Result<Option<String>, BackendError> {
+    if let Some(t) = tenant {
+        tx.query_opt(
+            "SELECT column_type FROM evidence_channel_columns \
+             WHERE tenant_id = $1 AND channel_name = $2 AND column_name = $3",
+            &[
+                SqlValue::TextOwned(t.to_string()),
+                SqlValue::TextOwned(channel.to_string()),
+                SqlValue::TextOwned(column.to_string()),
+            ],
+            |row| row.get::<String>("column_type"),
+        )
+        .await
+    } else {
+        tx.query_opt(
+            "SELECT column_type FROM evidence_channel_columns \
+             WHERE tenant_id IS NULL AND channel_name = $1 AND column_name = $2",
+            &[
+                SqlValue::TextOwned(channel.to_string()),
+                SqlValue::TextOwned(column.to_string()),
+            ],
+            |row| row.get::<String>("column_type"),
+        )
+        .await
+    }
+}
+
 /// `(channel_name, priority, columns)` row as returned by `list()`'s catalog
 /// query. Aliased to keep the inner closure's local type readable.
 type ChannelListing = (String, i32, Vec<(String, String)>);
@@ -123,8 +218,19 @@ impl<'a> ChannelRepo<'a> {
         Self { catalog }
     }
 
-    /// Register a new channel and its columns atomically.
+    /// Register a new channel and its columns atomically, scoped to the
+    /// catalog's currently-bound tenant.
+    ///
+    /// The channel name is unique *per tenant*: tenant B may register a channel
+    /// whose name already exists under tenant A without collision, but a
+    /// re-registration within the same tenant is rejected. Because SQLite treats
+    /// NULLs as distinct in a PRIMARY KEY, the composite `(tenant_id,
+    /// channel_name)` PK alone does not reject a duplicate *global*
+    /// (`tenant = None`) channel, so this does an explicit tenant-scoped
+    /// existence check before inserting (the PK is the backstop for the
+    /// non-NULL, tenant-scoped case).
     pub async fn register(&self, spec: &ChannelSpec) -> Result<()> {
+        let tenant = self.catalog.current_tenant().map(|t| t.to_string());
         let channel = spec.id.as_str().to_string();
         let channel_for_err = channel.clone();
         let priority = spec.priority as i64;
@@ -139,10 +245,23 @@ impl<'a> ChannelRepo<'a> {
             .catalog
             .backend()
             .transaction(TxOptions::default(), |tx| {
+                let tenant = tenant.clone();
                 Box::pin(async move {
+                    // Explicit per-tenant existence check: NULL-distinct PKs mean
+                    // the DB constraint cannot catch a duplicate global channel.
+                    let exists = channel_exists(tx, tenant.as_deref(), &channel).await?;
+                    if exists {
+                        return Err(BackendError::Constraint {
+                            table: "evidence_channels".to_string(),
+                            detail: "channel_name already registered for tenant".to_string(),
+                        });
+                    }
+
                     tx.execute(
-                        "INSERT INTO evidence_channels (channel_name, priority) VALUES ($1, $2)",
+                        "INSERT INTO evidence_channels (tenant_id, channel_name, priority) \
+                         VALUES ($1, $2, $3)",
                         &[
+                            SqlValue::from(tenant.clone()),
                             SqlValue::TextOwned(channel.clone()),
                             SqlValue::Int(priority),
                         ],
@@ -152,9 +271,10 @@ impl<'a> ChannelRepo<'a> {
                     for (name, ty, ord) in columns {
                         tx.execute(
                             "INSERT INTO evidence_channel_columns \
-                             (channel_name, column_name, column_type, ordinal) \
-                             VALUES ($1, $2, $3, $4)",
+                             (tenant_id, channel_name, column_name, column_type, ordinal) \
+                             VALUES ($1, $2, $3, $4, $5)",
                             &[
+                                SqlValue::from(tenant.clone()),
                                 SqlValue::TextOwned(channel.clone()),
                                 SqlValue::TextOwned(name),
                                 SqlValue::Text(ty),
@@ -173,11 +293,14 @@ impl<'a> ChannelRepo<'a> {
     }
 
     /// Append new columns to an already-registered channel. Append-only.
+    /// Scoped to the catalog's currently-bound tenant: a channel is resolved,
+    /// and its columns appended, only within the bound tenant's namespace.
     pub async fn add_columns(
         &self,
         channel: &ChannelId,
         new_columns: &[ChannelColumn],
     ) -> Result<()> {
+        let tenant = self.catalog.current_tenant().map(|t| t.to_string());
         let channel_name = channel.as_str().to_string();
         let channel_for_err = channel_name.clone();
         let cols: Vec<(String, ChannelColumnType)> = new_columns
@@ -188,44 +311,21 @@ impl<'a> ChannelRepo<'a> {
         self.catalog
             .backend()
             .transaction(TxOptions::default(), |tx| {
+                let tenant = tenant.clone();
                 Box::pin(async move {
-                    // Existence check on the parent row.
-                    let parent_exists = tx
-                        .query_opt(
-                            "SELECT 1 AS one FROM evidence_channels WHERE channel_name = $1",
-                            &[SqlValue::TextOwned(channel_name.clone())],
-                            |row| row.get::<i32>("one"),
-                        )
-                        .await?
-                        .is_some();
-                    if !parent_exists {
+                    let tref = tenant.as_deref();
+                    // Existence check on the parent row, tenant-scoped.
+                    if !channel_exists(tx, tref, &channel_name).await? {
                         return Err(BackendError::Execution(format!(
                             "channel '{channel_for_err}': not registered"
                         )));
                     }
 
-                    let max_ord = tx
-                        .query_opt(
-                            "SELECT MAX(ordinal) AS m FROM evidence_channel_columns WHERE channel_name = $1",
-                            &[SqlValue::TextOwned(channel_name.clone())],
-                            |row| row.try_get::<i32>("m"),
-                        )
-                        .await?
-                        .flatten();
+                    let max_ord = max_ordinal(tx, tref, &channel_name).await?;
                     let mut next = max_ord.unwrap_or(-1) + 1;
 
                     for (name, ty) in cols {
-                        let existing = tx
-                            .query_opt(
-                                "SELECT column_type FROM evidence_channel_columns \
-                                 WHERE channel_name = $1 AND column_name = $2",
-                                &[
-                                    SqlValue::TextOwned(channel_name.clone()),
-                                    SqlValue::TextOwned(name.clone()),
-                                ],
-                                |row| row.get::<String>("column_type"),
-                            )
-                            .await?;
+                        let existing = column_type(tx, tref, &channel_name, &name).await?;
                         if let Some(existing_type) = existing {
                             let existing = ChannelColumnType::from_sql_str(&existing_type)
                                 .map_err(|e| BackendError::Execution(e.to_string()))?;
@@ -245,9 +345,10 @@ impl<'a> ChannelRepo<'a> {
 
                         tx.execute(
                             "INSERT INTO evidence_channel_columns \
-                             (channel_name, column_name, column_type, ordinal) \
-                             VALUES ($1, $2, $3, $4)",
+                             (tenant_id, channel_name, column_name, column_type, ordinal) \
+                             VALUES ($1, $2, $3, $4, $5)",
                             &[
+                                SqlValue::from(tenant.clone()),
                                 SqlValue::TextOwned(channel_name.clone()),
                                 SqlValue::TextOwned(name),
                                 SqlValue::Text(ty.as_str()),
@@ -268,8 +369,20 @@ impl<'a> ChannelRepo<'a> {
         Ok(())
     }
 
-    /// Look up one channel's full spec.
+    /// Look up one channel's full spec, resolved in the catalog's currently-bound
+    /// tenant namespace.
+    ///
+    /// A tenant resolves its OWN channel if it has registered one of that name,
+    /// otherwise it falls back to the GLOBAL (`tenant_id IS NULL`) channel — the
+    /// same own-shadows-global precedence the model catalog uses (#140). This is
+    /// what lets every tenant resolve the global seed channels (`vector`,
+    /// `inference`, `bm25`) while still owning a private channel of the same
+    /// name. A `tenant = None` lookup resolves only global rows. Crucially, a
+    /// tenant NEVER resolves another tenant's row. Once the owning `tenant_id` is
+    /// resolved, the columns are read under that SAME `tenant_id`, so a tenant's
+    /// channel and a global channel of the same name never blend their columns.
     pub async fn get(&self, channel: &ChannelId) -> Result<Option<ChannelSpec>> {
+        let tenant = self.catalog.current_tenant().map(|t| t.to_string());
         let channel_name = channel.as_str().to_string();
         let id = channel.clone();
         let found = self
@@ -282,25 +395,62 @@ impl<'a> ChannelRepo<'a> {
                 },
                 |tx| {
                     let channel_name = channel_name.clone();
+                    let tenant = tenant.clone();
                     Box::pin(async move {
-                        let priority = tx
-                            .query_opt(
-                                "SELECT priority FROM evidence_channels WHERE channel_name = $1",
-                                &[SqlValue::TextOwned(channel_name.clone())],
-                                |row| row.get::<i32>("priority"),
+                        let tref = tenant.as_deref();
+                        // Resolve the owning row: own-tenant shadows global.
+                        let resolved = if let Some(t) = tref {
+                            tx.query_opt(
+                                "SELECT tenant_id, priority FROM evidence_channels \
+                                 WHERE (tenant_id = $1 OR tenant_id IS NULL) AND channel_name = $2 \
+                                 ORDER BY (tenant_id IS NOT NULL) DESC LIMIT 1",
+                                &[
+                                    SqlValue::TextOwned(t.to_string()),
+                                    SqlValue::TextOwned(channel_name.clone()),
+                                ],
+                                |row| {
+                                    Ok((
+                                        row.try_get::<String>("tenant_id")?,
+                                        row.get::<i32>("priority")?,
+                                    ))
+                                },
                             )
-                            .await?;
-                        let Some(priority) = priority else {
+                            .await?
+                        } else {
+                            tx.query_opt(
+                                "SELECT tenant_id, priority FROM evidence_channels \
+                                 WHERE tenant_id IS NULL AND channel_name = $1",
+                                &[SqlValue::TextOwned(channel_name.clone())],
+                                |row| {
+                                    Ok((
+                                        row.try_get::<String>("tenant_id")?,
+                                        row.get::<i32>("priority")?,
+                                    ))
+                                },
+                            )
+                            .await?
+                        };
+                        let Some((row_tenant, priority)) = resolved else {
                             return Ok(None);
                         };
-                        let cols = tx
-                            .query(
+                        // Read columns under the SAME resolved tenant_id.
+                        let cols = if let Some(rt) = row_tenant {
+                            tx.query(
                                 "SELECT column_name, column_type FROM evidence_channel_columns \
-                             WHERE channel_name = $1 ORDER BY ordinal",
+                                 WHERE tenant_id = $1 AND channel_name = $2 ORDER BY ordinal",
+                                &[SqlValue::TextOwned(rt), SqlValue::TextOwned(channel_name)],
+                                read_column_row,
+                            )
+                            .await?
+                        } else {
+                            tx.query(
+                                "SELECT column_name, column_type FROM evidence_channel_columns \
+                                 WHERE tenant_id IS NULL AND channel_name = $1 ORDER BY ordinal",
                                 &[SqlValue::TextOwned(channel_name)],
                                 read_column_row,
                             )
-                            .await?;
+                            .await?
+                        };
                         Ok(Some((priority, cols)))
                     })
                 },
@@ -326,8 +476,16 @@ impl<'a> ChannelRepo<'a> {
         }))
     }
 
-    /// List every registered channel, ordered by `(priority, channel_name)`.
+    /// List every registered channel resolved in the catalog's currently-bound
+    /// tenant namespace, ordered by `(priority, channel_name)`.
+    ///
+    /// A tenant sees its OWN channels plus the GLOBAL (`tenant_id IS NULL`)
+    /// channels it has not shadowed — its own channel of a given name takes
+    /// precedence over a global one of the same name (the #140 own-shadows-global
+    /// rule). It NEVER sees another tenant's channels. A `tenant = None` listing
+    /// returns only global rows.
     pub async fn list(&self) -> Result<Vec<ChannelSpec>> {
+        let tenant = self.catalog.current_tenant().map(|t| t.to_string());
         let entries = self
             .catalog
             .backend()
@@ -337,32 +495,83 @@ impl<'a> ChannelRepo<'a> {
                     ..Default::default()
                 },
                 |tx| {
+                    let tenant = tenant.clone();
                     Box::pin(async move {
-                        let parents: Vec<(String, i32)> = tx
-                            .query(
-                                "SELECT channel_name, priority FROM evidence_channels \
-                             ORDER BY priority, channel_name",
-                                &[],
+                        let tref = tenant.as_deref();
+                        // Candidate parents: own (if any) and global. Own rows
+                        // sort first so the dedup-by-name keeps the tenant's row
+                        // ahead of a global row of the same name.
+                        let candidates: Vec<(Option<String>, String, i32)> = if let Some(t) = tref {
+                            tx.query(
+                                "SELECT tenant_id, channel_name, priority FROM evidence_channels \
+                                 WHERE tenant_id = $1 OR tenant_id IS NULL \
+                                 ORDER BY (tenant_id IS NOT NULL) DESC, priority, channel_name",
+                                &[SqlValue::TextOwned(t.to_string())],
                                 |row| {
                                     Ok((
+                                        row.try_get::<String>("tenant_id")?,
                                         row.get::<String>("channel_name")?,
                                         row.get::<i32>("priority")?,
                                     ))
                                 },
                             )
-                            .await?;
-                        let mut out: Vec<ChannelListing> = Vec::with_capacity(parents.len());
-                        for (name, priority) in parents {
-                            let cols = tx
-                            .query(
-                                "SELECT column_name, column_type FROM evidence_channel_columns \
-                                 WHERE channel_name = $1 ORDER BY ordinal",
-                                &[SqlValue::TextOwned(name.clone())],
-                                read_column_row,
+                            .await?
+                        } else {
+                            tx.query(
+                                "SELECT tenant_id, channel_name, priority FROM evidence_channels \
+                                 WHERE tenant_id IS NULL ORDER BY priority, channel_name",
+                                &[],
+                                |row| {
+                                    Ok((
+                                        row.try_get::<String>("tenant_id")?,
+                                        row.get::<String>("channel_name")?,
+                                        row.get::<i32>("priority")?,
+                                    ))
+                                },
                             )
-                            .await?;
+                            .await?
+                        };
+
+                        // Dedup by channel_name, keeping the first occurrence
+                        // (own shadows global because own rows are ordered first).
+                        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        let mut resolved: Vec<(Option<String>, String, i32)> =
+                            Vec::with_capacity(candidates.len());
+                        for (row_tenant, name, priority) in candidates {
+                            if seen.insert(name.clone()) {
+                                resolved.push((row_tenant, name, priority));
+                            }
+                        }
+
+                        let mut out: Vec<ChannelListing> = Vec::with_capacity(resolved.len());
+                        for (row_tenant, name, priority) in resolved {
+                            let cols = if let Some(rt) = row_tenant {
+                                tx.query(
+                                    "SELECT column_name, column_type \
+                                     FROM evidence_channel_columns \
+                                     WHERE tenant_id = $1 AND channel_name = $2 ORDER BY ordinal",
+                                    &[
+                                        SqlValue::TextOwned(rt),
+                                        SqlValue::TextOwned(name.clone()),
+                                    ],
+                                    read_column_row,
+                                )
+                                .await?
+                            } else {
+                                tx.query(
+                                    "SELECT column_name, column_type \
+                                     FROM evidence_channel_columns \
+                                     WHERE tenant_id IS NULL AND channel_name = $1 ORDER BY ordinal",
+                                    &[SqlValue::TextOwned(name.clone())],
+                                    read_column_row,
+                                )
+                                .await?
+                            };
                             out.push((name, priority, cols));
                         }
+                        // Re-establish the documented (priority, channel_name)
+                        // order after the own-first dedup pass.
+                        out.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
                         Ok(out)
                     })
                 },

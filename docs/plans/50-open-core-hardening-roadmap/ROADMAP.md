@@ -89,15 +89,18 @@ survives with a real consumer's name attached, it belongs in that consumer's rep
   gap is CLOSED for mutable/topic/pubsub as of 0.26.4** (#58/#158 — `RemoteDatabase`
   gains `create_mutable_table`, `drop_mutable_table`, `list_mutable_tables`,
   `register_topic`, `drop_topic`, `list_topics`, `publish_topic`, `subscribe_collect`
-  with a conformance guard; see CHANGELOG v0.26.4). **Eval/infer client parity is
-  NOT closed:** the embedded `Database` exposes `infer`, `eval_embeddings`,
-  `eval_per_query`, `eval_inference`, `eval_compare`, `register_channel`, and
-  `add_channel_columns`; of that family only `eval_calibration` (T4, #119) and
-  `predict_with_context_predictor` (T3, #115) are on `RemoteDatabase`. The other
-  remaining gap is end-to-end cookbook chapters driving the landed verbs against
-  the published client (C1/C2 are authored in the cookbook; CI drives them on CPU
-  with the embedded engine — not yet at scale or against a published `grpc://`
-  server).
+  with a conformance guard; see CHANGELOG v0.26.4). **The eval/infer/channel client
+  parity gap is CLOSED as of 0.26.5** (#169/#171/#172 — `RemoteDatabase` now carries
+  `infer`, `eval_embeddings`, `eval_per_query`, `eval_inference`, `eval_compare`,
+  `register_channel`, `add_channel_columns`, `list_channels`, conformance-guarded by
+  `_INFERENCE_VERBS` / `_EVAL_VERBS` / `_CHANNEL_VERBS` in `test_conformance.py`;
+  see CHANGELOG v0.26.5). Cookbook chapter 14 (`jammi-cookbook` PR #15) is the
+  measured integration test — it drives all these verbs on both transports asserting
+  `remote == embedded` and surfaced the `eval_compare` significance-CI order bug
+  (#173) and an NER-confidence f32-precision question before release. The channel
+  error-taxonomy (gRPC status mapping for channel ops) carries forward to H3 §3.8.
+  The remaining open gap is end-to-end cookbook chapters at scale against a published
+  `grpc://` server (C1/C2/ch14 run on CPU with the embedded engine).
 - **Scale is unproven** — all validation was at small scale (≤4k rows). The
   memory-scaling edge is now partially addressed (mining bounded) but the broader
   scale tier (3.1) remains the #1 gap.
@@ -217,17 +220,28 @@ expressed as a *measured* result.
   remote transports. Cookbook chapters C1 (feature-store, mutable tables) and C2
   (CDC, trigger topics) author the end-to-end workflows on CPU with the embedded
   engine.
-- **Remaining open — eval/infer/channel client parity (the H1 residual):** the
-  embedded `Database` exposes `infer`, `eval_embeddings`, `eval_per_query`,
-  `eval_inference`, `eval_compare`, `register_channel`, `add_channel_columns`; none
-  of these are on `RemoteDatabase` (the server-side RPCs exist in
-  `eval.proto`/`inference.proto`/`catalog.proto`, but the published client carries no
-  wrappers), they have no conformance-guard set, and no measured cookbook chapter
-  drives them. Also open — a live client-parity *defect*, not just a gap: remote
-  `fine_tune_graph` builds its `FineTuneConfig` but never attaches it to
-  `StartTrainingRequest`, so the server silently runs engine defaults (#167; the
-  cookbook's `epochs=1` → 3-epochs observation). Also open: subscribe stream semantics at scale (replay+tail bounds,
-  cancellation, reconnection under load); channels/eval/infer cookbook chapters
+- **CLOSED — eval/infer/channel client parity (H1 residual, 0.26.5):** `infer`
+  (#169), the eval family `eval_embeddings` / `eval_per_query` / `eval_inference` /
+  `eval_compare` (#171), and the channel family `register_channel` /
+  `add_channel_columns` / `list_channels` (#172) are now on `RemoteDatabase`,
+  conformance-guarded by `_INFERENCE_VERBS` / `_EVAL_VERBS` / `_CHANNEL_VERBS` in
+  `test_conformance.py`. The channel catalog is tenant-scoped (#170 — migration 020,
+  UNIQUE per tenant, partial unique index closing the global-name TOCTOU race). The
+  `eval_compare` significance CIs are order-invariant (#173 — `bootstrap_ci`
+  canonicalizes before resampling). The `eval_embeddings` `model` → `embedding_table`
+  rename landed in the same release. Stub-generator pin + honest runtime floors
+  (#168) removes the import-time crash at declared minima. Cookbook chapter 14
+  (`jammi-cookbook` PR #15) is the measured integration test — it drives all these
+  verbs on both transports asserting `remote == embedded` and surfaced #173 and an
+  NER-confidence f32-precision question before release. Also open in H1's scope and
+  now tracked: the `fine_tune_graph` config propagation defect (#167 — the client
+  builds `FineTuneConfig` but does not attach it to `StartTrainingRequest`; server
+  runs engine defaults silently) — this item was not in the v0.26.5 bundle and
+  remains open.
+- **Remaining open:** the channel gRPC error-taxonomy — channel ops return
+  `Code::Internal` instead of `AlreadyExists` / `NotFound` / `InvalidArgument`;
+  carried to H3 §3.8. Subscribe stream semantics at scale (replay+tail bounds,
+  cancellation, reconnection under load); eval/infer/channel cookbook chapters
   against a published `grpc://` server at the scale tier; delivery-semantics
   specification.
 - **Approach.** Specify subscribe stream semantics (replay+tail bounds, cancellation,
@@ -288,6 +302,12 @@ expressed as a *measured* result.
   rather than literal zeros that validation rejected with an opaque error. The
   broader API-stability staging (provisional/stable annotations, reference-contract
   test in engine CI, typed error taxonomy) remains open.
+- **Carried from H1 (0.26.5) — channel gRPC error-taxonomy:** the evidence-channel
+  family landed on `RemoteDatabase` (#172), but the server-side gRPC status mapping
+  for channel operations returns `Code::Internal` for `AlreadyExists` /
+  `NotFound` / `InvalidArgument` conditions (the `JammiError::EvidenceChannel`
+  variants are not yet mapped to their correct gRPC codes in `map_engine_error`).
+  This is a known open item sequenced here.
 - **Approach.** Make the grounded-API-reference contract test the engine's own (a
   consumer cookbook already does this — lift it in). A typed error taxonomy with clear,
   actionable messages and stable gRPC status mapping. A provisional-vs-stable annotation
@@ -321,22 +341,33 @@ expressed as a *measured* result.
 
 ## 5. Sequencing
 
-- **H1 — landed except one residual.** Landed: the T1–T4+N remote-ML-surface spec
-  set (#107–#119 — training, pipeline + `eval_calibration`, conformal/RRF numerics on
-  the client, conformance guard), in by the 0.26.0 release; remote client parity for
-  mutable/topic/pubsub (3.4 partial, #58/#158), `with_tenant` → `set_tenant` +
-  `tenant_scope` (3.5 partial, #60/#161), hard-negative OOM + default anti-pattern +
-  the epoch-count oracle (3.3 partial + 3.8 partial, #63/#64/#160), and crates
-  index-wait (CI fix, #62), all in 0.26.4. The cp9 cookbook chapters (C1 mutable
-  feature-store, C2 CDC/triggers) authored and merged in `jammi-cookbook`.
-  **The H1 RESIDUAL — eval/infer/channel client parity:** `infer`,
-  `eval_embeddings`, `eval_per_query`, `eval_inference`, `eval_compare`,
-  `register_channel`, `add_channel_columns` are still embedded-only — no
-  `RemoteDatabase` wrappers, no conformance-guard coverage, no measured cookbook
-  chapters (see §3.4). **Also open from H1's scope:** eval/infer/channels cookbook
-  chapters against a published `grpc://` server at scale; subscribe stream semantics
-  under load; BYO-auth seam documentation; scale tier (moves to H2). See §3
-  workstreams for per-item status.
+- **H1 — CLOSED in v0.26.5.** Landed through 0.26.4: the T1–T4+N remote-ML-surface
+  spec set (#107–#119 — training, pipeline + `eval_calibration`, conformal/RRF
+  numerics on the client, conformance guard), in by the 0.26.0 release; remote client
+  parity for mutable/topic/pubsub (3.4 partial, #58/#158), `with_tenant` →
+  `set_tenant` + `tenant_scope` (3.5 partial, #60/#161), hard-negative OOM + default
+  anti-pattern + the epoch-count oracle (3.3 partial + 3.8 partial, #63/#64/#160),
+  and crates index-wait (CI fix, #62), all in 0.26.4. The cp9 cookbook chapters (C1
+  mutable feature-store, C2 CDC/triggers) authored and merged in `jammi-cookbook`.
+  **The H1 residual — eval/infer/channel client parity — is CLOSED in v0.26.5:**
+  `infer` (#169), the eval family `eval_embeddings` / `eval_per_query` /
+  `eval_inference` / `eval_compare` (#171), and the channel family
+  `register_channel` / `add_channel_columns` / `list_channels` (#172) are now on
+  `RemoteDatabase`, conformance-guarded by `_INFERENCE_VERBS` / `_EVAL_VERBS` /
+  `_CHANNEL_VERBS` in `test_conformance.py`. The channel catalog is tenant-scoped
+  (#170 — migration 020, cross-tenant leak D1, global-name TOCTOU closed by partial
+  unique index). The `eval_compare` significance CIs are order-invariant (#173 —
+  `bootstrap_ci` canonicalizes before resampling). Stub-generator pin + honest
+  runtime floors (#168). Cookbook chapter 14 (`jammi-cookbook` PR #15) is the
+  measured integration test — it drives all these verbs on both transports asserting
+  `remote == embedded` and surfaced #173 and an NER-confidence f32-precision question
+  before release. **Honestly deferred:** the channel gRPC error-taxonomy
+  (`JammiError::EvidenceChannel` → `Code::Internal` instead of `AlreadyExists` /
+  `NotFound` / `InvalidArgument`) is a known open item sequenced to H3 §3.8.
+  **Still open from H1's scope:** eval/infer/channels cookbook chapters against a
+  published `grpc://` server at scale; subscribe stream semantics under load;
+  BYO-auth seam documentation; scale tier (moves to H2). See §3 workstreams for
+  per-item status.
 - **H2 — scale & search (→ 0.27 / 0.28). _This is the M1 gate._** The scale tier
   (3.1), search completeness + ANN benchmarks (3.2), training memory-bounding (3.3).
   At the end of H2 the engine is **mainstream-ready for serious ML/Search on a trusted

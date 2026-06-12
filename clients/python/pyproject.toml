@@ -26,18 +26,31 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Database",
 ]
+# The grpcio/protobuf floors are COUPLED to the `grpcio-tools` pin in the
+# `dev` extra below. The generated stubs refuse to import under a grpcio older
+# than the generator's version (`GRPC_GENERATED_VERSION` guard in
+# `*_pb2_grpc.py`) or a protobuf runtime older than the generator's bundled
+# gencode version (`ValidateProtobufRuntimeVersion` in `*_pb2.py`), so the
+# floors must be at least what the pinned generator emits. Bump the pin and
+# the floors together; `tests/test_generated_floor.py` asserts the coupling.
 dependencies = [
-    "grpcio>=1.60",
-    "protobuf>=4.25",
+    "grpcio>=1.80.0",
+    "protobuf>=6.31.1",
     "pyarrow>=14",
     "typing_extensions>=4.0",
 ]
 
 [project.optional-dependencies]
 # `make generate` regenerates the proto stubs. The wheel ships the
-# already-generated stubs; this extra is for the developer workflow.
+# already-generated stubs; this extra is the generator toolchain for the
+# developer workflow AND every CI/publish lane — no workflow installs
+# `grpcio-tools` ad hoc. The exact `==` pin is load-bearing: the runtime
+# floors above are derived from what THIS generator emits, and an unpinned
+# generator would let the published wheel's floors silently lie. It is also
+# the newest grpcio-tools whose grpcio runtime counterpart still installs on
+# every Python in `requires-python` (grpcio >=1.81 needs Python >=3.10).
 dev = [
-    "grpcio-tools>=1.60",
+    "grpcio-tools==1.80.0",
     "pytest>=7",
 ]
 

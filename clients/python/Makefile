@@ -21,10 +21,14 @@ PROTO_FILES := \
 	$(PROTO_ROOT)/jammi/v1/audit.proto \
 	$(PROTO_ROOT)/jammi/v1/error.proto
 
-# `generate` rebuilds the proto stubs under _generated/. Run after any
-# *.proto change. CI runs `make generate` and asserts no diff; if this
-# target produces changes that aren't in git, CI fails.
-generate:
+# `generate` rebuilds the proto stubs under _generated/ from scratch. The
+# stubs are never committed: every CI lane and the wheel build regenerate
+# them with the `grpcio-tools` pinned in pyproject's `dev` extra, and
+# tests/test_generated_floor.py asserts the declared grpcio/protobuf floors
+# satisfy the import-time version guards that pin emits. Cleaning $(OUT_DIR)
+# first keeps regeneration reproducible — a proto deleted or moved upstream
+# would otherwise leave an orphaned stub behind.
+generate: clean
 	mkdir -p $(OUT_DIR)
 	python -m grpc_tools.protoc \
 		-I$(PROTO_ROOT) \

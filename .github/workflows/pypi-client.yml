@@ -29,11 +29,15 @@ jobs:
 
       # Generate the proto stubs from the canonical jammi.v1 proto, then build
       # the universal wheel. The stubs are generated-at-build (never committed),
-      # exactly like the npm client's `src/gen`.
+      # exactly like the npm client's `src/gen`. The dev extra carries the
+      # pinned `grpcio-tools` — the published wheel's grpcio/protobuf floors
+      # are derived from what that exact generator emits, so installing it
+      # unpinned here could ship a wheel that crashes at import under its own
+      # declared minima.
       - name: Generate proto stubs
         run: |
           python -m pip install --upgrade pip
-          python -m pip install grpcio-tools
+          python -m pip install -e '.[dev]'
           make generate
 
       - name: Build wheel

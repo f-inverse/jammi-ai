@@ -318,19 +318,21 @@ jobs:
         # venv to avoid polluting the system site-packages and to make
         # `python` resolve to the venv's interpreter for pytest.
         #
-        # The embed wheel now hard-deps `jammi-client` (the remote arm, by
+        # The embed wheel hard-deps `jammi-client` (the remote arm, by
         # composition). It is not on PyPI for an unreleased commit, so install
-        # it from the in-repo source first — generate its proto stubs, then
-        # `pip install -e` it — before `maturin develop` resolves the dep. This
-        # is also exactly what makes the conformance test (`jammi_ai.connect`'s
+        # it from the in-repo source first — `pip install -e` with the dev
+        # extra (which carries the pinned `grpcio-tools` generator and the
+        # client's real grpcio/protobuf floors), then generate its proto
+        # stubs — before `maturin develop` resolves the dep. This is also
+        # exactly what makes the conformance test (`jammi_ai.connect`'s
         # remote IS `jammi_client.RemoteDatabase`) runnable in this lane.
         run: |
           python3 -m venv .venv
           . .venv/bin/activate
           pip install --upgrade pip
-          pip install maturin pytest pyarrow grpcio grpcio-tools protobuf typing_extensions
+          pip install maturin pytest
+          pip install -e 'clients/python[dev]'
           make -C clients/python generate
-          pip install -e clients/python
           maturin develop --release
 
       - name: Run pytest

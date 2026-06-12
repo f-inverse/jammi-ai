@@ -1,0 +1,305 @@
+{
+  "compare": {
+    "per_table": [
+      {
+        "delta": null,
+        "embedding_eval": {
+          "aggregate": {
+            "mrr": 0.5,
+            "ndcg": 0.5,
+            "precision_at_k": 0.5,
+            "recall_at_k": 0.5
+          },
+          "eval_run_id": "run-baseline",
+          "per_query": [
+            {
+              "cohorts": {},
+              "distance": 0.25,
+              "metrics": {
+                "mrr": 0.5,
+                "ndcg": 0.5,
+                "precision": 0.5,
+                "recall": 0.5
+              },
+              "query_id": "q1",
+              "recall_at_ks": [
+                [
+                  1,
+                  0.5
+                ]
+              ]
+            }
+          ]
+        },
+        "table_name": "emb_baseline"
+      },
+      {
+        "delta": {
+          "mrr": {
+            "absolute": -0.125,
+            "relative": -0.25
+          },
+          "ndcg": {
+            "absolute": 0.125,
+            "relative": 0.25
+          },
+          "precision_at_k": {
+            "absolute": 0.0,
+            "relative": 0.0
+          },
+          "recall_at_k": {
+            "absolute": 0.25,
+            "relative": 0.5
+          },
+          "significance": {
+            "mrr": {
+              "ci_lower": -0.25,
+              "ci_upper": 0.0,
+              "p_value": 0.5
+            },
+            "ndcg": {
+              "ci_lower": 0.0,
+              "ci_upper": 0.25,
+              "p_value": 0.25
+            },
+            "precision_at_k": {
+              "ci_lower": 0.0,
+              "ci_upper": 0.0,
+              "p_value": 1.0
+            },
+            "recall_at_k": {
+              "ci_lower": 0.125,
+              "ci_upper": 0.375,
+              "p_value": 0.0625
+            }
+          }
+        },
+        "embedding_eval": {
+          "aggregate": {
+            "mrr": 0.5,
+            "ndcg": 0.5,
+            "precision_at_k": 0.5,
+            "recall_at_k": 0.75
+          },
+          "eval_run_id": "run-paired",
+          "per_query": [
+            {
+              "cohorts": {},
+              "distance": 0.25,
+              "metrics": {
+                "mrr": 0.5,
+                "ndcg": 0.5,
+                "precision": 0.5,
+                "recall": 0.75
+              },
+              "query_id": "q1",
+              "recall_at_ks": [
+                [
+                  1,
+                  0.75
+                ]
+              ]
+            }
+          ]
+        },
+        "table_name": "emb_paired"
+      },
+      {
+        "delta": {
+          "mrr": {
+            "absolute": -0.125,
+            "relative": -0.25
+          },
+          "ndcg": {
+            "absolute": 0.125,
+            "relative": 0.25
+          },
+          "precision_at_k": {
+            "absolute": 0.0,
+            "relative": 0.0
+          },
+          "recall_at_k": {
+            "absolute": 0.25,
+            "relative": 0.5
+          },
+          "significance": null
+        },
+        "embedding_eval": {
+          "aggregate": {
+            "mrr": 0.5,
+            "ndcg": 0.5,
+            "precision_at_k": 0.5,
+            "recall_at_k": 0.25
+          },
+          "eval_run_id": "run-unpaired",
+          "per_query": [
+            {
+              "cohorts": {},
+              "distance": 0.25,
+              "metrics": {
+                "mrr": 0.5,
+                "ndcg": 0.5,
+                "precision": 0.5,
+                "recall": 0.25
+              },
+              "query_id": "q1",
+              "recall_at_ks": [
+                [
+                  1,
+                  0.25
+                ]
+              ]
+            }
+          ]
+        },
+        "table_name": "emb_unpaired"
+      }
+    ]
+  },
+  "derivation": "Verbatim serde_json serialization of the reports constructed in crates/jammi-wire/src/eval/report.rs::projection_fixture_tests, which pins this file from the Rust side. The Python client's projection test (clients/python/tests/test_eval_projection.py) asserts its proto->dict helpers against the same file. Regenerate from the Rust pin test's failure output after an intentional shape change.",
+  "embedding": {
+    "aggregate": {
+      "mrr": 0.625,
+      "ndcg": 0.8125,
+      "precision_at_k": 0.5,
+      "recall_at_k": 0.75
+    },
+    "eval_run_id": "run-embedding-fixture",
+    "per_query": [
+      {
+        "cohorts": {
+          "family": "A",
+          "split": "val"
+        },
+        "distance": 0.125,
+        "metrics": {
+          "mrr": 1.0,
+          "ndcg": 1.0,
+          "precision": 0.5,
+          "recall": 1.0
+        },
+        "query_id": "q1",
+        "recall_at_ks": [
+          [
+            1,
+            0.5
+          ],
+          [
+            3,
+            1.0
+          ],
+          [
+            5,
+            1.0
+          ],
+          [
+            10,
+            1.0
+          ]
+        ]
+      },
+      {
+        "cohorts": {},
+        "distance": 0.0,
+        "metrics": {
+          "mrr": 0.25,
+          "ndcg": 0.625,
+          "precision": 0.5,
+          "recall": 0.5
+        },
+        "query_id": "q2",
+        "recall_at_ks": [
+          [
+            1,
+            0.0
+          ],
+          [
+            3,
+            0.5
+          ],
+          [
+            5,
+            0.5
+          ],
+          [
+            10,
+            0.5
+          ]
+        ]
+      }
+    ]
+  },
+  "inference_classification": {
+    "aggregate": {
+      "accuracy": 0.75,
+      "f1": 0.5,
+      "per_class": {
+        "ham": {
+          "f1": 0.625,
+          "precision": 0.5,
+          "recall": 1.0
+        },
+        "spam": {
+          "f1": 0.625,
+          "precision": 1.0,
+          "recall": 0.5
+        }
+      },
+      "task": "classification"
+    },
+    "per_record": [
+      {
+        "gold": "spam",
+        "predicted": "spam",
+        "record_id": "r1",
+        "task": "classification"
+      },
+      {
+        "gold": "spam",
+        "predicted": "ham",
+        "record_id": "r2",
+        "task": "classification"
+      }
+    ]
+  },
+  "inference_ner": {
+    "aggregate": {
+      "f1": 0.375,
+      "per_type": {
+        "PER": {
+          "f1": 0.375,
+          "precision": 0.5,
+          "recall": 0.25,
+          "support": 4
+        }
+      },
+      "precision": 0.5,
+      "recall": 0.25,
+      "task": "ner"
+    },
+    "per_record": [
+      {
+        "gold": [
+          {
+            "confidence": 0.0,
+            "end": 5,
+            "label": "PER",
+            "start": 0,
+            "text": ""
+          }
+        ],
+        "predicted": [
+          {
+            "confidence": 0.5,
+            "end": 5,
+            "label": "PER",
+            "start": 0,
+            "text": "Alice"
+          }
+        ],
+        "record_id": "n1",
+        "task": "ner"
+      }
+    ]
+  }
+}

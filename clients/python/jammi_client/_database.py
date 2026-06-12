@@ -15,6 +15,7 @@ binds the same way regardless of which client speaks.
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from contextlib import contextmanager
@@ -220,6 +221,193 @@ def _mutable_table_definition_to_dict(
     }
 
 
+def _aggregate_metrics_to_dict(m: eval_pb2.AggregateMetrics) -> Dict[str, Any]:
+    """Project wire `AggregateMetrics` into the embed wheel's aggregate dict."""
+    return {
+        "recall_at_k": m.recall_at_k,
+        "precision_at_k": m.precision_at_k,
+        "mrr": m.mrr,
+        "ndcg": m.ndcg,
+    }
+
+
+def _per_query_record_to_dict(r: eval_pb2.PerQueryRecord) -> Dict[str, Any]:
+    """Project a wire `PerQueryRecord` into the embed wheel's per-query dict.
+
+    `recall_at_ks` is a list of two-element `[k, recall]` pairs — the engine's
+    `(usize, f64)` tuples serialize to JSON arrays, so the typed `RecallAtK`
+    messages are flattened back to that pair shape. `cohorts` is a plain dict
+    (`{}` when the query carried no tags).
+    """
+    return {
+        "query_id": r.query_id,
+        "metrics": {
+            "recall": r.metrics.recall,
+            "precision": r.metrics.precision,
+            "mrr": r.metrics.mrr,
+            "ndcg": r.metrics.ndcg,
+        },
+        "recall_at_ks": [[p.k, p.recall] for p in r.recall_at_ks],
+        "distance": r.distance,
+        "cohorts": dict(r.cohorts),
+    }
+
+
+def _embedding_report_to_dict(report: eval_pb2.EmbeddingEvalReport) -> Dict[str, Any]:
+    """Project a wire `EmbeddingEvalReport` into the embed wheel's nested dict.
+
+    The shape matches the embed `Database.eval_embeddings` (which serializes the
+    engine's `EmbeddingEvalReport` to a dict): ``eval_run_id`` plus an
+    ``aggregate`` block and the ``per_query`` records — so a caller reads the
+    same keys on both transports.
+    """
+    return {
+        "eval_run_id": report.eval_run_id,
+        "aggregate": _aggregate_metrics_to_dict(report.aggregate),
+        "per_query": [_per_query_record_to_dict(r) for r in report.per_query],
+    }
+
+
+def _inference_aggregate_to_dict(agg: eval_pb2.InferenceAggregate) -> Dict[str, Any]:
+    """Project a wire `InferenceAggregate` into the embed wheel's tagged dict.
+
+    The engine's enum is internally serde-tagged (`"task": "classification"` /
+    `"task": "ner"`), so the proto oneof is flattened into one dict carrying the
+    tag alongside the variant's fields — not nested under a variant key.
+    """
+    which = agg.WhichOneof("aggregate")
+    if which == "classification":
+        c = agg.classification
+        return {
+            "task": "classification",
+            "accuracy": c.accuracy,
+            "f1": c.f1,
+            "per_class": {
+                label: {"precision": m.precision, "recall": m.recall, "f1": m.f1}
+                for label, m in c.per_class.items()
+            },
+        }
+    if which == "ner":
+        n = agg.ner
+        return {
+            "task": "ner",
+            "precision": n.precision,
+            "recall": n.recall,
+            "f1": n.f1,
+            "per_type": {
+                t: {
+                    "precision": m.precision,
+                    "recall": m.recall,
+                    "f1": m.f1,
+                    "support": m.support,
+                }
+                for t, m in n.per_type.items()
+            },
+        }
+    raise RuntimeError("InferenceEvalReport carried no aggregate")
+
+
+def _entity_to_dict(e: eval_pb2.Entity) -> Dict[str, Any]:
+    """Project a wire `Entity` span into the embed wheel's entity dict."""
+    return {
+        "label": e.label,
+        "start": e.start,
+        "end": e.end,
+        "text": e.text,
+        "confidence": e.confidence,
+    }
+
+
+def _per_record_prediction_to_dict(
+    rec: eval_pb2.PerRecordPrediction,
+) -> Dict[str, Any]:
+    """Project a wire `PerRecordPrediction` into the embed wheel's tagged dict.
+
+    Same flattening as :func:`_inference_aggregate_to_dict`: the oneof becomes
+    one dict with a ``"task"`` tag alongside the variant's fields.
+    """
+    which = rec.WhichOneof("prediction")
+    if which == "classification":
+        c = rec.classification
+        return {
+            "task": "classification",
+            "record_id": c.record_id,
+            "predicted": c.predicted,
+            "gold": c.gold,
+        }
+    if which == "ner":
+        n = rec.ner
+        return {
+            "task": "ner",
+            "record_id": n.record_id,
+            "predicted": [_entity_to_dict(e) for e in n.predicted],
+            "gold": [_entity_to_dict(e) for e in n.gold],
+        }
+    raise RuntimeError("PerRecordPrediction carried no prediction")
+
+
+def _inference_report_to_dict(report: eval_pb2.InferenceEvalReport) -> Dict[str, Any]:
+    """Project a wire `InferenceEvalReport` into the embed wheel's nested dict."""
+    return {
+        "aggregate": _inference_aggregate_to_dict(report.aggregate),
+        "per_record": [_per_record_prediction_to_dict(r) for r in report.per_record],
+    }
+
+
+def _metric_significance_to_dict(s: eval_pb2.MetricSignificance) -> Dict[str, Any]:
+    """Project a wire `MetricSignificance` into the embed wheel's dict."""
+    return {"p_value": s.p_value, "ci_lower": s.ci_lower, "ci_upper": s.ci_upper}
+
+
+def _aggregate_delta_to_dict(d: eval_pb2.AggregateDelta) -> Dict[str, Any]:
+    """Project a wire `AggregateDelta` into the embed wheel's delta dict.
+
+    ``significance`` is presence-wrapped on the wire: when the baseline and
+    treatment runs share no query to pair on, the embed dict carries ``None``
+    there — the key is always present, mirroring the engine's serde output.
+    """
+
+    def metric(m: eval_pb2.MetricDelta) -> Dict[str, Any]:
+        return {"absolute": m.absolute, "relative": m.relative}
+
+    significance = None
+    if d.HasField("significance"):
+        s = d.significance
+        significance = {
+            "recall_at_k": _metric_significance_to_dict(s.recall_at_k),
+            "precision_at_k": _metric_significance_to_dict(s.precision_at_k),
+            "mrr": _metric_significance_to_dict(s.mrr),
+            "ndcg": _metric_significance_to_dict(s.ndcg),
+        }
+    return {
+        "recall_at_k": metric(d.recall_at_k),
+        "precision_at_k": metric(d.precision_at_k),
+        "mrr": metric(d.mrr),
+        "ndcg": metric(d.ndcg),
+        "significance": significance,
+    }
+
+
+def _compare_report_to_dict(report: eval_pb2.CompareEvalReport) -> Dict[str, Any]:
+    """Project a wire `CompareEvalReport` into the embed wheel's nested dict.
+
+    ``delta`` is presence-wrapped on the wire: the baseline (first) table carries
+    ``None`` — the key is always present, mirroring the engine's serde output.
+    """
+    return {
+        "per_table": [
+            {
+                "table_name": t.table_name,
+                "embedding_eval": _embedding_report_to_dict(t.embedding_eval),
+                "delta": (
+                    _aggregate_delta_to_dict(t.delta) if t.HasField("delta") else None
+                ),
+            }
+            for t in report.per_table
+        ]
+    }
+
+
 def _calibration_report_to_dict(
     report: eval_pb2.CalibrationEvalReport,
 ) -> Dict[str, Any]:
@@ -342,6 +530,13 @@ _SET_AGGREGATOR = {
 _CALIBRATION_SHAPE = {
     "gaussian": eval_pb2.CalibrationShape.CALIBRATION_SHAPE_GAUSSIAN,
     "sample": eval_pb2.CalibrationShape.CALIBRATION_SHAPE_SAMPLE,
+}
+
+# Inference-eval task string → the wire `EvalTask` enum, matching the engine's
+# `EvalTask` parse (the two inference tasks that carry golden labels).
+_EVAL_TASK = {
+    "classification": eval_pb2.EvalTask.EVAL_TASK_CLASSIFICATION,
+    "ner": eval_pb2.EvalTask.EVAL_TASK_NER,
 }
 
 # Terminal training-job states, matching the engine's `TrainingJobStatus`.
@@ -1384,16 +1579,15 @@ class RemoteDatabase:
         )
         return _arrow_batch_to_table(resp.result)
 
-    # --- Engine-state pipeline verbs (PipelineService / EvalService) -------------
+    # --- Engine-state pipeline verbs (PipelineService) ----------------------------
     #
     # These build durable graph/embedding artifacts or assemble a target's
     # conditioning context on the remote engine. The two graph-build verbs return
     # the materialised table name (the caller reads it via `sql(...)`); the
     # compute stays server-side, so the table is byte-identical to one built in
-    # the embedded engine. `assemble_context` returns the pooled vector inline,
-    # and `eval_calibration` the typed calibration report. The signatures mirror
-    # the embed `Database`'s so a caller swaps transports without changing the
-    # call.
+    # the embedded engine. `assemble_context` returns the pooled vector inline.
+    # The signatures mirror the embed `Database`'s so a caller swaps transports
+    # without changing the call.
 
     def build_neighbor_graph(
         self,
@@ -1604,6 +1798,145 @@ class RemoteDatabase:
             "value_rows": value_rows,
             "source": resp.source,
         }
+
+    # --- Evaluation verbs (EvalService) -------------------------------------------
+    #
+    # The eval family measures model quality against golden data held in the
+    # engine, so the compute runs where the data is and only the typed report
+    # crosses the wire. Each verb returns the same nested dict the embed
+    # `Database` produces (the engine's serde report shape), so a caller reads
+    # the same keys on both transports. A `golden_source` is an unquoted
+    # relation reference — a bare name or the full catalog path
+    # `<source>.public.<table>`.
+
+    def eval_embeddings(
+        self,
+        *,
+        source: str,
+        golden_source: str,
+        embedding_table: Optional[str] = None,
+        k: int = 10,
+        cohorts: Optional[Dict[str, Dict[str, str]]] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate embedding retrieval quality against a golden relevance set.
+
+        Returns the same nested dict the embed `Database` produces:
+        ``eval_run_id``, ``aggregate`` (mean ``recall_at_k`` /
+        ``precision_at_k`` / ``mrr`` / ``ndcg`` over all queries), and
+        ``per_query`` (one record per golden-set query). ``embedding_table``
+        names the result table to evaluate; ``None`` resolves the source's most
+        recent embedding table. ``golden_source`` addresses the golden set by
+        its full catalog path (``<source>.public.<table>``) or bare name.
+        ``cohorts`` optionally maps a golden-set ``query_id`` to an opaque
+        ``{key: value}`` segment map, persisted with that query's per-query
+        metrics (read back via :meth:`eval_per_query`). Maps to
+        `EvalService.EvalEmbeddings`.
+        """
+        request = eval_pb2.EvalEmbeddingsRequest(
+            source_id=source,
+            golden_source=golden_source,
+            k=k,
+        )
+        if embedding_table is not None:
+            request.embedding_table = embedding_table
+        for query_id, tags in (cohorts or {}).items():
+            request.cohorts[query_id].tags.update(tags)
+        resp = self._eval.EvalEmbeddings(request, metadata=self._metadata)
+        return _embedding_report_to_dict(resp)
+
+    def eval_per_query(self, eval_run_id: str) -> List[Dict[str, Any]]:
+        """Read back the persisted per-query eval records for a run, scoped to
+        the calling tenant.
+
+        Returns a list of dicts, each carrying ``eval_run_id``, ``query_id``,
+        ``cohorts`` (a dict), and ``metrics`` (a dict of ``recall@1/3/5/10``,
+        ``mrr``, ``ndcg``, ``distance``) — the same shape the embed `Database`
+        produces. The wire carries ``cohorts``/``metrics`` as JSON-object
+        strings (their storage shape); they are decoded into structured dicts
+        here, exactly as the embed binding does. Maps to
+        `EvalService.EvalPerQuery`.
+        """
+        resp = self._eval.EvalPerQuery(
+            eval_pb2.EvalPerQueryRequest(eval_run_id=eval_run_id),
+            metadata=self._metadata,
+        )
+        return [
+            {
+                "eval_run_id": rec.eval_run_id,
+                "query_id": rec.query_id,
+                "cohorts": json.loads(rec.cohorts_json),
+                "metrics": json.loads(rec.metrics_json),
+            }
+            for rec in resp.records
+        ]
+
+    def eval_inference(
+        self,
+        *,
+        model: str,
+        source: str,
+        columns: List[str],
+        task: str,
+        golden_source: str,
+        label_column: str,
+    ) -> Dict[str, Any]:
+        """Evaluate inference quality against golden labels.
+
+        Returns the same nested dict the embed `Database` produces:
+        ``aggregate`` (task-shaped, tagged by ``"task"``) and ``per_record``
+        (one tagged record per predicted/gold pair). ``task`` is
+        ``"classification"`` or ``"ner"``; ``golden_source`` addresses the
+        golden labels by full catalog path (``<source>.public.<table>``) or
+        bare name, with ``label_column`` naming the gold-label column. Maps to
+        `EvalService.EvalInference`.
+        """
+        try:
+            task_value = _EVAL_TASK[task]
+        except KeyError:
+            raise ValueError(
+                f"task must be 'classification' or 'ner' (got {task!r})"
+            ) from None
+        resp = self._eval.EvalInference(
+            eval_pb2.EvalInferenceRequest(
+                model_id=model,
+                source_id=source,
+                columns=list(columns),
+                task=task_value,
+                golden_source=golden_source,
+                label_column=label_column,
+            ),
+            metadata=self._metadata,
+        )
+        return _inference_report_to_dict(resp)
+
+    def eval_compare(
+        self,
+        *,
+        embedding_tables: List[str],
+        source: str,
+        golden_source: str,
+        k: int = 10,
+    ) -> Dict[str, Any]:
+        """Compare multiple embedding tables side-by-side against one golden set.
+
+        Returns the same nested dict the embed `Database` produces: a
+        ``per_table`` list whose first entry is the baseline (``delta: None``)
+        and whose subsequent entries carry a ``delta`` against it (per-metric
+        absolute/relative deltas plus paired ``significance``, ``None`` when
+        the runs share no query to pair on). ``golden_source`` addresses the
+        golden set by full catalog path (``<source>.public.<table>``) or bare
+        name. Maps to `EvalService.EvalCompare`.
+        """
+        resp = self._eval.EvalCompare(
+            eval_pb2.EvalCompareRequest(
+                embedding_tables=list(embedding_tables),
+                source_id=source,
+                golden_source=golden_source,
+                k=k,
+            ),
+            metadata=self._metadata,
+        )
+        return _compare_report_to_dict(resp)
 
     def eval_calibration(
         self,

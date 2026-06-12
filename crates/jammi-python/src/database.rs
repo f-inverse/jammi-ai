@@ -1298,26 +1298,32 @@ impl PyDatabase {
     /// over all queries) and `per_query` (one record per golden-set query)
     /// keys.
     ///
+    /// `embedding_table` names the embedding result table to evaluate;
+    /// `None` resolves the source's most recent embedding table.
+    ///
     /// `cohorts` optionally maps a golden-set `query_id` to an opaque
     /// `{key: value}` segment map, persisted with that query's per-query
     /// metrics (read back via `db.eval_per_query(...)`, spec J9).
-    #[pyo3(signature = (*, source, golden_source, model=None, k=10, cohorts=None))]
+    #[pyo3(signature = (*, source, golden_source, embedding_table=None, k=10, cohorts=None))]
     fn eval_embeddings(
         &self,
         py: Python<'_>,
         source: &str,
         golden_source: &str,
-        model: Option<&str>,
+        embedding_table: Option<&str>,
         k: usize,
         cohorts: Option<HashMap<String, BTreeMap<String, String>>>,
     ) -> PyResult<Py<PyAny>> {
         let cohorts = cohorts.unwrap_or_default();
         let report = self
             .runtime
-            .block_on(
-                self.session
-                    .eval_embeddings(source, model, golden_source, k, &cohorts),
-            )
+            .block_on(self.session.eval_embeddings(
+                source,
+                embedding_table,
+                golden_source,
+                k,
+                &cohorts,
+            ))
             .map_err(to_pyerr)?;
         serializable_to_pydict(py, &report)
     }

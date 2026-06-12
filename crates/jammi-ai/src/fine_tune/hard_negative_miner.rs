@@ -30,13 +30,38 @@
 //!
 //! [Xiong et al. 2020]: https://arxiv.org/abs/2007.00808
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
 
 use super::HardNegativeConfig;
+
+/// Ceiling on how many *excluded* neighbours the over-fetch budgets for.
+///
+/// `mine` over-fetches `k + excluded.len() + 1` so that, after the excluded
+/// neighbourhood and the self-hit are dropped, `k` survivors remain. The term
+/// that can blow up is `excluded.len()`: on a dense corpus the
+/// `exclude_hops`-hop expansion can grow it to a large fraction of the corpus,
+/// and budgeting for all of it would turn the ANN query into a near-full scan —
+/// defeating the index. So the over-fetch budgets for at most this many excluded
+/// ids. The `k + 1` base is never capped, so the query always asks for at least
+/// `k` survivors plus the self-hit; the bound only limits headroom for an
+/// extreme excluded set. If that headroom is genuinely exhausted (the top
+/// `k + 1 + MAX_EXCLUDED_FETCH` neighbours are all excluded), the anchor falls
+/// through to the existing "no usable negative" drop path rather than returning
+/// a wrong (excluded) negative.
+const MAX_EXCLUDED_FETCH: usize = 512;
+
+/// How many neighbours to over-fetch for one anchor: `k` survivors, the self-hit,
+/// and headroom for the excluded ids — the excluded headroom capped at
+/// [`MAX_EXCLUDED_FETCH`] so a pathological excluded set cannot escalate the
+/// query toward a full scan. The `k + 1` base is uncapped, so `k` itself is
+/// never the limiting factor regardless of how large it is set.
+fn capped_fetch(k: usize, excluded_len: usize) -> usize {
+    k + 1 + excluded_len.min(MAX_EXCLUDED_FETCH)
+}
 
 /// One candidate row available to be mined as a hard negative: a stable id and
 /// its current embedding under the model being trained.
@@ -71,10 +96,6 @@ pub fn should_refresh(epoch: usize, refresh_every: usize) -> bool {
 /// querying the same index.
 pub struct HardNegativeMiner {
     index: SidecarIndex,
-    /// id → embedding, kept alongside the index because the index does not
-    /// expose its stored vectors and the k-hop expansion needs to re-query
-    /// using a frontier id's own embedding.
-    id_to_embedding: HashMap<String, Vec<f32>>,
     config: HardNegativeConfig,
 }
 
@@ -91,7 +112,6 @@ impl HardNegativeMiner {
             })?;
 
         let mut index = SidecarIndex::new(dim)?;
-        let mut id_to_embedding = HashMap::with_capacity(candidates.len());
         for cand in candidates {
             if cand.embedding.len() != dim {
                 return Err(JammiError::FineTune(format!(
@@ -101,15 +121,10 @@ impl HardNegativeMiner {
                 )));
             }
             index.add(&cand.id, &cand.embedding)?;
-            id_to_embedding.insert(cand.id.clone(), cand.embedding.clone());
         }
         index.build()?;
 
-        Ok(Self {
-            index,
-            id_to_embedding,
-            config,
-        })
+        Ok(Self { index, config })
     }
 
     /// Mine up to `k` hard negatives for one anchor, returning their ids in
@@ -123,8 +138,13 @@ impl HardNegativeMiner {
         let excluded = self.excluded_neighbourhood(&anchor.positive_id)?;
 
         // Over-fetch so that after removing the excluded neighbourhood (and any
-        // self/positive hit) at least `k` candidates remain when they exist.
-        let fetch = self.config.k + excluded.len() + 1;
+        // self/positive hit) at least `k` candidates remain when they exist. The
+        // excluded headroom is capped (see `capped_fetch`) so a pathologically
+        // large excluded set cannot turn the ANN query into a near-full scan; the
+        // `k + 1` base is uncapped. If that headroom is genuinely exhausted, the
+        // anchor falls through to the drop path below — it is never given a wrong
+        // (excluded) negative.
+        let fetch = capped_fetch(self.config.k, excluded.len());
         let neighbours = self.index.search(&anchor.embedding, fetch)?;
 
         let mut mined = Vec::with_capacity(self.config.k);
@@ -158,7 +178,7 @@ impl HardNegativeMiner {
         for _hop in 0..self.config.exclude_hops {
             let mut next = Vec::new();
             for id in &frontier {
-                let Some(vector) = self.embedding_of(id) else {
+                let Some(vector) = self.embedding_of(id)? else {
                     continue;
                 };
                 // k + 1 to cover the self-hit, which is dropped by the excluded
@@ -178,9 +198,9 @@ impl HardNegativeMiner {
         Ok(excluded)
     }
 
-    /// Look up a row's embedding by id from the miner's id→embedding map.
-    fn embedding_of(&self, id: &str) -> Option<Vec<f32>> {
-        self.id_to_embedding.get(id).cloned()
+    /// Look up a row's embedding by id from the index's own stored vectors.
+    fn embedding_of(&self, id: &str) -> Result<Option<Vec<f32>>> {
+        self.index.get(id)
     }
 }
 
@@ -275,5 +295,107 @@ mod tests {
         // Every-epoch refresh.
         assert!(should_refresh(0, 1));
         assert!(should_refresh(1, 1));
+    }
+
+    /// The k-hop exclusion re-queries each frontier id's embedding. With the
+    /// redundant `id_to_embedding` copy removed, that embedding now comes from
+    /// the index's own stored vectors via [`SidecarIndex::get`]. A 2-hop
+    /// expansion exercises the index lookup on ids that are *not* the original
+    /// positive (the second-hop frontier), proving the index-backed lookup
+    /// works: with both `dup` (1-hop of `pos`) and `bridge` (1-hop of `dup`,
+    /// 2-hop of `pos`) excluded, only the far-but-safe `real` is mined.
+    #[test]
+    fn two_hop_expansion_reads_embeddings_from_index() {
+        // `dup` is `pos`'s nearest neighbour (1-hop); `bridge` is `dup`'s nearest
+        // neighbour but *farther* from `pos` than `dup` is, so it is reachable
+        // only by expanding from `dup` — i.e. only via `dup`'s embedding fetched
+        // back from the index.
+        let candidates = vec![
+            cand("pos", vec![1.0, 0.0, 0.0, 0.0]),
+            cand("dup", vec![0.9, 0.436, 0.0, 0.0]),
+            cand("bridge", vec![0.8, 0.6, 0.0, 0.0]),
+            cand("real", vec![0.0, 0.0, 1.0, 0.0]),
+        ];
+        let config = HardNegativeConfig {
+            mine: true,
+            k: 1,
+            exclude_hops: 2,
+            refresh_every: 1,
+        };
+        let miner = HardNegativeMiner::build(&candidates, config).unwrap();
+
+        // The excluded neighbourhood must reach the 2-hop `bridge`, which is only
+        // discoverable by querying `dup`'s embedding fetched back from the index.
+        let excluded = miner.excluded_neighbourhood("pos").unwrap();
+        assert!(excluded.contains("pos"));
+        assert!(excluded.contains("dup"), "1-hop neighbour excluded");
+        assert!(
+            excluded.contains("bridge"),
+            "2-hop neighbour reached via index-fetched embedding, got {excluded:?}"
+        );
+
+        let anchor = AnchorQuery {
+            embedding: vec![1.0, 0.0, 0.0, 0.0],
+            positive_id: "pos".to_string(),
+        };
+        let mined = miner.mine(&anchor).unwrap();
+        assert_eq!(
+            mined,
+            vec!["real".to_string()],
+            "only the safe far row survives the 2-hop exclusion"
+        );
+    }
+
+    /// The excluded headroom is capped regardless of how large the excluded set
+    /// grows on a dense corpus, so the ANN query can never escalate into a
+    /// near-full scan; below the cap it is the exact over-fetch. The `k + 1` base
+    /// is never capped, so `k` survivors are always budgeted for even when `k`
+    /// itself is large.
+    #[test]
+    fn fetch_is_capped_under_dense_exclusion() {
+        // Small excluded set: exact over-fetch (k + excluded + self-hit).
+        assert_eq!(capped_fetch(1, 3), 5);
+        assert_eq!(capped_fetch(5, 10), 16);
+        // A pathological excluded set (a large fraction of a dense corpus) caps
+        // the excluded headroom at the ceiling instead of fetching the corpus —
+        // but the k+1 base is still added on top, so survivors are budgeted for.
+        assert_eq!(capped_fetch(1, 100_000), 1 + 1 + MAX_EXCLUDED_FETCH);
+        assert_eq!(capped_fetch(3, usize::MAX - 10), 3 + 1 + MAX_EXCLUDED_FETCH);
+        // A large `k` is never the limiter: the base scales with k, uncapped, so
+        // the query always asks for at least `k` survivors plus the self-hit.
+        assert_eq!(capped_fetch(1000, 0), 1001);
+        assert_eq!(capped_fetch(1000, 100_000), 1000 + 1 + MAX_EXCLUDED_FETCH);
+    }
+
+    /// Correctness is unchanged by the working-set bounding: for a fixed
+    /// deterministic fixture the miner selects the SAME hard negative it did
+    /// before the index-backed lookup and the fetch cap. With `k = 1` the
+    /// positive's 1-hop neighbour `dup` is excluded, and the hardest remaining
+    /// survivor — not the excluded near-duplicate, not the far row — is mined.
+    #[test]
+    fn selection_unchanged_for_deterministic_fixture() {
+        let candidates = vec![
+            cand("pos", vec![1.0, 0.0, 0.0]),
+            cand("dup", vec![0.999, 0.001, 0.0]),
+            cand("near", vec![0.9, 0.44, 0.0]),
+            cand("mid", vec![0.7, 0.71, 0.0]),
+            cand("far", vec![0.0, 0.0, 1.0]),
+        ];
+        let config = HardNegativeConfig {
+            mine: true,
+            k: 1,
+            exclude_hops: 1,
+            refresh_every: 1,
+        };
+        let miner = HardNegativeMiner::build(&candidates, config).unwrap();
+
+        let anchor = AnchorQuery {
+            embedding: vec![1.0, 0.0, 0.0],
+            positive_id: "pos".to_string(),
+        };
+        let mined = miner.mine(&anchor).unwrap();
+        // `dup` is excluded (1-hop of `pos`); the hardest survivor is `near`,
+        // ahead of `mid` and `far`.
+        assert_eq!(mined, vec!["near".to_string()]);
     }
 }

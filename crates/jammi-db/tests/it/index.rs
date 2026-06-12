@@ -43,6 +43,36 @@ fn sidecar_add_search_and_edge_cases() {
     assert!(empty.is_empty());
 }
 
+// ─── get: stored vectors readable back by id ─────────────────────────────────
+
+#[test]
+fn sidecar_get_returns_stored_vectors() {
+    let mut index = SidecarIndex::new(3).unwrap();
+    index.add("row_a", &[1.0, 0.0, 0.0]).unwrap();
+    index.add("row_b", &[0.0, 1.0, 0.0]).unwrap();
+    index.build().unwrap();
+
+    // A stored vector is readable back by its id — the index is the single owner
+    // of the embeddings, so callers need not keep a second id→vector copy.
+    let a = index.get("row_a").unwrap().expect("row_a is indexed");
+    assert_eq!(a, vec![1.0, 0.0, 0.0]);
+    let b = index.get("row_b").unwrap().expect("row_b is indexed");
+    assert_eq!(b, vec![0.0, 1.0, 0.0]);
+
+    // An unknown id is `None`, not an error.
+    assert!(index.get("missing").unwrap().is_none());
+
+    // The id→key reverse map survives save/load.
+    let dir = tempdir().unwrap();
+    let base_path = dir.path().join("get_roundtrip");
+    index.save(&base_path).unwrap();
+    let loaded = SidecarIndex::load(&base_path).unwrap();
+    assert_eq!(
+        loaded.get("row_b").unwrap().expect("row_b after load"),
+        vec![0.0, 1.0, 0.0]
+    );
+}
+
 // ─── Save/load roundtrip with manifest verification ──────────────────────────
 
 #[test]

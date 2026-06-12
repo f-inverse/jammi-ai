@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -18,6 +19,11 @@ pub struct SidecarIndex {
     dimensions: usize,
     index: usearch::Index,
     row_map: Vec<String>,
+    /// Reverse of `row_map`: `_row_id` → internal USearch key, so a stored
+    /// vector can be fetched back by id via [`SidecarIndex::get`] without the
+    /// caller keeping a second copy of the vectors. Holds only the ids (the same
+    /// strings already in `row_map`), never the embeddings.
+    row_index: HashMap<String, u64>,
     built: bool,
 }
 
@@ -36,8 +42,30 @@ impl SidecarIndex {
             dimensions,
             index,
             row_map: Vec::new(),
+            row_index: HashMap::new(),
             built: false,
         })
+    }
+
+    /// Fetch the stored vector for `row_id`, or `None` if the id is not indexed.
+    ///
+    /// Reads the vector USearch already holds rather than asking the caller to
+    /// keep its own id→vector map — the index is the single owner of the
+    /// embeddings it was built over.
+    pub fn get(&self, row_id: &str) -> Result<Option<Vec<f32>>> {
+        let Some(&key) = self.row_index.get(row_id) else {
+            return Ok(None);
+        };
+        let mut out = Vec::new();
+        let found = self
+            .index
+            .export(key, &mut out)
+            .map_err(|e| JammiError::Other(format!("USearch get: {e}")))?;
+        if found == 0 {
+            return Ok(None);
+        }
+        out.truncate(self.dimensions);
+        Ok(Some(out))
     }
 
     /// Save the sidecar bundle (`.usearch` + `.rowmap` + `.manifest.json`).
@@ -131,10 +159,17 @@ impl SidecarIndex {
             .load(usearch_path.to_str().unwrap_or_default())
             .map_err(|e| JammiError::Other(format!("USearch load: {e}")))?;
 
+        let row_index = row_map
+            .iter()
+            .enumerate()
+            .map(|(key, id)| (id.clone(), key as u64))
+            .collect();
+
         Ok(Self {
             dimensions,
             index,
             row_map,
+            row_index,
             built: true,
         })
     }
@@ -161,6 +196,7 @@ impl VectorIndex for SidecarIndex {
             .add(key, vector)
             .map_err(|e| JammiError::Other(format!("USearch add: {e}")))?;
         self.row_map.push(row_id.to_string());
+        self.row_index.insert(row_id.to_string(), key);
         Ok(())
     }
 

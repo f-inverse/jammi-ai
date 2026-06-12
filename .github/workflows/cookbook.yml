@@ -35,16 +35,17 @@ jobs:
         # The CI base image ships maturin + a system python3; venv-isolate to
         # avoid polluting site-packages and to make `python` resolve to the
         # venv's interpreter for the smoke runner. The embed wheel hard-deps
-        # `jammi-client`, not on PyPI for an unreleased commit — install it from
-        # the in-repo source (generate stubs, then `pip install -e`) before
-        # `maturin develop`.
+        # `jammi-client`, not on PyPI for an unreleased commit — install it
+        # from the in-repo source (`pip install -e` with the dev extra, which
+        # carries the pinned `grpcio-tools` generator, then generate stubs)
+        # before `maturin develop`.
         run: |
           python3 -m venv .venv
           . .venv/bin/activate
           pip install --upgrade pip
-          pip install maturin pyarrow grpcio grpcio-tools protobuf typing_extensions
+          pip install maturin
+          pip install -e 'clients/python[dev]'
           make -C clients/python generate
-          pip install -e clients/python
           maturin develop --release
 
       - name: Run cookbook smoke
@@ -65,15 +66,17 @@ jobs:
       - name: Build wheel + jammi-server binary
         # `flight_sql` shells out to `target/release/jammi-server`; build it
         # before invoking the smoke runner. The embed wheel hard-deps
-        # `jammi-client` (not on PyPI for an unreleased commit) — install it from
-        # the in-repo source before `maturin develop`.
+        # `jammi-client` (not on PyPI for an unreleased commit) — install it
+        # from the in-repo source (`pip install -e` with the dev extra, which
+        # carries the pinned `grpcio-tools` generator, then generate stubs)
+        # before `maturin develop`.
         run: |
           python3 -m venv .venv
           . .venv/bin/activate
           pip install --upgrade pip
-          pip install maturin pyarrow grpcio grpcio-tools protobuf typing_extensions
+          pip install maturin
+          pip install -e 'clients/python[dev]'
           make -C clients/python generate
-          pip install -e clients/python
           maturin develop --release
           cargo build --release -p jammi-server
 

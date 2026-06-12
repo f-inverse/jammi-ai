@@ -6,6 +6,19 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Fixed
+- **`jammi-client`'s declared floors can no longer lie about its stubs.** The
+  proto stubs are generated at wheel-build time, and an unpinned `grpcio-tools`
+  baked import-time guards (`GRPC_GENERATED_VERSION`,
+  `ValidateProtobufRuntimeVersion`) far above the wheel's declared
+  `grpcio>=1.60` / `protobuf>=4.25` — a wheel installed at its own minima
+  crashed on import. The generator is now pinned (`grpcio-tools==1.80.0` in the
+  `dev` extra, consumed by every CI/publish lane), the runtime floors are
+  raised to what that pin emits (`grpcio>=1.80.0`, `protobuf>=6.31.1`), and a
+  hermetic test asserts the floors satisfy the guards in freshly generated
+  stubs. `make generate` also cleans `_generated/` first, so a proto removed
+  upstream can't leave an orphaned stub behind.
+
 ## v0.26.4 — 2026-06-12
 
 Wire-parity for the trigger/mutable-table substrate, tenant-scope ergonomics, and

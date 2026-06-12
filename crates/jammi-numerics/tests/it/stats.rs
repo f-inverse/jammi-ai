@@ -84,3 +84,30 @@ fn bootstrap_ci_errors_on_empty_samples() {
     let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
     assert!(bootstrap_ci(&[], mean, 100, 0.05, 42).is_err());
 }
+
+#[test]
+fn bootstrap_ci_is_invariant_to_input_order() {
+    // The bootstrap is a property of the sample multiset, not its order. The
+    // resampler draws positions under a fixed seed, so before the canonical
+    // basis this same multiset in two orders selected different values and
+    // produced two different intervals. A permutation must now be byte-identical.
+    let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
+    let ordered: Vec<f64> = vec![0.1, 0.4, 0.2, 0.9, 0.3, 0.7, 0.5, 0.8, 0.6, 0.0];
+    let mut shuffled = ordered.clone();
+    shuffled.reverse();
+    shuffled.rotate_left(3);
+    assert_ne!(ordered, shuffled, "the two orders must actually differ");
+
+    let a = bootstrap_ci(&ordered, mean, 10_000, 0.05, 0x6a616d6d695f7031).unwrap();
+    let b = bootstrap_ci(&shuffled, mean, 10_000, 0.05, 0x6a616d6d695f7031).unwrap();
+    assert_eq!(
+        a.lower.to_bits(),
+        b.lower.to_bits(),
+        "ci_lower must be byte-identical across input orders"
+    );
+    assert_eq!(
+        a.upper.to_bits(),
+        b.upper.to_bits(),
+        "ci_upper must be byte-identical across input orders"
+    );
+}

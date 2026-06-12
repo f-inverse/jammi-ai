@@ -55,6 +55,21 @@ workspace ships every publishable crate at the same
   name.
 
 ### Fixed
+- **`eval_compare` significance CIs no longer depend on per-query emission
+  order.** `bootstrap_ci` resampled its input positionally under a fixed seed,
+  so the same multiset of paired per-query differences in a different order
+  selected different values and produced a different confidence interval. Since
+  `per_query` carries no `ORDER BY`, two engine instances could emit the same
+  records in different orders and diverge on `delta.significance.<metric>.ci_*`
+  while every point metric, delta, and the Mann–Whitney p-value agreed exactly
+  — a self-comparison (all differences zero) hid it. The bootstrap now
+  canonicalizes its sample basis (sorts the input) before the seeded resample,
+  making the interval a function of the sample *multiset*, not its order — the
+  property a seeded resampler needs to be reproducible across instances. All
+  three call sites compute the order-invariant mean, so the canonicalization is
+  correct for every one. A `jammi-numerics` unit test pins order-invariance of
+  `bootstrap_ci` directly and a `jammi-wire` test pins it through
+  `delta_significance` on a non-degenerate paired set.
 - **The evidence-channel catalog is now tenant-scoped (cross-tenant data leak,
   D1).** `evidence_channels.channel_name` was a global `TEXT PRIMARY KEY` and the
   channel repo carried no tenant predicate, so one tenant's `register`/`list`

@@ -360,8 +360,13 @@ pub struct DeltaSignificance {
 ///   baseline and treatment per-query distributions — distribution-free and
 ///   robust to the bounded, tie-heavy shape of retrieval metrics.
 ///
-/// Both are deterministic: the bootstrap runs under [`BOOTSTRAP_SEED`] and a
-/// fixed iteration count, so identical inputs yield identical output.
+/// Both are deterministic *and order-invariant*: the bootstrap runs under
+/// [`BOOTSTRAP_SEED`] and a fixed iteration count over a canonicalized sample
+/// basis (`bootstrap_ci` sorts its input), and the rank-sum U is closed-form,
+/// so the same paired multiset yields byte-identical output regardless of the
+/// order the per-query records were emitted in. This matters because
+/// `per_query` carries no stable emission order across engine instances, so a
+/// transport-independent CI must not depend on that order.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct MetricSignificance {
     pub p_value: f64,
@@ -1314,6 +1319,74 @@ mod significance_tests {
             "p-value should be small for a clear lift: {}",
             sig.recall_at_k.p_value
         );
+    }
+
+    #[test]
+    fn significance_is_invariant_to_per_query_emission_order() {
+        // `per_query` carries no stable order across engine instances (no ORDER
+        // BY on emission), so the paired significance — CI included — must be a
+        // function of the paired multiset, not the order the records arrive in.
+        // A genuinely non-degenerate compare (a non-constant, non-uniform lift)
+        // is what exposes order-sensitivity; a self-comparison's all-zero
+        // differences would hide it.
+        let lifts = [0.05, 0.40, -0.10, 0.30, 0.15, 0.55, -0.05, 0.25, 0.45, 0.10];
+        let make = |order: &[usize]| -> (Vec<PerQueryRecord>, Vec<PerQueryRecord>) {
+            let baseline: Vec<PerQueryRecord> = order
+                .iter()
+                .map(|&i| {
+                    let b = 0.2 + 0.03 * i as f64;
+                    record(&format!("q{i}"), b, b, b, b)
+                })
+                .collect();
+            let treatment: Vec<PerQueryRecord> = order
+                .iter()
+                .map(|&i| {
+                    let b = 0.2 + 0.03 * i as f64;
+                    let t = b + lifts[i];
+                    record(&format!("q{i}"), t, t, t, t)
+                })
+                .collect();
+            (baseline, treatment)
+        };
+
+        let ascending: Vec<usize> = (0..lifts.len()).collect();
+        let mut shuffled = ascending.clone();
+        shuffled.reverse();
+        shuffled.rotate_left(3);
+        assert_ne!(ascending, shuffled, "the two emission orders must differ");
+
+        let (b1, t1) = make(&ascending);
+        let (b2, t2) = make(&shuffled);
+        let a = delta_significance(&b1, &t1).expect("paired");
+        let c = delta_significance(&b2, &t2).expect("paired");
+
+        // The non-degenerate CI is the value the bug moved: assert it is not the
+        // degenerate [0, 0] before pinning order-invariance, so this test cannot
+        // pass vacuously on a collapsed interval.
+        assert!(
+            a.recall_at_k.ci_lower != 0.0 || a.recall_at_k.ci_upper != 0.0,
+            "fixture must be non-degenerate: CI is [{}, {}]",
+            a.recall_at_k.ci_lower,
+            a.recall_at_k.ci_upper
+        );
+        for (x, y) in [
+            (a.recall_at_k, c.recall_at_k),
+            (a.precision_at_k, c.precision_at_k),
+            (a.mrr, c.mrr),
+            (a.ndcg, c.ndcg),
+        ] {
+            assert_eq!(
+                x.ci_lower.to_bits(),
+                y.ci_lower.to_bits(),
+                "ci_lower must be byte-identical across emission orders"
+            );
+            assert_eq!(
+                x.ci_upper.to_bits(),
+                y.ci_upper.to_bits(),
+                "ci_upper must be byte-identical across emission orders"
+            );
+            assert_eq!(x.p_value.to_bits(), y.p_value.to_bits());
+        }
     }
 
     #[test]

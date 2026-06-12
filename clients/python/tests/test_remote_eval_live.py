@@ -62,6 +62,18 @@ TINY_MODERNBERT = f"local:{FIXTURES / 'tiny_modernbert'}"
 TINY_CLASSIFIER = f"local:{COOKBOOK_FIXTURES / 'tiny_modernbert_classifier'}"
 LABELS_URL = f"file://{COOKBOOK_FIXTURES / 'tiny_labels.csv'}"
 
+# A second deterministic encoder distinct from `tiny_modernbert`, so a compare
+# over the two embedding tables produces a genuinely non-zero delta (not the
+# all-zero self-comparison that hides an order-sensitive significance CI).
+TINY_BERT = f"local:{COOKBOOK_FIXTURES / 'tiny_bert'}"
+
+# The deterministic NER model + its corpus and per-span gold, the same fixtures
+# the engine's hermetic NER eval drives. NER per-record entities carry a
+# `confidence`, the field whose cross-transport parity this module pins.
+TINY_NER = f"local:{COOKBOOK_FIXTURES / 'tiny_modernbert_ner'}"
+NER_CORPUS_URL = f"file://{COOKBOOK_FIXTURES / 'tiny_ner_corpus.parquet'}"
+NER_GOLD_URL = f"file://{COOKBOOK_FIXTURES / 'tiny_ner_gold.csv'}"
+
 # Per-run identifiers whose VALUES differ across engine instances by
 # construction: `eval_run_id` is a fresh UUID per run; `table_name` embeds the
 # embedding table's creation timestamp. Their keys stay pinned by `_shape`.
@@ -84,21 +96,37 @@ def _shape(obj):
     return type(obj).__name__
 
 
-def _assert_values_close(a, b, path=""):
+# Per-field float tolerance overrides, keyed by dict key. A field carried on
+# the wire at a narrower precision than f64 cannot agree across transports to
+# the f64 `_TOL`: the engine computes a NER span's `confidence` in f32, so both
+# transports carry the same f32 value but widen it to a Python float by two
+# different conventions (the embed wheel serializes the f32 through serde's
+# shortest-decimal; the gRPC client reads a 32-bit proto `float` back as its
+# exact f64 widening). The two f64s agree only to f32 precision (~1e-7), so
+# `confidence` is compared at an f32-relative bound, never the f64 `_TOL`. This
+# is the field's true cross-transport contract, not a slackened metric.
+_F32_REL = 1e-6
+_FLOAT_TOL_BY_KEY = {"confidence": dict(rel=_F32_REL, abs=_F32_REL)}
+
+
+def _assert_values_close(a, b, path="", key=None):
     """Recursive value equality with `_TOL`-close floats, skipping the
-    instance-minted identifier values (their presence is pinned by `_shape`)."""
+    instance-minted identifier values (their presence is pinned by `_shape`).
+    A float under a key in `_FLOAT_TOL_BY_KEY` is compared at that key's bound
+    instead of `_TOL` — see the table for why `confidence` is f32-precision."""
     if isinstance(a, dict):
         assert set(a) == set(b), f"{path}: keys {set(a)} != {set(b)}"
         for k in a:
             if k in _INSTANCE_KEYS:
                 continue
-            _assert_values_close(a[k], b[k], f"{path}.{k}")
+            _assert_values_close(a[k], b[k], f"{path}.{k}", key=k)
     elif isinstance(a, list):
         assert len(a) == len(b), f"{path}: length {len(a)} != {len(b)}"
         for i, (x, y) in enumerate(zip(a, b)):
-            _assert_values_close(x, y, f"{path}[{i}]")
+            _assert_values_close(x, y, f"{path}[{i}]", key=key)
     elif isinstance(a, float):
-        assert a == pytest.approx(b, abs=_TOL), f"{path}: {a} != {b}"
+        tol = _FLOAT_TOL_BY_KEY.get(key, dict(abs=_TOL))
+        assert a == pytest.approx(b, **tol), f"{path}: {a} != {b}"
     else:
         assert a == b, f"{path}: {a!r} != {b!r}"
 
@@ -247,6 +275,145 @@ def test_eval_compare_round_trip_matches_embedded(live_server, tmp_path):
     finally:
         # The embedded engine releases its resources on drop (RAII); only the
         # remote client holds a gRPC channel that needs an explicit close.
+        remote.close()
+
+
+def _embed_with(db, tag: str, model: str, slot: str) -> str:
+    """Embed the `patents` corpus under a per-(test, model) source with a chosen
+    encoder, returning the embedding table name. The `slot` disambiguates two
+    encoders sharing one test's `tag` on the module-shared remote server."""
+    source = f"patents_{tag}_{slot}"
+    db.add_source(source, url=PATENTS_URL, format="parquet")
+    return db.generate_embeddings(
+        source=source,
+        model=model,
+        columns=["abstract"],
+        key="id",
+        modality="text",
+    )
+
+
+def test_eval_compare_nondegenerate_significance_matches_embedded(
+    live_server, tmp_path
+):
+    """`eval_compare` over two DIFFERENT encoders (a genuine, non-zero delta)
+    returns a significance CI that matches across transports AND is reproducible.
+
+    The self-comparison case (every paired difference is exactly zero) collapses
+    the bootstrap CI onto [0, 0], hiding any order-sensitivity in the resampler.
+    Two distinct encoders give non-zero per-query differences whose multiset the
+    two engines may emit in different orders; the CI must depend only on that
+    multiset, so it must agree across transports and reproduce within a transport.
+    """
+    tag = "cmpnd"
+    remote = jammi_client.connect(live_server)
+    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    try:
+        reports = {}
+        for name, db in (("remote", remote), ("embedded", embedded)):
+            baseline = _embed_with(db, tag, TINY_MODERNBERT, "mb")
+            treatment = _embed_with(db, tag, TINY_BERT, "bert")
+            golden = _register_relevance_golden(db, tag)
+            # Run twice on the SAME transport to pin within-transport
+            # reproducibility independently of the cross-transport parity.
+            first = db.eval_compare(
+                embedding_tables=[baseline, treatment],
+                source=f"patents_{tag}_mb",
+                golden_source=golden,
+                k=10,
+            )
+            second = db.eval_compare(
+                embedding_tables=[baseline, treatment],
+                source=f"patents_{tag}_mb",
+                golden_source=golden,
+                k=10,
+            )
+            for report in (first, second):
+                for entry in report["per_table"]:
+                    entry["embedding_eval"] = _sorted_per_query(
+                        entry["embedding_eval"]
+                    )
+            # Reproducible within a transport: the seeded bootstrap over a fixed
+            # multiset is byte-identical run-to-run, CI included.
+            for entry_a, entry_b in zip(first["per_table"], second["per_table"]):
+                _assert_values_close(entry_a["delta"], entry_b["delta"], path=name)
+            reports[name] = first
+
+        # The treatment delta is genuinely non-zero — the fixture is not a
+        # disguised self-comparison, so the CI is exercised off [0, 0].
+        sig = {}
+        for name, report in reports.items():
+            treatment = report["per_table"][1]
+            assert treatment["delta"] is not None, name
+            assert treatment["delta"]["significance"] is not None, name
+            sig[name] = treatment["delta"]["significance"]
+            nonzero = any(
+                treatment["delta"][m]["absolute"] != 0.0
+                for m in ("recall_at_k", "precision_at_k", "mrr", "ndcg")
+            )
+            assert nonzero, f"{name}: two distinct encoders must differ on some metric"
+
+        # The significance CI (the field the order-sensitivity bug moved) agrees
+        # across transports for every metric.
+        for metric in ("recall_at_k", "precision_at_k", "mrr", "ndcg"):
+            for bound in ("ci_lower", "ci_upper", "p_value"):
+                assert sig["remote"][metric][bound] == pytest.approx(
+                    sig["embedded"][metric][bound], abs=_TOL
+                ), (metric, bound, sig["remote"][metric][bound], sig["embedded"][metric][bound])
+    finally:
+        remote.close()
+
+
+def test_eval_inference_ner_round_trip_matches_embedded(live_server, tmp_path):
+    """`eval_inference` (NER) over the deterministic NER fixture returns the same
+    report shape and `_TOL`-close metrics on both transports, including each
+    per-record predicted entity's `confidence`.
+
+    NER is the only eval path whose per-record payload carries a `confidence`
+    float, so it is the path that exercises that field's cross-transport parity.
+    The engine computes the span confidence in f32; both transports carry that
+    same f32 but widen it to a Python float by different conventions (see
+    `_FLOAT_TOL_BY_KEY`), so `confidence` agrees only to f32 precision — that
+    f32-relative bound is its contract, while every other report float still
+    holds to `_TOL`.
+    """
+    tag = "infner"
+    source = f"patents_ner_{tag}"
+    golden_source = f"golden_ner_{tag}"
+    remote = jammi_client.connect(live_server)
+    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    try:
+        reports = {}
+        for name, db in (("remote", remote), ("embedded", embedded)):
+            db.add_source(source, url=NER_CORPUS_URL, format="parquet")
+            db.add_source(golden_source, url=NER_GOLD_URL, format="csv")
+            reports[name] = db.eval_inference(
+                model=TINY_NER,
+                source=source,
+                columns=["text"],
+                task="ner",
+                golden_source=f"{golden_source}.public.tiny_ner_gold",
+                label_column="label",
+            )
+
+        assert _shape(reports["remote"]) == _shape(reports["embedded"])
+        _assert_values_close(reports["remote"], reports["embedded"])
+
+        # The aggregate is the NER variant on both transports, and the per-record
+        # payload carries predicted entity spans with a `confidence` float.
+        saw_confidence = False
+        for name, report in reports.items():
+            assert report["aggregate"]["task"] == "ner", name
+            assert report["per_record"], name
+            for rec in report["per_record"]:
+                assert rec["task"] == "ner", name
+                for entity in rec["predicted"]:
+                    assert isinstance(entity["confidence"], float), name
+                    saw_confidence = True
+        # A predicted span (carrying a populated confidence) must appear, or the
+        # parity assertion above never touched the field the test exists to pin.
+        assert saw_confidence, "NER fixture must yield at least one predicted span"
+    finally:
         remote.close()
 
 

@@ -47,7 +47,7 @@ async fn smoke_cp3_full_pipeline() {
 
     // Vector search
     let results = session
-        .search("patents", vec![0.5_f32; 32], 5)
+        .search("patents", vec![0.5_f32; 32], 5, None)
         .await
         .unwrap()
         .run()

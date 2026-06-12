@@ -72,7 +72,7 @@ async fn third_party_scored_by_channel_columns_appear_in_search_results() {
     // already merged in by the engine.
     let query = vec![0.5_f32; 32];
     let batches = session
-        .search("patents", query, 5)
+        .search("patents", query, 5, None)
         .await
         .unwrap()
         .run()
@@ -160,7 +160,7 @@ async fn rows_not_touched_by_channel_have_null_in_that_channels_columns() {
 
     let query = vec![0.5_f32; 32];
     let batches = session
-        .search("patents", query, 5)
+        .search("patents", query, 5, None)
         .await
         .unwrap()
         .run()
@@ -217,7 +217,7 @@ async fn channel_contribution_arrow_dtypes_must_match_catalog_declaration() {
 
     let query = vec![0.5_f32; 32];
     let batches = session
-        .search("patents", query, 5)
+        .search("patents", query, 5, None)
         .await
         .unwrap()
         .run()

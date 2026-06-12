@@ -650,9 +650,13 @@ impl PyDatabase {
     /// `pyarrow.Table` directly — the same shape, the same call, as the bundled
     /// `jammi-client`'s `search` (and the typed `Search` gRPC verb). `filter` is
     /// an optional SQL predicate over the hydrated results; `select` projects
-    /// columns (empty keeps every hydrated column). For compound retrieval
-    /// (join / model inference over the results), use `query` (SQL).
-    #[pyo3(signature = (source, *, query, k, filter=None, select=None))]
+    /// columns (empty keeps every hydrated column). `embedding_table` names
+    /// which of the source's embedding tables to search (e.g. a raw,
+    /// propagated, or fine-tuned table); `None` searches the most-recent ready
+    /// table. For compound retrieval (join / model inference over the
+    /// results), use `query` (SQL).
+    #[pyo3(signature = (source, *, query, k, filter=None, select=None, embedding_table=None))]
+    #[allow(clippy::too_many_arguments)]
     fn search(
         &self,
         py: Python<'_>,
@@ -661,11 +665,13 @@ impl PyDatabase {
         k: usize,
         filter: Option<String>,
         select: Option<Vec<String>>,
+        embedding_table: Option<String>,
     ) -> PyResult<Py<PyAny>> {
         let request = SearchRequest {
             source_id: source.to_string(),
             query: SearchQuery::Vector(query),
             k,
+            embedding_table,
             filter,
             select: select.unwrap_or_default(),
         };

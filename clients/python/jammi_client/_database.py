@@ -1199,13 +1199,16 @@ class RemoteDatabase:
         k: int,
         filter: Optional[str] = None,
         select: Optional[List[str]] = None,
+        embedding_table: Optional[str] = None,
     ) -> pa.Table:
         """Nearest-neighbor search over a source's embedding table.
 
         `query` is the query vector; `filter` is an optional SQL predicate over
         the hydrated results; `select` projects columns (empty keeps the
-        keyed+scored shape). Returns a `pyarrow.Table`. Maps to
-        `EmbeddingService.Search`.
+        keyed+scored shape). `embedding_table` names which of the source's
+        embedding tables to search (e.g. a raw, propagated, or fine-tuned
+        table); ``None`` searches the most-recent ready table. Returns a
+        `pyarrow.Table`. Maps to `EmbeddingService.Search`.
         """
         request = embedding_pb2.SearchRequest(
             source_id=source,
@@ -1215,6 +1218,8 @@ class RemoteDatabase:
         )
         if filter is not None:
             request.filter = filter
+        if embedding_table is not None:
+            request.embedding_table = embedding_table
         resp = self._embedding.Search(request, metadata=self._metadata)
         return _hits_to_table(list(resp.hits))
 

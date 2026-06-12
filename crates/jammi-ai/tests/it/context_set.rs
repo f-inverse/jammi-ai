@@ -180,7 +180,7 @@ async fn exclude_self_drops_the_targets_own_row() {
     // Pick a real key and query by its own stored vector — it is the nearest
     // neighbour of itself, so without the guard it would head the context.
     let hydrated = session
-        .search("patents", vec![0.0_f32; 32], 1)
+        .search("patents", vec![0.0_f32; 32], 1, None)
         .await
         .unwrap()
         .run()

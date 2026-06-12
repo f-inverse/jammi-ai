@@ -71,6 +71,7 @@ async fn local_session_matches_engine_for_embed_and_search() {
             source_id: "patents".to_string(),
             query: SearchQuery::Vector(query.clone()),
             k: 5,
+            embedding_table: None,
             filter: None,
             select: Vec::new(),
         })
@@ -79,7 +80,7 @@ async fn local_session_matches_engine_for_embed_and_search() {
 
     // Same query straight through the engine builder.
     let via_engine = engine
-        .search("patents", query, 5)
+        .search("patents", query, 5, None)
         .await
         .unwrap()
         .run()
@@ -153,13 +154,14 @@ async fn local_session_encode_and_search_by_row_key_match_engine() {
             source_id: "patents".to_string(),
             query: SearchQuery::RowKey(key.clone()),
             k: 3,
+            embedding_table: None,
             filter: None,
             select: Vec::new(),
         })
         .await
         .unwrap();
     let via_engine_key = engine
-        .search_by_id("patents", &key, 3)
+        .search_by_id("patents", &key, 3, None)
         .await
         .unwrap()
         .run()

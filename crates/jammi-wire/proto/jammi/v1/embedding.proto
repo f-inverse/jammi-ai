@@ -137,6 +137,10 @@ message SearchRequest {
   // Columns to project into each hit's `columns` map. Empty = key + score
   // only (no projected columns).
   repeated string select = 6;
+  // Which embedding table of the source to search. Unset = the source's
+  // most-recent ready table. Naming a table searches that one (e.g. a raw,
+  // propagated, or fine-tuned table when a source carries several).
+  optional string embedding_table = 7;
 }
 
 message SearchResponse {

@@ -180,6 +180,7 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
         source_id: "patents".to_string(),
         query: SearchQuery::Vector(remote_vec.clone()),
         k: 5,
+        embedding_table: None,
         filter: None,
         select,
     };
@@ -336,6 +337,7 @@ async fn remote_reconstructs_the_exact_error_variant_local_returns() {
         source_id: "patents".to_string(),
         query: SearchQuery::RowKey("any-key".to_string()),
         k: 3,
+        embedding_table: None,
         filter: None,
         select: Vec::new(),
     };

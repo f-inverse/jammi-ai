@@ -129,6 +129,20 @@ _EVAL_VERBS = {
 }
 
 
+# The evidence-channel registry verbs. These DO hit the wire: the channel
+# catalog lives in the engine, so register/append/list run against the remote
+# engine's state (`CatalogService`). The embedded `Database` mutates/reads the
+# compiled engine's catalog; the client's `RemoteDatabase` drives them over
+# gRPC. The catalog is tenant-scoped, so both honour the session's bound tenant.
+# The call surface must agree so a caller swaps transports without changing the
+# call — pinned here against the embed `jammi_ai.Database`.
+_CHANNEL_VERBS = {
+    "register_channel",
+    "add_channel_columns",
+    "list_channels",
+}
+
+
 # The stateless conformal / RRF numerics. These are NOT on the gRPC wire: their
 # inputs are caller-supplied arrays the engine never holds, so a wire hop would
 # only ship data the caller already has. The embedded `Database` computes them
@@ -174,6 +188,7 @@ def test_remote_surface_has_every_verb():
         | _INFERENCE_VERBS
         | _PIPELINE_VERBS
         | _EVAL_VERBS
+        | _CHANNEL_VERBS
         | _MUTABLE_TOPIC_VERBS
     ):
         assert callable(getattr(jammi_client.RemoteDatabase, verb)), verb
@@ -223,6 +238,19 @@ def test_eval_verbs_have_identical_signatures_across_wheels():
     a caller swaps transports without changing the call — pinned name-for-name,
     kind-for-kind, and default-for-default so a divergence in either is caught."""
     for verb in _EVAL_VERBS:
+        client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
+        embed = _call_surface(getattr(jammi_ai.Database, verb))
+        assert client == embed, f"{verb}: {embed} != {client}"
+
+
+def test_channel_verbs_have_identical_signatures_across_wheels():
+    """The evidence-channel registry verbs carry the SAME call surface on the
+    client's `RemoteDatabase` as on the embedded engine's `jammi_ai.Database`.
+    Both drive over the same verb vocabulary (the client over gRPC, the embed
+    in-process), so a caller swaps transports without changing the call — pinned
+    name-for-name, kind-for-kind, and default-for-default so a divergence in
+    either is caught."""
+    for verb in _CHANNEL_VERBS:
         client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
         embed = _call_surface(getattr(jammi_ai.Database, verb))
         assert client == embed, f"{verb}: {embed} != {client}"

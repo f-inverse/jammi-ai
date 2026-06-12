@@ -26,6 +26,24 @@ workspace ships every publishable crate at the same
   `connect("grpc://…")` without changing the call. The result rides back as one
   unary `ArrowBatch`, so gRPC's default 4 MB receive cap bounds the result size a
   default channel can carry.
+- **`RemoteDatabase` gains the evidence-channel family.** The published gRPC
+  client's `register_channel`, `add_channel_columns`, and `list_channels` drive
+  the engine's provenance-channel registry server-side (`CatalogService`) and
+  carry the same call surface as the embedded `Database`, so a caller swaps
+  transports without changing the call. `list_channels` returns the same dict
+  shape on both transports — a list of
+  `{"channel_id", "priority", "columns": [{"name", "data_type"}]}` ordered by
+  `(priority, channel_id)`, with `data_type` the canonical PascalCase token
+  (`"Float32"`, `"Utf8"`, …) that `register_channel` accepts. The registry is
+  tenant-scoped: each verb rides the session's bound tenant, so a channel
+  registered under one tenant is invisible to another and both may hold a
+  channel of the same id without collision, while an unbound session sees only
+  the global seed channels.
+- **`Database.list_channels` on the embedded binding.** The in-process engine
+  now exposes `list_channels` alongside `register_channel` /
+  `add_channel_columns`, returning the registry read-back in the same dict
+  shape as the remote client — closing the read half of the channel registry on
+  both transports.
 
 ### Changed
 - **`Database.eval_embeddings` names its result-table selector for what it is.**

@@ -49,7 +49,11 @@ impl ChannelColumnType {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    /// The canonical PascalCase variant name (`"Float32"`, `"Utf8"`, …). This is
+    /// the string form shared with the catalog's stored representation, with
+    /// [`Self::from_sql_str`], and with public-API callers (the Python binding's
+    /// `register_channel` / `list_channels`, which round-trips this exact token).
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Float32 => "Float32",
             Self::Float64 => "Float64",

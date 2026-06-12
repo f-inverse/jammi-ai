@@ -539,8 +539,69 @@ _EVAL_TASK = {
     "ner": eval_pb2.EvalTask.EVAL_TASK_NER,
 }
 
+# Channel-column dtype token → the wire `ChannelColumnType` enum. The token is
+# the canonical PascalCase variant name the engine's `ChannelColumnType` parses
+# (`ChannelColumnType::from_sql_str`) and the embed binding's `register_channel`
+# accepts, so `register_channel(columns=[(name, dtype)])` takes the same
+# vocabulary on both transports.
+_CHANNEL_COLUMN_TYPE = {
+    "Float32": catalog_pb2.ChannelColumnType.CHANNEL_COLUMN_TYPE_FLOAT32,
+    "Float64": catalog_pb2.ChannelColumnType.CHANNEL_COLUMN_TYPE_FLOAT64,
+    "Int32": catalog_pb2.ChannelColumnType.CHANNEL_COLUMN_TYPE_INT32,
+    "Int64": catalog_pb2.ChannelColumnType.CHANNEL_COLUMN_TYPE_INT64,
+    "Utf8": catalog_pb2.ChannelColumnType.CHANNEL_COLUMN_TYPE_UTF8,
+    "Boolean": catalog_pb2.ChannelColumnType.CHANNEL_COLUMN_TYPE_BOOLEAN,
+}
+
+# Inverse of `_CHANNEL_COLUMN_TYPE`: wire enum → canonical PascalCase token. The
+# inverse of one map keeps the two directions from drifting; `list_channels`
+# decodes a wire column's `data_type` back to the same token `register_channel`
+# accepts, matching the embed binding's `ChannelColumnType::as_str`.
+_CHANNEL_COLUMN_TYPE_NAME = {v: k for k, v in _CHANNEL_COLUMN_TYPE.items()}
+
 # Terminal training-job states, matching the engine's `TrainingJobStatus`.
 _TERMINAL_STATES = {"completed", "failed"}
+
+
+def _channel_columns_message(
+    columns: Sequence[Tuple[str, str]],
+) -> List[catalog_pb2.ChannelColumn]:
+    """Encode `(name, dtype)` tuples into wire `ChannelColumn` messages.
+
+    `dtype` is the canonical PascalCase token (`"Float32"`, `"Utf8"`, …) the
+    embed binding's `register_channel` accepts; an unknown token raises
+    `ValueError` rather than silently sending `UNSPECIFIED`, mirroring the
+    engine's `ChannelColumnType::from_sql_str` rejection.
+    """
+    out: List[catalog_pb2.ChannelColumn] = []
+    for name, dtype in columns:
+        try:
+            data_type = _CHANNEL_COLUMN_TYPE[dtype]
+        except KeyError:
+            raise ValueError(
+                f"channel column dtype must be one of "
+                f"{sorted(_CHANNEL_COLUMN_TYPE)} (got {dtype!r})"
+            ) from None
+        out.append(catalog_pb2.ChannelColumn(name=name, data_type=data_type))
+    return out
+
+
+def _channel_spec_to_dict(c: catalog_pb2.Channel) -> Dict[str, Any]:
+    """Project a wire `Channel` into the embed binding's channel-spec dict.
+
+    The shape matches the embed `Database.list_channels` entry — ``channel_id``,
+    ``priority``, and ``columns`` (each a ``{"name", "data_type"}`` dict whose
+    ``data_type`` is the canonical PascalCase token) — so a caller reads the same
+    keys, in the same column order, regardless of transport.
+    """
+    return {
+        "channel_id": c.channel_id,
+        "priority": c.priority,
+        "columns": [
+            {"name": col.name, "data_type": _CHANNEL_COLUMN_TYPE_NAME[col.data_type]}
+            for col in c.columns
+        ],
+    }
 
 
 def _embedding_loss_message(
@@ -1969,6 +2030,71 @@ class RemoteDatabase:
             request.cohorts[record_id].tags.update(tags)
         resp = self._eval.EvalCalibration(request, metadata=self._metadata)
         return _calibration_report_to_dict(resp)
+
+    # --- Channels ----------------------------------------------------------------
+
+    def register_channel(
+        self,
+        channel_id: str,
+        *,
+        priority: int,
+        columns: Sequence[Tuple[str, str]],
+    ) -> None:
+        """Register an evidence-provenance channel and its initial columns.
+
+        `columns` is a list of `(name, dtype)` tuples where `dtype` is one of
+        ``"Float32"``, ``"Float64"``, ``"Int32"``, ``"Int64"``, ``"Utf8"``,
+        ``"Boolean"`` — the same vocabulary the embed binding accepts.
+        ``priority`` orders the channel against others contributing the same
+        column. The channel id is unique PER TENANT, scoped to this connection's
+        currently bound tenant: two tenants may each register a channel of the
+        same id without collision, but re-registering an id already present for
+        the bound tenant raises. Maps to `CatalogService.RegisterChannel`.
+        """
+        self._catalog.RegisterChannel(
+            catalog_pb2.RegisterChannelRequest(
+                channel_id=channel_id,
+                priority=priority,
+                columns=_channel_columns_message(columns),
+            ),
+            metadata=self._metadata,
+        )
+
+    def add_channel_columns(
+        self,
+        channel_id: str,
+        *,
+        columns: Sequence[Tuple[str, str]],
+    ) -> None:
+        """Append columns to an already-registered channel (append-only).
+
+        `columns` is a list of `(name, dtype)` tuples in the same vocabulary as
+        :meth:`register_channel`. The append-only invariant is enforced
+        server-side: redeclaring an existing column with a different dtype
+        raises. Maps to `CatalogService.AddChannelColumns`.
+        """
+        self._catalog.AddChannelColumns(
+            catalog_pb2.AddChannelColumnsRequest(
+                channel_id=channel_id,
+                columns=_channel_columns_message(columns),
+            ),
+            metadata=self._metadata,
+        )
+
+    def list_channels(self) -> List[Dict[str, Any]]:
+        """List every evidence channel registered to the currently bound tenant,
+        ordered by ``(priority, channel_id)``.
+
+        Returns the same list of dicts the embed `Database` produces — each
+        ``{"channel_id", "priority", "columns": [{"name", "data_type"}]}`` with
+        ``data_type`` the canonical PascalCase token and ``columns`` in
+        declaration order. An unbound connection sees only the global
+        (NULL-tenant) channels. Maps to `CatalogService.ListChannels`.
+        """
+        resp = self._catalog.ListChannels(
+            catalog_pb2.ListChannelsRequest(), metadata=self._metadata
+        )
+        return [_channel_spec_to_dict(c) for c in resp.channels]
 
     def _start_training(
         self, request: training_pb2.StartTrainingRequest

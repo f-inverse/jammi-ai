@@ -24,7 +24,7 @@ let query = session.encode_text_query(
 ).await?;
 
 // Search — returns top 10 results
-let results = session.search("patents", query, 10).await?
+let results = session.search("patents", query, 10, None).await?
     .run().await?;
 # Ok(()) }
 ```
@@ -67,7 +67,7 @@ fluent `QueryBuilder` (`session.search(...)` returns the builder, which also car
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
 # async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
-session.search("patents", query, 20).await?
+session.search("patents", query, 20, None).await?
     .filter("year > 2020")?
     .sort("similarity", true)?  // descending
     .limit(5)
@@ -100,7 +100,7 @@ function for inference. In Rust the same operations compose on the fluent builde
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
 # async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
-let results = session.search("patents", query, 100).await?
+let results = session.search("patents", query, 100, None).await?
     .filter("year > 2020")?
     .sort("similarity", true)?
     .limit(10)

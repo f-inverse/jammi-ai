@@ -251,6 +251,7 @@ impl DataClient {
             source_id,
             query,
             k,
+            embedding_table,
             filter,
             select,
         } = request;
@@ -264,6 +265,7 @@ impl DataClient {
                 source_id,
                 query: Some(query),
                 k: k as u32,
+                embedding_table,
                 filter,
                 select: select.clone(),
             })

@@ -243,6 +243,34 @@ def test_eval_verbs_have_identical_signatures_across_wheels():
         assert client == embed, f"{verb}: {embed} != {client}"
 
 
+# The vector-search verb. It DOES hit the wire: the source's embedding tables
+# live in the engine, so the ANN search runs where the vectors are
+# (`EmbeddingService.Search`) and only the hits cross the wire. The embedded
+# `Database` searches in the compiled engine; the client's `RemoteDatabase`
+# drives it over gRPC. The call surface — including the `embedding_table=`
+# selector that names WHICH of a source's embedding tables to search — must
+# agree so a caller swaps transports without changing the call. Pinned against
+# the embed `jammi_ai.Database`.
+_SEARCH_VERBS = {
+    "search",
+}
+
+
+def test_search_verb_has_identical_signature_across_wheels():
+    """`search` carries the SAME call surface on the client's `RemoteDatabase`
+    as on the embedded engine's `jammi_ai.Database` — including the
+    `embedding_table=` table selector. Both drive over the same verb vocabulary
+    (the client over gRPC, the embed in-process), so a caller swaps transports
+    without changing the call — pinned name-for-name, kind-for-kind, and
+    default-for-default so a divergence in either is caught."""
+    for verb in _SEARCH_VERBS:
+        client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
+        embed = _call_surface(getattr(jammi_ai.Database, verb))
+        assert client == embed, f"{verb}: {embed} != {client}"
+        names = {p[0] for p in embed}
+        assert "embedding_table" in names, f"{verb} must expose embedding_table"
+
+
 def test_channel_verbs_have_identical_signatures_across_wheels():
     """The evidence-channel registry verbs carry the SAME call surface on the
     client's `RemoteDatabase` as on the embedded engine's `jammi_ai.Database`.

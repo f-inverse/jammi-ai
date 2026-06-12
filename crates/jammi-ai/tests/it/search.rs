@@ -50,7 +50,7 @@ async fn search_returns_hydrated_results_with_provenance() {
 
     let query = vec![0.5_f32; 32];
     let results = session
-        .search("patents", query, 5)
+        .search("patents", query, 5, None)
         .await
         .unwrap()
         .run()
@@ -122,7 +122,7 @@ async fn search_by_id_ranks_the_query_row_first() {
 
     // Discover a real key by reading one row's `_row_id` from a plain search.
     let seed = session
-        .search("patents", vec![0.5_f32; 32], 1)
+        .search("patents", vec![0.5_f32; 32], 1, None)
         .await
         .unwrap()
         .run()
@@ -139,7 +139,7 @@ async fn search_by_id_ranks_the_query_row_first() {
     // search_by_id resolves that row's stored vector internally and ranks by
     // it; a row is its own nearest neighbor, so it must come back first.
     let results = session
-        .search_by_id("patents", &row_key, 5)
+        .search_by_id("patents", &row_key, 5, None)
         .await
         .unwrap()
         .run()
@@ -170,7 +170,10 @@ async fn search_by_id_ranks_the_query_row_first() {
 #[tokio::test]
 async fn search_by_id_rejects_an_unknown_key() {
     let (session, _dir) = session_with_embeddings().await;
-    let err = match session.search_by_id("patents", "no-such-key", 5).await {
+    let err = match session
+        .search_by_id("patents", "no-such-key", 5, None)
+        .await
+    {
         Ok(_) => panic!("an unknown key must error, not silently return nothing"),
         Err(e) => e,
     };
@@ -188,7 +191,7 @@ async fn search_sort_and_limit_compose() {
 
     let query = vec![0.5_f32; 32];
     let results = session
-        .search("patents", query, 10)
+        .search("patents", query, 10, None)
         .await
         .unwrap()
         .sort("similarity", true)
@@ -235,7 +238,7 @@ async fn search_fails_without_embedding_table() {
         .await
         .unwrap();
 
-    let result = session.search("patents", vec![0.0f32; 32], 5).await;
+    let result = session.search("patents", vec![0.0f32; 32], 5, None).await;
     assert!(
         result.is_err(),
         "Search should fail when no embedding table exists"
@@ -263,7 +266,7 @@ async fn search_with_join_on_real_foreign_key() {
 
     let query = vec![0.5_f32; 32];
     let results = session
-        .search("patents", query, 5)
+        .search("patents", query, 5, None)
         .await
         .unwrap()
         .join("assignees", "assignee_id=id", None)
@@ -308,7 +311,7 @@ async fn search_with_annotate_on_real_column() {
 
     let query = vec![0.5_f32; 32];
     let results = session
-        .search("patents", query, 3)
+        .search("patents", query, 3, None)
         .await
         .unwrap()
         .annotate(
@@ -437,13 +440,128 @@ async fn search_resolves_to_latest_embedding_table() {
     // Search should work using the resolved (latest) table.
     let query = vec![0.5_f32; 32];
     let results = session
-        .search("patents", query, 5)
+        .search("patents", query, 5, None)
         .await
         .unwrap()
         .run()
         .await
         .unwrap();
     assert!(!results.is_empty(), "Search should succeed on latest table");
+}
+
+// ─── Explicit table selector: search picks WHICH embedding table ─────────────
+
+/// The ordered `_row_id` neighbour keys a search returns, flattened across
+/// batches. Two searches that hit different embedding tables of the same source
+/// must return different neighbour lists — that is what proves the selector
+/// actually selects rather than silently using the most-recent table.
+fn neighbour_keys(batches: &[arrow::record_batch::RecordBatch]) -> Vec<String> {
+    let mut keys = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column_by_name("_row_id")
+            .expect("results carry `_row_id`")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("`_row_id` is a StringArray");
+        for i in 0..batch.num_rows() {
+            keys.push(ids.value(i).to_string());
+        }
+    }
+    keys
+}
+
+/// A source can carry several embedding tables (raw / propagated / fine-tuned).
+/// `search(..., embedding_table=Some(name))` searches THAT table; two different
+/// tables yield table-distinct neighbours for the same query, and
+/// `embedding_table=None` preserves the most-recent-table default.
+#[tokio::test]
+async fn search_embedding_table_selector_picks_the_named_table() {
+    let dir = TempDir::new().unwrap();
+    let config = common::test_config(dir.path());
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+
+    session
+        .add_source(
+            "patents",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let model = tiny_bert_model();
+
+    // Two embedding tables on the SAME source, embedding different text columns
+    // so their vectors — and therefore the nearest neighbours of a fixed query —
+    // differ. `r_title` is created first; `r_abstract` last (the most-recent).
+    let r_title = session
+        .generate_text_embeddings("patents", &model, &["title".to_string()], "id")
+        .await
+        .unwrap();
+    let r_abstract = session
+        .generate_text_embeddings("patents", &model, &["abstract".to_string()], "id")
+        .await
+        .unwrap();
+    assert_ne!(
+        r_title.table_name, r_abstract.table_name,
+        "the two columns must produce distinct embedding tables"
+    );
+
+    let query = session
+        .encode_text_query(&model, "quantum computing")
+        .await
+        .unwrap();
+    let k = 10;
+    let run = |table: Option<String>| {
+        let session = Arc::clone(&session);
+        let query = query.clone();
+        async move {
+            neighbour_keys(
+                &session
+                    .search("patents", query, k, table.as_deref())
+                    .await
+                    .unwrap()
+                    .sort("similarity", true)
+                    .unwrap()
+                    .run()
+                    .await
+                    .unwrap(),
+            )
+        }
+    };
+
+    let title_keys = run(Some(r_title.table_name.clone())).await;
+    let abstract_keys = run(Some(r_abstract.table_name.clone())).await;
+    let default_keys = run(None).await;
+
+    assert!(
+        !title_keys.is_empty() && !abstract_keys.is_empty(),
+        "each named table returns neighbours"
+    );
+
+    // The selector selects: naming the title table vs the abstract table for the
+    // same query returns table-distinct neighbour lists.
+    assert_ne!(
+        title_keys, abstract_keys,
+        "selecting different embedding tables must return different neighbours \
+         (title={title_keys:?}, abstract={abstract_keys:?})"
+    );
+
+    // `embedding_table=None` preserves today's behaviour: the most-recent ready
+    // table — here the abstract table, created last.
+    assert_eq!(
+        default_keys, abstract_keys,
+        "embedding_table=None must search the most-recent table (abstract)"
+    );
+    assert_ne!(
+        default_keys, title_keys,
+        "the default must NOT silently search the title table"
+    );
 }
 
 // ─── Semantic relevance: encode_query → search returns meaningful results ─────
@@ -461,7 +579,7 @@ async fn search_returns_semantically_relevant_results() {
     // k=20 is deliberately >= the number of patents to verify we never return
     // more rows than exist.
     let results = session
-        .search("patents", query_vec, 20)
+        .search("patents", query_vec, 20, None)
         .await
         .unwrap()
         .run()
@@ -580,7 +698,7 @@ async fn cross_modal_text_to_image_search() {
 
     // 3. Run vector search against the image embeddings using the text vector.
     let results = session
-        .search("figures", text_vec, 5)
+        .search("figures", text_vec, 5, None)
         .await
         .unwrap()
         .run()

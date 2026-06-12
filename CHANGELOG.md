@@ -6,6 +6,22 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Added
+- **`search` gains an `embedding_table=` selector.** A source can carry several
+  embedding tables (a raw table, a propagated table, a fine-tuned table); the
+  search verb now names which one to search. `search(source, query=…, k=…,
+  embedding_table="<table>")` searches that table; `embedding_table=None` (the
+  default) searches the source's most-recent ready table — today's behaviour,
+  unchanged. The selector reuses the exact `embedding_table=` name and
+  most-recent-default semantics `eval_embeddings` already ships. It rides the
+  whole surface atomically: the typed engine verbs (`Session::search` and the
+  query-by-example `Session::search_by_id`, so naming a table makes the example
+  vector AND its neighbours come from that one table), the flattened wire
+  `SearchRequest`, the gRPC `SearchRequest` (new `optional string
+  embedding_table = 7`) and its handler, the data-plane client, and both Python
+  bindings (embedded `Database.search` and remote `RemoteDatabase.search`) —
+  pinned identical across wheels by a conformance signature test.
+
 ## v0.26.5 — 2026-06-12
 
 ### Added

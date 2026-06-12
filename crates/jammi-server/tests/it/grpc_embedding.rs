@@ -363,6 +363,7 @@ async fn search_by_query_vector_ranks_self_match_first_over_the_wire() {
             source_id: "clips".into(),
             query: Some(SearchQuery::QueryVector(QueryVector { values: query_vec })),
             k: 3,
+            embedding_table: None,
             filter: None,
             select: Vec::new(),
         })
@@ -399,6 +400,7 @@ async fn search_by_row_key_ranks_that_row_first_over_the_wire() {
             source_id: "clips".into(),
             query: Some(SearchQuery::RowKey("clip_2".into())),
             k: 3,
+            embedding_table: None,
             filter: None,
             select: Vec::new(),
         })
@@ -426,6 +428,7 @@ async fn search_applies_filter_and_select_projection_over_the_wire() {
             source_id: "clips".into(),
             query: Some(SearchQuery::RowKey("clip_0".into())),
             k: 3,
+            embedding_table: None,
             filter: Some("clip_id != 'clip_0'".into()),
             select: vec!["clip_id".into()],
         })
@@ -471,6 +474,7 @@ async fn remove_source_drops_the_source_over_the_wire() {
             source_id: "clips".into(),
             query: Some(SearchQuery::RowKey("clip_0".into())),
             k: 3,
+            embedding_table: None,
             filter: None,
             select: Vec::new(),
         })
@@ -491,6 +495,7 @@ async fn search_requires_a_query_over_the_wire() {
             source_id: "clips".into(),
             query: None,
             k: 3,
+            embedding_table: None,
             filter: None,
             select: Vec::new(),
         })

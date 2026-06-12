@@ -263,14 +263,22 @@ impl Session {
             source_id,
             query,
             k,
+            embedding_table,
             filter,
             select,
         } = request;
+        let embedding_table = embedding_table.as_deref();
 
         let builder = match query {
-            SearchQuery::Vector(vector) => self.engine.search(&source_id, vector, k).await?,
+            SearchQuery::Vector(vector) => {
+                self.engine
+                    .search(&source_id, vector, k, embedding_table)
+                    .await?
+            }
             SearchQuery::RowKey(row_key) => {
-                self.engine.search_by_id(&source_id, &row_key, k).await?
+                self.engine
+                    .search_by_id(&source_id, &row_key, k, embedding_table)
+                    .await?
             }
         };
         let builder = match filter.as_deref() {

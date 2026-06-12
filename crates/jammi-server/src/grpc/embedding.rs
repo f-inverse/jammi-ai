@@ -145,6 +145,7 @@ impl EmbeddingService for EmbeddingServer {
             source_id: req.source_id,
             query,
             k: req.k as usize,
+            embedding_table: req.embedding_table,
             filter: req.filter,
             // The abstraction projects exactly the requested columns; the
             // handler needs `_row_id` + `similarity` for every hit's key and

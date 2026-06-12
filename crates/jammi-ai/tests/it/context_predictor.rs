@@ -410,7 +410,7 @@ async fn hyphenated_source_name_survives_generated_read_sql() {
     // clause that embeds the source name — the breaking site.
     let query = rows[0].x.clone();
     let results = session
-        .search("my-source-2024", query, 5)
+        .search("my-source-2024", query, 5, None)
         .await
         .unwrap()
         .run()

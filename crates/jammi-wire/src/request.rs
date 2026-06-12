@@ -40,8 +40,8 @@ pub enum SearchQuery {
 }
 
 /// A flattened vector-search request. Every knob a one-shot search exposes
-/// (`filter`, `select`) is a field here, so a transport can serialise the whole
-/// request rather than replay a chain of builder calls.
+/// (`embedding_table`, `filter`, `select`) is a field here, so a transport can
+/// serialise the whole request rather than replay a chain of builder calls.
 pub struct SearchRequest {
     /// Source whose embedding table is searched.
     pub source_id: String,
@@ -49,6 +49,9 @@ pub struct SearchRequest {
     pub query: SearchQuery,
     /// Number of nearest neighbours to retrieve.
     pub k: usize,
+    /// Which embedding table of the source to search. `None` selects the
+    /// source's most-recent ready table; `Some(name)` searches that table.
+    pub embedding_table: Option<String>,
     /// Optional SQL predicate applied to the hydrated results.
     pub filter: Option<String>,
     /// Columns to project. Empty keeps every hydrated column.

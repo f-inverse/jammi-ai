@@ -74,7 +74,7 @@ query_vec = db.encode_query(model="laion/CLIP-ViT-B-32-laion2B-s34B-b79K", query
 # use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
 # async fn ex(session: Arc<InferenceSession>, query_vec: Vec<f32>) -> jammi_db::error::Result<()> {
-let results = session.search("figures", query_vec, 10).await?.run().await?;
+let results = session.search("figures", query_vec, 10, None).await?.run().await?;
 # Ok(()) }
 ```
 

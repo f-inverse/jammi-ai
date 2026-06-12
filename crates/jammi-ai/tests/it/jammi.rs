@@ -56,6 +56,7 @@ async fn open_local_yields_a_working_embedded_session() {
             source_id: "patents".to_string(),
             query: SearchQuery::Vector(vec![0.5_f32; 32]),
             k: 5,
+            embedding_table: None,
             filter: None,
             select: Vec::new(),
         })

@@ -442,8 +442,9 @@ impl InferenceSession {
         source_id: &str,
         query: Vec<f32>,
         k: usize,
+        embedding_table: Option<&str>,
     ) -> Result<QueryBuilder> {
-        QueryBuilder::new(Arc::clone(self), source_id, query, k, None).await
+        QueryBuilder::new(Arc::clone(self), source_id, query, k, embedding_table).await
     }
 
     /// Start a search ranked by an existing row (query-by-example).
@@ -453,18 +454,23 @@ impl InferenceSession {
     /// never crosses the API boundary — this is consistent with the engine's
     /// "no raw-vector reads" line while exposing the standard vector-search
     /// primitive ("rows like this row").
+    ///
+    /// `embedding_table` selects which table both supplies the example vector
+    /// and is searched — the example and its neighbours come from the same
+    /// table. `None` selects the source's most-recent ready table.
     pub async fn search_by_id(
         self: &Arc<Self>,
         source_id: &str,
         row_key: &str,
         k: usize,
+        embedding_table: Option<&str>,
     ) -> Result<QueryBuilder> {
         let table = self
             .catalog()
-            .resolve_embedding_table(source_id, None)
+            .resolve_embedding_table(source_id, embedding_table)
             .await?;
         let query = self.inner.read_vector_by_key(&table, row_key).await?;
-        self.search(source_id, query, k).await
+        self.search(source_id, query, k, embedding_table).await
     }
 
     /// Run a model over `columns` of an arbitrary input plan, appending the

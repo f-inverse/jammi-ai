@@ -254,7 +254,7 @@ async fn recipe_semantic_search() {
 
     // Basic search (cookbook recipe)
     let results = session
-        .search("patents", query.clone(), 10)
+        .search("patents", query.clone(), 10, None)
         .await
         .unwrap()
         .run()
@@ -266,7 +266,7 @@ async fn recipe_semantic_search() {
 
     // QueryBuilder: filter + sort + limit + select (cookbook recipe)
     let filtered = session
-        .search("patents", query.clone(), 20)
+        .search("patents", query.clone(), 20, None)
         .await
         .unwrap()
         .filter("year > 2020")
@@ -345,7 +345,7 @@ async fn recipe_enrich_results() {
 
     // Join (cookbook recipe)
     let joined = session
-        .search("patents", query.clone(), 10)
+        .search("patents", query.clone(), 10, None)
         .await
         .unwrap()
         .join("assignees", "assignee_id=id", None)
@@ -359,7 +359,7 @@ async fn recipe_enrich_results() {
 
     // Annotate (cookbook recipe)
     let annotated = session
-        .search("patents", query.clone(), 10)
+        .search("patents", query.clone(), 10, None)
         .await
         .unwrap()
         .annotate(
@@ -388,7 +388,7 @@ async fn recipe_enrich_results() {
 
     // Compose join + filter + sort + limit + select (cookbook recipe)
     let composed = session
-        .search("patents", query, 100)
+        .search("patents", query, 100, None)
         .await
         .unwrap()
         .join("assignees", "assignee_id=id", None)
@@ -614,7 +614,7 @@ async fn recipe_modernbert_embeddings() {
 
     // search over ModernBERT-generated embeddings
     let results = session
-        .search("patents", query, 10)
+        .search("patents", query, 10, None)
         .await
         .unwrap()
         .run()
@@ -1114,7 +1114,7 @@ async fn recipe_generate_image_embeddings() {
 
     // Search with the query vector (cookbook recipe: semantic search over images)
     let results = session
-        .search("figures", query_vec, 3)
+        .search("figures", query_vec, 3, None)
         .await
         .unwrap()
         .run()
@@ -1239,7 +1239,7 @@ async fn recipe_generate_audio_embeddings() {
 
     // Search with the query vector (cookbook recipe: semantic search over audio).
     let results = session
-        .search("clips", query_vec, 3)
+        .search("clips", query_vec, 3, None)
         .await
         .unwrap()
         .run()

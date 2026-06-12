@@ -52,6 +52,7 @@ dependencies = [
 dev = [
     "grpcio-tools==1.80.0",
     "pytest>=7",
+    "tomli>=2; python_version < '3.11'",
 ]
 
 [project.urls]

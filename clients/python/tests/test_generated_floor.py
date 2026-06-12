@@ -17,8 +17,12 @@ satisfies them. Hermetic: reads only files inside this package.
 from __future__ import annotations
 
 import re
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11 — the package supports >= 3.9
+    import tomli as tomllib
 
 CLIENT_ROOT = Path(__file__).resolve().parents[1]
 GENERATED_DIR = CLIENT_ROOT / "jammi_client" / "_generated" / "jammi" / "v1"

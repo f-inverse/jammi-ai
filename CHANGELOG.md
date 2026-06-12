@@ -7,6 +7,17 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **`RemoteDatabase` gains the eval family.** The published gRPC client's
+  `eval_embeddings`, `eval_per_query`, `eval_inference`, and `eval_compare`
+  drive the engine's evaluation verbs server-side (`EvalService`) and return
+  the same nested report dicts the embedded `Database` produces — tagged
+  inference aggregates flatten to `{"task": …}` records, `recall_at_ks` rides
+  as `[k, recall]` pairs, and absent options (`delta` for a baseline,
+  `significance` for an unpairable run) are explicit `None`s. Together with the
+  already-present `eval_calibration`, the whole eval vocabulary swaps
+  transports without changing the call; the projection shape is pinned from
+  both the Rust and Python sides against one shared golden fixture
+  (`tests/fixtures/eval_report_projection.json`).
 - **`RemoteDatabase` gains the bulk inference verb.** The published gRPC client's
   `infer(source=…, model=…, columns=…, task=…, key=…)` runs a model over a
   registered source server-side (`InferenceService.Infer`) and returns the output
@@ -15,6 +26,15 @@ workspace ships every publishable crate at the same
   `connect("grpc://…")` without changing the call. The result rides back as one
   unary `ArrowBatch`, so gRPC's default 4 MB receive cap bounds the result size a
   default channel can carry.
+
+### Changed
+- **`Database.eval_embeddings` names its result-table selector for what it is.**
+  The embedded verb's optional kwarg is `embedding_table=` — it names the
+  embedding result table to evaluate (`None` resolves the source's most recent
+  table), which is what the engine always did with the value; the former
+  `model=` name misdescribed the lookup. The remote `eval_embeddings` carries
+  the same signature, and the cross-wheel conformance pin holds on the new
+  name.
 
 ### Fixed
 - **`jammi-client`'s declared floors can no longer lie about its stubs.** The

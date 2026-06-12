@@ -101,16 +101,30 @@ _INFERENCE_VERBS = {
 
 # The engine-state pipeline verbs. Like the training/predict verbs, these DO hit
 # the wire: they build durable graph/embedding artifacts or assemble a target's
-# conditioning context against the remote engine's state (`PipelineService` for
-# the build/propagate/assemble trio, `EvalService.EvalCalibration` for the
-# calibration report). The embedded `Database` runs them in the compiled engine;
-# the client's `RemoteDatabase` drives them over gRPC. The call surface must
-# agree so a caller swaps transports without changing the call — pinned here
-# against the embed `jammi_ai.Database`.
+# conditioning context against the remote engine's state (`PipelineService`).
+# The embedded `Database` runs them in the compiled engine; the client's
+# `RemoteDatabase` drives them over gRPC. The call surface must agree so a
+# caller swaps transports without changing the call — pinned here against the
+# embed `jammi_ai.Database`.
 _PIPELINE_VERBS = {
     "build_neighbor_graph",
     "propagate_embeddings",
     "assemble_context",
+}
+
+
+# The evaluation verbs. They DO hit the wire: the model and the golden data
+# both live in the engine, so the compute runs where the data is
+# (`EvalService`) and only the typed report crosses the wire. The embedded
+# `Database` runs them in the compiled engine; the client's `RemoteDatabase`
+# drives them over gRPC. The call surface must agree so a caller swaps
+# transports without changing the call — pinned here against the embed
+# `jammi_ai.Database`.
+_EVAL_VERBS = {
+    "eval_embeddings",
+    "eval_per_query",
+    "eval_inference",
+    "eval_compare",
     "eval_calibration",
 }
 
@@ -159,6 +173,7 @@ def test_remote_surface_has_every_verb():
         | _TRAINING_VERBS
         | _INFERENCE_VERBS
         | _PIPELINE_VERBS
+        | _EVAL_VERBS
         | _MUTABLE_TOPIC_VERBS
     ):
         assert callable(getattr(jammi_client.RemoteDatabase, verb)), verb
@@ -196,6 +211,18 @@ def test_pipeline_verbs_have_identical_signatures_across_wheels():
     a caller swaps transports without changing the call — pinned name-for-name,
     kind-for-kind, and default-for-default so a divergence in either is caught."""
     for verb in _PIPELINE_VERBS:
+        client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
+        embed = _call_surface(getattr(jammi_ai.Database, verb))
+        assert client == embed, f"{verb}: {embed} != {client}"
+
+
+def test_eval_verbs_have_identical_signatures_across_wheels():
+    """The evaluation verbs carry the SAME call surface on the client's
+    `RemoteDatabase` as on the embedded engine's `jammi_ai.Database`. Both drive
+    over the same verb vocabulary (the client over gRPC, the embed in-process), so
+    a caller swaps transports without changing the call — pinned name-for-name,
+    kind-for-kind, and default-for-default so a divergence in either is caught."""
+    for verb in _EVAL_VERBS:
         client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
         embed = _call_surface(getattr(jammi_ai.Database, verb))
         assert client == embed, f"{verb}: {embed} != {client}"

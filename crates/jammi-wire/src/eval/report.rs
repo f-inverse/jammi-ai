@@ -953,6 +953,283 @@ mod calibration_tests {
 }
 
 #[cfg(test)]
+mod projection_fixture_tests {
+    //! Pin the serde dict shape of every eval report against the committed
+    //! golden fixture `tests/fixtures/eval_report_projection.json`.
+    //!
+    //! The fixture is the contract a thin client's report projection
+    //! reproduces (the Python client's projection helpers are asserted against
+    //! the SAME file), so the two sides of the wire are locked to one shape:
+    //! the internally tagged `task` enums flatten into the record, the
+    //! `recall_at_ks` tuples serialize as two-element `[k, recall]` pairs, and
+    //! every absent `Option` (`delta` for a baseline, `significance` for an
+    //! unpairable run) is an explicit `null`, never a missing key.
+    //!
+    //! The fixture is the verbatim `serde_json` serialization of the reports
+    //! constructed below; to regenerate after an intentional shape change, copy
+    //! the pretty-printed "actual" JSON from this test's failure output back
+    //! into the fixture (keeping its top-level `derivation` note).
+
+    use super::*;
+    use jammi_numerics::classification::{ClassMetrics, ClassificationResult};
+    use jammi_numerics::ner::{Entity, NerMetrics, TypeMetrics};
+    use jammi_numerics::retrieval::AggregateMetrics;
+
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/eval_report_projection.json"
+    );
+
+    /// All float values in the fixture are exactly representable in binary
+    /// (halves/quarters/eighths/sixteenths), so the JSON round-trip is
+    /// bit-exact on both the Rust and Python side.
+    fn per_query(
+        query_id: &str,
+        metrics: QueryMetrics,
+        recall_at_ks: Vec<(usize, f64)>,
+        distance: f64,
+        cohorts: &[(&str, &str)],
+    ) -> PerQueryRecord {
+        PerQueryRecord {
+            query_id: query_id.to_string(),
+            metrics,
+            recall_at_ks,
+            distance,
+            cohorts: cohorts
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    fn embedding_report() -> EmbeddingEvalReport {
+        EmbeddingEvalReport {
+            eval_run_id: "run-embedding-fixture".into(),
+            aggregate: AggregateMetrics {
+                recall_at_k: 0.75,
+                precision_at_k: 0.5,
+                mrr: 0.625,
+                ndcg: 0.8125,
+            },
+            per_query: vec![
+                per_query(
+                    "q1",
+                    QueryMetrics {
+                        recall: 1.0,
+                        precision: 0.5,
+                        mrr: 1.0,
+                        ndcg: 1.0,
+                    },
+                    vec![(1, 0.5), (3, 1.0), (5, 1.0), (10, 1.0)],
+                    0.125,
+                    &[("family", "A"), ("split", "val")],
+                ),
+                per_query(
+                    "q2",
+                    QueryMetrics {
+                        recall: 0.5,
+                        precision: 0.5,
+                        mrr: 0.25,
+                        ndcg: 0.625,
+                    },
+                    vec![(1, 0.0), (3, 0.5), (5, 0.5), (10, 0.5)],
+                    0.0,
+                    &[],
+                ),
+            ],
+        }
+    }
+
+    fn classification_report() -> InferenceEvalReport {
+        InferenceEvalReport {
+            aggregate: InferenceAggregate::Classification(ClassificationResult {
+                accuracy: 0.75,
+                f1: 0.5,
+                per_class: [
+                    (
+                        "spam".to_string(),
+                        ClassMetrics {
+                            precision: 1.0,
+                            recall: 0.5,
+                            f1: 0.625,
+                        },
+                    ),
+                    (
+                        "ham".to_string(),
+                        ClassMetrics {
+                            precision: 0.5,
+                            recall: 1.0,
+                            f1: 0.625,
+                        },
+                    ),
+                ]
+                .into(),
+            }),
+            per_record: vec![
+                PerRecordPrediction::Classification {
+                    record_id: "r1".into(),
+                    predicted: "spam".into(),
+                    gold: "spam".into(),
+                },
+                PerRecordPrediction::Classification {
+                    record_id: "r2".into(),
+                    predicted: "ham".into(),
+                    gold: "spam".into(),
+                },
+            ],
+        }
+    }
+
+    fn ner_report() -> InferenceEvalReport {
+        InferenceEvalReport {
+            aggregate: InferenceAggregate::Ner(NerMetrics {
+                precision: 0.5,
+                recall: 0.25,
+                f1: 0.375,
+                per_type: [(
+                    "PER".to_string(),
+                    TypeMetrics {
+                        precision: 0.5,
+                        recall: 0.25,
+                        f1: 0.375,
+                        support: 4,
+                    },
+                )]
+                .into(),
+            }),
+            per_record: vec![PerRecordPrediction::Ner {
+                record_id: "n1".into(),
+                predicted: vec![Entity {
+                    label: "PER".into(),
+                    start: 0,
+                    end: 5,
+                    text: "Alice".into(),
+                    confidence: 0.5,
+                }],
+                gold: vec![Entity {
+                    label: "PER".into(),
+                    start: 0,
+                    end: 5,
+                    text: String::new(),
+                    confidence: 0.0,
+                }],
+            }],
+        }
+    }
+
+    /// A one-query embedding report for a compare entry; the values only need
+    /// to be distinct per table, not meaningful.
+    fn compare_member(run_id: &str, recall: f64) -> EmbeddingEvalReport {
+        EmbeddingEvalReport {
+            eval_run_id: run_id.into(),
+            aggregate: AggregateMetrics {
+                recall_at_k: recall,
+                precision_at_k: 0.5,
+                mrr: 0.5,
+                ndcg: 0.5,
+            },
+            per_query: vec![per_query(
+                "q1",
+                QueryMetrics {
+                    recall,
+                    precision: 0.5,
+                    mrr: 0.5,
+                    ndcg: 0.5,
+                },
+                vec![(1, recall)],
+                0.25,
+                &[],
+            )],
+        }
+    }
+
+    fn sig(p_value: f64, ci_lower: f64, ci_upper: f64) -> MetricSignificance {
+        MetricSignificance {
+            p_value,
+            ci_lower,
+            ci_upper,
+        }
+    }
+
+    fn compare_report() -> CompareEvalReport {
+        let delta = |significance| AggregateDelta {
+            recall_at_k: MetricDelta {
+                absolute: 0.25,
+                relative: 0.5,
+            },
+            precision_at_k: MetricDelta {
+                absolute: 0.0,
+                relative: 0.0,
+            },
+            mrr: MetricDelta {
+                absolute: -0.125,
+                relative: -0.25,
+            },
+            ndcg: MetricDelta {
+                absolute: 0.125,
+                relative: 0.25,
+            },
+            significance,
+        };
+        CompareEvalReport {
+            per_table: vec![
+                // The baseline carries no delta — an explicit null.
+                TableEvalReport {
+                    table_name: "emb_baseline".into(),
+                    embedding_eval: compare_member("run-baseline", 0.5),
+                    delta: None,
+                },
+                // A paired treatment carries delta + significance.
+                TableEvalReport {
+                    table_name: "emb_paired".into(),
+                    embedding_eval: compare_member("run-paired", 0.75),
+                    delta: Some(delta(Some(DeltaSignificance {
+                        recall_at_k: sig(0.0625, 0.125, 0.375),
+                        precision_at_k: sig(1.0, 0.0, 0.0),
+                        mrr: sig(0.5, -0.25, 0.0),
+                        ndcg: sig(0.25, 0.0, 0.25),
+                    }))),
+                },
+                // An unpairable treatment carries a delta whose significance
+                // is an explicit null.
+                TableEvalReport {
+                    table_name: "emb_unpaired".into(),
+                    embedding_eval: compare_member("run-unpaired", 0.25),
+                    delta: Some(delta(None)),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn report_serde_shapes_match_the_committed_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(FIXTURE).expect("read fixture"))
+                .expect("fixture is valid JSON");
+
+        for (key, actual) in [
+            (
+                "embedding",
+                serde_json::to_value(embedding_report()).unwrap(),
+            ),
+            (
+                "inference_classification",
+                serde_json::to_value(classification_report()).unwrap(),
+            ),
+            ("inference_ner", serde_json::to_value(ner_report()).unwrap()),
+            ("compare", serde_json::to_value(compare_report()).unwrap()),
+        ] {
+            assert_eq!(
+                actual,
+                fixture[key],
+                "serde shape of '{key}' drifted from the fixture; actual:\n{}",
+                serde_json::to_string_pretty(&actual).unwrap()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod significance_tests {
     use super::*;
 

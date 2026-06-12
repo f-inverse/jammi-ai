@@ -78,7 +78,7 @@ the SQL table function builds):
 # use jammi_ai::session::InferenceSession;
 use jammi_db::ModelTask;
 # async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
-let results = session.search("patents", query, 10).await?
+let results = session.search("patents", query, 10, None).await?
     .annotate("local:/models/all-MiniLM-L6-v2", ModelTask::TextEmbedding, &["abstract".into()]).await?
     .run().await?;
 # Ok(()) }

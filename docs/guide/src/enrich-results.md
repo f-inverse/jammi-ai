@@ -29,7 +29,7 @@ session.add_source("assignees", SourceType::File, SourceConnection {
     ..Default::default()
 }).await?;
 
-let results = session.search("patents", query, 10).await?
+let results = session.search("patents", query, 10, None).await?
     .join("assignees", "assignee_id=id", None).await?  // left join by default
     .run().await?;
 // Results now include company_name, country from assignees
@@ -67,7 +67,7 @@ Run a model over search results to add new columns:
 # use jammi_ai::session::InferenceSession;
 use jammi_db::ModelTask;
 # async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
-let results = session.search("patents", query, 10).await?
+let results = session.search("patents", query, 10, None).await?
     .annotate(
         "sentence-transformers/all-MiniLM-L6-v2",
         ModelTask::TextEmbedding,
@@ -117,7 +117,7 @@ All operations compose freely:
 # use jammi_ai::session::InferenceSession;
 use jammi_db::ModelTask;
 # async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
-let results = session.search("patents", query, 100).await?
+let results = session.search("patents", query, 100, None).await?
     .join("assignees", "assignee_id=id", None).await?
     .annotate("all-MiniLM-L6-v2", ModelTask::TextEmbedding, &["abstract".into()]).await?
     .filter("country = 'US'")?

@@ -223,12 +223,16 @@ impl<'a> ChannelRepo<'a> {
     ///
     /// The channel name is unique *per tenant*: tenant B may register a channel
     /// whose name already exists under tenant A without collision, but a
-    /// re-registration within the same tenant is rejected. Because SQLite treats
-    /// NULLs as distinct in a PRIMARY KEY, the composite `(tenant_id,
-    /// channel_name)` PK alone does not reject a duplicate *global*
-    /// (`tenant = None`) channel, so this does an explicit tenant-scoped
-    /// existence check before inserting (the PK is the backstop for the
-    /// non-NULL, tenant-scoped case).
+    /// re-registration within the same tenant is rejected. The explicit
+    /// tenant-scoped existence check below yields the friendly "already exists"
+    /// error; the database enforces the same uniqueness authoritatively via two
+    /// constraints — the `UNIQUE (tenant_id, channel_name)` constraint for the
+    /// non-NULL (tenant-scoped) case, and the partial unique index on
+    /// `channel_name WHERE tenant_id IS NULL` for the global (`tenant = None`)
+    /// case (both backends treat NULLs as distinct in a UNIQUE constraint, so
+    /// the composite constraint alone would not catch a duplicate global
+    /// channel). Either backstop surfaces through the same
+    /// `BackendError::Constraint` → "already exists" path as the explicit check.
     pub async fn register(&self, spec: &ChannelSpec) -> Result<()> {
         let tenant = self.catalog.current_tenant().map(|t| t.to_string());
         let channel = spec.id.as_str().to_string();
@@ -247,8 +251,10 @@ impl<'a> ChannelRepo<'a> {
             .transaction(TxOptions::default(), |tx| {
                 let tenant = tenant.clone();
                 Box::pin(async move {
-                    // Explicit per-tenant existence check: NULL-distinct PKs mean
-                    // the DB constraint cannot catch a duplicate global channel.
+                    // Explicit per-tenant existence check for a friendly error.
+                    // The DB constraints (composite UNIQUE for tenant-scoped,
+                    // partial unique index for global) are the authoritative
+                    // backstop; this surfaces the same "already exists" message.
                     let exists = channel_exists(tx, tenant.as_deref(), &channel).await?;
                     if exists {
                         return Err(BackendError::Constraint {
@@ -754,6 +760,36 @@ mod tests {
         let err = catalog.channels().register(&spec).await.unwrap_err();
         match err {
             JammiError::EvidenceChannel(m) => assert!(m.contains("already exists")),
+            other => panic!("expected EvidenceChannel(already exists), got {other:?}"),
+        }
+    }
+
+    /// A duplicate GLOBAL (unbound, `tenant = None`) registration is rejected the
+    /// second time with the SAME "already exists" semantics as a tenant-scoped
+    /// duplicate. `open_catalog` binds no tenant, so both `register` calls write
+    /// `tenant_id IS NULL`; the partial unique index added in migration 020 is the
+    /// DB-level backstop for this case (the composite `UNIQUE (tenant_id,
+    /// channel_name)` treats NULLs as distinct and cannot catch it). Serial is
+    /// sufficient to pin the constraint + error path — the concurrent Postgres
+    /// race is closed by that same DB index, not by this test.
+    #[tokio::test]
+    async fn register_rejects_duplicate_global_channel() {
+        let (_dir, catalog) = open_catalog().await;
+        let spec = ChannelSpec {
+            id: ChannelId::new("global_chan").unwrap(),
+            priority: 5,
+            columns: vec![ChannelColumn {
+                name: "marker".into(),
+                data_type: ChannelColumnType::Utf8,
+            }],
+        };
+        catalog.channels().register(&spec).await.unwrap();
+        let err = catalog.channels().register(&spec).await.unwrap_err();
+        match err {
+            JammiError::EvidenceChannel(m) => assert!(
+                m.contains("already exists"),
+                "global duplicate must reject with the same 'already exists' semantics, got: {m}"
+            ),
             other => panic!("expected EvidenceChannel(already exists), got {other:?}"),
         }
     }

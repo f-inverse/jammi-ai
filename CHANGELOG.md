@@ -47,9 +47,13 @@ workspace ships every publishable crate at the same
   carry `tenant_id` with `UNIQUE (tenant_id, channel_name)` and a composite FK,
   and `register`/`add_channel_columns`/`get`/`list` read and write `tenant_id`
   (`tenant = None` → `IS NULL` only; a tenant sees its own channels plus the
-  unshadowed global seeds, never another tenant's). The embedded
-  `register_channel` docstring is corrected to say per-tenant. An adversarial
-  cross-tenant isolation test covers the leak.
+  unshadowed global seeds, never another tenant's). Because both backends treat
+  NULLs as distinct in a UNIQUE constraint, a partial unique index on
+  `channel_name WHERE tenant_id IS NULL` enforces global-channel-name uniqueness
+  atomically — closing the race where two concurrent unbound registrations of
+  the same name could both commit. The embedded `register_channel` docstring is
+  corrected to say per-tenant. An adversarial cross-tenant isolation test covers
+  the leak.
 - **`jammi-client`'s declared floors can no longer lie about its stubs.** The
   proto stubs are generated at wheel-build time, and an unpinned `grpcio-tools`
   baked import-time guards (`GRPC_GENERATED_VERSION`,

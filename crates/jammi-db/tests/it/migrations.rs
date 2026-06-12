@@ -267,10 +267,14 @@ async fn migration_019_normalizes_available_status_to_registered() {
 
 /// Migration 020 tenant-qualifies the evidence-channel identity. Asserts that
 /// `evidence_channel_columns` gained a `tenant_id` column, that the seed columns
-/// survived the table rebuild with `tenant_id IS NULL`, and that the new
-/// per-tenant `UNIQUE (tenant_id, channel_name)` constraint on
-/// `evidence_channels` rejects a same-tenant duplicate while admitting the same
-/// name under a different tenant.
+/// survived the table rebuild with `tenant_id IS NULL`, that the new per-tenant
+/// `UNIQUE (tenant_id, channel_name)` constraint on `evidence_channels` rejects
+/// a same-tenant duplicate while admitting the same name under a different
+/// tenant, and that the partial unique index
+/// `idx_evidence_channels_global_name` exists and atomically rejects a duplicate
+/// *global* (`tenant_id IS NULL`) channel name at the DB level. The concurrent
+/// Postgres race is closed by that DB-level index, so a serial duplicate insert
+/// is sufficient to pin the constraint here — no flaky concurrency test needed.
 #[tokio::test]
 async fn migration_020_tenant_qualifies_channels() {
     let dir = tempdir().unwrap();
@@ -376,6 +380,79 @@ async fn migration_020_tenant_qualifies_channels() {
         ),
         "a same-tenant duplicate channel name must violate UNIQUE (tenant_id, channel_name); \
          got {dup:?}"
+    );
+
+    // The partial unique index that enforces global-channel-name uniqueness
+    // exists in the post-migration schema.
+    let global_index = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query::<_, String>(
+                        "SELECT name FROM sqlite_master \
+                         WHERE type = 'index' AND name = 'idx_evidence_channels_global_name'",
+                        &[],
+                        |row| row.get("name"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        global_index.first().map(String::as_str),
+        Some("idx_evidence_channels_global_name"),
+        "migration 020 must create the partial unique index on the global namespace"
+    );
+
+    // Two global (tenant_id IS NULL) inserts of the same channel name: the first
+    // commits, the second is rejected by the partial unique index. This closes
+    // the global-namespace race the composite UNIQUE (tenant_id, channel_name)
+    // cannot — NULLs are distinct in that constraint on both backends. A serial
+    // pair is enough to pin the constraint+error path; the concurrent Postgres
+    // race is closed by the same DB-level index, so no concurrency test is run.
+    let first_global = backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO evidence_channels (tenant_id, channel_name, priority) \
+                     VALUES (NULL, 'global_dup', 1)",
+                    &[],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await;
+    assert!(
+        first_global.is_ok(),
+        "the first global channel insert must succeed: {first_global:?}"
+    );
+    let second_global = backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO evidence_channels (tenant_id, channel_name, priority) \
+                     VALUES (NULL, 'global_dup', 2)",
+                    &[],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await;
+    assert!(
+        matches!(
+            second_global,
+            Err(jammi_db::catalog::backend::BackendError::Constraint { .. })
+        ),
+        "a duplicate global channel name must violate the partial unique index; \
+         got {second_global:?}"
     );
 }
 

@@ -205,8 +205,8 @@ async fn channel_namespace_is_per_tenant() {
     assert_eq!(b_x.columns[0].name, "b_marker");
 
     // INVARIANT 4: re-registering "chan_x" under A still rejects as a duplicate
-    // (per-tenant uniqueness is enforced even though the global namespace's
-    // composite PK treats NULL tenants as distinct).
+    // (per-tenant uniqueness is enforced by the UNIQUE constraint even though
+    // both backends treat NULL tenants as distinct in that constraint).
     let err = cat_a
         .channels()
         .register(&channel_spec("chan_x", 99, "dup"))

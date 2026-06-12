@@ -566,21 +566,33 @@ UPDATE models SET status = 'registered' WHERE status = 'available';
 /// FK-safe on both backends regardless of FK-enforcement state.
 ///
 /// Note on NULL semantics: both backends treat NULLs as DISTINCT in a UNIQUE
-/// constraint, so the constraint alone does not reject a duplicate *global*
-/// (`tenant_id IS NULL`) channel. The repo's `register` therefore does an
-/// explicit tenant-scoped existence check before inserting; the UNIQUE
-/// constraint is the DB-level backstop for the non-NULL (tenant-scoped) case.
-/// Greenfield: no production rows to preserve beyond the seeds.
+/// constraint, so the `UNIQUE (tenant_id, channel_name)` constraint alone does
+/// not reject a duplicate *global* (`tenant_id IS NULL`) channel. A PARTIAL
+/// UNIQUE INDEX on `channel_name WHERE tenant_id IS NULL` closes that gap: it
+/// makes the database enforce global-channel-name uniqueness atomically, so two
+/// concurrent unbound registrations of the same name can no longer both commit.
+/// Together the two constraints enforce per-namespace uniqueness with no
+/// app-level race — the composite UNIQUE covers the non-NULL tenants, the
+/// partial index covers the global namespace. `CREATE UNIQUE INDEX … WHERE …`
+/// is accepted with identical syntax by SQLite (≥3.8.0) and Postgres, and runs
+/// from this shared migration constant on both backends. The repo's `register`
+/// keeps its explicit tenant-scoped existence check for a friendly
+/// "already exists" error; the partial index (global) and the composite UNIQUE
+/// (tenant-scoped) are the authoritative DB-level backstops, and a duplicate
+/// surfaces through the same `BackendError::Constraint` → "already exists" path
+/// in either namespace. Greenfield: no production rows to preserve beyond the
+/// seeds.
 pub(super) const MIGRATION_020_CHANNEL_TENANT_SCOPE: &str = r#"
 CREATE TABLE evidence_channel_columns_old (
     channel_name    TEXT NOT NULL,
     column_name     TEXT NOT NULL,
     column_type     TEXT NOT NULL,
-    ordinal         INTEGER NOT NULL
+    ordinal         INTEGER NOT NULL,
+    declared_at     TEXT NOT NULL
 );
 
-INSERT INTO evidence_channel_columns_old (channel_name, column_name, column_type, ordinal)
-    SELECT channel_name, column_name, column_type, ordinal FROM evidence_channel_columns;
+INSERT INTO evidence_channel_columns_old (channel_name, column_name, column_type, ordinal, declared_at)
+    SELECT channel_name, column_name, column_type, ordinal, declared_at FROM evidence_channel_columns;
 
 DROP TABLE evidence_channel_columns;
 
@@ -601,6 +613,9 @@ ALTER TABLE evidence_channels_new RENAME TO evidence_channels;
 
 CREATE INDEX idx_evidence_channels_tenant ON evidence_channels(tenant_id);
 
+CREATE UNIQUE INDEX idx_evidence_channels_global_name
+    ON evidence_channels(channel_name) WHERE tenant_id IS NULL;
+
 CREATE TABLE evidence_channel_columns (
     tenant_id       TEXT,
     channel_name    TEXT NOT NULL,
@@ -615,8 +630,8 @@ CREATE TABLE evidence_channel_columns (
 CREATE UNIQUE INDEX idx_channel_cols_ordinal
     ON evidence_channel_columns(tenant_id, channel_name, ordinal);
 
-INSERT INTO evidence_channel_columns(tenant_id, channel_name, column_name, column_type, ordinal)
-    SELECT NULL, channel_name, column_name, column_type, ordinal FROM evidence_channel_columns_old;
+INSERT INTO evidence_channel_columns(tenant_id, channel_name, column_name, column_type, ordinal, declared_at)
+    SELECT NULL, channel_name, column_name, column_type, ordinal, declared_at FROM evidence_channel_columns_old;
 
 DROP TABLE evidence_channel_columns_old;
 "#;

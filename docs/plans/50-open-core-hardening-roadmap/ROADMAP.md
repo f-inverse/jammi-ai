@@ -54,7 +54,7 @@ survives with a real consumer's name attached, it belongs in that consumer's rep
 
 ---
 
-## 1. Where we are (evidence-graded, end of 0.26.3)
+## 1. Where we are (evidence-graded, end of 0.26.4)
 
 **Proven solid — validated to an unusually high bar.**
 - *Conformal prediction & calibration.* Coverage *validity* was validated by 28
@@ -70,20 +70,33 @@ survives with a real consumer's name attached, it belongs in that consumer's rep
 
 **Solid but with sharp edges.**
 - *Fine-tuning* works (LoRA/MNRL/graph-FT) but the honest finding is *supervision
-  caps the gain, not the loss*; **hard-negative mining OOMs at ~1500 pairs** (memory
-  not scale-bounded).
+  caps the gain, not the loss*. **Hard-negative mining OOM and the `refresh_every`
+  default anti-pattern are CLOSED as of 0.26.4** (#160 — mining is memory-bounded,
+  defaults overlay correctly on the wire; see CHANGELOG v0.26.4). The scale gap
+  remains open (see §3.1).
 - *Search ergonomics:* `search(source)` is ambiguous once a source has multiple
   embedding tables — callers fall back to an explicit fold.
 - *Multi-tenancy* is correct but not what most assume: catalog-row + discriminator-
   column isolation hold, but a **discriminator-less federated source is globally
-  readable** — the engine does not authenticate; that boundary lives above it.
+  readable** — the engine does not authenticate; that boundary lives above it. **The
+  `with_tenant` ergonomics gap is CLOSED as of 0.26.4** (#60/#161 — replaced by the
+  unambiguous `set_tenant` setter and the `tenant_scope` block-scoped context manager,
+  on both embedded and remote surfaces; see CHANGELOG v0.26.4).
 
 **Not yet battle-tested.**
 - Streaming/CDC, mutable feature-store tables, and the full eval family were
-  server-complete but lacked a published client surface until now; not yet driven
-  end-to-end from a user's seat.
-- **Scale is unproven** — all validation was at small scale (≤4k rows). The OOM is a
-  warning that memory-scaling edges are unmapped.
+  server-complete but lacked a published client surface until now. **The cp9 client
+  gap is CLOSED for mutable/topic/pubsub as of 0.26.4** (#58/#158 — `RemoteDatabase`
+  gains `create_mutable_table`, `drop_mutable_table`, `list_mutable_tables`,
+  `register_topic`, `drop_topic`, `list_topics`, `publish_topic`, `subscribe_collect`
+  with a conformance guard; see CHANGELOG v0.26.4). Eval/infer client parity was
+  already closed by T4 (#119). The remaining gap is end-to-end cookbook chapters
+  driving these verbs against the published client (C1/C2 are authored in the
+  cookbook; CI drives them on CPU with the embedded engine — not yet at scale or
+  against a published `grpc://` server).
+- **Scale is unproven** — all validation was at small scale (≤4k rows). The
+  memory-scaling edge is now partially addressed (mining bounded) but the broader
+  scale tier (3.1) remains the #1 gap.
 
 **Why this is a mature 0.26.x, not a 1.0.** The consumer loop is *still* surfacing
 real engine findings (the fine-tune vertical alone produced three). Several bugs fixed
@@ -131,12 +144,15 @@ Each workstream: the gap (with evidence), the approach, and an acceptance criter
 expressed as a *measured* result.
 
 ### 3.1 Scale & resource-bounding — **the #1 gap**
-- **Gap.** Everything validated at ≤4k rows; hard-negative mining OOMs at 1500 pairs
+- **Gap.** Everything validated at ≤4k rows; hard-negative mining OOMed at 1500 pairs
   in the corpus-encode pass *before training*, independent of batch size — a pass that
-  materializes embeddings without bounding memory.
-- **Approach.** Audit every pass that materializes corpus/embeddings/edges (embed,
-  mine-hard-negatives, propagate, fine-tune, exact-search fold) for chunked, bounded-
-  memory streaming. Add a scale tier to CI at documented sizes (e.g. 100k → 1M rows /
+  materialized embeddings without bounding memory. **Partial close (0.26.4):** mining
+  is now memory-bounded (no second full corpus-embedding copy; anchors scored in
+  batches; ANN over-fetch capped — #63/#160, CHANGELOG v0.26.4). The scale tier
+  itself remains open.
+- **Approach.** Audit every remaining pass that materializes corpus/embeddings/edges
+  (embed, propagate, fine-tune, exact-search fold) for chunked, bounded-memory
+  streaming. Add a scale tier to CI at documented sizes (e.g. 100k → 1M rows /
   10⁵–10⁶ edges) running on a representative box, asserting bounded peak RSS and a
   perf-regression gate.
 - **Acceptance.** A published benchmark (embed/s, search QPS, propagate on N-node
@@ -159,10 +175,17 @@ expressed as a *measured* result.
   hard-negative OOM (#63) + a `hard_negative_refresh_every` default that silently
   requires `>0`; a graph fine-tune warmup-epoch question (#64); no documented
   determinism/resume story at scale.
+- **CLOSED (0.26.4) — hard-negative OOM + default anti-pattern (#63/#64/#160,
+  CHANGELOG v0.26.4):** mining is memory-bounded; wire defaults overlay correctly
+  (zeros no longer ship as literal values that the engine rejects); graph fine-tune
+  epoch count is now locked to the caller's value. The `refresh_every` silent-default
+  anti-pattern (where a `None` default silently required a positive value at runtime)
+  is resolved — the default overlay now applies engine defaults unconditionally.
+- **Remaining open:** standardization/domain-contract property test for every
+  trainable head (high-offset oracle in CI), checkpoint/resume story at scale.
 - **Approach.** A standardization/domain-contract property test for **every** trainable
-  head (high-offset, low-variance, large-magnitude oracle in CI). Fix hard-negative
-  memory-bounding + the default mismatch (validate-with-clear-error or sane default).
-  Confirm/document the warmup epoch. Specify + test checkpoint/resume.
+  head (high-offset, low-variance, large-magnitude oracle in CI). Confirm/document the
+  warmup epoch. Specify + test checkpoint/resume.
 - **Acceptance.** Every head passes the high-offset oracle in CI; hard-negative mining
   runs at the scale tier; a documented, tested resume-after-crash path.
 
@@ -172,10 +195,20 @@ expressed as a *measured* result.
   server handlers but no client wrappers (now closing). Long-lived `subscribe` streaming
   semantics over gRPC (backpressure, reconnection, exactly-/at-least-once) are unproven
   at scale.
-- **Approach.** Finish client parity (mutable/topic/pubsub → then channels/eval/infer).
-  A **CI conformance guard** that `RemoteDatabase` surface == embedded surface name-for-
-  name + signature, so the fault line cannot silently reopen. Specify subscribe stream
-  semantics (replay+tail bounds, cancellation, reconnection) and test under load.
+- **CLOSED (partial, 0.26.4) — mutable/topic/pubsub + eval/infer/pipeline (#58/#119/#158,
+  CHANGELOG v0.26.4):** `RemoteDatabase` now carries the full verb surface: training
+  (T3), pipeline + eval (T4), and mutable-companion-table + topic + pub/sub (cp9
+  substrate). A conformance guard in `crates/jammi-python/tests/test_conformance.py`
+  pins the full set name-for-name + signature-for-signature across embedded and remote
+  transports. Cookbook chapters C1 (feature-store, mutable tables) and C2 (CDC,
+  trigger topics) author the end-to-end workflows on CPU with the embedded engine.
+  Multi-chunk publish parity is confirmed (#160 — the remote `publish_topic` collapses
+  multi-chunk tables before the wire hop, matching the embedded `concat_batches`).
+- **Remaining open:** subscribe stream semantics at scale (replay+tail bounds,
+  cancellation, reconnection under load); channels/eval/infer cookbook chapters against
+  a published `grpc://` server at the scale tier; delivery-semantics specification.
+- **Approach.** Specify subscribe stream semantics (replay+tail bounds, cancellation,
+  reconnection) and test under load.
 - **Acceptance.** Conformance guard green; a CDC chapter that publishes → predicate-
   filtered subscribe → backing-table replay end-to-end over the published client, at the
   scale tier, with stated delivery semantics.
@@ -184,12 +217,19 @@ expressed as a *measured* result.
 - **Gap.** The two-layer model (catalog-row + discriminator-column isolation; the "no
   auth in the engine" boundary) is correct but under-documented and under-tested; the
   `with_tenant` ergonomics bind-in-place/return-None (#60).
+- **CLOSED (partial, 0.26.4) — `with_tenant` ergonomics (#60/#161, CHANGELOG v0.26.4):**
+  `with_tenant` (bind-in-place, returned `None`, read like a builder) is replaced by
+  `set_tenant` (unambiguous sticky setter, `-> None`) and `tenant_scope` (block-scoped
+  context manager restoring the prior tenant on exit, yielding the same connection
+  object). Both the embedded and remote surfaces are updated atomically; the conformance
+  test asserts neither surface carries `with_tenant`.
+- **Remaining open:** a standing isolation oracle across the full verb surface (catalog
+  reads, search, propagate, query, mutable, topics); a documented, measured multi-tenant
+  chapter in CI at the scale tier; the BYO-auth seam documented with a worked example.
 - **Approach.** Publish the tenant contract explicitly (what isolates, what does not,
-  where the consumer must gate). A standing isolation oracle: the property must hold
-  across **every** verb (catalog reads, search, propagate, query, mutable, topics). A
-  scope-safe `with_tenant` (context manager / scoped handle). A clean, documented
-  **BYO-auth seam** (Flight SQL / gRPC interceptor) where a consumer plugs identity —
-  the engine ships the seam, never the auth.
+  where the consumer must gate). A standing isolation oracle across every verb. A clean,
+  documented **BYO-auth seam** (Flight SQL / gRPC interceptor) where a consumer plugs
+  identity — the engine ships the seam, never the auth.
 - **Acceptance.** A measured multi-tenant chapter (listing isolation + discriminator-
   column isolation as hard zeros + the honest global-source caveat) in CI across the
   verb surface; the BYO-auth seam documented with a worked example.
@@ -219,6 +259,12 @@ expressed as a *measured* result.
 ### 3.8 API stability staging & error taxonomy
 - **Gap.** The surface is good but not yet *deliberate*; some confusing failures (the
   `refresh_every`-default-None error is the anti-pattern).
+- **CLOSED (partial, 0.26.4) — `refresh_every` silent-default anti-pattern (#63/#64/#160,
+  CHANGELOG v0.26.4):** the hard-negative config defaults now overlay at the engine
+  level; the wire sends `optional` fields that fall back to `HardNegativeConfig::default()`
+  rather than literal zeros that validation rejected with an opaque error. The
+  broader API-stability staging (provisional/stable annotations, reference-contract
+  test in engine CI, typed error taxonomy) remains open.
 - **Approach.** Make the grounded-API-reference contract test the engine's own (a
   consumer cookbook already does this — lift it in). A typed error taxonomy with clear,
   actionable messages and stable gRPC status mapping. A provisional-vs-stable annotation
@@ -252,11 +298,16 @@ expressed as a *measured* result.
 
 ## 5. Sequencing
 
-- **H1 — finish what's in flight (→ 0.26.4 / 0.27).** Remote client parity (mutable/
-  topic/pubsub → eval/infer), the cp9 verticals (mutable feature-store, CDC/triggers)
-  authored against the published client, the open loop findings (`with_tenant`
-  ergonomics, crates index-wait, hard-negative OOM, graph warmup epoch). Closes 3.4
-  partially + the smaller 3.3/3.5 items.
+- **H1 — CLOSED (landed in 0.26.4).** Remote client parity for mutable/topic/pubsub
+  (3.4 partial, #58/#158); T1–T4+N remote-ML-surface spec set (training, pipeline,
+  eval, conformal/RRF parity on the wire, conformance guard); `with_tenant` →
+  `set_tenant` + `tenant_scope` (3.5 partial, #60/#161); hard-negative OOM + default
+  anti-pattern (3.3 partial + 3.8 partial, #63/#64/#160); crates index-wait (CI fix,
+  #62). The cp9 cookbook chapters (C1 mutable feature-store, C2 CDC/triggers) authored
+  and merged in `jammi-cookbook`. **What remains open from H1's scope:** eval/infer/
+  channels cookbook chapters against a published `grpc://` server at scale; subscribe
+  stream semantics under load; BYO-auth seam documentation; scale tier (moves to H2).
+  See §3 workstreams for per-item status.
 - **H2 — scale & search (→ 0.27 / 0.28). _This is the M1 gate._** The scale tier
   (3.1), search completeness + ANN benchmarks (3.2), training memory-bounding (3.3).
   At the end of H2 the engine is **mainstream-ready for serious ML/Search on a trusted

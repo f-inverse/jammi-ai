@@ -12,6 +12,29 @@ that produced this evidence — a bidirectional engine↔consumer-cookbook loop,
 adversarial oracle sweeps, and a per-PR rigor chain — is itself part of the roadmap,
 because *how* we harden is as load-bearing as *what* we harden.
 
+## Start here (fresh session)
+
+A session continuing this roadmap with no prior context should, in order:
+
+1. **Load the operational context.** Read §7 (Execution substrate) and the memory
+   files it names — they hold the build/test/release/infra specifics this document
+   deliberately keeps out of the strategy. Recalled memories reflect the state when
+   written; verify any file/flag/path they name still exists before acting on it.
+2. **Re-establish the baseline.** Run the engine CI gate (§7.2) and the standing
+   adversarial sweep on a clean `main`, green, before changing anything — the sweep
+   is the regression net, not a one-off.
+3. **Pick the next phase from §5.** H1 (in flight at the time of writing) → **H2 is
+   the M1 gate** (scale + search). Within a phase, take the workstream whose
+   acceptance — a *measured cookbook chapter + a CI oracle* — is most load-bearing;
+   §7.7 maps each workstream to its primary files.
+4. **Run every change through the rigor chain** (§2.3): plan → pressure-test →
+   implement → independent adversarial audit → CI → release. Authoring/extending the
+   cookbook chapter named in the workstream's acceptance *is* the integration test.
+
+Issue-ref note: `#NN` here are this project's internal task-tracker IDs (not GitHub
+issues). Each maps to a merged fix in git history / the `CHANGELOG`, and the
+surrounding prose is self-describing — treat the number as a label, not a lookup.
+
 ---
 
 ## 0. Two milestones, defined
@@ -260,3 +283,103 @@ expressed as a *measured* result.
 - Honesty is the non-negotiable: a manufactured benchmark, a mismeasured fix, or an
   overclaimed guarantee is a release blocker, not a nuance. The whole reason the core is
   trustworthy today is that nothing untrue was allowed to ship.
+
+---
+
+## 7. Execution substrate (operational reference)
+
+§1–§6 are deliberately free of host/tooling specifics so they stay true as the infra
+changes. Those specifics live here and in the linked memory files. **This host is not
+the `CLAUDE.md` devcontainer** — the paths, toolchain, and constraints below are for the
+SageMaker host this work has run on; re-verify them at the start of a new session.
+
+### 7.1 Engine build/test env (Rust)
+Use the `.cargo/config.toml` defaults (sccache + mold). Do **not** override
+`RUSTC_WRAPPER`/`RUSTFLAGS` — any override changes the sccache key and re-misses the
+cache (this once turned a gate into ~100 min of redundant compiles). Per shell:
+```
+export PATH=$HOME/.local/bin:$PATH          # prebuilt sccache 0.8.2 + mold 2.32.0
+export PROTOC=/opt/conda/bin/protoc         # not on the minimal PATH
+export CARGO_TARGET_DIR=/mnt/sagemaker-nvme/ct-<unique>   # NOT /home (100 GiB, fills)
+unset RUSTC_WRAPPER RUSTFLAGS
+```
+`sccache --start-server` once per session (`--stop-server` if it wedges). mold silently
+falls back to the host `ld` (host gcc predates `-fuse-ld=mold`) — sccache is the real
+win; don't chase mold.
+
+### 7.2 The engine CI gate (run ALL — not a subset)
+```
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --exclude jammi-python                 # full hermetic lane
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --exclude jammi-python --no-deps
+cargo test --workspace --exclude jammi-python --features live-hub-tests --no-run
+```
+Proto/client changes also need `make -C clients/python generate` + a `jammi-python`
+rebuild + the TS client build. Embedded Python tests need `maturin develop` — beware the
+cross-worktree `jammi_ai` shadowing trap: pin `PYTHONPATH` to the worktree's `python/` +
+`clients/python` and confirm `jammi_ai.__file__` resolves into the worktree (and that its
+`_native.abi3.so` is the fresh build). The **Postgres** lane (`test-pg`,
+`--features live-postgres-tests`) is CI-only — compile-check `--no-run` locally; remote
+CI is the authoritative gate. Background long runs and poll; iterate with
+`cargo test … -- the::test::name` on the built binary (no recompile), never by re-running
+with a different `-p`/`--features`. Memory: `[[engine-ci-gate-checklist]]`.
+
+### 7.3 Infra constraints (these bit this project)
+- **NVMe (`/mnt/sagemaker-nvme`, ~416 GiB) is the build volume**; each worktree `target/`
+  is multi-GiB and it *does* fill (`df -h /mnt/sagemaker-nvme`). Remove merged-PR
+  worktrees (`git worktree remove --force …`) and stale `ct-*` dirs. A worktree checked
+  out while the disk was full once silently dropped a tracked fixture and produced a
+  spurious test failure — keep headroom.
+- **`docker --gpus` is blocked on SageMaker** — GPU work runs the binary directly on the
+  A10G, not in a GPU container. The cookbook's heavy GPU emit is one-time; CI reads the
+  committed cache on CPU.
+- **The server's JSON log sink writes nothing to a non-TTY stdout** — to prove GPU use,
+  rely on `nvidia-smi --query-compute-apps=…`, not the server log.
+
+### 7.4 GPU / CUDA build (A10G)
+Full recipe in `[[cuda-build-recipe-host]]`: a one-time `cudatk` conda env
+(`cuda-toolkit=12.9`), `CUDA_ROOT` at the `targets/x86_64-linux` subdir,
+`CUDA_COMPUTE_CAP=86`, then `cargo build -p jammi-cli --features cuda`. Or use the
+published `jammi-server-cu12` wheel (bundles the `nvidia-*-cu12` runtime + an
+`LD_LIBRARY_PATH` shim). Prove the GPU path with `nvidia-smi` compute-apps.
+
+### 7.5 Release machinery (lockstep bump + 8 publishes)
+A release is a PR bumping `0.X.Y → 0.X.(Y+1)` across **8 files** — `Cargo.toml`,
+`Cargo.lock` (via `cargo update --workspace`), `CHANGELOG.md`, `pyproject.toml`,
+`clients/python/pyproject.toml`, `clients/typescript/package.json`,
+`packaging/server-cpu/pyproject.toml`, `packaging/server-cu12/pyproject.toml` — every
+publishable crate ships at the same `workspace.package.version`. On merge, tag
+**`vX.Y.Z`** (crates ×12 / npm / GHCR CPU+cu12 images / release binaries) **and
+`py-vX.Y.Z`** (PyPI: `jammi-ai`, `jammi-client`, `jammi-server`, `jammi-server-cu12`) on
+the merge commit. All channels use OIDC trusted publishing (no tokens); crates.yml waits
+for sparse-index propagation between dependent publishes; release-binaries creates the
+release if missing. Release pre-authorization is standing for engine patches; only the
+cookbook is user-gated. Memories: `[[packaging-25c-plan]]`, `[[jammi-distribution-model]]`,
+`[[release-authorization]]`.
+
+### 7.6 Repos & the cookbook loop
+- Engine: this repo (`f-inverse/jammi-ai`). `docs/plans/` is **gitignored** — this
+  roadmap is committed with `git add -f`, so a fresh session sees it only after its PR
+  merges.
+- Cookbook: **`f-inverse/jammi-cookbook`** (private, Quarto), version-pinned to a released
+  `jammi_ai`. Its gate: `ruff` · `check_api_reference.py` · `check_citations.py` ·
+  `no_deferral_grep.sh` · `pytest` · `quarto render` · checksum verify. The heavy GPU emit
+  is one-time and committed; chapters read the cache on CPU and assert against
+  `golden_metrics.json`. A fixed source/artifact path collides on re-render — use a fresh
+  `tempfile.mkdtemp` per render. Memories: `[[cookbook-repo-decisions]]`,
+  `[[cookbook-env-readiness]]`.
+
+### 7.7 Code map — workstream → primary files
+Entry points for §3 (not exhaustive; confirm against the current tree).
+
+| Workstream | Primary files |
+|---|---|
+| 3.1 Scale / bounded passes | `crates/jammi-ai/src/fine_tune/hard_negative_miner.rs`; `…/fine_tune/trainer.rs` (`mine_hard_negative_loader`); `…/pipeline/graph_propagation.rs`; `crates/jammi-db/src/index/{exact,sidecar}.rs`; the embed pass in `…/model/backend/candle.rs` |
+| 3.2 Search / retrieval | `crates/jammi-db/src/index/{exact,sidecar}.rs`; the `search`/`assemble_context` session methods; `crates/jammi-numerics` (RRF) |
+| 3.3 Training robustness | `crates/jammi-ai/src/fine_tune/{trainer,hard_negative_miner,regression_loss,target}.rs`; `…/pipeline/context_predictor.rs`; oracle tests `crates/jammi-ai/tests/it/ft_correctness_sweep.rs` |
+| 3.4 Remote parity / streaming | `clients/python/jammi_client/_database.py`; conformance guard `crates/jammi-python/tests/test_conformance.py`; server handlers `crates/jammi-server/src/grpc/`; trigger framing `crates/jammi-wire/src/trigger.rs` |
+| 3.5 Multi-tenant | `crates/jammi-db/src/tenant_scope.rs` (analyzer rule); `…/session.rs` (`bind_tenant`/`with_tenant_scoped`); BYO-auth seam = the Flight/gRPC interceptor in `crates/jammi-server/src/`; `docs/guide/src/multi-tenant.md` |
+| 3.6 Catalog lifecycle | `crates/jammi-db/src/catalog/model_repo.rs` (`retire_model`, `model_pk`); the append-only migrations in `crates/jammi-db/src/catalog/backend*.rs` |
+| 3.7 Operability | server + worker logging; `crates/jammi-ai/src/fine_tune/worker.rs` (lease / recovery / crash-window) |
+| 3.8 API stability / errors | typed errors per crate; gRPC mapping `crates/jammi-server/src/grpc/wire.rs` (`map_engine_error`); the cookbook's `check_api_reference.py` (lift into engine CI) |

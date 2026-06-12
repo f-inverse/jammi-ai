@@ -22,6 +22,18 @@ workspace ships every publishable crate at the same
   bindings (embedded `Database.search` and remote `RemoteDatabase.search`) —
   pinned identical across wheels by a conformance signature test.
 
+### Changed
+- **`exact_vector_search` is now bounded-memory.** The no-sidecar brute-force
+  fallback streams the scan one `RecordBatch` at a time and folds it into a
+  bounded top-`k` heap that retains only `(row_id, distance)` pairs — never a
+  vector — instead of collecting every vector before scoring. Peak memory is now
+  `O(k + batch_rows · d)`, independent of the corpus size `N`, rather than the
+  previous `O(N · d)`. The result is bit-identical: the kept set and its order
+  are unchanged because the `(distance, unique _row_id)` total order makes the
+  bounded top-`k` return exactly the same prefix as the prior
+  sort-then-truncate, and the per-row distance fold is untouched. One
+  `candidate_order` comparator drives both the heap and the final sort.
+
 ## v0.26.5 — 2026-06-12
 
 ### Added

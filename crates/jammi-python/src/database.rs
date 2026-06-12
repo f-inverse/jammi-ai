@@ -456,6 +456,36 @@ impl PyDatabase {
             .map_err(to_pyerr)
     }
 
+    /// List every evidence channel registered to the session's currently bound
+    /// tenant, ordered by `(priority, channel_id)`. Each entry is a dict
+    /// `{"channel_id": str, "priority": int, "columns": [{"name": str,
+    /// "data_type": str}]}` where `data_type` is the canonical PascalCase token
+    /// (`"Float32"`, `"Utf8"`, …) — the same token `register_channel` accepts.
+    /// Columns appear in declaration order. An unbound session sees only the
+    /// global (NULL-tenant) channels.
+    fn list_channels(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let specs = self
+            .runtime
+            .block_on(self.session.catalog().channels().list())
+            .map_err(to_pyerr)?;
+        let out = PyList::empty(py);
+        for spec in &specs {
+            let entry = PyDict::new(py);
+            entry.set_item("channel_id", spec.id.as_str())?;
+            entry.set_item("priority", spec.priority)?;
+            let columns = PyList::empty(py);
+            for col in &spec.columns {
+                let col_dict = PyDict::new(py);
+                col_dict.set_item("name", col.name.as_str())?;
+                col_dict.set_item("data_type", col.data_type.as_str())?;
+                columns.append(col_dict)?;
+            }
+            entry.set_item("columns", columns)?;
+            out.append(entry)?;
+        }
+        Ok(out.into_any().unbind())
+    }
+
     /// Register a mutable companion table.
     ///
     /// Tenant scope is inherited from the session's currently bound tenant

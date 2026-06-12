@@ -2160,12 +2160,23 @@ mod tests {
         let raw_probe = batch_from_raw(&raw_per_task[0], None, k, &device);
         let (raw_mean, raw_sigma) =
             train_and_serve_first(&spec, &raw_batches, &raw_probe, None, &device);
+        // Collapse takes three forms, all of which are "did not fit the target":
+        // a finite mean stranded far from the offset, a σ pinned at the floor, or
+        // a non-finite served value — the un-standardised path is numerically
+        // unstable on a high offset and sometimes diverges to NaN/∞ outright. A
+        // non-finite mean is the strongest possible evidence of collapse, so it
+        // must count here; the prior predicate let `NaN > 100 || NaN < 0.05`
+        // (both false) masquerade as a fit and flake the oracle.
+        let collapsed = !raw_mean.is_finite()
+            || !raw_sigma.is_finite()
+            || (raw_mean as f64 - true_mean).abs() > 100.0
+            || raw_sigma < 0.05;
         assert!(
-            (raw_mean as f64 - true_mean).abs() > 100.0 || raw_sigma < 0.05,
+            collapsed,
             "the un-standardised path was expected to collapse on a high-offset \
-             target (mean far off OR σ pinned at the floor), but served mean \
-             {raw_mean}, σ {raw_sigma} — if this no longer collapses the oracle is \
-             not exercising the bug"
+             target (non-finite, mean far off, OR σ pinned at the floor), but \
+             served mean {raw_mean}, σ {raw_sigma} — if this no longer collapses \
+             the oracle is not exercising the bug"
         );
     }
 }

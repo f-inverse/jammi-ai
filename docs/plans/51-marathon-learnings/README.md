@@ -11,6 +11,9 @@ and git history; these are the transferable *patterns*.
   why it works, as a narrative with named principles.
 - **[CASE-STUDIES.md](CASE-STUDIES.md)** — shared. The deepest findings worked end to end
   (the Adam/standardization lesson, domain-validity, the tenant model, the flaky control).
+- **[FIELD-NOTES.md](FIELD-NOTES.md)** — for human readers, the *domain* lessons (ML,
+  search/retrieval, graph, conformal/UQ) as predict-first "anomaly cards" optimized for
+  absorption, threaded by the domain-validity spine. The so-what behind the cookbook.
 
 Operational context (build env, gate, release machinery, infra) lives in the hardening
 roadmap's §7 and the project memory files.

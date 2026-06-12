@@ -33,7 +33,7 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         db = jammi_ai.connect(f"file://{tmp}")
-        db.with_tenant(TENANT)
+        db.set_tenant(TENANT)
 
         # 1. Build an audit record for a (hypothetical) search. query_lineage
         #    holds hashes / IDs — never raw payloads (there is a size cap).

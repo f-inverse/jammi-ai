@@ -44,7 +44,7 @@ def test_context_manager_creates_uses_and_deletes(tmp_path):
     """Open a session, store rows, read them back, and confirm the table is
     gone and a `closed` event landed once the `with` block exits."""
     db = jammi_ai.connect(f"file://{tmp_path}")
-    db.with_tenant(TENANT_A)
+    db.set_tenant(TENANT_A)
 
     phys = None
     with db.ephemeral_session(timeout_seconds=3600) as ephem:
@@ -89,7 +89,7 @@ def test_persistent_lineage_survives_ephemeral_close(tmp_path):
     """A persistent table referencing a hash outlives the ephemeral session
     that also held it (success criterion 6)."""
     db = jammi_ai.connect(f"file://{tmp_path}")
-    db.with_tenant(TENANT_A)
+    db.set_tenant(TENANT_A)
 
     db.create_mutable_table(
         "query_lineage",
@@ -128,7 +128,7 @@ def test_tenant_isolation(tmp_path):
     physical table run under a *different* parent tenant scopes the rows out.
     """
     db = jammi_ai.connect(f"file://{tmp_path}")
-    db.with_tenant(TENANT_A)
+    db.set_tenant(TENANT_A)
 
     with db.ephemeral_session(timeout_seconds=3600) as ephem:
         ephem.create_ephemeral_table(
@@ -145,9 +145,9 @@ def test_tenant_isolation(tmp_path):
         assert ephem.sql("imgs", "SELECT * FROM {table}").num_rows == 1
 
         # Tenant B, querying the physical table directly, sees none of A's rows.
-        db.with_tenant(TENANT_B)
+        db.set_tenant(TENANT_B)
         scoped_out = db.sql(f"SELECT * FROM {phys}")
         assert scoped_out.num_rows == 0
 
         # Restore A so close runs under the right scope.
-        db.with_tenant(TENANT_A)
+        db.set_tenant(TENANT_A)

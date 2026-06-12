@@ -245,8 +245,8 @@ def test_mutable_table_tenant_isolation_over_the_wire(live_server):
     db_a = jammi_client.connect(live_server)
     db_b = jammi_client.connect(live_server)
     try:
-        db_a.with_tenant(TENANT_A)
-        db_b.with_tenant(TENANT_B)
+        db_a.set_tenant(TENANT_A)
+        db_b.set_tenant(TENANT_B)
 
         db_a.create_mutable_table(
             "scoped_dim",
@@ -262,3 +262,48 @@ def test_mutable_table_tenant_isolation_over_the_wire(live_server):
     finally:
         db_a.close()
         db_b.close()
+
+
+def test_tenant_scope_scopes_and_restores_over_the_wire(live_server):
+    """`with db.tenant_scope(t)` scopes server-side reads to `t` for the block and
+    restores the prior tenant on exit — over gRPC. The remote tenant lives
+    server-side (keyed by session id); the client captures the prior tenant via
+    `GetTenant` on entry and rebinds it on exit. Nesting restores the outer tenant
+    on inner exit, not a blind clear. Registry isolation (`list_mutable_tables`,
+    proven session-scoped by the isolation test above) is the observable."""
+    db = jammi_client.connect(live_server)
+    other = jammi_client.connect(live_server)
+    try:
+        # `other` registers a B-only table the scoped `db` must not see under A.
+        other.set_tenant(TENANT_B)
+        other.create_mutable_table(
+            "b_only", schema=_dim_schema(), primary_key=["sku"]
+        )
+
+        assert db.tenant() is None  # starts unscoped
+
+        with db.tenant_scope(TENANT_A):
+            assert db.tenant() == TENANT_A
+            db.create_mutable_table(
+                "a_only", schema=_dim_schema(), primary_key=["sku"]
+            )
+            ids = {t["id"] for t in db.list_mutable_tables()}
+            assert "a_only" in ids and "b_only" not in ids  # scoped to A
+
+            with db.tenant_scope(TENANT_B):
+                assert db.tenant() == TENANT_B
+                inner = {t["id"] for t in db.list_mutable_tables()}
+                assert "b_only" in inner and "a_only" not in inner
+            # Inner exit restores A, not unscoped.
+            assert db.tenant() == TENANT_A
+            assert "a_only" in {t["id"] for t in db.list_mutable_tables()}
+
+            db.drop_mutable_table("a_only")
+
+        # Outer exit restores the prior (unscoped) scope.
+        assert db.tenant() is None
+
+        other.drop_mutable_table("b_only")
+    finally:
+        db.close()
+        other.close()

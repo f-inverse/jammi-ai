@@ -34,8 +34,10 @@ in-process or behind a server:
 
 ## Tenant scoping
 
-`db.with_tenant("tenant-a")` binds every subsequent call to a tenant. The
-quickstart runs unscoped (catalog rows have `tenant_id IS NULL`), which is
-the right default for a local interactive workflow.
+`db.set_tenant("tenant-a")` binds every subsequent call to a tenant; for a
+block-scoped binding that restores the prior tenant on exit, use
+`with db.tenant_scope("tenant-a"): ...`. The quickstart runs unscoped (catalog
+rows have `tenant_id IS NULL`), which is the right default for a local
+interactive workflow.
 
 Next: [register a data source](./03_register_source.md).

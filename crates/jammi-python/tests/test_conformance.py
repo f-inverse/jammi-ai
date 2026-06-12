@@ -65,7 +65,8 @@ _REMOTE_VERBS = {
     "sql",
     "list_sources",
     "describe_source",
-    "with_tenant",
+    "set_tenant",
+    "tenant_scope",
     "tenant",
     "get_server_info",
 }
@@ -335,6 +336,27 @@ def test_embedded_database_shares_the_unified_modality_verbs():
         "server_info",
     ):
         assert not hasattr(jammi_ai.Database, gone), f"{gone} should be hard-cut"
+
+
+def test_tenant_surface_agrees_across_wheels():
+    """The tenant verbs carry the SAME names on the embedded `Database` and the
+    client's `RemoteDatabase`: the sticky `set_tenant` setter, the block-scoped
+    `tenant_scope` context manager, and the `tenant` getter. The old
+    `with_tenant` (which mutated in place yet read like a builder, returning
+    ``None``) is gone from BOTH surfaces — a caller swaps transports without
+    changing the call, and neither surface carries the footgun."""
+    for verb in ("set_tenant", "tenant_scope", "tenant"):
+        assert callable(getattr(jammi_ai.Database, verb)), verb
+        assert callable(getattr(jammi_client.RemoteDatabase, verb)), verb
+    assert not hasattr(jammi_ai.Database, "with_tenant"), "with_tenant must be hard-cut"
+    assert not hasattr(
+        jammi_client.RemoteDatabase, "with_tenant"
+    ), "with_tenant must be hard-cut"
+    # `tenant_scope(tenant_id)` takes the same caller-visible parameter on both —
+    # the embedded native method and the client context manager agree name-for-name.
+    embed = _call_surface(jammi_ai.Database.tenant_scope)
+    client = _call_surface(jammi_client.RemoteDatabase.tenant_scope)
+    assert embed == client, f"tenant_scope: {embed} != {client}"
 
 
 def test_get_server_info_shape_agrees_across_transports(tmp_path):

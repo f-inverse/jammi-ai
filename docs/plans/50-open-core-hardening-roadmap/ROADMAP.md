@@ -223,7 +223,10 @@ expressed as a *measured* result.
   of these are on `RemoteDatabase` (the server-side RPCs exist in
   `eval.proto`/`inference.proto`/`catalog.proto`, but the published client carries no
   wrappers), they have no conformance-guard set, and no measured cookbook chapter
-  drives them. Also open: subscribe stream semantics at scale (replay+tail bounds,
+  drives them. Also open — a live client-parity *defect*, not just a gap: remote
+  `fine_tune_graph` builds its `FineTuneConfig` but never attaches it to
+  `StartTrainingRequest`, so the server silently runs engine defaults (#167; the
+  cookbook's `epochs=1` → 3-epochs observation). Also open: subscribe stream semantics at scale (replay+tail bounds,
   cancellation, reconnection under load); channels/eval/infer cookbook chapters
   against a published `grpc://` server at the scale tier; delivery-semantics
   specification.

@@ -10,7 +10,7 @@ Coordinator-maintained. Per-PR status, decisions log, research map, per-branch a
 | T1 catalog training-job primitives | merged | `t1-training-job-catalog` | #108 | lease-based training-job queue primitives in `jammi-db`; `training_jobs` table, kind+lease+claim/heartbeat/reclaim; no callers yet. Hardened by Postgres queue test coverage + true-parallel claim test (#114). |
 | T2a rename → training_jobs/TrainingJob | merged | `t2a-rename-training-jobs` | #109 | rename `fine_tune_jobs` infrastructure to `training_jobs/TrainingJob`; no behavior change |
 | T2b durable training worker + submit | merged | `t2b-training-worker` | #112 | durable `TrainingWorker`; `submit` verb; context-predictor promoted to a durable job returning a `TrainingJob` handle; `reclaim` replaces fleet-unsafe `cleanup_stale_*` |
-| T3 remote training + predict surface | merged | `t3-remote-training-surface` | #115 | `TrainingService` gRPC + `RemoteTrainingJob` handle; predict on the wire (`InferenceService.Predict`); conformance test updated; intra-doc link fix in CI (#116) |
+| T3 remote training + predict surface | merged | `t3-remote-training-surface` | #115 | `TrainingService` gRPC + `RemoteTrainingJob` handle; predict on the wire (`InferenceService.Predict`); conformance test updated |
 | T4 compute-to-data wire parity | merged | `t4-compute-to-data-wire-parity` | #119 | `assemble_context` / `build_neighbor_graph` / `propagate_embeddings` / `eval_calibration` on gRPC (`PipelineService` + `EvalService`); matching client wrappers in `jammi_client._database` |
 | N shared numeric utilities | merged | `n-client-conformal-numerics` | #110 | `conformalize*` / `rrf_fuse` as pure-Python in `jammi_client`; verb-surface parity with the embedded engine; conformance test pins numeric identity across transports |
 
@@ -50,7 +50,7 @@ T1 introduced the `training_jobs` catalog table with lease-based claim/heartbeat
 
 ### `t2a-rename-training-jobs` (T2a, #109)
 
-Renamed `fine_tune_jobs` infrastructure to `training_jobs` / `TrainingJob` across the workspace; no behavior change. CI docs fix for broken intra-doc links caused by the rename landed in the same day as #116.
+Renamed `fine_tune_jobs` infrastructure to `training_jobs` / `TrainingJob` across the workspace; no behavior change. The CI docs fix for the broken intra-doc links caused by the rename is #116.
 
 ### `t2b-training-worker` (T2b, #112)
 

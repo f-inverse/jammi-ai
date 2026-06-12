@@ -1344,6 +1344,46 @@ class RemoteDatabase:
         out["context_ref"] = list(resp.context_ref)
         return out
 
+    # --- Inference (data plane) ---------------------------------------------------
+    #
+    # The bulk inference verb DOES hit the wire: the model and the registered
+    # source both live in the engine, so the compute runs where the data is
+    # (`InferenceService.Infer`) and only the output rows cross the wire. The
+    # signature mirrors the embed `Database`'s so a caller swaps transports
+    # without changing the call.
+
+    def infer(
+        self,
+        *,
+        source: str,
+        model: str,
+        columns: List[str],
+        task: str,
+        key: str,
+    ) -> pa.Table:
+        """Run `model` over `columns` of a registered source for `task`,
+        returning one output row per source row as a `pyarrow.Table`.
+
+        `task` is the snake-case model-task string (``"text_embedding"``,
+        ``"image_embedding"``, ``"audio_embedding"``, ``"classification"``,
+        ``"ner"``, ``"regression"``); `key` names the column whose value becomes
+        each output row's ``_row_id``. Maps to `InferenceService.Infer`. The
+        whole result rides back as one unary `ArrowBatch` (a single Arrow IPC
+        stream), so gRPC's default 4 MB per-message receive cap bounds the
+        result size a default channel can carry.
+        """
+        resp = self._inference.Infer(
+            inference_pb2.InferRequest(
+                source_id=source,
+                model_id=model,
+                task=_MODEL_TASK[task],
+                columns=list(columns),
+                key_column=key,
+            ),
+            metadata=self._metadata,
+        )
+        return _arrow_batch_to_table(resp.result)
+
     # --- Engine-state pipeline verbs (PipelineService / EvalService) -------------
     #
     # These build durable graph/embedding artifacts or assemble a target's

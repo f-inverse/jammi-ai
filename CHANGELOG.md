@@ -7,6 +7,21 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **`jammi-bench` scale-measurement harness (`publish = false`).** A new
+  workspace member that links the engine and drives its primitives at scale,
+  emitting one machine-readable JSON report per run (`cargo run -p jammi-bench
+  --release -- <subcommand>`). It is a measurement *consumer* of the engine,
+  kept out of the published workspace so the engine stays a clean library while
+  still being compile-checked by the workspace gate. Its first functional
+  subcommand, `search-rss`, is the bounded-memory proof for the streamed
+  `exact_vector_search`: over seeded synthetic vectors at two corpus sizes it
+  measures the streamed path's peak RSS against a bench-only naive collect-all
+  baseline (the negative control — the `O(N·d)` path the streaming rewrite
+  removed), and asserts the streamed resident set stays flat as the corpus
+  grows while the baseline grows linearly. The remaining tiers (embed
+  throughput, ANN QPS, recall@k, propagate latency, peak RSS over a realistic
+  corpus) are scaffolded as explicit not-yet-measured stubs so the report schema
+  is stable from the first emit.
 - **`search` gains an `embedding_table=` selector.** A source can carry several
   embedding tables (a raw table, a propagated table, a fine-tuned table); the
   search verb now names which one to search. `search(source, query=…, k=…,

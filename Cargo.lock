@@ -4116,6 +4116,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "jammi-bench"
+version = "0.26.5"
+dependencies = [
+ "arrow",
+ "clap",
+ "datafusion",
+ "futures",
+ "jammi-db",
+ "jammi-numerics",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "jammi-cli"
 version = "0.26.5"
 dependencies = [

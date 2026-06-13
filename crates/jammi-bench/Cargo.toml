@@ -1,0 +1,27 @@
+[package]
+name = "jammi-bench"
+description = "Scale and performance measurement harness for the Jammi engine. A measurement consumer of the engine — not an engine surface — kept out of the published workspace so the engine stays a clean library."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "jammi-bench"
+path = "src/main.rs"
+
+[dependencies]
+jammi-db.workspace = true
+jammi-numerics.workspace = true
+
+arrow.workspace = true
+datafusion.workspace = true
+tokio.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+libc.workspace = true
+tempfile = "3"

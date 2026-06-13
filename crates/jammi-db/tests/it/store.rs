@@ -6,6 +6,7 @@ use arrow::record_batch::RecordBatch;
 use jammi_db::catalog::result_repo::CreateResultTableParams;
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::catalog::Catalog;
+use jammi_db::config::AnnIndexConfig;
 use jammi_db::model_task::ModelTask;
 use jammi_db::storage::{
     reader::{count_parquet_rows, is_valid_parquet},
@@ -327,7 +328,8 @@ async fn recovery_skips_index_rebuild_for_non_embedding_task() {
         .await
         .unwrap();
 
-    let store = ResultStore::new(dir.path(), Arc::clone(&catalog)).unwrap();
+    let store =
+        ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default()).unwrap();
     store.recover().await.unwrap();
 
     let record = catalog
@@ -349,7 +351,7 @@ async fn recovery_skips_index_rebuild_for_non_embedding_task() {
 async fn result_store_create_table_generates_correct_paths() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let store = ResultStore::new(dir.path(), catalog).unwrap();
+    let store = ResultStore::new(dir.path(), catalog, AnnIndexConfig::default()).unwrap();
 
     let info = store
         .create_table(
@@ -389,7 +391,13 @@ async fn result_store_with_memory_root_roots_and_roundtrips() {
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let registry = StorageRegistry::new();
     let root = StorageUrl::memory("jammi_results");
-    let store = ResultStore::with_root(root, registry, Arc::clone(&catalog)).unwrap();
+    let store = ResultStore::with_root(
+        root,
+        registry,
+        Arc::clone(&catalog),
+        AnnIndexConfig::default(),
+    )
+    .unwrap();
 
     let info = store
         .create_table(
@@ -459,7 +467,8 @@ async fn recovery_marks_missing_parquet_as_failed() {
         .await
         .unwrap();
 
-    let store = ResultStore::new(dir.path(), Arc::clone(&catalog)).unwrap();
+    let store =
+        ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default()).unwrap();
     store.recover().await.unwrap();
 
     assert_eq!(
@@ -501,7 +510,8 @@ async fn recovery_deletes_invalid_parquet_and_marks_failed() {
         .await
         .unwrap();
 
-    let store = ResultStore::new(dir.path(), Arc::clone(&catalog)).unwrap();
+    let store =
+        ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default()).unwrap();
     store.recover().await.unwrap();
 
     assert_eq!(
@@ -560,7 +570,8 @@ async fn recovery_promotes_valid_parquet_to_ready() {
         .await
         .unwrap();
 
-    let store = ResultStore::new(dir.path(), Arc::clone(&catalog)).unwrap();
+    let store =
+        ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default()).unwrap();
     store.recover().await.unwrap();
 
     let record = catalog.get_result_table("stuck").await.unwrap().unwrap();

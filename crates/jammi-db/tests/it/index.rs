@@ -5,6 +5,7 @@ use arrow::datatypes::{DataType, Field};
 use datafusion::common::TableReference;
 use datafusion::datasource::file_format::options::ParquetReadOptions;
 use datafusion::prelude::SessionContext;
+use jammi_db::config::AnnIndexConfig;
 use jammi_db::index::exact::exact_vector_search;
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
@@ -17,7 +18,7 @@ use tempfile::tempdir;
 #[test]
 fn sidecar_add_search_and_edge_cases() {
     // Core: add vectors, search returns correct nearest neighbor
-    let mut index = SidecarIndex::new(3).unwrap();
+    let mut index = SidecarIndex::new(3, &AnnIndexConfig::default()).unwrap();
     index.add("row_a", &[1.0, 0.0, 0.0]).unwrap();
     index.add("row_b", &[0.0, 1.0, 0.0]).unwrap();
     index.add("row_c", &[0.9, 0.1, 0.0]).unwrap();
@@ -38,7 +39,7 @@ fn sidecar_add_search_and_edge_cases() {
     assert_eq!(results.len(), 3);
 
     // Edge: empty index
-    let empty = SidecarIndex::new(3).unwrap();
+    let empty = SidecarIndex::new(3, &AnnIndexConfig::default()).unwrap();
     assert!(empty.search(&[1.0, 0.0, 0.0], 5).unwrap().is_empty());
     assert!(empty.is_empty());
 }
@@ -47,7 +48,7 @@ fn sidecar_add_search_and_edge_cases() {
 
 #[test]
 fn sidecar_get_returns_stored_vectors() {
-    let mut index = SidecarIndex::new(3).unwrap();
+    let mut index = SidecarIndex::new(3, &AnnIndexConfig::default()).unwrap();
     index.add("row_a", &[1.0, 0.0, 0.0]).unwrap();
     index.add("row_b", &[0.0, 1.0, 0.0]).unwrap();
     index.build().unwrap();
@@ -66,7 +67,7 @@ fn sidecar_get_returns_stored_vectors() {
     let dir = tempdir().unwrap();
     let base_path = dir.path().join("get_roundtrip");
     index.save(&base_path).unwrap();
-    let loaded = SidecarIndex::load(&base_path).unwrap();
+    let loaded = SidecarIndex::load(&base_path, &AnnIndexConfig::default()).unwrap();
     assert_eq!(
         loaded.get("row_b").unwrap().expect("row_b after load"),
         vec![0.0, 1.0, 0.0]
@@ -80,7 +81,7 @@ fn sidecar_save_load_roundtrip() {
     let dir = tempdir().unwrap();
     let base_path = dir.path().join("test_index");
 
-    let mut index = SidecarIndex::new(3).unwrap();
+    let mut index = SidecarIndex::new(3, &AnnIndexConfig::default()).unwrap();
     index.add("id_1", &[1.0, 0.0, 0.0]).unwrap();
     index.add("id_2", &[0.0, 1.0, 0.0]).unwrap();
     index.add("id_3", &[0.0, 0.0, 1.0]).unwrap();
@@ -103,7 +104,7 @@ fn sidecar_save_load_roundtrip() {
     assert_eq!(manifest["backend"], "usearch");
 
     // Load and verify search still works (row_id mapping survives)
-    let loaded = SidecarIndex::load(&base_path).unwrap();
+    let loaded = SidecarIndex::load(&base_path, &AnnIndexConfig::default()).unwrap();
     assert_eq!(loaded.len(), 3);
     let results = loaded.search(&[1.0, 0.0, 0.0], 1).unwrap();
     assert_eq!(results[0].0, "id_1");
@@ -116,7 +117,7 @@ fn sidecar_load_rejects_corrupted_rowmap() {
     let dir = tempdir().unwrap();
     let base_path = dir.path().join("bad_version");
 
-    let mut index = SidecarIndex::new(2).unwrap();
+    let mut index = SidecarIndex::new(2, &AnnIndexConfig::default()).unwrap();
     index.add("r1", &[1.0, 0.0]).unwrap();
     index.build().unwrap();
     index.save(&base_path).unwrap();
@@ -128,7 +129,7 @@ fn sidecar_load_rejects_corrupted_rowmap() {
     std::fs::write(&map_path, data).unwrap();
 
     assert!(
-        SidecarIndex::load(&base_path).is_err(),
+        SidecarIndex::load(&base_path, &AnnIndexConfig::default()).is_err(),
         "Should reject unknown rowmap version"
     );
 }

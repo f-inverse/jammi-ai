@@ -152,13 +152,21 @@ Set `endpoint` instead of `account_id` to point at an R2 custom domain. Result t
 # use std::sync::Arc;
 # use jammi_db::catalog::Catalog;
 # fn ex(catalog: Arc<Catalog>) -> jammi_db::error::Result<()> {
+use jammi_db::config::AnnIndexConfig;
 use jammi_db::storage::{StorageRegistry, StorageUrl};
 use jammi_db::store::ResultStore;
 use std::sync::Arc;
 
 let root = StorageUrl::parse("s3://benchmarks/jammi_db")?;
 let registry = StorageRegistry::new();
-let result_store = Arc::new(ResultStore::with_root(root, registry, catalog)?);
+// `AnnIndexConfig` tunes the HNSW sidecar index every embedding table carries;
+// the default reproduces the index backend's built-in defaults.
+let result_store = Arc::new(ResultStore::with_root(
+    root,
+    registry,
+    catalog,
+    AnnIndexConfig::default(),
+)?);
 # Ok(()) }
 ```
 

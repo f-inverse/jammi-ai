@@ -1115,12 +1115,13 @@ fn build_result_store(
     inner: &JammiSession,
     catalog: Arc<jammi_db::catalog::Catalog>,
 ) -> Result<ResultStore> {
+    let ann = inner.config().embedding.ann;
     match inner.config().storage.result_root.as_deref() {
         Some(root) => {
             let root = jammi_db::storage::StorageUrl::parse(root)?;
-            ResultStore::with_root(root, inner.storage_registry(), catalog)
+            ResultStore::with_root(root, inner.storage_registry(), catalog, ann)
         }
-        None => ResultStore::new(inner.config().artifact_dir.as_path(), catalog),
+        None => ResultStore::new(inner.config().artifact_dir.as_path(), catalog, ann),
     }
 }
 

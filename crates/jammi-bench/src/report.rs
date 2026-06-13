@@ -8,6 +8,8 @@
 //! [`Measurement::not_yet_measured`] marker rather than a zero that a gate
 //! could mistake for a real datapoint.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 /// One harness invocation's full output.
@@ -66,9 +68,9 @@ fn total_ram_mib() -> u64 {
 /// tiers its subcommand produced.
 #[derive(Debug, Default, Serialize)]
 pub struct Tiers {
-    /// The realistic quality tier (committed corpus): embed throughput, search
-    /// QPS, recall@k, propagate latency, peak RSS. Not yet measured in this
-    /// harness — present as a stub so the schema is stable.
+    /// The realistic quality tier (committed corpus): the ANN-vs-exact recall
+    /// curve, plus the perf metrics (embed throughput, search QPS, propagate
+    /// latency, peak RSS) still stubbed not-yet-measured. Populated by `arxiv`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arxiv: Option<ArxivTier>,
     /// The binding-memory tier: the streamed exact-search RSS proof and its
@@ -76,6 +78,16 @@ pub struct Tiers {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<BindingTier>,
 }
+
+/// The k values the recall curve is reported at: recall@1, recall@10, recall@100.
+///
+/// A curve rather than a single scalar because ANN quality is k-dependent — a
+/// graph index can nail the nearest neighbour (recall@1 high) yet thin out by
+/// recall@100, or the reverse. One number hides that shape; the curve makes the
+/// quality-vs-breadth trade visible and lets each k carry its own floor. These
+/// are the k the committed ground-truth top-k is emitted at, so the recall path
+/// can compute every point from one set of artifacts.
+pub const RECALL_KS: [usize; 3] = [1, 10, 100];
 
 /// The realistic quality tier — embed/search/recall/propagate over a committed
 /// corpus. Every metric is a [`Measurement`] so an un-run metric is explicit.
@@ -87,8 +99,13 @@ pub struct ArxivTier {
     pub search_qps_exact: Measurement,
     /// ANN (sidecar-index) search throughput, queries per second.
     pub search_qps_ann: Measurement,
-    /// Recall of ANN-over-frozen-index vs the committed exact ground truth.
-    pub recall_at_10: Measurement,
+    /// Recall of ANN-over-frozen-index vs the exact ground truth, as a curve
+    /// keyed by k. Each entry is the mean over the query set of
+    /// `|ANN_topk ∩ EXACT_topk| / k` — a set-intersection fraction, so it is
+    /// insensitive to within-top-k ordering. Keyed by k (1, 10, 100) so the
+    /// quality-vs-breadth shape is explicit and each k can carry its own floor.
+    /// A [`BTreeMap`] so the curve serializes in ascending k order.
+    pub recall: BTreeMap<usize, Measurement>,
     /// Neighbor-graph propagation latency, milliseconds.
     pub propagate_latency_ms: Measurement,
     /// Process peak resident set, mebibytes.
@@ -96,14 +113,21 @@ pub struct ArxivTier {
 }
 
 impl ArxivTier {
-    /// Every metric stubbed `not yet measured` — the schema exists, the numbers
-    /// land in a later PR.
-    pub fn stub() -> Self {
+    /// The tier with a measured recall curve and every perf metric still stubbed
+    /// `not yet measured`.
+    ///
+    /// The recall lane is the portable, machine-independent gate (a fraction, not
+    /// a rate), so it carries real datapoints from the first emit; the perf
+    /// metrics (embed/search QPS, propagate latency, peak RSS) are rate/latency
+    /// numbers measured on the emit box in a later PR, and stay explicit
+    /// not-yet-measured markers until then rather than a zero a gate could
+    /// mistake for a datapoint.
+    pub fn with_recall(recall: BTreeMap<usize, Measurement>) -> Self {
         Self {
             embed_per_s: Measurement::not_yet_measured("rows_per_s"),
             search_qps_exact: Measurement::not_yet_measured("queries_per_s"),
             search_qps_ann: Measurement::not_yet_measured("queries_per_s"),
-            recall_at_10: Measurement::not_yet_measured("fraction"),
+            recall,
             propagate_latency_ms: Measurement::not_yet_measured("ms"),
             peak_rss_mib: Measurement::not_yet_measured("mib"),
         }
@@ -222,5 +246,13 @@ impl Measurement {
     /// A not-yet-measured slot for a metric expressed in `unit`.
     pub fn not_yet_measured(unit: &'static str) -> Self {
         Self { value: None, unit }
+    }
+
+    /// A measured datapoint: `value` expressed in `unit`.
+    pub fn measured(value: f64, unit: &'static str) -> Self {
+        Self {
+            value: Some(value),
+            unit,
+        }
     }
 }

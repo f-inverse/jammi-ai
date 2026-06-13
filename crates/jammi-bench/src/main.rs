@@ -4,18 +4,21 @@
 //! A measurement *consumer* of the engine: it links `jammi-db`/`jammi-numerics`
 //! and drives their public surfaces at scale, emitting one machine-readable JSON
 //! report per run. It is `publish = false` and names no consumer — it measures
-//! the engine's generic primitives (exact search, and later embed throughput,
-//! ANN QPS, recall@k, propagate latency, peak RSS), so it is kept out of the
-//! published workspace to keep the engine a clean library while still being
+//! the engine's generic primitives (exact search, ANN-vs-exact recall, and later
+//! embed throughput, ANN QPS, propagate latency, peak RSS), so it is kept out of
+//! the published workspace to keep the engine a clean library while still being
 //! compile-checked by the workspace gate.
 //!
-//! Invoke as `cargo run -p jammi-bench --release -- <subcommand>`. Today only
-//! `search-rss` is functional — the bounded-RSS proof for streamed exact search
-//! (the payoff of the streamed `exact_vector_search` rewrite). The other tiers
-//! are scaffolded as explicit `not yet measured` stubs so the report schema is
-//! stable from the first emit.
+//! Invoke as `cargo run -p jammi-bench --release -- <subcommand>`. Two
+//! subcommands are functional: `search-rss`, the bounded-RSS proof for streamed
+//! exact search (the payoff of the streamed `exact_vector_search` rewrite), and
+//! `arxiv`, the ANN-vs-exact recall curve over a committed corpus (the exact
+//! oracle's top-k vs a frozen sidecar's, set-intersected). The remaining perf
+//! metrics are scaffolded as explicit `not yet measured` stubs so the report
+//! schema is stable from the first emit.
 
 mod corpus;
+mod recall;
 mod report;
 mod rss;
 mod search_rss;
@@ -49,9 +52,11 @@ enum Command {
     /// collect-all baseline (the negative control) grows linearly. Emits the
     /// JSON report and exits non-zero if the proof does not hold.
     SearchRss,
-    /// The realistic quality tier — embed throughput, search QPS, recall@k,
-    /// propagate latency, peak RSS over a committed corpus. Not yet measured;
-    /// emits the schema with explicit `not yet measured` markers.
+    /// The realistic quality tier over a committed corpus. Measures the
+    /// ANN-vs-exact recall curve (recall@k for k∈{1,10,100}) — the exact oracle's
+    /// top-k vs a frozen sidecar's, set-intersected — and emits it; the perf
+    /// metrics (embed throughput, search QPS, propagate latency, peak RSS) ride
+    /// along as explicit `not yet measured` markers until the perf lane lands.
     Arxiv,
     /// Internal: measure one search variant over a pre-materialized corpus in a
     /// fresh process and print `<peak_rss_mib> <result_digest>`. The `search-rss`
@@ -76,7 +81,7 @@ async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::SearchRss => run_search_rss().await,
-        Command::Arxiv => run_arxiv(),
+        Command::Arxiv => run_arxiv().await,
         Command::MeasureOnce {
             variant,
             rows,
@@ -148,20 +153,47 @@ async fn run_search_rss() -> std::process::ExitCode {
     }
 }
 
-/// Emit the realistic-tier schema with every metric stubbed. The numbers land
-/// in a later PR; this keeps the JSON shape stable from the first emit.
-fn run_arxiv() -> std::process::ExitCode {
+/// Run the realistic-tier recall path and emit the tier.
+///
+/// Measures the ANN-vs-exact recall curve (recall@k for k∈{1,10,100}) over the
+/// committed recall fixture bundle, filling the `recall` slots with real
+/// datapoints; the perf metrics (embed/search QPS, propagate latency, peak RSS)
+/// stay explicit `not yet measured` markers — they are the perf lane, measured
+/// in a later PR. The fixture bundle is committed by the on-box emit step; until
+/// it is present this subcommand fails loudly rather than emitting a faked
+/// recall number.
+async fn run_arxiv() -> std::process::ExitCode {
+    let fixture_dir = arxiv_fixture_dir();
+    let recall = match recall::recall_curve(&fixture_dir).await {
+        Ok(curve) => curve,
+        Err(e) => {
+            eprintln!(
+                "arxiv recall path failed over fixture {}: {e}",
+                fixture_dir.display()
+            );
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     let report = Report {
         engine_version: ENGINE_VERSION,
         host: Host::detect(),
         subcommand: "arxiv",
         tiers: Tiers {
-            arxiv: Some(ArxivTier::stub()),
+            arxiv: Some(ArxivTier::with_recall(recall)),
             binding: None,
         },
     };
     emit(&report);
     std::process::ExitCode::SUCCESS
+}
+
+/// The committed recall-fixture bundle directory, resolved against the crate
+/// root so the path is stable regardless of the working directory the harness
+/// is launched from.
+fn arxiv_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join("scale")
 }
 
 /// Write the report as pretty JSON to stdout.

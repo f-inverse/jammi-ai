@@ -17,11 +17,6 @@ pub trait VectorIndex: Send + Sync {
     /// Persist the index to disk.
     fn save(&self, path: &std::path::Path) -> Result<()>;
 
-    /// Load an index from disk.
-    fn load(path: &std::path::Path) -> Result<Self>
-    where
-        Self: Sized;
-
     /// Number of vectors currently in the index.
     fn len(&self) -> usize;
 

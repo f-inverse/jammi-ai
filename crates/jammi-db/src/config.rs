@@ -431,6 +431,29 @@ pub struct HttpConfig {
     pub headers: std::collections::HashMap<String, String>,
 }
 
+/// HNSW graph-tuning knobs for the ANN sidecar index — the universal
+/// recall-vs-cost dials of a hierarchical navigable small-world graph, named
+/// for the HNSW primitive and independent of the backing index library.
+///
+/// `0` on any field means "use the index backend's built-in default" (the
+/// derived [`Default`]), so an unset config reproduces the backend's defaults
+/// exactly. `connectivity` and `build_expansion` are fixed when the graph is
+/// constructed; `search_expansion` is a query-time dial applied to a loaded index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(default)]
+pub struct AnnIndexConfig {
+    /// Maximum connections per graph node (HNSW *M*). Higher trades a larger
+    /// index and slower build for better recall. `0` = backend default.
+    pub connectivity: usize,
+    /// Candidate-list width during graph construction (HNSW *ef_construction*).
+    /// Higher trades slower build for a better-quality graph. `0` = backend default.
+    pub build_expansion: usize,
+    /// Candidate-list width during search (HNSW *ef_search*). Higher trades
+    /// slower queries for better recall; mutable on a loaded index.
+    /// `0` = backend default.
+    pub search_expansion: usize,
+}
+
 /// Embedding index defaults.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -441,6 +464,8 @@ pub struct EmbeddingConfig {
     pub default_index_type: IndexType,
     /// Rows between index checkpoint writes. Default: 1000.
     pub checkpoint_interval: usize,
+    /// HNSW graph-tuning knobs for the ANN sidecar index.
+    pub ann: AnnIndexConfig,
 }
 
 /// Fine-tuning hyperparameter defaults.
@@ -759,6 +784,7 @@ impl Default for EmbeddingConfig {
             default_distance_metric: DistanceMetric::Cosine,
             default_index_type: IndexType::IvfHnswSq,
             checkpoint_interval: 1000,
+            ann: AnnIndexConfig::default(),
         }
     }
 }

@@ -112,7 +112,7 @@ impl<'a> EmbeddingPipeline<'a> {
             .result_store
             .open_writer(&table_info.parquet_url, embedding_schema)
             .await?;
-        let sidecar = SidecarIndex::new(embedding_dim)?;
+        let sidecar = SidecarIndex::new(embedding_dim, &self.session.inner_config().embedding.ann)?;
         let checkpoint_interval = self.session.inner_config().embedding.checkpoint_interval;
         let mut sink = ResultSink::for_embeddings(
             writer,

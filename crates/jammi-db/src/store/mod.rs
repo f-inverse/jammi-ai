@@ -17,6 +17,7 @@ use tracing::warn;
 use crate::catalog::result_repo::{CreateResultTableParams, ResultTableKind, ResultTableRecord};
 use crate::catalog::status::ResultTableStatus;
 use crate::catalog::Catalog;
+use crate::config::AnnIndexConfig;
 use crate::error::{JammiError, Result};
 use crate::index::sidecar::SidecarIndex;
 use crate::index::VectorIndex;
@@ -52,6 +53,10 @@ pub struct ResultStore {
     root: StorageUrl,
     registry: StorageRegistry,
     catalog: Arc<Catalog>,
+    /// HNSW tuning for every sidecar index this store builds and loads — the
+    /// deployment's [`AnnIndexConfig`], applied at build time (recovery and
+    /// materialization) and re-applied to the query-time dial on load.
+    ann: AnnIndexConfig,
 }
 
 /// Sanitize a model ID for use in file names.
@@ -80,7 +85,7 @@ impl ResultStore {
     /// directory is created if absent. Equivalent to
     /// `ResultStore::with_root(StorageUrl::parse(artifact_dir.join("jammi_db"))?, …)`
     /// with a default-constructed [`StorageRegistry`].
-    pub fn new(artifact_dir: &Path, catalog: Arc<Catalog>) -> Result<Self> {
+    pub fn new(artifact_dir: &Path, catalog: Arc<Catalog>, ann: AnnIndexConfig) -> Result<Self> {
         let jammi_db_dir = artifact_dir.join("jammi_db");
         std::fs::create_dir_all(&jammi_db_dir)?;
         let url = StorageUrl::parse(
@@ -92,6 +97,7 @@ impl ResultStore {
             root: url,
             registry: StorageRegistry::new(),
             catalog,
+            ann,
         })
     }
 
@@ -103,6 +109,7 @@ impl ResultStore {
         root: StorageUrl,
         registry: StorageRegistry,
         catalog: Arc<Catalog>,
+        ann: AnnIndexConfig,
     ) -> Result<Self> {
         if root.scheme() == Scheme::File {
             // Ensure the directory exists so create_table doesn't fail on
@@ -115,6 +122,7 @@ impl ResultStore {
             root,
             registry,
             catalog,
+            ann,
         })
     }
 
@@ -367,7 +375,7 @@ impl ResultStore {
         };
         let idx_url = StorageUrl::parse(idx_path)?;
         let handle = self.open_index(&idx_url)?;
-        match storage::sidecar_layout::load_sidecar(&handle).await {
+        match storage::sidecar_layout::load_sidecar(&handle, &self.ann).await {
             Ok(index) => Ok(Some(index)),
             Err(e) => {
                 warn!(
@@ -431,7 +439,7 @@ impl ResultStore {
         }
 
         let batches = storage::reader::read_all_record_batches(parquet_handle).await?;
-        let mut index = SidecarIndex::new(dimensions)?;
+        let mut index = SidecarIndex::new(dimensions, &self.ann)?;
         for batch in batches {
             let row_ids = batch
                 .column_by_name("_row_id")
@@ -508,7 +516,7 @@ impl ResultStore {
         let batch = embedding_batch(&schema, source_id, model_id, rows, dimensions)?;
 
         let mut writer = self.open_writer(&table_info.parquet_url, schema).await?;
-        let mut index = SidecarIndex::new(dimensions)?;
+        let mut index = SidecarIndex::new(dimensions, &self.ann)?;
         if !rows.is_empty() {
             writer.write_batch(&batch).await?;
             for (key, vector) in rows {

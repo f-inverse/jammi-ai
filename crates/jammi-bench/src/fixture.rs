@@ -29,6 +29,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use jammi_db::config::AnnIndexConfig;
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
 
@@ -200,7 +201,7 @@ fn freeze_sidecar(
     rows: &[(String, Vec<f32>)],
     dim: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut index = SidecarIndex::new(dim)?;
+    let mut index = SidecarIndex::new(dim, &AnnIndexConfig::default())?;
     for (id, v) in rows {
         index.add(id, v)?;
     }

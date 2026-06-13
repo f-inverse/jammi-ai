@@ -20,6 +20,7 @@
 
 use std::path::Path;
 
+use crate::config::AnnIndexConfig;
 use crate::error::Result;
 use crate::index::sidecar::SidecarIndex;
 
@@ -70,14 +71,15 @@ pub async fn save_sidecar(handle: &JammiObjectStore, index: &SidecarIndex) -> Re
     }
 }
 
-/// Load a sidecar bundle into a [`SidecarIndex`].
+/// Load a sidecar bundle into a [`SidecarIndex`], applying the query-time HNSW
+/// knob from `ann` to the loaded graph.
 ///
 /// For `file://` schemes USearch reads the destination path directly. For
 /// cloud schemes we download into a tempdir, then load from there.
-pub async fn load_sidecar(handle: &JammiObjectStore) -> Result<SidecarIndex> {
+pub async fn load_sidecar(handle: &JammiObjectStore, ann: &AnnIndexConfig) -> Result<SidecarIndex> {
     match handle.scheme() {
-        Scheme::File => load_sidecar_local(handle),
-        _ => load_sidecar_remote(handle).await,
+        Scheme::File => load_sidecar_local(handle, ann),
+        _ => load_sidecar_remote(handle, ann).await,
     }
 }
 
@@ -96,9 +98,9 @@ fn save_sidecar_local(handle: &JammiObjectStore, index: &SidecarIndex) -> Result
     Ok(())
 }
 
-fn load_sidecar_local(handle: &JammiObjectStore) -> Result<SidecarIndex> {
+fn load_sidecar_local(handle: &JammiObjectStore, ann: &AnnIndexConfig) -> Result<SidecarIndex> {
     let base = local_base_path(handle)?;
-    SidecarIndex::load(&base)
+    SidecarIndex::load(&base, ann)
 }
 
 async fn save_sidecar_remote(handle: &JammiObjectStore, index: &SidecarIndex) -> Result<()> {
@@ -118,7 +120,10 @@ async fn save_sidecar_remote(handle: &JammiObjectStore, index: &SidecarIndex) ->
     Ok(())
 }
 
-async fn load_sidecar_remote(handle: &JammiObjectStore) -> Result<SidecarIndex> {
+async fn load_sidecar_remote(
+    handle: &JammiObjectStore,
+    ann: &AnnIndexConfig,
+) -> Result<SidecarIndex> {
     let tmp = tempfile::tempdir()?;
     let stem = tmp.path().join("sidecar");
 
@@ -131,7 +136,7 @@ async fn load_sidecar_remote(handle: &JammiObjectStore) -> Result<SidecarIndex> 
         std::fs::write(stem.with_extension(ext), &bytes)?;
     }
 
-    SidecarIndex::load(&stem)
+    SidecarIndex::load(&stem, ann)
 }
 
 /// Resolve the on-disk stem for a `file://` handle. Strips the `.parquet`
@@ -150,7 +155,7 @@ mod tests {
     use crate::storage::{JammiObjectStore, StorageRegistry, StorageUrl};
 
     fn build_small_index() -> SidecarIndex {
-        let mut idx = SidecarIndex::new(4).unwrap();
+        let mut idx = SidecarIndex::new(4, &AnnIndexConfig::default()).unwrap();
         idx.add("row-a", &[1.0, 0.0, 0.0, 0.0]).unwrap();
         idx.add("row-b", &[0.0, 1.0, 0.0, 0.0]).unwrap();
         idx.add("row-c", &[0.0, 0.0, 1.0, 0.0]).unwrap();
@@ -168,7 +173,9 @@ mod tests {
         let index = build_small_index();
         save_sidecar(&handle, &index).await.unwrap();
 
-        let loaded = load_sidecar(&handle).await.unwrap();
+        let loaded = load_sidecar(&handle, &AnnIndexConfig::default())
+            .await
+            .unwrap();
         let hits = loaded.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(hits.first().map(|(id, _)| id.as_str()), Some("row-a"));
 

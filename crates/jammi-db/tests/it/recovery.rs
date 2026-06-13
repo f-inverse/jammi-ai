@@ -3,6 +3,7 @@ use std::sync::Arc;
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::catalog::Catalog;
+use jammi_db::config::AnnIndexConfig;
 use jammi_db::model_task::ModelTask;
 use jammi_db::store::ResultStore;
 use tempfile::tempdir;
@@ -30,7 +31,8 @@ async fn crash_recovery_cleans_up_stale_result_tables() {
         .await
         .unwrap();
 
-    let result_store = ResultStore::new(dir.path(), Arc::clone(&catalog)).unwrap();
+    let result_store =
+        ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default()).unwrap();
     let table_info = result_store
         .create_table(
             "src1",

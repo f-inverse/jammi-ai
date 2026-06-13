@@ -7,6 +7,27 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **`jammi-bench` ANN-vs-exact recall mechanism.** The harness now measures how
+  well a frozen sidecar index recovers the exact nearest neighbours. The
+  `arxiv` subcommand drives a recall path that reads a committed `(_row_id,
+  vector)` corpus back through the engine's own vector-read path, derives a
+  deterministic query-by-example set (the first rows by sorted `_row_id`), runs
+  the engine's `exact_vector_search` as the ground-truth oracle and a
+  **loaded — never rebuilt** `SidecarIndex` as the approximate retriever, and
+  reports recall@k as a *set-intersection* fraction
+  (`mean |ANN_topk ∩ EXACT_topk| / k`) for a curve of k∈{1, 10, 100}. The
+  `ArxivTier` schema's `recall_at_10` scalar becomes that k-keyed recall curve;
+  the perf metrics (embed/search QPS, propagate latency, peak RSS) stay explicit
+  not-yet-measured markers. Loading the frozen index (rather than rebuilding) is
+  deliberate: USearch's default HNSW build is nondeterministic, so the committed
+  graph is the one whose recall is asserted. A hermetic test proves the
+  mechanism over a tiny deterministic fixture (a sidecar frozen over the same
+  vectors the oracle scores recovers them, recall@k == 1.0; the exact oracle
+  reproduces a hand-checkable top-k; the set-intersection arithmetic is
+  order-blind; the sorted-`_row_id` subset is the deterministic projection). The
+  meaningful real-embedding recall *floor* (recall@k ≥ 0.95 over a committed
+  170k-row corpus) is asserted by a committed-fixture gate added after the
+  on-box emit, in a later change.
 - **`jammi-bench` scale-measurement harness (`publish = false`).** A new
   workspace member that links the engine and drives its primitives at scale,
   emitting one machine-readable JSON report per run (`cargo run -p jammi-bench
@@ -18,10 +39,10 @@ workspace ships every publishable crate at the same
   measures the streamed path's peak RSS against a bench-only naive collect-all
   baseline (the negative control — the `O(N·d)` path the streaming rewrite
   removed), and asserts the streamed resident set stays flat as the corpus
-  grows while the baseline grows linearly. The remaining tiers (embed
-  throughput, ANN QPS, recall@k, propagate latency, peak RSS over a realistic
-  corpus) are scaffolded as explicit not-yet-measured stubs so the report schema
-  is stable from the first emit.
+  grows while the baseline grows linearly. The realistic-corpus perf tiers
+  (embed throughput, ANN QPS, propagate latency, peak RSS) are scaffolded as
+  explicit not-yet-measured stubs so the report schema is stable from the first
+  emit.
 - **`search` gains an `embedding_table=` selector.** A source can carry several
   embedding tables (a raw table, a propagated table, a fine-tuned table); the
   search verb now names which one to search. `search(source, query=…, k=…,

@@ -816,7 +816,7 @@ async fn fine_tune_job_catalog_crud() {
 
 #[test]
 fn lora_backward_step_changes_weights() {
-    use candle_nn::{AdamW, Optimizer, ParamsAdamW};
+    use jammi_ai::fine_tune::adamw::{AdamW, ParamsAdamW};
 
     let device = Device::Cpu;
     let varmap = VarMap::new();
@@ -860,8 +860,10 @@ fn lora_backward_step_changes_weights() {
     let diff = (&cos_sim - &scores).unwrap();
     let loss = diff.sqr().unwrap().mean_all().unwrap();
 
-    // One backward step
-    optimizer.backward_step(&loss).unwrap();
+    // One backward step: gradients, then an optimizer step (what the old
+    // `Optimizer::backward_step` convenience did).
+    let grads = loss.backward().unwrap();
+    optimizer.step(&grads).unwrap();
 
     // Check that VarMap variables changed (at least one var should have non-zero gradient)
     let vars = varmap.all_vars();

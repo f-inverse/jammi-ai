@@ -6,8 +6,10 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BinaryArray, StringArray};
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
-use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarMap};
+use candle_nn::VarMap;
 use jammi_db::catalog::Catalog;
+
+use crate::fine_tune::adamw::{AdamW, ParamsAdamW};
 use jammi_db::error::{JammiError, Result};
 
 use super::data::{TextChunk, TrainingDataLoader};
@@ -2361,7 +2363,8 @@ mod tests {
 
     // ─── Distributional regression objectives (S18) ──────────────────────────
 
-    use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarMap};
+    use crate::fine_tune::adamw::{AdamW, ParamsAdamW};
+    use candle_nn::VarMap;
 
     /// A heteroscedastic synthetic regression set with TWO feature groups that
     /// share ONE regression mean but have different noise: a low-noise group

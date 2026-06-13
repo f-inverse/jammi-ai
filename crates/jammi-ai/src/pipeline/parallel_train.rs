@@ -16,7 +16,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use candle_core::{Tensor, Var};
-use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarMap};
+use candle_nn::VarMap;
+
+use crate::fine_tune::adamw::{AdamW, ParamsAdamW};
 use jammi_db::error::{JammiError, Result};
 
 use crate::fine_tune::optimizer::optimizer_step;

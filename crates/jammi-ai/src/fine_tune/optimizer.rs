@@ -7,8 +7,9 @@
 //! exactly one location rather than being copy-pasted per call site.
 
 use candle_core::{backprop::GradStore, DType, Tensor, Var};
-use candle_nn::{AdamW, Optimizer};
 use jammi_db::error::{JammiError, Result};
+
+use crate::fine_tune::adamw::AdamW;
 
 /// Clip gradients by global L2 norm in-place, matching
 /// `torch.nn.utils.clip_grad_norm_(params, max_norm)`.

@@ -9,6 +9,8 @@
 // vocabulary re-exported below lives on the `jammi-wire` substrate so a client
 // can encode a fine-tune request without the engine.
 #[cfg(feature = "local")]
+pub mod adamw;
+#[cfg(feature = "local")]
 pub mod classifier;
 #[cfg(feature = "local")]
 pub mod data;

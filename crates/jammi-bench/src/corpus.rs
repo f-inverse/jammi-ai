@@ -133,6 +133,53 @@ pub async fn materialize(
     Ok(url)
 }
 
+/// Write an explicit `(row_id, vector)` set to a Parquet object at `path`
+/// through the engine writer, filling the engine embedding schema.
+///
+/// Unlike [`materialize`], which streams an LCG-generated corpus, this writes
+/// rows the caller already holds — the read-back of a deterministic subset of a
+/// larger committed corpus, re-emitted as its own small fixture. `_source_id`
+/// and `_model_id` are constant placeholders the search never reads; only
+/// `_row_id` and `vector` participate in the oracle and the sidecar. Every row
+/// must have width `dim`; a mismatched row is a caller bug surfaced as an error.
+pub async fn write_vectors(
+    path: &Path,
+    rows: &[(String, Vec<f32>)],
+    dim: usize,
+) -> Result<StorageUrl, Box<dyn std::error::Error>> {
+    if let Some((id, v)) = rows.iter().find(|(_, v)| v.len() != dim) {
+        return Err(format!("row {id} has width {}, expected dim {dim}", v.len()).into());
+    }
+    let schema = embedding_table_schema(dim);
+    let url = StorageUrl::parse(path.to_str().ok_or("corpus path is not valid UTF-8")?)?;
+    let registry = StorageRegistry::new();
+    let driver = registry.driver_for(&url, None)?;
+    let handle = JammiObjectStore::new(driver, url.clone());
+    let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema)).await?;
+
+    let id_refs: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
+    let flat: Vec<f32> = rows.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+    let values = Arc::new(Float32Array::from(flat));
+    let item = Arc::new(arrow::datatypes::Field::new(
+        "item",
+        arrow::datatypes::DataType::Float32,
+        false,
+    ));
+    let vectors = FixedSizeListArray::try_new(item, dim as i32, values, None)?;
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(id_refs)) as ArrayRef,
+            Arc::new(StringArray::from(vec!["src"; rows.len()])),
+            Arc::new(StringArray::from(vec!["model"; rows.len()])),
+            Arc::new(vectors),
+        ],
+    )?;
+    writer.write_batch(&batch).await?;
+    writer.close().await?;
+    Ok(url)
+}
+
 /// Parse a filesystem path into the [`StorageUrl`] a corpus was written to, so
 /// a separate process can register a corpus the parent materialized.
 pub fn storage_url(path: &Path) -> Result<StorageUrl, Box<dyn std::error::Error>> {

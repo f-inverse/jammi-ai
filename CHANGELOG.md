@@ -7,6 +7,26 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **`jammi-bench` held-out ANN-vs-exact recall gate.** The `arxiv` subcommand
+  now measures recall over a **held-out** query set — a query parquet *disjoint*
+  from the indexed corpus — rather than querying the corpus with its own rows.
+  With held-out queries no query is its own nearest neighbour, so recall@k
+  reflects how well the frozen sidecar recovers the exact neighbours of *unseen*
+  points (the quantity a deployed index is judged on), not the structurally-1.0
+  recall a corpus-as-query set yields. A small hermetic fixture ships under
+  `crates/jammi-bench/fixtures/scale/` — a deterministic sorted-`_row_id` subset
+  of the real 170k-embedding scale cache (corpus rows + a frozen sidecar built
+  once over them + a separate held-out query slice), with a `floor.json` whose
+  per-k floors are the recall *measured on that slice* minus a safety margin. A
+  cargo-test gate loads the committed fixture, runs the held-out recall path,
+  and asserts each recall@k clears its committed floor — proving the held-out
+  gate works hermetically on real embeddings with no Git-LFS dependency. The
+  full 168k held-out recall gate runs in the cookbook chapter over the LFS cache
+  this fixture is subset from; the split keeps the engine repo LFS-free while
+  still asserting a real floor on a provable projection. The corpus-as-query
+  recall *mechanism* and its primitives (`mean_recall_at_k`, the
+  set-intersection arithmetic, the deterministic subset) are retained and still
+  tested.
 - **`jammi-bench` ANN-vs-exact recall mechanism.** The harness now measures how
   well a frozen sidecar index recovers the exact nearest neighbours. The
   `arxiv` subcommand drives a recall path that reads a committed `(_row_id,

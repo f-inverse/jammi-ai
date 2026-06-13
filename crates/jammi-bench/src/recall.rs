@@ -27,15 +27,45 @@
 //! the meaningful claim is "the ANN recovers at least this fraction of the true
 //! neighbours", not "the ANN reproduces a specific graph".
 //!
-//! ## What this module proves vs. what a later gate proves
+//! ## Corpus-as-query vs. held-out queries
 //!
-//! This module is the *mechanism*: load-frozen-ANN, run-exact-oracle,
-//! set-intersect, average. Its hermetic tests drive that mechanism over a tiny
-//! deterministic synthetic fixture, where the correctness is hand-checkable. The *meaningful* recall floor (recall@k ≥ 0.95 over the
-//! committed 170k real-embedding corpus) is asserted by a committed-fixture gate
-//! added after the on-box emit — a later PR, not this one. Synthetic vectors
-//! prove the math here; they cannot stand in for real-embedding recall quality,
-//! and this module fakes no scale number.
+//! There are two ways to source the query set, and they measure different
+//! things:
+//!
+//! * **Corpus-as-query** — the queries are corpus rows themselves. Each query's
+//!   true nearest neighbour is itself (distance ~0), so recall@1 is structurally
+//!   near-1.0 whatever the index quality. This exercises the
+//!   load / oracle / intersect / average mechanism (see
+//!   `ann_over_same_corpus_recovers_exact_neighbours`); it is *not* a meaningful
+//!   quality floor, because a query finding itself says nothing about how the ANN
+//!   handles unseen points.
+//! * **Held-out queries** ([`recall_curve_held_out`]) — the queries come from a
+//!   *separate* embedding set, disjoint from the indexed corpus by construction.
+//!   No query is its own neighbour, so recall@k measures how well the frozen ANN
+//!   recovers the exact neighbours of unseen points — the quantity a deployed
+//!   index is actually judged on. This is the path the `arxiv` subcommand drives
+//!   and the path a real recall floor is asserted against.
+//!
+//! Both run the *same* primitive ([`mean_recall_at_k`]); they differ only in
+//! where the query vectors come from. The held-out path takes its queries from a
+//! separate parquet rather than from the corpus rows.
+//!
+//! ## What the engine gate proves vs. what the cookbook proves
+//!
+//! The hermetic cargo-test gate (`held_out_recall_clears_committed_floor`)
+//! loads a *small committed fixture* — a deterministic sorted-`_row_id` subset of
+//! the real 170k cache (real embeddings: corpus rows + held-out query rows, with
+//! a sidecar frozen over the subset once) — and asserts the held-out recall@k
+//! clears a committed floor measured on that same slice. This proves the
+//! held-out gate works hermetically on real embeddings, inside `cargo test`,
+//! with no LFS dependency.
+//!
+//! The *full* 168k held-out recall gate runs in the cookbook chapter (a later
+//! step), which reads the Git-LFS cache the fixture is subset from. The split is
+//! deliberate: the engine repo carries no LFS, so the engine gate proves the
+//! held-out floor holds on a small provable projection that ships in the git
+//! object store, and the cookbook gate proves it at full scale on the same
+//! artifacts the fixture is carved from.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -49,25 +79,24 @@ use jammi_db::index::VectorIndex;
 use crate::corpus;
 use crate::report::{Measurement, RECALL_KS};
 
-/// File names of the committed recall fixture, relative to its bundle directory.
+/// File names of the committed *held-out* recall fixture, relative to its bundle
+/// directory.
 ///
-/// One directory holds the whole recall input: the corpus the oracle scans and
-/// the frozen sidecar bundle (three USearch files sharing the `STEM`). Naming
-/// them once here keeps the emit side (which writes them) and the gate side
-/// (which reads them) on one definition.
-const CORPUS_FILE: &str = "vectors.parquet";
-const SIDECAR_STEM: &str = "ann";
+/// The held-out bundle holds three inputs rather than two: the corpus the oracle
+/// scans and the sidecar is frozen over ([`HELD_OUT_CORPUS_FILE`] +
+/// [`HELD_OUT_SIDECAR_STEM`]), and a *separate* query parquet
+/// ([`HELD_OUT_QUERY_FILE`]) whose rows are disjoint from the corpus. The
+/// disjointness is what makes the recall a generalization measurement rather
+/// than a query-by-example one. Naming the files once keeps the fixture builder
+/// (which writes them) and the gate (which reads them) on one definition.
+const HELD_OUT_CORPUS_FILE: &str = "corpus_vectors.parquet";
+const HELD_OUT_QUERY_FILE: &str = "query_vectors.parquet";
+const HELD_OUT_SIDECAR_STEM: &str = "frozen";
 
-/// How many corpus rows form the query-by-example set: the first
-/// [`RECALL_QUERY_COUNT`] rows by sorted `_row_id`.
-///
-/// The query set is a deterministic projection of the committed corpus (the
-/// sorted-`_row_id` subset), not a separately committed file — so it is fixed by
-/// the corpus alone and reproduces on every box. Querying with corpus rows is a
-/// real query-by-example recall measurement: each query's true nearest neighbour
-/// is itself, and the ANN's job is to also surface the surrounding cluster the
-/// oracle ranks next.
-const RECALL_QUERY_COUNT: usize = 64;
+/// The table name the held-out query set registers under inside its
+/// `SessionContext`, distinct from [`RECALL_TABLE`] so corpus and queries can
+/// coexist in one context.
+const HELD_OUT_QUERY_TABLE: &str = "recall_held_out_queries";
 
 /// The table name the recall corpus registers under inside its `SessionContext`.
 const RECALL_TABLE: &str = "recall_corpus";
@@ -131,42 +160,50 @@ pub async fn mean_recall_at_k(
     Ok(total / queries.len() as f64)
 }
 
-/// Measure the recall curve over a committed fixture bundle directory.
+/// Measure the held-out recall curve over a committed fixture bundle directory.
 ///
-/// The directory holds the corpus parquet ([`CORPUS_FILE`]) and the frozen
-/// sidecar bundle ([`SIDECAR_STEM`]`.usearch`/`.rowmap`/`.manifest.json`). The
-/// query set is derived deterministically as the first [`RECALL_QUERY_COUNT`]
-/// corpus rows by sorted `_row_id` — a fixed function of the committed corpus,
-/// not a separate file. For each k in [`RECALL_KS`] this runs the exact oracle
-/// over the corpus and the loaded (never rebuilt) sidecar over the same vectors,
-/// and reports the mean set-intersection recall@k as a real [`Measurement`].
+/// The directory holds three inputs: the corpus parquet
+/// ([`HELD_OUT_CORPUS_FILE`]), the frozen sidecar bundle over that corpus
+/// ([`HELD_OUT_SIDECAR_STEM`]`.usearch`/`.rowmap`/`.manifest.json`), and a
+/// *separate* held-out query parquet ([`HELD_OUT_QUERY_FILE`]) whose `_row_id`s
+/// are disjoint from the corpus by construction.
 ///
-/// This is the recall *path* the `arxiv` subcommand drives. It is decoupled from
-/// any one corpus: the bundle the directory holds is whatever was committed
-/// there — the on-box real-embedding emit, or a deterministic subset of it. The
-/// emit, and the assertion of the meaningful floor against a committed golden,
-/// land in a later step; here the path computes a genuine curve from whatever
-/// bundle is present, and reports the absence of the bundle as an error rather
-/// than a faked number.
-pub async fn recall_curve(
+/// Unlike a corpus-as-query measurement, the query vectors are *not* projected
+/// out of the corpus — they come from the separate query parquet, so no query is
+/// its own nearest neighbour and recall@k measures how well the frozen ANN
+/// recovers the exact neighbours of unseen points. For each k in [`RECALL_KS`]
+/// this runs the
+/// exact oracle over the corpus (ground truth) and the loaded (never rebuilt)
+/// sidecar over the same corpus, querying both with the held-out vectors, and
+/// reports the mean set-intersection recall@k.
+///
+/// This is the real recall-floor path: the committed fixture is a deterministic
+/// subset of the 170k cache, and the cargo-test gate asserts each recall@k
+/// clears a floor measured on this same slice. The absence of any input is
+/// reported as an error rather than a faked number.
+pub async fn recall_curve_held_out(
     fixture_dir: &Path,
 ) -> Result<BTreeMap<usize, Measurement>, Box<dyn std::error::Error>> {
-    let corpus_path = fixture_dir.join(CORPUS_FILE);
-    let sidecar_base = fixture_dir.join(SIDECAR_STEM);
+    let corpus_path = fixture_dir.join(HELD_OUT_CORPUS_FILE);
+    let query_path = fixture_dir.join(HELD_OUT_QUERY_FILE);
+    let sidecar_base = fixture_dir.join(HELD_OUT_SIDECAR_STEM);
 
-    let url = corpus::storage_url(&corpus_path)?;
-    let ctx = corpus::register(&url, RECALL_TABLE).await?;
+    let corpus_url = corpus::storage_url(&corpus_path)?;
+    let ctx = corpus::register(&corpus_url, RECALL_TABLE).await?;
 
-    // The query set is the deterministic sorted-`_row_id` projection of the
-    // corpus — committed implicitly by the corpus, reproducible on any box.
-    let corpus_rows = corpus::load_vectors(&ctx, RECALL_TABLE).await?;
-    let queries: Vec<Vec<f32>> = corpus::sorted_row_id_subset(corpus_rows, RECALL_QUERY_COUNT)
+    // The query set is a SEPARATE embedding set, disjoint from the corpus — read
+    // its vectors back through the same load path the corpus uses, registered
+    // under its own table so it never collides with the corpus.
+    let query_url = corpus::storage_url(&query_path)?;
+    let query_ctx = corpus::register(&query_url, HELD_OUT_QUERY_TABLE).await?;
+    let queries: Vec<Vec<f32>> = corpus::load_vectors(&query_ctx, HELD_OUT_QUERY_TABLE)
+        .await?
         .into_iter()
         .map(|(_, v)| v)
         .collect();
     if queries.is_empty() {
         return Err(format!(
-            "recall fixture at {} has an empty corpus — no queries to project",
+            "held-out recall fixture at {} has an empty query set — no queries to measure recall over",
             fixture_dir.display()
         )
         .into());
@@ -184,11 +221,7 @@ pub async fn recall_curve(
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
-
-    use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
-    use jammi_db::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
-    use jammi_db::store::schema::embedding_table_schema;
+    use jammi_db::storage::StorageUrl;
     use tempfile::tempdir;
 
     use crate::corpus;
@@ -217,41 +250,6 @@ mod tests {
                 (id, v)
             })
             .collect()
-    }
-
-    /// Write `rows` to a Parquet object at `path` through the engine writer, the
-    /// same production path the synthetic and committed corpora use.
-    async fn write_corpus(path: &std::path::Path, rows: &[(String, Vec<f32>)], dim: usize) {
-        let schema = embedding_table_schema(dim);
-        let url = StorageUrl::parse(path.to_str().unwrap()).unwrap();
-        let registry = StorageRegistry::new();
-        let driver = registry.driver_for(&url, None).unwrap();
-        let handle = JammiObjectStore::new(driver, url);
-        let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema))
-            .await
-            .unwrap();
-
-        let ids: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
-        let flat: Vec<f32> = rows.iter().flat_map(|(_, v)| v.iter().copied()).collect();
-        let values = Arc::new(Float32Array::from(flat));
-        let item = Arc::new(arrow::datatypes::Field::new(
-            "item",
-            arrow::datatypes::DataType::Float32,
-            false,
-        ));
-        let vectors = FixedSizeListArray::try_new(item, dim as i32, values, None).unwrap();
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(ids)) as ArrayRef,
-                Arc::new(StringArray::from(vec!["src"; rows.len()])),
-                Arc::new(StringArray::from(vec!["model"; rows.len()])),
-                Arc::new(vectors),
-            ],
-        )
-        .unwrap();
-        writer.write_batch(&batch).await.unwrap();
-        writer.close().await.unwrap();
     }
 
     /// Build a sidecar over `rows` and freeze it to `base` (`.usearch`/`.rowmap`/
@@ -285,7 +283,9 @@ mod tests {
         let corpus_path = dir.path().join("tiny.parquet");
         let sidecar_base = dir.path().join("tiny");
 
-        write_corpus(&corpus_path, &rows, dim).await;
+        corpus::write_vectors(&corpus_path, &rows, dim)
+            .await
+            .unwrap();
         freeze_sidecar(&sidecar_base, &rows, dim);
 
         let url = StorageUrl::parse(corpus_path.to_str().unwrap()).unwrap();
@@ -322,7 +322,9 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let corpus_path = dir.path().join("tiny.parquet");
-        write_corpus(&corpus_path, &rows, dim).await;
+        corpus::write_vectors(&corpus_path, &rows, dim)
+            .await
+            .unwrap();
 
         let url = StorageUrl::parse(corpus_path.to_str().unwrap()).unwrap();
         let table = "tiny_corpus";
@@ -357,6 +359,48 @@ mod tests {
         // A perfect retriever scores 1.0; an empty one scores 0.0.
         assert_eq!(recall_at_k_for_query(&exact, &exact, 10), 1.0);
         assert_eq!(recall_at_k_for_query(&[], &exact, 10), 0.0);
+    }
+
+    /// The held-out recall gate: load the committed fixture (a real-embedding
+    /// subset of the 170k scale cache — corpus + sidecar frozen over it + a
+    /// SEPARATE disjoint query set) and assert each recall@k clears the floor
+    /// committed in `floor.json`.
+    ///
+    /// This is the hermetic engine proof that the *held-out* recall path works on
+    /// real embeddings: the queries are not corpus rows, so no query finds itself
+    /// and the recall is a genuine generalization measurement. The floor is the
+    /// recall measured on this same slice minus a safety margin, so the gate has
+    /// headroom against USearch-version or load-path drift without going vacuous.
+    /// The FULL 168k held-out gate runs in the cookbook chapter over the Git-LFS
+    /// cache this fixture is subset from; the engine repo carries no LFS, so this
+    /// gate proves the floor on the small committed projection.
+    #[tokio::test]
+    async fn held_out_recall_clears_committed_floor() {
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("scale");
+
+        let floor_json = std::fs::read_to_string(fixture_dir.join("floor.json"))
+            .expect("committed floor.json must be present in the fixture bundle");
+        let floor: serde_json::Value = serde_json::from_str(&floor_json).unwrap();
+
+        let curve = recall_curve_held_out(&fixture_dir)
+            .await
+            .expect("held-out recall path over the committed fixture must run");
+
+        for &k in &RECALL_KS {
+            let measured = curve
+                .get(&k)
+                .and_then(|m| m.value)
+                .unwrap_or_else(|| panic!("recall@{k} missing from measured curve"));
+            let floor_k = floor["recall"][k.to_string()]["floor"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("floor.json missing recall.{k}.floor"));
+            assert!(
+                measured >= floor_k,
+                "held-out recall@{k} = {measured} fell below committed floor {floor_k}"
+            );
+        }
     }
 
     /// The sorted-`_row_id` subset helper returns the deterministic

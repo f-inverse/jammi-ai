@@ -1,0 +1,25 @@
+{
+  "provenance": {
+    "source_corpus_rows": 168343,
+    "source_query_rows": 1000,
+    "slice_corpus_rows": 2000,
+    "slice_query_rows": 100,
+    "dim": 768,
+    "note": "deterministic first-N-by-sorted-_row_id subset of the full scale cache; corpus and queries disjoint by construction (held out in the source split)"
+  },
+  "margin": 0.04,
+  "recall": {
+    "1": {
+      "measured": 1.0,
+      "floor": 0.96
+    },
+    "10": {
+      "measured": 1.0,
+      "floor": 0.96
+    },
+    "100": {
+      "measured": 0.9969999999999998,
+      "floor": 0.9569999999999997
+    }
+  }
+}

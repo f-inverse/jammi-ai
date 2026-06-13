@@ -77,6 +77,10 @@ pub struct Tiers {
     /// negative control. Populated by `search-rss`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<BindingTier>,
+    /// The recall-vs-cost tier: how ANN recall and its build/query cost move as
+    /// the HNSW knobs are swept. Populated by `recall-sweep`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recall_sweep: Option<RecallSweepTier>,
 }
 
 /// The k values the recall curve is reported at: recall@1, recall@10, recall@100.
@@ -132,6 +136,60 @@ impl ArxivTier {
             peak_rss_mib: Measurement::not_yet_measured("mib"),
         }
     }
+}
+
+/// The recall-vs-cost tier: how ANN recall and its build/query cost move as the
+/// HNSW knobs are swept, each point measured against the exact oracle over a
+/// held-out query set.
+///
+/// Two axes, because the two cost lifecycles are different. The **build** axis
+/// sweeps the construction knobs (connectivity, build_expansion) — each point is
+/// a *separately built* graph, so the cost is build time and on-disk size, and
+/// recall here is an on-box reference (the swept graphs are not committed, so a
+/// reader cannot re-derive it — it is not a portable gate). The **search** axis
+/// sweeps `search_expansion` (ef_search) over ONE frozen graph re-dialed at query
+/// time — recall rises and QPS falls as ef grows, and because it re-dials a
+/// single committed index it *is* re-derivable, the portable recall-floor gate.
+#[derive(Debug, Serialize)]
+pub struct RecallSweepTier {
+    /// The USearch backend version the swept graphs were built/loaded with —
+    /// recall and the graph format are backend-dependent, so the version travels
+    /// with the curve and a reader rejects a cross-backend comparison.
+    pub backend_version: &'static str,
+    /// The corpus dimensionality every point was measured at.
+    pub dim: usize,
+    /// Corpus rows each graph was built over.
+    pub corpus_rows: usize,
+    /// Held-out queries each recall point averaged over.
+    pub query_rows: usize,
+    /// The build-knob axis (recall-vs-BUILD-cost): build time and index size rise
+    /// with the knobs while recall holds above its floor. On-box reference.
+    pub build_sweep: Vec<SweepPoint>,
+    /// The search-knob axis (recall-vs-QUERY-cost): one frozen graph re-dialed at
+    /// each `search_expansion`; recall rises and QPS falls as ef grows.
+    pub search_sweep: Vec<SweepPoint>,
+}
+
+/// One swept point: the HNSW knobs and every cost/quality metric measured at
+/// them. A metric that does not apply to a point's axis is an explicit
+/// [`Measurement::not_yet_measured`] marker, never a zero.
+#[derive(Debug, Serialize)]
+pub struct SweepPoint {
+    /// Max connections per graph node (HNSW *M*); `0` = backend default.
+    pub connectivity: usize,
+    /// Graph-construction candidate width (HNSW *ef_construction*); `0` = default.
+    pub build_expansion: usize,
+    /// Search candidate width (HNSW *ef_search*); `0` = backend default.
+    pub search_expansion: usize,
+    /// ANN-vs-exact recall@k over the held-out queries, set-intersection keyed by
+    /// k — the same portable fraction the `arxiv` tier reports.
+    pub recall: BTreeMap<usize, Measurement>,
+    /// Wall-clock to build the graph over the corpus (build-knob axis only).
+    pub build_time_ms: Measurement,
+    /// Serialized graph size on disk (build-knob axis only).
+    pub index_size_bytes: Measurement,
+    /// ANN search throughput at k=10 over the held-out queries.
+    pub search_qps: Measurement,
 }
 
 /// The binding-memory tier: the bounded-RSS proof for streamed exact search.

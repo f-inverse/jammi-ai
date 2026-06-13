@@ -113,6 +113,7 @@ impl SidecarIndex {
             "count": self.row_map.len(),
             "metric": "cosine",
             "backend": "usearch",
+            "backend_version": crate::index::backend_version(),
             "files": {
                 "index": usearch_path.file_name().and_then(|n| n.to_str()),
                 "rowmap": rowmap_path.file_name().and_then(|n| n.to_str()),

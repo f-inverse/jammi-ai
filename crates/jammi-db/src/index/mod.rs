@@ -3,6 +3,16 @@ pub mod sidecar;
 
 use crate::error::Result;
 
+/// The version string of the ANN index backend (USearch) this build links.
+///
+/// Recorded in sidecar manifests and measurement reports so a reader can reject
+/// a recall curve or a loaded graph produced against a different backend —
+/// recall and the serialized graph format are both backend-version-dependent,
+/// and the serialized header only carries the major version.
+pub fn backend_version() -> &'static str {
+    usearch::version()
+}
+
 /// Trait for ANN vector indexes keyed by `_row_id`.
 pub trait VectorIndex: Send + Sync {
     /// Add a vector with its row ID to the index.

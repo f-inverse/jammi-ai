@@ -1070,12 +1070,20 @@ impl TrainingLoop {
     /// (here and at serving) and the persisted head metadata all derive from it,
     /// so the served form can never disagree with the trained one.
     fn regression_form(&self) -> crate::inference::adapter::DistributionForm {
+        use super::target::StandardizableHead;
         use crate::inference::adapter::DistributionForm;
-        match self.config.regression_loss.unwrap_or_default() {
-            super::RegressionLoss::Pinball => DistributionForm::Quantile {
+        // Route the gaussian-vs-quantile decision through the offset-bearing-head
+        // classifier — the same closed enum the standardisation-contract guards
+        // and oracle pin — so the trained form, the persisted form, and the
+        // contract's notion of "which head this is" are one mapping. The quantile
+        // arm carries this run's configured levels.
+        let loss = self.config.regression_loss.unwrap_or_default();
+        if StandardizableHead::for_regression_loss(loss).is_gaussian() {
+            DistributionForm::Gaussian
+        } else {
+            DistributionForm::Quantile {
                 levels: self.config.quantile_levels.clone(),
-            },
-            _ => DistributionForm::Gaussian,
+            }
         }
     }
 
@@ -2744,6 +2752,278 @@ mod tests {
             l_crossing > l_ordered,
             "a crossing head must cost more than an ordered one \
              (crossing {l_crossing}, ordered {l_ordered})"
+        );
+    }
+}
+
+/// The standardisation-contract oracle for the **production fine-tune regression
+/// path** (heads 6/7 — Gaussian + quantile).
+///
+/// This is the genuinely-new coverage W5-PR1 adds. Unlike the MATH-level
+/// `gaussian_head_fits_high_offset_low_variance_target` /
+/// `pinball_trains_ordered_quantiles_to_their_levels` tests above (which hand-roll
+/// a `VarMap` head + scaler and call the loss functions directly), these oracles
+/// drive the **actual production dispatch** a real `db.fine_tune(task=regression)`
+/// exercises: a [`TrainingLoop`] built by the production [`TrainingLoopBuilder`],
+/// holding a real [`TrainingTarget::ProjectionHead`] regression head assembled by
+/// the production [`build_distribution_head`], with its [`TargetScaler`] reduced
+/// from the training targets exactly as `TrainingLoop::run` does — then each step
+/// runs the head forward through the production `TrainingLoop::regress`
+/// (which applies `TargetScaler::destandardize` keyed on the production
+/// `regression_form`) and scores it through the production `TrainingLoop::compute_loss`
+/// → `regression_loss` → the configured [`RegressionLoss`] dispatch.
+///
+/// The property (per head): a high-offset / low-variance target (calendar years,
+/// μ≈2017, σ≈2) is FIT — the served (de-standardised) mean lands within the
+/// context oracle's bar (`|mean − 2017| < 50`) and, for the Gaussian head, the
+/// served σ is off the floor (`> 0.1`). The companion in-context oracle that
+/// proves the SAME contract on the other offset-bearing dispatch surface lives in
+/// [`crate::pipeline::context_predictor`]'s
+/// `gaussian_in_context_head_fits_high_offset_low_variance_target` (it depends on
+/// pipeline-private episode/predictor machinery unreachable from this module, so
+/// it stays where its dependencies live; both surfaces are pinned, together).
+///
+/// Heads 1–5 (CoSENT / MNRL / Triplet / Classification-CE / NER-CE) are
+/// offset-INVARIANT by construction (cosine / softmax / class-index), carry no
+/// `TargetScaler`, and are deliberately excluded from
+/// [`super::target::StandardizableHead`] — so this oracle asserts nothing for them.
+#[cfg(test)]
+mod standardization_contract {
+    use std::sync::Arc;
+
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{VarBuilder, VarMap};
+
+    use super::super::data::TrainingBatch;
+    use super::super::lora::build_distribution_head;
+    use super::super::regression_loss::TargetScaler;
+    use super::super::target::TrainingTarget;
+    use super::super::{FineTuneConfig, RegressionLoss};
+    use super::{TrainingLoop, TrainingLoopBuilder};
+    use crate::fine_tune::adamw::{AdamW, ParamsAdamW};
+
+    const HIDDEN: usize = 8;
+    /// Calendar years — the textbook high-offset, low-variance regression target
+    /// (μ ≈ 2017, σ ≈ 2). Re-used by both arms.
+    const YEARS: [f32; 9] = [
+        2013.0, 2014.0, 2015.0, 2016.0, 2017.0, 2018.0, 2019.0, 2020.0, 2021.0,
+    ];
+    const TRUE_MEAN: f32 = 2017.0;
+
+    /// Build a real production [`TrainingLoop`] over a regression
+    /// [`TrainingTarget::ProjectionHead`] (projection + distribution head of the
+    /// given width), with its [`TargetScaler`] reduced from `targets` exactly as
+    /// `TrainingLoop::run` does. The infra (catalog/job/worker/artifact_dir) is the
+    /// production builder's required plumbing — the dispatch we exercise
+    /// (`regress` / `compute_loss`) never touches it, but we go through the real
+    /// constructor so nothing about the head/scaler wiring is synthetic.
+    async fn regression_loop(
+        config: FineTuneConfig,
+        head_width: usize,
+        targets: &Tensor,
+        device: &Device,
+    ) -> (TrainingLoop, VarMap) {
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let head = build_distribution_head(HIDDEN, head_width, &config, &vb).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        // Leak the tempdir so the artifact path outlives the loop without a drop
+        // race; a unit test process is short-lived, so this is contained.
+        let dir_path = dir.keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+        catalog
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: "oracle-model",
+                version: 1,
+                model_type: "embedding",
+                backend: "candle",
+                task: crate::model::ModelTask::Regression,
+                base_model_id: None,
+                artifact_path: None,
+                config_json: None,
+            })
+            .await
+            .unwrap();
+        catalog
+            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+                job_id: "oracle-job",
+                base_model_id: "oracle-model::1",
+                training_source: "src",
+                loss_type: "regression",
+                hyperparams: "{}",
+                kind: "fine_tune",
+                training_spec: "{}",
+            })
+            .await
+            .unwrap();
+        catalog
+            .claim_next_training_job("oracle-worker", std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("queued job is claimable");
+
+        let mut loop_ = TrainingLoopBuilder::new(
+            TrainingTarget::ProjectionHead { head },
+            varmap.clone(),
+            config,
+        )
+        .device(device.clone())
+        .job_id("oracle-job".into())
+        .worker_id("oracle-worker".into())
+        .catalog(catalog)
+        .artifact_dir(dir_path)
+        .build()
+        .unwrap();
+
+        // Reduce the scaler from the targets exactly as `run` does before the loop,
+        // so the head's `regress` de-standardisation emits μ_y at zero-init.
+        loop_.target_scaler = Some(TargetScaler::from_targets(targets).unwrap());
+        (loop_, varmap)
+    }
+
+    /// Train the production regression dispatch for `steps` AdamW steps on a fixed
+    /// batch of `(features, targets)` and return the served head's raw `(batch, k)`
+    /// output at the fitted parameters. Each step runs the PRODUCTION
+    /// `TrainingLoop::regress` (head forward + `TargetScaler::destandardize`) and
+    /// `TrainingLoop::compute_loss` (→ `regression_loss` → configured
+    /// `RegressionLoss`) — the exact chain `db.fine_tune(task=regression)` runs.
+    fn train_through_production_dispatch(
+        loop_: &TrainingLoop,
+        varmap: &VarMap,
+        features: &Tensor,
+        targets: &Tensor,
+        steps: usize,
+    ) -> Tensor {
+        let mut opt = AdamW::new(
+            varmap.all_vars(),
+            ParamsAdamW {
+                lr: 0.05,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for _ in 0..steps {
+            // PRODUCTION head forward: projection + distribution head, then the
+            // `TargetScaler::destandardize` keyed on the run's `regression_form`.
+            let head_out = loop_.regress(features).unwrap();
+            let batch = TrainingBatch::Regression {
+                input: head_out,
+                target: targets.clone(),
+            };
+            // PRODUCTION loss dispatch: compute_loss → regression_loss → the
+            // configured RegressionLoss arm.
+            let loss = loop_.compute_loss(&batch).unwrap();
+            let grads = loss.backward().unwrap();
+            opt.step(&grads).unwrap();
+        }
+        loop_.regress(features).unwrap()
+    }
+
+    /// Deterministic small feature matrix `(n, HIDDEN)` — the projected embeddings
+    /// the regression head sits on. Values are O(1) so the projection (identity
+    /// base + zero-init LoRA) feeds the distribution head a bounded signal.
+    fn features(n: usize, device: &Device) -> Tensor {
+        let mut vals = Vec::with_capacity(n * HIDDEN);
+        let mut s: u64 = 0x1234_5678;
+        for _ in 0..n * HIDDEN {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = ((s >> 33) as f32 / (1u32 << 31) as f32) - 1.0;
+            vals.push(u * 0.5);
+        }
+        Tensor::from_vec(vals, (n, HIDDEN), device).unwrap()
+    }
+
+    /// ORACLE (head 6 — production fine-tune Gaussian regression): the
+    /// β-NLL-trained parametric Gaussian head FITS a high-offset / low-variance
+    /// calendar-year target through the real production dispatch. The served
+    /// (de-standardised) mean lands within ±50 of μ_y ≈ 2017 and the served σ is
+    /// off the floor (> 0.1). A head that did NOT de-standardise would crawl
+    /// ≈ lr·steps units from zero-init and stall thousands short of 2017 (Adam's
+    /// per-step move is ≈ lr·sign(grad), scale-independent) — that is the failure
+    /// this guards on the production path, not the synthetic VarMap head.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ft_gaussian_head_fits_high_offset_through_production_dispatch() {
+        let device = Device::Cpu;
+        let n = YEARS.len();
+        let targets = Tensor::from_vec(YEARS.to_vec(), (n,), &device).unwrap();
+        let config = FineTuneConfig {
+            // β-NLL with β=0.5 is the engine's default regression objective.
+            regression_loss: Some(RegressionLoss::BetaNll { beta: 0.5 }),
+            ..Default::default()
+        };
+        let (loop_, varmap) = regression_loop(config, 2, &targets, &device).await;
+        let feats = features(n, &device);
+
+        let served = train_through_production_dispatch(&loop_, &varmap, &feats, &targets, 1500);
+        // The served head is raw `(mean, raw_std)`; map raw_std → σ exactly as the
+        // serving adapter does (STD_FLOOR + softplus), reading row 0.
+        let row0 = served.narrow(0, 0, 1).unwrap();
+        let (mean_t, sigma_t) = super::super::regression_loss::gaussian_params(&row0).unwrap();
+        let served_mean = mean_t.to_vec1::<f32>().unwrap()[0];
+        let served_sigma = sigma_t.to_vec1::<f32>().unwrap()[0];
+
+        assert!(
+            (served_mean - TRUE_MEAN).abs() < 50.0,
+            "production ft Gaussian head failed to fit the high-offset target: \
+             true mean {TRUE_MEAN}, served mean {served_mean} (off by {:.0}). \
+             The production regress() de-standardisation must converge the served \
+             mean to μ_y under the z-space reparameterisation.",
+            (served_mean - TRUE_MEAN).abs()
+        );
+        assert!(
+            served_sigma > 0.1,
+            "production ft Gaussian head served a collapsed σ {served_sigma} \
+             (the target spread is ≈ 2.6; a real σ must be well off the floor)"
+        );
+    }
+
+    /// ORACLE (head 7 — production fine-tune quantile regression): the
+    /// pinball-trained quantile head FITS the same high-offset calendar-year
+    /// target through the real production dispatch. Every served (de-standardised)
+    /// quantile column lands within ±50 of μ_y ≈ 2017 (the levels straddle a
+    /// σ≈2.6 spread, so all sit within a couple of units of 2017), and the columns
+    /// are ordered (non-crossing). A quantile head whose columns were NOT all
+    /// de-standardised would leave the upper levels stranded near 0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ft_quantile_head_fits_high_offset_through_production_dispatch() {
+        let device = Device::Cpu;
+        let n = YEARS.len();
+        let targets = Tensor::from_vec(YEARS.to_vec(), (n,), &device).unwrap();
+        let levels = vec![0.1, 0.5, 0.9];
+        let config = FineTuneConfig {
+            regression_loss: Some(RegressionLoss::Pinball),
+            quantile_levels: levels.clone(),
+            ..Default::default()
+        };
+        let (loop_, varmap) = regression_loop(config, levels.len(), &targets, &device).await;
+        let feats = features(n, &device);
+
+        let served = train_through_production_dispatch(&loop_, &varmap, &feats, &targets, 1500);
+        let row0 = served.to_vec2::<f32>().unwrap()[0].clone();
+        assert_eq!(
+            row0.len(),
+            levels.len(),
+            "served quantile head keeps all levels"
+        );
+
+        for (i, &q) in row0.iter().enumerate() {
+            assert!(
+                (q - TRUE_MEAN).abs() < 50.0,
+                "production ft quantile column {i} (level {}) failed to fit the \
+                 high-offset target: μ_y ≈ {TRUE_MEAN}, served {q} (off by {:.0}). \
+                 A column left un-de-standardised would strand near 0.",
+                levels[i],
+                (q - TRUE_MEAN).abs()
+            );
+        }
+        // Non-crossing: the pinball + non-crossing penalty keeps the served levels
+        // ordered, and de-standardisation is a monotone affine so order survives.
+        assert!(
+            row0[0] <= row0[1] && row0[1] <= row0[2],
+            "served quantiles must be non-crossing after de-standardisation: {row0:?}"
         );
     }
 }

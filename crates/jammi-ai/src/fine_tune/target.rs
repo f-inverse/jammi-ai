@@ -206,14 +206,214 @@ pub struct ProjectionHeadConfig {
     pub(crate) regression_form: Option<crate::inference::adapter::DistributionForm>,
 }
 
+/// The closed set of **offset-bearing** distribution heads — the heads whose
+/// output column(s) carry the target's offset and therefore depend on the
+/// [`TargetScaler`] reparameterisation to fit a high-offset / low-variance
+/// target under AdamW (whose per-step move is ≈`lr·sign(grad)`, independent of
+/// loss scale; see [`super::regression_loss::TargetScaler`]). Every variant here
+/// is a head that, served zero-init, must already emit μ_y and reach its target
+/// by an O(1) nudge of an O(1) z-space parameter.
+///
+/// The two *entry points* that produce such a head are the only two
+/// offset-bearing dispatch surfaces in the engine (confirmed exhaustively — no
+/// third surface): the fine-tune regression path, which dispatches on
+/// [`jammi_wire::fine_tune::RegressionLoss`], and the amortized in-context
+/// predictor, which dispatches on
+/// [`crate::pipeline::context_predictor::PredictiveHead`]. This enum is the
+/// type-level union of the heads those two enums can land on, and
+/// [`StandardizableHead::for_regression_loss`] /
+/// [`StandardizableHead::for_predictive_head`] are the **exhaustive, no-wildcard**
+/// maps from each enum's arms onto it — so a new arm on either enum fails to
+/// compile until it is enumerated here and given its standardisation contract.
+///
+/// The heads this enum deliberately *excludes* are offset-**invariant** by
+/// construction: CoSENT / MNRL / Triplet score cosine angles, Classification-CE
+/// / NER-CE score a softmax over class indices — none carry a continuous offset,
+/// so none needs (or gets) a [`TargetScaler`]. Adding one of them to this enum
+/// would be a category error; the union is exactly the four distributional
+/// heads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum StandardizableHead {
+    /// The fine-tune parametric Gaussian regression head `(mean, raw_std)`,
+    /// trained by the `GaussianNll` / `BetaNll` / `Crps` objectives. Reached
+    /// through [`jammi_wire::fine_tune::RegressionLoss`] via the
+    /// `TrainingBatch::Regression` dispatch.
+    RegressionGaussian,
+    /// The fine-tune quantile regression head (one column per level), trained by
+    /// the `Pinball` objective. Reached through
+    /// [`jammi_wire::fine_tune::RegressionLoss::Pinball`].
+    RegressionQuantile,
+    /// The amortized in-context Gaussian head, trained by the NLL / CRPS
+    /// objectives. Reached through
+    /// [`crate::pipeline::context_predictor::PredictiveHead::Gaussian`].
+    ContextGaussian,
+    /// The amortized in-context quantile head, trained by the pinball objective.
+    /// Reached through
+    /// [`crate::pipeline::context_predictor::PredictiveHead::Quantile`].
+    ContextQuantile,
+}
+
+impl StandardizableHead {
+    /// Every offset-bearing head, in declaration order. The single source of
+    /// truth for "which heads carry the standardisation contract" — the
+    /// completeness test fans over this and over the two source enums, and the
+    /// exhaustive `for_*` maps below keep it from drifting from the enum body.
+    /// Mirrors the [`jammi_db::ModelTask::ALL`] idiom.
+    pub(crate) const ALL: &'static [StandardizableHead] = &[
+        StandardizableHead::RegressionGaussian,
+        StandardizableHead::RegressionQuantile,
+        StandardizableHead::ContextGaussian,
+        StandardizableHead::ContextQuantile,
+    ];
+
+    /// Map a fine-tune [`jammi_wire::fine_tune::RegressionLoss`] arm onto the
+    /// offset-bearing head it trains. **Exhaustive, no `_ =>` wildcard**: a new
+    /// `RegressionLoss` arm fails to compile here until it is given its
+    /// standardisation contract — the cross-crate type-level guarantee that
+    /// every regression objective the wire vocabulary can carry maps to a
+    /// reparameterised head. The three Gaussian objectives all train the
+    /// parametric Gaussian head; the pinball objective trains the quantile head.
+    pub(crate) fn for_regression_loss(loss: super::RegressionLoss) -> StandardizableHead {
+        let head = match loss {
+            super::RegressionLoss::GaussianNll
+            | super::RegressionLoss::BetaNll { .. }
+            | super::RegressionLoss::Crps => StandardizableHead::RegressionGaussian,
+            super::RegressionLoss::Pinball => StandardizableHead::RegressionQuantile,
+        };
+        debug_assert!(
+            Self::ALL.contains(&head),
+            "for_regression_loss produced {head:?} absent from StandardizableHead::ALL"
+        );
+        head
+    }
+
+    /// Map an amortized in-context
+    /// [`crate::pipeline::context_predictor::PredictiveHead`] arm onto the
+    /// offset-bearing head it trains. **Exhaustive, no `_ =>` wildcard**: a new
+    /// `PredictiveHead` arm fails to compile here until it is enumerated.
+    pub(crate) fn for_predictive_head(
+        head: &crate::pipeline::context_predictor::PredictiveHead,
+    ) -> StandardizableHead {
+        use crate::pipeline::context_predictor::PredictiveHead;
+        match head {
+            PredictiveHead::Gaussian { .. } => StandardizableHead::ContextGaussian,
+            PredictiveHead::Quantile { .. } => StandardizableHead::ContextQuantile,
+        }
+    }
+
+    /// Whether this head's served distribution is parametric Gaussian
+    /// (`(mean, raw_std)`, only the mean column de-standardised) or quantile
+    /// (every column de-standardised). This is the single gaussian-vs-quantile
+    /// signal the [`TargetScaler::destandardize`] dispatch keys on, derived once
+    /// from the offset-bearing head identity so a regression head and the
+    /// matching context head can never disagree on how their offset is restored.
+    pub(crate) fn is_gaussian(self) -> bool {
+        match self {
+            StandardizableHead::RegressionGaussian | StandardizableHead::ContextGaussian => true,
+            StandardizableHead::RegressionQuantile | StandardizableHead::ContextQuantile => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use candle_core::{Device, Tensor};
     use tempfile::tempdir;
 
     use super::super::regression_loss::TargetScaler;
-    use super::{ProjectionHeadConfig, SavedAdapter};
+    use super::{ProjectionHeadConfig, SavedAdapter, StandardizableHead};
     use crate::inference::adapter::DistributionForm;
+    use crate::pipeline::context_predictor::{GaussianObjective, PredictiveHead};
+
+    /// COMPLETENESS GUARD (b): every arm of the two offset-bearing source enums
+    /// — [`jammi_wire::fine_tune::RegressionLoss`] and
+    /// [`crate::pipeline::context_predictor::PredictiveHead`] — maps to a
+    /// [`StandardizableHead`] that is listed in [`StandardizableHead::ALL`]. This
+    /// is complementary to the exhaustive-match guard in the `for_*` maps (which
+    /// catches a new *enum arm*): this test catches a new *loss landing on an
+    /// existing head* (e.g. a fourth Gaussian objective that should map to
+    /// `RegressionGaussian`) and an `ALL` slice that drifts from the enum body.
+    ///
+    /// The lists below are themselves exhaustive: `cargo` will not let them omit
+    /// a `RegressionLoss` / `PredictiveHead` arm silently, because the `for_*`
+    /// maps they feed are no-wildcard matches — so a new arm forces an edit here.
+    #[test]
+    fn every_offset_bearing_loss_maps_into_standardizable_head() {
+        // Every RegressionLoss arm (one representative per shape; the `for_*`
+        // map is exhaustive so the compiler enforces the arm set is complete).
+        let regression_losses = [
+            super::super::RegressionLoss::GaussianNll,
+            super::super::RegressionLoss::BetaNll { beta: 0.5 },
+            super::super::RegressionLoss::Crps,
+            super::super::RegressionLoss::Pinball,
+        ];
+        for loss in regression_losses {
+            let head = StandardizableHead::for_regression_loss(loss);
+            assert!(
+                StandardizableHead::ALL.contains(&head),
+                "RegressionLoss {loss:?} mapped to {head:?}, which is missing from \
+                 StandardizableHead::ALL"
+            );
+        }
+
+        // Every PredictiveHead arm.
+        let predictive_heads = [
+            PredictiveHead::Gaussian {
+                objective: GaussianObjective::Nll { beta: 0.5 },
+            },
+            PredictiveHead::Gaussian {
+                objective: GaussianObjective::Crps,
+            },
+            PredictiveHead::Quantile {
+                levels: vec![0.1, 0.5, 0.9],
+            },
+        ];
+        for head in &predictive_heads {
+            let mapped = StandardizableHead::for_predictive_head(head);
+            assert!(
+                StandardizableHead::ALL.contains(&mapped),
+                "PredictiveHead {head:?} mapped to {mapped:?}, which is missing from \
+                 StandardizableHead::ALL"
+            );
+        }
+
+        // The two regression objective families land on the two regression
+        // heads; the two context families on the two context heads — the union
+        // is exactly covered, with no offset-bearing head left unreached.
+        assert_eq!(
+            StandardizableHead::for_regression_loss(super::super::RegressionLoss::Crps),
+            StandardizableHead::RegressionGaussian
+        );
+        assert_eq!(
+            StandardizableHead::for_regression_loss(super::super::RegressionLoss::Pinball),
+            StandardizableHead::RegressionQuantile
+        );
+        assert_eq!(
+            StandardizableHead::for_predictive_head(&PredictiveHead::Quantile {
+                levels: vec![0.5]
+            }),
+            StandardizableHead::ContextQuantile
+        );
+
+        // Both regression heads and both context heads are reached by some arm —
+        // no variant of the union is orphaned from the dispatch.
+        let reached: std::collections::HashSet<StandardizableHead> = regression_losses
+            .into_iter()
+            .map(StandardizableHead::for_regression_loss)
+            .chain(
+                predictive_heads
+                    .iter()
+                    .map(StandardizableHead::for_predictive_head),
+            )
+            .collect();
+        for head in StandardizableHead::ALL {
+            assert!(
+                reached.contains(head),
+                "StandardizableHead::{head:?} is in ALL but no offset-bearing loss arm \
+                 reaches it — the union has an unreachable head"
+            );
+        }
+    }
 
     /// Persist a regression `ProjectionHeadConfig` (scaler + form) through the
     /// real `save_adapter` writer, reload it through the real `load_adapter`

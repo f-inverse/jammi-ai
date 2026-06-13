@@ -7,6 +7,44 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **Standardisation-contract oracle + completeness guards for every
+  offset-bearing distribution head.** The fine-tune "standardisation contract"
+  (a zero-init distribution head reaches a high-offset / low-variance target —
+  calendar years μ≈2017, σ≈2 — only by reparameterising through a single
+  dataset-level `TargetScaler`, since AdamW's per-step move is ≈`lr·sign(grad)`
+  and is loss-scale-independent) is now a type-checked, every-head property.
+  A new `StandardizableHead` closed enum
+  (`crates/jammi-ai/src/fine_tune/target.rs`) is the union of the four
+  offset-bearing heads — fine-tune Gaussian/quantile and in-context
+  Gaussian/quantile — with an `ALL` source-of-truth slice (the
+  `ModelTask::ALL` idiom). Two complementary completeness guards bind it: an
+  **exhaustive, no-wildcard** map from every `jammi_wire::RegressionLoss` arm
+  *and* every `PredictiveHead` arm onto a `StandardizableHead` — so a new arm on
+  either enum, including the cross-crate wire enum, **fails to compile** until it
+  is given its standardisation contract — plus a `#[test]` asserting every arm of
+  both enums lands on a head listed in `ALL` (catching a new loss that lands on
+  an existing head). The classifier is load-bearing in production: the fine-tune
+  trainer's `regression_form` and the context predictor's persisted-form tag both
+  route their gaussian-vs-quantile decision through it. The oracle itself adds
+  the genuinely-new coverage — an in-crate train-to-fit test that drives the
+  **production** fine-tune dispatch (`TrainingLoop::regress` →
+  `TargetScaler::destandardize` and `compute_loss` → `regression_loss` → the
+  configured `RegressionLoss`) for the Gaussian (head 6) and quantile (head 7)
+  fine-tune-regression heads, asserting the served mean fits μ_y within ±50 and
+  the served σ stays off the floor. With this change **all four offset-bearing
+  heads now carry a high-offset train-to-fit behavioural oracle**: the two
+  fine-tune-regression heads above, plus the two in-context heads
+  (`crates/jammi-ai/src/pipeline/context_predictor.rs`) — the pre-existing
+  Gaussian in-context oracle and a new sibling for the **quantile** in-context
+  head, which trains a pinball head to the same μ≈2017/σ≈2 target and asserts the
+  served, de-standardised quantile set fits μ_y within ±50 and is non-crossing.
+  Every oracle reads its assertion off the served/de-standardised parse the
+  serving path runs, and each pairs the fit with a destructive un-standardised
+  arm that fails that same bar — so each test would fail if the `TargetScaler`
+  reparameterisation were bypassed (verified by experiment, not narration). The
+  offset-bearing-head surfaces were confirmed exhaustively to be the complete
+  set — no further surface exists. All four heads fit the high-offset target
+  as-is; no head fix was needed.
 - **`jammi-bench` held-out ANN-vs-exact recall gate.** The `arxiv` subcommand
   now measures recall over a **held-out** query set — a query parquet *disjoint*
   from the indexed corpus — rather than querying the corpus with its own rows.

@@ -62,6 +62,7 @@ pub use jammi_encoders::ContextArchitecture;
 use crate::fine_tune::regression_loss;
 use crate::fine_tune::regression_loss::TargetScaler;
 use crate::fine_tune::spec::TrainingSpec;
+use crate::fine_tune::target::StandardizableHead;
 use crate::inference::adapter::distribution::{DistributionAdapter, DistributionForm};
 use crate::inference::adapter::{BackendOutput, OutputAdapter};
 use crate::pipeline::context_set::{
@@ -136,11 +137,23 @@ impl PredictiveHead {
     /// Serialise the head form into the persisted config so a served predictor
     /// reconstructs the exact distribution shape (Gaussian vs the precise
     /// quantile levels), not merely the head width.
+    ///
+    /// The gaussian-vs-quantile "kind" tag is decided by the offset-bearing-head
+    /// classifier ([`StandardizableHead::for_predictive_head`]) — the same closed
+    /// enum the standardisation-contract guards and oracle pin — so the persisted
+    /// kind, the trained de-standardisation, and the contract's head identity are
+    /// one mapping. The quantile arm additionally carries its exact levels (which
+    /// the kind tag alone cannot recover) so serving rebuilds the precise head.
     fn to_config_json(&self) -> serde_json::Value {
+        let kind = if StandardizableHead::for_predictive_head(self).is_gaussian() {
+            "gaussian"
+        } else {
+            "quantile"
+        };
         match self {
-            PredictiveHead::Gaussian { .. } => serde_json::json!({ "kind": "gaussian" }),
+            PredictiveHead::Gaussian { .. } => serde_json::json!({ "kind": kind }),
             PredictiveHead::Quantile { levels } => {
-                serde_json::json!({ "kind": "quantile", "levels": levels })
+                serde_json::json!({ "kind": kind, "levels": levels })
             }
         }
     }
@@ -1944,6 +1957,20 @@ mod tests {
         }
     }
 
+    /// The same calendar-year high-offset spec, but driving the **quantile** head
+    /// (the `Quantile{levels}` arm) instead of the Gaussian one — the second
+    /// offset-bearing context-predictor head, trained with the pinball objective.
+    /// Three ascending levels so the served set must be non-crossing, with the
+    /// median (`0.5`) carrying the point estimate the offset oracle checks.
+    fn high_offset_quantile_spec() -> ContextPredictorTrainConfig {
+        ContextPredictorTrainConfig {
+            head: PredictiveHead::Quantile {
+                levels: vec![0.1, 0.5, 0.9],
+            },
+            ..high_offset_spec()
+        }
+    }
+
     /// Build a synthetic episode set whose outcomes are calendar years
     /// (`true_mean ± spread`) — a high-offset, low-variance target. Each task is a
     /// distinct mean year; every row's `x` is a small random feature, every
@@ -2037,6 +2064,29 @@ mod tests {
         EpisodeBatch { episode, target_y }
     }
 
+    /// Randomise a freshly built predictor off its zero-init so the head is
+    /// non-degenerate (the same as the pipeline trainer's fresh varmap), assigning
+    /// the deterministic `Rng(1234)` stream to the variables **in sorted key
+    /// order**. The order matters: `VarMap::data()` is a `HashMap`, so iterating
+    /// `.values()` directly permutes which variable receives which slice of the rng
+    /// stream non-deterministically run-to-run — which the standardised path
+    /// absorbs (it converges regardless) but the un-standardised destructive arm is
+    /// chaotically sensitive to. Pinning the assignment order makes both arms of
+    /// every oracle reproducible without touching any production symbol.
+    fn randomize_init(varmap: &VarMap, device: &Device) {
+        let data = varmap.data().lock().unwrap();
+        let mut names: Vec<&String> = data.keys().collect();
+        names.sort();
+        let mut rng = Rng(1234);
+        for name in names {
+            let var = &data[name];
+            let n = var.shape().elem_count();
+            let vals: Vec<f32> = (0..n).map(|_| rng.next_unit() * 0.1).collect();
+            var.set(&Tensor::from_vec(vals, var.shape().clone(), device).unwrap())
+                .unwrap();
+        }
+    }
+
     /// Train the spec's predictor over `batches` and return the served Gaussian
     /// `(mean, σ)` at the first probe target after de-standardising the head with
     /// `scaler` (the identity de-standardisation when `scaler` is `None`).
@@ -2049,18 +2099,7 @@ mod tests {
     ) -> (f32, f32) {
         let varmap = VarMap::new();
         let predictor = build_predictor(spec, FEATURE_DIM, &varmap, device).unwrap();
-        // Randomise off the zero-init so the head is non-degenerate, the same as
-        // the pipeline trainer's fresh varmap.
-        {
-            let data = varmap.data().lock().unwrap();
-            let mut rng = Rng(1234);
-            for var in data.values() {
-                let n = var.shape().elem_count();
-                let vals: Vec<f32> = (0..n).map(|_| rng.next_unit() * 0.1).collect();
-                var.set(&Tensor::from_vec(vals, var.shape().clone(), device).unwrap())
-                    .unwrap();
-            }
-        }
+        randomize_init(&varmap, device);
         let config = ParallelTrainConfig {
             epochs: spec.epochs,
             learning_rate: spec.learning_rate,
@@ -2093,6 +2132,63 @@ mod tests {
         match dist {
             PredictedDistribution::Gaussian { mean, std } => (mean, std),
             PredictedDistribution::Quantile { .. } => unreachable!("Gaussian spec"),
+        }
+    }
+
+    /// The quantile peer of [`train_and_serve_first`]: train `spec` (whose head
+    /// must be the `Quantile{levels}` arm) and return the served, de-standardised
+    /// `(level, value)` pairs at the first probe target — read back through the
+    /// exact serving parse ([`distribution_from_head`] → [`destandardize_distribution`]),
+    /// so the assertion sees only what the served path would emit. The de-standardise
+    /// is the identity when `scaler` is `None` (the pre-fix arm).
+    fn train_and_serve_first_quantiles(
+        spec: &ContextPredictorTrainConfig,
+        batches: &[EpisodeBatch],
+        probe: &EpisodeBatch,
+        scaler: Option<&TargetScaler>,
+        device: &Device,
+    ) -> Vec<(f64, f32)> {
+        let levels = match &spec.head {
+            PredictiveHead::Quantile { levels } => levels.clone(),
+            PredictiveHead::Gaussian { .. } => unreachable!("quantile spec"),
+        };
+        let varmap = VarMap::new();
+        let predictor = build_predictor(spec, FEATURE_DIM, &varmap, device).unwrap();
+        randomize_init(&varmap, device);
+        let config = ParallelTrainConfig {
+            epochs: spec.epochs,
+            learning_rate: spec.learning_rate,
+            weight_decay: 0.0,
+            grad_clip: spec.grad_clip,
+        };
+        train_loop(
+            &varmap,
+            batches,
+            &config,
+            &AtomicBool::new(false),
+            |b: &EpisodeBatch| {
+                predictor
+                    .forward(&b.episode)
+                    .map_err(|e| JammiError::FineTune(format!("{e}")))
+            },
+            |preds, b: &EpisodeBatch| spec.head.score(preds, &b.target_y),
+        )
+        .unwrap();
+
+        // Serve the first probe target through the quantile form: one forward → the
+        // S18 quantile distribution (sorted, non-crossing) → the de-standardising
+        // affine — the served path's transform, end to end.
+        let head = predictor.forward(&probe.episode).unwrap();
+        let row0 = head.narrow(0, 0, 1).unwrap();
+        let form = DistributionForm::Quantile { levels };
+        let z_dist = distribution_from_head(&row0, &form).unwrap();
+        let dist = match scaler {
+            Some(s) => destandardize_distribution(z_dist, s),
+            None => z_dist,
+        };
+        match dist {
+            PredictedDistribution::Quantile { levels } => levels,
+            PredictedDistribution::Gaussian { .. } => unreachable!("quantile spec"),
         }
     }
 
@@ -2177,6 +2273,111 @@ mod tests {
              target (non-finite, mean far off, OR σ pinned at the floor), but \
              served mean {raw_mean}, σ {raw_sigma} — if this no longer collapses \
              the oracle is not exercising the bug"
+        );
+    }
+
+    /// ORACLE (quantile peer): the amortized in-context **quantile** predictor must
+    /// serve quantiles that bracket the true high-offset target mean (calendar years
+    /// ≈ 2017), ascending and non-crossing — and the raw (un-standardised) path it
+    /// replaced must collapse exactly as the Gaussian peer's does. This closes PR1's
+    /// thesis to all four offset-bearing heads: the context-predictor quantile head
+    /// is the last one without a high-offset train-to-fit behavioural oracle.
+    ///
+    /// The assertion reads the **served, de-standardised** `(level, value)` pairs —
+    /// the same [`distribution_from_head`] → [`destandardize_distribution`] parse the
+    /// serving path runs — so, exactly as the auditor proved for the Gaussian case,
+    /// the fit assertion would FAIL if the `TargetScaler` reparameterisation were
+    /// bypassed: a raw-space pinball head crawls ≈ lr·steps units under Adam and
+    /// stalls thousands short of 2017, which is the collapse arm below.
+    #[test]
+    fn quantile_in_context_head_fits_high_offset_low_variance_target() {
+        let device = Device::Cpu;
+        let spec = high_offset_quantile_spec();
+        let k = spec.context_k;
+        let true_mean = 2017.0_f64;
+        let (raw_per_task, all_y) = high_offset_episodes(k, true_mean);
+
+        // The scaler reduced from the full outcome distribution — the same train
+        // peer of the sampler's `train_target_scaler` the Gaussian oracle uses.
+        let y_tensor = Tensor::from_vec(
+            all_y.iter().map(|y| *y as f32).collect::<Vec<f32>>(),
+            (all_y.len(),),
+            &device,
+        )
+        .unwrap();
+        let scaler = TargetScaler::from_targets(&y_tensor).unwrap();
+
+        let probe = batch_from_raw(&raw_per_task[0], Some(&scaler), k, &device);
+        let std_batches: Vec<EpisodeBatch> = raw_per_task
+            .iter()
+            .map(|r| batch_from_raw(r, Some(&scaler), k, &device))
+            .collect();
+
+        // The standardised (fixed) path: the served quantiles are ascending
+        // (non-crossing) and each lands near the true mean (a low-variance target,
+        // so the spread between the 0.1 and 0.9 levels is small relative to the bar).
+        let served =
+            train_and_serve_first_quantiles(&spec, &std_batches, &probe, Some(&scaler), &device);
+        assert_eq!(
+            served.len(),
+            3,
+            "expected three served quantile levels, got {served:?}"
+        );
+        // Non-crossing: the served values are ascending in level order — the
+        // monotonicity the adapter sorts each row to guarantee.
+        for w in served.windows(2) {
+            assert!(
+                w[1].1 >= w[0].1,
+                "served quantiles crossed: level {} value {} then level {} value {} \
+                 (must be non-decreasing)",
+                w[0].0,
+                w[0].1,
+                w[1].0,
+                w[1].1
+            );
+        }
+        // Every served quantile fits the high offset within the same tolerance bar
+        // the Gaussian oracle uses — the low-variance target keeps even the tail
+        // levels inside ±50 of the true mean.
+        for (level, value) in &served {
+            assert!(
+                (*value as f64 - true_mean).abs() < 50.0,
+                "standardised in-context quantile head failed to fit the high-offset \
+                 target at level {level}: true mean {true_mean}, served {value} \
+                 (off by {:.0})",
+                (*value as f64 - true_mean).abs()
+            );
+        }
+
+        // NON-VACUITY (the destructive experiment): the pre-fix, un-standardised
+        // path must FAIL the very fit bar the standardised path just cleared. The
+        // pinball head cannot reach the high offset under Adam from its ≈0 init, so
+        // at least one served level strands far from 2017 (or goes non-finite). This
+        // is the arm that fails on main: it proves the fit above is bought by the
+        // `TargetScaler` reparameterisation and not by the budget alone — exactly
+        // the experiment the auditor ran for the Gaussian peer, now read back
+        // through the identical served-quantile parse.
+        let raw_batches: Vec<EpisodeBatch> = raw_per_task
+            .iter()
+            .map(|r| batch_from_raw(r, None, k, &device))
+            .collect();
+        let raw_probe = batch_from_raw(&raw_per_task[0], None, k, &device);
+        let raw_served =
+            train_and_serve_first_quantiles(&spec, &raw_batches, &raw_probe, None, &device);
+        // The fit assertion is "every served level within ±50 of the true mean".
+        // Collapse is the negation: some level is non-finite, or some level lands
+        // outside that bar — i.e. the raw path does NOT clear the fit the
+        // standardised path clears.
+        let raw_fits_all = raw_served
+            .iter()
+            .all(|(_, v)| v.is_finite() && (*v as f64 - true_mean).abs() < 50.0);
+        assert!(
+            !raw_fits_all,
+            "the un-standardised quantile path was expected to FAIL the high-offset \
+             fit bar (some served level non-finite or off by ≥ 50), but every level \
+             fit: served {raw_served:?} — if this still fits, the oracle is not \
+             exercising the standardisation bug (the fit above would not depend on \
+             the TargetScaler reparameterisation)"
         );
     }
 }

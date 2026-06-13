@@ -24,6 +24,7 @@ mod recall;
 mod report;
 mod rss;
 mod search_rss;
+mod sweep;
 
 use clap::{Parser, Subcommand};
 
@@ -79,6 +80,23 @@ enum Command {
         #[arg(long)]
         corpus_path: PathBuf,
     },
+    /// The recall-vs-cost sweep: how ANN recall and its build/query cost move as
+    /// the HNSW knobs are swept, each point measured against the exact oracle
+    /// over a held-out query set. Sweeps the build knobs (connectivity,
+    /// build_expansion → build time + index size) and the query knob
+    /// (search_expansion → recall vs QPS over one re-dialed graph), emitting the
+    /// `recall_sweep` tier. An on-box emitter (it builds a graph per build-knob
+    /// point): run with `RAYON_NUM_THREADS=1` and read the JSON; the committed
+    /// curve is its output, not a CI step.
+    RecallSweep {
+        /// Corpus vectors parquet — built into each swept graph and scored by
+        /// the exact oracle.
+        #[arg(long)]
+        corpus_src: PathBuf,
+        /// Held-out query vectors parquet, disjoint from the corpus.
+        #[arg(long)]
+        query_src: PathBuf,
+    },
     /// Internal: build the committed held-out recall fixture from the full scale
     /// cache. Reads the source corpus + held-out query parquets, takes the
     /// deterministic first-N / first-M sorted-`_row_id` subsets, freezes one
@@ -112,6 +130,10 @@ async fn main() -> std::process::ExitCode {
     match cli.command {
         Command::SearchRss => run_search_rss().await,
         Command::Arxiv => run_arxiv().await,
+        Command::RecallSweep {
+            corpus_src,
+            query_src,
+        } => run_recall_sweep(&corpus_src, &query_src).await,
         Command::MeasureOnce {
             variant,
             rows,
@@ -179,6 +201,7 @@ async fn run_search_rss() -> std::process::ExitCode {
         tiers: Tiers {
             arxiv: None,
             binding: Some(tier),
+            recall_sweep: None,
         },
     };
     emit(&report);
@@ -222,6 +245,57 @@ async fn run_arxiv() -> std::process::ExitCode {
         tiers: Tiers {
             arxiv: Some(ArxivTier::with_recall(recall)),
             binding: None,
+            recall_sweep: None,
+        },
+    };
+    emit(&report);
+    std::process::ExitCode::SUCCESS
+}
+
+/// Run the recall-vs-cost sweep over a corpus + held-out query parquet and emit
+/// the `recall_sweep` tier.
+///
+/// The on-box emitter for the recall-vs-cost curve: it builds one graph per
+/// build-knob point (so it is not a CI step — run it off-box with
+/// `RAYON_NUM_THREADS=1`) and re-dials `search_expansion` over one frozen graph
+/// for the query-cost axis. The committed curve is this command's JSON output.
+async fn run_recall_sweep(
+    corpus_src: &std::path::Path,
+    query_src: &std::path::Path,
+) -> std::process::ExitCode {
+    // Resolve to absolute paths: the corpus is registered as a `file://` object
+    // store URL, which a relative path cannot form. Canonicalize surfaces a
+    // missing input as a clear error here rather than an opaque store-not-found
+    // one deeper in DataFusion.
+    let (corpus_src, query_src) = match (
+        std::fs::canonicalize(corpus_src),
+        std::fs::canonicalize(query_src),
+    ) {
+        (Ok(c), Ok(q)) => (c, q),
+        (Err(e), _) => {
+            eprintln!("recall-sweep: corpus {}: {e}", corpus_src.display());
+            return std::process::ExitCode::FAILURE;
+        }
+        (_, Err(e)) => {
+            eprintln!("recall-sweep: query {}: {e}", query_src.display());
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let tier = match sweep::run(&corpus_src, &query_src).await {
+        Ok(tier) => tier,
+        Err(e) => {
+            eprintln!("recall-sweep failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let report = Report {
+        engine_version: ENGINE_VERSION,
+        host: Host::detect(),
+        subcommand: "recall-sweep",
+        tiers: Tiers {
+            arxiv: None,
+            binding: None,
+            recall_sweep: Some(tier),
         },
     };
     emit(&report);

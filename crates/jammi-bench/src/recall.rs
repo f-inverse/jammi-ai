@@ -112,7 +112,11 @@ const RECALL_TABLE: &str = "recall_corpus";
 /// length of either list: a degenerate retriever returning fewer than `k`
 /// simply scores lower, never divides by a smaller number. `k == 0` yields 0.0
 /// rather than dividing by zero.
-fn recall_at_k_for_query(ann: &[(String, f32)], exact: &[(String, f32)], k: usize) -> f64 {
+pub(crate) fn recall_at_k_for_query(
+    ann: &[(String, f32)],
+    exact: &[(String, f32)],
+    k: usize,
+) -> f64 {
     if k == 0 {
         return 0.0;
     }

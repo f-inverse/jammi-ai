@@ -1418,6 +1418,7 @@ class RemoteDatabase:
                 sample_config=sample,
             ),
             base_model=base_model,
+            config=config,
         )
         return self._start_training(request)
 

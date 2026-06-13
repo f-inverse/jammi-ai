@@ -1,0 +1,12 @@
+{
+  "backend": "usearch",
+  "count": 2000,
+  "created_at": "2026-06-13T10:13:34.078909136+00:00",
+  "dimensions": 768,
+  "files": {
+    "index": "frozen.usearch",
+    "rowmap": "frozen.rowmap"
+  },
+  "metric": "cosine",
+  "version": 1
+}

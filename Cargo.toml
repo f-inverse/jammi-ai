@@ -13,6 +13,7 @@ members = [
     "crates/jammi-lora",
     "crates/jammi-encoders",
     "crates/jammi-test-utils",
+    "crates/jammi-bench",
 ]
 # jammi-python is a PyO3 cdylib — build via maturin, not cargo build --workspace
 default-members = [
@@ -26,6 +27,7 @@ default-members = [
     "crates/jammi-cli",
     "crates/jammi-lora",
     "crates/jammi-encoders",
+    "crates/jammi-bench",
 ]
 
 [workspace.package]

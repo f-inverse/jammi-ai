@@ -1,6 +1,6 @@
 {
   "name": "@f-inverse/jammi-client",
-  "version": "0.26.5",
+  "version": "0.28.0",
   "description": "Official TypeScript gRPC-web client for the Jammi engine, generated from the canonical jammi.v1 proto. Runs on fetch (Cloudflare Workers / V8 isolates).",
   "license": "Apache-2.0",
   "repository": {

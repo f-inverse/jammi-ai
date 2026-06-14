@@ -524,6 +524,20 @@ impl TrainingWorker {
     }
 
     /// Re-run `SELECT columns FROM source` for a tabular fine-tune.
+    ///
+    /// A deterministic `ORDER BY` over the **full projected column tuple** pins
+    /// the row order. Without it, DataFusion gives no row-order guarantee
+    /// (multi-file / multi-partition scans reorder run-to-run), which would
+    /// perturb both the batching and the `TargetScaler` μ/σ reduction — breaking
+    /// bit-reproducibility. The projected columns are exactly the columns that
+    /// feed training, so the order is a *total* function of the trainable data:
+    /// the only rows that can tie are byte-identical on every selected column,
+    /// and such rows are interchangeable for both batching and the (commutative)
+    /// mean/std reduction. DataFusion may permute a tie group arbitrarily, but
+    /// that permutation cannot change any training output, so the result is a
+    /// pure function of the row multiset. (No engine-wide stable row-identity
+    /// column exists on an arbitrary registered source table, so ordering by the
+    /// projected tuple is the strongest total key available here.)
     async fn read_source_columns(
         &self,
         session: &Arc<InferenceSession>,
@@ -531,13 +545,11 @@ impl TrainingWorker {
         columns: &[String],
     ) -> Result<Vec<RecordBatch>> {
         let table_name = session.find_table_name(source)?;
-        let select = columns
-            .iter()
-            .map(|c| quote_ident(c))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let quoted: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
+        let select = quoted.join(", ");
+        let order_by = quoted.join(", ");
         let query = format!(
-            "SELECT {select} FROM {}",
+            "SELECT {select} FROM {} ORDER BY {order_by}",
             source_relation(source, &table_name)
         );
         session.sql(&query).await
@@ -1314,6 +1326,7 @@ fn run_fine_tune_blocking(
                 hidden_size,
                 num_classes,
                 &config,
+                &varmap,
                 &vb,
             )?
         } else if task == ModelTask::Regression {
@@ -1321,9 +1334,15 @@ fn run_fine_tune_blocking(
                 crate::fine_tune::RegressionLoss::Pinball => config.quantile_levels.len(),
                 _ => 2,
             };
-            crate::fine_tune::lora::build_distribution_head(hidden_size, output_dim, &config, &vb)?
+            crate::fine_tune::lora::build_distribution_head(
+                hidden_size,
+                output_dim,
+                &config,
+                &varmap,
+                &vb,
+            )?
         } else {
-            crate::fine_tune::lora::build_projection_head(hidden_size, &config, &vb)?
+            crate::fine_tune::lora::build_projection_head(hidden_size, &config, &varmap, &vb)?
         };
         crate::fine_tune::target::TrainingTarget::ProjectionHead { head }
     } else {
@@ -1476,6 +1495,7 @@ fn build_encoder_adapters(
         lora_dropout,
         rank_pattern: &config.rank_pattern,
         init_mode: config.init_lora_weights,
+        seed: config.seed,
     };
 
     let backbone_dtype: candle_core::DType = config.backbone_dtype.into();

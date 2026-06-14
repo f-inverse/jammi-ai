@@ -1064,6 +1064,9 @@ impl ModelBackend for CandleBackend {
                 lora_dropout: None,
                 rank_pattern: pattern,
                 init_mode: jammi_lora::LoraInitMode::ZerosB,
+                // Inference path: the seeded init is immediately overwritten by
+                // the loaded adapter weights, so the seed is never observed.
+                seed: 0,
             },
             _ => jammi_lora::LoraBuildConfig::frozen(),
         };

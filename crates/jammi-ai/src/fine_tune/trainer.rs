@@ -2825,7 +2825,7 @@ mod standardization_contract {
     ) -> (TrainingLoop, VarMap) {
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
-        let head = build_distribution_head(HIDDEN, head_width, &config, &vb).unwrap();
+        let head = build_distribution_head(HIDDEN, head_width, &config, &varmap, &vb).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         // Leak the tempdir so the artifact path outlives the loop without a drop
@@ -3024,6 +3024,282 @@ mod standardization_contract {
         assert!(
             row0[0] <= row0[1] && row0[1] <= row0[2],
             "served quantiles must be non-crossing after de-standardisation: {row0:?}"
+        );
+    }
+}
+
+/// W5-PR0b acceptance — CPU fine-tuning is bit-reproducible **through the real
+/// LoRA `forward` path**.
+///
+/// The headline contract is: a fine-tune on `Device::Cpu` is a pure function of
+/// `(seed, source rows, config)` — two runs at the same seed publish a
+/// byte-identical `adapter.safetensors`, a different seed publishes a different
+/// one. The four nondeterminism sources PR0b fixes — unseeded LoRA Kaiming/
+/// Gaussian init (#1/#2), unseeded dropout (#3), and unstable source row order
+/// (#6) — each break this.
+///
+/// Why this module exists and the `tests/it/ft_determinism.rs` integration test
+/// does NOT carry the load-bearing coverage: that test feeds the loop
+/// *precomputed* `TrainingBatch`es, so the trainer's precomputed branch routes
+/// straight to `compute_loss` over the RAW embeddings — `LoraLinear::forward` is
+/// never called, so **dropout is never drawn** and **the adapter never trains**
+/// (`projection.lora_b` stays all-zeros; the compared bytes are purely the
+/// seeded *init* of `lora_a`). That proves #1/#2 only.
+///
+/// This module instead drives the **production forward dispatch**, the same way
+/// the `standardization_contract` oracle above drives `regress` → `compute_loss`:
+/// every step runs the projection layer's `forward` (the production
+/// `project_frozen_embedding` step — drawing the projection dropout mask),
+/// `regress` (the distribution head's `forward` — drawing the distribution
+/// dropout mask, then `TargetScaler::destandardize`), and the production
+/// `compute_loss` → AdamW step. So the adapter genuinely TRAINS off zero-init and
+/// both LoRA layers' seeded dropout is on the executed path. The saved bytes are
+/// the production `save_adapter` artifact over the *trained* weights — the exact
+/// object the worker publishes.
+#[cfg(test)]
+mod determinism_through_forward {
+    use std::sync::Arc;
+
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{VarBuilder, VarMap};
+
+    use super::super::data::TrainingBatch;
+    use super::super::lora::{build_distribution_head, LoraModel};
+    use super::super::regression_loss::TargetScaler;
+    use super::super::target::TrainingTarget;
+    use super::super::{EarlyStoppingMetric, FineTuneConfig, RegressionLoss};
+    use super::{TrainingLoop, TrainingLoopBuilder};
+    use crate::fine_tune::adamw::{AdamW, ParamsAdamW};
+
+    const HIDDEN: usize = 8;
+    /// A high-offset / low-variance calendar-year target — the same fixture the
+    /// standardisation oracle uses, so the head is doing real (de-standardising)
+    /// regression work as it trains.
+    const YEARS: [f32; 9] = [
+        2013.0, 2014.0, 2015.0, 2016.0, 2017.0, 2018.0, 2019.0, 2020.0, 2021.0,
+    ];
+    /// Steps through the production dispatch. Chosen empirically large enough
+    /// that the second-order gradient reaches `projection.lora_b` (which is zero
+    /// at step 0, since the distribution head's `lora_b` starts at zero, and only
+    /// moves once that has moved off zero) — see the non-zero assertions below.
+    const STEPS: usize = 80;
+
+    /// The fine-tune config under test: `lora_dropout > 0` so the seeded-dropout
+    /// path is genuinely on the executed forward, β-NLL regression so the head
+    /// does de-standardising work, small deterministic loop settings.
+    fn determinism_config(seed: u64) -> FineTuneConfig {
+        FineTuneConfig {
+            seed,
+            epochs: 1,
+            batch_size: 1,
+            validation_fraction: 0.0,
+            warmup_steps: 0,
+            gradient_accumulation_steps: 1,
+            lora_dropout: 0.1,
+            regression_loss: Some(RegressionLoss::BetaNll { beta: 0.5 }),
+            early_stopping_metric: EarlyStoppingMetric::TrainLoss,
+            early_stopping_patience: 10_000,
+            learning_rate: 1e-3,
+            ..Default::default()
+        }
+    }
+
+    /// Deterministic O(1) feature matrix `(n, HIDDEN)` — the projected embeddings
+    /// the projection head sits on (stands in for a frozen base model's pooled
+    /// output, exactly as the standardisation oracle's `features`). Independent of
+    /// any seed so the *only* nondeterminism left is the one under test.
+    fn features(n: usize, device: &Device) -> Tensor {
+        let mut vals = Vec::with_capacity(n * HIDDEN);
+        let mut s: u64 = 0x1234_5678;
+        for _ in 0..n * HIDDEN {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = ((s >> 33) as f32 / (1u32 << 31) as f32) - 1.0;
+            vals.push(u * 0.5);
+        }
+        Tensor::from_vec(vals, (n, HIDDEN), device).unwrap()
+    }
+
+    /// Build a real production [`TrainingLoop`] over a regression
+    /// [`TrainingTarget::ProjectionHead`] (projection + 2-wide Gaussian head),
+    /// seeded at `seed`, with its [`TargetScaler`] reduced from `targets` exactly
+    /// as `TrainingLoop::run` does. Goes through the production builder so nothing
+    /// about the head/scaler wiring is synthetic.
+    async fn regression_loop(
+        seed: u64,
+        targets: &Tensor,
+        device: &Device,
+    ) -> (TrainingLoop, VarMap) {
+        let config = determinism_config(seed);
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let head = build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+        catalog
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: "det-model",
+                version: 1,
+                model_type: "embedding",
+                backend: "candle",
+                task: crate::model::ModelTask::Regression,
+                base_model_id: None,
+                artifact_path: None,
+                config_json: None,
+            })
+            .await
+            .unwrap();
+        catalog
+            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+                job_id: "det-job",
+                base_model_id: "det-model::1",
+                training_source: "src",
+                loss_type: "regression",
+                hyperparams: "{}",
+                kind: "fine_tune",
+                training_spec: "{}",
+            })
+            .await
+            .unwrap();
+        catalog
+            .claim_next_training_job("det-worker", std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("queued job is claimable");
+
+        let mut loop_ = TrainingLoopBuilder::new(
+            TrainingTarget::ProjectionHead { head },
+            varmap.clone(),
+            config,
+        )
+        .device(device.clone())
+        .job_id("det-job".into())
+        .worker_id("det-worker".into())
+        .catalog(catalog)
+        .artifact_dir(dir_path)
+        .build()
+        .unwrap();
+        loop_.target_scaler = Some(TargetScaler::from_targets(targets).unwrap());
+        (loop_, varmap)
+    }
+
+    /// Borrow the projection-head [`LoraModel`] out of a built loop's target.
+    fn head_of(loop_: &TrainingLoop) -> &LoraModel {
+        match &loop_.target {
+            TrainingTarget::ProjectionHead { head } => head,
+            _ => unreachable!("regression_loop builds a ProjectionHead target"),
+        }
+    }
+
+    /// Run one full fine-tune at `seed` through the PRODUCTION forward dispatch and
+    /// return the saved `adapter.safetensors` bytes plus the trained weights map.
+    ///
+    /// Each step is the exact production chain a `db.fine_tune(task=regression)`
+    /// runs per batch: projection `forward` (the `project_frozen_embedding` step,
+    /// drawing the projection dropout mask) → `regress` (distribution head
+    /// `forward`, drawing its dropout mask, then `destandardize`) → production
+    /// `compute_loss` → backward → AdamW. The adapter is then written through the
+    /// production `save_adapter` over the *trained* weights.
+    async fn run_and_capture(seed: u64) -> (Vec<u8>, std::collections::HashMap<String, Tensor>) {
+        let device = Device::Cpu;
+        let n = YEARS.len();
+        let targets = Tensor::from_vec(YEARS.to_vec(), (n,), &device).unwrap();
+        let feats = features(n, &device);
+
+        let (loop_, varmap) = regression_loop(seed, &targets, &device).await;
+
+        let mut opt = AdamW::new(varmap.all_vars(), ParamsAdamW::default()).unwrap();
+        for _ in 0..STEPS {
+            // PRODUCTION projection forward (== `project_frozen_embedding`): the
+            // base-model pooled output `feats` shifted by the projection LoRA. This
+            // draws the projection layer's seeded dropout mask.
+            let proj = head_of(&loop_).layers[0].1.forward(&feats).unwrap();
+            // PRODUCTION distribution forward + de-standardisation (`regress` reads
+            // `head.layers[1]`). Draws the distribution layer's seeded dropout mask.
+            let head_out = loop_.regress(&proj).unwrap();
+            let batch = TrainingBatch::Regression {
+                input: head_out,
+                target: targets.clone(),
+            };
+            let loss = loop_.compute_loss(&batch).unwrap();
+            let grads = loss.backward().unwrap();
+            opt.step(&grads).unwrap();
+        }
+
+        let weights = loop_.target.named_trainable_weights().unwrap();
+        let saved = loop_.target.saved_adapter(
+            &loop_.config,
+            loop_.target_scaler,
+            Some(loop_.regression_form()),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        jammi_lora::save_adapter(dir.path(), &weights, &saved).unwrap();
+        let bytes = std::fs::read(dir.path().join("adapter.safetensors")).unwrap();
+        (bytes, weights)
+    }
+
+    /// L∞ norm of a saved weight tensor, as f32.
+    fn max_abs(w: &std::collections::HashMap<String, Tensor>, key: &str) -> f32 {
+        w[key]
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    /// (a) Same seed → byte-identical published adapter, AND the adapter genuinely
+    /// trained: both LoRA layers' `lora_a`/`lora_b` are non-zero. The non-zero
+    /// `projection.lora_b` is the dead-path guard — a zero `lora_b` would mean the
+    /// head's `forward` was never trained (the precomputed-batch regression this
+    /// module replaces). Byte-equality here requires BOTH the seeded init AND the
+    /// seeded dropout mask to be reproducible: the dropout mask is drawn on the
+    /// executed forward every step (see `lora_linear.rs::forward`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn same_seed_byte_identical_through_trained_forward() {
+        let (a, wa) = run_and_capture(12345).await;
+        let (b, _wb) = run_and_capture(12345).await;
+        assert_eq!(
+            a,
+            b,
+            "same-seed CPU fine-tunes through the real forward path must publish a \
+             byte-identical adapter.safetensors ({} vs {} bytes) — an unseeded \
+             init/dropout source remains",
+            a.len(),
+            b.len()
+        );
+
+        // The adapter must have actually trained: a zero `lora_b` means the head's
+        // `forward` was never on the optimised path (the dead-path regression).
+        for key in [
+            "projection.lora_a",
+            "projection.lora_b",
+            "distribution.lora_b",
+        ] {
+            let m = max_abs(&wa, key);
+            assert!(
+                m > 0.0,
+                "{key} is all-zero after {STEPS} steps — the LoRA forward/training \
+                 path was not exercised (max|·| = {m})"
+            );
+        }
+    }
+
+    /// (b) A different seed → a different published adapter — guards against the
+    /// seed being silently ignored (which would make (a) pass vacuously).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn different_seed_differs_through_trained_forward() {
+        let (a, _) = run_and_capture(12345).await;
+        let (b, _) = run_and_capture(67890).await;
+        assert_ne!(
+            a, b,
+            "different seeds must publish different adapters — the seed is being ignored"
         );
     }
 }

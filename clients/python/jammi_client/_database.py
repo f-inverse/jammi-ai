@@ -1264,6 +1264,7 @@ class RemoteDatabase:
         hard_negative_exclude_hops: Optional[int] = None,
         hard_negative_refresh_every: Optional[int] = None,
         matryoshka_dims: Optional[List[int]] = None,
+        seed: Optional[int] = None,
     ) -> RemoteTrainingJob:
         """Submit a LoRA fine-tuning job to the remote engine; poll the handle.
 
@@ -1306,6 +1307,7 @@ class RemoteDatabase:
             hard_negative_exclude_hops=hard_negative_exclude_hops,
             hard_negative_refresh_every=hard_negative_refresh_every,
             matryoshka_dims=matryoshka_dims,
+            seed=seed,
         )
         request = training_pb2.StartTrainingRequest(
             fine_tune=training_pb2.FineTuneSpec(
@@ -1345,6 +1347,7 @@ class RemoteDatabase:
         learning_rate: Optional[float] = None,
         lora_rank: Optional[int] = None,
         matryoshka_dims: Optional[List[int]] = None,
+        seed: Optional[int] = None,
     ) -> RemoteTrainingJob:
         """Submit a graph-supervised fine-tune (S11) to the remote engine.
 
@@ -1403,6 +1406,10 @@ class RemoteDatabase:
             config.lora_rank = lora_rank
         if matryoshka_dims is not None:
             config.matryoshka_dims.extend(matryoshka_dims)
+        # The graph sampler's `sample_seed` and the LoRA `seed` are distinct: one
+        # seeds the node2vec walk, the other the adapter init / dropout.
+        if seed is not None:
+            config.seed = seed
 
         request = training_pb2.StartTrainingRequest(
             graph_fine_tune=training_pb2.GraphFineTuneSpec(
@@ -2142,6 +2149,7 @@ class RemoteDatabase:
         hard_negative_exclude_hops: Optional[int],
         hard_negative_refresh_every: Optional[int],
         matryoshka_dims: Optional[List[int]],
+        seed: Optional[int],
     ) -> training_pb2.FineTuneConfig:
         """Build the wire `FineTuneConfig` from the embed binding's flat kwargs.
 
@@ -2231,6 +2239,8 @@ class RemoteDatabase:
             config.hard_negatives.CopyFrom(hn)
         if matryoshka_dims is not None:
             config.matryoshka_dims.extend(matryoshka_dims)
+        if seed is not None:
+            config.seed = seed
         return config
 
     # --- Stateless conformal / RRF numerics (computed client-side) ---------------

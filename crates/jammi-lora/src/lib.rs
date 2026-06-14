@@ -28,6 +28,10 @@ mod error;
 mod lora_linear;
 #[cfg(feature = "candle")]
 mod save_load;
+// Seeded, candle-RNG-free init and dropout for the LoRA path. Only the
+// candle-backed `lora_linear` consumes it, so it rides the same feature gate.
+#[cfg(feature = "candle")]
+mod seeded;
 #[cfg(feature = "candle")]
 mod wrapper;
 

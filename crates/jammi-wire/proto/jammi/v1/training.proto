@@ -212,6 +212,11 @@ message FineTuneConfig {
   // Quantile levels for a pinball-trained regression head, ascending in (0, 1).
   // Empty for the parametric Gaussian objectives.
   repeated double quantile_levels = 28;
+  // Random seed for the fine-tune. The LoRA init and dropout mask are a pure
+  // function of this seed and each parameter's name, so on CPU the same
+  // (seed, rows, config) yields byte-identical adapters. Unset = the engine
+  // default fixed seed (never entropy, so an unset job is still reproducible).
+  optional uint64 seed = 29;
 }
 
 // Edge provenance for a graph fine-tune. Mirrors the engine's `EdgeProvenance`

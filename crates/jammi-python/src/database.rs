@@ -746,6 +746,7 @@ impl PyDatabase {
         hard_negative_exclude_hops = None,
         hard_negative_refresh_every = None,
         matryoshka_dims = None,
+        seed = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn fine_tune(
@@ -780,6 +781,7 @@ impl PyDatabase {
         hard_negative_exclude_hops: Option<usize>,
         hard_negative_refresh_every: Option<usize>,
         matryoshka_dims: Option<Vec<usize>>,
+        seed: Option<u64>,
     ) -> PyResult<PyTrainingJob> {
         let mut cfg = FineTuneConfig::default();
         if let Some(v) = lora_rank {
@@ -864,6 +866,9 @@ impl PyDatabase {
         }
         if let Some(v) = matryoshka_dims {
             cfg.matryoshka_dims = v;
+        }
+        if let Some(v) = seed {
+            cfg.seed = v;
         }
         if let Some(v) = target_modules {
             cfg.target_modules = v;
@@ -1206,6 +1211,7 @@ impl PyDatabase {
         learning_rate = None,
         lora_rank = None,
         matryoshka_dims = None,
+        seed = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn fine_tune_graph(
@@ -1233,6 +1239,7 @@ impl PyDatabase {
         learning_rate: Option<f64>,
         lora_rank: Option<usize>,
         matryoshka_dims: Option<Vec<usize>>,
+        seed: Option<u64>,
     ) -> PyResult<PyTrainingJob> {
         use jammi_ai::fine_tune::graph_sampler::{
             EdgeProvenance, GraphFineTuneSources, GraphSampleConfig,
@@ -1310,6 +1317,11 @@ impl PyDatabase {
         }
         if let Some(v) = matryoshka_dims {
             cfg.matryoshka_dims = v;
+        }
+        // `sample_seed` seeds the node2vec walk; `seed` seeds the LoRA init /
+        // dropout — two independent streams.
+        if let Some(v) = seed {
+            cfg.seed = v;
         }
 
         let sources = GraphFineTuneSources {

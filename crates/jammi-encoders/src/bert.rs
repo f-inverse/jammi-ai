@@ -484,6 +484,7 @@ impl<'a> BertBuilder<'a> {
                 lora_layer_vb: &lora_layer_vb,
                 layer_idx: n,
                 lora: &self.lora,
+                varmap,
             };
 
             let query = site.build("attention.self.query", "query", h, h)?;
@@ -548,6 +549,8 @@ struct LoraSite<'a, 'b> {
     lora_layer_vb: &'a VarBuilder<'b>,
     layer_idx: usize,
     lora: &'a LoraBuildConfig<'a>,
+    /// The trainable `VarMap` the seeded LoRA A/B tensors are registered into.
+    varmap: &'a VarMap,
 }
 
 impl LoraSite<'_, '_> {
@@ -577,6 +580,8 @@ impl LoraSite<'_, '_> {
                 self.lora.use_rslora,
                 self.lora.init_mode,
                 self.lora.lora_dropout,
+                self.lora.seed,
+                self.varmap,
                 &self.lora_layer_vb.pp(lora_subpath),
             )?;
             Ok(MaybeLoraLinear::Lora(lora_linear))

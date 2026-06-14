@@ -6,7 +6,7 @@
 //! layers that the trainer consumes uniformly.
 
 use candle_core::{DType, Tensor};
-use candle_nn::{Linear, VarBuilder};
+use candle_nn::{Linear, VarBuilder, VarMap};
 use jammi_db::error::{JammiError, Result};
 use jammi_lora::LoraLinear;
 
@@ -29,6 +29,37 @@ impl LoraModel {
     }
 }
 
+/// Build one `ZerosB` head LoRA layer at `vb.pp(name)`, seeded from
+/// `config.seed` and carrying `config.lora_dropout` (seeded dropout). The
+/// `varmap` receives the seeded trainable A/B tensors. Centralising this keeps
+/// every head builder's per-layer construction identical — seed and dropout
+/// thread through one place.
+fn build_head_layer(
+    base: Linear,
+    config: &super::FineTuneConfig,
+    varmap: &VarMap,
+    vb: &VarBuilder,
+    name: &str,
+) -> Result<LoraLinear> {
+    let dropout = if config.lora_dropout > 0.0 {
+        Some(config.lora_dropout as f32)
+    } else {
+        None
+    };
+    LoraLinear::new(
+        base,
+        config.lora_rank,
+        config.lora_alpha,
+        config.use_rslora,
+        jammi_lora::LoraInitMode::ZerosB,
+        dropout,
+        config.seed,
+        varmap,
+        &vb.pp(name),
+    )
+    .map_err(|e| JammiError::FineTune(format!("{name} LoRA: {e}")))
+}
+
 /// Build a projection-plus-classifier head for classification fine-tunes.
 ///
 /// Layer 0 (`projection`): LoRA-wrapped identity, `hidden → hidden`.
@@ -37,31 +68,20 @@ pub fn build_classification_head(
     hidden_size: usize,
     num_classes: usize,
     config: &super::FineTuneConfig,
+    varmap: &VarMap,
     vb: &VarBuilder,
 ) -> Result<LoraModel> {
     // Layer 0: projection (identity base, same as embedding)
     let proj_base = Tensor::eye(hidden_size, DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("Projection identity: {e}")))?;
     let proj_linear = Linear::new(proj_base, None);
-    let projection = LoraLinear::new_simple(
-        proj_linear,
-        config.lora_rank,
-        config.lora_alpha,
-        &vb.pp("projection"),
-    )
-    .map_err(|e| JammiError::FineTune(format!("Projection LoRA: {e}")))?;
+    let projection = build_head_layer(proj_linear, config, varmap, vb, "projection")?;
 
     // Layer 1: classifier (zeros base, trained from scratch via LoRA)
     let cls_base = Tensor::zeros((num_classes, hidden_size), DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("Classifier zeros: {e}")))?;
     let cls_linear = Linear::new(cls_base, None);
-    let classifier = LoraLinear::new_simple(
-        cls_linear,
-        config.lora_rank,
-        config.lora_alpha,
-        &vb.pp("classifier"),
-    )
-    .map_err(|e| JammiError::FineTune(format!("Classifier LoRA: {e}")))?;
+    let classifier = build_head_layer(cls_linear, config, varmap, vb, "classifier")?;
 
     Ok(LoraModel {
         layers: vec![
@@ -83,29 +103,18 @@ pub fn build_distribution_head(
     hidden_size: usize,
     output_dim: usize,
     config: &super::FineTuneConfig,
+    varmap: &VarMap,
     vb: &VarBuilder,
 ) -> Result<LoraModel> {
     let proj_base = Tensor::eye(hidden_size, DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("Regression projection identity: {e}")))?;
     let proj_linear = Linear::new(proj_base, None);
-    let projection = LoraLinear::new_simple(
-        proj_linear,
-        config.lora_rank,
-        config.lora_alpha,
-        &vb.pp("projection"),
-    )
-    .map_err(|e| JammiError::FineTune(format!("Regression projection LoRA: {e}")))?;
+    let projection = build_head_layer(proj_linear, config, varmap, vb, "projection")?;
 
     let head_base = Tensor::zeros((output_dim, hidden_size), DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("Distribution head zeros: {e}")))?;
     let head_linear = Linear::new(head_base, None);
-    let distribution = LoraLinear::new_simple(
-        head_linear,
-        config.lora_rank,
-        config.lora_alpha,
-        &vb.pp("distribution"),
-    )
-    .map_err(|e| JammiError::FineTune(format!("Distribution head LoRA: {e}")))?;
+    let distribution = build_head_layer(head_linear, config, varmap, vb, "distribution")?;
 
     Ok(LoraModel {
         layers: vec![
@@ -123,31 +132,20 @@ pub fn build_ner_head(
     hidden_size: usize,
     num_labels: usize,
     config: &super::FineTuneConfig,
+    varmap: &VarMap,
     vb: &VarBuilder,
 ) -> Result<LoraModel> {
     // Layer 0: projection (identity base, same as embedding/classification)
     let proj_base = Tensor::eye(hidden_size, DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("NER projection identity: {e}")))?;
     let proj_linear = Linear::new(proj_base, None);
-    let projection = LoraLinear::new_simple(
-        proj_linear,
-        config.lora_rank,
-        config.lora_alpha,
-        &vb.pp("projection"),
-    )
-    .map_err(|e| JammiError::FineTune(format!("NER projection LoRA: {e}")))?;
+    let projection = build_head_layer(proj_linear, config, varmap, vb, "projection")?;
 
     // Layer 1: token classifier (zeros base, trained from scratch via LoRA)
     let cls_base = Tensor::zeros((num_labels, hidden_size), DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("NER classifier zeros: {e}")))?;
     let cls_linear = Linear::new(cls_base, None);
-    let classifier = LoraLinear::new_simple(
-        cls_linear,
-        config.lora_rank,
-        config.lora_alpha,
-        &vb.pp("token_classifier"),
-    )
-    .map_err(|e| JammiError::FineTune(format!("NER classifier LoRA: {e}")))?;
+    let classifier = build_head_layer(cls_linear, config, varmap, vb, "token_classifier")?;
 
     Ok(LoraModel {
         layers: vec![
@@ -166,18 +164,13 @@ pub fn build_ner_head(
 pub fn build_projection_head(
     hidden_size: usize,
     config: &super::FineTuneConfig,
+    varmap: &VarMap,
     vb: &VarBuilder,
 ) -> Result<LoraModel> {
     let base_weight = Tensor::eye(hidden_size, DType::F32, vb.device())
         .map_err(|e| JammiError::FineTune(format!("Identity weight: {e}")))?;
     let base = Linear::new(base_weight, None);
-    let lora = LoraLinear::new_simple(
-        base,
-        config.lora_rank,
-        config.lora_alpha,
-        &vb.pp("projection"),
-    )
-    .map_err(|e| JammiError::FineTune(format!("Projection LoRA: {e}")))?;
+    let lora = build_head_layer(base, config, varmap, vb, "projection")?;
     Ok(LoraModel {
         layers: vec![("projection".into(), lora)],
     })

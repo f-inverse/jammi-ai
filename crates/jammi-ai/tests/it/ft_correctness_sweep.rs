@@ -89,7 +89,7 @@ async fn oracle_epochs_honored_exactly_precomputed() {
     for epochs in [1usize, 2, 5] {
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let head = build_projection_head(4, &FineTuneConfig::default(), &vb).unwrap();
+        let head = build_projection_head(4, &FineTuneConfig::default(), &varmap, &vb).unwrap();
 
         let batches: Vec<_> = (0..N).map(|_| learnable_batch(&device)).collect();
         let loader = TrainingDataLoader::from_precomputed(batches);
@@ -160,7 +160,7 @@ async fn oracle_steps_equal_epochs_times_ceil_batches_over_grad_accum() {
 
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    let head = build_projection_head(4, &FineTuneConfig::default(), &vb).unwrap();
+    let head = build_projection_head(4, &FineTuneConfig::default(), &varmap, &vb).unwrap();
     let batches: Vec<_> = (0..N).map(|_| learnable_batch(&device)).collect();
     let loader = TrainingDataLoader::from_precomputed(batches);
 
@@ -234,7 +234,7 @@ async fn oracle_grad_accum_partial_window_step_accounting() {
 
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    let head = build_projection_head(4, &FineTuneConfig::default(), &vb).unwrap();
+    let head = build_projection_head(4, &FineTuneConfig::default(), &varmap, &vb).unwrap();
     let batches: Vec<_> = (0..N).map(|_| learnable_batch(&device)).collect();
     let loader = TrainingDataLoader::from_precomputed(batches);
 

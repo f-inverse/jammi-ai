@@ -423,6 +423,7 @@ impl<'a> DistilBertBuilder<'a> {
                 lora_layer_vb: &lora_layer_vb,
                 layer_idx: n,
                 lora: &self.lora,
+                varmap,
             };
             let q_lin = attn_slot.build_in(
                 &attn_vb,
@@ -465,6 +466,7 @@ impl<'a> DistilBertBuilder<'a> {
                 lora_layer_vb: &lora_layer_vb,
                 layer_idx: n,
                 lora: &self.lora,
+                varmap,
             };
             let lin1 = ffn_slot.build_in(
                 &ffn_vb,
@@ -520,6 +522,8 @@ struct LoraSlot<'a, 'b> {
     lora_layer_vb: &'a VarBuilder<'b>,
     layer_idx: usize,
     lora: &'a LoraBuildConfig<'a>,
+    /// The trainable `VarMap` the seeded LoRA A/B tensors are registered into.
+    varmap: &'a VarMap,
 }
 
 impl LoraSlot<'_, '_> {
@@ -558,6 +562,8 @@ impl LoraSlot<'_, '_> {
                 self.lora.use_rslora,
                 self.lora.init_mode,
                 self.lora.lora_dropout,
+                self.lora.seed,
+                self.varmap,
                 &self.lora_layer_vb.pp(module_path),
             )?;
             Ok(MaybeLoraLinear::Lora(lora_linear))

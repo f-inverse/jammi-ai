@@ -59,6 +59,7 @@ fn modernbert_loads_with_target_modules() {
         lora_dropout: None,
         rank_pattern: &empty_pattern,
         init_mode: LoraInitMode::ZerosB,
+        seed: 0,
     };
 
     let model = ModernBert::builder()

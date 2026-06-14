@@ -362,6 +362,23 @@ pub struct FineTuneConfig {
     /// dimension only. Each entry must be `> 0` and `<=` the embedding width.
     #[serde(default)]
     pub matryoshka_dims: Vec<usize>,
+
+    /// Random seed for the fine-tune. The LoRA A/B initialisation and the
+    /// dropout mask are a pure function of this seed and each parameter's name,
+    /// so on `Device::Cpu` two runs with the same `(seed, source rows, config)`
+    /// produce byte-identical adapter weights — run-to-run and across processes.
+    /// Fixed per job (never drawn from entropy at construction); the default
+    /// [`DEFAULT_FINE_TUNE_SEED`] is used when a caller does not specify one.
+    #[serde(default = "default_fine_tune_seed")]
+    pub seed: u64,
+}
+
+/// The fixed default fine-tune seed. A constant (not entropy) so a job that
+/// omits `seed` is still reproducible.
+pub const DEFAULT_FINE_TUNE_SEED: u64 = 42;
+
+fn default_fine_tune_seed() -> u64 {
+    DEFAULT_FINE_TUNE_SEED
 }
 
 fn default_weight_decay() -> f64 {
@@ -402,6 +419,7 @@ impl Default for FineTuneConfig {
             cached: false,
             hard_negatives: HardNegativeConfig::default(),
             matryoshka_dims: Vec::new(),
+            seed: DEFAULT_FINE_TUNE_SEED,
         }
     }
 }

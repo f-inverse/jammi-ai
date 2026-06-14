@@ -7,6 +7,31 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **Seeded determinism for CPU fine-tuning (W5-PR0b) — adapters are now
+  bit-reproducible.** A LoRA fine-tune on `Device::Cpu` is a pure function of
+  `(seed, source rows, config)`: two runs with the same seed produce
+  byte-identical adapter weights, run-to-run and across separate processes.
+  `FineTuneConfig` gains a `seed: u64` field (default `42`, fixed — never drawn
+  from entropy), threaded through the proto and the Python/TS clients. The LoRA
+  A/B initialisation (`jammi-lora`) no longer draws candle's unseedable global
+  RNG: a jammi-owned SplitMix64 fills the host buffers from a stream keyed by
+  `(seed, fully-qualified parameter name)` — so the per-parameter draw is
+  independent of `VarMap`/`HashMap` iteration order and stable across processes —
+  and the seeded values are written into the registered trainable `Var`s in
+  place. LoRA dropout is likewise seeded (a run-owned per-layer Bernoulli mask
+  stream replaces candle's unseeded `ops::dropout`). The tabular source read
+  (`read_source_columns`) now appends a deterministic `ORDER BY` over the full
+  projected column tuple, pinning row order (DataFusion gives no order guarantee
+  without it); ties can only occur between rows byte-identical on every selected
+  column, which are interchangeable for both batching and the `TargetScaler`
+  μ/σ reduction, so the result is a pure function of the row multiset. Two
+  hermetic CPU acceptance tests prove this: `tests/it/ft_determinism.rs` covers
+  seeded-init byte-reproducibility, and an in-crate `determinism_through_forward`
+  module drives the production fine-tune dispatch (`lora_dropout > 0`, the LoRA
+  head's `forward` actually applied so the adapter trains off zero) to prove the
+  seeded-dropout and trained-trajectory contract — same-seed byte-equality,
+  different-seed divergence, and a non-zero `lora_b` dead-path guard.
+  Checkpoint/resume is a separate later PR.
 - **Standardisation-contract oracle + completeness guards for every
   offset-bearing distribution head.** The fine-tune "standardisation contract"
   (a zero-init distribution head reaches a high-offset / low-variance target —

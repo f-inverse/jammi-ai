@@ -28,6 +28,10 @@ pub struct LoraBuildConfig<'a> {
     pub rank_pattern: &'a HashMap<String, usize>,
     /// How the LoRA A/B matrices are initialised.
     pub init_mode: LoraInitMode,
+    /// Run seed for the LoRA A/B init and the dropout mask. Every adapter draw
+    /// is a pure function of this seed and the parameter's fully-qualified name,
+    /// so the same seed reproduces byte-identical adapters across processes.
+    pub seed: u64,
 }
 
 static EMPTY_TARGETS: &[String] = &[];
@@ -48,6 +52,9 @@ impl LoraBuildConfig<'static> {
             lora_dropout: None,
             rank_pattern: &EMPTY_RANK_PATTERN,
             init_mode: LoraInitMode::ZerosB,
+            // A frozen encoder installs no adapter, so the seed is never drawn
+            // from; a fixed value keeps `frozen()` const-constructible.
+            seed: 0,
         }
     }
 }

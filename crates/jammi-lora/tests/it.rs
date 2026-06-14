@@ -40,7 +40,18 @@ fn lora_linear_zeros_b_init_is_identity() {
     let x = rand_input(&device);
 
     let base_out = base.forward(&x).unwrap();
-    let lora = LoraLinear::new(base, 4, 8.0, false, LoraInitMode::ZerosB, None, &vb).unwrap();
+    let lora = LoraLinear::new(
+        base,
+        4,
+        8.0,
+        false,
+        LoraInitMode::ZerosB,
+        None,
+        0,
+        &varmap,
+        &vb,
+    )
+    .unwrap();
     let lora_out = lora.forward(&x).unwrap();
 
     let diff = (&lora_out - &base_out).unwrap().abs().unwrap();
@@ -67,7 +78,18 @@ fn lora_linear_gaussian_init_diverges_from_base() {
     let x = rand_input(&device);
 
     let base_out = base.forward(&x).unwrap();
-    let lora = LoraLinear::new(base, 4, 8.0, false, LoraInitMode::Gaussian, None, &vb).unwrap();
+    let lora = LoraLinear::new(
+        base,
+        4,
+        8.0,
+        false,
+        LoraInitMode::Gaussian,
+        None,
+        0,
+        &varmap,
+        &vb,
+    )
+    .unwrap();
     let lora_out = lora.forward(&x).unwrap();
 
     let diff = (&lora_out - &base_out).unwrap().abs().unwrap();
@@ -88,7 +110,7 @@ fn lora_linear_trainable_params_count() {
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
     let base = build_base(8, 16, &device);
-    let lora = LoraLinear::new_simple(base, 4, 8.0, &vb).unwrap();
+    let lora = LoraLinear::new_simple(base, 4, 8.0, 0, &varmap, &vb).unwrap();
     assert_eq!(lora.trainable_params().len(), 2);
 }
 
@@ -116,7 +138,18 @@ fn lora_linear_rslora_scaling() {
     );
     // For RSLoRA we have to construct via `new` to exercise the use_rslora
     // path; we then overwrite A/B with ones so the delta is observable.
-    let mut rslora = LoraLinear::new(base, 4, 4.0, true, LoraInitMode::ZerosB, None, &vb).unwrap();
+    let mut rslora = LoraLinear::new(
+        base,
+        4,
+        4.0,
+        true,
+        LoraInitMode::ZerosB,
+        None,
+        0,
+        &varmap,
+        &vb,
+    )
+    .unwrap();
     rslora.lora_a = lora_a;
     rslora.lora_b = lora_b;
 
@@ -185,7 +218,7 @@ fn maybe_lora_linear_named_weights_only_for_lora() {
     assert!(frozen.named_weights("query").unwrap().is_empty());
 
     let lora = MaybeLoraLinear::Lora(
-        LoraLinear::new_simple(build_base(8, 16, &device), 4, 8.0, &vb).unwrap(),
+        LoraLinear::new_simple(build_base(8, 16, &device), 4, 8.0, 0, &varmap, &vb).unwrap(),
     );
     let weights = lora.named_weights("query").unwrap();
     assert_eq!(weights.len(), 2);

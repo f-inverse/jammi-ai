@@ -27,7 +27,7 @@ fn lora_layer_mechanics() {
 
     let base_weight = Tensor::randn(0.0f32, 1.0, (4, 8), &device).unwrap();
     let base_linear = Linear::new(base_weight, None);
-    let mut lora = LoraLinear::new_simple(base_linear.clone(), 2, 4.0, &vb).unwrap();
+    let mut lora = LoraLinear::new_simple(base_linear.clone(), 2, 4.0, 0, &varmap, &vb).unwrap();
 
     // B initialized to zeros — critical: ensures LoRA starts as identity
     let b_vals = lora.lora_b.to_vec2::<f32>().unwrap();
@@ -824,7 +824,7 @@ fn lora_backward_step_changes_weights() {
 
     let base_weight = Tensor::randn(0.0f32, 1.0, (4, 8), &device).unwrap();
     let base = Linear::new(base_weight, None);
-    let lora = LoraLinear::new_simple(base, 2, 4.0, &vb.pp("test")).unwrap();
+    let lora = LoraLinear::new_simple(base, 2, 4.0, 0, &varmap, &vb.pp("test")).unwrap();
 
     // Capture B weights before training — should be zeros
     let b_before = lora.lora_b.to_vec2::<f32>().unwrap();
@@ -895,7 +895,7 @@ async fn training_divergence_detection() {
     let device = Device::Cpu;
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    let model = build_projection_head(32, &FineTuneConfig::default(), &vb).unwrap();
+    let model = build_projection_head(32, &FineTuneConfig::default(), &varmap, &vb).unwrap();
 
     // Create batches where scores are NaN → cosent_loss produces NaN
     let nan_batch = TrainingBatch::Contrastive {
@@ -1000,7 +1000,7 @@ async fn training_early_stopping_triggers() {
     let device = Device::Cpu;
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    let model = build_projection_head(32, &FineTuneConfig::default(), &vb).unwrap();
+    let model = build_projection_head(32, &FineTuneConfig::default(), &varmap, &vb).unwrap();
 
     // Training batches: similar embeddings with score=1.0 → low contrastive loss
     let make_train_batch = || {
@@ -1957,7 +1957,7 @@ async fn training_bails_when_lease_lost_mid_run() {
     let device = Device::Cpu;
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    let head = build_projection_head(32, &FineTuneConfig::default(), &vb).unwrap();
+    let head = build_projection_head(32, &FineTuneConfig::default(), &varmap, &vb).unwrap();
 
     // A benign precomputed batch so a non-cancelled run would simply train.
     let batch = TrainingBatch::Contrastive {

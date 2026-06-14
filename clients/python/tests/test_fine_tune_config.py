@@ -42,6 +42,7 @@ _UNSET = dict(
     hard_negative_exclude_hops=None,
     hard_negative_refresh_every=None,
     matryoshka_dims=None,
+    seed=None,
 )
 
 
@@ -76,6 +77,21 @@ def test_partial_hard_negatives_sets_only_present_knobs() -> None:
     assert hn.HasField("k") and hn.k == 5
     assert not hn.HasField("exclude_hops")
     assert not hn.HasField("refresh_every")
+
+
+def test_seed_unset_by_default_lets_engine_default_apply() -> None:
+    """An omitted `seed` leaves the field UNSET on the wire, so the server
+    resolves the engine's fixed default seed rather than decoding a literal 0."""
+    config = _build()
+    assert not config.HasField("seed")
+
+
+def test_seed_set_crosses_the_wire() -> None:
+    """A caller-supplied `seed` is sent with explicit presence so the engine
+    makes the fine-tune bit-reproducible from it."""
+    config = _build(seed=12345)
+    assert config.HasField("seed")
+    assert config.seed == 12345
 
 
 def test_no_hard_negative_kwargs_omits_the_message() -> None:

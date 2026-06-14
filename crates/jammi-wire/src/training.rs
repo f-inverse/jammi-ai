@@ -131,6 +131,9 @@ impl TryFrom<pb::FineTuneConfig> for FineTuneConfig {
         if !c.quantile_levels.is_empty() {
             cfg.quantile_levels = c.quantile_levels;
         }
+        if let Some(v) = c.seed {
+            cfg.seed = v;
+        }
 
         Ok(cfg)
     }
@@ -320,6 +323,7 @@ pub fn config_to_proto(config: &FineTuneConfig) -> pb::FineTuneConfig {
             .as_ref()
             .map(regression_loss_to_proto),
         quantile_levels: config.quantile_levels.clone(),
+        seed: Some(config.seed),
     }
 }
 

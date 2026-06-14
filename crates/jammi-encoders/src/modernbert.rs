@@ -501,6 +501,7 @@ impl<'a> ModernBertBuilder<'a> {
                 lora_layer_vb: &lora_layer_vb,
                 layer_idx: n,
                 lora: self.lora,
+                varmap,
             };
 
             let wqkv = site.build(
@@ -593,6 +594,8 @@ struct LoraSite<'a, 'b> {
     lora_layer_vb: &'a VarBuilder<'b>,
     layer_idx: usize,
     lora: LoraBuildConfig<'b>,
+    /// The trainable `VarMap` the seeded LoRA A/B tensors are registered into.
+    varmap: &'a VarMap,
 }
 
 impl<'a, 'b> LoraSite<'a, 'b> {
@@ -618,6 +621,8 @@ impl<'a, 'b> LoraSite<'a, 'b> {
                 self.lora.use_rslora,
                 self.lora.init_mode,
                 self.lora.lora_dropout,
+                self.lora.seed,
+                self.varmap,
                 &self.lora_layer_vb.pp(target_name),
             )?;
             Ok(MaybeLoraLinear::Lora(lora_linear))

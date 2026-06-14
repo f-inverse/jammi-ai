@@ -2,21 +2,36 @@
 //! peers of the R2 calibration metrics and the inference adapter's σ map.
 //!
 //! These are pure functions of a head output `(batch, k)` and a target — they
-//! read no training state, and they score the head's **raw, outcome-unit**
-//! output against the **raw** target. The trainer's `regression_loss` dispatches
-//! on the configured [`super::RegressionLoss`] to them; the inference adapter
-//! reads the single [`STD_FLOOR`] so the trained σ and the served σ are one
-//! constant.
+//! read no training state, and they score the head's **z-space** output against
+//! the **z-scored** target. The trainer's `regression_loss` dispatches on the
+//! configured [`super::RegressionLoss`] to them; the inference adapter reads the
+//! single [`STD_FLOOR`] so the trained σ and the served σ are one constant.
 //!
-//! Reachability of a high-offset target (calendar years, prices) is *not* a loss
-//! concern — scoring in a standardised space does not change how far Adam moves
-//! the raw head parameter, because Adam's per-step update is ≈`lr·sign(grad)`
-//! regardless of the gradient's magnitude. Reachability is solved inside the head
-//! by [`TargetScaler::destandardize_gaussian`] /
-//! [`TargetScaler::destandardize_quantile`], which reparameterise the head so its
-//! *optimised* parameter is O(1) from zero-init while its *output* is
-//! raw-correct. The loss only ever sees that raw-correct output, so it stays a
-//! pure function of `(head, target)`.
+//! # Two axes, two fixes
+//!
+//! A regression head faces two scale problems on a realistic target, and they
+//! have *different* fixes:
+//!
+//! - **Reachability of the offset (mean / quantile axis).** A zero-init head
+//!   emits 0, but a high-offset target (calendar years, prices) sits thousands of
+//!   units away. This is NOT a loss-space problem: Adam's per-step update is
+//!   ≈`lr·sign(grad)`, scale-free, so z-scoring the loss does not change how far
+//!   the raw parameter travels. It is solved by reparameterising the **head** so
+//!   the parameter it optimises is a z-space `z` (O(1) from zero-init) and its
+//!   de-standardised output is `μ_y + σ_y·z` — applied at serve by
+//!   [`TargetScaler::destandardize_gaussian`] / [`TargetScaler::destandardize_quantile`].
+//! - **Conditioning of the variance (σ axis) / loss divergence.** A raw σ column
+//!   (`STD_FLOOR + softplus(0) ≈ 0.693`) scored against a raw σ_y-scaled residual
+//!   produces an ill-scaled `(y−μ)²/σ²` ≈ `σ_y²/0.48` that is O(hundreds) on
+//!   step 0 for σ_y ≈ 19.5 — past the trainer's divergence guard. This IS a
+//!   loss-space problem, and z-space scoring is the fix: the loss sees the head's
+//!   raw z-output against a z-scored target, so residuals are O(1) for any scale.
+//!
+//! So the loss trains entirely in z-space (the head's σ column is a z-scale,
+//! σ_z ≈ 1) and de-standardisation to raw units lives only at serve: the mean /
+//! quantile affine at the backend, and the σ multiply (`σ_y·σ_z`) at the
+//! inference adapter. This matches the in-context predictor, which z-scores its
+//! target and context and de-standardises only at serve.
 
 use candle_core::Tensor;
 use jammi_db::error::{JammiError, Result};
@@ -31,57 +46,84 @@ use serde::{Deserialize, Serialize};
 /// so the trained `σ` and the served `σ` are one transform.
 pub(crate) const STD_FLOOR: f64 = 1e-3;
 
-/// Dataset-level target standardiser carried *by the regression head*: the
-/// `mean` (μ_y) and `std` (σ_y) of all training targets, computed once before
-/// the loop and held fixed for the whole run.
+/// The σ-axis de-standardise — the **single** source of the `σ_y·σ_z` math both
+/// serve paths use.
 ///
-/// # Why the head, not the loss
+/// A z-space-trained Gaussian head emits a z-scale σ (`σ_z`, post-softplus). To
+/// recover the raw σ the serve path multiplies by σ_y (the scaler's `std`) and
+/// re-floors at [`STD_FLOOR`] so the positivity invariant survives the multiply.
+/// The multiply has to land here, on the *post-softplus* σ, because `softplus` is
+/// non-linear (`σ_y·softplus(raw) ≠ softplus(σ_y·raw)`).
 ///
-/// A distribution head is zero-initialised, so its predictive `mean` starts at
-/// 0. A high-offset target — calendar years, prices — sits thousands of units
-/// from 0. Adam's per-parameter update is ≈`lr·sign(grad)`: it normalises by the
-/// gradient's running RMS, so the *distance* the raw mean parameter travels is
-/// ≈`lr` per step **regardless of the loss's scale or units**. Scoring the loss
-/// in a standardised z-space therefore does *not* help — the raw mean still
-/// crawls ≈`lr·steps` units and stalls thousands of units short of the target.
+/// Both serving surfaces call this so there is exactly one copy of the math:
+/// - the **fine-tune** head, via the inference adapter
+///   (`DistributionAdapter::adapt`, which builds the Arrow `predicted_std`
+///   column), and
+/// - the **in-context** predictor, via `destandardize_distribution` (which builds
+///   the typed `PredictedDistribution`).
 ///
-/// The fix is a reparameterisation, applied inside the head's forward: the head
-/// learns a z-space parameter `z` (O(1) from zero-init, reachable by Adam) and
-/// its output is the **de-standardised** raw value `μ_y + σ_y·z`. With `z`
-/// zero-init the head already emits `μ_y`, and Adam only has to nudge `z` by
-/// O(1) to track each row. The loss then scores this raw-correct output against
-/// the raw target with no scaler in sight, and serving reads the same raw output
-/// directly. The scaler is the one transform shared by training and serving, so
-/// it is **persisted with the head** (in the adapter config) and reloaded on
-/// serve.
+/// The two paths cannot yet share the *whole* de-standardise: they apply the mean
+/// affine at different points (the fine-tune path at the backend's
+/// `TargetScaler::destandardize`, before the adapter; the in-context path inside
+/// `destandardize_distribution`, after a scaler-free adapter) and emit different
+/// output types (an Arrow `ArrayRef` vs a typed `PredictedDistribution`). Unifying
+/// the full transport is the H3 serve-path unification; until then this helper is
+/// the one shared piece of σ math, so a change to the σ rule cannot drift between
+/// the two surfaces.
+pub(crate) fn destandardize_sigma(std_scale: f32, sigma_z: f32) -> f32 {
+    (std_scale * sigma_z).max(STD_FLOOR as f32)
+}
+
+/// Dataset-level target standardiser shared by the regression loss and the serve
+/// path: the `mean` (μ_y) and `std` (σ_y) of all training targets, computed once
+/// before the loop and held fixed for the whole run.
 ///
-/// # The σ column stays in the existing softplus path
+/// # Train in z-space, de-standardise at serve
 ///
-/// Only the *mean* (Gaussian) / quantile (pinball) columns carry the target
-/// offset and need de-standardisation. The Gaussian σ column is a *raw scale*
-/// the existing `STD_FLOOR + softplus(raw)` map already turns into a positive σ;
-/// its optimum (`σ_y`, an O(1) spread) is reachable from zero-init without any
-/// reparameterisation, so that column is passed through untouched — which is
-/// exactly what keeps `gaussian_params` and the serving adapter's σ map
-/// unchanged, and what keeps the served σ ≥ [`STD_FLOOR`].
+/// The fine-tune regression loss scores the head's raw z-output against a
+/// **z-scored** target ([`Self::standardize_value`]: `(y−μ_y)/σ_y`), so the
+/// optimizer sees O(1) residuals for any target scale. De-standardisation back to
+/// raw units happens only at serve:
+///
+/// - the **mean** (Gaussian) / **quantile** columns are mapped `μ_y + σ_y·z` by
+///   [`Self::destandardize`] at the backend (the offset axis);
+/// - the **σ** column — a z-scale (σ_z ≈ 1) the loss trained — is multiplied by
+///   σ_y on the post-softplus value at the inference adapter (the variance axis).
+///
+/// This solves both scale problems at once. The offset is reachable because a
+/// zero-init head already emits z = 0 → served `μ_y`, and Adam only nudges `z` by
+/// O(1) to track each row (Adam's `lr·sign(grad)` step is scale-free, so this part
+/// would work in raw or z space — it is the reparameterisation, not the loss
+/// space, that makes the offset reachable). The variance is well-conditioned
+/// because the z-scored target keeps `(z_y−z_μ)²/σ_z²` ≈ O(1) at every step,
+/// rather than the raw `σ_y²/σ_z²` that diverged. The scaler is the one transform
+/// shared by training and serving, so it is **persisted with the head** (in the
+/// adapter config) and reloaded on serve.
+///
+/// # The σ column: a z-scale, multiplied by σ_y post-softplus
+///
+/// The Gaussian σ column the head emits is a *z-scale*: the loss reads
+/// `σ_z = STD_FLOOR + softplus(raw)` and scores `(z_y−z_μ)²/σ_z²`, so a well-fit
+/// head learns σ_z ≈ 1 (the z-spread). The served σ must therefore be `σ_y·σ_z`.
+/// That multiply lands on the **post-softplus** σ at the adapter — `softplus` is
+/// non-linear, so `σ_y·softplus(raw) ≠ softplus(σ_y·raw)` and the factor cannot
+/// fold into the raw column — re-floored at [`STD_FLOOR`] so the positivity
+/// invariant survives. This mirrors the in-context predictor's σ map exactly.
 ///
 /// `std` is floored at [`STD_FLOOR`] at construction, so a degenerate
 /// (single-valued or constant) target set cannot produce a zero-multiplier
-/// scaler — the invalid `std = 0` state is unrepresentable, and a row's
-/// de-standardised mean still moves with `z` rather than collapsing onto μ_y.
+/// scaler — the invalid `std = 0` state is unrepresentable, the z-score
+/// `(y−μ_y)/σ_y` is finite, and the served σ = σ_y·σ_z ≥ STD_FLOOR.
 ///
-/// # The amortized in-context regressor standardises the data, not the head
+/// # One transform shared with the in-context regressor
 ///
-/// A fine-tune regression head carries a fixed encoder, so its reparameterisation
-/// lives in the head's forward ([`Self::destandardize`]). An amortized in-context
-/// predictor instead *conditions on* its context members' `y`-values, so the same
-/// reachability fix is applied in the **data** space: both the context members'
-/// `y` and the held-out target `y` are z-scored with one scaler
-/// ([`Self::standardize_value`]) before they enter the episode, so the head trains
-/// against an O(1) z-space target while conditioning on z-space context, and the
-/// served head output is de-standardised ([`Self::destandardize`]) back to raw
-/// units. The scaler is the one transform shared by both ends and is persisted
-/// with the predictor.
+/// The amortized in-context predictor already trains in z-space: it z-scores both
+/// the held-out target `y` and every context member's `y` with one scaler
+/// ([`Self::standardize_value`]) before they enter the episode, scores the head's
+/// z-output against the z-target, and de-standardises only at serve (`μ_y + σ_y·z`
+/// on the mean/quantiles, `σ_y·σ_z` on the σ). The fine-tune path is now the same
+/// shape: z-scored loss, de-standardise at serve. The scaler is the one transform
+/// shared by both ends and is persisted with the head.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub(crate) struct TargetScaler {
     /// Mean of all training targets, μ_y. The zero-init head emits this.
@@ -165,12 +207,13 @@ impl TargetScaler {
         }
     }
 
-    /// De-standardise a Gaussian head's raw `(batch, 2)` output. The mean column
-    /// (0) is mapped `μ_y + σ_y·z`; the raw-scale column (1) is passed through so
-    /// the downstream `STD_FLOOR + softplus(raw)` σ map is unchanged. With `z`
-    /// zero-init the emitted mean is exactly μ_y, so a high-offset target is
-    /// reachable; the emitted column-1 is the raw scale the loss and serving
-    /// adapter both already interpret.
+    /// De-standardise a Gaussian head's raw `(batch, 2)` output at serve. The mean
+    /// column (0) is mapped `μ_y + σ_y·z` (the offset axis); the raw-scale column
+    /// (1) is passed through unchanged here, because its σ-axis de-standardise
+    /// (`σ_y·softplus(raw)`) is a *post-softplus* multiply applied later by the
+    /// inference adapter — softplus is non-linear, so the σ_y factor cannot be
+    /// folded into the raw column. With `z` zero-init the emitted mean is exactly
+    /// μ_y, so a high-offset target is reachable.
     pub(crate) fn destandardize_gaussian(&self, raw_head: &Tensor) -> Result<Tensor> {
         let (_, k) = raw_head
             .dims2()

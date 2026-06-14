@@ -357,6 +357,16 @@ impl CandleModel {
         self.regression_form.as_ref()
     }
 
+    /// The persisted scaler's σ_y (target standard deviation), or `None` for a
+    /// non-regression / no-scaler head. Serving reads this to scale a Gaussian
+    /// head's served σ from z-units (σ_z, what the z-space loss trains) back to
+    /// raw units (`σ_y·σ_z`) — the σ-axis de-standardise that mirrors the mean
+    /// affine the backend already applies. The mean/quantile columns carry σ_y in
+    /// their affine at the backend; only the post-softplus σ needs σ_y here.
+    pub(crate) fn regression_std_scale(&self) -> Option<f32> {
+        self.regression_scaler.as_ref().map(|s| s.std() as f32)
+    }
+
     /// TEST-ONLY non-vacuity seam: zero the trained regression distribution
     /// head's LoRA `B` factor, collapsing the head to its zero-initialised base
     /// (`zeros(output_dim, hidden_size)`). A head in this state emits exactly the
@@ -498,9 +508,10 @@ impl CandleModel {
         // De-standardise the raw head output with the affine the trainer carried
         // on the head: the mean column (Gaussian) or every quantile column maps
         // `μ_y + σ_y·z`, so the served distribution carries the target offset. A
-        // base/no-scaler head leaves the output untouched (the trained head, if
-        // any, already learnt in raw space). The σ column stays raw — the
-        // `DistributionAdapter` turns it into a positive served std via softplus.
+        // base/no-scaler head leaves the output untouched. The σ column stays raw
+        // here — the loss trained it in z-space (σ_z), so the `DistributionAdapter`
+        // turns it into a positive served std via softplus AND scales it by σ_y
+        // (`σ_y·softplus(raw)`), the σ-axis half of the de-standardise contract.
         //
         // The gaussian-vs-quantile choice dispatches on the persisted
         // `DistributionForm`, the authoritative signal the head was trained for —

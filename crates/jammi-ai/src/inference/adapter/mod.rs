@@ -68,9 +68,13 @@ pub fn create_adapter(task: ModelTask, model: &LoadedModel) -> Result<Box<dyn Ou
             Some(DistributionForm::Quantile { levels }) => {
                 Ok(Box::new(DistributionAdapter::quantile(levels.clone())?))
             }
-            Some(DistributionForm::Gaussian) | None => {
-                Ok(Box::new(DistributionAdapter::gaussian()))
-            }
+            // A z-space-trained Gaussian head learns a z-scale σ (σ_z ≈ 1); the
+            // adapter scales it back to raw units by σ_y (the persisted scaler's
+            // std) on the post-softplus column. A head with no scaler (none today
+            // for a trained regression model) serves σ unscaled (`std_scale = 1`).
+            Some(DistributionForm::Gaussian) | None => Ok(Box::new(
+                DistributionAdapter::gaussian_scaled(model.regression_std_scale().unwrap_or(1.0)),
+            )),
         },
     }
 }

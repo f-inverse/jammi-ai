@@ -7,6 +7,47 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **Scale-robust regression fine-tune loss — the standardization contract on the
+  variance axis (W5-PR5).** `db.fine_tune(task="regression")` now converges for
+  ALL FOUR objectives (`GaussianNll`, `BetaNll` the default, `Crps`, `Pinball`)
+  on realistic-variance targets (σ_y ≈ 19+). Previously the default
+  `BetaNll{0.5}` and `GaussianNll` DIVERGED out of the box on high-variance data:
+  the loss scored `(y−μ)²/σ²` in raw outcome units, so a tens-of-units residual
+  against a zero-init σ (≈0.69) blew the loss past the trainer's divergence guard
+  on the first step. A new in-crate high-variance oracle
+  (`standardization_contract`, σ_y ≈ 19) proves each objective converges, the
+  served point estimate fits the target, and the served σ recovers σ_y exactly
+  (a per-row σ_raw/σ_z = σ_y identity against an independent reference, which
+  catches a missing OR mis-scaled multiply) — plus a raw-vs-z served-preservation
+  check (within a justified tolerance, since the non-scale-free AdamW perturbs the
+  trajectory) for the scale-equivariant objectives, a constant-target (degenerate
+  σ_y) arm, and a destructive non-vacuity guard. The bug fingerprint (raw-space
+  NLL trips the production divergence guard while Crps stays bounded) is pinned as
+  its own test.
+
+### Changed
+- **The regression fine-tune loss is now scored in standardized (z) space
+  (W5-PR5).** The head forward (`head_forward`, was `regress`) emits its raw
+  z-output with no de-standardisation, and the target is z-scored via
+  `TargetScaler::standardize_value` where the loss is computed, so the optimizer
+  sees O(1) residuals at any target scale. De-standardisation moved entirely to
+  the serve path, applied uniformly across all four objectives: the mean/quantile
+  affine (`μ_y + σ_y·z`) stays at the backend, and the σ-axis multiply lands on
+  the **post-softplus** σ (`σ_y·σ_z`, re-floored) at the inference adapter — which
+  now carries σ_y (`DistributionAdapter::gaussian_scaled`). This mirrors the
+  proven in-context predictor (`destandardize_distribution`), via a single shared
+  σ helper (`destandardize_sigma`) both serve paths call, making the two regression
+  surfaces one σ rule. For the scale-equivariant objectives (Crps, Pinball) z and
+  raw space share the same population minimizer, so the served point estimates are
+  preserved across the change — but NOT byte-equal: the production AdamW is not
+  scale-free (`eps = 1e-8`, decoupled `weight_decay`), so dividing the loss by σ_y
+  perturbs the trajectory. A served-output test pins this to a stated, justified
+  tolerance (measured ≈ 0.12·σ_y on the mean at σ_y ≈ 19), not to equality. The
+  divergence guard's `>100` threshold is unchanged. In z-space the regression-arm
+  losses are O(1), so the *numeric* `>100` branch rarely fires on finite
+  divergence — it is LESS discriminating there, not more — and the `is_nan()`
+  branch becomes the load-bearing backstop for those arms.
+
 - **Public `db.fine_tune(task="regression")` on-ramp end to end (W5-PR4).** A
   consumer can now fine-tune and serve a regression head through the public
   surface. A `(text, target)` source with a numeric `target` column, fine-tuned

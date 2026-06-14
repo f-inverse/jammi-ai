@@ -1131,10 +1131,25 @@ impl TrainingLoop {
             )),
             TextChunk::Regression { texts, targets } => {
                 let proj = encode(texts)?;
-                let head_out = self.regress(&proj)?;
-                let target_tensor =
-                    Tensor::from_vec(targets.clone(), (targets.len(),), &self.device)
-                        .map_err(|e| JammiError::FineTune(format!("Target tensor: {e}")))?;
+                // Score in standardized (z) space: the head emits its RAW z-output
+                // (no de-standardise), and the target is z-scored with the run's
+                // scaler. The optimizer then sees O(1) residuals regardless of the
+                // target's raw scale — de-standardisation is moved entirely to the
+                // serve path (mirroring the in-context predictor's
+                // `target_context_z`/`destandardize_distribution` split).
+                let head_out = self.head_forward(&proj)?;
+                let scaler = self.target_scaler.as_ref().ok_or_else(|| {
+                    JammiError::FineTune(
+                        "regression batch reached without a target scaler (run did not set one)"
+                            .into(),
+                    )
+                })?;
+                let z_targets: Vec<f32> = targets
+                    .iter()
+                    .map(|&y| scaler.standardize_value(y as f64) as f32)
+                    .collect();
+                let target_tensor = Tensor::from_vec(z_targets, (targets.len(),), &self.device)
+                    .map_err(|e| JammiError::FineTune(format!("Target tensor: {e}")))?;
                 Ok(super::data::TrainingBatch::Regression {
                     input: head_out,
                     target: target_tensor,
@@ -1168,42 +1183,31 @@ impl TrainingLoop {
     }
 
     /// Apply the distributional regression head to projected embeddings,
-    /// producing the de-standardised `(batch, k)` head parameters. Mirrors
+    /// producing the head's RAW `(batch, k)` z-space output — the parameter the
+    /// LoRA layer actually learns, with **no** de-standardisation. Mirrors
     /// [`Self::classify`]: only a `ProjectionHead` target with a second (head)
     /// layer can regress.
     ///
-    /// The LoRA layer learns a z-space parameter; this method maps its raw output
-    /// through the [`TargetScaler`]'s de-standardising affine (`μ_y + σ_y·z` on the
-    /// outcome-unit columns), so the returned head is raw-correct — the loss and
-    /// the serving adapter both read it directly with no further transform. With
-    /// the head zero-initialised the emitted mean is exactly μ_y, which is why a
-    /// high-offset target (calendar years, prices) is reachable under Adam.
-    fn regress(&self, embeddings: &Tensor) -> Result<Tensor> {
-        let raw = match &self.target {
+    /// The training loss scores this z-output directly against a z-scored target
+    /// (`embed_chunk` z-scores the target via [`TargetScaler::standardize_value`]),
+    /// so the optimizer sees O(1) residuals regardless of the target's raw scale.
+    /// De-standardisation (`μ_y + σ_y·z` on the mean/quantile columns, `σ_y·σ_z`
+    /// on the served σ) happens **only at serve** — the backend's de-standardising
+    /// affine and the inference adapter's σ scaling — so this method is the single
+    /// raw-head forward shared by training, determinism, and resume.
+    fn head_forward(&self, embeddings: &Tensor) -> Result<Tensor> {
+        match &self.target {
             TrainingTarget::ProjectionHead { head } if head.layers.len() > 1 => head.layers[1]
                 .1
                 .forward(embeddings)
-                .map_err(|e| JammiError::FineTune(format!("LoRA regression head: {e}")))?,
-            TrainingTarget::ProjectionHead { .. } => {
-                return Err(JammiError::FineTune(
-                    "No regression head in projection target".into(),
-                ))
-            }
-            TrainingTarget::EncoderAdapters(_) => {
-                return Err(JammiError::FineTune(
-                    "Regression with encoder adapters is not supported".into(),
-                ))
-            }
-        };
-        // The scaler is reduced from all training targets at the top of `run`, so
-        // a regression batch always reaches here with one present; its absence is
-        // an internal invariant violation, not a recoverable input error.
-        let scaler = self.target_scaler.as_ref().ok_or_else(|| {
-            JammiError::FineTune(
-                "regression head reached without a target scaler (run did not set one)".into(),
-            )
-        })?;
-        scaler.destandardize(&raw, &self.regression_form())
+                .map_err(|e| JammiError::FineTune(format!("LoRA regression head: {e}"))),
+            TrainingTarget::ProjectionHead { .. } => Err(JammiError::FineTune(
+                "No regression head in projection target".into(),
+            )),
+            TrainingTarget::EncoderAdapters(_) => Err(JammiError::FineTune(
+                "Regression with encoder adapters is not supported".into(),
+            )),
+        }
     }
 
     /// Accumulate cosine similarity stats from a triplet batch for epoch-level logging.
@@ -1288,6 +1292,14 @@ impl TrainingLoop {
         // Divergence detection. A diverged run returns the typed error and the
         // worker records the terminal `failed` status — terminal writes are the
         // worker's single authority, never the loop's.
+        //
+        // Post-W5-PR5 the regression-arm losses train in z-space (residuals O(1)),
+        // so the numeric `>100` branch is now LESS discriminating on finite
+        // divergence for those arms — it rarely fires because a healthy z-space
+        // regression loss stays O(1)–O(10). The `is_nan()` branch is therefore the
+        // load-bearing backstop for the regression arms (an overconfidence collapse
+        // or a NaN gradient). The threshold still guards the non-regression arms
+        // (CoSENT/MNRL/triplet/CE), whose magnitudes are unchanged.
         if loss_val.is_nan() || loss_val > 100.0 {
             self.divergence_count += 1;
             if self.divergence_count >= 3 {
@@ -1441,8 +1453,8 @@ impl TrainingLoop {
     }
 
     /// Proper-scoring regression loss (S18), dispatched on the configured
-    /// [`RegressionLoss`]. `input` is the distributional head's raw output
-    /// (`(batch, k)`); `target` is the observed `(batch,)` outcome.
+    /// [`RegressionLoss`]. `input` is the distributional head's raw z-space output
+    /// (`(batch, k)`); `target` is the **z-scored** `(batch,)` outcome.
     ///
     /// The three Gaussian arms read `(mean, raw_std)` from a two-wide head and
     /// score the predictive `Normal(mean, σ)`, where `σ = floor + softplus(raw_std)`
@@ -1451,9 +1463,12 @@ impl TrainingLoop {
     /// (the overconfidence collapse). The pinball arm reads one quantile per
     /// head column and scores each against its level.
     ///
-    /// `input` is already de-standardised by [`Self::regress`], so this loss is a
-    /// pure score of the head's raw, outcome-unit output against the raw target —
-    /// no scaler threads through here.
+    /// Both `input` and `target` are in standardized (z) space — `head_forward`
+    /// returns the raw z-output and `embed_chunk` z-scores the target — so this
+    /// loss scores O(1) residuals regardless of the target's raw scale. The four
+    /// objective fns are unchanged: they are pure functions of `(head, target)`,
+    /// already proven in z-space by the in-context predictor. De-standardisation
+    /// to raw units lives entirely on the serve path, never here.
     fn regression_loss(&self, input: &Tensor, target: &Tensor) -> Result<Tensor> {
         match self.config.regression_loss.unwrap_or_default() {
             super::RegressionLoss::GaussianNll => gaussian_nll_loss(input, target, 0.0),
@@ -3041,7 +3056,9 @@ mod tests {
 /// The property (per head): a high-offset / low-variance target (calendar years,
 /// μ≈2017, σ≈2) is FIT — the served (de-standardised) mean lands within the
 /// context oracle's bar (`|mean − 2017| < 50`) and, for the Gaussian head, the
-/// served σ is off the floor (`> 0.1`). The companion in-context oracle that
+/// served σ — read through the REAL adapter serve path (the σ_y multiply), not the
+/// raw z-σ — is off the floor and recovers σ_y exactly. The companion in-context
+/// oracle that
 /// proves the SAME contract on the other offset-bearing dispatch surface lives in
 /// [`crate::pipeline::context_predictor`]'s
 /// `gaussian_in_context_head_fits_high_offset_low_variance_target` (it depends on
@@ -3074,6 +3091,13 @@ mod standardization_contract {
         2013.0, 2014.0, 2015.0, 2016.0, 2017.0, 2018.0, 2019.0, 2020.0, 2021.0,
     ];
     const TRUE_MEAN: f32 = 2017.0;
+
+    /// A HIGH-variance, wide-range target (μ ≈ 34.7, σ_y ≈ 19.2) — an
+    /// arxiv-citation-count / wide-outcome analogue. This is the discriminating
+    /// scale the σ ≈ 2 `YEARS` fixture never exercised: in RAW-space training the
+    /// Gaussian NLL `(y−μ)²/σ²` is O(σ_y²/σ_init²) ≈ O(hundreds) on step 0, past
+    /// the divergence guard; in z-space the loss is O(1) for every objective.
+    const WIDE: [f32; 9] = [6.0, 13.0, 20.0, 27.0, 34.0, 41.0, 48.0, 55.0, 68.0];
 
     /// Build a real production [`TrainingLoop`] over a regression
     /// [`TrainingTarget::ProjectionHead`] (projection + distribution head of the
@@ -3142,17 +3166,118 @@ mod standardization_contract {
         .unwrap();
 
         // Reduce the scaler from the targets exactly as `run` does before the loop,
-        // so the head's `regress` de-standardisation emits μ_y at zero-init.
+        // so the head's z-scored target and the serve de-standardise share μ_y,σ_y.
         loop_.target_scaler = Some(TargetScaler::from_targets(targets).unwrap());
         (loop_, varmap)
     }
 
+    /// Z-score a raw target tensor with the loop's scaler — the exact transform
+    /// `embed_chunk` applies before the loss in production.
+    fn z_score_targets(loop_: &TrainingLoop, targets: &Tensor) -> Tensor {
+        let scaler = loop_.target_scaler.as_ref().unwrap();
+        let raw = targets.to_vec1::<f32>().unwrap();
+        let z: Vec<f32> = raw
+            .iter()
+            .map(|&y| scaler.standardize_value(y as f64) as f32)
+            .collect();
+        Tensor::from_vec(z, (raw.len(),), targets.device()).unwrap()
+    }
+
+    /// De-standardise a trained z-space head exactly as the serve path does: the
+    /// backend's `TargetScaler::destandardize` (mean / quantile affine, raw σ
+    /// passthrough) followed by the inference adapter's post-softplus σ_y scaling
+    /// on a Gaussian head. Returns `(served_means, served_sigmas_or_quantiles)`
+    /// per row: for Gaussian, the second vec is the served σ (σ_y·softplus(raw));
+    /// for quantile, the first vec is unused and the second is the sorted served
+    /// quantiles for row 0.
+    fn serve_through_production(loop_: &TrainingLoop, z_head: &Tensor) -> Vec<Vec<f32>> {
+        use crate::inference::adapter::{
+            BackendOutput, DistributionAdapter, DistributionForm, OutputAdapter,
+        };
+        let scaler = loop_.target_scaler.as_ref().unwrap();
+        let form = loop_.regression_form();
+        // Backend de-standardise: mean/quantile affine; raw σ passthrough.
+        let raw = scaler.destandardize(z_head, &form).unwrap();
+        let rows = raw.to_vec2::<f32>().unwrap();
+        let n = rows.len();
+        let width = rows.first().map_or(0, Vec::len);
+        let flat: Vec<f32> = rows.into_iter().flatten().collect();
+        let output = BackendOutput {
+            float_outputs: vec![flat],
+            string_outputs: vec![],
+            row_status: vec![true; n],
+            row_errors: vec![String::new(); n],
+            shapes: vec![(n, width)],
+        };
+        let adapter: Box<dyn OutputAdapter> = match &form {
+            DistributionForm::Gaussian => {
+                Box::new(DistributionAdapter::gaussian_scaled(scaler.std() as f32))
+            }
+            DistributionForm::Quantile { levels } => {
+                Box::new(DistributionAdapter::quantile(levels.clone()).unwrap())
+            }
+        };
+        let cols = adapter.adapt(&output, n).unwrap();
+        use arrow::array::{Array, Float32Array};
+        cols.iter()
+            .map(|c| {
+                let a = c.as_any().downcast_ref::<Float32Array>().unwrap();
+                (0..a.len()).map(|i| a.value(i)).collect::<Vec<f32>>()
+            })
+            .collect()
+    }
+
+    /// Serve a trained Gaussian z-head through the REAL production adapter
+    /// (`gaussian_scaled(σ_y)`) and ALSO compute an INDEPENDENT reference σ_z —
+    /// `softplus(raw_std)` read straight off the raw head column, NOT through the
+    /// production σ helper — and return `(σ_z_reference, σ_raw_served)` per row.
+    /// The ratio `σ_raw/σ_z` must be exactly σ_y for every row: this is the per-row
+    /// identity the σ-axis calibration falsifier pins. Computing the σ_z reference
+    /// independently (raw softplus, no `destandardize_sigma`) is load-bearing — a
+    /// *multiplicative* bug in the production helper (missing, doubled, or wrong
+    /// factor) would cancel out of a ratio of two helper outputs, so the reference
+    /// must bypass the helper to expose it.
+    fn serve_unscaled_and_scaled(loop_: &TrainingLoop, z_head: &Tensor) -> Vec<(f32, f32)> {
+        use crate::inference::adapter::{BackendOutput, DistributionAdapter, OutputAdapter};
+        use arrow::array::{Array, Float32Array};
+        let scaler = loop_.target_scaler.as_ref().unwrap();
+        let raw = scaler
+            .destandardize(z_head, &loop_.regression_form())
+            .unwrap();
+        let rows = raw.to_vec2::<f32>().unwrap();
+        // Independent σ_z reference: softplus(raw_std) per row, computed here from
+        // the raw head column with the test-only softplus, NOT via the production
+        // adapter, so a multiplicative bug in the σ helper cannot hide in the ratio.
+        let sigma_z_ref: Vec<f32> = rows
+            .iter()
+            .map(|r| super::super::regression_loss::softplus_std_for_test(r[1] as f64) as f32)
+            .collect();
+        let n = rows.len();
+        let width = rows.first().map_or(0, Vec::len);
+        let flat: Vec<f32> = rows.into_iter().flatten().collect();
+        let output = BackendOutput {
+            float_outputs: vec![flat],
+            string_outputs: vec![],
+            row_status: vec![true; n],
+            row_errors: vec![String::new(); n],
+            shapes: vec![(n, width)],
+        };
+        // Production serve path: the σ_y-scaled adapter (the number serving emits).
+        let cols = DistributionAdapter::gaussian_scaled(scaler.std() as f32)
+            .adapt(&output, n)
+            .unwrap();
+        let served = cols[1].as_any().downcast_ref::<Float32Array>().unwrap();
+        (0..n).map(|i| (sigma_z_ref[i], served.value(i))).collect()
+    }
+
     /// Train the production regression dispatch for `steps` AdamW steps on a fixed
-    /// batch of `(features, targets)` and return the served head's raw `(batch, k)`
-    /// output at the fitted parameters. Each step runs the PRODUCTION
-    /// `TrainingLoop::regress` (head forward + `TargetScaler::destandardize`) and
-    /// `TrainingLoop::compute_loss` (→ `regression_loss` → configured
-    /// `RegressionLoss`) — the exact chain `db.fine_tune(task=regression)` runs.
+    /// batch of `(features, targets)` and return the trained head's RAW z-space
+    /// `(batch, k)` output at the fitted parameters. Each step runs the PRODUCTION
+    /// `TrainingLoop::head_forward` (the raw z-head, no de-standardise) against a
+    /// z-scored target and `TrainingLoop::compute_loss` (→ `regression_loss` →
+    /// configured `RegressionLoss`) — the exact chain `db.fine_tune(task=regression)`
+    /// runs, scoring O(1) z-residuals. Use [`serve_through_production`] to recover
+    /// the served raw distribution from the returned z-head.
     fn train_through_production_dispatch(
         loop_: &TrainingLoop,
         varmap: &VarMap,
@@ -3160,6 +3285,7 @@ mod standardization_contract {
         targets: &Tensor,
         steps: usize,
     ) -> Tensor {
+        let z_target = z_score_targets(loop_, targets);
         let mut opt = AdamW::new(
             varmap.all_vars(),
             ParamsAdamW {
@@ -3169,20 +3295,76 @@ mod standardization_contract {
         )
         .unwrap();
         for _ in 0..steps {
-            // PRODUCTION head forward: projection + distribution head, then the
-            // `TargetScaler::destandardize` keyed on the run's `regression_form`.
-            let head_out = loop_.regress(features).unwrap();
+            // PRODUCTION head forward: projection + distribution head, RAW z-output.
+            let head_out = loop_.head_forward(features).unwrap();
             let batch = TrainingBatch::Regression {
                 input: head_out,
-                target: targets.clone(),
+                target: z_target.clone(),
             };
             // PRODUCTION loss dispatch: compute_loss → regression_loss → the
-            // configured RegressionLoss arm.
+            // configured RegressionLoss arm, scoring z-head vs z-target.
             let loss = loop_.compute_loss(&batch).unwrap();
             let grads = loss.backward().unwrap();
             opt.step(&grads).unwrap();
         }
-        loop_.regress(features).unwrap()
+        loop_.head_forward(features).unwrap()
+    }
+
+    /// Like [`train_through_production_dispatch`], but ALSO drives every step's
+    /// loss through the production divergence guard ([`TrainingLoop::process_batch_loss`]'s
+    /// `>100`/NaN check, reproduced here as a per-step assertion) and records the
+    /// max loss seen. Returns `(trained_z_head, max_loss)`. The guard is the exact
+    /// behavioural contract this PR fixes: in z-space every objective stays O(1),
+    /// so no step exceeds 100 — RED on current main for GaussianNll/BetaNll on the
+    /// WIDE target, GREEN after the z-space loss.
+    fn train_tracking_loss(
+        loop_: &TrainingLoop,
+        varmap: &VarMap,
+        features: &Tensor,
+        targets: &Tensor,
+        steps: usize,
+    ) -> (Tensor, f64) {
+        let z_target = z_score_targets(loop_, targets);
+        let mut opt = AdamW::new(
+            varmap.all_vars(),
+            ParamsAdamW {
+                lr: 0.05,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut max_loss = 0.0_f64;
+        let mut consecutive_diverged = 0u32;
+        for step in 0..steps {
+            let head_out = loop_.head_forward(features).unwrap();
+            let batch = TrainingBatch::Regression {
+                input: head_out,
+                target: z_target.clone(),
+            };
+            let loss = loop_.compute_loss(&batch).unwrap();
+            let loss_val = loss
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap() as f64;
+            // Reproduce the production divergence guard (trainer.rs `process_batch_loss`):
+            // a NaN or `>100` loss is a divergence; three consecutive trips abort.
+            if loss_val.is_nan() || loss_val > 100.0 {
+                consecutive_diverged += 1;
+                assert!(
+                    consecutive_diverged < 3,
+                    "z-space loss diverged (NaN or >100 for 3 consecutive steps) at step {step}: \
+                     loss {loss_val}. The z-space loss must keep every objective O(1) on a \
+                     σ_y≈19 target — this is the production divergence guard the PR fixes."
+                );
+            } else {
+                consecutive_diverged = 0;
+            }
+            max_loss = max_loss.max(loss_val);
+            let grads = loss.backward().unwrap();
+            opt.step(&grads).unwrap();
+        }
+        (loop_.head_forward(features).unwrap(), max_loss)
     }
 
     /// Deterministic small feature matrix `(n, HIDDEN)` — the projected embeddings
@@ -3222,27 +3404,49 @@ mod standardization_contract {
         let (loop_, varmap) = regression_loop(config, 2, &targets, &device).await;
         let feats = features(n, &device);
 
-        let served = train_through_production_dispatch(&loop_, &varmap, &feats, &targets, 1500);
-        // The served head is raw `(mean, raw_std)`; map raw_std → σ exactly as the
-        // serving adapter does (STD_FLOOR + softplus), reading row 0.
-        let row0 = served.narrow(0, 0, 1).unwrap();
-        let (mean_t, sigma_t) = super::super::regression_loss::gaussian_params(&row0).unwrap();
-        let served_mean = mean_t.to_vec1::<f32>().unwrap()[0];
-        let served_sigma = sigma_t.to_vec1::<f32>().unwrap()[0];
+        let z_head = train_through_production_dispatch(&loop_, &varmap, &feats, &targets, 1500);
+        // Serve exactly as production: backend de-standardise (mean affine) +
+        // adapter σ_y·softplus(raw). cols[0] = served means, cols[1] = served σ.
+        let cols = serve_through_production(&loop_, &z_head);
+        let served_mean = cols[0][0];
+        let served_sigma = cols[1][0];
 
         assert!(
             (served_mean - TRUE_MEAN).abs() < 50.0,
             "production ft Gaussian head failed to fit the high-offset target: \
              true mean {TRUE_MEAN}, served mean {served_mean} (off by {:.0}). \
-             The production regress() de-standardisation must converge the served \
-             mean to μ_y under the z-space reparameterisation.",
+             The served de-standardisation must converge the served mean to μ_y \
+             under the z-space loss.",
             (served_mean - TRUE_MEAN).abs()
         );
+        // Read σ through the REAL serve path (the adapter's σ_y multiply), not off
+        // the raw head (which would be σ_z ≈ 1, blind to the multiply). The served
+        // σ must (a) be off the floor and (b) recover σ_y EXACTLY: σ_raw/σ_z = σ_y
+        // per row, the same multiplicative identity the high-variance oracle pins.
+        // Reading `gaussian_params(&row0)` here would silently stop testing the
+        // served σ post-z-space (it returns σ_z, and σ_z > 0.1 trivially) — this
+        // routes through the adapter so the assertion tests the number serving emits.
         assert!(
             served_sigma > 0.1,
             "production ft Gaussian head served a collapsed σ {served_sigma} \
-             (the target spread is ≈ 2.6; a real σ must be well off the floor)"
+             (a real σ_y-scaled σ must be well off the floor)"
         );
+        let sigma_y = {
+            let s = loop_.target_scaler.as_ref().unwrap();
+            s.std() as f32
+        };
+        for (row, (sigma_z, sigma_raw)) in serve_unscaled_and_scaled(&loop_, &z_head)
+            .iter()
+            .enumerate()
+        {
+            let ratio = sigma_raw / sigma_z;
+            assert!(
+                (ratio - sigma_y).abs() <= 1e-3 * sigma_y,
+                "row {row} served σ {sigma_raw} / σ_z {sigma_z} = {ratio} must equal \
+                 σ_y={sigma_y} — the served σ is read through the real adapter (σ_y \
+                 multiply), not the raw z-σ; a missing multiply leaves the ratio at 1"
+            );
+        }
     }
 
     /// ORACLE (head 7 — production fine-tune quantile regression): the
@@ -3266,8 +3470,12 @@ mod standardization_contract {
         let (loop_, varmap) = regression_loop(config, levels.len(), &targets, &device).await;
         let feats = features(n, &device);
 
-        let served = train_through_production_dispatch(&loop_, &varmap, &feats, &targets, 1500);
-        let row0 = served.to_vec2::<f32>().unwrap()[0].clone();
+        let z_head = train_through_production_dispatch(&loop_, &varmap, &feats, &targets, 1500);
+        // Serve exactly as production: every quantile column is de-standardised by
+        // the backend affine, then the adapter sorts per row. `serve_through_production`
+        // returns one served column per level; read row 0 across the columns.
+        let cols = serve_through_production(&loop_, &z_head);
+        let row0: Vec<f32> = cols.iter().map(|c| c[0]).collect();
         assert_eq!(
             row0.len(),
             levels.len(),
@@ -3290,6 +3498,461 @@ mod standardization_contract {
             row0[0] <= row0[1] && row0[1] <= row0[2],
             "served quantiles must be non-crossing after de-standardisation: {row0:?}"
         );
+    }
+
+    // ─── W5-PR5 high-variance oracle (the scale-robustness deliverable) ───────
+    //
+    // The σ ≈ 2 `YEARS` oracles above never exercised the divergence the raw-space
+    // loss has on a realistic-variance target. These run the SAME production
+    // dispatch on the WIDE target (σ_y ≈ 19) and assert, for ALL FOUR objectives:
+    // (1) CONVERGES — no divergence-guard trip (RED on current main for
+    //     GaussianNll/BetaNll, GREEN for Crps/Pinball; GREEN for all four after
+    //     the z-space loss);
+    // (2) the served POINT estimate FITS the target (mean / quantile median);
+    // (3) for Gaussian, the served σ recovers σ_y EXACTLY (σ_raw/σ_z = σ_y per row,
+    //     against an independent σ_z reference) — the calibration assertion that
+    //     catches a missing OR mis-scaled post-softplus σ_y multiply;
+    // plus a destructive NON-VACUITY guard (untrained head → no served spread) and
+    // a raw-vs-z served-PRESERVATION check (within a justified tolerance, since the
+    // non-scale-free AdamW perturbs the trajectory) for the scale-equivariant
+    // objectives.
+
+    /// σ_y of the WIDE target — the σ-scale the served Gaussian σ must recover.
+    fn wide_sigma_y() -> f32 {
+        let device = Device::Cpu;
+        let t = Tensor::from_vec(WIDE.to_vec(), (WIDE.len(),), &device).unwrap();
+        TargetScaler::from_targets(&t).unwrap().std() as f32
+    }
+
+    fn wide_mean() -> f32 {
+        WIDE.iter().sum::<f32>() / WIDE.len() as f32
+    }
+
+    /// ORACLE (W5-PR5 — Gaussian-family scale-robustness): each of the three
+    /// Gaussian-form objectives (`GaussianNll`, `BetaNll{0.5}` the default, `Crps`)
+    /// trains the production dispatch on the σ_y≈19 WIDE target WITHOUT tripping the
+    /// divergence guard, the served mean FITS μ_y, and the served σ is recovered to
+    /// the right ORDER (~σ_y, not ~σ_z≈1 — the missing-σ_y-multiply calibration bug).
+    ///
+    /// RED on current main: GaussianNll/BetaNll trip the `>100` guard within the
+    /// first steps (raw `(y−μ)²/σ²` ≈ σ_y²/σ_init² ≈ 800), while Crps converges in
+    /// raw too — that asymmetry is the bug fingerprint. GREEN for all three here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ft_gaussian_family_scale_robust_on_high_variance_target() {
+        let device = Device::Cpu;
+        let n = WIDE.len();
+        let targets = Tensor::from_vec(WIDE.to_vec(), (n,), &device).unwrap();
+        let sigma_y = wide_sigma_y();
+        let mu_y = wide_mean();
+
+        for loss in [
+            RegressionLoss::GaussianNll,
+            RegressionLoss::BetaNll { beta: 0.5 },
+            RegressionLoss::Crps,
+        ] {
+            let config = FineTuneConfig {
+                regression_loss: Some(loss),
+                ..Default::default()
+            };
+            let (loop_, varmap) = regression_loop(config, 2, &targets, &device).await;
+            let feats = features(n, &device);
+
+            // (1) Convergence: every step's loss is finite and never trips the
+            //     divergence guard. This is RED on raw-space NLL/BetaNll.
+            let (z_head, max_loss) = train_tracking_loss(&loop_, &varmap, &feats, &targets, 1500);
+            assert!(
+                max_loss.is_finite() && max_loss < 100.0,
+                "{loss:?}: z-space loss must stay below the divergence guard on a \
+                 σ_y≈{sigma_y} target (max loss {max_loss})"
+            );
+
+            // (2) Served mean fits μ_y within one spread.
+            let cols = serve_through_production(&loop_, &z_head);
+            let served_mean = cols[0][0];
+            assert!(
+                (served_mean - mu_y).abs() < sigma_y,
+                "{loss:?}: served mean {served_mean} must fit μ_y≈{mu_y} within one \
+                 spread (σ_y≈{sigma_y})"
+            );
+
+            // (3) THE σ-AXIS CALIBRATION FALSIFIER. The bug this PR guards is a
+            // *multiplicative* error on the served σ: a missing σ_y multiply serves
+            // σ_z (≈ σ_y× too tight), a wrong factor serves k·σ_y. A loose order
+            // band (σ_y/3 < σ < 3σ_y) would pass a 2×-miscalibrated fit, so instead
+            // we pin the multiply EXACTLY: for every row the production-served σ
+            // divided by an INDEPENDENT σ_z reference (softplus(raw_std) read
+            // straight off the raw head, NOT through the production σ helper) must
+            // equal σ_y — the σ_y factor and nothing else. The independent reference
+            // is load-bearing: a multiplicative bug in the helper would cancel out of
+            // a ratio of two helper outputs. This catches a missing multiply (ratio
+            // 1 ≠ σ_y), a doubled multiply (ratio 2σ_y), or a softplus-inside
+            // mis-placement (ratio drifts per row). It is the tight, per-row identity
+            // that the loose order band approximated; both falsifiers demonstrated
+            // RED (ratio 1 and ratio 2σ_y) by neutralizing/doubling `destandardize_sigma`.
+            let scaled = serve_unscaled_and_scaled(&loop_, &z_head);
+            for (row, (sigma_z, sigma_raw)) in scaled.iter().enumerate() {
+                // σ_z is post-softplus, floored ≥ STD_FLOOR, so the ratio is well
+                // defined; the raw σ is re-floored, so compare only where the floor
+                // did not bind (σ_y·σ_z ≫ STD_FLOOR holds for every row here).
+                let ratio = sigma_raw / sigma_z;
+                assert!(
+                    (ratio - sigma_y).abs() <= 1e-3 * sigma_y,
+                    "{loss:?}: row {row} served σ {sigma_raw} / σ_z {sigma_z} = {ratio} \
+                     must equal σ_y={sigma_y} EXACTLY (the one multiplicative factor). \
+                     A missing post-softplus σ_y multiply leaves the ratio at 1 \
+                     (σ_z≈1, ~σ_y× too tight) — the silent under-dispersion bug."
+                );
+            }
+            // And the served σ is genuinely σ_y-scaled in absolute terms (not a
+            // collapsed-to-floor degenerate that would make the ratio vacuous): the
+            // high-residual row is on the ORDER of σ_y, not σ_z≈1.
+            let max_sigma = scaled.iter().map(|(_, s)| *s).fold(0.0f32, f32::max);
+            assert!(
+                max_sigma > sigma_y / 3.0,
+                "{loss:?}: the head's largest served σ {max_sigma} must be σ_y-scaled \
+                 (≈{sigma_y}), not the z-scale σ_z≈1 — a missing σ_y multiply is the bug"
+            );
+        }
+    }
+
+    /// ORACLE (W5-PR5 — quantile (Pinball) scale-robustness): the pinball head
+    /// trains the production dispatch on the WIDE target without diverging, every
+    /// served quantile lands within a spread of μ_y, and the median (level 0.5)
+    /// tracks μ_y. The served columns are non-crossing after de-standardisation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ft_quantile_scale_robust_on_high_variance_target() {
+        let device = Device::Cpu;
+        let n = WIDE.len();
+        let targets = Tensor::from_vec(WIDE.to_vec(), (n,), &device).unwrap();
+        let levels = vec![0.1, 0.5, 0.9];
+        let sigma_y = wide_sigma_y();
+        let mu_y = wide_mean();
+        let config = FineTuneConfig {
+            regression_loss: Some(RegressionLoss::Pinball),
+            quantile_levels: levels.clone(),
+            ..Default::default()
+        };
+        let (loop_, varmap) = regression_loop(config, levels.len(), &targets, &device).await;
+        let feats = features(n, &device);
+
+        let (z_head, max_loss) = train_tracking_loss(&loop_, &varmap, &feats, &targets, 1500);
+        assert!(
+            max_loss.is_finite() && max_loss < 100.0,
+            "Pinball: z-space loss must stay below the divergence guard on a σ_y≈{sigma_y} \
+             target (max loss {max_loss})"
+        );
+        let cols = serve_through_production(&loop_, &z_head);
+        let row0: Vec<f32> = cols.iter().map(|c| c[0]).collect();
+        for (i, &q) in row0.iter().enumerate() {
+            assert!(
+                (q - mu_y).abs() < 2.0 * sigma_y,
+                "Pinball: served quantile {i} (level {}) {q} must fit μ_y≈{mu_y} within \
+                 two spreads (σ_y≈{sigma_y})",
+                levels[i]
+            );
+        }
+        // Median tracks μ_y; columns non-crossing.
+        assert!(
+            (row0[1] - mu_y).abs() < sigma_y,
+            "Pinball: served median {} must track μ_y≈{mu_y}",
+            row0[1]
+        );
+        assert!(
+            row0[0] <= row0[1] && row0[1] <= row0[2],
+            "Pinball: served quantiles must be non-crossing: {row0:?}"
+        );
+    }
+
+    /// NON-VACUITY (W5-PR5 destructive guard): an UNTRAINED Gaussian head (zero
+    /// steps) serves the constant μ_y for EVERY row — zero spread across rows — so
+    /// it FAILS a learning bar that a trained head passes. Mirrors the PR4
+    /// μ-collapse guard: the fit assertions above would be vacuous against a head
+    /// that emits μ_y for all inputs, so this proves the served means actually move
+    /// with the input only after training. The trained head separates the rows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn untrained_gaussian_head_has_no_served_spread_trained_does() {
+        let device = Device::Cpu;
+        let n = WIDE.len();
+        let targets = Tensor::from_vec(WIDE.to_vec(), (n,), &device).unwrap();
+        let config = FineTuneConfig {
+            regression_loss: Some(RegressionLoss::Crps),
+            ..Default::default()
+        };
+        let feats = features(n, &device);
+
+        // Untrained: serve the zero-init head directly (no steps). z = 0 → served
+        // μ_y for every row → zero spread of served means.
+        let (loop0, _vm0) = regression_loop(config.clone(), 2, &targets, &device).await;
+        let z_head0 = loop0.head_forward(&feats).unwrap();
+        let served0 = serve_through_production(&loop0, &z_head0);
+        let spread0 = spread(&served0[0]);
+        assert!(
+            spread0 < 1e-3,
+            "untrained head must emit the constant μ_y for every row (≈0 spread), \
+             got spread {spread0} — the fit bar would be vacuous otherwise"
+        );
+
+        // Trained: the served means now separate the rows (non-trivial spread).
+        let (loop1, vm1) = regression_loop(config, 2, &targets, &device).await;
+        let z_head1 = train_through_production_dispatch(&loop1, &vm1, &feats, &targets, 1500);
+        let served1 = serve_through_production(&loop1, &z_head1);
+        let spread1 = spread(&served1[0]);
+        assert!(
+            spread1 > 1.0,
+            "a trained head must SEPARATE the rows (served-mean spread {spread1} ≫ \
+             the untrained {spread0}) — proving it learned input→target, not μ-regurgitation"
+        );
+    }
+
+    /// max − min of a served column — the row-to-row spread the non-vacuity guard
+    /// reads (an untrained head emits the constant μ_y → spread ≈ 0).
+    fn spread(col: &[f32]) -> f32 {
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for &v in col {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        hi - lo
+    }
+
+    /// THE BUG FINGERPRINT (W5-PR5 non-vacuity): the RAW-space loss DIVERGES on the
+    /// high-variance target — exactly the failure the z-space loss fixes. This
+    /// reconstructs the pre-PR5 flow (de-standardise the head BEFORE the loss, score
+    /// against the RAW target) on the WIDE σ_y≈19 target and asserts GaussianNll
+    /// trips the `>100` divergence threshold within the first few steps, while Crps
+    /// (bounded ≈σ) stays finite. That asymmetry — NLL diverges, Crps does not — is
+    /// the precise bug the z-space loss removes; the `*_scale_robust` oracles above
+    /// prove ALL FOUR converge in z-space, so this guards that the fix is load-bearing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn raw_space_gaussian_nll_diverges_on_high_variance_target() {
+        let device = Device::Cpu;
+        let n = WIDE.len();
+        let targets = Tensor::from_vec(WIDE.to_vec(), (n,), &device).unwrap();
+        let feats = features(n, &device);
+
+        // RAW-space reference dispatch (pre-PR5): head_forward → destandardize →
+        // loss against the RAW target — exactly what `regress` used to feed the
+        // loss. Each step's loss is run through the SAME guard predicate the
+        // production `process_batch_loss` uses (`is_nan() || > 100.0` with a
+        // 3-consecutive abort), so `diverged[i]` is true iff the production guard
+        // would have RETURNED the divergence error — the RED is the real guard
+        // verdict, not just a raw loss-magnitude assertion.
+        let mut max_loss = [0.0_f64; 2];
+        let mut diverged = [false; 2];
+        for (i, loss) in [RegressionLoss::GaussianNll, RegressionLoss::Crps]
+            .into_iter()
+            .enumerate()
+        {
+            let config = FineTuneConfig {
+                regression_loss: Some(loss),
+                ..Default::default()
+            };
+            let (loop_, varmap) = regression_loop(config, 2, &targets, &device).await;
+            let scaler = *loop_.target_scaler.as_ref().unwrap();
+            let mut opt = AdamW::new(
+                varmap.all_vars(),
+                ParamsAdamW {
+                    lr: 0.05,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut consecutive = 0u32;
+            for _ in 0..10 {
+                let z_out = loop_.head_forward(&feats).unwrap();
+                let raw_head = scaler
+                    .destandardize(&z_out, &loop_.regression_form())
+                    .unwrap();
+                let batch = TrainingBatch::Regression {
+                    input: raw_head,
+                    target: targets.clone(),
+                };
+                let loss_t = loop_.compute_loss(&batch).unwrap();
+                let lv = loss_t
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap() as f64;
+                max_loss[i] = max_loss[i].max(lv);
+                // The production guard predicate, reproduced exactly.
+                if lv.is_nan() || lv > 100.0 {
+                    consecutive += 1;
+                    if consecutive >= 3 {
+                        diverged[i] = true;
+                    }
+                } else {
+                    consecutive = 0;
+                }
+                let grads = loss_t.backward().unwrap();
+                opt.step(&grads).unwrap();
+            }
+        }
+
+        assert!(
+            diverged[0] && max_loss[0] > 100.0,
+            "raw-space GaussianNll must DIVERGE on a σ_y≈19 target (the bug): the \
+             production guard predicate fired ≥3 consecutive (diverged={}), max loss \
+             {} > 100 — z-space is what fixes this",
+            diverged[0],
+            max_loss[0]
+        );
+        assert!(
+            !diverged[1] && max_loss[1] < 100.0,
+            "raw-space Crps stays bounded (≈σ) even on σ_y≈19 (diverged={}, max loss \
+             {}) — the NLL-diverges-Crps-does-not asymmetry is the bug fingerprint",
+            diverged[1],
+            max_loss[1]
+        );
+    }
+
+    /// P10 — the scale-equivariant objectives (Crps, Pinball) share the SAME
+    /// population minimizer in z vs raw space: the z loss is the raw loss / σ_y, so
+    /// the analytic argmin is identical. The served raw output is therefore
+    /// preserved across the two loss spaces — but NOT byte-equal: the production
+    /// AdamW is not scale-free (its `eps = 1e-8` is added to `√v̂`, and the
+    /// decoupled `weight_decay` shrinks θ by `lr·λ` independent of the loss scale),
+    /// so dividing the loss by σ_y ≈ 19 shrinks every gradient by 1/σ_y and the eps
+    /// term's relative weight and the moment trajectory shift. The two runs land on
+    /// the same minimizer up to that optimizer-perturbation, not to machine epsilon.
+    ///
+    /// So this is a generous-TOLERANCE fit test, not an equality test: train z vs
+    /// raw to convergence on the SAME data/seed and assert the served raw mean/σ
+    /// agree within a tolerance JUSTIFIED against the eps/decay perturbation
+    /// (measured at σ_y ≈ 19 below). It is the strongest falsifier that z-space
+    /// *materially* alters what a converging objective learns. (β-NLL is NOT
+    /// asserted — it is not scale-equivariant, P12, and the raw path diverges, so
+    /// there is no raw solution to match.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn crps_served_output_preserved_within_tolerance_z_vs_raw() {
+        let device = Device::Cpu;
+        // The σ_y ≈ 19 WIDE target — the realistic scale. Crps is bounded ≈σ, so
+        // the RAW-space path also converges cleanly here (it never trips the >100
+        // guard), giving a raw solution to compare the z solution against AT the
+        // scale where the optimizer perturbation (eps/decay ÷σ_y) actually bites.
+        let n = WIDE.len();
+        let targets = Tensor::from_vec(WIDE.to_vec(), (n,), &device).unwrap();
+        let feats = features(n, &device);
+        let config = FineTuneConfig {
+            regression_loss: Some(RegressionLoss::Crps),
+            ..Default::default()
+        };
+
+        // Z-space (production) path.
+        let (loop_z, vm_z) = regression_loop(config.clone(), 2, &targets, &device).await;
+        let z_head = train_through_production_dispatch(&loop_z, &vm_z, &feats, &targets, 1500);
+        let served_z = serve_through_production(&loop_z, &z_head);
+
+        // Raw-space reference path: train the SAME head against the RAW target on
+        // the de-standardised head output (the pre-PR5 flow), then read the served
+        // raw distribution. Same scaler, same features, same seed.
+        let (loop_r, vm_r) = regression_loop(config, 2, &targets, &device).await;
+        let scaler_r = *loop_r.target_scaler.as_ref().unwrap();
+        let mut opt = AdamW::new(
+            vm_r.all_vars(),
+            ParamsAdamW {
+                lr: 0.05,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for _ in 0..1500 {
+            let z_out = loop_r.head_forward(&feats).unwrap();
+            let raw_head = scaler_r
+                .destandardize(&z_out, &loop_r.regression_form())
+                .unwrap();
+            let batch = TrainingBatch::Regression {
+                input: raw_head,
+                target: targets.clone(),
+            };
+            let loss = loop_r.compute_loss(&batch).unwrap();
+            let grads = loss.backward().unwrap();
+            opt.step(&grads).unwrap();
+        }
+        // The raw-trained head's de-standardised output IS the pre-PR5 served raw
+        // distribution: column 0 = served mean (μ_y+σ_y·z, already de-standardised),
+        // column 1 = raw σ → the OLD adapter's UNSCALED `softplus(raw)` (no σ_y
+        // multiply, since the σ was learned in raw units). Read it that way.
+        let z_head_r = loop_r.head_forward(&feats).unwrap();
+        let raw_head_r = scaler_r
+            .destandardize(&z_head_r, &loop_r.regression_form())
+            .unwrap();
+        let rows_r = raw_head_r.to_vec2::<f32>().unwrap();
+        let served_r_mean: Vec<f32> = rows_r.iter().map(|r| r[0]).collect();
+        let served_r_sigma: Vec<f32> = rows_r
+            .iter()
+            .map(|r| super::super::regression_loss::softplus_std_for_test(r[1] as f64) as f32)
+            .collect();
+
+        // Served raw means and σ are PRESERVED across the two loss spaces within a
+        // tolerance justified by the optimizer perturbation. The two runs share the
+        // population minimizer (scale-equivariant Crps → same argmin); they differ
+        // only by AdamW's non-scale-free eps/decay acting on a ÷σ_y-shrunk gradient.
+        //
+        // MEASURED at σ_y ≈ 19.2 (WIDE, 1500 steps, lr 0.05): the largest served-mean
+        // |z − raw| is ≈ 2.3 raw units (≈ 0.12·σ_y) — most rows agree to < 1 unit,
+        // two end rows differ by ≈ 2.3 — and the served-σ |z − raw| is ≈ 0.8. That
+        // residual is the AdamW eps/decay perturbation on a ÷σ_y-shrunk gradient,
+        // exactly as the doc-comment predicts; it is NOT machine epsilon. The bounds
+        // are 3.0 raw units (≈ 0.16·σ_y) for the mean and 2.0 for the σ — generous
+        // headroom over the measured ≈2.3 / ≈0.8 so the test is robust to the
+        // optimizer wobble, yet ≪ σ_y, so it still fails loudly if z-space
+        // MATERIALLY moved the solution (e.g. the ≈19× error a missing σ_y multiply
+        // or a wrong loss space causes).
+        let mean_tol = 3.0_f32;
+        let sigma_tol = 2.0_f32;
+        let max_mean_diff = served_r_mean
+            .iter()
+            .enumerate()
+            .take(n)
+            .map(|(row, &r)| (served_z[0][row] - r).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_mean_diff < mean_tol,
+            "Crps served mean: max |z − raw| {max_mean_diff} over {n} rows must be < \
+             {mean_tol} (≈0.16·σ_y) — same population minimizer up to the AdamW \
+             eps/decay perturbation, not a material change in the served output"
+        );
+        assert!(
+            (served_z[1][0] - served_r_sigma[0]).abs() < sigma_tol,
+            "Crps served σ: z-space (σ_y·σ_z) {} vs raw-space (σ_raw) {} must agree \
+             within {sigma_tol} — scale-equivariance ⇒ same σ minimizer (σ_raw ≈ \
+             σ_y·σ_z) up to the optimizer perturbation",
+            served_z[1][0],
+            served_r_sigma[0]
+        );
+    }
+
+    /// P9 — degenerate σ_y (constant target): a constant target floors σ_y at
+    /// STD_FLOOR, the z-score is finite (every z = 0), the head fits the constant,
+    /// and the served σ ≈ the floor (no spread). No NaN anywhere.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn constant_target_serves_the_constant_with_floored_sigma() {
+        let device = Device::Cpu;
+        let n = 9;
+        let constant = 42.0_f32;
+        let targets = Tensor::from_vec(vec![constant; n], (n,), &device).unwrap();
+        let config = FineTuneConfig {
+            regression_loss: Some(RegressionLoss::Crps),
+            ..Default::default()
+        };
+        let (loop_, varmap) = regression_loop(config, 2, &targets, &device).await;
+        let feats = features(n, &device);
+        let z_head = train_through_production_dispatch(&loop_, &varmap, &feats, &targets, 500);
+        let cols = serve_through_production(&loop_, &z_head);
+        for &m in &cols[0] {
+            assert!(
+                m.is_finite() && (m - constant).abs() < 1.0,
+                "constant target: served mean {m} must be the constant {constant}, no NaN"
+            );
+        }
+        for &s in &cols[1] {
+            // σ_y = STD_FLOOR, so served σ = σ_y·σ_z ≈ STD_FLOOR·O(1) — tiny, finite.
+            assert!(
+                s.is_finite() && s > 0.0 && s < 1.0,
+                "constant target: served σ {s} must be a finite near-floor value"
+            );
+        }
     }
 }
 
@@ -3464,10 +4127,12 @@ mod determinism_through_forward {
     ///
     /// Each step is the exact production chain a `db.fine_tune(task=regression)`
     /// runs per batch: projection `forward` (the `project_frozen_embedding` step,
-    /// drawing the projection dropout mask) → `regress` (distribution head
-    /// `forward`, drawing its dropout mask, then `destandardize`) → production
-    /// `compute_loss` → backward → AdamW. The adapter is then written through the
-    /// production `save_adapter` over the *trained* weights.
+    /// drawing the projection dropout mask) → `head_forward` (distribution head
+    /// `forward`, drawing its dropout mask, the raw z-output) → production
+    /// `compute_loss` against the z-scored target → backward → AdamW. The adapter
+    /// is then written through the production `save_adapter` over the *trained*
+    /// weights. The z-score is a pure affine on the target, so the run stays a
+    /// pure function of `(seed, rows, config)` and the bytes match across runs.
     async fn run_and_capture(seed: u64) -> (Vec<u8>, std::collections::HashMap<String, Tensor>) {
         let device = Device::Cpu;
         let n = YEARS.len();
@@ -3475,6 +4140,16 @@ mod determinism_through_forward {
         let feats = features(n, &device);
 
         let (loop_, varmap) = regression_loop(seed, &targets, &device).await;
+        // Z-score the target exactly as `embed_chunk` does — the production loss
+        // scores the raw z-head against the z-target.
+        let z_target = {
+            let scaler = loop_.target_scaler.as_ref().unwrap();
+            let z: Vec<f32> = YEARS
+                .iter()
+                .map(|&y| scaler.standardize_value(y as f64) as f32)
+                .collect();
+            Tensor::from_vec(z, (n,), &device).unwrap()
+        };
 
         let mut opt = AdamW::new(varmap.all_vars(), ParamsAdamW::default()).unwrap();
         for _ in 0..STEPS {
@@ -3482,12 +4157,12 @@ mod determinism_through_forward {
             // base-model pooled output `feats` shifted by the projection LoRA. This
             // draws the projection layer's seeded dropout mask.
             let proj = head_of(&loop_).layers[0].1.forward(&feats).unwrap();
-            // PRODUCTION distribution forward + de-standardisation (`regress` reads
-            // `head.layers[1]`). Draws the distribution layer's seeded dropout mask.
-            let head_out = loop_.regress(&proj).unwrap();
+            // PRODUCTION distribution forward (`head_forward` reads `head.layers[1]`),
+            // the raw z-output. Draws the distribution layer's seeded dropout mask.
+            let head_out = loop_.head_forward(&proj).unwrap();
             let batch = TrainingBatch::Regression {
                 input: head_out,
-                target: targets.clone(),
+                target: z_target.clone(),
             };
             let loss = loop_.compute_loss(&batch).unwrap();
             let grads = loss.backward().unwrap();
@@ -3774,17 +4449,29 @@ mod resume_invariant {
 
     /// One production training step over all three LoRA layers — the exact chain
     /// `TrainingLoop::run`'s production path runs per batch: projection forward,
-    /// the aux forward, the distribution forward + de-standardisation (`regress`),
-    /// production `compute_loss`, backward, AdamW step. Dropout masks are drawn on
-    /// every forward, advancing each layer's seeded stream.
+    /// the aux forward, the distribution forward (`head_forward`, the raw z-output),
+    /// production `compute_loss` against the z-scored target, backward, AdamW step.
+    /// Dropout masks are drawn on every forward, advancing each layer's seeded
+    /// stream.
     fn step_epoch(loop_: &TrainingLoop, opt: &mut AdamW, feats: &Tensor, targets: &Tensor) {
         let head = head_of(loop_);
         let proj = head.layers[0].1.forward(feats).unwrap();
         let aux = head.layers[2].1.forward(&proj).unwrap();
-        let head_out = loop_.regress(&aux).unwrap();
+        let head_out = loop_.head_forward(&aux).unwrap();
+        // Z-score the target with the resumed scaler (persisted across crash/resume),
+        // exactly as `embed_chunk` does in production.
+        let z_target = {
+            let scaler = loop_.target_scaler.as_ref().unwrap();
+            let raw = targets.to_vec1::<f32>().unwrap();
+            let z: Vec<f32> = raw
+                .iter()
+                .map(|&y| scaler.standardize_value(y as f64) as f32)
+                .collect();
+            Tensor::from_vec(z, (raw.len(),), targets.device()).unwrap()
+        };
         let batch = TrainingBatch::Regression {
             input: head_out,
-            target: targets.clone(),
+            target: z_target,
         };
         let loss = loop_.compute_loss(&batch).unwrap();
         let grads = loss.backward().unwrap();
@@ -4186,7 +4873,7 @@ mod resume_invariant {
             let head = head_of(&b_loop);
             let proj = head.layers[0].1.forward(&feats).unwrap();
             let aux = head.layers[2].1.forward(&proj).unwrap();
-            let _ = b_loop.regress(&aux).unwrap();
+            let _ = b_loop.head_forward(&aux).unwrap();
         }
         b_loop.target.set_training(true);
         step_epoch(&b_loop, &mut b_opt, &feats, &targets);

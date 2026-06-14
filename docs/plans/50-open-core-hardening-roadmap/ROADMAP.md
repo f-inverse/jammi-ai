@@ -42,11 +42,17 @@ surrounding prose is self-describing — treat the number as a label, not a look
 - **M1 — Mainstream-Ready ("serious ML/Search").** A team can build a real
   graph-conditioned retrieval + uncertainty workload on a **trusted network at real
   scale** and trust the results, the failure modes, and the operational story. Not an
-  API-stability commitment. Target: **0.28.x**.
-- **M2 — 1.0.** A deliberate, stable public surface with semver guarantees; every
-  verb measured, oracle-tested, remote/embedded-parity-tested, and scale-benchmarked;
-  the harder streaming/transaction guarantees stated and proven; storage/wire formats
-  versioned. Target: **1.0.0**.
+  API-stability commitment. Target: **0.28.x** — **SHIPPED as v0.28.0** (the H2
+  scale+search+training-robustness batch); **v0.29.0** then completed the
+  consumer-usable, scale-robust regression fine-tune surface.
+- **M2 — the 1.0 *engineering bar*.** A deliberate, stable public surface with semver
+  guarantees; every verb measured, oracle-tested, remote/embedded-parity-tested, and
+  scale-benchmarked; the harder streaming/transaction guarantees stated and proven;
+  storage/wire formats versioned. **Decoupled from the 1.0 *tag* (user decision,
+  2026-06-14):** this engineering bar ships as a normal **0.x** (terminal release
+  likely ~**v0.30.x**); the **1.0 tag is deferred** to a deliberate post-community-use
+  decision, not auto-cut at the end of H4 — a stability promise is earned by real
+  adoption, not self-certified. See §5.
 
 The discipline test gates every item entering the engine, unchanged: *would a user
 who has never heard of any particular consumer reach for this on its own?* If it only
@@ -368,17 +374,26 @@ expressed as a *measured* result.
   published `grpc://` server at scale; subscribe stream semantics under load;
   BYO-auth seam documentation; scale tier (moves to H2). See §3 workstreams for
   per-item status.
-- **H2 — scale & search (→ 0.27 / 0.28). _This is the M1 gate._** The scale tier
-  (3.1), search completeness + ANN benchmarks (3.2), training memory-bounding (3.3).
-  At the end of H2 the engine is **mainstream-ready for serious ML/Search on a trusted
-  network at real scale.**
+- **H2 — CLOSED (M1, v0.28.0 + v0.29.0).** The scale tier (3.1, jammi-bench +
+  ANN-vs-exact recall gate), search completeness + ANN benchmarks (3.2,
+  `search(embedding_table=)` + recall-vs-cost), and training robustness (3.3):
+  standardization oracle for every offset-bearing head (#185), seeded bit-reproducible
+  CPU fine-tuning (#186), durable byte-exact checkpoint/resume (#187), and — surfaced by
+  the cookbook loop — the public `db.fine_tune(task="regression")` surface (#189) made
+  scale-robust via a z-space loss so the default objective fits any target scale (#190).
+  Shipped as **M1 = v0.28.0**, then **v0.29.0** (regression surface). The engine is
+  **mainstream-ready for serious ML/Search on a trusted network at real scale.**
+  Remaining W5 loop-closer: the cookbook `fine_tune_regression` chapter (validated,
+  authoring against v0.29.0).
 - **H3 — operability & contracts (→ 0.28 / 0.29).** Observability + chaos (3.7), the
   multi-tenant contract + BYO-auth seam (3.5), the API-stability staging + error
   taxonomy (3.8), catalog lifecycle completeness (3.6).
 - **H4 — 1.0.** The breadth grid fully green, the harder guarantees proven, perf SLOs,
   format stability, the published security posture (§4).
 
-**M1 ≈ end of H2 (~0.28). 1.0 ≈ end of H4.**
+**M1 = end of H2 — SHIPPED (v0.28.0 + v0.29.0). H3 next.** The 1.0 *engineering bar*
+≈ end of H4, shipped as a 0.x (~v0.30.x); the **1.0 tag itself is decoupled and
+deferred** to a deliberate post-community-use decision (see §0, user 2026-06-14).
 
 ---
 

@@ -6,6 +6,19 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-06-14
+
+The regression fine-tune surface is now consumer-usable and scale-robust. A team
+can call `db.fine_tune(task="regression")` on a numeric target at any scale —
+default objective (`BetaNll{0.5}`) included — and read back calibrated
+predictions through `Infer`: this release wires that public on-ramp end to end
+(numeric-target detection, the Python `regression_loss`/`quantile_levels` kwargs,
+and `DistributionForm`-correct serving for both Gaussian and non-crossing
+quantile heads). It also moves the regression loss into standardized (z) space so
+the default Gaussian-family objectives converge on high-variance targets where
+they previously diverged out of the box, with served point estimates preserved
+within a tight tolerance (not byte-equal) and served σ correctly σ_y-scaled.
+
 ### Added
 - **Scale-robust regression fine-tune loss — the standardization contract on the
   variance axis (W5-PR5).** `db.fine_tune(task="regression")` now converges for
@@ -63,7 +76,6 @@ workspace ships every publishable crate at the same
   / `crps` / `pinball`) and `quantile_levels`, so a Python consumer can reach the
   Quantile head and every non-default Gaussian objective.
 
-### Changed
 - The classification training branch is now gated on `task != Regression`: a
   `(text, label)` source submitted with `task=regression` no longer falls into
   the classification path (which gathered a numeric outcome as a class index and

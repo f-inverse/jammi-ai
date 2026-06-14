@@ -9,9 +9,12 @@
 //! - the `uncertainty` evidence channel registers and merges through the real
 //!   catalog substrate (the conformal-sibling pattern, no migration);
 //! - the **R2 calibration gate**: a calibrated heteroscedastic predictive
-//!   Gaussian, served through the adapter, has realised coverage ≈ nominal and a
-//!   strictly lower proper score (CRPS) than a misspecified constant-variance
-//!   baseline — the head is *calibrated*, not merely accurate.
+//!   Gaussian, served through the adapter's σ_y-scaled serve path
+//!   (`gaussian_scaled`, the post-softplus σ_y de-standardise a z-space-trained
+//!   head needs), has realised coverage ≈ nominal and a strictly lower proper
+//!   score (CRPS) than a misspecified constant-variance baseline — the head is
+//!   *calibrated*, not merely accurate. The gate drives σ_y ≠ 1, so a missing
+//!   σ_y multiply (serving the z-scale σ_z unscaled) under-covers and fails it.
 //!
 //! The gradient-level pathology contracts (variance collapse under naive NLL vs
 //! β-NLL/CRPS, heteroscedastic σ, ordered pinball quantiles) are pinned by the
@@ -231,6 +234,15 @@ fn r2_calibration_gate_coverage_and_proper_score() {
     // Heteroscedastic truth: σ alternates between an easy and a hard regime; the
     // mean is a simple function of the row. The head predicts the TRUE (μ, σ)
     // per row — a calibrated head — and we draw y from it.
+    // σ_y is the persisted scaler's std a z-space-trained head carries; the served
+    // σ is `σ_y · softplus(raw)` (the post-softplus de-standardise). Driving the
+    // gate through `gaussian_scaled(σ_y)` with σ_y ≠ 1 makes this calibration gate
+    // genuinely DEPEND on the σ_y multiply being wired: a head that emitted a
+    // z-scale σ_z but served it unscaled (the silent under-dispersion bug) would
+    // under-cover by σ_y× and FAIL the coverage contract below. The head therefore
+    // emits raw_std encoding the z-scale `σ_z = σ_true/σ_y`, and the adapter's σ_y
+    // multiply recovers σ_true — exactly the fine-tune serve path.
+    let sigma_y = 4.0_f64;
     let mut means = Vec::with_capacity(n);
     let mut true_sigmas = Vec::with_capacity(n);
     let mut observed = Vec::with_capacity(n);
@@ -242,16 +254,20 @@ fn r2_calibration_gate_coverage_and_proper_score() {
         means.push(mu);
         true_sigmas.push(sigma);
         observed.push(y);
-        // The head emits (mean, raw_std) such that softplus(raw_std)+floor ≈ σ.
-        // Invert: raw = ln(e^{σ−floor} − 1). σ here is well above the floor.
-        let raw = ((sigma - 1e-3).exp() - 1.0).ln();
+        // The head emits a z-scale σ_z = σ_true/σ_y; the adapter recovers σ_true via
+        // the σ_y multiply. Invert softplus: raw = ln(e^{σ_z−floor} − 1).
+        let sigma_z = sigma / sigma_y;
+        let raw = ((sigma_z - 1e-3).exp() - 1.0).ln();
         raw_rows.push((mu as f32, raw as f32));
     }
 
-    // Serve through the real adapter so the gate scores exactly what inference
-    // would emit (mean passthrough, raw_std → softplus + floor).
+    // Serve through the REAL production serve path: `gaussian_scaled(σ_y)` applies
+    // the post-softplus σ_y multiply, so the gate scores exactly what inference
+    // emits for a z-space-trained head (mean passthrough, σ_y·softplus(raw)+floor).
     let out = gaussian_backend(&raw_rows);
-    let cols = DistributionAdapter::gaussian().adapt(&out, n).unwrap();
+    let cols = DistributionAdapter::gaussian_scaled(sigma_y as f32)
+        .adapt(&out, n)
+        .unwrap();
     let served_mean = cols[0].as_any().downcast_ref::<Float32Array>().unwrap();
     let served_std = cols[1].as_any().downcast_ref::<Float32Array>().unwrap();
 

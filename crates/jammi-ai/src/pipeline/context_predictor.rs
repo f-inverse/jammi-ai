@@ -1405,9 +1405,10 @@ fn destandardize_distribution(
             std: z_std,
         } => PredictedDistribution::Gaussian {
             mean: mean + std * z_mean,
-            // Re-floor after the multiply so the served σ keeps the positivity
-            // invariant the trained/served σ map guarantees.
-            std: (std * z_std).max(regression_loss::STD_FLOOR as f32),
+            // σ_y·σ_z + re-floor via the SHARED `destandardize_sigma` helper the
+            // fine-tune adapter also calls — one copy of the σ-axis math across
+            // both serve paths, so the σ rule cannot drift between them.
+            std: regression_loss::destandardize_sigma(std, z_std),
         },
         PredictedDistribution::Quantile { levels } => PredictedDistribution::Quantile {
             levels: levels

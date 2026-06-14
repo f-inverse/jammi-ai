@@ -79,22 +79,69 @@ pub enum DistributionForm {
 /// Adapt a regression backend's raw floats into a predictive-distribution
 /// Arrow schema: `(predicted_mean, predicted_std)` for the Gaussian form, or
 /// `quantile_{level}` columns for the quantile form.
+///
+/// # The σ-axis de-standardise
+///
+/// The fine-tune regression loss trains in standardized (z) space, so a Gaussian
+/// head's σ column is a **z-scale** (σ_z ≈ 1 for a well-fit head). To recover the
+/// raw σ the served value must be multiplied by σ_y. That multiply has to land on
+/// the **post-softplus** σ (`σ_y·softplus(raw)`, not `softplus(σ_y·raw)` — softplus
+/// is non-linear), which is the one place σ exists, so this adapter carries σ_y
+/// (`std_scale`) and applies it inside [`OutputAdapter::adapt`] via the shared
+/// `regression_loss::destandardize_sigma` helper — the **one** copy of the
+/// `σ_y·σ_z` math, which the in-context predictor's `destandardize_distribution`
+/// also calls. The mean/quantile affine
+/// (`μ_y + σ_y·z`) is applied earlier by the backend's de-standardise, so it is
+/// NOT repeated here.
+///
+/// The two serve paths share the σ math but not the whole de-standardise: they
+/// apply the mean affine at different points (fine-tune at the backend, in-context
+/// inside `destandardize_distribution`) and emit different types (an Arrow
+/// `ArrayRef` vs a typed `PredictedDistribution`). Fully unifying the transport is
+/// the H3 serve-path unification; the shared σ helper is the part that can be
+/// unified today (see `destandardize_sigma`).
+///
+/// A base / no-scaler head (`std_scale == 1`) is the identity, so the adapter's
+/// behaviour is unchanged for the in-context predictor (which de-standardises the
+/// σ itself before building the typed distribution) and for any head served
+/// without a scaler.
 #[derive(Debug, Clone)]
 pub struct DistributionAdapter {
     form: DistributionForm,
+    /// σ_y: the post-softplus multiply that turns the head's z-scale σ into raw
+    /// units. `1.0` for a no-scaler head (the identity).
+    std_scale: f32,
 }
 
 impl DistributionAdapter {
-    /// Parametric Gaussian head: serves `predicted_mean` + `predicted_std`.
+    /// Parametric Gaussian head: serves `predicted_mean` + `predicted_std`, with
+    /// no σ-axis de-standardise (`std_scale = 1`). Used where the served σ is
+    /// already in raw units (the in-context predictor, which de-standardises σ
+    /// itself) or where there is no scaler.
     pub fn gaussian() -> Self {
         Self {
             form: DistributionForm::Gaussian,
+            std_scale: 1.0,
+        }
+    }
+
+    /// Parametric Gaussian head whose served σ is scaled by `std_scale` (σ_y) on
+    /// the post-softplus column — the σ-axis de-standardise for a z-space-trained
+    /// fine-tune head. `std_scale = 1` is identical to [`Self::gaussian`].
+    pub fn gaussian_scaled(std_scale: f32) -> Self {
+        Self {
+            form: DistributionForm::Gaussian,
+            std_scale,
         }
     }
 
     /// Quantile head over the given levels. Levels must be ascending and lie in
     /// `(0, 1)`; otherwise the column order would be ambiguous, so it is a typed
     /// error rather than a silent sort.
+    ///
+    /// The quantile form carries no `std_scale`: every quantile column is
+    /// de-standardised by the backend's affine (`μ_y + σ_y·z_q`) before it reaches
+    /// the adapter, so there is no post-softplus σ for the adapter to scale.
     pub fn quantile(levels: Vec<f64>) -> Result<Self> {
         if levels.is_empty() {
             return Err(JammiError::Inference(
@@ -113,6 +160,7 @@ impl DistributionAdapter {
         }
         Ok(Self {
             form: DistributionForm::Quantile { levels },
+            std_scale: 1.0,
         })
     }
 
@@ -181,7 +229,20 @@ impl OutputAdapter for DistributionAdapter {
                         let mean = flat[row * 2];
                         let raw_std = flat[row * 2 + 1];
                         means.push(Some(mean));
-                        stds.push(Some(softplus_std(raw_std, SERVED_STD_FLOOR)));
+                        // σ-axis de-standardise: `σ_y · softplus(raw)`, applied on
+                        // the POST-softplus σ (softplus is non-linear, so the σ_y
+                        // factor cannot fold into the raw column). `std_scale == 1`
+                        // (no scaler / in-context, which de-standardises σ itself)
+                        // is the identity. The σ_y·σ_z multiply + re-floor is the
+                        // SHARED `destandardize_sigma` helper the in-context
+                        // `destandardize_distribution` also calls — one copy of the
+                        // σ math across both serve paths.
+                        let sigma_z = softplus_std(raw_std, SERVED_STD_FLOOR);
+                        let sigma = crate::fine_tune::regression_loss::destandardize_sigma(
+                            self.std_scale,
+                            sigma_z,
+                        );
+                        stds.push(Some(sigma));
                     } else {
                         means.push(None);
                         stds.push(None);
@@ -318,6 +379,59 @@ mod tests {
             );
             raw += 0.5;
         }
+    }
+
+    #[test]
+    fn scaled_gaussian_serves_sigma_y_times_softplus() {
+        // A z-space-trained head learns a z-scale σ (σ_z); the adapter recovers the
+        // raw σ as `σ_y · softplus(raw)` (post-softplus, re-floored). This is the
+        // σ-axis de-standardise the coverage/calibration contract depends on:
+        // without it the served σ would be ~σ_y× too tight (a silent calibration
+        // bug the point-estimate oracles cannot catch).
+        let sigma_y = 19.5_f32;
+        let mut raw = -5.0_f32;
+        while raw <= 5.0 {
+            let out = backend(vec![0.0, raw], 1, 2, vec![true]);
+            // Scaled adapter (σ_y) vs the identity adapter (σ_z).
+            let scaled = DistributionAdapter::gaussian_scaled(sigma_y)
+                .adapt(&out, 1)
+                .unwrap();
+            let served = scaled[1]
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(0);
+            let unscaled = DistributionAdapter::gaussian().adapt(&out, 1).unwrap();
+            let sigma_z = unscaled[1]
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(0);
+            let expected = (sigma_y * sigma_z).max(SERVED_STD_FLOOR);
+            assert!(
+                (served - expected).abs() <= 4.0 * f32::EPSILON * expected.abs().max(1.0),
+                "scaled served σ {served} != σ_y·σ_z {expected} for raw={raw}"
+            );
+            raw += 0.5;
+        }
+
+        // At a well-fit head (σ_z ≈ 1, i.e. raw=0 → softplus(0)≈0.693), the served σ
+        // is ~σ_y, NOT ~σ_z≈1 — the missing-post-softplus-multiply bug would leave it
+        // ≈ 0.693. This is the silent-under-dispersion falsifier.
+        let out0 = backend(vec![0.0, 0.0], 1, 2, vec![true]);
+        let s0 = DistributionAdapter::gaussian_scaled(sigma_y)
+            .adapt(&out0, 1)
+            .unwrap();
+        let served0 = s0[1]
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .value(0);
+        assert!(
+            served0 > 0.5 * sigma_y,
+            "served σ {served0} at raw=0 must be ~σ_y-scaled ({sigma_y}), not σ_z≈1 \
+             — a missing post-softplus σ_y multiply is the calibration bug"
+        );
     }
 
     #[test]

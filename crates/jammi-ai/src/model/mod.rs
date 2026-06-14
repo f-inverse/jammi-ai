@@ -331,6 +331,18 @@ impl LoadedModel {
         }
     }
 
+    /// The persisted scaler's σ_y for a reloaded regression head, or `None` for a
+    /// non-regression / no-scaler / ORT model. Serving reads this to scale a
+    /// Gaussian head's served σ from the z-space the loss trained (σ_z ≈ 1) back
+    /// to raw units (`σ_y·σ_z`) — the σ-axis half of the de-standardise contract
+    /// (the mean/quantile axes carry σ_y in the backend's affine).
+    pub fn regression_std_scale(&self) -> Option<f32> {
+        match self {
+            LoadedModel::Candle(m) => m.regression_std_scale(),
+            LoadedModel::Ort(_) => None,
+        }
+    }
+
     /// TEST-ONLY non-vacuity seam: zero a loaded regression head's trained LoRA
     /// `B` factor so it regresses to its zero-initialised base and emits the
     /// scaler offset `μ_y` for every input (the untrained-head behaviour). No-op

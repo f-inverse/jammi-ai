@@ -34,17 +34,23 @@
 //! exactly that collapse against the same fixture, locking these tests against a
 //! future regression that drops the trained head on serve (the original Break 5).
 //!
-//! ## Objective choice — a measured surface finding
+//! ## Objective choice
 //!
-//! On a realistic-variance target (σ_y ≈ 19.5 here, vs the PR1 oracle's σ ≈ 2),
-//! the Gaussian NLL objectives (`GaussianNll`, `BetaNll`) DIVERGE: the loss
-//! scores `(y-μ)²/σ²` in raw outcome units, so before the head's raw σ adapts a
-//! tens-of-years residual blows the loss past the trainer's divergence guard
-//! (`> 100`). The PR1 σ ≈ 2 fixture never tripped this. The robust objectives —
-//! `Crps` (a Gaussian-form head; scales linearly in the error) and `Pinball`
-//! (the quantile head) — train cleanly, so the Gaussian-form test below uses
-//! `Crps`. Both still serve `predicted_mean`/`predicted_std`; the served-form
-//! and quantile-vs-Gaussian dispatch they exercise is unchanged.
+//! These surface tests use `Crps` (a Gaussian-form head) and `Pinball` (the
+//! quantile head) — the two robust objectives — to exercise the served-form and
+//! quantile-vs-Gaussian dispatch on a realistic-variance target (σ_y ≈ 19.5 here,
+//! vs the PR1 oracle's σ ≈ 2).
+//!
+//! Historically (pre-W5-PR5) the Gaussian NLL objectives (`GaussianNll`,
+//! `BetaNll`) DIVERGED on this scale: the loss scored `(y-μ)²/σ²` in raw outcome
+//! units, so a tens-of-years residual blew the loss past the trainer's divergence
+//! guard (`> 100`) before the head's raw σ could adapt. W5-PR5 fixed that by
+//! scoring the loss in standardized (z) space — `db.fine_tune(task=regression)`
+//! now converges for ALL FOUR objectives on any target scale (see the
+//! `standardization_contract` high-variance oracle for the per-objective proof).
+//! These tests keep `Crps`/`Pinball` because the surface they pin (separation +
+//! served-form dispatch) is objective-independent and they were green pre- and
+//! post-fix, locking the public read path against either regression.
 
 use std::sync::Arc;
 
@@ -181,8 +187,9 @@ async fn gaussian_regression_separates_groups_through_public_path() {
                 learning_rate: 3e-2,
                 warmup_steps: 8,
                 lr_schedule: LrSchedule::Constant,
-                // Gaussian NLL diverges on a σ≈19.5 target (see module docs); the
-                // robust Gaussian-form objective is CRPS. Still serves mean/std.
+                // CRPS — a Gaussian-form objective (serves mean/std). Post-W5-PR5
+                // (z-space loss) GaussianNll/BetaNll also converge on this σ≈19.5
+                // target; CRPS is kept here as the robust Gaussian-form surface.
                 regression_loss: Some(RegressionLoss::Crps),
                 seed: 7,
                 ..Default::default()

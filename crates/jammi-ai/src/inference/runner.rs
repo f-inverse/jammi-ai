@@ -8,9 +8,7 @@ use futures::StreamExt;
 use jammi_db::error::{JammiError, Result};
 use tokio::sync::mpsc::Sender;
 
-use super::adapter::{
-    create_adapter, create_adapter_for_schema, create_error_output, BackendOutput, OutputAdapter,
-};
+use super::adapter::{create_adapter, BackendOutput, OutputAdapter};
 use super::observer::InferenceObserver;
 use super::schema::build_prefix_columns;
 use super::{extract_column, extract_columns, slice_columns};
@@ -180,7 +178,7 @@ impl InferenceRunner {
             Err(e) => {
                 tracing::warn!(rows = row_count, "Batch inference failed: {e}");
                 *current_batch_size = (*current_batch_size / 2).max(1);
-                self.build_error_batch(keys, &e.to_string(), row_count, output_schema)
+                self.build_error_batch(keys, adapter, &e.to_string(), row_count, output_schema)
             }
         }
     }
@@ -227,12 +225,19 @@ impl InferenceRunner {
                 }
                 Err(e) if Self::is_oom_error(&e) && *current_batch_size > 1 => continue,
                 Err(e) => {
-                    return self.build_error_batch(keys, &e.to_string(), row_count, output_schema);
+                    return self.build_error_batch(
+                        keys,
+                        adapter,
+                        &e.to_string(),
+                        row_count,
+                        output_schema,
+                    );
                 }
             }
         }
         self.build_error_batch(
             keys,
+            adapter,
             "GPU OOM persists at minimum batch size",
             row_count,
             output_schema,
@@ -268,9 +273,15 @@ impl InferenceRunner {
     }
 
     /// Build an all-error RecordBatch when the entire chunk fails.
+    ///
+    /// Uses the live `adapter` (built from the loaded model) so the error batch
+    /// matches the served schema even for a form-dependent head — a quantile
+    /// regression head's error columns are its level count, not the Gaussian
+    /// default of 2.
     fn build_error_batch(
         &self,
         keys: &ArrayRef,
+        adapter: &dyn OutputAdapter,
         error_message: &str,
         row_count: usize,
         output_schema: &SchemaRef,
@@ -278,23 +289,13 @@ impl InferenceRunner {
         let row_status = vec![false; row_count];
         let row_errors = vec![error_message.to_string(); row_count];
 
-        // Extract embedding dim from the output schema (FixedSizeList field)
-        let dim = output_schema
-            .fields()
-            .iter()
-            .find_map(|f| match f.data_type() {
-                arrow::datatypes::DataType::FixedSizeList(_, n) => Some(*n as usize),
-                _ => None,
-            })
-            .unwrap_or(0);
-
-        // Create a dummy BackendOutput with all-error rows
-        let mut dummy_output = create_error_output(self.task, row_count, dim);
+        // All-error backend output sized by the adapter, then re-stamped with
+        // this error's per-row message.
+        let mut dummy_output = adapter.error_output(row_count);
         dummy_output.row_status = row_status.clone();
         dummy_output.row_errors = row_errors.clone();
 
-        let task_adapter = create_adapter_for_schema(self.task, Some(dim));
-        let task_columns = task_adapter.adapt(&dummy_output, row_count)?;
+        let task_columns = adapter.adapt(&dummy_output, row_count)?;
 
         let prefix = build_prefix_columns(
             keys,

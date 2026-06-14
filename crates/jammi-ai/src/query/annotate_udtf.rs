@@ -131,7 +131,12 @@ impl TableFunctionImpl for AnnotateTableFunction {
         // to completion. The model is then warm in the cache for `scan`.
         let session = self.session()?;
         let model_source_for_dim = model_source.clone();
-        let embedding_dim = tokio::task::block_in_place(|| {
+        // The model is loaded here both for the embedding dim and, for a
+        // regression head, its persisted distribution form — the schema's
+        // regression columns (Gaussian `mean`/`std` vs quantile level columns)
+        // depend on the form, so the planned schema must read it rather than
+        // assume Gaussian.
+        let (embedding_dim, regression_form) = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let guard = session
                     .model_cache()
@@ -141,7 +146,8 @@ impl TableFunctionImpl for AnnotateTableFunction {
                         DataFusionError::Plan(format!("annotate: load model '{model}': {e}"))
                     })?;
                 let dim = guard.model.embedding_dim();
-                Ok::<_, DataFusionError>(dim)
+                let form = guard.model.regression_form().cloned();
+                Ok::<_, DataFusionError>((dim, form))
             })
         })?;
 
@@ -149,8 +155,14 @@ impl TableFunctionImpl for AnnotateTableFunction {
         // input schema is not consulted by `build_output_schema`, so an empty
         // placeholder is sufficient.
         let placeholder = Arc::new(arrow::datatypes::Schema::empty());
-        let schema = build_output_schema(&task, &placeholder, &key_column, embedding_dim)
-            .map_err(|e| DataFusionError::Plan(format!("annotate: output schema: {e}")))?;
+        let schema = build_output_schema(
+            &task,
+            &placeholder,
+            &key_column,
+            embedding_dim,
+            regression_form.as_ref(),
+        )
+        .map_err(|e| DataFusionError::Plan(format!("annotate: output schema: {e}")))?;
 
         Ok(Arc::new(AnnotateTable {
             session,

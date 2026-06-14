@@ -227,6 +227,21 @@ impl OutputAdapter for DistributionAdapter {
             }
         }
     }
+
+    fn error_output(&self, row_count: usize) -> BackendOutput {
+        // `head_width` floats per row (2 for Gaussian, one per level for
+        // quantile); every row is an error, so `adapt` nulls them out. Sizing on
+        // the form's width is what keeps a quantile head's error batch matching
+        // its served schema.
+        let width = self.head_width();
+        BackendOutput {
+            float_outputs: vec![vec![0.0; row_count * width]],
+            string_outputs: vec![],
+            row_status: vec![false; row_count],
+            row_errors: vec![String::new(); row_count],
+            shapes: vec![(row_count, width)],
+        }
+    }
 }
 
 #[cfg(test)]

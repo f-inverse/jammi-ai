@@ -649,6 +649,50 @@ def _embedding_loss_message(
     )
 
 
+def _regression_loss_message(
+    regression_loss: Optional[str],
+    *,
+    regression_beta: Optional[float] = None,
+) -> Optional[training_pb2.RegressionLoss]:
+    """Build the wire `RegressionLoss` oneof from the embed binding's named loss.
+
+    Mirrors the embed binding's `fine_tune` regression decoding exactly
+    (`crates/jammi-python/src/database.rs`): the named loss with its scalar knob
+    (`beta_nll` carries `regression_beta`, defaulting to 0.5), or `None` to let
+    the engine select its collapse-resistant β-NLL default. An unnamed loss with
+    only `regression_beta` set keeps the beta-implies-β-NLL shorthand. The
+    proto's per-variant message names map onto the wire `RegressionLoss` oneof
+    (`gaussian_nll`/`beta_nll`/`crps`/`pinball`, field 27); the wire validator
+    enforces the beta range and quantile-level constraints before training.
+    """
+    if regression_loss is None:
+        if regression_beta is not None:
+            return training_pb2.RegressionLoss(
+                beta_nll=training_pb2.RegressionLoss.BetaNll(beta=regression_beta)
+            )
+        return None
+    if regression_loss == "gaussian_nll":
+        return training_pb2.RegressionLoss(
+            gaussian_nll=training_pb2.RegressionLoss.GaussianNll()
+        )
+    if regression_loss == "beta_nll":
+        return training_pb2.RegressionLoss(
+            beta_nll=training_pb2.RegressionLoss.BetaNll(
+                beta=regression_beta if regression_beta is not None else 0.5
+            )
+        )
+    if regression_loss == "crps":
+        return training_pb2.RegressionLoss(crps=training_pb2.RegressionLoss.Crps())
+    if regression_loss == "pinball":
+        return training_pb2.RegressionLoss(
+            pinball=training_pb2.RegressionLoss.Pinball()
+        )
+    raise ValueError(
+        f"Unknown regression_loss {regression_loss!r}. Use 'gaussian_nll', "
+        f"'beta_nll', 'crps', or 'pinball'."
+    )
+
+
 class RemoteTrainingJob:
     """Handle to a remote training job, polled over `TrainingService`.
 
@@ -1265,6 +1309,9 @@ class RemoteDatabase:
         hard_negative_refresh_every: Optional[int] = None,
         matryoshka_dims: Optional[List[int]] = None,
         seed: Optional[int] = None,
+        regression_loss: Optional[str] = None,
+        regression_beta: Optional[float] = None,
+        quantile_levels: Optional[List[float]] = None,
     ) -> RemoteTrainingJob:
         """Submit a LoRA fine-tuning job to the remote engine; poll the handle.
 
@@ -1308,6 +1355,9 @@ class RemoteDatabase:
             hard_negative_refresh_every=hard_negative_refresh_every,
             matryoshka_dims=matryoshka_dims,
             seed=seed,
+            regression_loss=regression_loss,
+            regression_beta=regression_beta,
+            quantile_levels=quantile_levels,
         )
         request = training_pb2.StartTrainingRequest(
             fine_tune=training_pb2.FineTuneSpec(
@@ -2150,6 +2200,9 @@ class RemoteDatabase:
         hard_negative_refresh_every: Optional[int],
         matryoshka_dims: Optional[List[int]],
         seed: Optional[int],
+        regression_loss: Optional[str],
+        regression_beta: Optional[float],
+        quantile_levels: Optional[List[float]],
     ) -> training_pb2.FineTuneConfig:
         """Build the wire `FineTuneConfig` from the embed binding's flat kwargs.
 
@@ -2241,6 +2294,20 @@ class RemoteDatabase:
             config.matryoshka_dims.extend(matryoshka_dims)
         if seed is not None:
             config.seed = seed
+        # Regression objective (task="regression" only), field 27. Mirrors the
+        # embed binding's decoding: a named loss with its β knob, or — with only
+        # `regression_beta` set — the beta-implies-β-NLL shorthand. Left UNSET
+        # when neither is given so the server applies the engine's β-NLL default.
+        regression = _regression_loss_message(
+            regression_loss, regression_beta=regression_beta
+        )
+        if regression is not None:
+            config.regression_loss.CopyFrom(regression)
+        # Quantile levels (field 28) for a pinball-trained head; wired regardless
+        # of the named loss so a Pinball request is reachable. Empty leaves the
+        # field unset for the parametric Gaussian objectives.
+        if quantile_levels is not None:
+            config.quantile_levels.extend(quantile_levels)
         return config
 
     # --- Stateless conformal / RRF numerics (computed client-side) ---------------

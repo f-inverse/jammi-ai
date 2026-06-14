@@ -275,6 +275,12 @@ pub struct CandleModel {
     /// models fine-tuned via the `EncoderAdapters` target (those carry
     /// their LoRA inside the encoder, not on top of it).
     pub projection_head: Option<jammi_lora::LoraLinear>,
+    /// The regression `distribution` head layer (`hidden → output_dim`), reloaded
+    /// for a `ModelTask::Regression` fine-tune. This is the layer the trainer's
+    /// `regress` applies to the pooled embedding (NOT `projection_head`), so
+    /// serving applies it to reproduce the trained `(mean, raw_std)` / quantile
+    /// output. `None` for every non-regression head.
+    distribution_head: Option<jammi_lora::LoraLinear>,
     /// De-standardising affine for a regression head, reloaded from the adapter
     /// config. The regression head learns z-space parameters and emits a raw,
     /// outcome-unit distribution after this affine; serving applies the same
@@ -342,6 +348,38 @@ impl CandleModel {
         tokens_to_tensor(vecs, &self.device)
     }
 
+    /// The persisted predictive-distribution form of a reloaded regression head,
+    /// or `None` for a non-regression model (or a regression head saved without a
+    /// form). Serving reads this to select the `Infer` output adapter
+    /// (`gaussian()` vs `quantile(levels)`) — the authoritative signal the head
+    /// was trained for, never a head-width guess.
+    pub(crate) fn regression_form(&self) -> Option<&crate::inference::adapter::DistributionForm> {
+        self.regression_form.as_ref()
+    }
+
+    /// TEST-ONLY non-vacuity seam: zero the trained regression distribution
+    /// head's LoRA `B` factor, collapsing the head to its zero-initialised base
+    /// (`zeros(output_dim, hidden_size)`). A head in this state emits exactly the
+    /// scaler offset `μ_y` for every input through the de-standardising affine
+    /// (`μ_y + σ_y·0`), so a served prediction no longer tracks the input — the
+    /// exact behaviour an *untrained* head exhibits.
+    ///
+    /// This is the in-process equivalent of an auditor destructively zeroing
+    /// `distribution.lora_b` on disk: it lets the regression-surface tests prove
+    /// their group-separation assertion FAILS when the head carries no learned
+    /// signal, locking the tests against a future regression that drops the
+    /// trained head on serve (the original Break 5). Production never calls it; it
+    /// only mutates a per-test owned model, never a cached/shared one.
+    #[doc(hidden)]
+    pub fn zero_distribution_head_for_test(&mut self) {
+        if let Some(head) = self.distribution_head.as_mut() {
+            head.lora_b = head
+                .lora_b
+                .zeros_like()
+                .expect("zeros_like on a loaded LoRA B tensor is infallible");
+        }
+    }
+
     /// Access the text forward pass, returning an error if this is a vision-only model.
     fn text_forward(&self) -> Result<&dyn CandleTextForward> {
         self.text.as_deref().ok_or_else(|| {
@@ -378,9 +416,14 @@ impl CandleModel {
     /// base checkpoint with no such head cannot serve this task. That is a typed
     /// capability error, not a silent wrong output.
     fn forward_regression(&self, content: &[arrow::array::ArrayRef]) -> Result<BackendOutput> {
-        let head = self.projection_head.as_ref().ok_or_else(|| {
+        // The regression `distribution` head — the `hidden → output_dim` layer
+        // the trainer's `regress` applies to the pooled embedding. It is the
+        // authoritative regression head; `projection_head` (a hidden→hidden layer)
+        // is the trained projection that regression does NOT apply on the forward
+        // path, so serving must use `distribution_head` to match training.
+        let head = self.distribution_head.as_ref().ok_or_else(|| {
             JammiError::Inference(
-                "Regression inference needs a fine-tuned distributional projection head; \
+                "Regression inference needs a fine-tuned distributional head; \
                  this model carries none. Fine-tune a ModelTask::Regression head first."
                     .into(),
             )
@@ -1315,20 +1358,36 @@ impl ModelBackend for CandleBackend {
         // Load the post-pool projection head, if the saved adapter is one.
         // Encoder-adapters are installed inside `text` above via the encoder
         // builder's `.lora(...)` + `.adapter(Some(...))` calls.
-        let (projection_head, regression_scaler, regression_form) = match saved_adapter.as_ref() {
-            Some((crate::fine_tune::target::SavedAdapter::ProjectionHead(cfg), weights_path)) => (
-                load_projection_head(
+        let (projection_head, distribution_head, regression_scaler, regression_form) =
+            match saved_adapter.as_ref() {
+                Some((
+                    crate::fine_tune::target::SavedAdapter::ProjectionHead(cfg),
                     weights_path,
-                    cfg.lora_alpha,
-                    &device,
-                    &dimensions,
-                    &resolved.model_id.0,
-                )?,
-                cfg.target_scaler,
-                cfg.regression_form.clone(),
-            ),
-            _ => (None, None, None),
-        };
+                )) => {
+                    (
+                        load_projection_head(
+                            weights_path,
+                            cfg.lora_alpha,
+                            &device,
+                            &dimensions,
+                            &resolved.model_id.0,
+                        )?,
+                        // The `distribution` layer is present only for a
+                        // regression head; `load_distribution_head` returns `None`
+                        // for embedding/classification/NER projection heads.
+                        load_distribution_head(
+                            weights_path,
+                            cfg.lora_alpha,
+                            &device,
+                            &dimensions,
+                            &resolved.model_id.0,
+                        )?,
+                        cfg.target_scaler,
+                        cfg.regression_form.clone(),
+                    )
+                }
+                _ => (None, None, None, None),
+            };
 
         // Load NER token classifier if this is a NER model
         let ner_classifier = if is_ner {
@@ -1385,6 +1444,7 @@ impl ModelBackend for CandleBackend {
             tokenizer,
             device,
             projection_head,
+            distribution_head,
             regression_scaler,
             regression_form,
             id2label,
@@ -1498,6 +1558,67 @@ fn load_projection_head(
         Some(t) => t.clone(),
         None => return Ok(None),
     };
+
+    Ok(Some(jammi_lora::LoraLinear::from_loaded(
+        base_linear,
+        lora_a,
+        lora_b,
+        lora_alpha,
+    )))
+}
+
+/// Reload the regression `distribution` head layer — the `hidden → output_dim`
+/// LoRA layer that maps the pooled encoder embedding to the raw distribution
+/// parameters (`(mean, raw_std)` for Gaussian, one per level for quantile). This
+/// is the layer the trainer's `regress` applies to the pooled embedding (it uses
+/// `head.layers[1]`, the distribution layer — NOT the `projection` layer), so
+/// serving must apply the same one to reproduce the trained output shape.
+///
+/// Its zeros base spans `output_dim → hidden_size`; `output_dim` is recovered
+/// from the persisted `distribution.lora_b` row count (B is `output_dim × rank`),
+/// so the served head width matches the trained head without re-deriving it from
+/// the form. Returns `None` when the adapter carries no `distribution` layer
+/// (i.e. it is not a regression head).
+fn load_distribution_head(
+    adapter_file: &std::path::Path,
+    lora_alpha: f64,
+    device: &Device,
+    dimensions: &crate::model::ModelDimensions,
+    model_id: &str,
+) -> jammi_db::error::Result<Option<jammi_lora::LoraLinear>> {
+    let adapter_weights =
+        candle_core::safetensors::load(adapter_file, device).map_err(|e| JammiError::Model {
+            model_id: model_id.to_string(),
+            message: format!("Load adapter: {e}"),
+        })?;
+
+    let lora_a = match adapter_weights.get("distribution.lora_a") {
+        Some(t) => t.clone(),
+        None => return Ok(None),
+    };
+    let lora_b = match adapter_weights.get("distribution.lora_b") {
+        Some(t) => t.clone(),
+        None => return Ok(None),
+    };
+
+    // `output_dim` = rows of B (`output_dim × rank`). The base is the trained
+    // head's `zeros(output_dim, hidden_size)`; the learned signal lives entirely
+    // in the LoRA A/B factors, exactly as at train time.
+    let output_dim = lora_b
+        .dims2()
+        .map_err(|e| JammiError::Model {
+            model_id: model_id.to_string(),
+            message: format!("distribution.lora_b shape: {e}"),
+        })?
+        .0;
+    let hidden_size = dimensions.hidden_size;
+    let base = Tensor::zeros((output_dim, hidden_size), DType::F32, device).map_err(|e| {
+        JammiError::Model {
+            model_id: model_id.to_string(),
+            message: format!("distribution head base: {e}"),
+        }
+    })?;
+    let base_linear = candle_nn::Linear::new(base, None);
 
     Ok(Some(jammi_lora::LoraLinear::from_loaded(
         base_linear,

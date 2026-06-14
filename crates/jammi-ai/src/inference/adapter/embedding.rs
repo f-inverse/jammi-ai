@@ -53,4 +53,14 @@ impl OutputAdapter for EmbeddingAdapter {
         );
         Ok(vec![Arc::new(array)])
     }
+
+    fn error_output(&self, row_count: usize) -> BackendOutput {
+        BackendOutput {
+            float_outputs: vec![vec![0.0; row_count * self.dimensions]],
+            string_outputs: vec![],
+            row_status: vec![false; row_count],
+            row_errors: vec![String::new(); row_count],
+            shapes: vec![(row_count, self.dimensions)],
+        }
+    }
 }

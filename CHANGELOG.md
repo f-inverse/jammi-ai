@@ -7,10 +7,52 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+- **Public `db.fine_tune(task="regression")` on-ramp end to end (W5-PR4).** A
+  consumer can now fine-tune and serve a regression head through the public
+  surface. A `(text, target)` source with a numeric `target` column, fine-tuned
+  with `task=regression`, trains a distribution head and serves its
+  de-standardised prediction back through `Infer`. The worker's column→loader
+  detector gained a task-gated regression arm (built via
+  `TrainingDataLoader::from_regression`) and an `extract_numeric_column` helper
+  that reads `Int64`/`Int32`/`Float64`/`Float32` (and casts the remaining numeric
+  families) into `f32` targets — the int64 year path included — rejecting
+  null/NaN targets with a typed, row-citing error rather than coercing them to
+  `0.0` (which would corrupt the scaler's μ/σ). The Python `fine_tune` binding
+  now exposes `regression_loss` (`gaussian_nll` / `beta_nll` with `regression_beta`
+  / `crps` / `pinball`) and `quantile_levels`, so a Python consumer can reach the
+  Quantile head and every non-default Gaussian objective.
 
 ### Changed
+- The classification training branch is now gated on `task != Regression`: a
+  `(text, label)` source submitted with `task=regression` no longer falls into
+  the classification path (which gathered a numeric outcome as a class index and
+  triggered a CUDA device-side assert) — it now produces a typed
+  "regression needs a numeric `target` column" error.
 
 ### Fixed
+- **A quantile-trained regression head is no longer silently mis-served as
+  Gaussian on the `Infer` read path.** `create_adapter(Regression)` and the
+  schema-construction twin now select the output adapter from the served head's
+  persisted `DistributionForm` (threaded through `InferenceExec` /
+  `build_output_schema`), so a Pinball/Quantile head serves its `quantile_{level}`
+  columns (non-crossing) instead of being decoded as `(predicted_mean,
+  predicted_std)`. The all-error read path picks up the same form-aware width via
+  a new `OutputAdapter::error_output`.
+- **The regression `distribution` head layer is now reloaded and applied on
+  serve.** Previously only the `projection` layer was reconstructed, so a served
+  regression head emitted the pooled embedding (hidden-width) instead of its
+  distribution parameters; serving now applies the `distribution` layer the
+  trainer trains, reproducing the `(mean, raw_std)` / quantile output shape. The
+  end-to-end tests prove this by **group separation**: a fixture of two topically
+  distinct text groups mapped to well-separated year bands trains a head that, on
+  held-out items, serves group B above group A (Gaussian-form ≈ 6.9 yr,
+  quantile-form ≈ 12.9 yr), where an untrained μ-regurgitating head serves μ_y for
+  both (~0 separation). A permanent destructive guard zeroes the trained head and
+  asserts that collapse, locking the tests against a future head-serving
+  regression. On a realistic-variance target (σ_y ≈ 19.5) the Gaussian NLL
+  objectives diverge (the loss scores `(y-μ)²/σ²` in raw outcome units); the
+  Gaussian-form e2e path uses the robust `Crps` objective, which still serves
+  `predicted_mean`/`predicted_std`.
 
 ## [0.28.0] - 2026-06-14
 

@@ -131,6 +131,35 @@ impl ModelCache {
         }
     }
 
+    /// TEST-ONLY: resolve and load a fresh, UNSHARED [`LoadedModel`] off the
+    /// resolver + backend, bypassing the shared LRU cache entirely. The shared
+    /// cache hands out `Arc<LoadedModel>` (no `&mut`), so a test that needs to
+    /// mutate a model — e.g. the regression non-vacuity guard zeroing the trained
+    /// distribution head via
+    /// [`LoadedModel::zero_distribution_head_for_test`] — must own it. This goes
+    /// through the same resolve + `backend.load` path serving uses, so the owned
+    /// model is byte-identical to what `get_or_load` would cache. Not used by any
+    /// production path.
+    #[doc(hidden)]
+    pub async fn load_owned_for_test(
+        &self,
+        source: &ModelSource,
+        task: ModelTask,
+    ) -> Result<LoadedModel> {
+        let resolved = self.resolver.resolve(source, task, None).await?;
+        let backend: &dyn ModelBackend = match resolved.backend {
+            BackendType::Candle => &self.backends.candle,
+            BackendType::Ort => &self.backends.ort,
+            other => {
+                return Err(JammiError::Model {
+                    model_id: source.to_string(),
+                    message: format!("Backend {other:?} not available"),
+                })
+            }
+        };
+        backend.load(&resolved, &self.device_config)
+    }
+
     async fn do_load(
         &self,
         id: &ModelId,

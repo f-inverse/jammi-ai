@@ -23,4 +23,14 @@ impl OutputAdapter for NerAdapter {
             row_count,
         ))])
     }
+
+    fn error_output(&self, row_count: usize) -> BackendOutput {
+        BackendOutput {
+            float_outputs: vec![],
+            string_outputs: vec![vec![String::new(); row_count]],
+            row_status: vec![false; row_count],
+            row_errors: vec![String::new(); row_count],
+            shapes: vec![(row_count, 0)],
+        }
+    }
 }

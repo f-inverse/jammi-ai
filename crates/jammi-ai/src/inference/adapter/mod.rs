@@ -34,6 +34,13 @@ pub trait OutputAdapter: Send + Sync {
 
     /// Convert raw backend output into Arrow arrays for one batch.
     fn adapt(&self, output: &BackendOutput, row_count: usize) -> Result<Vec<ArrayRef>>;
+
+    /// A well-formed all-error [`BackendOutput`] for `row_count` rows, shaped so
+    /// `self.adapt(&output, row_count)` yields this adapter's exact columns (all
+    /// null). The error read path uses this so the failure batch matches the
+    /// served schema — critical for a quantile head, whose width is the level
+    /// count, not the Gaussian default of 2.
+    fn error_output(&self, row_count: usize) -> BackendOutput;
 }
 
 /// Create an adapter for a given task with model-derived dimensions.
@@ -48,19 +55,39 @@ pub fn create_adapter(task: ModelTask, model: &LoadedModel) -> Result<Box<dyn Ou
         }
         ModelTask::Classification => Ok(Box::new(ClassificationAdapter)),
         ModelTask::Ner => Ok(Box::new(ner::NerAdapter)),
-        // A regression model serves the parametric Gaussian head by default —
-        // the smooth, density-bearing core form. A quantile head is constructed
-        // explicitly (`DistributionAdapter::quantile`) by a caller that trained
-        // one, since its levels are model-specific.
-        ModelTask::Regression => Ok(Box::new(DistributionAdapter::gaussian())),
+        // A regression model serves the form its head was trained for, read
+        // from the head's persisted `DistributionForm`: `Gaussian` →
+        // `(predicted_mean, predicted_std)`, `Quantile { levels }` → one
+        // `quantile_{level}` column per level. Selecting on the persisted form
+        // (never on head width — a 2-level quantile head is also width 2) is
+        // what stops a quantile-trained head being silently mis-decoded as a
+        // Gaussian `(mean, std)` on the public `Infer` read path. A regression
+        // head saved without a form (none today) falls back to Gaussian, the
+        // density-bearing core form.
+        ModelTask::Regression => match model.regression_form() {
+            Some(DistributionForm::Quantile { levels }) => {
+                Ok(Box::new(DistributionAdapter::quantile(levels.clone())?))
+            }
+            Some(DistributionForm::Gaussian) | None => {
+                Ok(Box::new(DistributionAdapter::gaussian()))
+            }
+        },
     }
 }
 
-/// Create an adapter for schema construction only (no model needed).
-/// For embedding, pass the model's hidden_size as `embedding_dim`.
+/// Create an adapter for schema construction only (no model handle needed).
+///
+/// For embedding, pass the model's hidden_size as `embedding_dim`. For
+/// regression, pass the head's persisted `regression_form` so the planned
+/// output schema matches what the runtime adapter (built from the loaded model
+/// via [`create_adapter`]) emits — a quantile head's schema is its level
+/// columns, not the Gaussian default. `None` form falls back to Gaussian, and
+/// a malformed persisted quantile form (it was validated at fine-tune time)
+/// likewise falls back rather than failing schema planning.
 pub(crate) fn create_adapter_for_schema(
     task: ModelTask,
     embedding_dim: Option<usize>,
+    regression_form: Option<&DistributionForm>,
 ) -> Box<dyn OutputAdapter> {
     match task {
         ModelTask::TextEmbedding | ModelTask::ImageEmbedding | ModelTask::AudioEmbedding => {
@@ -68,7 +95,15 @@ pub(crate) fn create_adapter_for_schema(
         }
         ModelTask::Classification => Box::new(ClassificationAdapter),
         ModelTask::Ner => Box::new(ner::NerAdapter),
-        ModelTask::Regression => Box::new(DistributionAdapter::gaussian()),
+        ModelTask::Regression => match regression_form {
+            Some(DistributionForm::Quantile { levels }) => {
+                DistributionAdapter::quantile(levels.clone()).map_or_else(
+                    |_| Box::new(DistributionAdapter::gaussian()) as Box<dyn OutputAdapter>,
+                    |a| Box::new(a) as Box<dyn OutputAdapter>,
+                )
+            }
+            Some(DistributionForm::Gaussian) | None => Box::new(DistributionAdapter::gaussian()),
+        },
     }
 }
 
@@ -115,36 +150,5 @@ pub(crate) fn nullify_floats(
             })
             .collect(),
         None => vec![None::<f32>; row_count].into_iter().collect(),
-    }
-}
-
-/// Create dummy BackendOutput for an all-error batch of a given task.
-pub(crate) fn create_error_output(
-    task: ModelTask,
-    row_count: usize,
-    embedding_dim: usize,
-) -> BackendOutput {
-    let (float_outputs, string_outputs) = match task {
-        ModelTask::TextEmbedding | ModelTask::ImageEmbedding | ModelTask::AudioEmbedding => {
-            (vec![vec![0.0; row_count * embedding_dim]], vec![])
-        }
-        ModelTask::Classification => (
-            vec![vec![0.0; row_count]],
-            vec![
-                vec![String::new(); row_count],
-                vec![String::new(); row_count],
-            ],
-        ),
-        ModelTask::Ner => (vec![], vec![vec![String::new(); row_count]]),
-        // Gaussian head: two floats per row (mean, raw_std); every row is an
-        // error here, so the adapter nulls them out.
-        ModelTask::Regression => (vec![vec![0.0; row_count * 2]], vec![]),
-    };
-    BackendOutput {
-        float_outputs,
-        string_outputs,
-        row_status: vec![false; row_count],
-        row_errors: vec![String::new(); row_count],
-        shapes: vec![(row_count, 0)],
     }
 }

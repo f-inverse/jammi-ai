@@ -10,6 +10,7 @@ use datafusion::physical_plan::{
     Partitioning, PlanProperties,
 };
 
+use crate::inference::adapter::DistributionForm;
 use crate::inference::observer::InferenceObserver;
 use crate::inference::runner::InferenceRunner;
 use crate::inference::schema::build_output_schema;
@@ -31,6 +32,9 @@ pub struct InferenceExec {
     model_cache: Arc<ModelCache>,
     observer: Option<Arc<dyn InferenceObserver>>,
     embedding_dim: Option<usize>,
+    /// Served regression head's persisted distribution form, for schema
+    /// construction. `None` for non-regression tasks.
+    regression_form: Option<DistributionForm>,
     properties: PlanProperties,
 }
 
@@ -57,6 +61,7 @@ pub struct InferenceExecBuilder {
     batch_size: usize,
     observer: Option<Arc<dyn InferenceObserver>>,
     embedding_dim: Option<usize>,
+    regression_form: Option<DistributionForm>,
 }
 
 impl InferenceExecBuilder {
@@ -81,6 +86,7 @@ impl InferenceExecBuilder {
             batch_size: 32,
             observer: None,
             embedding_dim: None,
+            regression_form: None,
         }
     }
 
@@ -99,12 +105,18 @@ impl InferenceExecBuilder {
         self
     }
 
+    pub fn regression_form(mut self, form: Option<DistributionForm>) -> Self {
+        self.regression_form = form;
+        self
+    }
+
     pub fn build(self) -> jammi_db::error::Result<InferenceExec> {
         let output_schema = build_output_schema(
             &self.task,
             &self.input.schema(),
             &self.key_column,
             self.embedding_dim,
+            self.regression_form.as_ref(),
         )?;
         let properties = InferenceExec::compute_properties(output_schema);
         Ok(InferenceExec {
@@ -119,6 +131,7 @@ impl InferenceExecBuilder {
             model_cache: self.model_cache,
             observer: self.observer,
             embedding_dim: self.embedding_dim,
+            regression_form: self.regression_form,
             properties,
         })
     }
@@ -179,6 +192,7 @@ impl ExecutionPlan for InferenceExec {
             .batch_size(self.batch_size)
             .observer(self.observer.clone())
             .embedding_dim(self.embedding_dim)
+            .regression_form(self.regression_form.clone())
             .build()
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
         ))

@@ -496,6 +496,7 @@ impl InferenceSession {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let guard = self.model_cache.get_or_load(model, task, None).await?;
         let embedding_dim = guard.model.embedding_dim();
+        let regression_form = guard.model.regression_form().cloned();
         drop(guard);
 
         let inference = InferenceExecBuilder::new(
@@ -510,6 +511,7 @@ impl InferenceSession {
         .batch_size(self.inner.config().inference.batch_size)
         .observer(self.observer.clone())
         .embedding_dim(embedding_dim)
+        .regression_form(regression_form)
         .build()?;
 
         Ok(Arc::new(inference))
@@ -653,6 +655,48 @@ impl InferenceSession {
         Ok(output.float_outputs[0][..dim].to_vec())
     }
 
+    /// TEST-ONLY non-vacuity seam for the regression surface. Loads a fresh,
+    /// unshared copy of `model` (off the same resolve + backend load path serving
+    /// uses), optionally zeroes its trained distribution head, runs a regression
+    /// forward pass over `texts`, and returns the de-standardised served value of
+    /// distribution column 0 (the Gaussian mean / the lowest quantile) per row.
+    ///
+    /// With `zero_head = false` this returns exactly what the head learned, so a
+    /// test can confirm two text groups separate. With `zero_head = true` the head
+    /// is collapsed to its zero-initialised base, which emits the scaler offset
+    /// `μ_y` for every input — so the SAME separation assertion must FAIL,
+    /// proving the trained test is non-vacuous (it measures learning, not the
+    /// scaler centring at μ). Production never calls this; it mutates only the
+    /// per-call owned model.
+    #[doc(hidden)]
+    pub async fn served_regression_col0_for_test(
+        &self,
+        model: &ModelSource,
+        texts: &[String],
+        zero_head: bool,
+    ) -> Result<Vec<f32>> {
+        use arrow::array::StringArray;
+
+        let mut loaded = self
+            .model_cache
+            .load_owned_for_test(model, ModelTask::Regression)
+            .await?;
+        if zero_head {
+            loaded.zero_distribution_head_for_test();
+        }
+        let col: arrow::array::ArrayRef = Arc::new(StringArray::from(texts.to_vec()));
+        let output = loaded.forward(&[col], ModelTask::Regression)?;
+        let (num_rows, head_width) = output.shapes[0];
+        let flat = &output.float_outputs[0];
+        let mut col0 = Vec::with_capacity(num_rows);
+        for row in 0..num_rows {
+            if output.row_status[row] {
+                col0.push(flat[row * head_width]);
+            }
+        }
+        Ok(col0)
+    }
+
     /// Run inference on a registered source using a model.
     ///
     /// Scans the source, feeds `content_columns` through the model,
@@ -688,6 +732,7 @@ impl InferenceSession {
         // This also warms the cache so execute() hits a cache hit.
         let guard = self.model_cache.get_or_load(source, task, None).await?;
         let embedding_dim = guard.model.embedding_dim();
+        let regression_form = guard.model.regression_form().cloned();
         drop(guard);
 
         // Wrap with InferenceExec
@@ -703,6 +748,7 @@ impl InferenceSession {
         .batch_size(self.inner.config().inference.batch_size)
         .observer(self.observer.clone())
         .embedding_dim(embedding_dim)
+        .regression_form(regression_form)
         .build()?;
 
         // Execute and collect results

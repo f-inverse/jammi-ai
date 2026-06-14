@@ -318,6 +318,34 @@ impl LoadedModel {
         }
     }
 
+    /// The persisted predictive-distribution form of a reloaded regression head
+    /// (`Gaussian` or `Quantile { levels }`), or `None` for a non-regression
+    /// model. Serving reads this to select the `Infer` output adapter so a
+    /// quantile-trained head is served as quantile points, never silently
+    /// mis-decoded as a Gaussian `(mean, std)`. The ORT backend has no
+    /// regression head, so it always reports `None`.
+    pub fn regression_form(&self) -> Option<&crate::inference::adapter::DistributionForm> {
+        match self {
+            LoadedModel::Candle(m) => m.regression_form(),
+            LoadedModel::Ort(_) => None,
+        }
+    }
+
+    /// TEST-ONLY non-vacuity seam: zero a loaded regression head's trained LoRA
+    /// `B` factor so it regresses to its zero-initialised base and emits the
+    /// scaler offset `μ_y` for every input (the untrained-head behaviour). No-op
+    /// for a non-regression / ORT model. Used by the regression-surface tests to
+    /// prove their group-separation assertion collapses to ≈0 when the head
+    /// carries no learned signal. See
+    /// [`super::backend::candle::CandleModel::zero_distribution_head_for_test`].
+    #[doc(hidden)]
+    pub fn zero_distribution_head_for_test(&mut self) {
+        match self {
+            LoadedModel::Candle(m) => m.zero_distribution_head_for_test(),
+            LoadedModel::Ort(_) => {}
+        }
+    }
+
     /// Run forward pass on Arrow content columns. Returns raw output.
     pub fn forward(&self, content: &[ArrayRef], task: ModelTask) -> Result<BackendOutput> {
         match self {

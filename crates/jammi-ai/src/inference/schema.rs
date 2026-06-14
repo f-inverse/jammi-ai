@@ -21,15 +21,21 @@ pub fn common_prefix_fields() -> Vec<Field> {
 }
 
 /// Build the full output schema: prefix + task-specific.
+///
 /// For embedding tasks, `embedding_dim` must be the model's actual hidden size.
+/// For regression tasks, `regression_form` must be the served head's persisted
+/// [`DistributionForm`](adapter::DistributionForm) so the planned schema matches
+/// the runtime adapter's columns (a quantile head's schema is its level
+/// columns, not the Gaussian default of `mean`/`std`). `None` form ⇒ Gaussian.
 pub fn build_output_schema(
     task: &ModelTask,
     _input_schema: &SchemaRef,
     _key_column: &str,
     embedding_dim: Option<usize>,
+    regression_form: Option<&adapter::DistributionForm>,
 ) -> Result<SchemaRef> {
     let mut fields = common_prefix_fields();
-    let task_adapter = adapter::create_adapter_for_schema(*task, embedding_dim);
+    let task_adapter = adapter::create_adapter_for_schema(*task, embedding_dim, regression_form);
     fields.extend(task_adapter.output_schema());
     Ok(Arc::new(Schema::new(fields)))
 }

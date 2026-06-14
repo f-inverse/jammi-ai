@@ -747,6 +747,9 @@ impl PyDatabase {
         hard_negative_refresh_every = None,
         matryoshka_dims = None,
         seed = None,
+        regression_loss = None,
+        regression_beta = None,
+        quantile_levels = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn fine_tune(
@@ -782,6 +785,9 @@ impl PyDatabase {
         hard_negative_refresh_every: Option<usize>,
         matryoshka_dims: Option<Vec<usize>>,
         seed: Option<u64>,
+        regression_loss: Option<&str>,
+        regression_beta: Option<f64>,
+        quantile_levels: Option<Vec<f64>>,
     ) -> PyResult<PyTrainingJob> {
         let mut cfg = FineTuneConfig::default();
         if let Some(v) = lora_rank {
@@ -872,6 +878,41 @@ impl PyDatabase {
         }
         if let Some(v) = target_modules {
             cfg.target_modules = v;
+        }
+        // Regression objective (task="regression" only). `gaussian_nll`,
+        // `beta_nll` (β via `regression_beta`, default 0.5), and `crps` train the
+        // parametric Gaussian head; `pinball` trains the quantile head and
+        // requires `quantile_levels`. `quantile_levels` is wired regardless so a
+        // Pinball request is reachable; the wire validator enforces the
+        // beta-range and level constraints before training. Leaving
+        // `regression_loss` unset selects the collapse-resistant β-NLL default.
+        use jammi_ai::fine_tune::RegressionLoss;
+        match regression_loss {
+            Some("gaussian_nll") => cfg.regression_loss = Some(RegressionLoss::GaussianNll),
+            Some("beta_nll") => {
+                cfg.regression_loss = Some(RegressionLoss::BetaNll {
+                    beta: regression_beta.unwrap_or(0.5),
+                });
+            }
+            Some("crps") => cfg.regression_loss = Some(RegressionLoss::Crps),
+            Some("pinball") => cfg.regression_loss = Some(RegressionLoss::Pinball),
+            Some(other) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown regression_loss '{other}'. Use 'gaussian_nll', 'beta_nll', \
+                     'crps', or 'pinball'."
+                )))
+            }
+            None => {
+                // No named loss but a bare `regression_beta` keeps the β-NLL
+                // shorthand (beta implies β-NLL), mirroring how `triplet_margin`
+                // implies the triplet embedding loss above.
+                if let Some(beta) = regression_beta {
+                    cfg.regression_loss = Some(RegressionLoss::BetaNll { beta });
+                }
+            }
+        }
+        if let Some(levels) = quantile_levels {
+            cfg.quantile_levels = levels;
         }
         if let Some(metric) = early_stopping_metric {
             cfg.early_stopping_metric = match metric {

@@ -973,6 +973,91 @@ fn extract_binary_column(col: &dyn arrow::array::Array) -> Option<Vec<Vec<u8>>> 
     None
 }
 
+/// Why a numeric column could not be read into clean `f32` targets.
+enum NumericColumnError {
+    /// The column's Arrow type is not numeric (and the cast fallback failed).
+    NotNumeric,
+    /// A null target at the cited row index. Rejected rather than coerced to
+    /// `0.0`, which would silently corrupt the scaler's μ/σ.
+    Null(usize),
+    /// A `NaN` target at the cited row index (float columns only). Rejected for
+    /// the same reason as a null.
+    Nan(usize),
+}
+
+/// Extract a numeric column into `Vec<f32>`, accepting the Arrow numeric
+/// families DataFusion emits for a regression `target` column. Integer targets
+/// (e.g. an `int64` year) are common, so the fast paths cover
+/// `Int64`/`Int32`/`Float64`/`Float32`; the final `cast` fallback handles the
+/// remaining numeric types (`UInt*`, `Int16`, `Decimal`, …) so a target's exact
+/// Arrow width never decides whether the fine-tune is reachable.
+///
+/// **Null/NaN rejection is load-bearing.** `Array::value(i)` on a null slot
+/// returns a zero default rather than erroring, which would silently corrupt
+/// the scaler's μ/σ. A null or `NaN` target therefore returns a typed error
+/// citing the row, never a coerced `0.0`.
+fn extract_numeric_column(
+    col: &dyn arrow::array::Array,
+) -> std::result::Result<Vec<f32>, NumericColumnError> {
+    use arrow::array::{Array, Float32Array, Float64Array, Int32Array, Int64Array};
+    use arrow::datatypes::DataType;
+
+    // A string/binary `target` is a schema mistake, not numeric data — reject it
+    // as "not numeric" rather than letting the Float64 cast turn unparseable
+    // strings into nulls (which would surface a misleading per-row null error).
+    if matches!(
+        col.data_type(),
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::Boolean
+            | DataType::Null
+    ) {
+        return Err(NumericColumnError::NotNumeric);
+    }
+
+    // Reject a null in any slot up front; `value(i)` would otherwise return a
+    // garbage default for it.
+    if let Some(i) = (0..col.len()).find(|&i| col.is_null(i)) {
+        return Err(NumericColumnError::Null(i));
+    }
+
+    let floats: Vec<f32> = if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        (0..a.len()).map(|i| a.value(i) as f32).collect()
+    } else if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
+        (0..a.len()).map(|i| a.value(i) as f32).collect()
+    } else if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+        (0..a.len()).map(|i| a.value(i) as f32).collect()
+    } else if let Some(a) = col.as_any().downcast_ref::<Float32Array>() {
+        (0..a.len()).map(|i| a.value(i)).collect()
+    } else {
+        // Fallback: cast through Float64 for the remaining numeric families. A
+        // cast failure means the column is not numeric.
+        let casted = arrow::compute::cast(col, &DataType::Float64)
+            .map_err(|_| NumericColumnError::NotNumeric)?;
+        let a = casted
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or(NumericColumnError::NotNumeric)?;
+        // The cast can introduce nulls (e.g. an unrepresentable value); reject
+        // them with the same per-row contract.
+        if let Some(i) = (0..a.len()).find(|&i| a.is_null(i)) {
+            return Err(NumericColumnError::Null(i));
+        }
+        (0..a.len()).map(|i| a.value(i) as f32).collect()
+    };
+
+    // A NaN target (float columns only) would corrupt the scaler; reject it
+    // citing the row, mirroring the null contract.
+    if let Some(i) = floats.iter().position(|v| v.is_nan()) {
+        return Err(NumericColumnError::Nan(i));
+    }
+    Ok(floats)
+}
+
 /// Build a [`TrainingDataLoader`] from query result batches.
 ///
 /// `task` selects how `anchor`/`positive`/`negative` triplet columns are read:
@@ -999,6 +1084,17 @@ fn build_training_data_loader(
         && col_names.contains(&"positive")
         && !col_names.contains(&"negative");
     let has_classification = col_names.contains(&"text") && col_names.contains(&"label");
+    // Regression shares the `text` anchor with classification but reads a
+    // numeric `target` column instead of a string `label`. The two text-outcome
+    // formats are disambiguated by `task`, not by column names, exactly as the
+    // audio-triplet path is task-gated below: the regression arm is gated on
+    // `task == Regression` and ordered before classification, and classification
+    // is gated on `task != Regression`. So `task=regression` is authoritative —
+    // it can never fall into the classification path (which would gather a
+    // numeric outcome as a class index and CUDA-assert), and a `label`-only
+    // source under `task=regression` produces a typed "needs a numeric target"
+    // error rather than a device-side assert.
+    let has_regression = col_names.contains(&"text") && col_names.contains(&"target");
 
     if has_triplet && task == ModelTask::AudioEmbedding {
         return build_audio_triplet_loader(batches);
@@ -1126,6 +1222,50 @@ fn build_training_data_loader(
             }
         }
         Ok(TrainingDataLoader::from_pairs(rows))
+    } else if task == ModelTask::Regression {
+        // Regression: a string `text` column and a numeric `target` column. The
+        // target is read into `f32` (handling int64/float64/float32/… via
+        // `extract_numeric_column`); nulls and NaNs are rejected citing the row
+        // rather than coerced, since a coerced `0.0` would silently corrupt the
+        // scaler's μ/σ. A `task=regression` request with no usable `target`
+        // column is a typed error here, never a fall-through to classification.
+        if !has_regression {
+            return Err(JammiError::FineTune(format!(
+                "task=regression needs a string 'text' column and a numeric 'target' column, \
+                 but the projected columns are {col_names:?}. (Classification's string 'label' \
+                 is distinct: name the numeric outcome column 'target'.)"
+            )));
+        }
+        let mut rows = Vec::new();
+        for batch in batches {
+            let text_vals = batch
+                .column_by_name("text")
+                .and_then(|c| extract_string_column(c.as_ref()))
+                .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
+            let target_col = batch
+                .column_by_name("target")
+                .ok_or_else(|| JammiError::FineTune("Missing 'target' column".into()))?;
+            let target_vals = extract_numeric_column(target_col.as_ref()).map_err(|e| {
+                JammiError::FineTune(match e {
+                    NumericColumnError::NotNumeric => format!(
+                        "regression 'target' is not a numeric column (its Arrow type is {})",
+                        target_col.data_type()
+                    ),
+                    NumericColumnError::Null(i) => format!(
+                        "regression 'target' has a null at row {i}; a null target cannot be \
+                         coerced (it would corrupt the scaler) — remove or fill the row"
+                    ),
+                    NumericColumnError::Nan(i) => format!(
+                        "regression 'target' has a NaN at row {i}; a NaN target cannot be used \
+                         (it would corrupt the scaler) — remove or fix the row"
+                    ),
+                })
+            })?;
+            for i in 0..batch.num_rows() {
+                rows.push((text_vals[i].clone(), target_vals[i]));
+            }
+        }
+        Ok(TrainingDataLoader::from_regression(rows))
     } else if has_classification {
         let mut label_set = std::collections::BTreeSet::new();
         let mut rows = Vec::new();
@@ -1164,8 +1304,9 @@ fn build_training_data_loader(
         Err(JammiError::FineTune(format!(
             "Cannot detect training format from columns: {col_names:?}. \
              Expected contrastive (text_a, text_b, score), triplet (anchor, positive, negative), \
-             pairs (anchor, positive), or classification (text, label). For audio triplets, use \
-             the same (anchor, positive, negative) columns with task=audio_embedding."
+             pairs (anchor, positive), classification (text, label), or regression \
+             (text, target) with task=regression. For audio triplets, use the same \
+             (anchor, positive, negative) columns with task=audio_embedding."
         )))
     }
 }
@@ -1725,5 +1866,195 @@ mod tests {
         let b = resolve_worker_id();
         assert!(a.starts_with("worker-"), "default id is worker-prefixed");
         assert_ne!(a, b, "the random default mints a distinct id per call");
+    }
+
+    // ─── Regression detector (W5-PR4 public on-ramp) ─────────────────────────
+    //
+    // These pin the worker's column→loader detector for the regression
+    // `(text, target)` format and the `extract_numeric_column` helper that feeds
+    // it. They are the worker-side proof of the public on-ramp: a real
+    // `db.fine_tune(task=regression)` reaches the regression loader through
+    // exactly this `build_training_data_loader` dispatch. The end-to-end served
+    // read (train → Infer) is pinned by the integration suite
+    // (`tests/it/regression_surface.rs`).
+
+    use arrow::array::{
+        ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch as ArrowBatch,
+        StringArray,
+    };
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use crate::fine_tune::data::TrainingFormat;
+
+    fn text_target_batch(texts: &[&str], target: ArrayRef) -> ArrowBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("text", DataType::Utf8, true),
+            Field::new("target", target.data_type().clone(), true),
+        ]));
+        let text_arr = Arc::new(StringArray::from(texts.to_vec())) as ArrayRef;
+        ArrowBatch::try_new(schema, vec![text_arr, target]).unwrap()
+    }
+
+    fn regression_cols() -> Vec<String> {
+        vec!["text".into(), "target".into()]
+    }
+
+    /// `task=Regression` over a `(text, int64-target)` source builds a
+    /// `Regression`-format loader whose targets are the years read as `f32` —
+    /// the int64 arxiv-year path, the most common real target type.
+    #[test]
+    fn detector_builds_regression_loader_from_int64_target() {
+        let target = Arc::new(Int64Array::from(vec![2017i64, 2018, 2016])) as ArrayRef;
+        let batch = text_target_batch(&["a", "b", "c"], target);
+        let loader =
+            build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
+                .unwrap();
+        assert!(matches!(loader.format(), TrainingFormat::Regression));
+        assert_eq!(loader.len(), 3);
+        assert_eq!(
+            loader.regression_targets().unwrap(),
+            vec![2017.0, 2018.0, 2016.0]
+        );
+    }
+
+    /// Float64 and Float32 target columns both reduce to the same `f32` targets —
+    /// the extractor's downcast arms are width-agnostic.
+    #[test]
+    fn detector_reads_float64_and_float32_targets() {
+        let f64_batch = text_target_batch(
+            &["a", "b"],
+            Arc::new(Float64Array::from(vec![1.5f64, 2.5])) as ArrayRef,
+        );
+        let f32_batch = text_target_batch(
+            &["a", "b"],
+            Arc::new(Float32Array::from(vec![1.5f32, 2.5])) as ArrayRef,
+        );
+        for batch in [f64_batch, f32_batch] {
+            let loader =
+                build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
+                    .unwrap();
+            assert_eq!(loader.regression_targets().unwrap(), vec![1.5, 2.5]);
+        }
+    }
+
+    /// Int32 targets are also accepted (a narrower integer column).
+    #[test]
+    fn detector_reads_int32_target() {
+        let target = Arc::new(Int32Array::from(vec![10i32, 20])) as ArrayRef;
+        let batch = text_target_batch(&["a", "b"], target);
+        let loader =
+            build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
+                .unwrap();
+        assert_eq!(loader.regression_targets().unwrap(), vec![10.0, 20.0]);
+    }
+
+    /// THE headline guard: a `(text, label)` source under `task=regression` no
+    /// longer falls into the classification path (which would gather a string
+    /// outcome as a class index — the confirmed CUDA device-side assert). With
+    /// only a `label` column and no `target`, it surfaces a typed regression
+    /// error citing the missing numeric `target` column.
+    #[test]
+    fn task_regression_with_label_column_does_not_route_to_classification() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("text", DataType::Utf8, true),
+            Field::new("label", DataType::Utf8, true),
+        ]));
+        let text = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
+        let label = Arc::new(StringArray::from(vec!["2017", "2018"])) as ArrayRef;
+        let batch = ArrowBatch::try_new(schema, vec![text, label]).unwrap();
+        let cols = vec!["text".to_string(), "label".to_string()];
+        let err = build_training_data_loader(&[batch], &cols, ModelTask::Regression)
+            .err()
+            .unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("target"),
+            "regression routing error must name the missing numeric 'target' column, got: {msg}"
+        );
+        // And it must NOT have silently produced a classification loader.
+        assert!(
+            !msg.contains("class"),
+            "must not fall through to classification, got: {msg}"
+        );
+    }
+
+    /// `(text, label)` with `task != Regression` still routes to classification,
+    /// unchanged — the regression gate does not regress the existing path.
+    #[test]
+    fn classification_still_routes_when_task_not_regression() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("text", DataType::Utf8, true),
+            Field::new("label", DataType::Utf8, true),
+        ]));
+        let text = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
+        let label = Arc::new(StringArray::from(vec!["x", "y"])) as ArrayRef;
+        let batch = ArrowBatch::try_new(schema, vec![text, label]).unwrap();
+        let cols = vec!["text".to_string(), "label".to_string()];
+        let loader = build_training_data_loader(&[batch], &cols, ModelTask::TextEmbedding).unwrap();
+        assert!(matches!(
+            loader.format(),
+            TrainingFormat::Classification { num_classes: 2 }
+        ));
+    }
+
+    /// A null target is rejected with a typed error citing the row — never
+    /// coerced to `0.0`, which would silently corrupt the scaler's μ/σ.
+    #[test]
+    fn null_target_is_rejected_with_typed_error() {
+        let target = Arc::new(Int64Array::from(vec![Some(2017i64), None, Some(2018)])) as ArrayRef;
+        let batch = text_target_batch(&["a", "b", "c"], target);
+        let err = build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
+            .err()
+            .unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("null") && msg.contains("row 1"),
+            "null target must be rejected citing the row, got: {msg}"
+        );
+    }
+
+    /// A NaN target (float column) is likewise rejected citing the row.
+    #[test]
+    fn nan_target_is_rejected_with_typed_error() {
+        let target = Arc::new(Float64Array::from(vec![1.0f64, f64::NAN, 3.0])) as ArrayRef;
+        let batch = text_target_batch(&["a", "b", "c"], target);
+        let err = build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
+            .err()
+            .unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("NaN") && msg.contains("row 1"),
+            "NaN target must be rejected citing the row, got: {msg}"
+        );
+    }
+
+    /// A non-numeric `target` column (strings that don't parse) is a typed
+    /// "not a numeric column" error, not a panic.
+    #[test]
+    fn non_numeric_target_is_typed_error() {
+        let target = Arc::new(StringArray::from(vec!["alpha", "beta"])) as ArrayRef;
+        let batch = text_target_batch(&["a", "b"], target);
+        let err = build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("not a numeric"),
+            "non-numeric target must be a typed error, got: {err}"
+        );
+    }
+
+    /// A constant / single-value target builds a valid loader (σ=0 is floored
+    /// downstream by `STD_FLOOR`); the detector itself must not choke on it.
+    #[test]
+    fn constant_target_builds_loader() {
+        let target = Arc::new(Int64Array::from(vec![2017i64, 2017, 2017])) as ArrayRef;
+        let batch = text_target_batch(&["a", "b", "c"], target);
+        let loader =
+            build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
+                .unwrap();
+        assert_eq!(
+            loader.regression_targets().unwrap(),
+            vec![2017.0, 2017.0, 2017.0]
+        );
     }
 }

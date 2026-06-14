@@ -37,4 +37,17 @@ impl OutputAdapter for ClassificationAdapter {
             )),
         ])
     }
+
+    fn error_output(&self, row_count: usize) -> BackendOutput {
+        BackendOutput {
+            float_outputs: vec![vec![0.0; row_count]],
+            string_outputs: vec![
+                vec![String::new(); row_count],
+                vec![String::new(); row_count],
+            ],
+            row_status: vec![false; row_count],
+            row_errors: vec![String::new(); row_count],
+            shapes: vec![(row_count, 0)],
+        }
+    }
 }

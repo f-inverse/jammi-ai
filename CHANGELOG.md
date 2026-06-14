@@ -7,6 +7,24 @@ workspace ships every publishable crate at the same
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Fixed
+
+## [0.28.0] - 2026-06-14
+
+M1 — the "mainstream-ready" milestone. This release lands the H2
+scale-and-search tier alongside the training-robustness work: a team can now
+build a graph-conditioned retrieval + uncertainty workload at real scale on a
+trusted network and trust the results, the failure modes, and the operational
+story. Vector search is bounded-memory and tunable through typed HNSW knobs,
+recall-vs-cost is measurable against an exact oracle with a held-out gate, and
+fine-tuning is deterministic, durably resumable, and standardisation-correct
+across every offset-bearing head. The wire/proto/Python/TS surfaces move in
+lockstep, pinned by conformance signatures.
+
+### Added
 - **Seeded determinism for CPU fine-tuning (W5-PR0b) — adapters are now
   bit-reproducible.** A LoRA fine-tune on `Device::Cpu` is a pure function of
   `(seed, source rows, config)`: two runs with the same seed produce
@@ -173,6 +191,58 @@ workspace ships every publishable crate at the same
   embedding_table = 7`) and its handler, the data-plane client, and both Python
   bindings (embedded `Database.search` and remote `RemoteDatabase.search`) —
   pinned identical across wheels by a conformance signature test.
+- **Typed `AnnIndexConfig` exposes the HNSW graph knobs.** The ANN sidecar index
+  previously hard-coded USearch's built-in HNSW defaults, so a deployment could
+  not trade recall against build/query cost. The three universal HNSW dials —
+  `connectivity` (M), `build_expansion` (ef_construction), and `search_expansion`
+  (ef_search) — are now a typed `AnnIndexConfig` on `EmbeddingConfig`, named for
+  the HNSW primitive rather than the backing library. The mapping onto
+  `usearch::IndexOptions` lives in exactly one function (`sidecar::index_options`),
+  the sole place USearch field names appear. A `0` knob is the documented no-op
+  (USearch substitutes its built-in default), so an unset config reproduces
+  today's indexes byte-for-byte. `connectivity`/`build_expansion` are fixed at
+  construction; `search_expansion` is a query-time dial USearch does not persist,
+  so `SidecarIndex::load` re-applies it via `change_expansion_search`. The config
+  threads from `EmbeddingConfig` through `ResultStore` to every build site (embed
+  pipeline, recovery rebuild, derived-table materialization) and the query-time
+  load path — one deployment knob with zero wire/proto/Python surface. A
+  round-trip test proves non-default knobs reach the backing graph and that a
+  default resolves to USearch's documented 16/128/64; a load-path test proves
+  `search_expansion` is re-applied on load while the build knobs are inert on a
+  frozen graph; pinned default constants trip a backend bump that would silently
+  shift recall/cost.
+- **`jammi-bench recall-sweep` — recall-vs-cost sweep over the HNSW knobs.** The
+  scale tier proves ANN recall clears a floor at one knob setting; `recall-sweep`
+  now measures how recall trades against cost as the knobs move, against the exact
+  oracle over a held-out query set, on two axes: a **build** axis sweeping the
+  construction knobs (`connectivity`, `build_expansion`) — each point a separately
+  built graph, costed by build time and on-disk size, an on-box reference too
+  large to commit — and a **search** axis sweeping `search_expansion` over one
+  frozen, re-dialed graph, the re-derivable portable recall-floor curve the
+  cookbook re-runs against its own oracle. The exact ground truth is independent
+  of the ANN knobs, so the top-k is computed once per query and reused across
+  every swept point; QPS is measured on the very searches the recall curve runs,
+  at k=10. A smoke test runs the whole sweep over the committed 2000-row fixture
+  and asserts the output is schema-valid (every grid point present, every recall a
+  fraction in [0,1], every build point carrying a positive build time and a
+  non-empty index), making no monotonicity claim at that sub-millisecond corpus
+  scale. The linked USearch version (`jammi_db::index::backend_version()`) is now
+  recorded in the sweep tier and in every sidecar manifest `save` writes — recall
+  and the serialized graph format are backend-version-dependent.
+- **jammi-owned AdamW with serializable optimizer state.** The trainer's optimizer
+  is now `fine_tune::adamw::AdamW`, a reimplementation with the *identical* update
+  (decoupled weight decay, bias-corrected moments — the same arithmetic candle
+  ran) that adds `state()` / `load_state()` / `step_t()`: the per-parameter
+  moments and step counter a checkpoint must carry. `candle_nn::AdamW` keeps those
+  buffers private with no accessor, so a mid-flight resume through it would restart
+  the moments at zero and diverge — this jammi-owned optimizer is the substrate
+  that makes the byte-exact checkpoint/resume below possible. It is a drop-in for
+  both construction sites (text trainer, parallel context-predictor loop) and the
+  shared clip→step seam. `state()` deep-copies the moment tensors (a shallow
+  snapshot would be overwritten in place by the next step); `load_state` rejects a
+  parameter-count mismatch. Numerically faithful: the step-accounting oracle, all
+  16 trainer convergence tests, the in-context high-offset oracle, and the
+  distributional integration suite pass unchanged.
 
 ### Changed
 - **`exact_vector_search` is now bounded-memory.** The no-sidecar brute-force
@@ -185,6 +255,19 @@ workspace ships every publishable crate at the same
   bounded top-`k` return exactly the same prefix as the prior
   sort-then-truncate, and the per-row distance fold is untouched. One
   `candidate_order` comparator drives both the heap and the final sort.
+
+### Fixed
+- **`RemoteDatabase.fine_tune_graph` now attaches its `FineTuneConfig` to the
+  request (#167).** The remote graph fine-tune assembled a `FineTuneConfig` from
+  the caller's hyperparameters (loss, epochs, batch_size, learning_rate,
+  lora_rank, matryoshka_dims) but never attached it to the `StartTrainingRequest`,
+  so the server read `config = None`, fell back to its built-in defaults, and
+  silently dropped every hyperparameter the caller set. The embed fine-tune path
+  already attached `config=config`; the graph path was missing the same line. Two
+  regression tests capture the assembled request (stubbing `_start_training`, no
+  channel dialed) and assert the config rides it — one with explicit
+  hyperparameters, one confirming even the default-MNRL config attaches — both
+  failing without the fix.
 
 ## v0.26.5 — 2026-06-12
 

@@ -397,6 +397,48 @@ impl Bert {
         }
         Ok(())
     }
+
+    /// Per-site dropout-stream positions keyed `{site}.dropout`, over the same
+    /// site names [`Self::named_trainable_weights`] uses — the resume state for
+    /// the adapter's dropout so a resumed run replays each stream to its
+    /// epoch-boundary position.
+    pub fn dropout_positions(&self) -> Result<HashMap<String, u64>, EncoderError> {
+        let mut out = HashMap::new();
+        for (n, layer) in self.layers.iter().enumerate() {
+            for (site, lin) in lora_sites(layer) {
+                lin.collect_dropout_position(&format!("layer.{n}.{site}"), &mut out)?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Restore each LoRA site's dropout-stream position from a
+    /// [`Self::dropout_positions`]-shaped map. Missing keys are no-ops.
+    pub fn restore_dropout_positions(
+        &self,
+        positions: &HashMap<String, u64>,
+    ) -> Result<(), EncoderError> {
+        for (n, layer) in self.layers.iter().enumerate() {
+            for (site, lin) in lora_sites(layer) {
+                lin.restore_dropout_position(&format!("layer.{n}.{site}"), positions)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The six LoRA-wrappable linear sites of one encoder layer paired with their
+/// `named_trainable_weights` site names — the single source of the site→name
+/// mapping the weight, dropout-position, and restore traversals all share.
+fn lora_sites(layer: &BertLayer) -> [(&'static str, &MaybeLoraLinear); 6] {
+    [
+        ("query", &layer.attention.self_attention.query),
+        ("key", &layer.attention.self_attention.key),
+        ("value", &layer.attention.self_attention.value),
+        ("dense", &layer.attention.self_output.dense),
+        ("intermediate_dense", &layer.intermediate.dense),
+        ("output_dense", &layer.output.dense),
+    ]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

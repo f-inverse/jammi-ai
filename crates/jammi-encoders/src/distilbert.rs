@@ -322,6 +322,46 @@ impl DistilBert {
         }
         Ok(())
     }
+
+    /// Per-site dropout-stream positions keyed `{site}.dropout`, over the same
+    /// site names [`Self::named_trainable_weights`] uses — the resume state for
+    /// the adapter's dropout.
+    pub fn dropout_positions(&self) -> Result<HashMap<String, u64>, EncoderError> {
+        let mut out = HashMap::new();
+        for (n, layer) in self.layers.iter().enumerate() {
+            for (site, lin) in distil_lora_sites(layer) {
+                lin.collect_dropout_position(&format!("layer.{n}.{site}"), &mut out)?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Restore each LoRA site's dropout-stream position from a
+    /// [`Self::dropout_positions`]-shaped map. Missing keys are no-ops.
+    pub fn restore_dropout_positions(
+        &self,
+        positions: &HashMap<String, u64>,
+    ) -> Result<(), EncoderError> {
+        for (n, layer) in self.layers.iter().enumerate() {
+            for (site, lin) in distil_lora_sites(layer) {
+                lin.restore_dropout_position(&format!("layer.{n}.{site}"), positions)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The six LoRA-wrappable linear sites of one DistilBERT layer paired with their
+/// `named_trainable_weights` site names.
+fn distil_lora_sites(layer: &DistilBertLayer) -> [(&'static str, &MaybeLoraLinear); 6] {
+    [
+        ("q_lin", &layer.attention.q_lin),
+        ("k_lin", &layer.attention.k_lin),
+        ("v_lin", &layer.attention.v_lin),
+        ("out_lin", &layer.attention.out_lin),
+        ("lin1", &layer.ffn.lin1),
+        ("lin2", &layer.ffn.lin2),
+    ]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

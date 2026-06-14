@@ -394,7 +394,13 @@ impl TrainingWorker {
             )
             .await
         {
-            Ok(true) => {}
+            Ok(true) => {
+                // The finalize CAS won: the job is `completed`, so its durable
+                // resume checkpoint is dead. GC it (best-effort — a leftover
+                // resume prefix is harmless, never on the serving path, but the
+                // winner is the single point that reclaims it).
+                store.delete_resume_checkpoint(job_id).await.ok();
+            }
             Ok(false) => {
                 // Lost the lease before finalizing: our CAS matched zero rows, so
                 // we committed neither the job status nor any served path. Our
@@ -1362,18 +1368,45 @@ fn run_fine_tune_blocking(
         ))
     };
 
-    let mut training_loop =
-        crate::fine_tune::trainer::TrainingLoopBuilder::new(target, varmap, config)
-            .base_model(base_model_arc)
-            .job_id(job_id)
-            .worker_id(worker_id)
-            .catalog(Arc::clone(&catalog))
-            .artifact_dir(artifact_dir)
-            .device(device.clone())
-            .cancel(cancel)
-            .build()?;
+    // Discover a durable resume checkpoint for this job. If one exists (a prior
+    // attempt completed at least one epoch boundary before dying), the trainer
+    // restores weights + optimizer moments + scaler + dropout positions and
+    // continues from `last_completed + 1`; if none exists, it trains from scratch
+    // as today. The discovery never perturbs the publish/serving path — the
+    // resume prefix (`{job_id}/_resume/`) is a crash-recovery side channel.
+    let resume = discover_resume(&artifact_store, &job_id, &device)?;
+
+    let mut builder = crate::fine_tune::trainer::TrainingLoopBuilder::new(target, varmap, config)
+        .base_model(base_model_arc)
+        .job_id(job_id)
+        .worker_id(worker_id)
+        .catalog(Arc::clone(&catalog))
+        .artifact_dir(artifact_dir)
+        .device(device.clone())
+        .cancel(cancel)
+        .artifact_store(Arc::clone(&artifact_store));
+    if let Some(restored) = resume {
+        builder = builder.resume(restored);
+    }
+    let mut training_loop = builder.build()?;
 
     training_loop.run(&data_loader)
+}
+
+/// Fetch and load a job's durable resume checkpoint, if any. `None` when no
+/// checkpoint exists yet (from-scratch). A present-but-corrupt bundle surfaces as
+/// a hard error from the artifact store, not a silent from-scratch restart.
+fn discover_resume(
+    store: &Arc<ArtifactStore>,
+    job_id: &str,
+    device: &candle_core::Device,
+) -> Result<Option<crate::fine_tune::resume::RestoredCheckpoint>> {
+    let Some(local) =
+        tokio::runtime::Handle::current().block_on(store.fetch_resume_checkpoint(job_id))?
+    else {
+        return Ok(None);
+    };
+    crate::fine_tune::resume::load_bundle(local.dir(), device).map(Some)
 }
 
 /// Construct an encoder-adapters target: load the frozen backbone weights from

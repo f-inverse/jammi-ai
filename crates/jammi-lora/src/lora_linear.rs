@@ -308,4 +308,33 @@ impl LoraLinear {
     pub fn trainable_params(&self) -> Vec<&Tensor> {
         vec![&self.lora_a, &self.lora_b]
     }
+
+    /// This layer's dropout-stream draw position — the number of mask draws
+    /// consumed since the run start — or `None` when the layer has no dropout
+    /// stream (`lora_dropout == 0`). It is the resume state for the layer's
+    /// dropout: a resumed run replays the stream to this position so its next
+    /// masks byte-match the uninterrupted run. A poisoned stream mutex surfaces
+    /// as a typed error rather than a panic.
+    pub fn dropout_position(&self) -> Result<Option<u64>, LoraError> {
+        match &self.dropout_stream {
+            None => Ok(None),
+            Some(stream) => stream
+                .lock()
+                .map(|s| Some(s.position()))
+                .map_err(|_| LoraError::Config("dropout stream mutex poisoned".into())),
+        }
+    }
+
+    /// Restore this layer's dropout stream to `position` (replaying from the
+    /// origin) so the next training forwards draw the same masks the uninterrupted
+    /// run drew. A no-op when the layer has no dropout stream.
+    pub fn restore_dropout_position(&self, position: u64) -> Result<(), LoraError> {
+        if let Some(stream) = &self.dropout_stream {
+            stream
+                .lock()
+                .map_err(|_| LoraError::Config("dropout stream mutex poisoned".into()))?
+                .restore_position(position);
+        }
+        Ok(())
+    }
 }

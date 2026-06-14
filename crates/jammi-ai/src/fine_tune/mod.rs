@@ -27,6 +27,8 @@ pub mod optimizer;
 #[cfg(feature = "local")]
 pub(crate) mod regression_loss;
 #[cfg(feature = "local")]
+pub mod resume;
+#[cfg(feature = "local")]
 pub mod spec;
 #[cfg(feature = "local")]
 pub mod target;

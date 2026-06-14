@@ -31,7 +31,40 @@ workspace ships every publishable crate at the same
   head's `forward` actually applied so the adapter trains off zero) to prove the
   seeded-dropout and trained-trajectory contract — same-seed byte-equality,
   different-seed divergence, and a non-zero `lora_b` dead-path guard.
-  Checkpoint/resume is a separate later PR.
+- **Durable checkpoint/resume of LoRA fine-tuning, proven byte-exact (W5-PR2).**
+  A fine-tune that dies mid-training now resumes from a durable checkpoint and
+  continues the *exact* trajectory it would have taken without the crash — proven,
+  not approximated. At each epoch boundary the trainer writes a `ResumeCheckpoint`
+  bundle — adapter weights, the AdamW first/second moments **per parameter keyed
+  by name**, `step_t`, the `TargetScaler`'s `(μ, σ)`, and each dropout stream's
+  draw position — to a new attempt-shared, publish-exempt durable prefix
+  `{job_id}/_resume/` via `ArtifactStore::{put,fetch,delete}_resume_checkpoint`
+  (thin wrappers over the existing manifest-last machinery, never on the
+  serving/CAS path). On (re)claim the worker `discover`s that checkpoint and the
+  trainer restores it, starting at `last_completed_epoch + 1`; absent it, training
+  starts from scratch as before. The durable save is gated on the lease (the
+  `!cancel` epoch-boundary check), so a reclaimed zombie cannot regress the shared
+  checkpoint to a stale epoch; the finalize-CAS winner GCs it once the job is
+  `completed`. Three correctness fixes make the resume bit-exact: the trainer now
+  snapshots `VarMap::all_vars()` **once** and correlates optimizer moments to
+  parameter **names** (a `VarMap`'s HashMap order is not stable across processes,
+  so serialising moments positionally would silently load the wrong parameter's
+  trajectory); the dropout mask stream is replayable to a persisted draw position
+  (so a resumed run draws the same masks, and a validation pass — dropout off —
+  never perturbs it); and the scaler's `(μ, σ)` is *loaded* authoritatively on
+  resume, never recomputed from possibly-changed source rows. Restore writes the
+  weights **into the registered `Var`s in place** so the forward, the gradient,
+  and the optimizer step stay bound to one tensor identity. An in-crate
+  `resume_invariant` test proves the three-run invariant on `Device::Cpu`,
+  bit-exact and multi-thread: restored state is byte-equal to the uninterrupted
+  run's epoch-boundary snapshot AND the next steps produce byte-equal weights,
+  with ≥3 LoRA layers (so the name-keying, not positional luck, is what holds),
+  `lora_dropout > 0`, a lease-gate concurrency test, a source-mutation test (the
+  persisted scaler is authoritative), and a destructive weights-only-restore
+  control that diverges (so the next-steps assertion is non-vacuous). The
+  bit-exact next-step guarantee is scoped to `Device::Cpu`; on CUDA/Metal the
+  restored state is still byte-equal (load + compare) but subsequent steps match
+  only within tolerance.
 - **Standardisation-contract oracle + completeness guards for every
   offset-bearing distribution head.** The fine-tune "standardisation contract"
   (a zero-init distribution head reaches a high-offset / low-variance target —

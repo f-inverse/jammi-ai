@@ -53,6 +53,12 @@ use crate::storage::{JammiObjectStore, Scheme, StorageError, StorageRegistry, St
 /// the bundle is complete.
 const MANIFEST_NAME: &str = "manifest.json";
 
+/// The attempt-shared prefix segment for a job's durable resume checkpoint:
+/// `{job_id}/_resume/`. Distinct from the per-attempt publish prefix
+/// (`{job_id}/{worker_id}/{attempt}`) so resume state is keyed to the job, not an
+/// attempt — and never collides with a published artifact prefix.
+const RESUME_SEGMENT: &str = "_resume";
+
 /// One file in an artifact bundle: its relative name (the candle loader joins
 /// this onto the fetched directory) and the sha256 of its bytes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,6 +269,57 @@ impl ArtifactStore {
         }
         handle.delete_if_exists(&manifest_path).await?;
         Ok(())
+    }
+
+    /// Write a job's durable **resume checkpoint** under the attempt-shared prefix
+    /// `{job_id}/_resume/`, overwriting the prior epoch's bundle in place.
+    ///
+    /// Unlike [`Self::put_artifact`]'s per-attempt publish prefix, the resume
+    /// prefix carries no `worker_id`/`attempt` segment: resume state belongs to
+    /// the **job**, so attempt N+1 reads attempt N's progress. It is never
+    /// registered as a model's served `artifact_path` and never read by the
+    /// serving [`Self::fetch_artifact`] path — it is a crash-recovery side channel,
+    /// exempt from the catalog-pointer-as-commit publish protocol. The write is
+    /// manifest-last (torn-free) like every bundle, and **idempotent latest-wins**:
+    /// because every epoch's bundle has the same file set (the same LoRA layer
+    /// keys plus `resume_state.json`), each PUT overwrites the prior epoch's keys
+    /// in place and the manifest — written last — flips the durable checkpoint to
+    /// the new epoch atomically. Only the lease-holder writes (the trainer gates
+    /// the call on `!cancel` at the epoch boundary), so a lost-lease zombie cannot
+    /// regress the checkpoint to a stale epoch.
+    pub async fn put_resume_checkpoint(
+        &self,
+        job_id: &str,
+        files: &[(String, Bytes)],
+    ) -> Result<StorageUrl> {
+        self.put_artifact(&[job_id, RESUME_SEGMENT], files).await
+    }
+
+    /// Fetch a job's durable resume checkpoint, or `None` if no manifest exists
+    /// under `{job_id}/_resume/` yet (the job has not completed an epoch boundary,
+    /// so there is nothing to resume from — the worker starts from scratch).
+    ///
+    /// A present-but-corrupt bundle (manifest digest mismatch, missing key) is a
+    /// hard error from [`Self::fetch_artifact`], not a silent `None`: a torn resume
+    /// checkpoint must fail loudly rather than restart training from scratch and
+    /// mask the corruption.
+    pub async fn fetch_resume_checkpoint(&self, job_id: &str) -> Result<Option<LocalArtifact>> {
+        let prefix = self.prefix_url(&[job_id, RESUME_SEGMENT])?;
+        let handle = self.handle(&prefix)?;
+        let manifest_path = self.child(&prefix, MANIFEST_NAME)?;
+        if !handle.exists(&manifest_path).await? {
+            return Ok(None);
+        }
+        self.fetch_artifact(&prefix).await.map(Some)
+    }
+
+    /// GC a job's durable resume checkpoint once the job has terminated. Called by
+    /// the finalize-CAS winner only: the resume state is dead the moment the job
+    /// is `completed`, and the prefix is bounded to one bundle per job
+    /// (overwrite-in-place), so this is the single point that reclaims it.
+    pub async fn delete_resume_checkpoint(&self, job_id: &str) -> Result<()> {
+        let prefix = self.prefix_url(&[job_id, RESUME_SEGMENT])?;
+        self.delete_artifact_prefix(&prefix).await
     }
 
     /// Read and parse `manifest.json` under `prefix`. A missing or malformed
@@ -543,6 +600,96 @@ mod tests {
         assert!(store.fetch_artifact(&prefix).await.is_err());
         // Deleting again (already-clean) is a no-op, not an error.
         store.delete_artifact_prefix(&prefix).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_checkpoint_round_trips_and_overwrites_latest_wins() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = store_with_root(
+            StorageUrl::memory("artifacts-resume"),
+            cache.path().to_path_buf(),
+        );
+
+        // No checkpoint written yet → None (start from scratch).
+        assert!(store
+            .fetch_resume_checkpoint("job-r")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Persist epoch 0, then epoch 1 with the SAME file set — the second PUT
+        // overwrites in place and the manifest (written last) flips the durable
+        // checkpoint to epoch 1.
+        let epoch0 = vec![(
+            "resume_state.json".to_string(),
+            Bytes::from_static(b"{\"epoch\":0}"),
+        )];
+        store.put_resume_checkpoint("job-r", &epoch0).await.unwrap();
+        let epoch1 = vec![(
+            "resume_state.json".to_string(),
+            Bytes::from_static(b"{\"epoch\":1}"),
+        )];
+        store.put_resume_checkpoint("job-r", &epoch1).await.unwrap();
+
+        let fetched = store
+            .fetch_resume_checkpoint("job-r")
+            .await
+            .unwrap()
+            .expect("a written checkpoint is fetchable");
+        let bytes = std::fs::read(fetched.dir().join("resume_state.json")).unwrap();
+        assert_eq!(
+            &bytes[..],
+            b"{\"epoch\":1}",
+            "latest epoch wins on overwrite"
+        );
+
+        // GC by the finalize winner: the next fetch is None again.
+        store.delete_resume_checkpoint("job-r").await.unwrap();
+        assert!(store
+            .fetch_resume_checkpoint("job-r")
+            .await
+            .unwrap()
+            .is_none());
+        // Deleting again (already-clean) is a no-op.
+        store.delete_resume_checkpoint("job-r").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_prefix_is_disjoint_from_the_publish_prefix() {
+        let cache = tempfile::tempdir().unwrap();
+        let store = store_with_root(
+            StorageUrl::memory("artifacts-resume-disjoint"),
+            cache.path().to_path_buf(),
+        );
+        // Publish an attempt's served artifact and a resume checkpoint for the
+        // same job; neither read sees the other's bytes — the resume side channel
+        // never perturbs the served path.
+        let published = store
+            .put_artifact(&["job-d", "worker-a", "0"], &sample_files())
+            .await
+            .unwrap();
+        store
+            .put_resume_checkpoint(
+                "job-d",
+                &[(
+                    "resume_state.json".to_string(),
+                    Bytes::from_static(b"{\"epoch\":3}"),
+                )],
+            )
+            .await
+            .unwrap();
+
+        // The served prefix does not end at the resume segment, and the published
+        // bundle is intact.
+        assert!(published.as_str().ends_with("job-d/worker-a/0"));
+        let served = store.fetch_artifact(&published).await.unwrap();
+        assert!(served.dir().join("adapter.safetensors").exists());
+        assert!(!served.dir().join("resume_state.json").exists());
+
+        // GCing the resume checkpoint leaves the served artifact untouched.
+        store.delete_resume_checkpoint("job-d").await.unwrap();
+        let served_again = store.fetch_artifact(&published).await.unwrap();
+        assert!(served_again.dir().join("adapter.safetensors").exists());
     }
 
     #[test]

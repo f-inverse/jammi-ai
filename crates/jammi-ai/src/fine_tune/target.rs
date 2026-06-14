@@ -125,6 +125,57 @@ impl TrainingTarget {
         }
     }
 
+    /// Per-layer dropout-stream positions keyed `{name}.dropout`, the resume
+    /// state for the adapter's dropout: a resumed run replays each stream to the
+    /// position it held at the persisted epoch boundary, so its next training
+    /// forwards draw the same masks the uninterrupted run drew. Layers without
+    /// dropout (`lora_dropout == 0`) contribute no entry.
+    pub fn dropout_positions(&self) -> Result<HashMap<String, u64>> {
+        match self {
+            Self::ProjectionHead { head } => {
+                let mut out = HashMap::new();
+                for (name, layer) in &head.layers {
+                    if let Some(pos) = layer
+                        .dropout_position()
+                        .map_err(|e| JammiError::FineTune(format!("dropout position: {e}")))?
+                    {
+                        out.insert(format!("{name}.dropout"), pos);
+                    }
+                }
+                Ok(out)
+            }
+            Self::EncoderAdapters(state) => state
+                .encoder
+                .dropout_positions()
+                .map_err(|e| JammiError::FineTune(format!("Encoder dropout positions: {e}"))),
+        }
+    }
+
+    /// Restore each layer's dropout-stream position from a
+    /// [`Self::dropout_positions`]-shaped map. A missing key leaves that layer's
+    /// stream at the origin (the from-scratch position), which is correct for a
+    /// layer that had no dropout when the checkpoint was taken.
+    pub fn restore_dropout_positions(&self, positions: &HashMap<String, u64>) -> Result<()> {
+        match self {
+            Self::ProjectionHead { head } => {
+                for (name, layer) in &head.layers {
+                    if let Some(pos) = positions.get(&format!("{name}.dropout")) {
+                        layer.restore_dropout_position(*pos).map_err(|e| {
+                            JammiError::FineTune(format!("restore dropout position: {e}"))
+                        })?;
+                    }
+                }
+                Ok(())
+            }
+            Self::EncoderAdapters(state) => state
+                .encoder
+                .restore_dropout_positions(positions)
+                .map_err(|e| {
+                    JammiError::FineTune(format!("Encoder restore dropout positions: {e}"))
+                }),
+        }
+    }
+
     /// Build the persisted metadata for this target.
     ///
     /// `target_scaler` and `regression_form` are the regression head's persisted

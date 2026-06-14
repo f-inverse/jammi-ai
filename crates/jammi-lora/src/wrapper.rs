@@ -89,4 +89,35 @@ impl MaybeLoraLinear {
             }
         }
     }
+
+    /// Insert this layer's dropout-stream position keyed `{prefix}.dropout` into
+    /// `out`, if it has a dropout stream. No-op for `Frozen` and for a LoRA layer
+    /// with `lora_dropout == 0` (no stream to resume).
+    pub fn collect_dropout_position(
+        &self,
+        prefix: &str,
+        out: &mut HashMap<String, u64>,
+    ) -> Result<(), LoraError> {
+        if let Self::Lora(l) = self {
+            if let Some(pos) = l.dropout_position()? {
+                out.insert(format!("{prefix}.dropout"), pos);
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore this layer's dropout-stream position from `{prefix}.dropout` in
+    /// `positions`, if present. No-op for `Frozen` and when the key is absent.
+    pub fn restore_dropout_position(
+        &self,
+        prefix: &str,
+        positions: &HashMap<String, u64>,
+    ) -> Result<(), LoraError> {
+        if let Self::Lora(l) = self {
+            if let Some(pos) = positions.get(&format!("{prefix}.dropout")) {
+                l.restore_dropout_position(*pos)?;
+            }
+        }
+        Ok(())
+    }
 }

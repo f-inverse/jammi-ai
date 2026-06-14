@@ -120,4 +120,32 @@ impl AnyEncoder {
             Self::ClipText(_) => Ok(()),
         }
     }
+
+    /// Per-site dropout-stream positions for every LoRA-wrapped linear, keyed by
+    /// the same site names [`Self::named_trainable_weights`] uses — the resume
+    /// state for the adapter's dropout so a resumed run replays each stream to its
+    /// epoch-boundary position. Empty for a backbone with no installed adapters or
+    /// no dropout.
+    pub fn dropout_positions(&self) -> Result<HashMap<String, u64>, EncoderError> {
+        match self {
+            Self::Bert(e) => e.dropout_positions(),
+            Self::DistilBert(e) => e.dropout_positions(),
+            Self::ModernBert(e) => e.dropout_positions(),
+            Self::ClipText(_) => Ok(HashMap::new()),
+        }
+    }
+
+    /// Restore each LoRA site's dropout-stream position from a
+    /// [`Self::dropout_positions`]-shaped map. Missing keys are no-ops.
+    pub fn restore_dropout_positions(
+        &self,
+        positions: &HashMap<String, u64>,
+    ) -> Result<(), EncoderError> {
+        match self {
+            Self::Bert(e) => e.restore_dropout_positions(positions),
+            Self::DistilBert(e) => e.restore_dropout_positions(positions),
+            Self::ModernBert(e) => e.restore_dropout_positions(positions),
+            Self::ClipText(_) => Ok(()),
+        }
+    }
 }

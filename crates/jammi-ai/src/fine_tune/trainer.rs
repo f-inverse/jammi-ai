@@ -4,10 +4,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use arrow::array::{ArrayRef, BinaryArray, StringArray};
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::VarMap;
 use jammi_db::catalog::Catalog;
+use jammi_db::store::ArtifactStore;
 
 use crate::fine_tune::adamw::{AdamW, ParamsAdamW};
 use jammi_db::error::{JammiError, Result};
@@ -15,6 +18,7 @@ use jammi_db::error::{JammiError, Result};
 use super::data::{TextChunk, TrainingDataLoader};
 use super::optimizer::clip_and_step;
 use super::regression_loss::{crps_gaussian_loss, gaussian_nll_loss, pinball_loss, TargetScaler};
+use super::resume::{capture_bundle, NamedMoments, RestoredCheckpoint, ResumeState};
 use super::target::TrainingTarget;
 use super::{EarlyStoppingMetric, FineTuneConfig, LrSchedule};
 use crate::model::{LoadedModel, ModelTask};
@@ -141,6 +145,16 @@ pub struct TrainingLoop {
     /// reclaim. A `spawn_blocking` thread cannot be force-aborted, so this is the
     /// coarsest safe interruption point.
     cancel: Arc<AtomicBool>,
+    /// The durable artifact store the epoch-boundary resume checkpoint is written
+    /// to (under `{job_id}/_resume/`). `None` disables durable checkpointing — the
+    /// run trains but leaves nothing to resume from (used by trainer-internal
+    /// tests that drive the loop without a worker/store).
+    artifact_store: Option<Arc<ArtifactStore>>,
+    /// A resume bundle this run restores from before the first epoch, or `None`
+    /// for a from-scratch run. When present, training starts at
+    /// `state.last_completed_epoch + 1` with weights, optimizer moments, scaler,
+    /// and dropout positions restored.
+    resume: Option<RestoredCheckpoint>,
 }
 
 /// Builder for [`TrainingLoop`].
@@ -155,6 +169,8 @@ pub struct TrainingLoopBuilder {
     artifact_dir: Option<PathBuf>,
     device: Device,
     cancel: Arc<AtomicBool>,
+    artifact_store: Option<Arc<ArtifactStore>>,
+    resume: Option<RestoredCheckpoint>,
 }
 
 impl TrainingLoopBuilder {
@@ -175,7 +191,24 @@ impl TrainingLoopBuilder {
             artifact_dir: None,
             device: Device::Cpu,
             cancel: Arc::new(AtomicBool::new(false)),
+            artifact_store: None,
+            resume: None,
         }
+    }
+
+    /// Set the durable artifact store the epoch-boundary resume checkpoint is
+    /// written to. Omit it for a run that should not checkpoint durably (a
+    /// trainer-internal test).
+    pub fn artifact_store(mut self, store: Arc<ArtifactStore>) -> Self {
+        self.artifact_store = Some(store);
+        self
+    }
+
+    /// Restore from a discovered resume bundle: training continues from the
+    /// persisted epoch boundary instead of starting fresh.
+    pub fn resume(mut self, restored: RestoredCheckpoint) -> Self {
+        self.resume = Some(restored);
+        self
     }
 
     /// Set the device all training tensors should live on.
@@ -253,6 +286,8 @@ impl TrainingLoopBuilder {
             target_scaler: None,
             device: self.device,
             cancel: self.cancel,
+            artifact_store: self.artifact_store,
+            resume: self.resume,
         })
     }
 }
@@ -310,10 +345,19 @@ impl TrainingLoop {
             * self.config.epochs;
         let checkpoint_interval = (total_steps as f64 * 0.1).ceil() as usize;
 
-        // Create optimizer from VarMap's trainable variables.
+        // Snapshot the trainable variables ONCE. `VarMap::all_vars()` iterates a
+        // HashMap, so a second call could return a different order — and `AdamW`'s
+        // optimizer state is positional in the order it was built from. Building
+        // the optimizer and `trainable_vars` from one snapshot keeps the gradient
+        // accumulation, clipping, and the optimizer's moment vector all aligned to
+        // the same parameter order within this process. The cross-process
+        // correlation that makes resume safe is `optim_param_names` below — the
+        // moments serialize/restore BY NAME, never by this in-process order.
+        let trainable_vars = self.varmap.all_vars();
+
         // weight_decay matches train_embedding_model.py: AdamW(weight_decay=0.01).
         let mut optimizer = AdamW::new(
-            self.varmap.all_vars(),
+            trainable_vars.clone(),
             ParamsAdamW {
                 lr: self.config.learning_rate,
                 weight_decay: self.config.weight_decay,
@@ -322,7 +366,28 @@ impl TrainingLoop {
         )
         .map_err(|e| JammiError::FineTune(format!("Optimizer init: {e}")))?;
 
-        let mut global_step = 0;
+        // The parameter NAME for each entry of `optimizer.state()`'s moment
+        // vector, in that exact order. `AdamW::new` keeps the float subset of
+        // `trainable_vars` in order, and `state()` reports moments in that same
+        // order — so zipping `optim_param_names` with the moment vector keys every
+        // `(m, v)` by its parameter name. This is the R1 fix: a `VarMap`'s
+        // `all_vars()` order is not stable across processes, so the resume bundle
+        // must never serialize moments positionally; it serializes them by this
+        // name. The names come from `varmap.data()` keyed by tensor identity, so
+        // the correlation is independent of any HashMap iteration order.
+        let optim_param_names = self.optimizer_param_names(&trainable_vars)?;
+
+        // Restore from a discovered resume bundle (weights + optimizer moments +
+        // scaler + dropout positions). The persisted scaler is authoritative — it
+        // overrides the just-computed one so a source mutated between crash and
+        // resume cannot perturb the de-standardisation (R7). Returns the epoch the
+        // resumed run starts at (`last_completed + 1`) and its step counter.
+        let (start_epoch, mut global_step) = match self.resume.take() {
+            Some(restored) => {
+                self.restore_from_checkpoint(restored, &mut optimizer, &optim_param_names)?
+            }
+            None => (0, 0),
+        };
         let mut best_val_loss = f64::MAX;
         let mut patience_counter = 0;
         // Train into a fresh worker-private tempdir, never a shared path: two
@@ -337,15 +402,12 @@ impl TrainingLoop {
             .tempdir_in(&self.artifact_dir)?;
         let checkpoint_dir = artifact_tmp.path().to_path_buf();
 
-        // Collect trainable vars once; their TensorIds are stable for the run.
-        let trainable_vars = self.varmap.all_vars();
-
         // Hard negatives mined from the current model, re-mined every
         // `refresh_every` epochs. Held across epochs so a non-refresh epoch
         // reuses the last mining (the staleness/cost trade).
         let mut mined_loader: Option<TrainingDataLoader> = None;
 
-        for epoch in 0..self.config.epochs {
+        for epoch in start_epoch..self.config.epochs {
             // Cooperative cancellation: the worker's heartbeat sets this when the
             // lease is lost. Bail at the epoch boundary, leaving the job for
             // lease-based reclaim rather than recording a (wrong) terminal status.
@@ -538,6 +600,24 @@ impl TrainingLoop {
                     );
                     break;
                 }
+            }
+
+            // Durable resume checkpoint at the epoch boundary. Gated on the
+            // lease: a worker whose lease was reclaimed during this epoch must not
+            // overwrite the durable checkpoint with stale state. The trainer
+            // already checks `cancel` at the TOP of the next iteration; checking it
+            // again HERE, before the write, closes the window where a lease lost
+            // mid-epoch would still let this (now-zombie) attempt regress the
+            // shared `{job_id}/_resume/` bundle below the lease-winner's epoch (R5).
+            // A `None` store disables durable checkpointing (trainer-internal tests).
+            if !self.cancel.load(Ordering::Relaxed) {
+                self.save_resume_checkpoint(
+                    &checkpoint_dir,
+                    epoch,
+                    global_step,
+                    &optimizer,
+                    &optim_param_names,
+                )?;
             }
         }
 
@@ -1596,6 +1676,191 @@ impl TrainingLoop {
         let weights = candle_core::safetensors::load(path, &self.device)
             .map_err(|e| JammiError::FineTune(format!("Load checkpoint: {e}")))?;
         self.target.load_weights(&weights)
+    }
+
+    /// The parameter NAME for each entry of `optimizer.state()`'s moment vector,
+    /// in that exact order — the correlation that lets the resume bundle key
+    /// optimizer moments by name rather than by the unstable `all_vars()` order.
+    ///
+    /// `AdamW::new` keeps the float subset of `vars` in their given order, and
+    /// `state()` reports moments in that order, so this applies the same float
+    /// filter and maps each surviving var to its name via a tensor-identity →
+    /// name index built from `varmap.data()`. A trainable var absent from the
+    /// `VarMap` (which cannot happen — every trainable LoRA tensor is a registered
+    /// `Var`) is a hard error rather than a silently dropped moment.
+    fn optimizer_param_names(&self, vars: &[Var]) -> Result<Vec<String>> {
+        let data = self.varmap.data().lock().map_err(|_| {
+            JammiError::FineTune("optimizer param names: VarMap mutex poisoned".into())
+        })?;
+        let id_to_name: HashMap<candle_core::TensorId, &String> =
+            data.iter().map(|(name, var)| (var.id(), name)).collect();
+        vars.iter()
+            .filter(|var| var.dtype().is_float())
+            .map(|var| {
+                id_to_name
+                    .get(&var.id())
+                    .map(|name| (*name).clone())
+                    .ok_or_else(|| {
+                        JammiError::FineTune(
+                            "optimizer param names: a trainable var is not registered in the \
+                             VarMap — cannot key its optimizer moment by name"
+                                .into(),
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    /// Capture the moments `optimizer.state()` reports, keyed by parameter name
+    /// (the order-independent correlation `optim_param_names` provides). This is
+    /// the single capture routine the durable epoch-boundary save and the resume
+    /// test both use, so a reference snapshot and a crash-persist are taken at the
+    /// SAME boundary by the SAME code (R4).
+    fn capture_moments_by_name(
+        optimizer: &AdamW,
+        optim_param_names: &[String],
+    ) -> Result<(NamedMoments, usize)> {
+        let (moments, step_t) = optimizer
+            .state()
+            .map_err(|e| JammiError::FineTune(format!("capture optimizer state: {e}")))?;
+        if moments.len() != optim_param_names.len() {
+            return Err(JammiError::FineTune(format!(
+                "optimizer reported {} moments for {} named parameters",
+                moments.len(),
+                optim_param_names.len()
+            )));
+        }
+        let by_name = optim_param_names
+            .iter()
+            .cloned()
+            .zip(moments)
+            .collect::<HashMap<_, _>>();
+        Ok((by_name, step_t))
+    }
+
+    /// Assemble the full resume bundle at an epoch boundary: adapter weights, the
+    /// name-keyed optimizer moments, the scaler's `(μ, σ)`, the dropout-stream
+    /// positions, and the run counters. The single routine both the durable save
+    /// and the test's reference snapshot drive.
+    fn capture_resume_bundle(
+        &self,
+        scratch_dir: &Path,
+        last_completed_epoch: usize,
+        global_step: usize,
+        optimizer: &AdamW,
+        optim_param_names: &[String],
+    ) -> Result<Vec<(String, bytes::Bytes)>> {
+        let weights = self.target.named_trainable_weights()?;
+        let (moments, step_t) = Self::capture_moments_by_name(optimizer, optim_param_names)?;
+        let state = ResumeState {
+            last_completed_epoch,
+            global_step,
+            step_t,
+            seed: self.config.seed,
+            scaler: self.target_scaler.map(|s| (s.mean(), s.std())),
+            dropout_positions: self.target.dropout_positions()?,
+        };
+        capture_bundle(scratch_dir, &weights, &moments, &state)
+    }
+
+    /// Write the durable resume checkpoint to `{job_id}/_resume/` via the artifact
+    /// store, overwriting the prior epoch. A `None` store is a no-op (a
+    /// trainer-internal run with no durable checkpointing). The caller has already
+    /// confirmed the lease is held (`!cancel`).
+    fn save_resume_checkpoint(
+        &self,
+        checkpoint_dir: &Path,
+        epoch: usize,
+        global_step: usize,
+        optimizer: &AdamW,
+        optim_param_names: &[String],
+    ) -> Result<()> {
+        let Some(store) = self.artifact_store.as_ref() else {
+            return Ok(());
+        };
+        let scratch = checkpoint_dir.join("_resume_scratch");
+        let bundle =
+            self.capture_resume_bundle(&scratch, epoch, global_step, optimizer, optim_param_names)?;
+        tokio::runtime::Handle::current()
+            .block_on(store.put_resume_checkpoint(&self.job_id, &bundle))?;
+        Ok(())
+    }
+
+    /// Restore weights, optimizer moments (BY NAME), the scaler, and the dropout
+    /// positions from a discovered resume bundle, and return the epoch the resumed
+    /// run starts at (`last_completed + 1`) and its step counter.
+    ///
+    /// The optimizer moments are reordered from the persisted name→moment map into
+    /// the optimizer's positional order via `optim_param_names` (this process's
+    /// `all_vars()` order), so `AdamW::load_state` restores each parameter its OWN
+    /// moments regardless of how the two processes' HashMap orders differ (R1). The
+    /// scaler is loaded authoritatively, never recomputed (R7).
+    fn restore_from_checkpoint(
+        &mut self,
+        restored: RestoredCheckpoint,
+        optimizer: &mut AdamW,
+        optim_param_names: &[String],
+    ) -> Result<(usize, usize)> {
+        let RestoredCheckpoint {
+            weights,
+            moments,
+            state,
+        } = restored;
+
+        // Restore weights by writing into the registered `Var`s in place (by
+        // name), NOT by replacing the target's tensor fields. The optimizer holds
+        // those same `Var`s, and the LoRA layer's `lora_a`/`lora_b` fields share
+        // their storage; an in-place `Var::set` updates all three together, so the
+        // forward, the gradient, and the optimizer step stay bound to one tensor
+        // identity. Replacing the field tensor instead (a fresh `clone`) would
+        // sever that binding — the optimizer would step the now-orphaned `Var`
+        // while the forward read the stale field, freezing the restored weights.
+        {
+            let data = self.varmap.data().lock().map_err(|_| {
+                JammiError::FineTune("resume: VarMap mutex poisoned restoring weights".into())
+            })?;
+            for (name, tensor) in &weights {
+                let var = data.get(name).ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "resume: restored weight '{name}' is not a registered Var — the head \
+                         shape changed between crash and resume"
+                    ))
+                })?;
+                var.set(tensor)
+                    .map_err(|e| JammiError::FineTune(format!("resume: set '{name}': {e}")))?;
+            }
+        }
+
+        // Moments reordered by name into the optimizer's positional order.
+        let ordered = optim_param_names
+            .iter()
+            .map(|name| {
+                moments.get(name).cloned().ok_or_else(|| {
+                    JammiError::FineTune(format!(
+                        "resume: optimizer moment for parameter '{name}' missing from the \
+                         checkpoint — cannot restore its trajectory by name"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        optimizer
+            .load_state(&ordered, state.step_t)
+            .map_err(|e| JammiError::FineTune(format!("resume: load optimizer state: {e}")))?;
+
+        // The persisted scaler is authoritative — overwrite the recomputed one so
+        // a source mutated between crash and resume cannot perturb the
+        // de-standardisation (R7). A regression run always persists `(μ, σ)`; a
+        // non-regression run persists `None` and leaves the scaler unset.
+        self.target_scaler = state
+            .scaler
+            .map(|(mean, std)| TargetScaler::from_mean_std(mean, std));
+
+        // Replay each dropout stream to its epoch-boundary position so the next
+        // forwards draw the same masks the uninterrupted run drew (R3).
+        self.target
+            .restore_dropout_positions(&state.dropout_positions)?;
+
+        Ok((state.last_completed_epoch + 1, state.global_step))
     }
 }
 
@@ -3301,5 +3566,792 @@ mod determinism_through_forward {
             a, b,
             "different seeds must publish different adapters — the seed is being ignored"
         );
+    }
+}
+
+/// W5-PR2 deliverable — the resume invariant, proven byte-exact on `Device::Cpu`.
+///
+/// A fine-tune that dies at an epoch boundary, resumes from its durable
+/// checkpoint, and continues the EXACT trajectory the uninterrupted run would
+/// have. The proof is the three-run invariant of the design's §3:
+///
+///   1. the restored state is BYTE-EQUAL to the reference snapshot at the same
+///      boundary (LoRA A/B, AdamW `(m, v)` per param, `step_t`, μ, σ), AND
+///   2. the next steps produce weights BYTE-EQUAL to the reference's.
+///
+/// Assertion (2) is the one that catches a silent moment-reset: weights-only
+/// resume passes (1) but fails (2) because zero moments + `step_t = 1`
+/// bias-correction diverge immediately. The destructive `weights_only_*` test
+/// below stubs exactly that and observes (2) fail, proving (2) is non-vacuous.
+///
+/// Each run drives the PRODUCTION forward dispatch (`projection.forward` →
+/// `regress` → `compute_loss` → `AdamW::step`) with `lora_dropout > 0`, so the
+/// seeded dropout mask is genuinely on the executed path; the capture and restore
+/// are the trainer's real `capture_resume_bundle` / `restore_from_checkpoint`
+/// routines, persisted through a real `file://` `ArtifactStore`. The falsifiers
+/// embedded: R1 (≥3 LoRA layers so the optimizer's HashMap order is non-trivially
+/// permuted — the moments must be name-keyed, not positional), R3 (dropout > 0,
+/// drawn on the forward), R4 (the reference snapshot IS the persisted bundle —
+/// same routine, same boundary), R6 (the run is on a multi-thread runtime and
+/// asserts bit-exactness — a future candle reduction-order change fails loudly),
+/// R7 (the persisted μ/σ is restored, never recomputed).
+#[cfg(test)]
+mod resume_invariant {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::{Linear, VarBuilder, VarMap};
+
+    use jammi_db::storage::{StorageRegistry, StorageUrl};
+    use jammi_db::store::ArtifactStore;
+
+    use super::super::data::TrainingBatch;
+    use super::super::lora::LoraModel;
+    use super::super::regression_loss::TargetScaler;
+    use super::super::resume::{load_bundle, RestoredCheckpoint};
+    use super::super::target::TrainingTarget;
+    use super::super::{EarlyStoppingMetric, FineTuneConfig, RegressionLoss};
+    use super::{TrainingLoop, TrainingLoopBuilder};
+    use crate::fine_tune::adamw::{AdamW, ParamsAdamW};
+
+    const HIDDEN: usize = 8;
+    const YEARS: [f32; 9] = [
+        2013.0, 2014.0, 2015.0, 2016.0, 2017.0, 2018.0, 2019.0, 2020.0, 2021.0,
+    ];
+
+    /// `lora_dropout > 0` (R3), β-NLL regression so the head does de-standardising
+    /// work, deterministic small-loop settings.
+    fn resume_config(seed: u64) -> FineTuneConfig {
+        FineTuneConfig {
+            seed,
+            epochs: 1,
+            batch_size: 1,
+            validation_fraction: 0.0,
+            warmup_steps: 0,
+            gradient_accumulation_steps: 1,
+            lora_dropout: 0.1,
+            regression_loss: Some(RegressionLoss::BetaNll { beta: 0.5 }),
+            early_stopping_metric: EarlyStoppingMetric::TrainLoss,
+            early_stopping_patience: 10_000,
+            learning_rate: 1e-3,
+            ..Default::default()
+        }
+    }
+
+    /// Deterministic O(1) feature matrix `(n, HIDDEN)` standing in for a frozen
+    /// base model's pooled output — seed-independent so the only nondeterminism is
+    /// the one under test.
+    fn features(n: usize, device: &Device) -> Tensor {
+        let mut vals = Vec::with_capacity(n * HIDDEN);
+        let mut s: u64 = 0x1234_5678;
+        for _ in 0..n * HIDDEN {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = ((s >> 33) as f32 / (1u32 << 31) as f32) - 1.0;
+            vals.push(u * 0.5);
+        }
+        Tensor::from_vec(vals, (n, HIDDEN), device).unwrap()
+    }
+
+    /// One seeded LoRA layer (`ZerosB` init + seeded dropout) at `vb.pp(name)`,
+    /// registered into `varmap` — the production `build_head_layer` shape.
+    fn lora_layer(
+        out: usize,
+        in_: usize,
+        config: &FineTuneConfig,
+        varmap: &VarMap,
+        vb: &VarBuilder,
+        name: &str,
+    ) -> jammi_lora::LoraLinear {
+        let base = Linear::new(
+            Tensor::zeros((out, in_), DType::F32, vb.device()).unwrap(),
+            None,
+        );
+        jammi_lora::LoraLinear::new(
+            base,
+            config.lora_rank,
+            config.lora_alpha,
+            config.use_rslora,
+            jammi_lora::LoraInitMode::ZerosB,
+            Some(config.lora_dropout as f32),
+            config.seed,
+            varmap,
+            &vb.pp(name),
+        )
+        .unwrap()
+    }
+
+    /// A regression `ProjectionHead` with THREE LoRA layers (R1: enough that the
+    /// optimizer's `all_vars()` HashMap order is non-trivially permuted, so a
+    /// positional moment serialization would load the wrong param's moments). The
+    /// `distribution` head stays at index 1 so `TrainingLoop::regress` reads it.
+    /// All three layers are exercised and trained by `step_epoch` below.
+    async fn build_three_layer_loop(
+        seed: u64,
+        targets: &Tensor,
+        device: &Device,
+        store: Arc<ArtifactStore>,
+        resume: Option<RestoredCheckpoint>,
+        job: &str,
+    ) -> (TrainingLoop, VarMap) {
+        let config = resume_config(seed);
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+
+        let projection = lora_layer(HIDDEN, HIDDEN, &config, &varmap, &vb, "projection");
+        let distribution = lora_layer(2, HIDDEN, &config, &varmap, &vb, "distribution");
+        let aux = lora_layer(HIDDEN, HIDDEN, &config, &varmap, &vb, "aux");
+        let head = LoraModel {
+            layers: vec![
+                ("projection".into(), projection),
+                ("distribution".into(), distribution),
+                ("aux".into(), aux),
+            ],
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
+        catalog
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: "resume-model",
+                version: 1,
+                model_type: "embedding",
+                backend: "candle",
+                task: crate::model::ModelTask::Regression,
+                base_model_id: None,
+                artifact_path: None,
+                config_json: None,
+            })
+            .await
+            .unwrap();
+        catalog
+            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+                job_id: job,
+                base_model_id: "resume-model::1",
+                training_source: "src",
+                loss_type: "regression",
+                hyperparams: "{}",
+                kind: "fine_tune",
+                training_spec: "{}",
+            })
+            .await
+            .unwrap();
+        catalog
+            .claim_next_training_job("resume-worker", std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("queued job is claimable");
+
+        let mut builder = TrainingLoopBuilder::new(
+            TrainingTarget::ProjectionHead { head },
+            varmap.clone(),
+            config,
+        )
+        .device(device.clone())
+        .job_id(job.into())
+        .worker_id("resume-worker".into())
+        .catalog(catalog)
+        .artifact_dir(dir_path)
+        .artifact_store(store);
+        if let Some(restored) = resume {
+            builder = builder.resume(restored);
+        }
+        let mut loop_ = builder.build().unwrap();
+        loop_.target_scaler = Some(TargetScaler::from_targets(targets).unwrap());
+        (loop_, varmap)
+    }
+
+    fn head_of(loop_: &TrainingLoop) -> &LoraModel {
+        match &loop_.target {
+            TrainingTarget::ProjectionHead { head } => head,
+            _ => unreachable!("three-layer loop builds a ProjectionHead target"),
+        }
+    }
+
+    /// One production training step over all three LoRA layers — the exact chain
+    /// `TrainingLoop::run`'s production path runs per batch: projection forward,
+    /// the aux forward, the distribution forward + de-standardisation (`regress`),
+    /// production `compute_loss`, backward, AdamW step. Dropout masks are drawn on
+    /// every forward, advancing each layer's seeded stream.
+    fn step_epoch(loop_: &TrainingLoop, opt: &mut AdamW, feats: &Tensor, targets: &Tensor) {
+        let head = head_of(loop_);
+        let proj = head.layers[0].1.forward(feats).unwrap();
+        let aux = head.layers[2].1.forward(&proj).unwrap();
+        let head_out = loop_.regress(&aux).unwrap();
+        let batch = TrainingBatch::Regression {
+            input: head_out,
+            target: targets.clone(),
+        };
+        let loss = loop_.compute_loss(&batch).unwrap();
+        let grads = loss.backward().unwrap();
+        opt.step(&grads).unwrap();
+    }
+
+    /// A fresh `file://` artifact store under a kept tempdir — the real durable
+    /// resume backend the trainer writes `{job_id}/_resume/` into.
+    fn file_store() -> Arc<ArtifactStore> {
+        let root_dir = tempfile::tempdir().unwrap().keep();
+        let cache = tempfile::tempdir().unwrap().keep();
+        let root = StorageUrl::parse(root_dir.to_str().unwrap()).unwrap();
+        Arc::new(ArtifactStore::with_root(root, StorageRegistry::new(), cache).unwrap())
+    }
+
+    /// Flatten a weights/moments map to a sorted `(key, bytes)` list for
+    /// byte-equality assertions independent of HashMap order.
+    fn weight_bytes(map: &HashMap<String, Tensor>) -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<(String, Vec<u8>)> = map
+            .iter()
+            .map(|(k, t)| {
+                let v: Vec<f32> = t.flatten_all().unwrap().to_vec1().unwrap();
+                let bytes = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+                (k.clone(), bytes)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// The exact bit-pattern of a tensor's f32 elements.
+    fn tensor_bits(t: &Tensor) -> Vec<u8> {
+        t.flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect()
+    }
+
+    /// Drive one named-param optimizer for `optim_param_names` from a loop's
+    /// varmap, matching the trainer's single-snapshot order.
+    fn build_opt(varmap: &VarMap, loop_: &TrainingLoop) -> (AdamW, Vec<String>) {
+        let vars = varmap.all_vars();
+        let opt = AdamW::new(
+            vars.clone(),
+            ParamsAdamW {
+                lr: 1e-3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let names = loop_.optimizer_param_names(&vars).unwrap();
+        (opt, names)
+    }
+
+    /// Persist a resume checkpoint through the real capture routine and the real
+    /// store. Mirrors `TrainingLoop::save_resume_checkpoint` exactly — capture via
+    /// `capture_resume_bundle`, write via `put_resume_checkpoint` — but `.await`s
+    /// the store write instead of `block_on`-ing it, so it is callable from an
+    /// async test (the production save runs inside `spawn_blocking`, where
+    /// `block_on` is valid; a test thread already drives the runtime).
+    #[allow(clippy::too_many_arguments)]
+    async fn persist(
+        store: &Arc<ArtifactStore>,
+        job: &str,
+        loop_: &TrainingLoop,
+        scratch: &std::path::Path,
+        last_completed_epoch: usize,
+        global_step: usize,
+        opt: &AdamW,
+        names: &[String],
+    ) {
+        let bundle = loop_
+            .capture_resume_bundle(scratch, last_completed_epoch, global_step, opt, names)
+            .unwrap();
+        store.put_resume_checkpoint(job, &bundle).await.unwrap();
+    }
+
+    /// The full three-run invariant, multi-thread (R6).
+    ///
+    /// The "epoch boundary" here is `K` production steps; "the next steps" is `N`
+    /// more. Reference: run K steps, persist the durable bundle via the trainer's
+    /// `save_resume_checkpoint` (== `S_ref@K`), then run N more → `W_ref`. Crashed:
+    /// a second loop runs K steps, persists, and is dropped. Resumed: a third loop
+    /// `discover`s the durable bundle, restores via `restore_from_checkpoint`, runs
+    /// N steps → `W_resumed`. Then mutate the persisted scaler-source between crash
+    /// and resume (R7) and assert `W_resumed` still matches.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_reproduces_the_exact_trajectory_byte_for_byte() {
+        const K: usize = 6;
+        const N: usize = 5;
+        let device = Device::Cpu;
+        let n = YEARS.len();
+        let targets = Tensor::from_vec(YEARS.to_vec(), (n,), &device).unwrap();
+        let feats = features(n, &device);
+        let store = file_store();
+
+        // ── Reference ──────────────────────────────────────────────────────────
+        let (ref_loop, ref_varmap) =
+            build_three_layer_loop(42, &targets, &device, Arc::clone(&store), None, "ref-job")
+                .await;
+        let (mut ref_opt, ref_names) = build_opt(&ref_varmap, &ref_loop);
+        for _ in 0..K {
+            step_epoch(&ref_loop, &mut ref_opt, &feats, &targets);
+        }
+        // The reference snapshot at the K boundary IS the durable bundle (R4: same
+        // capture routine, same boundary). `global_step K-1 == last completed`. The
+        // durable save's `Handle::block_on` is valid only off the async runtime, so
+        // the test persists the captured bundle through the store directly (the
+        // capture is `capture_resume_bundle`, the exact routine the save uses).
+        let scratch = tempfile::tempdir().unwrap();
+        persist(
+            &store,
+            "ref-job",
+            &ref_loop,
+            scratch.path(),
+            K - 1,
+            K,
+            &ref_opt,
+            &ref_names,
+        )
+        .await;
+        let s_ref_at_k = load_bundle(
+            store
+                .fetch_resume_checkpoint("ref-job")
+                .await
+                .unwrap()
+                .unwrap()
+                .dir(),
+            &device,
+        )
+        .unwrap();
+        // Continue N steps → the reference forward trajectory.
+        for _ in 0..N {
+            step_epoch(&ref_loop, &mut ref_opt, &feats, &targets);
+        }
+        let w_ref: HashMap<String, Tensor> = ref_loop.target.named_trainable_weights().unwrap();
+
+        // ── Crashed ────────────────────────────────────────────────────────────
+        let (crash_loop, crash_varmap) =
+            build_three_layer_loop(42, &targets, &device, Arc::clone(&store), None, "crash-job")
+                .await;
+        let (mut crash_opt, crash_names) = build_opt(&crash_varmap, &crash_loop);
+        for _ in 0..K {
+            step_epoch(&crash_loop, &mut crash_opt, &feats, &targets);
+        }
+        let crash_scratch = tempfile::tempdir().unwrap();
+        persist(
+            &store,
+            "crash-job",
+            &crash_loop,
+            crash_scratch.path(),
+            K - 1,
+            K,
+            &crash_opt,
+            &crash_names,
+        )
+        .await;
+        let s_crash = load_bundle(
+            store
+                .fetch_resume_checkpoint("crash-job")
+                .await
+                .unwrap()
+                .unwrap()
+                .dir(),
+            &device,
+        )
+        .unwrap();
+        drop(crash_loop); // simulate process death
+
+        // ── Assertion (1): restored state BYTE-EQUAL to S_ref@K ──────────────────
+        assert_eq!(
+            weight_bytes(&s_crash.weights),
+            weight_bytes(&s_ref_at_k.weights),
+            "restored LoRA A/B must be byte-equal to the reference snapshot"
+        );
+        assert_eq!(
+            s_crash.state.step_t, s_ref_at_k.state.step_t,
+            "restored step_t must match"
+        );
+        assert_eq!(
+            s_crash.state.scaler, s_ref_at_k.state.scaler,
+            "restored (μ, σ) must match"
+        );
+        // ≥3 params' moments must each be byte-equal BY NAME (R1): a positional
+        // serialization would line up the wrong param under HashMap permutation.
+        assert!(
+            s_crash.moments.len() >= 3,
+            "the head must have ≥3 LoRA params so the optimizer HashMap order is \
+             non-trivially permuted (got {})",
+            s_crash.moments.len()
+        );
+        for (name, (m, v)) in &s_ref_at_k.moments {
+            let (cm, cv) = s_crash
+                .moments
+                .get(name)
+                .unwrap_or_else(|| panic!("moment '{name}' missing from crash bundle"));
+            assert_eq!(tensor_bits(m), tensor_bits(cm), "first moment '{name}'");
+            assert_eq!(tensor_bits(v), tensor_bits(cv), "second moment '{name}'");
+        }
+
+        // ── R7: mutate the scaler source between crash and resume ────────────────
+        // The persisted μ/σ must be authoritative — a recompute over a perturbed
+        // source would diverge. We hand the resumed loop a DIFFERENT scaler-source;
+        // resume must override it with the persisted (μ, σ) and still match.
+        let perturbed = Tensor::from_vec(vec![0.0f32; n], (n,), &device).unwrap();
+
+        // ── Resumed ──────────────────────────────────────────────────────────────
+        let (resume_loop, resume_varmap) = build_three_layer_loop(
+            42,
+            &perturbed,
+            &device,
+            Arc::clone(&store),
+            Some(s_crash),
+            "resume-job",
+        )
+        .await;
+        // The loop's restore ran in `build`? No — restore runs inside `run()`; here
+        // we drive the forward manually, so apply the same restore the trainer does.
+        let (mut resume_opt, resume_names) = build_opt(&resume_varmap, &resume_loop);
+        let restored_bundle = load_bundle(
+            store
+                .fetch_resume_checkpoint("crash-job")
+                .await
+                .unwrap()
+                .unwrap()
+                .dir(),
+            &device,
+        )
+        .unwrap();
+        let (start_epoch, _gstep) = {
+            // Borrow the loop mutably to restore weights/scaler/dropout, and the
+            // opt to restore moments — the exact `restore_from_checkpoint` routine.
+            let mut rl = resume_loop;
+            let se = rl
+                .restore_from_checkpoint(restored_bundle, &mut resume_opt, &resume_names)
+                .unwrap();
+            // The perturbed scaler-source must have been overridden by the
+            // persisted (μ, σ) — R7.
+            let restored_scaler = rl.target_scaler.unwrap();
+            assert!(
+                (restored_scaler.mean() - s_ref_at_k.state.scaler.unwrap().0).abs() < 1e-12,
+                "resume must load the persisted μ, not recompute it from the \
+                 (mutated) source"
+            );
+            // The restored state is already byte-equal to S_ref@K (weights,
+            // moments, step_t, dropout positions, scaler) — the binding that makes
+            // the NEXT steps reproduce is that the weights were restored INTO the
+            // optimizer's `Var`s, so each post-resume step updates the same tensor
+            // the forward reads (see `restore_from_checkpoint`).
+            {
+                let re_w = rl.target.named_trainable_weights().unwrap();
+                assert_eq!(
+                    weight_bytes(&re_w),
+                    weight_bytes(&s_ref_at_k.weights),
+                    "restored weights must be byte-equal to S_ref@K"
+                );
+                let (_re_m, re_t) =
+                    TrainingLoop::capture_moments_by_name(&resume_opt, &resume_names).unwrap();
+                assert_eq!(
+                    re_t, s_ref_at_k.state.step_t,
+                    "restored step_t must match S_ref@K"
+                );
+            }
+
+            for _ in 0..N {
+                step_epoch(&rl, &mut resume_opt, &feats, &targets);
+            }
+            let w_resumed: HashMap<String, Tensor> = rl.target.named_trainable_weights().unwrap();
+
+            // ── Assertion (2): next-N weights BYTE-EQUAL to the reference ─────────
+            assert_eq!(
+                weight_bytes(&w_resumed),
+                weight_bytes(&w_ref),
+                "the resumed run's next-{N}-step weights must be byte-equal to the \
+                 uninterrupted run's — a reset moment, lost step_t, recomputed \
+                 scaler, or desynced dropout stream would diverge here"
+            );
+            se
+        };
+        assert_eq!(start_epoch, K, "resume starts at last_completed + 1");
+    }
+
+    /// Non-vacuity of assertion (2): a WEIGHTS-ONLY restore (zero optimizer
+    /// moments + `step_t` reset to 0) passes assertion (1) on the weights but
+    /// DIVERGES on the next-N steps — exactly the silent moment-reset the contract
+    /// must catch. This stubs the broken restore and observes (2) fail, proving the
+    /// full test above is not passing trivially.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn weights_only_restore_diverges_on_next_steps() {
+        const K: usize = 6;
+        const N: usize = 5;
+        let device = Device::Cpu;
+        let n = YEARS.len();
+        let targets = Tensor::from_vec(YEARS.to_vec(), (n,), &device).unwrap();
+        let feats = features(n, &device);
+        let store = file_store();
+
+        let (ref_loop, ref_varmap) =
+            build_three_layer_loop(7, &targets, &device, Arc::clone(&store), None, "wo-ref-job")
+                .await;
+        let (mut ref_opt, ref_names) = build_opt(&ref_varmap, &ref_loop);
+        for _ in 0..K {
+            step_epoch(&ref_loop, &mut ref_opt, &feats, &targets);
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        persist(
+            &store,
+            "wo-ref-job",
+            &ref_loop,
+            scratch.path(),
+            K - 1,
+            K,
+            &ref_opt,
+            &ref_names,
+        )
+        .await;
+        let bundle = load_bundle(
+            store
+                .fetch_resume_checkpoint("wo-ref-job")
+                .await
+                .unwrap()
+                .unwrap()
+                .dir(),
+            &device,
+        )
+        .unwrap();
+        for _ in 0..N {
+            step_epoch(&ref_loop, &mut ref_opt, &feats, &targets);
+        }
+        let w_ref = ref_loop.target.named_trainable_weights().unwrap();
+
+        // BROKEN resume: restore ONLY the weights, scaler, and dropout — leave the
+        // optimizer at zero moments and step_t = 0 (the weights-only checkpoint).
+        let (mut wo_loop, wo_varmap) =
+            build_three_layer_loop(7, &targets, &device, Arc::clone(&store), None, "wo-job").await;
+        wo_loop.target.load_weights(&bundle.weights).unwrap();
+        wo_loop
+            .target
+            .restore_dropout_positions(&bundle.state.dropout_positions)
+            .unwrap();
+        let (mut wo_opt, _wo_names) = build_opt(&wo_varmap, &wo_loop); // fresh zero moments
+        for _ in 0..N {
+            step_epoch(&wo_loop, &mut wo_opt, &feats, &targets);
+        }
+        let w_wo = wo_loop.target.named_trainable_weights().unwrap();
+
+        assert_ne!(
+            weight_bytes(&w_wo),
+            weight_bytes(&w_ref),
+            "a weights-only restore (zero moments + step_t reset) MUST diverge on \
+             the next-{N} steps — if it matched, assertion (2) would be vacuous"
+        );
+    }
+
+    /// R3 (the validation half): a validation pass — `set_training(false)`, a
+    /// forward, `set_training(true)`, exactly what `TrainingLoop::run` wraps its
+    /// `evaluate` call in — must NOT perturb the dropout stream. If it did, the
+    /// masks the next training step draws would desync between a run that
+    /// validates and one that resumes, breaking byte-equality.
+    ///
+    /// Two reference loops run K training steps; one of them interleaves a
+    /// validation-mode forward (dropout off) before its next training step. Their
+    /// next-step weights must be byte-equal — proving the eval forward drew no
+    /// masks and left every layer's stream where the training forwards left it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validation_pass_does_not_perturb_the_dropout_stream() {
+        const K: usize = 4;
+        let device = Device::Cpu;
+        let n = YEARS.len();
+        let targets = Tensor::from_vec(YEARS.to_vec(), (n,), &device).unwrap();
+        let feats = features(n, &device);
+        let store = file_store();
+
+        // Run A: K steps, then one more training step.
+        let (a_loop, a_varmap) =
+            build_three_layer_loop(99, &targets, &device, Arc::clone(&store), None, "val-a").await;
+        let (mut a_opt, _) = build_opt(&a_varmap, &a_loop);
+        for _ in 0..K {
+            step_epoch(&a_loop, &mut a_opt, &feats, &targets);
+        }
+        step_epoch(&a_loop, &mut a_opt, &feats, &targets);
+        let w_a = a_loop.target.named_trainable_weights().unwrap();
+
+        // Run B: K steps, a VALIDATION-mode forward (dropout off), then the same
+        // training step. `set_training` is `&mut`, so take the head out by value
+        // through a fresh binding.
+        let (mut b_loop, b_varmap) =
+            build_three_layer_loop(99, &targets, &device, Arc::clone(&store), None, "val-b").await;
+        let (mut b_opt, _) = build_opt(&b_varmap, &b_loop);
+        for _ in 0..K {
+            step_epoch(&b_loop, &mut b_opt, &feats, &targets);
+        }
+        // A validation pass: dropout off → no mask draws, the stream is untouched.
+        b_loop.target.set_training(false);
+        {
+            let head = head_of(&b_loop);
+            let proj = head.layers[0].1.forward(&feats).unwrap();
+            let aux = head.layers[2].1.forward(&proj).unwrap();
+            let _ = b_loop.regress(&aux).unwrap();
+        }
+        b_loop.target.set_training(true);
+        step_epoch(&b_loop, &mut b_opt, &feats, &targets);
+        let w_b = b_loop.target.named_trainable_weights().unwrap();
+
+        assert_eq!(
+            weight_bytes(&w_a),
+            weight_bytes(&w_b),
+            "a validation-mode forward must draw no dropout masks — the dropout \
+             stream is a separate, training-only stream that validation cannot \
+             perturb, so the post-validation training step is byte-identical"
+        );
+    }
+
+    /// R5 (the lease gate): a zombie worker — one whose lease was reclaimed, so
+    /// its `cancel` flag is set — must NOT regress the shared `{job_id}/_resume/`
+    /// checkpoint below the lease-winner's epoch. The trainer gates the durable
+    /// save on `!cancel` at the epoch boundary, so a cancelled run writes nothing.
+    ///
+    /// Winner B persists an epoch-5 bundle. Zombie A then runs `TrainingLoop::run`
+    /// with `cancel` pre-set and the SAME `job_id` + store; it bails at the first
+    /// epoch-boundary cancel check and writes no durable checkpoint. The next
+    /// `discover_resume` still returns the winner's epoch 5 — resume never goes
+    /// backwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn zombie_lease_loser_cannot_regress_the_resume_checkpoint() {
+        use super::super::data::TrainingDataLoader;
+        use std::sync::atomic::AtomicBool;
+
+        let device = Device::Cpu;
+        let store = file_store();
+        let job = "r5-job";
+
+        // Winner B persists an epoch-5 resume bundle directly through the store
+        // (the durable state a healthy attempt would have written).
+        let winner_state = super::super::resume::ResumeState {
+            last_completed_epoch: 5,
+            global_step: 60,
+            step_t: 60,
+            seed: 42,
+            scaler: None,
+            dropout_positions: HashMap::new(),
+        };
+        let winner_bundle = vec![
+            (
+                "resume_state.json".to_string(),
+                Bytes::from(serde_json::to_vec(&winner_state).unwrap()),
+            ),
+            // Minimal valid safetensors so `load_bundle` parses the bundle; the
+            // tensor content is irrelevant to what R5 asserts (the epoch counter).
+            safetensors_entry("adapter.safetensors", &["w.lora_a", "w.lora_b"], &device),
+            safetensors_entry("optimizer.safetensors", &["w.m", "w.v"], &device),
+        ];
+        store
+            .put_resume_checkpoint(job, &winner_bundle)
+            .await
+            .unwrap();
+
+        // Zombie A: a real run with `cancel` already set, same job_id + store. It
+        // must bail before any durable write.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let config = resume_config(42);
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let projection = lora_layer(4, 4, &config, &varmap, &vb, "projection");
+        let head = LoraModel {
+            layers: vec![("projection".into(), projection)],
+        };
+
+        let dir = tempfile::tempdir().unwrap().keep();
+        let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir).await.unwrap());
+        catalog
+            .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+                model_id: "r5-model",
+                version: 1,
+                model_type: "embedding",
+                backend: "candle",
+                task: crate::model::ModelTask::TextEmbedding,
+                base_model_id: None,
+                artifact_path: None,
+                config_json: None,
+            })
+            .await
+            .unwrap();
+        catalog
+            .create_training_job(jammi_db::catalog::training_repo::CreateTrainingJobParams {
+                job_id: job,
+                base_model_id: "r5-model::1",
+                training_source: "src",
+                loss_type: "cosent",
+                hyperparams: "{}",
+                kind: "fine_tune",
+                training_spec: "{}",
+            })
+            .await
+            .unwrap();
+        catalog
+            .claim_next_training_job("r5-worker", std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let a = Tensor::new(&[[1.0f32, 0.0, 0.0, 0.0]], &device).unwrap();
+        let b = Tensor::new(&[[0.0f32, 1.0, 0.0, 0.0]], &device).unwrap();
+        let batch = TrainingBatch::Contrastive {
+            embeddings_a: a,
+            embeddings_b: b,
+            scores: Tensor::new(&[1.0f32], &device).unwrap(),
+        };
+        let loader = TrainingDataLoader::from_precomputed(vec![batch]);
+
+        let mut zombie =
+            TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                .device(device.clone())
+                .job_id(job.into())
+                .worker_id("r5-worker".into())
+                .catalog(catalog)
+                .artifact_dir(dir)
+                .artifact_store(Arc::clone(&store))
+                .cancel(cancel)
+                .build()
+                .unwrap();
+
+        // The cancelled run bails at the first epoch-boundary check.
+        let err = tokio::task::spawn_blocking(move || zombie.run(&loader))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("training cancelled"),
+            "a cancelled run must bail, got: {err}"
+        );
+
+        // The durable checkpoint still reports the winner's epoch 5 — the zombie
+        // wrote nothing, so resume never regressed.
+        let after = load_bundle(
+            store
+                .fetch_resume_checkpoint(job)
+                .await
+                .unwrap()
+                .unwrap()
+                .dir(),
+            &device,
+        )
+        .unwrap();
+        assert_eq!(
+            after.state.last_completed_epoch, 5,
+            "the zombie's stale write must not have regressed the checkpoint below \
+             the lease-winner's epoch"
+        );
+    }
+
+    /// A safetensors bundle entry over the given tensor keys so `load_bundle` can
+    /// parse a hand-built winner bundle (R5) whose tensor content is irrelevant.
+    fn safetensors_entry(name: &str, keys: &[&str], device: &Device) -> (String, Bytes) {
+        let mut map = HashMap::new();
+        for key in keys {
+            map.insert(
+                (*key).to_string(),
+                Tensor::zeros((1,), DType::F32, device).unwrap(),
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        candle_core::safetensors::save(&map, &path).unwrap();
+        (name.to_string(), Bytes::from(std::fs::read(&path).unwrap()))
     }
 }

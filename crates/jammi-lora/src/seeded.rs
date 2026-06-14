@@ -100,13 +100,24 @@ pub(crate) fn gaussian_fill(rng: &mut SplitMix64, len: usize, stdev: f32) -> Vec
 /// of draws. Validation forwards skip dropout (`set_training(false)`), so they
 /// never perturb the stream.
 pub(crate) struct DropoutStream {
+    /// The stream's deterministic origin — `(seed, "{layer_name}.dropout")` — kept
+    /// so the stream can be rewound to an exact draw position on resume (replay
+    /// from the origin by `position` draws), not just advanced from where it is.
+    origin_seed: u64,
     rng: SplitMix64,
+    /// Total `next_f32` draws consumed since the origin. This is the stream's
+    /// position; persisted at an epoch boundary and replayed on resume so a
+    /// resumed run's k-th-block-onward masks byte-match the uninterrupted run.
+    position: u64,
 }
 
 impl DropoutStream {
     pub(crate) fn new(seed: u64, layer_name: &str) -> Self {
+        let origin_seed = seed_for_param(seed, &format!("{layer_name}.dropout"));
         Self {
-            rng: SplitMix64::new(seed_for_param(seed, &format!("{layer_name}.dropout"))),
+            origin_seed,
+            rng: SplitMix64::new(origin_seed),
+            position: 0,
         }
     }
 
@@ -116,9 +127,31 @@ impl DropoutStream {
     pub(crate) fn draw_mask(&mut self, len: usize, p: f32) -> Vec<f32> {
         let keep = 1.0 - p;
         let scale = 1.0 / keep;
-        (0..len)
+        let mask = (0..len)
             .map(|_| if self.rng.next_f32() < p { 0.0 } else { scale })
-            .collect()
+            .collect();
+        self.position += len as u64;
+        mask
+    }
+
+    /// The stream's current draw position — the number of mask draws consumed
+    /// since the origin. The unit of resume state for this layer's dropout.
+    pub(crate) fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// Rewind to the origin and replay `position` draws, leaving the stream at the
+    /// exact state it had after consuming that many masks. A resumed run restores
+    /// each layer's dropout stream to the position it held at the persisted epoch
+    /// boundary, so the next forwards draw the same masks the uninterrupted run
+    /// drew — `SplitMix64` has no closed-form skip, but the LoRA matrices are
+    /// small, so replaying the consumed draws is cheap and exact.
+    pub(crate) fn restore_position(&mut self, position: u64) {
+        self.rng = SplitMix64::new(self.origin_seed);
+        for _ in 0..position {
+            self.rng.next_f32();
+        }
+        self.position = position;
     }
 }
 
@@ -181,5 +214,27 @@ mod tests {
         // Roughly p of the mask is dropped.
         let dropped = m1.iter().filter(|x| **x == 0.0).count() as f32 / m1.len() as f32;
         assert!((dropped - 0.3).abs() < 0.03, "dropped fraction {dropped}");
+    }
+
+    #[test]
+    fn restore_position_replays_the_exact_stream() {
+        // A reference stream draws three masks; a fresh stream restored to the
+        // reference's position after two masks must draw the third mask
+        // byte-identically — this is the resume invariant for dropout.
+        let mut reference = DropoutStream::new(7, "projection");
+        let _m0 = reference.draw_mask(16, 0.2);
+        let _m1 = reference.draw_mask(8, 0.2);
+        let pos = reference.position();
+        assert_eq!(pos, 24);
+        let m2_ref = reference.draw_mask(16, 0.2);
+
+        let mut resumed = DropoutStream::new(7, "projection");
+        resumed.restore_position(pos);
+        assert_eq!(resumed.position(), pos);
+        let m2_resumed = resumed.draw_mask(16, 0.2);
+        assert_eq!(
+            m2_ref, m2_resumed,
+            "a restored dropout stream must replay the uninterrupted stream byte-for-byte"
+        );
     }
 }

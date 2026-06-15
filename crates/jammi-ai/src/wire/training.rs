@@ -11,6 +11,7 @@
 //! submitted in-process. Validation stays in the engine (the submit verbs call
 //! `validate`); this is a pure shape map.
 
+use prost::Message;
 use tonic::Status;
 
 use crate::fine_tune::graph_sampler::{EdgeProvenance, GraphFineTuneSources, GraphSampleConfig};
@@ -32,6 +33,19 @@ use jammi_wire::{
 // The two LoRA fine-tune kinds carry their base-model + config in the request's
 // common `base_model`/`config` fields (folded into [`TrainingCommon`]); the
 // context-predictor kind carries its full budget inside `predictor_spec`.
+
+/// Decode a serialized [`pb::StartTrainingRequest`] body into the engine
+/// [`TrainingSpec`]. The embedded binding builds the request with the same
+/// pure-Python assembly the remote client uses, serializes it, and hands the
+/// bytes here — so the in-process and remote submit paths decode through one
+/// shared seam ([`training_spec_from_proto`]). A body that is not a valid
+/// `StartTrainingRequest` is a client error (`InvalidArgument`), matching how a
+/// malformed spec is rejected.
+pub fn training_spec_from_bytes(body: &[u8]) -> Result<TrainingSpec, Status> {
+    let req = pb::StartTrainingRequest::decode(body)
+        .map_err(|e| Status::invalid_argument(format!("malformed StartTraining request: {e}")))?;
+    training_spec_from_proto(req)
+}
 
 /// Decode a [`pb::StartTrainingRequest`] into the engine [`TrainingSpec`]. The
 /// `oneof` selects the variant; `base_model`/`config` fold into the two LoRA

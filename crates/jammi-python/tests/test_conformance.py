@@ -28,6 +28,32 @@ import jammi_ai
 import jammi_client
 
 
+def _embed_method(verb: str):
+    """Resolve `verb` against the COMPOSED embedded surface: the thin Python
+    `jammi_ai.Database`'s explicit method if it declares one, else the
+    `_NativeDatabase` low-level handle's method it delegates to via
+    ``__getattr__``.
+
+    The embedded `Database` is a thin wrapper over the compiled
+    `_NativeDatabase`: the migrated training verbs are explicit Python methods on
+    the wrapper (driving the shared request assembly), while every un-migrated
+    verb lives on the native handle and is forwarded at runtime. A class-level
+    introspection (which is what the conformance guard does) must look through the
+    same composition — wrapper first, native handle behind it — to see the verb a
+    caller actually invokes."""
+    if verb in vars(jammi_ai.Database):
+        return getattr(jammi_ai.Database, verb)
+    return getattr(jammi_ai._native._NativeDatabase, verb)
+
+
+def _embed_has(verb: str) -> bool:
+    """Whether the composed embedded surface carries `verb` — declared on the thin
+    `Database` wrapper or on the `_NativeDatabase` handle behind it."""
+    return verb in vars(jammi_ai.Database) or hasattr(
+        jammi_ai._native._NativeDatabase, verb
+    )
+
+
 def test_embed_remote_is_the_client_remote_database():
     """`jammi_ai.connect(remote)` returns the client's `RemoteDatabase` — the
     remote arm is defined once, in `jammi-client`, and reused by composition."""
@@ -203,7 +229,7 @@ def test_mutable_topic_verbs_have_identical_signatures_across_wheels():
     is caught."""
     for verb in _MUTABLE_TOPIC_VERBS:
         client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
-        embed = _call_surface(getattr(jammi_ai.Database, verb))
+        embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
 
 
@@ -215,7 +241,7 @@ def test_inference_verbs_have_identical_signatures_across_wheels():
     kind-for-kind, and default-for-default so a divergence in either is caught."""
     for verb in _INFERENCE_VERBS:
         client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
-        embed = _call_surface(getattr(jammi_ai.Database, verb))
+        embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
 
 
@@ -227,7 +253,7 @@ def test_pipeline_verbs_have_identical_signatures_across_wheels():
     kind-for-kind, and default-for-default so a divergence in either is caught."""
     for verb in _PIPELINE_VERBS:
         client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
-        embed = _call_surface(getattr(jammi_ai.Database, verb))
+        embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
 
 
@@ -239,7 +265,7 @@ def test_eval_verbs_have_identical_signatures_across_wheels():
     kind-for-kind, and default-for-default so a divergence in either is caught."""
     for verb in _EVAL_VERBS:
         client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
-        embed = _call_surface(getattr(jammi_ai.Database, verb))
+        embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
 
 
@@ -265,7 +291,7 @@ def test_search_verb_has_identical_signature_across_wheels():
     default-for-default so a divergence in either is caught."""
     for verb in _SEARCH_VERBS:
         client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
-        embed = _call_surface(getattr(jammi_ai.Database, verb))
+        embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
         names = {p[0] for p in embed}
         assert "embedding_table" in names, f"{verb} must expose embedding_table"
@@ -280,7 +306,7 @@ def test_channel_verbs_have_identical_signatures_across_wheels():
     either is caught."""
     for verb in _CHANNEL_VERBS:
         client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
-        embed = _call_surface(getattr(jammi_ai.Database, verb))
+        embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
 
 
@@ -292,7 +318,7 @@ def test_training_verbs_have_identical_signatures_across_wheels():
     kind-for-kind, and default-for-default so a divergence in either is caught."""
     for verb in _TRAINING_VERBS:
         client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
-        embed = _call_surface(getattr(jammi_ai.Database, verb))
+        embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
 
 
@@ -337,7 +363,7 @@ def test_numeric_verbs_have_identical_signatures_across_wheels():
     divergence in either implementation is caught."""
     for verb in _NUMERIC_VERBS:
         client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
-        embed = _call_surface(getattr(jammi_ai.Database, verb))
+        embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
 
 
@@ -433,7 +459,7 @@ def test_embedded_database_shares_the_unified_modality_verbs():
     `generate_embeddings` (the `modality=` form), matching the client — and the
     per-modality names are gone (the deferred Stage-1 unification)."""
     for verb in ("encode_query", "generate_embeddings", "get_server_info"):
-        assert hasattr(jammi_ai.Database, verb), verb
+        assert _embed_has(verb), verb
     for gone in (
         "encode_text_query",
         "encode_image_query",
@@ -443,7 +469,7 @@ def test_embedded_database_shares_the_unified_modality_verbs():
         "generate_audio_embeddings",
         "server_info",
     ):
-        assert not hasattr(jammi_ai.Database, gone), f"{gone} should be hard-cut"
+        assert not _embed_has(gone), f"{gone} should be hard-cut"
 
 
 def test_tenant_surface_agrees_across_wheels():
@@ -454,15 +480,15 @@ def test_tenant_surface_agrees_across_wheels():
     ``None``) is gone from BOTH surfaces — a caller swaps transports without
     changing the call, and neither surface carries the footgun."""
     for verb in ("set_tenant", "tenant_scope", "tenant"):
-        assert callable(getattr(jammi_ai.Database, verb)), verb
+        assert callable(_embed_method(verb)), verb
         assert callable(getattr(jammi_client.RemoteDatabase, verb)), verb
-    assert not hasattr(jammi_ai.Database, "with_tenant"), "with_tenant must be hard-cut"
+    assert not _embed_has("with_tenant"), "with_tenant must be hard-cut"
     assert not hasattr(
         jammi_client.RemoteDatabase, "with_tenant"
     ), "with_tenant must be hard-cut"
     # `tenant_scope(tenant_id)` takes the same caller-visible parameter on both —
     # the embedded native method and the client context manager agree name-for-name.
-    embed = _call_surface(jammi_ai.Database.tenant_scope)
+    embed = _call_surface(_embed_method("tenant_scope"))
     client = _call_surface(jammi_client.RemoteDatabase.tenant_scope)
     assert embed == client, f"tenant_scope: {embed} != {client}"
 

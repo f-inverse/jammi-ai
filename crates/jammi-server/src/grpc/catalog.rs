@@ -28,15 +28,14 @@ use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
 use jammi_ai::Session;
-use jammi_db::catalog::channel_repo::ChannelSpec;
 use jammi_db::error::JammiError;
 use jammi_db::source::SourceConnection;
 use jammi_db::trigger::ids::TopicId;
-use jammi_db::trigger::{TopicDefinition, TriggerError};
+use jammi_db::trigger::TriggerError;
 use jammi_db::TenantId;
 use jammi_wire::{
-    channel_to_proto, columns_from_proto, definition_from_proto, definition_to_proto,
-    model_to_proto, parse_channel_id, parse_table_id, source_type_from_proto, topic_to_proto,
+    channel_to_proto, definition_to_proto, model_to_proto, parse_table_id, source_type_from_proto,
+    topic_to_proto,
 };
 use tonic::{Request, Response, Status};
 
@@ -303,14 +302,10 @@ impl CatalogService for CatalogServer {
         request: Request<pb::RegisterChannelRequest>,
     ) -> Result<Response<()>, Status> {
         let tenant = session_tenant_traced(&request);
-        let req = request.into_inner();
-        let id = parse_channel_id(&req.channel_id)?;
-        let columns = columns_from_proto(req.columns)?;
-        let spec = ChannelSpec {
-            id,
-            priority: req.priority,
-            columns,
-        };
+        // Decode through the shared `jammi_ai::wire` seam — the same decode the
+        // embedded binding's `_register_channel_proto` drives — so both transports
+        // validate and submit an identical request.
+        let spec = jammi_ai::wire::register_channel_from_proto(request.into_inner())?;
         let session = self.local()?;
 
         scoped(self.engine()?, tenant, || session.register_channel(&spec))
@@ -326,13 +321,14 @@ impl CatalogService for CatalogServer {
         request: Request<pb::AddChannelColumnsRequest>,
     ) -> Result<Response<()>, Status> {
         let tenant = session_tenant_traced(&request);
-        let req = request.into_inner();
-        let id = parse_channel_id(&req.channel_id)?;
-        let columns = columns_from_proto(req.columns)?;
+        // Decode through the shared `jammi_ai::wire` seam — the same decode the
+        // embedded binding's `_add_channel_columns_proto` drives — so both
+        // transports validate and submit an identical request.
+        let args = jammi_ai::wire::add_channel_columns_from_proto(request.into_inner())?;
         let session = self.local()?;
 
         scoped(self.engine()?, tenant, || {
-            session.add_channel_columns(&id, &columns)
+            session.add_channel_columns(&args.id, &args.columns)
         })
         .await
         .map_err(map_engine_error)?;
@@ -364,11 +360,11 @@ impl CatalogService for CatalogServer {
         request: Request<pb::CreateMutableTableRequest>,
     ) -> Result<Response<pb::CreateMutableTableResponse>, Status> {
         let tenant = session_tenant_traced(&request);
-        let req = request.into_inner();
-        let def_proto = req
-            .definition
-            .ok_or_else(|| Status::invalid_argument("definition is required"))?;
-        let def = definition_from_proto(def_proto, tenant)?;
+        // Decode through the shared `jammi_ai::wire` seam — the same decode the
+        // embedded binding's `_create_mutable_table_proto` drives — so both
+        // transports validate and submit an identical request. The wire body is
+        // tenant-free; the decode stamps the session's resolved tenant.
+        let def = jammi_ai::wire::create_mutable_table_from_proto(request.into_inner(), tenant)?;
         let session = self.local()?;
 
         let id = scoped(self.engine()?, tenant, || session.create_mutable_table(def))
@@ -427,29 +423,12 @@ impl CatalogService for CatalogServer {
         request: Request<pb::RegisterTopicRequest>,
     ) -> Result<Response<pb::RegisterTopicResponse>, Status> {
         let tenant = session_tenant_traced(&request);
-        let req = request.into_inner();
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument("name is required"));
-        }
-        let schema = jammi_wire::decode_ipc_schema(&req.schema)?;
-        let broker_metadata = req.broker_metadata.into_iter().collect();
-        // Honor a caller-supplied id (the `Session::register_topic` surface
-        // carries the `TopicDefinition.id` the caller minted) so the topic's
-        // identity is consistent across transports; an empty id mints a fresh
-        // UUIDv7.
-        let id = if req.topic_id.is_empty() {
-            TopicId::new()
-        } else {
-            TopicId::from_str(&req.topic_id)
-                .map_err(|e| Status::invalid_argument(format!("invalid topic_id: {e}")))?
-        };
-        let topic = TopicDefinition {
-            id,
-            name: req.name,
-            schema,
-            tenant,
-            broker_metadata,
-        };
+        // Decode through the shared `jammi_ai::wire` seam — the same decode the
+        // embedded binding's `_register_topic_proto` drives — so both transports
+        // validate and submit an identical request. The wire body is tenant-free;
+        // the decode stamps the session's resolved tenant, honours a
+        // caller-supplied topic id, and mints a fresh UUIDv7 when none is given.
+        let topic = jammi_ai::wire::register_topic_from_proto(request.into_inner(), tenant)?;
         let session = self.local()?;
 
         // `register_topic` dual-registers the broker driver and the catalog (so a

@@ -24,6 +24,7 @@
 //! the embedded SDK). A thin wire-only client carries no engine pipeline type to
 //! reconstruct.
 
+use prost::Message;
 use tonic::Status;
 
 use crate::pipeline::context_set::{
@@ -53,6 +54,19 @@ pub struct BuildNeighborGraphArgs {
     pub params: BuildNeighborGraph,
 }
 
+/// Decode a serialized [`pb::BuildNeighborGraphRequest`] body into the engine's
+/// build args. The embedded binding builds the request with the same pure-Python
+/// assembly the remote client uses, serializes it, and hands the bytes here — so
+/// the in-process and remote paths decode through one shared seam
+/// ([`build_neighbor_graph_from_proto`]). A body that is not a valid request is a
+/// client error (`InvalidArgument`).
+pub fn build_neighbor_graph_from_bytes(body: &[u8]) -> Result<BuildNeighborGraphArgs, Status> {
+    let req = pb::BuildNeighborGraphRequest::decode(body).map_err(|e| {
+        Status::invalid_argument(format!("malformed BuildNeighborGraph request: {e}"))
+    })?;
+    build_neighbor_graph_from_proto(req)
+}
+
 /// Decode a [`pb::BuildNeighborGraphRequest`] into the engine's build args. The
 /// off-wire knobs (`self_exclude` / `exact_max_rows` / `resolve_keys`) come from
 /// [`BuildNeighborGraph::default`] so the engine stays the single source of
@@ -78,6 +92,19 @@ pub fn build_neighbor_graph_from_proto(
 }
 
 // ─── PropagateEmbeddings ─────────────────────────────────────────────────────
+
+/// Decode a serialized [`pb::PropagateEmbeddingsRequest`] body into the engine
+/// [`PropagateRequest`]. The embedded binding builds the request with the same
+/// pure-Python assembly the remote client uses, serializes it, and hands the
+/// bytes here — so the in-process and remote paths decode through one shared seam
+/// ([`propagate_request_from_proto`]). A body that is not a valid request is a
+/// client error (`InvalidArgument`).
+pub fn propagate_request_from_bytes(body: &[u8]) -> Result<PropagateRequest, Status> {
+    let req = pb::PropagateEmbeddingsRequest::decode(body).map_err(|e| {
+        Status::invalid_argument(format!("malformed PropagateEmbeddings request: {e}"))
+    })?;
+    propagate_request_from_proto(req)
+}
 
 /// Decode a [`pb::PropagateEmbeddingsRequest`] into the engine [`PropagateRequest`].
 /// The `graph` oneof selects the edge source (an S9 neighbour-graph table or a
@@ -181,6 +208,18 @@ fn propagation_output_from_proto(output: i32) -> Result<PropagationOutput, Statu
 }
 
 // ─── AssembleContext ─────────────────────────────────────────────────────────
+
+/// Decode a serialized [`pb::AssembleContextRequest`] body into the engine
+/// [`ContextRequest`]. The embedded binding builds the request with the same
+/// pure-Python assembly the remote client uses, serializes it, and hands the
+/// bytes here — so the in-process and remote paths decode through one shared seam
+/// ([`assemble_context_request_from_proto`]). A body that is not a valid request
+/// is a client error (`InvalidArgument`).
+pub fn assemble_context_request_from_bytes(body: &[u8]) -> Result<ContextRequest, Status> {
+    let req = pb::AssembleContextRequest::decode(body)
+        .map_err(|e| Status::invalid_argument(format!("malformed AssembleContext request: {e}")))?;
+    assemble_context_request_from_proto(req)
+}
 
 /// Decode a [`pb::AssembleContextRequest`] into the engine [`ContextRequest`].
 /// The optional edge gather decodes through the shared [`edge_gather_from_proto`]

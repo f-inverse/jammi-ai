@@ -263,6 +263,10 @@ jobs:
       - name: Test (hermetic)
         run: make test
 
+      - name: Guard — client imports no embed wheel
+        run: |
+          python -c "import sys, jammi_client; bad=[m for m in sys.modules if m=='jammi_ai' or m.startswith('jammi_ai.')]; assert not bad, f'jammi_client must not import jammi_ai: {bad}'; print('client import-direction OK')"
+
   test-broker:
     name: Test (NATS JetStream)
     runs-on: ubuntu-latest

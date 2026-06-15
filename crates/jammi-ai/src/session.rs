@@ -1060,6 +1060,53 @@ impl InferenceSession {
         .await
     }
 
+    /// Run a decoded [`TrainingSpec`] on this session, dispatching each variant
+    /// to its training entry point.
+    ///
+    /// The single spec→session seam: the gRPC `StartTraining` handler and the
+    /// embedded binding both decode a `StartTrainingRequest` into a
+    /// [`TrainingSpec`] and submit it here, so an identical decode yields an
+    /// identical job on either transport. The dispatch lives once, beside the
+    /// entry points it calls, rather than being re-written per transport.
+    pub async fn run_training_spec(self: &Arc<Self>, spec: TrainingSpec) -> Result<TrainingJob> {
+        match spec {
+            TrainingSpec::FineTune {
+                source,
+                columns,
+                method,
+                task,
+                common,
+            } => {
+                self.fine_tune(
+                    &source,
+                    &common.base_model,
+                    &columns,
+                    method,
+                    task,
+                    Some(common.config),
+                )
+                .await
+            }
+            TrainingSpec::GraphFineTune {
+                sources,
+                sample_config,
+                common,
+            } => {
+                self.fine_tune_graph(
+                    &sources,
+                    &common.base_model,
+                    sample_config,
+                    Some(common.config),
+                )
+                .await
+            }
+            TrainingSpec::ContextPredictor {
+                source,
+                predictor_spec,
+            } => self.train_context_predictor(&source, &predictor_spec).await,
+        }
+    }
+
     // =====================================================================
     // Evaluation
     // =====================================================================

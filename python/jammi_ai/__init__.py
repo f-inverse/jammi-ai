@@ -26,13 +26,14 @@ from jammi_client import LocalTarget, RemoteDatabase, Target, parse_target
 
 from jammi_ai._native import (
     open_local,
-    Database,
+    _NativeDatabase,
     TrainingJob,
     ModelTask,
     PerQueryAudit,
     AuditHandle,
     EphemeralSession,
 )
+from jammi_ai._database import Database
 
 __all__ = [
     "connect",
@@ -63,7 +64,11 @@ def connect(target: Union[str, Target]) -> Union[Database, RemoteDatabase]:
     """
     parsed = parse_target(target)
     if isinstance(parsed, LocalTarget):
-        return open_local(artifact_dir=parsed.artifact_dir)
+        # Wrap the low-level native handle in the thin Python `Database`: every
+        # un-migrated verb forwards to the handle, the training verbs drive the
+        # shared request assembly. The user-facing local surface is `Database`,
+        # never the raw `_NativeDatabase`.
+        return Database(open_local(artifact_dir=parsed.artifact_dir))
     # Remote — hand the original target to the bundled client; it re-parses to
     # the same RemoteTarget and opens the channel. One remote definition.
     return jammi_client.connect(parsed)

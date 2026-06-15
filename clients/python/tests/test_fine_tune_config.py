@@ -1,4 +1,4 @@
-"""Hermetic tests for `RemoteDatabase._fine_tune_config` proto construction.
+"""Hermetic tests for `build_fine_tune_config` proto construction.
 
 The builder uses each proto field's explicit presence (`optional`): an omitted
 kwarg leaves its field UNSET on the wire so the server resolves it to the engine
@@ -7,13 +7,14 @@ particular the hard-negative mining knobs, where a literal-zero `refresh_every`
 would make the server reject a mining-on config the caller built with only
 `mine_hard_negatives=True`.
 
-No channel is dialed: `_fine_tune_config` touches no instance state, so it is
-exercised through the unbound method with a sentinel `self`.
+No channel is dialed: `build_fine_tune_config` is a free function in the
+assembly layer, so it is exercised directly with no transport.
 """
 
 from __future__ import annotations
 
 from jammi_client import RemoteDatabase
+from jammi_client._assembly import build_fine_tune_config
 
 # All-`None` kwargs: the empty config a caller builds when nothing is set.
 _UNSET = dict(
@@ -51,8 +52,7 @@ _UNSET = dict(
 
 def _build(**overrides):
     kwargs = {**_UNSET, **overrides}
-    # `_fine_tune_config` reads no instance state; call it unbound.
-    return RemoteDatabase._fine_tune_config(object(), **kwargs)
+    return build_fine_tune_config(**kwargs)
 
 
 def test_mine_only_leaves_count_knobs_unset() -> None:

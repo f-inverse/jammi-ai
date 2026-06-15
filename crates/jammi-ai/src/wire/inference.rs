@@ -11,11 +11,65 @@
 //! served `PredictedDistribution`. These map the wire shapes onto the engine
 //! types; the ANN-only default is an absent gather, mirroring the embed binding.
 
+use prost::Message;
 use tonic::Status;
 
+use crate::model::ModelTask;
 use crate::pipeline::context_predictor::PredictedDistribution;
 use crate::pipeline::graph_neighbourhood::{EdgeDirection, EdgeGather, EdgeSourceRef};
+use jammi_wire::model_task_from_proto;
 use jammi_wire::proto::inference as pb;
+
+/// The decoded identity + task an `Infer` request carries. The engine method
+/// (`Session::infer`) takes these separately, so the decode returns them as a
+/// struct the binding destructures; `model` is the model-id string the engine
+/// parses into a [`ModelSource`](crate::model::ModelSource) at the call site,
+/// matching the in-process binding.
+pub struct InferArgs {
+    pub source_id: String,
+    pub model: String,
+    pub task: ModelTask,
+    pub columns: Vec<String>,
+    pub key_column: String,
+}
+
+/// Decode a serialized [`pb::InferRequest`] body into the engine [`InferArgs`].
+/// The embedded binding builds the request with the same pure-Python assembly
+/// the remote client uses, serializes it, and hands the bytes here — so the
+/// in-process and remote infer paths decode through one shared seam
+/// ([`infer_from_proto`]). A body that is not a valid `InferRequest` is a client
+/// error (`InvalidArgument`).
+pub fn infer_from_bytes(body: &[u8]) -> Result<InferArgs, Status> {
+    let req = pb::InferRequest::decode(body)
+        .map_err(|e| Status::invalid_argument(format!("malformed Infer request: {e}")))?;
+    infer_from_proto(req)
+}
+
+/// Decode a [`pb::InferRequest`] into the engine [`InferArgs`]. The required
+/// identity fields (`source_id` / `model_id` / `key_column`) and a non-empty
+/// `columns` list are validated at decode rather than deferred to the engine,
+/// matching the in-process binding's required arguments.
+pub fn infer_from_proto(req: pb::InferRequest) -> Result<InferArgs, Status> {
+    if req.source_id.is_empty() {
+        return Err(Status::invalid_argument("source_id is required"));
+    }
+    if req.model_id.is_empty() {
+        return Err(Status::invalid_argument("model_id is required"));
+    }
+    if req.key_column.is_empty() {
+        return Err(Status::invalid_argument("key_column is required"));
+    }
+    if req.columns.is_empty() {
+        return Err(Status::invalid_argument("columns is required"));
+    }
+    Ok(InferArgs {
+        source_id: req.source_id,
+        model: req.model_id,
+        task: model_task_from_proto(req.task)?,
+        columns: req.columns,
+        key_column: req.key_column,
+    })
+}
 
 /// Decode the optional wire [`pb::EdgeGather`] into an engine [`EdgeGather`] over
 /// a registered edge source. `None` = the ANN-only default. `hops == 0` keeps the

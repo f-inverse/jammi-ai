@@ -6,7 +6,7 @@
 //!
 //! * `GenerateEmbeddings` — scan a source's `columns`, run the modality's
 //!   tower, persist one vector per row (peer of `Session::generate_embeddings`,
-//!   keyed by [`Modality`]).
+//!   keyed by `Modality`).
 //! * `EncodeQuery` — encode a single query into one vector with the modality's
 //!   tower (peer of `Session::encode_query`).
 //! * `Search` — nearest-neighbor search over a source's embedding table, by a
@@ -18,7 +18,7 @@
 //! introspection — the control-plane catalog surface this lane reads — live on
 //! [`CatalogService`](crate::grpc::catalog).
 //!
-//! The abstraction dispatches each [`Modality`] onto the engine's concrete
+//! The abstraction dispatches each `Modality` onto the engine's concrete
 //! tower method; this module reimplements no embedding logic. Modality and
 //! input are validated at the wire edge: an unspecified modality and a
 //! text/bytes-vs-modality mismatch are rejected with `invalid_argument`.
@@ -34,8 +34,7 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
-use jammi_ai::{Modality, SearchQuery, SearchRequest as SessionSearch, Session};
-use jammi_wire::ProtoQueryInput;
+use jammi_ai::Session;
 use tonic::{Request, Response, Status};
 
 use std::collections::HashMap;
@@ -45,10 +44,10 @@ use arrow::util::display::{ArrayFormatter, FormatOptions};
 
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingService;
 use crate::grpc::proto::embedding::{
-    search_request::Query as ProtoQuery, EncodeQueryRequest, EncodeQueryResponse,
-    GenerateEmbeddingsRequest, ResultTable, SearchHit, SearchRequest, SearchResponse,
+    EncodeQueryRequest, EncodeQueryResponse, GenerateEmbeddingsRequest, ResultTable, SearchHit,
+    SearchRequest, SearchResponse,
 };
-use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant_traced};
+use crate::grpc::wire::{map_engine_error, scoped, session_tenant_traced};
 
 /// Server-side handler for the embedding gRPC surface. Holds a shared engine
 /// session it wraps in a [`Session`] per call to reach the unified
@@ -79,23 +78,19 @@ impl EmbeddingService for EmbeddingServer {
         request: Request<GenerateEmbeddingsRequest>,
     ) -> Result<Response<ResultTable>, Status> {
         let tenant = session_tenant_traced(&request);
-        let req = request.into_inner();
-        require_nonempty(&req.source_id, "source_id")?;
-        require_nonempty(&req.model_id, "model_id")?;
-        require_nonempty(&req.key_column, "key_column")?;
-        if req.columns.is_empty() {
-            return Err(Status::invalid_argument("columns is required"));
-        }
-        let modality = Modality::try_from(req.modality)?;
+        // Decode through the shared `jammi_ai::wire` seam — the same decode the
+        // embedded binding's `_generate_embeddings_proto` drives — so both
+        // transports validate and submit an identical request.
+        let args = jammi_ai::wire::generate_embeddings_from_proto(request.into_inner())?;
         let session = self.local();
 
         let record = scoped(&self.session, tenant, || {
             session.generate_embeddings(
-                &req.source_id,
-                &req.model_id,
-                &req.columns,
-                &req.key_column,
-                modality,
+                &args.source_id,
+                &args.model_id,
+                &args.columns,
+                &args.key_column,
+                args.modality,
             )
         })
         .await
@@ -110,18 +105,14 @@ impl EmbeddingService for EmbeddingServer {
         request: Request<EncodeQueryRequest>,
     ) -> Result<Response<EncodeQueryResponse>, Status> {
         let tenant = session_tenant_traced(&request);
-        let req = request.into_inner();
-        require_nonempty(&req.model_id, "model_id")?;
-        let modality = Modality::try_from(req.modality)?;
-        let input = ProtoQueryInput {
-            input: req.input,
-            modality,
-        }
-        .try_into()?;
+        // Decode through the shared `jammi_ai::wire` seam — the same decode the
+        // embedded binding's `_encode_query_proto` drives — so both transports
+        // validate and submit an identical request.
+        let args = jammi_ai::wire::encode_query_from_proto(request.into_inner())?;
         let session = self.local();
 
         let embedding = scoped(&self.session, tenant, || {
-            session.encode_query(&req.model_id, input, modality)
+            session.encode_query(&args.model_id, args.input, args.modality)
         })
         .await
         .map_err(map_engine_error)?;
@@ -135,28 +126,20 @@ impl EmbeddingService for EmbeddingServer {
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let tenant = session_tenant_traced(&request);
-        let req = request.into_inner();
-        require_nonempty(&req.source_id, "source_id")?;
-        let query = match req.query.ok_or_else(|| {
-            Status::invalid_argument("query (query_vector or row_key) is required")
-        })? {
-            ProtoQuery::QueryVector(v) => SearchQuery::Vector(v.values),
-            ProtoQuery::RowKey(key) => SearchQuery::RowKey(key),
-        };
-        let select = req.select;
-        let request = SessionSearch {
-            source_id: req.source_id,
-            query,
-            k: req.k as usize,
-            embedding_table: req.embedding_table,
-            filter: req.filter,
-            // The abstraction projects exactly the requested columns; the
-            // handler needs `_row_id` + `similarity` for every hit's key and
-            // score, so add them when a non-empty select would otherwise drop
-            // them. An empty select keeps every hydrated column (key + score
-            // included).
-            select: search_select(&select),
-        };
+        // Decode the request through the shared `jammi_ai::wire` seam — the same
+        // decode the embedded binding's `_search_proto` drives — so both
+        // transports validate and submit an identical request. Only the request
+        // is collapsed: the response is transport-specific (wire hits here, Arrow
+        // in the embedded binding), so the hit projection stays in this handler.
+        let mut request = jammi_ai::wire::search_from_proto(request.into_inner())?;
+        // The client's `select` is what each hit's `columns` map carries; keep it
+        // before expanding the engine projection.
+        let select = std::mem::take(&mut request.select);
+        // The abstraction projects exactly the requested columns; the handler
+        // needs `_row_id` + `similarity` for every hit's key and score, so add
+        // them when a non-empty select would otherwise drop them. An empty select
+        // keeps every hydrated column (key + score included).
+        request.select = search_select(&select);
         let session = self.local();
 
         let batches = scoped(&self.session, tenant, || session.search(request))

@@ -73,9 +73,13 @@ chrono.workspace = true
 # The residual engine-spec converters (`jammi_ai::wire`, under `local`) encode /
 # decode the engine `TrainingSpec` / predictor / edge-gather shapes against
 # jammi-wire's `proto` and return a `tonic::Status` on a malformed wire body, so
-# `tonic` rides the `local` feature as a runtime dep. The transport stack itself
-# (prost / Flight SQL / IPC) lives in jammi-wire, not here.
+# `tonic` rides the `local` feature as a runtime dep. `prost` rides it too: the
+# embedded binding hands the converters a serialized request body to decode
+# (the same proto the remote client sends), so `wire` owns the `prost`-decode
+# step rather than leaking the proto type and a second decode call site into the
+# PyO3 crate. The Flight SQL / IPC transport stack still lives in jammi-wire.
 tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -124,6 +128,7 @@ local = [
     "dep:tempfile",
     "dep:bytes",
     "dep:tonic",
+    "dep:prost",
     "jammi-lora/candle",
 ]
 live-hub-tests = []

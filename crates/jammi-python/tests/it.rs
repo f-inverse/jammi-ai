@@ -23,13 +23,9 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use _native::model_task::{ModelTaskArg, PyModelTask};
 use _native::PyDatabase;
-use jammi_ai::model::ModelTask;
 use jammi_db::config::JammiConfig;
 use jammi_db::TenantId;
-use pyo3::prelude::*;
-use pyo3::types::PyString;
 use tempfile::tempdir;
 
 fn test_config(artifact_dir: &std::path::Path) -> JammiConfig {
@@ -99,54 +95,4 @@ fn session_arc_shares_session_state_with_pydatabase() {
         None,
         "unbinding through one Arc must clear the shared state",
     );
-}
-
-/// Both ways a Python caller can supply `task=` to a binding — the
-/// `ModelTask` pyclass enum and the snake-case string — must extract to
-/// the same `ModelTask` variant. Catches a regression in the string-vs-
-/// pyclass branch of `ModelTaskArg::extract` that would let one shape
-/// produce a different variant than the other.
-#[test]
-fn model_task_arg_accepts_pyclass_and_string_identically() {
-    Python::initialize();
-
-    Python::attach(|py| {
-        // Path 1: typed PyClass instance — constructed via `Py::new`,
-        // which is the same path the `#[pymodule] _native` registration
-        // uses; sidesteps the `IntoPyObject` recursion that the
-        // generated derive hits when called from inside `Python::attach`
-        // on a freshly-loaded pyo3 0.28 type table.
-        let typed_obj = Py::new(py, PyModelTask::TextEmbedding)
-            .expect("Py::new PyModelTask")
-            .into_any()
-            .into_bound(py);
-        let typed_arg: ModelTaskArg = typed_obj.as_borrowed().extract().expect("extract pyclass");
-        assert_eq!(typed_arg.0, ModelTask::TextEmbedding);
-
-        // Path 2: snake-case string.
-        let str_obj = PyString::new(py, "text_embedding").into_any();
-        let str_arg: ModelTaskArg = str_obj.as_borrowed().extract().expect("extract string");
-        assert_eq!(str_arg.0, ModelTask::TextEmbedding);
-
-        // Both shapes converge on the same variant.
-        assert_eq!(typed_arg.0, str_arg.0);
-
-        // Round-trip every variant via string so the test exercises the
-        // full table.
-        for variant in [
-            ModelTask::TextEmbedding,
-            ModelTask::ImageEmbedding,
-            ModelTask::Classification,
-            ModelTask::Ner,
-        ] {
-            let s = PyString::new(py, variant.as_db_str()).into_any();
-            let arg: ModelTaskArg = s.as_borrowed().extract().expect("extract variant");
-            assert_eq!(arg.0, variant);
-        }
-
-        // Unknown string surfaces a typed PyErr (not a panic).
-        let bad = PyString::new(py, "not_a_task").into_any();
-        let err: PyResult<ModelTaskArg> = bad.as_borrowed().extract();
-        assert!(err.is_err(), "unknown task string must surface a PyErr");
-    });
 }

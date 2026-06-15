@@ -143,6 +143,7 @@ async fn start_embedding_server() -> (
                 trigger: None,
                 engine: Some(session),
                 tiers: jammi_server::tiers::TierSet::all_compiled(),
+                metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
             },
             async move {
                 let _ = shutdown_rx.await;

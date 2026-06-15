@@ -233,6 +233,7 @@ async fn start_grpc_test_server(seeds: &[TopicSeed]) -> ServerFixture {
                     jammi_server::tiers::ServiceTier::Event,
                 ])
                 .expect("event tier resolves"),
+                metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
             },
             async move {
                 let _ = shutdown_rx.await;

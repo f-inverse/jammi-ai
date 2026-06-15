@@ -133,6 +133,7 @@ pub async fn start_engine_server_with_tiers(tiers: jammi_server::tiers::TierSet)
                 trigger,
                 engine: Some(session),
                 tiers,
+                metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
             },
             async move {
                 let _ = shutdown_rx.await;

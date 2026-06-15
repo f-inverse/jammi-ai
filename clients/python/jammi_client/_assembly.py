@@ -13,7 +13,7 @@ the transport itself stay with the consumer that owns the channel.
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 from ._generated.jammi.v1 import catalog_pb2
 from ._generated.jammi.v1 import embedding_pb2
@@ -937,4 +937,89 @@ def build_assemble_context_request(
         if min_weight is not None:
             gather.min_weight = min_weight
         request.edges.CopyFrom(gather)
+    return request
+
+
+def build_generate_embeddings_request(
+    *,
+    source: str,
+    model: str,
+    columns: List[str],
+    key: str,
+    modality: Optional[str] = None,
+) -> embedding_pb2.GenerateEmbeddingsRequest:
+    """Assemble the `GenerateEmbeddingsRequest` for a bulk embedding run from the
+    binding's flat kwargs.
+
+    `modality` selects the tower (`"text"`/`"image"`/`"audio"`, defaulting to
+    text); `key` names the column whose value becomes each embedding row's key.
+    The same request the embed binding submits in-process.
+    """
+    return embedding_pb2.GenerateEmbeddingsRequest(
+        source_id=source,
+        model_id=model,
+        columns=list(columns),
+        key_column=key,
+        modality=_modality_value(modality),
+    )
+
+
+def build_encode_query_request(
+    *,
+    model: str,
+    query: Union[str, bytes],
+    modality: Optional[str] = None,
+) -> embedding_pb2.EncodeQueryRequest:
+    """Assemble the `EncodeQueryRequest` for a single-query encode from the
+    binding's flat kwargs.
+
+    `query` is a string for the text tower or raw bytes for the image/audio
+    tower; `modality` selects the tower (defaulting to text). The `input` oneof
+    carries the text or the bytes — exactly one, matched to the modality at the
+    decode edge. The same request the embed binding submits in-process.
+    """
+    request = embedding_pb2.EncodeQueryRequest(
+        model_id=model,
+        modality=_modality_value(modality),
+    )
+    if isinstance(query, str):
+        request.text = query
+    elif isinstance(query, (bytes, bytearray)):
+        request.data = bytes(query)
+    else:
+        raise TypeError(
+            "query must be a str (text tower) or bytes (image/audio tower)"
+        )
+    return request
+
+
+def build_search_request(
+    source: str,
+    *,
+    query: List[float],
+    k: int,
+    filter: Optional[str] = None,
+    select: Optional[List[str]] = None,
+    embedding_table: Optional[str] = None,
+) -> embedding_pb2.SearchRequest:
+    """Assemble the `SearchRequest` for a nearest-neighbour search from the
+    binding's flat kwargs.
+
+    `query` is the query vector (carried in the `query_vector` oneof arm);
+    `filter` is an optional SQL predicate over the hydrated results; `select`
+    projects columns (empty keeps the keyed+scored shape); `embedding_table`
+    names which of the source's embedding tables to search (unset = the
+    most-recent ready table). The same request the embed binding submits
+    in-process.
+    """
+    request = embedding_pb2.SearchRequest(
+        source_id=source,
+        query_vector=embedding_pb2.QueryVector(values=list(query)),
+        k=k,
+        select=list(select or []),
+    )
+    if filter is not None:
+        request.filter = filter
+    if embedding_table is not None:
+        request.embedding_table = embedding_table
     return request

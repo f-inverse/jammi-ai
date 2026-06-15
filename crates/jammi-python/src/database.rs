@@ -5,13 +5,12 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use futures::StreamExt;
-use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString};
-use pyo3::Borrowed;
+use pyo3::types::{PyDict, PyList};
 use pyo3_arrow::{PySchema, PyTable};
 
-use jammi_ai::local_session::{Modality, QueryInput, SearchQuery, SearchRequest, Session};
+use jammi_ai::local_session::Session;
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::pipeline::context_predictor::{ContextServeOptions, ContextServeSource};
 use jammi_ai::pipeline::context_set::{ContextSourceKind, HybridMerge};
@@ -257,28 +256,26 @@ impl PyDatabase {
         batches_to_pyarrow(py, &batches)
     }
 
-    /// Generate embeddings for `columns` of a registered source with the given
-    /// model and modality, persisting one L2-normalized vector per row. The
-    /// `modality` (`"text"`/`"image"`/`"audio"`) selects the tower; the image
-    /// and audio towers take exactly one content column. Returns the result
-    /// table name. The unified form — one verb keyed by modality, identical to
-    /// the bundled `jammi-client`'s.
-    #[pyo3(signature = (*, source, model, columns, key, modality=None))]
-    fn generate_embeddings(
-        &self,
-        source: &str,
-        model: &str,
-        columns: Vec<String>,
-        key: &str,
-        modality: Option<ModalityArg>,
-    ) -> PyResult<String> {
-        let modality = modality.map(|m| m.0).unwrap_or(Modality::Text);
+    /// Generate embeddings from a serialized `GenerateEmbeddingsRequest` body,
+    /// persisting one L2-normalized vector per row. The thin Python `Database`
+    /// wrapper builds this request with the same pure-Python assembly the remote
+    /// client uses (`jammi_client._assembly`), serializes it, and hands the bytes
+    /// here, so the embedded and remote embedding paths share one request
+    /// assembly and one decode seam
+    /// (`jammi_ai::wire::generate_embeddings_from_bytes`). Returns the result
+    /// table name. A malformed or invalid body raises `ValueError`.
+    fn _generate_embeddings_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
+        let args =
+            jammi_ai::wire::generate_embeddings_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let record = self
             .runtime
-            .block_on(
-                self.local_session()
-                    .generate_embeddings(source, model, &columns, key, modality),
-            )
+            .block_on(self.local_session().generate_embeddings(
+                &args.source_id,
+                &args.model_id,
+                &args.columns,
+                &args.key_column,
+                args.modality,
+            ))
             .map_err(to_pyerr)?;
         Ok(record.table_name)
     }
@@ -646,35 +643,17 @@ impl PyDatabase {
         }
     }
 
-    /// Nearest-neighbor search over a source's embedding table. Returns a
-    /// `pyarrow.Table` directly — the same shape, the same call, as the bundled
-    /// `jammi-client`'s `search` (and the typed `Search` gRPC verb). `filter` is
-    /// an optional SQL predicate over the hydrated results; `select` projects
-    /// columns (empty keeps every hydrated column). `embedding_table` names
-    /// which of the source's embedding tables to search (e.g. a raw,
-    /// propagated, or fine-tuned table); `None` searches the most-recent ready
-    /// table. For compound retrieval (join / model inference over the
-    /// results), use `query` (SQL).
-    #[pyo3(signature = (source, *, query, k, filter=None, select=None, embedding_table=None))]
-    #[allow(clippy::too_many_arguments)]
-    fn search(
-        &self,
-        py: Python<'_>,
-        source: &str,
-        query: Vec<f32>,
-        k: usize,
-        filter: Option<String>,
-        select: Option<Vec<String>>,
-        embedding_table: Option<String>,
-    ) -> PyResult<Py<PyAny>> {
-        let request = SearchRequest {
-            source_id: source.to_string(),
-            query: SearchQuery::Vector(query),
-            k,
-            embedding_table,
-            filter,
-            select: select.unwrap_or_default(),
-        };
+    /// Nearest-neighbor search over a source's embedding table from a serialized
+    /// `SearchRequest` body. Returns a `pyarrow.Table` directly — the same shape
+    /// the bundled `jammi-client`'s `search` returns. The thin Python `Database`
+    /// wrapper builds this request with the same pure-Python assembly the remote
+    /// client uses (`jammi_client._assembly`), serializes it, and hands the bytes
+    /// here, so the embedded and remote search paths share one request assembly
+    /// and one decode seam (`jammi_ai::wire::search_from_bytes`); only the
+    /// request is collapsed, the Arrow response wrapping stays here. A malformed
+    /// or invalid body raises `ValueError`.
+    fn _search_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        let request = jammi_ai::wire::search_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let batches = self
             .runtime
             .block_on(self.local_session().search(request))
@@ -952,21 +931,20 @@ impl PyDatabase {
         serializable_to_pydict(py, &report)
     }
 
-    /// Encode a single query into an embedding vector using the given model.
-    /// `modality` selects the tower (`"text"`/`"image"`/`"audio"`); `query` is a
-    /// string for the text tower or raw bytes for the image/audio tower. The
-    /// unified form — one verb keyed by modality, identical to the bundled
-    /// `jammi-client`'s.
-    #[pyo3(signature = (*, model, query, modality=None))]
-    fn encode_query(
-        &self,
-        model: &str,
-        query: QueryArg,
-        modality: Option<ModalityArg>,
-    ) -> PyResult<Vec<f32>> {
-        let modality = modality.map(|m| m.0).unwrap_or(Modality::Text);
+    /// Encode a single query into an embedding vector from a serialized
+    /// `EncodeQueryRequest` body. The thin Python `Database` wrapper builds this
+    /// request with the same pure-Python assembly the remote client uses
+    /// (`jammi_client._assembly`), serializes it, and hands the bytes here, so
+    /// the embedded and remote encode paths share one request assembly and one
+    /// decode seam (`jammi_ai::wire::encode_query_from_bytes`). Returns the
+    /// L2-normalized embedding. A malformed or invalid body raises `ValueError`.
+    fn _encode_query_proto(&self, proto_bytes: &[u8]) -> PyResult<Vec<f32>> {
+        let args = jammi_ai::wire::encode_query_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         self.runtime
-            .block_on(self.local_session().encode_query(model, query.0, modality))
+            .block_on(
+                self.local_session()
+                    .encode_query(&args.model_id, args.input, args.modality),
+            )
             .map_err(to_pyerr)
     }
 
@@ -1317,55 +1295,6 @@ fn context_source_tag(kind: ContextSourceKind) -> &'static str {
         ContextSourceKind::Ann => "ann",
         ContextSourceKind::Edges => "edges",
         ContextSourceKind::Hybrid => "hybrid",
-    }
-}
-
-/// Argument shim for every Python-facing `modality=` parameter: the snake-case
-/// string `"text"` / `"image"` / `"audio"`. Decoded once at the binding
-/// boundary into a typed [`Modality`]. Shared by the unified `encode_query` and
-/// `generate_embeddings` verbs.
-struct ModalityArg(Modality);
-
-impl<'a, 'py> FromPyObject<'a, 'py> for ModalityArg {
-    type Error = PyErr;
-
-    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-        let s = ob
-            .cast::<PyString>()
-            .map_err(|_| PyTypeError::new_err("modality must be a string"))?;
-        let raw: String = s.str()?.to_string();
-        let modality = match raw.as_str() {
-            "text" => Modality::Text,
-            "image" => Modality::Image,
-            "audio" => Modality::Audio,
-            other => {
-                return Err(PyTypeError::new_err(format!(
-                    "modality must be 'text', 'image', or 'audio' (got '{other}')"
-                )))
-            }
-        };
-        Ok(ModalityArg(modality))
-    }
-}
-
-/// Argument shim for `encode_query`'s `query=`: a string is text for the text
-/// tower; raw bytes are an image/audio clip for the vision/audio tower. Decoded
-/// once at the boundary into the engine's [`QueryInput`].
-struct QueryArg(QueryInput);
-
-impl<'a, 'py> FromPyObject<'a, 'py> for QueryArg {
-    type Error = PyErr;
-
-    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-        if let Ok(s) = ob.cast::<PyString>() {
-            return Ok(QueryArg(QueryInput::Text(s.str()?.to_string())));
-        }
-        if let Ok(bytes) = ob.extract::<Vec<u8>>() {
-            return Ok(QueryArg(QueryInput::Bytes(bytes)));
-        }
-        Err(PyTypeError::new_err(
-            "query must be a str (text tower) or bytes (image/audio tower)",
-        ))
     }
 }
 

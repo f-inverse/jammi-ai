@@ -6,10 +6,11 @@ surface, composed over the compiled `_native._NativeDatabase` low-level handle:
 * Every verb whose request is still assembled in Rust is forwarded verbatim to
   the native handle by ``__getattr__`` — the embedded implementation is unchanged.
 * The migrated verbs — the training verbs (`fine_tune`, `fine_tune_graph`,
-  `train_context_predictor`), the bulk inference verb (`infer`), and the
+  `train_context_predictor`), the bulk inference verb (`infer`), the
   engine-state pipeline verbs (`build_neighbor_graph`, `propagate_embeddings`,
-  `assemble_context`) — are explicit methods here. They build their request with
-  the SAME pure-Python assembly the remote client uses
+  `assemble_context`), and the embedding + search verbs (`generate_embeddings`,
+  `encode_query`, `search`) — are explicit methods here. They build their request
+  with the SAME pure-Python assembly the remote client uses
   (`jammi_client._assembly.build_*_request`), serialize it, and hand the bytes to
   the native handle's `_*_proto` primitive — which decodes through the engine's
   shared wire seam and runs the verb in-process. So the embedded and remote
@@ -23,18 +24,21 @@ gone from Rust; it lives once in `jammi_client._assembly`.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import pyarrow as pa
 
 from jammi_client._assembly import (
     build_assemble_context_request,
     build_context_predictor_request,
+    build_encode_query_request,
     build_fine_tune_graph_request,
     build_fine_tune_request,
+    build_generate_embeddings_request,
     build_infer_request,
     build_neighbor_graph_request,
     build_propagate_embeddings_request,
+    build_search_request,
 )
 
 
@@ -436,3 +440,84 @@ class Database:
             hybrid=hybrid,
         )
         return self._native._assemble_context_proto(request.SerializeToString())
+
+    def encode_query(
+        self,
+        *,
+        model: str,
+        query: Union[str, bytes],
+        modality: Optional[str] = None,
+    ) -> List[float]:
+        """Encode a single query into an embedding vector with the given model.
+
+        `query` is a string for the text tower or raw bytes for the image/audio
+        tower; `modality` selects the tower (`"text"`/`"image"`/`"audio"`,
+        defaulting to text). Same handle shape and verb signature as the remote
+        `RemoteDatabase.encode_query`; the request is assembled with the shared
+        `EncodeQueryRequest` builder and submitted through the engine's wire seam.
+        """
+        request = build_encode_query_request(
+            model=model,
+            query=query,
+            modality=modality,
+        )
+        return self._native._encode_query_proto(request.SerializeToString())
+
+    def generate_embeddings(
+        self,
+        *,
+        source: str,
+        model: str,
+        columns: List[str],
+        key: str,
+        modality: Optional[str] = None,
+    ) -> str:
+        """Embed `columns` of a registered source, persisting one vector per row.
+
+        `modality` selects the tower (`"text"`/`"image"`/`"audio"`, defaulting to
+        text); `key` names the column whose value becomes each embedding row's
+        key. Returns the result table name. Same handle shape and verb signature
+        as the remote `RemoteDatabase.generate_embeddings`; the request is
+        assembled with the shared `GenerateEmbeddingsRequest` builder and
+        submitted through the engine's wire seam.
+        """
+        request = build_generate_embeddings_request(
+            source=source,
+            model=model,
+            columns=columns,
+            key=key,
+            modality=modality,
+        )
+        return self._native._generate_embeddings_proto(request.SerializeToString())
+
+    def search(
+        self,
+        source: str,
+        *,
+        query: List[float],
+        k: int,
+        filter: Optional[str] = None,
+        select: Optional[List[str]] = None,
+        embedding_table: Optional[str] = None,
+    ) -> pa.Table:
+        """Nearest-neighbor search over a source's embedding table.
+
+        `query` is the query vector; `filter` is an optional SQL predicate over
+        the hydrated results; `select` projects columns (empty keeps the
+        keyed+scored shape). `embedding_table` names which of the source's
+        embedding tables to search (e.g. a raw, propagated, or fine-tuned table);
+        ``None`` searches the most-recent ready table. Returns a `pyarrow.Table`.
+        Mirrors the remote `RemoteDatabase.search`; the request is assembled with
+        the shared `SearchRequest` builder and submitted through the engine's
+        wire seam (only the request is shared — the Arrow response wrapping is the
+        embedded transport's).
+        """
+        request = build_search_request(
+            source,
+            query=query,
+            k=k,
+            filter=filter,
+            select=select,
+            embedding_table=embedding_table,
+        )
+        return self._native._search_proto(request.SerializeToString())

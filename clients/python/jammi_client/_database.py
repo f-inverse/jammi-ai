@@ -35,14 +35,16 @@ from ._assembly import (
     _SOURCE_KIND_NAME,
     _channel_columns_message,
     _local_source_url,
-    _modality_value,
     build_assemble_context_request,
     build_context_predictor_request,
+    build_encode_query_request,
     build_fine_tune_graph_request,
     build_fine_tune_request,
+    build_generate_embeddings_request,
     build_infer_request,
     build_neighbor_graph_request,
     build_propagate_embeddings_request,
+    build_search_request,
 )
 from ._credentials import AnonymousCredentials, ChannelCredentials
 from ._errors import TrainingError
@@ -949,18 +951,11 @@ class RemoteDatabase:
         `query` is a string for the text tower or raw bytes for the image/audio
         tower; `modality` selects the tower. Maps to `EmbeddingService.EncodeQuery`.
         """
-        request = embedding_pb2.EncodeQueryRequest(
-            model_id=model,
-            modality=_modality_value(modality),
+        request = build_encode_query_request(
+            model=model,
+            query=query,
+            modality=modality,
         )
-        if isinstance(query, str):
-            request.text = query
-        elif isinstance(query, (bytes, bytearray)):
-            request.data = bytes(query)
-        else:
-            raise TypeError(
-                "query must be a str (text tower) or bytes (image/audio tower)"
-            )
         resp = self._embedding.EncodeQuery(request, metadata=self._metadata)
         return list(resp.embedding)
 
@@ -978,16 +973,14 @@ class RemoteDatabase:
         `modality` selects the tower. Returns the result table name. Maps to
         `EmbeddingService.GenerateEmbeddings`.
         """
-        resp = self._embedding.GenerateEmbeddings(
-            embedding_pb2.GenerateEmbeddingsRequest(
-                source_id=source,
-                model_id=model,
-                columns=list(columns),
-                key_column=key,
-                modality=_modality_value(modality),
-            ),
-            metadata=self._metadata,
+        request = build_generate_embeddings_request(
+            source=source,
+            model=model,
+            columns=columns,
+            key=key,
+            modality=modality,
         )
+        resp = self._embedding.GenerateEmbeddings(request, metadata=self._metadata)
         return resp.table_name
 
     def search(
@@ -1009,16 +1002,14 @@ class RemoteDatabase:
         table); ``None`` searches the most-recent ready table. Returns a
         `pyarrow.Table`. Maps to `EmbeddingService.Search`.
         """
-        request = embedding_pb2.SearchRequest(
-            source_id=source,
-            query_vector=embedding_pb2.QueryVector(values=list(query)),
+        request = build_search_request(
+            source,
+            query=query,
             k=k,
-            select=list(select or []),
+            filter=filter,
+            select=select,
+            embedding_table=embedding_table,
         )
-        if filter is not None:
-            request.filter = filter
-        if embedding_table is not None:
-            request.embedding_table = embedding_table
         resp = self._embedding.Search(request, metadata=self._metadata)
         return _hits_to_table(list(resp.hits))
 

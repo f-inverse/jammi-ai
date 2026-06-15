@@ -28,7 +28,7 @@ use tonic::{Code, Request, Response, Status};
 
 use crate::grpc::proto::audit as pb;
 use crate::grpc::proto::audit::audit_service_server::AuditService;
-use crate::grpc::wire::{scoped, session_tenant};
+use crate::grpc::wire::{scoped, session_tenant_traced};
 
 /// Server-side handler for the audit gRPC surface. Holds a shared engine session
 /// it wraps in a [`Session`] per call to reach the unified transport
@@ -51,11 +51,12 @@ impl AuditServer {
 
 #[tonic::async_trait]
 impl AuditService for AuditServer {
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn audit_log(
         &self,
         request: Request<pb::AuditLogRequest>,
     ) -> Result<Response<()>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         let records = req
             .records
@@ -71,11 +72,12 @@ impl AuditService for AuditServer {
         Ok(Response::new(()))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn audit_fetch_by_query_id(
         &self,
         request: Request<pb::AuditFetchByQueryIdRequest>,
     ) -> Result<Response<pb::AuditFetchByQueryIdResponse>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         let query_id = parse_query_id(&req.query_id)?;
         let session = self.local();
@@ -91,11 +93,12 @@ impl AuditService for AuditServer {
         }))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn audit_fetch_recent(
         &self,
         request: Request<pb::AuditFetchRecentRequest>,
     ) -> Result<Response<pb::AuditFetchRecentResponse>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         let session = self.local();
 

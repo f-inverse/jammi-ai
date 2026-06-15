@@ -219,6 +219,14 @@ impl TrainingWorker {
     /// `record` must be a row this worker claimed (its `claimed_by` is the
     /// worker's id). The driving loop ([`Self::run_until`]) is the normal caller;
     /// it is exposed so a test can drive one claimed job in isolation.
+    #[tracing::instrument(
+        skip(self, session, record),
+        fields(
+            worker_id = %self.worker_id,
+            job_id = %record.job_id,
+            tenant_id = ?record.tenant_id,
+        )
+    )]
     pub async fn run_claimed_job(
         &self,
         session: &Arc<InferenceSession>,
@@ -458,6 +466,10 @@ impl TrainingWorker {
 
     /// Dispatch a claimed spec to its kind's from-scratch reconstruction and
     /// training, returning the [`TrainedArtifact`] on success.
+    #[tracing::instrument(
+        skip(self, session, catalog, spec, cancel),
+        fields(job_id = %job_id, worker_id = %self.worker_id)
+    )]
     async fn run_spec(
         &self,
         session: &Arc<InferenceSession>,

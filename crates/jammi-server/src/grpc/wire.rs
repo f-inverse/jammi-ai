@@ -40,6 +40,21 @@ pub fn session_tenant<T>(request: &Request<T>) -> Option<TenantId> {
         .and_then(|s| s.0)
 }
 
+/// Read the request's bound tenant and stamp it onto the current request span's
+/// `tenant_id` field.
+///
+/// The tenant only becomes known *inside* a handler — the per-service
+/// `TenantInterceptor` deposits the [`SessionTenant`] extension post-routing, so
+/// a pre-routing tower layer cannot see it. Each tenant-aware handler therefore
+/// opens its span with `tenant_id` empty and calls this once it has the request
+/// in hand to fill it in, so a trace ties the gRPC request to the tenant scope
+/// the call runs under. Returns the resolved tenant for the handler to scope on.
+pub fn session_tenant_traced<T>(request: &Request<T>) -> Option<TenantId> {
+    let tenant = session_tenant(request);
+    tracing::Span::current().record("tenant_id", tracing::field::debug(&tenant));
+    tenant
+}
+
 /// Run a session call under the request's tenant scope.
 ///
 /// A bound tenant installs the engine's task-local tenant override for the

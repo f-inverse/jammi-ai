@@ -32,7 +32,7 @@ use tonic::{Request, Response, Status};
 
 use crate::grpc::proto::eval as pb;
 use crate::grpc::proto::eval::eval_service_server::EvalService;
-use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant};
+use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant_traced};
 
 /// Server-side handler for the eval gRPC surface. Holds a shared engine session
 /// it wraps in a [`Session`] per call to reach the unified transport
@@ -55,11 +55,12 @@ impl EvalServer {
 
 #[tonic::async_trait]
 impl EvalService for EvalServer {
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn eval_embeddings(
         &self,
         request: Request<pb::EvalEmbeddingsRequest>,
     ) -> Result<Response<pb::EmbeddingEvalReport>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         require_nonempty(&req.source_id, "source_id")?;
         require_nonempty(&req.golden_source, "golden_source")?;
@@ -82,11 +83,12 @@ impl EvalService for EvalServer {
         Ok(Response::new(report.into()))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn eval_per_query(
         &self,
         request: Request<pb::EvalPerQueryRequest>,
     ) -> Result<Response<pb::EvalPerQueryResponse>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         require_nonempty(&req.eval_run_id, "eval_run_id")?;
         let session = self.local();
@@ -102,11 +104,12 @@ impl EvalService for EvalServer {
         }))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn eval_inference(
         &self,
         request: Request<pb::EvalInferenceRequest>,
     ) -> Result<Response<pb::InferenceEvalReport>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         require_nonempty(&req.model_id, "model_id")?;
         require_nonempty(&req.source_id, "source_id")?;
@@ -134,11 +137,12 @@ impl EvalService for EvalServer {
         Ok(Response::new(report.into()))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn eval_compare(
         &self,
         request: Request<pb::EvalCompareRequest>,
     ) -> Result<Response<pb::CompareEvalReport>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         require_nonempty(&req.source_id, "source_id")?;
         require_nonempty(&req.golden_source, "golden_source")?;
@@ -163,11 +167,12 @@ impl EvalService for EvalServer {
         Ok(Response::new(report.into()))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn eval_calibration(
         &self,
         request: Request<pb::EvalCalibrationRequest>,
     ) -> Result<Response<pb::CalibrationEvalReport>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         require_nonempty(&req.source_id, "source_id")?;
         require_nonempty(&req.golden_source, "golden_source")?;

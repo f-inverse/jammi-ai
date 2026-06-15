@@ -29,7 +29,7 @@ use tonic::{Request, Response, Status};
 
 use crate::grpc::proto::training as pb;
 use crate::grpc::proto::training::training_service_server::TrainingService;
-use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant};
+use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant_traced};
 
 /// Server-side handler for the training gRPC surface. Holds the shared engine
 /// session it submits jobs against and reads job records back from.
@@ -95,11 +95,12 @@ impl TrainingServer {
 
 #[tonic::async_trait]
 impl TrainingService for TrainingServer {
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn start_training(
         &self,
         request: Request<pb::StartTrainingRequest>,
     ) -> Result<Response<pb::StartTrainingResponse>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let spec = training_spec_from_proto(request.into_inner())?;
 
         let job = scoped(&self.session, tenant, || self.submit(spec))
@@ -112,11 +113,12 @@ impl TrainingService for TrainingServer {
         }))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn training_status(
         &self,
         request: Request<pb::TrainingStatusRequest>,
     ) -> Result<Response<pb::TrainingStatusResponse>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         require_nonempty(&req.job_id, "job_id")?;
 

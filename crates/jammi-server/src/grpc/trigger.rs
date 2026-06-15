@@ -81,11 +81,13 @@ impl TriggerService for TriggerServer {
     type SubscribeStream =
         Pin<Box<dyn Stream<Item = Result<SubscribedBatch, Status>> + Send + 'static>>;
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn publish(
         &self,
         request: Request<PublishRequest>,
     ) -> Result<Response<PublishResponse>, Status> {
         let tenant = resolve_tenant(&request, request_tenant(&request))?;
+        tracing::Span::current().record("tenant_id", tracing::field::debug(&tenant));
         let req = request.into_inner();
         let topic = self.lookup_topic(req.topic, tenant).await?;
         let batch = req
@@ -103,11 +105,13 @@ impl TriggerService for TriggerServer {
         }))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn subscribe(
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let tenant = resolve_tenant(&request, request_tenant(&request))?;
+        tracing::Span::current().record("tenant_id", tracing::field::debug(&tenant));
         let req = request.into_inner();
         let topic = self.lookup_topic(req.topic, tenant).await?;
         let predicate =

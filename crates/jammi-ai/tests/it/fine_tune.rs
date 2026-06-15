@@ -1543,6 +1543,154 @@ async fn worker_that_lost_lease_does_not_finalize() {
     );
 }
 
+// ─── Tracing span oracle: a worker run carries job_id + tenant_id ────────────
+//
+// The worker's `run_claimed_job` opens a `#[tracing::instrument]` span stamped
+// with the run's `worker_id`, `job_id`, and `tenant_id` so a trace ties a job to
+// its worker run (the gRPC request -> worker correlation lives on the shared
+// `job_id` / `tenant_id` fields). This drives the real worker path — a bound
+// tenant submits a job, the worker claims it (the claim record carries the
+// tenant), and `run_claimed_job` runs it to completion under a test-local
+// subscriber that emits span NEW/CLOSE events — then asserts a span actually
+// carrying both `job_id` and `tenant_id` was emitted. The assertion is on a
+// span (NEW/CLOSE), not a bare event: without `with_span_events` the span fields
+// would never reach the sink and the oracle would pass vacuously.
+//
+// Run on a current-thread runtime so the worker future never migrates off the
+// thread the test-local subscriber is installed on — the span NEW/CLOSE records
+// fire on that thread and land in the buffer. (A multi-thread runtime would let
+// the future resume on a worker thread with no default subscriber, the
+// "spawned/migrated tasks escape a thread-local subscriber" trap.)
+#[test]
+fn worker_run_span_carries_job_and_tenant() {
+    use std::io;
+    use std::str::FromStr;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use jammi_ai::fine_tune::worker::TrainingWorker;
+    use jammi_db::TenantId;
+    use tracing::subscriber::DefaultGuard;
+    use tracing_subscriber::fmt::format::FmtSpan;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// A `MakeWriter` that captures everything written into a shared buffer.
+    #[derive(Clone)]
+    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'w> MakeWriter<'w> for BufferWriter {
+        type Writer = BufferWriter;
+        fn make_writer(&'w self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let (session, _dir) = session_with_training_data().await;
+        let model = tiny_bert_model();
+
+        // A bound tenant so the submitted job — and the claim record the worker
+        // runs — carries a real `tenant_id` (not the unscoped `None`).
+        let tenant =
+            TenantId::from_str("018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9a").expect("valid tenant uuid");
+        session.bind_tenant(tenant);
+
+        // Submit with no worker loop running so the job sits `queued` and carries
+        // a real reconstructable spec. The worker claims it below; the returned
+        // handle is not needed here (the claim record carries the ids the span
+        // records).
+        session
+            .fine_tune(
+                "training",
+                &model,
+                &[
+                    "text_a".to_string(),
+                    "text_b".to_string(),
+                    "score".to_string(),
+                ],
+                FineTuneMethod::Lora,
+                ModelTask::TextEmbedding,
+                Some(FineTuneConfig {
+                    epochs: 1,
+                    batch_size: 8,
+                    lora_rank: 4,
+                    warmup_steps: 0,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        let worker = TrainingWorker::new(&session).expect("default worker intervals are valid");
+        let claim = session
+            .catalog()
+            .claim_next_training_job(worker.worker_id(), Duration::from_secs(3600))
+            .await
+            .unwrap()
+            .expect("the worker claims the queued job");
+        assert_eq!(
+            claim.tenant_id,
+            Some(tenant),
+            "the claim record carries the bound tenant the span records"
+        );
+        let job_id = claim.job_id.clone();
+
+        // Install a test-local subscriber that emits span NEW/CLOSE events over a
+        // buffer (prod `telemetry::install` is untouched — this never changes prod
+        // log volume), then drive the real worker run under it.
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(BufferWriter(buffer.clone()))
+            .with_ansi(false)
+            .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+            .finish();
+        let _guard: DefaultGuard = tracing::subscriber::set_default(subscriber);
+
+        worker.run_claimed_job(&session, claim).await;
+
+        let after = session.catalog().get_training_job(&job_id).await.unwrap();
+        assert_eq!(
+            after.status, "completed",
+            "the worker ran the claimed job to completion"
+        );
+
+        let logs = String::from_utf8(buffer.lock().unwrap().clone()).expect("utf-8 logs");
+        // A span (not a bare event) carrying both fields: the `run_claimed_job`
+        // span opens stamped with `job_id` and `tenant_id`. Span events render the
+        // span's fields in its `name{...}` context, so a line that names the span,
+        // names a span lifecycle event, and carries both ids proves the span was
+        // emitted with them. The `tenant_id` field is recorded with `?` (Debug),
+        // so the `Option<TenantId>` renders as `Some(...)` wrapping the uuid.
+        let span_line = logs.lines().find(|line| {
+            line.contains("run_claimed_job")
+                && (line.contains("new") || line.contains("close"))
+                && line.contains(&format!("job_id={job_id}"))
+                && line.contains("tenant_id=Some(")
+                && line.contains(&tenant.to_string())
+        });
+        assert!(
+            span_line.is_some(),
+            "expected a run_claimed_job span event carrying job_id={job_id} and \
+             tenant_id=Some(..{tenant}..); captured logs:\n{logs}"
+        );
+    });
+}
+
 // ─── Configurable lease drives reclaim ──────────────────────────────────────
 //
 // The prerequisite for the distributed-validation lane: a short configured

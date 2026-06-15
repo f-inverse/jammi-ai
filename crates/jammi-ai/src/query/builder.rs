@@ -337,7 +337,7 @@ impl QueryBuilder {
 /// missing, the channel produces no contribution and its declared
 /// columns become all-null in the merged output. Dtype mismatches are
 /// not coerced here; `merge_channels`'s validator surfaces them as a
-/// typed `EvidenceChannel` error so callers see the real mismatch.
+/// typed `ChannelAssembly` error so callers see the real mismatch.
 async fn extract_channel_contributions(
     batch: &RecordBatch,
     participating: &[ChannelId],
@@ -348,7 +348,7 @@ async fn extract_channel_contributions(
 
     for id in participating {
         let spec = catalog.channels().get(id).await?.ok_or_else(|| {
-            JammiError::EvidenceChannel(format!("channel '{id}': not registered"))
+            JammiError::ChannelAssembly(format!("channel '{id}': not registered"))
         })?;
         let positions: Option<Vec<usize>> = spec
             .columns
@@ -389,7 +389,7 @@ async fn extract_channel_contributions(
         new_fields.iter().map(|f| (**f).clone()).collect::<Vec<_>>(),
     ));
     let stripped = RecordBatch::try_new(new_schema, new_columns)
-        .map_err(|e| JammiError::EvidenceChannel(format!("extract_channel_contributions: {e}")))?;
+        .map_err(|e| JammiError::ChannelAssembly(format!("extract_channel_contributions: {e}")))?;
 
     Ok((stripped, contributions))
 }

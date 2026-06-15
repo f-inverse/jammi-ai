@@ -21,6 +21,7 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
+use jammi_db::catalog::channel_repo::ChannelCatalogError;
 use jammi_db::error::JammiError;
 use jammi_db::store::mutable::MutableTableError;
 use jammi_db::trigger::TriggerError;
@@ -127,6 +128,34 @@ pub fn map_engine_error(err: JammiError) -> Status {
                 MutableTableError::Backend(_) => Code::Internal,
             };
             (code, mt.to_string())
+        }
+        // A channel-catalog op carries a typed caller condition the coarse gRPC
+        // code set must preserve so a remote client distinguishes a duplicate
+        // channel, an absent channel, a column conflict, and bad input. A
+        // same-type redeclare and a duplicate channel are both `AlreadyExists`
+        // (the resource is already present); a different-type redeclare is a
+        // `FailedPrecondition` conflict against the stored declaration; an
+        // unregistered channel is `NotFound`; a bad slug or column-type token is
+        // `InvalidArgument`. (The two input variants are pre-rejected at the wire
+        // boundary — slugs by `parse_channel_id`, dtype tokens by the closed
+        // proto enum — so they are reachable only from the embedded surfaces.)
+        JammiError::ChannelCatalog(c) => {
+            let code = match c {
+                ChannelCatalogError::AlreadyExists(_)
+                | ChannelCatalogError::ColumnAlreadyDeclared { .. } => Code::AlreadyExists,
+                ChannelCatalogError::NotRegistered(_) => Code::NotFound,
+                ChannelCatalogError::ColumnConflict { .. } => Code::FailedPrecondition,
+                ChannelCatalogError::InvalidId(_) | ChannelCatalogError::InvalidColumnType(_) => {
+                    Code::InvalidArgument
+                }
+            };
+            (code, c.to_string())
+        }
+        // Channel-assembly failures are reached only from the engine-internal
+        // search-merge path on engine-derived inputs — an engine invariant, not a
+        // caller condition — so they fall through to `Internal`.
+        JammiError::ChannelAssembly(detail) => {
+            (Code::Internal, format!("channel assembly: {detail}"))
         }
         other => (Code::Internal, other.to_string()),
     };

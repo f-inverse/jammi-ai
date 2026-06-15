@@ -9,7 +9,7 @@ use jammi_db::ChannelId;
 /// `columns` aligns 1:1 with the channel's declared columns
 /// (`ChannelSpec::columns`) by index, and every array has the same length
 /// as the batch the contribution attaches to. The merger validates both
-/// invariants and rejects mismatches with a typed `EvidenceChannel`
+/// invariants and rejects mismatches with a typed `ChannelAssembly`
 /// error.
 #[derive(Debug, Clone)]
 pub struct ChannelContribution {

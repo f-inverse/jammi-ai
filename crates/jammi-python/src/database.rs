@@ -418,7 +418,7 @@ impl PyDatabase {
     /// session's currently bound tenant: two tenants may each register a
     /// channel of the same id without collision, but re-registering an id that
     /// already exists for the bound tenant raises `RuntimeError` carrying
-    /// `EvidenceChannel("channel '<id>': already exists")`.
+    /// `ChannelCatalog(AlreadyExists)` — `"channel '<id>': already exists"`.
     #[pyo3(signature = (channel_id, *, priority, columns))]
     fn register_channel(
         &self,
@@ -441,8 +441,8 @@ impl PyDatabase {
     /// Append columns to an already-registered channel. The append-only
     /// invariant is enforced: redeclaring an existing column with a
     /// different dtype raises `RuntimeError` carrying
-    /// `EvidenceChannel("channel '<id>': column '<name>' was declared <X>,
-    /// cannot redeclare as <Y>")`.
+    /// `ChannelCatalog(ColumnConflict)` — `"channel '<id>': column '<name>' was
+    /// declared <X>, cannot redeclare as <Y>"`.
     #[pyo3(signature = (channel_id, *, columns))]
     fn add_channel_columns(
         &self,
@@ -2192,11 +2192,18 @@ fn parse_class_score(
 fn parse_channel_columns(
     columns: &[(String, String)],
 ) -> PyResult<Vec<jammi_db::catalog::channel_repo::ChannelColumn>> {
+    use jammi_db::catalog::channel_repo::{ChannelCatalogError, ChannelColumnType};
     columns
         .iter()
         .map(|(name, dtype)| {
-            let data_type = jammi_db::catalog::channel_repo::ChannelColumnType::from_sql_str(dtype)
-                .map_err(to_pyerr)?;
+            // A caller-supplied dtype token that does not parse is a bad request
+            // (`InvalidColumnType`), not catalog corruption — the call-site
+            // context, not `from_sql_str`, makes that distinction.
+            let data_type = ChannelColumnType::from_sql_str(dtype).map_err(|t| {
+                to_pyerr(JammiError::ChannelCatalog(
+                    ChannelCatalogError::InvalidColumnType(t.0),
+                ))
+            })?;
             Ok(jammi_db::catalog::channel_repo::ChannelColumn {
                 name: name.clone(),
                 data_type,

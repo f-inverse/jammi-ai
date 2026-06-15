@@ -10,7 +10,9 @@
 use std::str::FromStr;
 
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
-use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
+use jammi_db::catalog::channel_repo::{
+    ChannelCatalogError, ChannelColumn, ChannelColumnType, ChannelSpec,
+};
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::Catalog;
 use jammi_db::error::JammiError;
@@ -213,11 +215,11 @@ async fn channel_namespace_is_per_tenant() {
         .await
         .unwrap_err();
     match err {
-        JammiError::EvidenceChannel(m) => assert!(
-            m.contains("already exists"),
-            "expected per-tenant duplicate reject, got: {m}"
+        JammiError::ChannelCatalog(ChannelCatalogError::AlreadyExists(c)) => assert_eq!(
+            c, "chan_x",
+            "expected per-tenant duplicate reject for 'chan_x'"
         ),
-        other => panic!("expected EvidenceChannel(already exists), got {other:?}"),
+        other => panic!("expected ChannelCatalog(AlreadyExists), got {other:?}"),
     }
 }
 

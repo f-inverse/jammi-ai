@@ -6,7 +6,10 @@
 
 use clap::Subcommand;
 use jammi_admin::CatalogClient;
-use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
+use jammi_db::catalog::channel_repo::{
+    ChannelCatalogError, ChannelColumn, ChannelColumnType, ChannelSpec,
+};
+use jammi_db::error::JammiError;
 use jammi_db::evidence_channel::ChannelId;
 
 #[derive(Subcommand)]
@@ -119,7 +122,8 @@ fn parse_column_specs(specs: &[String]) -> Result<Vec<ChannelColumn>, Box<dyn st
         if name.is_empty() {
             return Err(format!("--column '{trimmed}' has an empty column name").into());
         }
-        let data_type = ChannelColumnType::from_sql_str(ty)?;
+        let data_type = ChannelColumnType::from_sql_str(ty)
+            .map_err(|t| JammiError::ChannelCatalog(ChannelCatalogError::InvalidColumnType(t.0)))?;
         out.push(ChannelColumn {
             name: name.to_string(),
             data_type,

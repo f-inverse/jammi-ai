@@ -32,7 +32,7 @@ use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::local_session::{ChannelColumn, ChannelSpec};
 use jammi_ai::{Modality, Session};
 use jammi_client::DataClient;
-use jammi_db::catalog::channel_repo::ChannelColumnType;
+use jammi_db::catalog::channel_repo::{ChannelCatalogError, ChannelColumnType};
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::mutable::{MutableTableDefinitionBuilder, MutableTableError, MutableTableId};
@@ -573,15 +573,18 @@ async fn remote_register_and_add_channel_columns_round_trips_like_local() {
         .expect("remote register_channel");
 
     // Re-registering the same channel fails identically on both transports —
-    // a faithful `EvidenceChannel` error over the wire.
+    // a faithful `ChannelCatalog(AlreadyExists)` error over the wire.
     let remote_dup = remote
         .catalog()
         .register_channel(&spec)
         .await
         .expect_err("re-registering a channel must fail");
     assert!(
-        matches!(remote_dup, JammiError::EvidenceChannel(_)),
-        "re-register is an EvidenceChannel error, got {remote_dup:?}"
+        matches!(
+            remote_dup,
+            JammiError::ChannelCatalog(ChannelCatalogError::AlreadyExists(ref c)) if c == "evidence"
+        ),
+        "re-register is a ChannelCatalog(AlreadyExists) error, got {remote_dup:?}"
     );
 
     // The remote appends a column; the local session sees the same channel

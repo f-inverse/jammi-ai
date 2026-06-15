@@ -1,5 +1,7 @@
 use arrow::datatypes::DataType;
-use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
+use jammi_db::catalog::channel_repo::{
+    ChannelCatalogError, ChannelColumn, ChannelColumnType, ChannelSpec,
+};
 use jammi_db::catalog::Catalog;
 use jammi_db::error::JammiError;
 use jammi_db::ChannelId;
@@ -134,7 +136,7 @@ async fn add_columns_then_merged_schema_includes_new_column() {
 }
 
 /// SPEC-01 §9 — `register` must reject a channel id that's already in the
-/// catalog with `EvidenceChannel("…already exists")`.
+/// catalog with `ChannelCatalog(AlreadyExists(...))`.
 #[tokio::test]
 async fn register_rejects_duplicate_channel_id() {
     let (_dir, catalog) = open_catalog().await;
@@ -150,11 +152,11 @@ async fn register_rejects_duplicate_channel_id() {
 
     let err = catalog.channels().register(&spec).await.unwrap_err();
     match err {
-        JammiError::EvidenceChannel(msg) => assert!(
-            msg.contains("already exists") && msg.contains("scored_by"),
-            "expected 'already exists' for 'scored_by'; got: {msg}"
+        JammiError::ChannelCatalog(ChannelCatalogError::AlreadyExists(channel)) => assert_eq!(
+            channel, "scored_by",
+            "expected 'already exists' for 'scored_by'"
         ),
-        other => panic!("expected JammiError::EvidenceChannel, got {other:?}"),
+        other => panic!("expected ChannelCatalog(AlreadyExists), got {other:?}"),
     }
 }
 
@@ -190,11 +192,21 @@ async fn add_columns_rejects_int32_retype_of_utf8_column() {
         )
         .await
         .unwrap_err();
+    // The Display text is load-bearing — the message names both the column and
+    // the would-be new type so a Python caller sees exactly what failed.
+    assert!(
+        err.to_string().contains("cannot redeclare as Int32") && err.to_string().contains("ranker"),
+        "expected 'cannot redeclare as Int32' for 'ranker'; got: {err}"
+    );
     match err {
-        JammiError::EvidenceChannel(msg) => assert!(
-            msg.contains("cannot redeclare as Int32") && msg.contains("ranker"),
-            "expected 'cannot redeclare as Int32' for 'ranker'; got: {msg}"
-        ),
-        other => panic!("expected JammiError::EvidenceChannel, got {other:?}"),
+        JammiError::ChannelCatalog(ChannelCatalogError::ColumnConflict {
+            column,
+            requested,
+            ..
+        }) => {
+            assert_eq!(column, "ranker");
+            assert_eq!(requested, ChannelColumnType::Int32);
+        }
+        other => panic!("expected ChannelCatalog(ColumnConflict), got {other:?}"),
     }
 }

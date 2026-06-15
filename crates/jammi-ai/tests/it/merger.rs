@@ -115,7 +115,7 @@ async fn merged_channel_nullability_round_trips_through_datafusion() {
 }
 
 /// SPEC-01 §9 — a contribution whose array length doesn't match the batch's
-/// row count must surface as a typed `EvidenceChannel` error naming both
+/// row count must surface as a typed `ChannelAssembly` error naming both
 /// counts. SPEC-01 §3.7 phrases this as "has N rows, batch has M"; the
 /// production wording is "has N rows, expected M" (substring match against
 /// "has 2 rows" + "expected 3" + the column name pins both sides of the
@@ -143,19 +143,19 @@ async fn length_mismatched_contribution_returns_typed_error() {
     .unwrap_err();
 
     match err {
-        JammiError::EvidenceChannel(msg) => assert!(
+        JammiError::ChannelAssembly(msg) => assert!(
             msg.contains("has 2 rows")
                 && msg.contains("expected 3")
                 && msg.contains("similarity"),
             "expected length-mismatch error naming the column 'similarity' and row counts; got: {msg}"
         ),
-        other => panic!("expected JammiError::EvidenceChannel, got {other:?}"),
+        other => panic!("expected JammiError::ChannelAssembly, got {other:?}"),
     }
 }
 
 /// SPEC-01 §9 — a contribution whose Arrow dtype doesn't match the
 /// catalog-declared `ChannelColumnType` must surface as a typed
-/// `EvidenceChannel` error naming the column and both types.
+/// `ChannelAssembly` error naming the column and both types.
 #[tokio::test]
 async fn wrong_dtype_contribution_returns_typed_error() {
     let (_dir, catalog) = open_catalog().await;
@@ -179,10 +179,10 @@ async fn wrong_dtype_contribution_returns_typed_error() {
     .unwrap_err();
 
     match err {
-        JammiError::EvidenceChannel(msg) => assert!(
+        JammiError::ChannelAssembly(msg) => assert!(
             msg.contains("Float32") && msg.contains("Int32") && msg.contains("similarity"),
             "expected dtype-mismatch error naming 'similarity' + Int32 + Float32; got: {msg}"
         ),
-        other => panic!("expected JammiError::EvidenceChannel, got {other:?}"),
+        other => panic!("expected JammiError::ChannelAssembly, got {other:?}"),
     }
 }

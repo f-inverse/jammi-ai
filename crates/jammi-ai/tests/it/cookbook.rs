@@ -1330,7 +1330,9 @@ async fn cookbook_declare_provenance_channel_recipe_runs_end_to_end() {
 
 #[tokio::test]
 async fn cookbook_declare_provenance_channel_append_only_callout_matches_runtime() {
-    use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
+    use jammi_db::catalog::channel_repo::{
+        ChannelCatalogError, ChannelColumn, ChannelColumnType, ChannelSpec,
+    };
     use jammi_db::error::JammiError;
     use jammi_db::ChannelId;
 
@@ -1368,12 +1370,15 @@ async fn cookbook_declare_provenance_channel_append_only_callout_matches_runtime
         .await
         .unwrap_err();
     match err {
-        JammiError::EvidenceChannel(m) => {
-            assert!(m.contains("cannot redeclare"));
-            assert!(m.contains("Utf8"));
-            assert!(m.contains("Int32"));
+        JammiError::ChannelCatalog(ChannelCatalogError::ColumnConflict {
+            existing,
+            requested,
+            ..
+        }) => {
+            assert_eq!(existing, ChannelColumnType::Utf8);
+            assert_eq!(requested, ChannelColumnType::Int32);
         }
-        other => panic!("expected EvidenceChannel(cannot redeclare), got {other:?}"),
+        other => panic!("expected ChannelCatalog(ColumnConflict), got {other:?}"),
     }
 
     // Same column, same dtype → "already declared".
@@ -1390,8 +1395,8 @@ async fn cookbook_declare_provenance_channel_append_only_callout_matches_runtime
         .await
         .unwrap_err();
     match err {
-        JammiError::EvidenceChannel(m) => assert!(m.contains("already declared")),
-        other => panic!("expected EvidenceChannel(already declared), got {other:?}"),
+        JammiError::ChannelCatalog(ChannelCatalogError::ColumnAlreadyDeclared { .. }) => {}
+        other => panic!("expected ChannelCatalog(ColumnAlreadyDeclared), got {other:?}"),
     }
 }
 

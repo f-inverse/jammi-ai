@@ -418,6 +418,84 @@ async fn register_channel_rejects_unspecified_column_type() {
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }
 
+/// The channel-catalog error taxonomy maps each caller condition onto its own
+/// gRPC code at the wire seam — `Internal` (the engine-error catch-all) for all
+/// four would conflate a duplicate, an absent channel, and a column conflict. A
+/// remote client reads the code to distinguish them, so the mapping is asserted
+/// here on the wire path through `map_engine_error`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn channel_catalog_errors_map_to_distinct_grpc_codes() {
+    let fixture = start_fixture().await;
+    let ch = channel(fixture.addr).await;
+    let mut client =
+        CatalogServiceClient::with_interceptor(ch, with_session("session-channel-codes"));
+
+    let utf8_col = |name: &str| ChannelColumn {
+        name: name.into(),
+        data_type: ChannelColumnType::Utf8 as i32,
+    };
+
+    client
+        .register_channel(RegisterChannelRequest {
+            channel_id: "ranked".into(),
+            priority: 5,
+            columns: vec![utf8_col("ranker")],
+        })
+        .await
+        .expect("register channel");
+
+    // Duplicate register → AlreadyExists.
+    let dup = client
+        .register_channel(RegisterChannelRequest {
+            channel_id: "ranked".into(),
+            priority: 5,
+            columns: vec![utf8_col("ranker")],
+        })
+        .await
+        .expect_err("re-registering a channel must fail");
+    assert_eq!(dup.code(), tonic::Code::AlreadyExists);
+
+    // add_channel_columns on an absent channel → NotFound.
+    let absent = client
+        .add_channel_columns(AddChannelColumnsRequest {
+            channel_id: "never_registered".into(),
+            columns: vec![utf8_col("score")],
+        })
+        .await
+        .expect_err("appending to an absent channel must fail");
+    assert_eq!(absent.code(), tonic::Code::NotFound);
+
+    // Same-type redeclare → AlreadyExists (the append-only catalog rejects an
+    // idempotent redeclaration just as it rejects a duplicate channel).
+    let same_type = client
+        .add_channel_columns(AddChannelColumnsRequest {
+            channel_id: "ranked".into(),
+            columns: vec![utf8_col("ranker")],
+        })
+        .await
+        .expect_err("redeclaring an existing column must fail");
+    assert_eq!(same_type.code(), tonic::Code::AlreadyExists);
+
+    // Different-type redeclare → FailedPrecondition (a conflict against the
+    // stored declaration), and the contiguous Display crosses the wire intact.
+    let conflict = client
+        .add_channel_columns(AddChannelColumnsRequest {
+            channel_id: "ranked".into(),
+            columns: vec![ChannelColumn {
+                name: "ranker".into(),
+                data_type: ChannelColumnType::Int32 as i32,
+            }],
+        })
+        .await
+        .expect_err("retyping an existing column must fail");
+    assert_eq!(conflict.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        conflict.message().contains("cannot redeclare as Int32"),
+        "the redeclaration-conflict Display must survive the wire: {}",
+        conflict.message()
+    );
+}
+
 // ───────────────────────── Audit ─────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

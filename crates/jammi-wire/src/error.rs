@@ -23,12 +23,14 @@
 //! of the error type — not of any one verb surface — so the mapping is complete
 //! over `JammiError`: every owned-shape variant (the String- and struct-carrying
 //! ones — `Source`, `Model`, `Inference`, `Catalog`, `Schema`, `Config`, `Eval`,
-//! `Tenant`, `FineTune`, `Gpu`, `Backend`, `EvidenceChannel`) reconstructs
-//! exactly, field for field. So does [`JammiError::MutableTable`]: its inner
-//! [`MutableTableError`] is engine-owned and every variant's fields reconstruct,
-//! so it carries a structured [`pb::MutableTableErrorDetail`] (which nests an
-//! engine-owned [`pb::BackendErrorDetail`] for its `Backend` arm) and crosses
-//! the wire faithfully — never a fold. The only variants that fold into `other`
+//! `Tenant`, `FineTune`, `Gpu`, `Backend`, `ChannelAssembly`) reconstructs
+//! exactly, field for field. So do [`JammiError::MutableTable`] and
+//! [`JammiError::ChannelCatalog`]: their inner errors ([`MutableTableError`],
+//! [`ChannelCatalogError`]) are engine-owned and every variant's fields
+//! reconstruct, so they carry structured details ([`pb::MutableTableErrorDetail`]
+//! — which nests an engine-owned [`pb::BackendErrorDetail`] for its `Backend`
+//! arm — and [`pb::ChannelCatalogErrorDetail`]) and cross the wire faithfully —
+//! never a fold. The only variants that fold into `other`
 //! are the genuinely-foreign `#[from]` ones whose inner error cannot cross a
 //! process boundary (`Io`, `BackendDriver`, `Toml`, `Json`, `DataFusion`,
 //! `Trigger`, `Storage`, and the lone [`BackendError::Sqlx`] nested under
@@ -37,6 +39,7 @@
 //! genuine limit, not a lossy guess.
 
 use jammi_db::catalog::backend::BackendError;
+use jammi_db::catalog::channel_repo::{ChannelCatalogError, ChannelColumnType};
 use jammi_db::error::JammiError;
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
 use jammi_db::trigger::TriggerError;
@@ -102,7 +105,8 @@ impl From<&JammiError> for pb::JammiErrorDetail {
             JammiError::Backend(message) => Variant::Backend(pb::StringError {
                 message: message.clone(),
             }),
-            JammiError::EvidenceChannel(message) => Variant::EvidenceChannel(pb::StringError {
+            JammiError::ChannelCatalog(e) => Variant::ChannelCatalog(e.into()),
+            JammiError::ChannelAssembly(message) => Variant::ChannelAssembly(pb::StringError {
                 message: message.clone(),
             }),
             JammiError::MutableTable(e) => Variant::MutableTable(e.into()),
@@ -156,7 +160,8 @@ impl From<pb::JammiErrorDetail> for JammiError {
             Some(Variant::FineTune(e)) => JammiError::FineTune(e.message),
             Some(Variant::Gpu(e)) => JammiError::Gpu(e.message),
             Some(Variant::Backend(e)) => JammiError::Backend(e.message),
-            Some(Variant::EvidenceChannel(e)) => JammiError::EvidenceChannel(e.message),
+            Some(Variant::ChannelCatalog(e)) => JammiError::ChannelCatalog(e.into()),
+            Some(Variant::ChannelAssembly(e)) => JammiError::ChannelAssembly(e.message),
             Some(Variant::MutableTable(e)) => JammiError::MutableTable(e.into()),
             Some(Variant::Other(e)) => JammiError::Other(e.message),
             None => JammiError::Other(String::new()),
@@ -216,6 +221,87 @@ impl From<pb::MutableTableErrorDetail> for MutableTableError {
             Some(Variant::NoOrderColumn(_)) => MutableTableError::NoOrderColumn,
             Some(Variant::Backend(e)) => MutableTableError::Backend(e.into()),
             None => MutableTableError::Schema(String::new()),
+        }
+    }
+}
+
+/// Encode the engine-owned [`ChannelCatalogError`] into its structured wire
+/// detail. The two struct variants carry per-field messages (channel + column +
+/// canonical PascalCase type tokens) so `to_string()` rebuilds the exact Display
+/// the in-process error produces; no arm folds — every field reconstructs.
+impl From<&ChannelCatalogError> for pb::ChannelCatalogErrorDetail {
+    fn from(err: &ChannelCatalogError) -> Self {
+        use pb::channel_catalog_error_detail::Variant;
+        let variant = match err {
+            ChannelCatalogError::AlreadyExists(c) => Variant::AlreadyExists(c.clone()),
+            ChannelCatalogError::NotRegistered(c) => Variant::NotRegistered(c.clone()),
+            ChannelCatalogError::ColumnAlreadyDeclared {
+                channel,
+                column,
+                ty,
+            } => Variant::ColumnAlreadyDeclared(pb::ColumnAlreadyDeclared {
+                channel: channel.clone(),
+                column: column.clone(),
+                ty: ty.as_str().to_string(),
+            }),
+            ChannelCatalogError::ColumnConflict {
+                channel,
+                column,
+                existing,
+                requested,
+            } => Variant::ColumnConflict(pb::ColumnConflict {
+                channel: channel.clone(),
+                column: column.clone(),
+                existing: existing.as_str().to_string(),
+                requested: requested.as_str().to_string(),
+            }),
+            ChannelCatalogError::InvalidId(m) => Variant::InvalidId(m.clone()),
+            ChannelCatalogError::InvalidColumnType(m) => Variant::InvalidColumnType(m.clone()),
+        };
+        pb::ChannelCatalogErrorDetail {
+            variant: Some(variant),
+        }
+    }
+}
+
+/// Reconstruct the [`ChannelCatalogError`] from its wire detail — the inverse of
+/// the encode above. The struct variants re-parse the canonical PascalCase type
+/// token; a forged token that does not parse reconstructs as
+/// `InvalidColumnType` carrying the offending string — exactly the variant the
+/// engine produces for an unknown token, so decode stays total. A detail with no
+/// variant set reconstructs as an empty `NotRegistered` — kept inside the
+/// channel-catalog taxonomy rather than escaping to `Other`.
+impl From<pb::ChannelCatalogErrorDetail> for ChannelCatalogError {
+    fn from(detail: pb::ChannelCatalogErrorDetail) -> Self {
+        use pb::channel_catalog_error_detail::Variant;
+        // A forged or corrupt type token cannot reconstruct a `ChannelColumnType`;
+        // it surfaces as `InvalidColumnType` (carrying the token) — the same
+        // variant the engine yields for an unknown token, keeping decode total.
+        let parse_ty = |token: String| ChannelColumnType::from_sql_str(&token).map_err(|_| token);
+        match detail.variant {
+            Some(Variant::AlreadyExists(c)) => ChannelCatalogError::AlreadyExists(c),
+            Some(Variant::NotRegistered(c)) => ChannelCatalogError::NotRegistered(c),
+            Some(Variant::ColumnAlreadyDeclared(d)) => match parse_ty(d.ty) {
+                Ok(ty) => ChannelCatalogError::ColumnAlreadyDeclared {
+                    channel: d.channel,
+                    column: d.column,
+                    ty,
+                },
+                Err(token) => ChannelCatalogError::InvalidColumnType(token),
+            },
+            Some(Variant::ColumnConflict(d)) => match (parse_ty(d.existing), parse_ty(d.requested))
+            {
+                (Ok(existing), Ok(requested)) => ChannelCatalogError::ColumnConflict {
+                    channel: d.channel,
+                    column: d.column,
+                    existing,
+                    requested,
+                },
+                (Err(token), _) | (_, Err(token)) => ChannelCatalogError::InvalidColumnType(token),
+            },
+            Some(Variant::InvalidId(m)) => ChannelCatalogError::InvalidId(m),
+            Some(Variant::InvalidColumnType(m)) => ChannelCatalogError::InvalidColumnType(m),
+            None => ChannelCatalogError::NotRegistered(String::new()),
         }
     }
 }
@@ -636,7 +722,9 @@ mod tests {
             JammiError::Gpu("no CUDA device visible".into()),
             JammiError::Backend("vLLM returned HTTP 503".into()),
             JammiError::Tenant("nil UUID is not a valid tenant".into()),
-            JammiError::EvidenceChannel("channel 'patents' not registered".into()),
+            JammiError::ChannelAssembly(
+                "batch 0: channel 'vector' column 'similarity' has dtype Int32".into(),
+            ),
             JammiError::Schema {
                 table: "patents_embeddings".into(),
                 column: "vector".into(),
@@ -736,6 +824,59 @@ mod tests {
                 "MutableTable variant must reconstruct its fields faithfully: {err:?} -> {back:?}"
             );
         }
+    }
+
+    /// `JammiError::ChannelCatalog` is engine-owned and reconstructs faithfully —
+    /// it must NOT fold to `Other`. Every `ChannelCatalogError` variant (the two
+    /// string-carrying ids and the two struct variants carrying canonical
+    /// PascalCase type tokens) round-trips to the identical variant and `Display`
+    /// after the full Status round-trip. The contiguous "cannot redeclare as
+    /// <type>" Display of `ColumnConflict` is load-bearing for the CLI / cookbook
+    /// / db it-tests, so the `Display` equality below pins it across the wire.
+    #[test]
+    fn channel_catalog_variant_round_trips_faithfully() {
+        let cases = [
+            ChannelCatalogError::AlreadyExists("scored_by".into()),
+            ChannelCatalogError::NotRegistered("vector".into()),
+            ChannelCatalogError::ColumnAlreadyDeclared {
+                channel: "scored_by".into(),
+                column: "ranker".into(),
+                ty: ChannelColumnType::Utf8,
+            },
+            ChannelCatalogError::ColumnConflict {
+                channel: "scored_by".into(),
+                column: "ranker".into(),
+                existing: ChannelColumnType::Utf8,
+                requested: ChannelColumnType::Int32,
+            },
+            ChannelCatalogError::InvalidId("invalid channel id 'Bad': must be [a-z0-9_]".into()),
+            ChannelCatalogError::InvalidColumnType("Decimal".into()),
+        ];
+        for inner in cases {
+            let err = JammiError::ChannelCatalog(inner);
+            let back = round_trip(&err);
+            match (&err, &back) {
+                (JammiError::ChannelCatalog(_), JammiError::ChannelCatalog(_)) => {}
+                other => panic!(
+                    "ChannelCatalog must reconstruct as itself, never fold to Other: {other:?}"
+                ),
+            }
+            assert_eq!(
+                back.to_string(),
+                err.to_string(),
+                "ChannelCatalog variant must reconstruct its fields faithfully: {err:?} -> {back:?}"
+            );
+        }
+        // The contiguous redeclare-conflict Display crosses the wire intact.
+        let conflict = JammiError::ChannelCatalog(ChannelCatalogError::ColumnConflict {
+            channel: "scored_by".into(),
+            column: "ranker".into(),
+            existing: ChannelColumnType::Utf8,
+            requested: ChannelColumnType::Int32,
+        });
+        assert!(round_trip(&conflict)
+            .to_string()
+            .contains("cannot redeclare as Int32"));
     }
 
     /// Round-trip a [`TriggerError`] through the full Status path

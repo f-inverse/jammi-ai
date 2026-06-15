@@ -40,7 +40,7 @@ pub async fn merge_channels(
     contributions: &[Vec<ChannelContribution>],
 ) -> Result<Vec<RecordBatch>> {
     if contributions.len() != batches.len() {
-        return Err(JammiError::EvidenceChannel(format!(
+        return Err(JammiError::ChannelAssembly(format!(
             "contributions length {} does not match batches length {}",
             contributions.len(),
             batches.len()
@@ -52,7 +52,7 @@ pub async fn merge_channels(
     let mut specs: Vec<ChannelSpec> = Vec::with_capacity(participating.len());
     for id in participating {
         let spec = catalog.channels().get(id).await?.ok_or_else(|| {
-            JammiError::EvidenceChannel(format!("channel '{id}': not registered"))
+            JammiError::ChannelAssembly(format!("channel '{id}': not registered"))
         })?;
         specs.push(spec);
     }
@@ -108,7 +108,7 @@ fn merge_one_batch(
         std::collections::HashSet::with_capacity(contributions.len());
     for contrib in contributions {
         if !seen.insert(&contrib.channel) {
-            return Err(JammiError::EvidenceChannel(format!(
+            return Err(JammiError::ChannelAssembly(format!(
                 "channel '{}': duplicate contribution on batch {batch_index}",
                 contrib.channel
             )));
@@ -142,7 +142,7 @@ fn merge_one_batch(
     all_columns.extend(suffix_columns);
 
     RecordBatch::try_new(Arc::new(Schema::new(all_fields)), all_columns).map_err(|e| {
-        JammiError::EvidenceChannel(format!("batch {batch_index}: assembly failed: {e}"))
+        JammiError::ChannelAssembly(format!("batch {batch_index}: assembly failed: {e}"))
     })
 }
 
@@ -156,14 +156,14 @@ fn validate_contribution(
         .iter()
         .find(|s| s.id == contrib.channel)
         .ok_or_else(|| {
-            JammiError::EvidenceChannel(format!(
+            JammiError::ChannelAssembly(format!(
             "batch {batch_index}: contribution for channel '{}' is not in the participating set",
             contrib.channel
         ))
         })?;
 
     if contrib.columns.len() != spec.columns.len() {
-        return Err(JammiError::EvidenceChannel(format!(
+        return Err(JammiError::ChannelAssembly(format!(
             "batch {batch_index}: channel '{}' contribution has {} columns, expected {}",
             contrib.channel,
             contrib.columns.len(),
@@ -173,7 +173,7 @@ fn validate_contribution(
 
     for (idx, (arr, decl)) in contrib.columns.iter().zip(spec.columns.iter()).enumerate() {
         if arr.len() != row_count {
-            return Err(JammiError::EvidenceChannel(format!(
+            return Err(JammiError::ChannelAssembly(format!(
                 "batch {batch_index}: channel '{}' column '{}' has {} rows, expected {}",
                 contrib.channel,
                 decl.name,
@@ -183,7 +183,7 @@ fn validate_contribution(
         }
         let want = decl.data_type.to_arrow();
         if arr.data_type() != &want {
-            return Err(JammiError::EvidenceChannel(format!(
+            return Err(JammiError::ChannelAssembly(format!(
                 "batch {batch_index}: channel '{}' column '{}' has dtype {:?}, expected {:?} (column index {idx})",
                 contrib.channel, decl.name, arr.data_type(), want,
             )));
@@ -205,7 +205,7 @@ fn build_list_column(row_count: usize, values: &[ChannelId]) -> Result<ArrayRef>
         None,
     )
     .map_err(|e| {
-        JammiError::EvidenceChannel(format!("list construction for retrieved/annotated: {e}"))
+        JammiError::ChannelAssembly(format!("list construction for retrieved/annotated: {e}"))
     })?;
 
     Ok(Arc::new(list))
@@ -367,12 +367,12 @@ mod tests {
         .await
         .unwrap_err();
         match err {
-            JammiError::EvidenceChannel(m) => {
+            JammiError::ChannelAssembly(m) => {
                 assert!(m.contains("similarity"));
                 assert!(m.contains("2 rows"));
                 assert!(m.contains("expected 3"));
             }
-            other => panic!("expected EvidenceChannel(length), got {other:?}"),
+            other => panic!("expected ChannelAssembly(length), got {other:?}"),
         }
     }
 
@@ -396,8 +396,8 @@ mod tests {
         .await
         .unwrap_err();
         match err {
-            JammiError::EvidenceChannel(m) => assert!(m.contains("dtype")),
-            other => panic!("expected EvidenceChannel(dtype), got {other:?}"),
+            JammiError::ChannelAssembly(m) => assert!(m.contains("dtype")),
+            other => panic!("expected ChannelAssembly(dtype), got {other:?}"),
         }
     }
 
@@ -422,8 +422,8 @@ mod tests {
         .await
         .unwrap_err();
         match err {
-            JammiError::EvidenceChannel(m) => assert!(m.contains("not in the participating set")),
-            other => panic!("expected EvidenceChannel(non-participating), got {other:?}"),
+            JammiError::ChannelAssembly(m) => assert!(m.contains("not in the participating set")),
+            other => panic!("expected ChannelAssembly(non-participating), got {other:?}"),
         }
     }
 
@@ -442,8 +442,8 @@ mod tests {
         .await
         .unwrap_err();
         match err {
-            JammiError::EvidenceChannel(m) => assert!(m.contains("not registered")),
-            other => panic!("expected EvidenceChannel(unregistered), got {other:?}"),
+            JammiError::ChannelAssembly(m) => assert!(m.contains("not registered")),
+            other => panic!("expected ChannelAssembly(unregistered), got {other:?}"),
         }
     }
 
@@ -464,11 +464,11 @@ mod tests {
         .await
         .unwrap_err();
         match err {
-            JammiError::EvidenceChannel(m) => {
+            JammiError::ChannelAssembly(m) => {
                 assert!(m.contains("length"));
                 assert!(m.contains("does not match"));
             }
-            other => panic!("expected EvidenceChannel(shape), got {other:?}"),
+            other => panic!("expected ChannelAssembly(shape), got {other:?}"),
         }
     }
 
@@ -522,11 +522,11 @@ mod tests {
         .await
         .unwrap_err();
         match err {
-            JammiError::EvidenceChannel(m) => {
+            JammiError::ChannelAssembly(m) => {
                 assert!(m.contains("duplicate contribution"));
                 assert!(m.contains("batch 0"));
             }
-            other => panic!("expected EvidenceChannel(duplicate), got {other:?}"),
+            other => panic!("expected ChannelAssembly(duplicate), got {other:?}"),
         }
     }
 

@@ -45,11 +45,12 @@ message RpcStatus {
 //
 // The contract is complete over `JammiError`: every owned-shape variant — the
 // String- and struct-carrying ones whose fields fully reconstruct the variant —
-// has its own typed arm here. `MutableTable` is NOT folded: its inner
-// `MutableTableError` is engine-owned (every field reconstructs), so it carries
-// its own structured `MutableTableErrorDetail` and reconstructs faithfully —
-// the same standard the owned-shape variants meet. The only variants folded
-// into `other` are the genuinely-foreign `#[from]` ones whose inner error
+// has its own typed arm here. `MutableTable` and `ChannelCatalog` are NOT
+// folded: their inner errors (`MutableTableError`, `ChannelCatalogError`) are
+// engine-owned (every field reconstructs), so they carry their own structured
+// detail (`MutableTableErrorDetail`, `ChannelCatalogErrorDetail`) and
+// reconstruct faithfully — the same standard the owned-shape variants meet. The
+// only variants folded into `other` are the genuinely-foreign `#[from]` ones whose inner error
 // cannot cross a process boundary (`Io`/`std::io::Error`,
 // `BackendDriver`/`Toml`/`Json`/`DataFusion`/`Trigger`/`Storage`): they
 // reconstruct as `JammiError::Other` carrying the faithful `Display` string —
@@ -70,10 +71,46 @@ message JammiErrorDetail {
     StringError fine_tune = 10;
     StringError gpu = 11;
     StringError backend = 12;
-    StringError evidence_channel = 13;
+    ChannelCatalogErrorDetail channel_catalog = 13;
     MutableTableErrorDetail mutable_table = 14;
     ModelRetiredError model_retired = 15;
+    StringError channel_assembly = 16;
   }
+}
+
+// `JammiError::ChannelCatalog(ChannelCatalogError)`. The inner taxonomy is
+// engine-owned and every variant's fields reconstruct, so it crosses the wire
+// faithfully rather than folding to a string. The two struct variants carry
+// per-field messages (channel + column + type tokens) so `to_string()` rebuilds
+// the exact Display the in-process error produces; the column-type tokens are
+// the canonical PascalCase names (`"Float32"`, `"Utf8"`, …).
+message ChannelCatalogErrorDetail {
+  oneof variant {
+    string already_exists = 1;
+    string not_registered = 2;
+    ColumnAlreadyDeclared column_already_declared = 3;
+    ColumnConflict column_conflict = 4;
+    string invalid_id = 5;
+    string invalid_column_type = 6;
+  }
+}
+
+// `ChannelCatalogError::ColumnAlreadyDeclared { channel, column, ty }`. `ty` is
+// the canonical PascalCase column-type token shared with the catalog's stored
+// representation.
+message ColumnAlreadyDeclared {
+  string channel = 1;
+  string column = 2;
+  string ty = 3;
+}
+
+// `ChannelCatalogError::ColumnConflict { channel, column, existing, requested }`.
+// `existing` / `requested` are canonical PascalCase column-type tokens.
+message ColumnConflict {
+  string channel = 1;
+  string column = 2;
+  string existing = 3;
+  string requested = 4;
 }
 
 // `JammiError::ModelRetired { model_id }`. The serve/load path was asked for a
@@ -147,7 +184,7 @@ message TenantMismatch {
 
 // A `JammiError` variant carrying a single human-readable string (`Inference`,
 // `Catalog`, `Config`, `Eval`, `Tenant`, `FineTune`, `Gpu`, `Backend`,
-// `EvidenceChannel`, `Other`).
+// `ChannelAssembly`, `Other`).
 message StringError {
   string message = 1;
 }

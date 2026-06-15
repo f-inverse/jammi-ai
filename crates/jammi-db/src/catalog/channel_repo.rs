@@ -4,12 +4,78 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::error::{JammiError, Result};
 use crate::evidence_channel::ChannelId;
 
 use super::backend::{BackendError, Row, SqlValue, TxOptions};
 use super::Catalog;
+
+/// A caller-facing failure of a channel-catalog operation (register a channel,
+/// append columns). These are the conditions a remote caller can provoke and
+/// must be able to distinguish — `map_engine_error` maps each onto its own gRPC
+/// code. Catalog corruption on read-back (a stored dtype token or channel slug
+/// that no longer parses) is NOT in this taxonomy: it is an engine invariant
+/// failure routed to `Internal`, not a caller error.
+#[derive(Debug, Error)]
+pub enum ChannelCatalogError {
+    /// A channel of this id is already registered for the bound tenant.
+    #[error("channel '{0}': already exists")]
+    AlreadyExists(String),
+
+    /// An `add_columns` (or merged-schema) op named a channel that is not
+    /// registered for the bound tenant.
+    #[error("channel '{0}': not registered")]
+    NotRegistered(String),
+
+    /// `add_columns` re-declared an existing column with the SAME type — the
+    /// append-only catalog rejects even an idempotent redeclaration.
+    #[error("channel '{channel}': column '{column}' already declared")]
+    ColumnAlreadyDeclared {
+        /// The channel the column belongs to.
+        channel: String,
+        /// The column name being redeclared.
+        column: String,
+        /// The (matching) type of both the existing and requested declaration.
+        ty: ChannelColumnType,
+    },
+
+    /// `add_columns` re-declared an existing column with a DIFFERENT type — a
+    /// precondition conflict against the stored declaration.
+    #[error(
+        "channel '{channel}': column '{column}' was declared {existing}, \
+         cannot redeclare as {requested}"
+    )]
+    ColumnConflict {
+        /// The channel the column belongs to.
+        channel: String,
+        /// The column name being redeclared.
+        column: String,
+        /// The type the column was originally declared with.
+        existing: ChannelColumnType,
+        /// The conflicting type the caller asked to redeclare it as.
+        requested: ChannelColumnType,
+    },
+
+    /// A caller-supplied channel id failed the slug rules.
+    #[error("{0}")]
+    InvalidId(String),
+
+    /// A caller-supplied column-type token was not one of the closed set of
+    /// PascalCase Arrow names (`Float32`, `Utf8`, …).
+    #[error("unknown channel column type: '{0}'")]
+    InvalidColumnType(String),
+}
+
+/// A column-type token (`"Float32"`, `"Utf8"`, …) that is not one of the closed
+/// set of PascalCase Arrow names. A neutral parse outcome carrying the offending
+/// token, with no caller-vs-corruption verdict baked in: [`ChannelColumnType::
+/// from_sql_str`] returns it, and each call site decides whether the bad token
+/// is a caller's input (→ [`ChannelCatalogError::InvalidColumnType`], a bad
+/// request) or stored-catalog corruption (→ an internal fault).
+#[derive(Debug)]
+pub struct UnknownColumnTypeToken(pub String);
 
 /// The closed set of Arrow types a channel column may declare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +87,12 @@ pub enum ChannelColumnType {
     Int64,
     Utf8,
     Boolean,
+}
+
+impl std::fmt::Display for ChannelColumnType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl ChannelColumnType {
@@ -43,7 +115,7 @@ impl ChannelColumnType {
             DataType::Int64 => Ok(Self::Int64),
             DataType::Utf8 => Ok(Self::Utf8),
             DataType::Boolean => Ok(Self::Boolean),
-            other => Err(JammiError::EvidenceChannel(format!(
+            other => Err(JammiError::Catalog(format!(
                 "unsupported channel column type: {other:?}"
             ))),
         }
@@ -68,7 +140,13 @@ impl ChannelColumnType {
     /// `ChannelColumnType`. The canonical string form is shared with the
     /// catalog's stored representation and with public-API callers (e.g.
     /// the Python binding's `register_channel(columns=[(name, dtype_str)])`).
-    pub fn from_sql_str(s: &str) -> Result<Self> {
+    ///
+    /// The token comes from two kinds of source — a caller's request and a
+    /// read-back of the stored catalog — that fail differently (a bad request
+    /// vs. catalog corruption). This parser stays neutral on that distinction:
+    /// it returns the offending token as an [`UnknownColumnTypeToken`], and the
+    /// call site decides which `JammiError` it becomes.
+    pub fn from_sql_str(s: &str) -> std::result::Result<Self, UnknownColumnTypeToken> {
         match s {
             "Float32" => Ok(Self::Float32),
             "Float64" => Ok(Self::Float64),
@@ -76,9 +154,7 @@ impl ChannelColumnType {
             "Int64" => Ok(Self::Int64),
             "Utf8" => Ok(Self::Utf8),
             "Boolean" => Ok(Self::Boolean),
-            other => Err(JammiError::EvidenceChannel(format!(
-                "unknown channel column type stored in catalog: '{other}'"
-            ))),
+            other => Err(UnknownColumnTypeToken(other.to_string())),
         }
     }
 }
@@ -108,7 +184,7 @@ pub struct ChannelRepo<'a> {
 fn map_constraint(e: BackendError, channel: &str) -> JammiError {
     match e {
         BackendError::Constraint { .. } => {
-            JammiError::EvidenceChannel(format!("channel '{channel}': already exists"))
+            JammiError::ChannelCatalog(ChannelCatalogError::AlreadyExists(channel.to_string()))
         }
         other => JammiError::BackendDriver(other),
     }
@@ -116,6 +192,17 @@ fn map_constraint(e: BackendError, channel: &str) -> JammiError {
 
 fn read_column_row(row: &Row<'_>) -> std::result::Result<(String, String), BackendError> {
     Ok((row.get("column_name")?, row.get("column_type")?))
+}
+
+/// A stored `column_type` token read back from the catalog that no longer parses
+/// is corruption of the engine's own store, not a caller condition. It surfaces
+/// as an internal [`JammiError::Catalog`] (→ gRPC `Internal`), never the
+/// caller-facing [`ChannelCatalogError::InvalidColumnType`] (→ `InvalidArgument`).
+fn stored_type_corruption(channel: &str, token: &UnknownColumnTypeToken) -> JammiError {
+    JammiError::Catalog(format!(
+        "channel '{channel}': stored column type '{}' is not a known channel column type",
+        token.0
+    ))
 }
 
 /// Does a parent `evidence_channels` row exist for `(tenant, channel)`?
@@ -318,6 +405,13 @@ impl<'a> ChannelRepo<'a> {
             .map(|c| (c.name.clone(), c.data_type))
             .collect();
 
+        // The closure separates two failure kinds the transaction wrapper would
+        // otherwise blur: the OUTER `BackendError` is a genuine DB fault (or
+        // catalog corruption read back from the store — a stored type token that
+        // no longer parses); the INNER `ChannelCatalogError` is a typed caller
+        // validation outcome. After the transaction, `Ok(Ok(()))` is success,
+        // `Ok(Err(cat))` a caller error, and `Err(be)` an internal fault — no
+        // message-string matching to recover the kind.
         self.catalog
             .backend()
             .transaction(TxOptions::default(), |tx| {
@@ -326,9 +420,7 @@ impl<'a> ChannelRepo<'a> {
                     let tref = tenant.as_deref();
                     // Existence check on the parent row, tenant-scoped.
                     if !channel_exists(tx, tref, &channel_name).await? {
-                        return Err(BackendError::Execution(format!(
-                            "channel '{channel_for_err}': not registered"
-                        )));
+                        return Ok(Err(ChannelCatalogError::NotRegistered(channel_for_err)));
                     }
 
                     let max_ord = max_ordinal(tx, tref, &channel_name).await?;
@@ -337,19 +429,30 @@ impl<'a> ChannelRepo<'a> {
                     for (name, ty) in cols {
                         let existing = column_type(tx, tref, &channel_name, &name).await?;
                         if let Some(existing_type) = existing {
+                            // A stored token that no longer parses is catalog
+                            // corruption, not a caller condition: it stays the
+                            // OUTER backend fault.
                             let existing = ChannelColumnType::from_sql_str(&existing_type)
-                                .map_err(|e| BackendError::Execution(e.to_string()))?;
+                                .map_err(|t| {
+                                    BackendError::Execution(format!(
+                                        "channel '{channel_for_err}': stored column type '{}' \
+                                         for '{name}' is not a known channel column type",
+                                        t.0
+                                    ))
+                                })?;
                             if existing == ty {
-                                return Err(BackendError::Execution(format!(
-                                    "channel '{channel_for_err}': column '{name}' already declared"
-                                )));
+                                return Ok(Err(ChannelCatalogError::ColumnAlreadyDeclared {
+                                    channel: channel_for_err,
+                                    column: name,
+                                    ty,
+                                }));
                             } else {
-                                return Err(BackendError::Execution(format!(
-                                    "channel '{channel_for_err}': column '{name}' was declared {}, \
-                                     cannot redeclare as {}",
-                                    existing.as_str(),
-                                    ty.as_str(),
-                                )));
+                                return Ok(Err(ChannelCatalogError::ColumnConflict {
+                                    channel: channel_for_err,
+                                    column: name,
+                                    existing,
+                                    requested: ty,
+                                }));
                             }
                         }
 
@@ -368,14 +471,12 @@ impl<'a> ChannelRepo<'a> {
                         .await?;
                         next += 1;
                     }
-                    Ok(())
+                    Ok(Ok(()))
                 })
             })
             .await
-            .map_err(|e| match e {
-                BackendError::Execution(m) => JammiError::EvidenceChannel(m),
-                other => JammiError::BackendDriver(other),
-            })?;
+            .map_err(JammiError::BackendDriver)?
+            .map_err(JammiError::ChannelCatalog)?;
         Ok(())
     }
 
@@ -470,12 +571,16 @@ impl<'a> ChannelRepo<'a> {
         let Some((priority, raw_cols)) = found else {
             return Ok(None);
         };
+        // A stored type token that no longer parses is catalog corruption, not a
+        // caller condition — route it to an internal fault, never an
+        // `InvalidColumnType` caller error.
         let columns: Result<Vec<ChannelColumn>> = raw_cols
             .into_iter()
             .map(|(name, ty)| {
                 Ok(ChannelColumn {
                     name,
-                    data_type: ChannelColumnType::from_sql_str(&ty)?,
+                    data_type: ChannelColumnType::from_sql_str(&ty)
+                        .map_err(|t| stored_type_corruption(channel.as_str(), &t))?,
                 })
             })
             .collect();
@@ -590,13 +695,23 @@ impl<'a> ChannelRepo<'a> {
 
         let mut specs = Vec::with_capacity(entries.len());
         for (name, priority, raw_cols) in entries {
-            let id = ChannelId::new(name)?;
+            // Both the channel slug and the column-type tokens here are READ
+            // BACK from the store; a value that no longer parses is catalog
+            // corruption, routed to an internal fault — never the caller-facing
+            // `InvalidId` / `InvalidColumnType`, which `get()` (re-using caller
+            // input) keeps.
+            let id = ChannelId::new(&name).map_err(|_| {
+                JammiError::Catalog(format!(
+                    "stored channel name '{name}' is not a valid channel id"
+                ))
+            })?;
             let columns: Result<Vec<ChannelColumn>> = raw_cols
                 .into_iter()
                 .map(|(cname, ctype)| {
                     Ok(ChannelColumn {
                         name: cname,
-                        data_type: ChannelColumnType::from_sql_str(&ctype)?,
+                        data_type: ChannelColumnType::from_sql_str(&ctype)
+                            .map_err(|t| stored_type_corruption(&name, &t))?,
                     })
                 })
                 .collect();
@@ -615,7 +730,7 @@ impl<'a> ChannelRepo<'a> {
         let mut specs: Vec<ChannelSpec> = Vec::with_capacity(participating.len());
         for id in participating {
             let spec = self.get(id).await?.ok_or_else(|| {
-                JammiError::EvidenceChannel(format!("channel '{id}': not registered"))
+                JammiError::ChannelCatalog(ChannelCatalogError::NotRegistered(id.to_string()))
             })?;
             specs.push(spec);
         }
@@ -660,7 +775,7 @@ mod tests {
     #[test]
     fn from_arrow_rejects_unsupported_type() {
         let err = ChannelColumnType::from_arrow(&DataType::UInt16).unwrap_err();
-        assert!(matches!(err, JammiError::EvidenceChannel(_)));
+        assert!(matches!(err, JammiError::Catalog(_)));
     }
 
     #[test]
@@ -763,8 +878,10 @@ mod tests {
         catalog.channels().register(&spec).await.unwrap();
         let err = catalog.channels().register(&spec).await.unwrap_err();
         match err {
-            JammiError::EvidenceChannel(m) => assert!(m.contains("already exists")),
-            other => panic!("expected EvidenceChannel(already exists), got {other:?}"),
+            JammiError::ChannelCatalog(ChannelCatalogError::AlreadyExists(c)) => {
+                assert_eq!(c, "scored_by")
+            }
+            other => panic!("expected ChannelCatalog(AlreadyExists), got {other:?}"),
         }
     }
 
@@ -790,11 +907,11 @@ mod tests {
         catalog.channels().register(&spec).await.unwrap();
         let err = catalog.channels().register(&spec).await.unwrap_err();
         match err {
-            JammiError::EvidenceChannel(m) => assert!(
-                m.contains("already exists"),
-                "global duplicate must reject with the same 'already exists' semantics, got: {m}"
+            JammiError::ChannelCatalog(ChannelCatalogError::AlreadyExists(c)) => assert_eq!(
+                c, "global_chan",
+                "global duplicate must reject with the same 'already exists' semantics"
             ),
-            other => panic!("expected EvidenceChannel(already exists), got {other:?}"),
+            other => panic!("expected ChannelCatalog(AlreadyExists), got {other:?}"),
         }
     }
 
@@ -859,8 +976,15 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            JammiError::EvidenceChannel(m) => assert!(m.contains("already declared")),
-            other => panic!("expected EvidenceChannel(already declared), got {other:?}"),
+            JammiError::ChannelCatalog(ChannelCatalogError::ColumnAlreadyDeclared {
+                column,
+                ty,
+                ..
+            }) => {
+                assert_eq!(column, "ranker");
+                assert_eq!(ty, ChannelColumnType::Utf8);
+            }
+            other => panic!("expected ChannelCatalog(ColumnAlreadyDeclared), got {other:?}"),
         }
     }
 
@@ -892,13 +1016,21 @@ mod tests {
             )
             .await
             .unwrap_err();
+        // The contiguous "cannot redeclare as <type>" substring is load-bearing
+        // for the CLI / cookbook / db it-tests, so pin it on the Display too.
+        assert!(err.to_string().contains("cannot redeclare as Int32"));
         match err {
-            JammiError::EvidenceChannel(m) => {
-                assert!(m.contains("cannot redeclare"));
-                assert!(m.contains("Utf8"));
-                assert!(m.contains("Int32"));
+            JammiError::ChannelCatalog(ChannelCatalogError::ColumnConflict {
+                column,
+                existing,
+                requested,
+                ..
+            }) => {
+                assert_eq!(column, "ranker");
+                assert_eq!(existing, ChannelColumnType::Utf8);
+                assert_eq!(requested, ChannelColumnType::Int32);
             }
-            other => panic!("expected EvidenceChannel(cannot redeclare), got {other:?}"),
+            other => panic!("expected ChannelCatalog(ColumnConflict), got {other:?}"),
         }
     }
 
@@ -933,8 +1065,10 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            JammiError::EvidenceChannel(m) => assert!(m.contains("not registered")),
-            other => panic!("expected EvidenceChannel(not registered), got {other:?}"),
+            JammiError::ChannelCatalog(ChannelCatalogError::NotRegistered(c)) => {
+                assert_eq!(c, "nonexistent")
+            }
+            other => panic!("expected ChannelCatalog(NotRegistered), got {other:?}"),
         }
     }
 }

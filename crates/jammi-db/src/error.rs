@@ -83,9 +83,18 @@ pub enum JammiError {
     #[error("DataFusion error: {0}")]
     DataFusion(#[from] datafusion::error::DataFusionError),
 
-    /// Evidence channel validation or registration error.
-    #[error("Evidence channel error: {0}")]
-    EvidenceChannel(String),
+    /// A channel-catalog operation (register a channel, append columns) failed
+    /// with a caller-facing condition the gRPC surface must distinguish
+    /// (already-exists / not-registered / column conflict / invalid input).
+    #[error("Channel catalog error: {0}")]
+    ChannelCatalog(#[from] crate::catalog::channel_repo::ChannelCatalogError),
+
+    /// Channel-assembly runtime failure: a data-shape contract violation while
+    /// merging channel contributions into a result batch. These are reached only
+    /// from the engine-internal search-merge path on engine-derived inputs, so
+    /// they are engine-invariant failures, not caller conditions.
+    #[error("Channel assembly error: {0}")]
+    ChannelAssembly(String),
 
     /// Lexical (BM25 / tantivy) sidecar build, persistence, or query failure.
     #[error("Lexical retrieval error: {0}")]

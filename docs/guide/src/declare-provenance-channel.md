@@ -107,7 +107,7 @@ session.catalog().channels().add_columns(
 db.add_channel_columns("scored_by", columns=[("scored_at", "Utf8")])
 ```
 
-`add_columns` is append-only by construction. Trying to redeclare `ranker` with the same or a different type returns `JammiError::EvidenceChannel(_)`.
+`add_columns` is append-only by construction. Trying to redeclare `ranker` with the same or a different type returns `JammiError::ChannelCatalog(_)`.
 
 ## Use the channel
 
@@ -189,14 +189,14 @@ for row in table.to_pylist():
 
 The channel declaration is append-only. Once `scored_by` ships with `ranker: Utf8`, you cannot:
 
-- Redeclare `ranker` as `Int32` — `add_columns` rejects with `JammiError::EvidenceChannel("channel 'scored_by': column 'ranker' was declared Utf8, cannot redeclare as Int32")`. From Python, the same call raises `RuntimeError` carrying the identical message:
+- Redeclare `ranker` as `Int32` — `add_columns` rejects with `JammiError::ChannelCatalog(ChannelCatalogError::ColumnConflict { … })`, whose message is `"channel 'scored_by': column 'ranker' was declared Utf8, cannot redeclare as Int32"`. From Python, the same call raises `RuntimeError` carrying the identical message:
 
   ```python
   db.add_channel_columns("scored_by", columns=[("ranker", "Int32")])
   # RuntimeError: channel 'scored_by': column 'ranker' was declared Utf8, cannot redeclare as Int32
   ```
 
-- Add a second column with the same name — `add_columns` rejects with `JammiError::EvidenceChannel("channel 'scored_by': column 'ranker' already declared")`.
+- Add a second column with the same name — `add_columns` rejects with `JammiError::ChannelCatalog(ChannelCatalogError::ColumnAlreadyDeclared { … })`, whose message is `"channel 'scored_by': column 'ranker' already declared"`.
 - Drop `ranker` from the channel — there is no `drop_column` method by design.
 
 If a column needs to change shape, declare a new column under a new name and migrate consumers. This preserves byte-for-byte readability of any backing table or downstream artifact that already references the original column.

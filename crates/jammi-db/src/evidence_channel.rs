@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::channel_repo::ChannelCatalogError;
 use crate::error::{JammiError, Result};
 
 /// Validated identifier for an evidence channel.
@@ -31,28 +32,25 @@ impl ChannelId {
 }
 
 fn validate(s: &str) -> Result<()> {
+    let invalid = |reason: &str| {
+        JammiError::ChannelCatalog(ChannelCatalogError::InvalidId(format!(
+            "invalid channel id '{s}': {reason}"
+        )))
+    };
     if s.is_empty() {
-        return Err(JammiError::EvidenceChannel(format!(
-            "invalid channel id '{s}': must not be empty"
-        )));
+        return Err(invalid("must not be empty"));
     }
     if s.len() > 64 {
-        return Err(JammiError::EvidenceChannel(format!(
-            "invalid channel id '{s}': must be at most 64 characters"
-        )));
+        return Err(invalid("must be at most 64 characters"));
     }
     let bytes = s.as_bytes();
     let first = bytes[0];
     if !(first.is_ascii_lowercase()) {
-        return Err(JammiError::EvidenceChannel(format!(
-            "invalid channel id '{s}': must start with a lowercase ASCII letter"
-        )));
+        return Err(invalid("must start with a lowercase ASCII letter"));
     }
     for &b in &bytes[1..] {
         if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_') {
-            return Err(JammiError::EvidenceChannel(format!(
-                "invalid channel id '{s}': must be [a-z0-9_]"
-            )));
+            return Err(invalid("must be [a-z0-9_]"));
         }
     }
     Ok(())
@@ -105,25 +103,37 @@ mod tests {
     #[test]
     fn rejects_empty_string() {
         let err = ChannelId::new("").unwrap_err();
-        assert!(matches!(err, JammiError::EvidenceChannel(_)));
+        assert!(matches!(
+            err,
+            JammiError::ChannelCatalog(ChannelCatalogError::InvalidId(_))
+        ));
     }
 
     #[test]
     fn rejects_uppercase_letter() {
         let err = ChannelId::new("Vector").unwrap_err();
-        assert!(matches!(err, JammiError::EvidenceChannel(_)));
+        assert!(matches!(
+            err,
+            JammiError::ChannelCatalog(ChannelCatalogError::InvalidId(_))
+        ));
     }
 
     #[test]
     fn rejects_leading_digit() {
         let err = ChannelId::new("1vector").unwrap_err();
-        assert!(matches!(err, JammiError::EvidenceChannel(_)));
+        assert!(matches!(
+            err,
+            JammiError::ChannelCatalog(ChannelCatalogError::InvalidId(_))
+        ));
     }
 
     #[test]
     fn rejects_hyphen() {
         let err = ChannelId::new("vector-1").unwrap_err();
-        assert!(matches!(err, JammiError::EvidenceChannel(_)));
+        assert!(matches!(
+            err,
+            JammiError::ChannelCatalog(ChannelCatalogError::InvalidId(_))
+        ));
     }
 
     #[test]

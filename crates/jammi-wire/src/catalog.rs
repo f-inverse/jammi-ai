@@ -190,6 +190,10 @@ pub fn model_to_proto(record: &ModelRecord) -> pb::Model {
         backend: record.backend.clone(),
         task: super::model_task_to_proto(record.task) as i32,
         status: record.status.clone(),
+        // The projection exposes only whether the model is promoted, derived
+        // from the presence of the server-side `promoted_at` flag; the raw
+        // timestamp stays server-side.
+        promoted: record.promoted_at.is_some(),
     }
 }
 
@@ -216,6 +220,11 @@ pub fn model_from_proto(model: pb::Model) -> Result<ModelRecord, Status> {
         config_json: None,
         status: model.status,
         created_at: String::new(),
+        // The wire carries only the `promoted` boolean (not the raw timestamp),
+        // so the flag reconstructs to a present-but-empty marker when promoted —
+        // faithful to the boolean projection, the same way the other
+        // not-carried fields reconstruct to their defaults.
+        promoted_at: model.promoted.then(String::new),
     })
 }
 

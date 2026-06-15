@@ -96,6 +96,11 @@ _MODEL_TASK = {
     "regression": inference_pb2.ModelTask.REGRESSION,
 }
 
+# Wire `ModelTask` enum → the canonical snake-case string the engine's
+# `ModelTask` serialises to, so a model dict carries the same `task` spelling
+# whether it crossed the gRPC wire or came back from the in-process engine.
+_MODEL_TASK_NAME = {wire: name for name, wire in _MODEL_TASK.items()}
+
 # Backbone-dtype string → the wire `BackboneDtype` enum (the embed binding's
 # `backbone_dtype=` vocabulary).
 _BACKBONE_DTYPE = {

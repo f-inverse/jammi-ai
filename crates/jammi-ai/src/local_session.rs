@@ -165,6 +165,33 @@ impl Session {
         self.engine.catalog().retire_model(model_id, version).await
     }
 
+    /// Hard-delete a model row. Unlike [`Self::retire_model`] (a soft flip that
+    /// keeps the row resolvable for provenance), this removes the row — so it is
+    /// refused while any reference still points at the model, surfacing
+    /// [`JammiError::ModelReferenced`](jammi_db::error::JammiError::ModelReferenced).
+    /// When `version` is `None` the latest version is targeted. A tenant may
+    /// delete only a model it owns. When `if_exists` is set, deleting an absent
+    /// model is a success no-op; otherwise it is reported as absent.
+    pub async fn delete_model(
+        &self,
+        model_id: &str,
+        version: Option<i32>,
+        if_exists: bool,
+    ) -> Result<()> {
+        self.engine
+            .catalog()
+            .delete_model(model_id, version, if_exists)
+            .await
+    }
+
+    /// Promote a model, marking it the promoted row for its `(tenant, name)`.
+    /// Any previously-promoted sibling is demoted in the same step, so at most
+    /// one version per name is promoted at a time. When `version` is `None` the
+    /// latest version is promoted. A tenant may promote only a model it owns.
+    pub async fn promote_model(&self, model_id: &str, version: Option<i32>) -> Result<()> {
+        self.engine.catalog().promote_model(model_id, version).await
+    }
+
     /// Describe one registered source by id, or `None` when no source with that
     /// id is visible to the session's tenant.
     pub async fn describe_source(&self, source_id: &str) -> Result<Option<SourceDescriptor>> {

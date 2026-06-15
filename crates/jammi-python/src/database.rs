@@ -920,8 +920,8 @@ impl PyDatabase {
     /// (`jammi_ai::wire::build_neighbor_graph_from_bytes`). Returns the new edge
     /// table's name. A malformed or invalid body raises `ValueError`.
     fn _build_neighbor_graph_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
-        let args =
-            jammi_ai::wire::build_neighbor_graph_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
+        let args = jammi_ai::wire::build_neighbor_graph_from_bytes(proto_bytes)
+            .map_err(status_to_pyerr)?;
         let record = self
             .runtime
             .block_on(self.session.build_neighbor_graph(
@@ -1273,4 +1273,3 @@ fn parse_class_score(
         ))),
     }
 }
-

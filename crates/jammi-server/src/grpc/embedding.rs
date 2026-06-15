@@ -6,7 +6,7 @@
 //!
 //! * `GenerateEmbeddings` — scan a source's `columns`, run the modality's
 //!   tower, persist one vector per row (peer of `Session::generate_embeddings`,
-//!   keyed by [`Modality`]).
+//!   keyed by `Modality`).
 //! * `EncodeQuery` — encode a single query into one vector with the modality's
 //!   tower (peer of `Session::encode_query`).
 //! * `Search` — nearest-neighbor search over a source's embedding table, by a
@@ -18,7 +18,7 @@
 //! introspection — the control-plane catalog surface this lane reads — live on
 //! [`CatalogService`](crate::grpc::catalog).
 //!
-//! The abstraction dispatches each [`Modality`] onto the engine's concrete
+//! The abstraction dispatches each `Modality` onto the engine's concrete
 //! tower method; this module reimplements no embedding logic. Modality and
 //! input are validated at the wire edge: an unspecified modality and a
 //! text/bytes-vs-modality mismatch are rejected with `invalid_argument`.

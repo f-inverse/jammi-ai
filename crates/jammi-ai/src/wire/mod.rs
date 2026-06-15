@@ -23,9 +23,15 @@ mod pipeline;
 mod training;
 
 pub use catalog::{
-    add_channel_columns_from_bytes, add_channel_columns_from_proto, create_mutable_table_from_bytes,
-    create_mutable_table_from_proto, register_channel_from_bytes, register_channel_from_proto,
-    register_topic_from_bytes, register_topic_from_proto, AddChannelColumnsArgs,
+    add_channel_columns_from_bytes, add_channel_columns_from_proto,
+    create_mutable_table_from_bytes, create_mutable_table_from_proto, register_channel_from_bytes,
+    register_channel_from_proto, register_topic_from_bytes, register_topic_from_proto,
+    AddChannelColumnsArgs,
+};
+pub use embedding::{
+    encode_query_from_bytes, encode_query_from_proto, generate_embeddings_from_bytes,
+    generate_embeddings_from_proto, search_from_bytes, search_from_proto, EncodeQueryArgs,
+    GenerateEmbeddingsArgs,
 };
 pub use eval::{
     eval_calibration_from_bytes, eval_calibration_from_proto, eval_compare_from_bytes,
@@ -33,11 +39,6 @@ pub use eval::{
     eval_inference_from_bytes, eval_inference_from_proto, eval_per_query_from_bytes,
     eval_per_query_from_proto, EvalCalibrationArgs, EvalCompareArgs, EvalEmbeddingsArgs,
     EvalInferenceArgs,
-};
-pub use embedding::{
-    encode_query_from_bytes, encode_query_from_proto, generate_embeddings_from_bytes,
-    generate_embeddings_from_proto, search_from_bytes, search_from_proto, EncodeQueryArgs,
-    GenerateEmbeddingsArgs,
 };
 pub use inference::{
     edge_gather_from_proto, edge_gather_to_proto, infer_from_bytes, infer_from_proto,

@@ -17,6 +17,7 @@
 // only in an engine build (the server and the embedded SDK).
 mod catalog;
 mod embedding;
+mod eval;
 mod inference;
 mod pipeline;
 mod training;
@@ -25,6 +26,13 @@ pub use catalog::{
     add_channel_columns_from_bytes, add_channel_columns_from_proto, create_mutable_table_from_bytes,
     create_mutable_table_from_proto, register_channel_from_bytes, register_channel_from_proto,
     register_topic_from_bytes, register_topic_from_proto, AddChannelColumnsArgs,
+};
+pub use eval::{
+    eval_calibration_from_bytes, eval_calibration_from_proto, eval_compare_from_bytes,
+    eval_compare_from_proto, eval_embeddings_from_bytes, eval_embeddings_from_proto,
+    eval_inference_from_bytes, eval_inference_from_proto, eval_per_query_from_bytes,
+    eval_per_query_from_proto, EvalCalibrationArgs, EvalCompareArgs, EvalEmbeddingsArgs,
+    EvalInferenceArgs,
 };
 pub use embedding::{
     encode_query_from_bytes, encode_query_from_proto, generate_embeddings_from_bytes,

@@ -1146,3 +1146,136 @@ def build_register_topic_request(
         schema=_encode_ipc_schema(schema),
         broker_metadata=broker_metadata or {},
     )
+
+
+def build_eval_embeddings_request(
+    *,
+    source: str,
+    golden_source: str,
+    embedding_table: Optional[str] = None,
+    k: int = 10,
+    cohorts: Optional[Dict[str, Dict[str, str]]] = None,
+) -> eval_pb2.EvalEmbeddingsRequest:
+    """Assemble the `EvalEmbeddingsRequest` for a retrieval-quality eval from the
+    binding's flat kwargs.
+
+    `embedding_table` names the result table to evaluate; `None` resolves the
+    source's most recent embedding table (the empty-string wire sentinel).
+    `golden_source` addresses the golden relevance set by full catalog path or
+    bare name. `cohorts` optionally maps a golden-set `query_id` to an opaque
+    `{key: value}` segment map persisted with that query's per-query metrics. The
+    same request the embed binding submits in-process.
+    """
+    request = eval_pb2.EvalEmbeddingsRequest(
+        source_id=source,
+        golden_source=golden_source,
+        k=k,
+    )
+    if embedding_table is not None:
+        request.embedding_table = embedding_table
+    for query_id, tags in (cohorts or {}).items():
+        request.cohorts[query_id].tags.update(tags)
+    return request
+
+
+def build_eval_per_query_request(
+    eval_run_id: str,
+) -> eval_pb2.EvalPerQueryRequest:
+    """Assemble the `EvalPerQueryRequest` for a per-query records readback from
+    the binding's flat kwargs.
+
+    `eval_run_id` names the run whose persisted per-query records to read back,
+    scoped to the calling tenant. The same request the embed binding submits
+    in-process.
+    """
+    return eval_pb2.EvalPerQueryRequest(eval_run_id=eval_run_id)
+
+
+def build_eval_inference_request(
+    *,
+    model: str,
+    source: str,
+    columns: List[str],
+    task: str,
+    golden_source: str,
+    label_column: str,
+) -> eval_pb2.EvalInferenceRequest:
+    """Assemble the `EvalInferenceRequest` for an inference-quality eval from the
+    binding's flat kwargs.
+
+    `task` is `"classification"` or `"ner"`, mapped to the wire `EvalTask` enum
+    (an unknown token raises `ValueError`). `golden_source` addresses the golden
+    labels by full catalog path or bare name, with `label_column` naming the
+    gold-label column. The same request the embed binding submits in-process.
+    """
+    try:
+        task_value = _EVAL_TASK[task]
+    except KeyError:
+        raise ValueError(
+            f"task must be 'classification' or 'ner' (got {task!r})"
+        ) from None
+    return eval_pb2.EvalInferenceRequest(
+        model_id=model,
+        source_id=source,
+        columns=list(columns),
+        task=task_value,
+        golden_source=golden_source,
+        label_column=label_column,
+    )
+
+
+def build_eval_compare_request(
+    *,
+    embedding_tables: List[str],
+    source: str,
+    golden_source: str,
+    k: int = 10,
+) -> eval_pb2.EvalCompareRequest:
+    """Assemble the `EvalCompareRequest` for a side-by-side embedding-table
+    comparison from the binding's flat kwargs.
+
+    `embedding_tables` names at least two result tables (the first is the
+    baseline, each subsequent one is compared against it). `golden_source`
+    addresses the golden set by full catalog path or bare name. The same request
+    the embed binding submits in-process.
+    """
+    return eval_pb2.EvalCompareRequest(
+        embedding_tables=list(embedding_tables),
+        source_id=source,
+        golden_source=golden_source,
+        k=k,
+    )
+
+
+def build_eval_calibration_request(
+    *,
+    source: str,
+    golden_source: str,
+    shape: str,
+    cohorts: Optional[Dict[str, Dict[str, str]]] = None,
+) -> eval_pb2.EvalCalibrationRequest:
+    """Assemble the `EvalCalibrationRequest` for a calibration-honesty eval from
+    the binding's flat kwargs.
+
+    `shape` is `"gaussian"` or `"sample"`, mapped to the wire `CalibrationShape`
+    enum (an unknown token raises `ValueError`) — it selects which columns are
+    read and which family scores. `golden_source` pairs a held-out predictive
+    distribution with its realised outcome. `cohorts` optionally maps a
+    `record_id` to an opaque `{key: value}` segment map persisted with that
+    record's per-record scores. The same request the embed binding submits
+    in-process.
+    """
+    try:
+        shape_value = _CALIBRATION_SHAPE[shape]
+    except KeyError:
+        raise ValueError(
+            f"shape must be 'gaussian' or 'sample' (got {shape!r})"
+        ) from None
+    request = eval_pb2.EvalCalibrationRequest(
+        source_id=source,
+        golden_source=golden_source,
+        shape=shape_value,
+    )
+    for record_id, tags in (cohorts or {}).items():
+        request.cohorts[record_id].tags.update(tags)
+    return request

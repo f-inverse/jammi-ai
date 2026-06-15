@@ -9,8 +9,10 @@ surface, composed over the compiled `_native._NativeDatabase` low-level handle:
   `train_context_predictor`), the bulk inference verb (`infer`), the
   engine-state pipeline verbs (`build_neighbor_graph`, `propagate_embeddings`,
   `assemble_context`), the embedding + search verbs (`generate_embeddings`,
-  `encode_query`, `search`), and the catalog/substrate verbs (`register_channel`,
-  `add_channel_columns`, `create_mutable_table`, `register_topic`) — are explicit
+  `encode_query`, `search`), the catalog/substrate verbs (`register_channel`,
+  `add_channel_columns`, `create_mutable_table`, `register_topic`), and the eval
+  verbs (`eval_embeddings`, `eval_per_query`, `eval_inference`, `eval_compare`,
+  `eval_calibration`) — are explicit
   methods here. They build their request
   with the SAME pure-Python assembly the remote client uses
   (`jammi_client._assembly.build_*_request`), serialize it, and hand the bytes to
@@ -36,6 +38,11 @@ from jammi_client._assembly import (
     build_context_predictor_request,
     build_create_mutable_table_request,
     build_encode_query_request,
+    build_eval_calibration_request,
+    build_eval_compare_request,
+    build_eval_embeddings_request,
+    build_eval_inference_request,
+    build_eval_per_query_request,
     build_fine_tune_graph_request,
     build_fine_tune_request,
     build_generate_embeddings_request,
@@ -628,3 +635,139 @@ class Database:
             broker_metadata=broker_metadata,
         )
         return self._native._register_topic_proto(request.SerializeToString())
+
+    def eval_embeddings(
+        self,
+        *,
+        source: str,
+        golden_source: str,
+        embedding_table: Optional[str] = None,
+        k: int = 10,
+        cohorts: Optional[Dict[str, Dict[str, str]]] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate embedding retrieval quality against a golden relevance set.
+
+        Returns a nested dict with ``eval_run_id``, ``aggregate`` (mean
+        ``recall_at_k`` / ``precision_at_k`` / ``mrr`` / ``ndcg`` over all
+        queries), and ``per_query`` (one record per golden-set query).
+        ``embedding_table`` names the result table to evaluate; ``None`` resolves
+        the source's most recent embedding table. ``golden_source`` addresses the
+        golden set by its full catalog path (``<source>.public.<table>``) or bare
+        name. ``cohorts`` optionally maps a golden-set ``query_id`` to an opaque
+        ``{key: value}`` segment map, persisted with that query's per-query
+        metrics (read back via :meth:`eval_per_query`). Same handle shape and verb
+        signature as the remote `RemoteDatabase.eval_embeddings`; the request is
+        assembled with the shared `EvalEmbeddingsRequest` builder and submitted
+        through the engine's wire seam.
+        """
+        request = build_eval_embeddings_request(
+            source=source,
+            golden_source=golden_source,
+            embedding_table=embedding_table,
+            k=k,
+            cohorts=cohorts,
+        )
+        return self._native._eval_embeddings_proto(request.SerializeToString())
+
+    def eval_per_query(self, eval_run_id: str) -> List[Dict[str, Any]]:
+        """Read back the persisted per-query eval records for a run, scoped to
+        the calling tenant.
+
+        Returns a list of dicts, each carrying ``eval_run_id``, ``query_id``,
+        ``cohorts`` (a dict), and ``metrics`` (a dict of ``recall@1/3/5/10``,
+        ``mrr``, ``ndcg``, ``distance``). Same handle shape and verb signature as
+        the remote `RemoteDatabase.eval_per_query`; the request is assembled with
+        the shared `EvalPerQueryRequest` builder and submitted through the
+        engine's wire seam.
+        """
+        request = build_eval_per_query_request(eval_run_id)
+        return self._native._eval_per_query_proto(request.SerializeToString())
+
+    def eval_inference(
+        self,
+        *,
+        model: str,
+        source: str,
+        columns: List[str],
+        task: str,
+        golden_source: str,
+        label_column: str,
+    ) -> Dict[str, Any]:
+        """Evaluate inference quality against golden labels.
+
+        Returns a nested dict with ``aggregate`` (task-shaped, tagged by
+        ``"task"``) and ``per_record`` (one tagged record per predicted/gold
+        pair). ``task`` is ``"classification"`` or ``"ner"``; ``golden_source``
+        addresses the golden labels by full catalog path
+        (``<source>.public.<table>``) or bare name, with ``label_column`` naming
+        the gold-label column. Same handle shape and verb signature as the remote
+        `RemoteDatabase.eval_inference`; the request is assembled with the shared
+        `EvalInferenceRequest` builder and submitted through the engine's wire
+        seam.
+        """
+        request = build_eval_inference_request(
+            model=model,
+            source=source,
+            columns=columns,
+            task=task,
+            golden_source=golden_source,
+            label_column=label_column,
+        )
+        return self._native._eval_inference_proto(request.SerializeToString())
+
+    def eval_compare(
+        self,
+        *,
+        embedding_tables: List[str],
+        source: str,
+        golden_source: str,
+        k: int = 10,
+    ) -> Dict[str, Any]:
+        """Compare multiple embedding tables side-by-side against one golden set.
+
+        Returns a nested dict with a ``per_table`` list whose first entry is the
+        baseline (``delta: None``) and whose subsequent entries carry a ``delta``
+        against it (per-metric absolute/relative deltas plus paired
+        ``significance``, ``None`` when the runs share no query to pair on).
+        ``golden_source`` addresses the golden set by full catalog path
+        (``<source>.public.<table>``) or bare name. Same handle shape and verb
+        signature as the remote `RemoteDatabase.eval_compare`; the request is
+        assembled with the shared `EvalCompareRequest` builder and submitted
+        through the engine's wire seam.
+        """
+        request = build_eval_compare_request(
+            embedding_tables=embedding_tables,
+            source=source,
+            golden_source=golden_source,
+            k=k,
+        )
+        return self._native._eval_compare_proto(request.SerializeToString())
+
+    def eval_calibration(
+        self,
+        *,
+        source: str,
+        golden_source: str,
+        shape: str,
+        cohorts: Optional[Dict[str, Dict[str, str]]] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate whether a predictor's uncertainty is honest against a held-out
+        golden set pairing a predictive distribution with its realised outcome.
+
+        Returns a nested dict with ``aggregate`` (``crps`` / ``nll`` /
+        ``adaptive_ece`` / ``sharpness`` / ``coverage`` / ``n``), ``per_cohort``,
+        ``per_record``, and ``eval_run_id``. ``shape`` is ``"gaussian"`` or
+        ``"sample"``. ``cohorts`` optionally maps a ``record_id`` to an opaque
+        ``{key: value}`` segment map persisted with that record's per-record
+        scores. Same handle shape and verb signature as the remote
+        `RemoteDatabase.eval_calibration`; the request is assembled with the
+        shared `EvalCalibrationRequest` builder and submitted through the engine's
+        wire seam.
+        """
+        request = build_eval_calibration_request(
+            source=source,
+            golden_source=golden_source,
+            shape=shape,
+            cohorts=cohorts,
+        )
+        return self._native._eval_calibration_proto(request.SerializeToString())

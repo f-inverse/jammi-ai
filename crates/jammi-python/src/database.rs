@@ -1,4 +1,3 @@
-use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -748,48 +747,47 @@ impl PyDatabase {
         Ok(out.into_any().unbind())
     }
 
-    /// Evaluate embedding quality. Returns a dict with `aggregate` (mean
-    /// over all queries) and `per_query` (one record per golden-set query)
-    /// keys.
-    ///
-    /// `embedding_table` names the embedding result table to evaluate;
-    /// `None` resolves the source's most recent embedding table.
-    ///
-    /// `cohorts` optionally maps a golden-set `query_id` to an opaque
-    /// `{key: value}` segment map, persisted with that query's per-query
-    /// metrics (read back via `db.eval_per_query(...)`, spec J9).
-    #[pyo3(signature = (*, source, golden_source, embedding_table=None, k=10, cohorts=None))]
-    fn eval_embeddings(
-        &self,
-        py: Python<'_>,
-        source: &str,
-        golden_source: &str,
-        embedding_table: Option<&str>,
-        k: usize,
-        cohorts: Option<HashMap<String, BTreeMap<String, String>>>,
-    ) -> PyResult<Py<PyAny>> {
-        let cohorts = cohorts.unwrap_or_default();
+    /// Evaluate embedding quality from a serialized `EvalEmbeddingsRequest`
+    /// body. The thin Python `Database` wrapper builds this request with the same
+    /// pure-Python assembly the remote client uses (`jammi_client._assembly`),
+    /// serializes it, and hands the bytes here, so the embedded and remote
+    /// eval-embeddings paths share one request assembly and one decode seam
+    /// (`jammi_ai::wire::eval_embeddings_from_bytes`). Returns a dict with
+    /// `aggregate` (mean over all queries) and `per_query` (one record per
+    /// golden-set query) keys — byte-identical to the report the kwargs surface
+    /// produced. A malformed or invalid body raises `ValueError`.
+    fn _eval_embeddings_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        let args =
+            jammi_ai::wire::eval_embeddings_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let report = self
             .runtime
             .block_on(self.session.eval_embeddings(
-                source,
-                embedding_table,
-                golden_source,
-                k,
-                &cohorts,
+                &args.source_id,
+                args.embedding_table.as_deref(),
+                &args.golden_source,
+                args.k,
+                &args.cohorts,
             ))
             .map_err(to_pyerr)?;
         serializable_to_pydict(py, &report)
     }
 
-    /// Read back the persisted per-query eval records for a run (spec J9),
-    /// scoped to the calling tenant. Returns a list of dicts, each carrying
-    /// `eval_run_id`, `query_id`, `cohorts` (a dict), and `metrics` (a dict
-    /// of `recall@1/3/5/10`, `mrr`, `ndcg`, `distance`).
-    fn eval_per_query(&self, py: Python<'_>, eval_run_id: &str) -> PyResult<Py<PyAny>> {
+    /// Read back the persisted per-query eval records for a run from a serialized
+    /// `EvalPerQueryRequest` body (spec J9), scoped to the calling tenant. The
+    /// thin Python `Database` wrapper builds this request with the same pure-Python
+    /// assembly the remote client uses (`jammi_client._assembly`), serializes it,
+    /// and hands the bytes here, so the embedded and remote per-query readback
+    /// paths share one request assembly and one decode seam
+    /// (`jammi_ai::wire::eval_per_query_from_bytes`). Returns a list of dicts, each
+    /// carrying `eval_run_id`, `query_id`, `cohorts` (a dict), and `metrics` (a
+    /// dict of `recall@1/3/5/10`, `mrr`, `ndcg`, `distance`). A malformed or
+    /// invalid body raises `ValueError`.
+    fn _eval_per_query_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        let eval_run_id =
+            jammi_ai::wire::eval_per_query_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let records = self
             .runtime
-            .block_on(self.session.eval_per_query(eval_run_id))
+            .block_on(self.session.eval_per_query(&eval_run_id))
             .map_err(to_pyerr)?;
 
         let out = pyo3::types::PyList::empty(py);
@@ -809,87 +807,76 @@ impl PyDatabase {
         Ok(out.unbind().into())
     }
 
-    /// Evaluate inference quality. Returns a dict with `aggregate`
-    /// (task-shaped, tagged by `"task"`) and `per_record` (one record per
-    /// predicted/gold pair) keys.
-    #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, model, source, columns, task, golden_source, label_column))]
-    fn eval_inference(
-        &self,
-        py: Python<'_>,
-        model: &str,
-        source: &str,
-        columns: Vec<String>,
-        task: &str,
-        golden_source: &str,
-        label_column: &str,
-    ) -> PyResult<Py<PyAny>> {
-        let eval_task = parse_eval_task(task)?;
+    /// Evaluate inference quality from a serialized `EvalInferenceRequest` body.
+    /// The thin Python `Database` wrapper builds this request with the same
+    /// pure-Python assembly the remote client uses (`jammi_client._assembly`),
+    /// serializes it, and hands the bytes here, so the embedded and remote
+    /// eval-inference paths share one request assembly and one decode seam
+    /// (`jammi_ai::wire::eval_inference_from_bytes`). Returns a dict with
+    /// `aggregate` (task-shaped, tagged by `"task"`) and `per_record` (one record
+    /// per predicted/gold pair) keys. A malformed or invalid body raises
+    /// `ValueError`.
+    fn _eval_inference_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        let args =
+            jammi_ai::wire::eval_inference_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let report = self
             .runtime
             .block_on(self.session.eval_inference(
-                model,
-                source,
-                &columns,
-                eval_task,
-                golden_source,
-                label_column,
+                &args.model_id,
+                &args.source_id,
+                &args.columns,
+                args.task,
+                &args.golden_source,
+                &args.label_column,
             ))
             .map_err(to_pyerr)?;
         serializable_to_pydict(py, &report)
     }
 
-    /// Compare multiple embedding tables side-by-side. Returns a dict with a
-    /// `per_table` list; the first entry is the baseline (`delta: None`)
-    /// and every subsequent entry carries a `delta` against it.
-    #[pyo3(signature = (*, embedding_tables, source, golden_source, k=10))]
-    fn eval_compare(
-        &self,
-        py: Python<'_>,
-        embedding_tables: Vec<String>,
-        source: &str,
-        golden_source: &str,
-        k: usize,
-    ) -> PyResult<Py<PyAny>> {
+    /// Compare multiple embedding tables side-by-side from a serialized
+    /// `EvalCompareRequest` body. The thin Python `Database` wrapper builds this
+    /// request with the same pure-Python assembly the remote client uses
+    /// (`jammi_client._assembly`), serializes it, and hands the bytes here, so the
+    /// embedded and remote eval-compare paths share one request assembly and one
+    /// decode seam (`jammi_ai::wire::eval_compare_from_bytes`). Returns a dict with
+    /// a `per_table` list; the first entry is the baseline (`delta: None`) and
+    /// every subsequent entry carries a `delta` against it. A malformed or invalid
+    /// body raises `ValueError`.
+    fn _eval_compare_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        let args = jammi_ai::wire::eval_compare_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let report = self
             .runtime
-            .block_on(
-                self.session
-                    .eval_compare(&embedding_tables, source, golden_source, k),
-            )
+            .block_on(self.session.eval_compare(
+                &args.embedding_tables,
+                &args.source_id,
+                &args.golden_source,
+                args.k,
+            ))
             .map_err(to_pyerr)?;
         serializable_to_pydict(py, &report)
     }
 
-    /// Evaluate whether a predictor's uncertainty is honest (spec R2). Returns a
-    /// dict with `aggregate` (the proper-score headline `crps`/`nll`, the
-    /// `adaptive_ece` PIT-calibration diagnostic, `sharpness`, `coverage`),
+    /// Evaluate whether a predictor's uncertainty is honest (spec R2) from a
+    /// serialized `EvalCalibrationRequest` body. The thin Python `Database`
+    /// wrapper builds this request with the same pure-Python assembly the remote
+    /// client uses (`jammi_client._assembly`), serializes it, and hands the bytes
+    /// here, so the embedded and remote eval-calibration paths share one request
+    /// assembly and one decode seam (`jammi_ai::wire::eval_calibration_from_bytes`).
+    /// Returns a dict with `aggregate` (the proper-score headline `crps`/`nll`,
+    /// the `adaptive_ece` PIT-calibration diagnostic, `sharpness`, `coverage`),
     /// `per_cohort` (coverage + CRPS with n + CI per cohort), and `per_record`
-    /// keys.
-    ///
-    /// `golden_source` pairs a held-out predictive distribution with its
-    /// realised `outcome`. `shape` is `"gaussian"` (columns `record_id`, `mean`,
-    /// `sd`, `outcome`) or `"sample"` (columns `record_id`, `draws` as a JSON
-    /// array per row, `outcome`). `cohorts` optionally maps a `record_id` to an
-    /// opaque `{key: value}` segment map persisted with that record's per-record
-    /// scores (read back via `db.eval_per_query(...)`).
-    #[pyo3(signature = (*, source, golden_source, shape, cohorts=None))]
-    fn eval_calibration(
-        &self,
-        py: Python<'_>,
-        source: &str,
-        golden_source: &str,
-        shape: &str,
-        cohorts: Option<HashMap<String, BTreeMap<String, String>>>,
-    ) -> PyResult<Py<PyAny>> {
-        let shape = parse_calibration_shape(shape)?;
-        let cohorts = cohorts.unwrap_or_default();
+    /// keys. A malformed or invalid body raises `ValueError`.
+    fn _eval_calibration_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        let args =
+            jammi_ai::wire::eval_calibration_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let report = self
             .runtime
-            .block_on(
-                self.session
-                    .eval_calibration(source, golden_source, shape, &cohorts),
-            )
+            .block_on(self.session.eval_calibration(
+                &args.source_id,
+                &args.golden_source,
+                args.shape,
+                &args.cohorts,
+            ))
             .map_err(to_pyerr)?;
         serializable_to_pydict(py, &report)
     }
@@ -1262,14 +1249,6 @@ fn context_source_tag(kind: ContextSourceKind) -> &'static str {
 }
 
 fn parse_file_format(s: &str) -> PyResult<FileFormat> {
-    s.parse().map_err(to_pyerr)
-}
-
-fn parse_eval_task(s: &str) -> PyResult<jammi_ai::eval::EvalTask> {
-    s.parse().map_err(to_pyerr)
-}
-
-fn parse_calibration_shape(s: &str) -> PyResult<jammi_ai::eval::EvalCalibrationShape> {
     s.parse().map_err(to_pyerr)
 }
 

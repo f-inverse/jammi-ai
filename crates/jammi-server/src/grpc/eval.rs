@@ -27,12 +27,11 @@ use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
 use jammi_ai::Session;
-use jammi_wire::{calibration_shape_from_proto, cohorts_from_proto, EvalTaskFromWire};
 use tonic::{Request, Response, Status};
 
 use crate::grpc::proto::eval as pb;
 use crate::grpc::proto::eval::eval_service_server::EvalService;
-use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant_traced};
+use crate::grpc::wire::{map_engine_error, scoped, session_tenant_traced};
 
 /// Server-side handler for the eval gRPC surface. Holds a shared engine session
 /// it wraps in a [`Session`] per call to reach the unified transport
@@ -61,20 +60,19 @@ impl EvalService for EvalServer {
         request: Request<pb::EvalEmbeddingsRequest>,
     ) -> Result<Response<pb::EmbeddingEvalReport>, Status> {
         let tenant = session_tenant_traced(&request);
-        let req = request.into_inner();
-        require_nonempty(&req.source_id, "source_id")?;
-        require_nonempty(&req.golden_source, "golden_source")?;
-        let embedding_table = optional_str(&req.embedding_table);
-        let cohorts = cohorts_from_proto(req.cohorts);
+        // Decode through the shared `jammi_ai::wire` seam — the same decode the
+        // embedded binding's `_eval_embeddings_proto` drives — so both transports
+        // validate and submit an identical request.
+        let args = jammi_ai::wire::eval_embeddings_from_proto(request.into_inner())?;
         let session = self.local();
 
         let report = scoped(&self.session, tenant, || {
             session.eval_embeddings(
-                &req.source_id,
-                embedding_table,
-                &req.golden_source,
-                req.k as usize,
-                &cohorts,
+                &args.source_id,
+                args.embedding_table.as_deref(),
+                &args.golden_source,
+                args.k,
+                &args.cohorts,
             )
         })
         .await
@@ -89,12 +87,14 @@ impl EvalService for EvalServer {
         request: Request<pb::EvalPerQueryRequest>,
     ) -> Result<Response<pb::EvalPerQueryResponse>, Status> {
         let tenant = session_tenant_traced(&request);
-        let req = request.into_inner();
-        require_nonempty(&req.eval_run_id, "eval_run_id")?;
+        // Decode through the shared `jammi_ai::wire` seam — the same decode the
+        // embedded binding's `_eval_per_query_proto` drives — so both transports
+        // validate and submit an identical request.
+        let eval_run_id = jammi_ai::wire::eval_per_query_from_proto(request.into_inner())?;
         let session = self.local();
 
         let records = scoped(&self.session, tenant, || {
-            session.eval_per_query(&req.eval_run_id)
+            session.eval_per_query(&eval_run_id)
         })
         .await
         .map_err(map_engine_error)?;
@@ -110,25 +110,20 @@ impl EvalService for EvalServer {
         request: Request<pb::EvalInferenceRequest>,
     ) -> Result<Response<pb::InferenceEvalReport>, Status> {
         let tenant = session_tenant_traced(&request);
-        let req = request.into_inner();
-        require_nonempty(&req.model_id, "model_id")?;
-        require_nonempty(&req.source_id, "source_id")?;
-        require_nonempty(&req.golden_source, "golden_source")?;
-        require_nonempty(&req.label_column, "label_column")?;
-        if req.columns.is_empty() {
-            return Err(Status::invalid_argument("columns is required"));
-        }
-        let task = EvalTaskFromWire::try_from(req.task)?.0;
+        // Decode through the shared `jammi_ai::wire` seam — the same decode the
+        // embedded binding's `_eval_inference_proto` drives — so both transports
+        // validate and submit an identical request.
+        let args = jammi_ai::wire::eval_inference_from_proto(request.into_inner())?;
         let session = self.local();
 
         let report = scoped(&self.session, tenant, || {
             session.eval_inference(
-                &req.model_id,
-                &req.source_id,
-                &req.columns,
-                task,
-                &req.golden_source,
-                &req.label_column,
+                &args.model_id,
+                &args.source_id,
+                &args.columns,
+                args.task,
+                &args.golden_source,
+                &args.label_column,
             )
         })
         .await
@@ -143,22 +138,18 @@ impl EvalService for EvalServer {
         request: Request<pb::EvalCompareRequest>,
     ) -> Result<Response<pb::CompareEvalReport>, Status> {
         let tenant = session_tenant_traced(&request);
-        let req = request.into_inner();
-        require_nonempty(&req.source_id, "source_id")?;
-        require_nonempty(&req.golden_source, "golden_source")?;
-        if req.embedding_tables.len() < 2 {
-            return Err(Status::invalid_argument(
-                "embedding_tables requires at least two tables",
-            ));
-        }
+        // Decode through the shared `jammi_ai::wire` seam — the same decode the
+        // embedded binding's `_eval_compare_proto` drives — so both transports
+        // validate and submit an identical request.
+        let args = jammi_ai::wire::eval_compare_from_proto(request.into_inner())?;
         let session = self.local();
 
         let report = scoped(&self.session, tenant, || {
             session.eval_compare(
-                &req.embedding_tables,
-                &req.source_id,
-                &req.golden_source,
-                req.k as usize,
+                &args.embedding_tables,
+                &args.source_id,
+                &args.golden_source,
+                args.k,
             )
         })
         .await
@@ -173,30 +164,24 @@ impl EvalService for EvalServer {
         request: Request<pb::EvalCalibrationRequest>,
     ) -> Result<Response<pb::CalibrationEvalReport>, Status> {
         let tenant = session_tenant_traced(&request);
-        let req = request.into_inner();
-        require_nonempty(&req.source_id, "source_id")?;
-        require_nonempty(&req.golden_source, "golden_source")?;
-        let shape = calibration_shape_from_proto(req.shape)?;
-        let cohorts = cohorts_from_proto(req.cohorts);
+        // Decode through the shared `jammi_ai::wire` seam — the same decode the
+        // embedded binding's `_eval_calibration_proto` drives — so both transports
+        // validate and submit an identical request.
+        let args = jammi_ai::wire::eval_calibration_from_proto(request.into_inner())?;
 
         let report = scoped(&self.session, tenant, || async {
             self.session
-                .eval_calibration(&req.source_id, &req.golden_source, shape, &cohorts)
+                .eval_calibration(
+                    &args.source_id,
+                    &args.golden_source,
+                    args.shape,
+                    &args.cohorts,
+                )
                 .await
         })
         .await
         .map_err(map_engine_error)?;
 
         Ok(Response::new(report.into()))
-    }
-}
-
-/// `""` → `None`, a non-empty string → `Some(&str)`. Mirrors the engine's
-/// `Option<&str>` "use the most recent table" sentinel for `embedding_table`.
-fn optional_str(s: &str) -> Option<&str> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
     }
 }

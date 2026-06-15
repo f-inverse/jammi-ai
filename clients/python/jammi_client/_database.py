@@ -27,10 +27,8 @@ import pyarrow.flight  # noqa: F401  (registers the `pa.flight` submodule)
 
 from . import _conformal
 from ._assembly import (
-    _CALIBRATION_SHAPE,
     _CHANNEL_COLUMN_TYPE,
     _EDGE_DIRECTION,
-    _EVAL_TASK,
     _FILE_FORMAT,
     _SOURCE_KIND_NAME,
     _local_source_url,
@@ -39,6 +37,11 @@ from ._assembly import (
     build_context_predictor_request,
     build_create_mutable_table_request,
     build_encode_query_request,
+    build_eval_calibration_request,
+    build_eval_compare_request,
+    build_eval_embeddings_request,
+    build_eval_inference_request,
+    build_eval_per_query_request,
     build_fine_tune_graph_request,
     build_fine_tune_request,
     build_generate_embeddings_request,
@@ -1506,15 +1509,13 @@ class RemoteDatabase:
         metrics (read back via :meth:`eval_per_query`). Maps to
         `EvalService.EvalEmbeddings`.
         """
-        request = eval_pb2.EvalEmbeddingsRequest(
-            source_id=source,
+        request = build_eval_embeddings_request(
+            source=source,
             golden_source=golden_source,
+            embedding_table=embedding_table,
             k=k,
+            cohorts=cohorts,
         )
-        if embedding_table is not None:
-            request.embedding_table = embedding_table
-        for query_id, tags in (cohorts or {}).items():
-            request.cohorts[query_id].tags.update(tags)
         resp = self._eval.EvalEmbeddings(request, metadata=self._metadata)
         return _embedding_report_to_dict(resp)
 
@@ -1531,7 +1532,7 @@ class RemoteDatabase:
         `EvalService.EvalPerQuery`.
         """
         resp = self._eval.EvalPerQuery(
-            eval_pb2.EvalPerQueryRequest(eval_run_id=eval_run_id),
+            build_eval_per_query_request(eval_run_id),
             metadata=self._metadata,
         )
         return [
@@ -1564,23 +1565,15 @@ class RemoteDatabase:
         bare name, with ``label_column`` naming the gold-label column. Maps to
         `EvalService.EvalInference`.
         """
-        try:
-            task_value = _EVAL_TASK[task]
-        except KeyError:
-            raise ValueError(
-                f"task must be 'classification' or 'ner' (got {task!r})"
-            ) from None
-        resp = self._eval.EvalInference(
-            eval_pb2.EvalInferenceRequest(
-                model_id=model,
-                source_id=source,
-                columns=list(columns),
-                task=task_value,
-                golden_source=golden_source,
-                label_column=label_column,
-            ),
-            metadata=self._metadata,
+        request = build_eval_inference_request(
+            model=model,
+            source=source,
+            columns=columns,
+            task=task,
+            golden_source=golden_source,
+            label_column=label_column,
         )
+        resp = self._eval.EvalInference(request, metadata=self._metadata)
         return _inference_report_to_dict(resp)
 
     def eval_compare(
@@ -1601,15 +1594,13 @@ class RemoteDatabase:
         golden set by full catalog path (``<source>.public.<table>``) or bare
         name. Maps to `EvalService.EvalCompare`.
         """
-        resp = self._eval.EvalCompare(
-            eval_pb2.EvalCompareRequest(
-                embedding_tables=list(embedding_tables),
-                source_id=source,
-                golden_source=golden_source,
-                k=k,
-            ),
-            metadata=self._metadata,
+        request = build_eval_compare_request(
+            embedding_tables=embedding_tables,
+            source=source,
+            golden_source=golden_source,
+            k=k,
         )
+        resp = self._eval.EvalCompare(request, metadata=self._metadata)
         return _compare_report_to_dict(resp)
 
     def eval_calibration(
@@ -1628,19 +1619,12 @@ class RemoteDatabase:
         ``n``), ``per_cohort``, ``per_record``, and ``eval_run_id``. ``shape`` is
         ``"gaussian"`` or ``"sample"``. Maps to `EvalService.EvalCalibration`.
         """
-        try:
-            shape_value = _CALIBRATION_SHAPE[shape]
-        except KeyError:
-            raise ValueError(
-                f"shape must be 'gaussian' or 'sample' (got {shape!r})"
-            ) from None
-        request = eval_pb2.EvalCalibrationRequest(
-            source_id=source,
+        request = build_eval_calibration_request(
+            source=source,
             golden_source=golden_source,
-            shape=shape_value,
+            shape=shape,
+            cohorts=cohorts,
         )
-        for record_id, tags in (cohorts or {}).items():
-            request.cohorts[record_id].tags.update(tags)
         resp = self._eval.EvalCalibration(request, metadata=self._metadata)
         return _calibration_report_to_dict(resp)
 

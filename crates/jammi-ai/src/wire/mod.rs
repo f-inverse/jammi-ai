@@ -15,11 +15,17 @@
 // response structs (`BuildNeighborGraph` / `PropagateRequest` / `ContextRequest`
 // / `ContextRepresentation`), which live behind the `local` feature — reachable
 // only in an engine build (the server and the embedded SDK).
+mod catalog;
 mod embedding;
 mod inference;
 mod pipeline;
 mod training;
 
+pub use catalog::{
+    add_channel_columns_from_bytes, add_channel_columns_from_proto, create_mutable_table_from_bytes,
+    create_mutable_table_from_proto, register_channel_from_bytes, register_channel_from_proto,
+    register_topic_from_bytes, register_topic_from_proto, AddChannelColumnsArgs,
+};
 pub use embedding::{
     encode_query_from_bytes, encode_query_from_proto, generate_embeddings_from_bytes,
     generate_embeddings_from_proto, search_from_bytes, search_from_proto, EncodeQueryArgs,

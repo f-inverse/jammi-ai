@@ -13,7 +13,9 @@ the transport itself stay with the consumer that owns the channel.
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+import pyarrow as pa
 
 from ._generated.jammi.v1 import catalog_pb2
 from ._generated.jammi.v1 import embedding_pb2
@@ -1023,3 +1025,124 @@ def build_search_request(
     if embedding_table is not None:
         request.embedding_table = embedding_table
     return request
+
+
+def _encode_ipc_schema(schema: pa.Schema) -> bytes:
+    """Encode a `pyarrow.Schema` as a schema-only Arrow IPC stream — the framing
+    the engine's `decode_ipc_schema` reads back (a `StreamWriter` opened on the
+    schema and finished with no batches). This is the byte shape
+    `MutableTableDefinition.schema` and `RegisterTopicRequest.schema` carry, the
+    same self-describing IPC framing the trigger batch payloads use.
+    """
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, schema):
+        # No batches: a schema-only stream is the writer opened and closed, which
+        # emits the schema message the server decodes back into a `SchemaRef`.
+        pass
+    return sink.getvalue().to_pybytes()
+
+
+def build_register_channel_request(
+    channel_id: str,
+    *,
+    priority: int,
+    columns: Sequence[Tuple[str, str]],
+) -> catalog_pb2.RegisterChannelRequest:
+    """Assemble the `RegisterChannelRequest` for a new evidence channel from the
+    binding's flat kwargs.
+
+    `columns` is a list of `(name, dtype)` tuples where `dtype` is the canonical
+    PascalCase token (`"Float32"`, `"Utf8"`, …); `priority` orders the channel
+    against others contributing the same column. The channel id is unique per
+    tenant (the wire body is tenant-free — the server stamps the session tenant).
+    The same request the embed binding submits in-process.
+    """
+    return catalog_pb2.RegisterChannelRequest(
+        channel_id=channel_id,
+        priority=priority,
+        columns=_channel_columns_message(columns),
+    )
+
+
+def build_add_channel_columns_request(
+    channel_id: str,
+    *,
+    columns: Sequence[Tuple[str, str]],
+) -> catalog_pb2.AddChannelColumnsRequest:
+    """Assemble the `AddChannelColumnsRequest` for an append-only column addition
+    from the binding's flat kwargs.
+
+    `columns` is a list of `(name, dtype)` tuples in the same PascalCase
+    vocabulary :func:`build_register_channel_request` accepts. The same request
+    the embed binding submits in-process.
+    """
+    return catalog_pb2.AddChannelColumnsRequest(
+        channel_id=channel_id,
+        columns=_channel_columns_message(columns),
+    )
+
+
+def build_create_mutable_table_request(
+    name: str,
+    *,
+    schema: pa.Schema,
+    primary_key: List[str],
+    indexes: Optional[List[Dict[str, Any]]] = None,
+    order_column: Optional[str] = None,
+    chunk_size: Optional[int] = None,
+) -> catalog_pb2.CreateMutableTableRequest:
+    """Assemble the `CreateMutableTableRequest` for a mutable companion table from
+    the binding's flat kwargs.
+
+    `schema` is the table's `pyarrow.Schema` (rides as a schema-only Arrow IPC
+    stream); `primary_key` is a non-empty subset of its columns. `indexes` is an
+    optional list of ``{"name", "columns", "unique"}`` dicts — one secondary
+    index per entry. `order_column` is an optional monotonic column enabling
+    streaming `scan_after` reads; `chunk_size` overrides the engine's default scan
+    chunk size. The wire body is tenant-free — the server stamps the session
+    tenant onto the catalog row. The same request the embed binding submits
+    in-process.
+    """
+    wire_indexes = [
+        catalog_pb2.MutableIndex(
+            name=idx["name"],
+            columns=list(idx["columns"]),
+            unique=bool(idx.get("unique", False)),
+        )
+        for idx in (indexes or [])
+    ]
+    definition = catalog_pb2.MutableTableDefinition(
+        id=name,
+        schema=_encode_ipc_schema(schema),
+        primary_key=list(primary_key),
+        indexes=wire_indexes,
+    )
+    if order_column is not None:
+        definition.order_column = order_column
+    if chunk_size is not None:
+        definition.chunk_size = chunk_size
+    return catalog_pb2.CreateMutableTableRequest(definition=definition)
+
+
+def build_register_topic_request(
+    name: str,
+    *,
+    schema: pa.Schema,
+    broker_metadata: Optional[Dict[str, str]] = None,
+) -> catalog_pb2.RegisterTopicRequest:
+    """Assemble the `RegisterTopicRequest` for a trigger-stream topic from the
+    binding's flat kwargs.
+
+    `schema` is the contract every published batch must satisfy (rides as a
+    schema-only Arrow IPC stream). `broker_metadata` is opaque driver-side
+    configuration (retention, replication, …). The `topic_id` is left unset — the
+    engine mints a fresh id at the decode seam (the server and the embedded
+    binding share that mint), keeping a single source of the minted id. The wire
+    body is tenant-free; the server stamps the session tenant. The same request
+    the embed binding submits in-process.
+    """
+    return catalog_pb2.RegisterTopicRequest(
+        name=name,
+        schema=_encode_ipc_schema(schema),
+        broker_metadata=broker_metadata or {},
+    )

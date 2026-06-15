@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use futures::StreamExt;
-use pyo3::exceptions::{PyKeyError, PyValueError};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use pyo3_arrow::{PySchema, PyTable};
@@ -19,10 +19,8 @@ use jammi_ai::session::InferenceSession;
 use jammi_db::config::JammiConfig;
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_db::store::mutable::{
-    MutableIndexDef, MutableTableDefinitionBuilder, MutableTableError, MutableTableId,
-};
-use jammi_db::trigger::{Offset, Predicate, TopicDefinition, TopicId};
+use jammi_db::store::mutable::{MutableTableError, MutableTableId};
+use jammi_db::trigger::{Offset, Predicate};
 
 use crate::convert::{batches_to_pyarrow, serializable_to_pydict};
 use crate::error::{status_to_pyerr, to_pyerr};
@@ -407,49 +405,44 @@ impl PyDatabase {
         batches_to_pyarrow(py, &collected)
     }
 
-    /// Register a new evidence-provenance channel. `columns` is a list of
-    /// `(name, dtype)` tuples where `dtype` is one of `"Float32"`, `"Float64"`,
-    /// `"Int32"`, `"Int64"`, `"Utf8"`, `"Boolean"`. Priority orders the
-    /// channel against others on the same row when several contribute the
-    /// same column. The channel id is unique PER TENANT, scoped to the
-    /// session's currently bound tenant: two tenants may each register a
-    /// channel of the same id without collision, but re-registering an id that
-    /// already exists for the bound tenant raises `RuntimeError` carrying
-    /// `ChannelCatalog(AlreadyExists)` — `"channel '<id>': already exists"`.
-    #[pyo3(signature = (channel_id, *, priority, columns))]
-    fn register_channel(
-        &self,
-        channel_id: &str,
-        priority: i32,
-        columns: Vec<(String, String)>,
-    ) -> PyResult<()> {
-        let id = jammi_db::ChannelId::new(channel_id).map_err(to_pyerr)?;
-        let cols = parse_channel_columns(&columns)?;
-        let spec = jammi_db::catalog::channel_repo::ChannelSpec {
-            id,
-            priority,
-            columns: cols,
-        };
+    /// Register a new evidence-provenance channel from a serialized
+    /// `RegisterChannelRequest` body. The thin Python `Database` wrapper builds
+    /// this request with the same pure-Python assembly the remote client uses
+    /// (`jammi_client._assembly`), serializes it, and hands the bytes here, so the
+    /// embedded and remote register-channel paths share one request assembly and
+    /// one decode seam (`jammi_ai::wire::register_channel_from_bytes`). The
+    /// channel id is unique PER TENANT, scoped to the session's currently bound
+    /// tenant: re-registering an id that already exists for the bound tenant
+    /// raises `RuntimeError` carrying `ChannelCatalog(AlreadyExists)`. A malformed
+    /// or invalid body raises `ValueError`.
+    fn _register_channel_proto(&self, proto_bytes: &[u8]) -> PyResult<()> {
+        let spec =
+            jammi_ai::wire::register_channel_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         self.runtime
             .block_on(self.session.catalog().channels().register(&spec))
             .map_err(to_pyerr)
     }
 
-    /// Append columns to an already-registered channel. The append-only
-    /// invariant is enforced: redeclaring an existing column with a
+    /// Append columns to an already-registered channel from a serialized
+    /// `AddChannelColumnsRequest` body. The thin Python `Database` wrapper builds
+    /// this request with the same pure-Python assembly the remote client uses
+    /// (`jammi_client._assembly`), serializes it, and hands the bytes here, so the
+    /// embedded and remote add-columns paths share one request assembly and one
+    /// decode seam (`jammi_ai::wire::add_channel_columns_from_bytes`). The
+    /// append-only invariant is enforced: redeclaring an existing column with a
     /// different dtype raises `RuntimeError` carrying
-    /// `ChannelCatalog(ColumnConflict)` — `"channel '<id>': column '<name>' was
-    /// declared <X>, cannot redeclare as <Y>"`.
-    #[pyo3(signature = (channel_id, *, columns))]
-    fn add_channel_columns(
-        &self,
-        channel_id: &str,
-        columns: Vec<(String, String)>,
-    ) -> PyResult<()> {
-        let id = jammi_db::ChannelId::new(channel_id).map_err(to_pyerr)?;
-        let cols = parse_channel_columns(&columns)?;
+    /// `ChannelCatalog(ColumnConflict)`. A malformed or invalid body raises
+    /// `ValueError`.
+    fn _add_channel_columns_proto(&self, proto_bytes: &[u8]) -> PyResult<()> {
+        let args =
+            jammi_ai::wire::add_channel_columns_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         self.runtime
-            .block_on(self.session.catalog().channels().add_columns(&id, &cols))
+            .block_on(
+                self.session
+                    .catalog()
+                    .channels()
+                    .add_columns(&args.id, &args.columns),
+            )
             .map_err(to_pyerr)
     }
 
@@ -483,52 +476,24 @@ impl PyDatabase {
         Ok(out.into_any().unbind())
     }
 
-    /// Register a mutable companion table.
-    ///
-    /// Tenant scope is inherited from the session's currently bound tenant
-    /// (set via `set_tenant`). `schema` is any object implementing the
-    /// Arrow PyCapsule schema interface (e.g. `pyarrow.Schema`,
-    /// `arro3.Schema`). `primary_key` is a non-empty list of column names
-    /// drawn from `schema`. `indexes` is an optional list of dicts of shape
-    /// `{"name": str, "columns": [str, ...], "unique": bool=False}` — one
-    /// `CREATE INDEX` per entry. `order_column` is an optional `Int64` /
-    /// `UInt64` column that enables `MutableTableRegistry::scan_after`
-    /// streaming reads. `chunk_size` overrides the default scan chunk size
-    /// of 8192. Returns the catalog id of the registered table.
-    #[pyo3(signature = (name, *, schema, primary_key, indexes=None, order_column=None, chunk_size=None))]
-    fn create_mutable_table(
-        &self,
-        name: String,
-        schema: PySchema,
-        primary_key: Vec<String>,
-        indexes: Option<Vec<Bound<'_, PyDict>>>,
-        order_column: Option<String>,
-        chunk_size: Option<usize>,
-    ) -> PyResult<String> {
-        let id = MutableTableId::new(&name).map_err(to_pyerr)?;
-        let schema_ref = schema.into_inner();
-
-        let mut builder = MutableTableDefinitionBuilder::new(id.clone(), schema_ref)
-            .primary_key(primary_key)
-            .tenant(self.session.tenant());
-
-        if let Some(specs) = indexes {
-            for idx in parse_index_specs(&specs)? {
-                builder = builder.index(idx);
-            }
-        }
-        if let Some(col) = order_column {
-            builder = builder.order_column(col);
-        }
-        if let Some(size) = chunk_size {
-            builder = builder.chunk_size(size);
-        }
-
-        let def = builder.build().map_err(to_pyerr)?;
-        self.runtime
+    /// Register a mutable companion table from a serialized
+    /// `CreateMutableTableRequest` body. The thin Python `Database` wrapper builds
+    /// this request with the same pure-Python assembly the remote client uses
+    /// (`jammi_client._assembly`), serializes it, and hands the bytes here, so the
+    /// embedded and remote create paths share one request assembly and one decode
+    /// seam (`jammi_ai::wire::create_mutable_table_from_bytes`). The wire body is
+    /// tenant-free — the decode stamps the session's currently bound tenant onto
+    /// the definition. Returns the catalog id of the registered table. A malformed
+    /// or invalid body raises `ValueError`.
+    fn _create_mutable_table_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
+        let def =
+            jammi_ai::wire::create_mutable_table_from_bytes(proto_bytes, self.session.tenant())
+                .map_err(status_to_pyerr)?;
+        let id = self
+            .runtime
             .block_on(self.session.create_mutable_table(def))
             .map_err(to_pyerr)?;
-        Ok(id.as_str().to_string())
+        Ok(id.to_string())
     }
 
     /// Drop a mutable companion table. If `if_exists` is true, dropping a
@@ -580,25 +545,23 @@ impl PyDatabase {
         Ok(out.into_any().unbind())
     }
 
-    /// Register a trigger-stream topic. The schema is the contract every
-    /// published batch must satisfy; the catalog encoder rejects DataTypes
-    /// outside the supported wire types with `TriggerError::UnsupportedSchemaType`.
-    /// `broker_metadata` is opaque driver-side configuration (retention,
-    /// replication, etc.). Returns the engine-minted topic id.
-    #[pyo3(signature = (name, *, schema, broker_metadata=None))]
-    fn register_topic(
-        &self,
-        name: String,
-        schema: PySchema,
-        broker_metadata: Option<BTreeMap<String, String>>,
-    ) -> PyResult<String> {
-        let topic = TopicDefinition {
-            id: TopicId::new(),
-            name,
-            schema: schema.into_inner(),
-            tenant: self.session.tenant(),
-            broker_metadata: broker_metadata.unwrap_or_default(),
-        };
+    /// Register a trigger-stream topic from a serialized `RegisterTopicRequest`
+    /// body. The thin Python `Database` wrapper builds this request with the same
+    /// pure-Python assembly the remote client uses (`jammi_client._assembly`),
+    /// serializes it, and hands the bytes here, so the embedded and remote
+    /// register-topic paths share one request assembly and one decode seam
+    /// (`jammi_ai::wire::register_topic_from_bytes`). The wire body is tenant-free
+    /// — the decode stamps the session's currently bound tenant onto the
+    /// definition and mints a fresh topic id. `register_topic` dual-registers the
+    /// broker driver and the catalog, so a later `publish` resolves the topic.
+    /// Returns the engine-minted topic id. A malformed body (or a schema carrying
+    /// a DataType outside the supported wire types) raises `ValueError`.
+    fn _register_topic_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
+        let topic = jammi_ai::wire::register_topic_from_bytes(proto_bytes, self.session.tenant())
+            .map_err(status_to_pyerr)?;
+        // Dual-register the broker driver and the catalog (so a later `publish`
+        // resolves the topic) — the same invariant the control-plane handler's
+        // `Session::register_topic` holds.
         self.runtime
             .block_on(self.session.trigger_broker().register_topic(&topic))
             .map_err(to_pyerr)?;
@@ -1332,53 +1295,3 @@ fn parse_class_score(
     }
 }
 
-fn parse_channel_columns(
-    columns: &[(String, String)],
-) -> PyResult<Vec<jammi_db::catalog::channel_repo::ChannelColumn>> {
-    use jammi_db::catalog::channel_repo::{ChannelCatalogError, ChannelColumnType};
-    columns
-        .iter()
-        .map(|(name, dtype)| {
-            // A caller-supplied dtype token that does not parse is a bad request
-            // (`InvalidColumnType`), not catalog corruption — the call-site
-            // context, not `from_sql_str`, makes that distinction.
-            let data_type = ChannelColumnType::from_sql_str(dtype).map_err(|t| {
-                to_pyerr(JammiError::ChannelCatalog(
-                    ChannelCatalogError::InvalidColumnType(t.0),
-                ))
-            })?;
-            Ok(jammi_db::catalog::channel_repo::ChannelColumn {
-                name: name.clone(),
-                data_type,
-            })
-        })
-        .collect()
-}
-
-/// Parse a Python list of `{"name": str, "columns": [str], "unique": bool}`
-/// dicts into typed `MutableIndexDef` values. Missing required keys raise
-/// `KeyError`; wrong value types raise the underlying pyo3 extraction error.
-/// `unique` defaults to `false` when the key is absent.
-fn parse_index_specs(specs: &[Bound<'_, PyDict>]) -> PyResult<Vec<MutableIndexDef>> {
-    specs.iter().map(parse_one_index_spec).collect()
-}
-
-fn parse_one_index_spec(spec: &Bound<'_, PyDict>) -> PyResult<MutableIndexDef> {
-    let name: String = spec
-        .get_item("name")?
-        .ok_or_else(|| PyKeyError::new_err("index spec missing required key 'name'"))?
-        .extract()?;
-    let columns: Vec<String> = spec
-        .get_item("columns")?
-        .ok_or_else(|| PyKeyError::new_err("index spec missing required key 'columns'"))?
-        .extract()?;
-    let unique: bool = match spec.get_item("unique")? {
-        Some(v) => v.extract()?,
-        None => false,
-    };
-    Ok(MutableIndexDef {
-        name,
-        columns,
-        unique,
-    })
-}

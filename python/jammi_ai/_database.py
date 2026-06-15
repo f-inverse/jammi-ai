@@ -8,8 +8,10 @@ surface, composed over the compiled `_native._NativeDatabase` low-level handle:
 * The migrated verbs — the training verbs (`fine_tune`, `fine_tune_graph`,
   `train_context_predictor`), the bulk inference verb (`infer`), the
   engine-state pipeline verbs (`build_neighbor_graph`, `propagate_embeddings`,
-  `assemble_context`), and the embedding + search verbs (`generate_embeddings`,
-  `encode_query`, `search`) — are explicit methods here. They build their request
+  `assemble_context`), the embedding + search verbs (`generate_embeddings`,
+  `encode_query`, `search`), and the catalog/substrate verbs (`register_channel`,
+  `add_channel_columns`, `create_mutable_table`, `register_topic`) — are explicit
+  methods here. They build their request
   with the SAME pure-Python assembly the remote client uses
   (`jammi_client._assembly.build_*_request`), serialize it, and hand the bytes to
   the native handle's `_*_proto` primitive — which decodes through the engine's
@@ -24,13 +26,15 @@ gone from Rust; it lives once in `jammi_client._assembly`.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import pyarrow as pa
 
 from jammi_client._assembly import (
+    build_add_channel_columns_request,
     build_assemble_context_request,
     build_context_predictor_request,
+    build_create_mutable_table_request,
     build_encode_query_request,
     build_fine_tune_graph_request,
     build_fine_tune_request,
@@ -38,6 +42,8 @@ from jammi_client._assembly import (
     build_infer_request,
     build_neighbor_graph_request,
     build_propagate_embeddings_request,
+    build_register_channel_request,
+    build_register_topic_request,
     build_search_request,
 )
 
@@ -521,3 +527,104 @@ class Database:
             embedding_table=embedding_table,
         )
         return self._native._search_proto(request.SerializeToString())
+
+    def register_channel(
+        self,
+        channel_id: str,
+        *,
+        priority: int,
+        columns: Sequence[Tuple[str, str]],
+    ) -> None:
+        """Register an evidence-provenance channel and its initial columns.
+
+        `columns` is a list of `(name, dtype)` tuples where `dtype` is the
+        canonical PascalCase token (`"Float32"`, `"Utf8"`, …); `priority` orders
+        the channel against others contributing the same column. The channel id is
+        unique per tenant, scoped to the session's bound tenant. Same handle shape
+        and verb signature as the remote `RemoteDatabase.register_channel`; the
+        request is assembled with the shared `RegisterChannelRequest` builder and
+        submitted through the engine's wire seam.
+        """
+        request = build_register_channel_request(
+            channel_id,
+            priority=priority,
+            columns=columns,
+        )
+        self._native._register_channel_proto(request.SerializeToString())
+
+    def add_channel_columns(
+        self,
+        channel_id: str,
+        *,
+        columns: Sequence[Tuple[str, str]],
+    ) -> None:
+        """Append columns to an already-registered channel (append-only).
+
+        `columns` is a list of `(name, dtype)` tuples in the same PascalCase
+        vocabulary as :meth:`register_channel`. The append-only invariant is
+        enforced: redeclaring an existing column with a different dtype raises.
+        Same handle shape and verb signature as the remote
+        `RemoteDatabase.add_channel_columns`; the request is assembled with the
+        shared `AddChannelColumnsRequest` builder and submitted through the
+        engine's wire seam.
+        """
+        request = build_add_channel_columns_request(
+            channel_id,
+            columns=columns,
+        )
+        self._native._add_channel_columns_proto(request.SerializeToString())
+
+    def create_mutable_table(
+        self,
+        name: str,
+        *,
+        schema: pa.Schema,
+        primary_key: List[str],
+        indexes: Optional[List[Dict[str, Any]]] = None,
+        order_column: Optional[str] = None,
+        chunk_size: Optional[int] = None,
+    ) -> str:
+        """Register a mutable companion table and return its catalog id.
+
+        `schema` is the table's `pyarrow.Schema`; `primary_key` is a non-empty
+        list of column names drawn from it. `indexes` is an optional list of
+        ``{"name", "columns", "unique"}`` dicts — one secondary index per entry.
+        `order_column` is an optional monotonic column enabling streaming
+        `scan_after` reads; `chunk_size` overrides the engine's default scan chunk
+        size. Tenant scope is the session's bound tenant. Same handle shape and
+        verb signature as the remote `RemoteDatabase.create_mutable_table`; the
+        request is assembled with the shared `CreateMutableTableRequest` builder
+        and submitted through the engine's wire seam.
+        """
+        request = build_create_mutable_table_request(
+            name,
+            schema=schema,
+            primary_key=primary_key,
+            indexes=indexes,
+            order_column=order_column,
+            chunk_size=chunk_size,
+        )
+        return self._native._create_mutable_table_proto(request.SerializeToString())
+
+    def register_topic(
+        self,
+        name: str,
+        *,
+        schema: pa.Schema,
+        broker_metadata: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """Register a trigger-stream topic and return its engine-minted topic id.
+
+        `schema` is the contract every published batch must satisfy.
+        `broker_metadata` is opaque driver-side configuration (retention,
+        replication, …). Tenant scope is the session's bound tenant. Same handle
+        shape and verb signature as the remote `RemoteDatabase.register_topic`; the
+        request is assembled with the shared `RegisterTopicRequest` builder and
+        submitted through the engine's wire seam.
+        """
+        request = build_register_topic_request(
+            name,
+            schema=schema,
+            broker_metadata=broker_metadata,
+        )
+        return self._native._register_topic_proto(request.SerializeToString())

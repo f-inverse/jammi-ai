@@ -33,10 +33,11 @@ from ._assembly import (
     _EVAL_TASK,
     _FILE_FORMAT,
     _SOURCE_KIND_NAME,
-    _channel_columns_message,
     _local_source_url,
+    build_add_channel_columns_request,
     build_assemble_context_request,
     build_context_predictor_request,
+    build_create_mutable_table_request,
     build_encode_query_request,
     build_fine_tune_graph_request,
     build_fine_tune_request,
@@ -44,6 +45,8 @@ from ._assembly import (
     build_infer_request,
     build_neighbor_graph_request,
     build_propagate_embeddings_request,
+    build_register_channel_request,
+    build_register_topic_request,
     build_search_request,
 )
 from ._credentials import AnonymousCredentials, ChannelCredentials
@@ -127,21 +130,6 @@ def _arrow_batch_to_table(batch: Any) -> pa.Table:
         return pa.table({})
     reader = pa.ipc.open_stream(body)
     return reader.read_all()
-
-
-def _encode_ipc_schema(schema: pa.Schema) -> bytes:
-    """Encode a `pyarrow.Schema` as a schema-only Arrow IPC stream — the framing
-    the engine's `decode_ipc_schema` reads back (a `StreamWriter` opened on the
-    schema and finished with no batches). This is the byte shape
-    `MutableTableDefinition.schema` and `RegisterTopicRequest.schema` carry, the
-    same self-describing IPC framing the trigger batch payloads use.
-    """
-    sink = pa.BufferOutputStream()
-    with pa.ipc.new_stream(sink, schema):
-        # No batches: a schema-only stream is the writer opened and closed, which
-        # emits the schema message the server decodes back into a `SchemaRef`.
-        pass
-    return sink.getvalue().to_pybytes()
 
 
 def _table_to_arrow_batch(batch: pa.Table) -> "trigger_pb2.ArrowBatch":
@@ -725,28 +713,15 @@ class RemoteDatabase:
         tenant (the wire body is tenant-free). Maps to
         `CatalogService.CreateMutableTable`.
         """
-        wire_indexes = [
-            catalog_pb2.MutableIndex(
-                name=idx["name"],
-                columns=list(idx["columns"]),
-                unique=bool(idx.get("unique", False)),
-            )
-            for idx in (indexes or [])
-        ]
-        definition = catalog_pb2.MutableTableDefinition(
-            id=name,
-            schema=_encode_ipc_schema(schema),
-            primary_key=list(primary_key),
-            indexes=wire_indexes,
+        request = build_create_mutable_table_request(
+            name,
+            schema=schema,
+            primary_key=primary_key,
+            indexes=indexes,
+            order_column=order_column,
+            chunk_size=chunk_size,
         )
-        if order_column is not None:
-            definition.order_column = order_column
-        if chunk_size is not None:
-            definition.chunk_size = chunk_size
-        resp = self._catalog.CreateMutableTable(
-            catalog_pb2.CreateMutableTableRequest(definition=definition),
-            metadata=self._metadata,
-        )
+        resp = self._catalog.CreateMutableTable(request, metadata=self._metadata)
         return resp.mutable_table_id
 
     def drop_mutable_table(self, name: str, *, if_exists: bool = False) -> None:
@@ -800,10 +775,10 @@ class RemoteDatabase:
         configuration (retention, replication, …). Tenant scope is the session's
         bound tenant. Maps to `CatalogService.RegisterTopic`.
         """
-        request = catalog_pb2.RegisterTopicRequest(
-            name=name,
-            schema=_encode_ipc_schema(schema),
-            broker_metadata=broker_metadata or {},
+        request = build_register_topic_request(
+            name,
+            schema=schema,
+            broker_metadata=broker_metadata,
         )
         resp = self._catalog.RegisterTopic(request, metadata=self._metadata)
         return resp.topic_id
@@ -1689,14 +1664,12 @@ class RemoteDatabase:
         same id without collision, but re-registering an id already present for
         the bound tenant raises. Maps to `CatalogService.RegisterChannel`.
         """
-        self._catalog.RegisterChannel(
-            catalog_pb2.RegisterChannelRequest(
-                channel_id=channel_id,
-                priority=priority,
-                columns=_channel_columns_message(columns),
-            ),
-            metadata=self._metadata,
+        request = build_register_channel_request(
+            channel_id,
+            priority=priority,
+            columns=columns,
         )
+        self._catalog.RegisterChannel(request, metadata=self._metadata)
 
     def add_channel_columns(
         self,
@@ -1711,13 +1684,11 @@ class RemoteDatabase:
         server-side: redeclaring an existing column with a different dtype
         raises. Maps to `CatalogService.AddChannelColumns`.
         """
-        self._catalog.AddChannelColumns(
-            catalog_pb2.AddChannelColumnsRequest(
-                channel_id=channel_id,
-                columns=_channel_columns_message(columns),
-            ),
-            metadata=self._metadata,
+        request = build_add_channel_columns_request(
+            channel_id,
+            columns=columns,
         )
+        self._catalog.AddChannelColumns(request, metadata=self._metadata)
 
     def list_channels(self) -> List[Dict[str, Any]]:
         """List every evidence channel registered to the currently bound tenant,

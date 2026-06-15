@@ -20,11 +20,13 @@ mod pipeline;
 mod training;
 
 pub use inference::{
-    edge_gather_from_proto, edge_gather_to_proto, predicted_distribution_to_proto,
+    edge_gather_from_proto, edge_gather_to_proto, infer_from_bytes, infer_from_proto,
+    predicted_distribution_to_proto, InferArgs,
 };
 pub use pipeline::{
-    assemble_context_from_proto, assemble_context_request_from_proto, assemble_context_to_proto,
-    build_neighbor_graph_from_proto, context_source_tag, propagate_request_from_proto,
-    BuildNeighborGraphArgs,
+    assemble_context_from_proto, assemble_context_request_from_bytes,
+    assemble_context_request_from_proto, assemble_context_to_proto,
+    build_neighbor_graph_from_bytes, build_neighbor_graph_from_proto, context_source_tag,
+    propagate_request_from_bytes, propagate_request_from_proto, BuildNeighborGraphArgs,
 };
 pub use training::{training_spec_from_bytes, training_spec_from_proto, training_spec_to_proto};

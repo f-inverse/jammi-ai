@@ -1,16 +1,11 @@
 //! Python-facing wrapper for [`jammi_ai::model::ModelTask`].
 //!
-//! Exposes the engine's `ModelTask` enum to Python as a pyclass enum so call
-//! sites like `db.infer(..., task=ModelTask.TextEmbedding, ...)` exchange
-//! typed values across the FFI boundary. Strings are still accepted at every
-//! task-bearing argument — they decode through
-//! [`jammi_db::ModelTask::try_from_db_str`] exactly once at the binding
-//! edge, so the Rust side never sees `&str` for `task`.
+//! Exposes the engine's `ModelTask` enum to Python as a pyclass enum, surfacing
+//! every task variant with its canonical catalog snake-case spelling
+//! (`as_db_str` / `from_str` mirror [`jammi_db::ModelTask::try_from_db_str`]) so
+//! a caller can name a task as a typed value rather than a bare string.
 
-use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use pyo3::types::PyString;
-use pyo3::Borrowed;
 
 use jammi_ai::model::ModelTask;
 
@@ -77,30 +72,5 @@ impl From<ModelTask> for PyModelTask {
             ModelTask::Ner => PyModelTask::Ner,
             ModelTask::Regression => PyModelTask::Regression,
         }
-    }
-}
-
-/// Argument shim accepted by every Python-facing `task=` parameter — either
-/// a `ModelTask` enum value (preferred) or the catalog snake-case string.
-/// Strings are decoded through `ModelTask::try_from_db_str` exactly once at
-/// the binding boundary; the Rust call site sees a typed `ModelTask`.
-pub struct ModelTaskArg(pub ModelTask);
-
-impl<'a, 'py> FromPyObject<'a, 'py> for ModelTaskArg {
-    type Error = PyErr;
-
-    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-        if let Ok(typed) = ob.extract::<PyModelTask>() {
-            return Ok(ModelTaskArg(typed.into()));
-        }
-        if let Ok(s) = ob.cast::<PyString>() {
-            let raw: String = s.str()?.to_string();
-            let task = ModelTask::try_from_db_str(&raw).map_err(to_pyerr)?;
-            return Ok(ModelTaskArg(task));
-        }
-        Err(PyTypeError::new_err(
-            "task must be a ModelTask enum value or its snake_case string \
-             (text_embedding, image_embedding, audio_embedding, classification, ner, regression)",
-        ))
     }
 }

@@ -5,28 +5,36 @@ surface, composed over the compiled `_native._NativeDatabase` low-level handle:
 
 * Every verb whose request is still assembled in Rust is forwarded verbatim to
   the native handle by ``__getattr__`` — the embedded implementation is unchanged.
-* The training verbs (`fine_tune`, `fine_tune_graph`, `train_context_predictor`)
-  are explicit methods here. They build their `StartTrainingRequest` with the
-  SAME pure-Python assembly the remote client uses
+* The migrated verbs — the training verbs (`fine_tune`, `fine_tune_graph`,
+  `train_context_predictor`), the bulk inference verb (`infer`), and the
+  engine-state pipeline verbs (`build_neighbor_graph`, `propagate_embeddings`,
+  `assemble_context`) — are explicit methods here. They build their request with
+  the SAME pure-Python assembly the remote client uses
   (`jammi_client._assembly.build_*_request`), serialize it, and hand the bytes to
-  the native handle's `_start_training_proto` primitive — which decodes through
-  the engine's shared wire seam and runs the job in-process. So the embedded and
-  remote training submits share one request assembly and one decode, differing
-  only in the transport primitive (a PyO3 call here, a gRPC call there). The
-  signatures mirror `jammi_client.RemoteDatabase`'s — the conformance contract.
+  the native handle's `_*_proto` primitive — which decodes through the engine's
+  shared wire seam and runs the verb in-process. So the embedded and remote
+  paths share one request assembly and one decode, differing only in the
+  transport primitive (a PyO3 call here, a gRPC call there). The signatures
+  mirror `jammi_client.RemoteDatabase`'s — the conformance contract.
 
-The kwargs→struct assembly the native handle used to carry for these three verbs
-is gone from Rust; it lives once in `jammi_client._assembly`.
+The kwargs→struct assembly the native handle used to carry for these verbs is
+gone from Rust; it lives once in `jammi_client._assembly`.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+
+import pyarrow as pa
 
 from jammi_client._assembly import (
+    build_assemble_context_request,
     build_context_predictor_request,
     build_fine_tune_graph_request,
     build_fine_tune_request,
+    build_infer_request,
+    build_neighbor_graph_request,
+    build_propagate_embeddings_request,
 )
 
 
@@ -266,3 +274,165 @@ class Database:
             model_id=model_id,
         )
         return self._native._start_training_proto(request.SerializeToString())
+
+    def infer(
+        self,
+        *,
+        source: str,
+        model: str,
+        columns: List[str],
+        task: str,
+        key: str,
+    ) -> pa.Table:
+        """Run `model` over `columns` of a registered source for `task`,
+        returning one output row per source row as a `pyarrow.Table`.
+
+        `task` is the snake-case model-task string (``"text_embedding"``,
+        ``"image_embedding"``, ``"audio_embedding"``, ``"classification"``,
+        ``"ner"``, ``"regression"``); `key` names the column whose value becomes
+        each output row's ``_row_id``. Same handle shape and verb signature as
+        the remote `RemoteDatabase.infer`. The request is assembled with the
+        shared `InferRequest` builder and submitted through the engine's wire
+        seam.
+        """
+        request = build_infer_request(
+            source=source,
+            model=model,
+            columns=columns,
+            task=task,
+            key=key,
+        )
+        return self._native._infer_proto(request.SerializeToString())
+
+    def build_neighbor_graph(
+        self,
+        source: str,
+        *,
+        k: int,
+        min_similarity: Optional[float] = None,
+        mutual: bool = False,
+        exact: bool = False,
+        table: Optional[str] = None,
+    ) -> str:
+        """Materialise the k-NN graph of a source's embedding table and return the
+        new edge table's name.
+
+        The returned table has columns ``(src, dst, rank, similarity)``. The
+        default driver is index-assisted and approximate; pass ``exact=True`` for
+        a deterministic, complete graph. ``min_similarity`` floors weak edges;
+        ``mutual=True`` keeps only reciprocal edges. Mirrors the remote
+        `RemoteDatabase.build_neighbor_graph`; the request is assembled with the
+        shared `BuildNeighborGraphRequest` builder and submitted through the
+        engine's wire seam. Read the table via :meth:`sql`.
+        """
+        request = build_neighbor_graph_request(
+            source,
+            k=k,
+            min_similarity=min_similarity,
+            mutual=mutual,
+            exact=exact,
+            table=table,
+        )
+        return self._native._build_neighbor_graph_proto(request.SerializeToString())
+
+    def propagate_embeddings(
+        self,
+        source: str,
+        *,
+        embedding_table: Optional[str] = None,
+        edge_graph_table: Optional[str] = None,
+        edge_source: Optional[str] = None,
+        edge_src_column: Optional[str] = None,
+        edge_dst_column: Optional[str] = None,
+        edge_weight_column: Optional[str] = None,
+        direction: Optional[str] = None,
+        hops: Optional[int] = None,
+        weighting: Optional[str] = None,
+        alpha: Optional[float] = None,
+        output: Optional[str] = None,
+    ) -> str:
+        """Propagate an embedding table's features over a declared graph (the
+        decoupled-GNN forward pass) into a new, searchable embedding table.
+
+        The graph is either an S9 similarity graph (``edge_graph_table``, a
+        :meth:`build_neighbor_graph` output) or a registered external edge source
+        (``edge_source``) — pass exactly one. ``weighting`` selects the neighbour
+        normalisation; ``output`` is ``"final"`` or ``"jumping_knowledge"``.
+        Returns the materialised table's name. Mirrors the remote
+        `RemoteDatabase.propagate_embeddings`; the request is assembled with the
+        shared `PropagateEmbeddingsRequest` builder and submitted through the
+        engine's wire seam. Read the table via :meth:`sql`.
+        """
+        request = build_propagate_embeddings_request(
+            source,
+            embedding_table=embedding_table,
+            edge_graph_table=edge_graph_table,
+            edge_source=edge_source,
+            edge_src_column=edge_src_column,
+            edge_dst_column=edge_dst_column,
+            edge_weight_column=edge_weight_column,
+            direction=direction,
+            hops=hops,
+            weighting=weighting,
+            alpha=alpha,
+            output=output,
+        )
+        return self._native._propagate_embeddings_proto(request.SerializeToString())
+
+    def assemble_context(
+        self,
+        source: str,
+        *,
+        query: List[float],
+        k: int,
+        value_columns: Optional[List[str]] = None,
+        aggregator: Optional[str] = None,
+        exclude_self: bool = True,
+        exclude_key: Optional[str] = None,
+        split: Optional[str] = None,
+        edge_source: Optional[str] = None,
+        edge_src_column: Optional[str] = None,
+        edge_dst_column: Optional[str] = None,
+        edge_type_column: Optional[str] = None,
+        edge_weight_column: Optional[str] = None,
+        edge_hops: Optional[int] = None,
+        edge_fanout: Optional[int] = None,
+        edge_direction: Optional[str] = None,
+        edge_types: Optional[List[str]] = None,
+        min_weight: Optional[float] = None,
+        hybrid: bool = False,
+    ) -> Dict[str, Any]:
+        """Assemble and encode a target's context set: retrieve `k` nearest
+        neighbours of `query` (or a declared-edge walk / their union), pair them
+        with `value_columns`, and pool the neighbour vectors into one fixed-width
+        context vector.
+
+        Returns the same dict shape as the remote `RemoteDatabase`:
+        ``context_vector`` (list of floats, or ``None`` for a degenerate empty
+        context), ``context_size``, ``context_keys``, ``value_rows`` (a
+        ``pyarrow.Table``), and ``source`` (the assembly fact). The request is
+        assembled with the shared `AssembleContextRequest` builder and submitted
+        through the engine's wire seam.
+        """
+        request = build_assemble_context_request(
+            source,
+            query=query,
+            k=k,
+            value_columns=value_columns,
+            aggregator=aggregator,
+            exclude_self=exclude_self,
+            exclude_key=exclude_key,
+            split=split,
+            edge_source=edge_source,
+            edge_src_column=edge_src_column,
+            edge_dst_column=edge_dst_column,
+            edge_type_column=edge_type_column,
+            edge_weight_column=edge_weight_column,
+            edge_hops=edge_hops,
+            edge_fanout=edge_fanout,
+            edge_direction=edge_direction,
+            edge_types=edge_types,
+            min_weight=min_weight,
+            hybrid=hybrid,
+        )
+        return self._native._assemble_context_proto(request.SerializeToString())

@@ -730,3 +730,211 @@ def build_context_predictor_request(
             predictor_spec=spec,
         )
     )
+
+
+def build_infer_request(
+    *,
+    source: str,
+    model: str,
+    columns: List[str],
+    task: str,
+    key: str,
+) -> inference_pb2.InferRequest:
+    """Assemble the `InferRequest` for a bulk inference run from the binding's
+    flat kwargs.
+
+    `task` is the snake-case model-task string the wire `ModelTask` enum carries;
+    `key` names the column whose value becomes each output row's `_row_id`. The
+    same request the embed binding submits in-process.
+    """
+    return inference_pb2.InferRequest(
+        source_id=source,
+        model_id=model,
+        task=_MODEL_TASK[task],
+        columns=list(columns),
+        key_column=key,
+    )
+
+
+def build_neighbor_graph_request(
+    source: str,
+    *,
+    k: int,
+    min_similarity: Optional[float] = None,
+    mutual: bool = False,
+    exact: bool = False,
+    table: Optional[str] = None,
+) -> pipeline_pb2.BuildNeighborGraphRequest:
+    """Assemble the `BuildNeighborGraphRequest` for a k-NN graph materialisation
+    from the binding's flat kwargs.
+
+    The optional `min_similarity` floor and `table` selector carry explicit
+    presence — left unset when omitted so the engine resolves the default. The
+    same request the embed binding submits in-process.
+    """
+    request = pipeline_pb2.BuildNeighborGraphRequest(
+        source_id=source,
+        k=k,
+        mutual=mutual,
+        exact=exact,
+    )
+    if min_similarity is not None:
+        request.min_similarity = min_similarity
+    if table is not None:
+        request.table = table
+    return request
+
+
+def build_propagate_embeddings_request(
+    source: str,
+    *,
+    embedding_table: Optional[str] = None,
+    edge_graph_table: Optional[str] = None,
+    edge_source: Optional[str] = None,
+    edge_src_column: Optional[str] = None,
+    edge_dst_column: Optional[str] = None,
+    edge_weight_column: Optional[str] = None,
+    direction: Optional[str] = None,
+    hops: Optional[int] = None,
+    weighting: Optional[str] = None,
+    alpha: Optional[float] = None,
+    output: Optional[str] = None,
+) -> pipeline_pb2.PropagateEmbeddingsRequest:
+    """Assemble the `PropagateEmbeddingsRequest` for a feature-propagation pass
+    from the binding's flat kwargs.
+
+    The graph is either an S9 similarity graph (`edge_graph_table`) or a
+    registered external edge source (`edge_source`) — exactly one, the proto
+    `graph` oneof. Every optional scalar carries explicit presence, left unset
+    when omitted so the engine resolves the default. The same request the embed
+    binding submits in-process.
+    """
+    if edge_graph_table is not None and edge_source is not None:
+        raise ValueError(
+            "pass exactly one of edge_graph_table (S9 graph) or edge_source "
+            "(registered edges), not both"
+        )
+    request = pipeline_pb2.PropagateEmbeddingsRequest(source_id=source)
+    if edge_graph_table is not None:
+        request.edge_graph_table = edge_graph_table
+    elif edge_source is not None:
+        request.edge_source.CopyFrom(
+            pipeline_pb2.PropagateEdgeSource(
+                edge_source=edge_source,
+                src_column=edge_src_column if edge_src_column is not None else "src",
+                dst_column=edge_dst_column if edge_dst_column is not None else "dst",
+            )
+        )
+        if edge_weight_column is not None:
+            request.edge_source.weight_column = edge_weight_column
+    else:
+        raise ValueError(
+            "propagate_embeddings requires a graph: edge_graph_table or edge_source"
+        )
+    if embedding_table is not None:
+        request.embedding_table = embedding_table
+    if direction is not None:
+        try:
+            request.direction = _EDGE_DIRECTION[direction]
+        except KeyError:
+            raise ValueError(
+                f"direction must be 'out', 'in', or 'undirected' (got {direction!r})"
+            ) from None
+    if hops is not None:
+        request.hops = hops
+    if weighting is not None:
+        try:
+            request.weighting = _PROPAGATION_WEIGHTING[weighting]
+        except KeyError:
+            raise ValueError(
+                "weighting must be 'degree_normalized', 'uniform', or "
+                f"'edge_similarity' (got {weighting!r})"
+            ) from None
+    if alpha is not None:
+        request.alpha = alpha
+    if output is not None:
+        try:
+            request.output = _PROPAGATION_OUTPUT[output]
+        except KeyError:
+            raise ValueError(
+                f"output must be 'final' or 'jumping_knowledge' (got {output!r})"
+            ) from None
+    return request
+
+
+def build_assemble_context_request(
+    source: str,
+    *,
+    query: List[float],
+    k: int,
+    value_columns: Optional[List[str]] = None,
+    aggregator: Optional[str] = None,
+    exclude_self: bool = True,
+    exclude_key: Optional[str] = None,
+    split: Optional[str] = None,
+    edge_source: Optional[str] = None,
+    edge_src_column: Optional[str] = None,
+    edge_dst_column: Optional[str] = None,
+    edge_type_column: Optional[str] = None,
+    edge_weight_column: Optional[str] = None,
+    edge_hops: Optional[int] = None,
+    edge_fanout: Optional[int] = None,
+    edge_direction: Optional[str] = None,
+    edge_types: Optional[List[str]] = None,
+    min_weight: Optional[float] = None,
+    hybrid: bool = False,
+) -> pipeline_pb2.AssembleContextRequest:
+    """Assemble the `AssembleContextRequest` for a context-set assembly from the
+    binding's flat kwargs.
+
+    An absent edge gather is the ANN-only default; a present gather is a
+    declared-edge walk, or — with `hybrid` set — the union of the two. The same
+    request the embed binding submits in-process.
+    """
+    request = pipeline_pb2.AssembleContextRequest(
+        source_id=source,
+        query=list(query),
+        k=k,
+        value_columns=list(value_columns or []),
+        exclude_self=exclude_self,
+        hybrid=hybrid,
+    )
+    if aggregator is not None:
+        try:
+            request.aggregator = _SET_AGGREGATOR[aggregator]
+        except KeyError:
+            raise ValueError(
+                f"aggregator must be 'mean', 'sum', or 'max' (got {aggregator!r})"
+            ) from None
+    if exclude_key is not None:
+        request.exclude_key = exclude_key
+    if split is not None:
+        request.split = split
+    if edge_source is not None:
+        gather = inference_pb2.EdgeGather(
+            edge_source=edge_source,
+            src_column=edge_src_column if edge_src_column is not None else "src",
+            dst_column=edge_dst_column if edge_dst_column is not None else "dst",
+        )
+        if edge_type_column is not None:
+            gather.type_column = edge_type_column
+        if edge_weight_column is not None:
+            gather.weight_column = edge_weight_column
+        if edge_hops is not None:
+            gather.hops = edge_hops
+        if edge_fanout is not None:
+            gather.fanout = edge_fanout
+        if edge_direction is not None:
+            try:
+                gather.direction = _EDGE_DIRECTION[edge_direction]
+            except KeyError:
+                raise ValueError(
+                    f"edge_direction must be 'out', 'in', or 'undirected' "
+                    f"(got {edge_direction!r})"
+                ) from None
+        if edge_types is not None:
+            gather.edge_types.extend(edge_types)
+        if min_weight is not None:
+            gather.min_weight = min_weight
+        request.edges.CopyFrom(gather)
+    return request

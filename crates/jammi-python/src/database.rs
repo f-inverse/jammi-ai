@@ -14,13 +14,8 @@ use pyo3_arrow::{PySchema, PyTable};
 use jammi_ai::local_session::{Modality, QueryInput, SearchQuery, SearchRequest, Session};
 use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::pipeline::context_predictor::{ContextServeOptions, ContextServeSource};
-use jammi_ai::pipeline::context_set::{
-    ContextRequest, ContextSource, ContextSourceKind, HybridMerge, SetAggregator,
-};
+use jammi_ai::pipeline::context_set::{ContextSourceKind, HybridMerge};
 use jammi_ai::pipeline::graph_neighbourhood::{EdgeDirection, EdgeGather, EdgeSourceRef};
-use jammi_ai::pipeline::graph_propagation::{
-    PropagateRequest, PropagationOutput, PropagationWeighting,
-};
 use jammi_ai::session::InferenceSession;
 use jammi_db::config::JammiConfig;
 use jammi_db::error::JammiError;
@@ -33,7 +28,6 @@ use jammi_db::trigger::{Offset, Predicate, TopicDefinition, TopicId};
 use crate::convert::{batches_to_pyarrow, serializable_to_pydict};
 use crate::error::{status_to_pyerr, to_pyerr};
 use crate::job::PyTrainingJob;
-use crate::model_task::ModelTaskArg;
 
 /// The low-level embedded engine handle, wrapping `Arc<InferenceSession>` with a
 /// shared tokio runtime. Exposed to Python as `_NativeDatabase`: the thin Python
@@ -289,24 +283,25 @@ impl PyDatabase {
         Ok(record.table_name)
     }
 
-    /// Run inference. Returns a `pyarrow.Table`.
-    #[pyo3(signature = (*, source, model, columns, task, key))]
-    fn infer(
-        &self,
-        py: Python<'_>,
-        source: &str,
-        model: &str,
-        columns: Vec<String>,
-        task: ModelTaskArg,
-        key: &str,
-    ) -> PyResult<Py<PyAny>> {
-        let model_source = ModelSource::parse(model);
+    /// Run inference from a serialized `InferRequest` body. The thin Python
+    /// `Database` wrapper builds this request with the same pure-Python assembly
+    /// the remote client uses (`jammi_client._assembly`), serializes it, and
+    /// hands the bytes here, so the embedded and remote infer paths share one
+    /// request assembly and one decode seam
+    /// (`jammi_ai::wire::infer_from_bytes`). Returns a `pyarrow.Table`. A
+    /// malformed or invalid body raises `ValueError`.
+    fn _infer_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        let args = jammi_ai::wire::infer_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
+        let model_source = ModelSource::parse(&args.model);
         let batches = self
             .runtime
-            .block_on(
-                self.session
-                    .infer(source, &model_source, task.0, &columns, key),
-            )
+            .block_on(self.session.infer(
+                &args.source_id,
+                &model_source,
+                args.task,
+                &args.columns,
+                &args.key_column,
+            ))
             .map_err(to_pyerr)?;
         batches_to_pyarrow(py, &batches)
     }
@@ -988,164 +983,40 @@ impl PyDatabase {
         Ok(())
     }
 
-    /// Materialize the k-nearest-neighbour graph of a source's embedding table
-    /// and return the new edge table's name.
-    ///
-    /// This is for *global-structure* work — clustering, near-duplicate
-    /// detection, training-data prep — where the whole edge set is consumed as
-    /// a durable artifact. For "neighbours of *these* rows", use `search`.
-    ///
-    /// The returned table has columns `(src, dst, rank, similarity)`, with
-    /// `src`/`dst` joining directly to the source on the key. The default
-    /// driver is index-assisted and produces an approximate, non-deterministic
-    /// graph; pass `exact=True` for a deterministic, complete one (gated by a
-    /// row-count ceiling). `min_similarity` floors weak edges; `mutual=True`
-    /// keeps only reciprocal edges.
-    #[pyo3(signature = (source, *, k, min_similarity=None, mutual=false, exact=false, table=None))]
-    fn build_neighbor_graph(
-        &self,
-        source: &str,
-        k: usize,
-        min_similarity: Option<f32>,
-        mutual: bool,
-        exact: bool,
-        table: Option<String>,
-    ) -> PyResult<String> {
-        let params = jammi_ai::pipeline::neighbor_graph::BuildNeighborGraph {
-            k,
-            min_similarity,
-            mutual,
-            exact,
-            ..Default::default()
-        };
+    /// Materialise the k-nearest-neighbour graph of a source's embedding table
+    /// from a serialized `BuildNeighborGraphRequest` body. The thin Python
+    /// `Database` wrapper builds this request with the same pure-Python assembly
+    /// the remote client uses (`jammi_client._assembly`), serializes it, and
+    /// hands the bytes here, so the embedded and remote paths share one request
+    /// assembly and one decode seam
+    /// (`jammi_ai::wire::build_neighbor_graph_from_bytes`). Returns the new edge
+    /// table's name. A malformed or invalid body raises `ValueError`.
+    fn _build_neighbor_graph_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
+        let args =
+            jammi_ai::wire::build_neighbor_graph_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let record = self
             .runtime
-            .block_on(
-                self.session
-                    .build_neighbor_graph(source, table.as_deref(), &params),
-            )
+            .block_on(self.session.build_neighbor_graph(
+                &args.source_id,
+                args.embedding_table.as_deref(),
+                &args.params,
+            ))
             .map_err(to_pyerr)?;
         Ok(record.table_name)
     }
 
     /// Propagate an embedding table's features over a declared graph (the
-    /// decoupled-GNN forward pass) into a new, searchable embedding table.
-    ///
-    /// Each output row is its `hops`-hop neighbourhood aggregate of the input
-    /// embeddings, with self-loops (`Ã = A + I`) and an APPNP `alpha`-teleport
-    /// restart that anchors every node against over-smoothing. The graph is
-    /// either an S9 similarity graph (`edge_graph_table`, a `build_neighbor_graph`
-    /// output) or a registered external edge source (`edge_source` with
-    /// `edge_src_column`/`edge_dst_column`); pass exactly one.
-    ///
-    /// `weighting` selects the neighbour normalisation: `"degree_normalized"`
-    /// (the default, symmetric `Â`, the PageRank-decay form), `"uniform"`
-    /// (random-walk mean), or `"edge_similarity"` (edge-weighted mean, using the
-    /// edge weight as fixed attention). `output` is `"final"` (a `d`-dim table)
-    /// or `"jumping_knowledge"` (the L2-normalised per-hop concat, `(K+1)·d`-dim,
-    /// indexing in its own space). Deterministic: identical inputs yield a
-    /// byte-identical table.
-    ///
-    /// Returns the materialised embedding table's name.
-    #[pyo3(signature = (
-        source,
-        *,
-        embedding_table = None,
-        edge_graph_table = None,
-        edge_source = None,
-        edge_src_column = None,
-        edge_dst_column = None,
-        edge_weight_column = None,
-        direction = None,
-        hops = None,
-        weighting = None,
-        alpha = None,
-        output = None,
-    ))]
-    #[allow(clippy::too_many_arguments)]
-    fn propagate_embeddings(
-        &self,
-        source: &str,
-        embedding_table: Option<String>,
-        edge_graph_table: Option<String>,
-        edge_source: Option<String>,
-        edge_src_column: Option<String>,
-        edge_dst_column: Option<String>,
-        edge_weight_column: Option<String>,
-        direction: Option<&str>,
-        hops: Option<usize>,
-        weighting: Option<&str>,
-        alpha: Option<f64>,
-        output: Option<&str>,
-    ) -> PyResult<String> {
-        let edge_source_ref = match (edge_graph_table, edge_source) {
-            (Some(table_name), None) => EdgeSourceRef::NeighborGraph { table_name },
-            (None, Some(source_id)) => EdgeSourceRef::Registered {
-                source_id,
-                src_column: edge_src_column.unwrap_or_else(|| "src".into()),
-                dst_column: edge_dst_column.unwrap_or_else(|| "dst".into()),
-                type_column: None,
-                weight_column: edge_weight_column,
-                as_of_column: None,
-            },
-            (Some(_), Some(_)) => {
-                return Err(PyValueError::new_err(
-                    "pass exactly one of edge_graph_table (S9 graph) or edge_source \
-                     (registered edges), not both",
-                ))
-            }
-            (None, None) => {
-                return Err(PyValueError::new_err(
-                    "propagate_embeddings requires a graph: edge_graph_table or edge_source",
-                ))
-            }
-        };
-
-        let direction = match direction {
-            None | Some("out") => EdgeDirection::Out,
-            Some("in") => EdgeDirection::In,
-            Some("undirected") => EdgeDirection::Undirected,
-            Some(o) => {
-                return Err(PyValueError::new_err(format!(
-                    "direction must be 'out', 'in', or 'undirected' (got '{o}')"
-                )))
-            }
-        };
-        let weighting = match weighting {
-            None | Some("degree_normalized") => PropagationWeighting::DegreeNormalized,
-            Some("uniform") => PropagationWeighting::Uniform,
-            Some("edge_similarity") => PropagationWeighting::EdgeSimilarity,
-            Some(o) => {
-                return Err(PyValueError::new_err(format!(
-                    "weighting must be 'degree_normalized', 'uniform', or 'edge_similarity' \
-                     (got '{o}')"
-                )))
-            }
-        };
-        let output = match output {
-            None | Some("final") => PropagationOutput::Final,
-            Some("jumping_knowledge") => PropagationOutput::JumpingKnowledge,
-            Some(o) => {
-                return Err(PyValueError::new_err(format!(
-                    "output must be 'final' or 'jumping_knowledge' (got '{o}')"
-                )))
-            }
-        };
-
-        let mut request = PropagateRequest::new(source, edge_source_ref)
-            .with_direction(direction)
-            .with_weighting(weighting)
-            .with_output(output);
-        if let Some(t) = embedding_table {
-            request = request.with_embedding_table(t);
-        }
-        if let Some(h) = hops {
-            request = request.with_hops(h);
-        }
-        if let Some(a) = alpha {
-            request = request.with_alpha(a);
-        }
-
+    /// decoupled-GNN forward pass) into a new, searchable embedding table, from a
+    /// serialized `PropagateEmbeddingsRequest` body. The thin Python `Database`
+    /// wrapper builds this request with the same pure-Python assembly the remote
+    /// client uses (`jammi_client._assembly`), serializes it, and hands the bytes
+    /// here, so the embedded and remote paths share one request assembly and one
+    /// decode seam (`jammi_ai::wire::propagate_request_from_bytes`). Returns the
+    /// materialised embedding table's name. A malformed or invalid body raises
+    /// `ValueError`.
+    fn _propagate_embeddings_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
+        let request =
+            jammi_ai::wire::propagate_request_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let record = self
             .runtime
             .block_on(self.session.propagate_embeddings(&request))
@@ -1287,109 +1158,26 @@ impl PyDatabase {
             .collect())
     }
 
-    /// Assemble and encode a target's context set: retrieve `source`'s `k`
-    /// nearest neighbours of `query`, pair them with `value_columns`, and pool
-    /// the neighbour vectors permutation-invariantly into one fixed-width
-    /// context vector — the encode-and-aggregate half of a Neural Process.
-    ///
-    /// `aggregator` selects the fixed pooling (`"mean"` / `"sum"` / `"max"`).
-    /// The leakage guards are on by default: `exclude_self=True` drops the
-    /// target's own row (pass its key as `exclude_key`), and `split` scopes the
-    /// context to a train split (a SQL predicate over the source's columns).
+    /// Assemble and encode a target's context set from a serialized
+    /// `AssembleContextRequest` body: retrieve `k` nearest neighbours of the
+    /// query (or a declared-edge walk / their union), pair them with the value
+    /// columns, and pool the neighbour vectors permutation-invariantly into one
+    /// fixed-width context vector — the encode-and-aggregate half of a Neural
+    /// Process. The thin Python `Database` wrapper builds this request with the
+    /// same pure-Python assembly the remote client uses (`jammi_client._assembly`),
+    /// serializes it, and hands the bytes here, so the embedded and remote paths
+    /// share one request assembly and one decode seam
+    /// (`jammi_ai::wire::assemble_context_request_from_bytes`).
     ///
     /// Returns a dict: `context_vector` (list of floats, or `None` for an empty
     /// context), `context_size` (count, carried separately from the vector),
-    /// `context_keys` (members in retrieval order), and `value_rows` (a
-    /// `pyarrow.Table` of the requested value columns in the same order).
-    #[pyo3(signature = (
-        source,
-        *,
-        query,
-        k,
-        value_columns = None,
-        aggregator = None,
-        exclude_self = true,
-        exclude_key = None,
-        split = None,
-        edge_source = None,
-        edge_src_column = None,
-        edge_dst_column = None,
-        edge_type_column = None,
-        edge_weight_column = None,
-        edge_hops = None,
-        edge_fanout = None,
-        edge_direction = None,
-        edge_types = None,
-        min_weight = None,
-        hybrid = false,
-    ))]
-    #[allow(clippy::too_many_arguments)]
-    fn assemble_context(
-        &self,
-        py: Python<'_>,
-        source: &str,
-        query: Vec<f32>,
-        k: usize,
-        value_columns: Option<Vec<String>>,
-        aggregator: Option<&str>,
-        exclude_self: bool,
-        exclude_key: Option<String>,
-        split: Option<String>,
-        edge_source: Option<String>,
-        edge_src_column: Option<String>,
-        edge_dst_column: Option<String>,
-        edge_type_column: Option<String>,
-        edge_weight_column: Option<String>,
-        edge_hops: Option<usize>,
-        edge_fanout: Option<usize>,
-        edge_direction: Option<String>,
-        edge_types: Option<Vec<String>>,
-        min_weight: Option<f64>,
-        hybrid: bool,
-    ) -> PyResult<Py<PyAny>> {
-        let aggregator = match aggregator {
-            None | Some("mean") => SetAggregator::Mean,
-            Some("sum") => SetAggregator::Sum,
-            Some("max") => SetAggregator::Max,
-            Some(other) => {
-                return Err(PyValueError::new_err(format!(
-                    "aggregator must be 'mean', 'sum', or 'max' (got '{other}')"
-                )))
-            }
-        };
-
-        let gather = edge_gather_from_kwargs(
-            edge_source,
-            edge_src_column,
-            edge_dst_column,
-            edge_type_column,
-            edge_weight_column,
-            edge_hops,
-            edge_fanout,
-            edge_direction,
-            edge_types,
-            min_weight,
-        )?;
-        // ANN by default; a declared edge source switches to an edge walk, or a
-        // union of both when `hybrid` is set.
-        let context_source = match gather {
-            None => ContextSource::Ann { k },
-            Some(edges) if hybrid => ContextSource::Hybrid {
-                ann_k: k,
-                edges,
-                merge: HybridMerge::Union,
-            },
-            Some(edges) => ContextSource::Edges(edges),
-        };
-
-        let mut request = ContextRequest::new(source, query, k);
-        request.source = context_source;
-        request.value_columns = value_columns.unwrap_or_default();
-        request.aggregator = aggregator;
-        request.exclude_self = exclude_self;
-        request.exclude_key = exclude_key;
-        request.split = split;
-
+    /// `context_keys` (members in retrieval order), `value_rows` (a
+    /// `pyarrow.Table` of the requested value columns in the same order), and
+    /// `source` (the assembly fact). A malformed or invalid body raises
+    /// `ValueError`.
+    fn _assemble_context_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        let request = jammi_ai::wire::assemble_context_request_from_bytes(proto_bytes)
+            .map_err(status_to_pyerr)?;
         let context = self
             .runtime
             .block_on(self.session.assemble_context(&request))

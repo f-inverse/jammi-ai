@@ -32,17 +32,17 @@ from ._assembly import (
     _EDGE_DIRECTION,
     _EVAL_TASK,
     _FILE_FORMAT,
-    _MODEL_TASK,
-    _PROPAGATION_OUTPUT,
-    _PROPAGATION_WEIGHTING,
-    _SET_AGGREGATOR,
     _SOURCE_KIND_NAME,
     _channel_columns_message,
     _local_source_url,
     _modality_value,
+    build_assemble_context_request,
     build_context_predictor_request,
     build_fine_tune_graph_request,
     build_fine_tune_request,
+    build_infer_request,
+    build_neighbor_graph_request,
+    build_propagate_embeddings_request,
 )
 from ._credentials import AnonymousCredentials, ChannelCredentials
 from ._errors import TrainingError
@@ -50,7 +50,7 @@ from ._generated.jammi.v1 import catalog_pb2, catalog_pb2_grpc
 from ._generated.jammi.v1 import embedding_pb2, embedding_pb2_grpc
 from ._generated.jammi.v1 import eval_pb2, eval_pb2_grpc
 from ._generated.jammi.v1 import inference_pb2, inference_pb2_grpc
-from ._generated.jammi.v1 import pipeline_pb2, pipeline_pb2_grpc
+from ._generated.jammi.v1 import pipeline_pb2_grpc
 from ._generated.jammi.v1 import training_pb2, training_pb2_grpc
 from ._generated.jammi.v1 import trigger_pb2, trigger_pb2_grpc
 
@@ -1341,16 +1341,14 @@ class RemoteDatabase:
         stream), so gRPC's default 4 MB per-message receive cap bounds the
         result size a default channel can carry.
         """
-        resp = self._inference.Infer(
-            inference_pb2.InferRequest(
-                source_id=source,
-                model_id=model,
-                task=_MODEL_TASK[task],
-                columns=list(columns),
-                key_column=key,
-            ),
-            metadata=self._metadata,
+        request = build_infer_request(
+            source=source,
+            model=model,
+            columns=columns,
+            task=task,
+            key=key,
         )
+        resp = self._inference.Infer(request, metadata=self._metadata)
         return _arrow_batch_to_table(resp.result)
 
     # --- Engine-state pipeline verbs (PipelineService) ----------------------------
@@ -1382,16 +1380,14 @@ class RemoteDatabase:
         ``mutual=True`` keeps only reciprocal edges. Maps to
         `PipelineService.BuildNeighborGraph`; read the table via :meth:`sql`.
         """
-        request = pipeline_pb2.BuildNeighborGraphRequest(
-            source_id=source,
+        request = build_neighbor_graph_request(
+            source,
             k=k,
+            min_similarity=min_similarity,
             mutual=mutual,
             exact=exact,
+            table=table,
         )
-        if min_similarity is not None:
-            request.min_similarity = min_similarity
-        if table is not None:
-            request.table = table
         resp = self._pipeline.BuildNeighborGraph(request, metadata=self._metadata)
         return resp.table_name
 
@@ -1421,56 +1417,20 @@ class RemoteDatabase:
         Returns the materialised table's name. Maps to
         `PipelineService.PropagateEmbeddings`; read the table via :meth:`sql`.
         """
-        if edge_graph_table is not None and edge_source is not None:
-            raise ValueError(
-                "pass exactly one of edge_graph_table (S9 graph) or edge_source "
-                "(registered edges), not both"
-            )
-        request = pipeline_pb2.PropagateEmbeddingsRequest(source_id=source)
-        if edge_graph_table is not None:
-            request.edge_graph_table = edge_graph_table
-        elif edge_source is not None:
-            request.edge_source.CopyFrom(
-                pipeline_pb2.PropagateEdgeSource(
-                    edge_source=edge_source,
-                    src_column=edge_src_column if edge_src_column is not None else "src",
-                    dst_column=edge_dst_column if edge_dst_column is not None else "dst",
-                )
-            )
-            if edge_weight_column is not None:
-                request.edge_source.weight_column = edge_weight_column
-        else:
-            raise ValueError(
-                "propagate_embeddings requires a graph: edge_graph_table or edge_source"
-            )
-        if embedding_table is not None:
-            request.embedding_table = embedding_table
-        if direction is not None:
-            try:
-                request.direction = _EDGE_DIRECTION[direction]
-            except KeyError:
-                raise ValueError(
-                    f"direction must be 'out', 'in', or 'undirected' (got {direction!r})"
-                ) from None
-        if hops is not None:
-            request.hops = hops
-        if weighting is not None:
-            try:
-                request.weighting = _PROPAGATION_WEIGHTING[weighting]
-            except KeyError:
-                raise ValueError(
-                    "weighting must be 'degree_normalized', 'uniform', or "
-                    f"'edge_similarity' (got {weighting!r})"
-                ) from None
-        if alpha is not None:
-            request.alpha = alpha
-        if output is not None:
-            try:
-                request.output = _PROPAGATION_OUTPUT[output]
-            except KeyError:
-                raise ValueError(
-                    f"output must be 'final' or 'jumping_knowledge' (got {output!r})"
-                ) from None
+        request = build_propagate_embeddings_request(
+            source,
+            embedding_table=embedding_table,
+            edge_graph_table=edge_graph_table,
+            edge_source=edge_source,
+            edge_src_column=edge_src_column,
+            edge_dst_column=edge_dst_column,
+            edge_weight_column=edge_weight_column,
+            direction=direction,
+            hops=hops,
+            weighting=weighting,
+            alpha=alpha,
+            output=output,
+        )
         resp = self._pipeline.PropagateEmbeddings(request, metadata=self._metadata)
         return resp.table_name
 
@@ -1508,53 +1468,27 @@ class RemoteDatabase:
         and ``source`` (the assembly fact). Maps to
         `PipelineService.AssembleContext`.
         """
-        request = pipeline_pb2.AssembleContextRequest(
-            source_id=source,
-            query=list(query),
+        request = build_assemble_context_request(
+            source,
+            query=query,
             k=k,
-            value_columns=list(value_columns or []),
+            value_columns=value_columns,
+            aggregator=aggregator,
             exclude_self=exclude_self,
+            exclude_key=exclude_key,
+            split=split,
+            edge_source=edge_source,
+            edge_src_column=edge_src_column,
+            edge_dst_column=edge_dst_column,
+            edge_type_column=edge_type_column,
+            edge_weight_column=edge_weight_column,
+            edge_hops=edge_hops,
+            edge_fanout=edge_fanout,
+            edge_direction=edge_direction,
+            edge_types=edge_types,
+            min_weight=min_weight,
             hybrid=hybrid,
         )
-        if aggregator is not None:
-            try:
-                request.aggregator = _SET_AGGREGATOR[aggregator]
-            except KeyError:
-                raise ValueError(
-                    f"aggregator must be 'mean', 'sum', or 'max' (got {aggregator!r})"
-                ) from None
-        if exclude_key is not None:
-            request.exclude_key = exclude_key
-        if split is not None:
-            request.split = split
-        if edge_source is not None:
-            gather = inference_pb2.EdgeGather(
-                edge_source=edge_source,
-                src_column=edge_src_column if edge_src_column is not None else "src",
-                dst_column=edge_dst_column if edge_dst_column is not None else "dst",
-            )
-            if edge_type_column is not None:
-                gather.type_column = edge_type_column
-            if edge_weight_column is not None:
-                gather.weight_column = edge_weight_column
-            if edge_hops is not None:
-                gather.hops = edge_hops
-            if edge_fanout is not None:
-                gather.fanout = edge_fanout
-            if edge_direction is not None:
-                try:
-                    gather.direction = _EDGE_DIRECTION[edge_direction]
-                except KeyError:
-                    raise ValueError(
-                        f"edge_direction must be 'out', 'in', or 'undirected' "
-                        f"(got {edge_direction!r})"
-                    ) from None
-            if edge_types is not None:
-                gather.edge_types.extend(edge_types)
-            if min_weight is not None:
-                gather.min_weight = min_weight
-            request.edges.CopyFrom(gather)
-
         resp = self._pipeline.AssembleContext(request, metadata=self._metadata)
         # The pooled vector is presence-wrapped so a degenerate empty context
         # (`None`) stays distinguishable from a present-but-empty vector — the

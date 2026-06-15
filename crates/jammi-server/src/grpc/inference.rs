@@ -24,7 +24,7 @@ use jammi_ai::pipeline::context_set::HybridMerge;
 use jammi_ai::session::InferenceSession;
 use jammi_ai::wire::{edge_gather_from_proto, predicted_distribution_to_proto};
 use jammi_ai::Session;
-use jammi_wire::{infer_result_to_proto, model_task_from_proto};
+use jammi_wire::infer_result_to_proto;
 use tonic::{Request, Response, Status};
 
 use crate::grpc::proto::inference::inference_service_server::InferenceService;
@@ -60,23 +60,19 @@ impl InferenceService for InferenceServer {
         request: Request<InferRequest>,
     ) -> Result<Response<InferResponse>, Status> {
         let tenant = session_tenant_traced(&request);
-        let req = request.into_inner();
-        require_nonempty(&req.source_id, "source_id")?;
-        require_nonempty(&req.model_id, "model_id")?;
-        require_nonempty(&req.key_column, "key_column")?;
-        if req.columns.is_empty() {
-            return Err(Status::invalid_argument("columns is required"));
-        }
-        let task = model_task_from_proto(req.task)?;
+        // Decode through the shared `jammi_ai::wire` seam — the same decode the
+        // embedded binding's `_infer_proto` drives — so both transports validate
+        // and submit an identical request.
+        let args = jammi_ai::wire::infer_from_proto(request.into_inner())?;
         let session = self.local();
 
         let batches = scoped(&self.session, tenant, || {
             session.infer(
-                &req.source_id,
-                &req.model_id,
-                task,
-                &req.columns,
-                &req.key_column,
+                &args.source_id,
+                &args.model,
+                args.task,
+                &args.columns,
+                &args.key_column,
             )
         })
         .await

@@ -27,4 +27,4 @@ pub use pipeline::{
     build_neighbor_graph_from_proto, context_source_tag, propagate_request_from_proto,
     BuildNeighborGraphArgs,
 };
-pub use training::{training_spec_from_proto, training_spec_to_proto};
+pub use training::{training_spec_from_bytes, training_spec_from_proto, training_spec_to_proto};

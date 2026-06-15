@@ -42,54 +42,13 @@ impl TrainingServer {
         Self { session }
     }
 
-    /// Dispatch a decoded engine [`TrainingSpec`] to the matching submit verb,
-    /// returning the durable [`TrainingJob`] handle. The spec variant is the
-    /// engine's source of truth for which verb produced the job, so the match
-    /// arms re-destructure it back into the verb's positional arguments — the
-    /// inverse of the engine's own spec construction.
+    /// Submit a decoded engine [`TrainingSpec`] on the request's session,
+    /// returning the durable [`TrainingJob`] handle. Delegates to the shared
+    /// [`InferenceSession::run_training_spec`] seam — the same dispatch the
+    /// embedded binding drives — so both transports submit an identical job from
+    /// an identical decode.
     async fn submit(&self, spec: TrainingSpec) -> Result<TrainingJob, jammi_db::error::JammiError> {
-        match spec {
-            TrainingSpec::FineTune {
-                source,
-                columns,
-                method,
-                task,
-                common,
-            } => {
-                self.session
-                    .fine_tune(
-                        &source,
-                        &common.base_model,
-                        &columns,
-                        method,
-                        task,
-                        Some(common.config),
-                    )
-                    .await
-            }
-            TrainingSpec::GraphFineTune {
-                sources,
-                sample_config,
-                common,
-            } => {
-                self.session
-                    .fine_tune_graph(
-                        &sources,
-                        &common.base_model,
-                        sample_config,
-                        Some(common.config),
-                    )
-                    .await
-            }
-            TrainingSpec::ContextPredictor {
-                source,
-                predictor_spec,
-            } => {
-                self.session
-                    .train_context_predictor(&source, &predictor_spec)
-                    .await
-            }
-        }
+        self.session.run_training_spec(spec).await
     }
 }
 

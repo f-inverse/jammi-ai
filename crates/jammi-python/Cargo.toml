@@ -21,10 +21,18 @@ jammi-db.workspace = true
 # remote arm is the bundled pure-Python `jammi-client` (composition, dispatched
 # in `jammi_ai/__init__.py`), NOT a second Rust gRPC client. The Rust wire
 # client lives in the separate `jammi-wire` / `jammi-admin` / `jammi-client`
-# crates for Rust consumers + `jammi-server`; none is compiled into this wheel,
-# so the built wheel links no tonic/prost.
+# crates for Rust consumers + `jammi-server`; none is compiled into this wheel.
+#
+# The embedded training verbs build their request with the same pure-Python
+# assembly the remote client uses, then hand the serialized body to the shared
+# `jammi_ai::wire` decode seam — so `prost` (the decode, owned by `jammi-ai`'s
+# `local` feature) and `tonic` (only its `Status` type, the decode/validation
+# error this crate maps to a Python exception) ride the wheel transitively. No
+# transport stack (no client stubs, no channel) is linked.
 jammi-ai = { workspace = true }
-jammi-lora.workspace = true
+# Names only `tonic::Status`: the engine wire-decode seam reports a malformed or
+# invalid request body as a `Status`, mapped to a Python exception in `error.rs`.
+tonic = { workspace = true }
 pyo3.workspace = true
 arrow.workspace = true
 arrow-array.workspace = true

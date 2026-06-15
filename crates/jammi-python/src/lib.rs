@@ -15,7 +15,9 @@ use crate::error::to_pyerr;
 use crate::job::PyTrainingJob;
 use crate::model_task::PyModelTask;
 
-/// The `Database` pyclass. Re-exported so native Rust consumers (such as
+/// The `_NativeDatabase` pyclass: the low-level embedded engine handle. The
+/// user-facing `Database` is the thin Python wrapper (`jammi_ai/_database.py`)
+/// that holds one of these. Re-exported so native Rust consumers (such as
 /// downstream crates that layer their own bindings on top of this one) can
 /// hold and drive the same instance the Python interpreter sees, and call
 /// [`PyDatabase::session_arc`] to share its underlying session.

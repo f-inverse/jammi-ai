@@ -47,6 +47,7 @@
 - [Scope a Federated Source by Tenant](./scope-source-by-tenant.md)
 - [Deploy as a Server](./deploy-server.md)
 - [Monitor Inference](./monitor-inference.md)
+- [Operability: Health, Metrics, and Failure Modes](./operability.md)
 
 # Reference
 

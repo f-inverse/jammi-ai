@@ -186,6 +186,7 @@ async fn shape_c_multi_tenant_server_isolates_two_tenants_across_primitives() {
                     jammi_server::tiers::ServiceTier::Event,
                 ])
                 .expect("event tier resolves"),
+                metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
             },
             async move {
                 let _ = shutdown_rx.await;

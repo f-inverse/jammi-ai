@@ -56,6 +56,7 @@ use crate::grpc::session::{SessionStore, TenantInterceptor};
 use crate::grpc::training::TrainingServer;
 use crate::grpc::trigger::TriggerServer;
 use crate::grpc_web_trailers::GrpcWebTrailersLayer;
+use crate::metrics_layer::MetricsLayer;
 use crate::routes::health::{self, MetricsRegistry};
 use crate::tiers::{ServiceTier, TierSet};
 
@@ -327,6 +328,7 @@ impl OssServer {
                 trigger,
                 engine: Some(Arc::clone(&self.session)),
                 tiers: self.tiers.clone(),
+                metrics: Arc::clone(&self.metrics),
             },
             shutdown,
         )
@@ -358,6 +360,10 @@ pub struct GrpcChain {
     pub engine: Option<Arc<InferenceSession>>,
     /// The tier set this chain mounts and advertises over `GetServerInfo`.
     pub tiers: TierSet,
+    /// Shared metrics registry. The whole-server [`MetricsLayer`] holds it and
+    /// drives the substrate counters / latency histogram from the request path;
+    /// the Axum `/metrics` route reads the same registry to scrape it.
+    pub metrics: Arc<MetricsRegistry>,
 }
 
 /// Build and run the gRPC chain on `chain.addr`, mounting services per the
@@ -400,6 +406,7 @@ pub async fn serve_grpc_chain(
         trigger,
         engine,
         tiers,
+        metrics,
     } = chain;
     let interceptor = TenantInterceptor::new(store.clone());
 
@@ -427,8 +434,13 @@ pub async fn serve_grpc_chain(
     // in-body `0x80` trailer frame the gRPC-Web wire format requires. Raw gRPC
     // over HTTP/2 (the Rust data-plane client) is unaffected — those responses are
     // not gRPC-Web and the layer skips them.
+    // `MetricsLayer` is added first, so it is the outermost layer in the tower
+    // stack: it observes every request (Flight + all gRPC services, including
+    // their gRPC-Web framing) by its method path before any routing, driving the
+    // substrate counters and the Search latency histogram from one site.
     let mut builder = Server::builder()
         .accept_http1(true)
+        .layer(MetricsLayer::new(metrics))
         .layer(GrpcWebTrailersLayer::new())
         .layer(GrpcWebLayer::new())
         .add_service(flight_svc)

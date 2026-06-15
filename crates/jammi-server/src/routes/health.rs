@@ -106,7 +106,7 @@ impl MetricsRegistry {
 
         let grpc_requests = IntCounter::new(
             "jammi_grpc_requests_total",
-            "Total number of gRPC requests served (CatalogService + TriggerService).",
+            "Total number of gRPC requests served across all jammi.v1 services.",
         )?;
         inner.register(Box::new(grpc_requests.clone()))?;
 

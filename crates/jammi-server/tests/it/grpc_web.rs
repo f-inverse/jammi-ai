@@ -61,6 +61,7 @@ async fn start_session_only_server() -> (
                 engine: None,
                 tiers: jammi_server::tiers::TierSet::resolve(std::iter::empty())
                     .expect("core-only tier set resolves"),
+                metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
             },
             async move {
                 let _ = shutdown_rx.await;

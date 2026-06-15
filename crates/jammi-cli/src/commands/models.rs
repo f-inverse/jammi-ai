@@ -5,7 +5,7 @@
 
 use clap::Subcommand;
 use jammi_admin::CatalogClient;
-use jammi_db::catalog::model_repo::ModelRecord;
+use jammi_db::catalog::model_repo::ModelDescriptor;
 
 #[derive(Subcommand)]
 pub enum ModelAction {
@@ -82,16 +82,20 @@ pub async fn run(
 }
 
 fn print_header() {
-    println!("{:<40} {:<12} {:<14} Status", "Model ID", "Backend", "Task");
-    println!("{}", "-".repeat(78));
+    println!(
+        "{:<40} {:<12} {:<14} {:<12} Promoted",
+        "Model ID", "Backend", "Task", "Status"
+    );
+    println!("{}", "-".repeat(87));
 }
 
-fn print_row(m: &ModelRecord) {
+fn print_row(m: &ModelDescriptor) {
     println!(
-        "{:<40} {:<12} {:<14} {}",
+        "{:<40} {:<12} {:<14} {:<12} {}",
         m.model_id,
         m.backend,
         format!("{:?}", m.task),
-        m.status
+        m.status,
+        if m.promoted { "yes" } else { "no" }
     );
 }

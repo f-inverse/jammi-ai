@@ -62,9 +62,49 @@ pub struct ModelRecord {
     /// ISO-8601 timestamp this row was promoted, or `None` if it is not the
     /// promoted row for its `(tenant, name)`. At most one row per scope carries
     /// a non-`None` value — the partial unique index `idx_models_promoted` (and
-    /// its global peer) enforces that. The wire/`Model` projection exposes only
-    /// the derived `promoted` boolean, never this raw timestamp.
+    /// its global peer) enforces that. This raw timestamp never leaves the
+    /// catalog: every client-facing surface reads the derived `promoted` boolean
+    /// off [`ModelDescriptor`], the curated projection of this record.
     pub promoted_at: Option<String>,
+}
+
+/// Registry introspection for one registered model — the client-facing
+/// projection of a [`ModelRecord`].
+///
+/// This is the model peer of [`SourceDescriptor`](super::source_repo::SourceDescriptor):
+/// it carries only the fields a client keys off (the model's id, inference
+/// backend, task, lifecycle status, and whether it is the promoted version), so
+/// every transport — the embedded session, the gRPC `Model` projection, and the
+/// remote client — reads the same shape. The record's server-internal
+/// bookkeeping (version counter, derived-from lineage, artifact path, config
+/// blob, registration timestamp, and the raw `promoted_at` timestamp) stays in
+/// [`ModelRecord`] and never reaches a client.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModelDescriptor {
+    /// The model's name (an HF repo id or a fine-tuned id).
+    pub model_id: String,
+    /// Inference backend (e.g. `"candle"`, `"vllm"`, `"http"`).
+    pub backend: String,
+    /// Task this model performs.
+    pub task: ModelTask,
+    /// Lifecycle status (e.g. `"registered"`, `"loaded"`, `"failed"`).
+    pub status: String,
+    /// Whether this is the promoted version for its name — the derived view of
+    /// the record's `promoted_at` flag (`true` when set), the only promotion
+    /// signal a client sees.
+    pub promoted: bool,
+}
+
+impl From<&ModelRecord> for ModelDescriptor {
+    fn from(record: &ModelRecord) -> Self {
+        Self {
+            model_id: record.model_id.clone(),
+            backend: record.backend.clone(),
+            task: record.task,
+            status: record.status.clone(),
+            promoted: record.promoted_at.is_some(),
+        }
+    }
 }
 
 /// Input parameters for [`Catalog::register_model`].

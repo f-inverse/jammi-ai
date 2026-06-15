@@ -14,7 +14,7 @@
 //! header the transport stamps, never in a request body.
 
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelSpec};
-use jammi_db::catalog::model_repo::ModelRecord;
+use jammi_db::catalog::model_repo::ModelDescriptor;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{SourceConnection, SourceType};
@@ -143,8 +143,11 @@ impl CatalogClient {
 
     // --- models ----------------------------------------------------------
 
-    /// Describe every model registered to the session's tenant.
-    pub async fn list_models(&self) -> Result<Vec<ModelRecord>> {
+    /// Describe every model registered to the session's tenant, as the
+    /// client-facing [`ModelDescriptor`] projection — the same shape the embedded
+    /// `Database.list_models` returns, so a caller reads identical fields
+    /// regardless of transport.
+    pub async fn list_models(&self) -> Result<Vec<ModelDescriptor>> {
         let resp = self
             .client()
             .list_models(ListModelsRequest {})
@@ -157,8 +160,9 @@ impl CatalogClient {
             .collect()
     }
 
-    /// Describe one registered model by id, or `None` when absent.
-    pub async fn describe_model(&self, model_id: &str) -> Result<Option<ModelRecord>> {
+    /// Describe one registered model by id, or `None` when absent. Returns the
+    /// client-facing [`ModelDescriptor`] projection.
+    pub async fn describe_model(&self, model_id: &str) -> Result<Option<ModelDescriptor>> {
         match self
             .client()
             .describe_model(DescribeModelRequest {

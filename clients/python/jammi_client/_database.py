@@ -102,15 +102,22 @@ def _model_to_dict(m: catalog_pb2.Model) -> Dict[str, Any]:
 
     The `Model` projection is intentionally minimal — `model_id`, `backend`,
     `task`, `status`, and the derived `promoted` flag — so the remote dict
-    carries exactly the client-observable fields the server emits, with `task`
-    spelled the same snake-case string the engine serialises (server-internal
-    bookkeeping the embed wheel serialises stays server-side, mirroring how the
-    `Model` message is the minimal client projection of the engine's record).
+    carries exactly the client-observable fields the embedded `Database.list_models`
+    returns (its `ModelDescriptor` projection), with `task` spelled the same
+    snake-case string the engine serialises. An unrecognised `task` enum is a
+    server/client proto-version skew, surfaced rather than silently coerced.
     """
+    try:
+        task = _MODEL_TASK_NAME[m.task]
+    except KeyError:
+        raise ValueError(
+            f"unknown ModelTask enum value {m.task!r} on the wire — "
+            "client and server proto versions disagree"
+        ) from None
     return {
         "model_id": m.model_id,
         "backend": m.backend,
-        "task": _MODEL_TASK_NAME.get(m.task, "text_embedding"),
+        "task": task,
         "status": m.status,
         "promoted": m.promoted,
     }
@@ -750,21 +757,19 @@ class RemoteDatabase:
         """Hard-delete a model row. Unlike :meth:`retire_model`, this removes the
         row, so it is refused with ``FAILED_PRECONDITION`` while any reference
         still points at the model — that status propagates to the caller. When
-        ``version`` is ``None`` the latest version is targeted. With
-        ``if_exists=True`` a missing model is a no-op rather than a NotFound.
+        ``version`` is ``None`` the latest version is targeted. ``if_exists``
+        rides the request: the engine treats a missing model as a no-op when it
+        is set and raises NotFound otherwise, so the server is authoritative and
+        there is no client-side NotFound handling to do (unlike
+        :meth:`drop_mutable_table`, whose request carries no ``if_exists`` flag).
         Maps to `CatalogService.DeleteModel`.
         """
-        try:
-            self._catalog.DeleteModel(
-                catalog_pb2.DeleteModelRequest(
-                    model_id=model_id, version=version, if_exists=if_exists
-                ),
-                metadata=self._metadata,
-            )
-        except grpc.RpcError as exc:
-            if if_exists and exc.code() == grpc.StatusCode.NOT_FOUND:
-                return
-            raise
+        self._catalog.DeleteModel(
+            catalog_pb2.DeleteModelRequest(
+                model_id=model_id, version=version, if_exists=if_exists
+            ),
+            metadata=self._metadata,
+        )
 
     def promote_model(self, model_id: str, *, version: Optional[int] = None) -> None:
         """Promote a model, marking it the promoted version for its name. Any

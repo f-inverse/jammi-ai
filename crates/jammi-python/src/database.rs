@@ -235,10 +235,12 @@ impl PyDatabase {
             .transpose()
     }
 
-    /// List a record for every *active* model registered to the current tenant.
-    /// Each is a dict carrying the model's id, backend, task, status, and version
-    /// bookkeeping. Retired models are hidden — the active-listing sense, the
-    /// peer of `list_sources`. Registry introspection, not a SQL query.
+    /// List a descriptor for every *active* model registered to the current
+    /// tenant. Each is a dict carrying the model's `model_id`, `backend`, `task`,
+    /// `status`, and `promoted` flag — the same client-facing projection the
+    /// remote transport returns, so a caller reads identical keys regardless of
+    /// transport. Retired models are hidden — the active-listing sense, the peer
+    /// of `list_sources`. Registry introspection, not a SQL query.
     fn list_models(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let records = self
             .runtime
@@ -248,9 +250,10 @@ impl PyDatabase {
     }
 
     /// Describe one registered model by id, or `None` when no *active* model with
-    /// that id is visible to the current tenant. A retired model reads as absent
-    /// here (the introspection sense), even though the catalog's
-    /// reference-resolution path still resolves it for provenance.
+    /// that id is visible to the current tenant. Returns the same dict shape
+    /// `list_models` yields per entry. A retired model reads as absent here (the
+    /// introspection sense), even though the catalog's reference-resolution path
+    /// still resolves it for provenance.
     fn describe_model(&self, py: Python<'_>, model_id: &str) -> PyResult<Option<Py<PyAny>>> {
         let record = self
             .runtime

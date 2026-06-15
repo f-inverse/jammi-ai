@@ -36,7 +36,7 @@ use arrow::array::RecordBatch;
 use futures::Stream;
 
 use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
-use jammi_db::catalog::model_repo::ModelRecord;
+use jammi_db::catalog::model_repo::ModelDescriptor;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::catalog::status::ModelStatus;
@@ -139,11 +139,16 @@ impl Session {
         self.engine.catalog().list_source_descriptors().await
     }
 
-    /// Describe every model registered to the session's tenant. Registry
-    /// introspection (the peer of [`Self::list_sources`] on the model catalog),
-    /// not a SQL query.
-    pub async fn list_models(&self) -> Result<Vec<ModelRecord>> {
-        self.engine.catalog().list_models().await
+    /// Describe every model registered to the session's tenant, as the
+    /// client-facing [`ModelDescriptor`] projection. Registry introspection (the
+    /// peer of [`Self::list_sources`] on the model catalog), not a SQL query. The
+    /// projection is the single client-facing shape: the catalog's full
+    /// [`ModelRecord`](jammi_db::catalog::model_repo::ModelRecord) (with its
+    /// server-internal bookkeeping and raw promotion timestamp) never crosses
+    /// this boundary.
+    pub async fn list_models(&self) -> Result<Vec<ModelDescriptor>> {
+        let records = self.engine.catalog().list_models().await?;
+        Ok(records.iter().map(ModelDescriptor::from).collect())
     }
 
     /// Describe one registered model by id, or `None` when no *active* model
@@ -151,9 +156,13 @@ impl Session {
     /// introspection sense (the per-model peer of [`Self::list_models`]), so a
     /// retired model reads as absent here — even though the catalog's
     /// reference-resolution path (`get_model`) still returns it for provenance.
-    pub async fn describe_model(&self, model_id: &str) -> Result<Option<ModelRecord>> {
+    /// Returns the client-facing [`ModelDescriptor`] projection, never the raw
+    /// record.
+    pub async fn describe_model(&self, model_id: &str) -> Result<Option<ModelDescriptor>> {
         let record = self.engine.catalog().get_model(model_id).await?;
-        Ok(record.filter(|r| r.status != ModelStatus::Retired.to_string()))
+        Ok(record
+            .filter(|r| r.status != ModelStatus::Retired.to_string())
+            .map(|r| ModelDescriptor::from(&r)))
     }
 
     /// Soft-retire a model: hide it from active listings and refuse to serve it,

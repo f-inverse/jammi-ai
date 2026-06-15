@@ -480,8 +480,10 @@ async fn remote_round_trips_the_topic_lifecycle_like_local() {
     let local = local(&server);
     let topic = events_topic();
 
-    // Register over the wire; the local session (same engine) must see it.
-    remote
+    // Register over the wire; the server mints the topic id and returns it
+    // (the id is engine-assigned identity, not caller input). The local session
+    // (same engine) must see it under that server-assigned id.
+    let topic_id = remote
         .catalog()
         .register_topic(&topic)
         .await
@@ -490,8 +492,8 @@ async fn remote_round_trips_the_topic_lifecycle_like_local() {
     assert!(
         listed_local
             .iter()
-            .any(|t| t.name == topic.name && t.id == topic.id),
-        "the topic the remote registered (with its client-minted id) is visible locally"
+            .any(|t| t.name == topic.name && t.id == topic_id),
+        "the topic the remote registered (under its server-minted id) is visible locally"
     );
 
     // The remote `list_topics` reconstructs the SAME full definitions the local
@@ -499,7 +501,7 @@ async fn remote_round_trips_the_topic_lifecycle_like_local() {
     let listed_remote = remote.catalog().list_topics().await.expect("remote list");
     let remote_ours = listed_remote
         .iter()
-        .find(|t| t.id == topic.id)
+        .find(|t| t.id == topic_id)
         .expect("remote list includes our topic");
     assert_eq!(remote_ours.name, topic.name);
     assert_eq!(remote_ours.tenant, topic.tenant);
@@ -520,15 +522,16 @@ async fn remote_round_trips_the_topic_lifecycle_like_local() {
         "first publish to a fresh topic is offset 0"
     );
 
-    // Drop over the wire by the topic id; the local session no longer sees it.
+    // Drop over the wire by the server-minted topic id; the local session no
+    // longer sees it.
     remote
         .catalog()
-        .drop_topic(topic.id)
+        .drop_topic(topic_id)
         .await
         .expect("remote drop");
     let after = local.list_topics().await.expect("local list after drop");
     assert!(
-        !after.iter().any(|t| t.id == topic.id),
+        !after.iter().any(|t| t.id == topic_id),
         "the dropped topic is gone on both transports"
     );
 

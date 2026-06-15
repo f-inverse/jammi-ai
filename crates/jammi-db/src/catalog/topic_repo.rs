@@ -191,6 +191,15 @@ impl TopicRepo {
         // 1. Look up the topic to find the backing-table name. Dropping the
         //    catalog row before the backing table would trip the FK
         //    constraint (`ON DELETE RESTRICT`).
+        //
+        //    The lookup carries the SAME STRICT predicate as the delete below:
+        //    a tenant session resolves only a topic it owns, never a shared
+        //    GLOBAL (`tenant_id IS NULL`) one it did not create, so it surfaces
+        //    `TopicNotFound` and never reaches the delete + `DROP TABLE`. Keeping
+        //    the lookup loose would let a non-owner pass step 1 (resolving the
+        //    backing-table name), have the strict delete match zero rows, and
+        //    still drop the shared backing table in step 3 — orphaning the
+        //    GLOBAL catalog row and destroying shared data.
         let id_str = topic_id.to_string();
         let tenant_str = tenant.map(|t| t.to_string());
         let backend = self.catalog.backend_arc();
@@ -208,7 +217,8 @@ impl TopicRepo {
                             "SELECT topic_id, name, schema_json, tenant_id, \
                                     broker_metadata, backing_table \
                              FROM topics \
-                             WHERE topic_id = $1 AND (tenant_id = $2 OR tenant_id IS NULL)",
+                             WHERE topic_id = $1 \
+                               AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
                             &[SqlValue::TextOwned(id_str), SqlValue::from(tenant_str)],
                             parse_topic_row,
                         )
@@ -221,6 +231,11 @@ impl TopicRepo {
         let raw = raw.ok_or_else(|| TriggerError::TopicNotFound(topic_id.to_string()))?;
 
         // 2. Delete the topic row first so the FK no longer pins the table.
+        //    STRICT delete predicate (mirrors `retire_model`): a tenant deletes
+        //    only its own row, never a GLOBAL one — only an unscoped session
+        //    (`$2 IS NULL`) manages GLOBAL rows. Step 1 already gated on the
+        //    same predicate, so this is the matching delete for the row we just
+        //    confirmed we own.
         let id_str_for_delete = topic_id.to_string();
         let tenant_for_delete = tenant.map(|t| t.to_string());
         backend
@@ -230,7 +245,7 @@ impl TopicRepo {
                 Box::pin(async move {
                     tx.execute(
                         "DELETE FROM topics WHERE topic_id = $1 \
-                         AND (tenant_id = $2 OR tenant_id IS NULL)",
+                         AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
                         &[SqlValue::TextOwned(id_str), SqlValue::from(tenant_str)],
                     )
                     .await?;

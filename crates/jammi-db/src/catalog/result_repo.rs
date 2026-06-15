@@ -314,7 +314,12 @@ impl Catalog {
     }
 
     /// Delete all result tables for a source. Returns the deleted records
-    /// so callers can clean up associated disk files. Scoped to tenant.
+    /// so callers can clean up associated disk files. Scoped strictly to the
+    /// session's tenant — a tenant deletes only its own result tables, never a
+    /// shared GLOBAL (`tenant_id IS NULL`) table it did not create; only an
+    /// unscoped session manages GLOBAL rows. The SELECT carries the same STRICT
+    /// predicate as the DELETE so the returned record set (the disk-cleanup
+    /// set) is exactly the deleted set, never a superset.
     pub async fn delete_result_tables_for_source(
         &self,
         source_id: &str,
@@ -330,14 +335,14 @@ impl Catalog {
                     let records = tx
                         .query(
                             "SELECT * FROM result_tables WHERE source_id = $1 \
-                               AND (tenant_id = $2 OR tenant_id IS NULL)",
+                               AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
                             &[SqlValue::TextOwned(sid.clone()), tenant_param.clone()],
                             parse_row,
                         )
                         .await?;
                     tx.execute(
                         "DELETE FROM result_tables WHERE source_id = $1 \
-                           AND (tenant_id = $2 OR tenant_id IS NULL)",
+                           AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
                         &[SqlValue::TextOwned(sid), tenant_param],
                     )
                     .await?;

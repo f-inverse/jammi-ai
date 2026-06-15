@@ -51,16 +51,25 @@ async fn build_harness_with_tenant(tenant: Option<TenantId>) -> Harness {
     let sqlite = SqliteBackend::open(&db_path).await.unwrap();
     let backend_impl = BackendImpl::Sqlite(sqlite);
     backend_impl.migrate().await.unwrap();
-    let catalog = Arc::new(Catalog::from_backend(backend_impl));
-    let backend = catalog.backend_arc();
 
-    let mutable_backend: Arc<dyn MutableBackend> =
-        Arc::new(SqliteMutableBackend::new(Arc::clone(&backend)));
+    // The catalog and the mutable-table registry must share ONE tenant binding
+    // — exactly as `JammiSession::build` wires them — so a catalog-row lookup
+    // (`get_mutable_table`) and a row scan resolve the same tenant. A divergent
+    // binding would let the registry believe it is tenant-scoped while the
+    // catalog reads unscoped, silently missing the tenant's backing tables.
     let tenant_binding = TenantBinding::unscoped();
     tenant_binding.set_shared(match tenant {
         Some(t) => TenantContext::Scoped(t),
         None => TenantContext::Unscoped,
     });
+    let catalog = Arc::new(Catalog::from_backend_with_tenant(
+        backend_impl,
+        Some(tenant_binding.clone()),
+    ));
+    let backend = catalog.backend_arc();
+
+    let mutable_backend: Arc<dyn MutableBackend> =
+        Arc::new(SqliteMutableBackend::new(Arc::clone(&backend)));
     let registry = Arc::new(MutableTableRegistry::new(
         Arc::clone(&catalog),
         mutable_backend,

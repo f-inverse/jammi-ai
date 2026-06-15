@@ -100,6 +100,8 @@ async fn register_topic(
     let broker_metadata: BTreeMap<String, String> = serde_json::from_str(broker_metadata)
         .map_err(|e| format!("broker_metadata must be a JSON object: {e}"))?;
     let topic = TopicDefinition {
+        // The id is engine-assigned: the server mints it and returns the
+        // authoritative value below. This placeholder is never sent.
         id: TopicId::new(),
         name: name.to_string(),
         schema: Arc::new(schema),
@@ -108,8 +110,8 @@ async fn register_topic(
         tenant: None,
         broker_metadata,
     };
-    session.register_topic(&topic).await?;
-    println!("Topic '{name}' registered (id={}).", topic.id);
+    let id = session.register_topic(&topic).await?;
+    println!("Topic '{name}' registered (id={id}).");
     Ok(())
 }
 

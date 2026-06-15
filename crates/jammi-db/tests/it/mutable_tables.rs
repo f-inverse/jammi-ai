@@ -313,8 +313,16 @@ async fn list_filters_by_tenant_scope(backend: BackendKind) {
     assert!(scoped.iter().any(|d| d.id.as_str() == scoped_id.as_str()));
     assert!(scoped.iter().all(|d| d.id.as_str() != global_id.as_str()));
 
+    // The global table is dropped from the unscoped session (its owner). The
+    // tenant-scoped table can only be dropped by a session bound to that tenant
+    // — the strict delete predicate refuses an unscoped (or foreign-tenant)
+    // session, mirroring `retire_model`. Bind tenant A for its cleanup.
     session.drop_mutable_table(&global_id).await.unwrap();
-    session.drop_mutable_table(&scoped_id).await.unwrap();
+    session
+        .with_tenant(tenant_a)
+        .drop_mutable_table(&scoped_id)
+        .await
+        .unwrap();
 }
 
 #[test_case(BackendKind::Sqlite ; "sqlite")]
@@ -651,6 +659,108 @@ async fn binary_column_roundtrip_through_provider(backend: BackendKind) {
     assert_eq!(blobs.value(1), payload_b.as_slice());
 
     session.drop_mutable_table(&id).await.unwrap();
+}
+
+/// Cross-tenant isolation regression: a tenant must not be able to READ or
+/// DELETE another tenant's mutable companion table by knowing its (low-entropy,
+/// user-chosen) id. Drives the catalog repo directly — the root-cause surface —
+/// so it pins the tenant predicate on `get_mutable_table` / `delete_mutable_table`
+/// rather than any caller-side guard.
+///
+/// Both sessions share one backend (the same SQLite catalog file under `dir`),
+/// so tenant B's repo queries can see — and, before the fix, destroy — tenant
+/// A's row. Pre-fix this test FAILS at step 2: the unscoped `WHERE id = $1`
+/// SELECT returns A's row to B, and the unscoped `DELETE FROM mutable_tables
+/// WHERE id = $1` removes it.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutable_table_isolation_blocks_cross_tenant_get_and_delete(backend: BackendKind) {
+    use jammi_db::TenantId;
+    use std::str::FromStr;
+
+    let dir = tempdir().unwrap();
+    let tenant_a = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
+    let tenant_b = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b").unwrap();
+
+    // Stable id so tenant B can name tenant A's table exactly — the attack
+    // vector is a guessed/known id, not entropy.
+    let id = unique_id("events");
+
+    // 1) Tenant A creates the table under its own tenant scope.
+    let session_a = skip_if_no_backend!(backend, dir.path()).with_tenant(tenant_a);
+    let def = MutableTableDefinitionBuilder::new(id.clone(), events_schema())
+        .primary_key(vec!["id".into()])
+        .tenant(Some(tenant_a))
+        .build()
+        .unwrap();
+    session_a.create_mutable_table(def).await.unwrap();
+
+    // Tenant A can resolve its own table.
+    let got_a = session_a
+        .catalog()
+        .get_mutable_table(&id)
+        .await
+        .unwrap()
+        .expect("tenant A must see its own table");
+    assert_eq!(got_a.tenant, Some(tenant_a));
+
+    // 2) Tenant B cannot READ tenant A's table.
+    let session_b = skip_if_no_backend!(backend, dir.path()).with_tenant(tenant_b);
+    assert!(
+        session_b
+            .catalog()
+            .get_mutable_table(&id)
+            .await
+            .unwrap()
+            .is_none(),
+        "tenant B must NOT be able to read tenant A's mutable table"
+    );
+
+    // 3) Tenant B's delete must NOT destroy tenant A's table. The DELETE is a
+    // success no-op (zero rows matched) — the destructive cross-tenant delete
+    // is closed.
+    session_b.catalog().delete_mutable_table(&id).await.unwrap();
+
+    // The registry-level drop path must also refuse: it resolves the backing
+    // table via the now-tenant-scoped `get`, so it cannot even find tenant A's
+    // table to DROP.
+    match session_b.mutable_tables().drop_table(&id).await {
+        Err(MutableTableError::NotFound(missing)) => assert_eq!(missing.as_str(), id.as_str()),
+        other => panic!("tenant B drop_table should be NotFound; got {other:?}"),
+    }
+
+    // Tenant A's table STILL EXISTS after tenant B's delete + drop attempts.
+    assert!(
+        session_a
+            .catalog()
+            .get_mutable_table(&id)
+            .await
+            .unwrap()
+            .is_some(),
+        "tenant A's table must survive tenant B's cross-tenant delete attempt"
+    );
+
+    // 4) Tenant A can still get and then delete its OWN table.
+    assert!(session_a
+        .catalog()
+        .get_mutable_table(&id)
+        .await
+        .unwrap()
+        .is_some());
+    session_a.catalog().delete_mutable_table(&id).await.unwrap();
+    assert!(
+        session_a
+            .catalog()
+            .get_mutable_table(&id)
+            .await
+            .unwrap()
+            .is_none(),
+        "tenant A's own delete must remove its table"
+    );
 }
 
 /// `Utf8` extracter — handles both `StringArray` and `StringViewArray`

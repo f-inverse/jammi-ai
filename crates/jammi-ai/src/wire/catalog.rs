@@ -143,10 +143,13 @@ pub fn register_topic_from_bytes(
 
 /// Decode a [`pb::RegisterTopicRequest`] into the engine [`TopicDefinition`]. The
 /// `name` is required; the schema rides as an Arrow IPC schema message decoded
-/// through the shared [`decode_ipc_schema`]. A caller-supplied `topic_id` is
-/// honoured so the topic's identity stays consistent across transports; an empty
-/// id mints a fresh UUIDv7 here — the engine is the single source of a minted id,
-/// returned to the caller after registration.
+/// through the shared [`decode_ipc_schema`]. The topic id is engine-assigned
+/// identity, not caller input: it is always minted server-side here and any
+/// `req.topic_id` on the wire is ignored. The `topics.topic_id` PK has no
+/// `ON CONFLICT`, so honouring a caller id would let one tenant replay a known
+/// UUID to PK-collide another tenant's registration; minting it here closes that
+/// for every transport that shares this seam. The minted id is returned to the
+/// caller after registration.
 pub fn register_topic_from_proto(
     req: pb::RegisterTopicRequest,
     tenant: Option<TenantId>,
@@ -155,18 +158,75 @@ pub fn register_topic_from_proto(
         return Err(Status::invalid_argument("name is required"));
     }
     let schema = decode_ipc_schema(&req.schema)?;
-    let id = if req.topic_id.is_empty() {
-        TopicId::new()
-    } else {
-        req.topic_id
-            .parse::<TopicId>()
-            .map_err(|e| Status::invalid_argument(format!("invalid topic_id: {e}")))?
-    };
     Ok(TopicDefinition {
-        id,
+        id: TopicId::new(),
         name: req.name,
         schema,
         tenant,
         broker_metadata: req.broker_metadata.into_iter().collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use arrow_schema::{DataType, Field, Schema};
+    use jammi_wire::encode_ipc_stream;
+    use prost::Message;
+
+    fn topic_schema_bytes() -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        encode_ipc_stream(&schema, &[]).unwrap()
+    }
+
+    /// The embedded transport feeds a serialized `RegisterTopicRequest` straight
+    /// into [`register_topic_from_bytes`] — the SAME seam the gRPC handler
+    /// drives. A caller-supplied `topic_id` must be IGNORED and a fresh
+    /// server-side id minted, so neither transport lets a caller pin (and replay)
+    /// a topic's identity to PK-collide another tenant's registration.
+    #[test]
+    fn register_topic_from_bytes_mints_id_and_ignores_caller_id() {
+        let attacker_id = TopicId::new();
+        let req = pb::RegisterTopicRequest {
+            name: "events".into(),
+            schema: topic_schema_bytes(),
+            broker_metadata: Default::default(),
+            topic_id: attacker_id.to_string(),
+        };
+
+        let topic =
+            register_topic_from_bytes(&req.encode_to_vec(), None).expect("decode register-topic");
+
+        assert_ne!(
+            topic.id, attacker_id,
+            "the seam must mint a fresh id, never honour the caller-supplied one"
+        );
+        assert_eq!(topic.name, "events");
+        assert_eq!(topic.tenant, None);
+    }
+
+    /// Two registrations replaying the SAME caller id each get a DISTINCT
+    /// server-minted id — the property that makes the global `topics.topic_id`
+    /// PK collision-proof across tenants.
+    #[test]
+    fn register_topic_replaying_one_caller_id_yields_distinct_minted_ids() {
+        let replayed = TopicId::new().to_string();
+        let make = || pb::RegisterTopicRequest {
+            name: "events".into(),
+            schema: topic_schema_bytes(),
+            broker_metadata: Default::default(),
+            topic_id: replayed.clone(),
+        };
+
+        let first = register_topic_from_bytes(&make().encode_to_vec(), None).unwrap();
+        let second = register_topic_from_bytes(&make().encode_to_vec(), None).unwrap();
+
+        assert_ne!(
+            first.id, second.id,
+            "two registrations replaying one caller id must get distinct minted ids"
+        );
+    }
 }

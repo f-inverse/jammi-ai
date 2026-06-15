@@ -13,6 +13,8 @@
 //! — never a lossy gRPC-code-category guess. Tenant scope rides on the session
 //! header the transport stamps, never in a request body.
 
+use std::str::FromStr;
+
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelSpec};
 use jammi_db::catalog::model_repo::ModelDescriptor;
 use jammi_db::catalog::source_repo::SourceDescriptor;
@@ -338,24 +340,31 @@ impl CatalogClient {
     // --- topics (control plane) ------------------------------------------
 
     /// Register a topic (creates its backing table) for the trigger stream.
+    /// Returns the server-minted [`TopicId`] — the topic's identity is
+    /// engine-assigned, not caller-chosen, so any `topic.id` the caller carried
+    /// is irrelevant on the wire and the authoritative id comes back in the
+    /// response. A later `drop_topic` keys on this returned id.
     pub async fn register_topic(
         &self,
         topic: &TopicDefinition,
-    ) -> std::result::Result<(), TriggerError> {
+    ) -> std::result::Result<TopicId, TriggerError> {
         let schema =
             encode_ipc_stream(&topic.schema, &[]).map_err(|s| trigger_error_from_status(&s))?;
-        self.client()
+        let resp = self
+            .client()
             .register_topic(RegisterTopicRequest {
                 name: topic.name.clone(),
                 schema,
                 broker_metadata: topic.broker_metadata.clone().into_iter().collect(),
-                // Carry the caller-minted id so the topic's identity matches the
-                // in-process path; a later `drop_topic(topic.id)` then resolves.
-                topic_id: topic.id.to_string(),
+                // The id is engine-assigned, not caller input: the server mints
+                // it and ignores this field. Sent empty to make that explicit.
+                topic_id: String::new(),
             })
             .await
-            .map_err(|s| trigger_error_from_status(&s))?;
-        Ok(())
+            .map_err(|s| trigger_error_from_status(&s))?
+            .into_inner();
+        TopicId::from_str(&resp.topic_id)
+            .map_err(|e| TriggerError::Catalog(format!("server returned an invalid topic_id: {e}")))
     }
 
     /// List every topic visible to the session's tenant.

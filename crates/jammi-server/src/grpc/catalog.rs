@@ -12,7 +12,7 @@
 //!   They need no engine, so they answer even on an engine-light deployment.
 //! * **Engine-backed** — sources / models / channels / mutable tables / topics
 //!   delegate 1:1 to the transport-agnostic [`Session`]
-//!   abstraction (`session_tenant(&request)` → [`scoped`] → [`map_engine_error`]
+//!   abstraction (`session_tenant_traced(&request)` → [`scoped`] → [`map_engine_error`]
 //!   / [`map_trigger_error`]), exactly mirroring the handlers they were lifted
 //!   from. These require an engine; an engine-light deployment returns a
 //!   truthful `Unavailable` rather than a faked empty result.
@@ -44,7 +44,7 @@ use crate::grpc::proto::catalog as pb;
 use crate::grpc::proto::catalog::catalog_service_server::CatalogService;
 use crate::grpc::session::{SessionId, SessionStore, SESSION_HEADER};
 use crate::grpc::wire::{
-    map_engine_error, map_trigger_error, require_nonempty, scoped, session_tenant,
+    map_engine_error, map_trigger_error, require_nonempty, scoped, session_tenant_traced,
 };
 use crate::tiers::TierSet;
 
@@ -146,11 +146,12 @@ impl CatalogService for CatalogServer {
 
     // --- sources / models --------------------------------------------------
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn add_source(
         &self,
         request: Request<pb::AddSourceRequest>,
     ) -> Result<Response<()>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         require_nonempty(&req.source_id, "source_id")?;
         let source_type = source_type_from_proto(req.source_kind)?;
@@ -168,11 +169,12 @@ impl CatalogService for CatalogServer {
         Ok(Response::new(()))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn remove_source(
         &self,
         request: Request<pb::RemoveSourceRequest>,
     ) -> Result<Response<()>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         require_nonempty(&req.source_id, "source_id")?;
         let session = self.local()?;
@@ -185,11 +187,12 @@ impl CatalogService for CatalogServer {
         Ok(Response::new(()))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn list_sources(
         &self,
         request: Request<pb::ListSourcesRequest>,
     ) -> Result<Response<pb::ListSourcesResponse>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let session = self.local()?;
 
         let descriptors = scoped(self.engine()?, tenant, || session.list_sources())
@@ -203,11 +206,12 @@ impl CatalogService for CatalogServer {
         Ok(Response::new(pb::ListSourcesResponse { sources }))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn describe_source(
         &self,
         request: Request<pb::DescribeSourceRequest>,
     ) -> Result<Response<pb::SourceDescriptor>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         require_nonempty(&req.source_id, "source_id")?;
         let session = self.local()?;
@@ -225,11 +229,12 @@ impl CatalogService for CatalogServer {
         Ok(Response::new(pb::SourceDescriptor::from(descriptor)))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn list_models(
         &self,
         request: Request<pb::ListModelsRequest>,
     ) -> Result<Response<pb::ListModelsResponse>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let session = self.local()?;
 
         let records = scoped(self.engine()?, tenant, || session.list_models())
@@ -240,11 +245,12 @@ impl CatalogService for CatalogServer {
         Ok(Response::new(pb::ListModelsResponse { models }))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn describe_model(
         &self,
         request: Request<pb::DescribeModelRequest>,
     ) -> Result<Response<pb::Model>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         require_nonempty(&req.model_id, "model_id")?;
         let session = self.local()?;
@@ -261,11 +267,12 @@ impl CatalogService for CatalogServer {
         Ok(Response::new(model_to_proto(&record)))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn retire_model(
         &self,
         request: Request<pb::RetireModelRequest>,
     ) -> Result<Response<()>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         require_nonempty(&req.model_id, "model_id")?;
         let session = self.local()?;
@@ -290,11 +297,12 @@ impl CatalogService for CatalogServer {
 
     // --- channels ----------------------------------------------------------
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn register_channel(
         &self,
         request: Request<pb::RegisterChannelRequest>,
     ) -> Result<Response<()>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         let id = parse_channel_id(&req.channel_id)?;
         let columns = columns_from_proto(req.columns)?;
@@ -312,11 +320,12 @@ impl CatalogService for CatalogServer {
         Ok(Response::new(()))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn add_channel_columns(
         &self,
         request: Request<pb::AddChannelColumnsRequest>,
     ) -> Result<Response<()>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         let id = parse_channel_id(&req.channel_id)?;
         let columns = columns_from_proto(req.columns)?;
@@ -331,11 +340,12 @@ impl CatalogService for CatalogServer {
         Ok(Response::new(()))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn list_channels(
         &self,
         request: Request<pb::ListChannelsRequest>,
     ) -> Result<Response<pb::ListChannelsResponse>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let session = self.local()?;
 
         let specs = scoped(self.engine()?, tenant, || session.list_channels())
@@ -348,11 +358,12 @@ impl CatalogService for CatalogServer {
 
     // --- mutable tables ----------------------------------------------------
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn create_mutable_table(
         &self,
         request: Request<pb::CreateMutableTableRequest>,
     ) -> Result<Response<pb::CreateMutableTableResponse>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         let def_proto = req
             .definition
@@ -369,11 +380,12 @@ impl CatalogService for CatalogServer {
         }))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn drop_mutable_table(
         &self,
         request: Request<pb::DropMutableTableRequest>,
     ) -> Result<Response<()>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         let id = parse_table_id(&req.mutable_table_id)?;
         let session = self.local()?;
@@ -385,11 +397,12 @@ impl CatalogService for CatalogServer {
         Ok(Response::new(()))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn list_mutable_tables(
         &self,
         request: Request<pb::ListMutableTablesRequest>,
     ) -> Result<Response<pb::ListMutableTablesResponse>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let session = self.local()?;
 
         let defs = scoped(self.engine()?, tenant, || session.list_mutable_tables())
@@ -408,11 +421,12 @@ impl CatalogService for CatalogServer {
 
     // --- topics ------------------------------------------------------------
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn register_topic(
         &self,
         request: Request<pb::RegisterTopicRequest>,
     ) -> Result<Response<pb::RegisterTopicResponse>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         if req.name.is_empty() {
             return Err(Status::invalid_argument("name is required"));
@@ -450,11 +464,12 @@ impl CatalogService for CatalogServer {
         }))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn drop_topic(
         &self,
         request: Request<pb::DropTopicRequest>,
     ) -> Result<Response<()>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         if req.topic_id.is_empty() {
             return Err(Status::invalid_argument("topic_id is required"));
@@ -472,11 +487,12 @@ impl CatalogService for CatalogServer {
         }
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn list_topics(
         &self,
         request: Request<pb::ListTopicsRequest>,
     ) -> Result<Response<pb::ListTopicsResponse>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let session = self.local()?;
 
         let topics = scoped(self.engine()?, tenant, || session.list_topics())

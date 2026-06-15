@@ -34,7 +34,7 @@ use crate::grpc::proto::pipeline::{
     AssembleContextRequest, AssembleContextResponse, BuildNeighborGraphRequest,
     PropagateEmbeddingsRequest,
 };
-use crate::grpc::wire::{map_engine_error, scoped, session_tenant};
+use crate::grpc::wire::{map_engine_error, scoped, session_tenant_traced};
 
 /// Server-side handler for the pipeline gRPC surface. Holds the shared engine
 /// session it drives directly inside the request's tenant scope.
@@ -50,11 +50,12 @@ impl PipelineServer {
 
 #[tonic::async_trait]
 impl PipelineService for PipelineServer {
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn build_neighbor_graph(
         &self,
         request: Request<BuildNeighborGraphRequest>,
     ) -> Result<Response<ResultTable>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let args = build_neighbor_graph_from_proto(request.into_inner())?;
 
         let record = scoped(&self.session, tenant, || async {
@@ -72,11 +73,12 @@ impl PipelineService for PipelineServer {
         Ok(Response::new(record.into()))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn propagate_embeddings(
         &self,
         request: Request<PropagateEmbeddingsRequest>,
     ) -> Result<Response<ResultTable>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = propagate_request_from_proto(request.into_inner())?;
 
         let record = scoped(&self.session, tenant, || async {
@@ -88,11 +90,12 @@ impl PipelineService for PipelineServer {
         Ok(Response::new(record.into()))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn assemble_context(
         &self,
         request: Request<AssembleContextRequest>,
     ) -> Result<Response<AssembleContextResponse>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = assemble_context_request_from_proto(request.into_inner())?;
 
         let context = scoped(&self.session, tenant, || async {

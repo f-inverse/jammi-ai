@@ -12,6 +12,7 @@ mod grpc_remote_compute;
 mod grpc_remote_list;
 mod grpc_remote_session;
 mod grpc_session;
+mod grpc_tracing_span;
 mod grpc_training;
 mod grpc_trigger;
 mod grpc_web;

@@ -48,7 +48,7 @@ use crate::grpc::proto::embedding::{
     search_request::Query as ProtoQuery, EncodeQueryRequest, EncodeQueryResponse,
     GenerateEmbeddingsRequest, ResultTable, SearchHit, SearchRequest, SearchResponse,
 };
-use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant};
+use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant_traced};
 
 /// Server-side handler for the embedding gRPC surface. Holds a shared engine
 /// session it wraps in a [`Session`] per call to reach the unified
@@ -73,11 +73,12 @@ impl EmbeddingServer {
 
 #[tonic::async_trait]
 impl EmbeddingService for EmbeddingServer {
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn generate_embeddings(
         &self,
         request: Request<GenerateEmbeddingsRequest>,
     ) -> Result<Response<ResultTable>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         require_nonempty(&req.source_id, "source_id")?;
         require_nonempty(&req.model_id, "model_id")?;
@@ -103,11 +104,12 @@ impl EmbeddingService for EmbeddingServer {
         Ok(Response::new(ResultTable::from(record)))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn encode_query(
         &self,
         request: Request<EncodeQueryRequest>,
     ) -> Result<Response<EncodeQueryResponse>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         require_nonempty(&req.model_id, "model_id")?;
         let modality = Modality::try_from(req.modality)?;
@@ -127,11 +129,12 @@ impl EmbeddingService for EmbeddingServer {
         Ok(Response::new(EncodeQueryResponse { embedding }))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn search(
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         require_nonempty(&req.source_id, "source_id")?;
         let query = match req.query.ok_or_else(|| {

@@ -29,7 +29,7 @@ use tonic::{Request, Response, Status};
 
 use crate::grpc::proto::inference::inference_service_server::InferenceService;
 use crate::grpc::proto::inference::{InferRequest, InferResponse, PredictRequest, PredictResponse};
-use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant};
+use crate::grpc::wire::{map_engine_error, require_nonempty, scoped, session_tenant_traced};
 
 /// Server-side handler for the inference gRPC surface. Holds a shared engine
 /// session it wraps in a [`Session`] per call to reach the unified
@@ -54,11 +54,12 @@ impl InferenceServer {
 
 #[tonic::async_trait]
 impl InferenceService for InferenceServer {
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn infer(
         &self,
         request: Request<InferRequest>,
     ) -> Result<Response<InferResponse>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         require_nonempty(&req.source_id, "source_id")?;
         require_nonempty(&req.model_id, "model_id")?;
@@ -86,11 +87,12 @@ impl InferenceService for InferenceServer {
         }))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn predict(
         &self,
         request: Request<PredictRequest>,
     ) -> Result<Response<PredictResponse>, Status> {
-        let tenant = session_tenant(&request);
+        let tenant = session_tenant_traced(&request);
         let req = request.into_inner();
         require_nonempty(&req.model_id, "model_id")?;
         require_nonempty(&req.source, "source")?;

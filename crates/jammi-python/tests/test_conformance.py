@@ -204,6 +204,22 @@ _MUTABLE_TOPIC_VERBS = {
 }
 
 
+# The model-lifecycle verbs. These DO hit the wire: the model catalog lives in
+# the engine, so list/describe/retire/delete/promote run against the remote
+# engine's state (`CatalogService`). The embedded `Database` mutates/reads the
+# compiled engine's catalog; the client's `RemoteDatabase` drives them over
+# gRPC. The catalog is tenant-scoped, so both honour the session's bound tenant.
+# The call surface must agree so a caller swaps transports without changing the
+# call — pinned here against the embed `jammi_ai.Database`.
+_LIFECYCLE_VERBS = {
+    "list_models",
+    "describe_model",
+    "retire_model",
+    "delete_model",
+    "promote_model",
+}
+
+
 def test_remote_surface_has_every_verb():
     """The client's `RemoteDatabase` exposes the full transport-agnostic verb
     set — the same vocabulary the embedded `Database` carries."""
@@ -216,8 +232,68 @@ def test_remote_surface_has_every_verb():
         | _EVAL_VERBS
         | _CHANNEL_VERBS
         | _MUTABLE_TOPIC_VERBS
+        | _LIFECYCLE_VERBS
     ):
         assert callable(getattr(jammi_client.RemoteDatabase, verb)), verb
+
+
+def test_lifecycle_verbs_have_identical_signatures_across_wheels():
+    """The model-lifecycle verbs carry the SAME call surface on the client's
+    `RemoteDatabase` as on the embedded engine's `jammi_ai.Database`. Both drive
+    over the same verb vocabulary (the client over gRPC, the embed in-process), so
+    a caller swaps transports without changing the call — pinned name-for-name,
+    kind-for-kind, and default-for-default so a divergence in either is caught."""
+    for verb in _LIFECYCLE_VERBS:
+        client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
+        embed = _call_surface(_embed_method(verb))
+        assert client == embed, f"{verb}: {embed} != {client}"
+
+
+# The client-facing model projection: exactly the keys a `list_models` /
+# `describe_model` entry carries on BOTH transports. The embed wheel projects its
+# catalog record through `ModelDescriptor` and the remote builds the same dict
+# from the wire `Model`, so the two agree key-for-key — and, critically, neither
+# exposes the server-internal `promoted_at` timestamp (only the derived
+# `promoted` boolean) nor the record's version/lineage/path bookkeeping.
+_MODEL_DICT_KEYS = {"model_id", "backend", "task", "status", "promoted"}
+
+
+def test_model_projection_is_minimal_and_leaks_no_internal_fields():
+    """The wire `Model` message — the single source of the client-facing model
+    shape — carries exactly the minimal projection and never the raw
+    `promoted_at` timestamp or other server-internal bookkeeping. Pinned against
+    the proto descriptor so adding an internal field to the projection (the
+    leak the `ModelDescriptor` split prevents) fails here.
+
+    Hermetic: reads the generated proto descriptor, never dialing a server."""
+    from jammi_client._generated.jammi.v1 import catalog_pb2
+
+    proto_fields = {f.name for f in catalog_pb2.Model.DESCRIPTOR.fields}
+    assert proto_fields == _MODEL_DICT_KEYS, (
+        f"wire Model fields {proto_fields} != the minimal client projection "
+        f"{_MODEL_DICT_KEYS} — a server-internal field leaked into the projection"
+    )
+    assert "promoted_at" not in proto_fields, (
+        "the raw promoted_at timestamp must never cross the wire; expose only the "
+        "derived 'promoted' boolean"
+    )
+
+
+def test_embed_list_models_returns_the_projection_shape(tmp_path):
+    """The embedded `Database.list_models` returns the `ModelDescriptor`
+    projection — a list of dicts whose keys are exactly the client-facing set,
+    with no `promoted_at` leak. An empty engine lists nothing, so this pins the
+    list-shape and (when populated) the key contract via the shared assertion.
+
+    Hermetic: opens a local engine (`file://`), contacts no server."""
+    db = jammi_ai.connect(f"file://{tmp_path}")
+    models = db.list_models()
+    assert isinstance(models, list)
+    for m in models:
+        assert set(m) == _MODEL_DICT_KEYS, (
+            f"embed list_models entry keys {set(m)} != {_MODEL_DICT_KEYS}"
+        )
+        assert "promoted_at" not in m, "embed must not leak the raw promoted_at"
 
 
 def test_mutable_topic_verbs_have_identical_signatures_across_wheels():

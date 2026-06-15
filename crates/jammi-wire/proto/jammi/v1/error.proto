@@ -75,6 +75,7 @@ message JammiErrorDetail {
     MutableTableErrorDetail mutable_table = 14;
     ModelRetiredError model_retired = 15;
     StringError channel_assembly = 16;
+    ModelReferencedError model_referenced = 17;
   }
 }
 
@@ -120,6 +121,18 @@ message ColumnConflict {
 // the generic model error.
 message ModelRetiredError {
   string model_id = 1;
+}
+
+// `JammiError::ModelReferenced { model_id, referenced_by }`. A `delete_model`
+// was refused because the model is still the target of one or more references.
+// Distinct from `ModelError` (a bad-argument model fault → `InvalidArgument`)
+// and `ModelRetiredError` (a serve/load precondition): this is a delete
+// precondition failure → `FailedPrecondition`. `referenced_by` lists the generic
+// catalog edge names still pointing at the model (e.g. `result_tables`,
+// `training_jobs.output_model_id`).
+message ModelReferencedError {
+  string model_id = 1;
+  repeated string referenced_by = 2;
 }
 
 // `JammiError::MutableTable(MutableTableError)`. The inner taxonomy is

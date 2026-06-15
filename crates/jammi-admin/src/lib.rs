@@ -14,7 +14,7 @@
 //! header the transport stamps, never in a request body.
 
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelSpec};
-use jammi_db::catalog::model_repo::ModelRecord;
+use jammi_db::catalog::model_repo::ModelDescriptor;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{SourceConnection, SourceType};
@@ -24,11 +24,11 @@ use jammi_db::{ChannelId, ServerInfo, TenantId};
 
 use jammi_wire::proto::catalog::catalog_service_client::CatalogServiceClient;
 use jammi_wire::proto::catalog::{
-    AddChannelColumnsRequest, AddSourceRequest, CreateMutableTableRequest, DescribeModelRequest,
-    DescribeSourceRequest, DropMutableTableRequest, DropTopicRequest, ListChannelsRequest,
-    ListModelsRequest, ListMutableTablesRequest, ListSourcesRequest, ListTopicsRequest,
-    RegisterChannelRequest, RegisterTopicRequest, RemoveSourceRequest, RetireModelRequest,
-    SetTenantRequest, Tenant,
+    AddChannelColumnsRequest, AddSourceRequest, CreateMutableTableRequest, DeleteModelRequest,
+    DescribeModelRequest, DescribeSourceRequest, DropMutableTableRequest, DropTopicRequest,
+    ListChannelsRequest, ListModelsRequest, ListMutableTablesRequest, ListSourcesRequest,
+    ListTopicsRequest, PromoteModelRequest, RegisterChannelRequest, RegisterTopicRequest,
+    RemoveSourceRequest, RetireModelRequest, SetTenantRequest, Tenant,
 };
 use jammi_wire::{
     channel_from_proto, columns_to_proto, definition_list_from_proto, definition_to_proto,
@@ -143,8 +143,11 @@ impl CatalogClient {
 
     // --- models ----------------------------------------------------------
 
-    /// Describe every model registered to the session's tenant.
-    pub async fn list_models(&self) -> Result<Vec<ModelRecord>> {
+    /// Describe every model registered to the session's tenant, as the
+    /// client-facing [`ModelDescriptor`] projection — the same shape the embedded
+    /// `Database.list_models` returns, so a caller reads identical fields
+    /// regardless of transport.
+    pub async fn list_models(&self) -> Result<Vec<ModelDescriptor>> {
         let resp = self
             .client()
             .list_models(ListModelsRequest {})
@@ -157,8 +160,9 @@ impl CatalogClient {
             .collect()
     }
 
-    /// Describe one registered model by id, or `None` when absent.
-    pub async fn describe_model(&self, model_id: &str) -> Result<Option<ModelRecord>> {
+    /// Describe one registered model by id, or `None` when absent. Returns the
+    /// client-facing [`ModelDescriptor`] projection.
+    pub async fn describe_model(&self, model_id: &str) -> Result<Option<ModelDescriptor>> {
         match self
             .client()
             .describe_model(DescribeModelRequest {
@@ -179,6 +183,42 @@ impl CatalogClient {
     pub async fn retire_model(&self, model_id: &str, version: Option<i32>) -> Result<()> {
         self.client()
             .retire_model(RetireModelRequest {
+                model_id: model_id.to_string(),
+                version,
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?;
+        Ok(())
+    }
+
+    /// Hard-delete a model. When `version` is `None` the latest version is
+    /// targeted. A model outside the caller's scope is rejected as NotFound; a
+    /// still-referenced model is rejected as `FailedPrecondition`
+    /// ([`JammiError::ModelReferenced`]).
+    /// When `if_exists` is set, deleting an absent model is a no-op.
+    pub async fn delete_model(
+        &self,
+        model_id: &str,
+        version: Option<i32>,
+        if_exists: bool,
+    ) -> Result<()> {
+        self.client()
+            .delete_model(DeleteModelRequest {
+                model_id: model_id.to_string(),
+                version,
+                if_exists,
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?;
+        Ok(())
+    }
+
+    /// Promote a model, marking it the promoted version for its name. When
+    /// `version` is `None` the latest version is promoted. A model outside the
+    /// caller's scope is rejected as NotFound.
+    pub async fn promote_model(&self, model_id: &str, version: Option<i32>) -> Result<()> {
+        self.client()
+            .promote_model(PromoteModelRequest {
                 model_id: model_id.to_string(),
                 version,
             })

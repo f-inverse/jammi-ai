@@ -104,6 +104,22 @@ service CatalogService {
   // Idempotent — retiring an already-retired model succeeds as a no-op.
   rpc RetireModel(RetireModelRequest) returns (google.protobuf.Empty);
 
+  // Hard-delete a model row. Peer of the abstraction's `delete_model`. Unlike
+  // `RetireModel` (a soft flip that keeps the row resolvable for provenance),
+  // this removes the row, so it is refused with `FailedPrecondition` while any
+  // reference still points at the model (a result table, a training job's base
+  // or output model, an eval run). When `version` is unset the latest version
+  // is targeted. A tenant may delete ONLY a model it owns. `if_exists` makes a
+  // missing model a no-op rather than a NotFound error.
+  rpc DeleteModel(DeleteModelRequest) returns (google.protobuf.Empty);
+
+  // Promote a model, marking it the promoted version for its name. Peer of the
+  // abstraction's `promote_model`. Any previously-promoted sibling is demoted in
+  // the same step, so at most one version per name is promoted at a time. When
+  // `version` is unset the latest version is promoted. A tenant may promote ONLY
+  // a model it owns; a model outside its scope returns NotFound.
+  rpc PromoteModel(PromoteModelRequest) returns (google.protobuf.Empty);
+
   // --- channels ----------------------------------------------------------
 
   // Register a provenance channel and its initial columns. Peer of the
@@ -287,6 +303,21 @@ message RetireModelRequest {
   optional int32 version = 2;
 }
 
+message DeleteModelRequest {
+  string model_id = 1;
+  // The version to delete. Unset targets the latest version.
+  optional int32 version = 2;
+  // When true, deleting a model that does not exist is a no-op rather than a
+  // NotFound error.
+  bool if_exists = 3;
+}
+
+message PromoteModelRequest {
+  string model_id = 1;
+  // The version to promote. Unset promotes the latest version.
+  optional int32 version = 2;
+}
+
 // The client-observable projection of the engine's `ModelRecord`. Carries the
 // fields a client needs to identify a registered model — its id, the inference
 // backend, the task it performs, and its lifecycle status. Server-internal
@@ -302,6 +333,10 @@ message Model {
   jammi.v1.inference.ModelTask task = 3;
   // Lifecycle status (e.g. "registered", "loaded", "failed").
   string status = 4;
+  // Whether this is the promoted version for its name. Derived server-side from
+  // the model's promotion flag; the raw promotion timestamp stays server-side,
+  // matching the minimal projection the rest of this message keeps.
+  bool promoted = 5;
 }
 
 // === channels =============================================================

@@ -180,6 +180,7 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "018_eval_runs_model_id_nullable",
             "019_normalize_model_status",
             "020_channel_tenant_scope",
+            "021_model_promotion",
         ]
     );
 }

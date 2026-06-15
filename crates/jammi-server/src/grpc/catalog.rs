@@ -294,6 +294,61 @@ impl CatalogService for CatalogServer {
         Ok(Response::new(()))
     }
 
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
+    async fn delete_model(
+        &self,
+        request: Request<pb::DeleteModelRequest>,
+    ) -> Result<Response<()>, Status> {
+        let tenant = session_tenant_traced(&request);
+        let req = request.into_inner();
+        require_nonempty(&req.model_id, "model_id")?;
+        let session = self.local()?;
+
+        // A model outside the caller's scope (absent without `if_exists`, or a
+        // GLOBAL model a tenant session cannot delete) surfaces as
+        // `JammiError::Model` — a NotFound at the wire, mirroring `retire_model`.
+        // A still-referenced model surfaces as `JammiError::ModelReferenced`,
+        // which `map_engine_error` renders as `FailedPrecondition`. Every other
+        // engine fault keeps its faithful `map_engine_error` mapping.
+        scoped(self.engine()?, tenant, || {
+            session.delete_model(&req.model_id, req.version, req.if_exists)
+        })
+        .await
+        .map_err(|e| match e {
+            JammiError::Model { model_id, .. } => {
+                Status::not_found(format!("model '{model_id}' not found"))
+            }
+            other => map_engine_error(other),
+        })?;
+        Ok(Response::new(()))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
+    async fn promote_model(
+        &self,
+        request: Request<pb::PromoteModelRequest>,
+    ) -> Result<Response<()>, Status> {
+        let tenant = session_tenant_traced(&request);
+        let req = request.into_inner();
+        require_nonempty(&req.model_id, "model_id")?;
+        let session = self.local()?;
+
+        // A model outside the caller's scope surfaces as `JammiError::Model` — a
+        // NotFound at the wire, mirroring `retire_model`. Every other engine
+        // fault keeps its faithful `map_engine_error` mapping.
+        scoped(self.engine()?, tenant, || {
+            session.promote_model(&req.model_id, req.version)
+        })
+        .await
+        .map_err(|e| match e {
+            JammiError::Model { model_id, .. } => {
+                Status::not_found(format!("model '{model_id}' not found"))
+            }
+            other => map_engine_error(other),
+        })?;
+        Ok(Response::new(()))
+    }
+
     // --- channels ----------------------------------------------------------
 
     #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]

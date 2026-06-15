@@ -70,6 +70,13 @@ impl From<&JammiError> for pb::JammiErrorDetail {
             JammiError::ModelRetired { model_id } => Variant::ModelRetired(pb::ModelRetiredError {
                 model_id: model_id.clone(),
             }),
+            JammiError::ModelReferenced {
+                model_id,
+                referenced_by,
+            } => Variant::ModelReferenced(pb::ModelReferencedError {
+                model_id: model_id.clone(),
+                referenced_by: referenced_by.clone(),
+            }),
             JammiError::Inference(message) => Variant::Inference(pb::StringError {
                 message: message.clone(),
             }),
@@ -145,6 +152,10 @@ impl From<pb::JammiErrorDetail> for JammiError {
             },
             Some(Variant::ModelRetired(e)) => JammiError::ModelRetired {
                 model_id: e.model_id,
+            },
+            Some(Variant::ModelReferenced(e)) => JammiError::ModelReferenced {
+                model_id: e.model_id,
+                referenced_by: e.referenced_by,
             },
             Some(Variant::Inference(e)) => JammiError::Inference(e.message),
             Some(Variant::Catalog(e)) => JammiError::Catalog(e.message),
@@ -715,6 +726,13 @@ mod tests {
             JammiError::Model {
                 model_id: "local:/models/tiny_bert".into(),
                 message: "Model directory does not exist".into(),
+            },
+            JammiError::ModelRetired {
+                model_id: "local:/models/tiny_bert".into(),
+            },
+            JammiError::ModelReferenced {
+                model_id: "local:/models/tiny_bert".into(),
+                referenced_by: vec!["result_tables".into(), "training_jobs.base_model_id".into()],
             },
             JammiError::Inference("encode_query forward: shape mismatch".into()),
             JammiError::FineTune("checkpoint epoch 3 diverged".into()),

@@ -4,7 +4,7 @@
 //! Sources / models: maps the wire `SourceKind` / `FileFormat` /
 //! `SourceConnection` / `SourceDescriptor` / `Model` onto the engine's
 //! [`SourceType`], [`FileFormat`], [`SourceConnection`], [`SourceDescriptor`],
-//! and [`ModelRecord`]. Only the URL + format cross the wire on a connection —
+//! and [`ModelDescriptor`]. Only the URL + format cross the wire on a connection —
 //! cloud credentials are server-side, so the connection decode fills the rest
 //! from `Default`.
 //!
@@ -24,7 +24,7 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
-use jammi_db::catalog::model_repo::ModelRecord;
+use jammi_db::catalog::model_repo::ModelDescriptor;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::trigger::ids::TopicId;
@@ -174,48 +174,39 @@ pub fn source_descriptor_from_proto(
     })
 }
 
-/// Encode the engine's [`ModelRecord`] into the wire `Model` — the client-
-/// observable projection a `ListModels` / `DescribeModel` response carries. Only
-/// the registry-identity fields cross the wire (`model_id` / `backend` / `task`
-/// / `status`); the version counter, derived-from lineage, artifact path, config
-/// blob, and registration timestamp are server-internal bookkeeping a list
-/// consumer does not key off, mirroring how [`ResultTableRecord`] projects onto
-/// [`embedding_pb::ResultTable`]. The `task` rides the shared
-/// [`super::model_task_to_proto`] vocabulary.
+/// Encode the engine's [`ModelDescriptor`] onto the wire `Model` — the client-
+/// observable projection a `ListModels` / `DescribeModel` response carries. The
+/// descriptor is already the curated client projection (`model_id` / `backend` /
+/// `task` / `status` / `promoted`), so this is a field-for-field encode with no
+/// server-internal bookkeeping to drop — that was dropped where the projection
+/// was built, mirroring how [`SourceDescriptor`] projects a `SourceRecord`. The
+/// `task` rides the shared [`super::model_task_to_proto`] vocabulary.
 ///
-/// [`ResultTableRecord`]: jammi_db::catalog::result_repo::ResultTableRecord
-pub fn model_to_proto(record: &ModelRecord) -> pb::Model {
+/// [`SourceDescriptor`]: jammi_db::catalog::source_repo::SourceDescriptor
+pub fn model_to_proto(descriptor: &ModelDescriptor) -> pb::Model {
     pb::Model {
-        model_id: record.model_id.clone(),
-        backend: record.backend.clone(),
-        task: super::model_task_to_proto(record.task) as i32,
-        status: record.status.clone(),
+        model_id: descriptor.model_id.clone(),
+        backend: descriptor.backend.clone(),
+        task: super::model_task_to_proto(descriptor.task) as i32,
+        status: descriptor.status.clone(),
+        promoted: descriptor.promoted,
     }
 }
 
-/// Reconstruct the engine's [`ModelRecord`] from the wire `Model` — the inverse
-/// of [`model_to_proto`], for the the remote client receive side. The
-/// fields not carried on the wire are server-internal bookkeeping, so they
-/// reconstruct at their "not carried" values (`version = 1` default, `None`,
-/// `String::new` — including `catalog_pk`, a server-side row key a list
-/// consumer never resolves against), exactly as [`result_table_from_proto`]
-/// does for a result table. The message is self-describing in `task`, so an out-of-range /
-/// unspecified task surfaces as the faithful `invalid_argument` the shared
-/// decoder builds.
-pub fn model_from_proto(model: pb::Model) -> Result<ModelRecord, Status> {
+/// Reconstruct the engine's [`ModelDescriptor`] from the wire `Model` — the
+/// inverse of [`model_to_proto`], for the remote client receive side. The wire
+/// `Model` carries exactly the descriptor's fields, so the round-trip is
+/// lossless: there is no server-internal bookkeeping to synthesize. The message
+/// is self-describing in `task`, so an out-of-range / unspecified task surfaces
+/// as the faithful `invalid_argument` the shared decoder builds.
+pub fn model_from_proto(model: pb::Model) -> Result<ModelDescriptor, Status> {
     let task = super::model_task_from_proto(model.task)?;
-    Ok(ModelRecord {
+    Ok(ModelDescriptor {
         model_id: model.model_id,
-        catalog_pk: String::new(),
-        version: 1,
-        model_type: String::new(),
-        base_model_id: None,
         backend: model.backend,
         task,
-        artifact_path: None,
-        config_json: None,
         status: model.status,
-        created_at: String::new(),
+        promoted: model.promoted,
     })
 }
 

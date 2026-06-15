@@ -39,6 +39,19 @@ pub enum JammiError {
         model_id: String,
     },
 
+    /// A `delete_model` was refused because the model is still the target of one
+    /// or more references. Deleting it would orphan those edges, so this is a
+    /// precondition failure, not a bad argument — it maps to gRPC
+    /// `FailedPrecondition`. `referenced_by` names the blocking edges as generic
+    /// catalog edge names (e.g. `result_tables`, `training_jobs.output_model_id`).
+    #[error("Model referenced: {model_id}: still referenced by {}", referenced_by.join(", "))]
+    ModelReferenced {
+        /// Identifier of the referenced model.
+        model_id: String,
+        /// Generic names of the catalog edges still pointing at the model.
+        referenced_by: Vec<String>,
+    },
+
     /// Inference execution failure.
     #[error("Inference error: {0}")]
     Inference(String),

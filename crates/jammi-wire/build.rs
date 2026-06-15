@@ -5,6 +5,7 @@
 //! generated `jammi.v1` tonic stubs (client + server) without naming a feature.
 
 fn main() {
+    use std::env;
     use std::path::PathBuf;
 
     // Source builds (`cargo install jammi-cli`) have no guarantee of a system
@@ -46,6 +47,15 @@ fn main() {
     config.enable_type_names();
     config.type_name_domain(["."], "type.googleapis.com");
 
+    // Export the compiled `FileDescriptorSet` so consumers can decode the
+    // service surface from the binary itself. The tenant-isolation oracle
+    // derives the live `jammi.v1` rpc list from this descriptor rather than a
+    // hand-maintained constant, so a new rpc is structurally forced into
+    // coverage. `OUT_DIR` is always set for build scripts.
+    let descriptor_path =
+        PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set for build scripts"))
+            .join("jammi_descriptor.bin");
+
     tonic_prost_build::configure()
         // Both client and server stubs are built: the server stubs back
         // `jammi-server`'s service impls; the client stubs back `jammi-admin` /
@@ -53,6 +63,7 @@ fn main() {
         // in-process server.
         .build_client(true)
         .build_server(true)
+        .file_descriptor_set_path(&descriptor_path)
         .compile_with_config(
             config,
             &proto_files

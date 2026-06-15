@@ -20,4 +20,5 @@ mod health;
 mod serve_e2e;
 mod server;
 mod service_tiers;
+mod tenant_isolation_oracle;
 mod uat_shapes;

@@ -2,14 +2,27 @@ name: Distributed validation
 
 # The multi-process distributed-validation lane: N `jammi-server` worker
 # processes claiming from a shared Postgres catalog + a shared object store
-# (MinIO), proving the durable-worker fleet-safety properties (exactly-one
-# claim, kill-9 reclaim, the artifact crash-window on real object storage,
-# cross-tenant isolation) under real distribution.
+# (MinIO), proving the durable-worker fleet-safety properties under real
+# distribution.
 #
-# This is the heaviest lane (process spawn + a real object store), so it is NOT
-# on the default hermetic PR path and is advisory, not merge-blocking. Process
-# spawn lanes earn promotion to required only after a flake-free streak; until
-# then `continue-on-error: true` surfaces a red result without blocking a merge.
+# It is split into two jobs by failure character:
+#
+#   * `deterministic` — the claim-correctness tests (exactly-one claim,
+#     cross-tenant isolation). Their outcome is decided by Postgres locking,
+#     not by a timing window, so a red here is a real regression signal: this
+#     job runs WITHOUT `continue-on-error`, and the nightly watcher treats its
+#     failure as actionable.
+#
+#   * `chaos` — the SIGKILL crash-window tests (kill-9 reclaim, the
+#     publish/finalize crash, the cross-host artifact round-trip). These race a
+#     kill against an in-flight publish and stay timing-sensitive until a
+#     measured flake-free streak earns them promotion, so this job keeps
+#     `continue-on-error: true` to surface a red without blocking.
+#
+# Both are the heaviest lanes (process spawn + a real object store), so neither
+# is on the default hermetic PR path. There is no `pull_request` trigger: this
+# lane never gates a merge (it would be branch protection by another name).
+# Each job re-provisions its own Postgres + MinIO so they are independent.
 on:
   workflow_dispatch:
   schedule:
@@ -26,14 +39,19 @@ env:
   RUST_BACKTRACE: 1
   RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=mold"
   SCCACHE_GHA_ENABLED: "true"
+  # Pinned MinIO + mc versions. A versioned `archive/` release URL is immutable,
+  # so the lane is reproducible and a `dl.min.io` "latest" reshuffle can never
+  # silently change the binary under us; the `actions/cache` step below means a
+  # `dl.min.io` outage on a re-run can't red the lane either.
+  MINIO_RELEASE: "RELEASE.2025-09-07T16-13-09Z"
+  MC_RELEASE: "RELEASE.2025-08-13T08-35-41Z"
 
 jobs:
-  distributed:
-    name: Distributed validation (Postgres + MinIO)
+  deterministic:
+    name: Deterministic claim correctness (Postgres + MinIO)
     runs-on: ubuntu-latest
-    # Advisory: a red result is visible but does not block a merge or fail the
-    # required check set. Promote to required after a flake-free streak.
-    continue-on-error: true
+    # No `continue-on-error`: these tests are decided by Postgres locking, not a
+    # timing window, so a red is a real regression the nightly watcher acts on.
     container:
       image: ghcr.io/f-inverse/jammi-ai-ci:latest
     services:
@@ -66,16 +84,33 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Install and start MinIO + create the bucket
+      - name: Cache the pinned MinIO + mc binaries
+        id: minio-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/minio-bin
+          key: minio-${{ env.MINIO_RELEASE }}-mc-${{ env.MC_RELEASE }}
+
+      - name: Download the pinned MinIO + mc binaries (cache miss)
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        # Pull the exact pinned versions from the immutable `archive/` path. On a
+        # cache hit this step is skipped entirely, so a `dl.min.io` outage on a
+        # re-run cannot red the lane.
+        run: |
+          mkdir -p /opt/minio-bin
+          curl -fsSL "https://dl.min.io/server/minio/release/linux-amd64/archive/minio.${MINIO_RELEASE}" -o /opt/minio-bin/minio
+          curl -fsSL "https://dl.min.io/client/mc/release/linux-amd64/archive/mc.${MC_RELEASE}" -o /opt/minio-bin/mc
+          chmod +x /opt/minio-bin/minio /opt/minio-bin/mc
+
+      - name: Start MinIO + create the bucket
         # GHA `services:` cannot pass `server /data` to the MinIO image's
         # entrypoint, so — mirroring how `test-broker` runs the NATS tarball
-        # directly — we run the MinIO release binary in the background, wait for
+        # directly — we run the cached MinIO binary in the background, wait for
         # its readiness probe, then `mc mb` the bucket the lane roots artifacts
-        # under. Both binaries come from the official MinIO download host.
+        # under.
         run: |
-          curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio -o /usr/local/bin/minio
-          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc
-          chmod +x /usr/local/bin/minio /usr/local/bin/mc
+          install -m 0755 /opt/minio-bin/minio /usr/local/bin/minio
+          install -m 0755 /opt/minio-bin/mc /usr/local/bin/mc
           mkdir -p /tmp/minio-data
           MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
             minio server /tmp/minio-data --address 127.0.0.1:9000 >/tmp/minio.log 2>&1 &
@@ -125,12 +160,144 @@ jobs:
       - name: Compile-check the distributed harness
         run: cargo test -p jammi-ai --features live-distributed-tests --test distributed --no-run
 
-      - name: Run the distributed-validation lane
+      - name: Run the deterministic claim-correctness tests
         # Serialise: every test spawns its own worker fleet and races on the
         # shared catalog + bucket; one test at a time keeps the (already
         # generous) terminal-state timeouts honest and the per-run unique
         # prefixes the sole isolation needed.
-        run: cargo test -p jammi-ai --features live-distributed-tests --test distributed -- --test-threads=1
+        run: |
+          cargo test -p jammi-ai --features live-distributed-tests --test distributed -- --test-threads=1 one_job_n_workers_exactly_one_wins
+          cargo test -p jammi-ai --features live-distributed-tests --test distributed -- --test-threads=1 mixed_tenant_queue_completes_each_under_its_own_scope
+
+      - name: MinIO log (on failure)
+        if: failure()
+        run: cat /tmp/minio.log || true
+
+  chaos:
+    name: SIGKILL crash-window chaos (Postgres + MinIO)
+    runs-on: ubuntu-latest
+    # Advisory: the crash-window tests race a SIGKILL against an in-flight
+    # publish and stay timing-sensitive until a measured flake-free streak. A red
+    # result is visible but does not block. Promote (drop this line) after a
+    # flake-free streak.
+    continue-on-error: true
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: jammi
+          POSTGRES_PASSWORD: jammi
+          POSTGRES_DB: jammi_test
+        options: >-
+          --health-cmd "pg_isready -U jammi -d jammi_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+        ports:
+          - 5432:5432
+    env:
+      # Service container is reachable at `postgres` from the job container
+      # (same Docker network); the catalog connects via sqlx::PgPool.
+      JAMMI_TEST_PG_URL: postgres://jammi:jammi@postgres:5432/jammi_test
+      # MinIO runs in-job (see the setup step) and binds 127.0.0.1:9000 inside
+      # the job container, so the harness and the spawned workers all reach it
+      # on localhost. `allow_http` is on for the plain-HTTP endpoint.
+      JAMMI_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      JAMMI_TEST_S3_BUCKET: jammi-dist
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache the pinned MinIO + mc binaries
+        id: minio-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/minio-bin
+          key: minio-${{ env.MINIO_RELEASE }}-mc-${{ env.MC_RELEASE }}
+
+      - name: Download the pinned MinIO + mc binaries (cache miss)
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        # Pull the exact pinned versions from the immutable `archive/` path. On a
+        # cache hit this step is skipped entirely, so a `dl.min.io` outage on a
+        # re-run cannot red the lane.
+        run: |
+          mkdir -p /opt/minio-bin
+          curl -fsSL "https://dl.min.io/server/minio/release/linux-amd64/archive/minio.${MINIO_RELEASE}" -o /opt/minio-bin/minio
+          curl -fsSL "https://dl.min.io/client/mc/release/linux-amd64/archive/mc.${MC_RELEASE}" -o /opt/minio-bin/mc
+          chmod +x /opt/minio-bin/minio /opt/minio-bin/mc
+
+      - name: Start MinIO + create the bucket
+        # GHA `services:` cannot pass `server /data` to the MinIO image's
+        # entrypoint, so — mirroring how `test-broker` runs the NATS tarball
+        # directly — we run the cached MinIO binary in the background, wait for
+        # its readiness probe, then `mc mb` the bucket the lane roots artifacts
+        # under.
+        run: |
+          install -m 0755 /opt/minio-bin/minio /usr/local/bin/minio
+          install -m 0755 /opt/minio-bin/mc /usr/local/bin/mc
+          mkdir -p /tmp/minio-data
+          MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
+            minio server /tmp/minio-data --address 127.0.0.1:9000 >/tmp/minio.log 2>&1 &
+          # Readiness wait on the MinIO health endpoint (mirrors the NATS lane's
+          # health-poll loop).
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
+              echo "minio ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:9000/minio/health/live
+          mc alias set local http://127.0.0.1:9000 "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"
+          mc mb --ignore-existing "local/${JAMMI_TEST_S3_BUCKET}"
+
+      - name: Require the distributed backends (no hollow green)
+        # The harness early-returns to a silent pass when any of these is unset
+        # (`Backends::from_env_or_skip` → None, harness.rs). On this lane the
+        # backends are always provisioned (Postgres service + in-job MinIO), so a
+        # missing var means the lane is misconfigured, not legitimately skipped —
+        # fail loudly instead of reporting a green run that exercised nothing.
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for var in JAMMI_TEST_PG_URL JAMMI_TEST_S3_ENDPOINT JAMMI_TEST_S3_BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::${var} is empty — the distributed lane would skip silently (hollow green)"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+      - name: Build the `jammi-server` binary
+        # The harness spawns `jammi-server` worker processes and resolves the
+        # binary next to the test executable under `{target}/{profile}/`. Build
+        # it explicitly so it exists before the harness runs. `storage-s3` is
+        # required: each worker writes its trained-model artifact to the shared
+        # `s3://` MinIO root, which needs the S3 object-store driver compiled in —
+        # without it a worker claims the job, trains, then fails the publish with
+        # `SchemeNotEnabled`, and the job never reaches `completed`. The driver
+        # lives on the server now that the CLI is a strict wire client, so the
+        # feature moves here.
+        run: cargo build -p jammi-server --bin jammi-server --features storage-s3
+
+      - name: Compile-check the distributed harness
+        run: cargo test -p jammi-ai --features live-distributed-tests --test distributed --no-run
+
+      - name: Run the SIGKILL crash-window chaos tests
+        # Serialise: every test spawns its own worker fleet and races on the
+        # shared catalog + bucket; one test at a time keeps the (already
+        # generous) terminal-state timeouts honest and the per-run unique
+        # prefixes the sole isolation needed.
+        run: |
+          cargo test -p jammi-ai --features live-distributed-tests --test distributed -- --test-threads=1 killed_worker_job_is_reclaimed_and_completed_once
+          cargo test -p jammi-ai --features live-distributed-tests --test distributed -- --test-threads=1 crash_between_publish_and_finalize_commits_only_the_winner
+          cargo test -p jammi-ai --features live-distributed-tests --test distributed -- --test-threads=1 artifact_written_on_worker_is_readable_by_a_different_client
 
       - name: MinIO log (on failure)
         if: failure()

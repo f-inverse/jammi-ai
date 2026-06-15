@@ -194,7 +194,7 @@ impl CatalogClient {
     /// Hard-delete a model. When `version` is `None` the latest version is
     /// targeted. A model outside the caller's scope is rejected as NotFound; a
     /// still-referenced model is rejected as `FailedPrecondition`
-    /// ([`JammiError::ModelReferenced`](jammi_db::error::JammiError::ModelReferenced)).
+    /// ([`JammiError::ModelReferenced`]).
     /// When `if_exists` is set, deleting an absent model is a no-op.
     pub async fn delete_model(
         &self,

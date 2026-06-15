@@ -93,10 +93,37 @@ impl Catalog {
         Ok(())
     }
 
-    /// Look up a mutable table by id. Returns `None` if not registered.
+    /// Look up a mutable table by id, scoped to the catalog's current tenant.
+    /// Returns `None` if no row with that id is owned by the current tenant or
+    /// is global (`tenant_id IS NULL`). A tenant therefore sees its own table
+    /// plus shared global tables, but never another tenant's — the read-path
+    /// counterpart of [`Self::get_model`]'s `(tenant_id = $N OR tenant_id IS
+    /// NULL)` predicate.
     pub async fn get_mutable_table(
         &self,
         id: &MutableTableId,
+    ) -> Result<Option<MutableTableDefinition>, MutableTableError> {
+        let tenant = self.current_tenant();
+        self.get_mutable_table_for_tenant(id, tenant).await
+    }
+
+    /// Look up a mutable table by id, scoped to an explicit `tenant` rather
+    /// than the catalog's session binding.
+    ///
+    /// The trigger publish/subscribe paths resolve and authorize a topic
+    /// against the tenant-scoped [`crate::catalog::topic_repo::TopicRepo`]
+    /// first, then resolve the topic's backing `__topic_*` table as an
+    /// already-authorized, engine-internal step. The backing table is stamped
+    /// with the *topic's* tenant at registration, but the session binding in
+    /// effect at resolution time is the caller's request scope — which the
+    /// data-plane handlers thread explicitly rather than via a task-local.
+    /// Reading the binding here would scope the lookup to the wrong tenant, so
+    /// those paths pass the topic's tenant directly. [`Self::get_mutable_table`]
+    /// is the session-binding variant for ordinary catalog reads.
+    pub async fn get_mutable_table_for_tenant(
+        &self,
+        id: &MutableTableId,
+        tenant: Option<TenantId>,
     ) -> Result<Option<MutableTableDefinition>, MutableTableError> {
         let id_str = id.as_str().to_string();
         let row = self
@@ -108,11 +135,13 @@ impl Catalog {
                 },
                 |tx| {
                     let id_str = id_str.clone();
+                    let tenant_str = tenant.map(|t| t.to_string());
                     Box::pin(async move {
                         tx.query_opt(
                             "SELECT schema_json, primary_key, tenant_id, user_metadata, order_column \
-                             FROM mutable_tables WHERE id = $1",
-                            &[SqlValue::TextOwned(id_str)],
+                             FROM mutable_tables \
+                             WHERE id = $1 AND (tenant_id = $2 OR tenant_id IS NULL)",
+                            &[SqlValue::TextOwned(id_str), SqlValue::from(tenant_str)],
                             read_mutable_row,
                         )
                         .await
@@ -238,23 +267,46 @@ impl Catalog {
         Ok(defs)
     }
 
-    /// Delete the catalog row + index rows for `id`. Caller is responsible
-    /// for issuing the backend `DROP TABLE` first.
+    /// Delete the catalog row + index rows for `id`, scoped strictly to the
+    /// catalog's current tenant. Caller is responsible for issuing the backend
+    /// `DROP TABLE` first.
+    ///
+    /// The tenant predicate is the STRICT form (`tenant_id = $cur OR (tenant_id
+    /// IS NULL AND $cur IS NULL)`) used by [`Self::retire_model`], not the read
+    /// path's `OR tenant_id IS NULL` leak: a tenant session (non-NULL `$cur`)
+    /// deletes only a row it owns, never another tenant's and never a shared
+    /// GLOBAL (`tenant_id IS NULL`) table it did not create; an unscoped session
+    /// deletes only its own GLOBAL rows. The index-row delete is filtered by the
+    /// same predicate against the parent so a non-matching table leaves both its
+    /// catalog row and index rows untouched.
     pub async fn delete_mutable_table(&self, id: &MutableTableId) -> Result<(), MutableTableError> {
         let id_str = id.as_str().to_string();
+        let tenant = self.current_tenant();
         self.backend()
             .transaction(TxOptions::default(), |tx| {
+                let id_str = id_str.clone();
+                let tenant_str = tenant.map(|t| t.to_string());
                 Box::pin(async move {
                     // Index rows cascade via the FK, but we delete explicitly
-                    // for backends that don't enforce CASCADE on DELETE.
+                    // for backends that don't enforce CASCADE on DELETE. The
+                    // index delete is gated on the parent row being owned by the
+                    // current tenant, so a foreign or shared table keeps its
+                    // index rows when the catalog-row delete below matches none.
                     tx.execute(
-                        "DELETE FROM mutable_table_indexes WHERE table_id = $1",
-                        &[SqlValue::TextOwned(id_str.clone())],
+                        "DELETE FROM mutable_table_indexes WHERE table_id = $1 AND EXISTS ( \
+                             SELECT 1 FROM mutable_tables \
+                             WHERE id = $1 \
+                               AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL)))",
+                        &[
+                            SqlValue::TextOwned(id_str.clone()),
+                            SqlValue::from(tenant_str.clone()),
+                        ],
                     )
                     .await?;
                     tx.execute(
-                        "DELETE FROM mutable_tables WHERE id = $1",
-                        &[SqlValue::TextOwned(id_str)],
+                        "DELETE FROM mutable_tables \
+                         WHERE id = $1 AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
+                        &[SqlValue::TextOwned(id_str), SqlValue::from(tenant_str)],
                     )
                     .await?;
                     Ok(())

@@ -458,11 +458,12 @@ message RegisterTopicRequest {
   // Broker-driver-specific configuration (retention, replication, etc.),
   // opaque to the engine. Empty == no driver metadata.
   map<string, string> broker_metadata = 3;
-  // Caller-supplied topic id (UUID string). The `Session::register_topic`
-  // surface takes a `TopicDefinition` whose `id` the caller already minted, so
-  // the wire carries it and the server persists *that* id — keeping the topic's
-  // identity (and a later `DropTopic` by id) consistent across the in-process
-  // and remote transports. Empty == server mints a fresh id.
+  // Reserved on the wire; the server ignores it. The topic id is engine-assigned
+  // identity, not caller input: the server always mints a fresh UUIDv7 and
+  // returns it in `RegisterTopicResponse.topic_id`. Honouring a caller id would
+  // let one tenant replay a known UUID to PK-collide another tenant's
+  // registration (`topics.topic_id` is a global PK with no `ON CONFLICT`), so
+  // clients send this empty and key a later `DropTopic` on the returned id.
   string topic_id = 4;
 }
 

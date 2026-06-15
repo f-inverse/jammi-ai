@@ -228,8 +228,13 @@ impl Catalog {
         })
     }
 
-    /// Remove a source from the catalog. Scoped to the session's tenant —
-    /// a tenant cannot delete another tenant's source.
+    /// Remove a source from the catalog. Scoped strictly to the session's
+    /// tenant — a tenant cannot delete another tenant's source, nor a shared
+    /// GLOBAL (`tenant_id IS NULL`) source it did not create; only an unscoped
+    /// session manages GLOBAL rows. Uses the STRICT delete predicate
+    /// (`tenant_id = $cur OR (tenant_id IS NULL AND $cur IS NULL)`) shared with
+    /// [`Catalog::retire_model`], not the read path's `OR tenant_id IS NULL`
+    /// leak.
     pub async fn remove_source(&self, source_id: &str) -> Result<()> {
         let sid = source_id.to_string();
         let tenant = self.current_tenant();
@@ -239,7 +244,7 @@ impl Catalog {
                     tx.set_tenant(tenant);
                     tx.execute(
                         "DELETE FROM sources WHERE source_id = $1 \
-                           AND (tenant_id = $2 OR tenant_id IS NULL)",
+                           AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
                         &[
                             SqlValue::TextOwned(sid),
                             SqlValue::from(tenant.map(|t| t.to_string())),

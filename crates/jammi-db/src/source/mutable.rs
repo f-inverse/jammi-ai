@@ -159,9 +159,15 @@ impl MutableTableRegistry {
         table: &MutableTableId,
         batch: &RecordBatch,
     ) -> Result<u64, MutableTableError> {
+        // Resolve the table definition under the transaction's bound tenant,
+        // not the session binding. The caller (e.g. the trigger publish path)
+        // has already authorized the write and bound the owning tenant on the
+        // transaction; the backing table is stamped with that tenant, so the
+        // lookup must scope to it rather than whatever the request-time session
+        // binding happens to be.
         let def = self
             .catalog
-            .get_mutable_table(table)
+            .get_mutable_table_for_tenant(table, tx.tenant())
             .await?
             .ok_or_else(|| MutableTableError::NotFound(table.clone()))?;
 
@@ -243,9 +249,14 @@ impl MutableTableRegistry {
         Pin<Box<dyn Stream<Item = Result<RecordBatch, MutableTableError>> + Send>>,
         MutableTableError,
     > {
+        // Resolve the definition under the same explicit `tenant` the replay
+        // SQL filters by, not the session binding: the subscribe/replay path
+        // threads the topic's tenant down here, and the backing table is owned
+        // by that tenant. Reading the binding instead would miss the table when
+        // the request scope differs from the topic's tenant.
         let def = self
             .catalog
-            .get_mutable_table(table)
+            .get_mutable_table_for_tenant(table, tenant)
             .await?
             .ok_or_else(|| MutableTableError::NotFound(table.clone()))?;
         let order_col = def

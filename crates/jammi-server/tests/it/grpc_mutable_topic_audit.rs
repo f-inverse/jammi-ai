@@ -42,7 +42,7 @@ use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use super::common::grpc::{channel, with_session, TENANT_A};
+use super::common::grpc::{channel, with_session, TENANT_A, TENANT_B};
 
 /// 32-byte hex master key for the audit HMAC. Matches the engine-level audit
 /// integration tests; deterministic so signature verification is reproducible.
@@ -313,6 +313,75 @@ async fn register_topic_then_list_then_drop() {
     assert!(
         !after.topics.iter().any(|t| t.name == "events"),
         "dropped topic must not appear in ListTopics"
+    );
+}
+
+/// The topic id is engine-assigned identity, not caller input: `register_topic`
+/// ALWAYS mints the id server-side and ignores any `topic_id` on the wire. A
+/// caller cannot pin a topic to a chosen UUID, so it cannot replay a known UUID
+/// to PK-collide another tenant's registration (`topics.topic_id` is a global
+/// PK with no `ON CONFLICT`). Two tenants supplying the SAME id both succeed,
+/// each getting a distinct server-minted id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn register_topic_mints_id_server_side_and_ignores_caller_id() {
+    let fixture = start_fixture().await;
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+    // A caller-chosen id the attacker would try to pin / replay.
+    let attacker_id = Uuid::now_v7().to_string();
+
+    // Tenant A registers, supplying `attacker_id`. The server mints a fresh id
+    // and returns it — the caller's id is ignored.
+    set_tenant(fixture.addr, "session-mint-a", TENANT_A).await;
+    let mut client_a = CatalogServiceClient::with_interceptor(
+        channel(fixture.addr).await,
+        with_session("session-mint-a"),
+    );
+    let reg_a = client_a
+        .register_topic(RegisterTopicRequest {
+            name: "events_a".into(),
+            schema: encode_schema_ipc(&schema),
+            broker_metadata: HashMap::new(),
+            topic_id: attacker_id.clone(),
+        })
+        .await
+        .expect("register topic A")
+        .into_inner();
+    assert_ne!(
+        reg_a.topic_id, attacker_id,
+        "the server must mint a fresh id, never honour the caller-supplied one"
+    );
+    assert!(
+        Uuid::parse_str(&reg_a.topic_id).is_ok(),
+        "the minted id is a UUID"
+    );
+
+    // Tenant B replays the SAME `attacker_id`. With the caller id honoured this
+    // would PK-collide tenant A's row (no `ON CONFLICT`); with the id minted
+    // server-side it cannot — B gets its own distinct id and the call succeeds.
+    set_tenant(fixture.addr, "session-mint-b", TENANT_B).await;
+    let mut client_b = CatalogServiceClient::with_interceptor(
+        channel(fixture.addr).await,
+        with_session("session-mint-b"),
+    );
+    let reg_b = client_b
+        .register_topic(RegisterTopicRequest {
+            name: "events_b".into(),
+            schema: encode_schema_ipc(&schema),
+            broker_metadata: HashMap::new(),
+            topic_id: attacker_id.clone(),
+        })
+        .await
+        .expect("register topic B must not PK-collide tenant A");
+    let reg_b = reg_b.into_inner();
+    assert_ne!(
+        reg_b.topic_id, attacker_id,
+        "tenant B's id is also server-minted, not the replayed caller id"
+    );
+    assert_ne!(
+        reg_a.topic_id, reg_b.topic_id,
+        "two registrations replaying the same caller id get distinct server-minted ids"
     );
 }
 

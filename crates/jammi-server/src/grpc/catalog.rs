@@ -481,8 +481,10 @@ impl CatalogService for CatalogServer {
         // Decode through the shared `jammi_ai::wire` seam — the same decode the
         // embedded binding's `_register_topic_proto` drives — so both transports
         // validate and submit an identical request. The wire body is tenant-free;
-        // the decode stamps the session's resolved tenant, honours a
-        // caller-supplied topic id, and mints a fresh UUIDv7 when none is given.
+        // the decode stamps the session's resolved tenant and mints the topic id
+        // server-side (the seam ignores any caller-supplied `topic_id`, so a
+        // caller cannot replay a known UUID to PK-collide another tenant's
+        // registration). The minted id is returned below.
         let topic = jammi_ai::wire::register_topic_from_proto(request.into_inner(), tenant)?;
         let session = self.local()?;
 

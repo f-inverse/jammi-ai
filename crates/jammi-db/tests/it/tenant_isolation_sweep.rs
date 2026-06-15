@@ -51,16 +51,18 @@ fn register_params<'a>(model_id: &'a str, backend: &'a str) -> RegisterModelPara
 
 /// HEADLINE: tenant B must NOT be able to overwrite tenant A's model row.
 ///
-/// `models.model_id` is a GLOBAL primary key (`name::version`), and
-/// `register_model` uses `INSERT ... ON CONFLICT(model_id) DO UPDATE` with no
-/// tenant predicate in the conflict clause. The write-side guard
-/// `assert_tenant_matches` only checks that the *new* row's tenant equals the
-/// session binding — it never compares against the *existing* row's owner.
+/// The `models.model_id` primary key is tenant-qualified: `model_pk` builds it
+/// as `"{tenant}::{name}::{version}"` for a tenant-scoped model (and the bare
+/// `"{name}::{version}"` only for an unscoped/global registration). Two tenants
+/// registering the same `name::version` therefore key two DISTINCT rows, so the
+/// `INSERT ... ON CONFLICT(model_id) DO UPDATE` upsert can only ever update the
+/// session tenant's OWN row — a tenant's write never reaches another tenant's
+/// row through the conflict clause.
 ///
-/// So tenant B registering a model whose `model_id::version` collides with
-/// tenant A's existing row silently UPDATEs A's row (its `backend`, `task`,
-/// `model_type`, `metadata`, `artifact_path`), corrupting another tenant's
-/// catalog entry. This is a cross-tenant write leak.
+/// This test pins that invariant: tenant B registering the same `name::version`
+/// as tenant A leaves A's row (its `backend`, `task`, `model_type`, `metadata`,
+/// `artifact_path`) untouched, because the two registrations address different
+/// tenant-qualified PKs.
 #[tokio::test]
 async fn tenant_b_cannot_overwrite_tenant_a_model() {
     let dir = tempdir().unwrap();

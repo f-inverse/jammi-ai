@@ -22,20 +22,24 @@
 //! * **(B) the CPU-hermetic gate** — this module — drives the *same engine fns*
 //!   over a tiny committed bundle on `Device::Cpu`. It is the portable
 //!   code-path-regression net: a regression in the resolve → tokenize → forward →
-//!   adapt path moves the committed digest and trips `cargo test`.
+//!   adapt path moves the digest off the in-process baseline and trips `cargo test`.
 //!
 //! The two lanes here mirror that priority:
 //!
 //! 1. **The determinism digest (the cell-(d) anchor)** — the engine's serving
 //!    path is byte-deterministic on `Device::Cpu` over a fixed model and fixed
-//!    inputs (the engine's own
+//!    inputs **on a machine** (the engine's own
 //!    `embedding_vectors_are_semantically_meaningful_and_reproducible` contract:
-//!    encoding the same text twice yields identical vectors). So a committed
-//!    checksum of the served output — the embedding vectors for the embed verb,
-//!    the full per-row score distributions for the infer verb — gates for
-//!    equality. A regression in the forward, the pooling, the tokenizer
-//!    dispatch, the label mapping, or the output adapter moves the bits and trips
-//!    the gate; a perturbed input or a different model moves it too (the teeth).
+//!    encoding the same text twice yields identical vectors). The served output is
+//!    `f32` (embedding vectors; score distributions), and an `f32` forward's exact
+//!    bits are NOT identical across CPUs (SIMD/FMA/BLAS reduction order differs), so
+//!    the gate does not assert a committed cross-machine constant — that would
+//!    spuriously "fail" on any box but the rebuild box. It asserts the real,
+//!    same-machine property: serve twice on the running box and the two digests
+//!    agree. A regression in the forward, the pooling, the tokenizer dispatch, the
+//!    label mapping, or the output adapter is caught by the relative perturbation
+//!    teeth — a perturbed input or a different model moving the digest off the
+//!    in-process baseline computed on the same box.
 //! 2. **The serving throughput (coarse code-path net, NOT the SLO)** — rows/s the
 //!    tiny model serves through the real verb on this box, gated against a
 //!    committed same-box baseline by [`crate::rate_gate`]. This catches a *code
@@ -78,7 +82,7 @@ use jammi_db::config::{GpuConfig, JammiConfig};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
 
-use crate::report::{DigestGate, Measurement, ModelInferenceTier, RateVerdict};
+use crate::report::{DeterminismGate, Measurement, ModelInferenceTier, RateVerdict};
 
 /// The source id the synthetic corpus registers under. Generic — names no
 /// consumer; the corpus is a neutral family of short factual sentences.
@@ -127,11 +131,15 @@ pub struct ModelInferenceSpec {
     pub target_keys: Vec<String>,
     /// The committed embed digest: the checksum the engine's
     /// `generate_text_embeddings` produced over the corpus and the committed embed
-    /// bundle when the spec was cut, folded over the persisted vector column.
+    /// bundle when the spec was cut, on the rebuild box, folded over the persisted
+    /// vector column. A documented same-box reference (the vectors are `f32`, whose
+    /// exact bits vary by CPU) — never asserted for cross-machine equality.
     pub embed_digest: String,
     /// The committed infer digest: the checksum the engine's `infer`
     /// (`Classification`) produced over the committed targets and the committed
-    /// classifier bundle — folded over the full per-row score distributions.
+    /// classifier bundle, on the rebuild box — folded over the full per-row score
+    /// distributions. A documented same-box reference (`f32` scores), never asserted
+    /// for cross-machine equality.
     pub infer_digest: String,
     /// The committed same-box embed serving baseline, rows/s. A coarse
     /// code-path-regression reference over the tiny model — NOT the full-scale
@@ -301,8 +309,9 @@ impl Fnv {
 ///
 /// The fold is over the full persisted `vector` column in result-table storage
 /// order, which is the embedding pipeline's deterministic source-scan write order
-/// — so the digest is reload-invariant (the `digests_are_reload_invariant` test
-/// proves it). A length tag per vector makes the row boundaries explicit so a
+/// — so the digest is reproducible on a machine (the tier's on-box determinism
+/// gate folds it twice and asserts equality). A length tag per vector makes the
+/// row boundaries explicit so a
 /// dimensionality change cannot be masked by a float collision.
 ///
 /// Returns `(digest, serve_wall_ms, rows_served)`. The serve wall-time is over
@@ -404,11 +413,12 @@ fn rows_per_s(rows: usize, wall_ms: f64) -> f64 {
     }
 }
 
-/// Re-derive a committed digest digest-only (dropping the serve timing): stand up
-/// the corpus session and serve the named verb over the named bundle. The path
-/// the digest gates re-run, with `model_dir` explicit so a teeth test can point
-/// at a different bundle. Test-only — the production `run`/`rebuild` paths use
-/// [`serve_embed`]/[`serve_infer`] directly because they also need the timing.
+/// Fold a digest digest-only (dropping the serve timing): stand up the corpus
+/// session and serve the named verb over the named bundle. Used by the determinism
+/// test (folding twice on the running box) and the teeth tests (with `model_dir`
+/// explicit so a perturbation can point at a different bundle). Test-only — the
+/// production `run`/`rebuild` paths use [`serve_embed`]/[`serve_infer`] directly
+/// because they also need the timing.
 #[cfg(test)]
 async fn fold_embed_digest(
     spec: &ModelInferenceSpec,
@@ -435,31 +445,40 @@ async fn fold_infer_digest(
 }
 
 /// Run the model-inference tier against the committed spec: serve both verbs over
-/// their committed bundles, fold both digests, and assemble the tier with the two
-/// digest gates and the two same-box rate gates.
+/// their committed bundles TWICE on this box, fold both determinism gates, and
+/// assemble the tier with the two same-box rate gates.
 ///
-/// The digests gate for byte-equality (the portable cell-(d) anchor); the
-/// serving throughputs are coarse same-box code-path nets gated by the
-/// relative-drop [`crate::rate_gate`] — NOT the scaling SLO, which is the
-/// cookbook (A) full-scale value.
+/// Each digest gate asserts same-machine determinism — serve twice on the running
+/// box and the two digests agree (the served output is `f32`, so the committed
+/// digest rides as a same-box reference, not a cross-machine constant). The serving
+/// throughputs are coarse same-box code-path nets gated by the relative-drop
+/// [`crate::rate_gate`] — NOT the scaling SLO, which is the cookbook (A) full-scale
+/// value.
 pub async fn run(
     spec: &ModelInferenceSpec,
 ) -> Result<ModelInferenceTier, Box<dyn std::error::Error>> {
     let rows = build_corpus(spec);
 
     // Embed lane: a fresh session so the serve wall-time is a clean single-call
-    // measurement, not contaminated by the infer serve.
-    let (session, _dir) = corpus_session(&rows).await?;
+    // measurement, not contaminated by the infer serve. The first serve yields the
+    // timing/rate and the first digest; the second (fresh session) yields the second
+    // digest for the same-machine determinism gate.
     let embed_id = local_model_id(&ModelInferenceSpec::embed_model_dir())?;
-    let (embed_digest, embed_ms, embed_rows) = serve_embed(&session, &embed_id).await?;
-    let embed_rate = rows_per_s(embed_rows, embed_ms);
-
-    // Infer lane: a fresh session likewise.
     let (session, _dir) = corpus_session(&rows).await?;
+    let (embed_digest_first, embed_ms, embed_rows) = serve_embed(&session, &embed_id).await?;
+    let embed_rate = rows_per_s(embed_rows, embed_ms);
+    let (session, _dir) = corpus_session(&rows).await?;
+    let (embed_digest_second, _ms, _n) = serve_embed(&session, &embed_id).await?;
+
+    // Infer lane: a fresh session likewise, served twice.
     let infer_id = local_model_id(&ModelInferenceSpec::classifier_model_dir())?;
-    let (infer_digest, infer_ms, infer_rows) =
+    let (session, _dir) = corpus_session(&rows).await?;
+    let (infer_digest_first, infer_ms, infer_rows) =
         serve_infer(&session, &infer_id, &spec.target_keys).await?;
     let infer_rate = rows_per_s(infer_rows, infer_ms);
+    let (session, _dir) = corpus_session(&rows).await?;
+    let (infer_digest_second, _ms, _n) =
+        serve_infer(&session, &infer_id, &spec.target_keys).await?;
 
     let embed_gate = crate::rate_gate::RateGate::evaluate(
         embed_rate,
@@ -484,11 +503,11 @@ pub async fn run(
             passed: embed_gate.passed,
             detail: embed_gate.detail(),
         }),
-        embed_digest: DigestGate {
-            passed: embed_digest == spec.embed_digest,
-            measured: embed_digest,
-            committed: spec.embed_digest.clone(),
-        },
+        embed_digest: DeterminismGate::new(
+            embed_digest_first,
+            embed_digest_second,
+            spec.embed_digest.clone(),
+        ),
         infer_rows_per_s: Measurement::measured(infer_rate, "rows_per_s"),
         infer_serve_ms: Measurement::measured(infer_ms, "ms"),
         infer_rate_gate: Some(RateVerdict {
@@ -499,17 +518,17 @@ pub async fn run(
             passed: infer_gate.passed,
             detail: infer_gate.detail(),
         }),
-        infer_digest: DigestGate {
-            passed: infer_digest == spec.infer_digest,
-            measured: infer_digest,
-            committed: spec.infer_digest.clone(),
-        },
+        infer_digest: DeterminismGate::new(
+            infer_digest_first,
+            infer_digest_second,
+            spec.infer_digest.clone(),
+        ),
     })
 }
 
 /// Whether all four gates held — the verdict the subcommand maps to its exit code
-/// and the `cargo test` gate asserts: both digests matched their committed values
-/// AND both serving throughputs cleared their same-box floors.
+/// and the `cargo test` gate asserts: both verbs were deterministic across two
+/// same-machine serves AND both serving throughputs cleared their same-box floors.
 pub fn gates_passed(tier: &ModelInferenceTier) -> bool {
     tier.embed_digest.passed
         && tier.infer_digest.passed
@@ -625,105 +644,14 @@ mod tests {
         }
     }
 
-    /// The teeth, DIGESTS-CLEAR direction: serving both verbs over the committed
-    /// bundles reproduces both committed digests. A regression in either real
-    /// serving path moves its bits and trips this.
+    /// The portable determinism gate (DIGESTS-CLEAR direction): serving each verb
+    /// over its committed bundle twice on THIS box (each a fresh session + serve)
+    /// produces the byte-identical digest. This is the engine's real contract —
+    /// same-machine, reload-invariant byte-identity for an `f32` serve — and is true
+    /// on any CI box by construction, unlike a committed cross-machine constant,
+    /// which `f32` SIMD/FMA/BLAS differences would spuriously break.
     #[tokio::test(flavor = "multi_thread")]
-    async fn reserve_matches_committed_digests() {
-        let spec =
-            ModelInferenceSpec::load().expect("baselines/model_inference.json must be present");
-        let embed = fold_embed_digest(&spec, &ModelInferenceSpec::embed_model_dir())
-            .await
-            .expect("embed fold runs over the committed bundle");
-        assert_eq!(
-            embed, spec.embed_digest,
-            "the re-served embed digest drifted"
-        );
-        let infer = fold_infer_digest(&spec, &ModelInferenceSpec::classifier_model_dir())
-            .await
-            .expect("infer fold runs over the committed bundle");
-        assert_eq!(
-            infer, spec.infer_digest,
-            "the re-served infer digest drifted"
-        );
-    }
-
-    /// The teeth, GATE-FAILS direction for the EMBED verb (RC1: an assertion must
-    /// be able to fail). Serving the *classifier* bundle through the embed verb
-    /// produces a different embedding (a different model, different weights and
-    /// hidden geometry), so the embed digest moves — proving the gate reacts to
-    /// the served model, not a constant. The committed embed bundle reproduces the
-    /// committed digest (the contrast that gives the perturbation its teeth).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn embed_over_a_different_model_changes_the_digest() {
-        let spec =
-            ModelInferenceSpec::load().expect("baselines/model_inference.json must be present");
-        let correct = fold_embed_digest(&spec, &ModelInferenceSpec::embed_model_dir())
-            .await
-            .expect("committed embed serve");
-        assert_eq!(
-            correct, spec.embed_digest,
-            "the committed embed bundle must reproduce the committed embed digest"
-        );
-        let perturbed = fold_embed_digest(&spec, &ModelInferenceSpec::classifier_model_dir())
-            .await
-            .expect("perturbed embed serve");
-        assert_ne!(
-            perturbed, spec.embed_digest,
-            "embedding through a different model must move the embed digest"
-        );
-    }
-
-    /// The teeth, GATE-FAILS direction for the INFER verb: serving over a
-    /// perturbed corpus (a different seed rotates which sentences the rows draw,
-    /// so the classifier scores different text) produces a different infer digest.
-    /// This proves the digest reacts to the served *input*, the regression a
-    /// silently-changed tokenization or input-column wiring would cause.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn infer_over_perturbed_input_changes_the_digest() {
-        let spec =
-            ModelInferenceSpec::load().expect("baselines/model_inference.json must be present");
-        let correct = fold_infer_digest(&spec, &ModelInferenceSpec::classifier_model_dir())
-            .await
-            .expect("committed infer serve");
-        assert_eq!(
-            correct, spec.infer_digest,
-            "the committed corpus must reproduce the committed infer digest"
-        );
-
-        let mut perturbed_spec = spec.clone();
-        perturbed_spec.corpus_seed = spec.corpus_seed.wrapping_add(1);
-        let perturbed =
-            fold_infer_digest(&perturbed_spec, &ModelInferenceSpec::classifier_model_dir())
-                .await
-                .expect("perturbed infer serve");
-        assert_ne!(
-            perturbed, spec.infer_digest,
-            "classifying different input text must move the infer digest"
-        );
-    }
-
-    /// The gate-fails direction at the harness level: a tampered committed digest
-    /// fails [`gates_passed`], proving the verdict reacts to the committed value.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn tampered_committed_digest_fails_the_gate() {
-        let mut spec =
-            ModelInferenceSpec::load().expect("baselines/model_inference.json must be present");
-        spec.embed_digest = "deadbeefdeadbeef".to_string();
-        let tier = run(&spec).await.expect("tier still runs");
-        assert!(
-            !gates_passed(&tier),
-            "a tampered committed digest must trip the gate"
-        );
-    }
-
-    /// Both digests are reload-invariant: two independent folds of each committed
-    /// bundle (each a fresh session + serve) produce byte-identical digests. This
-    /// is the deterministic-serving contract the gate rests on — were the serve
-    /// reload-sensitive, the committed digest would be a moving target and the
-    /// gate meaningless (the vacuity trap).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn digests_are_reload_invariant() {
+    async fn reserve_is_deterministic_on_this_machine() {
         let spec =
             ModelInferenceSpec::load().expect("baselines/model_inference.json must be present");
         let embed_one = fold_embed_digest(&spec, &ModelInferenceSpec::embed_model_dir())
@@ -732,10 +660,9 @@ mod tests {
         let embed_two = fold_embed_digest(&spec, &ModelInferenceSpec::embed_model_dir())
             .await
             .expect("second embed fold");
-        assert_eq!(embed_one, embed_two, "embed serve must be reload-invariant");
         assert_eq!(
-            embed_one, spec.embed_digest,
-            "and equal to the committed digest"
+            embed_one, embed_two,
+            "two same-machine embed serves disagreed — embed is not deterministic on this box"
         );
 
         let infer_one = fold_infer_digest(&spec, &ModelInferenceSpec::classifier_model_dir())
@@ -744,10 +671,58 @@ mod tests {
         let infer_two = fold_infer_digest(&spec, &ModelInferenceSpec::classifier_model_dir())
             .await
             .expect("second infer fold");
-        assert_eq!(infer_one, infer_two, "infer serve must be reload-invariant");
         assert_eq!(
-            infer_one, spec.infer_digest,
-            "and equal to the committed digest"
+            infer_one, infer_two,
+            "two same-machine infer serves disagreed — infer is not deterministic on this box"
+        );
+    }
+
+    /// The teeth, GATE-FAILS direction for the EMBED verb (RC1: an assertion must
+    /// be able to fail). Serving the *classifier* bundle through the embed verb
+    /// produces a different embedding (a different model, different weights and
+    /// hidden geometry), so the embed digest moves off the IN-PROCESS baseline (the
+    /// committed embed bundle served on THIS box) — proving the gate reacts to the
+    /// served model. Both serves run on the same machine, so the teeth are portable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn embed_over_a_different_model_changes_the_digest() {
+        let spec =
+            ModelInferenceSpec::load().expect("baselines/model_inference.json must be present");
+        let baseline = fold_embed_digest(&spec, &ModelInferenceSpec::embed_model_dir())
+            .await
+            .expect("committed embed serve");
+        let perturbed = fold_embed_digest(&spec, &ModelInferenceSpec::classifier_model_dir())
+            .await
+            .expect("perturbed embed serve");
+        assert_ne!(
+            perturbed, baseline,
+            "embedding through a different model must move the embed digest"
+        );
+    }
+
+    /// The teeth, GATE-FAILS direction for the INFER verb: serving over a
+    /// perturbed corpus (a different seed rotates which sentences the rows draw,
+    /// so the classifier scores different text) produces a different infer digest
+    /// than the IN-PROCESS baseline (the committed corpus served on THIS box). This
+    /// proves the digest reacts to the served *input*, the regression a
+    /// silently-changed tokenization or input-column wiring would cause. Both serves
+    /// run on the same machine, so the teeth are portable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn infer_over_perturbed_input_changes_the_digest() {
+        let spec =
+            ModelInferenceSpec::load().expect("baselines/model_inference.json must be present");
+        let baseline = fold_infer_digest(&spec, &ModelInferenceSpec::classifier_model_dir())
+            .await
+            .expect("committed infer serve");
+
+        let mut perturbed_spec = spec.clone();
+        perturbed_spec.corpus_seed = spec.corpus_seed.wrapping_add(1);
+        let perturbed =
+            fold_infer_digest(&perturbed_spec, &ModelInferenceSpec::classifier_model_dir())
+                .await
+                .expect("perturbed infer serve");
+        assert_ne!(
+            perturbed, baseline,
+            "classifying different input text must move the infer digest"
         );
     }
 

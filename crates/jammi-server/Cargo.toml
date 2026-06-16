@@ -100,3 +100,10 @@ parquet.workspace = true
 arrow-ipc.workspace = true
 prost.workspace = true
 prost-types.workspace = true
+# The bring-your-own-auth worked example (`grpc_byo_auth`) mints and verifies a
+# generic signed bearer token to drive its custom authenticating interceptor.
+# Test-only: the engine authenticates nothing itself — a consumer plugs identity
+# in front of the seam, and these are the primitives that example reaches for.
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true

@@ -266,28 +266,6 @@ impl CatalogService for CatalogServer {
     }
 
     #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
-    async fn retire_model(
-        &self,
-        request: Request<pb::RetireModelRequest>,
-    ) -> Result<Response<()>, Status> {
-        let tenant = session_tenant_traced(&request);
-        let req = request.into_inner();
-        require_nonempty(&req.model_id, "model_id")?;
-        let session = self.local()?;
-
-        // A model outside the caller's scope (absent, or a GLOBAL model a tenant
-        // session cannot retire) surfaces from the engine as
-        // `JammiError::ModelNotFound`, which `map_engine_error` renders as
-        // `NotFound`. Every fault keeps its faithful `map_engine_error` mapping.
-        scoped(self.engine()?, tenant, || {
-            session.retire_model(&req.model_id, req.version)
-        })
-        .await
-        .map_err(map_engine_error)?;
-        Ok(Response::new(()))
-    }
-
-    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
     async fn delete_model(
         &self,
         request: Request<pb::DeleteModelRequest>,
@@ -305,27 +283,6 @@ impl CatalogService for CatalogServer {
         // `map_engine_error` mapping.
         scoped(self.engine()?, tenant, || {
             session.delete_model(&req.model_id, req.version, req.if_exists)
-        })
-        .await
-        .map_err(map_engine_error)?;
-        Ok(Response::new(()))
-    }
-
-    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
-    async fn promote_model(
-        &self,
-        request: Request<pb::PromoteModelRequest>,
-    ) -> Result<Response<()>, Status> {
-        let tenant = session_tenant_traced(&request);
-        let req = request.into_inner();
-        require_nonempty(&req.model_id, "model_id")?;
-        let session = self.local()?;
-
-        // A model outside the caller's scope surfaces as
-        // `JammiError::ModelNotFound` — a NotFound at the wire. Every fault keeps
-        // its faithful `map_engine_error` mapping.
-        scoped(self.engine()?, tenant, || {
-            session.promote_model(&req.model_id, req.version)
         })
         .await
         .map_err(map_engine_error)?;

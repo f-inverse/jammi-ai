@@ -59,13 +59,6 @@ pub struct ModelRecord {
     pub status: String,
     /// ISO-8601 timestamp of initial registration.
     pub created_at: String,
-    /// ISO-8601 timestamp this row was promoted, or `None` if it is not the
-    /// promoted row for its `(tenant, name)`. At most one row per scope carries
-    /// a non-`None` value — the partial unique index `idx_models_promoted` (and
-    /// its global peer) enforces that. This raw timestamp never leaves the
-    /// catalog: every client-facing surface reads the derived `promoted` boolean
-    /// off [`ModelDescriptor`], the curated projection of this record.
-    pub promoted_at: Option<String>,
 }
 
 /// Registry introspection for one registered model — the client-facing
@@ -73,12 +66,11 @@ pub struct ModelRecord {
 ///
 /// This is the model peer of [`SourceDescriptor`](super::source_repo::SourceDescriptor):
 /// it carries only the fields a client keys off (the model's id, inference
-/// backend, task, lifecycle status, and whether it is the promoted version), so
-/// every transport — the embedded session, the gRPC `Model` projection, and the
-/// remote client — reads the same shape. The record's server-internal
-/// bookkeeping (version counter, derived-from lineage, artifact path, config
-/// blob, registration timestamp, and the raw `promoted_at` timestamp) stays in
-/// [`ModelRecord`] and never reaches a client.
+/// backend, task, and lifecycle status), so every transport — the embedded
+/// session, the gRPC `Model` projection, and the remote client — reads the same
+/// shape. The record's server-internal bookkeeping (version counter,
+/// derived-from lineage, artifact path, config blob, registration timestamp)
+/// stays in [`ModelRecord`] and never reaches a client.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelDescriptor {
     /// The model's name (an HF repo id or a fine-tuned id).
@@ -89,10 +81,6 @@ pub struct ModelDescriptor {
     pub task: ModelTask,
     /// Lifecycle status (e.g. `"registered"`, `"loaded"`, `"failed"`).
     pub status: String,
-    /// Whether this is the promoted version for its name — the derived view of
-    /// the record's `promoted_at` flag (`true` when set), the only promotion
-    /// signal a client sees.
-    pub promoted: bool,
 }
 
 impl From<&ModelRecord> for ModelDescriptor {
@@ -102,7 +90,6 @@ impl From<&ModelRecord> for ModelDescriptor {
             backend: record.backend.clone(),
             task: record.task,
             status: record.status.clone(),
-            promoted: record.promoted_at.is_some(),
         }
     }
 }
@@ -130,7 +117,7 @@ pub struct RegisterModelParams<'a> {
 
 const SELECT_COLS: &str =
     "model_id, name, model_type, task, backend, version, status, metadata, artifact_path, \
-     created_at, promoted_at";
+     created_at";
 
 impl Catalog {
     /// Register or refresh a model in the catalog. The session's bound
@@ -202,10 +189,9 @@ impl Catalog {
     ///
     /// This is the reference-resolution path: a training job's base model, an
     /// eval run's model, and the serve/load resolver all bind through it. It
-    /// returns RETIRED models too — a job or eval that references a since-retired
-    /// model must still resolve it, so excluding retired here would break
-    /// historical provenance. The active-listing sense (hiding retired) lives in
-    /// [`Self::list_models`]; the serve/load path refuses a retired model itself.
+    /// resolves the model regardless of lifecycle status so a job or eval that
+    /// references it always binds. The list-facing sense lives in
+    /// [`Self::list_models`].
     pub async fn get_model(&self, model_id: &str) -> Result<Option<ModelRecord>> {
         let sql = format!(
             "SELECT {SELECT_COLS} FROM models \
@@ -278,74 +264,8 @@ impl Catalog {
             .await?)
     }
 
-    /// Soft-retire a model. Resolves the catalog PK off the read path
-    /// ([`Self::get_model`] for the latest version, or
-    /// [`Self::get_model_version`] when `version` is given), then flips that
-    /// row's `status` to [`ModelStatus::Retired`](super::status::ModelStatus).
-    ///
-    /// A tenant may retire ONLY a row it owns: the UPDATE is filtered on the
-    /// resolved PK AND `tenant_id = $current` strictly — not the read path's
-    /// `OR tenant_id IS NULL`. So a tenant session asking to retire a GLOBAL
-    /// (`tenant_id IS NULL`) model, or a model that does not exist for it, gets
-    /// [`JammiError::ModelNotFound`]: retiring a model outside the caller's
-    /// own scope is forbidden, not silently applied to a shared row.
-    ///
-    /// Idempotent: retiring an already-retired model is a success no-op (the
-    /// row stays `'retired'`).
-    pub async fn retire_model(&self, model_id: &str, version: Option<i32>) -> Result<()> {
-        let record = match version {
-            Some(v) => self.get_model_version(model_id, v).await?,
-            None => self.get_model(model_id).await?,
-        };
-        let record = record.ok_or_else(|| JammiError::ModelNotFound {
-            model_id: model_id.to_string(),
-        })?;
-        let pk = record.catalog_pk;
-        let tenant = self.current_tenant();
-        let retired = super::status::ModelStatus::Retired.to_string();
-        let affected = self
-            .backend()
-            .transaction(TxOptions::default(), |tx| {
-                Box::pin(async move {
-                    tx.set_tenant(tenant);
-                    tx.assert_tenant_matches(tenant, "models")?;
-                    // Strict tenant predicate: a session retires only a row
-                    // whose owner equals its OWN tenant — never the read path's
-                    // `OR tenant_id IS NULL` leak. The `IS NULL AND $3 IS NULL`
-                    // arm matches `None == None` (a NULL `=` comparison is never
-                    // true in SQL), so an unscoped session retires its own
-                    // GLOBAL row while a tenant session (with a non-NULL `$3`)
-                    // matches only its own rows — a GLOBAL row's NULL tenant
-                    // fails both arms, so a tenant cannot retire a shared model.
-                    // A non-matching PK affects zero rows and surfaces NotFound
-                    // below.
-                    tx.execute(
-                        "UPDATE models \
-                         SET status = $1, updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
-                         WHERE model_id = $2 \
-                           AND (tenant_id = $3 OR (tenant_id IS NULL AND $3 IS NULL))",
-                        &[
-                            SqlValue::TextOwned(retired),
-                            SqlValue::TextOwned(pk),
-                            SqlValue::from(tenant.map(|t| t.to_string())),
-                        ],
-                    )
-                    .await
-                })
-            })
-            .await?;
-        if affected == 0 {
-            return Err(JammiError::ModelNotFound {
-                model_id: model_id.to_string(),
-            });
-        }
-        Ok(())
-    }
-
-    /// Hard-delete a model row. Unlike [`Self::retire_model`] (a soft state
-    /// flip that keeps the row resolvable for provenance), this removes the row
-    /// entirely — so it is refused while any reference still points at the
-    /// model, to avoid orphaning those edges.
+    /// Hard-delete a model row, removing it entirely — so it is refused while
+    /// any reference still points at the model, to avoid orphaning those edges.
     ///
     /// The referential scan covers all four edges that target a model, each
     /// matched on the key that edge actually stores:
@@ -361,10 +281,9 @@ impl Catalog {
     /// violation would leak as an opaque backend error.
     ///
     /// Tenant scope is strict — a session deletes only a row whose owner equals
-    /// its OWN tenant (the same `tenant_id = $t OR (tenant_id IS NULL AND $t IS
-    /// NULL)` predicate [`Self::retire_model`] uses), so a tenant cannot delete
-    /// a GLOBAL or a peer's model. An absent row is `NotFound` unless
-    /// `if_exists` is set, in which case it is a success no-op.
+    /// its OWN tenant (`tenant_id = $t OR (tenant_id IS NULL AND $t IS NULL)`),
+    /// so a tenant cannot delete a GLOBAL or a peer's model. An absent row is
+    /// `NotFound` unless `if_exists` is set, in which case it is a success no-op.
     ///
     /// The scan and the DELETE run in a single `Serializable` transaction: the
     /// two no-FK edges have no constraint backstop, so a weaker isolation level
@@ -445,88 +364,13 @@ impl Catalog {
         }
     }
 
-    /// Promote a model row, marking it the promoted row for its `(tenant,
-    /// name)`. Promotion is a single nullable `promoted_at` flag — there is no
-    /// lineage table, no demotion-event row, and no pointer to the prior
-    /// promoted version; the previously-promoted sibling (if any) is demoted in
-    /// the same transaction by clearing its flag.
-    ///
-    /// At most one row per `(tenant, name)` may be promoted at a time. That is
-    /// enforced two ways: the explicit demote-then-promote here, and the
-    /// partial unique indexes `idx_models_promoted` / `idx_models_promoted_global`
-    /// (so a direct double-promote that skips the demote is still rejected).
-    ///
-    /// Strict tenant scope, same as [`Self::retire_model`]: a session promotes
-    /// only a row it owns; a non-matching scope resolves no row and surfaces
-    /// `NotFound`. Runs at `Serializable` so the demote and the promote commit
-    /// as one indivisible step against concurrent promotions of the same name.
-    pub async fn promote_model(&self, model_id: &str, version: Option<i32>) -> Result<()> {
-        let record = match version {
-            Some(v) => self.get_model_version(model_id, v).await?,
-            None => self.get_model(model_id).await?,
-        };
-        let record = record.ok_or_else(|| JammiError::ModelNotFound {
-            model_id: model_id.to_string(),
-        })?;
-        let pk = record.catalog_pk;
-        let name = record.model_id;
-        let tenant = self.current_tenant();
-        let model_id_owned = model_id.to_string();
-
-        let affected = self
-            .backend()
-            .transaction(
-                TxOptions {
-                    isolation: IsolationLevel::Serializable,
-                    ..Default::default()
-                },
-                |tx| {
-                    Box::pin(async move {
-                        tx.set_tenant(tenant);
-                        tx.assert_tenant_matches(tenant, "models")?;
-                        let tenant_val = SqlValue::from(tenant.map(|t| t.to_string()));
-
-                        // Demote the prior promoted sibling (if any) so the
-                        // partial unique index does not collide on the promote.
-                        tx.execute(
-                            "UPDATE models SET promoted_at = NULL \
-                             WHERE name = $1 \
-                               AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
-                            &[SqlValue::TextOwned(name), tenant_val.clone()],
-                        )
-                        .await?;
-                        let affected = tx
-                            .execute(
-                                "UPDATE models \
-                                 SET promoted_at = CAST(CURRENT_TIMESTAMP AS TEXT), \
-                                     updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
-                                 WHERE model_id = $1 \
-                                   AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
-                                &[SqlValue::TextOwned(pk), tenant_val],
-                            )
-                            .await?;
-                        Ok(affected)
-                    })
-                },
-            )
-            .await?;
-        if affected == 0 {
-            return Err(JammiError::ModelNotFound {
-                model_id: model_id_owned,
-            });
-        }
-        Ok(())
-    }
-
-    /// List the *active* models visible to the session's tenant. Retired models
-    /// are hidden — this is the active-listing sense, the peer of
-    /// `list_sources`. A reference resolver that must still see a retired model
-    /// (provenance, a base-model FK) uses [`Self::get_model`], which returns
-    /// retired rows.
+    /// List the models visible to the session's tenant — the peer of
+    /// `list_sources`. A reference resolver that binds a single model by name
+    /// (provenance, a base-model FK) uses [`Self::get_model`] instead.
     pub async fn list_models(&self) -> Result<Vec<ModelRecord>> {
         let sql = format!(
             "SELECT {SELECT_COLS} FROM models \
-             WHERE (tenant_id = $1 OR tenant_id IS NULL) AND status != 'retired' \
+             WHERE (tenant_id = $1 OR tenant_id IS NULL) \
              ORDER BY created_at"
         );
         let tenant = self.current_tenant();
@@ -640,7 +484,7 @@ async fn scan_model_references(
 }
 
 /// Parse: model_id, name, model_type, task, backend, version, status, metadata,
-/// artifact_path, created_at, promoted_at
+/// artifact_path, created_at
 fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendError> {
     let catalog_pk: String = row.get("model_id")?;
     let name: String = row.get("name")?;
@@ -655,7 +499,6 @@ fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendErr
     let status: String = row.try_get("status")?.unwrap_or_default();
     let metadata: Option<String> = row.try_get("metadata")?;
     let created_at: String = row.try_get("created_at")?.unwrap_or_default();
-    let promoted_at: Option<String> = row.try_get("promoted_at")?;
 
     // The served path is its own column (the single-writer commit pointer); the
     // `metadata` blob carries only the descriptive `base_model_id`/`config_json`.
@@ -683,6 +526,5 @@ fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendErr
         config_json,
         status,
         created_at,
-        promoted_at,
     })
 }

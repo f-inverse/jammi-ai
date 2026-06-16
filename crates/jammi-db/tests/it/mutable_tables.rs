@@ -316,7 +316,7 @@ async fn list_filters_by_tenant_scope(backend: BackendKind) {
     // The global table is dropped from the unscoped session (its owner). The
     // tenant-scoped table can only be dropped by a session bound to that tenant
     // — the strict delete predicate refuses an unscoped (or foreign-tenant)
-    // session, mirroring `retire_model`. Bind tenant A for its cleanup.
+    // session, mirroring `delete_model`. Bind tenant A for its cleanup.
     session.drop_mutable_table(&global_id).await.unwrap();
     session
         .with_tenant(tenant_a)

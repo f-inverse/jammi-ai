@@ -11,9 +11,9 @@ workspace ships every publishable crate at the same
 **H3 — operability & contracts.** This release hardens the engine for production
 operation and pins its contracts: structured observability with a documented
 failure-mode matrix, a typed error taxonomy mapped to correct gRPC status codes,
-catalog lifecycle completeness (hard delete with referential integrity, model
-promotion), and a stated, standing multi-tenant isolation contract across the full
-verb surface with a bring-your-own-auth seam.
+catalog lifecycle completeness (hard delete with referential integrity), and a
+stated, standing multi-tenant isolation contract across the full verb surface with
+a bring-your-own-auth seam.
 
 ### Added
 - **Operability surface (§3.7).** The previously-dead Prometheus counters now
@@ -22,11 +22,12 @@ verb surface with a bring-your-own-auth seam.
   lane in CI.
 - **Catalog lifecycle (§3.6).** `delete_model` — hard delete gated by a four-edge
   referential scan that raises a typed `ModelReferenced` (→ `FailedPrecondition`)
-  rather than letting a database FK reject the delete — and `promote_model`, a
-  single `promoted_at` flag enforced by partial unique indexes (migration 021). The
-  full model-verb surface (`list_models`/`describe_model`/`retire_model`/
-  `delete_model`/`promote_model`) is now on the embedded PyO3 and remote Python
-  clients, projected through a minimal `ModelDescriptor`.
+  rather than letting a database FK reject the delete, with `ModelNotFound`
+  (→ `NotFound`) for an absent or out-of-scope target. The engine model-verb
+  surface (`list_models`/`describe_model`/`delete_model`) is on the embedded PyO3
+  and remote Python clients, projected through a minimal `ModelDescriptor`: the
+  engine catalog is for listing and cleaning up models with referential integrity,
+  not lifecycle-stage management.
 - **Multi-tenant contract (§3.5).** A standing tenant-isolation oracle that proves
   isolation across every verb and binds coverage to the compiled proto descriptor —
   a new rpc landing without an isolation case fails CI. A documented
@@ -49,6 +50,14 @@ verb surface with a bring-your-own-auth seam.
 - **Model-not-found gRPC status.** The lifecycle verbs now return a typed
   `ModelNotFound` mapped to `NotFound` (previously `InvalidArgument`, contradicting
   the documented contract).
+
+### Removed
+- **Model promotion and retirement.** The engine catalog is for listing and
+  cleaning up models; lifecycle-stage management (promotion, retirement, and the
+  `retired` status) is out of scope. Dropped the `promote_model`/`retire_model`
+  verbs across every surface (catalog, gRPC, CLI, embedded PyO3, remote client),
+  the `ModelStatus::Retired` state and its `ModelRetired` error, the `promoted`
+  projection field, and the model-promotion catalog migration.
 
 ## [0.29.0] - 2026-06-14
 

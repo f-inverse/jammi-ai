@@ -233,7 +233,7 @@ impl Catalog {
     /// GLOBAL (`tenant_id IS NULL`) source it did not create; only an unscoped
     /// session manages GLOBAL rows. Uses the STRICT delete predicate
     /// (`tenant_id = $cur OR (tenant_id IS NULL AND $cur IS NULL)`) shared with
-    /// [`Catalog::retire_model`], not the read path's `OR tenant_id IS NULL`
+    /// [`Catalog::delete_model`], not the read path's `OR tenant_id IS NULL`
     /// leak.
     pub async fn remove_source(&self, source_id: &str) -> Result<()> {
         let sid = source_id.to_string();

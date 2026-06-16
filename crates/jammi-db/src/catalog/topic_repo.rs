@@ -231,7 +231,7 @@ impl TopicRepo {
         let raw = raw.ok_or_else(|| TriggerError::TopicNotFound(topic_id.to_string()))?;
 
         // 2. Delete the topic row first so the FK no longer pins the table.
-        //    STRICT delete predicate (mirrors `retire_model`): a tenant deletes
+        //    STRICT delete predicate (mirrors `delete_model`): a tenant deletes
         //    only its own row, never a GLOBAL one — only an unscoped session
         //    (`$2 IS NULL`) manages GLOBAL rows. Step 1 already gated on the
         //    same predicate, so this is the matching delete for the row we just

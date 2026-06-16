@@ -29,8 +29,8 @@ use jammi_wire::proto::catalog::{
     AddChannelColumnsRequest, AddSourceRequest, CreateMutableTableRequest, DeleteModelRequest,
     DescribeModelRequest, DescribeSourceRequest, DropMutableTableRequest, DropTopicRequest,
     ListChannelsRequest, ListModelsRequest, ListMutableTablesRequest, ListSourcesRequest,
-    ListTopicsRequest, PromoteModelRequest, RegisterChannelRequest, RegisterTopicRequest,
-    RemoveSourceRequest, RetireModelRequest, SetTenantRequest, Tenant,
+    ListTopicsRequest, RegisterChannelRequest, RegisterTopicRequest, RemoveSourceRequest,
+    SetTenantRequest, Tenant,
 };
 use jammi_wire::{
     channel_from_proto, columns_to_proto, definition_list_from_proto, definition_to_proto,
@@ -180,19 +180,6 @@ impl CatalogClient {
         }
     }
 
-    /// Soft-retire a model. When `version` is `None` the latest version is
-    /// retired. A model outside the caller's scope is rejected as NotFound.
-    pub async fn retire_model(&self, model_id: &str, version: Option<i32>) -> Result<()> {
-        self.client()
-            .retire_model(RetireModelRequest {
-                model_id: model_id.to_string(),
-                version,
-            })
-            .await
-            .map_err(|s| error_from_status(&s))?;
-        Ok(())
-    }
-
     /// Hard-delete a model. When `version` is `None` the latest version is
     /// targeted. A model outside the caller's scope is rejected as NotFound; a
     /// still-referenced model is rejected as `FailedPrecondition`
@@ -209,20 +196,6 @@ impl CatalogClient {
                 model_id: model_id.to_string(),
                 version,
                 if_exists,
-            })
-            .await
-            .map_err(|s| error_from_status(&s))?;
-        Ok(())
-    }
-
-    /// Promote a model, marking it the promoted version for its name. When
-    /// `version` is `None` the latest version is promoted. A model outside the
-    /// caller's scope is rejected as NotFound.
-    pub async fn promote_model(&self, model_id: &str, version: Option<i32>) -> Result<()> {
-        self.client()
-            .promote_model(PromoteModelRequest {
-                model_id: model_id.to_string(),
-                version,
             })
             .await
             .map_err(|s| error_from_status(&s))?;

@@ -12,7 +12,6 @@ mod foundation;
 mod index;
 mod migrations;
 mod model_lifecycle;
-mod model_retire;
 #[cfg(feature = "test-hooks")]
 mod mutable_crash_recovery;
 mod mutable_federation;

@@ -1,29 +1,21 @@
-//! Model DELETE and PROMOTE lifecycle on the `models` catalog table.
+//! Model DELETE lifecycle on the `models` catalog table.
 //!
-//! DELETE is the hard counterpart of RETIRE: it removes the row, so it is
-//! refused while any reference still points at the model. The load-bearing rule
-//! is the four-edge referential scan, each edge keyed by what it actually stores
-//! — the model NAME for the two no-FK edges (`result_tables.model_id`,
-//! `training_jobs.output_model_id`) and the catalog PK for the two FK-backed
-//! ones (`training_jobs.base_model_id`, `eval_runs.model_id`). A pk-keyed scan
-//! would silently miss the two name-keyed edges, so each is exercised directly.
-//!
-//! PROMOTE is a single nullable flag: promoting a version demotes the prior one,
-//! so at most one row per `(tenant, name)` is promoted; the partial unique
-//! indexes back that even against a direct double-promote. Both verbs are
-//! strictly tenant-scoped — a tenant touches only a row it owns.
+//! DELETE removes the row, so it is refused while any reference still points at
+//! the model. The load-bearing rule is the four-edge referential scan, each edge
+//! keyed by what it actually stores — the model NAME for the two no-FK edges
+//! (`result_tables.model_id`, `training_jobs.output_model_id`) and the catalog PK
+//! for the two FK-backed ones (`training_jobs.base_model_id`, `eval_runs.model_id`).
+//! A pk-keyed scan would silently miss the two name-keyed edges, so each is
+//! exercised directly. DELETE is strictly tenant-scoped — a tenant touches only a
+//! row it owns.
 //!
 //! Every test is parameterised over [`BackendKind`] via `test_case` + `cfg_attr`.
 //! The SQLite lane is always generated; the Postgres lane is generated only when
 //! the `live-postgres-tests` feature is on, and skips at runtime when
 //! `JAMMI_TEST_PG_URL` is unset (an early return, never `#[ignore]`). The
-//! Postgres lane is where the contract bites hardest: the partial unique indexes
-//! are real `CREATE UNIQUE INDEX … WHERE …` constraints a direct double-promote
-//! violates with a typed `BackendError::Constraint`, the four-edge scan runs
+//! Postgres lane is where the contract bites hardest: the four-edge scan runs
 //! under PG `Serializable` and still surfaces the typed `ModelReferenced` rather
-//! than a raw FK error, and migration 021's two partial indexes are asserted to
-//! exist via `pg_indexes` (the PG analogue of the SQLite `sqlite_master` check in
-//! `migrations.rs`). On the Postgres lane that one catalog DB is shared across
+//! than a raw FK error. On the Postgres lane that one catalog DB is shared across
 //! the whole run, so each test first clears the referential tables via
 //! [`reset_catalog`]; CI's `test-pg` job runs the lane with `--test-threads=1`,
 //! so the reset-then-populate sequence cannot race a sibling test.
@@ -31,7 +23,7 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use jammi_db::catalog::backend::{BackendError, BackendKind, SqlValue, TxOptions};
+use jammi_db::catalog::backend::{BackendKind, TxOptions};
 use jammi_db::catalog::eval_repo::EvalRunRecord;
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
@@ -514,298 +506,4 @@ async fn delete_absent_without_if_exists_is_not_found(backend: BackendKind) {
         matches!(err, JammiError::ModelNotFound { .. }),
         "absent delete without if_exists is a model NotFound, got {err:?}"
     );
-}
-
-/// HEADLINE: promote sets the flag; the projected `promoted` bool reads true.
-#[test_case(BackendKind::Sqlite ; "sqlite")]
-#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
-#[tokio::test]
-async fn promote_sets_the_flag(backend: BackendKind) {
-    let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
-    let cat = base.pinned_to_tenant(Some(tenant_a()));
-
-    cat.register_model(register_params("acme/embed-mini"))
-        .await
-        .unwrap();
-    assert!(
-        cat.get_model("acme/embed-mini")
-            .await
-            .unwrap()
-            .unwrap()
-            .promoted_at
-            .is_none(),
-        "a freshly registered model is not promoted"
-    );
-
-    cat.promote_model("acme/embed-mini", None).await.unwrap();
-    assert!(
-        cat.get_model("acme/embed-mini")
-            .await
-            .unwrap()
-            .unwrap()
-            .promoted_at
-            .is_some(),
-        "promote sets the promoted flag"
-    );
-}
-
-/// Promoting v2 demotes v1: at most one version per `(tenant, name)` is promoted.
-#[test_case(BackendKind::Sqlite ; "sqlite")]
-#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
-#[tokio::test]
-async fn promoting_a_version_demotes_the_prior(backend: BackendKind) {
-    let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
-    let cat = base.pinned_to_tenant(Some(tenant_a()));
-
-    let v1 = RegisterModelParams {
-        version: 1,
-        ..register_params("acme/embed-mini")
-    };
-    let v2 = RegisterModelParams {
-        version: 2,
-        ..register_params("acme/embed-mini")
-    };
-    cat.register_model(v1).await.unwrap();
-    cat.register_model(v2).await.unwrap();
-
-    cat.promote_model("acme/embed-mini", Some(1)).await.unwrap();
-    assert!(
-        cat.get_model_version("acme/embed-mini", 1)
-            .await
-            .unwrap()
-            .unwrap()
-            .promoted_at
-            .is_some(),
-        "v1 is promoted"
-    );
-
-    cat.promote_model("acme/embed-mini", Some(2)).await.unwrap();
-    assert!(
-        cat.get_model_version("acme/embed-mini", 2)
-            .await
-            .unwrap()
-            .unwrap()
-            .promoted_at
-            .is_some(),
-        "v2 is now promoted"
-    );
-    assert!(
-        cat.get_model_version("acme/embed-mini", 1)
-            .await
-            .unwrap()
-            .unwrap()
-            .promoted_at
-            .is_none(),
-        "promoting v2 demoted v1 — exactly one version is promoted"
-    );
-}
-
-/// The partial unique index rejects a direct double-promote (one that skips the
-/// in-verb demote) in the TENANT-scoped namespace — a second tenant-owned row
-/// promoted under `idx_models_promoted` collides. On the Postgres lane the
-/// collision surfaces as the typed `BackendError::Constraint` naming the `models`
-/// table; the SQLite lane raises the equivalent unique-violation, so both lanes
-/// assert the same typed constraint error rather than a bare `is_err()`.
-#[test_case(BackendKind::Sqlite ; "sqlite")]
-#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
-#[tokio::test]
-async fn double_promote_rejected_by_partial_index_tenant_scope(backend: BackendKind) {
-    let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
-    let cat = base.pinned_to_tenant(Some(tenant_a()));
-
-    let v1 = RegisterModelParams {
-        version: 1,
-        ..register_params("acme/embed-mini")
-    };
-    let v2 = RegisterModelParams {
-        version: 2,
-        ..register_params("acme/embed-mini")
-    };
-    cat.register_model(v1).await.unwrap();
-    cat.register_model(v2).await.unwrap();
-
-    cat.promote_model("acme/embed-mini", Some(1)).await.unwrap();
-    // A raw UPDATE that sets v2 promoted WITHOUT demoting v1 must hit the
-    // partial unique index `idx_models_promoted(tenant_id, name)`.
-    let pk_v2 = cat
-        .get_model_version("acme/embed-mini", 2)
-        .await
-        .unwrap()
-        .unwrap()
-        .catalog_pk;
-    assert_constraint_violation(
-        direct_promote(&cat, &pk_v2).await,
-        "a direct second promote in the same (tenant, name) must violate the partial unique index",
-    );
-}
-
-/// The GLOBAL-namespace partial index (`idx_models_promoted_global`, on `name`
-/// WHERE `tenant_id IS NULL`) rejects a double-promote among GLOBAL rows — the
-/// gap the composite `(tenant_id, name)` index leaves, since SQL treats the NULL
-/// tenants as distinct.
-#[test_case(BackendKind::Sqlite ; "sqlite")]
-#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
-#[tokio::test]
-async fn double_promote_rejected_by_partial_index_global_scope(backend: BackendKind) {
-    let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
-    let global = base.pinned_to_tenant(None);
-
-    let v1 = RegisterModelParams {
-        version: 1,
-        ..register_params("shared/global-embed")
-    };
-    let v2 = RegisterModelParams {
-        version: 2,
-        ..register_params("shared/global-embed")
-    };
-    global.register_model(v1).await.unwrap();
-    global.register_model(v2).await.unwrap();
-
-    global
-        .promote_model("shared/global-embed", Some(1))
-        .await
-        .unwrap();
-    let pk_v2 = global
-        .get_model_version("shared/global-embed", 2)
-        .await
-        .unwrap()
-        .unwrap()
-        .catalog_pk;
-    assert_constraint_violation(
-        direct_promote(&global, &pk_v2).await,
-        "a direct second GLOBAL promote must violate the global partial unique index",
-    );
-}
-
-/// Tenant B cannot promote tenant A's model: the strict tenant predicate matches
-/// no row B owns, so it is a NotFound.
-#[test_case(BackendKind::Sqlite ; "sqlite")]
-#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
-#[tokio::test]
-async fn cross_tenant_promote_is_not_found(backend: BackendKind) {
-    let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
-    let cat_a = base.pinned_to_tenant(Some(tenant_a()));
-    let cat_b = base.pinned_to_tenant(Some(tenant_b()));
-
-    cat_a
-        .register_model(register_params("acme/embed-mini"))
-        .await
-        .unwrap();
-
-    let err = cat_b
-        .promote_model("acme/embed-mini", None)
-        .await
-        .expect_err("tenant B must not promote tenant A's model");
-    assert!(
-        matches!(err, JammiError::ModelNotFound { .. }),
-        "cross-tenant promote is a model NotFound, got {err:?}"
-    );
-}
-
-/// Migration-chain assertion: after the full chain (through 021) the two partial
-/// unique indexes that back the at-most-one-promoted invariant exist on `models`.
-/// SQLite reads them from `sqlite_master`; Postgres from `pg_indexes` — the PG
-/// analogue of the SQLite index checks in `migrations.rs`. This is the
-/// schema-shape complement to the behavioural double-promote tests above: the
-/// indexes are present, not merely inferred from a rejected write.
-#[test_case(BackendKind::Sqlite ; "sqlite")]
-#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
-#[tokio::test]
-async fn migration_021_partial_indexes_exist(backend: BackendKind) {
-    let dir = tempdir().unwrap();
-    let (_session, base) = lifecycle_catalog!(backend, dir.path());
-
-    for idx in ["idx_models_promoted", "idx_models_promoted_global"] {
-        let exists = index_exists_on_models(&base, backend, idx).await;
-        assert!(
-            exists,
-            "partial unique index '{idx}' must exist on `models` after migration 021 on {backend:?}"
-        );
-    }
-}
-
-/// Whether a named index exists on `models`, read from the backend's catalog
-/// metadata — `sqlite_master` on SQLite, `pg_indexes` on Postgres.
-async fn index_exists_on_models(cat: &Catalog, backend: BackendKind, index: &str) -> bool {
-    // COUNT(*) so the result column is a bigint on Postgres (read as i64);
-    // a bare `SELECT 1` is int4 there and fails the i64 read (SQLite's flexible
-    // typing tolerated it, Postgres does not).
-    let sql = match backend {
-        BackendKind::Sqlite => {
-            "SELECT COUNT(*) AS n FROM sqlite_master \
-             WHERE type = 'index' AND name = $1 AND tbl_name = 'models'"
-        }
-        BackendKind::Postgres => {
-            "SELECT COUNT(*) AS n FROM pg_indexes \
-             WHERE indexname = $1 AND tablename = 'models'"
-        }
-    };
-    let index = index.to_string();
-    cat.backend_arc()
-        .transaction(
-            TxOptions {
-                read_only: true,
-                ..Default::default()
-            },
-            |tx| {
-                Box::pin(async move {
-                    let counts: Vec<i64> = tx
-                        .query(sql, &[SqlValue::TextOwned(index)], |row| {
-                            row.get::<i64>("n")
-                        })
-                        .await?;
-                    Ok(counts.first().copied().unwrap_or(0) > 0)
-                })
-            },
-        )
-        .await
-        .unwrap()
-}
-
-/// Assert a `direct_promote` outcome is the typed unique-constraint violation
-/// the partial index raises (classified from the backend's unique-violation and
-/// wrapped as `JammiError::BackendDriver`), not some other failure. Postgres
-/// populates the offending table on the `DatabaseError`, so the `models` table
-/// is asserted there; SQLite's driver does not surface a table name on a unique
-/// violation (it reports `<unknown>`), so the table is asserted only when the
-/// backend reports it — the variant is the load-bearing invariant on both lanes.
-fn assert_constraint_violation(result: Result<(), JammiError>, context: &str) {
-    match result {
-        Err(JammiError::BackendDriver(BackendError::Constraint { table, .. })) => {
-            if table != "<unknown>" {
-                assert_eq!(
-                    table, "models",
-                    "{context}: a reported constraint table must name `models`"
-                );
-            }
-        }
-        Err(other) => panic!("{context}: expected a constraint violation, got {other:?}"),
-        Ok(()) => panic!("{context}: the direct double-promote was accepted"),
-    }
-}
-
-/// Set `promoted_at` on a row directly (no demote of a sibling) to exercise the
-/// partial unique index in isolation — the backstop a `promote_model` skips. The
-/// index is keyed by the row's stored `tenant_id`, not the session.
-async fn direct_promote(cat: &Catalog, pk: &str) -> Result<(), JammiError> {
-    let pk = pk.to_string();
-    cat.backend_arc()
-        .transaction(TxOptions::default(), |tx| {
-            Box::pin(async move {
-                tx.execute(
-                    "UPDATE models SET promoted_at = CAST(CURRENT_TIMESTAMP AS TEXT) \
-                     WHERE model_id = $1",
-                    &[SqlValue::TextOwned(pk)],
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .await
-        .map_err(JammiError::from)
 }

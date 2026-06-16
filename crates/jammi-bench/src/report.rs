@@ -99,6 +99,14 @@ pub struct Tiers {
     /// Populated by `eval-scale`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eval: Option<EvalTier>,
+    /// The CPU-hermetic propagation tier: the engine's `propagate_embeddings`
+    /// (APPNP/SGC decoupled-GNN forward pass) over a committed synthetic
+    /// graph+embedding fixture. Gated on the DETERMINISM contract — a committed
+    /// digest of the propagated output vectors that any box re-derives — with
+    /// propagation wall-time at named graph sizes riding along as an un-gated,
+    /// machine-dependent reference. Populated by `propagate-scale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub propagate: Option<PropagateTier>,
 }
 
 /// The k values the recall curve is reported at: recall@1, recall@10, recall@100.
@@ -616,4 +624,87 @@ pub struct BootstrapDeterminism {
     pub shuffled_upper: f64,
     /// Human-readable summary of the verdict.
     pub detail: String,
+}
+
+/// The CPU-hermetic propagation tier: the engine's `propagate_embeddings`
+/// (APPNP/SGC decoupled-GNN forward pass) folded over a committed synthetic
+/// graph+embedding fixture, gated on the engine's documented *determinism
+/// contract* and carrying propagation wall-time at named graph sizes as an
+/// un-gated reference.
+///
+/// Two lanes, mirroring the harness's split between a portable gate and a
+/// machine-dependent reference (the binding/training tiers' rate-vs-proof split,
+/// and the recall tier's portable-fraction floor vs on-box cost):
+///
+/// * **The digest gate** ([`digest`](PropagateTier::digest)) — `propagate_embeddings`
+///   is byte-identical across runs and `target_partitions` (the engine's
+///   determinism contract: a fixed `(group, neighbour)` fold order in `f64` with
+///   one final `f32` cast). So the *portable* gate is a stable checksum of the
+///   propagated output vectors over a committed fixture: re-fold through the real
+///   engine, assert the digest equals the committed one. A regression in the
+///   propagation math (the APPNP fold, the `D̃^{-1/2}` degree normalisation, the
+///   hop count, the `α`-teleport) changes the bits and trips the gate. This is the
+///   portable analogue of the recall floor and the eval golden.
+/// * **The latency reference** ([`latencies`](PropagateTier::latencies)) —
+///   propagation wall-time at named graph sizes. Machine-dependent, so it rides
+///   as a [`Measurement`] reference only, NEVER a portable floor (the un-gated-rate
+///   discipline: a wall-time is a property of the box, not the engine).
+#[derive(Debug, Serialize)]
+pub struct PropagateTier {
+    /// The embedding dimensionality the fixture's `X⁽⁰⁾` and the propagated
+    /// output live in — the digest is over `dim`-wide vectors, so it travels.
+    pub dim: usize,
+    /// Hops the gated fold ran (the APPNP depth the committed digest is over).
+    pub hops: usize,
+    /// The APPNP teleport probability `α` the gated fold ran with.
+    pub alpha: f64,
+    /// The neighbour-weighting the gated fold ran (the engine's
+    /// `PropagationWeighting`, named so the digest's provenance is explicit).
+    pub weighting: &'static str,
+    /// The determinism gate: the digest of the propagated output vectors re-folded
+    /// this run through the real engine, the committed digest, and the
+    /// `re-folded == committed` verdict.
+    pub digest: DigestGate,
+    /// Propagation wall-time at each named graph size — an un-gated,
+    /// machine-dependent reference curve, ascending in `nodes`.
+    pub latencies: Vec<PropagateLatency>,
+}
+
+/// The propagation determinism gate: a stable checksum of the engine's propagated
+/// output vectors, re-folded this run and compared to the committed digest.
+///
+/// The digest is a real fold (a deterministic checksum over the `_row_id`-sorted
+/// propagated `f32` bits), never a hand-written constant — the off-box rebuilder
+/// re-derives it from the same fixture the gate re-folds. Asserting `measured ==
+/// committed` is the propagation analogue of the eval tier's exact golden match,
+/// licensed here because the engine's determinism contract makes the output
+/// byte-identical (so an equality, not a tolerance, is the right relation).
+#[derive(Debug, Serialize)]
+pub struct DigestGate {
+    /// The digest of the propagated output re-folded this run through the real
+    /// engine `propagate_embeddings`.
+    pub measured: String,
+    /// The committed digest the re-fold must equal — the same fold, recorded when
+    /// the spec was cut.
+    pub committed: String,
+    /// Whether the gate held: `measured == committed`.
+    pub passed: bool,
+}
+
+/// One named graph size's propagation wall-time — an un-gated reference point.
+///
+/// Both the node count and the bounded fan-out travel with the time, because the
+/// wall-time is a function of the edge set the engine folds, not the node count
+/// alone. The latency is a [`Measurement`] so an un-run size is an explicit
+/// not-yet-measured marker rather than a zero a reader could mistake for "instant".
+#[derive(Debug, Serialize)]
+pub struct PropagateLatency {
+    /// Node count for this reference point.
+    pub nodes: usize,
+    /// Bounded fan-out (intra-class clique size minus one) each node wired at —
+    /// the edge count, and so the fold cost, scales with it.
+    pub fan_out: usize,
+    /// Propagation wall-time over the whole `propagate_embeddings` call (load +
+    /// fold + materialize), milliseconds. Machine-dependent reference, un-gated.
+    pub propagate_ms: Measurement,
 }

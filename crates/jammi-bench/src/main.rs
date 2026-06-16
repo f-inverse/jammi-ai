@@ -22,6 +22,7 @@ mod conformal;
 mod corpus;
 mod eval;
 mod fixture;
+mod propagate;
 mod rate_gate;
 mod recall;
 mod report;
@@ -188,6 +189,22 @@ enum Command {
     /// provenance-recording rebuilder for the committed golden.
     #[command(hide = true)]
     RebuildEvalSpec,
+    /// The CPU-hermetic propagation tier: re-folds the engine's
+    /// `propagate_embeddings` (APPNP/SGC decoupled-GNN forward pass) over a
+    /// committed synthetic graph+embedding fixture and gates the DETERMINISM
+    /// contract — a committed digest of the propagated output vectors that any
+    /// box re-derives — while measuring propagation wall-time at named graph
+    /// sizes as an un-gated, machine-dependent reference. Emits the JSON report
+    /// with the `propagate` tier set and exits non-zero if the digest drifts.
+    PropagateScale,
+    /// Internal: rebuild the committed propagation spec
+    /// (`baselines/propagate.json`) from a fresh fold — folds the gated fixture
+    /// through the engine and records its output digest. Run off-box once when
+    /// the spec is established or the engine's propagation contract changes; CI
+    /// only loads and re-folds it. Not a CI step — the provenance-recording
+    /// rebuilder for the committed digest.
+    #[command(hide = true)]
+    RebuildPropagateSpec,
 }
 
 #[tokio::main]
@@ -222,6 +239,8 @@ async fn main() -> std::process::ExitCode {
         Command::EvalScale => run_eval_scale(),
         Command::RebuildConformalSpec => run_rebuild_conformal_spec(),
         Command::RebuildEvalSpec => run_rebuild_eval_spec(),
+        Command::PropagateScale => run_propagate_scale().await,
+        Command::RebuildPropagateSpec => run_rebuild_propagate_spec().await,
     }
 }
 
@@ -307,6 +326,7 @@ async fn run_train_scale() -> std::process::ExitCode {
             training: Some(tier),
             conformal: None,
             eval: None,
+            propagate: None,
         },
     };
     emit(&report);
@@ -362,6 +382,7 @@ fn run_conformal_scale() -> std::process::ExitCode {
             training: None,
             conformal: Some(tier),
             eval: None,
+            propagate: None,
         },
     };
     emit(&report);
@@ -407,6 +428,7 @@ fn run_eval_scale() -> std::process::ExitCode {
             training: None,
             conformal: None,
             eval: Some(tier),
+            propagate: None,
         },
     };
     emit(&report);
@@ -416,6 +438,53 @@ fn run_eval_scale() -> std::process::ExitCode {
         eprintln!(
             "an eval metric DRIFTED off its committed golden (or the eval_compare bootstrap CI \
              diverged across orderings) — see tiers.eval for the metric that regressed"
+        );
+        std::process::ExitCode::FAILURE
+    }
+}
+
+/// Run the CPU-hermetic propagation tier: load the committed spec, re-fold the
+/// gated digest through the engine's real `propagate_embeddings`, measure the
+/// un-gated latency reference, emit the report with the `propagate` tier set, and
+/// map the digest verdict to the exit code. A digest drift prints and exits
+/// non-zero — the run never fakes a pass.
+async fn run_propagate_scale() -> std::process::ExitCode {
+    let spec = match propagate::PropagateSpec::load() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("propagate-scale could not load the committed spec: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let tier = match propagate::run(&spec).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("propagate-scale digest fold failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let passed = propagate::gate_passed(&tier);
+    let report = Report {
+        engine_version: ENGINE_VERSION,
+        host: Host::detect(),
+        subcommand: "propagate-scale",
+        tiers: Tiers {
+            arxiv: None,
+            binding: None,
+            recall_sweep: None,
+            training: None,
+            conformal: None,
+            eval: None,
+            propagate: Some(tier),
+        },
+    };
+    emit(&report);
+    if passed {
+        std::process::ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "the propagation digest DRIFTED off its committed value — the engine's \
+             propagate_embeddings output changed; see tiers.propagate.digest for the bits"
         );
         std::process::ExitCode::FAILURE
     }
@@ -515,6 +584,68 @@ fn run_rebuild_eval_spec() -> std::process::ExitCode {
     }
 }
 
+/// The embedding dimensionality the committed propagation fixture's `X⁽⁰⁾` and
+/// the propagated output live in.
+const PROPAGATE_DIM: usize = 16;
+/// The number of classes the committed propagation graph wires within — a clique
+/// per class, so two classes give a graph with structure to smooth over.
+const PROPAGATE_N_CLASSES: usize = 4;
+/// Nodes per class in the *gated* fixture (the tractable digest size the
+/// hermetic `cargo test` gate re-folds in seconds). The gated node count is
+/// `PROPAGATE_N_CLASSES · PROPAGATE_GATE_PER_CLASS`.
+const PROPAGATE_GATE_PER_CLASS: usize = 8;
+/// Bounded fan-out: each node wires to its next `PROPAGATE_FAN_OUT` class-mates
+/// (a circulant graph per class), so the edge set is `O(nodes · fan_out)` and
+/// stays under the engine's edge-set ceiling at the larger latency sizes.
+const PROPAGATE_FAN_OUT: usize = 4;
+/// The APPNP hop count the committed digest is folded at — the engine's
+/// over-smoothing sweet spot.
+const PROPAGATE_HOPS: usize = 2;
+/// The APPNP teleport probability the committed digest is folded with — the
+/// engine's default restart.
+const PROPAGATE_ALPHA: f64 = 0.1;
+/// The node counts the un-gated propagation latency reference is measured at — a
+/// machine-dependent wall-time curve, ascending. The named sizes the
+/// `propagate-scale` subcommand emits the reference at; they are NOT gated.
+const PROPAGATE_LATENCY_NODES: [usize; 2] = [1_000, 10_000];
+
+/// Rebuild and write the committed propagation spec from a fresh fold. The
+/// off-box one-shot; prints the spec it wrote so the operator sees the digest
+/// being committed.
+async fn run_rebuild_propagate_spec() -> std::process::ExitCode {
+    let spec = match propagate::rebuild_spec(
+        PROPAGATE_DIM,
+        PROPAGATE_N_CLASSES,
+        PROPAGATE_GATE_PER_CLASS,
+        PROPAGATE_FAN_OUT,
+        PROPAGATE_HOPS,
+        PROPAGATE_ALPHA,
+        &PROPAGATE_LATENCY_NODES,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("rebuild-propagate-spec failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match serde_json::to_string_pretty(&spec) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(propagate::PropagateSpec::path(), format!("{json}\n")) {
+                eprintln!("rebuild-propagate-spec could not write the spec: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+            println!("{json}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("failed to serialize propagate spec: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 /// The `measure-once` child: run one variant over the pre-materialized corpus,
 /// print its peak RSS and result digest, and exit. The parent reads the single
 /// stdout line; a failure exits non-zero so the parent surfaces it.
@@ -568,6 +699,7 @@ async fn run_search_rss() -> std::process::ExitCode {
             training: None,
             conformal: None,
             eval: None,
+            propagate: None,
         },
     };
     emit(&report);
@@ -615,6 +747,7 @@ async fn run_arxiv() -> std::process::ExitCode {
             training: None,
             conformal: None,
             eval: None,
+            propagate: None,
         },
     };
     emit(&report);
@@ -668,6 +801,7 @@ async fn run_recall_sweep(
             training: None,
             conformal: None,
             eval: None,
+            propagate: None,
         },
     };
     emit(&report);

@@ -45,7 +45,7 @@ use crate::report::RECALL_KS;
 /// trips. Matched to the full-cache golden's margin (0.04) so the small slice
 /// and the 170k gate carry the same discipline — the floor is never the bare
 /// measured number (which would trip on any drift) nor an invented round value.
-const FLOOR_MARGIN: f64 = 0.04;
+pub(crate) const FLOOR_MARGIN: f64 = 0.04;
 
 /// The committed floor record: per-k measured recall and the margin-subtracted
 /// floor the gate asserts, plus the slice provenance.

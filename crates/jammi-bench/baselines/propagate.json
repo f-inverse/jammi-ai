@@ -1,0 +1,13 @@
+{
+  "dim": 16,
+  "n_classes": 4,
+  "gate_per_class": 8,
+  "fan_out": 4,
+  "hops": 2,
+  "alpha": 0.1,
+  "digest": "bf8d219930e39aaf",
+  "latency_nodes": [
+    1000,
+    10000
+  ]
+}

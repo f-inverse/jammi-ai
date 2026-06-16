@@ -4121,10 +4121,14 @@ name = "jammi-bench"
 version = "0.30.0"
 dependencies = [
  "arrow",
+ "candle-core",
+ "candle-nn",
  "clap",
  "datafusion",
  "futures",
+ "jammi-ai",
  "jammi-db",
+ "jammi-lora",
  "jammi-numerics",
  "libc",
  "serde",

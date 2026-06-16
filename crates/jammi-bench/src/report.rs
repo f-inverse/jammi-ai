@@ -81,6 +81,59 @@ pub struct Tiers {
     /// the HNSW knobs are swept. Populated by `recall-sweep`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recall_sweep: Option<RecallSweepTier>,
+    /// The CPU-hermetic training tier: in-batch-negative fine-tune throughput
+    /// (pairs/s) gated against a committed same-box baseline, plus the bounded
+    /// (GradCache) vs unbounded (single-pass) activation-memory negative control.
+    /// Populated by `train-scale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub training: Option<TrainingTier>,
+    /// The CPU-hermetic conformal-coverage tier: the engine's split-conformal
+    /// calibration drives a marginal coverage that is gated against a committed
+    /// floor (`coverage_floor = measured − MARGIN`, the recall-floor idiom), one
+    /// point per calibration-set size. Populated by `conformal-scale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conformal: Option<ConformalTier>,
+    /// The CPU-hermetic eval-metric tier: the engine's retrieval / classification
+    /// metric folds and the order-invariant bootstrap CI, each re-folded over a
+    /// committed golden and gated against a committed value within a tolerance.
+    /// Populated by `eval-scale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eval: Option<EvalTier>,
+    /// The CPU-hermetic propagation tier: the engine's `propagate_embeddings`
+    /// (APPNP/SGC decoupled-GNN forward pass) over a committed synthetic
+    /// graph+embedding fixture. Gated on the DETERMINISM contract — a committed
+    /// digest of the propagated output vectors that any box re-derives — with
+    /// propagation wall-time at named graph sizes riding along as an un-gated,
+    /// machine-dependent reference. Populated by `propagate-scale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub propagate: Option<PropagateTier>,
+    /// The CPU-hermetic graph fine-tune tier: the engine's biased-walk graph
+    /// sampler (`GraphSampler`, the data path `fine_tune_graph` threads through)
+    /// drives a sampled-pairs-per-second throughput gated against a committed
+    /// same-box baseline by [`crate::rate_gate`], plus a committed-digest gate on
+    /// the sampled pair set (the sampler is seeded, so the pairs are byte-stable —
+    /// a regression in the walk bias, the negative mining, or the adjacency moves
+    /// the digest). Populated by `graph-train-scale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_train: Option<GraphTrainTier>,
+    /// The CPU-hermetic context-predictor tier: the engine's episodic
+    /// meta-training (`sample_context_episodes` + `train_loop`) drives a
+    /// training-throughput rate gated against a committed same-box baseline, and
+    /// the serving path (`predict_with_context_predictor` over committed weights)
+    /// carries a committed-digest gate on the predicted distribution with predict
+    /// wall-time as an un-gated reference. Populated by `context-predictor-scale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_predictor: Option<ContextPredictorTier>,
+    /// The CPU-hermetic model-inference tier: the engine's GPU-model serving
+    /// verbs `generate_text_embeddings` (the `generate_embeddings` path) and
+    /// `infer` (`Classification`), driven on `Device::Cpu` over tiny committed
+    /// model bundles. Each lane gates a committed determinism DIGEST of the served
+    /// output (the portable cell anchor) and a coarse same-box serving rate by
+    /// [`crate::rate_gate`]. The rate is a code-path-regression net over the tiny
+    /// model — NOT the full-scale scaling SLO, which is captured off-box in the
+    /// cookbook (the A/B split). Populated by `model-inference-scale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_inference: Option<ModelInferenceTier>,
 }
 
 /// The k values the recall curve is reported at: recall@1, recall@10, recall@100.
@@ -313,4 +366,613 @@ impl Measurement {
             unit,
         }
     }
+}
+
+/// The CPU-hermetic training tier: how fast the engine's in-batch-negative
+/// fine-tune primitive trains on this box, and the proof that the GradCache
+/// (chunked) backward holds a bounded activation footprint while the single-pass
+/// backward — which keeps every row's encoder graph alive at once — grows with
+/// the pair count.
+///
+/// Two lanes, mirroring the binding tier's split between a measured rate and a
+/// bounded-vs-growth proof:
+///
+/// * **Throughput** ([`pairs_per_s`](TrainingTier::pairs_per_s)) — pairs trained
+///   per second through one GradCache backward + AdamW step over the largest
+///   pair count, on `Device::Cpu`. A *rate*, so it is gated against a committed
+///   same-box baseline by [`crate::rate_gate`], not a portable floor.
+/// * **The OOM negative control** ([`oom`](TrainingTier::oom)) — the same
+///   activation-memory cliff the binding tier's RSS proof has for search: the
+///   single-pass backward's peak RSS grows with the pair count while GradCache's
+///   stays flat. The verdict is observed live across ascending pair counts,
+///   never asserted against a remembered constant.
+#[derive(Debug, Serialize)]
+pub struct TrainingTier {
+    /// The base-model hidden width the synthetic embeddings and projection head
+    /// run at — the encoder activation per row scales with it, so it travels
+    /// with the numbers.
+    pub hidden_size: usize,
+    /// The pair count the throughput was measured at (the largest in the OOM
+    /// sweep, where the per-second rate is most stable).
+    pub throughput_pairs: usize,
+    /// In-batch-negative fine-tune throughput: pairs trained per second through
+    /// one GradCache backward + optimizer step on `Device::Cpu`.
+    pub pairs_per_s: Measurement,
+    /// Wall-clock of the single measured GradCache epoch (one backward + step
+    /// over `throughput_pairs` pairs), milliseconds.
+    pub epoch_wall_ms: Measurement,
+    /// The throughput rate-regression verdict: the measured `pairs_per_s` gated
+    /// against the committed same-box baseline. Present only when the baseline
+    /// was loaded; absent when the report is emitted without a baseline to gate
+    /// against (the rate then rides as a bare measurement).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_gate: Option<RateVerdict>,
+    /// The bounded-vs-growth activation-memory proof over ascending pair counts.
+    pub oom: OomControl,
+}
+
+/// The throughput rate-regression verdict carried in the report: the measured
+/// rate, the committed baseline it was gated against, the threshold applied, the
+/// derived floor, and whether the gate held. Mirrors the in-code gate's fields
+/// so the report records the full arithmetic, not a bare boolean.
+#[derive(Debug, Serialize)]
+pub struct RateVerdict {
+    /// The measured rate the gate evaluated.
+    pub measured_pairs_per_s: f64,
+    /// The committed same-box baseline rate.
+    pub baseline_pairs_per_s: f64,
+    /// The relative-drop threshold applied.
+    pub threshold: f64,
+    /// The floor `baseline · (1 − threshold)` the measured rate had to clear.
+    pub floor_pairs_per_s: f64,
+    /// Whether the measured rate cleared the floor.
+    pub passed: bool,
+    /// Human-readable summary of the verdict with the full arithmetic.
+    pub detail: String,
+}
+
+/// The activation-memory negative control: the GradCache (bounded) and
+/// single-pass (unbounded) backward peak RSS at each ascending pair count, and
+/// the verdict that the encoder activation graph GradCache removes is the
+/// dominant growth term.
+///
+/// The single-pass backward holds every pair's encoder activation graph
+/// (`O(n · depth · d)`) plus the `n × n` in-batch-negative similarity graph
+/// alive until the one `backward()` returns; GradCache detaches each chunk's
+/// representation and backprops one chunk's graph at a time, so it holds only
+/// `O(chunk · depth · d)` of activations — but it still keeps the `O(n · d)`
+/// representations and the `n × n` similarity graph, so its footprint is not
+/// flat in `n`, just far smaller. The verdict is over the smallest-to-largest
+/// delta: the single-pass delta must exceed the GradCache delta by a clear
+/// separation margin (the activation graph GradCache removed) *and* itself clear
+/// a growth floor.
+#[derive(Debug, Serialize)]
+pub struct OomControl {
+    /// How peak RSS was sampled — the same whole-process high-water source the
+    /// binding tier uses.
+    pub rss_source: RssSource,
+    /// One entry per pair count, ascending in `pairs`.
+    pub points: Vec<OomPoint>,
+    /// The verdict over `points`: GradCache RSS flat, single-pass RSS grows.
+    pub assertion: OomAssertion,
+}
+
+/// One pair count's peak RSS for each backward path, each a fresh-process
+/// high-water mark so an earlier larger run's `VmHWM` cannot contaminate it.
+#[derive(Debug, Serialize)]
+pub struct OomPoint {
+    /// In-batch-negative pair count for this point.
+    pub pairs: usize,
+    /// Peak RSS (MiB) of the GradCache (chunked) backward + step over `pairs`
+    /// pairs — the bounded path.
+    pub gradcache_rss_mib: f64,
+    /// Peak RSS (MiB) of the single-pass backward over `pairs` pairs — the
+    /// unbounded negative control that keeps every encoder graph alive at once.
+    pub single_pass_rss_mib: f64,
+}
+
+/// The verdict of the activation-memory proof, over the peak RSS delta between
+/// the smallest and largest pair count.
+#[derive(Debug, Serialize)]
+pub struct OomAssertion {
+    /// Whether the proof held: the single-pass RSS grew past the growth floor
+    /// AND exceeded the GradCache RSS growth by the separation margin (the
+    /// activation graph GradCache removed is the dominant growth term).
+    pub passed: bool,
+    /// GradCache peak-RSS delta (MiB) between the smallest and largest pair
+    /// count — reps-plus-similarity growth, which GradCache does *not* remove.
+    pub gradcache_delta_mib: f64,
+    /// Single-pass peak-RSS delta (MiB) between the smallest and largest pair
+    /// count — the full activation graph, which grows with `n`.
+    pub single_pass_delta_mib: f64,
+    /// The floor (MiB) the single-pass delta had to exceed for "grows".
+    pub single_pass_growth_floor_mib: f64,
+    /// The single-pass-minus-GradCache delta (MiB): the activation-graph growth
+    /// GradCache's chunked re-encode kept off the resident set.
+    pub activation_graph_separation_mib: f64,
+    /// The margin (MiB) `activation_graph_separation_mib` had to exceed for the
+    /// removed activation graph to count as the dominant growth.
+    pub activation_graph_separation_floor_mib: f64,
+    /// Human-readable summary of the verdict.
+    pub detail: String,
+}
+
+/// The CPU-hermetic conformal-coverage tier: the marginal coverage the engine's
+/// split-conformal calibration achieves over a committed calibration/test split,
+/// gated against a committed floor.
+///
+/// Coverage is a *portable fraction* — the `⌈(n+1)(1-alpha)⌉` quantile and the
+/// `1[score ≤ q̂]` coverage count are pure arithmetic over committed scores, so
+/// any box re-derives the same number. It therefore carries a *real CI floor*
+/// gate in the recall fraction's `measured ≥ floor` idiom (not the same-box rate
+/// gate the GPU-bound tiers need): `coverage_floor = measured − MARGIN`, the
+/// margin the headroom the guarantee has against a quantile-arithmetic drift
+/// before the gate trips.
+///
+/// One point per calibration-set size: the set size is the *curve* (how the
+/// finite-sample coverage tightens toward `1 − α` as `n` grows), the coverage is
+/// the *gate* (each point must clear its committed floor, and the floor tracks
+/// the `1 − α − ε` the guarantee promises).
+#[derive(Debug, Serialize)]
+pub struct ConformalTier {
+    /// The nominal miscoverage level `α` the thresholds target — the guarantee is
+    /// marginal coverage `≥ 1 − α`, so it travels with every point.
+    pub alpha: f64,
+    /// One coverage point per calibration-set size, ascending in `cal_rows`.
+    pub points: Vec<ConformalPoint>,
+}
+
+/// One conformal coverage point: a calibration-set size and the marginal
+/// coverage each score family achieved over the held-out test split at it, with
+/// the committed floor each was gated against.
+///
+/// Three score families, one per verb the tier covers: LAC classification
+/// (`conformalize`), absolute-residual regression (`conformalize_interval`), and
+/// CQR regression (`conformalize_cqr`). Each is the engine's own
+/// `ConformalModel` calibration scored by the engine's `coverage` /
+/// `interval_coverage` over the *same* committed test split, so a regression in
+/// any conformal code path moves the measured number here.
+#[derive(Debug, Serialize)]
+pub struct ConformalPoint {
+    /// Calibration-set size this point calibrated the thresholds over.
+    pub cal_rows: usize,
+    /// Held-out test-set size the coverage was measured over.
+    pub test_rows: usize,
+    /// LAC-classification marginal coverage (`conformalize`): the fraction of
+    /// test rows whose prediction set contained the true class.
+    pub classification_coverage: CoverageGate,
+    /// Absolute-residual marginal coverage (`conformalize_interval`): the
+    /// fraction of test rows whose interval `[ŷ − q̂, ŷ + q̂]` contained `y`.
+    pub absolute_residual_coverage: CoverageGate,
+    /// CQR marginal coverage (`conformalize_cqr`): the fraction of test rows
+    /// whose adaptive interval `[q_lo − q̂, q_hi + q̂]` contained `y`.
+    pub cqr_coverage: CoverageGate,
+}
+
+/// One coverage measurement and the committed floor it was gated against — the
+/// portable-fraction analogue of [`RateVerdict`], asserting `measured ≥ floor`
+/// where `floor = committed_measured − MARGIN`.
+#[derive(Debug, Serialize)]
+pub struct CoverageGate {
+    /// The marginal coverage measured this run, a fraction in `[0, 1]`.
+    pub measured: Measurement,
+    /// The committed floor `measured` must clear: the coverage measured on this
+    /// same committed split minus the safety margin.
+    pub floor: f64,
+    /// Whether the gate held: `measured ≥ floor`.
+    pub passed: bool,
+}
+
+/// The CPU-hermetic eval-metric tier: the engine's retrieval / classification
+/// metric folds and the order-invariant bootstrap significance CI, each
+/// re-folded over a committed golden and gated against a committed value within
+/// a tolerance.
+///
+/// Every number is a *deterministic fold* of committed inputs through the
+/// engine's own metric kernels — `RetrievalMetrics` (recall/MRR/nDCG),
+/// `ClassificationMetrics` (accuracy/F1), and the seeded order-invariant
+/// `bootstrap_ci` (the `eval_compare` significance interval). The committed
+/// golden carries the value each fold produced when the golden was cut; the gate
+/// asserts the re-fold lands within a tight tolerance of it (a fold is exact
+/// arithmetic, so the tolerance is for f64 reassociation, not measurement noise)
+/// — a regression in any metric kernel moves the re-folded number off the golden.
+///
+/// One point per eval-set size: the set size is the *curve*, the metrics are the
+/// gated correctness numbers (they hold across sizes because the committed
+/// golden is generated at each size).
+#[derive(Debug, Serialize)]
+pub struct EvalTier {
+    /// The k cutoff the retrieval metrics were folded at.
+    pub k: usize,
+    /// One metric point per eval-set size, ascending in `query_rows`.
+    pub points: Vec<EvalPoint>,
+    /// The order-invariance verdict for the `eval_compare` bootstrap CI: the same
+    /// per-query delta multiset in two different orders yields a byte-identical
+    /// interval (engine #173). Asserted once over the largest point's deltas.
+    pub bootstrap_order_invariant: BootstrapDeterminism,
+}
+
+/// One eval point: an eval-set size and the metric folds the engine kernels
+/// produced over the committed golden at it, each gated against its committed
+/// value within a tolerance.
+#[derive(Debug, Serialize)]
+pub struct EvalPoint {
+    /// Retrieval query count this point folded the recall/MRR/nDCG over
+    /// (`eval_embeddings` / `eval_per_query`).
+    pub query_rows: usize,
+    /// Classification row count this point folded accuracy/F1 over
+    /// (`eval_inference`).
+    pub inference_rows: usize,
+    /// Mean recall@k over the golden retrieval set.
+    pub recall_at_k: MetricGate,
+    /// Mean reciprocal rank over the golden retrieval set.
+    pub mrr: MetricGate,
+    /// Mean nDCG over the golden retrieval set.
+    pub ndcg: MetricGate,
+    /// Classification accuracy over the golden inference set.
+    pub accuracy: MetricGate,
+    /// Macro-F1 over the golden inference set.
+    pub macro_f1: MetricGate,
+}
+
+/// One metric fold and the committed golden value it was gated against, asserting
+/// `|measured − golden| ≤ tolerance`. Unlike a coverage floor (a one-sided `≥`),
+/// a metric re-fold is exact arithmetic, so the gate is a two-sided tolerance
+/// band catching any drift in either direction.
+#[derive(Debug, Serialize)]
+pub struct MetricGate {
+    /// The metric value re-folded this run through the engine kernel.
+    pub measured: Measurement,
+    /// The committed golden value the fold must match within `tolerance`.
+    pub golden: f64,
+    /// The two-sided tolerance band: `|measured − golden| ≤ tolerance`.
+    pub tolerance: f64,
+    /// Whether the gate held.
+    pub passed: bool,
+}
+
+/// The `eval_compare` bootstrap-CI determinism verdict: the seeded percentile
+/// bootstrap is a function of the per-query delta *multiset*, not its order, so
+/// the same deltas shuffled into a different order yield a byte-identical
+/// interval. The verdict carries both intervals so a failure surfaces the
+/// divergence, not just a boolean.
+#[derive(Debug, Serialize)]
+pub struct BootstrapDeterminism {
+    /// Whether the two orderings produced a byte-identical `[lower, upper]`.
+    pub passed: bool,
+    /// The CI lower bound from the canonical-order resample.
+    pub canonical_lower: f64,
+    /// The CI upper bound from the canonical-order resample.
+    pub canonical_upper: f64,
+    /// The CI lower bound from the shuffled-order resample — equal to
+    /// `canonical_lower` when the order-invariance holds.
+    pub shuffled_lower: f64,
+    /// The CI upper bound from the shuffled-order resample.
+    pub shuffled_upper: f64,
+    /// Human-readable summary of the verdict.
+    pub detail: String,
+}
+
+/// The CPU-hermetic propagation tier: the engine's `propagate_embeddings`
+/// (APPNP/SGC decoupled-GNN forward pass) folded over a committed synthetic
+/// graph+embedding fixture, gated on the engine's documented *determinism
+/// contract* and carrying propagation wall-time at named graph sizes as an
+/// un-gated reference.
+///
+/// Two lanes, mirroring the harness's split between a portable gate and a
+/// machine-dependent reference (the binding/training tiers' rate-vs-proof split,
+/// and the recall tier's portable-fraction floor vs on-box cost):
+///
+/// * **The determinism gate** ([`digest`](PropagateTier::digest)) — the engine's
+///   real contract is that `propagate_embeddings` is byte-identical across runs and
+///   `target_partitions` *on a machine* (a fixed `(group, neighbour)` fold order in
+///   `f64` with one final `f32` cast). The output is `f32`, so the exact bits are
+///   NOT identical across CPUs (SIMD/FMA/BLAS reduction order differs), and a
+///   committed cross-machine bit digest would be the wrong gate shape. So the
+///   *portable* gate re-folds the committed fixture through the real engine twice on
+///   the running box and asserts the two digests are equal to each other (a
+///   [`DeterminismGate`]). A regression in the propagation math (the APPNP fold, the
+///   `D̃^{-1/2}` degree normalisation, the hop count, the `α`-teleport) is caught by
+///   the relative perturbation teeth in `cargo test`, which compare a perturbed fold
+///   against the in-process baseline on the same box. The committed digest rides as
+///   a documented same-box reference, never asserted for cross-machine equality.
+/// * **The latency reference** ([`latencies`](PropagateTier::latencies)) —
+///   propagation wall-time at named graph sizes. Machine-dependent, so it rides
+///   as a [`Measurement`] reference only, NEVER a portable floor (the un-gated-rate
+///   discipline: a wall-time is a property of the box, not the engine).
+#[derive(Debug, Serialize)]
+pub struct PropagateTier {
+    /// The embedding dimensionality the fixture's `X⁽⁰⁾` and the propagated
+    /// output live in — the digest is over `dim`-wide vectors, so it travels.
+    pub dim: usize,
+    /// Hops the gated fold ran (the APPNP depth the committed digest is over).
+    pub hops: usize,
+    /// The APPNP teleport probability `α` the gated fold ran with.
+    pub alpha: f64,
+    /// The neighbour-weighting the gated fold ran (the engine's
+    /// `PropagationWeighting`, named so the digest's provenance is explicit).
+    pub weighting: &'static str,
+    /// The determinism gate: the digest of the propagated output vectors re-folded
+    /// twice this run through the real engine on this box, asserting the two are
+    /// equal (the same-machine byte-identity contract). The committed digest rides
+    /// as a same-box reference, never asserted for cross-machine equality.
+    pub digest: DeterminismGate,
+    /// Propagation wall-time at each named graph size — an un-gated,
+    /// machine-dependent reference curve, ascending in `nodes`.
+    pub latencies: Vec<PropagateLatency>,
+}
+
+/// A committed-equality determinism gate: a stable checksum of an engine output,
+/// re-folded this run and compared to the committed digest for byte-equality.
+///
+/// The digest is a real fold (a deterministic checksum over the output), never a
+/// hand-written constant — the off-box rebuilder re-derives it from the same
+/// fixture the gate re-folds. Asserting `measured == committed` is the analogue of
+/// the eval tier's exact golden match, and is only the right relation when the
+/// output is byte-identical *across machines* — i.e. the fold is over integer /
+/// string bytes with no floating-point reduction (the graph-sampler pair set:
+/// node ids and walk sequences over a seeded integer RNG). For `f32`-output folds,
+/// cross-machine bit-identity does NOT hold (SIMD/FMA/BLAS reduction order varies
+/// by CPU), so those tiers use [`DeterminismGate`] instead, which proves the real
+/// (same-machine) contract.
+#[derive(Debug, Serialize)]
+pub struct DigestGate {
+    /// The digest re-folded this run through the real engine path.
+    pub measured: String,
+    /// The committed digest the re-fold must equal — the same fold, recorded when
+    /// the spec was cut.
+    pub committed: String,
+    /// Whether the gate held: `measured == committed`.
+    pub passed: bool,
+}
+
+/// A same-machine determinism gate for an `f32`-output fold: the engine's real
+/// contract is "byte-identical across runs and threads ON A MACHINE", not
+/// cross-machine bit-identity (an `f32` reduction's exact bits depend on the CPU's
+/// SIMD/FMA/BLAS reduction order, which varies by machine). So this gate proves the
+/// real, portable property: it re-folds the same fixture through the same real
+/// engine path twice on the running box and asserts the two digests are equal *to
+/// each other*. That is true on any machine by construction, regardless of which
+/// exact bits that machine produces.
+///
+/// The committed digest rides along as `committed_reference` — a documented
+/// **same-box reference** (like the machine-dependent rate baselines), recorded
+/// when the spec was cut on the rebuild box. It is reported so a human can compare
+/// against the box the spec was cut on, but it is NEVER asserted for equality: a
+/// different CI box producing different `f32` bits is expected, not a regression.
+#[derive(Debug, Serialize)]
+pub struct DeterminismGate {
+    /// The digest the first same-machine fold produced this run.
+    pub first: String,
+    /// The digest the second same-machine fold produced this run. Equal to
+    /// [`first`](DeterminismGate::first) iff the engine path is deterministic on
+    /// this box — the gated property.
+    pub second: String,
+    /// The committed digest, recorded on the rebuild box when the spec was cut. A
+    /// documented same-box reference only — reported for human comparison, never
+    /// asserted for cross-machine equality.
+    pub committed_reference: String,
+    /// Whether the gate held: `first == second` (the same-machine determinism
+    /// contract).
+    pub passed: bool,
+}
+
+impl DeterminismGate {
+    /// Build the gate from two same-machine folds and the committed reference.
+    /// `passed` is `first == second` — the portable same-machine contract.
+    pub fn new(first: String, second: String, committed_reference: String) -> Self {
+        let passed = first == second;
+        Self {
+            first,
+            second,
+            committed_reference,
+            passed,
+        }
+    }
+}
+
+/// One named graph size's propagation wall-time — an un-gated reference point.
+///
+/// Both the node count and the bounded fan-out travel with the time, because the
+/// wall-time is a function of the edge set the engine folds, not the node count
+/// alone. The latency is a [`Measurement`] so an un-run size is an explicit
+/// not-yet-measured marker rather than a zero a reader could mistake for "instant".
+#[derive(Debug, Serialize)]
+pub struct PropagateLatency {
+    /// Node count for this reference point.
+    pub nodes: usize,
+    /// Bounded fan-out (intra-class clique size minus one) each node wired at —
+    /// the edge count, and so the fold cost, scales with it.
+    pub fan_out: usize,
+    /// Propagation wall-time over the whole `propagate_embeddings` call (load +
+    /// fold + materialize), milliseconds. Machine-dependent reference, un-gated.
+    pub propagate_ms: Measurement,
+}
+
+/// The CPU-hermetic graph fine-tune tier: the engine's biased-walk graph sampler
+/// (`GraphSampler`, the data path `fine_tune_graph` threads through) measured for
+/// throughput and gated for determinism.
+///
+/// Two lanes, the harness's portable-gate-vs-machine-dependent-rate split applied
+/// to the graph-supervision data path:
+///
+/// * **Throughput** ([`pairs_per_s`](GraphTrainTier::pairs_per_s)) — the
+///   `(anchor, positive, hard_negatives)` training rows the biased-walk sampler
+///   draws per second over a committed synthetic graph. A *rate* (a property of
+///   the box), so it is gated against a committed same-box baseline by
+///   [`crate::rate_gate`], not a portable floor — the same discipline the
+///   training tier's throughput follows.
+/// * **The determinism digest** ([`digest`](GraphTrainTier::digest)) — the
+///   sampler is seeded (a `SplitMix64` integer walk/negative stream), so the
+///   sampled pair set is byte-stable across runs. The digest folds the sampled
+///   rows' node ids / text bytes — integers and strings, NO floating-point
+///   reduction — so it is byte-identical *across machines*, not merely same-box
+///   (the biased-walk roulette is sequential scalar `f64` with no SIMD/FMA/BLAS, so
+///   it too is IEEE-754 portable). This is why this tier gates the committed digest
+///   for cross-machine equality (a [`DigestGate`]), unlike the `f32`-output tiers
+///   (propagate, context-predictor, model-inference) whose bits float by CPU and so
+///   gate same-machine determinism instead. A regression in the walk bias (`p`/`q`),
+///   the structure-aware negative mining (the k-hop false-negative guard), or the
+///   adjacency construction moves the rows and trips the gate. Licensed by the
+///   sampler's documented seeded reproducibility (the engine's
+///   `graph_spec_round_trip_resamples_identical_pairs` contract).
+#[derive(Debug, Serialize)]
+pub struct GraphTrainTier {
+    /// The node count of the committed synthetic graph the throughput and the
+    /// digest were measured over — the sampler cost scales with it, so it travels.
+    pub nodes: usize,
+    /// The edge count of the committed synthetic graph.
+    pub edges: usize,
+    /// The number of `(anchor, positive, [hard_negative])` rows the sampler drew
+    /// from the committed graph — the digest is over these, and the throughput is
+    /// this count divided by the sample wall-clock.
+    pub sampled_pairs: usize,
+    /// Sampled training rows drawn per second through one `GraphSampler::sample`
+    /// over the committed graph, on the CPU. A *rate*, gated against a committed
+    /// same-box baseline.
+    pub pairs_per_s: Measurement,
+    /// Wall-clock of the single measured `GraphSampler::sample` call,
+    /// milliseconds.
+    pub sample_wall_ms: Measurement,
+    /// The throughput rate-regression verdict: the measured `pairs_per_s` gated
+    /// against the committed same-box baseline. Present only when the baseline was
+    /// loaded; absent when the rate rides as a bare measurement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_gate: Option<RateVerdict>,
+    /// The determinism gate: the digest of the sampled pair set re-drawn this run
+    /// through the real engine sampler, the committed digest, and the
+    /// `re-drawn == committed` verdict.
+    pub digest: DigestGate,
+}
+
+/// The CPU-hermetic context-predictor tier: the engine's episodic meta-training
+/// and in-context serving, measured for throughput and gated for determinism.
+///
+/// Two lanes, the harness's split between a machine-dependent rate and a portable
+/// gate, here spanning the *two* engine verbs the tier covers:
+///
+/// * **Training throughput** ([`train_pairs_per_s`](ContextPredictorTier::train_pairs_per_s))
+///   — the meta-training episodes the engine's `sample_context_episodes` +
+///   `train_loop` drive per second on the CPU. A *rate*, so it is gated against a
+///   committed same-box baseline by [`crate::rate_gate`], the training tier's
+///   discipline.
+/// * **The predict determinism gate** ([`predict_digest`](ContextPredictorTier::predict_digest))
+///   — `predict_with_context_predictor` is byte-deterministic given the served
+///   weights and the target *on a machine* (the engine's inference-only no-gradient
+///   contract). The predicted distribution is `f32`, so its exact bits are not
+///   identical across CPUs; the gate re-predicts the committed targets over the
+///   committed weight bundle twice on the running box and asserts the two digests
+///   are equal to each other (a [`DeterminismGate`]). A regression in the
+///   serve/predict path (context assembly, the in-context forward, the distribution
+///   adapter, the de-standardisation) is caught by the relative perturbation teeth
+///   in `cargo test` (a wrong `context_k` vs the in-process baseline). The committed
+///   digest rides as a same-box reference, never asserted for cross-machine
+///   equality. Predict wall-time rides as an un-gated, machine-dependent
+///   [`Measurement`] reference — a latency is a property of the box, never a
+///   portable floor.
+#[derive(Debug, Serialize)]
+pub struct ContextPredictorTier {
+    /// The predictor architecture the committed weights were trained under
+    /// (`Cnp` / `AttnCnp`), so the digest's provenance is explicit.
+    pub architecture: &'static str,
+    /// The context width `k` the committed predictor serves at — the digest is
+    /// over a `k`-neighbour context, so a serve at a different `k` moves it.
+    pub context_k: usize,
+    /// The number of meta-training episodes the throughput was measured over.
+    pub train_episodes: usize,
+    /// Meta-training episode-steps per second through the engine's
+    /// `train_context_predictor` (sample + `train_loop`) on the CPU. A *rate*,
+    /// gated against a committed same-box baseline.
+    pub train_pairs_per_s: Measurement,
+    /// Wall-clock of the single measured meta-training run (the episodic
+    /// `train_loop` over `train_episodes` episodes), milliseconds.
+    pub train_wall_ms: Measurement,
+    /// The training throughput rate-regression verdict against the committed
+    /// same-box baseline. Present only when the baseline was loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_gate: Option<RateVerdict>,
+    /// The predict determinism gate: the digest of the predicted distributions
+    /// `predict_with_context_predictor` produced over the committed weight bundle
+    /// and committed targets, re-folded twice this run on this box and asserted
+    /// equal (the same-machine determinism contract). The committed digest rides as
+    /// a same-box reference, never asserted for cross-machine equality.
+    pub predict_digest: DeterminismGate,
+    /// Predict wall-time over the committed target set — an un-gated,
+    /// machine-dependent reference, never a portable floor.
+    pub predict_latency_ms: Measurement,
+}
+
+/// The CPU-hermetic model-inference tier: the engine's GPU-model serving verbs
+/// `generate_text_embeddings` (the `generate_embeddings` path) and `infer`
+/// (`Classification`), driven on `Device::Cpu` over tiny committed model bundles,
+/// measured for serving throughput and gated for determinism.
+///
+/// ## The A/B split this tier embodies
+///
+/// These are GPU-model inference rates. The representative full-scale rate — rows
+/// per second through a production-size model on a GPU — is the scaling SLO and
+/// is captured off-box in the cookbook **(A)**; it does NOT live here. This tier
+/// is the CPU-hermetic gate **(B)**: it drives the *same engine verbs* over a tiny
+/// committed bundle so the regression net runs in `cargo test` with no download.
+///
+/// Two lanes per verb, the harness's portable-gate-vs-machine-dependent-rate
+/// split:
+///
+/// * **The determinism gate** ([`embed_digest`](ModelInferenceTier::embed_digest),
+///   [`infer_digest`](ModelInferenceTier::infer_digest)) — the engine's serving
+///   path is byte-deterministic on the CPU over a fixed model and fixed inputs *on
+///   a machine*. The served output is `f32` (embedding vectors; score
+///   distributions), so its exact bits are not identical across CPUs; each gate
+///   re-serves twice on the running box and asserts the two digests are equal to
+///   each other (a [`DeterminismGate`]). A regression in the resolve / tokenize /
+///   forward / pool / adapt path is caught by the relative perturbation teeth in
+///   `cargo test` (a different model / perturbed input vs the in-process baseline).
+///   The committed digests ride as same-box references, never asserted for
+///   cross-machine equality.
+/// * **The serving throughput** ([`embed_rows_per_s`](ModelInferenceTier::embed_rows_per_s),
+///   [`infer_rows_per_s`](ModelInferenceTier::infer_rows_per_s)) — rows/s the tiny
+///   model serves through the real verb on this box, gated against a committed
+///   same-box baseline by [`crate::rate_gate`]. This is a coarse
+///   *code-path-regression* net (it catches lost batching, a per-row model
+///   reload, a dropped fast path) — emphatically NOT the scaling SLO, which is the
+///   cookbook (A) value over a real model on a real device.
+#[derive(Debug, Serialize)]
+pub struct ModelInferenceTier {
+    /// The number of target rows the infer digest folded over — the embed digest
+    /// folds the whole persisted vector column, so this is the infer fold width.
+    pub targets: usize,
+    /// Embed serving throughput: rows/s through the engine's real
+    /// `generate_text_embeddings` over the tiny embed bundle on the CPU. A coarse
+    /// same-box code-path net, NOT the scaling SLO.
+    pub embed_rows_per_s: Measurement,
+    /// Wall-clock of the single measured `generate_text_embeddings` call,
+    /// milliseconds. Machine-dependent reference.
+    pub embed_serve_ms: Measurement,
+    /// The embed throughput rate-regression verdict against the committed same-box
+    /// baseline. Present only when the baseline was loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embed_rate_gate: Option<RateVerdict>,
+    /// The embed determinism gate: the digest of the persisted embedding vectors
+    /// `generate_text_embeddings` produced over the corpus and the committed embed
+    /// bundle, re-served twice this run on this box and asserted equal (the
+    /// same-machine determinism contract). The committed digest rides as a same-box
+    /// reference, never asserted for cross-machine equality.
+    pub embed_digest: DeterminismGate,
+    /// Infer serving throughput: rows/s through the engine's real `infer`
+    /// (`Classification`) over the tiny classifier bundle on the CPU. A coarse
+    /// same-box code-path net, NOT the scaling SLO.
+    pub infer_rows_per_s: Measurement,
+    /// Wall-clock of the single measured `infer` call, milliseconds.
+    /// Machine-dependent reference.
+    pub infer_serve_ms: Measurement,
+    /// The infer throughput rate-regression verdict against the committed same-box
+    /// baseline. Present only when the baseline was loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub infer_rate_gate: Option<RateVerdict>,
+    /// The infer determinism gate: the digest of the per-row score distributions
+    /// `infer` produced over the committed targets and the committed classifier
+    /// bundle, re-served twice this run on this box and asserted equal (the
+    /// same-machine determinism contract). The committed digest rides as a same-box
+    /// reference, never asserted for cross-machine equality.
+    pub infer_digest: DeterminismGate,
 }

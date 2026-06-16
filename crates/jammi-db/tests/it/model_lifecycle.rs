@@ -732,13 +732,16 @@ async fn migration_021_partial_indexes_exist(backend: BackendKind) {
 /// Whether a named index exists on `models`, read from the backend's catalog
 /// metadata — `sqlite_master` on SQLite, `pg_indexes` on Postgres.
 async fn index_exists_on_models(cat: &Catalog, backend: BackendKind, index: &str) -> bool {
+    // COUNT(*) so the result column is a bigint on Postgres (read as i64);
+    // a bare `SELECT 1` is int4 there and fails the i64 read (SQLite's flexible
+    // typing tolerated it, Postgres does not).
     let sql = match backend {
         BackendKind::Sqlite => {
-            "SELECT 1 AS one FROM sqlite_master \
+            "SELECT COUNT(*) AS n FROM sqlite_master \
              WHERE type = 'index' AND name = $1 AND tbl_name = 'models'"
         }
         BackendKind::Postgres => {
-            "SELECT 1 AS one FROM pg_indexes \
+            "SELECT COUNT(*) AS n FROM pg_indexes \
              WHERE indexname = $1 AND tablename = 'models'"
         }
     };
@@ -751,12 +754,12 @@ async fn index_exists_on_models(cat: &Catalog, backend: BackendKind, index: &str
             },
             |tx| {
                 Box::pin(async move {
-                    let rows: Vec<i64> = tx
+                    let counts: Vec<i64> = tx
                         .query(sql, &[SqlValue::TextOwned(index)], |row| {
-                            row.get::<i64>("one")
+                            row.get::<i64>("n")
                         })
                         .await?;
-                    Ok(!rows.is_empty())
+                    Ok(counts.first().copied().unwrap_or(0) > 0)
                 })
             },
         )

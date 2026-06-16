@@ -87,6 +87,18 @@ pub struct Tiers {
     /// Populated by `train-scale`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub training: Option<TrainingTier>,
+    /// The CPU-hermetic conformal-coverage tier: the engine's split-conformal
+    /// calibration drives a marginal coverage that is gated against a committed
+    /// floor (`coverage_floor = measured − MARGIN`, the recall-floor idiom), one
+    /// point per calibration-set size. Populated by `conformal-scale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conformal: Option<ConformalTier>,
+    /// The CPU-hermetic eval-metric tier: the engine's retrieval / classification
+    /// metric folds and the order-invariant bootstrap CI, each re-folded over a
+    /// committed golden and gated against a committed value within a tolerance.
+    /// Populated by `eval-scale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eval: Option<EvalTier>,
 }
 
 /// The k values the recall curve is reported at: recall@1, recall@10, recall@100.
@@ -446,6 +458,162 @@ pub struct OomAssertion {
     /// The margin (MiB) `activation_graph_separation_mib` had to exceed for the
     /// removed activation graph to count as the dominant growth.
     pub activation_graph_separation_floor_mib: f64,
+    /// Human-readable summary of the verdict.
+    pub detail: String,
+}
+
+/// The CPU-hermetic conformal-coverage tier: the marginal coverage the engine's
+/// split-conformal calibration achieves over a committed calibration/test split,
+/// gated against a committed floor.
+///
+/// Coverage is a *portable fraction* — the `⌈(n+1)(1-alpha)⌉` quantile and the
+/// `1[score ≤ q̂]` coverage count are pure arithmetic over committed scores, so
+/// any box re-derives the same number. It therefore carries a *real CI floor*
+/// gate in the recall fraction's `measured ≥ floor` idiom (not the same-box rate
+/// gate the GPU-bound tiers need): `coverage_floor = measured − MARGIN`, the
+/// margin the headroom the guarantee has against a quantile-arithmetic drift
+/// before the gate trips.
+///
+/// One point per calibration-set size: the set size is the *curve* (how the
+/// finite-sample coverage tightens toward `1 − α` as `n` grows), the coverage is
+/// the *gate* (each point must clear its committed floor, and the floor tracks
+/// the `1 − α − ε` the guarantee promises).
+#[derive(Debug, Serialize)]
+pub struct ConformalTier {
+    /// The nominal miscoverage level `α` the thresholds target — the guarantee is
+    /// marginal coverage `≥ 1 − α`, so it travels with every point.
+    pub alpha: f64,
+    /// One coverage point per calibration-set size, ascending in `cal_rows`.
+    pub points: Vec<ConformalPoint>,
+}
+
+/// One conformal coverage point: a calibration-set size and the marginal
+/// coverage each score family achieved over the held-out test split at it, with
+/// the committed floor each was gated against.
+///
+/// Three score families, one per verb the tier covers: LAC classification
+/// (`conformalize`), absolute-residual regression (`conformalize_interval`), and
+/// CQR regression (`conformalize_cqr`). Each is the engine's own
+/// `ConformalModel` calibration scored by the engine's `coverage` /
+/// `interval_coverage` over the *same* committed test split, so a regression in
+/// any conformal code path moves the measured number here.
+#[derive(Debug, Serialize)]
+pub struct ConformalPoint {
+    /// Calibration-set size this point calibrated the thresholds over.
+    pub cal_rows: usize,
+    /// Held-out test-set size the coverage was measured over.
+    pub test_rows: usize,
+    /// LAC-classification marginal coverage (`conformalize`): the fraction of
+    /// test rows whose prediction set contained the true class.
+    pub classification_coverage: CoverageGate,
+    /// Absolute-residual marginal coverage (`conformalize_interval`): the
+    /// fraction of test rows whose interval `[ŷ − q̂, ŷ + q̂]` contained `y`.
+    pub absolute_residual_coverage: CoverageGate,
+    /// CQR marginal coverage (`conformalize_cqr`): the fraction of test rows
+    /// whose adaptive interval `[q_lo − q̂, q_hi + q̂]` contained `y`.
+    pub cqr_coverage: CoverageGate,
+}
+
+/// One coverage measurement and the committed floor it was gated against — the
+/// portable-fraction analogue of [`RateVerdict`], asserting `measured ≥ floor`
+/// where `floor = committed_measured − MARGIN`.
+#[derive(Debug, Serialize)]
+pub struct CoverageGate {
+    /// The marginal coverage measured this run, a fraction in `[0, 1]`.
+    pub measured: Measurement,
+    /// The committed floor `measured` must clear: the coverage measured on this
+    /// same committed split minus the safety margin.
+    pub floor: f64,
+    /// Whether the gate held: `measured ≥ floor`.
+    pub passed: bool,
+}
+
+/// The CPU-hermetic eval-metric tier: the engine's retrieval / classification
+/// metric folds and the order-invariant bootstrap significance CI, each
+/// re-folded over a committed golden and gated against a committed value within
+/// a tolerance.
+///
+/// Every number is a *deterministic fold* of committed inputs through the
+/// engine's own metric kernels — `RetrievalMetrics` (recall/MRR/nDCG),
+/// `ClassificationMetrics` (accuracy/F1), and the seeded order-invariant
+/// `bootstrap_ci` (the `eval_compare` significance interval). The committed
+/// golden carries the value each fold produced when the golden was cut; the gate
+/// asserts the re-fold lands within a tight tolerance of it (a fold is exact
+/// arithmetic, so the tolerance is for f64 reassociation, not measurement noise)
+/// — a regression in any metric kernel moves the re-folded number off the golden.
+///
+/// One point per eval-set size: the set size is the *curve*, the metrics are the
+/// gated correctness numbers (they hold across sizes because the committed
+/// golden is generated at each size).
+#[derive(Debug, Serialize)]
+pub struct EvalTier {
+    /// The k cutoff the retrieval metrics were folded at.
+    pub k: usize,
+    /// One metric point per eval-set size, ascending in `query_rows`.
+    pub points: Vec<EvalPoint>,
+    /// The order-invariance verdict for the `eval_compare` bootstrap CI: the same
+    /// per-query delta multiset in two different orders yields a byte-identical
+    /// interval (engine #173). Asserted once over the largest point's deltas.
+    pub bootstrap_order_invariant: BootstrapDeterminism,
+}
+
+/// One eval point: an eval-set size and the metric folds the engine kernels
+/// produced over the committed golden at it, each gated against its committed
+/// value within a tolerance.
+#[derive(Debug, Serialize)]
+pub struct EvalPoint {
+    /// Retrieval query count this point folded the recall/MRR/nDCG over
+    /// (`eval_embeddings` / `eval_per_query`).
+    pub query_rows: usize,
+    /// Classification row count this point folded accuracy/F1 over
+    /// (`eval_inference`).
+    pub inference_rows: usize,
+    /// Mean recall@k over the golden retrieval set.
+    pub recall_at_k: MetricGate,
+    /// Mean reciprocal rank over the golden retrieval set.
+    pub mrr: MetricGate,
+    /// Mean nDCG over the golden retrieval set.
+    pub ndcg: MetricGate,
+    /// Classification accuracy over the golden inference set.
+    pub accuracy: MetricGate,
+    /// Macro-F1 over the golden inference set.
+    pub macro_f1: MetricGate,
+}
+
+/// One metric fold and the committed golden value it was gated against, asserting
+/// `|measured − golden| ≤ tolerance`. Unlike a coverage floor (a one-sided `≥`),
+/// a metric re-fold is exact arithmetic, so the gate is a two-sided tolerance
+/// band catching any drift in either direction.
+#[derive(Debug, Serialize)]
+pub struct MetricGate {
+    /// The metric value re-folded this run through the engine kernel.
+    pub measured: Measurement,
+    /// The committed golden value the fold must match within `tolerance`.
+    pub golden: f64,
+    /// The two-sided tolerance band: `|measured − golden| ≤ tolerance`.
+    pub tolerance: f64,
+    /// Whether the gate held.
+    pub passed: bool,
+}
+
+/// The `eval_compare` bootstrap-CI determinism verdict: the seeded percentile
+/// bootstrap is a function of the per-query delta *multiset*, not its order, so
+/// the same deltas shuffled into a different order yield a byte-identical
+/// interval. The verdict carries both intervals so a failure surfaces the
+/// divergence, not just a boolean.
+#[derive(Debug, Serialize)]
+pub struct BootstrapDeterminism {
+    /// Whether the two orderings produced a byte-identical `[lower, upper]`.
+    pub passed: bool,
+    /// The CI lower bound from the canonical-order resample.
+    pub canonical_lower: f64,
+    /// The CI upper bound from the canonical-order resample.
+    pub canonical_upper: f64,
+    /// The CI lower bound from the shuffled-order resample — equal to
+    /// `canonical_lower` when the order-invariance holds.
+    pub shuffled_lower: f64,
+    /// The CI upper bound from the shuffled-order resample.
+    pub shuffled_upper: f64,
     /// Human-readable summary of the verdict.
     pub detail: String,
 }

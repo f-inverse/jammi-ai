@@ -18,7 +18,9 @@
 //! as explicit `not yet measured` stubs so the report schema is stable from the
 //! first emit.
 
+mod conformal;
 mod corpus;
+mod eval;
 mod fixture;
 mod rate_gate;
 mod recall;
@@ -156,6 +158,36 @@ enum Command {
         #[arg(long)]
         pairs: usize,
     },
+    /// The CPU-hermetic conformal-coverage tier: re-folds the engine's split
+    /// conformal calibration (LAC classification, absolute-residual and CQR
+    /// regression) over a committed spec, measuring the marginal coverage as a
+    /// PORTABLE FRACTION at each calibration-set size and gating it against a
+    /// committed floor (`coverage_floor = measured − margin`, the recall-floor
+    /// idiom). Emits the JSON report with the `conformal` tier set and exits
+    /// non-zero if any coverage falls below its floor.
+    ConformalScale,
+    /// The CPU-hermetic eval-metric tier: re-folds the engine's retrieval
+    /// (recall/MRR/nDCG) and classification (accuracy/F1) metric kernels and the
+    /// order-invariant `eval_compare` bootstrap CI over a committed golden,
+    /// gating each metric against its committed value within a tolerance and
+    /// asserting the bootstrap's order-invariance (engine #173). Emits the JSON
+    /// report with the `eval` tier set and exits non-zero on any drift.
+    EvalScale,
+    /// Internal: rebuild the committed conformal spec (`baselines/conformal.json`)
+    /// from a fresh measurement — measures each family's coverage at each
+    /// calibration size and writes `floor = measured − margin`. Run off-box once
+    /// when the spec is established or the engine's conformal contract changes;
+    /// CI only loads and re-folds it. Not a CI step — the provenance-recording
+    /// rebuilder for the committed spec.
+    #[command(hide = true)]
+    RebuildConformalSpec,
+    /// Internal: rebuild the committed eval spec (`baselines/eval.json`) from a
+    /// fresh fold — folds each metric at each eval-set size and records it as the
+    /// golden. Run off-box once when the spec is established or a metric kernel
+    /// changes; CI only loads and re-folds it. Not a CI step — the
+    /// provenance-recording rebuilder for the committed golden.
+    #[command(hide = true)]
+    RebuildEvalSpec,
 }
 
 #[tokio::main]
@@ -186,6 +218,10 @@ async fn main() -> std::process::ExitCode {
         Command::TrainScale => run_train_scale().await,
         Command::TrainMeasureOnce { path, pairs } => run_train_measure_once(&path, pairs),
         Command::TrainThroughputOnce { pairs } => run_train_throughput_once(pairs),
+        Command::ConformalScale => run_conformal_scale(),
+        Command::EvalScale => run_eval_scale(),
+        Command::RebuildConformalSpec => run_rebuild_conformal_spec(),
+        Command::RebuildEvalSpec => run_rebuild_eval_spec(),
     }
 }
 
@@ -269,6 +305,8 @@ async fn run_train_scale() -> std::process::ExitCode {
             binding: None,
             recall_sweep: None,
             training: Some(tier),
+            conformal: None,
+            eval: None,
         },
     };
     emit(&report);
@@ -289,6 +327,191 @@ async fn run_train_scale() -> std::process::ExitCode {
         std::process::ExitCode::SUCCESS
     } else {
         std::process::ExitCode::FAILURE
+    }
+}
+
+/// Run the CPU-hermetic conformal-coverage tier: load the committed spec, re-fold
+/// every score family through the engine's real conformal calibration, emit the
+/// report with the `conformal` tier set, and map the coverage-floor verdict to
+/// the exit code. A coverage below its floor prints the numbers and exits
+/// non-zero — the run never fakes a pass.
+fn run_conformal_scale() -> std::process::ExitCode {
+    let spec = match conformal::ConformalSpec::load() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("conformal-scale could not load the committed spec: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let tier = match conformal::run(&spec) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("conformal-scale coverage measurement failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let passed = conformal::all_gates_passed(&tier);
+    let report = Report {
+        engine_version: ENGINE_VERSION,
+        host: Host::detect(),
+        subcommand: "conformal-scale",
+        tiers: Tiers {
+            arxiv: None,
+            binding: None,
+            recall_sweep: None,
+            training: None,
+            conformal: Some(tier),
+            eval: None,
+        },
+    };
+    emit(&report);
+    if passed {
+        std::process::ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "conformal coverage FELL BELOW a committed floor — see tiers.conformal.points[*] \
+             for the family and size that regressed"
+        );
+        std::process::ExitCode::FAILURE
+    }
+}
+
+/// Run the CPU-hermetic eval-metric tier: load the committed spec, re-fold every
+/// metric through the engine's real metric kernels, assert the bootstrap CI's
+/// order-invariance, emit the report with the `eval` tier set, and map the
+/// tolerance verdict to the exit code. Any drift prints and exits non-zero.
+fn run_eval_scale() -> std::process::ExitCode {
+    let spec = match eval::EvalSpec::load() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("eval-scale could not load the committed spec: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let tier = match eval::run(&spec) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("eval-scale metric fold failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let passed = eval::all_gates_passed(&tier);
+    let report = Report {
+        engine_version: ENGINE_VERSION,
+        host: Host::detect(),
+        subcommand: "eval-scale",
+        tiers: Tiers {
+            arxiv: None,
+            binding: None,
+            recall_sweep: None,
+            training: None,
+            conformal: None,
+            eval: Some(tier),
+        },
+    };
+    emit(&report);
+    if passed {
+        std::process::ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "an eval metric DRIFTED off its committed golden (or the eval_compare bootstrap CI \
+             diverged across orderings) — see tiers.eval for the metric that regressed"
+        );
+        std::process::ExitCode::FAILURE
+    }
+}
+
+/// The calibration-set sizes the conformal-coverage curve is committed at: how
+/// the finite-sample coverage tightens toward `1 − α` as `n` grows. The coverage
+/// is the gate at each; the size is the curve.
+const CONFORMAL_CAL_SIZES: [usize; 3] = [1_000, 10_000, 100_000];
+/// The held-out test-set size every conformal coverage point is scored over —
+/// large enough that the empirical coverage estimate is tight around the
+/// guarantee at every calibration size.
+const CONFORMAL_TEST_ROWS: usize = 20_000;
+/// The nominal miscoverage level the committed conformal spec targets (a 90%
+/// coverage guarantee).
+const CONFORMAL_ALPHA: f64 = 0.1;
+/// The class cardinality the synthetic LAC classification spec draws over.
+const CONFORMAL_N_CLASSES: usize = 5;
+
+/// Rebuild and write the committed conformal spec from a fresh measurement. The
+/// off-box one-shot; prints the spec it wrote so the operator sees the numbers
+/// being committed.
+fn run_rebuild_conformal_spec() -> std::process::ExitCode {
+    let spec = match conformal::rebuild_spec(
+        CONFORMAL_ALPHA,
+        CONFORMAL_N_CLASSES,
+        CONFORMAL_TEST_ROWS,
+        &CONFORMAL_CAL_SIZES,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("rebuild-conformal-spec failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match serde_json::to_string_pretty(&spec) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(conformal::ConformalSpec::path(), format!("{json}\n")) {
+                eprintln!("rebuild-conformal-spec could not write the spec: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+            println!("{json}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("failed to serialize conformal spec: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// The eval-set sizes the committed metric curve is folded at, as
+/// `(retrieval_query_rows, classification_inference_rows)` pairs.
+///
+/// A geometric 3-point curve over sizes the hermetic `cargo test` gate re-folds
+/// in seconds: the gate's job is to prove the metric kernels fold the same number
+/// off the committed golden at each size (size-invariance of the *correctness*
+/// numbers), which a tractable largest point demonstrates as faithfully as a huge
+/// one — exactly the recall gate's "small committed projection in the engine
+/// repo" precedent. The full {1k, 10k, 100k} *timing* curve is an off-box /
+/// cookbook concern (re-run `rebuild-eval-spec` with larger sizes there), the
+/// same split recall.rs documents between its committed slice and the 168k
+/// cookbook gate.
+const EVAL_SIZES: [(usize, usize); 3] = [(1_000, 1_000), (4_000, 4_000), (16_000, 16_000)];
+/// The retrieval cutoff `k` the committed eval spec folds recall/MRR/nDCG at.
+const EVAL_K: usize = 10;
+/// The candidate-list length each synthetic query retrieves.
+const EVAL_LIST_LEN: usize = 50;
+/// The number of relevant documents seeded per synthetic query.
+const EVAL_RELEVANT_PER_QUERY: usize = 5;
+/// The class cardinality the synthetic classification golden draws over.
+const EVAL_N_CLASSES: usize = 4;
+
+/// Rebuild and write the committed eval spec from a fresh fold. The off-box
+/// one-shot; prints the spec it wrote.
+fn run_rebuild_eval_spec() -> std::process::ExitCode {
+    let spec = eval::rebuild_spec(
+        EVAL_K,
+        EVAL_LIST_LEN,
+        EVAL_RELEVANT_PER_QUERY,
+        EVAL_N_CLASSES,
+        &EVAL_SIZES,
+    );
+    match serde_json::to_string_pretty(&spec) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(eval::EvalSpec::path(), format!("{json}\n")) {
+                eprintln!("rebuild-eval-spec could not write the spec: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+            println!("{json}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("failed to serialize eval spec: {e}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
@@ -343,6 +566,8 @@ async fn run_search_rss() -> std::process::ExitCode {
             binding: Some(tier),
             recall_sweep: None,
             training: None,
+            conformal: None,
+            eval: None,
         },
     };
     emit(&report);
@@ -388,6 +613,8 @@ async fn run_arxiv() -> std::process::ExitCode {
             binding: None,
             recall_sweep: None,
             training: None,
+            conformal: None,
+            eval: None,
         },
     };
     emit(&report);
@@ -439,6 +666,8 @@ async fn run_recall_sweep(
             binding: None,
             recall_sweep: Some(tier),
             training: None,
+            conformal: None,
+            eval: None,
         },
     };
     emit(&report);

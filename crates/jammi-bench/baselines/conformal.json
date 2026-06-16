@@ -1,0 +1,53 @@
+{
+  "alpha": 0.1,
+  "n_classes": 5,
+  "test_rows": 20000,
+  "margin": 0.05,
+  "points": [
+    {
+      "cal_rows": 1000,
+      "classification": {
+        "measured": 0.90735,
+        "floor": 0.85735
+      },
+      "absolute_residual": {
+        "measured": 0.9052,
+        "floor": 0.8552
+      },
+      "cqr": {
+        "measured": 0.9028,
+        "floor": 0.8528
+      }
+    },
+    {
+      "cal_rows": 10000,
+      "classification": {
+        "measured": 0.9024,
+        "floor": 0.8523999999999999
+      },
+      "absolute_residual": {
+        "measured": 0.90055,
+        "floor": 0.8505499999999999
+      },
+      "cqr": {
+        "measured": 0.90415,
+        "floor": 0.85415
+      }
+    },
+    {
+      "cal_rows": 100000,
+      "classification": {
+        "measured": 0.89835,
+        "floor": 0.8483499999999999
+      },
+      "absolute_residual": {
+        "measured": 0.89945,
+        "floor": 0.8494499999999999
+      },
+      "cqr": {
+        "measured": 0.9053,
+        "floor": 0.8553
+      }
+    }
+  ]
+}

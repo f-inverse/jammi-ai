@@ -1,0 +1,36 @@
+{
+  "k": 10,
+  "list_len": 50,
+  "relevant_per_query": 5,
+  "n_classes": 4,
+  "tolerance": 1e-9,
+  "points": [
+    {
+      "query_rows": 1000,
+      "inference_rows": 1000,
+      "recall_at_k": 0.5286000000000011,
+      "mrr": 0.491932936507936,
+      "ndcg": 0.357555729276094,
+      "accuracy": 0.769,
+      "macro_f1": 0.7690352978190247
+    },
+    {
+      "query_rows": 4000,
+      "inference_rows": 4000,
+      "recall_at_k": 0.5331499999999945,
+      "mrr": 0.5079453373015863,
+      "ndcg": 0.36834114651525407,
+      "accuracy": 0.74875,
+      "macro_f1": 0.7487774714249598
+    },
+    {
+      "query_rows": 16000,
+      "inference_rows": 16000,
+      "recall_at_k": 0.5355000000000207,
+      "mrr": 0.5120637400793492,
+      "ndcg": 0.37186827888283386,
+      "accuracy": 0.7465,
+      "macro_f1": 0.746479809717026
+    }
+  ]
+}

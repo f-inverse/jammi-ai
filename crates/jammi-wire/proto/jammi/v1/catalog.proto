@@ -302,6 +302,9 @@ message Model {
   jammi.v1.inference.ModelTask task = 3;
   // Lifecycle status (e.g. "registered", "loaded", "failed").
   string status = 4;
+  // 5 was a `promoted` flag — removed (model promotion is not an engine concern).
+  reserved 5;
+  reserved "promoted";
 }
 
 // === channels =============================================================

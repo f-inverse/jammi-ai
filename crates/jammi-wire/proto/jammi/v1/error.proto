@@ -130,8 +130,8 @@ message ModelReferencedError {
   repeated string referenced_by = 2;
 }
 
-// `JammiError::ModelNotFound { model_id }`. A lifecycle verb (retire / delete /
-// promote) resolved no model row for the caller's tenant. Distinct from
+// `JammiError::ModelNotFound { model_id }`. A `delete_model` call resolved no
+// model row for the caller's tenant. Distinct from
 // `ModelError` (a bad-argument model fault → `InvalidArgument`): an absent row
 // is a NotFound → `NotFound`, so it carries its own variant rather than folding
 // onto the generic model error.

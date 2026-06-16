@@ -31,10 +31,10 @@ pub enum JammiError {
         message: String,
     },
 
-    /// A lifecycle verb (retire / delete / promote) resolved no model row for
-    /// the caller's tenant — the model does not exist, or exists only outside
-    /// the caller's scope. An absent row is a NotFound, not a bad argument, so
-    /// it maps to gRPC `NotFound` rather than `InvalidArgument`.
+    /// A `delete_model` call resolved no model row for the caller's tenant — the
+    /// model does not exist, or exists only outside the caller's scope. An absent
+    /// row is a NotFound, not a bad argument, so it maps to gRPC `NotFound` rather
+    /// than `InvalidArgument`.
     #[error("Model not found: {model_id}")]
     ModelNotFound {
         /// Identifier of the model that resolved no row.

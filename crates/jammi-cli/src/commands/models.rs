@@ -66,7 +66,7 @@ fn print_header() {
         "{:<40} {:<12} {:<14} {:<12}",
         "Model ID", "Backend", "Task", "Status"
     );
-    println!("{}", "-".repeat(78));
+    println!("{}", "-".repeat(81));
 }
 
 fn print_row(m: &ModelDescriptor) {

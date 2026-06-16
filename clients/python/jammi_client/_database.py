@@ -710,11 +710,10 @@ class RemoteDatabase:
         return _source_descriptor_to_dict(d)
 
     def list_models(self) -> List[Dict[str, Any]]:
-        """A record for every *active* model registered to the current tenant.
+        """A record for every model in the current tenant's catalog.
 
         Maps to `CatalogService.ListModels`; same dict shape per entry as
-        :meth:`describe_model`. Retired models are hidden — the active-listing
-        sense, the peer of :meth:`list_sources`.
+        :meth:`describe_model`. The peer of :meth:`list_sources`.
         """
         resp = self._catalog.ListModels(
             catalog_pb2.ListModelsRequest(), metadata=self._metadata

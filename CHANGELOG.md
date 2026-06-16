@@ -6,6 +6,50 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-06-16
+
+**H3 — operability & contracts.** This release hardens the engine for production
+operation and pins its contracts: structured observability with a documented
+failure-mode matrix, a typed error taxonomy mapped to correct gRPC status codes,
+catalog lifecycle completeness (hard delete with referential integrity, model
+promotion), and a stated, standing multi-tenant isolation contract across the full
+verb surface with a bring-your-own-auth seam.
+
+### Added
+- **Operability surface (§3.7).** The previously-dead Prometheus counters now
+  increment (one path-filtered tower layer); gRPC and worker tracing spans
+  correlated by tenant/job; an operability guide + failure-mode matrix; a chaos
+  lane in CI.
+- **Catalog lifecycle (§3.6).** `delete_model` — hard delete gated by a four-edge
+  referential scan that raises a typed `ModelReferenced` (→ `FailedPrecondition`)
+  rather than letting a database FK reject the delete — and `promote_model`, a
+  single `promoted_at` flag enforced by partial unique indexes (migration 021). The
+  full model-verb surface (`list_models`/`describe_model`/`retire_model`/
+  `delete_model`/`promote_model`) is now on the embedded PyO3 and remote Python
+  clients, projected through a minimal `ModelDescriptor`.
+- **Multi-tenant contract (§3.5).** A standing tenant-isolation oracle that proves
+  isolation across every verb and binds coverage to the compiled proto descriptor —
+  a new rpc landing without an isolation case fails CI. A documented
+  bring-your-own-auth seam with a worked custom-interceptor example (auth placed
+  ahead of the unauthenticated session-correlation header).
+
+### Changed
+- **Channel error taxonomy (§3.8).** Evidence-channel operations return typed
+  errors mapped to correct gRPC codes (`AlreadyExists`/`NotFound`/
+  `FailedPrecondition`/`InvalidArgument`) instead of `Internal`.
+- **Transport-parity collapse (§3.8).** The embedded-PyO3 and pure-client request
+  assembly is collapsed onto a single proto seam (`jammi_client._assembly` +
+  `jammi_ai::wire` decoders), so each verb's field map lives once.
+
+### Fixed
+- **Cross-tenant isolation (§3.5).** Closed cross-tenant read/delete on mutable
+  tables, sources, result tables, and topics via a strict tenant predicate on every
+  destructive path; topic ids are now server-minted, so a caller can no longer
+  replay a UUID to collide another tenant's topic registration.
+- **Model-not-found gRPC status.** The lifecycle verbs now return a typed
+  `ModelNotFound` mapped to `NotFound` (previously `InvalidArgument`, contradicting
+  the documented contract).
+
 ## [0.29.0] - 2026-06-14
 
 The regression fine-tune surface is now consumer-usable and scale-robust. A team

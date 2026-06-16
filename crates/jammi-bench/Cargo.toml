@@ -15,6 +15,15 @@ path = "src/main.rs"
 [dependencies]
 jammi-db.workspace = true
 jammi-numerics.workspace = true
+# The training-throughput tier drives the engine's hermetic CPU fine-tune
+# primitives (`gradcache_backward`, `build_projection_head`, `AdamW`) and the
+# LoRA layer they run over, so the bench pulls jammi-ai's embedded (`local`)
+# engine and the candle stack it trains on — the same surface the engine's own
+# `fine_tune` integration suite exercises on `Device::Cpu`.
+jammi-ai = { workspace = true, features = ["local"] }
+jammi-lora = { workspace = true, features = ["candle"] }
+candle-core.workspace = true
+candle-nn.workspace = true
 
 arrow.workspace = true
 datafusion.workspace = true

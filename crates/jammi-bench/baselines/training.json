@@ -1,0 +1,11 @@
+{
+  "_comment": "Committed SAME-BOX throughput baseline for the CPU-hermetic training tier. A rate is not portable (unlike the recall fraction), so this is a same-box reference refreshed by hand when the emit box changes, not a number a different machine re-derives. Measured in the release profile via `jammi-bench train-throughput-once --pairs 1536` (one GradCache in-batch-negative backward + AdamW step over 1536 synthetic pairs on Device::Cpu). The relative-drop threshold is NOT stored here: it is the harness's single DEFAULT_REGRESSION_THRESHOLD (0.30), defined once in rate_gate.rs. The gate fails a measured rate below pairs_per_s*(1-threshold). The threshold is generous to survive shared-runner noise: the structural regression this gate exists to catch (a quadratic blowup, a serialized parallel path) collapses throughput by far more than 30%, while observed run-to-run spread on this box was ~10%.",
+  "engine_version": "0.30.0",
+  "host": {
+    "logical_cpus": 8,
+    "total_ram_mib": 31720
+  },
+  "profile": "release",
+  "pairs": 1536,
+  "pairs_per_s": 180.0
+}

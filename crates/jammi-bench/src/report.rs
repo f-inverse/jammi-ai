@@ -81,6 +81,12 @@ pub struct Tiers {
     /// the HNSW knobs are swept. Populated by `recall-sweep`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recall_sweep: Option<RecallSweepTier>,
+    /// The CPU-hermetic training tier: in-batch-negative fine-tune throughput
+    /// (pairs/s) gated against a committed same-box baseline, plus the bounded
+    /// (GradCache) vs unbounded (single-pass) activation-memory negative control.
+    /// Populated by `train-scale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub training: Option<TrainingTier>,
 }
 
 /// The k values the recall curve is reported at: recall@1, recall@10, recall@100.
@@ -313,4 +319,133 @@ impl Measurement {
             unit,
         }
     }
+}
+
+/// The CPU-hermetic training tier: how fast the engine's in-batch-negative
+/// fine-tune primitive trains on this box, and the proof that the GradCache
+/// (chunked) backward holds a bounded activation footprint while the single-pass
+/// backward — which keeps every row's encoder graph alive at once — grows with
+/// the pair count.
+///
+/// Two lanes, mirroring the binding tier's split between a measured rate and a
+/// bounded-vs-growth proof:
+///
+/// * **Throughput** ([`pairs_per_s`](TrainingTier::pairs_per_s)) — pairs trained
+///   per second through one GradCache backward + AdamW step over the largest
+///   pair count, on `Device::Cpu`. A *rate*, so it is gated against a committed
+///   same-box baseline by [`crate::rate_gate`], not a portable floor.
+/// * **The OOM negative control** ([`oom`](TrainingTier::oom)) — the same
+///   activation-memory cliff the binding tier's RSS proof has for search: the
+///   single-pass backward's peak RSS grows with the pair count while GradCache's
+///   stays flat. The verdict is observed live across ascending pair counts,
+///   never asserted against a remembered constant.
+#[derive(Debug, Serialize)]
+pub struct TrainingTier {
+    /// The base-model hidden width the synthetic embeddings and projection head
+    /// run at — the encoder activation per row scales with it, so it travels
+    /// with the numbers.
+    pub hidden_size: usize,
+    /// The pair count the throughput was measured at (the largest in the OOM
+    /// sweep, where the per-second rate is most stable).
+    pub throughput_pairs: usize,
+    /// In-batch-negative fine-tune throughput: pairs trained per second through
+    /// one GradCache backward + optimizer step on `Device::Cpu`.
+    pub pairs_per_s: Measurement,
+    /// Wall-clock of the single measured GradCache epoch (one backward + step
+    /// over `throughput_pairs` pairs), milliseconds.
+    pub epoch_wall_ms: Measurement,
+    /// The throughput rate-regression verdict: the measured `pairs_per_s` gated
+    /// against the committed same-box baseline. Present only when the baseline
+    /// was loaded; absent when the report is emitted without a baseline to gate
+    /// against (the rate then rides as a bare measurement).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_gate: Option<RateVerdict>,
+    /// The bounded-vs-growth activation-memory proof over ascending pair counts.
+    pub oom: OomControl,
+}
+
+/// The throughput rate-regression verdict carried in the report: the measured
+/// rate, the committed baseline it was gated against, the threshold applied, the
+/// derived floor, and whether the gate held. Mirrors the in-code gate's fields
+/// so the report records the full arithmetic, not a bare boolean.
+#[derive(Debug, Serialize)]
+pub struct RateVerdict {
+    /// The measured rate the gate evaluated.
+    pub measured_pairs_per_s: f64,
+    /// The committed same-box baseline rate.
+    pub baseline_pairs_per_s: f64,
+    /// The relative-drop threshold applied.
+    pub threshold: f64,
+    /// The floor `baseline · (1 − threshold)` the measured rate had to clear.
+    pub floor_pairs_per_s: f64,
+    /// Whether the measured rate cleared the floor.
+    pub passed: bool,
+    /// Human-readable summary of the verdict with the full arithmetic.
+    pub detail: String,
+}
+
+/// The activation-memory negative control: the GradCache (bounded) and
+/// single-pass (unbounded) backward peak RSS at each ascending pair count, and
+/// the verdict that the encoder activation graph GradCache removes is the
+/// dominant growth term.
+///
+/// The single-pass backward holds every pair's encoder activation graph
+/// (`O(n · depth · d)`) plus the `n × n` in-batch-negative similarity graph
+/// alive until the one `backward()` returns; GradCache detaches each chunk's
+/// representation and backprops one chunk's graph at a time, so it holds only
+/// `O(chunk · depth · d)` of activations — but it still keeps the `O(n · d)`
+/// representations and the `n × n` similarity graph, so its footprint is not
+/// flat in `n`, just far smaller. The verdict is over the smallest-to-largest
+/// delta: the single-pass delta must exceed the GradCache delta by a clear
+/// separation margin (the activation graph GradCache removed) *and* itself clear
+/// a growth floor.
+#[derive(Debug, Serialize)]
+pub struct OomControl {
+    /// How peak RSS was sampled — the same whole-process high-water source the
+    /// binding tier uses.
+    pub rss_source: RssSource,
+    /// One entry per pair count, ascending in `pairs`.
+    pub points: Vec<OomPoint>,
+    /// The verdict over `points`: GradCache RSS flat, single-pass RSS grows.
+    pub assertion: OomAssertion,
+}
+
+/// One pair count's peak RSS for each backward path, each a fresh-process
+/// high-water mark so an earlier larger run's `VmHWM` cannot contaminate it.
+#[derive(Debug, Serialize)]
+pub struct OomPoint {
+    /// In-batch-negative pair count for this point.
+    pub pairs: usize,
+    /// Peak RSS (MiB) of the GradCache (chunked) backward + step over `pairs`
+    /// pairs — the bounded path.
+    pub gradcache_rss_mib: f64,
+    /// Peak RSS (MiB) of the single-pass backward over `pairs` pairs — the
+    /// unbounded negative control that keeps every encoder graph alive at once.
+    pub single_pass_rss_mib: f64,
+}
+
+/// The verdict of the activation-memory proof, over the peak RSS delta between
+/// the smallest and largest pair count.
+#[derive(Debug, Serialize)]
+pub struct OomAssertion {
+    /// Whether the proof held: the single-pass RSS grew past the growth floor
+    /// AND exceeded the GradCache RSS growth by the separation margin (the
+    /// activation graph GradCache removed is the dominant growth term).
+    pub passed: bool,
+    /// GradCache peak-RSS delta (MiB) between the smallest and largest pair
+    /// count — reps-plus-similarity growth, which GradCache does *not* remove.
+    pub gradcache_delta_mib: f64,
+    /// Single-pass peak-RSS delta (MiB) between the smallest and largest pair
+    /// count — the full activation graph, which grows with `n`.
+    pub single_pass_delta_mib: f64,
+    /// The floor (MiB) the single-pass delta had to exceed for "grows".
+    pub single_pass_growth_floor_mib: f64,
+    /// The single-pass-minus-GradCache delta (MiB): the activation-graph growth
+    /// GradCache's chunked re-encode kept off the resident set.
+    pub activation_graph_separation_mib: f64,
+    /// The margin (MiB) `activation_graph_separation_mib` had to exceed for the
+    /// removed activation graph to count as the dominant growth.
+    pub activation_graph_separation_floor_mib: f64,
+    /// Human-readable summary of the verdict.
+    pub detail: String,
 }

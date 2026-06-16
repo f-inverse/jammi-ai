@@ -20,11 +20,13 @@
 
 mod corpus;
 mod fixture;
+mod rate_gate;
 mod recall;
 mod report;
 mod rss;
 mod search_rss;
 mod sweep;
+mod train_scale;
 
 use clap::{Parser, Subcommand};
 
@@ -32,6 +34,7 @@ use std::path::PathBuf;
 
 use report::{ArxivTier, Host, Report, Tiers};
 use search_rss::Variant;
+use train_scale::BackwardPath;
 
 /// Workspace version this binary was built from, stamped into every report so a
 /// downstream gate can reject a cross-version comparison.
@@ -122,6 +125,37 @@ enum Command {
         #[arg(long)]
         query_rows: usize,
     },
+    /// The CPU-hermetic training tier: measures the engine's in-batch-negative
+    /// fine-tune throughput (pairs/s) through one GradCache backward + AdamW step
+    /// on `Device::Cpu`, and re-triggers the activation-memory negative control —
+    /// the single-pass backward (every encoder graph alive at once) grows with
+    /// the pair count while the bounded GradCache path stays flat. Emits the JSON
+    /// report with the `training` tier set; the rate gate against the committed
+    /// baseline runs in `cargo test`, not here.
+    TrainScale,
+    /// Internal: run one backward path over a synthetic CPU fine-tune at a given
+    /// pair count in a fresh process and print `<peak_rss_mib>`. The `train-scale`
+    /// OOM control spawns this per `(path, pairs)` so each peak-RSS sample starts
+    /// from a clean process high-water mark. Not intended for direct use.
+    #[command(hide = true)]
+    TrainMeasureOnce {
+        /// Which backward path to exercise (`gradcache` or `single-pass`).
+        #[arg(long)]
+        path: String,
+        /// In-batch-negative pair count for this measurement.
+        #[arg(long)]
+        pairs: usize,
+    },
+    /// Internal: measure GradCache training throughput at a given pair count in a
+    /// fresh process and print `<pairs_per_s> <wall_ms>`. The `cargo test` rate
+    /// gate spawns this at a reduced pair count to drive the same throughput code
+    /// path the committed baseline is set from. Not intended for direct use.
+    #[command(hide = true)]
+    TrainThroughputOnce {
+        /// In-batch-negative pair count to time one GradCache backward + step over.
+        #[arg(long)]
+        pairs: usize,
+    },
 }
 
 #[tokio::main]
@@ -149,6 +183,112 @@ async fn main() -> std::process::ExitCode {
             run_build_scale_fixture(&corpus_src, &query_src, &out_dir, corpus_rows, query_rows)
                 .await
         }
+        Command::TrainScale => run_train_scale().await,
+        Command::TrainMeasureOnce { path, pairs } => run_train_measure_once(&path, pairs),
+        Command::TrainThroughputOnce { pairs } => run_train_throughput_once(pairs),
+    }
+}
+
+/// The `train-throughput-once` child: time one GradCache backward + step over
+/// `pairs` synthetic pairs in this fresh process and print its rate. A failure
+/// exits non-zero so the parent gate surfaces it.
+fn run_train_throughput_once(pairs: usize) -> std::process::ExitCode {
+    match train_scale::run_throughput_at(pairs) {
+        Ok(t) => {
+            train_scale::emit_throughput_result(t.pairs_per_s, t.wall_ms);
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("train-throughput-once (@ {pairs} pairs) failed: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// The `train-measure-once` child: run one backward path over a synthetic CPU
+/// fine-tune at `pairs` pairs, print its peak RSS, and exit. The parent reads the
+/// single stdout line; a failure exits non-zero so the parent surfaces it.
+fn run_train_measure_once(path: &str, pairs: usize) -> std::process::ExitCode {
+    let path = match BackwardPath::parse(path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("train-measure-once: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match train_scale::measure_once(path, pairs) {
+        Ok(rss_mib) => {
+            train_scale::emit_child_result(rss_mib);
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!(
+                "train-measure-once ({} @ {pairs} pairs) failed: {e}",
+                path.as_str()
+            );
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run the CPU-hermetic training tier: measure GradCache throughput, run the
+/// activation-memory negative control, emit the report with the `training` tier
+/// set, and map the OOM verdict to the process exit code. A failed control
+/// prints the full numbers and exits non-zero — the run never fakes a pass.
+async fn run_train_scale() -> std::process::ExitCode {
+    let baseline = match train_scale::Baseline::load() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("train-scale could not load the committed throughput baseline: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let throughput = match train_scale::run_throughput() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("train-scale throughput measurement failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let oom = match train_scale::run_oom_control().await {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("train-scale OOM control failed to run: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let tier = train_scale::build_tier(throughput, baseline, oom);
+    let oom_passed = tier.oom.assertion.passed;
+    let rate_passed = tier.rate_gate.as_ref().is_none_or(|v| v.passed);
+    let report = Report {
+        engine_version: ENGINE_VERSION,
+        host: Host::detect(),
+        subcommand: "train-scale",
+        tiers: Tiers {
+            arxiv: None,
+            binding: None,
+            recall_sweep: None,
+            training: Some(tier),
+        },
+    };
+    emit(&report);
+    if !oom_passed {
+        eprintln!(
+            "training OOM control FAILED — the single-pass backward is not growing past the \
+             floor while the activation-graph separation dominates; see \
+             tiers.training.oom.assertion for the numbers"
+        );
+    }
+    if !rate_passed {
+        eprintln!(
+            "training throughput REGRESSED below the committed baseline floor; see \
+             tiers.training.rate_gate for the numbers"
+        );
+    }
+    if oom_passed && rate_passed {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
     }
 }
 
@@ -202,6 +342,7 @@ async fn run_search_rss() -> std::process::ExitCode {
             arxiv: None,
             binding: Some(tier),
             recall_sweep: None,
+            training: None,
         },
     };
     emit(&report);
@@ -246,6 +387,7 @@ async fn run_arxiv() -> std::process::ExitCode {
             arxiv: Some(ArxivTier::with_recall(recall)),
             binding: None,
             recall_sweep: None,
+            training: None,
         },
     };
     emit(&report);
@@ -296,6 +438,7 @@ async fn run_recall_sweep(
             arxiv: None,
             binding: None,
             recall_sweep: Some(tier),
+            training: None,
         },
     };
     emit(&report);

@@ -20,13 +20,25 @@ pub enum JammiError {
         message: String,
     },
 
-    /// Model lifecycle error, scoped to a specific model.
+    /// Model lifecycle error, scoped to a specific model. A genuine bad-argument
+    /// fault (e.g. an invalid version) — distinct from [`Self::ModelNotFound`],
+    /// which an absent row raises. Maps to gRPC `InvalidArgument`.
     #[error("Model error: {model_id}: {message}")]
     Model {
         /// Identifier of the failing model.
         model_id: String,
         /// Human-readable error description.
         message: String,
+    },
+
+    /// A lifecycle verb (retire / delete / promote) resolved no model row for
+    /// the caller's tenant — the model does not exist, or exists only outside
+    /// the caller's scope. An absent row is a NotFound, not a bad argument, so
+    /// it maps to gRPC `NotFound` rather than `InvalidArgument`.
+    #[error("Model not found: {model_id}")]
+    ModelNotFound {
+        /// Identifier of the model that resolved no row.
+        model_id: String,
     },
 
     /// The serve/load path was asked for a model that has been retired. A

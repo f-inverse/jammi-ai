@@ -143,7 +143,7 @@ async fn second_tenant_cannot_retire_first_tenants_model() {
         .await
         .expect_err("tenant B must not retire tenant A's model");
     assert!(
-        matches!(err, jammi_db::error::JammiError::Model { .. }),
+        matches!(err, jammi_db::error::JammiError::ModelNotFound { .. }),
         "cross-tenant retire is reported as a model NotFound, got: {err:?}"
     );
 
@@ -192,7 +192,7 @@ async fn tenant_cannot_retire_global_model() {
         .await
         .expect_err("a tenant must not retire a GLOBAL model");
     assert!(
-        matches!(err, jammi_db::error::JammiError::Model { .. }),
+        matches!(err, jammi_db::error::JammiError::ModelNotFound { .. }),
         "retiring a GLOBAL model from a tenant session is NotFound, got: {err:?}"
     );
 

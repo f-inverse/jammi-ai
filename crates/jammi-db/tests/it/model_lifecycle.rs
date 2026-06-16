@@ -474,7 +474,7 @@ async fn cross_tenant_delete_is_not_found(backend: BackendKind) {
         .await
         .expect_err("tenant B must not delete tenant A's model");
     assert!(
-        matches!(err, JammiError::Model { .. }),
+        matches!(err, JammiError::ModelNotFound { .. }),
         "cross-tenant delete is a model NotFound, got {err:?}"
     );
     assert!(
@@ -511,7 +511,7 @@ async fn delete_absent_without_if_exists_is_not_found(backend: BackendKind) {
         .await
         .expect_err("a strict delete of an absent model is NotFound");
     assert!(
-        matches!(err, JammiError::Model { .. }),
+        matches!(err, JammiError::ModelNotFound { .. }),
         "absent delete without if_exists is a model NotFound, got {err:?}"
     );
 }
@@ -702,7 +702,7 @@ async fn cross_tenant_promote_is_not_found(backend: BackendKind) {
         .await
         .expect_err("tenant B must not promote tenant A's model");
     assert!(
-        matches!(err, JammiError::Model { .. }),
+        matches!(err, JammiError::ModelNotFound { .. }),
         "cross-tenant promote is a model NotFound, got {err:?}"
     );
 }

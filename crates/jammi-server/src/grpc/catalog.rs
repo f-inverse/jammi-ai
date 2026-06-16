@@ -28,7 +28,6 @@ use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
 use jammi_ai::Session;
-use jammi_db::error::JammiError;
 use jammi_db::source::SourceConnection;
 use jammi_db::trigger::ids::TopicId;
 use jammi_db::trigger::TriggerError;
@@ -277,20 +276,14 @@ impl CatalogService for CatalogServer {
         let session = self.local()?;
 
         // A model outside the caller's scope (absent, or a GLOBAL model a tenant
-        // session cannot retire) surfaces from the engine as `JammiError::Model`
-        // — the "no such model for this tenant" fault, which is a NotFound at the
-        // wire, mirroring `describe_model`. Every other engine fault keeps its
-        // faithful `map_engine_error` mapping.
+        // session cannot retire) surfaces from the engine as
+        // `JammiError::ModelNotFound`, which `map_engine_error` renders as
+        // `NotFound`. Every fault keeps its faithful `map_engine_error` mapping.
         scoped(self.engine()?, tenant, || {
             session.retire_model(&req.model_id, req.version)
         })
         .await
-        .map_err(|e| match e {
-            JammiError::Model { model_id, .. } => {
-                Status::not_found(format!("model '{model_id}' not found"))
-            }
-            other => map_engine_error(other),
-        })?;
+        .map_err(map_engine_error)?;
         Ok(Response::new(()))
     }
 
@@ -306,20 +299,15 @@ impl CatalogService for CatalogServer {
 
         // A model outside the caller's scope (absent without `if_exists`, or a
         // GLOBAL model a tenant session cannot delete) surfaces as
-        // `JammiError::Model` — a NotFound at the wire, mirroring `retire_model`.
-        // A still-referenced model surfaces as `JammiError::ModelReferenced`,
-        // which `map_engine_error` renders as `FailedPrecondition`. Every other
-        // engine fault keeps its faithful `map_engine_error` mapping.
+        // `JammiError::ModelNotFound` — a NotFound at the wire. A still-referenced
+        // model surfaces as `JammiError::ModelReferenced`, which `map_engine_error`
+        // renders as `FailedPrecondition`. Every fault keeps its faithful
+        // `map_engine_error` mapping.
         scoped(self.engine()?, tenant, || {
             session.delete_model(&req.model_id, req.version, req.if_exists)
         })
         .await
-        .map_err(|e| match e {
-            JammiError::Model { model_id, .. } => {
-                Status::not_found(format!("model '{model_id}' not found"))
-            }
-            other => map_engine_error(other),
-        })?;
+        .map_err(map_engine_error)?;
         Ok(Response::new(()))
     }
 
@@ -333,19 +321,14 @@ impl CatalogService for CatalogServer {
         require_nonempty(&req.model_id, "model_id")?;
         let session = self.local()?;
 
-        // A model outside the caller's scope surfaces as `JammiError::Model` — a
-        // NotFound at the wire, mirroring `retire_model`. Every other engine
-        // fault keeps its faithful `map_engine_error` mapping.
+        // A model outside the caller's scope surfaces as
+        // `JammiError::ModelNotFound` — a NotFound at the wire. Every fault keeps
+        // its faithful `map_engine_error` mapping.
         scoped(self.engine()?, tenant, || {
             session.promote_model(&req.model_id, req.version)
         })
         .await
-        .map_err(|e| match e {
-            JammiError::Model { model_id, .. } => {
-                Status::not_found(format!("model '{model_id}' not found"))
-            }
-            other => map_engine_error(other),
-        })?;
+        .map_err(map_engine_error)?;
         Ok(Response::new(()))
     }
 

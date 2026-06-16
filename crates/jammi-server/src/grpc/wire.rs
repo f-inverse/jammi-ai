@@ -116,6 +116,11 @@ pub fn map_engine_error(err: JammiError) -> Status {
             Code::InvalidArgument,
             format!("model {model_id}: {message}"),
         ),
+        // An absent model row a lifecycle verb resolved nothing for — a NotFound,
+        // not the bad-argument `Model` fault. Mirrors the `ModelReferenced` arm.
+        JammiError::ModelNotFound { model_id } => {
+            (Code::NotFound, format!("model {model_id} not found"))
+        }
         JammiError::ModelRetired { model_id } => (
             Code::FailedPrecondition,
             format!("model {model_id} is retired"),
@@ -236,4 +241,42 @@ pub fn map_trigger_error(err: TriggerError) -> Status {
         TriggerError::Catalog(detail) => (Code::Internal, format!("catalog: {detail}")),
     };
     attach_trigger_detail(code, message, &err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jammi_wire::error_from_status;
+
+    /// An absent model from a lifecycle verb is `ModelNotFound`, which maps to
+    /// gRPC `NotFound` — distinct from the bad-argument `Model` fault, which maps
+    /// to `InvalidArgument`. This is the contract the catalog handlers rely on
+    /// after dropping their manual `Model → not_found` interception.
+    #[test]
+    fn model_not_found_maps_to_not_found() {
+        let status = map_engine_error(JammiError::ModelNotFound {
+            model_id: "acme/embed-mini".into(),
+        });
+        assert_eq!(status.code(), Code::NotFound);
+
+        // The bad-argument model fault keeps mapping to InvalidArgument.
+        let bad = map_engine_error(JammiError::Model {
+            model_id: "acme/embed-mini".into(),
+            message: "invalid version".into(),
+        });
+        assert_eq!(bad.code(), Code::InvalidArgument);
+    }
+
+    /// The faithful detail attached to the Status reconstructs the exact
+    /// `ModelNotFound` variant on the client side — not a coarse code guess.
+    #[test]
+    fn model_not_found_detail_round_trips() {
+        let status = map_engine_error(JammiError::ModelNotFound {
+            model_id: "acme/embed-mini".into(),
+        });
+        match error_from_status(&status) {
+            JammiError::ModelNotFound { model_id } => assert_eq!(model_id, "acme/embed-mini"),
+            other => panic!("expected ModelNotFound to round-trip, got {other:?}"),
+        }
+    }
 }

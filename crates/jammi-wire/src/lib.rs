@@ -27,6 +27,16 @@ use tonic::Status;
 
 pub mod proto;
 
+/// The compiled `jammi.v1` proto `FileDescriptorSet`, emitted by `build.rs`.
+///
+/// This is the authoritative, machine-readable description of the wire surface:
+/// every service and every rpc the binary actually serves, decoded with
+/// [`prost_types::FileDescriptorSet`]. The tenant-isolation oracle derives its
+/// rpc inventory from this rather than a hand-maintained list, so a newly added
+/// rpc cannot escape coverage by being forgotten in a constant.
+pub const FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/jammi_descriptor.bin"));
+
 pub mod eval;
 pub mod fine_tune;
 pub mod request;

@@ -118,6 +118,83 @@ client.SetTenant(
 # observe Alice's tenant scope.
 ```
 
+This flow assumes a **trusted network**. The `jammi-session-id` header is a
+client-minted, opaque transport correlation id — it identifies a *connection*,
+not a *principal*. The server does not authenticate it: anyone who presents
+another session's id assumes that session's tenant. `SetTenant` writes a tenant
+the caller *asserts*; nothing verifies the caller is entitled to it. That is the
+right trade-off when every client is inside your trust boundary (a private VPC, a
+sidecar mesh, a single-process notebook), and the wrong one the moment an
+untrusted caller can reach the port. **Do not treat `jammi-session-id` as an
+authentication or authorization boundary.**
+
+## Bring your own auth
+
+Jammi authenticates nothing on its own — it is a substrate, and identity is a
+consumer's vocabulary. To put a tenant boundary in front of untrusted callers,
+you supply the authentication and authorization yourself and bind the result to
+the engine's per-request tenant scope. The seam is a **custom tonic
+interceptor** that runs ahead of every engine verb:
+
+1. **Authenticate the principal.** Read the caller's credential — a bearer token,
+   a session cookie your gateway exchanges, a service-to-service token — and
+   verify it. A missing or invalid credential is rejected here, before any
+   handler runs.
+2. **Authorize the tenant.** Derive the tenant from the *verified* claim — never
+   from a header the caller controls. This is where your policy lives: which
+   tenant this principal may act as.
+3. **Bind it.** Attach the resolved tenant as a `SessionTenant` request
+   extension. Every engine-backed verb reads that extension and scopes its work
+   to that tenant — the same extension the built-in interceptor sets, now sourced
+   from an authenticated claim instead of an unauthenticated session lookup.
+
+Because authentication and authorization run *in front of* session resolution,
+the tenant the engine acts on is the one the credential proves, not one the
+caller asserts. The `jammi-session-id` header plays no part in this path.
+
+```rust,ignore
+use tonic::{Request, Status, service::Interceptor};
+use jammi_db::TenantId;
+use jammi_server::grpc::session::SessionTenant;
+
+/// A consumer's authenticating interceptor. `verify_credential` is the
+/// consumer's own identity logic — it authenticates the caller and returns the
+/// tenant the verified claim authorizes, or `None` to reject the request.
+#[derive(Clone)]
+struct AuthInterceptor;
+
+impl Interceptor for AuthInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        // 1. Authenticate: pull the credential the caller presented.
+        let credential = request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| Status::unauthenticated("missing credential"))?;
+
+        // 2. Authorize: derive the tenant from the *verified* claim. A failed
+        //    check rejects the request — it never falls through to an unscoped
+        //    read that could surface another tenant's rows.
+        let tenant: TenantId = verify_credential(credential)
+            .ok_or_else(|| Status::unauthenticated("invalid credential"))?;
+
+        // 3. Bind: every engine verb downstream scopes to this tenant.
+        request.extensions_mut().insert(SessionTenant(Some(tenant)));
+        Ok(request)
+    }
+}
+# fn verify_credential(_c: &str) -> Option<TenantId> { None }
+```
+
+Mount it the same way the built-in interceptor is mounted — wrap each service
+with `ServiceServer::with_interceptor(server, AuthInterceptor)` in place of the
+stock `TenantInterceptor`. The seam types are
+[`SessionTenant`](https://docs.rs/jammi-server) (the per-request binding every
+verb reads) and any `tonic::service::Interceptor`. Reject, don't default: an
+interceptor that binds `None` on a failed check runs the request *unscoped*,
+which for a `tenant_id IS NULL`-bearing catalog is a global read — so a rejected
+caller must fail the request, not bind nothing.
+
 ## Disjoint views — what to expect
 
 Two sessions on the same process, bound to different tenants, will:

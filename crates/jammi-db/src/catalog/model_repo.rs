@@ -287,7 +287,7 @@ impl Catalog {
     /// resolved PK AND `tenant_id = $current` strictly — not the read path's
     /// `OR tenant_id IS NULL`. So a tenant session asking to retire a GLOBAL
     /// (`tenant_id IS NULL`) model, or a model that does not exist for it, gets
-    /// [`JammiError::Model`] NotFound: retiring a model outside the caller's
+    /// [`JammiError::ModelNotFound`]: retiring a model outside the caller's
     /// own scope is forbidden, not silently applied to a shared row.
     ///
     /// Idempotent: retiring an already-retired model is a success no-op (the
@@ -297,9 +297,8 @@ impl Catalog {
             Some(v) => self.get_model_version(model_id, v).await?,
             None => self.get_model(model_id).await?,
         };
-        let record = record.ok_or_else(|| JammiError::Model {
+        let record = record.ok_or_else(|| JammiError::ModelNotFound {
             model_id: model_id.to_string(),
-            message: "no such model to retire for this tenant".into(),
         })?;
         let pk = record.catalog_pk;
         let tenant = self.current_tenant();
@@ -336,9 +335,8 @@ impl Catalog {
             })
             .await?;
         if affected == 0 {
-            return Err(JammiError::Model {
+            return Err(JammiError::ModelNotFound {
                 model_id: model_id.to_string(),
-                message: "no such model to retire for this tenant".into(),
             });
         }
         Ok(())
@@ -385,9 +383,8 @@ impl Catalog {
             Some(r) => r,
             None if if_exists => return Ok(()),
             None => {
-                return Err(JammiError::Model {
+                return Err(JammiError::ModelNotFound {
                     model_id: model_id.to_string(),
-                    message: "no such model to delete for this tenant".into(),
                 })
             }
         };
@@ -441,9 +438,8 @@ impl Catalog {
                 model_id: model_id.to_string(),
                 referenced_by,
             }),
-            DeleteOutcome::Deleted(0) => Err(JammiError::Model {
+            DeleteOutcome::Deleted(0) => Err(JammiError::ModelNotFound {
                 model_id: model_id.to_string(),
-                message: "no such model to delete for this tenant".into(),
             }),
             DeleteOutcome::Deleted(_) => Ok(()),
         }
@@ -469,9 +465,8 @@ impl Catalog {
             Some(v) => self.get_model_version(model_id, v).await?,
             None => self.get_model(model_id).await?,
         };
-        let record = record.ok_or_else(|| JammiError::Model {
+        let record = record.ok_or_else(|| JammiError::ModelNotFound {
             model_id: model_id.to_string(),
-            message: "no such model to promote for this tenant".into(),
         })?;
         let pk = record.catalog_pk;
         let name = record.model_id;
@@ -516,9 +511,8 @@ impl Catalog {
             )
             .await?;
         if affected == 0 {
-            return Err(JammiError::Model {
+            return Err(JammiError::ModelNotFound {
                 model_id: model_id_owned,
-                message: "no such model to promote for this tenant".into(),
             });
         }
         Ok(())

@@ -76,6 +76,7 @@ message JammiErrorDetail {
     ModelRetiredError model_retired = 15;
     StringError channel_assembly = 16;
     ModelReferencedError model_referenced = 17;
+    ModelNotFoundError model_not_found = 18;
   }
 }
 
@@ -133,6 +134,15 @@ message ModelRetiredError {
 message ModelReferencedError {
   string model_id = 1;
   repeated string referenced_by = 2;
+}
+
+// `JammiError::ModelNotFound { model_id }`. A lifecycle verb (retire / delete /
+// promote) resolved no model row for the caller's tenant. Distinct from
+// `ModelError` (a bad-argument model fault → `InvalidArgument`): an absent row
+// is a NotFound → `NotFound`, so it carries its own variant rather than folding
+// onto the generic model error.
+message ModelNotFoundError {
+  string model_id = 1;
 }
 
 // `JammiError::MutableTable(MutableTableError)`. The inner taxonomy is

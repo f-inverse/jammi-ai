@@ -67,6 +67,11 @@ impl From<&JammiError> for pb::JammiErrorDetail {
                 model_id: model_id.clone(),
                 message: message.clone(),
             }),
+            JammiError::ModelNotFound { model_id } => {
+                Variant::ModelNotFound(pb::ModelNotFoundError {
+                    model_id: model_id.clone(),
+                })
+            }
             JammiError::ModelRetired { model_id } => Variant::ModelRetired(pb::ModelRetiredError {
                 model_id: model_id.clone(),
             }),
@@ -149,6 +154,9 @@ impl From<pb::JammiErrorDetail> for JammiError {
             Some(Variant::Model(e)) => JammiError::Model {
                 model_id: e.model_id,
                 message: e.message,
+            },
+            Some(Variant::ModelNotFound(e)) => JammiError::ModelNotFound {
+                model_id: e.model_id,
             },
             Some(Variant::ModelRetired(e)) => JammiError::ModelRetired {
                 model_id: e.model_id,
@@ -726,6 +734,9 @@ mod tests {
             JammiError::Model {
                 model_id: "local:/models/tiny_bert".into(),
                 message: "Model directory does not exist".into(),
+            },
+            JammiError::ModelNotFound {
+                model_id: "local:/models/tiny_bert".into(),
             },
             JammiError::ModelRetired {
                 model_id: "local:/models/tiny_bert".into(),

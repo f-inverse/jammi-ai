@@ -1,6 +1,7 @@
 mod common;
 mod flight_annotate;
 mod flight_tenant;
+mod grpc_byo_auth;
 mod grpc_embedding;
 mod grpc_eval;
 mod grpc_inference;

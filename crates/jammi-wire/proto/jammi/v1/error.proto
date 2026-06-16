@@ -73,11 +73,15 @@ message JammiErrorDetail {
     StringError backend = 12;
     ChannelCatalogErrorDetail channel_catalog = 13;
     MutableTableErrorDetail mutable_table = 14;
-    ModelRetiredError model_retired = 15;
     StringError channel_assembly = 16;
     ModelReferencedError model_referenced = 17;
     ModelNotFoundError model_not_found = 18;
   }
+  // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
+  // retired field number or name, so a peer built against either contract reads
+  // an unknown field rather than a silently-reinterpreted one.
+  reserved 15;
+  reserved "model_retired";
 }
 
 // `JammiError::ChannelCatalog(ChannelCatalogError)`. The inner taxonomy is
@@ -115,29 +119,19 @@ message ColumnConflict {
   string requested = 4;
 }
 
-// `JammiError::ModelRetired { model_id }`. The serve/load path was asked for a
-// model that has been retired. Distinct from `ModelError` (a bad-argument model
-// fault → `InvalidArgument`); this is a precondition failure →
-// `FailedPrecondition`, so it carries its own variant rather than folding onto
-// the generic model error.
-message ModelRetiredError {
-  string model_id = 1;
-}
-
 // `JammiError::ModelReferenced { model_id, referenced_by }`. A `delete_model`
 // was refused because the model is still the target of one or more references.
-// Distinct from `ModelError` (a bad-argument model fault → `InvalidArgument`)
-// and `ModelRetiredError` (a serve/load precondition): this is a delete
-// precondition failure → `FailedPrecondition`. `referenced_by` lists the generic
-// catalog edge names still pointing at the model (e.g. `result_tables`,
-// `training_jobs.output_model_id`).
+// Distinct from `ModelError` (a bad-argument model fault → `InvalidArgument`):
+// this is a delete precondition failure → `FailedPrecondition`. `referenced_by`
+// lists the generic catalog edge names still pointing at the model (e.g.
+// `result_tables`, `training_jobs.output_model_id`).
 message ModelReferencedError {
   string model_id = 1;
   repeated string referenced_by = 2;
 }
 
-// `JammiError::ModelNotFound { model_id }`. A lifecycle verb (retire / delete /
-// promote) resolved no model row for the caller's tenant. Distinct from
+// `JammiError::ModelNotFound { model_id }`. A `delete_model` call resolved no
+// model row for the caller's tenant. Distinct from
 // `ModelError` (a bad-argument model fault → `InvalidArgument`): an absent row
 // is a NotFound → `NotFound`, so it carries its own variant rather than folding
 // onto the generic model error.

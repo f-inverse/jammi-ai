@@ -235,12 +235,11 @@ impl PyDatabase {
             .transpose()
     }
 
-    /// List a descriptor for every *active* model registered to the current
-    /// tenant. Each is a dict carrying the model's `model_id`, `backend`, `task`,
-    /// `status`, and `promoted` flag — the same client-facing projection the
-    /// remote transport returns, so a caller reads identical keys regardless of
-    /// transport. Retired models are hidden — the active-listing sense, the peer
-    /// of `list_sources`. Registry introspection, not a SQL query.
+    /// List a descriptor for every model registered to the current tenant. Each
+    /// is a dict carrying the model's `model_id`, `backend`, `task`, and
+    /// `status` — the same client-facing projection the remote transport
+    /// returns, so a caller reads identical keys regardless of transport. The
+    /// peer of `list_sources`. Registry introspection, not a SQL query.
     fn list_models(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let records = self
             .runtime
@@ -249,11 +248,9 @@ impl PyDatabase {
         serializable_to_pydict(py, &records)
     }
 
-    /// Describe one registered model by id, or `None` when no *active* model with
-    /// that id is visible to the current tenant. Returns the same dict shape
-    /// `list_models` yields per entry. A retired model reads as absent here (the
-    /// introspection sense), even though the catalog's reference-resolution path
-    /// still resolves it for provenance.
+    /// Describe one registered model by id, or `None` when no model with that id
+    /// is visible to the current tenant. Returns the same dict shape
+    /// `list_models` yields per entry.
     fn describe_model(&self, py: Python<'_>, model_id: &str) -> PyResult<Option<Py<PyAny>>> {
         let record = self
             .runtime
@@ -262,21 +259,10 @@ impl PyDatabase {
         record.map(|r| serializable_to_pydict(py, &r)).transpose()
     }
 
-    /// Soft-retire a model: hide it from listings and refuse to serve it, while
-    /// keeping it resolvable as a reference target. When `version` is `None` the
-    /// latest version is retired. A model outside the caller's scope is rejected.
-    #[pyo3(signature = (model_id, *, version=None))]
-    fn retire_model(&self, model_id: &str, version: Option<i32>) -> PyResult<()> {
-        self.runtime
-            .block_on(self.local_session().retire_model(model_id, version))
-            .map_err(to_pyerr)
-    }
-
-    /// Hard-delete a model row. Unlike `retire_model` (a soft flip that keeps the
-    /// row resolvable for provenance), this removes the row, so it is refused
-    /// while any reference still points at the model. When `version` is `None`
-    /// the latest version is targeted. When `if_exists` is true, deleting an
-    /// absent model is a no-op rather than an error.
+    /// Hard-delete a model row, removing it — so it is refused while any
+    /// reference still points at the model. When `version` is `None` the latest
+    /// version is targeted. When `if_exists` is true, deleting an absent model
+    /// is a no-op rather than an error.
     #[pyo3(signature = (model_id, *, version=None, if_exists=false))]
     fn delete_model(&self, model_id: &str, version: Option<i32>, if_exists: bool) -> PyResult<()> {
         self.runtime
@@ -284,17 +270,6 @@ impl PyDatabase {
                 self.local_session()
                     .delete_model(model_id, version, if_exists),
             )
-            .map_err(to_pyerr)
-    }
-
-    /// Promote a model, marking it the promoted version for its name. Any
-    /// previously-promoted sibling is demoted in the same step. When `version`
-    /// is `None` the latest version is promoted. A model outside the caller's
-    /// scope is rejected.
-    #[pyo3(signature = (model_id, *, version=None))]
-    fn promote_model(&self, model_id: &str, version: Option<i32>) -> PyResult<()> {
-        self.runtime
-            .block_on(self.local_session().promote_model(model_id, version))
             .map_err(to_pyerr)
     }
 

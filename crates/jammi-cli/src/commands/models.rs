@@ -16,12 +16,6 @@ pub enum ModelAction {
         /// Model id (e.g. an HF repo id or a fine-tuned id).
         model_id: String,
     },
-    /// Soft-retire a model: hide it from listings and refuse to serve it, while
-    /// keeping it resolvable as a reference target. Retires the latest version.
-    Retire {
-        /// Model id (e.g. an HF repo id or a fine-tuned id).
-        model_id: String,
-    },
     /// Hard-delete a model row. Refused while any reference still points at the
     /// model. Targets the latest version.
     Delete {
@@ -30,12 +24,6 @@ pub enum ModelAction {
         /// Treat a missing model as a no-op rather than an error.
         #[arg(long)]
         if_exists: bool,
-    },
-    /// Promote a model, marking it the promoted version for its name. Any
-    /// previously-promoted sibling is demoted. Promotes the latest version.
-    Promote {
-        /// Model id (e.g. an HF repo id or a fine-tuned id).
-        model_id: String,
     },
 }
 
@@ -62,10 +50,6 @@ pub async fn run(
             }
             None => println!("No model '{model_id}' registered."),
         },
-        ModelAction::Retire { model_id } => {
-            session.retire_model(&model_id, None).await?;
-            println!("Retired model '{model_id}'.");
-        }
         ModelAction::Delete {
             model_id,
             if_exists,
@@ -73,29 +57,24 @@ pub async fn run(
             session.delete_model(&model_id, None, if_exists).await?;
             println!("Deleted model '{model_id}'.");
         }
-        ModelAction::Promote { model_id } => {
-            session.promote_model(&model_id, None).await?;
-            println!("Promoted model '{model_id}'.");
-        }
     }
     Ok(())
 }
 
 fn print_header() {
     println!(
-        "{:<40} {:<12} {:<14} {:<12} Promoted",
+        "{:<40} {:<12} {:<14} {:<12}",
         "Model ID", "Backend", "Task", "Status"
     );
-    println!("{}", "-".repeat(87));
+    println!("{}", "-".repeat(81));
 }
 
 fn print_row(m: &ModelDescriptor) {
     println!(
-        "{:<40} {:<12} {:<14} {:<12} {}",
+        "{:<40} {:<12} {:<14} {:<12}",
         m.model_id,
         m.backend,
         format!("{:?}", m.task),
         m.status,
-        if m.promoted { "yes" } else { "no" }
     );
 }

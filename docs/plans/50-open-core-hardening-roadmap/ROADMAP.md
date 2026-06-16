@@ -278,15 +278,19 @@ expressed as a *measured* result.
   verb surface; the BYO-auth seam documented with a worked example.
 
 ### 3.6 Catalog & lifecycle completeness
-- **Gap.** Model retire shipped; no hard delete of unreferenced models, no
-  versioning/promotion semantics; source schema-evolution and reload-at-scale unproven;
-  migration-on-Postgres path exercised but not load-tested.
-- **Approach.** Hard-delete-when-unreferenced (typed `ModelReferenced` error); model
-  version/promotion verbs; source schema evolution; migration load tests on both
-  backends.
-- **Acceptance.** Lifecycle chapter covering register → promote → retire → delete with
-  referential-integrity assertions; migrations validated at the scale tier on SQLite +
-  Postgres.
+- **Gap.** No hard delete of unreferenced models; the model read surface
+  (`list_models`/`describe_model`) absent from the embedded + remote clients;
+  source schema-evolution and reload-at-scale unproven; migration-on-Postgres path
+  exercised but not load-tested. (Model promotion and retirement are lifecycle-stage
+  governance — out of open-core scope; the engine catalog is for listing and cleaning
+  up the models it handles.)
+- **Approach.** Hard-delete-when-unreferenced (typed `ModelReferenced` error, with a
+  typed `ModelNotFound` for the absent case); the model read surface
+  (`list_models`/`describe_model`) on both the embedded and remote clients; source
+  schema evolution; migration load tests on both backends.
+- **Acceptance.** Lifecycle chapter covering register (via training) → list / describe →
+  delete with referential-integrity assertions; migrations validated at the scale tier
+  on SQLite + Postgres.
 
 ### 3.7 Operability / production-readiness
 - **Gap.** Observability is thin (the silent-non-TTY-logs bug was a canary); no
@@ -506,6 +510,6 @@ Entry points for §3 (not exhaustive; confirm against the current tree).
 | 3.3 Training robustness | `crates/jammi-ai/src/fine_tune/{trainer,hard_negative_miner,regression_loss,target}.rs`; `…/pipeline/context_predictor.rs`; oracle tests `crates/jammi-ai/tests/it/ft_correctness_sweep.rs` |
 | 3.4 Remote parity / streaming | `clients/python/jammi_client/_database.py`; conformance guard `crates/jammi-python/tests/test_conformance.py`; server handlers `crates/jammi-server/src/grpc/`; trigger framing `crates/jammi-wire/src/trigger.rs` |
 | 3.5 Multi-tenant | `crates/jammi-db/src/tenant_scope.rs` (analyzer rule); `…/session.rs` (`bind_tenant`/`with_tenant_scoped`); BYO-auth seam = the Flight/gRPC interceptor in `crates/jammi-server/src/`; `docs/guide/src/multi-tenant.md` |
-| 3.6 Catalog lifecycle | `crates/jammi-db/src/catalog/model_repo.rs` (`retire_model`, `model_pk`); the append-only migrations in `crates/jammi-db/src/catalog/backend*.rs` |
+| 3.6 Catalog lifecycle | `crates/jammi-db/src/catalog/model_repo.rs` (`delete_model`, `model_pk`); the append-only migrations in `crates/jammi-db/src/catalog/backend*.rs` |
 | 3.7 Operability | server + worker logging; `crates/jammi-ai/src/fine_tune/worker.rs` (lease / recovery / crash-window) |
 | 3.8 API stability / errors | typed errors per crate; gRPC mapping `crates/jammi-server/src/grpc/wire.rs` (`map_engine_error`); the cookbook's `check_api_reference.py` (lift into engine CI) |

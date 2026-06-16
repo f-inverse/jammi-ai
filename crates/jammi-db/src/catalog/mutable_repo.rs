@@ -272,7 +272,7 @@ impl Catalog {
     /// `DROP TABLE` first.
     ///
     /// The tenant predicate is the STRICT form (`tenant_id = $cur OR (tenant_id
-    /// IS NULL AND $cur IS NULL)`) used by [`Self::retire_model`], not the read
+    /// IS NULL AND $cur IS NULL)`) used by [`Self::delete_model`], not the read
     /// path's `OR tenant_id IS NULL` leak: a tenant session (non-NULL `$cur`)
     /// deletes only a row it owns, never another tenant's and never a shared
     /// GLOBAL (`tenant_id IS NULL`) table it did not create; an unscoped session

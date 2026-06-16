@@ -121,10 +121,6 @@ pub fn map_engine_error(err: JammiError) -> Status {
         JammiError::ModelNotFound { model_id } => {
             (Code::NotFound, format!("model {model_id} not found"))
         }
-        JammiError::ModelRetired { model_id } => (
-            Code::FailedPrecondition,
-            format!("model {model_id} is retired"),
-        ),
         JammiError::ModelReferenced {
             model_id,
             referenced_by,

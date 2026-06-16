@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use jammi_db::catalog::status::ModelStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::ArtifactStore;
@@ -72,17 +71,6 @@ impl ModelResolver {
             Some(r) => r,
             None => return Ok(None),
         };
-
-        // The serve/load path refuses a retired model. `get_model` still
-        // returns retired rows (it is the reference-resolution path), so the
-        // refusal lives here, where a model is about to be loaded for serving —
-        // not in the catalog read. A retired base model likewise refuses, since
-        // a fine-tuned model resolves its base through this same path.
-        if record.status == ModelStatus::Retired.to_string() {
-            return Err(JammiError::ModelRetired {
-                model_id: model_id.0.clone(),
-            });
-        }
 
         // For fine-tuned models: resolve via the base model, set adapter_path.
         // The artifact_path for a fine-tuned model is the object-store prefix the

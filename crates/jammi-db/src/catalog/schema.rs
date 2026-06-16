@@ -635,20 +635,3 @@ INSERT INTO evidence_channel_columns(tenant_id, channel_name, column_name, colum
 
 DROP TABLE evidence_channel_columns_old;
 "#;
-
-/// Promotion flag for models: a nullable `promoted_at` timestamp plus the
-/// uniqueness guard that at most one row per name is promoted within a scope.
-///
-/// Two partial indexes are required because SQL treats `NULL` values as
-/// distinct: a single `(tenant_id, name)` index leaves the GLOBAL namespace
-/// (`tenant_id IS NULL`) unconstrained — every global row's NULL `tenant_id`
-/// is distinct from every other, so the first index never collides them. The
-/// second index closes that gap by constraining `name` alone over the global
-/// rows, mirroring the pattern migration 020 uses for global channel names.
-pub(super) const MIGRATION_021_MODEL_PROMOTION: &str = r#"
-ALTER TABLE models ADD COLUMN promoted_at TEXT;
-CREATE UNIQUE INDEX idx_models_promoted
-    ON models(tenant_id, name) WHERE promoted_at IS NOT NULL;
-CREATE UNIQUE INDEX idx_models_promoted_global
-    ON models(name) WHERE promoted_at IS NOT NULL AND tenant_id IS NULL;
-"#;

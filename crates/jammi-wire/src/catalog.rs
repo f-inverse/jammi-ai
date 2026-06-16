@@ -177,7 +177,7 @@ pub fn source_descriptor_from_proto(
 /// Encode the engine's [`ModelDescriptor`] onto the wire `Model` — the client-
 /// observable projection a `ListModels` / `DescribeModel` response carries. The
 /// descriptor is already the curated client projection (`model_id` / `backend` /
-/// `task` / `status` / `promoted`), so this is a field-for-field encode with no
+/// `task` / `status`), so this is a field-for-field encode with no
 /// server-internal bookkeeping to drop — that was dropped where the projection
 /// was built, mirroring how [`SourceDescriptor`] projects a `SourceRecord`. The
 /// `task` rides the shared [`super::model_task_to_proto`] vocabulary.
@@ -189,7 +189,6 @@ pub fn model_to_proto(descriptor: &ModelDescriptor) -> pb::Model {
         backend: descriptor.backend.clone(),
         task: super::model_task_to_proto(descriptor.task) as i32,
         status: descriptor.status.clone(),
-        promoted: descriptor.promoted,
     }
 }
 
@@ -206,7 +205,6 @@ pub fn model_from_proto(model: pb::Model) -> Result<ModelDescriptor, Status> {
         backend: model.backend,
         task,
         status: model.status,
-        promoted: model.promoted,
     })
 }
 

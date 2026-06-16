@@ -507,25 +507,6 @@ fn cases() -> Vec<IsolationCase> {
                 assert_eq!(b.backend, "vllm", "tenant B sees its own model backend");
             }
         ),
-        case!("CatalogService", "RetireModel", CaseKind::Hermetic, None, {
-            // Strict tenant predicate: retiring a peer's model is NotFound and
-            // leaves A's row untouched.
-            let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
-            cat_a
-                .register_model(register_params("m_a", "candle"))
-                .await
-                .unwrap();
-            assert!(
-                cat_b.retire_model("m_a", None).await.is_err(),
-                "tenant B must not retire tenant A's model"
-            );
-            let a = cat_a.get_model("m_a").await.unwrap().unwrap();
-            assert_eq!(
-                a.status.as_str(),
-                "registered",
-                "A's model must stay un-retired"
-            );
-        }),
         case!("CatalogService", "DeleteModel", CaseKind::Hermetic, None, {
             // Hard-delete is strict-tenant: a peer's delete is NotFound and the
             // row survives.
@@ -543,25 +524,6 @@ fn cases() -> Vec<IsolationCase> {
                 "tenant A's model must survive tenant B's delete attempt"
             );
         }),
-        case!(
-            "CatalogService",
-            "PromoteModel",
-            CaseKind::Hermetic,
-            None,
-            {
-                // Promote resolves through the tenant-filtered get_model, so a peer
-                // cannot promote a model it cannot resolve.
-                let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
-                cat_a
-                    .register_model(register_params("m_a", "candle"))
-                    .await
-                    .unwrap();
-                assert!(
-                    cat_b.promote_model("m_a", None).await.is_err(),
-                    "tenant B must not promote tenant A's model"
-                );
-            }
-        ),
         // --- channels --------------------------------------------------------
         case!(
             "CatalogService",

@@ -6,7 +6,6 @@ mod grpc_embedding;
 mod grpc_eval;
 mod grpc_inference;
 mod grpc_introspection;
-mod grpc_model_retire;
 mod grpc_mutable_topic_audit;
 mod grpc_pipeline;
 mod grpc_remote_compute;

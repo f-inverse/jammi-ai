@@ -101,11 +101,11 @@ def _model_to_dict(m: catalog_pb2.Model) -> Dict[str, Any]:
     """Project a wire `Model` into the model dict a caller reads.
 
     The `Model` projection is intentionally minimal — `model_id`, `backend`,
-    `task`, `status`, and the derived `promoted` flag — so the remote dict
-    carries exactly the client-observable fields the embedded `Database.list_models`
-    returns (its `ModelDescriptor` projection), with `task` spelled the same
-    snake-case string the engine serialises. An unrecognised `task` enum is a
-    server/client proto-version skew, surfaced rather than silently coerced.
+    `task`, and `status` — so the remote dict carries exactly the
+    client-observable fields the embedded `Database.list_models` returns (its
+    `ModelDescriptor` projection), with `task` spelled the same snake-case string
+    the engine serialises. An unrecognised `task` enum is a server/client
+    proto-version skew, surfaced rather than silently coerced.
     """
     try:
         task = _MODEL_TASK_NAME[m.task]
@@ -119,7 +119,6 @@ def _model_to_dict(m: catalog_pb2.Model) -> Dict[str, Any]:
         "backend": m.backend,
         "task": task,
         "status": m.status,
-        "promoted": m.promoted,
     }
 
 
@@ -711,11 +710,10 @@ class RemoteDatabase:
         return _source_descriptor_to_dict(d)
 
     def list_models(self) -> List[Dict[str, Any]]:
-        """A record for every *active* model registered to the current tenant.
+        """A record for every model in the current tenant's catalog.
 
         Maps to `CatalogService.ListModels`; same dict shape per entry as
-        :meth:`describe_model`. Retired models are hidden — the active-listing
-        sense, the peer of :meth:`list_sources`.
+        :meth:`describe_model`. The peer of :meth:`list_sources`.
         """
         resp = self._catalog.ListModels(
             catalog_pb2.ListModelsRequest(), metadata=self._metadata
@@ -726,8 +724,7 @@ class RemoteDatabase:
         """Describe one registered model by id, or ``None`` if not visible.
 
         Maps to `CatalogService.DescribeModel`. The engine returns a NotFound
-        status when no *active* model with that id exists (a retired model reads
-        as absent here); that is surfaced as ``None``.
+        status when no model with that id exists; that is surfaced as ``None``.
         """
         try:
             m = self._catalog.DescribeModel(
@@ -740,45 +737,22 @@ class RemoteDatabase:
             raise
         return _model_to_dict(m)
 
-    def retire_model(self, model_id: str, *, version: Optional[int] = None) -> None:
-        """Soft-retire a model: hide it from listings and refuse to serve it,
-        while keeping it resolvable as a reference target. When ``version`` is
-        ``None`` the latest version is retired. A model outside the caller's
-        scope is rejected. Maps to `CatalogService.RetireModel`.
-        """
-        self._catalog.RetireModel(
-            catalog_pb2.RetireModelRequest(model_id=model_id, version=version),
-            metadata=self._metadata,
-        )
-
     def delete_model(
         self, model_id: str, *, version: Optional[int] = None, if_exists: bool = False
     ) -> None:
-        """Hard-delete a model row. Unlike :meth:`retire_model`, this removes the
-        row, so it is refused with ``FAILED_PRECONDITION`` while any reference
-        still points at the model — that status propagates to the caller. When
-        ``version`` is ``None`` the latest version is targeted. ``if_exists``
-        rides the request: the engine treats a missing model as a no-op when it
-        is set and raises NotFound otherwise, so the server is authoritative and
-        there is no client-side NotFound handling to do (unlike
-        :meth:`drop_mutable_table`, whose request carries no ``if_exists`` flag).
-        Maps to `CatalogService.DeleteModel`.
+        """Hard-delete a model row, removing it, so it is refused with
+        ``FAILED_PRECONDITION`` while any reference still points at the model —
+        that status propagates to the caller. When ``version`` is ``None`` the
+        latest version is targeted. ``if_exists`` rides the request: the engine
+        treats a missing model as a no-op when it is set and raises NotFound
+        otherwise, so the server is authoritative and there is no client-side
+        NotFound handling to do (unlike :meth:`drop_mutable_table`, whose request
+        carries no ``if_exists`` flag). Maps to `CatalogService.DeleteModel`.
         """
         self._catalog.DeleteModel(
             catalog_pb2.DeleteModelRequest(
                 model_id=model_id, version=version, if_exists=if_exists
             ),
-            metadata=self._metadata,
-        )
-
-    def promote_model(self, model_id: str, *, version: Optional[int] = None) -> None:
-        """Promote a model, marking it the promoted version for its name. Any
-        previously-promoted sibling is demoted in the same step. When ``version``
-        is ``None`` the latest version is promoted. A model outside the caller's
-        scope is rejected. Maps to `CatalogService.PromoteModel`.
-        """
-        self._catalog.PromoteModel(
-            catalog_pb2.PromoteModelRequest(model_id=model_id, version=version),
             metadata=self._metadata,
         )
 

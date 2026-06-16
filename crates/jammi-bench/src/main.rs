@@ -24,6 +24,7 @@ mod corpus;
 mod eval;
 mod fixture;
 mod graph_train;
+mod model_inference;
 mod propagate;
 mod rate_gate;
 mod recall;
@@ -242,6 +243,25 @@ enum Command {
     /// CI step — the provenance-recording rebuilder for the committed bundle.
     #[command(hide = true)]
     RebuildContextPredictorSpec,
+    /// The CPU-hermetic model-inference tier: drives the engine's GPU-model
+    /// serving verbs `generate_text_embeddings` (the `generate_embeddings` path)
+    /// and `infer` (`Classification`) on `Device::Cpu` over tiny committed model
+    /// bundles. Each verb gates a committed determinism digest of the served
+    /// output (the portable cell anchor) and a coarse same-box serving rate. The
+    /// rate is a code-path-regression net over the tiny model, NOT the full-scale
+    /// scaling SLO — that representative number is captured off-box in the
+    /// cookbook (the A/B split). Emits the JSON report with the `model_inference`
+    /// tier set and exits non-zero if a digest drifts or a throughput regresses.
+    ModelInferenceScale,
+    /// Internal: rebuild the committed model-inference spec
+    /// (`baselines/model_inference.json`) from a fresh serve — regenerates the
+    /// corpus, serves both verbs over the committed tiny bundles
+    /// (`baselines/embed_model/`, `baselines/classifier_model/`), and records both
+    /// digests and both same-box serving baselines. Run off-box once when the spec
+    /// is established or the serving contract changes; CI only loads and
+    /// re-serves. Not a CI step — the provenance-recording rebuilder.
+    #[command(hide = true)]
+    RebuildModelInferenceSpec,
 }
 
 #[tokio::main]
@@ -282,6 +302,8 @@ async fn main() -> std::process::ExitCode {
         Command::RebuildGraphTrainSpec => run_rebuild_graph_train_spec(),
         Command::ContextPredictorScale => run_context_predictor_scale().await,
         Command::RebuildContextPredictorSpec => run_rebuild_context_predictor_spec().await,
+        Command::ModelInferenceScale => run_model_inference_scale().await,
+        Command::RebuildModelInferenceSpec => run_rebuild_model_inference_spec().await,
     }
 }
 
@@ -370,6 +392,7 @@ async fn run_train_scale() -> std::process::ExitCode {
             propagate: None,
             graph_train: None,
             context_predictor: None,
+            model_inference: None,
         },
     };
     emit(&report);
@@ -428,6 +451,7 @@ fn run_conformal_scale() -> std::process::ExitCode {
             propagate: None,
             graph_train: None,
             context_predictor: None,
+            model_inference: None,
         },
     };
     emit(&report);
@@ -476,6 +500,7 @@ fn run_eval_scale() -> std::process::ExitCode {
             propagate: None,
             graph_train: None,
             context_predictor: None,
+            model_inference: None,
         },
     };
     emit(&report);
@@ -525,6 +550,7 @@ async fn run_propagate_scale() -> std::process::ExitCode {
             propagate: Some(tier),
             graph_train: None,
             context_predictor: None,
+            model_inference: None,
         },
     };
     emit(&report);
@@ -730,6 +756,7 @@ fn run_graph_train_scale() -> std::process::ExitCode {
             propagate: None,
             graph_train: Some(tier),
             context_predictor: None,
+            model_inference: None,
         },
     };
     emit(&report);
@@ -826,6 +853,7 @@ async fn run_context_predictor_scale() -> std::process::ExitCode {
             propagate: None,
             graph_train: None,
             context_predictor: Some(tier),
+            model_inference: None,
         },
     };
     emit(&report);
@@ -894,6 +922,96 @@ async fn run_rebuild_context_predictor_spec() -> std::process::ExitCode {
     }
 }
 
+/// Run the CPU-hermetic model-inference tier: load the committed spec, serve both
+/// GPU-model verbs (`generate_text_embeddings` and `infer`) over the committed
+/// tiny bundles on `Device::Cpu`, re-fold both digests, emit the report with the
+/// `model_inference` tier set, and map the verdict to the exit code. A digest
+/// drift or a serving-throughput regression prints and exits non-zero.
+async fn run_model_inference_scale() -> std::process::ExitCode {
+    let spec = match model_inference::ModelInferenceSpec::load() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("model-inference-scale could not load the committed spec: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let tier = match model_inference::run(&spec).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("model-inference-scale run failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let passed = model_inference::gates_passed(&tier);
+    let report = Report {
+        engine_version: ENGINE_VERSION,
+        host: Host::detect(),
+        subcommand: "model-inference-scale",
+        tiers: Tiers {
+            arxiv: None,
+            binding: None,
+            recall_sweep: None,
+            training: None,
+            conformal: None,
+            eval: None,
+            propagate: None,
+            graph_train: None,
+            context_predictor: None,
+            model_inference: Some(tier),
+        },
+    };
+    emit(&report);
+    if passed {
+        std::process::ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "model-inference gate FAILED — a served-output digest drifted off its committed value, \
+             or a serving throughput regressed below the same-box floor; see tiers.model_inference \
+             for the numbers"
+        );
+        std::process::ExitCode::FAILURE
+    }
+}
+
+/// The committed model-inference generation parameters — the synthetic corpus
+/// shape and how many targets the infer digest folds over.
+const MODEL_INFERENCE_PARAMS: model_inference::ModelInferenceParams =
+    model_inference::ModelInferenceParams {
+        row_count: 16,
+        corpus_seed: 11,
+        target_count: 8,
+    };
+
+/// Rebuild and write the committed model-inference spec from a fresh serve over
+/// the committed bundles. The off-box one-shot; prints the spec it wrote so the
+/// operator sees the digests and baselines being committed.
+async fn run_rebuild_model_inference_spec() -> std::process::ExitCode {
+    let spec = match model_inference::rebuild_spec(MODEL_INFERENCE_PARAMS).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("rebuild-model-inference-spec failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match serde_json::to_string_pretty(&spec) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(
+                model_inference::ModelInferenceSpec::path(),
+                format!("{json}\n"),
+            ) {
+                eprintln!("rebuild-model-inference-spec could not write the spec: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+            println!("{json}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("failed to serialize model-inference spec: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 /// The `measure-once` child: run one variant over the pre-materialized corpus,
 /// print its peak RSS and result digest, and exit. The parent reads the single
 /// stdout line; a failure exits non-zero so the parent surfaces it.
@@ -950,6 +1068,7 @@ async fn run_search_rss() -> std::process::ExitCode {
             propagate: None,
             graph_train: None,
             context_predictor: None,
+            model_inference: None,
         },
     };
     emit(&report);
@@ -1000,6 +1119,7 @@ async fn run_arxiv() -> std::process::ExitCode {
             propagate: None,
             graph_train: None,
             context_predictor: None,
+            model_inference: None,
         },
     };
     emit(&report);
@@ -1056,6 +1176,7 @@ async fn run_recall_sweep(
             propagate: None,
             graph_train: None,
             context_predictor: None,
+            model_inference: None,
         },
     };
     emit(&report);

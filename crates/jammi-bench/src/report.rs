@@ -124,6 +124,16 @@ pub struct Tiers {
     /// wall-time as an un-gated reference. Populated by `context-predictor-scale`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_predictor: Option<ContextPredictorTier>,
+    /// The CPU-hermetic model-inference tier: the engine's GPU-model serving
+    /// verbs `generate_text_embeddings` (the `generate_embeddings` path) and
+    /// `infer` (`Classification`), driven on `Device::Cpu` over tiny committed
+    /// model bundles. Each lane gates a committed determinism DIGEST of the served
+    /// output (the portable cell anchor) and a coarse same-box serving rate by
+    /// [`crate::rate_gate`]. The rate is a code-path-regression net over the tiny
+    /// model — NOT the full-scale scaling SLO, which is captured off-box in the
+    /// cookbook (the A/B split). Populated by `model-inference-scale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_inference: Option<ModelInferenceTier>,
 }
 
 /// The k values the recall curve is reported at: recall@1, recall@10, recall@100.
@@ -827,4 +837,73 @@ pub struct ContextPredictorTier {
     /// Predict wall-time over the committed target set — an un-gated,
     /// machine-dependent reference, never a portable floor.
     pub predict_latency_ms: Measurement,
+}
+
+/// The CPU-hermetic model-inference tier: the engine's GPU-model serving verbs
+/// `generate_text_embeddings` (the `generate_embeddings` path) and `infer`
+/// (`Classification`), driven on `Device::Cpu` over tiny committed model bundles,
+/// measured for serving throughput and gated for determinism.
+///
+/// ## The A/B split this tier embodies
+///
+/// These are GPU-model inference rates. The representative full-scale rate — rows
+/// per second through a production-size model on a GPU — is the scaling SLO and
+/// is captured off-box in the cookbook **(A)**; it does NOT live here. This tier
+/// is the CPU-hermetic gate **(B)**: it drives the *same engine verbs* over a tiny
+/// committed bundle so the regression net runs in `cargo test` with no download.
+///
+/// Two lanes per verb, the harness's portable-gate-vs-machine-dependent-rate
+/// split:
+///
+/// * **The determinism digest** ([`embed_digest`](ModelInferenceTier::embed_digest),
+///   [`infer_digest`](ModelInferenceTier::infer_digest)) — the engine's serving
+///   path is byte-deterministic on the CPU over a fixed model and fixed inputs, so
+///   a committed checksum of the served output (the persisted embedding vectors;
+///   the full per-row score distributions) gates for equality. A regression in the
+///   resolve / tokenize / forward / pool / adapt path moves the bits and trips the
+///   gate. This is the portable cell anchor.
+/// * **The serving throughput** ([`embed_rows_per_s`](ModelInferenceTier::embed_rows_per_s),
+///   [`infer_rows_per_s`](ModelInferenceTier::infer_rows_per_s)) — rows/s the tiny
+///   model serves through the real verb on this box, gated against a committed
+///   same-box baseline by [`crate::rate_gate`]. This is a coarse
+///   *code-path-regression* net (it catches lost batching, a per-row model
+///   reload, a dropped fast path) — emphatically NOT the scaling SLO, which is the
+///   cookbook (A) value over a real model on a real device.
+#[derive(Debug, Serialize)]
+pub struct ModelInferenceTier {
+    /// The number of target rows the infer digest folded over — the embed digest
+    /// folds the whole persisted vector column, so this is the infer fold width.
+    pub targets: usize,
+    /// Embed serving throughput: rows/s through the engine's real
+    /// `generate_text_embeddings` over the tiny embed bundle on the CPU. A coarse
+    /// same-box code-path net, NOT the scaling SLO.
+    pub embed_rows_per_s: Measurement,
+    /// Wall-clock of the single measured `generate_text_embeddings` call,
+    /// milliseconds. Machine-dependent reference.
+    pub embed_serve_ms: Measurement,
+    /// The embed throughput rate-regression verdict against the committed same-box
+    /// baseline. Present only when the baseline was loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embed_rate_gate: Option<RateVerdict>,
+    /// The embed determinism gate: the digest of the persisted embedding vectors
+    /// `generate_text_embeddings` produced over the corpus and the committed embed
+    /// bundle this run, the committed digest, and the `re-served == committed`
+    /// verdict.
+    pub embed_digest: DigestGate,
+    /// Infer serving throughput: rows/s through the engine's real `infer`
+    /// (`Classification`) over the tiny classifier bundle on the CPU. A coarse
+    /// same-box code-path net, NOT the scaling SLO.
+    pub infer_rows_per_s: Measurement,
+    /// Wall-clock of the single measured `infer` call, milliseconds.
+    /// Machine-dependent reference.
+    pub infer_serve_ms: Measurement,
+    /// The infer throughput rate-regression verdict against the committed same-box
+    /// baseline. Present only when the baseline was loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub infer_rate_gate: Option<RateVerdict>,
+    /// The infer determinism gate: the digest of the per-row score distributions
+    /// `infer` produced over the committed targets and the committed classifier
+    /// bundle this run, the committed digest, and the `re-served == committed`
+    /// verdict.
+    pub infer_digest: DigestGate,
 }

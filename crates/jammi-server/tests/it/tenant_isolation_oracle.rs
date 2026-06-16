@@ -105,11 +105,6 @@ const CONTROL_PLANE_ALLOWLIST: &[(&str, &str)] = &[
     // Handshake metadata — reports the server's mounted service tiers and
     // version. Tenant-independent.
     ("CatalogService", "GetServerInfo"),
-    // Training status reads a row by server-minted `job_id`. The tenant gate is
-    // on the create path (`StartTraining` → `create_training_job`, covered as a
-    // case); the status read is keyed by an unguessable server id and the job
-    // row's tenant binding was fixed at create time.
-    ("TrainingService", "TrainingStatus"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -613,6 +608,16 @@ fn cases() -> Vec<IsolationCase> {
                     .unwrap();
                 assert_eq!(a_x.columns[0].name, "a_marker");
                 assert_eq!(b_x.columns[0].name, "b_marker");
+                // Intra-tenant uniqueness: A re-registering its own 'chan_x' is
+                // rejected (a per-tenant duplicate), not silently accepted.
+                assert!(
+                    cat_a
+                        .channels()
+                        .register(&channel_spec("chan_x", 30, "dup"))
+                        .await
+                        .is_err(),
+                    "re-registering an existing channel within a tenant must be rejected"
+                );
             }
         ),
         case!(
@@ -952,7 +957,12 @@ fn cases() -> Vec<IsolationCase> {
             CaseKind::ComputeResolver,
             Some(E2E_ISOLATION_TEST),
             {
-                assert_embedding_resolver_isolated().await;
+                // GenerateEmbeddings loads its embedding model (tenant-filtered
+                // `get_model`) and reads the input source (tenant-scoped SQL); it
+                // does NOT call `resolve_embedding_table` (it writes a fresh table).
+                // The model leg is asserted here; the source leg is covered by the
+                // AddSource/ListSources/DescribeSource cases.
+                assert_model_resolver_isolated().await;
             }
         ),
         case!(
@@ -1024,6 +1034,19 @@ fn cases() -> Vec<IsolationCase> {
             CaseKind::ComputeResolver,
             Some(E2E_ISOLATION_TEST),
             {
+                assert_training_create_isolated().await;
+            }
+        ),
+        case!(
+            "TrainingService",
+            "TrainingStatus",
+            CaseKind::Hermetic,
+            None,
+            {
+                // TrainingStatus reads the job row via the tenant-filtered
+                // `get_training_job` (NOT by an "unguessable" id) — a peer cannot
+                // read another tenant's job status. The shared helper creates a
+                // job under A and asserts that exact read isolation.
                 assert_training_create_isolated().await;
             }
         ),
@@ -1184,10 +1207,9 @@ async fn assert_audit_isolated() {
     );
 }
 
-/// Search / Propagate / BuildNeighborGraph / GenerateEmbeddings /
-/// AssembleContext resolve their input embedding table through
-/// `resolve_embedding_table`, which is tenant-filtered: a peer cannot resolve a
-/// tenant's ready embedding table.
+/// Search / Propagate / BuildNeighborGraph / AssembleContext resolve their input
+/// embedding table through `resolve_embedding_table`, which is tenant-filtered: a
+/// peer cannot resolve a tenant's ready embedding table.
 async fn assert_embedding_resolver_isolated() {
     let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
     // A ready model-output embedding table for source "src_a", owned by A.
@@ -1211,8 +1233,10 @@ async fn assert_embedding_resolver_isolated() {
     );
 }
 
-/// Infer / Predict / EncodeQuery resolve the model through `get_model`, which
-/// is tenant-filtered: a peer cannot resolve a tenant's private model.
+/// Infer / Predict / EncodeQuery / GenerateEmbeddings resolve the model through
+/// `get_model`, which is tenant-filtered: a peer cannot resolve a tenant's
+/// private model. (Infer / Predict additionally read a source scan via
+/// tenant-scoped SQL, covered by the Flight SQL and source cases.)
 async fn assert_model_resolver_isolated() {
     let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
     cat_a

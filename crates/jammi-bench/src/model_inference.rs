@@ -52,19 +52,18 @@
 //! adapts a label + score distribution. Driving each over its own tiny bundle
 //! exercises the two real paths, so a regression in either moves its own digest.
 //!
-//! ## The committed artifact bundles
+//! ## The committed spec + the referenced fixtures
 //!
 //! `baselines/model_inference.json` carries the synthetic corpus spec (so the
 //! gate regenerates the exact deterministic text rows), the infer digest's target
 //! keys (a deterministic prefix, folded in key order so any box folds the same
 //! per-row scores), the two digests, and the two same-box baselines. The tiny
-//! model bundles
-//! (`config.json` + `model.safetensors` + `tokenizer.json`, ~100 KB each) live
-//! beside it under `baselines/embed_model/` and `baselines/classifier_model/`.
-//! They are the engine's own committed tiny fixtures (a 32-dim 1-layer BERT and a
-//! 32-dim 1-layer ModernBERT classifier); the rebuild re-derives every committed
-//! value by serving over those bundles and copies them in from the engine's
-//! fixture tree so the bench is self-contained.
+//! model bundles themselves are NOT copied here — they are REFERENCED from the
+//! engine's shared fixture tree (`cookbook/fixtures/tiny_bert` and
+//! `tiny_modernbert_classifier` — a 32-dim 1-layer BERT and a 32-dim 1-layer
+//! ModernBERT classifier), the same fixtures the `jammi-encoders` tests reference
+//! by relative path. The rebuild re-derives every committed value by serving over
+//! those referenced bundles; nothing is duplicated.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -151,18 +150,20 @@ impl ModelInferenceSpec {
             .join("model_inference.json")
     }
 
-    /// The crate-relative directory the committed embed bundle lives in.
+    /// The shared engine fixture the embed bundle is read from — REFERENCED, not
+    /// copied (the `jammi-encoders` tests reference this same `tiny_bert` fixture
+    /// the same way). A tiny real BERT; the resolver's no-network `local:` branch
+    /// loads it on `Device::Cpu`.
     pub fn embed_model_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("baselines")
-            .join("embed_model")
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_bert")
     }
 
-    /// The crate-relative directory the committed classifier bundle lives in.
+    /// The shared engine fixture the classifier bundle is read from — REFERENCED,
+    /// not copied (same idiom as the `jammi-encoders` tests). A tiny real ModernBERT
+    /// classifier loaded via the resolver's no-network `local:` branch.
     pub fn classifier_model_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("baselines")
-            .join("classifier_model")
+            .join("../../cookbook/fixtures/tiny_modernbert_classifier")
     }
 
     /// Load the committed spec from `baselines/model_inference.json`.
@@ -521,9 +522,9 @@ pub fn gates_passed(tier: &ModelInferenceTier) -> bool {
 /// same-box serving baselines. The off-box one-shot that writes
 /// `baselines/model_inference.json`; CI only ever loads and re-serves.
 ///
-/// The bundles themselves are the engine's own committed tiny fixtures, copied
-/// into the bench's `baselines/` so it is self-contained — they are not
-/// regenerated here (there is no training step; they are pre-built tiny models).
+/// The bundles themselves are the engine's own shared tiny fixtures, REFERENCED
+/// from `cookbook/fixtures/` (not copied) — they are not regenerated here (there
+/// is no training step; they are pre-built tiny models).
 pub async fn rebuild_spec(
     params: ModelInferenceParams,
 ) -> Result<ModelInferenceSpec, Box<dyn std::error::Error>> {
@@ -604,12 +605,12 @@ mod tests {
         );
     }
 
-    /// The committed model bundles are present and complete: each verb's bundle
-    /// carries the three files the resolver's local branch loads. A missing file
-    /// would make the serve fail to even resolve, so this guards the committed
-    /// artifacts' completeness.
+    /// The referenced shared model fixtures are present and complete: each verb's
+    /// fixture carries the three files the resolver's local branch loads. A missing
+    /// file would make the serve fail to even resolve, so this guards the referenced
+    /// fixtures' completeness.
     #[test]
-    fn committed_model_bundles_are_present() {
+    fn referenced_model_fixtures_are_present() {
         for dir in [
             ModelInferenceSpec::embed_model_dir(),
             ModelInferenceSpec::classifier_model_dir(),

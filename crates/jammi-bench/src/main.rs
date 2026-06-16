@@ -1,22 +1,58 @@
 //! `jammi-bench` — the scale and performance measurement harness for the Jammi
 //! engine.
 //!
-//! A measurement *consumer* of the engine: it links `jammi-db`/`jammi-numerics`
-//! and drives their public surfaces at scale, emitting one machine-readable JSON
-//! report per run. It is `publish = false` and names no consumer — it measures
-//! the engine's generic primitives (exact search, ANN-vs-exact recall, and later
-//! embed throughput, ANN QPS, propagate latency, peak RSS), so it is kept out of
+//! A measurement *consumer* of the engine: it links `jammi-db`/`jammi-numerics`/
+//! `jammi-ai` and drives their public surfaces at scale, emitting one
+//! machine-readable JSON report per run. It is `publish = false` and names no
+//! consumer — it measures the engine's generic primitives — so it is kept out of
 //! the published workspace to keep the engine a clean library while still being
 //! compile-checked by the workspace gate.
 //!
-//! Invoke as `cargo run -p jammi-bench --release -- <subcommand>`. Two
-//! subcommands are functional: `search-rss`, the bounded-RSS proof for streamed
-//! exact search (the payoff of the streamed `exact_vector_search` rewrite), and
-//! `arxiv`, the ANN-vs-exact recall curve over a committed corpus measured with
-//! a HELD-OUT query set disjoint from the corpus (the exact oracle's top-k vs a
-//! frozen sidecar's, set-intersected). The remaining perf metrics are scaffolded
-//! as explicit `not yet measured` stubs so the report schema is stable from the
-//! first emit.
+//! Invoke as `cargo run -p jammi-bench --release -- <subcommand>`. Each tier has a
+//! subcommand (and, where it commits a baseline/spec, a `rebuild-*` peer):
+//! `search-rss` (bounded-RSS proof for streamed exact search), `arxiv` (ANN-vs-exact
+//! recall curve over a committed corpus, held-out query set), `recall-sweep`,
+//! `train-scale` (fine-tune throughput + live OOM negative-control), `conformal-scale`
+//! (split-conformal coverage floor), `eval-scale` (retrieval/classification metric
+//! goldens + bootstrap order-invariance), `propagate-scale` (propagation determinism
+//! digest + latency ref), `graph-train-scale` (graph-finetune sampler throughput),
+//! `context-predictor-scale` (predictor train throughput + predict digest), and
+//! `model-inference-scale` (`generate_embeddings` + `infer` output digests + coarse
+//! serving throughput). Every committed number is a real re-derivable fold (a
+//! `rebuild-*` subcommand reproduces it); an un-measured slot serializes as `null`,
+//! never a faked zero.
+//!
+//! ## Breadth-grid cell (d): which verbs get a scale benchmark, and which are N/A
+//!
+//! A scale benchmark is meaningful only for verbs whose cost grows with input size
+//! (the data/compute plane). Control-plane/metadata verbs have no scale dimension;
+//! benchmarking them "at scale" would measure the catalog backend, not a Jammi
+//! primitive — so they are documented N/A here rather than silently skipped.
+//!
+//! * SCALE-RELEVANT (benchmarked above): `search` + `build_neighbor_graph` (recall /
+//!   RSS / sweep tiers), `fine_tune`, `fine_tune_graph`, `train_context_predictor`,
+//!   `predict_with_context_predictor`, `generate_embeddings`, `infer`,
+//!   `propagate_embeddings`, `conformalize{,_cqr,_interval}`, and the
+//!   `eval_{embeddings,per_query,inference,compare}` family.
+//! * N/A — control plane (O(1)/O(catalog), not O(corpus)): the `list_*` /
+//!   `describe_*` / `get_server_info` / `set_tenant` / `tenant` / `tenant_scope` /
+//!   `register_*` / `drop_*` / `publish_topic` / `subscribe_collect` /
+//!   `create_mutable_table` / `drop_mutable_table` / `delete_model` / `preload_model` /
+//!   `ephemeral_session` surfaces. (Trigger-stream delivery under load is a *guarantee*
+//!   proven elsewhere, not a throughput cell.)
+//! * N/A — bounded-by-k / covered-by-proxy: `rrf_fuse` and `assemble_context` are
+//!   bounded by retrieval depth k (and `assemble_context`'s retrieval cost IS the
+//!   `search` it composes); `encode_query` is single-item (its scale cousin is
+//!   `generate_embeddings`); `sql`'s data-scale cost is DataFusion's, and the only
+//!   Jammi-owned scale edge it reaches (vector scan) is `search`.
+//!
+//! The model-inference serving rates (`generate_embeddings`, `infer`) and the
+//! training throughputs are inherently GPU-model numbers at scale; their PORTABLE
+//! gates (output digests, coverage/metric floors) run here in CI over tiny CPU models
+//! / same-box baselines, while the representative scaling RATE is captured off-box in
+//! the cookbook (the A/B split). The automated CI lane that invokes these `*-scale`
+//! subcommands on a representative box and fails on the exit code is a tracked
+//! perf-SLO follow-up (the §4.4 front-barrier), not yet wired.
 
 mod conformal;
 mod context_predictor;

@@ -1,0 +1,15 @@
+{
+  "communities": 8,
+  "nodes_per": 64,
+  "intra_degree": 4,
+  "bridge_stride": 8,
+  "walk_length": 4,
+  "walks_per_node": 4,
+  "return_p": 1.0,
+  "in_out_q": 0.5,
+  "hard_negatives": 2,
+  "exclude_hops": 1,
+  "seed": 828927508497,
+  "digest": "99afc6ceaacfa2e9",
+  "baseline_pairs_per_s": 6418.103563834347
+}

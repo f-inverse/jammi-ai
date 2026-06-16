@@ -107,6 +107,23 @@ pub struct Tiers {
     /// machine-dependent reference. Populated by `propagate-scale`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub propagate: Option<PropagateTier>,
+    /// The CPU-hermetic graph fine-tune tier: the engine's biased-walk graph
+    /// sampler (`GraphSampler`, the data path `fine_tune_graph` threads through)
+    /// drives a sampled-pairs-per-second throughput gated against a committed
+    /// same-box baseline by [`crate::rate_gate`], plus a committed-digest gate on
+    /// the sampled pair set (the sampler is seeded, so the pairs are byte-stable —
+    /// a regression in the walk bias, the negative mining, or the adjacency moves
+    /// the digest). Populated by `graph-train-scale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_train: Option<GraphTrainTier>,
+    /// The CPU-hermetic context-predictor tier: the engine's episodic
+    /// meta-training (`sample_context_episodes` + `train_loop`) drives a
+    /// training-throughput rate gated against a committed same-box baseline, and
+    /// the serving path (`predict_with_context_predictor` over committed weights)
+    /// carries a committed-digest gate on the predicted distribution with predict
+    /// wall-time as an un-gated reference. Populated by `context-predictor-scale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_predictor: Option<ContextPredictorTier>,
 }
 
 /// The k values the recall curve is reported at: recall@1, recall@10, recall@100.
@@ -707,4 +724,107 @@ pub struct PropagateLatency {
     /// Propagation wall-time over the whole `propagate_embeddings` call (load +
     /// fold + materialize), milliseconds. Machine-dependent reference, un-gated.
     pub propagate_ms: Measurement,
+}
+
+/// The CPU-hermetic graph fine-tune tier: the engine's biased-walk graph sampler
+/// (`GraphSampler`, the data path `fine_tune_graph` threads through) measured for
+/// throughput and gated for determinism.
+///
+/// Two lanes, the harness's portable-gate-vs-machine-dependent-rate split applied
+/// to the graph-supervision data path:
+///
+/// * **Throughput** ([`pairs_per_s`](GraphTrainTier::pairs_per_s)) — the
+///   `(anchor, positive, hard_negatives)` training rows the biased-walk sampler
+///   draws per second over a committed synthetic graph. A *rate* (a property of
+///   the box), so it is gated against a committed same-box baseline by
+///   [`crate::rate_gate`], not a portable floor — the same discipline the
+///   training tier's throughput follows.
+/// * **The determinism digest** ([`digest`](GraphTrainTier::digest)) — the
+///   sampler is seeded (a `SplitMix64` walk/negative stream), so the sampled pair
+///   set is byte-stable across runs. The committed digest is a stable checksum of
+///   the sampled rows; a regression in the walk bias (`p`/`q`), the
+///   structure-aware negative mining (the k-hop false-negative guard), or the
+///   adjacency construction moves the rows and trips the gate. This is the
+///   portable analogue of the propagation digest, licensed by the sampler's
+///   documented seeded reproducibility (the engine's
+///   `graph_spec_round_trip_resamples_identical_pairs` contract).
+#[derive(Debug, Serialize)]
+pub struct GraphTrainTier {
+    /// The node count of the committed synthetic graph the throughput and the
+    /// digest were measured over — the sampler cost scales with it, so it travels.
+    pub nodes: usize,
+    /// The edge count of the committed synthetic graph.
+    pub edges: usize,
+    /// The number of `(anchor, positive, [hard_negative])` rows the sampler drew
+    /// from the committed graph — the digest is over these, and the throughput is
+    /// this count divided by the sample wall-clock.
+    pub sampled_pairs: usize,
+    /// Sampled training rows drawn per second through one `GraphSampler::sample`
+    /// over the committed graph, on the CPU. A *rate*, gated against a committed
+    /// same-box baseline.
+    pub pairs_per_s: Measurement,
+    /// Wall-clock of the single measured `GraphSampler::sample` call,
+    /// milliseconds.
+    pub sample_wall_ms: Measurement,
+    /// The throughput rate-regression verdict: the measured `pairs_per_s` gated
+    /// against the committed same-box baseline. Present only when the baseline was
+    /// loaded; absent when the rate rides as a bare measurement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_gate: Option<RateVerdict>,
+    /// The determinism gate: the digest of the sampled pair set re-drawn this run
+    /// through the real engine sampler, the committed digest, and the
+    /// `re-drawn == committed` verdict.
+    pub digest: DigestGate,
+}
+
+/// The CPU-hermetic context-predictor tier: the engine's episodic meta-training
+/// and in-context serving, measured for throughput and gated for determinism.
+///
+/// Two lanes, the harness's split between a machine-dependent rate and a portable
+/// gate, here spanning the *two* engine verbs the tier covers:
+///
+/// * **Training throughput** ([`train_pairs_per_s`](ContextPredictorTier::train_pairs_per_s))
+///   — the meta-training episodes the engine's `sample_context_episodes` +
+///   `train_loop` drive per second on the CPU. A *rate*, so it is gated against a
+///   committed same-box baseline by [`crate::rate_gate`], the training tier's
+///   discipline.
+/// * **The predict digest gate** ([`predict_digest`](ContextPredictorTier::predict_digest))
+///   — `predict_with_context_predictor` is byte-deterministic given the served
+///   weights and the target (the engine's inference-only no-gradient contract), so
+///   over a committed weight bundle and committed targets the predicted
+///   distribution is a stable checksum. The committed digest gates it for
+///   equality; a regression in the serve/predict path (context assembly, the
+///   in-context forward, the distribution adapter, the de-standardisation) moves
+///   the bits and trips it. Predict wall-time rides as an un-gated,
+///   machine-dependent [`Measurement`] reference — a latency is a property of the
+///   box, never a portable floor.
+#[derive(Debug, Serialize)]
+pub struct ContextPredictorTier {
+    /// The predictor architecture the committed weights were trained under
+    /// (`Cnp` / `AttnCnp`), so the digest's provenance is explicit.
+    pub architecture: &'static str,
+    /// The context width `k` the committed predictor serves at — the digest is
+    /// over a `k`-neighbour context, so a serve at a different `k` moves it.
+    pub context_k: usize,
+    /// The number of meta-training episodes the throughput was measured over.
+    pub train_episodes: usize,
+    /// Meta-training episode-steps per second through the engine's
+    /// `train_context_predictor` (sample + `train_loop`) on the CPU. A *rate*,
+    /// gated against a committed same-box baseline.
+    pub train_pairs_per_s: Measurement,
+    /// Wall-clock of the single measured meta-training run (the episodic
+    /// `train_loop` over `train_episodes` episodes), milliseconds.
+    pub train_wall_ms: Measurement,
+    /// The training throughput rate-regression verdict against the committed
+    /// same-box baseline. Present only when the baseline was loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_gate: Option<RateVerdict>,
+    /// The predict determinism gate: the digest of the predicted distributions
+    /// `predict_with_context_predictor` produced over the committed weight bundle
+    /// and committed targets this run, the committed digest, and the
+    /// `re-predicted == committed` verdict.
+    pub predict_digest: DigestGate,
+    /// Predict wall-time over the committed target set — an un-gated,
+    /// machine-dependent reference, never a portable floor.
+    pub predict_latency_ms: Measurement,
 }

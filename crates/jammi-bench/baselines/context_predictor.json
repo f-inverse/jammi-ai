@@ -1,0 +1,26 @@
+{
+  "n_tasks": 8,
+  "rows_per_task": 18,
+  "dataset_seed": 321,
+  "architecture": "Cnp",
+  "context_k": 6,
+  "hidden_dim": 16,
+  "num_heads": 2,
+  "num_layers": 2,
+  "epochs": 30,
+  "learning_rate": 0.005,
+  "grad_clip": 1.0,
+  "test_task_fraction": 0.25,
+  "min_task_count": 4,
+  "spec_seed": 7,
+  "config_json": "{\"architecture\":\"Cnp\",\"context_k\":6,\"feature_dim\":4,\"head\":{\"kind\":\"gaussian\"},\"head_width\":2,\"hidden_dim\":16,\"num_heads\":2,\"num_layers\":2,\"target_scaler\":{\"mean\":-0.04143233597278595,\"std\":0.6916563799296143},\"value_column\":\"y\"}",
+  "target_keys": [
+    "t0_r0",
+    "t0_r1",
+    "t0_r2",
+    "t0_r3",
+    "t0_r4"
+  ],
+  "predict_digest": "265048934cff4d63",
+  "baseline_episode_steps_per_s": 21.29133108231682
+}

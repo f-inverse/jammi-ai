@@ -19,9 +19,11 @@
 //! first emit.
 
 mod conformal;
+mod context_predictor;
 mod corpus;
 mod eval;
 mod fixture;
+mod graph_train;
 mod propagate;
 mod rate_gate;
 mod recall;
@@ -205,6 +207,41 @@ enum Command {
     /// rebuilder for the committed digest.
     #[command(hide = true)]
     RebuildPropagateSpec,
+    /// The CPU-hermetic graph fine-tune tier: re-samples the engine's biased-walk
+    /// graph sampler (`GraphSampler` — the data path `fine_tune_graph` threads
+    /// through) over a committed synthetic graph, gates the sampled-pair set on a
+    /// committed determinism digest any box re-derives, and gates the
+    /// sampled-pairs-per-second throughput against a committed same-box baseline.
+    /// Emits the JSON report with the `graph_train` tier set and exits non-zero if
+    /// the digest drifts or the throughput regresses.
+    GraphTrainScale,
+    /// Internal: rebuild the committed graph fine-tune spec
+    /// (`baselines/graph_train.json`) from a fresh sample — regenerates the graph,
+    /// samples it through the engine, and records the sampled-pair digest and the
+    /// same-box throughput. Run off-box once when the spec is established or the
+    /// sampler contract changes; CI only loads and re-samples it. Not a CI step —
+    /// the provenance-recording rebuilder for the committed digest + baseline.
+    #[command(hide = true)]
+    RebuildGraphTrainSpec,
+    /// The CPU-hermetic context-predictor tier: measures the engine's
+    /// `train_context_predictor` meta-training throughput (gated against a
+    /// committed same-box baseline) and gates `predict_with_context_predictor` on
+    /// a committed digest of the predicted distributions over a committed trained
+    /// weight bundle (predict is byte-deterministic given the weights + targets),
+    /// with predict wall-time as an un-gated reference. Emits the JSON report with
+    /// the `context_predictor` tier set and exits non-zero if the digest drifts or
+    /// the throughput regresses.
+    ContextPredictorScale,
+    /// Internal: rebuild the committed context-predictor spec
+    /// (`baselines/context_predictor.json`) and its trained weight bundle
+    /// (`baselines/context_predictor_weights/`) from a fresh train + predict —
+    /// trains a predictor through the engine, commits the trained weights, and
+    /// records the predict digest those weights produce plus the same-box training
+    /// baseline. Run off-box once when the spec is established or the serve/predict
+    /// contract changes; CI only loads the committed weights and re-predicts. Not a
+    /// CI step — the provenance-recording rebuilder for the committed bundle.
+    #[command(hide = true)]
+    RebuildContextPredictorSpec,
 }
 
 #[tokio::main]
@@ -241,6 +278,10 @@ async fn main() -> std::process::ExitCode {
         Command::RebuildEvalSpec => run_rebuild_eval_spec(),
         Command::PropagateScale => run_propagate_scale().await,
         Command::RebuildPropagateSpec => run_rebuild_propagate_spec().await,
+        Command::GraphTrainScale => run_graph_train_scale(),
+        Command::RebuildGraphTrainSpec => run_rebuild_graph_train_spec(),
+        Command::ContextPredictorScale => run_context_predictor_scale().await,
+        Command::RebuildContextPredictorSpec => run_rebuild_context_predictor_spec().await,
     }
 }
 
@@ -327,6 +368,8 @@ async fn run_train_scale() -> std::process::ExitCode {
             conformal: None,
             eval: None,
             propagate: None,
+            graph_train: None,
+            context_predictor: None,
         },
     };
     emit(&report);
@@ -383,6 +426,8 @@ fn run_conformal_scale() -> std::process::ExitCode {
             conformal: Some(tier),
             eval: None,
             propagate: None,
+            graph_train: None,
+            context_predictor: None,
         },
     };
     emit(&report);
@@ -429,6 +474,8 @@ fn run_eval_scale() -> std::process::ExitCode {
             conformal: None,
             eval: Some(tier),
             propagate: None,
+            graph_train: None,
+            context_predictor: None,
         },
     };
     emit(&report);
@@ -476,6 +523,8 @@ async fn run_propagate_scale() -> std::process::ExitCode {
             conformal: None,
             eval: None,
             propagate: Some(tier),
+            graph_train: None,
+            context_predictor: None,
         },
     };
     emit(&report);
@@ -646,6 +695,205 @@ async fn run_rebuild_propagate_spec() -> std::process::ExitCode {
     }
 }
 
+/// Run the CPU-hermetic graph fine-tune tier: load the committed spec, re-sample
+/// the graph through the engine's real `GraphSampler`, gate the sampled-pair
+/// digest and the throughput, emit the report with the `graph_train` tier set,
+/// and map the verdict to the exit code. A digest drift or a throughput
+/// regression prints and exits non-zero — the run never fakes a pass.
+fn run_graph_train_scale() -> std::process::ExitCode {
+    let spec = match graph_train::GraphTrainSpec::load() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("graph-train-scale could not load the committed spec: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let tier = match graph_train::run(&spec) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("graph-train-scale sample failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let passed = graph_train::gates_passed(&tier);
+    let report = Report {
+        engine_version: ENGINE_VERSION,
+        host: Host::detect(),
+        subcommand: "graph-train-scale",
+        tiers: Tiers {
+            arxiv: None,
+            binding: None,
+            recall_sweep: None,
+            training: None,
+            conformal: None,
+            eval: None,
+            propagate: None,
+            graph_train: Some(tier),
+            context_predictor: None,
+        },
+    };
+    emit(&report);
+    if passed {
+        std::process::ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "graph fine-tune gate FAILED — the sampled-pair digest drifted off its committed \
+             value, or the sample throughput regressed below the same-box floor; see \
+             tiers.graph_train for the numbers"
+        );
+        std::process::ExitCode::FAILURE
+    }
+}
+
+/// The committed graph fine-tune generation parameters — the synthetic-graph shape
+/// and the sampler knobs the committed digest and same-box baseline are derived
+/// from. A multi-community circulant with sparse bridges, sampled by a
+/// higher-order biased walk with structure-aware negative mining.
+const GRAPH_TRAIN_PARAMS: graph_train::GraphTrainParams = graph_train::GraphTrainParams {
+    communities: 8,
+    nodes_per: 64,
+    intra_degree: 4,
+    bridge_stride: 8,
+    walk_length: 4,
+    walks_per_node: 4,
+    return_p: 1.0,
+    in_out_q: 0.5,
+    hard_negatives: 2,
+    exclude_hops: 1,
+    seed: 0x00C0_FFEE_0011,
+};
+
+/// Rebuild and write the committed graph fine-tune spec from a fresh sample. The
+/// off-box one-shot; prints the spec it wrote so the operator sees the digest and
+/// baseline being committed.
+fn run_rebuild_graph_train_spec() -> std::process::ExitCode {
+    let spec = match graph_train::rebuild_spec(GRAPH_TRAIN_PARAMS) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("rebuild-graph-train-spec failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match serde_json::to_string_pretty(&spec) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(graph_train::GraphTrainSpec::path(), format!("{json}\n"))
+            {
+                eprintln!("rebuild-graph-train-spec could not write the spec: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+            println!("{json}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("failed to serialize graph-train spec: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run the CPU-hermetic context-predictor tier: load the committed spec, measure
+/// `train_context_predictor` throughput, re-fold the predict digest over the
+/// committed weight bundle through `predict_with_context_predictor`, emit the
+/// report with the `context_predictor` tier set, and map the verdict to the exit
+/// code. A digest drift or a throughput regression prints and exits non-zero.
+async fn run_context_predictor_scale() -> std::process::ExitCode {
+    let spec = match context_predictor::ContextPredictorSpec::load() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("context-predictor-scale could not load the committed spec: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let tier = match context_predictor::run(&spec).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("context-predictor-scale run failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let passed = context_predictor::gates_passed(&tier);
+    let report = Report {
+        engine_version: ENGINE_VERSION,
+        host: Host::detect(),
+        subcommand: "context-predictor-scale",
+        tiers: Tiers {
+            arxiv: None,
+            binding: None,
+            recall_sweep: None,
+            training: None,
+            conformal: None,
+            eval: None,
+            propagate: None,
+            graph_train: None,
+            context_predictor: Some(tier),
+        },
+    };
+    emit(&report);
+    if passed {
+        std::process::ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "context-predictor gate FAILED — the predicted-distribution digest drifted off its \
+             committed value, or the training throughput regressed below the same-box floor; see \
+             tiers.context_predictor for the numbers"
+        );
+        std::process::ExitCode::FAILURE
+    }
+}
+
+/// The committed context-predictor generation parameters — the synthetic
+/// meta-dataset shape, the predictor spec, and how many targets the predict digest
+/// folds over. A CNP over a family of linear functions, the engine
+/// context-predictor suite's own hermetic shape.
+const CONTEXT_PREDICTOR_PARAMS: context_predictor::ContextPredictorParams =
+    context_predictor::ContextPredictorParams {
+        n_tasks: 8,
+        rows_per_task: 18,
+        dataset_seed: 321,
+        architecture: "Cnp",
+        context_k: 6,
+        hidden_dim: 16,
+        num_heads: 2,
+        num_layers: 2,
+        epochs: 30,
+        learning_rate: 0.005,
+        grad_clip: 1.0,
+        test_task_fraction: 0.25,
+        min_task_count: 4,
+        spec_seed: 7,
+        target_count: 5,
+    };
+
+/// Rebuild and write the committed context-predictor spec and its trained weight
+/// bundle from a fresh train + predict. The off-box one-shot; prints the spec it
+/// wrote so the operator sees the digest and baseline being committed.
+async fn run_rebuild_context_predictor_spec() -> std::process::ExitCode {
+    let spec = match context_predictor::rebuild_spec(CONTEXT_PREDICTOR_PARAMS).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("rebuild-context-predictor-spec failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match serde_json::to_string_pretty(&spec) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(
+                context_predictor::ContextPredictorSpec::path(),
+                format!("{json}\n"),
+            ) {
+                eprintln!("rebuild-context-predictor-spec could not write the spec: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+            println!("{json}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("failed to serialize context-predictor spec: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 /// The `measure-once` child: run one variant over the pre-materialized corpus,
 /// print its peak RSS and result digest, and exit. The parent reads the single
 /// stdout line; a failure exits non-zero so the parent surfaces it.
@@ -700,6 +948,8 @@ async fn run_search_rss() -> std::process::ExitCode {
             conformal: None,
             eval: None,
             propagate: None,
+            graph_train: None,
+            context_predictor: None,
         },
     };
     emit(&report);
@@ -748,6 +998,8 @@ async fn run_arxiv() -> std::process::ExitCode {
             conformal: None,
             eval: None,
             propagate: None,
+            graph_train: None,
+            context_predictor: None,
         },
     };
     emit(&report);
@@ -802,6 +1054,8 @@ async fn run_recall_sweep(
             conformal: None,
             eval: None,
             propagate: None,
+            graph_train: None,
+            context_predictor: None,
         },
     };
     emit(&report);

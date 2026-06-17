@@ -2,12 +2,21 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 
+use serde::Deserialize;
+
 use crate::config::AnnIndexConfig;
 use crate::error::{JammiError, Result};
 use crate::index::VectorIndex;
 
 /// Current rowmap format version.
 const ROWMAP_VERSION: u32 = 1;
+
+/// Current ANN `.manifest.json` format version. A future format change bumps
+/// this so a reader rejects a newer manifest as a typed
+/// [`JammiError::IncompatibleFormat`] rather than silently misparsing — the
+/// `.rowmap` and materialization-manifest reject-newer idiom applied to the ANN
+/// sidecar's metadata.
+const ANN_MANIFEST_VERSION: u32 = 1;
 
 /// Build the USearch index options for a sidecar of the given dimension.
 ///
@@ -46,6 +55,29 @@ pub struct SidecarIndex {
     /// strings already in `row_map`), never the embeddings.
     row_index: HashMap<String, u64>,
     built: bool,
+}
+
+/// The load-relevant header of the ANN `.manifest.json` sidecar.
+///
+/// Deserialised as a typed struct (never field-by-field `Value` lookups) so the
+/// load path mirrors [`crate::store::manifest::MaterializationManifest::from_json_bytes`]:
+/// the determinants of a safe load — the manifest format `version`, the
+/// embedding `dimensions`, and the USearch `backend_version` the graph was
+/// serialised by — are all required. A manifest missing any of them is a hard
+/// `serde` error (decoded into a typed [`JammiError`]), never silently defaulted.
+/// The remaining metadata (`count`, `metric`, `files`, `created_at`) is
+/// provenance the load path does not consume, so it is ignored on read.
+#[derive(Debug, Deserialize)]
+struct AnnManifest {
+    /// Manifest format version, checked reject-newer against
+    /// [`ANN_MANIFEST_VERSION`].
+    version: u32,
+    /// Embedding width the graph was built over.
+    dimensions: usize,
+    /// The USearch version that serialised the graph, strict-compared against
+    /// [`crate::index::backend_version`] — USearch gives no compatibility
+    /// ordering, so any mismatch is incompatible.
+    backend_version: String,
 }
 
 impl SidecarIndex {
@@ -108,7 +140,7 @@ impl SidecarIndex {
         // Save manifest
         let manifest_path = base_path.with_extension("manifest.json");
         let manifest = serde_json::json!({
-            "version": 1,
+            "version": ANN_MANIFEST_VERSION,
             "dimensions": self.dimensions,
             "count": self.row_map.len(),
             "metric": "cosine",
@@ -136,14 +168,39 @@ impl SidecarIndex {
     /// until it is set explicitly. We re-apply it from `ann` when non-zero; a
     /// `0` leaves the backend default in place (today's behaviour).
     pub fn load(base_path: &Path, ann: &AnnIndexConfig) -> Result<Self> {
-        // Load manifest to get dimensions
+        // Load the manifest as a typed struct (mirroring
+        // `MaterializationManifest::from_json_bytes`): a missing `version`,
+        // `dimensions`, or `backend_version` is a hard typed error, never a
+        // silent default.
         let manifest_path = base_path.with_extension("manifest.json");
-        let manifest_str = std::fs::read_to_string(&manifest_path)?;
-        let manifest: serde_json::Value = serde_json::from_str(&manifest_str)?;
-        let dimensions = manifest["dimensions"]
-            .as_u64()
-            .ok_or_else(|| JammiError::Other("Missing dimensions in manifest".into()))?
-            as usize;
+        let manifest_bytes = std::fs::read(&manifest_path)?;
+        let manifest: AnnManifest = serde_json::from_slice(&manifest_bytes)?;
+
+        // The ANN manifest format has a compatibility ordering — reject only a
+        // NEWER version than this build can read.
+        if manifest.version > ANN_MANIFEST_VERSION {
+            return Err(JammiError::IncompatibleFormat {
+                artifact: "ann-manifest".into(),
+                found: manifest.version.to_string(),
+                supported: ANN_MANIFEST_VERSION.to_string(),
+            });
+        }
+
+        // STRICT backend-version validation: USearch's serialized graph format
+        // gives no compatibility ordering, so a version that differs at all from
+        // the linked USearch can silently mis-deserialise the graph and return
+        // wrong neighbours. Any mismatch is incompatible — there is no
+        // "reject-newer" here, only exact equality.
+        let current_backend = crate::index::backend_version();
+        if manifest.backend_version != current_backend {
+            return Err(JammiError::IncompatibleFormat {
+                artifact: "usearch-index".into(),
+                found: manifest.backend_version,
+                supported: current_backend.to_string(),
+            });
+        }
+
+        let dimensions = manifest.dimensions;
 
         // Load rowmap
         let rowmap_path = base_path.with_extension("rowmap");
@@ -151,10 +208,16 @@ impl SidecarIndex {
         let mut version_bytes = [0u8; 4];
         file.read_exact(&mut version_bytes)?;
         let version = u32::from_le_bytes(version_bytes);
-        if version != ROWMAP_VERSION {
-            return Err(JammiError::Other(format!(
-                "Unknown rowmap version {version}, expected {ROWMAP_VERSION}"
-            )));
+        // Reject only a NEWER format than this build can read, mirroring the
+        // materialization manifest's reject-newer idiom: the rowmap layout has a
+        // compatibility ordering, so an older or equal stamp is readable while a
+        // newer one carries a layout this build does not know.
+        if version > ROWMAP_VERSION {
+            return Err(JammiError::IncompatibleFormat {
+                artifact: "rowmap".into(),
+                found: version.to_string(),
+                supported: ROWMAP_VERSION.to_string(),
+            });
         }
 
         let mut row_map = Vec::new();
@@ -349,5 +412,152 @@ mod tests {
             loaded_default.index.expansion_search(),
             USEARCH_DEFAULT_EXPANSION_SEARCH
         );
+    }
+
+    /// Build and save a valid one-vector sidecar bundle at `base`, returning it
+    /// ready for a tamper-then-reload teeth test.
+    fn save_valid_bundle(base: &Path) {
+        let mut idx = SidecarIndex::new(4, &AnnIndexConfig::default()).unwrap();
+        idx.add("a", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.build().unwrap();
+        idx.save(base).unwrap();
+    }
+
+    /// Read the saved `.manifest.json` at `base` into a mutable JSON value.
+    fn read_manifest_json(base: &Path) -> serde_json::Value {
+        let manifest_path = base.with_extension("manifest.json");
+        let bytes = std::fs::read(&manifest_path).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Overwrite the `.manifest.json` at `base` with `value`.
+    fn write_manifest_json(base: &Path, value: &serde_json::Value) {
+        let manifest_path = base.with_extension("manifest.json");
+        std::fs::write(&manifest_path, serde_json::to_string_pretty(value).unwrap()).unwrap();
+    }
+
+    /// The error from a load that must fail. `SidecarIndex` is intentionally not
+    /// `Debug` (it wraps an opaque USearch handle), so the teeth tests cannot use
+    /// `unwrap_err`; this funnels the failing load to its [`JammiError`].
+    fn load_err(base: &Path) -> JammiError {
+        match SidecarIndex::load(base, &AnnIndexConfig::default()) {
+            Ok(_) => panic!("expected load to fail, but it succeeded"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn newer_rowmap_version_is_rejected() {
+        // A `.rowmap` stamped one past this build's version is a typed
+        // IncompatibleFormat rejection — the manifest reject-newer idiom applied
+        // to the rowmap's binary header. Modeled on
+        // `manifest.rs::newer_manifest_version_is_rejected`.
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("rowmap_newer");
+        save_valid_bundle(&base);
+
+        // Rewrite only the leading u32 version of the .rowmap to ROWMAP_VERSION+1,
+        // preserving the entry bytes after it.
+        let rowmap_path = base.with_extension("rowmap");
+        let mut bytes = std::fs::read(&rowmap_path).unwrap();
+        bytes[..4].copy_from_slice(&(ROWMAP_VERSION + 1).to_le_bytes());
+        std::fs::write(&rowmap_path, &bytes).unwrap();
+
+        let err = load_err(&base);
+        match err {
+            JammiError::IncompatibleFormat {
+                artifact,
+                found,
+                supported,
+            } => {
+                assert_eq!(artifact, "rowmap");
+                assert_eq!(found, (ROWMAP_VERSION + 1).to_string());
+                assert_eq!(supported, ROWMAP_VERSION.to_string());
+            }
+            other => panic!("expected IncompatibleFormat for rowmap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn newer_ann_manifest_version_is_rejected() {
+        // An ANN `.manifest.json` stamped one past this build's version is a
+        // typed IncompatibleFormat rejection (the now-LIVE version stamp), not a
+        // dead write-only field.
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("ann_newer");
+        save_valid_bundle(&base);
+
+        let mut manifest = read_manifest_json(&base);
+        manifest["version"] = serde_json::json!(ANN_MANIFEST_VERSION + 1);
+        write_manifest_json(&base, &manifest);
+
+        let err = load_err(&base);
+        match err {
+            JammiError::IncompatibleFormat {
+                artifact,
+                found,
+                supported,
+            } => {
+                assert_eq!(artifact, "ann-manifest");
+                assert_eq!(found, (ANN_MANIFEST_VERSION + 1).to_string());
+                assert_eq!(supported, ANN_MANIFEST_VERSION.to_string());
+            }
+            other => panic!("expected IncompatibleFormat for ann-manifest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_manifest_version_is_a_hard_error() {
+        // A manifest with no `version` field is a hard typed error (a serde
+        // decode failure surfacing as JammiError::Json), never a silent
+        // default-to-1.
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("ann_no_version");
+        save_valid_bundle(&base);
+
+        let mut manifest = read_manifest_json(&base);
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("version")
+            .expect("fixture manifest must have carried a version to remove");
+        write_manifest_json(&base, &manifest);
+
+        let err = load_err(&base);
+        assert!(
+            matches!(err, JammiError::Json(_)),
+            "a missing version must be a hard decode error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn mismatched_usearch_backend_version_is_rejected() {
+        // The stamped USearch `backend_version` is STRICT-compared on load: any
+        // value other than the linked USearch's is incompatible, because the
+        // serialized graph format carries no compatibility ordering and a bump
+        // can silently mis-deserialise the graph. This is the silent-corruption
+        // fix — without it the wrong-neighbours risk is undetected.
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("backend_mismatch");
+        save_valid_bundle(&base);
+
+        let bogus = "0.0.0-not-the-linked-usearch";
+        let mut manifest = read_manifest_json(&base);
+        manifest["backend_version"] = serde_json::json!(bogus);
+        write_manifest_json(&base, &manifest);
+
+        let err = load_err(&base);
+        match err {
+            JammiError::IncompatibleFormat {
+                artifact,
+                found,
+                supported,
+            } => {
+                assert_eq!(artifact, "usearch-index");
+                assert_eq!(found, bogus);
+                assert_eq!(supported, crate::index::backend_version());
+            }
+            other => panic!("expected IncompatibleFormat for usearch-index, got {other:?}"),
+        }
     }
 }

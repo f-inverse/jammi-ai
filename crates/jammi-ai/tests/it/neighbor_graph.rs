@@ -629,10 +629,9 @@ async fn neighbor_graph_rejects_zero_k() {
 // keyed on the COMPLETE descriptor.
 
 use jammi_db::store::{CacheOutcome, CachePolicy};
-use std::time::Instant;
 
 #[tokio::test]
-async fn cache_use_exact_hit_reuses_and_is_far_under_the_cold_build() {
+async fn cache_use_exact_hit_reuses_the_primed_table() {
     let (session, _dir) = session_with_embeddings().await;
     let params = BuildNeighborGraph {
         k: 5,
@@ -640,27 +639,26 @@ async fn cache_use_exact_hit_reuses_and_is_far_under_the_cold_build() {
         ..Default::default()
     };
 
-    // Cold build (Use, but nothing cached yet) → Computed, and time it.
-    let cold_start = Instant::now();
+    // Cold build (Use, but nothing cached yet) → Computed: it primes the cache.
     let (first, first_outcome) = session
         .build_neighbor_graph("patents", None, &params, CachePolicy::Use)
         .await
         .unwrap();
-    let cold = cold_start.elapsed();
     assert_eq!(
         first_outcome,
         CacheOutcome::Computed,
         "the first Use build has nothing to reuse — it computes"
     );
 
-    // Second Use over the identical (definition, source digest) → Reused, and the
-    // probe short-circuits before the expensive build, so it is far faster.
-    let warm_start = Instant::now();
+    // Second Use over the identical (definition, source digest) → Reused: the
+    // probe short-circuits before the expensive build and names the primed table.
+    // (The "reuse is faster" property is covered by the exit-code-gated SLO bench
+    // `cache-slo-scale`; this hermetic test asserts only the deterministic
+    // cache behaviour, never a wall-clock margin.)
     let (second, second_outcome) = session
         .build_neighbor_graph("patents", None, &params, CachePolicy::Use)
         .await
         .unwrap();
-    let warm = warm_start.elapsed();
 
     assert_eq!(
         second_outcome,
@@ -672,13 +670,6 @@ async fn cache_use_exact_hit_reuses_and_is_far_under_the_cold_build() {
     assert_eq!(
         second.table_name, first.table_name,
         "the reused record names the cached table, not a fresh one"
-    );
-    // The probe is a catalog lookup + an extant-bytes check — orders under the
-    // cold compute. A 2x margin is a conservative, non-flaky floor for the
-    // skip-the-whole-build win (the real ratio is far larger).
-    assert!(
-        warm * 2 < cold,
-        "a cache hit ({warm:?}) must be far under the cold build ({cold:?})"
     );
 }
 
@@ -823,11 +814,10 @@ async fn cache_hit_leaves_no_building_orphan_to_reap() {
     };
 
     // Prime the cache, then take a cache hit.
-    let _ = session
+    session
         .build_neighbor_graph("patents", None, &params, CachePolicy::Use)
         .await
-        .unwrap()
-        .0;
+        .unwrap();
     let (_reused, outcome) = session
         .build_neighbor_graph("patents", None, &params, CachePolicy::Use)
         .await

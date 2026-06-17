@@ -1,0 +1,80 @@
+name: Performance regression (early warning)
+
+# The nightly performance-SLO early-warning lane: runs the CPU-hermetic `*-scale`
+# bench subcommands and asserts each exits 0 against its committed same-box
+# baseline. Each tier's exit code IS the gate — a structural throughput
+# regression (a path that went quadratic, a serialized parallel section, a
+# dropped fast path) collapses the measured rate below the committed floor
+# (`baseline·(1 − 0.30)`, the harness's single generous band) and the subcommand
+# exits non-zero. The documented contract is `docs/guide/src/performance-slos.md`.
+#
+# This lane is EARLY-WARNING ONLY — it never gates a merge. The 30% relative-drop
+# threshold was sized for a same-box manual emit, not a contended shared GHA
+# runner whose throughput jitters with co-tenant load; a required per-PR rate
+# gate would flap, get muted, and rot into a broken window. So there is no
+# `pull_request` trigger: a red here is a signal a maintainer reads the next
+# morning, not a blocked PR. The authoritative, release-blocking same-box-ish
+# gate lives in `crates.yml` on the `v*` tag, where a structural regression
+# SHOULD block a release.
+#
+# What the per-PR lane already gates (in `ci.yml`'s workspace test run) is a
+# *property* of the mechanism — `committed_baseline_gates_with_teeth` proves the
+# committed baseline is a well-formed, generously-thresholded gate that can fail.
+# This lane adds the missing piece: actually running the measured-rate gate on a
+# real box, on a schedule, so a regression surfaces between releases.
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly at 05:23 UTC — off-peak, and offset from round hours (and from the
+    # distributed lane's 04:17) to avoid the cron stampede when many repos fire
+    # at :00.
+    - cron: "23 5 * * *"
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=mold"
+  SCCACHE_GHA_ENABLED: "true"
+  # Pin Rayon to a single thread so the measured rate reflects the engine's
+  # per-core code path, not the runner's variable core count — the same posture
+  # the committed baselines were emitted under and the on-box emitters document.
+  RAYON_NUM_THREADS: "1"
+
+jobs:
+  perf-scale:
+    name: CPU-hermetic scale tiers (measured-rate gate)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Build the bench harness (release)
+        # The committed baselines were emitted in the release profile; the rate
+        # gate only means anything against a release build, so build it once and
+        # invoke the binary directly per tier.
+        run: cargo build -p jammi-bench --release
+
+      # Each `*-scale` tier emits its JSON report to stdout and maps its gate
+      # verdict to the process exit code: a throughput below the committed floor
+      # (or a determinism-digest drift) exits non-zero. Running each as its own
+      # step means a red surfaces which tier regressed by name in the job log.
+      - name: train-scale (fine-tune throughput + OOM control)
+        run: ./target/release/jammi-bench train-scale
+
+      - name: graph-train-scale (graph sampler throughput + digest)
+        run: ./target/release/jammi-bench graph-train-scale
+
+      - name: context-predictor-scale (predictor train throughput + predict digest)
+        run: ./target/release/jammi-bench context-predictor-scale
+
+      - name: model-inference-scale (serving throughput + output digests)
+        run: ./target/release/jammi-bench model-inference-scale
+
+      - name: arxiv (held-out ANN-vs-exact recall over the committed corpus)
+        run: ./target/release/jammi-bench arxiv

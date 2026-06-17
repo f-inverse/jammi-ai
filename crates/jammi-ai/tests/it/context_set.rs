@@ -244,14 +244,13 @@ async fn materialize_context_writes_a_searchable_embedding_table() {
         .map(|i| (format!("target-{i}"), vec![i as f32; 32]))
         .collect();
 
+    let recipe = ContextRequest::new("patents", vec![0.0_f32; 32], 5);
     let table = session
-        .materialize_context(
-            "patents",
-            MaterializedContext {
-                rows: &rows,
-                dimensions: 32,
-            },
-        )
+        .materialize_context(MaterializedContext {
+            rows: &rows,
+            dimensions: 32,
+            recipe: &recipe,
+        })
         .await
         .unwrap();
 
@@ -274,14 +273,13 @@ async fn materialize_context_rejects_duplicate_target_keys() {
         ("dup".to_string(), vec![0.0_f32; 32]),
         ("dup".to_string(), vec![1.0_f32; 32]),
     ];
+    let recipe = ContextRequest::new("patents", vec![0.0_f32; 32], 5);
     let err = session
-        .materialize_context(
-            "patents",
-            MaterializedContext {
-                rows: &rows,
-                dimensions: 32,
-            },
-        )
+        .materialize_context(MaterializedContext {
+            rows: &rows,
+            dimensions: 32,
+            recipe: &recipe,
+        })
         .await
         .expect_err("a target key must be unique in a context table");
     assert!(err.to_string().contains("duplicate target key"));

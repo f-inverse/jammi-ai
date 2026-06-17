@@ -1,19 +1,22 @@
 //! Scale-sanity for the as-of operator (exit-criterion #8): a large facts × spine
 //! join over many groups completes within the sort-merge bound — O((n+m) log)
-//! dominated by the per-side sort — not the `NestedLoopJoinExec` quadratic path
-//! DataFusion falls back to for plain inequality joins.
+//! dominated by the per-side sort — guarding against an internal
+//! O(n·m)-per-group merge-loop regression in `AsofJoinExec` itself.
 //!
 //! The test runs IN-MEMORY at TRUE SCALE (1,000,000 facts × 100,000 spine over
-//! 10,000 groups), driving the real operator path: each side is registered as an
-//! in-memory relation, planned, wrapped in the same `SortExec` the verb inserts,
-//! and merged by `AsofJoinExec`. It bypasses Parquet IO and the catalog so the
-//! wall-clock it asserts is the sort-merge work itself, not storage — the bound
-//! the exit-criterion is about.
+//! 10,000 groups), driving the operator directly: each side is registered as an
+//! in-memory relation, wrapped in the same `SortExec` the verb inserts, and
+//! merged by a directly-constructed `AsofJoinExec`. Because the operator is
+//! constructed directly (not planned from a logical inequality predicate), this
+//! path can never reach DataFusion's `NestedLoopJoinExec` fallback — what it
+//! guards is the operator's own per-group merge staying linear, not a planner
+//! choice. It bypasses Parquet IO and the catalog so the wall-clock it asserts is
+//! the sort-merge work itself, not storage — the bound the exit-criterion is about.
 //!
 //! The ceiling is deliberately generous and measured once (the same same-box-rate
-//! discipline the W1 benches use): a quadratic regression (10^5 × 10^6 ≈ 10^11
-//! row-pairs) would take minutes-to-hours and blow any sane ceiling, while the
-//! sort-merge completes in low single-digit seconds on the reference box. The
+//! discipline the W1 benches use): an O(n·m)-per-group regression (10^5 × 10^6 ≈
+//! 10^11 row-pairs) would take minutes-to-hours and blow any sane ceiling, while
+//! the linear merge completes in low single-digit seconds on the reference box. The
 //! assertion is a structural-complexity guard, not a micro-benchmark — a true
 //! scale run, not a scaled-down proxy.
 
@@ -161,11 +164,11 @@ async fn scale_sanity_sort_merge_bound() {
     // Generous ceiling: the sort-merge of 1.1M total rows over 10k groups
     // completes in low single-digit seconds on the reference box; 60s leaves a
     // wide margin for a contended CI runner while still being orders of magnitude
-    // below the quadratic NestedLoop path (which would not finish). A breach here
-    // means the operator regressed off the sort-merge bound, not a slow box.
+    // below an O(n·m)-per-group merge-loop regression (which would not finish). A
+    // breach here means the operator regressed off the sort-merge bound, not a slow box.
     assert!(
         elapsed.as_secs() < 60,
         "asof_join over {facts_n} facts × {spine_n} spine ({groups} groups) took {elapsed:?}; \
-         expected the sort-merge bound (seconds), not the quadratic path"
+         expected the sort-merge bound (seconds), not an O(n·m)-per-group merge loop"
     );
 }

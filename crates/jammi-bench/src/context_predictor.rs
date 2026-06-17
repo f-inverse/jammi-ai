@@ -320,11 +320,13 @@ async fn dataset_session(
         .result_store()
         .materialize_embedding_table(
             session.context(),
-            SOURCE_ID,
-            EMBED_MODEL_ID,
-            None,
+            jammi_db::store::EmbeddingTableSpec {
+                source_id: SOURCE_ID,
+                model_id: EMBED_MODEL_ID,
+                derived_from: None,
+                dimensions: FEATURE_DIM,
+            },
             &pairs,
-            FEATURE_DIM,
             jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
         )
         .await?;

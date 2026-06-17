@@ -136,7 +136,7 @@ pub enum ComputeDevice {
 /// [`DefinitionHash`] alongside the [`ProducingDescriptor`].
 ///
 /// Carries the engine semantic version, the compute device, and the identities
-/// + backend kinds of every model the producer invokes — the determinants of
+/// and backend kinds of every model the producer invokes — the determinants of
 /// the output that are *not* part of the producing description itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaterializationEnv {

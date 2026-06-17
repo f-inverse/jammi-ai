@@ -162,11 +162,13 @@ async fn graph_session(
         .result_store()
         .materialize_embedding_table(
             session.context(),
-            "nodes",
-            "synthetic-embed",
-            None,
+            jammi_db::store::EmbeddingTableSpec {
+                source_id: "nodes",
+                model_id: "synthetic-embed",
+                derived_from: None,
+                dimensions: DIM,
+            },
             &pairs,
-            DIM,
             jammi_db::store::manifest::Materialization::new(&desc, &env, inputs),
         )
         .await

@@ -34,6 +34,33 @@ use crate::storage::{
 };
 use crate::tenant_scope::TenantBinding;
 
+/// The catalog-row provenance of an embedding result table
+/// [`ResultStore::materialize_embedding_table`] writes — *what* the table is in
+/// the catalog, distinct from the [`Materialization`] descriptor that captures
+/// *how* its data was computed.
+///
+/// Groups the values the catalog row needs verbatim: the `source_id` the output
+/// rows belong to, the `model_id` that records the derivation provenance (the
+/// context-set encoder or propagation kernel, not a foundation model), the
+/// `derived_from` FK-lineage anchor naming the source embedding table this was
+/// computed from (`None` when no single source table backs the whole batch),
+/// and the embedding `dimensions`. These are *not* derived from the descriptor:
+/// the catalog's `source_id` / `derived_from` are its own lineage columns, which
+/// a producer may anchor differently from the descriptor's internal source
+/// fields, so the row carries them explicitly.
+#[derive(Debug)]
+pub struct EmbeddingTableSpec<'a> {
+    /// The source the output rows belong to (catalog `source_id`).
+    pub source_id: &'a str,
+    /// The derivation provenance recorded as the catalog `model_id`.
+    pub model_id: &'a str,
+    /// The source embedding result table this output was derived from — the
+    /// FK-lineage anchor. `None` when no single source table backs the batch.
+    pub derived_from: Option<&'a str>,
+    /// The embedding width of every output vector.
+    pub dimensions: usize,
+}
+
 /// Returned by [`ResultStore::create_table`] — the generated paths and name
 /// for a new result table, before any data has been written.
 #[derive(Debug)]
@@ -836,13 +863,17 @@ impl ResultStore {
     pub async fn materialize_embedding_table(
         &self,
         ctx: &SessionContext,
-        source_id: &str,
-        model_id: &str,
-        derived_from: Option<&str>,
+        spec: EmbeddingTableSpec<'_>,
         rows: &[(String, Vec<f32>)],
-        dimensions: usize,
         materialization: Materialization<'_>,
     ) -> Result<ResultTableRecord> {
+        let EmbeddingTableSpec {
+            source_id,
+            model_id,
+            derived_from,
+            dimensions,
+        } = spec;
+
         // A normal embedding result table (S9 vocabulary: kind='model'); the
         // task is the embedding task that drives the sidecar-index sidecar URL.
         let table_info = self

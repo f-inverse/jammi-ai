@@ -349,11 +349,13 @@ impl InferenceSession {
         self.result_store()
             .materialize_embedding_table(
                 self.context(),
-                &request.source_id,
-                PROPAGATE_MODEL_ID,
-                Some(&table.table_name),
+                jammi_db::store::EmbeddingTableSpec {
+                    source_id: &request.source_id,
+                    model_id: PROPAGATE_MODEL_ID,
+                    derived_from: Some(table.table_name.as_str()),
+                    dimensions: out_dim,
+                },
                 &rows,
-                out_dim,
                 jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
             )
             .await

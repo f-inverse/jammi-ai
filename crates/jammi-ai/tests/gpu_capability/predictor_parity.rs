@@ -135,11 +135,13 @@ async fn meta_session(
         .result_store()
         .materialize_embedding_table(
             session.context(),
-            "fns",
-            "synthetic-embed",
-            None,
+            jammi_db::store::EmbeddingTableSpec {
+                source_id: "fns",
+                model_id: "synthetic-embed",
+                derived_from: None,
+                dimensions: FEATURE_DIM,
+            },
             &pairs,
-            FEATURE_DIM,
             jammi_db::store::manifest::Materialization::new(&__d, &__e, __i),
         )
         .await

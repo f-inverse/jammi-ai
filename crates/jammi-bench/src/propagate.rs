@@ -384,15 +384,29 @@ async fn graph_session(
 
     // The synthetic input embedding table, keyed by `_row_id`.
     let features = build_features(nodes, dim);
+    let descriptor = jammi_db::store::manifest::ProducingDescriptor::ContextSet {
+        encoder_id: INPUT_MODEL_ID.to_string(),
+        source_id: NODES_SOURCE.to_string(),
+        dimensions: dim,
+    };
+    let env =
+        jammi_db::store::manifest::MaterializationEnv::new(session.compute_device(), Vec::new());
+    let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
+        NODES_SOURCE,
+        "1970-01-01T00:00:00Z",
+    )];
     session
         .result_store()
         .materialize_embedding_table(
             session.context(),
-            NODES_SOURCE,
-            INPUT_MODEL_ID,
-            None,
+            jammi_db::store::EmbeddingTableSpec {
+                source_id: NODES_SOURCE,
+                model_id: INPUT_MODEL_ID,
+                derived_from: None,
+                dimensions: dim,
+            },
             &features,
-            dim,
+            jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
         )
         .await?;
 

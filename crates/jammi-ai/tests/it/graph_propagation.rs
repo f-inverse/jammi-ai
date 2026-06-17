@@ -167,15 +167,20 @@ async fn graph_session_with_partitions(
         .iter()
         .map(|n| (n.id.clone(), node_vector(&n.id, n.class)))
         .collect();
+    let (__d, __e, __i) =
+        jammi_test_utils::synthetic_seed_contract("synthetic-embed", "nodes", DIM);
     session
         .result_store()
         .materialize_embedding_table(
             session.context(),
-            "nodes",
-            "synthetic-embed",
-            None,
+            jammi_db::store::EmbeddingTableSpec {
+                source_id: "nodes",
+                model_id: "synthetic-embed",
+                derived_from: None,
+                dimensions: DIM,
+            },
             &pairs,
-            DIM,
+            jammi_db::store::manifest::Materialization::new(&__d, &__e, __i),
         )
         .await
         .unwrap();

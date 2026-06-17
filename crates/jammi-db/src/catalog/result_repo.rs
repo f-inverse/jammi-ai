@@ -87,6 +87,15 @@ pub struct ResultTableRecord {
     /// callers see only their own rows, so for them this is always either
     /// their tenant or `None`.
     pub tenant_id: Option<String>,
+    /// The materialization-contract definition hash — the indexable summary of
+    /// the `.materialization.json` sidecar's `definition_hash`. `None` for a
+    /// pre-contract table (created before migration 021), which verifies as
+    /// [`crate::store::manifest::MatchVerdict::MissingManifest`].
+    pub definition_hash: Option<String>,
+    /// The materialization-contract input anchors as canonical JSON — the
+    /// indexable summary of the sidecar's `input_anchors`. `None` for a
+    /// pre-contract table.
+    pub input_anchors_json: Option<String>,
 }
 
 fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendError> {
@@ -119,6 +128,8 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendErr
         created_at: row.get("created_at")?,
         completed_at: row.try_get("completed_at")?,
         tenant_id: row.try_get("tenant_id")?,
+        definition_hash: row.try_get("definition_hash")?,
+        input_anchors_json: row.try_get("input_anchors_json")?,
     })
 }
 
@@ -231,6 +242,77 @@ impl Catalog {
                                 SqlValue::TextOwned(status_str),
                                 SqlValue::Int(rows_i64),
                                 SqlValue::from(completed_at),
+                                SqlValue::TextOwned(name),
+                                SqlValue::from(tenant.map(|t| t.to_string())),
+                            ],
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Flip a result table `building -> ready` **and** persist its
+    /// materialization-contract summary columns (`definition_hash`,
+    /// `input_anchors_json`) in a single transaction -- the indexable summary of
+    /// the `.materialization.json` sidecar, so verification and provenance
+    /// queries need not open every sidecar. This is the catalog half of the
+    /// single `building -> ready` boundary
+    /// ([`crate::store::ResultStore::finalize_with_manifest`]); the sidecar is
+    /// written before this commits, so a crash never leaves a `ready` row whose
+    /// manifest never landed.
+    ///
+    /// Like [`Self::update_result_table_status`] this is tenant-scoped outside
+    /// an admin scope and PK-only inside one (recovery promotes an orphan it
+    /// found cross-tenant). `completed_at` is set because `ready` is terminal.
+    pub async fn promote_result_table_with_manifest(
+        &self,
+        name: &str,
+        rows: usize,
+        definition_hash: &str,
+        input_anchors_json: &str,
+    ) -> Result<()> {
+        let completed_at = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        let name = name.to_string();
+        let rows_i64 = rows as i64;
+        let definition_hash = definition_hash.to_string();
+        let input_anchors_json = input_anchors_json.to_string();
+        let admin = TenantBinding::is_admin_scope();
+        let tenant = self.current_tenant();
+
+        self.backend()
+            .transaction(TxOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.set_tenant(tenant);
+                    if admin {
+                        tx.execute(
+                            "UPDATE result_tables SET status = 'ready', row_count = $1, \
+                             completed_at = $2, definition_hash = $3, input_anchors_json = $4 \
+                             WHERE table_name = $5",
+                            &[
+                                SqlValue::Int(rows_i64),
+                                SqlValue::TextOwned(completed_at),
+                                SqlValue::TextOwned(definition_hash),
+                                SqlValue::TextOwned(input_anchors_json),
+                                SqlValue::TextOwned(name),
+                            ],
+                        )
+                        .await?;
+                    } else {
+                        tx.execute(
+                            "UPDATE result_tables SET status = 'ready', row_count = $1, \
+                             completed_at = $2, definition_hash = $3, input_anchors_json = $4 \
+                             WHERE table_name = $5 AND (tenant_id = $6 OR tenant_id IS NULL)",
+                            &[
+                                SqlValue::Int(rows_i64),
+                                SqlValue::TextOwned(completed_at),
+                                SqlValue::TextOwned(definition_hash),
+                                SqlValue::TextOwned(input_anchors_json),
                                 SqlValue::TextOwned(name),
                                 SqlValue::from(tenant.map(|t| t.to_string())),
                             ],

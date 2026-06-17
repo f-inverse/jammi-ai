@@ -305,15 +305,29 @@ async fn dataset_session(
         .await?;
 
     let pairs: Vec<(String, Vec<f32>)> = rows.iter().map(|r| (r.id.clone(), r.x.clone())).collect();
+    let descriptor = jammi_db::store::manifest::ProducingDescriptor::ContextSet {
+        encoder_id: EMBED_MODEL_ID.to_string(),
+        source_id: SOURCE_ID.to_string(),
+        dimensions: FEATURE_DIM,
+    };
+    let env =
+        jammi_db::store::manifest::MaterializationEnv::new(session.compute_device(), Vec::new());
+    let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
+        SOURCE_ID,
+        "1970-01-01T00:00:00Z",
+    )];
     session
         .result_store()
         .materialize_embedding_table(
             session.context(),
-            SOURCE_ID,
-            EMBED_MODEL_ID,
-            None,
+            jammi_db::store::EmbeddingTableSpec {
+                source_id: SOURCE_ID,
+                model_id: EMBED_MODEL_ID,
+                derived_from: None,
+                dimensions: FEATURE_DIM,
+            },
             &pairs,
-            FEATURE_DIM,
+            jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
         )
         .await?;
 

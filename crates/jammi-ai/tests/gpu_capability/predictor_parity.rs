@@ -129,15 +129,20 @@ async fn meta_session(
         .unwrap();
 
     let pairs: Vec<(String, Vec<f32>)> = rows.iter().map(|r| (r.id.clone(), r.x.clone())).collect();
+    let (__d, __e, __i) =
+        jammi_test_utils::synthetic_seed_contract("synthetic-embed", "fns", FEATURE_DIM);
     session
         .result_store()
         .materialize_embedding_table(
             session.context(),
-            "fns",
-            "synthetic-embed",
-            None,
+            jammi_db::store::EmbeddingTableSpec {
+                source_id: "fns",
+                model_id: "synthetic-embed",
+                derived_from: None,
+                dimensions: FEATURE_DIM,
+            },
             &pairs,
-            FEATURE_DIM,
+            jammi_db::store::manifest::Materialization::new(&__d, &__e, __i),
         )
         .await
         .unwrap();

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use jammi_db::error::{JammiError, Result};
+use jammi_db::store::manifest::ComputeDevice;
 use jammi_encoders::{
     Bert, BertConfig, DistilBert, DistilBertConfig, ModernBert, ModernBertConfig, Pooling,
 };
@@ -1703,6 +1704,30 @@ pub(crate) fn select_device(config: &DeviceConfig) -> Result<Device> {
         }
     }
     gpu_unavailable(config.gpu_device, config.require_gpu)
+}
+
+/// The [`ComputeDevice`] the engine *effectively* runs on for `config` — the
+/// device-identity the materialization contract folds into its definition hash,
+/// so a CPU run and a CUDA run of the same model hash differently. Resolved
+/// through the same [`select_device`] logic the loader uses (including the
+/// CPU-fallback when a requested GPU is unavailable), so the recorded device is
+/// the one that actually produced the floats, never merely the one requested.
+pub(crate) fn effective_compute_device(config: &DeviceConfig) -> ComputeDevice {
+    match select_device(config) {
+        Ok(Device::Cpu) => ComputeDevice::Cpu,
+        #[cfg(feature = "cuda")]
+        Ok(Device::Cuda(_)) => ComputeDevice::Cuda {
+            ordinal: config.gpu_device.max(0) as u32,
+        },
+        #[cfg(feature = "metal")]
+        Ok(Device::Metal(_)) => ComputeDevice::Metal {
+            ordinal: config.gpu_device.max(0) as u32,
+        },
+        // An accelerator variant compiled out, or a `require_gpu` error: the
+        // engine runs on CPU in every such case (a hard `require_gpu` failure
+        // surfaces at load, before any materialization reaches here).
+        _ => ComputeDevice::Cpu,
+    }
 }
 
 /// Decide what to do when a GPU was requested but could not be acquired.

@@ -154,3 +154,80 @@ pub async fn register_test_channel(
     };
     catalog.channels().register(&spec).await
 }
+
+/// Build the materialization-contract triple for a **synthetic seed embedding
+/// table** that an integration test materialises directly through
+/// [`jammi_db::store::ResultStore::materialize_embedding_table`] (a fixture set
+/// up before exercising propagation / context-prediction / serving).
+///
+/// The triple describes a context-set-shaped materialisation (no model invoked
+/// — the vectors are synthetic) over a CPU device, with the source recorded as
+/// an unpinned input at a fixed instant. Tests use it so the contract args are
+/// declared once, not copy-pasted per fixture.
+pub fn synthetic_seed_contract(
+    encoder_id: &str,
+    source_id: &str,
+    dimensions: usize,
+) -> (
+    jammi_db::store::manifest::ProducingDescriptor,
+    jammi_db::store::manifest::MaterializationEnv,
+    Vec<jammi_db::store::manifest::InputAnchor>,
+) {
+    use jammi_db::store::manifest::{
+        ComputeDevice, InputAnchor, MaterializationEnv, ProducingDescriptor,
+    };
+    let descriptor = ProducingDescriptor::ContextSet {
+        encoder_id: encoder_id.to_string(),
+        source_id: source_id.to_string(),
+        dimensions,
+    };
+    let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());
+    let inputs = vec![InputAnchor::unpinned_at_instant(
+        source_id,
+        "1970-01-01T00:00:00Z",
+    )];
+    (descriptor, env, inputs)
+}
+
+/// Write a minimal `.materialization.json` sidecar beside a result table's
+/// Parquet object, for recovery/store tests that construct a *promotable* torn
+/// `building` state — a crash that landed the Parquet AND the manifest but never
+/// committed the `building -> ready` flip. The manifest attests the given
+/// Parquet bytes' digest under a synthetic context-set descriptor on CPU, so
+/// recovery promotes the row (it has a manifest) and the summary columns
+/// backfill from it.
+pub async fn write_manifest_sidecar_for(
+    store: &jammi_db::store::ResultStore,
+    parquet_url: &jammi_db::storage::StorageUrl,
+    source_id: &str,
+    dimensions: usize,
+) {
+    use jammi_db::store::manifest::{
+        ArtifactDigest, ComputeDevice, InputAnchor, MaterializationEnv, MaterializationManifest,
+        ProducingDescriptor,
+    };
+    let handle = store.open_parquet(parquet_url).unwrap();
+    let path = handle.data_path().unwrap();
+    let bytes = handle.get_bytes(&path).await.unwrap();
+    let manifest = MaterializationManifest::compute(
+        &ProducingDescriptor::ContextSet {
+            encoder_id: "synthetic-embed".into(),
+            source_id: source_id.into(),
+            dimensions,
+        },
+        &MaterializationEnv::new(ComputeDevice::Cpu, Vec::new()),
+        vec![InputAnchor::unpinned_at_instant(
+            source_id,
+            "1970-01-01T00:00:00Z",
+        )],
+        ArtifactDigest::of_bytes(&bytes),
+        "test-run".into(),
+        "1970-01-01T00:00:00Z".into(),
+    )
+    .unwrap();
+    let sidecar = handle.sibling_path("materialization.json").unwrap();
+    handle
+        .put_bytes(&sidecar, manifest.to_json_bytes().unwrap().into())
+        .await
+        .unwrap();
+}

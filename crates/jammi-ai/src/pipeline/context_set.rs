@@ -683,18 +683,39 @@ impl InferenceSession {
             ));
         }
 
+        // The materialization contract: a context set pools from the source's
+        // raw rows (no model invoked here — the encoder is the pooling kernel),
+        // so the environment carries the engine version + device with an empty
+        // model set. There is no single source result table the batch derives
+        // from, so the input is the source itself, which has no version surface
+        // in open-core → `UnpinnedAtInstant` (honest, not a fabricated pin).
+        let descriptor = jammi_db::store::manifest::ProducingDescriptor::ContextSet {
+            encoder_id: "jammi:context-set".to_string(),
+            source_id: source_id.to_string(),
+            dimensions: context.dimensions,
+        };
+        let env =
+            jammi_db::store::manifest::MaterializationEnv::new(self.compute_device(), Vec::new());
+        let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
+            source_id,
+            chrono::Utc::now().to_rfc3339(),
+        )];
+
         self.result_store()
             .materialize_embedding_table(
                 self.context(),
-                source_id,
-                "jammi:context-set",
-                // A pooled context set is keyed by *target* keys and pools each
-                // target's neighbours from the source's raw rows — there is no
-                // single source result table the whole batch derives from, so
-                // there is no FK-lineage anchor to record.
-                None,
+                jammi_db::store::EmbeddingTableSpec {
+                    source_id,
+                    model_id: "jammi:context-set",
+                    // A pooled context set is keyed by *target* keys and pools
+                    // each target's neighbours from the source's raw rows —
+                    // there is no single source result table the whole batch
+                    // derives from, so there is no FK-lineage anchor to record.
+                    derived_from: None,
+                    dimensions: context.dimensions,
+                },
                 context.rows,
-                context.dimensions,
+                jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
             )
             .await
     }

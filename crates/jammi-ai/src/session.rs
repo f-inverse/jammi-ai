@@ -387,6 +387,15 @@ impl InferenceSession {
         &self.device_config
     }
 
+    /// The [`ComputeDevice`](jammi_db::store::manifest::ComputeDevice) this
+    /// session effectively runs models on — the device-identity the
+    /// materialization contract folds into every result table's definition hash,
+    /// so a CPU and a CUDA run of the same model are not falsely reported as a
+    /// `Match`.
+    pub fn compute_device(&self) -> jammi_db::store::manifest::ComputeDevice {
+        crate::model::backend::candle::effective_compute_device(&self.device_config)
+    }
+
     /// Resolve a single member row's stored `vector` from an embedding result
     /// table by key, or `None` when no row matches — the per-member read the
     /// episodic context sampler builds its tensors from, reusing the engine's
@@ -733,6 +742,7 @@ impl InferenceSession {
         let guard = self.model_cache.get_or_load(source, task, None).await?;
         let embedding_dim = guard.model.embedding_dim();
         let regression_form = guard.model.regression_form().cloned();
+        let backend_kind = guard.model.backend_kind();
         drop(guard);
 
         // Wrap with InferenceExec
@@ -785,12 +795,38 @@ impl InferenceSession {
                 writer.write_batch(batch).await?;
             }
             let row_count = writer.close().await?;
+
+            // The materialization contract: the inference verb + its typed
+            // parameters as the producing description, the engine/device/model
+            // identity as the environment, and the source's read-time anchor as
+            // the sole input. A registered source exposes no as-of/version
+            // surface in open-core, so it is honestly recorded as
+            // `UnpinnedAtInstant` rather than a fabricated pin.
+            let descriptor = jammi_db::store::manifest::ProducingDescriptor::Inference {
+                model_id: source.to_string(),
+                task,
+                source_id: source_id.to_string(),
+                content_columns: content_columns.to_vec(),
+                key_column: key_column.to_string(),
+            };
+            let env = jammi_db::store::manifest::MaterializationEnv::new(
+                self.compute_device(),
+                vec![jammi_db::store::manifest::ModelIdentity {
+                    model_id: source.to_string(),
+                    backend: backend_kind.to_string(),
+                }],
+            );
+            let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
+                source_id,
+                chrono::Utc::now().to_rfc3339(),
+            )];
             self.result_store
-                .finalize(
+                .finalize_with_manifest(
                     self.inner.context(),
                     &table_info.table_name,
                     &table_info.parquet_url,
                     row_count,
+                    jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
                 )
                 .await?;
         }

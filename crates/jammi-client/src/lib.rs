@@ -599,6 +599,14 @@ fn proto_cache_policy(cache: CachePolicy) -> jammi_wire::proto::inference::Cache
 /// `UNSPECIFIED` is never emitted by a producer handler — a producer always
 /// reports `COMPUTED`/`REUSED` — so it is a loud decode error, never a silent
 /// default.
+///
+/// Latent gap (not reachable today): `InferResponse` carries no table-name
+/// field, so the inference call site decodes with an empty `reused_table`; a
+/// remote inference `Reused` would therefore lose the reused-table name. This
+/// is harmless now because inference anchors on an `UnpinnedAtInstant` source
+/// and so always reports `Computed` — but if a versioned source ever makes
+/// inference cacheable, the proto must grow a reused-table field for inference
+/// before its `Reused` arm can be honest.
 fn cache_outcome_from_proto(
     outcome: i32,
     reused_table: &str,

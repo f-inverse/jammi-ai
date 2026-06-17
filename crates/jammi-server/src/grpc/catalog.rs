@@ -33,8 +33,8 @@ use jammi_db::trigger::ids::TopicId;
 use jammi_db::trigger::TriggerError;
 use jammi_db::TenantId;
 use jammi_wire::{
-    channel_to_proto, definition_to_proto, match_verdict_to_proto, model_to_proto, parse_table_id,
-    source_type_from_proto, topic_to_proto,
+    channel_to_proto, definition_to_proto, model_to_proto, parse_table_id, source_type_from_proto,
+    topic_to_proto,
 };
 use tonic::{Request, Response, Status};
 
@@ -345,30 +345,6 @@ impl CatalogService for CatalogServer {
 
         let channels = specs.iter().map(channel_to_proto).collect();
         Ok(Response::new(pb::ListChannelsResponse { channels }))
-    }
-
-    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
-    async fn verify_materialization(
-        &self,
-        request: Request<pb::VerifyMaterializationRequest>,
-    ) -> Result<Response<pb::VerifyMaterializationResponse>, Status> {
-        let tenant = session_tenant_traced(&request);
-        let session = self.local()?;
-        let req = request.into_inner();
-        let table = req.table;
-        let expected = req
-            .expected_definition
-            .map(jammi_db::store::manifest::DefinitionHash);
-
-        let verdict = scoped(self.engine()?, tenant, || {
-            session.verify_materialization(&table, expected.clone())
-        })
-        .await
-        .map_err(map_engine_error)?;
-
-        Ok(Response::new(pb::VerifyMaterializationResponse {
-            verdict: Some(match_verdict_to_proto(verdict)),
-        }))
     }
 
     // --- mutable tables ----------------------------------------------------

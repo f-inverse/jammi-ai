@@ -156,8 +156,6 @@ async fn graph_session(
         .iter()
         .map(|n| (n.id.to_string(), node_vector(n.id)))
         .collect();
-    let (desc, env, inputs) =
-        jammi_test_utils::synthetic_seed_contract("synthetic-embed", "nodes", DIM);
     session
         .result_store()
         .materialize_embedding_table(
@@ -167,7 +165,6 @@ async fn graph_session(
             None,
             &pairs,
             DIM,
-            jammi_db::store::manifest::Materialization::new(&desc, &env, inputs),
         )
         .await
         .unwrap();

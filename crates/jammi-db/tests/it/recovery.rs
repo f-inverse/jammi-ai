@@ -343,12 +343,10 @@ async fn building_with_valid_parquet_promotes_with_true_count(kind: BackendKind)
     let store = result_store(dir.path(), Arc::clone(&catalog));
 
     let info = create_building_embedding(&store).await;
-    // Torn state: a fully-valid closed Parquet with 7 rows and its
-    // materialization manifest, but the catalog row is still `building` (crash
-    // between the manifest write and the status flip). Because the manifest
-    // landed, recovery promotes it with the footer's true count.
+    // Torn state: a fully-valid closed Parquet with 7 rows, but the catalog row
+    // is still `building` (crash between bytes-durable and the status flip).
+    // No sidecar was ever written.
     write_closed_embedding_parquet(&store, &info, 7).await;
-    jammi_test_utils::write_manifest_sidecar_for(&store, &info.parquet_url, "src1", DIMS).await;
     if let Some(ref idx_url) = info.index_url {
         let idx_handle = store.open_index(idx_url).unwrap();
         // Prove the sidecar is genuinely absent before recovery.
@@ -409,10 +407,8 @@ async fn partial_but_valid_parquet_promotes_with_footer_count(kind: BackendKind)
 
     let info = create_building_embedding(&store).await;
     // A closed Parquet that holds only 2 rows (a flush landed mid-run, then the
-    // file was closed cleanly before the crash), plus its manifest. Recovery
-    // must trust the footer (and the manifest's presence) to promote.
+    // file was closed cleanly before the crash). Recovery must trust the footer.
     write_closed_embedding_parquet(&store, &info, 2).await;
-    jammi_test_utils::write_manifest_sidecar_for(&store, &info.parquet_url, "src1", DIMS).await;
 
     store.recover().await.unwrap();
 
@@ -483,9 +479,6 @@ async fn recover_is_idempotent(kind: BackendKind) {
 
     let info = create_building_embedding(&store).await;
     write_closed_embedding_parquet(&store, &info, 3).await;
-    // A promotable torn state: the manifest sidecar landed before the crash, so
-    // recovery promotes (a manifest-less valid Parquet would be reaped instead).
-    jammi_test_utils::write_manifest_sidecar_for(&store, &info.parquet_url, "src1", DIMS).await;
 
     store.recover().await.unwrap();
     let after_first = record(&catalog, &info.table_name).await;
@@ -530,10 +523,8 @@ async fn recover_reconciles_every_tenant(kind: BackendKind) {
     // was never finalized — both should promote to Ready under recovery.
     let info_a = create_building_embedding(&store_a).await;
     write_closed_embedding_parquet(&store_a, &info_a, 4).await;
-    jammi_test_utils::write_manifest_sidecar_for(&store_a, &info_a.parquet_url, "src1", DIMS).await;
     let info_b = create_building_embedding(&store_b).await;
     write_closed_embedding_parquet(&store_b, &info_b, 6).await;
-    jammi_test_utils::write_manifest_sidecar_for(&store_b, &info_b.parquet_url, "src1", DIMS).await;
 
     // Each tenant sees ONLY its own building table before recovery (proves the
     // rows are genuinely tenant-bound, not GLOBAL).

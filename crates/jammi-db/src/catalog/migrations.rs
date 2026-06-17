@@ -68,10 +68,6 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "020_channel_tenant_scope",
         schema::MIGRATION_020_CHANNEL_TENANT_SCOPE,
     ),
-    (
-        "021_materialization_contract",
-        schema::MIGRATION_021_MATERIALIZATION_CONTRACT,
-    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

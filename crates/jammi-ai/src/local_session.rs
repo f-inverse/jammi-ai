@@ -39,9 +39,8 @@ use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
 use jammi_db::catalog::model_repo::ModelDescriptor;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::catalog::source_repo::SourceDescriptor;
-use jammi_db::error::{JammiError, Result};
+use jammi_db::error::Result;
 use jammi_db::source::{SourceConnection, SourceType};
-use jammi_db::store::manifest::{DefinitionHash, MatchVerdict};
 use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
 use jammi_db::trigger::{DeliveredBatch, Offset, Predicate, TopicDefinition, TriggerError};
 use jammi_db::{ModelTask, PerQueryAudit, ServerInfo, TenantId, TopicId};
@@ -161,7 +160,7 @@ impl Session {
 
     /// Hard-delete a model row, removing it — so it is refused while any
     /// reference still points at the model, surfacing
-    /// [`JammiError::ModelReferenced`].
+    /// [`JammiError::ModelReferenced`](jammi_db::error::JammiError::ModelReferenced).
     /// When `version` is `None` the latest version is targeted. A tenant may
     /// delete only a model it owns. When `if_exists` is set, deleting an absent
     /// model is a success no-op; otherwise it is reported as absent.
@@ -319,35 +318,6 @@ impl Session {
         let source = ModelSource::parse(model_id);
         self.engine
             .infer(source_id, &source, task, content_columns, key_column)
-            .await
-    }
-
-    // --- materialization contract ----------------------------------------
-
-    /// Recompute a materialised result table's artifact digest and check it
-    /// (and, if given, an expected definition hash) against its
-    /// `.materialization.json` manifest. Read-only; returns a [`MatchVerdict`],
-    /// never acting on one.
-    ///
-    /// The verdict attests the Parquet **data**, never the ANN search index (the
-    /// index is a derived accelerator reconstructible from the data). A table
-    /// created before the contract landed carries no manifest and verifies as
-    /// [`MatchVerdict::MissingManifest`] — a truthful unknown, never a fabricated
-    /// match.
-    pub async fn verify_materialization(
-        &self,
-        table: &str,
-        expected_definition: Option<DefinitionHash>,
-    ) -> Result<MatchVerdict> {
-        let record = self
-            .engine
-            .catalog()
-            .get_result_table(table)
-            .await?
-            .ok_or_else(|| JammiError::Catalog(format!("Result table '{table}' not found")))?;
-        self.engine
-            .result_store()
-            .verify_materialization(&record, expected_definition.as_ref())
             .await
     }
 

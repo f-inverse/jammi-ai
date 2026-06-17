@@ -109,28 +109,3 @@ pub async fn maybe_signal_lifecycle(op: &str) {
     }
     signal_and_park(ready_file).await;
 }
-
-/// Names the materialization commit boundary the child parks at. When set, the
-/// result-store fires [`maybe_signal_materialization`] *after* the Parquet (and
-/// ANN sidecar) bytes are durable but *before* the `.materialization.json`
-/// sidecar is written and the `building -> ready` flip commits — the
-/// crash window the contract must survive: a valid Parquet with no manifest. A
-/// `SIGKILL` while parked here leaves a `building` row whose Parquet landed but
-/// whose manifest never did, which recovery must reconcile to `failed` (it
-/// cannot reconstruct the producing descriptor), never promote manifest-less.
-pub const MATERIALIZATION_CHECKPOINT_ENV: &str = "JAMMI_TEST_MATERIALIZATION_CHECKPOINT";
-
-/// Signal-and-park if [`MATERIALIZATION_CHECKPOINT_ENV`] is set. Called inside
-/// the result-store's `building -> ready` boundary, after the Parquet bytes are
-/// durable and before the manifest sidecar is written. Subsequent calls are
-/// no-ops.
-pub async fn maybe_signal_materialization() {
-    let ready_file = match std::env::var(READY_FILE_ENV).ok() {
-        Some(p) => PathBuf::from(p),
-        None => return,
-    };
-    if std::env::var(MATERIALIZATION_CHECKPOINT_ENV).is_err() {
-        return;
-    }
-    signal_and_park(ready_file).await;
-}

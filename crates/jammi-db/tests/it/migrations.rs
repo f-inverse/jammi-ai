@@ -180,7 +180,6 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "018_eval_runs_model_id_nullable",
             "019_normalize_model_status",
             "020_channel_tenant_scope",
-            "021_materialization_contract",
         ]
     );
 }
@@ -783,41 +782,4 @@ async fn migration_010_rewrites_legacy_local_rows_to_file() {
             ("modern".to_string(), "\"file\"".to_string()),
         ]
     );
-}
-
-/// Migration 021 adds the materialization-contract summary columns
-/// (`definition_hash`, `input_anchors_json`) to `result_tables`. Both are
-/// nullable so a pre-contract row carries NULL and verifies as an honest
-/// `MissingManifest`. Asserted on a fresh SQLite DB via `pragma_table_info`.
-#[tokio::test]
-async fn migration_021_adds_materialization_summary_columns() {
-    let dir = tempdir().unwrap();
-    let _catalog = Catalog::open(dir.path()).await.unwrap();
-    let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
-
-    let columns = backend
-        .transaction(
-            TxOptions {
-                read_only: true,
-                ..Default::default()
-            },
-            |tx| {
-                Box::pin(async move {
-                    tx.query::<_, String>(
-                        "SELECT name FROM pragma_table_info('result_tables')",
-                        &[],
-                        |row| row.get("name"),
-                    )
-                    .await
-                })
-            },
-        )
-        .await
-        .unwrap();
-    for expected in ["definition_hash", "input_anchors_json"] {
-        assert!(
-            columns.iter().any(|c| c == expected),
-            "result_tables must have '{expected}' after migration 021; got {columns:?}"
-        );
-    }
 }

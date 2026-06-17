@@ -635,30 +635,3 @@ INSERT INTO evidence_channel_columns(tenant_id, channel_name, column_name, colum
 
 DROP TABLE evidence_channel_columns_old;
 "#;
-
-/// Migration 021 — the materialization contract's catalog summary columns.
-///
-/// Every result table carries a `.materialization.json` sidecar attesting *how*
-/// it was produced (a `definition_hash` over the producing descriptor + the
-/// output-affecting environment) and the as-of `input_anchors` of every input
-/// it read. Those two values are mirrored onto `result_tables` as an indexable
-/// summary so `verify_materialization` and provenance queries need not open
-/// every sidecar; the sidecar remains the full attestation.
-///
-/// Both columns are nullable: a row created before this migration (a
-/// pre-contract table) carries `NULL` here and verifies as a truthful
-/// `MissingManifest`, never a fabricated match. A row created after it always
-/// carries both — they are written in the same transaction that flips
-/// `building -> ready` (see `Catalog::promote_result_table_with_manifest`), so a
-/// `ready` post-contract row with `NULL` summary columns is a torn write that
-/// recovery reconciles, never a silent gap.
-///
-/// `input_anchors_json` is the single source of truth for input provenance: the
-/// older `derived_from` column (migration 013) is an FK-lineage convenience that
-/// is now a *view over* the anchors (a derivation's `ResultDigest` anchor names
-/// the same source table), not a second, independently-maintained provenance
-/// record.
-pub(super) const MIGRATION_021_MATERIALIZATION_CONTRACT: &str = r#"
-ALTER TABLE result_tables ADD COLUMN definition_hash    TEXT;
-ALTER TABLE result_tables ADD COLUMN input_anchors_json TEXT;
-"#;

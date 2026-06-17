@@ -330,8 +330,6 @@ async fn recovery_skips_index_rebuild_for_non_embedding_task() {
 
     let store =
         ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default()).unwrap();
-    // A promotable torn state: the manifest sidecar landed before the crash.
-    jammi_test_utils::write_manifest_sidecar_for(&store, &url, "src", 0).await;
     store.recover().await.unwrap();
 
     let record = catalog
@@ -574,9 +572,6 @@ async fn recovery_promotes_valid_parquet_to_ready() {
 
     let store =
         ResultStore::new(dir.path(), Arc::clone(&catalog), AnnIndexConfig::default()).unwrap();
-    // A promotable torn state: the manifest sidecar landed before the crash, so
-    // recovery promotes it (a manifest-less valid Parquet would be reaped).
-    jammi_test_utils::write_manifest_sidecar_for(&store, &url, "src", 0).await;
     store.recover().await.unwrap();
 
     let record = catalog.get_result_table("stuck").await.unwrap().unwrap();

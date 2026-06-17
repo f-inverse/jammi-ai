@@ -116,16 +116,6 @@ service CatalogService {
   // registry introspection, not a SQL query.
   rpc ListChannels(ListChannelsRequest) returns (ListChannelsResponse);
 
-  // --- materialization contract ------------------------------------------
-
-  // Recompute a materialised result table's artifact digest and check it (and,
-  // if given, an expected definition hash) against its `.materialization.json`
-  // manifest. Read-only; returns a verdict, never acting on one. Peer of the
-  // abstraction's `verify_materialization`. The verdict attests the Parquet
-  // data, never the ANN search index.
-  rpc VerifyMaterialization(VerifyMaterializationRequest)
-      returns (VerifyMaterializationResponse);
-
   // --- mutable tables ----------------------------------------------------
 
   // Register a mutable companion table. After this returns the table is
@@ -349,42 +339,6 @@ message RegisterChannelRequest {
 message AddChannelColumnsRequest {
   string channel_id = 1;
   repeated ChannelColumn columns = 2;
-}
-
-message VerifyMaterializationRequest {
-  // The result table whose materialization manifest is verified.
-  string table = 1;
-  // An optional expected definition hash. When set, the manifest's
-  // `definition_hash` must equal it for a `Match`; when unset, only the
-  // artifact digest is checked.
-  optional string expected_definition = 2;
-}
-
-// The outcome of `VerifyMaterialization`. Exactly one verdict kind is set; the
-// `verdict` oneof mirrors the engine's `MatchVerdict` enum so the remote
-// reconstruction is faithful.
-message VerifyMaterializationResponse {
-  oneof verdict {
-    // The artifact verifies, with every input reproducibly pinned.
-    Match match = 1;
-    // The artifact's digest or definition hash differs from the expectation.
-    Mismatch mismatch = 2;
-    // The artifact verifies, but at least one input was unpinned.
-    MatchWithUnpinnedInputs match_with_unpinned_inputs = 3;
-    // No manifest exists for the table (a pre-contract table).
-    MissingManifest missing_manifest = 4;
-  }
-
-  message Match {}
-  message Mismatch {
-    string expected = 1;
-    string found = 2;
-  }
-  message MatchWithUnpinnedInputs {
-    // Source ids of the inputs that were not reproducibly pinned.
-    repeated string unpinned = 1;
-  }
-  message MissingManifest {}
 }
 
 message ListChannelsRequest {}

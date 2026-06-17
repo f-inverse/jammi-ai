@@ -1,15 +1,9 @@
 pub mod artifact;
-pub mod manifest;
 pub mod mutable;
 pub mod schema;
 pub mod vectors;
 
 pub use artifact::{ArtifactStore, LocalArtifact};
-pub use manifest::{
-    AnchorKind, AnchorValue, ArtifactDigest, ComputeDevice, DefinitionHash, InputAnchor,
-    ManifestError, MatchVerdict, Materialization, MaterializationEnv, MaterializationManifest,
-    ModelIdentity, ProducingDescriptor,
-};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -133,13 +127,6 @@ impl ResultStore {
         })
     }
 
-    /// The catalog this store writes result-table rows through. Read accessor
-    /// for callers that hold a `ResultStore` and need the same catalog handle
-    /// (e.g. to resolve a `ResultTableRecord` by name before verifying it).
-    pub fn catalog(&self) -> &Arc<Catalog> {
-        &self.catalog
-    }
-
     /// Open the [`JammiObjectStore`] handle for a result-table Parquet URL.
     pub fn open_parquet(&self, url: &StorageUrl) -> Result<JammiObjectStore> {
         let driver = self.registry.driver_for(url, None)?;
@@ -239,177 +226,20 @@ impl ResultStore {
         register_parquet_table(ctx, &self.registry, name, url).await
     }
 
-    /// Finalize a result table behind its materialization contract: the single
-    /// `building -> ready` transition every producer routes through.
-    ///
-    /// Builds the [`MaterializationManifest`] from the producer's
-    /// [`ProducingDescriptor`], the output-affecting [`MaterializationEnv`], the
-    /// resolved [`InputAnchor`]s, and the written Parquet's freshly-computed
-    /// [`ArtifactDigest`], then performs the publish in this crash-safe order:
-    ///
-    /// 1. compute the artifact digest over the durable Parquet bytes;
-    /// 2. write the `.materialization.json` sidecar (a sibling of the Parquet,
-    ///    distinct from the ANN `.manifest.json` index sidecar);
-    /// 3. register the table in DataFusion; and
-    /// 4. flip `building -> ready` **and** persist the catalog summary columns
-    ///    (`definition_hash`, `input_anchors_json`) in one transaction.
-    ///
-    /// The sidecar is written *before* the status flip — the same boundary the
-    /// ANN sidecar uses — so a crash never leaves a `ready` table without a
-    /// manifest. A crash between (1) and (2) leaves a `building` row whose
-    /// Parquet is valid but whose manifest never landed; recovery reconciles
-    /// that to `failed` (the producing descriptor cannot be reconstructed),
-    /// never a manifest-less promotion.
-    ///
-    /// This is the sole `building -> ready` path: there is no manifest-free
-    /// finalize. Every result-table producer — inference, the embedding
-    /// pipeline, the neighbor-graph derivation, and the
-    /// [`Self::materialize_embedding_table`] producers (graph propagation,
-    /// context sets) — supplies a descriptor, an environment, and its inputs
-    /// here, so no table escapes without an attestation.
-    pub async fn finalize_with_manifest(
+    /// Finalize a result table: register in DataFusion and update catalog
+    /// status to 'ready'.
+    pub async fn finalize(
         &self,
         ctx: &SessionContext,
         name: &str,
         url: &StorageUrl,
         rows: usize,
-        materialization: Materialization<'_>,
-    ) -> Result<MaterializationManifest> {
-        let parquet_handle = self.open_parquet(url)?;
-        let parquet_path = parquet_handle.data_path()?;
-        let bytes = parquet_handle.get_bytes(&parquet_path).await?;
-        let digest = ArtifactDigest::of_bytes(&bytes);
-
-        let manifest = MaterializationManifest::compute(
-            materialization.descriptor,
-            materialization.env,
-            materialization.inputs,
-            digest,
-            run_id().to_string(),
-            chrono::Utc::now().to_rfc3339(),
-        )
-        .map_err(manifest_to_jammi)?;
-
-        // Crash window the contract must survive: the Parquet is durable but the
-        // manifest is not yet written and the status flip has not committed.
-        #[cfg(feature = "test-hooks")]
-        crate::store::mutable::test_hook::maybe_signal_materialization().await;
-
-        self.write_materialization_sidecar(url, &manifest).await?;
-
-        self.register_table(ctx, name, url).await?;
-
-        let anchors_json = serde_json::to_string(&manifest.input_anchors)
-            .map_err(|e| JammiError::Other(format!("serialise input anchors: {e}")))?;
-        self.catalog
-            .promote_result_table_with_manifest(
-                name,
-                rows,
-                manifest.definition_hash.as_str(),
-                &anchors_json,
-            )
-            .await?;
-        Ok(manifest)
-    }
-
-    /// Resolve the [`InputAnchor`] for an immutable result-table input: its
-    /// content digest is its anchor ([`AnchorKind::ResultDigest`]). Prefers the
-    /// digest the input's own manifest already attests (no re-read); falls back
-    /// to recomputing it from the input's Parquet bytes for a pre-contract
-    /// source table that carries no manifest.
-    pub async fn result_digest_anchor(&self, table: &ResultTableRecord) -> Result<InputAnchor> {
-        let parquet_url = StorageUrl::parse(&table.parquet_path)?;
-        let digest = match self.read_materialization_manifest(&parquet_url).await? {
-            Some(m) => m.artifact,
-            None => {
-                let handle = self.open_parquet(&parquet_url)?;
-                let path = handle.data_path()?;
-                let bytes = handle.get_bytes(&path).await?;
-                ArtifactDigest::of_bytes(&bytes)
-            }
-        };
-        Ok(InputAnchor::result_digest(&table.table_name, &digest))
-    }
-
-    /// Read a result table's `.materialization.json` sidecar, if present.
-    ///
-    /// Returns `Ok(None)` when no sidecar exists — a pre-contract table, or one
-    /// whose write was torn before the manifest landed. The caller distinguishes
-    /// those via the catalog summary columns.
-    pub async fn read_materialization_manifest(
-        &self,
-        parquet_url: &StorageUrl,
-    ) -> Result<Option<MaterializationManifest>> {
-        let handle = self.open_parquet(parquet_url)?;
-        let sidecar = materialization_sidecar_path(&handle)?;
-        if !handle.exists(&sidecar).await? {
-            return Ok(None);
-        }
-        let bytes = handle.get_bytes(&sidecar).await?;
-        let manifest =
-            MaterializationManifest::from_json_bytes(&bytes).map_err(manifest_to_jammi)?;
-        Ok(Some(manifest))
-    }
-
-    /// Write a result table's `.materialization.json` sidecar.
-    async fn write_materialization_sidecar(
-        &self,
-        parquet_url: &StorageUrl,
-        manifest: &MaterializationManifest,
     ) -> Result<()> {
-        let handle = self.open_parquet(parquet_url)?;
-        let sidecar = materialization_sidecar_path(&handle)?;
-        let bytes = manifest.to_json_bytes().map_err(manifest_to_jammi)?;
-        handle.put_bytes(&sidecar, bytes.into()).await?;
+        self.register_table(ctx, name, url).await?;
+        self.catalog
+            .update_result_table_status(name, ResultTableStatus::Ready, rows)
+            .await?;
         Ok(())
-    }
-
-    /// Recompute a `ready` result table's artifact digest and check it (and, if
-    /// given, an expected definition hash) against its manifest sidecar. The
-    /// read-only `verify_materialization` verb. Returns a [`MatchVerdict`]; it
-    /// never acts on one (refuse / alarm / fall back is the consumer's policy).
-    ///
-    /// The verdict attests the Parquet **data**, never the ANN search index.
-    pub async fn verify_materialization(
-        &self,
-        table: &ResultTableRecord,
-        expected_definition: Option<&DefinitionHash>,
-    ) -> Result<MatchVerdict> {
-        let parquet_url = StorageUrl::parse(&table.parquet_path)?;
-        let Some(manifest) = self.read_materialization_manifest(&parquet_url).await? else {
-            // No sidecar: a pre-contract table (truthful unknown) — distinct from
-            // a post-contract table that *should* carry one (a torn write or a
-            // bypassed funnel), which recovery reconciles, not this read path.
-            return Ok(MatchVerdict::MissingManifest);
-        };
-
-        let handle = self.open_parquet(&parquet_url)?;
-        let path = handle.data_path()?;
-        let bytes = handle.get_bytes(&path).await?;
-        let recomputed = ArtifactDigest::of_bytes(&bytes);
-
-        if recomputed != manifest.artifact {
-            return Ok(MatchVerdict::Mismatch {
-                expected: manifest.artifact.0,
-                found: recomputed.0,
-            });
-        }
-
-        if let Some(expected) = expected_definition {
-            if *expected != manifest.definition_hash {
-                return Ok(MatchVerdict::Mismatch {
-                    expected: expected.0.clone(),
-                    found: manifest.definition_hash.0,
-                });
-            }
-        }
-
-        let unpinned = manifest.unpinned_inputs();
-        if unpinned.is_empty() {
-            Ok(MatchVerdict::Match)
-        } else {
-            Ok(MatchVerdict::MatchWithUnpinnedInputs { unpinned })
-        }
     }
 
     /// Reconcile every result table left `building` by a crash, restoring the
@@ -507,33 +337,6 @@ impl ResultStore {
                 self.catalog
                     .update_result_table_status(&table.table_name, ResultTableStatus::Failed, 0)
                     .await?;
-            } else if self
-                .read_materialization_manifest(&parquet_url)
-                .await?
-                .is_none()
-            {
-                // Valid Parquet but NO manifest sidecar: the write was torn in
-                // the window between the Parquet landing and the manifest being
-                // written (before the `building -> ready` flip). The contract
-                // forbids promoting a table without an attestation, and the
-                // producing descriptor cannot be reconstructed here — so this
-                // row is reaped to `failed`, not promoted manifest-less.
-                warn!(
-                    table = table.table_name,
-                    "Recovery: valid Parquet but no materialization manifest \
-                     (torn write before manifest); deleting and marking failed"
-                );
-                parquet_handle.delete_if_exists(&parquet_path).await.ok();
-                if let Some(ref idx) = table.index_path {
-                    let idx_url = StorageUrl::parse(idx)?;
-                    let idx_handle = self.open_index(&idx_url)?;
-                    storage::sidecar_layout::delete_sidecar(&idx_handle, SidecarKind::Ann)
-                        .await
-                        .ok();
-                }
-                self.catalog
-                    .update_result_table_status(&table.table_name, ResultTableStatus::Failed, 0)
-                    .await?;
             } else {
                 let row_count = storage::reader::count_parquet_rows(&parquet_handle).await?;
                 // Rebuild ANN index if this is an embedding table
@@ -556,82 +359,14 @@ impl ResultStore {
                         }
                     }
                 }
-                // The manifest sidecar is present (written before the flip), so
-                // its summary columns can be backfilled as part of the same
-                // promotion the live path performs. A `building` row reaching
-                // here always has a manifest (the no-manifest case failed above).
-                let manifest = self
-                    .read_materialization_manifest(&parquet_url)
-                    .await?
-                    .ok_or_else(|| {
-                        JammiError::Catalog(format!(
-                            "Recovery: manifest vanished mid-reconcile for '{}'",
-                            table.table_name
-                        ))
-                    })?;
-                let anchors_json = serde_json::to_string(&manifest.input_anchors)
-                    .map_err(|e| JammiError::Other(format!("serialise input anchors: {e}")))?;
                 self.catalog
-                    .promote_result_table_with_manifest(
+                    .update_result_table_status(
                         &table.table_name,
+                        ResultTableStatus::Ready,
                         row_count,
-                        manifest.definition_hash.as_str(),
-                        &anchors_json,
                     )
                     .await?;
             }
-        }
-
-        self.reconcile_ready_manifests().await?;
-        Ok(())
-    }
-
-    /// Reconcile already-`ready` result tables against the materialization
-    /// contract: a post-contract row (one whose catalog `definition_hash` is
-    /// set, so it was promoted under the contract) whose `.materialization.json`
-    /// sidecar is now absent is a corruption — the attestation a verifier would
-    /// read is gone. Such a row is driven to `failed` and its bytes reaped,
-    /// rather than left queryable with a silently-missing manifest.
-    ///
-    /// A **pre-contract** row (catalog `definition_hash IS NULL`, created before
-    /// migration 021) legitimately has no sidecar; it is left untouched and
-    /// verifies as an honest [`MatchVerdict::MissingManifest`]. This is the
-    /// distinction the contract requires: a bug (post-contract, no sidecar) is
-    /// reaped; a legitimate historical table is preserved.
-    async fn reconcile_ready_manifests(&self) -> Result<()> {
-        let ready = self
-            .catalog
-            .list_result_tables_by_status(ResultTableStatus::Ready)
-            .await?;
-        for table in ready {
-            // Only a post-contract row (summary column set) is expected to carry
-            // a sidecar; a pre-contract row legitimately does not.
-            if table.definition_hash.is_none() {
-                continue;
-            }
-            let parquet_url = StorageUrl::parse(&table.parquet_path)?;
-            let handle = self.open_parquet(&parquet_url)?;
-            let sidecar = materialization_sidecar_path(&handle)?;
-            if handle.exists(&sidecar).await? {
-                continue;
-            }
-            warn!(
-                table = table.table_name,
-                "Recovery: post-contract ready table is missing its materialization \
-                 manifest sidecar; deleting and marking failed"
-            );
-            let data_path = handle.data_path()?;
-            handle.delete_if_exists(&data_path).await.ok();
-            if let Some(ref idx) = table.index_path {
-                let idx_url = StorageUrl::parse(idx)?;
-                let idx_handle = self.open_index(&idx_url)?;
-                storage::sidecar_layout::delete_sidecar(&idx_handle, SidecarKind::Ann)
-                    .await
-                    .ok();
-            }
-            self.catalog
-                .update_result_table_status(&table.table_name, ResultTableStatus::Failed, 0)
-                .await?;
         }
         Ok(())
     }
@@ -841,7 +576,6 @@ impl ResultStore {
         derived_from: Option<&str>,
         rows: &[(String, Vec<f32>)],
         dimensions: usize,
-        materialization: Materialization<'_>,
     ) -> Result<ResultTableRecord> {
         // A normal embedding result table (S9 vocabulary: kind='model'); the
         // task is the embedding task that drives the sidecar-index sidecar URL.
@@ -878,12 +612,11 @@ impl ResultStore {
             }
         }
 
-        self.finalize_with_manifest(
+        self.finalize(
             ctx,
             &table_info.table_name,
             &table_info.parquet_url,
             row_count,
-            materialization,
         )
         .await?;
 
@@ -945,33 +678,6 @@ fn embedding_batch(
         ],
     )
     .map_err(|e| JammiError::Other(format!("materialize: build batch: {e}")))
-}
-
-/// The per-process producing-run identity stamped on every manifest's
-/// `produced_by`. Provenance only — never the reproducibility anchor (that is
-/// the input anchors). One id per engine process, generated on first use.
-fn run_id() -> &'static str {
-    static RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    RUN_ID.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
-}
-
-/// The `.materialization.json` sidecar path beside a result table's Parquet
-/// object. Distinct from the ANN `.manifest.json` index sidecar
-/// ([`crate::storage::sidecar_layout`]): this attests the Parquet data, that one
-/// describes the search index.
-fn materialization_sidecar_path(handle: &JammiObjectStore) -> Result<object_store::path::Path> {
-    Ok(handle.sibling_path("materialization.json")?)
-}
-
-/// Lift a [`ManifestError`] into the engine error type. A storage failure keeps
-/// its `Storage` shape; everything else is a `Catalog`-class invariant breach in
-/// the contract layer.
-fn manifest_to_jammi(e: ManifestError) -> JammiError {
-    match e {
-        ManifestError::Storage(s) => JammiError::Storage(s),
-        ManifestError::Serde(s) => JammiError::Json(s),
-        other => JammiError::Catalog(other.to_string()),
-    }
 }
 
 /// Register a Parquet URL as a DataFusion table under `jammi.{name}`.

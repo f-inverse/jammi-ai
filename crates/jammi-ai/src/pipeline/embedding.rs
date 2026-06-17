@@ -55,7 +55,6 @@ impl<'a> EmbeddingPipeline<'a> {
             .model
             .embedding_dim()
             .ok_or_else(|| JammiError::Inference("Model does not support embeddings".into()))?;
-        let backend_kind = guard.model.backend_kind();
         drop(guard);
 
         // Create result table in catalog
@@ -146,40 +145,13 @@ impl<'a> EmbeddingPipeline<'a> {
             }
         }
 
-        // The materialization contract: the embedding verb + its typed
-        // parameters as the producing description, the engine/device/model
-        // identity as the environment, and the source's read-time anchor as the
-        // sole input (a registered source has no version surface in open-core →
-        // `UnpinnedAtInstant`, honest rather than a fabricated pin).
-        let descriptor = jammi_db::store::manifest::ProducingDescriptor::Embedding {
-            model_id: canonical_model_id.clone(),
-            task: self.task,
-            source_id: source_id.to_string(),
-            columns: columns.to_vec(),
-            key_column: key_column.to_string(),
-            dimensions: embedding_dim,
-        };
-        let env = jammi_db::store::manifest::MaterializationEnv::new(
-            self.session.compute_device(),
-            vec![jammi_db::store::manifest::ModelIdentity {
-                model_id: canonical_model_id.clone(),
-                backend: backend_kind.to_string(),
-            }],
-        );
-        let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
-            source_id,
-            chrono::Utc::now().to_rfc3339(),
-        )];
-
-        // Finalize: write the manifest sidecar, register in DataFusion, and flip
-        // the catalog row `building -> ready` with its summary columns.
+        // Finalize: register in DataFusion and update catalog to 'ready'
         self.result_store
-            .finalize_with_manifest(
+            .finalize(
                 self.session.context(),
                 &table_info.table_name,
                 &table_info.parquet_url,
                 row_count,
-                jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
             )
             .await?;
 

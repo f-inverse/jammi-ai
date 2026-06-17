@@ -292,17 +292,6 @@ pub enum LoadedModel {
 }
 
 impl LoadedModel {
-    /// The backend kind that loaded this model, as the canonical lowercase token
-    /// the materialization contract records in `ModelIdentity.backend`. A loaded
-    /// model is always a native backend (`candle` / `ort`); the `http` backend
-    /// serves remotely and is never a `LoadedModel`.
-    pub fn backend_kind(&self) -> &'static str {
-        match self {
-            LoadedModel::Candle(_) => "candle",
-            LoadedModel::Ort(_) => "ort",
-        }
-    }
-
     /// Estimate GPU memory for one inference batch.
     pub fn estimate_batch_memory(&self, batch_size: usize, seq_len: usize) -> usize {
         match self {

@@ -683,24 +683,6 @@ impl InferenceSession {
             ));
         }
 
-        // The materialization contract: a context set pools from the source's
-        // raw rows (no model invoked here — the encoder is the pooling kernel),
-        // so the environment carries the engine version + device with an empty
-        // model set. There is no single source result table the batch derives
-        // from, so the input is the source itself, which has no version surface
-        // in open-core → `UnpinnedAtInstant` (honest, not a fabricated pin).
-        let descriptor = jammi_db::store::manifest::ProducingDescriptor::ContextSet {
-            encoder_id: "jammi:context-set".to_string(),
-            source_id: source_id.to_string(),
-            dimensions: context.dimensions,
-        };
-        let env =
-            jammi_db::store::manifest::MaterializationEnv::new(self.compute_device(), Vec::new());
-        let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
-            source_id,
-            chrono::Utc::now().to_rfc3339(),
-        )];
-
         self.result_store()
             .materialize_embedding_table(
                 self.context(),
@@ -713,7 +695,6 @@ impl InferenceSession {
                 None,
                 context.rows,
                 context.dimensions,
-                jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
             )
             .await
     }

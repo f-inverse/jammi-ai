@@ -148,11 +148,5 @@ pub fn result_table_from_proto(table: pb::ResultTable) -> Result<ResultTableReco
         // Tenant identity is server-side bookkeeping resolved from the session,
         // not carried on the result wire — the reconstruction leaves it absent.
         tenant_id: None,
-        // The materialization-contract summary columns are server-side
-        // provenance, not carried on the `GenerateEmbeddings` result wire; a
-        // remote consumer that wants the attestation reaches it through
-        // `verify_materialization`, not this reconstruction.
-        definition_hash: None,
-        input_anchors_json: None,
     })
 }

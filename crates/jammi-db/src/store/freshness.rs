@@ -403,7 +403,7 @@ impl ResultStore {
     /// The one-hop reverse-dependency edges of `source`: every `ready` result
     /// table whose recorded `input_anchors` name `source` as an input. Read-only
     /// and tenant-scoped; a caller walks the relation transitively (with the
-    /// stack-safe [`crate::store::derives_from_closure`] helper) to find the
+    /// stack-safe [`Self::derives_from_closure`] helper) to find the
     /// whole downstream subgraph of a change.
     ///
     /// The candidate set is narrowed by the SQL pre-filter

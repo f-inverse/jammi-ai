@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 
-use crate::catalog::backend::{BackendError, Row, SqlValue, TxOptions};
+use crate::catalog::backend::{BackendError, Row, SqlValue, Transaction, TxOptions};
 use crate::store::mutable::definition::{
     MutableIndexDef, MutableTableDefinition, MutableTableError, MutableTableId,
 };
@@ -35,57 +35,23 @@ type MutableListingTuple = (
 );
 
 impl Catalog {
-    /// Insert the registration row + index rows for `def` atomically.
+    /// Insert the registration row + index rows for `def` in one transaction.
+    ///
+    /// Standalone entry point for callers that register only the catalog row
+    /// (e.g. ephemeral sessions that materialise storage separately). The
+    /// [`MutableTableRegistry`](crate::source::mutable::MutableTableRegistry)
+    /// does not route through here: it shares ONE transaction with the storage
+    /// `CREATE TABLE` DDL so the catalog row and the storage table commit or
+    /// roll back together.
     pub async fn create_mutable_table(
         &self,
         def: &MutableTableDefinition,
     ) -> Result<(), MutableTableError> {
-        let id_str = def.id.as_str().to_string();
-        let schema_json = encode_schema(def.schema.as_ref())?;
-        let primary_key_json = serde_json::to_string(&def.primary_key)
-            .map_err(|e| MutableTableError::Schema(e.to_string()))?;
-        let user_metadata = def.user_metadata.to_string();
-        let backend_kind = format!("{:?}", self.backend().backend_kind()).to_lowercase();
-        let tenant_str = def.tenant.map(|t| t.to_string());
-        let order_column = def.order_column.clone();
-        let indexes = def.indexes.clone();
-
+        let payload = MutableRowPayload::encode(def, self.backend().backend_kind())?;
         self.backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
-                    tx.execute(
-                        "INSERT INTO mutable_tables \
-                         (id, schema_json, primary_key, tenant_id, user_metadata, backend_kind, order_column) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                        &[
-                            SqlValue::TextOwned(id_str.clone()),
-                            SqlValue::TextOwned(schema_json),
-                            SqlValue::TextOwned(primary_key_json),
-                            SqlValue::from(tenant_str),
-                            SqlValue::TextOwned(user_metadata),
-                            SqlValue::TextOwned(backend_kind),
-                            SqlValue::from(order_column),
-                        ],
-                    )
-                    .await?;
-
-                    for idx in &indexes {
-                        let cols_json = serde_json::to_string(&idx.columns).map_err(|e| {
-                            BackendError::Execution(format!("index columns JSON: {e}"))
-                        })?;
-                        tx.execute(
-                            "INSERT INTO mutable_table_indexes \
-                             (table_id, index_name, columns, is_unique) \
-                             VALUES ($1, $2, $3, $4)",
-                            &[
-                                SqlValue::TextOwned(id_str.clone()),
-                                SqlValue::TextOwned(idx.name.clone()),
-                                SqlValue::TextOwned(cols_json),
-                                SqlValue::Int(if idx.unique { 1 } else { 0 }),
-                            ],
-                        )
-                        .await?;
-                    }
+                    payload.write(tx).await?;
                     Ok(())
                 })
             })
@@ -285,30 +251,8 @@ impl Catalog {
         self.backend()
             .transaction(TxOptions::default(), |tx| {
                 let id_str = id_str.clone();
-                let tenant_str = tenant.map(|t| t.to_string());
                 Box::pin(async move {
-                    // Index rows cascade via the FK, but we delete explicitly
-                    // for backends that don't enforce CASCADE on DELETE. The
-                    // index delete is gated on the parent row being owned by the
-                    // current tenant, so a foreign or shared table keeps its
-                    // index rows when the catalog-row delete below matches none.
-                    tx.execute(
-                        "DELETE FROM mutable_table_indexes WHERE table_id = $1 AND EXISTS ( \
-                             SELECT 1 FROM mutable_tables \
-                             WHERE id = $1 \
-                               AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL)))",
-                        &[
-                            SqlValue::TextOwned(id_str.clone()),
-                            SqlValue::from(tenant_str.clone()),
-                        ],
-                    )
-                    .await?;
-                    tx.execute(
-                        "DELETE FROM mutable_tables \
-                         WHERE id = $1 AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
-                        &[SqlValue::TextOwned(id_str), SqlValue::from(tenant_str)],
-                    )
-                    .await?;
+                    delete_mutable_table_rows(tx, &id_str, tenant).await?;
                     Ok(())
                 })
             })
@@ -362,6 +306,135 @@ impl Catalog {
             })
             .collect()
     }
+}
+
+/// Pre-encoded `mutable_tables` + index row payload, ready to write inside an
+/// arbitrary transaction.
+///
+/// Encoding (Arrow schema → JSON, primary-key → JSON, backend-kind string) is
+/// fallible and borrows nothing from the transaction, so it is split from the
+/// write step: [`MutableRowPayload::encode`] runs up front, then
+/// [`MutableRowPayload::write`] issues the `INSERT`s on a borrowed
+/// [`Transaction`]. This lets the [`MutableTableRegistry`](crate::source::mutable::MutableTableRegistry)
+/// write the catalog row and the storage `CREATE TABLE` in ONE transaction —
+/// the registration row and its backing table commit or roll back together,
+/// so a crash never leaves one without the other.
+pub(crate) struct MutableRowPayload {
+    id: String,
+    schema_json: String,
+    primary_key_json: String,
+    tenant_str: Option<String>,
+    user_metadata: String,
+    backend_kind: String,
+    order_column: Option<String>,
+    indexes: Vec<MutableIndexDef>,
+}
+
+impl MutableRowPayload {
+    /// Encode `def` into a writeable payload. Fails on unsupported schema
+    /// types before any transaction is opened.
+    pub(crate) fn encode(
+        def: &MutableTableDefinition,
+        backend_kind: crate::catalog::backend::BackendKind,
+    ) -> Result<Self, MutableTableError> {
+        let schema_json = encode_schema(def.schema.as_ref())?;
+        let primary_key_json = serde_json::to_string(&def.primary_key)
+            .map_err(|e| MutableTableError::Schema(e.to_string()))?;
+        Ok(Self {
+            id: def.id.as_str().to_string(),
+            schema_json,
+            primary_key_json,
+            tenant_str: def.tenant.map(|t| t.to_string()),
+            user_metadata: def.user_metadata.to_string(),
+            backend_kind: format!("{backend_kind:?}").to_lowercase(),
+            order_column: def.order_column.clone(),
+            indexes: def.indexes.clone(),
+        })
+    }
+
+    /// Insert the `mutable_tables` row and its index rows on `tx`. Does not
+    /// commit — the surrounding transaction owns commit/rollback.
+    pub(crate) async fn write(self, tx: &mut Transaction<'_>) -> Result<(), BackendError> {
+        tx.execute(
+            "INSERT INTO mutable_tables \
+             (id, schema_json, primary_key, tenant_id, user_metadata, backend_kind, order_column) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[
+                SqlValue::TextOwned(self.id.clone()),
+                SqlValue::TextOwned(self.schema_json),
+                SqlValue::TextOwned(self.primary_key_json),
+                SqlValue::from(self.tenant_str),
+                SqlValue::TextOwned(self.user_metadata),
+                SqlValue::TextOwned(self.backend_kind),
+                SqlValue::from(self.order_column),
+            ],
+        )
+        .await?;
+
+        for idx in &self.indexes {
+            let cols_json = serde_json::to_string(&idx.columns)
+                .map_err(|e| BackendError::Execution(format!("index columns JSON: {e}")))?;
+            tx.execute(
+                "INSERT INTO mutable_table_indexes \
+                 (table_id, index_name, columns, is_unique) \
+                 VALUES ($1, $2, $3, $4)",
+                &[
+                    SqlValue::TextOwned(self.id.clone()),
+                    SqlValue::TextOwned(idx.name.clone()),
+                    SqlValue::TextOwned(cols_json),
+                    SqlValue::Int(if idx.unique { 1 } else { 0 }),
+                ],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+}
+
+/// Delete the `mutable_tables` row + index rows for `id` on `tx`, scoped
+/// strictly to `tenant`. Does not commit — the surrounding transaction owns
+/// commit/rollback so the catalog-row delete and the storage `DROP TABLE` land
+/// together.
+///
+/// The tenant predicate is the STRICT form (`tenant_id = $cur OR (tenant_id IS
+/// NULL AND $cur IS NULL)`) used by [`Catalog::delete_model`], not the read
+/// path's `OR tenant_id IS NULL` leak: a tenant session (non-NULL `tenant`)
+/// deletes only a row it owns, never another tenant's and never a shared
+/// GLOBAL (`tenant_id IS NULL`) table it did not create; an unscoped session
+/// deletes only its own GLOBAL rows. The index-row delete is filtered by the
+/// same predicate against the parent so a non-matching table leaves both its
+/// catalog row and index rows untouched.
+pub(crate) async fn delete_mutable_table_rows(
+    tx: &mut Transaction<'_>,
+    id: &str,
+    tenant: Option<TenantId>,
+) -> Result<(), BackendError> {
+    let tenant_str = tenant.map(|t| t.to_string());
+    // Index rows cascade via the FK, but we delete explicitly for backends
+    // that don't enforce CASCADE on DELETE. The index delete is gated on the
+    // parent row being owned by `tenant`, so a foreign or shared table keeps
+    // its index rows when the catalog-row delete below matches none.
+    tx.execute(
+        "DELETE FROM mutable_table_indexes WHERE table_id = $1 AND EXISTS ( \
+             SELECT 1 FROM mutable_tables \
+             WHERE id = $1 \
+               AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL)))",
+        &[
+            SqlValue::TextOwned(id.to_string()),
+            SqlValue::from(tenant_str.clone()),
+        ],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM mutable_tables \
+         WHERE id = $1 AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
+        &[
+            SqlValue::TextOwned(id.to_string()),
+            SqlValue::from(tenant_str),
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 fn read_mutable_row(row: &Row<'_>) -> Result<MutableRowTuple, BackendError> {

@@ -57,9 +57,55 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --exclude jammi-python
 
+  perf-gate:
+    name: Performance regression gate (release-blocking)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    # The release tag is the authoritative same-box-ish performance gate: a
+    # structural throughput regression (a path that went quadratic, a serialized
+    # parallel section, a dropped fast path) SHOULD block a release. Each
+    # `*-scale` tier maps its measured-rate-vs-committed-floor verdict (and its
+    # determinism-digest check) to the process exit code, so a regression exits
+    # non-zero and reds this job — and because `publish` needs it, the crates
+    # never ship. This is the gated half of §4.4; the nightly `perf.yml` lane is
+    # the non-blocking early-warning half. The documented contract (the verb ×
+    # baseline × threshold × reference-box SLO table) is
+    # `docs/guide/src/performance-slos.md`.
+    env:
+      # Pin Rayon to one thread so the measured rate reflects the engine's
+      # per-core code path, not the runner's core count — the posture the
+      # committed baselines were emitted under.
+      RAYON_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Build the bench harness (release)
+        # The committed baselines are release-profile numbers; the rate gate
+        # only means anything against a release build.
+        run: cargo build -p jammi-bench --release
+
+      - name: train-scale (fine-tune throughput + OOM control)
+        run: ./target/release/jammi-bench train-scale
+
+      - name: graph-train-scale (graph sampler throughput + digest)
+        run: ./target/release/jammi-bench graph-train-scale
+
+      - name: context-predictor-scale (predictor train throughput + predict digest)
+        run: ./target/release/jammi-bench context-predictor-scale
+
+      - name: model-inference-scale (serving throughput + output digests)
+        run: ./target/release/jammi-bench model-inference-scale
+
+      - name: arxiv (held-out ANN-vs-exact recall over the committed corpus)
+        run: ./target/release/jammi-bench arxiv
+
   publish:
     name: Publish to crates.io
-    needs: validate
+    # A release ships only if BOTH the workspace validates AND the performance
+    # gate holds — a structural perf regression blocks the tag.
+    needs: [validate, perf-gate]
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/f-inverse/jammi-ai-ci:latest

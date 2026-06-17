@@ -101,8 +101,9 @@ JammiSession::sql("SELECT ...")
 ### Embedding generation path (text and image)
 
 ```text
-InferenceSession::generate_text_embeddings(source, model, columns, key)
-InferenceSession::generate_image_embeddings(source, model, image_column, key)
+InferenceSession::generate_text_embeddings(source, model, columns, key, cache)
+InferenceSession::generate_image_embeddings(source, model, image_column, key, cache)
+    -> Probe cache (CachePolicy::Use) — a hit short-circuits, returning Reused
     -> EmbeddingPipeline::run(task = TextEmbedding | ImageEmbedding)
     -> Register result_table (status = "building")
     -> Build plan: SourceScan -> InferenceExec(task)
@@ -116,7 +117,7 @@ InferenceSession::generate_image_embeddings(source, model, image_column, key)
     |   '-- Feed vectors to SidecarIndex::add()
     -> Close writer, build ANN index, save sidecar bundle
     -> Register as DataFusion table, update catalog to "ready"
-    -> Return ResultTableRecord
+    -> Return (ResultTableRecord, CacheOutcome::Computed)
 ```
 
 ### Vector search path

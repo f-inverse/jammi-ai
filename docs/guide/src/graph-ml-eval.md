@@ -35,16 +35,17 @@ table must be built over the **same rows** so the comparison is apples-to-apples
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
+# use jammi_db::store::CachePolicy;
 # async fn ex(session: &InferenceSession, baseline_model: &str, treatment_model: &str) -> jammi_db::error::Result<()> {
 // Baseline: plain text embeddings.
-let baseline = session
-    .generate_text_embeddings("patents", baseline_model, &["abstract".into()], "id")
+let (baseline, _) = session
+    .generate_text_embeddings("patents", baseline_model, &["abstract".into()], "id", CachePolicy::Bypass)
     .await?;
 
 // Treatment: embeddings from a structure-aware model (e.g. a fine-tuned
 // checkpoint), over the same source and key column.
-let treatment = session
-    .generate_text_embeddings("patents", treatment_model, &["abstract".into()], "id")
+let (treatment, _) = session
+    .generate_text_embeddings("patents", treatment_model, &["abstract".into()], "id", CachePolicy::Bypass)
     .await?;
 
 let baseline_table = baseline.table_name;

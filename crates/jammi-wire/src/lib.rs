@@ -65,7 +65,7 @@ pub use catalog::{
 pub use channel::{
     channel_from_proto, channel_to_proto, columns_from_proto, columns_to_proto, parse_channel_id,
 };
-pub use embedding::{result_table_from_proto, ProtoQueryInput};
+pub use embedding::{result_table_from_proto, result_table_with_outcome, ProtoQueryInput};
 pub use error::{
     attach_audit_detail, attach_error_detail, attach_trigger_detail, audit_error_from_status,
     error_from_status, trigger_error_from_status,

@@ -284,6 +284,23 @@ impl ResultStore {
         definition: &DefinitionHash,
         inputs: &[InputAnchor],
     ) -> Result<Option<String>> {
+        Ok(self
+            .probe_cache_record(definition, inputs)
+            .await?
+            .map(|record| record.table_name))
+    }
+
+    /// [`Self::probe_cache`] returning the reusable table's full
+    /// [`ResultTableRecord`] on a sound hit, not just its name — the shape a
+    /// producer needs when it short-circuits, so it can hand the reused record
+    /// straight back without a second catalog read. `None` on a miss (no match,
+    /// an unpinned input, or a hit whose artifact was reaped). Read-only and
+    /// tenant-scoped.
+    pub async fn probe_cache_record(
+        &self,
+        definition: &DefinitionHash,
+        inputs: &[InputAnchor],
+    ) -> Result<Option<ResultTableRecord>> {
         let Some(table_name) = self.lookup_cached(definition, inputs).await? else {
             return Ok(None);
         };
@@ -297,7 +314,7 @@ impl ResultStore {
         let handle = self.open_parquet(&parquet_url)?;
         let path = handle.data_path()?;
         if handle.exists(&path).await? {
-            Ok(Some(table_name))
+            Ok(Some(record))
         } else {
             Ok(None)
         }

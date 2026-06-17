@@ -493,9 +493,13 @@ async fn declared_self_edge_does_not_inflate_augmented_degree() {
 
     let (plain_session, _d1) = graph_session(&nodes, &[Edge::plain("a", "b")], None).await;
     let plain_table = plain_session
-        .propagate_embeddings(&registered_request(&plain_session).await)
+        .propagate_embeddings(
+            &registered_request(&plain_session).await,
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let plain_out = read_table_vectors(&plain_session, &plain_table).await;
 
     let (self_session, _d2) = graph_session(
@@ -506,9 +510,13 @@ async fn declared_self_edge_does_not_inflate_augmented_degree() {
     )
     .await;
     let self_table = self_session
-        .propagate_embeddings(&registered_request(&self_session).await)
+        .propagate_embeddings(
+            &registered_request(&self_session).await,
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let self_out = read_table_vectors(&self_session, &self_table).await;
 
     let plain_a = &plain_out["a"];
@@ -545,9 +553,13 @@ async fn isolated_node_propagates_to_its_own_x0() {
 
     let raw = node_vector("lonely", 1);
     let table = session
-        .propagate_embeddings(&registered_request(&session).await)
+        .propagate_embeddings(
+            &registered_request(&session).await,
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let out = read_table_vectors(&session, &table).await;
 
     let got = out
@@ -575,9 +587,13 @@ async fn homophily_propagation_beats_raw() {
     let (session, _dir) = graph_session(&nodes, &edges, None).await;
 
     let table = session
-        .propagate_embeddings(&registered_request(&session).await)
+        .propagate_embeddings(
+            &registered_request(&session).await,
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let propagated = read_table_vectors(&session, &table).await;
 
     // Structure respect both ways: the nearest-neighbour class-agreement rate
@@ -630,9 +646,13 @@ async fn heterophily_propagation_is_worse_than_raw() {
     // No teleport restart so the heterophilous mixing is not masked by the
     // α-anchor — this is the homophily-failure contract, demonstrated.
     let table = session
-        .propagate_embeddings(&registered_request(&session).await.with_alpha(0.0))
+        .propagate_embeddings(
+            &registered_request(&session).await.with_alpha(0.0),
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let propagated = read_table_vectors(&session, &table).await;
 
     // Cross-class averaging collapses the class separation: propagated
@@ -685,9 +705,11 @@ async fn alpha_restart_controls_oversmoothing() {
                 .with_weighting(PropagationWeighting::Uniform)
                 .with_alpha(0.0)
                 .with_hops(3),
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let appnp_deep = session
         .propagate_embeddings(
             &registered_request(&session)
@@ -695,9 +717,11 @@ async fn alpha_restart_controls_oversmoothing() {
                 .with_weighting(PropagationWeighting::DegreeNormalized)
                 .with_alpha(0.3)
                 .with_hops(3),
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     let uniform_vecs = read_table_vectors(&session, &uniform_deep).await;
     let appnp_vecs = read_table_vectors(&session, &appnp_deep).await;
@@ -722,9 +746,11 @@ async fn alpha_restart_controls_oversmoothing() {
                     .with_weighting(PropagationWeighting::Uniform)
                     .with_alpha(0.0)
                     .with_hops(1),
+                jammi_db::store::CachePolicy::Bypass,
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
     )
     .await;
     let two_hop = read_table_vectors(
@@ -736,9 +762,11 @@ async fn alpha_restart_controls_oversmoothing() {
                     .with_weighting(PropagationWeighting::Uniform)
                     .with_alpha(0.0)
                     .with_hops(2),
+                jammi_db::store::CachePolicy::Bypass,
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
     )
     .await;
     let raw: HashMap<String, Vec<f32>> = nodes
@@ -776,12 +804,20 @@ async fn deterministic_across_target_partitions() {
 
     let (session1, _d1) = graph_session_with_partitions(&nodes, &edges, None, 1).await;
     let req1 = registered_request(&session1).await;
-    let table1 = session1.propagate_embeddings(&req1).await.unwrap();
+    let table1 = session1
+        .propagate_embeddings(&req1, jammi_db::store::CachePolicy::Bypass)
+        .await
+        .unwrap()
+        .0;
     let out1 = read_table_vectors(&session1, &table1).await;
 
     let (session4, _d4) = graph_session_with_partitions(&nodes, &edges, None, 4).await;
     let req4 = registered_request(&session4).await;
-    let table4 = session4.propagate_embeddings(&req4).await.unwrap();
+    let table4 = session4
+        .propagate_embeddings(&req4, jammi_db::store::CachePolicy::Bypass)
+        .await
+        .unwrap()
+        .0;
     let out4 = read_table_vectors(&session4, &table4).await;
 
     assert_eq!(out1.len(), out4.len());
@@ -828,9 +864,11 @@ async fn edge_similarity_clamps_negative_and_falls_back_on_zero_weight() {
                 .with_weighting(PropagationWeighting::EdgeSimilarity)
                 .with_alpha(0.0)
                 .with_hops(1),
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let out = read_table_vectors(&session, &table).await;
 
     // Expected: a = (1·X_a + 2·X_b) / 3 — c excluded by the clamp.
@@ -869,9 +907,11 @@ async fn edge_similarity_isolated_node_falls_back_to_x0() {
             &registered_request(&session)
                 .await
                 .with_weighting(PropagationWeighting::EdgeSimilarity),
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let out = read_table_vectors(&session, &table).await;
     let raw = node_vector("lonely", 1);
     for (g, r) in out["lonely"].iter().zip(&raw) {
@@ -897,9 +937,11 @@ async fn hop_cap_clamps_request() {
                     .await
                     .with_alpha(0.0)
                     .with_hops(10),
+                jammi_db::store::CachePolicy::Bypass,
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
     )
     .await;
     let three = read_table_vectors(
@@ -910,9 +952,11 @@ async fn hop_cap_clamps_request() {
                     .await
                     .with_alpha(0.0)
                     .with_hops(3),
+                jammi_db::store::CachePolicy::Bypass,
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
     )
     .await;
     let one = read_table_vectors(
@@ -923,9 +967,11 @@ async fn hop_cap_clamps_request() {
                     .await
                     .with_alpha(0.0)
                     .with_hops(1),
+                jammi_db::store::CachePolicy::Bypass,
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
     )
     .await;
 
@@ -960,9 +1006,11 @@ async fn jumping_knowledge_concats_every_hop_normalizes_blocks_and_is_searchable
                 .await
                 .with_hops(hops)
                 .with_output(PropagationOutput::JumpingKnowledge),
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(
         table.dimensions,
         Some((DIM * blocks) as i32),
@@ -1011,9 +1059,13 @@ async fn output_is_model_kind_with_lineage_and_is_regraphable() {
         .await
         .unwrap();
     let table = session
-        .propagate_embeddings(&registered_request(&session).await)
+        .propagate_embeddings(
+            &registered_request(&session).await,
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert_eq!(
         table.kind,
@@ -1040,9 +1092,11 @@ async fn output_is_model_kind_with_lineage_and_is_regraphable() {
                 exact: true,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert!(graph.row_count > 0, "the propagated table is re-graphable");
 }
 
@@ -1055,9 +1109,13 @@ async fn evaluable_through_r1_eval_embeddings() {
     let (nodes, edges) = two_class_homophilous(5);
     let (session, _dir) = graph_session(&nodes, &edges, None).await;
     let table = session
-        .propagate_embeddings(&registered_request(&session).await)
+        .propagate_embeddings(
+            &registered_request(&session).await,
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     let resolved = session
         .catalog()
@@ -1168,9 +1226,11 @@ async fn two_hop_symmetric_appnp_hand_checked() {
                     .with_weighting(PropagationWeighting::DegreeNormalized)
                     .with_alpha(alpha)
                     .with_hops(2),
+                jammi_db::store::CachePolicy::Bypass,
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
     )
     .await;
 
@@ -1220,9 +1280,11 @@ async fn undirected_redundant_reverse_edge_does_not_double_count() {
                     .with_weighting(PropagationWeighting::Uniform)
                     .with_alpha(0.0)
                     .with_hops(1),
+                jammi_db::store::CachePolicy::Bypass,
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
     )
     .await;
 
@@ -1242,9 +1304,11 @@ async fn undirected_redundant_reverse_edge_does_not_double_count() {
                     .with_weighting(PropagationWeighting::Uniform)
                     .with_alpha(0.0)
                     .with_hops(1),
+                jammi_db::store::CachePolicy::Bypass,
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
     )
     .await;
 
@@ -1296,9 +1360,11 @@ async fn weighting_variants_hand_checked() {
                     .with_weighting(PropagationWeighting::Uniform)
                     .with_alpha(0.0)
                     .with_hops(1),
+                jammi_db::store::CachePolicy::Bypass,
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
     )
     .await;
     // b averages {a, b, c}.
@@ -1321,9 +1387,11 @@ async fn weighting_variants_hand_checked() {
                     .with_weighting(PropagationWeighting::DegreeNormalized)
                     .with_alpha(0.0)
                     .with_hops(1),
+                jammi_db::store::CachePolicy::Bypass,
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
     )
     .await;
     let s2 = 2.0_f32.sqrt();
@@ -1383,9 +1451,11 @@ async fn cross_tenant_edge_endpoint_is_never_propagated() {
                 .with_weighting(PropagationWeighting::Uniform)
                 .with_alpha(0.0)
                 .with_hops(1),
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let out = read_table_vectors(&session, &table).await;
 
     assert!(
@@ -1411,7 +1481,10 @@ async fn edge_set_over_ceiling_is_refused() {
 
     let mut request = registered_request(&session).await;
     request.max_rows = 1; // the fixture has many edges (counting both directions)
-    let err = session.propagate_embeddings(&request).await.unwrap_err();
+    let err = session
+        .propagate_embeddings(&request, jammi_db::store::CachePolicy::Bypass)
+        .await
+        .unwrap_err();
     assert!(
         err.to_string().contains("exceeds the ceiling"),
         "an over-ceiling edge set is refused loudly, not silently OOM: {err}"

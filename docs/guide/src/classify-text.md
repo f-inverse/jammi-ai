@@ -11,16 +11,18 @@ Run a classification model over text columns to assign labels and confidence sco
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
+# use jammi_db::store::CachePolicy;
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 use jammi_ai::model::{ModelSource, ModelTask};
 
 let model = ModelSource::hf("answerdotai/ModernBERT-base-classification");
-let results = session.infer(
+let (_results, _outcome) = session.infer(
     "patents",
     &model,
     ModelTask::Classification,
     &["abstract".to_string()],
     "id",
+    CachePolicy::Bypass,
 ).await?;
 # Ok(()) }
 ```

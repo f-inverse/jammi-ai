@@ -987,7 +987,12 @@ fn materialization_sidecar_path(handle: &JammiObjectStore) -> Result<object_stor
 /// Lift a [`ManifestError`] into the engine error type. A storage failure keeps
 /// its `Storage` shape; everything else is a `Catalog`-class invariant breach in
 /// the contract layer.
-fn manifest_to_jammi(e: ManifestError) -> JammiError {
+/// Fold a [`ManifestError`] into the engine's [`JammiError`] — the single
+/// canonical conversion the materialization funnel and the action-layer probes
+/// (which compute a [`MaterializationManifest::definition_of`] outside the
+/// funnel) both use, so a manifest error surfaces the same typed arm regardless
+/// of where it arose.
+pub fn manifest_to_jammi(e: ManifestError) -> JammiError {
     match e {
         ManifestError::Storage(s) => JammiError::Storage(s),
         ManifestError::Serde(s) => JammiError::Json(s),

@@ -150,9 +150,16 @@ async fn text_embeddings_via_open_clip_share_latent_dim_with_vision() {
         .unwrap();
 
     let record = session
-        .generate_text_embeddings("captions", &model_id, &["abstract".to_string()], "id")
+        .generate_text_embeddings(
+            "captions",
+            &model_id,
+            &["abstract".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(record.status, "ready");
     assert_eq!(
         record.dimensions,
@@ -216,9 +223,11 @@ mod live {
                 ModelTask::TextEmbedding,
                 &["abstract".to_string()],
                 "id",
+                jammi_db::store::CachePolicy::Bypass,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .0;
 
         assert!(!results.is_empty());
         let batch = &results[0];
@@ -301,9 +310,11 @@ mod live {
                 ModelTask::Classification,
                 &["abstract".into()],
                 "id",
+                jammi_db::store::CachePolicy::Bypass,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .0;
 
         assert!(!batches.is_empty());
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -521,9 +532,16 @@ mod live {
 
         // This is the exact path that previously failed with PatentCLIP
         let record = session
-            .generate_image_embeddings("test_imgs", "patentclip/PatentCLIP_Vit_B", "img", "fid")
+            .generate_image_embeddings(
+                "test_imgs",
+                "patentclip/PatentCLIP_Vit_B",
+                "img",
+                "fid",
+                jammi_db::store::CachePolicy::Bypass,
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .0;
 
         assert_eq!(record.status, "ready");
         assert_eq!(record.row_count, 2);

@@ -559,9 +559,10 @@ impl InferenceSession {
         model_id: &str,
         columns: &[String],
         key_column: &str,
-    ) -> Result<ResultTableRecord> {
+        cache: jammi_db::store::CachePolicy,
+    ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
         let result = EmbeddingPipeline::new(self, &self.result_store, ModelTask::TextEmbedding)
-            .run(source_id, model_id, columns, key_column)
+            .run(source_id, model_id, columns, key_column, cache)
             .await?;
         self.ann_cache.invalidate_source(source_id)?;
         Ok(result)
@@ -586,9 +587,16 @@ impl InferenceSession {
         model_id: &str,
         image_column: &str,
         key_column: &str,
-    ) -> Result<ResultTableRecord> {
+        cache: jammi_db::store::CachePolicy,
+    ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
         let result = EmbeddingPipeline::new(self, &self.result_store, ModelTask::ImageEmbedding)
-            .run(source_id, model_id, &[image_column.to_string()], key_column)
+            .run(
+                source_id,
+                model_id,
+                &[image_column.to_string()],
+                key_column,
+                cache,
+            )
             .await?;
         self.ann_cache.invalidate_source(source_id)?;
         Ok(result)
@@ -629,9 +637,16 @@ impl InferenceSession {
         model_id: &str,
         audio_column: &str,
         key_column: &str,
-    ) -> Result<ResultTableRecord> {
+        cache: jammi_db::store::CachePolicy,
+    ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
         let result = EmbeddingPipeline::new(self, &self.result_store, ModelTask::AudioEmbedding)
-            .run(source_id, model_id, &[audio_column.to_string()], key_column)
+            .run(
+                source_id,
+                model_id,
+                &[audio_column.to_string()],
+                key_column,
+                cache,
+            )
             .await?;
         self.ann_cache.invalidate_source(source_id)?;
         Ok(result)
@@ -717,7 +732,8 @@ impl InferenceSession {
         task: ModelTask,
         content_columns: &[String],
         key_column: &str,
-    ) -> Result<Vec<RecordBatch>> {
+        cache: jammi_db::store::CachePolicy,
+    ) -> Result<(Vec<RecordBatch>, jammi_db::store::CacheOutcome)> {
         // Validate content columns are not empty
         if content_columns.is_empty() {
             return Err(JammiError::Inference(
@@ -744,6 +760,53 @@ impl InferenceSession {
         let regression_form = guard.model.regression_form().cloned();
         let backend_kind = guard.model.backend_kind();
         drop(guard);
+
+        // The materialization contract is knowable here (model loaded, source
+        // named), so the cache probe keys on the identical definition + anchors
+        // the funnel records at finalize. The sole input is the raw source with
+        // no version surface → `UnpinnedAtInstant`, so a `Use` request is
+        // honestly always a miss; the probe still runs for surface uniformity.
+        let descriptor = jammi_db::store::manifest::ProducingDescriptor::Inference {
+            model_id: source.to_string(),
+            task,
+            source_id: source_id.to_string(),
+            content_columns: content_columns.to_vec(),
+            key_column: key_column.to_string(),
+        };
+        let env = jammi_db::store::manifest::MaterializationEnv::new(
+            self.compute_device(),
+            vec![jammi_db::store::manifest::ModelIdentity {
+                model_id: source.to_string(),
+                backend: backend_kind.to_string(),
+            }],
+        );
+        let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
+            source_id,
+            chrono::Utc::now().to_rfc3339(),
+        )];
+
+        if cache == jammi_db::store::CachePolicy::Use {
+            let def_hash = jammi_db::store::manifest::MaterializationManifest::definition_of(
+                &descriptor,
+                &env,
+            )
+            .map_err(jammi_db::store::manifest_to_jammi)?;
+            if let Some(reused) = self
+                .result_store
+                .probe_cache_record(&def_hash, &inputs)
+                .await?
+            {
+                // A sound hit: return the cached table's rows (not a fresh
+                // compute) and report the reuse. Inference anchors unpinned, so
+                // this never fires today — but the path is correct the moment a
+                // versioned source makes inference cacheable.
+                let table = reused.table_name.clone();
+                let batches = self
+                    .sql(&format!("SELECT * FROM \"jammi.{}\"", reused.table_name))
+                    .await?;
+                return Ok((batches, jammi_db::store::CacheOutcome::Reused { table }));
+            }
+        }
 
         // Wrap with InferenceExec
         let inference_exec = InferenceExecBuilder::new(
@@ -796,30 +859,8 @@ impl InferenceSession {
             }
             let row_count = writer.close().await?;
 
-            // The materialization contract: the inference verb + its typed
-            // parameters as the producing description, the engine/device/model
-            // identity as the environment, and the source's read-time anchor as
-            // the sole input. A registered source exposes no as-of/version
-            // surface in open-core, so it is honestly recorded as
-            // `UnpinnedAtInstant` rather than a fabricated pin.
-            let descriptor = jammi_db::store::manifest::ProducingDescriptor::Inference {
-                model_id: source.to_string(),
-                task,
-                source_id: source_id.to_string(),
-                content_columns: content_columns.to_vec(),
-                key_column: key_column.to_string(),
-            };
-            let env = jammi_db::store::manifest::MaterializationEnv::new(
-                self.compute_device(),
-                vec![jammi_db::store::manifest::ModelIdentity {
-                    model_id: source.to_string(),
-                    backend: backend_kind.to_string(),
-                }],
-            );
-            let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
-                source_id,
-                chrono::Utc::now().to_rfc3339(),
-            )];
+            // Finalize with the contract built at the top (the same definition +
+            // anchors the cache probe keyed on).
             self.result_store
                 .finalize_with_manifest(
                     self.inner.context(),
@@ -831,7 +872,7 @@ impl InferenceSession {
                 .await?;
         }
 
-        Ok(batches)
+        Ok((batches, jammi_db::store::CacheOutcome::Computed))
     }
 
     /// Build a SELECT query for the key + content columns from a source table.
@@ -889,12 +930,19 @@ impl InferenceSession {
     /// The default driver is index-assisted and produces an *approximate*,
     /// *non-deterministic* graph; set `BuildNeighborGraph::exact` for a
     /// deterministic, complete one (gated by a row-count ceiling).
+    /// `cache` opts the build into memoization: under
+    /// [`CachePolicy::Use`](jammi_db::store::CachePolicy::Use) an exact prior
+    /// materialisation (same definition over the same source-table digest) is
+    /// reused instead of rebuilt, and the returned
+    /// [`CacheOutcome`](jammi_db::store::CacheOutcome) reports which path ran. The
+    /// default [`Bypass`](jammi_db::store::CachePolicy::Bypass) always rebuilds.
     pub async fn build_neighbor_graph(
         &self,
         source_id: &str,
         embedding_table: Option<&str>,
         params: &crate::pipeline::neighbor_graph::BuildNeighborGraph,
-    ) -> Result<ResultTableRecord> {
+        cache: jammi_db::store::CachePolicy,
+    ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
         match self.tenant() {
             // A bound tenant runs the build inside its scope, so the catalog
             // resolves only that tenant's embedding table — a caller cannot
@@ -905,7 +953,7 @@ impl InferenceSession {
                         self,
                         self.result_store.as_ref(),
                     )
-                    .run(source_id, embedding_table, params)
+                    .run(source_id, embedding_table, params, cache)
                     .await
                 })
                 .await
@@ -915,7 +963,7 @@ impl InferenceSession {
                     self,
                     self.result_store.as_ref(),
                 )
-                .run(source_id, embedding_table, params)
+                .run(source_id, embedding_table, params, cache)
                 .await
             }
         }

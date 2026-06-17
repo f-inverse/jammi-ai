@@ -27,6 +27,7 @@ use jammi_ai::pipeline::graph_propagation::{PropagateRequest, PropagationWeighti
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::store::CachePolicy;
 use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
 
@@ -264,15 +265,15 @@ async fn device_independence_for(label: &str, tune: impl Fn(PropagateRequest) ->
     let (nodes, edges) = two_class_homophilous(6);
 
     let (cpu, _cd) = graph_session(&nodes, &edges, true).await;
-    let cpu_table = cpu
-        .propagate_embeddings(&tune(base_request(&cpu).await))
+    let (cpu_table, _) = cpu
+        .propagate_embeddings(&tune(base_request(&cpu).await), CachePolicy::Bypass)
         .await
         .unwrap();
     let cpu_vecs = read_table_vectors(&cpu, &cpu_table).await;
 
     let (gpu, _gd) = graph_session(&nodes, &edges, false).await;
-    let gpu_table = gpu
-        .propagate_embeddings(&tune(base_request(&gpu).await))
+    let (gpu_table, _) = gpu
+        .propagate_embeddings(&tune(base_request(&gpu).await), CachePolicy::Bypass)
         .await
         .unwrap();
     let gpu_vecs = read_table_vectors(&gpu, &gpu_table).await;

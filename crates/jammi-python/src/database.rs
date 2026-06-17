@@ -302,7 +302,7 @@ impl PyDatabase {
     fn _generate_embeddings_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
         let args =
             jammi_ai::wire::generate_embeddings_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let record = self
+        let (record, _outcome) = self
             .runtime
             .block_on(self.local_session().generate_embeddings(
                 &args.source_id,
@@ -310,6 +310,7 @@ impl PyDatabase {
                 &args.columns,
                 &args.key_column,
                 args.modality,
+                args.cache,
             ))
             .map_err(to_pyerr)?;
         Ok(record.table_name)
@@ -325,7 +326,7 @@ impl PyDatabase {
     fn _infer_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
         let args = jammi_ai::wire::infer_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let model_source = ModelSource::parse(&args.model);
-        let batches = self
+        let (batches, _outcome) = self
             .runtime
             .block_on(self.session.infer(
                 &args.source_id,
@@ -333,6 +334,7 @@ impl PyDatabase {
                 args.task,
                 &args.columns,
                 &args.key_column,
+                args.cache,
             ))
             .map_err(to_pyerr)?;
         batches_to_pyarrow(py, &batches)
@@ -1015,12 +1017,13 @@ impl PyDatabase {
     fn _build_neighbor_graph_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
         let args = jammi_ai::wire::build_neighbor_graph_from_bytes(proto_bytes)
             .map_err(status_to_pyerr)?;
-        let record = self
+        let (record, _outcome) = self
             .runtime
             .block_on(self.session.build_neighbor_graph(
                 &args.source_id,
                 args.embedding_table.as_deref(),
                 &args.params,
+                args.cache,
             ))
             .map_err(to_pyerr)?;
         Ok(record.table_name)
@@ -1036,11 +1039,11 @@ impl PyDatabase {
     /// materialised embedding table's name. A malformed or invalid body raises
     /// `ValueError`.
     fn _propagate_embeddings_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
-        let request =
+        let (request, cache) =
             jammi_ai::wire::propagate_request_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let record = self
+        let (record, _outcome) = self
             .runtime
-            .block_on(self.session.propagate_embeddings(&request))
+            .block_on(self.session.propagate_embeddings(&request, cache))
             .map_err(to_pyerr)?;
         Ok(record.table_name)
     }

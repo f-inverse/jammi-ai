@@ -301,6 +301,7 @@ class Database:
         columns: List[str],
         task: str,
         key: str,
+        cache: Optional[str] = None,
     ) -> pa.Table:
         """Run `model` over `columns` of a registered source for `task`,
         returning one output row per source row as a `pyarrow.Table`.
@@ -308,10 +309,12 @@ class Database:
         `task` is the snake-case model-task string (``"text_embedding"``,
         ``"image_embedding"``, ``"audio_embedding"``, ``"classification"``,
         ``"ner"``, ``"regression"``); `key` names the column whose value becomes
-        each output row's ``_row_id``. Same handle shape and verb signature as
-        the remote `RemoteDatabase.infer`. The request is assembled with the
-        shared `InferRequest` builder and submitted through the engine's wire
-        seam.
+        each output row's ``_row_id``. `cache` opts into memoization
+        (``"use"``) or keeps the default recompute (``None``/``"bypass"``) —
+        inference anchors its source unpinned, so ``"use"`` is honestly always a
+        recompute today. Same handle shape and verb signature as the remote
+        `RemoteDatabase.infer`. The request is assembled with the shared
+        `InferRequest` builder and submitted through the engine's wire seam.
         """
         request = build_infer_request(
             source=source,
@@ -319,6 +322,7 @@ class Database:
             columns=columns,
             task=task,
             key=key,
+            cache=cache,
         )
         return self._native._infer_proto(request.SerializeToString())
 
@@ -331,6 +335,7 @@ class Database:
         mutual: bool = False,
         exact: bool = False,
         table: Optional[str] = None,
+        cache: Optional[str] = None,
     ) -> str:
         """Materialise the k-NN graph of a source's embedding table and return the
         new edge table's name.
@@ -350,6 +355,7 @@ class Database:
             mutual=mutual,
             exact=exact,
             table=table,
+            cache=cache,
         )
         return self._native._build_neighbor_graph_proto(request.SerializeToString())
 
@@ -368,6 +374,7 @@ class Database:
         weighting: Optional[str] = None,
         alpha: Optional[float] = None,
         output: Optional[str] = None,
+        cache: Optional[str] = None,
     ) -> str:
         """Propagate an embedding table's features over a declared graph (the
         decoupled-GNN forward pass) into a new, searchable embedding table.
@@ -394,6 +401,7 @@ class Database:
             weighting=weighting,
             alpha=alpha,
             output=output,
+            cache=cache,
         )
         return self._native._propagate_embeddings_proto(request.SerializeToString())
 
@@ -533,15 +541,19 @@ class Database:
         columns: List[str],
         key: str,
         modality: Optional[str] = None,
+        cache: Optional[str] = None,
     ) -> str:
         """Embed `columns` of a registered source, persisting one vector per row.
 
         `modality` selects the tower (`"text"`/`"image"`/`"audio"`, defaulting to
         text); `key` names the column whose value becomes each embedding row's
-        key. Returns the result table name. Same handle shape and verb signature
-        as the remote `RemoteDatabase.generate_embeddings`; the request is
-        assembled with the shared `GenerateEmbeddingsRequest` builder and
-        submitted through the engine's wire seam.
+        key; `cache` opts into memoization (``"use"``) or keeps the default
+        recompute (``None``/``"bypass"``) — embeddings anchor their source
+        unpinned, so ``"use"`` is honestly always a recompute today. Returns the
+        result table name. Same handle shape and verb signature as the remote
+        `RemoteDatabase.generate_embeddings`; the request is assembled with the
+        shared `GenerateEmbeddingsRequest` builder and submitted through the
+        engine's wire seam.
         """
         request = build_generate_embeddings_request(
             source=source,
@@ -549,6 +561,7 @@ class Database:
             columns=columns,
             key=key,
             modality=modality,
+            cache=cache,
         )
         return self._native._generate_embeddings_proto(request.SerializeToString())
 

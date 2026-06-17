@@ -12,6 +12,7 @@ use std::sync::Arc;
 use jammi_ai::session::InferenceSession;
 use jammi_db::config::JammiConfig;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::store::CachePolicy;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,11 +35,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 3. Generate embeddings
-    let record = session.generate_text_embeddings(
+    let (record, _outcome) = session.generate_text_embeddings(
         "patents",
         "sentence-transformers/all-MiniLM-L6-v2",
         &["title".to_string()],
         "id",
+        CachePolicy::Bypass,
     ).await?;
     println!("Embedded {} rows", record.row_count);
 

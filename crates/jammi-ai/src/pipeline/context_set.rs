@@ -683,7 +683,8 @@ impl InferenceSession {
     pub async fn materialize_context(
         &self,
         context: MaterializedContext<'_>,
-    ) -> Result<ResultTableRecord> {
+        cache: jammi_db::store::CachePolicy,
+    ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
         // De-duplicate target keys so the table's `_row_id` stays a key: a
         // batch must not carry two pooled vectors for the same target.
         let seen: BTreeSet<&str> = context.rows.iter().map(|(k, _)| k.as_str()).collect();
@@ -723,7 +724,29 @@ impl InferenceSession {
             chrono::Utc::now().to_rfc3339(),
         )];
 
-        self.result_store()
+        // Cache probe before the write. A context set anchors its source
+        // `UnpinnedAtInstant` (a raw source with no version surface), so a `Use`
+        // request is honestly always a miss; the probe runs for surface
+        // uniformity and provable off-ness. The probe is before any Parquet
+        // write, so a hit would leave no `building` orphan to reap.
+        if cache == jammi_db::store::CachePolicy::Use {
+            let def_hash = jammi_db::store::manifest::MaterializationManifest::definition_of(
+                &descriptor,
+                &env,
+            )
+            .map_err(jammi_db::store::manifest_to_jammi)?;
+            if let Some(reused) = self
+                .result_store()
+                .probe_cache_record(&def_hash, &inputs)
+                .await?
+            {
+                let table = reused.table_name.clone();
+                return Ok((reused, jammi_db::store::CacheOutcome::Reused { table }));
+            }
+        }
+
+        let record = self
+            .result_store()
             .materialize_embedding_table(
                 self.context(),
                 jammi_db::store::EmbeddingTableSpec {
@@ -739,7 +762,8 @@ impl InferenceSession {
                 context.rows,
                 jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
             )
-            .await
+            .await?;
+        Ok((record, jammi_db::store::CacheOutcome::Computed))
     }
 }
 

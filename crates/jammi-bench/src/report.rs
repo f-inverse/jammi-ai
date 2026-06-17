@@ -134,6 +134,16 @@ pub struct Tiers {
     /// cookbook (the A/B split). Populated by `model-inference-scale`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_inference: Option<ModelInferenceTier>,
+    /// The CPU-hermetic cache-hit SLO tier: the engine's opt-in producer
+    /// memoization (`CachePolicy::Use`) on a cacheable producer (the
+    /// neighbour-graph, anchored on an immutable `ResultDigest`). A cold `Use`
+    /// build (nothing cached) is timed against a warm `Use` hit (the top-of-
+    /// producer probe short-circuits the whole compute), and the gate asserts the
+    /// hit clears a committed speed-up floor — the portable property of skipping
+    /// the build, not the machine-dependent absolute wall-time. Populated by
+    /// `cache-slo-scale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_slo: Option<CacheSloTier>,
 }
 
 /// The k values the recall curve is reported at: recall@1, recall@10, recall@100.
@@ -975,4 +985,73 @@ pub struct ModelInferenceTier {
     /// same-machine determinism contract). The committed digest rides as a same-box
     /// reference, never asserted for cross-machine equality.
     pub infer_digest: DeterminismGate,
+}
+
+/// The CPU-hermetic cache-hit SLO tier: the engine's opt-in producer memoization
+/// (`CachePolicy::Use`) measured on a genuinely cacheable producer — the
+/// neighbour-graph, which anchors on the immutable source-table `ResultDigest`,
+/// so the same build over the same parent is a sound reuse.
+///
+/// The gated property is the **speed-up**, not an absolute wall-time. A cold
+/// `Use` build (nothing cached yet) does the whole compute; a warm `Use` over the
+/// identical `(definition, source-digest)` short-circuits at the top-of-producer
+/// probe — a catalog lookup plus an extant-bytes check — and skips the entire
+/// build. The ratio `cold / warm` is a portable property of *skipping the work*
+/// (a build that takes time vs a lookup that does not), so gating a committed
+/// minimum speed-up is the right SLO: it has teeth (a probe that did not actually
+/// short-circuit would fail it) yet does not pin a machine-dependent absolute.
+#[derive(Debug, Serialize)]
+pub struct CacheSloTier {
+    /// Neighbourhood size `k` the gated graph is built at.
+    pub k: usize,
+    /// Cold `Use` build wall-time (nothing cached → the full compute),
+    /// milliseconds. Machine-dependent reference; only its *ratio* to the hit is
+    /// gated.
+    pub cold_build_ms: Measurement,
+    /// Warm `Use` hit wall-time (the top-of-producer probe short-circuits the
+    /// whole build), milliseconds. Machine-dependent reference.
+    pub warm_hit_ms: Measurement,
+    /// The speed-up gate: the measured `cold / warm` ratio against the committed
+    /// minimum, and whether it cleared.
+    pub speedup: SpeedupGate,
+}
+
+/// The cache-hit speed-up verdict: the measured `cold / warm` ratio gated against
+/// a committed minimum. Records the full arithmetic (both wall-times, the ratio,
+/// the floor, the verdict), mirroring the rate gate's honesty — never a bare
+/// boolean.
+#[derive(Debug, Serialize)]
+pub struct SpeedupGate {
+    /// The cold `Use` build wall-time, milliseconds.
+    pub cold_ms: f64,
+    /// The warm `Use` hit wall-time, milliseconds.
+    pub warm_ms: f64,
+    /// The measured speed-up `cold_ms / warm_ms`.
+    pub measured_speedup: f64,
+    /// The committed minimum speed-up the hit had to clear.
+    pub min_speedup: f64,
+    /// Whether `measured_speedup >= min_speedup` — the cache hit really did
+    /// short-circuit the build, by at least the committed margin.
+    pub passed: bool,
+}
+
+impl SpeedupGate {
+    /// Build the verdict from the two wall-times and the committed floor. A
+    /// zero/negative warm time (a clock that did not advance) is treated as an
+    /// unbounded speed-up — the hit was below the timer resolution, which clears
+    /// any finite floor.
+    pub fn new(cold_ms: f64, warm_ms: f64, min_speedup: f64) -> Self {
+        let measured_speedup = if warm_ms > 0.0 {
+            cold_ms / warm_ms
+        } else {
+            f64::INFINITY
+        };
+        Self {
+            cold_ms,
+            warm_ms,
+            measured_speedup,
+            min_speedup,
+            passed: measured_speedup >= min_speedup,
+        }
+    }
 }

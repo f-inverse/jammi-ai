@@ -2,7 +2,7 @@
 
 > Part of the [60 — temporal correctness](./README.md) plan group. Builds directly on [`SPEC-02-materialization-contract.md`](./SPEC-02-materialization-contract.md) (the `ProducingDescriptor` / `InputAnchor` / `DefinitionHash` every result table carries) — it reads and re-runs the contract, it does not extend the contract's shape. Research rules: [`../cp9-substrate-primitives/RESEARCH-METHODOLOGY.md`](../cp9-substrate-primitives/RESEARCH-METHODOLOGY.md).
 >
-> **Status:** Sensing layer **implemented** (W-61a, migration 022). Action layer **specified here**; the cache foundation (`CachePolicy` / `CacheOutcome` / `ResultStore::probe_cache` / `JammiError::NotRecomputable`) is implemented in `jammi-db`; the producer probes, the `recompute` verb, and the cross-stack wiring follow the design in §4–§6 below.
+> **Status:** Sensing layer **implemented** (W-61a, migration 022). Cache foundation (`CachePolicy` / `CacheOutcome` / `ResultStore::probe_cache` / `JammiError::NotRecomputable`) **implemented** in `jammi-db`. **Producer memoization (§4) implemented (W-61b-cache):** all five result-table producers carry a `CachePolicy` parameter (default `Bypass`) embed==remote, probe at the top of the verb under `Use`, and return a `CacheOutcome`. The `recompute` verb (§5) remains specified here and follows in a sibling workstream.
 
 ## 1. Goal
 
@@ -96,6 +96,10 @@ A cache hit requires every input anchor to be reproducibly identifiable. `lookup
 | Graph propagation | `ResultDigest` ×2 (embedding table + edge relation) | **Yes** |
 
 The three unpinned producers still gain the `CachePolicy` parameter (for embed==remote parity and so the surface is uniform), but the probe correctly resolves to a miss every time — the cache is honestly *off* there, not silently broken. The two derived producers, anchored on immutable `ResultDigest`s, are genuinely cacheable: the same build over the same parent yields the same output, so reuse is sound.
+
+**As built (W-61b-cache).** The probe key is computed from the *same* fold the funnel records: a producer builds its `ProducingDescriptor` + `MaterializationEnv` + `InputAnchor`s at the top of the verb, derives the `DefinitionHash` via the new public `MaterializationManifest::definition_of(descriptor, env)` (the exact fold `MaterializationManifest::compute` runs at finalize), and calls `ResultStore::probe_cache_record(&def_hash, &inputs)` — `probe_cache` returning the reusable `ResultTableRecord` so a hit hands the record straight back. On `Some(record)` the producer returns `(record, CacheOutcome::Reused { table })` and skips the compute; on `None`/`Bypass` it computes and returns `(record, CacheOutcome::Computed)`. The probe runs **before any `create_table` / Parquet write**, so a hit leaves no `building` orphan — the reap-safe in-funnel re-probe (§4.4) is therefore unnecessary and not built.
+
+**Wire representation.** `CachePolicy` is a proto enum (`jammi.v1.inference.CachePolicy`, `UNSPECIFIED → Bypass`, out-of-range rejected loudly via `cache_policy_from_proto`) carried as a `cache` field on the four producer requests that cross the wire (`InferRequest`, `GenerateEmbeddingsRequest`, `BuildNeighborGraphRequest`, `PropagateEmbeddingsRequest`); `CacheOutcome` is a proto enum carried on `ResultTable` (`cache_outcome`) and `InferResponse`, so reuse is observable over gRPC. The `_PIPELINE_VERBS` conformance guard is unchanged: `CachePolicy` is a *parameter* on existing verbs, not a new verb, so the Python `Database`/`RemoteDatabase` gain a matching `cache` keyword on all four wire verbs (name-for-name parity), no new `_PIPELINE_VERBS` entry. **The ContextSet durable producer (`materialize_context`) is embed-only** — it is not on the gRPC/Python surface (only `assemble_context`, the inline-vector RPC, is), so its `CachePolicy` parameter appears on the Rust embed signature alone.
 
 ### 4.4 The reap-safe in-funnel short-circuit (secondary)
 

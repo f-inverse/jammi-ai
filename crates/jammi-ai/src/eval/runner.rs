@@ -273,7 +273,7 @@ impl<'a> EvalRunner<'a> {
                     .await?;
                 let golden = load_classification_golden_from_batches(&batches)?;
 
-                let results = self
+                let (results, _) = self
                     .session
                     .infer(
                         source_id,
@@ -281,6 +281,7 @@ impl<'a> EvalRunner<'a> {
                         crate::model::ModelTask::Classification,
                         columns,
                         "id",
+                        jammi_db::store::CachePolicy::Bypass,
                     )
                     .await?;
 
@@ -325,7 +326,7 @@ impl<'a> EvalRunner<'a> {
                     .await?;
                 let golden = load_ner_golden_from_batches(&batches)?;
 
-                let results = self
+                let (results, _) = self
                     .session
                     .infer(
                         source_id,
@@ -333,6 +334,7 @@ impl<'a> EvalRunner<'a> {
                         crate::model::ModelTask::Ner,
                         columns,
                         "id",
+                        jammi_db::store::CachePolicy::Bypass,
                     )
                     .await?;
 

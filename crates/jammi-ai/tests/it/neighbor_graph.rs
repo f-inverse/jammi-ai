@@ -45,6 +45,7 @@ async fn session_with_embeddings() -> (Arc<InferenceSession>, TempDir) {
             &tiny_bert_model(),
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
         .unwrap();
@@ -117,9 +118,11 @@ async fn neighbor_graph_has_correct_shape_and_ranking() {
                 exact: true, // deterministic so the assertions are stable
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert_eq!(edges_table.kind, ResultTableKind::NeighborGraph);
     assert!(
@@ -184,9 +187,11 @@ async fn neighbor_graph_endpoints_join_directly_to_source() {
                 k: 3,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     // `src` joins straight to the source's key column with no detour through
     // the embedding table — every edge resolves to a real patent title.
@@ -224,9 +229,11 @@ async fn neighbor_graph_min_similarity_floors_weak_edges() {
                 exact: true,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let all = collect_edges(&session, &unfiltered).await;
 
     // A floor strictly above the weakest surviving edge must drop at least it.
@@ -254,9 +261,11 @@ async fn neighbor_graph_min_similarity_floors_weak_edges() {
                 exact: true,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let filtered = collect_edges(&session, &filtered_table).await;
 
     assert!(
@@ -285,9 +294,11 @@ async fn neighbor_graph_mutual_is_a_reciprocal_subset() {
                 exact: true,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let directed = collect_edges(&session, &directed_table).await;
     use std::collections::HashSet;
     let directed_pairs: HashSet<(String, String)> = directed
@@ -305,9 +316,11 @@ async fn neighbor_graph_mutual_is_a_reciprocal_subset() {
                 exact: true,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let mutual = collect_edges(&session, &mutual_table).await;
 
     assert!(
@@ -342,9 +355,11 @@ async fn neighbor_graph_exact_is_deterministic_across_runs() {
                     exact: true,
                     ..Default::default()
                 },
+                jammi_db::store::CachePolicy::Bypass,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .0;
         collect_edges(&session, &table).await
     };
 
@@ -374,9 +389,11 @@ async fn neighbor_graph_index_agrees_with_exact_within_tolerance() {
                 exact: true,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let approx_table = session
         .build_neighbor_graph(
             "patents",
@@ -386,9 +403,11 @@ async fn neighbor_graph_index_agrees_with_exact_within_tolerance() {
                 exact: false,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     use std::collections::HashSet;
     let exact: HashSet<(String, String)> = collect_edges(&session, &exact_table)
@@ -426,9 +445,11 @@ async fn neighbor_graph_similarity_is_a_plain_non_null_column() {
                 k: 4,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     let batches = session
         .sql(&format!(
@@ -477,9 +498,11 @@ async fn two_hop_expansion_is_plain_sql_over_the_edge_table() {
                 exact: true,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     // A self-join expands one hop to two — entirely in the query, with no
     // traversal operator in the engine.
@@ -527,6 +550,7 @@ async fn neighbor_graph_is_tenant_scoped() {
             &tiny_bert_model(),
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
         .unwrap();
@@ -538,9 +562,11 @@ async fn neighbor_graph_is_tenant_scoped() {
                 k: 3,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert!(
         session
             .catalog()
@@ -563,6 +589,7 @@ async fn neighbor_graph_is_tenant_scoped() {
                 k: 3,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await;
     assert!(
@@ -584,11 +611,231 @@ async fn neighbor_graph_rejects_zero_k() {
                 k: 0,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
         .unwrap_err();
     assert!(
         err.to_string().contains("k >= 1"),
         "k = 0 is a typed error, got: {err}"
+    );
+}
+
+// ─── Opt-in memoization (CachePolicy) ────────────────────────────────────────
+//
+// A neighbour-graph anchors on the immutable source-embedding-table digest
+// (`ResultDigest`), so it is GENUINELY cacheable: the same build over the same
+// parent yields the same edges. These prove the dial is opt-in, observable, and
+// keyed on the COMPLETE descriptor.
+
+use jammi_db::store::{CacheOutcome, CachePolicy};
+
+#[tokio::test]
+async fn cache_use_exact_hit_reuses_the_primed_table() {
+    let (session, _dir) = session_with_embeddings().await;
+    let params = BuildNeighborGraph {
+        k: 5,
+        exact: true,
+        ..Default::default()
+    };
+
+    // Cold build (Use, but nothing cached yet) → Computed: it primes the cache.
+    let (first, first_outcome) = session
+        .build_neighbor_graph("patents", None, &params, CachePolicy::Use)
+        .await
+        .unwrap();
+    assert_eq!(
+        first_outcome,
+        CacheOutcome::Computed,
+        "the first Use build has nothing to reuse — it computes"
+    );
+
+    // Second Use over the identical (definition, source digest) → Reused: the
+    // probe short-circuits before the expensive build and names the primed table.
+    // (The "reuse is faster" property is covered by the exit-code-gated SLO bench
+    // `cache-slo-scale`; this hermetic test asserts only the deterministic
+    // cache behaviour, never a wall-clock margin.)
+    let (second, second_outcome) = session
+        .build_neighbor_graph("patents", None, &params, CachePolicy::Use)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        second_outcome,
+        CacheOutcome::Reused {
+            table: first.table_name.clone()
+        },
+        "an exact (definition, source-digest) match reuses the prior table"
+    );
+    assert_eq!(
+        second.table_name, first.table_name,
+        "the reused record names the cached table, not a fresh one"
+    );
+}
+
+#[tokio::test]
+async fn cache_bypass_always_recomputes_a_distinct_table() {
+    let (session, _dir) = session_with_embeddings().await;
+    let params = BuildNeighborGraph {
+        k: 5,
+        exact: true,
+        ..Default::default()
+    };
+
+    let (a, a_outcome) = session
+        .build_neighbor_graph("patents", None, &params, CachePolicy::Bypass)
+        .await
+        .unwrap();
+    let (b, b_outcome) = session
+        .build_neighbor_graph("patents", None, &params, CachePolicy::Bypass)
+        .await
+        .unwrap();
+
+    assert_eq!(a_outcome, CacheOutcome::Computed);
+    assert_eq!(
+        b_outcome,
+        CacheOutcome::Computed,
+        "the default Bypass never reuses — it always recomputes"
+    );
+    assert_ne!(
+        a.table_name, b.table_name,
+        "two Bypass builds materialise two distinct tables"
+    );
+}
+
+#[tokio::test]
+async fn cache_one_bit_param_change_recomputes_not_reuses() {
+    // The probe keys on the COMPLETE ProducingDescriptor (PR-A's completeness).
+    // A one-bit change to ANY output-affecting build param — here `k` 5 -> 6 —
+    // is a different definition hash, so the second Use cannot reuse the first.
+    let (session, _dir) = session_with_embeddings().await;
+
+    let (first, _) = session
+        .build_neighbor_graph(
+            "patents",
+            None,
+            &BuildNeighborGraph {
+                k: 5,
+                exact: true,
+                ..Default::default()
+            },
+            CachePolicy::Use,
+        )
+        .await
+        .unwrap();
+
+    let (second, outcome) = session
+        .build_neighbor_graph(
+            "patents",
+            None,
+            &BuildNeighborGraph {
+                k: 6, // one knob changed → a different definition → no reuse
+                exact: true,
+                ..Default::default()
+            },
+            CachePolicy::Use,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        CacheOutcome::Computed,
+        "a one-bit param change is a different cache key — it must recompute, \
+         proving the probe keys on the full descriptor, not a lossy subset"
+    );
+    assert_ne!(first.table_name, second.table_name);
+}
+
+#[tokio::test]
+async fn cache_use_does_not_reuse_across_a_recomputed_parent() {
+    // The neighbour-graph anchors on the parent embedding table's digest. A
+    // SECOND, distinct embedding table (a recomputed parent, new digest) gives a
+    // different input anchor, so a Use build over it cannot reuse the first
+    // graph — reuse is sound only over the identical parent state.
+    let (session, _dir) = session_with_embeddings().await;
+    let params = BuildNeighborGraph {
+        k: 5,
+        exact: true,
+        ..Default::default()
+    };
+
+    // First graph over the first embedding table.
+    let (g1, _) = session
+        .build_neighbor_graph("patents", None, &params, CachePolicy::Use)
+        .await
+        .unwrap();
+
+    // Recompute the parent: a fresh embedding table with a new digest.
+    let (parent2, _) = session
+        .generate_text_embeddings(
+            "patents",
+            &tiny_bert_model(),
+            &["abstract".to_string()],
+            "id",
+            CachePolicy::Bypass,
+        )
+        .await
+        .unwrap();
+
+    let (g2, outcome) = session
+        .build_neighbor_graph(
+            "patents",
+            Some(&parent2.table_name),
+            &params,
+            CachePolicy::Use,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        CacheOutcome::Computed,
+        "a different parent digest is a different input anchor — no reuse"
+    );
+    assert_ne!(g1.table_name, g2.table_name);
+}
+
+#[tokio::test]
+async fn cache_hit_leaves_no_building_orphan_to_reap() {
+    // The probe runs at the TOP of the producer, BEFORE `create_table` / any
+    // Parquet write — so a cache hit short-circuits with NO `building` row and NO
+    // orphaned bytes. There is therefore no new crash window: `recover()` (the
+    // reaper) finds nothing to reconcile, exactly as for a clean state. This is
+    // the design that makes the secondary in-funnel re-probe unnecessary.
+    use jammi_db::catalog::status::ResultTableStatus;
+    use jammi_db::store::CachePolicy;
+
+    let (session, _dir) = session_with_embeddings().await;
+    let params = BuildNeighborGraph {
+        k: 5,
+        exact: true,
+        ..Default::default()
+    };
+
+    // Prime the cache, then take a cache hit.
+    session
+        .build_neighbor_graph("patents", None, &params, CachePolicy::Use)
+        .await
+        .unwrap();
+    let (_reused, outcome) = session
+        .build_neighbor_graph("patents", None, &params, CachePolicy::Use)
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, jammi_db::store::CacheOutcome::Reused { .. }),
+        "expected a cache hit to exercise the short-circuit"
+    );
+
+    // No `building` orphan was left by the short-circuit.
+    let orphans = session
+        .catalog()
+        .list_result_tables_by_status(ResultTableStatus::Building)
+        .await
+        .unwrap();
+    assert!(
+        orphans.is_empty(),
+        "a top-of-producer cache hit leaves no building orphan, got {:?}",
+        orphans.iter().map(|r| &r.table_name).collect::<Vec<_>>()
     );
 }

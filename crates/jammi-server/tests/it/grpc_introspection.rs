@@ -107,9 +107,11 @@ async fn remote_list_and_describe_sources_like_local() {
             &["abstract".to_string()],
             "id",
             Modality::Text,
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .expect("generate_embeddings");
+        .expect("generate_embeddings")
+        .0;
     assert_eq!(table.status, "ready");
     assert!(table.row_count > 0, "patents corpus embeds rows");
     assert!(table.dimensions.is_some(), "dimensions recorded");

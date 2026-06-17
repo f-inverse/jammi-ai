@@ -71,6 +71,11 @@ message GenerateEmbeddingsRequest {
   string key_column = 4;
   // Which tower to run over the columns.
   Modality modality = 5;
+  // Opt-in memoization. UNSPECIFIED maps to the engine default (`Bypass`).
+  // Embedding anchors its source `UnpinnedAtInstant`, so a `Use` request is
+  // honestly always a miss — the cache is off here until sources expose a
+  // version surface.
+  jammi.v1.inference.CachePolicy cache = 6;
 }
 
 // Subset of the engine's `ResultTableRecord` a client needs to locate and
@@ -93,6 +98,12 @@ message ResultTable {
   // audio). Carried so the record reconstructs its `ModelTask` faithfully on
   // the wire rather than from a guessed default.
   jammi.v1.inference.ModelTask task = 7;
+  // Which path the producer that returned this table took under its
+  // `CachePolicy` — COMPUTED for a fresh build, REUSED for an exact cache hit.
+  // UNSPECIFIED on a `ResultTable` that did not come from a producer (e.g. a
+  // catalog `DescribeSource` projection), so reuse is observable without
+  // claiming a producer ran. Mirrors the engine's `CacheOutcome`.
+  jammi.v1.inference.CacheOutcome cache_outcome = 8;
 }
 
 message EncodeQueryRequest {

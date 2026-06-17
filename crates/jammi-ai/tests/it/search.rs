@@ -35,6 +35,7 @@ async fn session_with_embeddings() -> (Arc<InferenceSession>, TempDir) {
             &tiny_bert_model(),
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
         .unwrap();
@@ -403,15 +404,29 @@ async fn search_resolves_to_latest_embedding_table() {
 
     // Generate first embedding table (columns=["title"]).
     let r1 = session
-        .generate_text_embeddings("patents", &model, &["title".to_string()], "id")
+        .generate_text_embeddings(
+            "patents",
+            &model,
+            &["title".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     // Generate second embedding table (columns=["abstract"]), created later.
     let r2 = session
-        .generate_text_embeddings("patents", &model, &["abstract".to_string()], "id")
+        .generate_text_embeddings(
+            "patents",
+            &model,
+            &["abstract".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert_ne!(
         r1.table_name, r2.table_name,
@@ -500,13 +515,27 @@ async fn search_embedding_table_selector_picks_the_named_table() {
     // so their vectors — and therefore the nearest neighbours of a fixed query —
     // differ. `r_title` is created first; `r_abstract` last (the most-recent).
     let r_title = session
-        .generate_text_embeddings("patents", &model, &["title".to_string()], "id")
+        .generate_text_embeddings(
+            "patents",
+            &model,
+            &["title".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let r_abstract = session
-        .generate_text_embeddings("patents", &model, &["abstract".to_string()], "id")
+        .generate_text_embeddings(
+            "patents",
+            &model,
+            &["abstract".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert_ne!(
         r_title.table_name, r_abstract.table_name,
         "the two columns must produce distinct embedding tables"
@@ -686,7 +715,13 @@ async fn cross_modal_text_to_image_search() {
 
     // 1. Embed the image corpus with the OpenCLIP vision tower.
     session
-        .generate_image_embeddings("figures", &model_id, "image", "figure_id")
+        .generate_image_embeddings(
+            "figures",
+            &model_id,
+            "image",
+            "figure_id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
         .unwrap();
 

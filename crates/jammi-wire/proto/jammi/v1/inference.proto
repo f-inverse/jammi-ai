@@ -36,6 +36,32 @@ service InferenceService {
   rpc Predict(PredictRequest) returns (PredictResponse);
 }
 
+// Opt-in producer memoization, shared across the result-table producer verbs
+// (`Infer`, `GenerateEmbeddings`, `BuildNeighborGraph`, `PropagateEmbeddings`).
+// Mirrors the engine's `CachePolicy`. UNSPECIFIED maps to the engine default
+// (`Bypass`, always recompute) — the documented mapping, matching how every
+// other `*_UNSPECIFIED` arm here resolves to its engine default; an out-of-range
+// enum value is the loud `invalid_argument` the shared decoder builds, never a
+// silent fall-through.
+enum CachePolicy {
+  CACHE_POLICY_UNSPECIFIED = 0;
+  // Probe for an exact prior materialisation and reuse it instead of recomputing.
+  CACHE_POLICY_USE = 1;
+  // Always recompute (the explicit form of the default).
+  CACHE_POLICY_BYPASS = 2;
+}
+
+// Which path a producer took under a `CachePolicy`, so reuse is observable on
+// the wire, never inferred. Mirrors the engine's `CacheOutcome`. UNSPECIFIED is
+// never emitted by the engine; it is the wire-default a decoder rejects loudly.
+enum CacheOutcome {
+  CACHE_OUTCOME_UNSPECIFIED = 0;
+  // The producer ran its compute and materialised a new table.
+  CACHE_OUTCOME_COMPUTED = 1;
+  // An exact cache hit short-circuited the compute; the named table was reused.
+  CACHE_OUTCOME_REUSED = 2;
+}
+
 // Which model task `Infer` runs over the columns. Mirrors the engine's
 // `ModelTask` (`jammi-db`); the embedding variants encode to vectors, the
 // inference variants assign labels / extract entities.
@@ -63,6 +89,11 @@ message InferRequest {
   // Optional tenant scope override; if unset, the session's tenant
   // (set via SessionService.SetTenant) applies. Empty string == none.
   string tenant_id = 6;
+  // Opt-in memoization. UNSPECIFIED maps to the engine default (`Bypass`).
+  // Inference anchors its source `UnpinnedAtInstant`, so a `Use` request is
+  // honestly always a miss — the cache is off here until sources expose a
+  // version surface.
+  CachePolicy cache = 7;
 }
 
 message InferResponse {
@@ -70,6 +101,10 @@ message InferResponse {
   // (schema + batches) in `data_body`. Mirrors the `Vec<RecordBatch>` the
   // engine's `infer` returns; reuses TriggerService's `ArrowBatch` shape.
   jammi.v1.trigger.ArrowBatch result = 1;
+  // Which path the producer took. Always COMPUTED for inference (its unpinned
+  // source is never a sound cache hit), carried so the surface is uniform with
+  // the cacheable producers.
+  CacheOutcome cache_outcome = 2;
 }
 
 // Which direction a declared-edge gather follows an edge from the target's

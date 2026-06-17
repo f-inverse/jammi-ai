@@ -84,19 +84,23 @@ impl EmbeddingService for EmbeddingServer {
         let args = jammi_ai::wire::generate_embeddings_from_proto(request.into_inner())?;
         let session = self.local();
 
-        let record = scoped(&self.session, tenant, || {
+        let (record, outcome) = scoped(&self.session, tenant, || {
             session.generate_embeddings(
                 &args.source_id,
                 &args.model_id,
                 &args.columns,
                 &args.key_column,
                 args.modality,
+                args.cache,
             )
         })
         .await
         .map_err(map_engine_error)?;
 
-        Ok(Response::new(ResultTable::from(record)))
+        Ok(Response::new(jammi_wire::result_table_with_outcome(
+            record,
+            jammi_ai::wire::cache_outcome_to_proto(&outcome),
+        )))
     }
 
     #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]

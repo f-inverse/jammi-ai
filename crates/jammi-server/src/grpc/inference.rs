@@ -66,13 +66,14 @@ impl InferenceService for InferenceServer {
         let args = jammi_ai::wire::infer_from_proto(request.into_inner())?;
         let session = self.local();
 
-        let batches = scoped(&self.session, tenant, || {
+        let (batches, outcome) = scoped(&self.session, tenant, || {
             session.infer(
                 &args.source_id,
                 &args.model,
                 args.task,
                 &args.columns,
                 &args.key_column,
+                args.cache,
             )
         })
         .await
@@ -80,6 +81,7 @@ impl InferenceService for InferenceServer {
 
         Ok(Response::new(InferResponse {
             result: Some(infer_result_to_proto(batches)?),
+            cache_outcome: jammi_ai::wire::cache_outcome_to_proto(&outcome),
         }))
     }
 

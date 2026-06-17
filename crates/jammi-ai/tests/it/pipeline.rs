@@ -48,9 +48,11 @@ async fn generate_embeddings_produces_complete_result() {
             &tiny_bert_model(),
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     // Parquet file exists with rows
     assert!(record.row_count > 0);
@@ -136,14 +138,23 @@ async fn multiple_tables_and_sidecar_fallback() {
             &tiny_bert_model(),
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     let r2 = session
-        .generate_text_embeddings("patents", &tiny_bert_model(), &["title".to_string()], "id")
+        .generate_text_embeddings(
+            "patents",
+            &tiny_bert_model(),
+            &["title".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     // Two distinct tables
     assert_ne!(r1.table_name, r2.table_name);
@@ -201,9 +212,11 @@ async fn failed_rows_skipped_in_embedding_output() {
             &tiny_bert_model(),
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     // patents_with_nulls has 10 rows, 3 with null abstract
     assert!(
@@ -228,9 +241,11 @@ async fn infer_persists_results_to_parquet() {
             ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert!(!results.is_empty(), "Should return batches to caller");
 
@@ -272,6 +287,7 @@ async fn existing_tables_loaded_on_new_session() {
                 &tiny_bert_model(),
                 &["abstract".to_string()],
                 "id",
+                jammi_db::store::CachePolicy::Bypass,
             )
             .await
             .unwrap();
@@ -325,7 +341,13 @@ async fn concurrent_embedding_generation_on_same_source() {
     let model_a = model.clone();
     let task_a = tokio::spawn(async move {
         session_a
-            .generate_text_embeddings("patents", &model_a, &["title".to_string()], "id")
+            .generate_text_embeddings(
+                "patents",
+                &model_a,
+                &["title".to_string()],
+                "id",
+                jammi_db::store::CachePolicy::Bypass,
+            )
             .await
     });
 
@@ -333,13 +355,19 @@ async fn concurrent_embedding_generation_on_same_source() {
     let model_b = model.clone();
     let task_b = tokio::spawn(async move {
         session_b
-            .generate_text_embeddings("patents", &model_b, &["abstract".to_string()], "id")
+            .generate_text_embeddings(
+                "patents",
+                &model_b,
+                &["abstract".to_string()],
+                "id",
+                jammi_db::store::CachePolicy::Bypass,
+            )
             .await
     });
 
     let (result_a, result_b) = tokio::try_join!(task_a, task_b).unwrap();
-    let record_a = result_a.unwrap();
-    let record_b = result_b.unwrap();
+    let (record_a, _) = result_a.unwrap();
+    let (record_b, _) = result_b.unwrap();
 
     // Both completed successfully with status "ready"
     assert_eq!(record_a.status, "ready");
@@ -445,10 +473,59 @@ async fn large_batch_embedding_completes_without_oom() {
             &tiny_bert_model(),
             &["text".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert_eq!(record.row_count, 5000);
     assert_eq!(record.status, "ready");
+}
+
+// ─── Opt-in memoization: embeddings are honestly NEVER cacheable ─────────────
+//
+// An embedding pipeline anchors its raw source `UnpinnedAtInstant` (no version
+// surface in open-core), so `probe_cache` never hits: a `Use` request always
+// computes. The cache is honestly OFF here, not silently broken.
+
+#[tokio::test]
+async fn cache_use_on_embeddings_always_recomputes_unpinned_source() {
+    use jammi_db::store::{CacheOutcome, CachePolicy};
+
+    let (session, _dir) = session_with_patents().await;
+
+    let (first, first_outcome) = session
+        .generate_text_embeddings(
+            "patents",
+            &tiny_bert_model(),
+            &["abstract".to_string()],
+            "id",
+            CachePolicy::Use,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_outcome, CacheOutcome::Computed);
+
+    // A byte-identical second Use request still computes — the source is unpinned,
+    // so the probe is honestly always a miss and a fresh table is materialised.
+    let (second, second_outcome) = session
+        .generate_text_embeddings(
+            "patents",
+            &tiny_bert_model(),
+            &["abstract".to_string()],
+            "id",
+            CachePolicy::Use,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second_outcome,
+        CacheOutcome::Computed,
+        "an unpinned-anchored producer never reuses — caching is honestly off"
+    );
+    assert_ne!(
+        first.table_name, second.table_name,
+        "each Use embedding run materialises a fresh table (no reuse)"
+    );
 }

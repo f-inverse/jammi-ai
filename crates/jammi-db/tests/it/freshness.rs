@@ -659,6 +659,38 @@ async fn probe_cache_misses_on_a_one_bit_change() {
 }
 
 #[tokio::test]
+async fn probe_cache_record_returns_the_reusable_record_on_a_hit() {
+    // The producer-facing variant returns the full `ResultTableRecord` (not just
+    // the name) so a producer that short-circuits hands the reused record back
+    // without a second catalog read. On a hit it is the cached table's record;
+    // on a one-bit-changed probe it is `None`.
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog(dir.path()).await;
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = SessionContext::new();
+
+    let inputs = vec![InputAnchor::mutable_version("docs", 9)];
+    let (record, def) = materialize(&store, &ctx, inputs.clone()).await;
+
+    let hit = store
+        .probe_cache_record(&def, &inputs)
+        .await
+        .unwrap()
+        .expect("an exact match with extant bytes is a sound reuse");
+    assert_eq!(hit.table_name, record.table_name);
+    assert_eq!(hit.status, "ready");
+
+    let miss = store
+        .probe_cache_record(&def, &[InputAnchor::mutable_version("docs", 10)])
+        .await
+        .unwrap();
+    assert!(
+        miss.is_none(),
+        "a one-bit anchor change is a different key — no reusable record"
+    );
+}
+
+#[tokio::test]
 async fn probe_cache_never_hits_an_unpinned_request() {
     let dir = tempdir().unwrap();
     let catalog = fresh_catalog(dir.path()).await;

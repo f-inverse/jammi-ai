@@ -34,6 +34,7 @@ use tonic::transport::Endpoint;
 use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
+use jammi_db::store::{CacheOutcome, CachePolicy};
 use jammi_db::trigger::{DeliveredBatch, Offset, Predicate, TopicDefinition, TriggerError};
 use jammi_db::{AuditError, ModelTask, PerQueryAudit, TenantId};
 
@@ -203,7 +204,8 @@ impl DataClient {
         columns: &[String],
         key_column: &str,
         modality: Modality,
-    ) -> Result<ResultTableRecord> {
+        cache: CachePolicy,
+    ) -> Result<(ResultTableRecord, CacheOutcome)> {
         let table = self
             .embedding_client()
             .generate_embeddings(GenerateEmbeddingsRequest {
@@ -212,11 +214,15 @@ impl DataClient {
                 columns: columns.to_vec(),
                 key_column: key_column.to_string(),
                 modality: proto_modality(modality) as i32,
+                cache: proto_cache_policy(cache) as i32,
             })
             .await
             .map_err(|s| error_from_status(&s))?
             .into_inner();
-        result_table_from_proto(table).map_err(|s| error_from_status(&s))
+        let outcome = cache_outcome_from_proto(table.cache_outcome, &table.table_name)
+            .map_err(|s| error_from_status(&s))?;
+        let record = result_table_from_proto(table).map_err(|s| error_from_status(&s))?;
+        Ok((record, outcome))
     }
 
     /// Encode a single query into a vector with the given model.
@@ -285,7 +291,8 @@ impl DataClient {
         task: ModelTask,
         content_columns: &[String],
         key_column: &str,
-    ) -> Result<Vec<RecordBatch>> {
+        cache: CachePolicy,
+    ) -> Result<(Vec<RecordBatch>, CacheOutcome)> {
         let resp = self
             .inference_client()
             .infer(InferRequest {
@@ -295,12 +302,20 @@ impl DataClient {
                 columns: content_columns.to_vec(),
                 key_column: key_column.to_string(),
                 tenant_id: String::new(),
+                cache: proto_cache_policy(cache) as i32,
             })
             .await
             .map_err(|s| error_from_status(&s))?
             .into_inner();
+        // Inference's source is unpinned, so the outcome is always `Computed`; the
+        // reused-table name is irrelevant (a hit never happens), so an empty
+        // placeholder is honest for the decode's `Reused` arm.
+        let outcome =
+            cache_outcome_from_proto(resp.cache_outcome, "").map_err(|s| error_from_status(&s))?;
         let batch = resp.result.unwrap_or_default();
-        decode_ipc_stream(&batch.data_header, &batch.data_body).map_err(|s| error_from_status(&s))
+        let batches = decode_ipc_stream(&batch.data_header, &batch.data_body)
+            .map_err(|s| error_from_status(&s))?;
+        Ok((batches, outcome))
     }
 
     // --- fine-tune -------------------------------------------------------
@@ -565,6 +580,46 @@ impl DataClient {
             .map_err(|s| audit_error_from_status(&s))?
             .into_inner();
         resp.records.into_iter().map(record_from_wire).collect()
+    }
+}
+
+/// Map the engine [`CachePolicy`] onto the wire enum. Encode is total.
+fn proto_cache_policy(cache: CachePolicy) -> jammi_wire::proto::inference::CachePolicy {
+    use jammi_wire::proto::inference::CachePolicy as Pb;
+    match cache {
+        CachePolicy::Use => Pb::Use,
+        CachePolicy::Bypass => Pb::Bypass,
+    }
+}
+
+/// Decode the wire cache-outcome enum a producer response carries into the
+/// engine [`CacheOutcome`], so a remote caller observes reuse exactly as an
+/// in-process one does. `reused_table` is the table name the response also
+/// carries (the reused table on a hit); it is only read for the `Reused` arm.
+/// `UNSPECIFIED` is never emitted by a producer handler — a producer always
+/// reports `COMPUTED`/`REUSED` — so it is a loud decode error, never a silent
+/// default.
+///
+/// Latent gap (not reachable today): `InferResponse` carries no table-name
+/// field, so the inference call site decodes with an empty `reused_table`; a
+/// remote inference `Reused` would therefore lose the reused-table name. This
+/// is harmless now because inference anchors on an `UnpinnedAtInstant` source
+/// and so always reports `Computed` — but if a versioned source ever makes
+/// inference cacheable, the proto must grow a reused-table field for inference
+/// before its `Reused` arm can be honest.
+fn cache_outcome_from_proto(
+    outcome: i32,
+    reused_table: &str,
+) -> std::result::Result<CacheOutcome, tonic::Status> {
+    use jammi_wire::proto::inference::CacheOutcome as Pb;
+    match Pb::try_from(outcome) {
+        Ok(Pb::Computed) => Ok(CacheOutcome::Computed),
+        Ok(Pb::Reused) => Ok(CacheOutcome::Reused {
+            table: reused_table.to_string(),
+        }),
+        Ok(Pb::Unspecified) | Err(_) => Err(tonic::Status::internal(
+            "producer returned an unspecified cache outcome",
+        )),
     }
 }
 

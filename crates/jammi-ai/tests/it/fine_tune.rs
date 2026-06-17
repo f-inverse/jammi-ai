@@ -603,9 +603,16 @@ async fn audio_projection_head_fine_tune_changes_embeddings() {
 
     // Base audio embeddings over the corpus.
     let base_rec = session
-        .generate_audio_embeddings("audio_corpus", &model, "audio", "clip_id")
+        .generate_audio_embeddings(
+            "audio_corpus",
+            &model,
+            "audio",
+            "clip_id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     // Fine-tune a projection head on the audio triplets. Empty target_modules
     // → projection head on the frozen CLAP audio tower. Triplet loss; the epoch
@@ -659,9 +666,16 @@ async fn audio_projection_head_fine_tune_changes_embeddings() {
 
     // Tuned audio embeddings over the same corpus.
     let ft_rec = session
-        .generate_audio_embeddings("audio_corpus", job.model_id(), "audio", "clip_id")
+        .generate_audio_embeddings(
+            "audio_corpus",
+            job.model_id(),
+            "audio",
+            "clip_id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     // Eval audio→audio retrieval for both, against the held-out golden set.
     let base_metrics = session
@@ -1148,9 +1162,16 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
 
     // Generate base embeddings
     let base_rec = session
-        .generate_text_embeddings("patents", &model, &["abstract".to_string()], "id")
+        .generate_text_embeddings(
+            "patents",
+            &model,
+            &["abstract".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     // Fine-tune with LoRA. The tiny 32-dim model needs enough total
     // gradient to shift LoRA's zero-initialized B matrix away from the
@@ -1184,9 +1205,16 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
 
     // Generate embeddings with the fine-tuned model
     let ft_rec = session
-        .generate_text_embeddings("patents", job.model_id(), &["abstract".to_string()], "id")
+        .generate_text_embeddings(
+            "patents",
+            job.model_id(),
+            &["abstract".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     // Eval base embeddings against golden relevance
     let base_metrics = session

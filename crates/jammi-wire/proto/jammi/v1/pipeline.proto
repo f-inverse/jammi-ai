@@ -147,6 +147,10 @@ message BuildNeighborGraphRequest {
   // Optional specific embedding table to build the graph over; unset resolves
   // the source's default embedding table.
   optional string table = 6;
+  // Opt-in memoization. UNSPECIFIED maps to the engine default (`Bypass`). A
+  // neighbour-graph is anchored on the immutable source-table digest, so it is
+  // genuinely cacheable: a `Use` request reuses an exact prior build.
+  jammi.v1.inference.CachePolicy cache = 7;
 }
 
 // Which neighbour-contribution normalisation a propagation hop uses. Mirrors the
@@ -210,6 +214,11 @@ message PropagateEmbeddingsRequest {
   optional double alpha = 8;
   // What the propagation emits.
   PropagationOutput output = 9;
+  // Opt-in memoization. UNSPECIFIED maps to the engine default (`Bypass`). A
+  // propagation is anchored on the immutable source-embedding-table and
+  // edge-relation digests, so it is genuinely cacheable: a `Use` request reuses
+  // an exact prior run.
+  jammi.v1.inference.CachePolicy cache = 10;
 }
 
 // Which permutation-invariant reduction the context-set encoder pools with.

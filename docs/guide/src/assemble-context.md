@@ -116,15 +116,19 @@ table, with its own sidecar ANN index:
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
 # use jammi_ai::pipeline::context_set::{ContextRequest, MaterializedContext};
+# use jammi_db::store::CachePolicy;
 # async fn ex(session: &std::sync::Arc<InferenceSession>, rows: Vec<(String, Vec<f32>)>) -> jammi_db::error::Result<()> {
 // The recipe carries *how* every row was pooled — the source, candidate set,
 // value columns, aggregator, self-exclusion, and split — and names the source.
 let recipe = ContextRequest::new("patents", vec![0.0_f32; 32], 5);
-let table = session
-    .materialize_context(MaterializedContext { rows: &rows, dimensions: 32, recipe: &recipe })
+let (table, _outcome) = session
+    .materialize_context(
+        MaterializedContext { rows: &rows, dimensions: 32, recipe: &recipe },
+        CachePolicy::Bypass,
+    )
     .await?;
 // `table` is a normal embedding result table: search it, join it, index it.
-let _ = table;
+println!("materialised context table: {}", table.table_name);
 # Ok(()) }
 ```
 

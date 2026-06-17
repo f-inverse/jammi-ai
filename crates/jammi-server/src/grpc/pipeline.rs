@@ -58,19 +58,23 @@ impl PipelineService for PipelineServer {
         let tenant = session_tenant_traced(&request);
         let args = build_neighbor_graph_from_proto(request.into_inner())?;
 
-        let record = scoped(&self.session, tenant, || async {
+        let (record, outcome) = scoped(&self.session, tenant, || async {
             self.session
                 .build_neighbor_graph(
                     &args.source_id,
                     args.embedding_table.as_deref(),
                     &args.params,
+                    args.cache,
                 )
                 .await
         })
         .await
         .map_err(map_engine_error)?;
 
-        Ok(Response::new(record.into()))
+        Ok(Response::new(jammi_wire::result_table_with_outcome(
+            record,
+            jammi_ai::wire::cache_outcome_to_proto(&outcome),
+        )))
     }
 
     #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
@@ -79,15 +83,18 @@ impl PipelineService for PipelineServer {
         request: Request<PropagateEmbeddingsRequest>,
     ) -> Result<Response<ResultTable>, Status> {
         let tenant = session_tenant_traced(&request);
-        let req = propagate_request_from_proto(request.into_inner())?;
+        let (req, cache) = propagate_request_from_proto(request.into_inner())?;
 
-        let record = scoped(&self.session, tenant, || async {
-            self.session.propagate_embeddings(&req).await
+        let (record, outcome) = scoped(&self.session, tenant, || async {
+            self.session.propagate_embeddings(&req, cache).await
         })
         .await
         .map_err(map_engine_error)?;
 
-        Ok(Response::new(record.into()))
+        Ok(Response::new(jammi_wire::result_table_with_outcome(
+            record,
+            jammi_ai::wire::cache_outcome_to_proto(&outcome),
+        )))
     }
 
     #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]

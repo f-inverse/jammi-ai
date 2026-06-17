@@ -81,17 +81,18 @@ space** — do not search it against the original `d`-dimensional vectors.
 # use jammi_db::config::JammiConfig;
 use jammi_ai::pipeline::graph_neighbourhood::{EdgeDirection, EdgeSourceRef};
 use jammi_ai::pipeline::graph_propagation::{PropagateRequest, PropagationWeighting};
+use jammi_db::store::CachePolicy;
 # async fn ex(config: JammiConfig, model_id: &str) -> jammi_db::error::Result<()> {
 # let session = Arc::new(InferenceSession::new(config).await?);
 
 // Embed the documents first (any embedding model).
 session
-    .generate_text_embeddings("papers", model_id, &["abstract".into()], "id")
+    .generate_text_embeddings("papers", model_id, &["abstract".into()], "id", CachePolicy::Bypass)
     .await?;
 
 // Propagate over a declared citation edge source (src/dst are the paper ids,
 // which are the embedding keys). Citations are undirected for smoothing.
-let propagated = session
+let (propagated, _outcome) = session
     .propagate_embeddings(
         &PropagateRequest::new(
             "papers",
@@ -107,6 +108,7 @@ let propagated = session
         .with_direction(EdgeDirection::Undirected)
         .with_weighting(PropagationWeighting::DegreeNormalized)
         .with_hops(2),
+        CachePolicy::Bypass,
     )
     .await?;
 
@@ -137,17 +139,20 @@ Jammi itself builds — pass its table name as the edge source:
 # use jammi_db::config::JammiConfig;
 use jammi_ai::pipeline::graph_neighbourhood::EdgeSourceRef;
 use jammi_ai::pipeline::graph_propagation::PropagateRequest;
+use jammi_db::store::CachePolicy;
 # async fn ex(config: JammiConfig, graph_table: &str) -> jammi_db::error::Result<()> {
 # let session = Arc::new(InferenceSession::new(config).await?);
-let propagated = session
-    .propagate_embeddings(&PropagateRequest::new(
-        "items",
-        EdgeSourceRef::NeighborGraph {
-            table_name: graph_table.into(),
-        },
-    ))
+let (_propagated, _outcome) = session
+    .propagate_embeddings(
+        &PropagateRequest::new(
+            "items",
+            EdgeSourceRef::NeighborGraph {
+                table_name: graph_table.into(),
+            },
+        ),
+        CachePolicy::Bypass,
+    )
     .await?;
-# let _ = propagated;
 # Ok(())
 # }
 ```

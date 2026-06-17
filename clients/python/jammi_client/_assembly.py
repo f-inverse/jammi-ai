@@ -66,6 +66,21 @@ def _modality_value(modality: Optional[str]) -> int:
         ) from None
 
 
+def _cache_policy_value(cache: Optional[str]) -> int:
+    """Resolve a `cache=` argument to its wire `CachePolicy` enum.
+
+    `None` (the default) and ``"bypass"`` both resolve to the engine default
+    (always recompute); ``"use"`` opts into memoization. Any other string is a
+    loud `ValueError`, never a silent default — the same honesty the engine's
+    decode keeps for an out-of-range enum.
+    """
+    if cache is None or cache == "bypass":
+        return inference_pb2.CachePolicy.CACHE_POLICY_BYPASS
+    if cache == "use":
+        return inference_pb2.CachePolicy.CACHE_POLICY_USE
+    raise ValueError(f"cache must be 'use' or 'bypass' (got {cache!r})")
+
+
 def _local_source_url(url: str) -> str:
     """Normalise a bare local path into a `file://` URL.
 
@@ -759,13 +774,16 @@ def build_infer_request(
     columns: List[str],
     task: str,
     key: str,
+    cache: Optional[str] = None,
 ) -> inference_pb2.InferRequest:
     """Assemble the `InferRequest` for a bulk inference run from the binding's
     flat kwargs.
 
     `task` is the snake-case model-task string the wire `ModelTask` enum carries;
-    `key` names the column whose value becomes each output row's `_row_id`. The
-    same request the embed binding submits in-process.
+    `key` names the column whose value becomes each output row's `_row_id`;
+    `cache` opts into memoization (``"use"``) or keeps the default recompute
+    (``None``/``"bypass"``). The same request the embed binding submits
+    in-process.
     """
     return inference_pb2.InferRequest(
         source_id=source,
@@ -773,6 +791,7 @@ def build_infer_request(
         task=_MODEL_TASK[task],
         columns=list(columns),
         key_column=key,
+        cache=_cache_policy_value(cache),
     )
 
 
@@ -784,19 +803,23 @@ def build_neighbor_graph_request(
     mutual: bool = False,
     exact: bool = False,
     table: Optional[str] = None,
+    cache: Optional[str] = None,
 ) -> pipeline_pb2.BuildNeighborGraphRequest:
     """Assemble the `BuildNeighborGraphRequest` for a k-NN graph materialisation
     from the binding's flat kwargs.
 
     The optional `min_similarity` floor and `table` selector carry explicit
-    presence — left unset when omitted so the engine resolves the default. The
-    same request the embed binding submits in-process.
+    presence — left unset when omitted so the engine resolves the default.
+    `cache` opts into memoization (``"use"``) or keeps the default recompute
+    (``None``/``"bypass"``). The same request the embed binding submits
+    in-process.
     """
     request = pipeline_pb2.BuildNeighborGraphRequest(
         source_id=source,
         k=k,
         mutual=mutual,
         exact=exact,
+        cache=_cache_policy_value(cache),
     )
     if min_similarity is not None:
         request.min_similarity = min_similarity
@@ -819,6 +842,7 @@ def build_propagate_embeddings_request(
     weighting: Optional[str] = None,
     alpha: Optional[float] = None,
     output: Optional[str] = None,
+    cache: Optional[str] = None,
 ) -> pipeline_pb2.PropagateEmbeddingsRequest:
     """Assemble the `PropagateEmbeddingsRequest` for a feature-propagation pass
     from the binding's flat kwargs.
@@ -834,7 +858,10 @@ def build_propagate_embeddings_request(
             "pass exactly one of edge_graph_table (S9 graph) or edge_source "
             "(registered edges), not both"
         )
-    request = pipeline_pb2.PropagateEmbeddingsRequest(source_id=source)
+    request = pipeline_pb2.PropagateEmbeddingsRequest(
+        source_id=source,
+        cache=_cache_policy_value(cache),
+    )
     if edge_graph_table is not None:
         request.edge_graph_table = edge_graph_table
     elif edge_source is not None:
@@ -1028,13 +1055,16 @@ def build_generate_embeddings_request(
     columns: List[str],
     key: str,
     modality: Optional[str] = None,
+    cache: Optional[str] = None,
 ) -> embedding_pb2.GenerateEmbeddingsRequest:
     """Assemble the `GenerateEmbeddingsRequest` for a bulk embedding run from the
     binding's flat kwargs.
 
     `modality` selects the tower (`"text"`/`"image"`/`"audio"`, defaulting to
-    text); `key` names the column whose value becomes each embedding row's key.
-    The same request the embed binding submits in-process.
+    text); `key` names the column whose value becomes each embedding row's key;
+    `cache` opts into memoization (``"use"``) or keeps the default recompute
+    (``None``/``"bypass"``). The same request the embed binding submits
+    in-process.
     """
     return embedding_pb2.GenerateEmbeddingsRequest(
         source_id=source,
@@ -1042,6 +1072,7 @@ def build_generate_embeddings_request(
         columns=list(columns),
         key_column=key,
         modality=_modality_value(modality),
+        cache=_cache_policy_value(cache),
     )
 
 

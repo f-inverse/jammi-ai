@@ -567,7 +567,9 @@ pub async fn fold_digest(
     let edges = build_edges(&nodes, spec.fan_out);
     let (session, _dir) = graph_session(&nodes, &edges, spec.dim, target_partitions).await?;
     let request = build_request(&session, hops, alpha).await?;
-    let table = session.propagate_embeddings(&request).await?;
+    let (table, _) = session
+        .propagate_embeddings(&request, jammi_db::store::CachePolicy::Bypass)
+        .await?;
     let rows = read_sorted_vectors(&session, &table).await?;
     Ok(digest(&rows))
 }
@@ -589,7 +591,9 @@ async fn measure_latency(
     let request = build_request(&session, spec.hops, spec.alpha).await?;
 
     let start = Instant::now();
-    let _table = session.propagate_embeddings(&request).await?;
+    let _table = session
+        .propagate_embeddings(&request, jammi_db::store::CachePolicy::Bypass)
+        .await?;
     let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
 
     Ok(PropagateLatency {

@@ -52,6 +52,7 @@ async fn session_with_embeddings() -> (Arc<InferenceSession>, TempDir) {
             &tiny_bert_model(),
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
         .unwrap();
@@ -246,13 +247,17 @@ async fn materialize_context_writes_a_searchable_embedding_table() {
 
     let recipe = ContextRequest::new("patents", vec![0.0_f32; 32], 5);
     let table = session
-        .materialize_context(MaterializedContext {
-            rows: &rows,
-            dimensions: 32,
-            recipe: &recipe,
-        })
+        .materialize_context(
+            MaterializedContext {
+                rows: &rows,
+                dimensions: 32,
+                recipe: &recipe,
+            },
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert_eq!(table.row_count, 3);
     assert_eq!(table.dimensions, Some(32));
@@ -275,11 +280,14 @@ async fn materialize_context_rejects_duplicate_target_keys() {
     ];
     let recipe = ContextRequest::new("patents", vec![0.0_f32; 32], 5);
     let err = session
-        .materialize_context(MaterializedContext {
-            rows: &rows,
-            dimensions: 32,
-            recipe: &recipe,
-        })
+        .materialize_context(
+            MaterializedContext {
+                rows: &rows,
+                dimensions: 32,
+                recipe: &recipe,
+            },
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
         .expect_err("a target key must be unique in a context table");
     assert!(err.to_string().contains("duplicate target key"));

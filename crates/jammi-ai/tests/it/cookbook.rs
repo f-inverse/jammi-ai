@@ -161,9 +161,16 @@ async fn recipe_generate_embeddings() {
 
     // Basic generate_embeddings (cookbook recipe)
     let record = session
-        .generate_text_embeddings("patents", &model_id, &["abstract".to_string()], "id")
+        .generate_text_embeddings(
+            "patents",
+            &model_id,
+            &["abstract".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert_eq!(record.status, "ready");
     assert!(record.row_count > 0);
@@ -198,9 +205,11 @@ async fn recipe_generate_embeddings() {
             ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert!(!raw.is_empty());
     assert!(raw[0].schema().field_with_name("_status").is_ok());
     assert!(raw[0].schema().field_with_name("vector").is_ok());
@@ -212,9 +221,11 @@ async fn recipe_generate_embeddings() {
             &model_id,
             &["title".to_string(), "abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(multi.status, "ready");
     assert!(multi.row_count > 0);
 }
@@ -241,7 +252,13 @@ async fn recipe_semantic_search() {
         .unwrap();
 
     session
-        .generate_text_embeddings("patents", &model_id, &["abstract".to_string()], "id")
+        .generate_text_embeddings(
+            "patents",
+            &model_id,
+            &["abstract".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
         .unwrap();
 
@@ -337,7 +354,13 @@ async fn recipe_enrich_results() {
         .unwrap();
 
     session
-        .generate_text_embeddings("patents", &model_id, &["abstract".to_string()], "id")
+        .generate_text_embeddings(
+            "patents",
+            &model_id,
+            &["abstract".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
         .unwrap();
 
@@ -471,9 +494,16 @@ async fn recipe_fine_tune() {
         .unwrap();
 
     let record = session
-        .generate_text_embeddings("patents", ft_model_id, &["abstract".into()], "id")
+        .generate_text_embeddings(
+            "patents",
+            ft_model_id,
+            &["abstract".into()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(record.status, "ready");
     assert!(record.row_count > 0);
 
@@ -522,9 +552,16 @@ async fn recipe_evaluation() {
 
     // Generate embeddings first
     let record = session
-        .generate_text_embeddings("patents", &model_id, &["abstract".to_string()], "id")
+        .generate_text_embeddings(
+            "patents",
+            &model_id,
+            &["abstract".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     // eval_embeddings (cookbook recipe)
     let metrics = session
@@ -549,9 +586,16 @@ async fn recipe_evaluation() {
 
     // eval_compare with two embedding tables (cookbook recipe)
     let record2 = session
-        .generate_text_embeddings("patents", &model_id, &["title".to_string()], "id")
+        .generate_text_embeddings(
+            "patents",
+            &model_id,
+            &["title".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     let comparison = session
         .eval_compare(
@@ -597,9 +641,16 @@ async fn recipe_modernbert_embeddings() {
 
     // generate_embeddings — same API as BERT, different model
     let record = session
-        .generate_text_embeddings("patents", &model_id, &["abstract".to_string()], "id")
+        .generate_text_embeddings(
+            "patents",
+            &model_id,
+            &["abstract".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert_eq!(record.status, "ready");
     assert!(record.row_count > 0);
@@ -715,7 +766,13 @@ async fn recipe_model_management() {
 
     // Generate embeddings — auto-registers the model
     session
-        .generate_text_embeddings("patents", &tiny_bert_id(), &["abstract".to_string()], "id")
+        .generate_text_embeddings(
+            "patents",
+            &tiny_bert_id(),
+            &["abstract".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
         .unwrap();
 
@@ -743,6 +800,7 @@ async fn recipe_model_management() {
             &tiny_modernbert_id(),
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
         .unwrap();
@@ -781,9 +839,11 @@ async fn recipe_classification_inference() {
             ModelTask::Classification,
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert!(!results.is_empty());
     let batch = &results[0];
@@ -881,9 +941,11 @@ async fn recipe_ner_inference() {
             ModelTask::Ner,
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert!(!results.is_empty());
     let batch = &results[0];
@@ -1061,9 +1123,16 @@ async fn recipe_generate_image_embeddings() {
 
     // Generate image embeddings
     let record = session
-        .generate_image_embeddings("figures", &model_id, "image", "figure_id")
+        .generate_image_embeddings(
+            "figures",
+            &model_id,
+            "image",
+            "figure_id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert_eq!(record.status, "ready");
     assert_eq!(record.row_count, 5);
@@ -1206,9 +1275,16 @@ async fn recipe_generate_audio_embeddings() {
 
     // Generate audio embeddings (decode -> resample -> log-mel -> forward).
     let record = session
-        .generate_audio_embeddings("clips", &model_id, "audio", "clip_id")
+        .generate_audio_embeddings(
+            "clips",
+            &model_id,
+            "audio",
+            "clip_id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert_eq!(record.status, "ready");
     assert_eq!(record.row_count, 3);

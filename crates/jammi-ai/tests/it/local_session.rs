@@ -58,9 +58,11 @@ async fn local_session_matches_engine_for_embed_and_search() {
             &["abstract".to_string()],
             "id",
             Modality::Text,
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(record.status, "ready");
     assert!(record.row_count > 0);
 
@@ -111,6 +113,7 @@ async fn local_session_encode_and_search_by_row_key_match_engine() {
             &["abstract".to_string()],
             "id",
             Modality::Text,
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
         .unwrap();

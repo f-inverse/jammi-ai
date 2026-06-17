@@ -54,6 +54,7 @@
 //! subcommands on a representative box and fails on the exit code is a tracked
 //! perf-SLO follow-up (the §4.4 front-barrier), not yet wired.
 
+mod cache_slo;
 mod conformal;
 mod context_predictor;
 mod corpus;
@@ -298,6 +299,16 @@ enum Command {
     /// re-serves. Not a CI step — the provenance-recording rebuilder.
     #[command(hide = true)]
     RebuildModelInferenceSpec,
+    /// The CPU-hermetic cache-hit SLO tier: drives the engine's opt-in producer
+    /// memoization (`CachePolicy::Use`) on a cacheable producer (the
+    /// neighbour-graph, anchored on the immutable source-table `ResultDigest`).
+    /// Times a cold `Use` build (nothing cached → the full compute) against a warm
+    /// `Use` hit (the top-of-producer probe short-circuits the whole build) and
+    /// gates that the hit cleared the committed minimum speed-up — the portable
+    /// property of skipping the work, not a machine-dependent absolute. Emits the
+    /// JSON report with the `cache_slo` tier set and exits non-zero if the warm hit
+    /// did not short-circuit (wrong outcome) or did not clear the floor.
+    CacheSloScale,
 }
 
 #[tokio::main]
@@ -340,6 +351,57 @@ async fn main() -> std::process::ExitCode {
         Command::RebuildContextPredictorSpec => run_rebuild_context_predictor_spec().await,
         Command::ModelInferenceScale => run_model_inference_scale().await,
         Command::RebuildModelInferenceSpec => run_rebuild_model_inference_spec().await,
+        Command::CacheSloScale => run_cache_slo_scale().await,
+    }
+}
+
+/// The `cache-slo-scale` subcommand: load the committed spec, run the tier (cold
+/// vs warm `Use` neighbour-graph build), emit the report, and exit non-zero if
+/// the warm hit did not clear the committed speed-up floor (or did not actually
+/// short-circuit — `run` errors in that case).
+async fn run_cache_slo_scale() -> std::process::ExitCode {
+    let spec = match cache_slo::CacheSloSpec::load() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cache-slo-scale could not load the committed spec: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let tier = match cache_slo::run(&spec).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("cache-slo-scale run failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let passed = cache_slo::gate_passed(&tier);
+    let report = Report {
+        engine_version: ENGINE_VERSION,
+        host: Host::detect(),
+        subcommand: "cache-slo-scale",
+        tiers: Tiers {
+            arxiv: None,
+            binding: None,
+            recall_sweep: None,
+            training: None,
+            conformal: None,
+            eval: None,
+            propagate: None,
+            graph_train: None,
+            context_predictor: None,
+            model_inference: None,
+            cache_slo: Some(tier),
+        },
+    };
+    emit(&report);
+    if passed {
+        std::process::ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "the cache hit did NOT clear the committed speed-up floor — the \
+             top-of-producer probe did not short-circuit; see tiers.cache_slo.speedup"
+        );
+        std::process::ExitCode::FAILURE
     }
 }
 
@@ -429,6 +491,7 @@ async fn run_train_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
+            cache_slo: None,
         },
     };
     emit(&report);
@@ -488,6 +551,7 @@ fn run_conformal_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
+            cache_slo: None,
         },
     };
     emit(&report);
@@ -537,6 +601,7 @@ fn run_eval_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
+            cache_slo: None,
         },
     };
     emit(&report);
@@ -587,6 +652,7 @@ async fn run_propagate_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
+            cache_slo: None,
         },
     };
     emit(&report);
@@ -793,6 +859,7 @@ fn run_graph_train_scale() -> std::process::ExitCode {
             graph_train: Some(tier),
             context_predictor: None,
             model_inference: None,
+            cache_slo: None,
         },
     };
     emit(&report);
@@ -890,6 +957,7 @@ async fn run_context_predictor_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: Some(tier),
             model_inference: None,
+            cache_slo: None,
         },
     };
     emit(&report);
@@ -994,6 +1062,7 @@ async fn run_model_inference_scale() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: Some(tier),
+            cache_slo: None,
         },
     };
     emit(&report);
@@ -1105,6 +1174,7 @@ async fn run_search_rss() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
+            cache_slo: None,
         },
     };
     emit(&report);
@@ -1156,6 +1226,7 @@ async fn run_arxiv() -> std::process::ExitCode {
             graph_train: None,
             context_predictor: None,
             model_inference: None,
+            cache_slo: None,
         },
     };
     emit(&report);
@@ -1213,6 +1284,7 @@ async fn run_recall_sweep(
             graph_train: None,
             context_predictor: None,
             model_inference: None,
+            cache_slo: None,
         },
     };
     emit(&report);

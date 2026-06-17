@@ -31,6 +31,10 @@ pub struct InferArgs {
     pub task: ModelTask,
     pub columns: Vec<String>,
     pub key_column: String,
+    /// The opt-in memoization policy (the engine method's `cache` arg). Inference
+    /// anchors its source `UnpinnedAtInstant`, so `Use` is honestly always a
+    /// miss; the field rides for surface uniformity with the cacheable producers.
+    pub cache: jammi_db::store::CachePolicy,
 }
 
 /// Decode a serialized [`pb::InferRequest`] body into the engine [`InferArgs`].
@@ -68,6 +72,7 @@ pub fn infer_from_proto(req: pb::InferRequest) -> Result<InferArgs, Status> {
         task: model_task_from_proto(req.task)?,
         columns: req.columns,
         key_column: req.key_column,
+        cache: crate::wire::cache_policy_from_proto(req.cache)?,
     })
 }
 

@@ -66,16 +66,17 @@ to run on very large tables).
 # use jammi_ai::session::InferenceSession;
 # use jammi_db::config::JammiConfig;
 use jammi_ai::pipeline::neighbor_graph::BuildNeighborGraph;
+use jammi_db::store::CachePolicy;
 # async fn ex(config: JammiConfig, model_id: &str) -> jammi_db::error::Result<()> {
 # let session = Arc::new(InferenceSession::new(config).await?);
 
 // Embed the corpus first (any embedding model).
 session
-    .generate_text_embeddings("patents", model_id, &["abstract".into()], "id")
+    .generate_text_embeddings("patents", model_id, &["abstract".into()], "id", CachePolicy::Bypass)
     .await?;
 
 // Materialize the kNN graph, keeping only strong, reciprocal edges.
-let edges = session
+let (edges, _outcome) = session
     .build_neighbor_graph(
         "patents",
         None, // resolve the latest embedding table
@@ -85,6 +86,7 @@ let edges = session
             mutual: true,              // both rows agree they are neighbours
             ..Default::default()
         },
+        CachePolicy::Bypass,
     )
     .await?;
 

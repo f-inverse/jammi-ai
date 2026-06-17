@@ -8,6 +8,7 @@ use datafusion::catalog::TableProvider;
 use futures::Stream;
 
 use crate::catalog::backend::{BackendError, Transaction, TxOptions};
+use crate::catalog::mutable_repo::{delete_mutable_table_rows, MutableRowPayload};
 use crate::catalog::Catalog;
 use crate::store::mutable::definition::{
     MutableTableDefinition, MutableTableError, MutableTableId,
@@ -39,37 +40,43 @@ impl MutableTableRegistry {
         }
     }
 
-    /// Register a mutable table. Atomically: catalog row + storage table +
-    /// secondary indexes commit together; nothing lands if any step fails.
+    /// Shared handle to the DDL/DML-rendering backend. Lets the trigger-stream
+    /// [`TopicRepo`](crate::catalog::topic_repo::TopicRepo) provision a backing
+    /// table inside its own topic-row transaction via `register_in_tx` /
+    /// `drop_in_tx` without going through [`Self::register`] (which would open
+    /// a second transaction).
+    pub fn backend_arc(&self) -> Arc<dyn MutableBackend> {
+        Arc::clone(&self.backend)
+    }
+
+    /// Register a mutable table. The catalog registration row, its index rows,
+    /// the storage `CREATE TABLE`, and the secondary-index DDL all run in ONE
+    /// backend transaction via `register_in_tx`. The mutable storage tables
+    /// live in the catalog's own database, so a single transaction spans both
+    /// the catalog row and the backing table: either every step commits or
+    /// nothing lands. A crash mid-register can never leave a catalog row without
+    /// its backing table, or a backing table without its catalog row.
     pub async fn register(
         &self,
         def: MutableTableDefinition,
     ) -> Result<Arc<dyn TableProvider>, MutableTableError> {
-        // 1) Catalog row + index rows (their own transaction inside the repo).
-        self.catalog.create_mutable_table(&def).await?;
-
-        // 2) Storage table + secondary indexes in one backend transaction.
-        let ddl = self.backend.create_table_ddl(&def);
-        let index_ddls: Vec<String> = def
-            .indexes
-            .iter()
-            .map(|idx| self.backend.create_index_ddl(&def, idx))
-            .collect();
-
+        let def = Arc::new(def);
+        let def_for_tx = Arc::clone(&def);
+        let backend = Arc::clone(&self.backend);
         self.backend
             .catalog_backend()
             .transaction(TxOptions::default(), move |tx| {
                 Box::pin(async move {
-                    tx.execute(&ddl, &[]).await?;
-                    for stmt in index_ddls {
-                        tx.execute(&stmt, &[]).await?;
-                    }
+                    register_in_tx(backend.as_ref(), tx, &def_for_tx)
+                        .await
+                        .map_err(map_mutable_err)?;
+                    #[cfg(feature = "test-hooks")]
+                    crate::store::mutable::test_hook::maybe_signal_lifecycle("register").await;
                     Ok(())
                 })
             })
             .await?;
 
-        let def = Arc::new(def);
         Ok(Arc::new(MutableTableProvider::new(
             def,
             Arc::clone(&self.backend),
@@ -77,26 +84,34 @@ impl MutableTableRegistry {
         )))
     }
 
-    /// Drop a mutable table: backend `DROP TABLE` then delete catalog row.
+    /// Drop a mutable table: storage `DROP TABLE` + catalog-row delete in ONE
+    /// backend transaction via `drop_in_tx`. The storage table and the
+    /// catalog/index rows share the catalog's database, so both vanish together
+    /// or neither does — a crash mid-drop never strands a catalog row pointing
+    /// at a missing table.
     pub async fn drop_table(&self, id: &MutableTableId) -> Result<(), MutableTableError> {
         let def = self
             .catalog
             .get_mutable_table(id)
             .await?
             .ok_or_else(|| MutableTableError::NotFound(id.clone()))?;
-
-        let ddl = self.backend.drop_table_ddl(&def);
+        // Resolve tenant once, outside the closure, so the strict delete
+        // predicate carries the session's scope into the transaction.
+        let tenant = self.catalog.current_tenant();
+        let backend = Arc::clone(&self.backend);
         self.backend
             .catalog_backend()
             .transaction(TxOptions::default(), move |tx| {
                 Box::pin(async move {
-                    tx.execute(&ddl, &[]).await?;
+                    drop_in_tx(backend.as_ref(), tx, &def, tenant)
+                        .await
+                        .map_err(map_mutable_err)?;
+                    #[cfg(feature = "test-hooks")]
+                    crate::store::mutable::test_hook::maybe_signal_lifecycle("drop_table").await;
                     Ok(())
                 })
             })
             .await?;
-
-        self.catalog.delete_mutable_table(id).await?;
         Ok(())
     }
 
@@ -273,6 +288,62 @@ impl MutableTableRegistry {
             vec![batch]
         };
         Ok(Box::pin(futures::stream::iter(batches.into_iter().map(Ok))))
+    }
+}
+
+/// Provision a mutable table inside an already-open transaction: write the
+/// catalog registration row + index rows, then the storage `CREATE TABLE` and
+/// its secondary-index DDL. Does NOT commit — the caller's transaction owns
+/// commit/rollback.
+///
+/// Shared primitive behind [`MutableTableRegistry::register`] (which wraps it
+/// in its own transaction) and
+/// [`TopicRepo::register_topic`](crate::catalog::topic_repo::TopicRepo::register_topic)
+/// (which shares the topic-row transaction). Because the mutable storage tables
+/// live in the catalog's own database, one transaction spans the catalog row
+/// and the backing table — they commit or roll back together.
+pub(crate) async fn register_in_tx(
+    backend: &dyn MutableBackend,
+    tx: &mut Transaction<'_>,
+    def: &MutableTableDefinition,
+) -> Result<(), MutableTableError> {
+    let payload = MutableRowPayload::encode(def, backend.catalog_backend().backend_kind())?;
+    // Catalog registration row + index rows first.
+    payload.write(tx).await?;
+    // Then the backing storage table + its secondary indexes.
+    tx.execute(&backend.create_table_ddl(def), &[]).await?;
+    for idx in &def.indexes {
+        tx.execute(&backend.create_index_ddl(def, idx), &[]).await?;
+    }
+    Ok(())
+}
+
+/// Drop a mutable table inside an already-open transaction: storage
+/// `DROP TABLE` then catalog-row + index-row delete (strict tenant scope).
+/// Does NOT commit — the caller's transaction owns commit/rollback.
+///
+/// Shared primitive behind [`MutableTableRegistry::drop_table`] and
+/// [`TopicRepo::drop_topic`](crate::catalog::topic_repo::TopicRepo::drop_topic).
+pub(crate) async fn drop_in_tx(
+    backend: &dyn MutableBackend,
+    tx: &mut Transaction<'_>,
+    def: &MutableTableDefinition,
+    tenant: Option<TenantId>,
+) -> Result<(), MutableTableError> {
+    tx.execute(&backend.drop_table_ddl(def), &[]).await?;
+    delete_mutable_table_rows(tx, def.id.as_str(), tenant).await?;
+    Ok(())
+}
+
+/// Flatten a [`MutableTableError`] into a [`BackendError`] so an `*_in_tx`
+/// helper's error can propagate out of a `CatalogBackend::transaction` closure
+/// (whose error type is `BackendError`) and trigger rollback. A `Backend`
+/// variant passes through unwrapped; any other variant (schema/JSON encode
+/// failure) is surfaced as [`BackendError::Execution`].
+fn map_mutable_err(e: MutableTableError) -> BackendError {
+    match e {
+        MutableTableError::Backend(b) => b,
+        other => BackendError::Execution(other.to_string()),
     }
 }
 

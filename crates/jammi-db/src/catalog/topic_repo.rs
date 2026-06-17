@@ -16,7 +16,7 @@ use arrow_schema::{DataType, Field, Schema};
 
 use crate::catalog::backend::{BackendError, Row, SqlValue, TxOptions};
 use crate::catalog::Catalog;
-use crate::source::mutable::MutableTableRegistry;
+use crate::source::mutable::{drop_in_tx, register_in_tx, MutableTableRegistry};
 use crate::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
 use crate::tenant::TenantId;
 use crate::trigger::error::TriggerError;
@@ -38,33 +38,36 @@ impl TopicRepo {
         Self { catalog, mutable }
     }
 
-    /// Register a topic: insert the `topics` row and provision the Phase-2
-    /// backing table. The backing table is registered via the mutable-table
-    /// registry, which runs its own transaction; on failure the partial
-    /// topics-row insert is rolled back via the engine's higher-level
-    /// transaction so the catalog stays consistent.
+    /// Register a topic: provision the Phase-2 backing mutable table and insert
+    /// the `topics` row in ONE backend transaction. The backing
+    /// `mutable_tables` row, its `CREATE TABLE` DDL, and the `topics` row all
+    /// commit together — the mutable storage table lives in the catalog's own
+    /// database, so one transaction spans both. A crash mid-register leaves
+    /// either nothing or the complete topic + backing table: never a `topics`
+    /// row pointing at a missing backing table, nor an orphan backing table.
+    ///
+    /// Ordering within the transaction respects the FK
+    /// `topics.backing_table REFERENCES mutable_tables(id)`: the backing
+    /// `mutable_tables` row is written before the `topics` row.
     pub async fn register_topic(&self, topic: &TopicDefinition) -> Result<(), TriggerError> {
-        // 1. Create the backing mutable table first — that gives us the
-        //    storage rows that the topic catalog points at via FK.
+        // Build the backing-table definition the topic catalog points at.
         let backing_id = MutableTableId::new(topic.backing_table_name())
             .map_err(|e| TriggerError::Catalog(e.to_string()))?;
         let augmented = Arc::new(augment_schema_for_backing(&topic.schema));
-        let backing_def = MutableTableDefinitionBuilder::new(backing_id.clone(), augmented)
-            .allow_internal_columns()
-            .primary_key(vec![
-                OFFSET_COLUMN.to_string(),
-                ROW_INDEX_COLUMN.to_string(),
-            ])
-            .order_column(OFFSET_COLUMN)
-            .tenant(topic.tenant)
-            .build()
-            .map_err(|e| TriggerError::Catalog(e.to_string()))?;
-        self.mutable
-            .register(backing_def)
-            .await
-            .map_err(TriggerError::BackingTable)?;
+        let backing_def = Arc::new(
+            MutableTableDefinitionBuilder::new(backing_id.clone(), augmented)
+                .allow_internal_columns()
+                .primary_key(vec![
+                    OFFSET_COLUMN.to_string(),
+                    ROW_INDEX_COLUMN.to_string(),
+                ])
+                .order_column(OFFSET_COLUMN)
+                .tenant(topic.tenant)
+                .build()
+                .map_err(|e| TriggerError::Catalog(e.to_string()))?,
+        );
 
-        // 2. Insert the topic catalog row referencing the backing table.
+        // Encode the topic-row payload up front (fallible, borrows nothing).
         let topic_id = topic.id.to_string();
         let name = topic.name.clone();
         let schema_json = encode_schema_json(topic.schema.as_ref())?;
@@ -73,16 +76,16 @@ impl TopicRepo {
             .map_err(|e| TriggerError::Catalog(format!("broker_metadata serialisation: {e}")))?;
         let backing_table = backing_id.as_str().to_string();
 
+        let mutable_backend = self.mutable.backend_arc();
         let backend = self.catalog.backend_arc();
         backend
             .transaction(TxOptions::default(), move |tx| {
-                let topic_id = topic_id.clone();
-                let name = name.clone();
-                let schema_json = schema_json.clone();
-                let tenant_str = tenant_str.clone();
-                let broker_metadata = broker_metadata.clone();
-                let backing_table = backing_table.clone();
                 Box::pin(async move {
+                    // FK order: backing `mutable_tables` row + storage table
+                    // first, then the `topics` row that references it.
+                    register_in_tx(mutable_backend.as_ref(), tx, &backing_def)
+                        .await
+                        .map_err(|e| BackendError::Execution(e.to_string()))?;
                     tx.execute(
                         "INSERT INTO topics \
                          (topic_id, name, schema_json, tenant_id, broker_metadata, backing_table) \
@@ -97,6 +100,9 @@ impl TopicRepo {
                         ],
                     )
                     .await?;
+                    #[cfg(feature = "test-hooks")]
+                    crate::store::mutable::test_hook::maybe_signal_lifecycle("register_topic")
+                        .await;
                     Ok::<(), BackendError>(())
                 })
             })
@@ -230,38 +236,61 @@ impl TopicRepo {
             .map_err(TriggerError::Backend)?;
         let raw = raw.ok_or_else(|| TriggerError::TopicNotFound(topic_id.to_string()))?;
 
-        // 2. Delete the topic row first so the FK no longer pins the table.
+        // 2. Resolve the backing-table definition under the topic's own tenant
+        //    (the backing table is stamped with the topic's tenant at
+        //    registration), still in the read phase.
+        let backing_id = MutableTableId::new(raw.backing_table)
+            .map_err(|e| TriggerError::Catalog(e.to_string()))?;
+        let backing_def = Arc::new(
+            self.catalog
+                .get_mutable_table_for_tenant(&backing_id, tenant)
+                .await
+                .map_err(TriggerError::BackingTable)?
+                .ok_or_else(|| {
+                    TriggerError::Catalog(format!(
+                        "backing table {backing_id} missing for topic {topic_id}"
+                    ))
+                })?,
+        );
+
+        // 3. Delete the `topics` row and drop the backing mutable table in ONE
+        //    transaction. FK `topics.backing_table REFERENCES mutable_tables(id)`
+        //    is `ON DELETE RESTRICT`, so the referencing `topics` row is deleted
+        //    first, then the backing storage table + its `mutable_tables` /
+        //    index rows via `drop_in_tx`. Both share the catalog database, so a
+        //    crash leaves either the whole topic or nothing — never a stranded
+        //    backing table nor a `topics` row pointing at a dropped table.
+        //
         //    STRICT delete predicate (mirrors `delete_model`): a tenant deletes
         //    only its own row, never a GLOBAL one — only an unscoped session
         //    (`$2 IS NULL`) manages GLOBAL rows. Step 1 already gated on the
-        //    same predicate, so this is the matching delete for the row we just
+        //    same predicate, so this is the matching delete for the row we
         //    confirmed we own.
         let id_str_for_delete = topic_id.to_string();
         let tenant_for_delete = tenant.map(|t| t.to_string());
+        let mutable_backend = self.mutable.backend_arc();
         backend
             .transaction(TxOptions::default(), move |tx| {
-                let id_str = id_str_for_delete.clone();
-                let tenant_str = tenant_for_delete.clone();
                 Box::pin(async move {
                     tx.execute(
                         "DELETE FROM topics WHERE topic_id = $1 \
                          AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
-                        &[SqlValue::TextOwned(id_str), SqlValue::from(tenant_str)],
+                        &[
+                            SqlValue::TextOwned(id_str_for_delete),
+                            SqlValue::from(tenant_for_delete),
+                        ],
                     )
                     .await?;
+                    drop_in_tx(mutable_backend.as_ref(), tx, &backing_def, tenant)
+                        .await
+                        .map_err(|e| BackendError::Execution(e.to_string()))?;
+                    #[cfg(feature = "test-hooks")]
+                    crate::store::mutable::test_hook::maybe_signal_lifecycle("drop_topic").await;
                     Ok::<(), BackendError>(())
                 })
             })
             .await
             .map_err(TriggerError::Backend)?;
-
-        // 3. Now drop the backing mutable table.
-        let backing_id = MutableTableId::new(raw.backing_table)
-            .map_err(|e| TriggerError::Catalog(e.to_string()))?;
-        self.mutable
-            .drop_table(&backing_id)
-            .await
-            .map_err(TriggerError::BackingTable)?;
         Ok(())
     }
 }

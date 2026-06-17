@@ -144,6 +144,26 @@ pub enum JammiError {
         actual: String,
     },
 
+    /// A persisted artifact carries a format stamp this build cannot read: the
+    /// on-disk format is newer than supported (for stamps with a compatibility
+    /// ordering) or simply incompatible (for backend stamps with none). One
+    /// variant serves every stamped sidecar format — the `.rowmap`, the ANN
+    /// `.manifest.json` version, and the USearch graph's `backend_version` — so
+    /// the load paths reject an unreadable artifact as a typed error rather than
+    /// risk a silent misparse. The upgrade path is to re-emit; there is no
+    /// back-compat reader.
+    #[error("incompatible {artifact} format: found {found}, this build supports {supported}")]
+    IncompatibleFormat {
+        /// The artifact whose stamp was rejected (e.g. `"rowmap"`,
+        /// `"ann-manifest"`, `"usearch-index"`).
+        artifact: String,
+        /// The format stamp found on disk.
+        found: String,
+        /// What this build supports — a version for ordered stamps, the current
+        /// backend version for the strict USearch check.
+        supported: String,
+    },
+
     /// Catch-all for errors that don't fit another variant.
     #[error("{0}")]
     Other(String),

@@ -55,8 +55,7 @@ async fn session_with_embeddings() -> (Arc<InferenceSession>, TempDir) {
             jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap()
-        .0;
+        .unwrap();
     (session, dir)
 }
 

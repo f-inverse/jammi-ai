@@ -48,8 +48,7 @@ async fn session_with_embeddings() -> (Arc<InferenceSession>, TempDir) {
             jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap()
-        .0;
+        .unwrap();
     (session, dir)
 }
 
@@ -554,8 +553,7 @@ async fn neighbor_graph_is_tenant_scoped() {
             jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap()
-        .0;
+        .unwrap();
     let alice_edges = session
         .build_neighbor_graph(
             "patents",

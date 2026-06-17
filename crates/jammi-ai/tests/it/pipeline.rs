@@ -290,8 +290,7 @@ async fn existing_tables_loaded_on_new_session() {
                 jammi_db::store::CachePolicy::Bypass,
             )
             .await
-            .unwrap()
-            .0;
+            .unwrap();
     }
 
     // Second session: result table should be queryable without re-generating

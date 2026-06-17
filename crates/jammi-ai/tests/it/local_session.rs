@@ -116,8 +116,7 @@ async fn local_session_encode_and_search_by_row_key_match_engine() {
             jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap()
-        .0;
+        .unwrap();
 
     let via_session = session
         .encode_query(

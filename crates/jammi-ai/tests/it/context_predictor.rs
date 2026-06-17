@@ -583,8 +583,7 @@ async fn train_context_predictor_over_generated_embeddings() {
             jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap()
-        .0;
+        .unwrap();
 
     // The catalogued model's bare name differs from its PK, so the previously
     // mis-resolving `Some` arm would submit a job whose `base_model_id` is the

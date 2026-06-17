@@ -260,8 +260,7 @@ async fn recipe_semantic_search() {
             jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap()
-        .0;
+        .unwrap();
 
     // encode_query (cookbook recipe)
     let query = session
@@ -363,8 +362,7 @@ async fn recipe_enrich_results() {
             jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap()
-        .0;
+        .unwrap();
 
     let query = vec![0.5_f32; 32]; // tiny_bert is 32-dim
 
@@ -776,8 +774,7 @@ async fn recipe_model_management() {
             jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap()
-        .0;
+        .unwrap();
 
     // Model now visible in catalog
     let models = session.catalog().list_models().await.unwrap();
@@ -806,8 +803,7 @@ async fn recipe_model_management() {
             jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap()
-        .0;
+        .unwrap();
 
     let models = session.catalog().list_models().await.unwrap();
     assert_eq!(models.len(), 2, "Both models should be registered");

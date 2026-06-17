@@ -38,8 +38,7 @@ async fn session_with_embeddings() -> (Arc<InferenceSession>, TempDir) {
             jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap()
-        .0;
+        .unwrap();
 
     (session, dir)
 }
@@ -724,8 +723,7 @@ async fn cross_modal_text_to_image_search() {
             jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap()
-        .0;
+        .unwrap();
 
     // 2. Embed a text query with the OpenCLIP text tower (same checkpoint).
     let text_vec = session

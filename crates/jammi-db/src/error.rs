@@ -176,6 +176,19 @@ pub enum JammiError {
         table: String,
     },
 
+    /// A `recompute` was asked to re-produce a table that carries no
+    /// materialization contract — its catalog `definition_hash IS NULL`, so it is
+    /// a **pre-contract** table created before the materialization contract
+    /// landed. Without a recorded [`ProducingDescriptor`](crate::store::manifest::ProducingDescriptor)
+    /// there is nothing to dispatch a faithful replay on, and guessing a producer
+    /// call from a table's columns would be a fabricated re-run — so this is a
+    /// loud typed refusal, never a silent best-effort. Carries the table named.
+    #[error("table `{table}` carries no materialization contract and cannot be recomputed")]
+    NotRecomputable {
+        /// The table that has no recorded producing descriptor to replay.
+        table: String,
+    },
+
     /// Catch-all for errors that don't fit another variant.
     #[error("{0}")]
     Other(String),

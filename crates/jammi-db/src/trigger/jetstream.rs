@@ -5,8 +5,10 @@
 //! JetStream stream named `jammi_topic_<topic_id>` with one subject
 //! `jammi.topic.<id>.batch`; publishes carry the Arrow IPC payload as the
 //! NATS message body and the engine-assigned offset / produced-at instant
-//! as message headers. Subscribes use an ordered pull consumer with a
-//! `DeliverByStartSequence` policy translated from `from_offset`.
+//! as message headers. Subscribes use a pull consumer that delivers from the
+//! earliest retained event whenever a replay point is requested; the engine
+//! subscribe seam dedups the overlap by engine `_offset` (the JetStream stream
+//! sequence is an independent counter and must not be conflated with it).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -190,16 +192,7 @@ impl TriggerBroker for JetStreamBroker {
             .await
             .map_err(|e| TriggerError::Driver(format!("get_stream {stream_name}: {e}")))?;
 
-        let deliver_policy = match from_offset {
-            None => DeliverPolicy::New,
-            // `Offset(0)` means "from the earliest retained batch"; JetStream's
-            // `DeliverAll` covers that without requiring the start sequence to
-            // exist in the retained window.
-            Some(off) if off.value() == 0 => DeliverPolicy::All,
-            Some(off) => DeliverPolicy::ByStartSequence {
-                start_sequence: off.value(),
-            },
-        };
+        let deliver_policy = deliver_policy_for(from_offset);
 
         let consumer = stream
             .create_consumer(consumer::pull::Config {
@@ -335,4 +328,49 @@ fn decode_message(
         produced_at,
         batch,
     })
+}
+
+/// Translate the engine `_offset` lower bound into a JetStream
+/// [`DeliverPolicy`].
+///
+/// `from_offset` is an engine `_offset`, NOT a JetStream stream sequence — the
+/// two are independent counters that skew permanently after any post-commit
+/// fan-out failure. JetStream cannot translate an engine offset into its own
+/// sequence, so a requested replay point maps to [`DeliverPolicy::All`]
+/// (over-deliver from the earliest retained event) and the engine subscribe
+/// seam dedups by engine `_offset`. Mapping onto `ByStartSequence` would land
+/// the live tail at the wrong message after any skew and break at-least-once
+/// at the replay/live seam.
+fn deliver_policy_for(from_offset: Option<Offset>) -> DeliverPolicy {
+    match from_offset {
+        None => DeliverPolicy::New,
+        Some(_) => DeliverPolicy::All,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_point_over_delivers_never_maps_to_a_native_start_sequence() {
+        // Regression guard for the replay/live seam conflation bug: a
+        // requested engine-offset replay point MUST NOT be handed to JetStream
+        // as a `ByStartSequence` (a native stream sequence). It maps to
+        // `DeliverAll`; the engine seam dedups by engine `_offset`.
+        let now = Utc::now();
+        for engine_offset in [0u64, 1, 7, 42, u64::MAX] {
+            let policy = deliver_policy_for(Some(Offset::new(engine_offset, now)));
+            assert!(
+                matches!(policy, DeliverPolicy::All),
+                "engine offset {engine_offset} must over-deliver (DeliverAll), got {policy:?}"
+            );
+            assert!(
+                !matches!(policy, DeliverPolicy::ByStartSequence { .. }),
+                "engine offset must never be conflated with a JetStream stream sequence"
+            );
+        }
+        // No replay point requested → only future events.
+        assert!(matches!(deliver_policy_for(None), DeliverPolicy::New));
+    }
 }

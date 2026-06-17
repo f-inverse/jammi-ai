@@ -4,8 +4,33 @@
 //! `CatalogBackend::transaction` and best-effort fans out to the broker. The
 //! subscriber stitches a contiguous stream by routing the historical prefix
 //! through `MutableTableRegistry::scan_after` and the live tail through the
-//! broker's `subscribe`, filtering by offset so the two halves do not
-//! overlap.
+//! broker's `subscribe`.
+//!
+//! ## Keying the replay/live seam by engine `_offset`
+//!
+//! The engine `_offset` (a per-topic monotone counter seeded from
+//! `MAX(_offset)` on the backing table) is the *only* sequence the seam keys
+//! on. A broker's own native sequence (JetStream's stream sequence) is an
+//! independent counter: after any post-commit fan-out failure — the
+//! best-effort path in [`crate::trigger::Publisher`] — the engine offset and
+//! the native sequence skew permanently. Handing an engine offset to a broker
+//! as if it were a native start-sequence would therefore start the live tail
+//! at the wrong position and drop (or duplicate) events at the seam, breaking
+//! the at-least-once guarantee exactly where the design must hold it.
+//!
+//! Instead the seam subscribes the live tail with **overlap** — the broker
+//! starts at or before `from_offset` (see
+//! [`crate::trigger::broker::TriggerBroker::subscribe`]) — and the subscriber
+//! **dedups by engine `_offset`**: it yields the whole replay prefix, then for
+//! each live event yields it only when its `_offset` is strictly greater than
+//! the highest offset already yielded. The net contract:
+//!
+//! * replay covers `[from_offset ..= last_replayed]`;
+//! * the live tail overlaps that window and continues past it;
+//! * no engine `_offset >= from_offset` is ever skipped (at-least-once +
+//!   replay-completeness);
+//! * duplicates occur only at the seam (acceptable under at-least-once;
+//!   downstream dedups by the `(_offset, _row_idx)` composite key).
 
 use std::sync::Arc;
 
@@ -38,9 +63,9 @@ impl Subscriber {
 
     /// Open a subscription that yields every batch matching `predicate` for
     /// `topic`, starting at `from_offset` if set. The returned stream is the
-    /// concatenation of the backing-table replay (offsets `>= from_offset`,
-    /// strictly less than the broker's first live offset) followed by the
-    /// live broker stream.
+    /// backing-table replay (offsets `>= from_offset`) followed by the live
+    /// broker stream, which overlaps the replayed prefix and is deduped by
+    /// engine `_offset` (see the module docs). No engine `_offset` is skipped.
     ///
     /// Resolves the tenant binding once, here, to filter the backing-table
     /// replay. The resulting stream contains data only from that tenant
@@ -100,25 +125,38 @@ impl Subscriber {
             .await?;
         let last_replayed = replay_delivered.iter().map(|d| d.offset.value()).max();
 
-        // Live tail starts strictly above the replayed prefix so the two
-        // halves do not deliver the same offset twice.
-        let live_from = match (from_offset, last_replayed) {
-            (_, Some(max)) => Some(Offset::new(max + 1, chrono::Utc::now())),
-            (Some(off), None) => Some(off),
-            (None, None) => None,
-        };
+        // The live tail subscribes at `from_offset` — the *same* engine
+        // `_offset` lower bound the replay used — so it OVERLAPS the replayed
+        // prefix rather than trying to resume strictly above it. Per the
+        // broker contract this is interpreted in engine-offset space, never
+        // as a driver-native start-sequence, so a broker whose native
+        // sequence has skewed from the engine offset cannot land the live tail
+        // at the wrong position. The dedup below discards the overlap.
         let mut live = self
             .broker
-            .subscribe(topic.id, predicate, live_from)
+            .subscribe(topic.id, predicate, from_offset)
             .await?;
 
         let stream = try_stream! {
+            // Highest engine `_offset` already yielded. Seeded with the
+            // replay high-water mark so live events inside the overlap window
+            // are dropped; `None` (no replay) lets the first live event
+            // through.
+            let mut last_yielded = last_replayed;
             for delivered in replay_delivered {
                 yield delivered;
             }
             while let Some(item) = live.next().await {
                 let delivered = item?;
-                yield delivered;
+                // Dedup the replay/live overlap by engine `_offset`: only
+                // advance past what replay already covered. Equality is a
+                // duplicate from the seam overlap; anything lower is a stale
+                // over-delivery from a broker that could not translate the
+                // engine offset into its own sequence.
+                if last_yielded.is_none_or(|seen| delivered.offset.value() > seen) {
+                    last_yielded = Some(delivered.offset.value());
+                    yield delivered;
+                }
             }
         };
         Ok(Subscription::new(SubscriptionId::new(), Box::pin(stream)))

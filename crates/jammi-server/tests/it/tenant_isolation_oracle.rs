@@ -907,6 +907,17 @@ fn cases() -> Vec<IsolationCase> {
                 assert_verify_materialization_isolated().await;
             }
         ),
+        // --- sensing layer (staleness + lineage) -----------------------------
+        // `staleness` and `derives_from` both resolve their table through the
+        // tenant-filtered `get_result_table` before sensing it, so a peer cannot
+        // sense the freshness or lineage of a table it cannot resolve. Hermetic
+        // CPU reads.
+        case!("CatalogService", "Staleness", CaseKind::Hermetic, None, {
+            assert_staleness_isolated().await;
+        }),
+        case!("CatalogService", "DerivesFrom", CaseKind::Hermetic, None, {
+            assert_derives_from_isolated().await;
+        }),
         // --- audit (tenant-scoped — NOT allowlisted) -------------------------
         case!("AuditService", "AuditLog", CaseKind::Hermetic, None, {
             assert_audit_isolated().await;
@@ -1265,15 +1276,19 @@ async fn assert_source_resolver_isolated() {
 /// wraps it in `scoped(engine, tenant, …)`. A's own verify returns
 /// [`MatchVerdict::Match`]; B's verify of A's table name fails to resolve the
 /// row and errors (a not-found `Catalog` error), never leaking A's artifact.
-async fn assert_verify_materialization_isolated() {
+/// Materialise one embedding result table through the single funnel, scoped to
+/// tenant A — the shared fixture the materialization-contract and sensing-layer
+/// isolation cases (`verify_materialization`, `staleness`, `derives_from`) all
+/// build on. Returns the constructed engine + session and the private table name.
+async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, String, TempDir) {
     use jammi_db::store::manifest::{
-        ComputeDevice, InputAnchor, MatchVerdict, Materialization, MaterializationEnv,
-        ModelIdentity, ProducingDescriptor,
+        ComputeDevice, InputAnchor, Materialization, MaterializationEnv, ModelIdentity,
+        ProducingDescriptor,
     };
 
     const DIMS: usize = 4;
-    let model_id = "verify-model";
-    let source_id = "verify-src";
+    let model_id = "sensing-model";
+    let source_id = "sensing-src";
 
     let dir = tempdir().unwrap();
     let engine = Arc::new(
@@ -1283,7 +1298,6 @@ async fn assert_verify_materialization_isolated() {
     );
     let session = Session::new(Arc::clone(&engine));
 
-    // Tenant A materialises one embedding result table through the single funnel.
     // `create_table` stamps the catalog row with the scoped tenant (A), so the
     // resulting row is private to A.
     let table_name = engine
@@ -1369,6 +1383,14 @@ async fn assert_verify_materialization_isolated() {
         })
         .await;
 
+    (engine, session, table_name, dir)
+}
+
+async fn assert_verify_materialization_isolated() {
+    use jammi_db::store::manifest::MatchVerdict;
+
+    let (engine, session, table_name, _dir) = materialize_table_for_tenant_a().await;
+
     // Tenant A verifies its own table: the funnel-attested digest recomputes, so
     // the verdict is Match.
     let a_verdict = engine
@@ -1394,6 +1416,73 @@ async fn assert_verify_materialization_isolated() {
     assert!(
         b_result.is_err(),
         "CROSS-TENANT LEAK: tenant B resolved and verified tenant A's materialization: {b_result:?}"
+    );
+}
+
+/// `staleness` resolves its table through the tenant-filtered
+/// `get_result_table`, so a peer cannot sense a table it cannot resolve. Tenant
+/// A senses its own table (it carries no recorded definition change and a
+/// `MutableVersion` input with no current-resolution surface, so the honest
+/// verdict is `Undecidable`, not an error); tenant B is refused.
+async fn assert_staleness_isolated() {
+    use jammi_db::store::manifest::DefinitionHash;
+    use jammi_db::store::Staleness;
+
+    let (engine, session, table_name, _dir) = materialize_table_for_tenant_a().await;
+
+    // Tenant A senses its own table. The recorded `MutableVersion` input has no
+    // current-resolution surface, so the honest verdict is `Undecidable` — a real
+    // verdict, not an error: A can sense its own table.
+    let a_verdict = engine
+        .with_tenant_scoped(tenant_a(), |_scope| {
+            session.staleness(&table_name, DefinitionHash("does-not-matter".into()))
+        })
+        .await
+        .expect("tenant A must sense its own table");
+    assert!(
+        matches!(a_verdict, Staleness::Undecidable { .. }),
+        "tenant A's own table senses to a real verdict, got {a_verdict:?}"
+    );
+
+    // Tenant B senses A's table name: `get_result_table` resolves no row for B,
+    // so staleness errors (not-found) rather than leaking A's freshness state.
+    let b_result = engine
+        .with_tenant_scoped(tenant_b(), |_scope| {
+            session.staleness(&table_name, DefinitionHash("does-not-matter".into()))
+        })
+        .await;
+    assert!(
+        b_result.is_err(),
+        "CROSS-TENANT LEAK: tenant B sensed tenant A's table staleness: {b_result:?}"
+    );
+}
+
+/// `derives_from` resolves its anchor table through the tenant-filtered
+/// `get_result_table` before gathering dependents, so a peer cannot enumerate
+/// the lineage of a table it cannot resolve. Tenant A reads its own lineage
+/// (empty, but a real Ok); tenant B is refused.
+async fn assert_derives_from_isolated() {
+    let (engine, session, table_name, _dir) = materialize_table_for_tenant_a().await;
+
+    // Tenant A reads its own table's lineage — a real Ok (empty: nothing derives
+    // from it yet), proving A can sense its own table.
+    let a_edges = engine
+        .with_tenant_scoped(tenant_a(), |_scope| session.derives_from(&table_name))
+        .await
+        .expect("tenant A must read its own lineage");
+    assert!(
+        a_edges.is_empty(),
+        "no table derives from A's leaf table yet, got {a_edges:?}"
+    );
+
+    // Tenant B reads A's table name: `get_result_table` resolves no row for B,
+    // so derives_from errors (not-found) rather than leaking A's lineage.
+    let b_result = engine
+        .with_tenant_scoped(tenant_b(), |_scope| session.derives_from(&table_name))
+        .await;
+    assert!(
+        b_result.is_err(),
+        "CROSS-TENANT LEAK: tenant B read tenant A's lineage: {b_result:?}"
     );
 }
 

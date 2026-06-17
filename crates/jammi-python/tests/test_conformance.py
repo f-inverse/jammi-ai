@@ -135,6 +135,7 @@ _INFERENCE_VERBS = {
 _PIPELINE_VERBS = {
     "build_neighbor_graph",
     "propagate_embeddings",
+    "asof_join",
     "assemble_context",
     "verify_materialization",
 }

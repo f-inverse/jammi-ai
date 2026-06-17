@@ -1007,6 +1007,16 @@ fn cases() -> Vec<IsolationCase> {
                 assert_embedding_resolver_isolated().await;
             }
         ),
+        // `asof_join` reads two tenant-scoped SOURCE relations (not embedding
+        // tables): it resolves each through the session's tenant-scoped catalog
+        // (`find_table_name` over the per-tenant source list), so a caller cannot
+        // point either side at another tenant's relation. The join runs no model,
+        // so this gate — source resolution — is the whole tenant boundary, and it
+        // is asserted for real here. A peer cannot even resolve tenant A's source
+        // to join against it.
+        case!("PipelineService", "AsofJoin", CaseKind::Hermetic, None, {
+            assert_source_resolver_isolated().await;
+        }),
         case!(
             "TrainingService",
             "StartTraining",
@@ -1209,6 +1219,37 @@ async fn assert_embedding_resolver_isolated() {
     assert!(
         cat_b.resolve_embedding_table("src_a", None).await.is_err(),
         "CROSS-TENANT LEAK: tenant B resolved tenant A's embedding table"
+    );
+}
+
+/// `asof_join` resolves its two input relations through the tenant-scoped source
+/// catalog: a peer cannot resolve a tenant's registered source, so it cannot
+/// point either side of the join at that source. This drives the real source
+/// resolution gate — `get_source` / `list_sources` are tenant-filtered.
+async fn assert_source_resolver_isolated() {
+    let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
+    cat_a
+        .register_source("asof_src_a", SourceType::File, &parquet_connection())
+        .await
+        .unwrap();
+    assert!(
+        cat_a.get_source("asof_src_a").await.unwrap().is_some(),
+        "tenant A must resolve its own asof_join input source"
+    );
+    assert!(
+        cat_b.get_source("asof_src_a").await.unwrap().is_none(),
+        "CROSS-TENANT LEAK: tenant B resolved tenant A's source to asof-join against it"
+    );
+    let b_ids: Vec<String> = cat_b
+        .list_sources()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.source_id)
+        .collect();
+    assert!(
+        !b_ids.contains(&"asof_src_a".to_string()),
+        "CROSS-TENANT READ LEAK: tenant B lists tenant A's asof_join source: {b_ids:?}"
     );
 }
 

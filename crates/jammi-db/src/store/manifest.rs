@@ -245,6 +245,79 @@ pub enum ProducingDescriptor {
         /// The pooled-vector width.
         dimensions: usize,
     },
+    /// As-of temporal join output: each spine row matched to at most one fact
+    /// row valid as-of the spine instant within its equality group, materialised
+    /// as a new result table. (`asof_join` via the `AsofJoinExec` sort-merge.)
+    ///
+    /// The fields are the join's output-affecting parameters in a
+    /// transport-neutral encoding — the temporal-engine enums live in the AI
+    /// crate, so the descriptor records them as the canonical string/scalar
+    /// tags the hash folds over. Two runs of the same join over the same input
+    /// anchors hash identically; any change to a knob, a key, or the projection
+    /// changes the bytes and therefore the hash.
+    AsofJoin {
+        /// The spine relation's catalog id.
+        spine: String,
+        /// The facts relation's catalog id.
+        facts: String,
+        /// The spine's equality ("by") columns, in declared order.
+        spine_by: Vec<String>,
+        /// The facts' equality ("by") columns, in declared order.
+        facts_by: Vec<String>,
+        /// The spine's temporal ordering column.
+        spine_time: String,
+        /// The facts' temporal ordering column.
+        facts_time: String,
+        /// Match direction (`backward` / `forward` / `nearest`).
+        direction: AsofDirection,
+        /// Boundary inclusivity (`inclusive` / `exclusive`).
+        boundary: AsofBoundary,
+        /// Optional look-back/forward limit, encoded as `(unit, magnitude)`
+        /// where `unit` is `duration` (microseconds) or `steps`. `None` =
+        /// unbounded look-back.
+        tolerance: Option<AsofTolerance>,
+        /// Tie-break: the secondary descending column, or `None` for the loud
+        /// `error` policy.
+        tie_break_column: Option<String>,
+        /// Right-side projection columns, in output order. Empty = all non-key
+        /// columns.
+        project: Vec<String>,
+    },
+}
+
+/// Match direction recorded in an [`ProducingDescriptor::AsofJoin`] — the
+/// transport-neutral mirror of the AI crate's `MatchDirection`, so the
+/// definition hash covers the direction without `jammi-db` depending on the
+/// temporal-engine types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AsofDirection {
+    /// Most recent fact at/before the spine instant.
+    Backward,
+    /// First fact at/after the spine instant.
+    Forward,
+    /// Smallest absolute distance, ties toward the past.
+    Nearest,
+}
+
+/// Boundary inclusivity recorded in an [`ProducingDescriptor::AsofJoin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AsofBoundary {
+    /// A fact at exactly the spine instant is eligible (`<=` / `>=`).
+    Inclusive,
+    /// Strict (`<` / `>`).
+    Exclusive,
+}
+
+/// Look-back/forward limit recorded in an [`ProducingDescriptor::AsofJoin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AsofTolerance {
+    /// Microsecond limit for a temporal key.
+    Duration(i64),
+    /// Step limit for an integer key.
+    Steps(i64),
 }
 
 impl ProducingDescriptor {

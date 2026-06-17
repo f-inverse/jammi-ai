@@ -1012,6 +1012,23 @@ impl PyDatabase {
         Ok(record.table_name)
     }
 
+    /// Assemble a point-in-time-correct table by an as-of temporal join of two
+    /// registered relations, from a serialized `AsofJoinRequest` body. The thin
+    /// Python `Database` wrapper builds this request with the same pure-Python
+    /// assembly the remote client uses (`jammi_client._assembly`), serializes it,
+    /// and hands the bytes here, so the embedded and remote paths share one
+    /// request assembly and one decode seam
+    /// (`jammi_ai::wire::asof_join_from_bytes`). Returns the materialised table's
+    /// name. A malformed or invalid body raises `ValueError`.
+    fn _asof_join_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
+        let args = jammi_ai::wire::asof_join_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
+        let record = self
+            .runtime
+            .block_on(self.session.asof_join(&args.spine, &args.facts, &args.spec))
+            .map_err(to_pyerr)?;
+        Ok(record.table_name)
+    }
+
     /// Conformalize a classification predictor into prediction sets.
     ///
     /// Split (inductive) conformal: `calibration` holds one row of per-class

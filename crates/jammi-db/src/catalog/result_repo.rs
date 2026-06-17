@@ -20,6 +20,11 @@ pub enum ResultTableKind {
     Model,
     /// A k-nearest-neighbour edge relation derived from an embedding table.
     NeighborGraph,
+    /// A relational table produced by an as-of temporal join of two relations.
+    /// Like [`NeighborGraph`](Self::NeighborGraph) it is a derivation that
+    /// carries no ANN sidecar and is excluded from embedding-table resolution —
+    /// it is data of record, not a search structure.
+    AsofJoin,
 }
 
 impl ResultTableKind {
@@ -29,6 +34,7 @@ impl ResultTableKind {
         match self {
             Self::Model => "model",
             Self::NeighborGraph => "neighbor_graph",
+            Self::AsofJoin => "asof_join",
         }
     }
 
@@ -38,8 +44,9 @@ impl ResultTableKind {
         match s {
             "model" => Ok(Self::Model),
             "neighbor_graph" => Ok(Self::NeighborGraph),
+            "asof_join" => Ok(Self::AsofJoin),
             other => Err(JammiError::Catalog(format!(
-                "Unknown result-table kind '{other}'. Expected: model, neighbor_graph"
+                "Unknown result-table kind '{other}'. Expected: model, neighbor_graph, asof_join"
             ))),
         }
     }

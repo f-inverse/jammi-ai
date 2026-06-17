@@ -1,3 +1,6 @@
+mod asof_merge;
+mod asof_scale;
+mod asof_verb;
 mod backends;
 mod channel_contract;
 mod common;

@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
 use jammi_ai::wire::{
-    assemble_context_request_from_proto, assemble_context_to_proto,
+    asof_join_from_proto, assemble_context_request_from_proto, assemble_context_to_proto,
     build_neighbor_graph_from_proto, propagate_request_from_proto,
 };
 use tonic::{Request, Response, Status};
@@ -31,7 +31,7 @@ use tonic::{Request, Response, Status};
 use crate::grpc::proto::embedding::ResultTable;
 use crate::grpc::proto::pipeline::pipeline_service_server::PipelineService;
 use crate::grpc::proto::pipeline::{
-    AssembleContextRequest, AssembleContextResponse, BuildNeighborGraphRequest,
+    AsofJoinRequest, AssembleContextRequest, AssembleContextResponse, BuildNeighborGraphRequest,
     PropagateEmbeddingsRequest,
 };
 use crate::grpc::wire::{map_engine_error, scoped, session_tenant_traced};
@@ -105,5 +105,24 @@ impl PipelineService for PipelineServer {
         .map_err(map_engine_error)?;
 
         Ok(Response::new(assemble_context_to_proto(context)?))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
+    async fn asof_join(
+        &self,
+        request: Request<AsofJoinRequest>,
+    ) -> Result<Response<ResultTable>, Status> {
+        let tenant = session_tenant_traced(&request);
+        let args = asof_join_from_proto(request.into_inner())?;
+
+        let record = scoped(&self.session, tenant, || async {
+            self.session
+                .asof_join(&args.spine, &args.facts, &args.spec)
+                .await
+        })
+        .await
+        .map_err(map_engine_error)?;
+
+        Ok(Response::new(record.into()))
     }
 }

@@ -154,6 +154,19 @@ _SET_AGGREGATOR = {
     "max": pipeline_pb2.SetAggregator.SET_AGGREGATOR_MAX,
 }
 
+# As-of match directions, matching the engine's `MatchDirection`.
+_ASOF_DIRECTION = {
+    "backward": pipeline_pb2.AsofDirection.ASOF_DIRECTION_BACKWARD,
+    "forward": pipeline_pb2.AsofDirection.ASOF_DIRECTION_FORWARD,
+    "nearest": pipeline_pb2.AsofDirection.ASOF_DIRECTION_NEAREST,
+}
+
+# As-of boundary inclusivity, matching the engine's `Boundary`.
+_ASOF_BOUNDARY = {
+    "inclusive": pipeline_pb2.AsofBoundary.ASOF_BOUNDARY_INCLUSIVE,
+    "exclusive": pipeline_pb2.AsofBoundary.ASOF_BOUNDARY_EXCLUSIVE,
+}
+
 # Calibration predictive shapes, matching the engine's `EvalCalibrationShape`.
 _CALIBRATION_SHAPE = {
     "gaussian": eval_pb2.CalibrationShape.CALIBRATION_SHAPE_GAUSSIAN,
@@ -866,6 +879,67 @@ def build_propagate_embeddings_request(
             raise ValueError(
                 f"output must be 'final' or 'jumping_knowledge' (got {output!r})"
             ) from None
+    return request
+
+
+def build_asof_join_request(
+    spine: str,
+    facts: str,
+    *,
+    spine_by: List[str],
+    spine_time: str,
+    facts_by: List[str],
+    facts_time: str,
+    direction: Optional[str] = None,
+    boundary: Optional[str] = None,
+    tolerance_duration_micros: Optional[int] = None,
+    tolerance_steps: Optional[int] = None,
+    tie_break_column: Optional[str] = None,
+    project: Optional[List[str]] = None,
+) -> pipeline_pb2.AsofJoinRequest:
+    """Assemble the `AsofJoinRequest` for an as-of temporal join from the
+    binding's flat kwargs.
+
+    `spine`/`facts` are source ids; the two `*_by`/`*_time` pairs name each
+    side's equality + temporal columns (an empty `*_by` is the explicit single-
+    global-group choice). `direction` and `boundary` carry explicit presence,
+    left unset so the engine resolves the leakage-safe defaults (`backward` /
+    `inclusive`). At most one tolerance unit may be given. `tie_break_column`
+    unset selects the loud error-on-ambiguity policy. The same request the embed
+    binding submits in-process.
+    """
+    if tolerance_duration_micros is not None and tolerance_steps is not None:
+        raise ValueError(
+            "pass at most one tolerance unit: tolerance_duration_micros or "
+            "tolerance_steps, not both"
+        )
+    request = pipeline_pb2.AsofJoinRequest(
+        spine=spine,
+        facts=facts,
+        left=pipeline_pb2.AsofKey(by=list(spine_by), time=spine_time),
+        right=pipeline_pb2.AsofKey(by=list(facts_by), time=facts_time),
+        project=list(project) if project is not None else [],
+    )
+    if direction is not None:
+        try:
+            request.direction = _ASOF_DIRECTION[direction]
+        except KeyError:
+            raise ValueError(
+                f"direction must be 'backward', 'forward', or 'nearest' (got {direction!r})"
+            ) from None
+    if boundary is not None:
+        try:
+            request.boundary = _ASOF_BOUNDARY[boundary]
+        except KeyError:
+            raise ValueError(
+                f"boundary must be 'inclusive' or 'exclusive' (got {boundary!r})"
+            ) from None
+    if tolerance_duration_micros is not None:
+        request.tolerance.duration_micros = tolerance_duration_micros
+    elif tolerance_steps is not None:
+        request.tolerance.steps = tolerance_steps
+    if tie_break_column is not None:
+        request.tie_break_column = tie_break_column
     return request
 
 

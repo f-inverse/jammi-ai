@@ -1,3 +1,4 @@
+pub mod asof;
 pub mod context_predictor;
 pub mod context_set;
 pub mod embedding;

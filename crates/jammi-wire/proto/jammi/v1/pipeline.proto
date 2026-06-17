@@ -46,6 +46,83 @@ service PipelineService {
   // context vector. Peer of the engine's `assemble_context`; returns the pooled
   // vector and the carried metadata inline (no durable handle).
   rpc AssembleContext(AssembleContextRequest) returns (AssembleContextResponse);
+
+  // Assemble a point-in-time-correct table: for each row of `spine`, attach the
+  // `facts` row valid as-of the spine row's temporal key, within each equality
+  // group. Peer of the engine's `asof_join`; the compute stays server-side and
+  // the client reads the materialised table via `sql(...)`.
+  rpc AsofJoin(AsofJoinRequest) returns (jammi.v1.embedding.ResultTable);
+}
+
+// Match direction for an as-of join. Mirrors the engine's `MatchDirection`;
+// UNSPECIFIED maps to the engine default (`Backward`) — the only leakage-safe
+// choice for past-keyed assembly.
+enum AsofDirection {
+  ASOF_DIRECTION_UNSPECIFIED = 0;
+  ASOF_DIRECTION_BACKWARD = 1;
+  ASOF_DIRECTION_FORWARD = 2;
+  ASOF_DIRECTION_NEAREST = 3;
+}
+
+// Boundary inclusivity for an as-of join. Mirrors the engine's `Boundary`;
+// UNSPECIFIED maps to the engine default (`Inclusive`, `<=`/`>=`).
+enum AsofBoundary {
+  ASOF_BOUNDARY_UNSPECIFIED = 0;
+  ASOF_BOUNDARY_INCLUSIVE = 1;
+  ASOF_BOUNDARY_EXCLUSIVE = 2;
+}
+
+// One side's column roles: the equality ("by") columns that partition the match
+// into independent groups (may be empty — one global group), and the single
+// temporal ordering column.
+message AsofKey {
+  // Equality columns, in declared order. May be empty.
+  repeated string by = 1;
+  // The temporal ordering column (required; exactly one).
+  string time = 2;
+}
+
+// A look-back/forward limit for an as-of join: a candidate farther than this is
+// no-match. Exactly one unit — `duration_micros` for temporal keys, `steps` for
+// integer keys — modelled as a oneof so the unit is unambiguous; an absent
+// `Tolerance` (the field unset on the request) means unbounded look-back.
+message AsofTolerance {
+  oneof limit {
+    // Microsecond limit for a temporal key.
+    int64 duration_micros = 1;
+    // Step limit for an integer key.
+    int64 steps = 2;
+  }
+}
+
+// Run an as-of temporal join of two registered relations. Mirrors the engine's
+// `asof_join` binding: `spine` and `facts` are source ids; the two `AsofKey`s
+// name the equality + temporal columns on each side. `direction` and `boundary`
+// default through their UNSPECIFIED arms; `tolerance` is optional (absent =
+// unbounded); `tie_break_column` carries explicit presence — present names the
+// secondary descending disambiguator, absent selects the loud error-on-ambiguity
+// policy. `project` lists the right-side output columns (empty = all non-key).
+message AsofJoinRequest {
+  // The spine relation's source id.
+  string spine = 1;
+  // The facts relation's source id.
+  string facts = 2;
+  // The spine's column roles.
+  AsofKey left = 3;
+  // The facts' column roles.
+  AsofKey right = 4;
+  // Match direction. UNSPECIFIED maps to the engine default (`Backward`).
+  AsofDirection direction = 5;
+  // Boundary inclusivity. UNSPECIFIED maps to the engine default (`Inclusive`).
+  AsofBoundary boundary = 6;
+  // Optional look-back/forward limit; unset means unbounded.
+  optional AsofTolerance tolerance = 7;
+  // Optional tie-break secondary column (newest wins). Unset selects the loud
+  // `AmbiguousMatch` policy — a true duplicate at the matched instant fails
+  // rather than being resolved non-deterministically.
+  optional string tie_break_column = 8;
+  // Right-side columns to attach to the output. Empty keeps all non-key columns.
+  repeated string project = 9;
 }
 
 // Materialise a source's k-NN similarity graph. Mirrors the engine's

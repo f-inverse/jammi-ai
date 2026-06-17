@@ -34,6 +34,7 @@ from ._assembly import (
     _SOURCE_KIND_NAME,
     _local_source_url,
     build_add_channel_columns_request,
+    build_asof_join_request,
     build_assemble_context_request,
     build_context_predictor_request,
     build_create_mutable_table_request,
@@ -1499,6 +1500,53 @@ class RemoteDatabase:
             output=output,
         )
         resp = self._pipeline.PropagateEmbeddings(request, metadata=self._metadata)
+        return resp.table_name
+
+    def asof_join(
+        self,
+        spine: str,
+        facts: str,
+        *,
+        spine_by: List[str],
+        spine_time: str,
+        facts_by: List[str],
+        facts_time: str,
+        direction: Optional[str] = None,
+        boundary: Optional[str] = None,
+        tolerance_duration_micros: Optional[int] = None,
+        tolerance_steps: Optional[int] = None,
+        tie_break_column: Optional[str] = None,
+        project: Optional[List[str]] = None,
+    ) -> str:
+        """Assemble a point-in-time-correct table: for each row of ``spine``,
+        attach the ``facts`` row valid as-of the spine row's temporal key, within
+        each equality group, and return the new table's name.
+
+        ``spine``/``facts`` are registered source ids; the ``*_by``/``*_time``
+        pairs name each side's equality + temporal columns (an empty ``*_by`` is
+        one global group). ``direction`` is ``"backward"`` (default, leakage-
+        safe), ``"forward"``, or ``"nearest"``; ``boundary`` is ``"inclusive"``
+        (default) or ``"exclusive"``; at most one tolerance unit may be given;
+        ``tie_break_column`` names the secondary descending disambiguator, and
+        when omitted a duplicate at the matched instant fails loudly. Left rows
+        are always preserved; unmatched fact columns are null. Maps to
+        `PipelineService.AsofJoin`; read the table via :meth:`sql`.
+        """
+        request = build_asof_join_request(
+            spine,
+            facts,
+            spine_by=spine_by,
+            spine_time=spine_time,
+            facts_by=facts_by,
+            facts_time=facts_time,
+            direction=direction,
+            boundary=boundary,
+            tolerance_duration_micros=tolerance_duration_micros,
+            tolerance_steps=tolerance_steps,
+            tie_break_column=tie_break_column,
+            project=project,
+        )
+        resp = self._pipeline.AsofJoin(request, metadata=self._metadata)
         return resp.table_name
 
     def assemble_context(

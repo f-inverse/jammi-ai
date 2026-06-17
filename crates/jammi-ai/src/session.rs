@@ -921,6 +921,35 @@ impl InferenceSession {
         }
     }
 
+    /// Assemble a point-in-time-correct table: for each row of `spine`, attach
+    /// the `facts` row valid as-of the spine row's temporal key, within each
+    /// equality group. Writes a result table (carrying the materialization
+    /// manifest) and returns its record. Left rows are always preserved;
+    /// unmatched fact columns are null.
+    ///
+    /// `spine` and `facts` are registered source ids. Both are resolved through
+    /// the session's tenant-scoped catalog: when a tenant is bound the join runs
+    /// inside that tenant's scope, so a caller cannot point either side at
+    /// another tenant's relation. The [`AsofJoinSpec`](crate::pipeline::asof::AsofJoinSpec)
+    /// carries the four pinned knobs (direction, boundary, tolerance, tie-break)
+    /// and the equality/temporal key roles.
+    pub async fn asof_join(
+        &self,
+        spine: &str,
+        facts: &str,
+        spec: &crate::pipeline::asof::AsofJoinSpec,
+    ) -> Result<ResultTableRecord> {
+        match self.tenant() {
+            Some(tenant) => {
+                self.with_tenant_scoped(tenant, |_scope| async move {
+                    crate::pipeline::asof::verb::run(self, spine, facts, spec).await
+                })
+                .await
+            }
+            None => crate::pipeline::asof::verb::run(self, spine, facts, spec).await,
+        }
+    }
+
     // =====================================================================
     // Fine-tuning
     // =====================================================================

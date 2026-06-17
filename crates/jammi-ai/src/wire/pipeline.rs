@@ -27,6 +27,9 @@
 use prost::Message;
 use tonic::Status;
 
+use crate::pipeline::asof::{
+    AsofJoinSpec, AsofJoinSpecBuilder, AsofKey, Boundary, MatchDirection, TieBreak, Tolerance,
+};
 use crate::pipeline::context_set::{
     ContextRepresentation, ContextRequest, ContextSource, ContextSourceKind, HybridMerge,
     SetAggregator,
@@ -204,6 +207,121 @@ fn propagation_output_from_proto(output: i32) -> Result<PropagationOutput, Statu
         }
         Ok(pb::PropagationOutput::JumpingKnowledge) => Ok(PropagationOutput::JumpingKnowledge),
         Err(_) => Err(Status::invalid_argument("unknown propagation output")),
+    }
+}
+
+// ─── AsofJoin ────────────────────────────────────────────────────────────────
+
+/// The decoded spine + facts source ids and the assembled [`AsofJoinSpec`] an
+/// `AsofJoin` request carries. The engine method takes the two ids separately
+/// from the spec, so the decode returns them as a struct the handler
+/// destructures.
+pub struct AsofJoinArgs {
+    /// The spine relation's source id.
+    pub spine: String,
+    /// The facts relation's source id.
+    pub facts: String,
+    /// The assembled join descriptor.
+    pub spec: AsofJoinSpec,
+}
+
+/// Decode a serialized [`pb::AsofJoinRequest`] body into the engine's as-of join
+/// args. The embedded binding builds the request with the same pure-Python
+/// assembly the remote client uses, serializes it, and hands the bytes here — so
+/// the in-process and remote paths decode through one shared seam
+/// ([`asof_join_from_proto`]). A body that is not a valid request is a client
+/// error (`InvalidArgument`).
+pub fn asof_join_from_bytes(body: &[u8]) -> Result<AsofJoinArgs, Status> {
+    let req = pb::AsofJoinRequest::decode(body)
+        .map_err(|e| Status::invalid_argument(format!("malformed AsofJoin request: {e}")))?;
+    asof_join_from_proto(req)
+}
+
+/// Decode a [`pb::AsofJoinRequest`] into the engine's as-of join args. The
+/// direction/boundary `UNSPECIFIED` arms resolve to the engine defaults
+/// (`Backward` / `Inclusive`); an absent `tolerance` is unbounded look-back; an
+/// absent `tie_break_column` selects the loud `TieBreak::Error` policy — so an
+/// omitted field never silently changes the leakage-safe default.
+pub fn asof_join_from_proto(req: pb::AsofJoinRequest) -> Result<AsofJoinArgs, Status> {
+    if req.spine.is_empty() {
+        return Err(Status::invalid_argument("spine is required"));
+    }
+    if req.facts.is_empty() {
+        return Err(Status::invalid_argument("facts is required"));
+    }
+    let left = asof_key_from_proto(req.left, "left")?;
+    let right = asof_key_from_proto(req.right, "right")?;
+
+    let tie_break = match req.tie_break_column {
+        Some(column) if !column.is_empty() => TieBreak::ByColumnDesc(column),
+        _ => TieBreak::Error,
+    };
+    let spec = AsofJoinSpecBuilder::new(left, right)
+        .direction(asof_direction_from_proto(req.direction)?)
+        .boundary(asof_boundary_from_proto(req.boundary)?)
+        .tolerance(asof_tolerance_from_proto(req.tolerance)?)
+        .tie_break(tie_break)
+        .project(req.project)
+        .build();
+
+    Ok(AsofJoinArgs {
+        spine: req.spine,
+        facts: req.facts,
+        spec,
+    })
+}
+
+/// Decode one side's [`pb::AsofKey`] into the engine [`AsofKey`]. The temporal
+/// `time` column is required; an empty `by` is the explicit single-global-group
+/// choice and is kept verbatim.
+fn asof_key_from_proto(key: Option<pb::AsofKey>, side: &str) -> Result<AsofKey, Status> {
+    let key = key.ok_or_else(|| Status::invalid_argument(format!("{side} key is required")))?;
+    if key.time.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "{side} temporal key `time` is required"
+        )));
+    }
+    Ok(AsofKey {
+        by: key.by,
+        time: key.time,
+    })
+}
+
+/// Map the wire [`pb::AsofDirection`]; `UNSPECIFIED` keeps the engine default
+/// (`Backward`).
+fn asof_direction_from_proto(direction: i32) -> Result<MatchDirection, Status> {
+    match pb::AsofDirection::try_from(direction) {
+        Ok(pb::AsofDirection::Unspecified) | Ok(pb::AsofDirection::Backward) => {
+            Ok(MatchDirection::Backward)
+        }
+        Ok(pb::AsofDirection::Forward) => Ok(MatchDirection::Forward),
+        Ok(pb::AsofDirection::Nearest) => Ok(MatchDirection::Nearest),
+        Err(_) => Err(Status::invalid_argument("unknown asof direction")),
+    }
+}
+
+/// Map the wire [`pb::AsofBoundary`]; `UNSPECIFIED` keeps the engine default
+/// (`Inclusive`).
+fn asof_boundary_from_proto(boundary: i32) -> Result<Boundary, Status> {
+    match pb::AsofBoundary::try_from(boundary) {
+        Ok(pb::AsofBoundary::Unspecified) | Ok(pb::AsofBoundary::Inclusive) => {
+            Ok(Boundary::Inclusive)
+        }
+        Ok(pb::AsofBoundary::Exclusive) => Ok(Boundary::Exclusive),
+        Err(_) => Err(Status::invalid_argument("unknown asof boundary")),
+    }
+}
+
+/// Map the optional wire [`pb::AsofTolerance`] into the engine [`Tolerance`]. An
+/// absent message (or an empty `limit` oneof) is unbounded look-back (`None`);
+/// the oneof's unit is preserved unambiguously.
+fn asof_tolerance_from_proto(
+    tolerance: Option<pb::AsofTolerance>,
+) -> Result<Option<Tolerance>, Status> {
+    match tolerance.and_then(|t| t.limit) {
+        None => Ok(None),
+        Some(pb::asof_tolerance::Limit::DurationMicros(d)) => Ok(Some(Tolerance::Duration(d))),
+        Some(pb::asof_tolerance::Limit::Steps(s)) => Ok(Some(Tolerance::Steps(s))),
     }
 }
 

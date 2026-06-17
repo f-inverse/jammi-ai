@@ -453,6 +453,19 @@ pub enum ContextAggregator {
     Max,
 }
 
+/// How a hybrid context merges its ANN and declared-edge candidate sets,
+/// recorded in [`ContextCandidateSource::Hybrid`] — the transport-neutral mirror
+/// of the AI crate's `HybridMerge`. An enum (not a bool) so per-edge-type merge
+/// channels can be added; the merge is output-affecting (it selects which keys
+/// survive into the pool), so it is part of the definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextHybridMerge {
+    /// Union the candidate key sets (ANN first, then declared-edge members not
+    /// already present), dedup, pool once.
+    Union,
+}
+
 /// Where a context set's candidate members came from, recorded in
 /// [`ProducingDescriptor::ContextSet`] — the transport-neutral mirror of the AI
 /// crate's `ContextSource`. The candidate-set source is a determinant: the same
@@ -476,6 +489,9 @@ pub enum ContextCandidateSource {
         ann_k: usize,
         /// The declared-edge gather for the edge arm.
         gather: ContextEdgeGather,
+        /// How the two candidate sets merge — an output-determinant recorded so
+        /// a second merge channel can't silently regress the descriptor.
+        merge: ContextHybridMerge,
     },
 }
 

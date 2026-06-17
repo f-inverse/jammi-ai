@@ -756,10 +756,27 @@ fn candidate_source_for(
         ContextSource::Edges(gather) => M::Edges {
             gather: edge_gather_for(gather),
         },
-        ContextSource::Hybrid { ann_k, edges, .. } => M::Hybrid {
+        ContextSource::Hybrid {
+            ann_k,
+            edges,
+            merge,
+        } => M::Hybrid {
             ann_k: *ann_k,
             gather: edge_gather_for(edges),
+            // `merge` is an output-determinant (it selects which keys survive
+            // into the pool). With only `Union` today a variance test can't yet
+            // distinguish two merges, but it is recorded for forward-completeness
+            // so the next merge channel can't silently regress the descriptor.
+            merge: merge_for(*merge),
         },
+    }
+}
+
+/// Map the AI-crate [`HybridMerge`] to the manifest's merge-channel mirror.
+fn merge_for(merge: HybridMerge) -> jammi_db::store::manifest::ContextHybridMerge {
+    use jammi_db::store::manifest::ContextHybridMerge as M;
+    match merge {
+        HybridMerge::Union => M::Union,
     }
 }
 

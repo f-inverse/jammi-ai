@@ -13,6 +13,7 @@ use arrow::datatypes::DataType;
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::store::CachePolicy;
 use tempfile::TempDir;
 
 use crate::harness;
@@ -77,8 +78,14 @@ async fn generate_embeddings_cpu_gpu_parity() {
     let cpu_dir = TempDir::new().unwrap();
     let cpu = harness::cpu_session(cpu_dir.path()).await;
     add_patents(&cpu).await;
-    let cpu_table = cpu
-        .generate_text_embeddings("patents", &model, &["abstract".to_string()], "id")
+    let (cpu_table, _) = cpu
+        .generate_text_embeddings(
+            "patents",
+            &model,
+            &["abstract".to_string()],
+            "id",
+            CachePolicy::Bypass,
+        )
         .await
         .unwrap();
     let cpu_vecs = keyed_vectors(&cpu, &cpu_table).await;
@@ -86,8 +93,14 @@ async fn generate_embeddings_cpu_gpu_parity() {
     let gpu_dir = TempDir::new().unwrap();
     let gpu = harness::gpu_session(gpu_dir.path()).await;
     add_patents(&gpu).await;
-    let gpu_table = gpu
-        .generate_text_embeddings("patents", &model, &["abstract".to_string()], "id")
+    let (gpu_table, _) = gpu
+        .generate_text_embeddings(
+            "patents",
+            &model,
+            &["abstract".to_string()],
+            "id",
+            CachePolicy::Bypass,
+        )
         .await
         .unwrap();
     let gpu_vecs = keyed_vectors(&gpu, &gpu_table).await;

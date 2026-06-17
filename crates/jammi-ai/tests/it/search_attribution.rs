@@ -44,9 +44,11 @@ async fn session_with_embeddings() -> (Arc<InferenceSession>, TempDir) {
             &tiny_bert_model(),
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     (session, dir)
 }

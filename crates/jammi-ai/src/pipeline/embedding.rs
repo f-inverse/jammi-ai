@@ -5,7 +5,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::store::ResultStore;
+use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore};
 
 use crate::model::{ModelSource, ModelTask};
 use crate::operator::inference_exec::InferenceExecBuilder;
@@ -36,13 +36,22 @@ impl<'a> EmbeddingPipeline<'a> {
     }
 
     /// Run the embedding pipeline: scan source → run inference → persist to Parquet + index.
+    ///
+    /// `cache` opts into memoization. Embeddings anchor their source as
+    /// [`AnchorKind::UnpinnedAtInstant`](jammi_db::store::manifest::AnchorKind::UnpinnedAtInstant)
+    /// — a raw source has no version surface in open-core — so an `Use` request
+    /// is honestly **always** a miss (`probe_cache` short-circuits any unpinned
+    /// anchor): the cache is off here until sources expose a version surface. The
+    /// returned [`CacheOutcome`] is therefore always `Computed`; the probe still
+    /// runs so the surface is uniform and the honest off-ness is provable.
     pub async fn run(
         &self,
         source_id: &str,
         model_id: &str,
         columns: &[String],
         key_column: &str,
-    ) -> Result<ResultTableRecord> {
+        cache: CachePolicy,
+    ) -> Result<(ResultTableRecord, CacheOutcome)> {
         let model_source = ModelSource::parse(model_id);
 
         // Pre-load model to get embedding dimensions
@@ -58,8 +67,49 @@ impl<'a> EmbeddingPipeline<'a> {
         let backend_kind = guard.model.backend_kind();
         drop(guard);
 
-        // Create result table in catalog
+        // The materialization contract is knowable here — the model is loaded
+        // (so `embedding_dim` is fixed) and the source is named — so the cache
+        // probe keys on the identical definition + anchors the funnel records at
+        // finalize. The sole input is the raw source with no version surface →
+        // `UnpinnedAtInstant`, so the probe is honestly always a miss.
         let canonical_model_id = model_source.to_string();
+        let descriptor = jammi_db::store::manifest::ProducingDescriptor::Embedding {
+            model_id: canonical_model_id.clone(),
+            task: self.task,
+            source_id: source_id.to_string(),
+            columns: columns.to_vec(),
+            key_column: key_column.to_string(),
+            dimensions: embedding_dim,
+        };
+        let env = jammi_db::store::manifest::MaterializationEnv::new(
+            self.session.compute_device(),
+            vec![jammi_db::store::manifest::ModelIdentity {
+                model_id: canonical_model_id.clone(),
+                backend: backend_kind.to_string(),
+            }],
+        );
+        let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
+            source_id,
+            chrono::Utc::now().to_rfc3339(),
+        )];
+
+        if cache == CachePolicy::Use {
+            let def_hash = jammi_db::store::manifest::MaterializationManifest::definition_of(
+                &descriptor,
+                &env,
+            )
+            .map_err(jammi_db::store::manifest_to_jammi)?;
+            if let Some(reused) = self
+                .result_store
+                .probe_cache_record(&def_hash, &inputs)
+                .await?
+            {
+                let table = reused.table_name.clone();
+                return Ok((reused, CacheOutcome::Reused { table }));
+            }
+        }
+
+        // Create result table in catalog
         let col_list = columns.join(",");
         let table_info = self
             .result_store
@@ -146,33 +196,9 @@ impl<'a> EmbeddingPipeline<'a> {
             }
         }
 
-        // The materialization contract: the embedding verb + its typed
-        // parameters as the producing description, the engine/device/model
-        // identity as the environment, and the source's read-time anchor as the
-        // sole input (a registered source has no version surface in open-core →
-        // `UnpinnedAtInstant`, honest rather than a fabricated pin).
-        let descriptor = jammi_db::store::manifest::ProducingDescriptor::Embedding {
-            model_id: canonical_model_id.clone(),
-            task: self.task,
-            source_id: source_id.to_string(),
-            columns: columns.to_vec(),
-            key_column: key_column.to_string(),
-            dimensions: embedding_dim,
-        };
-        let env = jammi_db::store::manifest::MaterializationEnv::new(
-            self.session.compute_device(),
-            vec![jammi_db::store::manifest::ModelIdentity {
-                model_id: canonical_model_id.clone(),
-                backend: backend_kind.to_string(),
-            }],
-        );
-        let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
-            source_id,
-            chrono::Utc::now().to_rfc3339(),
-        )];
-
-        // Finalize: write the manifest sidecar, register in DataFusion, and flip
-        // the catalog row `building -> ready` with its summary columns.
+        // Finalize with the contract built at the top (the same definition +
+        // anchors the cache probe keyed on), write the manifest sidecar, register
+        // in DataFusion, and flip the catalog row `building -> ready`.
         self.result_store
             .finalize_with_manifest(
                 self.session.context(),
@@ -184,7 +210,8 @@ impl<'a> EmbeddingPipeline<'a> {
             .await?;
 
         // Return the updated record
-        self.session
+        let record = self
+            .session
             .catalog()
             .get_result_table(&table_info.table_name)
             .await?
@@ -193,6 +220,7 @@ impl<'a> EmbeddingPipeline<'a> {
                     "Result table '{}' not found after finalization",
                     table_info.table_name
                 ))
-            })
+            })?;
+        Ok((record, CacheOutcome::Computed))
     }
 }

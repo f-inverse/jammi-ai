@@ -1123,11 +1123,13 @@ class RemoteDatabase:
         columns: List[str],
         key: str,
         modality: Optional[str] = None,
+        cache: Optional[str] = None,
     ) -> str:
         """Embed `columns` of a registered source, persisting one vector per row.
 
-        `modality` selects the tower. Returns the result table name. Maps to
-        `EmbeddingService.GenerateEmbeddings`.
+        `modality` selects the tower; `cache` opts into memoization (``"use"``)
+        or keeps the default recompute (``None``/``"bypass"``). Returns the
+        result table name. Maps to `EmbeddingService.GenerateEmbeddings`.
         """
         request = build_generate_embeddings_request(
             source=source,
@@ -1135,6 +1137,7 @@ class RemoteDatabase:
             columns=columns,
             key=key,
             modality=modality,
+            cache=cache,
         )
         resp = self._embedding.GenerateEmbeddings(request, metadata=self._metadata)
         return resp.table_name
@@ -1476,6 +1479,7 @@ class RemoteDatabase:
         columns: List[str],
         task: str,
         key: str,
+        cache: Optional[str] = None,
     ) -> pa.Table:
         """Run `model` over `columns` of a registered source for `task`,
         returning one output row per source row as a `pyarrow.Table`.
@@ -1483,10 +1487,12 @@ class RemoteDatabase:
         `task` is the snake-case model-task string (``"text_embedding"``,
         ``"image_embedding"``, ``"audio_embedding"``, ``"classification"``,
         ``"ner"``, ``"regression"``); `key` names the column whose value becomes
-        each output row's ``_row_id``. Maps to `InferenceService.Infer`. The
-        whole result rides back as one unary `ArrowBatch` (a single Arrow IPC
-        stream), so gRPC's default 4 MB per-message receive cap bounds the
-        result size a default channel can carry.
+        each output row's ``_row_id``; `cache` opts into memoization (``"use"``)
+        or keeps the default recompute (``None``/``"bypass"``). Maps to
+        `InferenceService.Infer`. The whole result rides back as one unary
+        `ArrowBatch` (a single Arrow IPC stream), so gRPC's default 4 MB
+        per-message receive cap bounds the result size a default channel can
+        carry.
         """
         request = build_infer_request(
             source=source,
@@ -1494,6 +1500,7 @@ class RemoteDatabase:
             columns=columns,
             task=task,
             key=key,
+            cache=cache,
         )
         resp = self._inference.Infer(request, metadata=self._metadata)
         return _arrow_batch_to_table(resp.result)
@@ -1517,6 +1524,7 @@ class RemoteDatabase:
         mutual: bool = False,
         exact: bool = False,
         table: Optional[str] = None,
+        cache: Optional[str] = None,
     ) -> str:
         """Materialise the k-NN graph of a source's embedding table and return the
         new edge table's name.
@@ -1524,7 +1532,10 @@ class RemoteDatabase:
         The returned table has columns ``(src, dst, rank, similarity)``. The
         default driver is index-assisted and approximate; pass ``exact=True`` for
         a deterministic, complete graph. ``min_similarity`` floors weak edges;
-        ``mutual=True`` keeps only reciprocal edges. Maps to
+        ``mutual=True`` keeps only reciprocal edges. `cache` opts into
+        memoization (``"use"``) or keeps the default recompute
+        (``None``/``"bypass"``) — a neighbour-graph is genuinely cacheable (it
+        anchors on the immutable source-table digest). Maps to
         `PipelineService.BuildNeighborGraph`; read the table via :meth:`sql`.
         """
         request = build_neighbor_graph_request(
@@ -1534,6 +1545,7 @@ class RemoteDatabase:
             mutual=mutual,
             exact=exact,
             table=table,
+            cache=cache,
         )
         resp = self._pipeline.BuildNeighborGraph(request, metadata=self._metadata)
         return resp.table_name
@@ -1553,6 +1565,7 @@ class RemoteDatabase:
         weighting: Optional[str] = None,
         alpha: Optional[float] = None,
         output: Optional[str] = None,
+        cache: Optional[str] = None,
     ) -> str:
         """Propagate an embedding table's features over a declared graph (the
         decoupled-GNN forward pass) into a new, searchable embedding table.
@@ -1560,9 +1573,12 @@ class RemoteDatabase:
         The graph is either an S9 similarity graph (``edge_graph_table``, a
         :meth:`build_neighbor_graph` output) or a registered external edge source
         (``edge_source``) — pass exactly one. ``weighting`` selects the neighbour
-        normalisation; ``output`` is ``"final"`` or ``"jumping_knowledge"``.
-        Returns the materialised table's name. Maps to
-        `PipelineService.PropagateEmbeddings`; read the table via :meth:`sql`.
+        normalisation; ``output`` is ``"final"`` or ``"jumping_knowledge"``;
+        `cache` opts into memoization (``"use"``) or keeps the default recompute
+        (``None``/``"bypass"``) — a propagation is genuinely cacheable (it
+        anchors on immutable source/edge digests). Returns the materialised
+        table's name. Maps to `PipelineService.PropagateEmbeddings`; read the
+        table via :meth:`sql`.
         """
         request = build_propagate_embeddings_request(
             source,
@@ -1577,6 +1593,7 @@ class RemoteDatabase:
             weighting=weighting,
             alpha=alpha,
             output=output,
+            cache=cache,
         )
         resp = self._pipeline.PropagateEmbeddings(request, metadata=self._metadata)
         return resp.table_name

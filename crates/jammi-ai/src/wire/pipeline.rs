@@ -55,6 +55,9 @@ pub struct BuildNeighborGraphArgs {
     /// resolve the source's default — the engine method's `embedding_table` arg.
     pub embedding_table: Option<String>,
     pub params: BuildNeighborGraph,
+    /// The opt-in memoization policy for this build (the engine method's `cache`
+    /// arg) — `Bypass` (always rebuild) unless the request set `Use`.
+    pub cache: jammi_db::store::CachePolicy,
 }
 
 /// Decode a serialized [`pb::BuildNeighborGraphRequest`] body into the engine's
@@ -91,6 +94,7 @@ pub fn build_neighbor_graph_from_proto(
         source_id: req.source_id,
         embedding_table: req.table,
         params,
+        cache: crate::wire::cache_policy_from_proto(req.cache)?,
     })
 }
 
@@ -102,7 +106,9 @@ pub fn build_neighbor_graph_from_proto(
 /// bytes here — so the in-process and remote paths decode through one shared seam
 /// ([`propagate_request_from_proto`]). A body that is not a valid request is a
 /// client error (`InvalidArgument`).
-pub fn propagate_request_from_bytes(body: &[u8]) -> Result<PropagateRequest, Status> {
+pub fn propagate_request_from_bytes(
+    body: &[u8],
+) -> Result<(PropagateRequest, jammi_db::store::CachePolicy), Status> {
     let req = pb::PropagateEmbeddingsRequest::decode(body).map_err(|e| {
         Status::invalid_argument(format!("malformed PropagateEmbeddings request: {e}"))
     })?;
@@ -116,10 +122,11 @@ pub fn propagate_request_from_bytes(body: &[u8]) -> Result<PropagateRequest, Sta
 /// builder default — the engine's value.
 pub fn propagate_request_from_proto(
     req: pb::PropagateEmbeddingsRequest,
-) -> Result<PropagateRequest, Status> {
+) -> Result<(PropagateRequest, jammi_db::store::CachePolicy), Status> {
     if req.source_id.is_empty() {
         return Err(Status::invalid_argument("source_id is required"));
     }
+    let cache = crate::wire::cache_policy_from_proto(req.cache)?;
     let edge_source = match req.graph {
         Some(pb::propagate_embeddings_request::Graph::EdgeGraphTable(table_name)) => {
             if table_name.is_empty() {
@@ -160,7 +167,7 @@ pub fn propagate_request_from_proto(
     if let Some(alpha) = req.alpha {
         request = request.with_alpha(alpha);
     }
-    Ok(request)
+    Ok((request, cache))
 }
 
 /// `""` → the engine's binding default column name; a non-empty value is kept.

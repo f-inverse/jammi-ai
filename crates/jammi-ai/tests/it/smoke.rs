@@ -32,9 +32,16 @@ async fn smoke_cp3_full_pipeline() {
     // Generate embeddings
     let tiny_bert = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
     let record = session
-        .generate_text_embeddings("patents", &tiny_bert, &["abstract".to_string()], "id")
+        .generate_text_embeddings(
+            "patents",
+            &tiny_bert,
+            &["abstract".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert_eq!(record.status, "ready");
     assert!(record.row_count > 0);

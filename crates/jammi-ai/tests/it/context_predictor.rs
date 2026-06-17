@@ -575,9 +575,16 @@ async fn train_context_predictor_over_generated_embeddings() {
     // the result table under the model's bare canonical name.
     let model_id = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
     session
-        .generate_text_embeddings("fns", &model_id, &["text".to_string()], "_row_id")
+        .generate_text_embeddings(
+            "fns",
+            &model_id,
+            &["text".to_string()],
+            "_row_id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     // The catalogued model's bare name differs from its PK, so the previously
     // mis-resolving `Some` arm would submit a job whose `base_model_id` is the

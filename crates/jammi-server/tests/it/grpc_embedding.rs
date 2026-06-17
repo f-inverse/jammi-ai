@@ -189,6 +189,7 @@ async fn generate_and_encode_audio_modality_over_the_wire() {
             columns: vec!["audio".into()],
             key_column: "clip_id".into(),
             modality: Modality::Audio as i32,
+            cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
         })
         .await
         .expect("generate_embeddings")
@@ -259,6 +260,7 @@ async fn generate_and_encode_text_modality_over_the_wire() {
             columns: vec!["abstract".into()],
             key_column: "id".into(),
             modality: Modality::Text as i32,
+            cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
         })
         .await
         .expect("generate_embeddings")
@@ -327,6 +329,7 @@ async fn embed_corpus(
             columns: vec!["audio".into()],
             key_column: "clip_id".into(),
             modality: Modality::Audio as i32,
+            cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
         })
         .await
         .expect("generate_embeddings");
@@ -520,6 +523,7 @@ async fn generate_embeddings_rejects_unspecified_modality() {
             columns: vec!["audio".into()],
             key_column: "clip_id".into(),
             modality: Modality::Unspecified as i32,
+            cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
         })
         .await
         .expect_err("unspecified modality must be rejected");

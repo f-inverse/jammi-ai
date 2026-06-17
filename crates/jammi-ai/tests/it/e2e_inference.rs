@@ -59,9 +59,11 @@ async fn e2e_embedding_produces_vectors_with_correct_schema() {
             ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert!(!results.is_empty(), "Should produce at least one batch");
     let batch = &results[0];
@@ -105,9 +107,11 @@ async fn e2e_every_row_has_valid_status() {
             ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     let mut total_rows = 0;
     for batch in &results {
@@ -143,9 +147,11 @@ async fn e2e_provenance_columns_have_correct_values() {
             ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     let batch = &results[0];
 
@@ -209,9 +215,11 @@ async fn e2e_null_text_rows_produce_error_status() {
             ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     let mut ok_count = 0;
     let mut error_count = 0;
@@ -270,9 +278,11 @@ async fn e2e_error_rows_have_null_vector_and_error_message() {
             ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     for batch in &results {
         let status = batch
@@ -355,9 +365,11 @@ async fn e2e_observer_receives_batch_notifications() {
             ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert!(!results.is_empty());
     assert!(
@@ -380,9 +392,11 @@ async fn e2e_model_registered_in_catalog_after_inference() {
             ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert!(!results.is_empty());
 
     let models = session.catalog().list_models().await.unwrap();
@@ -499,9 +513,11 @@ async fn e2e_modernbert_embedding_produces_vectors_with_correct_schema() {
             ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert!(!results.is_empty(), "Should produce at least one batch");
     let batch = &results[0];
@@ -574,9 +590,11 @@ async fn e2e_classification_produces_correct_schema() {
             ModelTask::Classification,
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert!(!results.is_empty(), "Should produce at least one batch");
     let batch = &results[0];
@@ -608,9 +626,11 @@ async fn e2e_classification_labels_match_id2label() {
             ModelTask::Classification,
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     let batch = &results[0];
     let label_col = batch
@@ -667,9 +687,11 @@ async fn e2e_ner_produces_entities_json() {
             ModelTask::Ner,
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert!(!results.is_empty(), "Should produce at least one batch");
     let batch = &results[0];
@@ -709,9 +731,11 @@ async fn e2e_ner_entities_have_valid_spans() {
             ModelTask::Ner,
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     let batch = &results[0];
     let entities_col = batch

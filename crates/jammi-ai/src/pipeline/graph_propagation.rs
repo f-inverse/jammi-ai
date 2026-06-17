@@ -292,7 +292,8 @@ impl InferenceSession {
     pub async fn propagate_embeddings(
         self: &Arc<Self>,
         request: &PropagateRequest,
-    ) -> Result<ResultTableRecord> {
+        cache: jammi_db::store::CachePolicy,
+    ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
         let table = self
             .catalog()
             .resolve_embedding_table(&request.source_id, request.embedding_table.as_deref())
@@ -303,6 +304,54 @@ impl InferenceSession {
                 table.table_name
             ))
         })? as usize;
+
+        // Top-of-producer cache probe, before the expensive load+propagate. The
+        // output width is knowable now (`Final` keeps one block, `JumpingKnowledge`
+        // concatenates X⁽⁰⁾..X⁽ᴷ⁾ — `effective_hops + 1` blocks), so the descriptor
+        // and the two `ResultDigest` input anchors (the source embedding table and
+        // the edge relation, both immutable) are fully resolvable here, byte-
+        // identical to what the funnel records at finalize. A propagation derives
+        // from immutable result tables, so it is genuinely cacheable.
+        let out_dim = match request.output {
+            PropagationOutput::Final => dimensions,
+            PropagationOutput::JumpingKnowledge => dimensions * (request.effective_hops() + 1),
+        };
+        let descriptor = jammi_db::store::manifest::ProducingDescriptor::GraphPropagation {
+            source_table: table.table_name.clone(),
+            edge_source: edge_source_id(&request.edge_source),
+            kernel_id: PROPAGATE_MODEL_ID.to_string(),
+            direction: propagation_direction(request.direction),
+            hops: request.effective_hops(),
+            alpha_bits: request.alpha.to_bits(),
+            weighting: propagation_weighting(request.weighting),
+            output: propagation_output(request.output),
+            dimensions: out_dim,
+        };
+        let env =
+            jammi_db::store::manifest::MaterializationEnv::new(self.compute_device(), Vec::new());
+        let inputs = vec![
+            self.result_store().result_digest_anchor(&table).await?,
+            self.edge_source_anchor(&request.edge_source).await?,
+        ];
+
+        if cache == jammi_db::store::CachePolicy::Use {
+            let def_hash = jammi_db::store::manifest::MaterializationManifest::definition_of(
+                &descriptor,
+                &env,
+            )
+            .map_err(jammi_db::store::manifest_to_jammi)?;
+            if let Some(reused) = self
+                .result_store()
+                .probe_cache_record(&def_hash, &inputs)
+                .await?
+            {
+                let name = reused.table_name.clone();
+                return Ok((
+                    reused,
+                    jammi_db::store::CacheOutcome::Reused { table: name },
+                ));
+            }
+        }
 
         // X⁽⁰⁾: the source vectors keyed by `_row_id`, in a stable total order so
         // the materialised output is reproducible.
@@ -331,34 +380,19 @@ impl InferenceSession {
             }
         };
 
-        let (rows, out_dim) = assemble_output(&initial, &history, request.output, dimensions);
+        let (rows, assembled_dim) = assemble_output(&initial, &history, request.output, dimensions);
+        // The output width was predicted at the top (the cache key keys on it);
+        // the assembled width must agree, or the prediction — and the probe key —
+        // would be wrong. A mismatch is a kernel bug, surfaced loudly.
+        debug_assert_eq!(
+            assembled_dim, out_dim,
+            "propagate_embeddings: predicted output width {out_dim} != assembled {assembled_dim}"
+        );
 
-        // The materialization contract: graph propagation invokes no model (a
-        // pure kernel over the source vectors + adjacency), so the environment
-        // carries the engine version + device with an empty model set. It reads
-        // TWO inputs — the source embedding table holding X⁽⁰⁾ and the edge
-        // relation defining the graph — so both are anchored; the kernel knobs
-        // that change the propagated vectors (direction, effective hops, the
-        // teleport α, weighting, output mode) are recorded in the descriptor.
-        let descriptor = jammi_db::store::manifest::ProducingDescriptor::GraphPropagation {
-            source_table: table.table_name.clone(),
-            edge_source: edge_source_id(&request.edge_source),
-            kernel_id: PROPAGATE_MODEL_ID.to_string(),
-            direction: propagation_direction(request.direction),
-            hops: request.effective_hops(),
-            alpha_bits: request.alpha.to_bits(),
-            weighting: propagation_weighting(request.weighting),
-            output: propagation_output(request.output),
-            dimensions: out_dim,
-        };
-        let env =
-            jammi_db::store::manifest::MaterializationEnv::new(self.compute_device(), Vec::new());
-        let inputs = vec![
-            self.result_store().result_digest_anchor(&table).await?,
-            self.edge_source_anchor(&request.edge_source).await?,
-        ];
-
-        self.result_store()
+        // Materialize with the contract built at the top (the same definition +
+        // anchors the cache probe keyed on).
+        let record = self
+            .result_store()
             .materialize_embedding_table(
                 self.context(),
                 jammi_db::store::EmbeddingTableSpec {
@@ -370,7 +404,8 @@ impl InferenceSession {
                 &rows,
                 jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
             )
-            .await
+            .await?;
+        Ok((record, jammi_db::store::CacheOutcome::Computed))
     }
 
     /// Load `X⁽⁰⁾` — every `(_row_id, vector)` of the embedding table — into a

@@ -710,7 +710,7 @@ impl MaterializationManifest {
         produced_by: String,
         produced_at: String,
     ) -> Result<Self, ManifestError> {
-        let definition_hash = definition_hash(descriptor, env)?;
+        let definition_hash = Self::definition_of(descriptor, env)?;
         Ok(Self {
             artifact,
             definition_hash,
@@ -720,6 +720,21 @@ impl MaterializationManifest {
             engine_version: env.engine_version.clone(),
             manifest_version: MANIFEST_VERSION,
         })
+    }
+
+    /// The [`DefinitionHash`] a producer would record for `(descriptor, env)` —
+    /// the *same* fold [`Self::compute`] performs, exposed so a cache probe can
+    /// build the lookup key **before** the expensive compute (it has no artifact
+    /// digest yet, only the definition). The probe key is therefore byte-identical
+    /// to what the funnel records at finalize: a top-of-producer
+    /// `definition_of(descriptor, env)` and the finalised manifest's
+    /// `definition_hash` are the same value for the same inputs, which is what
+    /// makes the memoization sound.
+    pub fn definition_of(
+        descriptor: &ProducingDescriptor,
+        env: &MaterializationEnv,
+    ) -> Result<DefinitionHash, ManifestError> {
+        definition_hash(descriptor, env)
     }
 
     /// The unpinned inputs, by source id — the inputs whose anchor is an

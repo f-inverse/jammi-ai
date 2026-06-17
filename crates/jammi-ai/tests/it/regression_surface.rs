@@ -210,9 +210,11 @@ async fn gaussian_regression_separates_groups_through_public_path() {
             ModelTask::Regression,
             &["text".to_string()],
             "target",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let schema_a = results_a[0].schema();
     let cols: Vec<&str> = schema_a
         .fields()
@@ -231,9 +233,11 @@ async fn gaussian_regression_separates_groups_through_public_path() {
             ModelTask::Regression,
             &["text".to_string()],
             "target",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     let mean_a = mean(&served_column(&results_a, "predicted_mean"));
     let mean_b = mean(&served_column(&results_b, "predicted_mean"));
@@ -304,9 +308,11 @@ async fn quantile_regression_serves_and_separates_groups() {
             ModelTask::Regression,
             &["text".to_string()],
             "target",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let results_b = session
         .infer(
             "holdout_b",
@@ -314,9 +320,11 @@ async fn quantile_regression_serves_and_separates_groups() {
             ModelTask::Regression,
             &["text".to_string()],
             "target",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     let cols: Vec<String> = results_a[0]
         .schema()

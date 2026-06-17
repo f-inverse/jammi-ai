@@ -103,9 +103,11 @@ async fn embed_patents_and_golden(session: &Session) -> String {
             &["abstract".to_string()],
             "id",
             Modality::Text,
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
         .expect("generate embeddings")
+        .0
         .table_name
 }
 
@@ -124,9 +126,11 @@ async fn remote_infer_round_trips_like_local() {
             ModelTask::TextEmbedding,
             &columns,
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .expect("remote infer");
+        .expect("remote infer")
+        .0;
     let local_rows = local
         .infer(
             "patents",
@@ -134,9 +138,11 @@ async fn remote_infer_round_trips_like_local() {
             ModelTask::TextEmbedding,
             &columns,
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .expect("local infer");
+        .expect("local infer")
+        .0;
 
     let row_ids = |batches: &[arrow::record_batch::RecordBatch]| -> Vec<String> {
         let mut out = Vec::new();

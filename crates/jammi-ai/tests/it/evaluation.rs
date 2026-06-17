@@ -358,9 +358,11 @@ async fn session_with_embeddings_and_golden() -> (Arc<InferenceSession>, String,
             &tiny_bert_model(),
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let table_name = record.table_name.clone();
 
     // Register golden relevance dataset
@@ -808,13 +810,27 @@ async fn eval_compare_distinct_tables_has_nonzero_deltas() {
 
     // Generate embeddings from two different text columns → different metrics
     let rec1 = session
-        .generate_text_embeddings("patents", &model, &["abstract".to_string()], "id")
+        .generate_text_embeddings(
+            "patents",
+            &model,
+            &["abstract".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let rec2 = session
-        .generate_text_embeddings("patents", &model, &["title".to_string()], "id")
+        .generate_text_embeddings(
+            "patents",
+            &model,
+            &["title".to_string()],
+            "id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     let comparison = session
         .eval_compare(
@@ -889,9 +905,16 @@ async fn eval_image_embeddings_end_to_end() {
 
     // Generate image embeddings (single strategy, no rotation for simplicity)
     let record = session
-        .generate_image_embeddings("figures", &tiny_open_clip, "image", "figure_id")
+        .generate_image_embeddings(
+            "figures",
+            &tiny_open_clip,
+            "image",
+            "figure_id",
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let table_name = record.table_name.clone();
 
     // Register golden image relevance dataset

@@ -45,9 +45,11 @@ async fn session_with_embeddings() -> (Arc<InferenceSession>, TempDir) {
             &tiny_bert_model(),
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     (session, dir)
 }
 
@@ -117,9 +119,11 @@ async fn neighbor_graph_has_correct_shape_and_ranking() {
                 exact: true, // deterministic so the assertions are stable
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert_eq!(edges_table.kind, ResultTableKind::NeighborGraph);
     assert!(
@@ -184,9 +188,11 @@ async fn neighbor_graph_endpoints_join_directly_to_source() {
                 k: 3,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     // `src` joins straight to the source's key column with no detour through
     // the embedding table — every edge resolves to a real patent title.
@@ -224,9 +230,11 @@ async fn neighbor_graph_min_similarity_floors_weak_edges() {
                 exact: true,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let all = collect_edges(&session, &unfiltered).await;
 
     // A floor strictly above the weakest surviving edge must drop at least it.
@@ -254,9 +262,11 @@ async fn neighbor_graph_min_similarity_floors_weak_edges() {
                 exact: true,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let filtered = collect_edges(&session, &filtered_table).await;
 
     assert!(
@@ -285,9 +295,11 @@ async fn neighbor_graph_mutual_is_a_reciprocal_subset() {
                 exact: true,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let directed = collect_edges(&session, &directed_table).await;
     use std::collections::HashSet;
     let directed_pairs: HashSet<(String, String)> = directed
@@ -305,9 +317,11 @@ async fn neighbor_graph_mutual_is_a_reciprocal_subset() {
                 exact: true,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let mutual = collect_edges(&session, &mutual_table).await;
 
     assert!(
@@ -342,9 +356,11 @@ async fn neighbor_graph_exact_is_deterministic_across_runs() {
                     exact: true,
                     ..Default::default()
                 },
+                jammi_db::store::CachePolicy::Bypass,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .0;
         collect_edges(&session, &table).await
     };
 
@@ -374,9 +390,11 @@ async fn neighbor_graph_index_agrees_with_exact_within_tolerance() {
                 exact: true,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let approx_table = session
         .build_neighbor_graph(
             "patents",
@@ -386,9 +404,11 @@ async fn neighbor_graph_index_agrees_with_exact_within_tolerance() {
                 exact: false,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     use std::collections::HashSet;
     let exact: HashSet<(String, String)> = collect_edges(&session, &exact_table)
@@ -426,9 +446,11 @@ async fn neighbor_graph_similarity_is_a_plain_non_null_column() {
                 k: 4,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     let batches = session
         .sql(&format!(
@@ -477,9 +499,11 @@ async fn two_hop_expansion_is_plain_sql_over_the_edge_table() {
                 exact: true,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
     // A self-join expands one hop to two — entirely in the query, with no
     // traversal operator in the engine.
@@ -527,9 +551,11 @@ async fn neighbor_graph_is_tenant_scoped() {
             &tiny_bert_model(),
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     let alice_edges = session
         .build_neighbor_graph(
             "patents",
@@ -538,9 +564,11 @@ async fn neighbor_graph_is_tenant_scoped() {
                 k: 3,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert!(
         session
             .catalog()
@@ -563,6 +591,7 @@ async fn neighbor_graph_is_tenant_scoped() {
                 k: 3,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await;
     assert!(
@@ -584,6 +613,7 @@ async fn neighbor_graph_rejects_zero_k() {
                 k: 0,
                 ..Default::default()
             },
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
         .unwrap_err();

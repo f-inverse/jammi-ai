@@ -15,6 +15,7 @@
 // response structs (`BuildNeighborGraph` / `PropagateRequest` / `ContextRequest`
 // / `ContextRepresentation`), which live behind the `local` feature — reachable
 // only in an engine build (the server and the embedded SDK).
+mod cache;
 mod catalog;
 mod embedding;
 mod eval;
@@ -22,6 +23,7 @@ mod inference;
 mod pipeline;
 mod training;
 
+pub use cache::{cache_outcome_to_proto, cache_policy_from_proto};
 pub use catalog::{
     add_channel_columns_from_bytes, add_channel_columns_from_proto,
     create_mutable_table_from_bytes, create_mutable_table_from_proto, register_channel_from_bytes,

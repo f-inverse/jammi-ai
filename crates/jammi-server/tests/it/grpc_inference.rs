@@ -83,6 +83,7 @@ async fn infer_returns_arrow_rows_over_the_wire() {
             columns: vec!["abstract".into()],
             key_column: "id".into(),
             tenant_id: String::new(),
+            cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
         })
         .await
         .expect("infer")
@@ -164,6 +165,7 @@ async fn infer_under_a_tenant_scope_succeeds_over_the_wire() {
             columns: vec!["abstract".into()],
             key_column: "id".into(),
             tenant_id: String::new(),
+            cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
         })
         .await
         .expect("infer under tenant scope")
@@ -193,6 +195,7 @@ async fn infer_rejects_unspecified_task() {
             columns: vec!["abstract".into()],
             key_column: "id".into(),
             tenant_id: String::new(),
+            cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
         })
         .await
         .expect_err("unspecified task must be rejected");
@@ -215,6 +218,7 @@ async fn infer_rejects_missing_columns() {
             columns: Vec::new(),
             key_column: "id".into(),
             tenant_id: String::new(),
+            cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
         })
         .await
         .expect_err("missing columns must be rejected");

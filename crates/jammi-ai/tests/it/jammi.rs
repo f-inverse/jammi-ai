@@ -45,9 +45,11 @@ async fn open_local_yields_a_working_embedded_session() {
             &["abstract".to_string()],
             "id",
             Modality::Text,
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .expect("generate_embeddings through the opened session");
+        .expect("generate_embeddings through the opened session")
+        .0;
     assert_eq!(record.status, "ready");
     assert!(record.row_count > 0, "patents corpus embeds rows");
 

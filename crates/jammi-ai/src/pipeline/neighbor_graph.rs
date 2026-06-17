@@ -46,7 +46,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::VectorIndex;
-use jammi_db::store::ResultStore;
+use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore};
 
 use crate::session::InferenceSession;
 
@@ -232,7 +232,8 @@ impl<'a> NeighborGraphPipeline<'a> {
         source_id: &str,
         embedding_table: Option<&str>,
         params: &BuildNeighborGraph,
-    ) -> Result<ResultTableRecord> {
+        cache: CachePolicy,
+    ) -> Result<(ResultTableRecord, CacheOutcome)> {
         if params.k == 0 {
             return Err(JammiError::Config(
                 "build_neighbor_graph requires k >= 1".into(),
@@ -245,9 +246,46 @@ impl<'a> NeighborGraphPipeline<'a> {
             .resolve_embedding_table(source_id, embedding_table)
             .await?;
 
+        // Top-of-producer cache probe, before the expensive read+build. The
+        // descriptor and the sole `ResultDigest` input anchor are both knowable
+        // here — the source embedding table is already resolved and its digest is
+        // its anchor — so the probe key is byte-identical to what the funnel
+        // records at finalize. A neighbor-graph is anchored on an immutable
+        // result table, so it is genuinely cacheable: the same build over the
+        // same parent yields the same edges.
+        let descriptor = neighbor_graph_descriptor(&source_table, params);
+        let env = jammi_db::store::manifest::MaterializationEnv::new(
+            self.session.compute_device(),
+            Vec::new(),
+        );
+        let inputs = vec![
+            self.result_store
+                .result_digest_anchor(&source_table)
+                .await?,
+        ];
+
+        if cache == CachePolicy::Use {
+            let def_hash = jammi_db::store::manifest::MaterializationManifest::definition_of(
+                &descriptor,
+                &env,
+            )
+            .map_err(jammi_db::store::manifest_to_jammi)?;
+            if let Some(reused) = self
+                .result_store
+                .probe_cache_record(&def_hash, &inputs)
+                .await?
+            {
+                let table = reused.table_name.clone();
+                return Ok((reused, CacheOutcome::Reused { table }));
+            }
+        }
+
         let nodes = self.read_nodes(&source_table).await?;
         let edges = self.build_edges(&source_table, &nodes, params).await?;
-        self.write_edge_table(&source_table, edges, params).await
+        let record = self
+            .write_edge_table(&source_table, edges, &descriptor, &env, inputs)
+            .await?;
+        Ok((record, CacheOutcome::Computed))
     }
 
     /// Read every `(_row_id, vector)` pair from the embedding table's Parquet,
@@ -366,7 +404,9 @@ impl<'a> NeighborGraphPipeline<'a> {
         &self,
         source_table: &ResultTableRecord,
         edges: Vec<Edge>,
-        params: &BuildNeighborGraph,
+        descriptor: &jammi_db::store::manifest::ProducingDescriptor,
+        env: &jammi_db::store::manifest::MaterializationEnv,
+        inputs: Vec<jammi_db::store::manifest::InputAnchor>,
     ) -> Result<ResultTableRecord> {
         // The edge table is a derivation: its `task` rides the source's so the
         // NOT NULL column round-trips, but `kind = NeighborGraph` excludes it
@@ -396,34 +436,16 @@ impl<'a> NeighborGraphPipeline<'a> {
         writer.write_batch(&batch).await?;
         writer.close().await?;
 
-        // The materialization contract: a neighbor-graph derivation invokes no
-        // model, so the environment carries the engine version + device with an
-        // empty model set; its sole input is the source embedding table, pinned
-        // by its immutable content digest (`ResultDigest`). The descriptor
-        // records every output-affecting build parameter so two graphs that
-        // differ in any of them hash differently.
-        let descriptor = jammi_db::store::manifest::ProducingDescriptor::NeighborGraph {
-            source_table: source_table.table_name.clone(),
-            k: params.k,
-            min_similarity_bits: params.min_similarity.map(f32::to_bits),
-            mutual: params.mutual,
-            self_exclude: params.self_exclude,
-            exact: params.exact,
-            exact_max_rows: params.exact_max_rows,
-        };
-        let env = jammi_db::store::manifest::MaterializationEnv::new(
-            self.session.compute_device(),
-            Vec::new(),
-        );
-        let inputs = vec![self.result_store.result_digest_anchor(source_table).await?];
-
+        // The materialization contract was built at the top of `run` (so the
+        // cache probe keyed on the identical definition + anchors before any
+        // compute); the funnel records exactly those bytes here.
         self.result_store
             .finalize_with_manifest(
                 self.session.context(),
                 &table_info.table_name,
                 &table_info.parquet_url,
                 row_count,
-                jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
+                jammi_db::store::manifest::Materialization::new(descriptor, env, inputs),
             )
             .await?;
 
@@ -437,6 +459,28 @@ impl<'a> NeighborGraphPipeline<'a> {
                     table_info.table_name
                 ))
             })
+    }
+}
+
+/// The neighbor-graph producing descriptor: the verb + every output-affecting
+/// build parameter, so two graphs that differ in any of them hash differently.
+/// Knowable before the read+build (it needs only the source table name and the
+/// params), so the cache probe and the finalised manifest share one definition.
+/// Its sole input is the source embedding table, pinned by its immutable content
+/// digest (`ResultDigest`) — which is why a neighbor-graph is genuinely
+/// cacheable.
+fn neighbor_graph_descriptor(
+    source_table: &ResultTableRecord,
+    params: &BuildNeighborGraph,
+) -> jammi_db::store::manifest::ProducingDescriptor {
+    jammi_db::store::manifest::ProducingDescriptor::NeighborGraph {
+        source_table: source_table.table_name.clone(),
+        k: params.k,
+        min_similarity_bits: params.min_similarity.map(f32::to_bits),
+        mutual: params.mutual,
+        self_exclude: params.self_exclude,
+        exact: params.exact,
+        exact_max_rows: params.exact_max_rows,
     }
 }
 

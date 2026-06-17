@@ -30,6 +30,10 @@ pub struct GenerateEmbeddingsArgs {
     pub columns: Vec<String>,
     pub key_column: String,
     pub modality: Modality,
+    /// The opt-in memoization policy (the engine method's `cache` arg). Embedding
+    /// anchors its source `UnpinnedAtInstant`, so `Use` is honestly always a
+    /// miss; the field rides for surface uniformity with the cacheable producers.
+    pub cache: jammi_db::store::CachePolicy,
 }
 
 /// Decode a serialized [`pb::GenerateEmbeddingsRequest`] body into the engine
@@ -71,6 +75,7 @@ pub fn generate_embeddings_from_proto(
         columns: req.columns,
         key_column: req.key_column,
         modality: Modality::try_from(req.modality)?,
+        cache: crate::wire::cache_policy_from_proto(req.cache)?,
     })
 }
 

@@ -133,9 +133,11 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
             &["abstract".to_string()],
             "id",
             Modality::Text,
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .expect("remote generate_embeddings");
+        .expect("remote generate_embeddings")
+        .0;
 
     assert_eq!(remote_table.status, "ready");
     assert!(remote_table.row_count > 0, "patents corpus embeds rows");
@@ -260,9 +262,11 @@ async fn remote_add_source_round_trips_like_local() {
             &["abstract".to_string()],
             "id",
             Modality::Text,
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .expect("generate_embeddings over the remote-registered source");
+        .expect("generate_embeddings over the remote-registered source")
+        .0;
     assert_eq!(remote_table.status, "ready");
     assert!(
         remote_table.row_count > 0,
@@ -280,9 +284,11 @@ async fn remote_add_source_round_trips_like_local() {
             jammi_db::ModelTask::TextEmbedding,
             &["abstract".to_string()],
             "id",
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await
-        .expect("local infer resolves the remote-registered source");
+        .expect("local infer resolves the remote-registered source")
+        .0;
     assert!(
         local_rows.iter().map(|b| b.num_rows()).sum::<usize>() > 0,
         "infer over the remote-registered source returns rows"

@@ -29,8 +29,11 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow::array::Int64Array;
+use arrow::array::{FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::prelude::SessionContext;
+use jammi_ai::session::InferenceSession;
+use jammi_ai::Session;
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
 use jammi_db::catalog::eval_repo::EvalRunRecord;
@@ -890,6 +893,20 @@ fn cases() -> Vec<IsolationCase> {
                 assert_eval_run_isolated().await;
             }
         ),
+        // --- materialization contract ----------------------------------------
+        // `verify_materialization` recomputes the stored Parquet digest against
+        // the table's manifest — a hermetic CPU read whose open is the
+        // tenant-filtered `get_result_table`, so a peer cannot resolve a
+        // tenant's table to verify it.
+        case!(
+            "CatalogService",
+            "VerifyMaterialization",
+            CaseKind::Hermetic,
+            None,
+            {
+                assert_verify_materialization_isolated().await;
+            }
+        ),
         // --- audit (tenant-scoped — NOT allowlisted) -------------------------
         case!("AuditService", "AuditLog", CaseKind::Hermetic, None, {
             assert_audit_isolated().await;
@@ -1192,6 +1209,150 @@ async fn assert_embedding_resolver_isolated() {
     assert!(
         cat_b.resolve_embedding_table("src_a", None).await.is_err(),
         "CROSS-TENANT LEAK: tenant B resolved tenant A's embedding table"
+    );
+}
+
+/// `verify_materialization` recomputes the stored Parquet digest and checks it
+/// against the table's manifest sidecar — a hermetic, CPU-only read. It opens
+/// with `catalog().get_result_table(name)`, which is tenant-filtered, so a peer
+/// cannot even resolve the table to verify it.
+///
+/// This drives the real wire path: tenant A materialises an embedding table
+/// through the single `finalize_with_manifest` funnel (the same funnel the
+/// production producers use), then `Session::verify_materialization` runs under
+/// each tenant's scope — exactly as the gRPC `VerifyMaterialization` handler
+/// wraps it in `scoped(engine, tenant, …)`. A's own verify returns
+/// [`MatchVerdict::Match`]; B's verify of A's table name fails to resolve the
+/// row and errors (a not-found `Catalog` error), never leaking A's artifact.
+async fn assert_verify_materialization_isolated() {
+    use jammi_db::store::manifest::{
+        ComputeDevice, InputAnchor, MatchVerdict, Materialization, MaterializationEnv,
+        ModelIdentity, ProducingDescriptor,
+    };
+
+    const DIMS: usize = 4;
+    let model_id = "verify-model";
+    let source_id = "verify-src";
+
+    let dir = tempdir().unwrap();
+    let engine = Arc::new(
+        InferenceSession::new(test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let session = Session::new(Arc::clone(&engine));
+
+    // Tenant A materialises one embedding result table through the single funnel.
+    // `create_table` stamps the catalog row with the scoped tenant (A), so the
+    // resulting row is private to A.
+    let table_name = engine
+        .with_tenant_scoped(tenant_a(), |_scope| async {
+            let store = engine.result_store();
+            let info = store
+                .create_table(
+                    source_id,
+                    ModelTask::TextEmbedding,
+                    ResultTableKind::Model,
+                    None,
+                    model_id,
+                    Some(DIMS as i32),
+                    Some("_row_id"),
+                    Some("body"),
+                )
+                .await
+                .unwrap();
+
+            // Write a real embedding Parquet so the digest the funnel attests is
+            // the digest the verify path recomputes.
+            let schema = jammi_db::store::schema::embedding_table_schema(DIMS);
+            let n = 3usize;
+            let row_id = StringArray::from_iter_values((0..n).map(|i| format!("row-{i}")));
+            let src = StringArray::from_iter_values((0..n).map(|_| source_id));
+            let model = StringArray::from_iter_values((0..n).map(|_| model_id));
+            let flat: Vec<f32> = (0..n)
+                .flat_map(|i| (0..DIMS).map(move |d| (i * DIMS + d) as f32))
+                .collect();
+            let item = Arc::new(Field::new("item", DataType::Float32, false));
+            let vectors = FixedSizeListArray::try_new(
+                item,
+                DIMS as i32,
+                Arc::new(Float32Array::from(flat)),
+                None,
+            )
+            .unwrap();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(row_id),
+                    Arc::new(src),
+                    Arc::new(model),
+                    Arc::new(vectors),
+                ],
+            )
+            .unwrap();
+            let mut writer = store.open_writer(&info.parquet_url, schema).await.unwrap();
+            writer.write_batch(&batch).await.unwrap();
+            let rows = writer.close().await.unwrap();
+
+            let descriptor = ProducingDescriptor::Embedding {
+                model_id: model_id.into(),
+                task: ModelTask::TextEmbedding,
+                source_id: source_id.into(),
+                columns: vec!["body".into()],
+                key_column: "_row_id".into(),
+                dimensions: DIMS,
+            };
+            let env = MaterializationEnv::new(
+                ComputeDevice::Cpu,
+                vec![ModelIdentity {
+                    model_id: model_id.into(),
+                    backend: "candle".into(),
+                }],
+            );
+            let ctx = SessionContext::new();
+            store
+                .finalize_with_manifest(
+                    &ctx,
+                    &info.table_name,
+                    &info.parquet_url,
+                    rows,
+                    Materialization::new(
+                        &descriptor,
+                        &env,
+                        vec![InputAnchor::mutable_version(source_id, 1)],
+                    ),
+                )
+                .await
+                .unwrap();
+            info.table_name
+        })
+        .await;
+
+    // Tenant A verifies its own table: the funnel-attested digest recomputes, so
+    // the verdict is Match.
+    let a_verdict = engine
+        .with_tenant_scoped(tenant_a(), |_scope| {
+            session.verify_materialization(&table_name, None)
+        })
+        .await
+        .expect("tenant A must verify its own materialization");
+    assert_eq!(
+        a_verdict,
+        MatchVerdict::Match,
+        "tenant A's own materialization must verify as Match"
+    );
+
+    // Tenant B verifies A's table name: the tenant-filtered `get_result_table`
+    // resolves no row for B, so verify errors (not-found) rather than leaking A's
+    // artifact or fabricating a verdict.
+    let b_result = engine
+        .with_tenant_scoped(tenant_b(), |_scope| {
+            session.verify_materialization(&table_name, None)
+        })
+        .await;
+    assert!(
+        b_result.is_err(),
+        "CROSS-TENANT LEAK: tenant B resolved and verified tenant A's materialization: {b_result:?}"
     );
 }
 

@@ -534,34 +534,10 @@ impl ResultStore {
                 self.catalog
                     .update_result_table_status(&table.table_name, ResultTableStatus::Failed, 0)
                     .await?;
-            } else if self
-                .read_materialization_manifest(&parquet_url)
-                .await?
-                .is_none()
-            {
-                // Valid Parquet but NO manifest sidecar: the write was torn in
-                // the window between the Parquet landing and the manifest being
-                // written (before the `building -> ready` flip). The contract
-                // forbids promoting a table without an attestation, and the
-                // producing descriptor cannot be reconstructed here — so this
-                // row is reaped to `failed`, not promoted manifest-less.
-                warn!(
-                    table = table.table_name,
-                    "Recovery: valid Parquet but no materialization manifest \
-                     (torn write before manifest); deleting and marking failed"
-                );
-                parquet_handle.delete_if_exists(&parquet_path).await.ok();
-                if let Some(ref idx) = table.index_path {
-                    let idx_url = StorageUrl::parse(idx)?;
-                    let idx_handle = self.open_index(&idx_url)?;
-                    storage::sidecar_layout::delete_sidecar(&idx_handle, SidecarKind::Ann)
-                        .await
-                        .ok();
-                }
-                self.catalog
-                    .update_result_table_status(&table.table_name, ResultTableStatus::Failed, 0)
-                    .await?;
-            } else {
+            } else if let Some(manifest) = self.read_materialization_manifest(&parquet_url).await? {
+                // The manifest sidecar is present (written before the flip), so
+                // its summary columns can be backfilled as part of the same
+                // promotion the live path performs.
                 let row_count = storage::reader::count_parquet_rows(&parquet_handle).await?;
                 // Rebuild ANN index if this is an embedding table
                 if table.task.is_embedding() {
@@ -583,19 +559,6 @@ impl ResultStore {
                         }
                     }
                 }
-                // The manifest sidecar is present (written before the flip), so
-                // its summary columns can be backfilled as part of the same
-                // promotion the live path performs. A `building` row reaching
-                // here always has a manifest (the no-manifest case failed above).
-                let manifest = self
-                    .read_materialization_manifest(&parquet_url)
-                    .await?
-                    .ok_or_else(|| {
-                        JammiError::Catalog(format!(
-                            "Recovery: manifest vanished mid-reconcile for '{}'",
-                            table.table_name
-                        ))
-                    })?;
                 let anchors_json = serde_json::to_string(&manifest.input_anchors)
                     .map_err(|e| JammiError::Other(format!("serialise input anchors: {e}")))?;
                 self.catalog
@@ -605,6 +568,29 @@ impl ResultStore {
                         manifest.definition_hash.as_str(),
                         &anchors_json,
                     )
+                    .await?;
+            } else {
+                // Valid Parquet but NO manifest sidecar: the write was torn in
+                // the window between the Parquet landing and the manifest being
+                // written (before the `building -> ready` flip). The contract
+                // forbids promoting a table without an attestation, and the
+                // producing descriptor cannot be reconstructed here — so this
+                // row is reaped to `failed`, not promoted manifest-less.
+                warn!(
+                    table = table.table_name,
+                    "Recovery: valid Parquet but no materialization manifest \
+                     (torn write before manifest); deleting and marking failed"
+                );
+                parquet_handle.delete_if_exists(&parquet_path).await.ok();
+                if let Some(ref idx) = table.index_path {
+                    let idx_url = StorageUrl::parse(idx)?;
+                    let idx_handle = self.open_index(&idx_url)?;
+                    storage::sidecar_layout::delete_sidecar(&idx_handle, SidecarKind::Ann)
+                        .await
+                        .ok();
+                }
+                self.catalog
+                    .update_result_table_status(&table.table_name, ResultTableStatus::Failed, 0)
                     .await?;
             }
         }

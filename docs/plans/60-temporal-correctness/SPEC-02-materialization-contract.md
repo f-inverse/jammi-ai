@@ -319,12 +319,14 @@ clients/python/jammi_client/_database.py        CHANGED  remote stub + verdict p
 crates/jammi-python/tests/test_conformance.py   CHANGED  _PIPELINE_VERBS += verify_materialization
 crates/jammi-db/tests/it/materialization.rs                +new  adversarial oracle (the §11 verdicts) + funnel + recovery
 crates/jammi-db/tests/it/materialization_crash_recovery.rs +new  SIGKILL crash-injection (manifest window)
-docs/guide/src/materialization-contract.md      +new  cookbook recipe (§9) — SEPARATE post-tag deliverable (ch19)
+docs/guide/src/materialization-contract.md      +new  guide recipe (§9) — ships in this PR; ch19 measured acceptance is separate post-tag
 ```
 
-## 9. Cookbook recipe (separate post-tag deliverable — ch19)
+## 9. Guide recipe (ships in this PR) — and the separate ch19 measured acceptance
 
-The cookbook chapter is a **separate deliverable** (ch19), authored against the released engine after this change lands; it is not part of this PR. Planned outline: `docs/guide/src/materialization-contract.md` — "Proving a table is what you think it is." Outline: materialise a table; read its manifest (definition hash, input anchors, run); recompute and `verify_materialization` → `Match`; change the producing query and show the definition hash changes (so a stale copy is detectable); show `MatchWithUnpinnedInputs` for an unversioned source. Closing note: this is the contract a consumer carries across a serving boundary so an online read can assert it corresponds to the offline definition — but the boundary itself is the consumer's to build. `SUMMARY.md` updated; `mdbook build` clean; samples compile under `mdbook test`.
+The guide chapter `docs/guide/src/materialization-contract.md` — "Proving a table is what you think it is" — ships **in this PR**: materialise a table; read its manifest (definition hash, input anchors, run); recompute and `verify_materialization` → `Match`; change the producing query and show the definition hash changes (so a stale copy is detectable); show `MatchWithUnpinnedInputs` for an unversioned source. The closing note: this is the contract a consumer carries across a serving boundary so an online read can assert it corresponds to the offline definition — but the boundary itself is the consumer's to build. `SUMMARY.md` updated; `mdbook build` clean; samples compile under `mdbook test`.
+
+What remains a **separate post-tag deliverable** is the cookbook **ch19 measured acceptance**: authored against the released engine after this change lands, it exercises the recipe end-to-end against a real built engine and records the measured run — the engine↔cookbook validation loop, distinct from the guide prose that ships here.
 
 ## 10. Discipline-test example — a clinical-trial data fabric, not a feature store
 
@@ -350,10 +352,10 @@ This passes the discipline test. None of *"patient," "lab," "audit," "submission
 4. **Anchor correctness.** A result-table input contributes its own artifact digest (`ResultDigest`, via `result_digest_anchor`); a mutable-table input a monotonic version (`MutableVersion`); an unversioned/registered source yields `UnpinnedAtInstant`. `materialization.rs::verdict_match_with_unpinned_inputs` + `the_funnel_persists_sidecar_and_summary_columns`.
 5. **Round-trip.** Manifest written on materialize, read back identical (`manifest.rs::manifest_round_trips_through_json`); the catalog summary columns match the sidecar (`materialization.rs::the_funnel_persists_sidecar_and_summary_columns`).
 6. **Verdicts.** `verify_materialization` returns `Match` for an untouched table, `Mismatch` against a wrong expected hash or tampered data, `MatchWithUnpinnedInputs` when an input was unpinned, `MissingManifest` for a pre-`021` table — the adversarial oracle in `materialization.rs`.
-7. **No table escapes.** The bare `finalize` is deleted and `finalize_with_manifest` is the sole `building -> ready` transition, so the type system enforces that every one of the five producers (inference, embedding, neighbor-graph, graph-propagation, context-set) supplies a descriptor/env/inputs — a producer that tried to publish without one would not compile. The funnel test (`materialization.rs::the_funnel_persists_sidecar_and_summary_columns`) asserts a materialised table carries both the sidecar and the catalog summary columns.
+7. **No table escapes.** The bare `finalize` is deleted and `finalize_with_manifest` is the sole producer `building -> ready` transition, so every one of the five producers (inference, embedding, neighbor-graph, graph-propagation, context-set) supplies a descriptor/env/inputs to publish a table — no PRODUCTION path flips a table to `ready` without a manifest. (The low-level `update_result_table_status(.., Ready, ..)` still exists and compiles — recovery's manifest-aware promotion and tests call it directly — but no producer reaches `ready` except through `finalize_with_manifest`, or through the recovery promotion that first reads a landed sidecar.) The funnel test (`materialization.rs::the_funnel_persists_sidecar_and_summary_columns`) asserts a materialised table carries both the sidecar and the catalog summary columns.
 8. **Embed == remote.** Conformance guard green for `verify_materialization`; identical verdict on both transports for a fixture.
 9. **No band-aids.** Zero net new `#[allow(...)]`, `let _ =`, `// TODO`, `#[ignore]`; `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`, and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` pass.
-10. **Recipe.** The §9 cookbook chapter (ch19) is a separate post-tag deliverable, not part of this change.
+10. **Recipe.** The §9 guide chapter (`docs/guide/src/materialization-contract.md`) ships in this change; `mdbook build` clean and its samples compile under `mdbook test`. The cookbook ch19 *measured acceptance* (the run against the released engine) remains a separate post-tag deliverable.
 
 ## 12. Engineering-principles audit
 

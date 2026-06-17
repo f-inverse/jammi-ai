@@ -333,6 +333,19 @@ impl InferenceSession {
 
         let (rows, out_dim) = assemble_output(&initial, &history, request.output, dimensions);
 
+        // The materialization contract: graph propagation invokes no model (a
+        // pure kernel over the source vectors + adjacency), so the environment
+        // carries the engine version + device with an empty model set; its input
+        // is the source embedding table, pinned by its content digest.
+        let descriptor = jammi_db::store::manifest::ProducingDescriptor::GraphPropagation {
+            source_table: table.table_name.clone(),
+            kernel_id: PROPAGATE_MODEL_ID.to_string(),
+            dimensions: out_dim,
+        };
+        let env =
+            jammi_db::store::manifest::MaterializationEnv::new(self.compute_device(), Vec::new());
+        let inputs = vec![self.result_store().result_digest_anchor(&table).await?];
+
         self.result_store()
             .materialize_embedding_table(
                 self.context(),
@@ -341,6 +354,7 @@ impl InferenceSession {
                 Some(&table.table_name),
                 &rows,
                 out_dim,
+                jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
             )
             .await
     }

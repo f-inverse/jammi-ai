@@ -251,3 +251,49 @@ pub fn topic_from_proto(wire: pb::Topic) -> Result<TopicDefinition, Status> {
         broker_metadata,
     })
 }
+
+// === materialization contract =============================================
+
+/// Map the engine's [`MatchVerdict`](jammi_db::store::manifest::MatchVerdict)
+/// onto the proto `verdict` oneof so a remote `verify_materialization`
+/// reconstructs the identical verdict the in-process path returns.
+pub fn match_verdict_to_proto(
+    verdict: jammi_db::store::manifest::MatchVerdict,
+) -> pb::verify_materialization_response::Verdict {
+    use jammi_db::store::manifest::MatchVerdict;
+    use pb::verify_materialization_response as v;
+    match verdict {
+        MatchVerdict::Match => v::Verdict::Match(v::Match {}),
+        MatchVerdict::Mismatch { expected, found } => {
+            v::Verdict::Mismatch(v::Mismatch { expected, found })
+        }
+        MatchVerdict::MatchWithUnpinnedInputs { unpinned } => {
+            v::Verdict::MatchWithUnpinnedInputs(v::MatchWithUnpinnedInputs { unpinned })
+        }
+        MatchVerdict::MissingManifest => v::Verdict::MissingManifest(v::MissingManifest {}),
+    }
+}
+
+/// Reconstruct the engine's [`MatchVerdict`](jammi_db::store::manifest::MatchVerdict)
+/// from the proto `verdict` oneof. An absent oneof is a malformed response —
+/// the server always sets exactly one verdict — and is rejected as `Internal`.
+pub fn match_verdict_from_proto(
+    verdict: Option<pb::verify_materialization_response::Verdict>,
+) -> Result<jammi_db::store::manifest::MatchVerdict, Status> {
+    use jammi_db::store::manifest::MatchVerdict;
+    use pb::verify_materialization_response as v;
+    match verdict {
+        Some(v::Verdict::Match(_)) => Ok(MatchVerdict::Match),
+        Some(v::Verdict::Mismatch(m)) => Ok(MatchVerdict::Mismatch {
+            expected: m.expected,
+            found: m.found,
+        }),
+        Some(v::Verdict::MatchWithUnpinnedInputs(m)) => Ok(MatchVerdict::MatchWithUnpinnedInputs {
+            unpinned: m.unpinned,
+        }),
+        Some(v::Verdict::MissingManifest(_)) => Ok(MatchVerdict::MissingManifest),
+        None => Err(Status::internal(
+            "VerifyMaterializationResponse carried no verdict",
+        )),
+    }
+}

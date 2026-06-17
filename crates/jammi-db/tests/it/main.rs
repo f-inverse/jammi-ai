@@ -10,6 +10,9 @@ mod exact_search;
 mod fine_tune_queue;
 mod foundation;
 mod index;
+mod materialization;
+#[cfg(feature = "test-hooks")]
+mod materialization_crash_recovery;
 mod migrations;
 mod model_lifecycle;
 #[cfg(feature = "test-hooks")]

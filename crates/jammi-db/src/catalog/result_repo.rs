@@ -2,6 +2,7 @@ use crate::catalog::backend::{BackendError, Row, SqlValue, TxOptions};
 use crate::catalog::Catalog;
 use crate::error::{JammiError, Result};
 use crate::model_task::ModelTask;
+use crate::tenant_scope::TenantBinding;
 
 /// Whether a result table is a direct model output or a derivation of another
 /// result table.
@@ -80,6 +81,12 @@ pub struct ResultTableRecord {
     pub text_columns: Option<String>,
     pub created_at: String,
     pub completed_at: Option<String>,
+    /// Owning tenant, or `None` for a GLOBAL (shared) table. Recovery reads
+    /// this to re-scope a cross-tenant reconciliation back to the row's own
+    /// tenant when it enumerates orphans under an admin scan; tenant-scoped
+    /// callers see only their own rows, so for them this is always either
+    /// their tenant or `None`.
+    pub tenant_id: Option<String>,
 }
 
 fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendError> {
@@ -111,6 +118,7 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendErr
         text_columns: row.try_get("text_columns")?,
         created_at: row.get("created_at")?,
         completed_at: row.try_get("completed_at")?,
+        tenant_id: row.try_get("tenant_id")?,
     })
 }
 
@@ -166,6 +174,14 @@ impl Catalog {
 
     /// Update a result table's status and row count. Sets `completed_at` when
     /// transitioning to a terminal state (Ready/Failed).
+    ///
+    /// Inside a [`crate::session::JammiSession::with_admin_scope`] closure the
+    /// tenant predicate is dropped and the row is reconciled by its
+    /// `table_name` primary key alone — startup recovery promotes/fails an
+    /// orphan it found under the cross-tenant scan without first re-binding to
+    /// that tenant. The match is exact because `table_name` is the table's
+    /// PRIMARY KEY. Outside admin scope the update is tenant-scoped, so one
+    /// tenant can never flip another tenant's row.
     pub async fn update_result_table_status(
         &self,
         name: &str,
@@ -187,24 +203,40 @@ impl Catalog {
         let status_str = status.to_string();
         let name = name.to_string();
         let rows_i64 = rows as i64;
+        let admin = TenantBinding::is_admin_scope();
         let tenant = self.current_tenant();
 
         self.backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.set_tenant(tenant);
-                    tx.execute(
-                        "UPDATE result_tables SET status = $1, row_count = $2, completed_at = $3 \
-                         WHERE table_name = $4 AND (tenant_id = $5 OR tenant_id IS NULL)",
-                        &[
-                            SqlValue::TextOwned(status_str),
-                            SqlValue::Int(rows_i64),
-                            SqlValue::from(completed_at),
-                            SqlValue::TextOwned(name),
-                            SqlValue::from(tenant.map(|t| t.to_string())),
-                        ],
-                    )
-                    .await?;
+                    if admin {
+                        tx.execute(
+                            "UPDATE result_tables SET status = $1, row_count = $2, \
+                             completed_at = $3 WHERE table_name = $4",
+                            &[
+                                SqlValue::TextOwned(status_str),
+                                SqlValue::Int(rows_i64),
+                                SqlValue::from(completed_at),
+                                SqlValue::TextOwned(name),
+                            ],
+                        )
+                        .await?;
+                    } else {
+                        tx.execute(
+                            "UPDATE result_tables SET status = $1, row_count = $2, \
+                             completed_at = $3 \
+                             WHERE table_name = $4 AND (tenant_id = $5 OR tenant_id IS NULL)",
+                            &[
+                                SqlValue::TextOwned(status_str),
+                                SqlValue::Int(rows_i64),
+                                SqlValue::from(completed_at),
+                                SqlValue::TextOwned(name),
+                                SqlValue::from(tenant.map(|t| t.to_string())),
+                            ],
+                        )
+                        .await?;
+                    }
                     Ok(())
                 })
             })
@@ -242,11 +274,19 @@ impl Catalog {
     }
 
     /// List result tables with a given status, scoped to the session tenant.
+    ///
+    /// Inside a [`crate::session::JammiSession::with_admin_scope`] closure the
+    /// per-row tenant filter is dropped and rows from **every** tenant are
+    /// returned — the cross-tenant enumeration startup recovery needs so a
+    /// `building` orphan owned by any tenant is reconciled, not only the
+    /// session's own and GLOBAL (`tenant_id IS NULL`) rows. Outside admin scope
+    /// the query is tenant-scoped exactly as every other read on this table.
     pub async fn list_result_tables_by_status(
         &self,
         status: super::status::ResultTableStatus,
     ) -> Result<Vec<ResultTableRecord>> {
         let status_str = status.to_string();
+        let admin = TenantBinding::is_admin_scope();
         let tenant = self.current_tenant();
         Ok(self
             .backend()
@@ -257,17 +297,27 @@ impl Catalog {
                 },
                 |tx| {
                     Box::pin(async move {
-                        tx.query(
-                            "SELECT * FROM result_tables WHERE status = $1 \
-                               AND (tenant_id = $2 OR tenant_id IS NULL) \
-                             ORDER BY created_at",
-                            &[
-                                SqlValue::TextOwned(status_str),
-                                SqlValue::from(tenant.map(|t| t.to_string())),
-                            ],
-                            parse_row,
-                        )
-                        .await
+                        if admin {
+                            tx.query(
+                                "SELECT * FROM result_tables WHERE status = $1 \
+                                 ORDER BY created_at",
+                                &[SqlValue::TextOwned(status_str)],
+                                parse_row,
+                            )
+                            .await
+                        } else {
+                            tx.query(
+                                "SELECT * FROM result_tables WHERE status = $1 \
+                                   AND (tenant_id = $2 OR tenant_id IS NULL) \
+                                 ORDER BY created_at",
+                                &[
+                                    SqlValue::TextOwned(status_str),
+                                    SqlValue::from(tenant.map(|t| t.to_string())),
+                                ],
+                                parse_row,
+                            )
+                            .await
+                        }
                     })
                 },
             )

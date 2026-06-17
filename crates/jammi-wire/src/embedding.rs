@@ -145,5 +145,8 @@ pub fn result_table_from_proto(table: pb::ResultTable) -> Result<ResultTableReco
         text_columns: None,
         created_at: String::new(),
         completed_at: None,
+        // Tenant identity is server-side bookkeeping resolved from the session,
+        // not carried on the result wire — the reconstruction leaves it absent.
+        tenant_id: None,
     })
 }

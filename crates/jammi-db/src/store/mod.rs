@@ -26,6 +26,7 @@ use crate::storage::sidecar_layout::SidecarKind;
 use crate::storage::{
     self, JammiObjectStore, ObjectParquetWriter, Scheme, StorageRegistry, StorageUrl,
 };
+use crate::tenant_scope::TenantBinding;
 
 /// Returned by [`ResultStore::create_table`] — the generated paths and name
 /// for a new result table, before any data has been written.
@@ -241,8 +242,65 @@ impl ResultStore {
         Ok(())
     }
 
-    /// Recover tables stuck in 'building' status after a crash.
+    /// Reconcile every result table left `building` by a crash, restoring the
+    /// crash-consistency invariant of the catalog↔result-storage boundary.
+    ///
+    /// # Guarantee
+    ///
+    /// **Crash-consistent eventual reconciliation.** Object storage cannot join
+    /// the catalog transaction, so a table is published in two steps: the bytes
+    /// (Parquet + sidecar) are written first, then a single catalog row flips
+    /// `building → ready`. The status gate makes that boundary crash-safe
+    /// without a distributed transaction:
+    ///
+    /// - **No half-written table is ever queryable.** Only a `ready` row is
+    ///   loaded into DataFusion ([`Self::load_existing_tables`]); a `building`
+    ///   or `failed` row is never registered, so a crash mid-write leaves
+    ///   nothing addressable.
+    /// - **Reconciliation is terminal.** This sweep visits every `building` row
+    ///   and drives it to exactly one terminal state — `ready` if its bytes are
+    ///   a fully-valid closed Parquet (promoted with the *true* footer row
+    ///   count, and the ANN sidecar rebuilt from the Parquet so an embedding
+    ///   table self-heals even if its sidecar never landed), `failed` otherwise
+    ///   (missing bytes, or a torn/partial Parquet whose bytes are then reaped).
+    ///   No row is left `building`.
+    /// - **A promoted row's `row_count` is the truth on disk**, read from the
+    ///   Parquet footer — never the count the writer *intended* before it
+    ///   crashed.
+    ///
+    /// The sweep is idempotent: re-running it after it has reconciled every
+    /// `building` row is a no-op.
+    ///
+    /// # Cross-tenant scope
+    ///
+    /// Recovery runs under [`crate::session::JammiSession::with_admin_scope`] so
+    /// it enumerates and reconciles `building` orphans owned by **every**
+    /// tenant, not only the (unscoped, GLOBAL) startup session's own rows. Each
+    /// promoted/failed row keeps its own `tenant_id`; the bypass is confined to
+    /// this sweep and clears the instant it returns.
+    ///
+    /// # Durability boundary
+    ///
+    /// Both catalog backends replay their write-ahead log on restart, so a
+    /// *process* crash never loses a committed `building → ready` (or the
+    /// `building` insert that recovery later reconciles): the row that was
+    /// durably committed before the crash is present after it. The backends
+    /// differ only under host **power loss**: Postgres defaults to a synchronous
+    /// commit (`fsync`), so a committed transaction survives power loss;
+    /// SQLite runs `synchronous=NORMAL` under WAL, which fsyncs at checkpoint
+    /// but not on every commit, so a power loss can lose the last committed
+    /// transaction(s) since the previous checkpoint. That is a property of the
+    /// catalog's durability setting, not of this reconciliation — whatever the
+    /// catalog durably retained, recovery reconciles consistently against the
+    /// bytes on disk.
     pub async fn recover(&self) -> Result<()> {
+        TenantBinding::admin_scope(self.recover_inner()).await
+    }
+
+    /// The cross-tenant reconciliation loop, run inside [`Self::recover`]'s
+    /// admin scope so the catalog enumeration and the per-row status flips both
+    /// see and write across every tenant's `building` rows.
+    async fn recover_inner(&self) -> Result<()> {
         let building = self
             .catalog
             .list_result_tables_by_status(ResultTableStatus::Building)
@@ -313,8 +371,30 @@ impl ResultStore {
         Ok(())
     }
 
-    /// Load all 'ready' result tables into DataFusion.
+    /// Load every `ready` result table into DataFusion.
+    ///
+    /// Runs under an admin scope so a restart re-registers `ready` tables for
+    /// **every** tenant (a single startup session is unscoped/GLOBAL and would
+    /// otherwise miss tenant-owned tables).
+    ///
+    /// All tenants' `ready` tables share one DataFusion context, so raw `sql()`
+    /// over a result table is **not** tenant-isolated — a session can resolve any
+    /// `jammi.{name}` it can name. This is by design: the open-core engine targets
+    /// a **trusted network** and ships no security boundary of its own.
+    /// `tenant_scope` is an *organizational* mechanism (catalog-API access such as
+    /// `get_result_table` is tenant-scoped); access
+    /// control against a hostile principal is the consumer's responsibility — the
+    /// BYO-auth seam / a governing platform — never the engine's. See the guide's
+    /// security posture / threat model for the boundary.
+    ///
+    /// A `ready` row whose bytes are absent (a torn write that committed `ready`
+    /// before the bytes were durable on a power loss) is skipped, not
+    /// registered, so it is never queryable.
     pub async fn load_existing_tables(&self, ctx: &SessionContext) -> Result<()> {
+        TenantBinding::admin_scope(self.load_existing_tables_inner(ctx)).await
+    }
+
+    async fn load_existing_tables_inner(&self, ctx: &SessionContext) -> Result<()> {
         let ready = self
             .catalog
             .list_result_tables_by_status(ResultTableStatus::Ready)

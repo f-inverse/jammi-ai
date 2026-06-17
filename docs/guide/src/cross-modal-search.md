@@ -13,12 +13,14 @@ This recipe shows the full path: index images with the vision tower, embed a tex
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
+# use jammi_db::store::CachePolicy;
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 session.generate_image_embeddings(
     "figures",
     "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
     "image",       // column containing image data
     "figure_id",   // key column
+    CachePolicy::Bypass,
 ).await?;
 # Ok(()) }
 ```

@@ -11,12 +11,14 @@ Generate vector embeddings by running a model over text columns from a registere
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
+# use jammi_db::store::CachePolicy;
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
-let record = session.generate_text_embeddings(
+let (record, _outcome) = session.generate_text_embeddings(
     "patents",
     "sentence-transformers/all-MiniLM-L6-v2",
     &["abstract".to_string()],
     "id",
+    CachePolicy::Bypass,
 ).await?;
 
 println!("Embedded {} rows, {} dimensions", record.row_count, record.dimensions.unwrap());
@@ -76,12 +78,14 @@ Pass multiple column names to concatenate them (space-separated) before embeddin
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
+# use jammi_db::store::CachePolicy;
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 session.generate_text_embeddings(
     "papers",
     "sentence-transformers/all-MiniLM-L6-v2",
     &["title".to_string(), "abstract".to_string()],
     "doi",
+    CachePolicy::Bypass,
 ).await?;
 # Ok(()) }
 ```
@@ -107,9 +111,10 @@ Each call creates a new table. Multiple tables can coexist for the same source (
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
+# use jammi_db::store::CachePolicy;
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
-session.generate_text_embeddings("patents", "all-MiniLM-L6-v2", &["abstract".into()], "id").await?;
-session.generate_text_embeddings("patents", "bge-small-en-v1.5", &["title".into()], "id").await?;
+session.generate_text_embeddings("patents", "all-MiniLM-L6-v2", &["abstract".into()], "id", CachePolicy::Bypass).await?;
+session.generate_text_embeddings("patents", "bge-small-en-v1.5", &["title".into()], "id", CachePolicy::Bypass).await?;
 # Ok(()) }
 ```
 
@@ -151,11 +156,12 @@ To get embeddings as `RecordBatch` without writing to disk:
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
+# use jammi_db::store::CachePolicy;
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 use jammi_ai::model::{ModelSource, ModelTask};
 
 let model = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");
-let results = session.infer("patents", &model, ModelTask::TextEmbedding, &["abstract".into()], "id").await?;
+let (_results, _outcome) = session.infer("patents", &model, ModelTask::TextEmbedding, &["abstract".into()], "id", CachePolicy::Bypass).await?;
 # Ok(()) }
 ```
 

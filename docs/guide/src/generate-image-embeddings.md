@@ -13,12 +13,14 @@ The OpenCLIP family is cross-modal: the vision tower and the text tower in the s
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
+# use jammi_db::store::CachePolicy;
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
-let record = session.generate_image_embeddings(
+let (record, _outcome) = session.generate_image_embeddings(
     "figures",
     "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
     "image",       // column containing image data
     "figure_id",   // key column
+    CachePolicy::Bypass,
 ).await?;
 
 println!("Embedded {} images, {} dimensions", record.row_count, record.dimensions.unwrap());

@@ -145,11 +145,13 @@ The fine-tuned model is automatically registered and can be used anywhere a mode
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
 # use jammi_ai::fine_tune::training_job::TrainingJob;
+# use jammi_db::store::CachePolicy;
 # async fn ex(session: &InferenceSession, job: &TrainingJob) -> jammi_db::error::Result<()> {
 let model_id = job.model_id();
 
 let embedding = session.encode_text_query(model_id, "quantum computing").await?;
-session.generate_text_embeddings("patents", model_id, &["abstract".into()], "id").await?;
+println!("query embedding has {} dims", embedding.len());
+session.generate_text_embeddings("patents", model_id, &["abstract".into()], "id", CachePolicy::Bypass).await?;
 # Ok(()) }
 ```
 

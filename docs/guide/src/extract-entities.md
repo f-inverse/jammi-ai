@@ -11,16 +11,18 @@ Run a Named Entity Recognition model over text columns to extract person names, 
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
+# use jammi_db::store::CachePolicy;
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 use jammi_ai::model::{ModelSource, ModelTask};
 
 let model = ModelSource::hf("dslim/bert-base-NER");
-let results = session.infer(
+let (_results, _outcome) = session.infer(
     "patents",
     &model,
     ModelTask::Ner,
     &["abstract".to_string()],
     "id",
+    CachePolicy::Bypass,
 ).await?;
 # Ok(()) }
 ```

@@ -449,6 +449,31 @@ _CHANNEL_COLUMN_TYPE_NAME = {v: k for k, v in _CHANNEL_COLUMN_TYPE.items()}
 _TERMINAL_STATES = {"completed", "failed"}
 
 
+def _verify_verdict_to_dict(
+    resp: "catalog_pb2.VerifyMaterializationResponse",
+) -> Dict[str, Any]:
+    """Reconstruct the embed `Database`'s verdict dict from the wire
+    `VerifyMaterializationResponse` oneof, tag-for-tag (the embed shape is serde's
+    ``#[serde(tag = "verdict", rename_all = "snake_case")]`` of `MatchVerdict`)."""
+    which = resp.WhichOneof("verdict")
+    if which == "match":
+        return {"verdict": "match"}
+    if which == "mismatch":
+        return {
+            "verdict": "mismatch",
+            "expected": resp.mismatch.expected,
+            "found": resp.mismatch.found,
+        }
+    if which == "match_with_unpinned_inputs":
+        return {
+            "verdict": "match_with_unpinned_inputs",
+            "unpinned": list(resp.match_with_unpinned_inputs.unpinned),
+        }
+    if which == "missing_manifest":
+        return {"verdict": "missing_manifest"}
+    raise RuntimeError("VerifyMaterializationResponse carried no verdict")
+
+
 def _channel_spec_to_dict(c: catalog_pb2.Channel) -> Dict[str, Any]:
     """Project a wire `Channel` into the embed binding's channel-spec dict.
 
@@ -1761,6 +1786,27 @@ class RemoteDatabase:
             catalog_pb2.ListChannelsRequest(), metadata=self._metadata
         )
         return [_channel_spec_to_dict(c) for c in resp.channels]
+
+    def verify_materialization(
+        self, table: str, expected_definition: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Recompute a materialised result table's artifact digest and check it
+        (and, if given, an expected definition hash) against its
+        ``.materialization.json`` manifest.
+
+        Returns the same verdict dict the embed `Database` produces, tagged
+        ``{"verdict": "match" | "mismatch" | "match_with_unpinned_inputs" |
+        "missing_manifest", ...}``: ``mismatch`` carries ``expected`` / ``found``,
+        ``match_with_unpinned_inputs`` carries ``unpinned`` (the source ids of the
+        inputs that were not reproducibly pinned). Read-only; the engine returns a
+        verdict and never acts on one. The verdict attests the Parquet data, never
+        the ANN search index. Maps to `CatalogService.VerifyMaterialization`.
+        """
+        request = catalog_pb2.VerifyMaterializationRequest(table=table)
+        if expected_definition is not None:
+            request.expected_definition = expected_definition
+        resp = self._catalog.VerifyMaterialization(request, metadata=self._metadata)
+        return _verify_verdict_to_dict(resp)
 
     def _start_training(
         self, request: training_pb2.StartTrainingRequest

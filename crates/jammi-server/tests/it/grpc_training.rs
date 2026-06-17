@@ -322,6 +322,8 @@ async fn seed_predictor_dataset_under_tenant_a(server: &EngineServer) {
                 .await
                 .expect("add predictor source under tenant A");
 
+            let (__d, __e, __i) =
+                jammi_test_utils::synthetic_seed_contract("synthetic-embed", "fns", FEATURE_DIM);
             server
                 .engine
                 .result_store()
@@ -332,6 +334,7 @@ async fn seed_predictor_dataset_under_tenant_a(server: &EngineServer) {
                     None,
                     &pairs,
                     FEATURE_DIM,
+                    jammi_db::store::manifest::Materialization::new(&__d, &__e, __i),
                 )
                 .await
                 .expect("materialize tenant-A embedding table");

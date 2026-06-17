@@ -2,41 +2,26 @@
 
 > Part of the [60 — temporal correctness](./README.md) plan group. Independent of [`SPEC-01-asof-join.md`](./SPEC-01-asof-join.md) except at the shared result-store write path (see [`README.md` — Concurrent-session strategy](./README.md)); pinned to land first. Research rules: [`../cp9-substrate-primitives/RESEARCH-METHODOLOGY.md`](../cp9-substrate-primitives/RESEARCH-METHODOLOGY.md).
 >
-> **Status:** Proposed (draft).
+> **Status:** Implemented (the integration assumptions below were corrected against this engine during a pressure-test — there is no LogicalPlan-centric single funnel; see §3.3, §6, §6A).
 
 ## 1. Goal
 
-A *materialization contract* is the verifiable identity a materialised table carries so that any later reader can assert **"this artifact is the output of definition D over input-state S"** — without trusting a name, a path, or an out-of-band convention. The engine already writes a result table as an immutable Parquet object plus, for embedding tables, an ANN-index sidecar set (`crates/jammi-db/src/store/`: `ResultTableInfo { table_name, parquet_url, index_url }`, whose layout helpers append `.usearch`/`.rowmap`/`.manifest.json`). This spec adds a *separate* `.materialization.json` sidecar — written for **every** result table, not only embedding tables — carrying a signed-shaped attestation that binds three things to the table's content digest: a **content hash of the producing logical plan and the environment that affects its output**, the **immutable as-of anchors of every input** the plan read, and the **producing-run identity and instant**. It adds one verb, `verify_materialization`, that recomputes the artifact digest and reports whether it matches a caller-supplied expectation. The primitive carries only what every reproducibility-minded consumer needs; it ships **no** policy — what a reader *does* with a mismatch (refuse, alarm, fall back) is the reader's concern, not the engine's.
+A *materialization contract* is the verifiable identity a materialised table carries so that any later reader can assert **"this artifact is the output of definition D over input-state S"** — without trusting a name, a path, or an out-of-band convention. The engine already writes a result table as an immutable Parquet object plus, for embedding tables, an ANN-index sidecar set (`crates/jammi-db/src/store/`: `ResultTableInfo { table_name, parquet_url, index_url }`, whose layout helpers append `.usearch`/`.rowmap`/`.manifest.json`). This spec adds a *separate* `.materialization.json` sidecar — written for **every** result table, not only embedding tables — carrying a signed-shaped attestation that binds three things to the table's content digest: a **content hash of the producing description (the verb + its typed parameters) and the environment that affects its output** (engine version, compute device, invoked-model identities), the **immutable as-of anchors of every input** the producer read, and the **producing-run identity and instant**. It adds one verb, `verify_materialization`, that recomputes the artifact digest and reports whether it matches a caller-supplied expectation. The primitive carries only what every reproducibility-minded consumer needs; it ships **no** policy — what a reader *does* with a mismatch (refuse, alarm, fall back) is the reader's concern, not the engine's.
 
 This is a seam, not a serving tier. The contract makes "the served value matches the definition that trained it, as of T" a checkable fact at a boundary; it does not build the boundary. That keeps the engine on the right side of [`../../PHILOSOPHY.md`](../../PHILOSOPHY.md): the engine ships the export/attestation contract; the KV store, the online tier, and the refuse-to-serve policy live in the consumer's composition.
 
-## 2. Concurrent-session strategy
+## 2. Implementation shape
 
-Single-capability spec. One sequential scaffold, two parallel subagents, integration.
+Single-capability change, landed atomically across `jammi-db` + `jammi-ai` + `jammi-wire` + `jammi-server` + PyO3 + the remote client + conformance on one branch.
 
-### 2.A — Sequential scaffolding (~45 min, main session)
+1. **Contract** (`crates/jammi-db/src/store/manifest.rs`) — `ProducingDescriptor`, `MaterializationEnv` (with `ComputeDevice` + `ModelIdentity`), `Materialization` (the producer's `{descriptor, env, inputs}` bundle), `InputAnchor`/`AnchorKind`/`AnchorValue`, `DefinitionHash`, `ArtifactDigest`, `MaterializationManifest`, `MatchVerdict`, `ManifestError`. The definition hash and sidecar (de)serialisation are pure functions here.
+2. **Funnel** (`store/mod.rs`) — `finalize_with_manifest` replaces the bare `finalize` (deleted) as the single `building -> ready` transition; `verify_materialization`, `result_digest_anchor`, manifest sidecar read/write; recovery (`recover_inner` + `reconcile_ready_manifests`) made manifest-aware. A `test-hooks` checkpoint (`maybe_signal_materialization`) marks the crash window.
+3. **Catalog** — migration `021` (`definition_hash TEXT`, `input_anchors_json TEXT` on `result_tables`); `promote_result_table_with_manifest` flips status + persists the summary columns atomically; `ResultTableRecord` carries the two columns.
+4. **Producers** — the five result-table producers (`infer`, the embedding pipeline, the neighbor-graph derivation, `propagate_embeddings`, `materialize_context`) each build their `ProducingDescriptor` + `MaterializationEnv` (engine version + effective compute device via `InferenceSession::compute_device` + invoked-model identities) + `InputAnchor`s and route through the funnel.
+5. **Verb** — `Session::verify_materialization` → PyO3 `PyDatabase` binding → gRPC `CatalogService.VerifyMaterialization` + `RemoteDatabase` stub → `_PIPELINE_VERBS` in `test_conformance.py`.
+6. **Tests** — `tests/it/materialization.rs` (the §11 verdict oracle + funnel + recovery), `tests/it/materialization_crash_recovery.rs` (the SIGKILL manifest-window crash), the `manifest.rs` unit tests (determinism / sensitivity / device / round-trip), and the migration-021 column test.
 
-1. `crates/jammi-db/src/store/manifest.rs` — `MaterializationManifest`, `InputAnchor`, `DefinitionHash`, `ArtifactDigest`, `MatchVerdict`, `ManifestError` (the frozen contract, §3).
-2. `crates/jammi-db/src/store/mod.rs` — extend `ResultTableInfo` with `manifest: MaterializationManifest`; add the manifest-write call to the existing materialization path (signature only, body `todo!()`).
-3. `crates/jammi-db/src/catalog/schema.rs` — add `MIGRATION_021_MATERIALIZATION_CONTRACT` (DDL string adding `definition_hash TEXT`, `input_anchors_json TEXT` to `result_tables`). `021` is the next free number after the registered `020` (`MIGRATION_020_CHANNEL_TENANT_SCOPE`).
-4. `crates/jammi-db/src/catalog/migrations.rs` — append `schema::MIGRATION_021_MATERIALIZATION_CONTRACT` to the migration slice.
-
-Phase A ends when `cargo check -p jammi-db` passes and migration `021` applies against an empty SQLite DB in a unit test.
-
-### 2.B — Two parallel subagents (~3 h wall-clock)
-
-| Subagent | Files written | Responsibility | Independent test |
-|---|---|---|---|
-| **Hashing subagent** | `store/manifest.rs` (hashing impl), `store/plan_canonical.rs` | Canonicalise a `LogicalPlan` + environment into a stable `DefinitionHash`; compute the `ArtifactDigest` over the Parquet object | `crates/jammi-db/tests/it/definition_hash.rs` (determinism + sensitivity) |
-| **Manifest-IO subagent** | `store/manifest.rs` (read/write), result-store wiring | Write the manifest sidecar on materialize; read it back; populate `ResultTableInfo` | `crates/jammi-db/tests/it/manifest_roundtrip.rs` |
-
-**Coordination contract** (frozen in Phase A): `MaterializationManifest::compute(plan, env, inputs, digest) -> Result<Self, ManifestError>` and the sidecar path helper `materialization_url(base: &StorageUrl) -> StorageUrl` (appends `.materialization.json`, mirroring — but distinct from — the existing `.usearch`/`.rowmap`/`.manifest.json` index-sidecar convention).
-
-### 2.C — Sequential integration (~45 min, main session)
-
-1. Add `verify_materialization` to embedded `Database` + remote `RemoteDatabase`; add to `_PIPELINE_VERBS` in `test_conformance.py` (§7).
-2. Backfill: ensure every existing materialization call site (embedding, fine-tune output, eval, and SPEC-01's `asof_join`) flows through the manifest-writing path — no table escapes without a manifest.
-3. `cargo clippy --all-features -- -D warnings`, `cargo fmt --check`. No `#[allow(...)]`.
+> **Note on the original plan (corrected during pressure-test).** The draft assumed a `LogicalPlan`-centric single funnel with a `store/plan_canonical.rs` and a `MaterializationManifest::compute(plan, …)`. This engine has no such plan for result-table producers and no pre-existing single funnel — both were corrected (§3.3, §6, §6A): the definition input is a `ProducingDescriptor`, and the funnel was *built* by replacing `finalize`.
 
 ## 3. Public API surface (exhaustive)
 
@@ -45,7 +30,7 @@ Phase A ends when `cargo check -p jammi-db` passes and migration `021` applies a
 ```rust
 use serde::{Deserialize, Serialize};
 
-/// Content hash of *how* a table was produced: a canonicalised logical plan
+/// Content hash of *how* a table was produced: a canonical producing descriptor
 /// plus the environment that affects its output. SHA-256, hex-encoded.
 ///
 /// "Environment" is deliberately broad — the engine semantic version, the
@@ -137,16 +122,66 @@ pub struct MaterializationManifest {
 }
 
 impl MaterializationManifest {
-    /// Compute over a finished plan, its environment, resolved input anchors,
-    /// and the written artifact's digest. Pure: no I/O.
+    /// Compute over a producing *description* (not a plan — see below), its
+    /// environment, resolved input anchors, and the written artifact's digest.
+    /// Pure: no I/O.
     pub fn compute(
-        plan: &LogicalPlan,
+        descriptor: &ProducingDescriptor,
         env: &MaterializationEnv,
         inputs: Vec<InputAnchor>,
         artifact: ArtifactDigest,
+        produced_by: String,
+        produced_at: String,
     ) -> Result<Self, ManifestError>;
 }
 ```
+
+**Definition input — a producing descriptor, not a `LogicalPlan`.** This engine's
+result-table producers are hand-built physical pipelines; there is no single
+`LogicalPlan` to canonicalise (the only `LogicalPlan` lives in the SQL lane,
+`tenant_scope.rs`, and is unrelated to result-table materialisation). So the
+definition hash is computed over a `ProducingDescriptor` — a typed,
+deterministically-serialisable description of the verb and its parameters that
+each producer fills in:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "producer", rename_all = "snake_case")]
+pub enum ProducingDescriptor {
+    Inference { model_id, task, source_id, content_columns, key_column },
+    Embedding { model_id, task, source_id, columns, key_column, dimensions },
+    NeighborGraph { source_table, k },
+    GraphPropagation { source_table, kernel_id, dimensions },
+    ContextSet { encoder_id, source_id, dimensions },
+}
+```
+
+The five producers and the variant each fills: `infer` →
+`Inference`; the embedding pipeline → `Embedding`; the neighbor-graph
+derivation → `NeighborGraph`; `propagate_embeddings` → `GraphPropagation`;
+`materialize_context` → `ContextSet`. Canonicalisation is a sorted-key JSON
+encoding (object keys sorted, array order preserved — column / model order is
+significant), SHA-256-folded with the environment, length-prefixed and
+domain-separated so a descriptor field can never alias an environment field.
+
+**Environment — includes the compute device.** `MaterializationEnv` carries the
+engine semantic version, the **compute device** (`Cpu | Cuda { ordinal } | Metal
+{ ordinal }`), and the identity + backend kind of every invoked model:
+
+```rust
+pub struct MaterializationEnv {
+    pub engine_version: String,
+    pub device: ComputeDevice,        // CPU vs CUDA yields different floats
+    pub models: Vec<ModelIdentity>,   // { model_id, backend } per invoked model
+}
+```
+
+A model run on CPU vs CUDA yields different float outputs but the same model
+identity. Omitting the device would yield a false `Match` across devices — the
+Bazel cross-compiler failure the spec cites against itself — so the device is
+part of the world the hash covers. The device recorded is the *effective* one
+(resolved through the loader's `select_device`, including the CPU fallback when
+a requested GPU is unavailable), never merely the one requested.
 
 ### 3.4 The verdict + verb (`store/manifest.rs`, `session.rs`)
 
@@ -164,11 +199,20 @@ pub enum MatchVerdict {
     /// The artifact verifies, but at least one input was `UnpinnedAtInstant`,
     /// so reproducibility cannot be fully asserted. Honest, not silent.
     MatchWithUnpinnedInputs { unpinned: Vec<String> },
+    /// No manifest sidecar exists for the table — a pre-contract table. A
+    /// truthful "unknown," never a fabricated match.
+    MissingManifest,
 }
 
-// On Database / RemoteDatabase:
+// On the Session surface (embedded `PyDatabase` + remote `RemoteDatabase`):
 /// Recompute the artifact digest of a materialised table and compare it (and,
 /// if given, an expected definition hash) against its manifest. Read-only.
+///
+/// **`Match` attests the DATA, not the index.** The digest covers the Parquet
+/// object — the data-of-record — never the `.usearch`/`.rowmap` ANN sidecars,
+/// which are a derived accelerator reconstructible from the data. A `Match`
+/// asserts the data is the output of the expected definition, not that any
+/// particular index bytes are present.
 pub async fn verify_materialization(
     &self,
     table: &str,
@@ -181,8 +225,8 @@ pub async fn verify_materialization(
 ```rust
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
-    #[error("logical plan is not canonicalisable: {0}")]
-    UncanonicalPlan(String),
+    #[error("producing descriptor is not canonicalisable: {0}")]
+    UncanonicalDescriptor(String),
     #[error("manifest sidecar missing for table `{0}`")]
     MissingManifest(String),
     #[error("manifest format version {found} is newer than supported {supported}")]
@@ -207,7 +251,7 @@ The full manifest is the sidecar `.materialization.json`; the two catalog column
 
 ### 5.1 What the definition hash covers
 
-The canonical logical plan **and** its world: the plan's normalised structure (operators, expressions, projections — column *positions* and literal values, not display strings or generated aliases), plus the engine semantic version, the identity (canonical name + version) of every model the plan invokes, and the input backend kinds. This mirrors the cleanest published statement of the pattern — Dagster's `data_version` is "computed by hashing the `code_version` together with the data versions of all input assets"[^dagster] — and heeds the Bazel cross-compiler failure: a hash that omits a determinant of the output yields false cache hits / false matches[^bazel]. dbt's per-node checksum-driven `state:modified`[^dbt] is the same idea applied to SQL nodes.
+The canonical producing descriptor **and** its world: the descriptor's typed fields (the verb plus its parameters — model id, task, source, columns, key, dimensions, neighbour count, kernel id — serialised with sorted object keys and significant array order), plus the engine semantic version, **the compute device**, and the identity + backend kind of every model the producer invokes. This mirrors the cleanest published statement of the pattern — Dagster's `data_version` is "computed by hashing the `code_version` together with the data versions of all input assets"[^dagster] — and heeds the Bazel cross-compiler failure: a hash that omits a determinant of the output yields false cache hits / false matches[^bazel]. dbt's per-node checksum-driven `state:modified`[^dbt] is the same idea applied to SQL nodes.
 
 ### 5.2 Why an id, not a timestamp, is the as-of anchor
 
@@ -223,28 +267,59 @@ The manifest is *shaped* like an attestation (subject digest + predicate) but th
 
 ## 6. Wiring
 
-Every materialization path already funnels through the result-store write in `crates/jammi-db/src/store/`. SPEC-02 adds one step at the end of that funnel: after the Parquet object is written, compute its `ArtifactDigest`, build the `MaterializationManifest` from the plan + env + resolved input anchors, write the `.materialization.json` sidecar, and persist the two summary columns. Because the funnel is single, **no table can be produced without a manifest** — the integration step (§2.C item 2) audits every call site (embedding, fine-tune, eval, and SPEC-01 `asof_join`). Input anchors are resolved at read time from the catalog: a result-table input contributes its own `ArtifactDigest`; a mutable table its monotonic version; a federated source its as-of/version column value if it has one, else `UnpinnedAtInstant`.
+**There is no pre-existing single funnel — SPEC-02 builds one.** Five producers write result tables, each with its own `building -> ready` step: inference output (`session.rs`), the embedding pipeline (`pipeline/embedding.rs`), the neighbor-graph derivation (`pipeline/neighbor_graph.rs`), and graph-propagation + context-set (both via `ResultStore::materialize_embedding_table`). The shared low-level transition was `ResultStore::finalize(ctx, name, url, rows)`, which carried no descriptor / env / inputs.
+
+SPEC-02 replaces it with the single `building -> ready` transition `ResultStore::finalize_with_manifest(ctx, name, url, rows, descriptor, env, inputs)` and **deletes the bare `finalize`** (no-backwards-compat). All five producers route through it, each supplying its `ProducingDescriptor` variant, a `MaterializationEnv` (engine version + effective compute device + invoked-model identities), and its resolved `InputAnchor`s. `finalize_with_manifest` performs the publish in a crash-safe order: compute the `ArtifactDigest` over the durable Parquet bytes; write the `.materialization.json` sidecar; register the table in DataFusion; then flip `building -> ready` and persist the two summary columns (`definition_hash`, `input_anchors_json`) in one transaction. Because the sidecar lands *before* the status flip — the same boundary the ANN sidecar uses — **no `ready` table ever lacks a manifest**, and because the funnel is single, **no table is produced without one**.
+
+Input anchors are resolved by the producer at write time: a result-table input contributes its own `ArtifactDigest` (`ResultDigest`) — read from its own manifest, or recomputed for a pre-contract source; a mutable table its monotonic version (`MutableVersion`); a registered source, which exposes no as-of/version surface in open-core, its read instant honestly recorded as `UnpinnedAtInstant`.
+
+## 6A. Recovery — the manifest is part of the crash-consistency boundary
+
+SPEC-02 couples to the W2-T2 recovery sweep (`ResultStore::recover_inner`, #205), which reconciles `building` orphans against Parquet validity and rebuilds the ANN sidecar. The manifest joins that same atomic boundary:
+
+1. **Write-before-flip.** `finalize_with_manifest` writes the `.materialization.json` sidecar *before* the `building -> ready` status flip (the same ordering the ANN sidecar uses), so a crash can never leave a `ready` table without a manifest.
+
+2. **`building` reconciliation is manifest-aware.** A crash can leave a `building` row whose Parquet is valid but whose manifest never landed (the window between the Parquet close and the sidecar write). Recovery cannot reconstruct the `ProducingDescriptor` — it is not persisted as structured catalog data, it lives in the producer's call — so it **cannot synthesise a manifest**. The contract forbids promoting a manifest-less table, so such a row is reaped to `failed` and its bytes deleted, exactly as a torn/invalid Parquet is. A `building` row whose Parquet *and* sidecar both landed (a crash after the sidecar, before the flip) is promoted to `ready` with its summary columns backfilled from the sidecar.
+
+3. **`ready` reconciliation distinguishes a bug from history.** `reconcile_ready_manifests` sweeps already-`ready` rows: a **post-contract** row (catalog `definition_hash` set — it was promoted under the contract) whose sidecar is now absent is a corruption (the attestation a verifier would read is gone) and is reaped to `failed`; a **pre-contract** row (`definition_hash IS NULL`, created before migration 021) legitimately has no sidecar and is left untouched, verifying as an honest `MissingManifest`. This is the post-021-bug vs legitimate-pre-021 distinction the contract requires.
+
+A crash-injection test (`materialization_crash_recovery.rs`, feature `test-hooks`) proves (2): the `maybe_signal_materialization` hook fires inside `finalize_with_manifest` after the Parquet is durable and before the manifest write; the child parks, the parent `SIGKILL`s and restarts, and recovery reaps the manifest-less row — reusing the self-respawn + `SIGKILL` harness pattern from `mutable_crash_recovery.rs`.
 
 ## 7. Verb conventions (embed == remote)
 
-`verify_materialization` follows the established path: Rust impl on `Database` → PyO3 binding → gRPC handler + `RemoteDatabase` stub → add `"verify_materialization"` to `_PIPELINE_VERBS` in `crates/jammi-python/tests/test_conformance.py`. The verb is read-only and computed identically on both transports (the digest recomputation runs server-side; the verdict crosses the wire), so the conformance guard pins signature parity and a fixture asserts identical verdicts embedded vs remote.
+`verify_materialization` follows the established path: a `Session` method (`crates/jammi-ai/src/local_session.rs`) → PyO3 binding on `PyDatabase` (`crates/jammi-python/src/database.rs`) → gRPC `CatalogService.VerifyMaterialization` handler + `RemoteDatabase` stub → `"verify_materialization"` in `_PIPELINE_VERBS` in `crates/jammi-python/tests/test_conformance.py`. (There is no Rust `Database` struct; the embedded surface is the `PyDatabase` pyclass over `InferenceSession`, reached through the shared `Session` wrapper, exactly as every other verb.) The verb is read-only and computed identically on both transports (the digest recomputation runs server-side; the verdict crosses the wire as a `oneof` mirroring `MatchVerdict`), so the conformance guard pins signature parity and the adversarial oracle (`tests/it/materialization.rs`) asserts each verdict. It is control-plane (a digest + verify), so it carries **no scale benchmark** (breadth-grid cell-(d) N/A): there is no result-set size to sweep, only a fixed digest recomputation over one table.
 
 ## 8. Module layout
 
 ```
 crates/jammi-db/src/store/
-  manifest.rs        +new  MaterializationManifest, InputAnchor, DefinitionHash, ArtifactDigest, MatchVerdict, ManifestError
-  plan_canonical.rs  +new  LogicalPlan → stable canonical bytes
-  mod.rs             CHANGED  ResultTableInfo gains `manifest`; materialize path writes the sidecar
+  manifest.rs        +new  ProducingDescriptor, MaterializationEnv, ComputeDevice, ModelIdentity,
+                           InputAnchor/AnchorKind/AnchorValue, DefinitionHash, ArtifactDigest,
+                           MaterializationManifest, MatchVerdict, ManifestError (the frozen contract,
+                           definition-hash + sidecar IO are pure functions here)
+  mod.rs             CHANGED  finalize_with_manifest (the single building->ready funnel; bare `finalize`
+                           DELETED); verify_materialization; read/write sidecar; result_digest_anchor;
+                           recover_inner is manifest-aware + reconcile_ready_manifests
+  mutable/test_hook.rs CHANGED  maybe_signal_materialization (the Parquet-written-but-manifest-not crash hook)
 crates/jammi-db/src/catalog/schema.rs           CHANGED  MIGRATION_021_MATERIALIZATION_CONTRACT
 crates/jammi-db/src/catalog/migrations.rs       CHANGED  register 021
-crates/jammi-ai/src/session.rs                  CHANGED  verify_materialization
-crates/jammi-python/src/lib.rs                  CHANGED  PyO3 binding
-clients/python/jammi_client/_database.py        CHANGED  remote stub
+crates/jammi-db/src/catalog/result_repo.rs      CHANGED  promote_result_table_with_manifest; record gains
+                           definition_hash / input_anchors_json
+crates/jammi-ai/src/session.rs                  CHANGED  compute_device() (effective device for the env)
+crates/jammi-ai/src/local_session.rs            CHANGED  verify_materialization (the Session verb)
+crates/jammi-ai/src/model/{mod,backend/candle}.rs CHANGED  LoadedModel::backend_kind; effective_compute_device
+crates/jammi-ai/src/{session.rs, pipeline/embedding.rs, pipeline/neighbor_graph.rs,
+                     pipeline/graph_propagation.rs, pipeline/context_set.rs}  CHANGED  the 5 producers
+                           supply descriptor + env + inputs to finalize_with_manifest
+crates/jammi-wire/proto/jammi/v1/catalog.proto  CHANGED  VerifyMaterialization rpc + messages
+crates/jammi-wire/src/catalog.rs                CHANGED  match_verdict_{to,from}_proto
+crates/jammi-server/src/grpc/catalog.rs         CHANGED  VerifyMaterialization handler
+crates/jammi-python/src/database.rs             CHANGED  PyO3 verify_materialization binding
+clients/python/jammi_client/_database.py        CHANGED  remote stub + verdict projection
 crates/jammi-python/tests/test_conformance.py   CHANGED  _PIPELINE_VERBS += verify_materialization
-crates/jammi-db/tests/it/definition_hash.rs     +new
-crates/jammi-db/tests/it/manifest_roundtrip.rs  +new
-docs/guide/src/materialization-contract.md      +new  cookbook recipe (§9)
+crates/jammi-db/tests/it/materialization.rs                +new  adversarial oracle (the §11 verdicts) + funnel + recovery
+crates/jammi-db/tests/it/materialization_crash_recovery.rs +new  SIGKILL crash-injection (manifest window)
+docs/guide/src/materialization-contract.md      +new  cookbook recipe (§9) — SEPARATE post-tag deliverable (ch19)
 ```
 
 ## 9. Cookbook recipe (mandatory exit-criteria bullet)
@@ -271,11 +346,11 @@ This passes the discipline test. None of *"patient," "lab," "audit," "submission
 
 1. **Determinism.** Materialising the same plan over the same inputs twice yields byte-identical `definition_hash`. `tests/it/definition_hash.rs`.
 2. **Sensitivity.** Changing the plan (a projection, a literal, a model version) changes the `definition_hash`; changing only display aliases does not. Same file.
-3. **Environment coverage.** A different engine version or a different invoked-model version yields a different hash — the Bazel lesson encoded as a test.
+3. **Environment coverage.** A different engine version, a different invoked-model version, **or a different compute device (CPU vs CUDA)** yields a different hash — the Bazel lesson encoded as a test (`manifest.rs` unit tests: `different_engine_version_changes_the_hash`, `different_model_version_changes_the_hash`, `different_device_changes_the_hash`).
 4. **Anchor correctness.** A result-table input contributes its own artifact digest; a mutable-table input contributes a version that increments after an insert; an unversioned source yields `UnpinnedAtInstant`.
 5. **Round-trip.** Manifest written on materialize, read back identical; `ResultTableInfo.manifest` populated; catalog summary columns match the sidecar. `tests/it/manifest_roundtrip.rs`.
 6. **Verdicts.** `verify_materialization` returns `Match` for an untouched table, `Mismatch` against a wrong expected hash, `MatchWithUnpinnedInputs` when an input was unpinned, `MissingManifest` for a pre-`021` table.
-7. **No table escapes.** A test enumerates every materialization call site (embedding, fine-tune, eval, asof_join) and asserts each produces a manifest.
+7. **No table escapes.** The bare `finalize` is deleted and `finalize_with_manifest` is the sole `building -> ready` transition, so the type system enforces that every one of the five producers (inference, embedding, neighbor-graph, graph-propagation, context-set) supplies a descriptor/env/inputs — a producer that tried to publish without one would not compile. The funnel test (`materialization.rs::the_funnel_persists_sidecar_and_summary_columns`) asserts a materialised table carries both the sidecar and the catalog summary columns.
 8. **Embed == remote.** Conformance guard green for `verify_materialization`; identical verdict on both transports for a fixture.
 9. **No band-aids.** Zero net new `#[allow(...)]`, `let _ =`, `// TODO`, `#[ignore]`; `cargo clippy --all-features -- -D warnings` and `cargo fmt --check` pass.
 10. **Recipe.** §9 chapter renders and its samples compile.
@@ -285,7 +360,7 @@ This passes the discipline test. None of *"patient," "lab," "audit," "submission
 | Principle | How this spec satisfies it |
 |---|---|
 | *Clean, functional style* | `MaterializationManifest::compute` is pure (inputs → manifest, no I/O); I/O lives only in the manifest-IO layer. Canonicalisation is a fold over the plan tree, stack-safe via an explicit work-stack. |
-| *Clear boundaries* | Three concerns, three units: canonicalisation (`plan_canonical.rs`), the manifest value + hashing (`manifest.rs`), and the result-store write that emits it. The verb depends on the store's read API, not its internals. |
+| *Clear boundaries* | Three concerns: the contract value + hashing + sidecar IO (`manifest.rs`, pure), the result-store funnel that emits it (`store/mod.rs`), and the producers that fill the descriptor. The verb depends on the store's read API, not its internals. |
 | *DRY* | One materialization funnel stamps every table; no per-call-site manifest logic duplicated. One sidecar-path helper mirrors the existing `.usearch`/`.rowmap` convention rather than inventing a second layout. |
 | *No backwards compatibility* | New module, new migration. Pre-`005` tables return `MissingManifest`, not a compatibility shim that fabricates a manifest. |
 | *Type-driven design* | `DefinitionHash`/`ArtifactDigest`/`AnchorValue` newtypes (can't be confused); `AnchorKind`/`MatchVerdict` enums, never strings; `manifest_version` makes a future format change a typed `UnsupportedManifestVersion`, not a silent misparse. |
@@ -299,7 +374,7 @@ This passes the discipline test. None of *"patient," "lab," "audit," "submission
 1. **Signed envelope.** §5.4 keeps signing out of the engine. If a consumer demonstrates a need for engine-native non-repudiation that cannot live in their closure, revisit — but the default (content guarantee in the engine, signature in the consumer) is the discipline-respecting choice.
 2. **Index sidecar in the digest.** The `ArtifactDigest` covers the Parquet object; should it also cover the `.usearch`/`.rowmap` ANN sidecars? For now the digest is the data-of-record (the Parquet); a search index is a derived accelerator reconstructible from it. Revisit if a consumer needs to attest the exact index bytes.
 3. **Cross-engine-version verification.** A table produced by engine vX verified by engine vY: the definition hash includes the engine version, so a different verifier version reports `Mismatch` on definition even if the data is identical. Is that too strict? Deferred — the strict default is the loud-and-correct one; a "data-equal but definition-differs" verdict could be added if a consumer needs it.
-4. **`derived_from` consolidation.** The existing provenance `derived_from` field overlaps with `input_anchors`. They should converge — `input_anchors` is the richer, hashed form. Whether to drop `derived_from` or express it as a view over `input_anchors` is a follow-up; not litigated here.
+4. **`derived_from` consolidation — resolved.** `input_anchors` is the source of truth for input provenance. The existing `derived_from` column (migration 013) is retained only as an indexed FK-lineage convenience and is no longer an *independent* provenance record: a producer that records `derived_from = X` always emits, in the same call, a `ResultDigest` `InputAnchor` for `X` (see `ResultStore::result_digest_anchor`, used by the neighbor-graph and graph-propagation producers), so the FK column is implied by — a projection of — the anchor set, never maintained separately. The richer, hashed form (`input_anchors_json`, migration 021) is authoritative; `derived_from` stays a queryable shorthand for the single-parent derivations, kept consistent by construction.
 
 ## 14. References
 

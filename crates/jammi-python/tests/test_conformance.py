@@ -136,6 +136,7 @@ _PIPELINE_VERBS = {
     "build_neighbor_graph",
     "propagate_embeddings",
     "assemble_context",
+    "verify_materialization",
 }
 
 

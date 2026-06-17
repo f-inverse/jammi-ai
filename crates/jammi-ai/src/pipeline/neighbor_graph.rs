@@ -247,7 +247,7 @@ impl<'a> NeighborGraphPipeline<'a> {
 
         let nodes = self.read_nodes(&source_table).await?;
         let edges = self.build_edges(&source_table, &nodes, params).await?;
-        self.write_edge_table(&source_table, edges).await
+        self.write_edge_table(&source_table, edges, params.k).await
     }
 
     /// Read every `(_row_id, vector)` pair from the embedding table's Parquet,
@@ -366,6 +366,7 @@ impl<'a> NeighborGraphPipeline<'a> {
         &self,
         source_table: &ResultTableRecord,
         edges: Vec<Edge>,
+        k: usize,
     ) -> Result<ResultTableRecord> {
         // The edge table is a derivation: its `task` rides the source's so the
         // NOT NULL column round-trips, but `kind = NeighborGraph` excludes it
@@ -395,12 +396,27 @@ impl<'a> NeighborGraphPipeline<'a> {
         writer.write_batch(&batch).await?;
         writer.close().await?;
 
+        // The materialization contract: a neighbor-graph derivation invokes no
+        // model, so the environment carries the engine version + device with an
+        // empty model set; its sole input is the source embedding table, pinned
+        // by its immutable content digest (`ResultDigest`).
+        let descriptor = jammi_db::store::manifest::ProducingDescriptor::NeighborGraph {
+            source_table: source_table.table_name.clone(),
+            k,
+        };
+        let env = jammi_db::store::manifest::MaterializationEnv::new(
+            self.session.compute_device(),
+            Vec::new(),
+        );
+        let inputs = vec![self.result_store.result_digest_anchor(source_table).await?];
+
         self.result_store
-            .finalize(
+            .finalize_with_manifest(
                 self.session.context(),
                 &table_info.table_name,
                 &table_info.parquet_url,
                 row_count,
+                jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
             )
             .await?;
 

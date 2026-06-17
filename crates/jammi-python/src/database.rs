@@ -513,6 +513,28 @@ impl PyDatabase {
         Ok(out.into_any().unbind())
     }
 
+    /// Recompute a materialised result table's artifact digest and check it
+    /// (and, if given, an expected definition hash) against its
+    /// `.materialization.json` manifest. Returns the verdict as a dict tagged
+    /// `{"verdict": "match" | "mismatch" | "match_with_unpinned_inputs" |
+    /// "missing_manifest", ...}`. Read-only; the engine returns a verdict and
+    /// never acts on one. The verdict attests the Parquet data, not the ANN
+    /// index.
+    #[pyo3(signature = (table, expected_definition=None))]
+    fn verify_materialization(
+        &self,
+        py: Python<'_>,
+        table: &str,
+        expected_definition: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        let expected = expected_definition.map(jammi_db::store::manifest::DefinitionHash);
+        let verdict = self
+            .runtime
+            .block_on(self.local_session().verify_materialization(table, expected))
+            .map_err(to_pyerr)?;
+        serializable_to_pydict(py, &verdict)
+    }
+
     /// Register a mutable companion table from a serialized
     /// `CreateMutableTableRequest` body. The thin Python `Database` wrapper builds
     /// this request with the same pure-Python assembly the remote client uses

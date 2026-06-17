@@ -540,6 +540,144 @@ async fn derives_from_closure_surfaces_a_cycle_as_a_typed_error() {
     );
 }
 
+#[tokio::test]
+async fn derives_from_closure_collects_a_diamond_descendant_once() {
+    // A re-converging DAG (a diamond): two parents P1, P2 both feed one shared
+    // child C. The stack-safe closure must collect C's subtree exactly once (it is
+    // `expanded` after the first descent) and must NOT mistake the second arrival
+    // at C for a back-edge cycle. This is the distinction a flat visited-set walk
+    // cannot make — the W-61a audit's follow-up.
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog(dir.path()).await;
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = SessionContext::new();
+
+    // root feeds P1 and P2; both P1 and P2 feed the shared child C.
+    let (root, _) = materialize(&store, &ctx, vec![]).await;
+    let root_anchor = store.result_digest_anchor(&root).await.unwrap();
+    let (p1, _) = materialize(&store, &ctx, vec![root_anchor.clone()]).await;
+    let (p2, _) = materialize(&store, &ctx, vec![root_anchor]).await;
+    let p1_anchor = store.result_digest_anchor(&p1).await.unwrap();
+    let p2_anchor = store.result_digest_anchor(&p2).await.unwrap();
+    // C anchors on BOTH P1 and P2 — the re-converging node.
+    let (c, _) = materialize(&store, &ctx, vec![p1_anchor, p2_anchor]).await;
+
+    let closure = store.derives_from_closure(&root.table_name).await.unwrap();
+
+    // Edges into C: one from P1, one from P2 — both recorded (they are real
+    // reverse-dependency edges). But C is *expanded* once, so its own subtree
+    // (empty here) is walked once and the walk terminates — no cycle error.
+    let into_c: Vec<&str> = closure
+        .iter()
+        .filter(|e| e.derived == c.table_name)
+        .map(|e| e.input.as_str())
+        .collect();
+    assert_eq!(
+        into_c.len(),
+        2,
+        "both P1→C and P2→C are real edges and both are reported, got {into_c:?}"
+    );
+    let reached: std::collections::HashSet<&str> =
+        closure.iter().map(|e| e.derived.as_str()).collect();
+    assert!(
+        reached.contains(p1.table_name.as_str())
+            && reached.contains(p2.table_name.as_str())
+            && reached.contains(c.table_name.as_str()),
+        "the diamond walk reaches P1, P2, and the shared C, got {reached:?}"
+    );
+}
+
+// === probe_cache (action-layer hit confirmation) ===========================
+
+#[tokio::test]
+async fn probe_cache_hits_an_exact_match_with_an_extant_artifact() {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog(dir.path()).await;
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = SessionContext::new();
+
+    let inputs = vec![InputAnchor::mutable_version("docs", 7)];
+    let (record, def) = materialize(&store, &ctx, inputs.clone()).await;
+
+    let hit = store.probe_cache(&def, &inputs).await.unwrap();
+    assert_eq!(
+        hit.as_deref(),
+        Some(record.table_name.as_str()),
+        "an exact (definition, inputs) match with extant bytes is a sound reuse"
+    );
+}
+
+#[tokio::test]
+async fn probe_cache_misses_when_the_artifact_was_reaped() {
+    // A `ready` catalog row whose Parquet bytes are gone (a torn write that
+    // committed `ready` before durability, or a half-deleted table) must NOT be
+    // handed back as a reuse — the producer would short-circuit to a table it
+    // cannot read. The bare `lookup_cached` sensor still reports the catalog hit;
+    // `probe_cache` re-confirms the bytes and falls through to a miss.
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog(dir.path()).await;
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = SessionContext::new();
+
+    let inputs = vec![InputAnchor::mutable_version("docs", 11)];
+    let (record, def) = materialize(&store, &ctx, inputs.clone()).await;
+
+    // Reap the artifact bytes out from under the still-`ready` catalog row.
+    let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
+    let handle = store.open_parquet(&url).unwrap();
+    let path = handle.data_path().unwrap();
+    handle.delete_if_exists(&path).await.unwrap();
+
+    assert_eq!(
+        store.lookup_cached(&def, &inputs).await.unwrap().as_deref(),
+        Some(record.table_name.as_str()),
+        "the bare sensor still reports the catalog-level hit"
+    );
+    assert_eq!(
+        store.probe_cache(&def, &inputs).await.unwrap(),
+        None,
+        "probe_cache re-confirms the artifact and misses when the bytes are gone"
+    );
+}
+
+#[tokio::test]
+async fn probe_cache_misses_on_a_one_bit_change() {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog(dir.path()).await;
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = SessionContext::new();
+
+    let (_record, def) =
+        materialize(&store, &ctx, vec![InputAnchor::mutable_version("docs", 7)]).await;
+
+    let probe = vec![InputAnchor::mutable_version("docs", 8)];
+    assert_eq!(
+        store.probe_cache(&def, &probe).await.unwrap(),
+        None,
+        "a one-bit anchor change is a different cache key — never a hit"
+    );
+}
+
+#[tokio::test]
+async fn probe_cache_never_hits_an_unpinned_request() {
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog(dir.path()).await;
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = SessionContext::new();
+
+    let unpinned = vec![InputAnchor::unpinned_at_instant(
+        "federated",
+        "2026-06-17T00:00:00Z",
+    )];
+    let (_record, def) = materialize(&store, &ctx, unpinned.clone()).await;
+
+    assert_eq!(
+        store.probe_cache(&def, &unpinned).await.unwrap(),
+        None,
+        "an unpinned anchor is never a sound reuse — honestly off"
+    );
+}
+
 // === helpers ===============================================================
 
 /// Re-attest a parent table's `.materialization.json` sidecar to a new artifact

@@ -55,6 +55,48 @@ use crate::storage::StorageUrl;
 use super::manifest::{AnchorKind, DefinitionHash, InputAnchor};
 use super::ResultStore;
 
+/// Whether a producer reuses an already-materialised result for its exact
+/// `(definition, input anchors)` instead of recomputing it — the **opt-in**
+/// memoization dial every result-table producer carries.
+///
+/// The default is [`Self::Bypass`], never [`Self::Use`]: a producer must never
+/// silently hand back a table the caller did not just compute. Surprise reuse is
+/// the "honest, not silent" sin — a caller that wanted a *fresh* run and got a
+/// cached one, with no signal, cannot tell the difference. Reuse is therefore
+/// both explicitly requested (`Use`) *and* explicitly reported (the producer
+/// returns a [`CacheOutcome`] so the caller observes which path ran), never
+/// inferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CachePolicy {
+    /// Probe the cache before computing: on an exact `(definition, inputs)` hit
+    /// with an extant artifact, short-circuit and reuse the cached table,
+    /// skipping the expensive compute.
+    Use,
+    /// Always recompute. The default — a producer never reuses a prior result
+    /// unless the caller opts in.
+    #[default]
+    Bypass,
+}
+
+/// Which path a producer took, returned so reuse is **observable**, never
+/// inferred. A caller that passed [`CachePolicy::Use`] learns from the outcome
+/// whether the expensive compute ran ([`Self::Computed`]) or an existing
+/// artifact was reused ([`Self::Reused`]) — the honest signal that distinguishes
+/// a fresh run from a cache hit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "cache_outcome", rename_all = "snake_case")]
+pub enum CacheOutcome {
+    /// The producer ran its compute and materialised a new table.
+    Computed,
+    /// An exact cache hit short-circuited the compute; the named already-`ready`
+    /// table was reused.
+    Reused {
+        /// The reused cached table's name.
+        table: String,
+    },
+}
+
 /// Whether a `ready` result table is still the output of its recorded
 /// definition over its recorded inputs' *current* state — a read-only verdict
 /// the engine reports and never acts on.
@@ -219,6 +261,46 @@ impl ResultStore {
             }
         }
         Ok(None)
+    }
+
+    /// The **action-layer** cache probe a producer runs at the top of its verb,
+    /// before the expensive compute: resolve [`Self::lookup_cached`] for the
+    /// exact `(definition, inputs)`, then confirm the hit's Parquet artifact is
+    /// still extant on disk. Returns the reusable table's name on a sound hit,
+    /// `None` on a miss.
+    ///
+    /// The extant-artifact check is the difference between this and the bare
+    /// [`Self::lookup_cached`] sensor: a `ready` catalog row whose bytes were
+    /// reaped (a torn write that committed `ready` before durability on a power
+    /// loss; a half-deleted table) must *not* be handed back as a reuse — the
+    /// producer would short-circuit to a table that cannot be read. A cache hit
+    /// is only sound when the catalog row *and* its artifact both survive, so the
+    /// probe re-confirms the bytes the cached row points at. An
+    /// [`AnchorKind::UnpinnedAtInstant`] input never reaches the extant check:
+    /// [`Self::lookup_cached`] already short-circuits it to a miss, so an
+    /// unpinned-anchored producer is honestly never a hit.
+    pub async fn probe_cache(
+        &self,
+        definition: &DefinitionHash,
+        inputs: &[InputAnchor],
+    ) -> Result<Option<String>> {
+        let Some(table_name) = self.lookup_cached(definition, inputs).await? else {
+            return Ok(None);
+        };
+        // A hit names a `ready` row; confirm its Parquet bytes are still present.
+        // A row whose artifact was reaped is not a sound reuse — fall through to a
+        // recompute rather than short-circuit to an unreadable table.
+        let Some(record) = self.catalog().get_result_table(&table_name).await? else {
+            return Ok(None);
+        };
+        let parquet_url = StorageUrl::parse(&record.parquet_path)?;
+        let handle = self.open_parquet(&parquet_url)?;
+        let path = handle.data_path()?;
+        if handle.exists(&path).await? {
+            Ok(Some(table_name))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Report whether a `ready` result table is still the output of its recorded

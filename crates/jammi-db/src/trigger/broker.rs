@@ -38,10 +38,29 @@ pub trait TriggerBroker: Send + Sync + 'static {
         offset: u64,
     ) -> Result<Offset, TriggerError>;
 
-    /// Attach a subscriber. If `from_offset.is_some()` and the offset is
-    /// older than what the driver retains, the broker returns
-    /// [`TriggerError::OffsetEvicted`] — the engine's subscribe path falls
-    /// back to backing-table replay for the missing prefix.
+    /// Attach a subscriber to the live tail.
+    ///
+    /// `from_offset`, when set, is an **engine `_offset` lower bound**, not a
+    /// driver-native sequence. The broker MUST begin delivery at or before
+    /// that engine offset — delivering earlier events is permitted — so the
+    /// caller is guaranteed never to miss an engine offset `>= from_offset`.
+    /// It is the engine's subscribe seam ([`crate::trigger::Subscriber`]) that
+    /// dedups the overlap by engine `_offset`; the broker is not required to
+    /// start *exactly* at `from_offset`.
+    ///
+    /// This contract is what keeps the at-least-once guarantee correct across
+    /// drivers whose native sequence is an independent counter from the engine
+    /// `_offset` (JetStream's stream sequence): the engine never hands an
+    /// engine offset to a driver as if it were a native sequence, because the
+    /// two skew permanently after any post-commit fan-out failure (the
+    /// best-effort path in [`crate::trigger::Publisher`]). A driver that cannot
+    /// translate an engine offset into its own sequence MUST over-deliver
+    /// (start from the earliest retained event) rather than guess a sequence.
+    ///
+    /// If `from_offset.is_some()` and the offset is older than what the driver
+    /// retains, the broker returns [`TriggerError::OffsetEvicted`] — the
+    /// engine's subscribe path falls back to backing-table replay for the
+    /// missing prefix.
     async fn subscribe(
         &self,
         topic_id: TopicId,

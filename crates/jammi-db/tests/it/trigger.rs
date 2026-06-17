@@ -45,7 +45,24 @@ async fn build_harness() -> Harness {
     build_harness_with_tenant(None).await
 }
 
+/// Like [`build_harness`] but also hands back the concrete [`InMemoryBroker`]
+/// so a test can arm `trigger_failure_for_next_publish`. The same broker is
+/// wired into the harness's publisher/subscriber as the `dyn TriggerBroker`,
+/// so arming it affects the live fan-out the harness exercises.
+async fn build_harness_with_in_memory_broker() -> (Harness, Arc<InMemoryBroker>) {
+    let in_mem = Arc::new(InMemoryBroker::new());
+    let h = build_harness_with_broker(None, Arc::clone(&in_mem) as Arc<dyn TriggerBroker>).await;
+    (h, in_mem)
+}
+
 async fn build_harness_with_tenant(tenant: Option<TenantId>) -> Harness {
+    build_harness_with_broker(tenant, Arc::new(InMemoryBroker::new())).await
+}
+
+async fn build_harness_with_broker(
+    tenant: Option<TenantId>,
+    broker: Arc<dyn TriggerBroker>,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("catalog.db");
     let sqlite = SqliteBackend::open(&db_path).await.unwrap();
@@ -76,7 +93,6 @@ async fn build_harness_with_tenant(tenant: Option<TenantId>) -> Harness {
         tenant_binding,
     ));
 
-    let broker: Arc<dyn TriggerBroker> = Arc::new(InMemoryBroker::new());
     let publisher = Publisher::new(
         Arc::clone(&broker),
         Arc::clone(&backend),
@@ -1045,4 +1061,249 @@ async fn session_with_broker_swallows_fan_out_failure() {
         .publish_scoped(&topic, None, batch_of(&[2], &["Y"], &[2.0]))
         .await
         .expect("subsequent publish succeeds after the one-shot failure clears");
+}
+
+#[tokio::test]
+async fn crash_mid_publish_replays_committed_offsets_with_no_loss() {
+    // Track T1 — crash-mid-publish replay (hermetic, in-memory).
+    //
+    // Publish N batches against a real SQLite backing table, injecting a
+    // post-commit broker fan-out failure on one of them via
+    // `InMemoryBroker::trigger_failure_for_next_publish`. The publisher's
+    // transactional-outbox contract commits the augmented event BEFORE the
+    // best-effort fan-out, so the failed offset is still durably logged.
+    //
+    // Simulate a crash by dropping the publisher and the broker, stand up a
+    // fresh empty broker + subscriber, and replay from offset 0. The full
+    // multiset `{0..N-1}` must come back, contiguous — no loss, even at the
+    // offset whose live fan-out failed.
+    let (h, in_mem) = build_harness_with_in_memory_broker().await;
+    let topic = topic_def("events.crash_mid_publish", None);
+    h.broker.register_topic(&topic).await.unwrap();
+    h.topic_repo.register_topic(&topic).await.unwrap();
+
+    const N: i64 = 64;
+    // Inject the post-commit fan-out failure on the publish at offset 7 — the
+    // commit lands, the broker `publish` returns Err, the publisher logs WARN
+    // and returns Ok. The backing table is authoritative.
+    const FAIL_AT: i64 = 7;
+    for i in 0..N {
+        if i == FAIL_AT {
+            in_mem.trigger_failure_for_next_publish("simulated post-commit fan-out failure");
+        }
+        h.publisher
+            .publish_scoped(&topic, None, batch_of(&[i], &["X"], &[i as f64]))
+            .await
+            .expect("publish returns Ok even when the best-effort fan-out fails");
+    }
+
+    // Crash: drop the publisher and the original broker entirely.
+    drop(h.publisher);
+    drop(in_mem);
+    drop(h.broker);
+    // (the harness still owns `registry`, the durable backing-table handle)
+
+    // Fresh broker (empty live state) + subscriber over the same backing table.
+    let fresh_broker: Arc<dyn TriggerBroker> = Arc::new(InMemoryBroker::new());
+    fresh_broker.register_topic(&topic).await.unwrap();
+    let fresh_subscriber = Subscriber::new(Arc::clone(&fresh_broker), Arc::clone(&h.registry));
+
+    let from = Offset::new(0, chrono::Utc::now());
+    let mut stream = fresh_subscriber
+        .subscribe(&topic, Predicate::match_all(), Some(from))
+        .await
+        .unwrap();
+
+    let mut seen: Vec<u64> = Vec::new();
+    while seen.len() < N as usize {
+        let delivered = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("subscribe stream timed out")
+            .expect("stream ended early")
+            .unwrap();
+        seen.push(delivered.offset.value());
+    }
+    assert_eq!(seen.len(), N as usize, "every committed offset must replay");
+    for (i, off) in seen.iter().enumerate() {
+        assert_eq!(
+            *off, i as u64,
+            "offsets must replay contiguous {{0..N-1}} — the fan-out failure at offset {FAIL_AT} must not create a gap"
+        );
+    }
+}
+
+#[tokio::test]
+async fn live_tail_resumes_with_no_loss_after_post_commit_fan_out_failure() {
+    // Track T1 — the in-memory analogue of the JetStream consumer-recreate
+    // resume test. A late subscriber attaches at `from_offset` AFTER a
+    // post-commit fan-out failure has skewed the broker's view from the
+    // engine `_offset`, then keeps consuming as new publishes arrive live.
+    // Every committed offset in `[from..max]` must be delivered with no skip,
+    // proving the replay/live seam is keyed on the engine `_offset` and not on
+    // any broker-native sequence.
+    let (h, in_mem) = build_harness_with_in_memory_broker().await;
+    let topic = topic_def("events.resume_after_failure", None);
+    h.broker.register_topic(&topic).await.unwrap();
+    h.topic_repo.register_topic(&topic).await.unwrap();
+
+    // Phase 1: publish 0..K with a post-commit fan-out failure in the middle.
+    const K: i64 = 10;
+    const FAIL_AT: i64 = 4;
+    for i in 0..K {
+        if i == FAIL_AT {
+            in_mem.trigger_failure_for_next_publish("simulated post-commit fan-out failure");
+        }
+        h.publisher
+            .publish_scoped(&topic, None, batch_of(&[i], &["X"], &[i as f64]))
+            .await
+            .unwrap();
+    }
+
+    // A late subscriber attaches at offset 0: replay covers [0..K-1] from the
+    // backing table, and the live tail overlaps it (deduped by `_offset`).
+    let from = Offset::new(0, chrono::Utc::now());
+    let mut stream = h
+        .subscriber
+        .subscribe(&topic, Predicate::match_all(), Some(from))
+        .await
+        .unwrap();
+
+    // Phase 2: keep publishing past the attach point — these arrive live.
+    const TOTAL: i64 = 20;
+    let publisher = h.publisher;
+    let topic_clone = topic.clone();
+    let pub_handle = tokio::spawn(async move {
+        for i in K..TOTAL {
+            publisher
+                .publish_scoped(&topic_clone, None, batch_of(&[i], &["X"], &[i as f64]))
+                .await
+                .unwrap();
+        }
+    });
+
+    let mut seen: Vec<u64> = Vec::new();
+    while seen.len() < TOTAL as usize {
+        let delivered = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("subscribe stream timed out")
+            .expect("stream ended early")
+            .unwrap();
+        seen.push(delivered.offset.value());
+    }
+    pub_handle.await.unwrap();
+
+    // No skip anywhere in [0..TOTAL); the seam (replay→live) must not drop the
+    // boundary offset even though the broker's live view skewed at FAIL_AT.
+    let expected: Vec<u64> = (0..TOTAL as u64).collect();
+    let mut deduped = seen.clone();
+    deduped.dedup();
+    assert_eq!(
+        deduped, expected,
+        "every committed offset [0..TOTAL) must be delivered in order with no skip"
+    );
+    // Duplicates, if any, occur only at the replay/live seam — never a skip.
+    assert!(
+        seen.windows(2).all(|w| w[1] == w[0] || w[1] == w[0] + 1),
+        "offsets must be non-decreasing with unit steps (seam duplicates allowed, skips not): {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn at_least_once_no_skip_property_over_randomized_states() {
+    // Track T1 — at-least-once / no-skip property test.
+    //
+    // Over randomized publish counts, subscriber attach points, and an
+    // injected post-commit broker fan-out failure offset, assert the
+    // delivery contract for every case:
+    //   * every committed `_offset` in `[from..max]` is delivered at least
+    //     once (no gap / no skip);
+    //   * deliveries are non-decreasing and step by at most 1, so any
+    //     duplicate is a replay/live SEAM duplicate, never a reorder or skip.
+    //
+    // Non-vacuity: each case constructs the post-commit-failure state by
+    // arming `trigger_failure_for_next_publish` at a deterministically-chosen
+    // offset BEFORE that publish, so the engine `_offset` and the broker's
+    // live view are genuinely skewed when the subscriber attaches at
+    // `from < fail_at` and must cross the seam.
+
+    // Small deterministic LCG (Numerical Recipes constants) — keeps the test
+    // hermetic and reproducible without pulling in a PRNG dependency.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_in(&mut self, modulus: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % modulus
+        }
+    }
+
+    let mut rng = Lcg(0x1234_5678_9abc_def0);
+    // Enough randomized cases to cover the interesting attach/fail orderings
+    // without making the hermetic suite slow.
+    for case in 0..24u64 {
+        let total = 4 + rng.next_in(28); // 4..=31 publishes
+                                         // Fail-at lands somewhere inside the published range so the live view
+                                         // skews from the engine offset.
+        let fail_at = rng.next_in(total);
+        // Attach at or before the failure so the subscriber crosses the seam
+        // covering the skewed offset.
+        let from = rng.next_in(fail_at + 1);
+
+        let (h, in_mem) = build_harness_with_in_memory_broker().await;
+        let topic = topic_def(&format!("events.prop_case_{case}"), None);
+        h.broker.register_topic(&topic).await.unwrap();
+        h.topic_repo.register_topic(&topic).await.unwrap();
+
+        for i in 0..total as i64 {
+            if i as u64 == fail_at {
+                in_mem.trigger_failure_for_next_publish("simulated post-commit fan-out failure");
+            }
+            h.publisher
+                .publish_scoped(&topic, None, batch_of(&[i], &["X"], &[i as f64]))
+                .await
+                .unwrap();
+        }
+
+        let from_off = Offset::new(from, chrono::Utc::now());
+        let mut stream = h
+            .subscriber
+            .subscribe(&topic, Predicate::match_all(), Some(from_off))
+            .await
+            .unwrap();
+
+        let expected_count = (total - from) as usize;
+        let mut seen: Vec<u64> = Vec::new();
+        while seen.len() < expected_count {
+            let delivered = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap_or_else(|_| panic!("case {case}: stream timed out (from={from} fail_at={fail_at} total={total})"))
+                .expect("stream ended early")
+                .unwrap();
+            seen.push(delivered.offset.value());
+        }
+
+        // Every offset in [from..total) delivered at least once, no skip.
+        let mut deduped = seen.clone();
+        deduped.dedup();
+        let expected: Vec<u64> = (from..total).collect();
+        assert_eq!(
+            deduped, expected,
+            "case {case}: from={from} fail_at={fail_at} total={total} — every committed offset must be delivered at least once with no skip; saw {seen:?}"
+        );
+        // Non-decreasing, unit step — duplicates only at the seam.
+        assert!(
+            seen.windows(2).all(|w| w[1] == w[0] || w[1] == w[0] + 1),
+            "case {case}: deliveries must be ordered with unit steps (seam dup ok, skip not): {seen:?}"
+        );
+        // The seam may duplicate the boundary offset; it must never duplicate
+        // more than one offset's worth (a runaway dup would signal the live
+        // tail is re-delivering far behind the replay high-water mark).
+        let dup_count = seen.len() - deduped.len();
+        assert!(
+            dup_count <= 1,
+            "case {case}: at most one seam duplicate expected, saw {dup_count}: {seen:?}"
+        );
+    }
 }

@@ -475,6 +475,85 @@ def _verify_verdict_to_dict(
     raise RuntimeError("VerifyMaterializationResponse carried no verdict")
 
 
+def _stale_reason_to_dict(reason: "catalog_pb2.StaleReason") -> Dict[str, Any]:
+    """Reconstruct the embed `StaleReason` dict from the wire oneof, tag-for-tag
+    (serde's ``#[serde(tag = "reason", rename_all = "snake_case")]``)."""
+    which = reason.WhichOneof("reason")
+    if which == "definition_changed":
+        return {
+            "reason": "definition_changed",
+            "recorded": reason.definition_changed.recorded,
+            "current": reason.definition_changed.current,
+        }
+    if which == "input_advanced":
+        return {
+            "reason": "input_advanced",
+            "source": reason.input_advanced.source,
+            "recorded": reason.input_advanced.recorded,
+            "current": reason.input_advanced.current,
+        }
+    if which == "input_vanished":
+        return {
+            "reason": "input_vanished",
+            "source": reason.input_vanished.source,
+        }
+    raise RuntimeError("StaleReason carried no reason")
+
+
+def _staleness_verdict_to_dict(
+    resp: "catalog_pb2.StalenessResponse",
+) -> Dict[str, Any]:
+    """Reconstruct the embed `Database`'s staleness dict from the wire
+    `StalenessResponse` oneof, tag-for-tag (serde's
+    ``#[serde(tag = "staleness", rename_all = "snake_case")]`` of `Staleness`)."""
+    which = resp.WhichOneof("staleness")
+    if which == "fresh":
+        return {"staleness": "fresh"}
+    if which == "stale":
+        return {
+            "staleness": "stale",
+            "reasons": [_stale_reason_to_dict(r) for r in resp.stale.reasons],
+        }
+    if which == "undecidable":
+        return {
+            "staleness": "undecidable",
+            "unpinned": list(resp.undecidable.unpinned),
+            "decided_reasons": [
+                _stale_reason_to_dict(r) for r in resp.undecidable.decided_reasons
+            ],
+        }
+    if which == "missing_manifest":
+        return {"staleness": "missing_manifest"}
+    raise RuntimeError("StalenessResponse carried no staleness")
+
+
+# The wire `AnchorKind` enum value -> the serde snake_case tag the embed binding
+# emits for `DerivesFromEdge.kind` (serde's `rename_all = "snake_case"` of the
+# engine's `AnchorKind`). `UNSPECIFIED` is the proto3 zero value the engine never
+# sends.
+_ANCHOR_KIND_TO_TAG = {
+    catalog_pb2.ANCHOR_KIND_RESULT_DIGEST: "result_digest",
+    catalog_pb2.ANCHOR_KIND_MUTABLE_VERSION: "mutable_version",
+    catalog_pb2.ANCHOR_KIND_SOURCE_VERSION: "source_version",
+    catalog_pb2.ANCHOR_KIND_UNPINNED_AT_INSTANT: "unpinned_at_instant",
+}
+
+
+def _derives_from_edges_to_list(
+    resp: "catalog_pb2.DerivesFromResponse",
+) -> List[Dict[str, Any]]:
+    """Reconstruct the embed `Database`'s list of `DerivesFromEdge` dicts from the
+    wire `DerivesFromResponse` — `{"input", "derived", "kind"}` per edge, matching
+    serde's struct encoding of the engine's `DerivesFromEdge`."""
+    out: List[Dict[str, Any]] = []
+    for edge in resp.edges:
+        kind = _ANCHOR_KIND_TO_TAG.get(edge.kind)
+        if kind is None:
+            raise RuntimeError("DerivesFromEdge carried an unspecified anchor kind")
+        out.append({"input": edge.input, "derived": edge.derived, "kind": kind})
+    return out
+
+
 def _channel_spec_to_dict(c: catalog_pb2.Channel) -> Dict[str, Any]:
     """Project a wire `Channel` into the embed binding's channel-spec dict.
 
@@ -1855,6 +1934,37 @@ class RemoteDatabase:
             request.expected_definition = expected_definition
         resp = self._catalog.VerifyMaterialization(request, metadata=self._metadata)
         return _verify_verdict_to_dict(resp)
+
+    def staleness(self, table: str, current_definition: str) -> Dict[str, Any]:
+        """Report whether a ``ready`` result table is still the output of its
+        recorded definition over its recorded inputs' current state — the
+        read-only ``staleness`` sensor.
+
+        ``current_definition`` is the hash of how this table is produced now (the
+        left side of the definition comparison). Returns the same verdict dict the
+        embed `Database` produces, tagged ``{"staleness": "fresh" | "stale" |
+        "undecidable" | "missing_manifest", ...}``: ``stale`` carries ``reasons``,
+        ``undecidable`` carries ``unpinned`` + ``decided_reasons``. Read-only;
+        reports a verdict and acts on nothing. Maps to
+        `CatalogService.Staleness`.
+        """
+        request = catalog_pb2.StalenessRequest(
+            table=table, current_definition=current_definition
+        )
+        resp = self._catalog.Staleness(request, metadata=self._metadata)
+        return _staleness_verdict_to_dict(resp)
+
+    def derives_from(self, table: str) -> List[Dict[str, Any]]:
+        """The one-hop reverse-dependency edges of a result table — every
+        ``ready`` table that anchored on it.
+
+        Returns the same list the embed `Database` produces: one dict
+        ``{"input", "derived", "kind"}`` per edge. Read-only lineage data the
+        caller walks transitively. Maps to `CatalogService.DerivesFrom`.
+        """
+        request = catalog_pb2.DerivesFromRequest(table=table)
+        resp = self._catalog.DerivesFrom(request, metadata=self._metadata)
+        return _derives_from_edges_to_list(resp)
 
     def _start_training(
         self, request: training_pb2.StartTrainingRequest

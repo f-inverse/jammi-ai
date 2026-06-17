@@ -33,8 +33,8 @@ use jammi_db::trigger::ids::TopicId;
 use jammi_db::trigger::TriggerError;
 use jammi_db::TenantId;
 use jammi_wire::{
-    channel_to_proto, definition_to_proto, match_verdict_to_proto, model_to_proto, parse_table_id,
-    source_type_from_proto, topic_to_proto,
+    channel_to_proto, definition_to_proto, derives_from_edge_to_proto, match_verdict_to_proto,
+    model_to_proto, parse_table_id, source_type_from_proto, staleness_to_proto, topic_to_proto,
 };
 use tonic::{Request, Response, Status};
 
@@ -368,6 +368,47 @@ impl CatalogService for CatalogServer {
 
         Ok(Response::new(pb::VerifyMaterializationResponse {
             verdict: Some(match_verdict_to_proto(verdict)),
+        }))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
+    async fn staleness(
+        &self,
+        request: Request<pb::StalenessRequest>,
+    ) -> Result<Response<pb::StalenessResponse>, Status> {
+        let tenant = session_tenant_traced(&request);
+        let session = self.local()?;
+        let req = request.into_inner();
+        let table = req.table;
+        let current = jammi_db::store::manifest::DefinitionHash(req.current_definition);
+
+        let verdict = scoped(self.engine()?, tenant, || {
+            session.staleness(&table, current.clone())
+        })
+        .await
+        .map_err(map_engine_error)?;
+
+        Ok(Response::new(pb::StalenessResponse {
+            staleness: Some(staleness_to_proto(verdict)),
+        }))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
+    async fn derives_from(
+        &self,
+        request: Request<pb::DerivesFromRequest>,
+    ) -> Result<Response<pb::DerivesFromResponse>, Status> {
+        let tenant = session_tenant_traced(&request);
+        let session = self.local()?;
+        let req = request.into_inner();
+        let table = req.table;
+
+        let edges = scoped(self.engine()?, tenant, || session.derives_from(&table))
+            .await
+            .map_err(map_engine_error)?;
+
+        Ok(Response::new(pb::DerivesFromResponse {
+            edges: edges.into_iter().map(derives_from_edge_to_proto).collect(),
         }))
     }
 

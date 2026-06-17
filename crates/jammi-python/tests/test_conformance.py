@@ -138,6 +138,8 @@ _PIPELINE_VERBS = {
     "asof_join",
     "assemble_context",
     "verify_materialization",
+    "staleness",
+    "derives_from",
 }
 
 

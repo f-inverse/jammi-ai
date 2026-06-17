@@ -9,6 +9,7 @@ mod eval_per_query;
 mod exact_search;
 mod fine_tune_queue;
 mod foundation;
+mod freshness;
 mod index;
 mod materialization;
 #[cfg(feature = "test-hooks")]

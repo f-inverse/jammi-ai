@@ -43,6 +43,7 @@ use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::store::manifest::{DefinitionHash, MatchVerdict};
 use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
+use jammi_db::store::{DerivesFromEdge, Staleness};
 use jammi_db::trigger::{DeliveredBatch, Offset, Predicate, TopicDefinition, TriggerError};
 use jammi_db::{ModelTask, PerQueryAudit, ServerInfo, TenantId, TopicId};
 
@@ -348,6 +349,59 @@ impl Session {
         self.engine
             .result_store()
             .verify_materialization(&record, expected_definition.as_ref())
+            .await
+    }
+
+    /// Report whether a `ready` result table is still the output of its recorded
+    /// definition over its recorded inputs' current state — the read-only
+    /// `staleness` sensor. Reports a [`Staleness`]; it acts on nothing
+    /// (recompute / accept / alarm is the reader's policy, the
+    /// `verify_materialization` stance).
+    ///
+    /// `current_definition` is the hash of *how this table is produced now* — the
+    /// caller computes it from the producer's current descriptor + environment;
+    /// a divergence from the recorded hash is a `DefinitionChanged` reason. An
+    /// input with no reproducible current anchor makes the verdict
+    /// [`Staleness::Undecidable`] (never a confident `Fresh`). A pre-contract
+    /// table (no recorded definition) is [`Staleness::MissingManifest`].
+    ///
+    /// Tenant-scoped: the table is resolved through the tenant-filtered
+    /// `get_result_table`, so a peer cannot sense a table it cannot resolve.
+    pub async fn staleness(
+        &self,
+        table: &str,
+        current_definition: DefinitionHash,
+    ) -> Result<Staleness> {
+        let record = self
+            .engine
+            .catalog()
+            .get_result_table(table)
+            .await?
+            .ok_or_else(|| JammiError::Catalog(format!("Result table '{table}' not found")))?;
+        self.engine
+            .result_store()
+            .staleness(&record, &current_definition)
+            .await
+    }
+
+    /// The one-hop reverse-dependency edges of a result table — every `ready`
+    /// table that anchored on it. Read-only lineage data the caller walks
+    /// transitively; the engine ships the edges, never the recompute loop.
+    ///
+    /// Tenant-scoped: the table is resolved through the tenant-filtered
+    /// `get_result_table` before its dependents are gathered, so a peer cannot
+    /// enumerate the lineage of a table it cannot resolve. The returned edges are
+    /// likewise drawn only from the tenant's own (and GLOBAL) `ready` tables.
+    pub async fn derives_from(&self, table: &str) -> Result<Vec<DerivesFromEdge>> {
+        let record = self
+            .engine
+            .catalog()
+            .get_result_table(table)
+            .await?
+            .ok_or_else(|| JammiError::Catalog(format!("Result table '{table}' not found")))?;
+        self.engine
+            .result_store()
+            .derives_from(&record.table_name)
             .await
     }
 

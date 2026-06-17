@@ -164,6 +164,18 @@ pub enum JammiError {
         supported: String,
     },
 
+    /// A derives-from lineage walk revisited a table it was already descending
+    /// through — the reverse-dependency edges form a cycle, so a transitive walk
+    /// has no well-founded termination. A materialization lineage is a DAG by
+    /// construction (a producer's inputs are anchored before its output exists),
+    /// so a cycle is a corruption of the recorded `input_anchors_json`, not a
+    /// caller condition. Carries the table at which the back-edge was detected.
+    #[error("dependency cycle in derives-from lineage at table `{table}`")]
+    DependencyCycle {
+        /// The table whose re-entry closed the cycle.
+        table: String,
+    },
+
     /// Catch-all for errors that don't fit another variant.
     #[error("{0}")]
     Other(String),

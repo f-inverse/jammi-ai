@@ -535,6 +535,39 @@ impl PyDatabase {
         serializable_to_pydict(py, &verdict)
     }
 
+    /// Report whether a `ready` result table is still the output of its recorded
+    /// definition over its recorded inputs' current state — the read-only
+    /// `staleness` sensor. `current_definition` is the hash of how this table is
+    /// produced now. Returns a dict tagged `{"staleness": "fresh" | "stale" |
+    /// "undecidable" | "missing_manifest", ...}`: `stale` carries `reasons`,
+    /// `undecidable` carries `unpinned` + `decided_reasons`. Read-only; reports a
+    /// verdict and acts on nothing.
+    fn staleness(
+        &self,
+        py: Python<'_>,
+        table: &str,
+        current_definition: String,
+    ) -> PyResult<Py<PyAny>> {
+        let current = jammi_db::store::manifest::DefinitionHash(current_definition);
+        let verdict = self
+            .runtime
+            .block_on(self.local_session().staleness(table, current))
+            .map_err(to_pyerr)?;
+        serializable_to_pydict(py, &verdict)
+    }
+
+    /// The one-hop reverse-dependency edges of a result table — every `ready`
+    /// table that anchored on it. Returns a list of dicts
+    /// `{"input", "derived", "kind"}`. Read-only lineage data the caller walks
+    /// transitively.
+    fn derives_from(&self, py: Python<'_>, table: &str) -> PyResult<Py<PyAny>> {
+        let edges = self
+            .runtime
+            .block_on(self.local_session().derives_from(table))
+            .map_err(to_pyerr)?;
+        serializable_to_pydict(py, &edges)
+    }
+
     /// Register a mutable companion table from a serialized
     /// `CreateMutableTableRequest` body. The thin Python `Database` wrapper builds
     /// this request with the same pure-Python assembly the remote client uses

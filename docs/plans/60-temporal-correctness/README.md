@@ -22,6 +22,7 @@ Neither spec adds a serving tier, a KV store, RBAC, or any feature-store, govern
 |------|-----------|-----------------|------------------------------|-----------|
 | [SPEC-01](./SPEC-01-asof-join.md) | As-of temporal join (sort-merge `AsofJoinExec` physical operator) | `asof_join` verb → materialized result table | `asof_join` | none (reads sources, writes a result table via the existing path) |
 | [SPEC-02](./SPEC-02-materialization-contract.md) | Materialization contract (definition hash + input as-of anchors) | new `.materialization.json` sidecar + `verify_materialization` verb | `verify_materialization` | 021 (adds `definition_hash`, `input_anchors` to `result_tables`) |
+| [SPEC-03](./SPEC-03-incremental-recompute.md) | Incremental-recompute sensing (read-only staleness, cache-lookup, reverse-dependency lineage over the SPEC-02 contract) | `store/freshness.rs` sensing layer + `staleness` / `derives_from` verbs | `staleness`, `derives_from` | 022 (indexes `result_tables.definition_hash` for cache lookup) |
 
 ## Concurrent-session strategy
 

@@ -181,6 +181,7 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "019_normalize_model_status",
             "020_channel_tenant_scope",
             "021_materialization_contract",
+            "022_definition_hash_index",
         ]
     );
 }

@@ -126,6 +126,18 @@ service CatalogService {
   rpc VerifyMaterialization(VerifyMaterializationRequest)
       returns (VerifyMaterializationResponse);
 
+  // Report whether a `ready` result table is still the output of its recorded
+  // definition over its recorded inputs' current state. Read-only sensor;
+  // reports a verdict, never acting on one (recompute / accept / alarm is the
+  // reader's policy). Peer of the abstraction's `staleness`. Tenant-scoped: a
+  // peer cannot sense a table it cannot resolve.
+  rpc Staleness(StalenessRequest) returns (StalenessResponse);
+
+  // Return the one-hop reverse-dependency edges of a result table — every
+  // `ready` table that anchored on it. Read-only lineage data; the caller walks
+  // it transitively. Peer of the abstraction's `derives_from`. Tenant-scoped.
+  rpc DerivesFrom(DerivesFromRequest) returns (DerivesFromResponse);
+
   // --- mutable tables ----------------------------------------------------
 
   // Register a mutable companion table. After this returns the table is
@@ -385,6 +397,97 @@ message VerifyMaterializationResponse {
     repeated string unpinned = 1;
   }
   message MissingManifest {}
+}
+
+message StalenessRequest {
+  // The result table whose staleness is sensed.
+  string table = 1;
+  // The current definition hash of how this table is produced — the left side
+  // of the definition comparison. The caller computes it from the producer's
+  // current descriptor + environment; a mismatch with the recorded hash is a
+  // DefinitionChanged reason.
+  string current_definition = 2;
+}
+
+// One reason a `Staleness` verdict is stale: a single determinant that diverged
+// from what was recorded. The `reason` oneof mirrors the engine's `StaleReason`
+// enum tag-for-tag.
+message StaleReason {
+  oneof reason {
+    DefinitionChanged definition_changed = 1;
+    InputAdvanced input_advanced = 2;
+    InputVanished input_vanished = 3;
+  }
+
+  message DefinitionChanged {
+    string recorded = 1;
+    string current = 2;
+  }
+  message InputAdvanced {
+    string source = 1;
+    string recorded = 2;
+    string current = 3;
+  }
+  message InputVanished {
+    string source = 1;
+  }
+}
+
+// The outcome of `Staleness`. Exactly one verdict kind is set; the `staleness`
+// oneof mirrors the engine's `Staleness` enum so the remote reconstruction is
+// faithful.
+message StalenessResponse {
+  oneof staleness {
+    // Definition and every input anchor are unchanged — reuse is safe.
+    Fresh fresh = 1;
+    // Provably out of date for the listed reasons (all confidently resolved).
+    Stale stale = 2;
+    // Cannot be confidently asserted: one or more inputs have no reproducible
+    // current anchor. Any confidently-decided reasons are still reported.
+    Undecidable undecidable = 3;
+    // No recorded definition (a pre-contract table) — a truthful unknown.
+    MissingManifest missing_manifest = 4;
+  }
+
+  message Fresh {}
+  message Stale {
+    repeated StaleReason reasons = 1;
+  }
+  message Undecidable {
+    // Source ids whose current anchor could not be resolved.
+    repeated string unpinned = 1;
+    // The staleness reasons that WERE confidently decided despite the cloud.
+    repeated StaleReason decided_reasons = 2;
+  }
+  message MissingManifest {}
+}
+
+// What kind of immutable state pointer an input anchor carries — the wire mirror
+// of the engine's `AnchorKind`. UNSPECIFIED is never sent by the engine; it
+// exists only as the proto3 zero value.
+enum AnchorKind {
+  ANCHOR_KIND_UNSPECIFIED = 0;
+  ANCHOR_KIND_RESULT_DIGEST = 1;
+  ANCHOR_KIND_MUTABLE_VERSION = 2;
+  ANCHOR_KIND_SOURCE_VERSION = 3;
+  ANCHOR_KIND_UNPINNED_AT_INSTANT = 4;
+}
+
+message DerivesFromRequest {
+  // The result table whose one-hop reverse-dependency edges are returned.
+  string table = 1;
+}
+
+// One reverse-dependency edge: `derived` anchored on `input` with anchor kind
+// `kind`. Mirrors the engine's `DerivesFromEdge`.
+message DerivesFromEdge {
+  string input = 1;
+  string derived = 2;
+  AnchorKind kind = 3;
+}
+
+message DerivesFromResponse {
+  repeated DerivesFromEdge edges = 1;
 }
 
 message ListChannelsRequest {}

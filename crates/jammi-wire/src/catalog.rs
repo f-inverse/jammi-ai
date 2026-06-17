@@ -297,3 +297,160 @@ pub fn match_verdict_from_proto(
         )),
     }
 }
+
+// === sensing layer (staleness + lineage) ==================================
+
+/// Map the engine's [`StaleReason`](jammi_db::store::StaleReason) onto the proto
+/// `reason` oneof.
+fn stale_reason_to_proto(reason: jammi_db::store::StaleReason) -> pb::StaleReason {
+    use jammi_db::store::StaleReason;
+    use pb::stale_reason as r;
+    let reason = match reason {
+        StaleReason::DefinitionChanged { recorded, current } => {
+            r::Reason::DefinitionChanged(r::DefinitionChanged { recorded, current })
+        }
+        StaleReason::InputAdvanced {
+            source,
+            recorded,
+            current,
+        } => r::Reason::InputAdvanced(r::InputAdvanced {
+            source,
+            recorded,
+            current,
+        }),
+        StaleReason::InputVanished { source } => {
+            r::Reason::InputVanished(r::InputVanished { source })
+        }
+    };
+    pb::StaleReason {
+        reason: Some(reason),
+    }
+}
+
+/// Reconstruct the engine's [`StaleReason`](jammi_db::store::StaleReason) from
+/// the proto `reason` oneof. An absent oneof is a malformed reason.
+fn stale_reason_from_proto(
+    reason: pb::StaleReason,
+) -> Result<jammi_db::store::StaleReason, Status> {
+    use jammi_db::store::StaleReason;
+    use pb::stale_reason as r;
+    match reason.reason {
+        Some(r::Reason::DefinitionChanged(d)) => Ok(StaleReason::DefinitionChanged {
+            recorded: d.recorded,
+            current: d.current,
+        }),
+        Some(r::Reason::InputAdvanced(a)) => Ok(StaleReason::InputAdvanced {
+            source: a.source,
+            recorded: a.recorded,
+            current: a.current,
+        }),
+        Some(r::Reason::InputVanished(v)) => Ok(StaleReason::InputVanished { source: v.source }),
+        None => Err(Status::internal("StaleReason carried no reason")),
+    }
+}
+
+/// Map the engine's [`Staleness`](jammi_db::store::Staleness) onto the proto
+/// `staleness` oneof so a remote `staleness` reconstructs the identical verdict
+/// the in-process path returns.
+pub fn staleness_to_proto(
+    verdict: jammi_db::store::Staleness,
+) -> pb::staleness_response::Staleness {
+    use jammi_db::store::Staleness;
+    use pb::staleness_response as s;
+    match verdict {
+        Staleness::Fresh => s::Staleness::Fresh(s::Fresh {}),
+        Staleness::Stale { reasons } => s::Staleness::Stale(s::Stale {
+            reasons: reasons.into_iter().map(stale_reason_to_proto).collect(),
+        }),
+        Staleness::Undecidable {
+            unpinned,
+            decided_reasons,
+        } => s::Staleness::Undecidable(s::Undecidable {
+            unpinned,
+            decided_reasons: decided_reasons
+                .into_iter()
+                .map(stale_reason_to_proto)
+                .collect(),
+        }),
+        Staleness::MissingManifest => s::Staleness::MissingManifest(s::MissingManifest {}),
+    }
+}
+
+/// Reconstruct the engine's [`Staleness`](jammi_db::store::Staleness) from the
+/// proto `staleness` oneof. An absent oneof is a malformed response.
+pub fn staleness_from_proto(
+    verdict: Option<pb::staleness_response::Staleness>,
+) -> Result<jammi_db::store::Staleness, Status> {
+    use jammi_db::store::Staleness;
+    use pb::staleness_response as s;
+    match verdict {
+        Some(s::Staleness::Fresh(_)) => Ok(Staleness::Fresh),
+        Some(s::Staleness::Stale(st)) => Ok(Staleness::Stale {
+            reasons: st
+                .reasons
+                .into_iter()
+                .map(stale_reason_from_proto)
+                .collect::<Result<_, _>>()?,
+        }),
+        Some(s::Staleness::Undecidable(u)) => Ok(Staleness::Undecidable {
+            unpinned: u.unpinned,
+            decided_reasons: u
+                .decided_reasons
+                .into_iter()
+                .map(stale_reason_from_proto)
+                .collect::<Result<_, _>>()?,
+        }),
+        Some(s::Staleness::MissingManifest(_)) => Ok(Staleness::MissingManifest),
+        None => Err(Status::internal("StalenessResponse carried no staleness")),
+    }
+}
+
+/// Map the engine's [`AnchorKind`](jammi_db::store::AnchorKind) onto the proto
+/// enum.
+fn anchor_kind_to_proto(kind: jammi_db::store::AnchorKind) -> pb::AnchorKind {
+    use jammi_db::store::AnchorKind;
+    match kind {
+        AnchorKind::ResultDigest => pb::AnchorKind::ResultDigest,
+        AnchorKind::MutableVersion => pb::AnchorKind::MutableVersion,
+        AnchorKind::SourceVersion => pb::AnchorKind::SourceVersion,
+        AnchorKind::UnpinnedAtInstant => pb::AnchorKind::UnpinnedAtInstant,
+    }
+}
+
+/// Reconstruct the engine's [`AnchorKind`](jammi_db::store::AnchorKind) from the
+/// proto enum. `UNSPECIFIED` (the proto3 zero value the engine never sends) is a
+/// malformed edge.
+fn anchor_kind_from_proto(kind: i32) -> Result<jammi_db::store::AnchorKind, Status> {
+    use jammi_db::store::AnchorKind;
+    match pb::AnchorKind::try_from(kind) {
+        Ok(pb::AnchorKind::ResultDigest) => Ok(AnchorKind::ResultDigest),
+        Ok(pb::AnchorKind::MutableVersion) => Ok(AnchorKind::MutableVersion),
+        Ok(pb::AnchorKind::SourceVersion) => Ok(AnchorKind::SourceVersion),
+        Ok(pb::AnchorKind::UnpinnedAtInstant) => Ok(AnchorKind::UnpinnedAtInstant),
+        Ok(pb::AnchorKind::Unspecified) | Err(_) => Err(Status::internal(
+            "DerivesFromEdge carried an unspecified anchor kind",
+        )),
+    }
+}
+
+/// Map an engine [`DerivesFromEdge`](jammi_db::store::DerivesFromEdge) onto its
+/// proto message.
+pub fn derives_from_edge_to_proto(edge: jammi_db::store::DerivesFromEdge) -> pb::DerivesFromEdge {
+    pb::DerivesFromEdge {
+        input: edge.input,
+        derived: edge.derived,
+        kind: anchor_kind_to_proto(edge.kind) as i32,
+    }
+}
+
+/// Reconstruct an engine [`DerivesFromEdge`](jammi_db::store::DerivesFromEdge)
+/// from its proto message.
+pub fn derives_from_edge_from_proto(
+    edge: pb::DerivesFromEdge,
+) -> Result<jammi_db::store::DerivesFromEdge, Status> {
+    Ok(jammi_db::store::DerivesFromEdge {
+        input: edge.input,
+        derived: edge.derived,
+        kind: anchor_kind_from_proto(edge.kind)?,
+    })
+}

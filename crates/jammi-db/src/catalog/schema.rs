@@ -662,3 +662,23 @@ pub(super) const MIGRATION_021_MATERIALIZATION_CONTRACT: &str = r#"
 ALTER TABLE result_tables ADD COLUMN definition_hash    TEXT;
 ALTER TABLE result_tables ADD COLUMN input_anchors_json TEXT;
 "#;
+
+/// Migration 022 — the cache-lookup index over `definition_hash`.
+///
+/// The sensing layer's cache lookup answers "is there already a `ready` table
+/// produced by *this* definition?" — `WHERE definition_hash = $1 AND status =
+/// 'ready'`. That predicate is the hot path of a recompute decision (asked once
+/// per producer invocation), so `definition_hash` carries its own index; the
+/// `status` arm is the existing low-cardinality filter the planner already
+/// handles. Many rows can share a `definition_hash` (the same definition over
+/// different input anchors, or re-emissions of the same inputs), so this is a
+/// non-unique index — the *exact* `(definition_hash, input_anchors)` match is a
+/// Rust post-filter over the decoded `input_anchors_json` of the candidate rows
+/// the index narrows to.
+///
+/// `input_anchors_json` is deliberately **not** indexed: an anchor set is a
+/// structured value matched for set equality in Rust, not by a SQL predicate, so
+/// an index over its opaque JSON text would never be probed.
+pub(super) const MIGRATION_022_DEFINITION_HASH_INDEX: &str = r#"
+CREATE INDEX idx_result_tables_definition_hash ON result_tables(definition_hash);
+"#;

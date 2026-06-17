@@ -452,6 +452,102 @@ impl Catalog {
             .await?)
     }
 
+    /// Find the `ready` result tables produced by a given `definition_hash`,
+    /// scoped to the session tenant — the indexed candidate set the sensing
+    /// layer's cache lookup ([`crate::store::ResultStore::lookup_cached`])
+    /// narrows before its Rust exact-anchor post-filter.
+    ///
+    /// The predicate is `definition_hash = $1 AND status = 'ready'` (migration
+    /// 022's index covers the equality arm). Many rows can share a definition
+    /// hash (the same definition over different anchors, or re-emissions), so
+    /// this returns every candidate; the *exact* `(definition_hash,
+    /// input_anchors)` match is the caller's anchor-set comparison.
+    pub async fn find_ready_result_tables_by_definition(
+        &self,
+        definition_hash: &str,
+    ) -> Result<Vec<ResultTableRecord>> {
+        let hash = definition_hash.to_string();
+        let tenant = self.current_tenant();
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query(
+                            "SELECT * FROM result_tables \
+                               WHERE definition_hash = $1 AND status = 'ready' \
+                                 AND (tenant_id = $2 OR tenant_id IS NULL) \
+                             ORDER BY created_at",
+                            &[
+                                SqlValue::TextOwned(hash),
+                                SqlValue::from(tenant.map(|t| t.to_string())),
+                            ],
+                            parse_row,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?)
+    }
+
+    /// Find the `ready` result tables whose recorded `input_anchors_json` names
+    /// `source` as an input — the candidate set for the sensing layer's
+    /// one-hop reverse-dependency lineage
+    /// ([`crate::store::ResultStore::derives_from`]). Scoped to the session
+    /// tenant.
+    ///
+    /// The predicate is a `LIKE` over the JSON-encoded source key — a safe
+    /// *over-approximation* (the substring could in principle appear in another
+    /// field) the caller refines with an exact decode-and-match. The pattern is
+    /// a bound parameter, and `source` is escaped for LIKE so a name containing
+    /// `%`, `_`, or the escape character cannot widen the match.
+    pub async fn find_ready_result_tables_anchored_on(
+        &self,
+        source: &str,
+    ) -> Result<Vec<ResultTableRecord>> {
+        // The anchor's source is serialised as `"source":"<value>"` in
+        // `input_anchors_json`; escape LIKE metacharacters in `<value>` so a
+        // crafted source name cannot turn the pre-filter into a wildcard. `\` is
+        // the escape character declared in the ESCAPE clause.
+        let escaped = source
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%\"source\":\"{escaped}\"%");
+        let tenant = self.current_tenant();
+        Ok(self
+            .backend()
+            .transaction(
+                TxOptions {
+                    read_only: true,
+                    ..Default::default()
+                },
+                |tx| {
+                    Box::pin(async move {
+                        tx.query(
+                            "SELECT * FROM result_tables \
+                               WHERE status = 'ready' \
+                                 AND input_anchors_json LIKE $1 ESCAPE '\\' \
+                                 AND (tenant_id = $2 OR tenant_id IS NULL) \
+                             ORDER BY created_at",
+                            &[
+                                SqlValue::TextOwned(pattern),
+                                SqlValue::from(tenant.map(|t| t.to_string())),
+                            ],
+                            parse_row,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?)
+    }
+
     /// Delete all result tables for a source. Returns the deleted records
     /// so callers can clean up associated disk files. Scoped strictly to the
     /// session's tenant — a tenant deletes only its own result tables, never a

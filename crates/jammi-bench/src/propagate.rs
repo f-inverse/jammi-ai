@@ -387,6 +387,11 @@ async fn graph_session(
     let descriptor = jammi_db::store::manifest::ProducingDescriptor::ContextSet {
         encoder_id: INPUT_MODEL_ID.to_string(),
         source_id: NODES_SOURCE.to_string(),
+        candidate_source: jammi_db::store::manifest::ContextCandidateSource::Ann { k: 5 },
+        value_columns: Vec::new(),
+        aggregator: jammi_db::store::manifest::ContextAggregator::Mean,
+        exclude_self: true,
+        split: None,
         dimensions: dim,
     };
     let env =

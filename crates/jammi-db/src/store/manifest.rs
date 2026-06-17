@@ -49,10 +49,15 @@ use sha2::{Digest, Sha256};
 
 use crate::model_task::ModelTask;
 
-/// Manifest format version. A future format change bumps this so a reader
-/// detects it as a typed [`ManifestError::UnsupportedManifestVersion`] rather
-/// than silently misparsing.
-pub const MANIFEST_VERSION: u32 = 1;
+/// Manifest format version. A change to the [`ProducingDescriptor`] shape — the
+/// determinant set a producer folds into its [`DefinitionHash`] — bumps this so
+/// a reader detects an incompatible older manifest as a typed
+/// [`ManifestError::UnsupportedManifestVersion`] rather than comparing a stale
+/// hash computed over a different determinant set. The hash is opaque in the
+/// persisted manifest (the descriptor is folded away, not stored), so a version
+/// mismatch is the *only* signal that an on-disk hash is incomparable: a reader
+/// must reject it, never silently trust it.
+pub const MANIFEST_VERSION: u32 = 2;
 
 /// Content hash of *how* a table was produced: a canonical encoding of the
 /// [`ProducingDescriptor`] plus the [`MaterializationEnv`] that affects its
@@ -217,31 +222,104 @@ pub enum ProducingDescriptor {
     },
     /// Neighbor-graph derivation: a k-NN edge relation derived from an embedding
     /// table. (`NeighborGraphPipeline::write_edge_table`.)
+    ///
+    /// Every field below changes the emitted edge set or its determinism, so all
+    /// are part of the definition: `k` sets the fan-out; `min_similarity_bits`
+    /// prunes edges below a floor; `mutual` keeps only reciprocal edges; `self_exclude`
+    /// drops (or keeps) the self-edge; `exact` selects the deterministic
+    /// brute-force driver over the non-deterministic index-assisted one (so it is
+    /// itself output-affecting); and `exact_max_rows` is the ceiling that gates
+    /// the exact driver. (The `resolve_keys` flag is *not* recorded: today a
+    /// resolved endpoint equals its `_row_id` either way, so it does not affect
+    /// the output — recording it would be a false determinant.)
     NeighborGraph {
         /// The embedding result table the edges were derived from.
         source_table: String,
         /// The number of neighbours per node.
         k: usize,
+        /// Edge-weight floor: edges below this `similarity` are dropped, by its
+        /// IEEE-754 bit pattern (`f32::to_bits`) so the descriptor stays
+        /// bit-exact and `Eq`/`Hash`-able. `None` keeps all `k` edges per node.
+        min_similarity_bits: Option<u32>,
+        /// Keep an edge only when its reverse also survives (reciprocal filter).
+        mutual: bool,
+        /// Whether the self-edge `(a, a)` is excluded.
+        self_exclude: bool,
+        /// Whether the deterministic, complete exact driver was forced (vs the
+        /// non-deterministic index-assisted one).
+        exact: bool,
+        /// Row-count ceiling that gates the exact driver.
+        exact_max_rows: usize,
     },
     /// Graph-propagation output: K hops of feature propagation over a
     /// neighbor-graph, materialised as a new embedding table.
     /// (`propagate_embeddings` via `materialize_embedding_table`.)
+    ///
+    /// Propagation reads **two** inputs — the embedding table holding `X⁽⁰⁾` and
+    /// the edge relation defining the graph — so both are anchored in
+    /// [`MaterializationManifest::input_anchors`]; the edge relation is recorded
+    /// here by id (`edge_source`) as the second determinant. The kernel knobs
+    /// `direction`, `hops` (the *effective*, post-clamp depth), `alpha`,
+    /// `weighting`, and `output` each change the propagated vectors or their
+    /// dimensionality, so all are part of the definition.
     GraphPropagation {
         /// The embedding result table whose features were propagated.
         source_table: String,
+        /// The edge relation the propagation read, by id — the second input
+        /// anchor's source. A staleness/lineage determinant independent of the
+        /// kernel knobs: the same knobs over a different graph yield a different
+        /// output.
+        edge_source: String,
         /// The propagation kernel's canonical id.
         kernel_id: String,
+        /// Edge-direction the walk followed.
+        direction: PropagationDirection,
+        /// The number of hops actually run (clamped to the depth cap).
+        hops: usize,
+        /// APPNP teleport probability re-mixed each hop, recorded by its IEEE-754
+        /// bit pattern (`f64::to_bits`) so the descriptor stays bit-exact and
+        /// `Eq`/`Hash`-able — two runs with the same `α` hash identically, and a
+        /// different `α` (down to the last bit) changes the hash.
+        alpha_bits: u64,
+        /// How neighbour contributions were weighted.
+        weighting: PropagationWeighting,
+        /// What the propagation emitted (final block vs Jumping-Knowledge concat).
+        output: PropagationOutput,
         /// The output embedding width.
         dimensions: usize,
     },
     /// Context-set output: per-target pooled context vectors materialised as a
-    /// new embedding table. (`materialize_context` via
-    /// `materialize_embedding_table`.)
+    /// new embedding table. The real producer is the
+    /// `assemble_context`→`materialize_context` pair — `materialize_context` is a
+    /// sink receiving pre-pooled rows, so the determinants are the
+    /// `assemble_context` **recipe** (the `ContextRequest`) the whole batch
+    /// shared. (`materialize_context` via `materialize_embedding_table`.)
+    ///
+    /// The per-target `query` vector and `exclude_key` are deliberately **not**
+    /// recorded: a batch materialises one recipe over many targets, and those two
+    /// fields vary per target — they are the *inputs over which* the recipe runs
+    /// (and become the output table's row keys), not the recipe's definition.
+    /// Recording one target's query in a batch-level descriptor would be a false
+    /// determinant; the definition is the recipe every target was pooled under.
     ContextSet {
         /// The encoder's canonical id.
         encoder_id: String,
         /// The source whose rows were pooled per target.
         source_id: String,
+        /// Where each target's candidate members came from — ANN retrieval, a
+        /// declared-edge walk, or both — the determinant that selects which
+        /// neighbours are pooled.
+        candidate_source: ContextCandidateSource,
+        /// The label / outcome columns hydrated from the source per context row.
+        value_columns: Vec<String>,
+        /// The permutation-invariant pooling reduction.
+        aggregator: ContextAggregator,
+        /// Whether the leakage guard dropped each target's own row from its
+        /// context before pooling.
+        exclude_self: bool,
+        /// The optional split predicate scoping the context (the train/target
+        /// leakage line). `None` = no split scope.
+        split: Option<String>,
         /// The pooled-vector width.
         dimensions: usize,
     },
@@ -318,6 +396,154 @@ pub enum AsofTolerance {
     Duration(i64),
     /// Step limit for an integer key.
     Steps(i64),
+}
+
+/// Edge direction recorded in [`ProducingDescriptor::GraphPropagation`] and the
+/// edge gather of [`ProducingDescriptor::ContextSet`] — the transport-neutral
+/// mirror of the AI crate's `EdgeDirection`, so the definition hash covers the
+/// walk direction without `jammi-db` depending on the graph types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PropagationDirection {
+    /// Follow `src → dst` edges (out-neighbours).
+    Out,
+    /// Follow `dst → src` edges (in-neighbours).
+    In,
+    /// Both directions count as adjacency.
+    Undirected,
+}
+
+/// Neighbour-contribution weighting recorded in
+/// [`ProducingDescriptor::GraphPropagation`] — the transport-neutral mirror of
+/// the AI crate's `PropagationWeighting`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PropagationWeighting {
+    /// Random-walk normalisation `D̃^{-1}Ã` (the plain neighbour mean).
+    Uniform,
+    /// Symmetric normalisation `D̃^{-1/2}(A+I)D̃^{-1/2}` (the APPNP default).
+    DegreeNormalized,
+    /// Edge-weighted mean `Σ(w·x)/Σw` over the neighbourhood.
+    EdgeSimilarity,
+}
+
+/// What a propagation emitted, recorded in
+/// [`ProducingDescriptor::GraphPropagation`] — the transport-neutral mirror of
+/// the AI crate's `PropagationOutput`. Changes the output dimensionality, so it
+/// is part of the definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PropagationOutput {
+    /// Only the final `X⁽ᴷ⁾` block — a `d`-dim table in the input's space.
+    Final,
+    /// The per-hop blocks concatenated (Jumping Knowledge) — `(K+1)·d`-dim.
+    JumpingKnowledge,
+}
+
+/// The pooling reduction recorded in [`ProducingDescriptor::ContextSet`] — the
+/// transport-neutral mirror of the AI crate's `SetAggregator`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextAggregator {
+    /// Element-wise mean.
+    Mean,
+    /// Element-wise sum.
+    Sum,
+    /// Element-wise maximum.
+    Max,
+}
+
+/// How a hybrid context merges its ANN and declared-edge candidate sets,
+/// recorded in [`ContextCandidateSource::Hybrid`] — the transport-neutral mirror
+/// of the AI crate's `HybridMerge`. An enum (not a bool) so per-edge-type merge
+/// channels can be added; the merge is output-affecting (it selects which keys
+/// survive into the pool), so it is part of the definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextHybridMerge {
+    /// Union the candidate key sets (ANN first, then declared-edge members not
+    /// already present), dedup, pool once.
+    Union,
+}
+
+/// Where a context set's candidate members came from, recorded in
+/// [`ProducingDescriptor::ContextSet`] — the transport-neutral mirror of the AI
+/// crate's `ContextSource`. The candidate-set source is a determinant: the same
+/// pooling over a different candidate set yields a different output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "candidate", rename_all = "snake_case")]
+pub enum ContextCandidateSource {
+    /// `search(query, k)` over the source's embedding table.
+    Ann {
+        /// Neighbourhood size.
+        k: usize,
+    },
+    /// A declared-edge walk anchored at the target.
+    Edges {
+        /// The edge gather that produced the candidate keys.
+        gather: ContextEdgeGather,
+    },
+    /// Union of the ANN and declared-edge candidate sets, pooled once.
+    Hybrid {
+        /// ANN neighbourhood size for the retrieval arm.
+        ann_k: usize,
+        /// The declared-edge gather for the edge arm.
+        gather: ContextEdgeGather,
+        /// How the two candidate sets merge — an output-determinant recorded so
+        /// a second merge channel can't silently regress the descriptor.
+        merge: ContextHybridMerge,
+    },
+}
+
+/// A bounded declared-edge gather recorded in a [`ContextCandidateSource`] — the
+/// transport-neutral mirror of the AI crate's `EdgeGather`, carrying every
+/// output-affecting knob of the walk. `hops` is the *effective* (post-clamp)
+/// depth, so the cap itself never needs recording.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextEdgeGather {
+    /// The edge relation walked.
+    pub edge_source: ContextEdgeSource,
+    /// The effective (post-clamp) number of hops walked.
+    pub hops: usize,
+    /// Per-node per-hop neighbour sample cap (GraphSAGE). `None` = exact.
+    pub fanout: Option<usize>,
+    /// The direction the walk followed.
+    pub direction: PropagationDirection,
+    /// Optional edge-type allow-list, in declared order.
+    pub edge_types: Option<Vec<String>>,
+    /// Optional minimum edge weight to traverse, by IEEE-754 bit pattern so the
+    /// descriptor stays bit-exact and `Eq`/`Hash`-able. `None` = no floor.
+    pub min_weight_bits: Option<u64>,
+    /// Optional as-of pin (used with a registered source's as-of column).
+    pub as_of: Option<String>,
+}
+
+/// Which edge relation a context gather walked, recorded in a
+/// [`ContextEdgeGather`] — the transport-neutral mirror of the AI crate's
+/// `EdgeSourceRef`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "edge_source", rename_all = "snake_case")]
+pub enum ContextEdgeSource {
+    /// A `neighbor_graph` result table, by registered name.
+    NeighborGraph {
+        /// The registered result-table name.
+        table_name: String,
+    },
+    /// A registered external edge source: its id plus the columns the walk read.
+    Registered {
+        /// The registered source id holding the edge rows.
+        source_id: String,
+        /// Column holding the edge's source endpoint.
+        src_column: String,
+        /// Column holding the edge's destination endpoint.
+        dst_column: String,
+        /// Optional edge-type column (for the `edge_types` filter).
+        type_column: Option<String>,
+        /// Optional edge-weight column (for the `min_weight` filter).
+        weight_column: Option<String>,
+        /// Optional as-of column (for the `as_of` pin).
+        as_of_column: Option<String>,
+    },
 }
 
 impl ProducingDescriptor {
@@ -511,11 +737,22 @@ impl MaterializationManifest {
         Ok(serde_json::to_vec_pretty(self)?)
     }
 
-    /// Parse a manifest from its sidecar bytes, rejecting a format version newer
-    /// than this build supports.
+    /// Parse a manifest from its sidecar bytes, rejecting any format version this
+    /// build does not support.
+    ///
+    /// The persisted manifest carries an *opaque* [`DefinitionHash`] — the
+    /// [`ProducingDescriptor`] is folded into it, not stored — so the manifest's
+    /// JSON shape does not change when the descriptor's determinant set changes.
+    /// That makes the version the *only* signal that an on-disk hash was computed
+    /// over a different determinant set and is therefore incomparable. The
+    /// version is validated **before** the parsed manifest is handed back, so a
+    /// reader never silently trusts a stale hash: any version that is not exactly
+    /// [`MANIFEST_VERSION`] — older (a different, now-superseded determinant set)
+    /// or newer (a format this build cannot read) — is a typed
+    /// [`ManifestError::UnsupportedManifestVersion`], the signal to re-emit.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, ManifestError> {
         let manifest: Self = serde_json::from_slice(bytes)?;
-        if manifest.manifest_version > MANIFEST_VERSION {
+        if manifest.manifest_version != MANIFEST_VERSION {
             return Err(ManifestError::UnsupportedManifestVersion {
                 found: manifest.manifest_version,
                 supported: MANIFEST_VERSION,
@@ -617,12 +854,18 @@ pub enum ManifestError {
         "table `{0}` is post-contract but has no manifest sidecar (torn write or bypassed funnel)"
     )]
     PostContractManifestMissing(String),
-    /// The manifest sidecar's format version is newer than this build supports.
-    #[error("manifest format version {found} is newer than supported {supported}")]
+    /// The manifest sidecar's format version is not the one this build supports —
+    /// older (a superseded determinant set, so its definition hash is
+    /// incomparable) or newer (a format this build cannot read). Either way the
+    /// artifact must be re-emitted.
+    #[error(
+        "manifest format version {found} is incompatible with supported version {supported}; \
+         re-emit the artifact"
+    )]
     UnsupportedManifestVersion {
         /// The version found on disk.
         found: u32,
-        /// The newest version this build can read.
+        /// The format version this build reads and writes.
         supported: u32,
     },
     /// JSON (de)serialisation of a descriptor / environment / manifest failed.
@@ -740,8 +983,7 @@ mod tests {
         assert_eq!(manifest, back);
     }
 
-    #[test]
-    fn newer_manifest_version_is_rejected() {
+    fn manifest_at_version(version: u32) -> Vec<u8> {
         let mut manifest = MaterializationManifest::compute(
             &embedding_descriptor(),
             &cpu_env(),
@@ -751,12 +993,380 @@ mod tests {
             "2026-06-17T00:00:00Z".into(),
         )
         .unwrap();
-        manifest.manifest_version = MANIFEST_VERSION + 1;
-        let bytes = serde_json::to_vec(&manifest).unwrap();
+        manifest.manifest_version = version;
+        serde_json::to_vec(&manifest).unwrap()
+    }
+
+    #[test]
+    fn newer_manifest_version_is_rejected() {
         assert!(matches!(
-            MaterializationManifest::from_json_bytes(&bytes),
-            Err(ManifestError::UnsupportedManifestVersion { .. })
+            MaterializationManifest::from_json_bytes(&manifest_at_version(MANIFEST_VERSION + 1)),
+            Err(ManifestError::UnsupportedManifestVersion { found, supported })
+                if found == MANIFEST_VERSION + 1 && supported == MANIFEST_VERSION
         ));
+    }
+
+    #[test]
+    fn older_manifest_version_is_rejected_cleanly() {
+        // An old (v1) manifest's opaque definition hash was computed over a
+        // now-superseded descriptor determinant set, so it is incomparable.
+        // The reader must reject it as a typed error — the signal to re-emit —
+        // never a panic, never a silent stale-hash match. (v1 predates this
+        // build's MANIFEST_VERSION = 2.)
+        assert_eq!(
+            MANIFEST_VERSION, 2,
+            "this guard assumes v1 is the prior format"
+        );
+        assert!(matches!(
+            MaterializationManifest::from_json_bytes(&manifest_at_version(1)),
+            Err(ManifestError::UnsupportedManifestVersion { found: 1, supported })
+                if supported == MANIFEST_VERSION
+        ));
+    }
+
+    // ---- Non-vacuity guard: every output-affecting param of every data-producer
+    // variant must move the definition hash. A default-only round-trip passes
+    // vacuously exactly where a descriptor is lossy, so each case below flips a
+    // *non-default* value and asserts the hash changes — the regression guard
+    // that would have caught the original lossy NeighborGraph/GraphPropagation/
+    // ContextSet descriptors.
+
+    fn no_model_env() -> MaterializationEnv {
+        MaterializationEnv::new(ComputeDevice::Cpu, Vec::new())
+    }
+
+    /// A named mutation of a descriptor-fields fixture: a label (for the
+    /// assertion message) paired with the closure that flips one output-affecting
+    /// field to a non-default value.
+    type LabelledMutation<T> = (&'static str, fn(&mut T));
+
+    fn assert_each_change_moves_hash<T: Clone>(
+        base: &T,
+        env: &MaterializationEnv,
+        to_descriptor: impl Fn(&T) -> ProducingDescriptor,
+        mutations: &[LabelledMutation<T>],
+    ) {
+        let base_hash = definition_hash(&to_descriptor(base), env).unwrap();
+        for (label, mutate) in mutations {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                base_hash,
+                definition_hash(&to_descriptor(&changed), env).unwrap(),
+                "changing `{label}` must change the definition hash (lossy descriptor otherwise)"
+            );
+        }
+    }
+
+    fn neighbor_graph_descriptor(p: &BuildNeighborGraphFields) -> ProducingDescriptor {
+        ProducingDescriptor::NeighborGraph {
+            source_table: "emb".into(),
+            k: p.k,
+            min_similarity_bits: p.min_similarity_bits,
+            mutual: p.mutual,
+            self_exclude: p.self_exclude,
+            exact: p.exact,
+            exact_max_rows: p.exact_max_rows,
+        }
+    }
+
+    #[derive(Clone)]
+    struct BuildNeighborGraphFields {
+        k: usize,
+        min_similarity_bits: Option<u32>,
+        mutual: bool,
+        self_exclude: bool,
+        exact: bool,
+        exact_max_rows: usize,
+    }
+
+    #[test]
+    fn neighbor_graph_each_param_moves_the_hash() {
+        let base = BuildNeighborGraphFields {
+            k: 10,
+            min_similarity_bits: None,
+            mutual: false,
+            self_exclude: true,
+            exact: false,
+            exact_max_rows: 50_000,
+        };
+        assert_each_change_moves_hash(
+            &base,
+            &no_model_env(),
+            neighbor_graph_descriptor,
+            &[
+                ("k", |p| p.k = 25),
+                ("min_similarity", |p| {
+                    p.min_similarity_bits = Some(0.7_f32.to_bits())
+                }),
+                ("mutual", |p| p.mutual = true),
+                ("self_exclude", |p| p.self_exclude = false),
+                ("exact", |p| p.exact = true),
+                ("exact_max_rows", |p| p.exact_max_rows = 1_000),
+            ],
+        );
+    }
+
+    #[derive(Clone)]
+    struct GraphPropagationFields {
+        edge_source: String,
+        direction: PropagationDirection,
+        hops: usize,
+        alpha_bits: u64,
+        weighting: PropagationWeighting,
+        output: PropagationOutput,
+        dimensions: usize,
+    }
+
+    fn graph_propagation_descriptor(p: &GraphPropagationFields) -> ProducingDescriptor {
+        ProducingDescriptor::GraphPropagation {
+            source_table: "emb".into(),
+            edge_source: p.edge_source.clone(),
+            kernel_id: "graph_propagate".into(),
+            direction: p.direction,
+            hops: p.hops,
+            alpha_bits: p.alpha_bits,
+            weighting: p.weighting,
+            output: p.output,
+            dimensions: p.dimensions,
+        }
+    }
+
+    #[test]
+    fn graph_propagation_each_param_moves_the_hash() {
+        let base = GraphPropagationFields {
+            edge_source: "graph".into(),
+            direction: PropagationDirection::Out,
+            hops: 2,
+            alpha_bits: 0.1_f64.to_bits(),
+            weighting: PropagationWeighting::DegreeNormalized,
+            output: PropagationOutput::Final,
+            dimensions: 384,
+        };
+        assert_each_change_moves_hash(
+            &base,
+            &no_model_env(),
+            graph_propagation_descriptor,
+            &[
+                ("edge_source", |p| p.edge_source = "other_graph".into()),
+                ("direction", |p| {
+                    p.direction = PropagationDirection::Undirected
+                }),
+                ("hops", |p| p.hops = 3),
+                ("alpha", |p| p.alpha_bits = 0.25_f64.to_bits()),
+                ("weighting", |p| {
+                    p.weighting = PropagationWeighting::EdgeSimilarity
+                }),
+                ("output", |p| p.output = PropagationOutput::JumpingKnowledge),
+                ("dimensions", |p| p.dimensions = 768),
+            ],
+        );
+    }
+
+    #[derive(Clone)]
+    struct ContextSetFields {
+        candidate_source: ContextCandidateSource,
+        value_columns: Vec<String>,
+        aggregator: ContextAggregator,
+        exclude_self: bool,
+        split: Option<String>,
+        dimensions: usize,
+    }
+
+    fn context_set_descriptor(p: &ContextSetFields) -> ProducingDescriptor {
+        ProducingDescriptor::ContextSet {
+            encoder_id: "jammi:context-set".into(),
+            source_id: "patents".into(),
+            candidate_source: p.candidate_source.clone(),
+            value_columns: p.value_columns.clone(),
+            aggregator: p.aggregator,
+            exclude_self: p.exclude_self,
+            split: p.split.clone(),
+            dimensions: p.dimensions,
+        }
+    }
+
+    #[test]
+    fn context_set_each_param_moves_the_hash() {
+        let base = ContextSetFields {
+            candidate_source: ContextCandidateSource::Ann { k: 5 },
+            value_columns: vec!["label".into()],
+            aggregator: ContextAggregator::Mean,
+            exclude_self: true,
+            split: None,
+            dimensions: 32,
+        };
+        assert_each_change_moves_hash(
+            &base,
+            &no_model_env(),
+            context_set_descriptor,
+            &[
+                ("candidate_source.k", |p| {
+                    p.candidate_source = ContextCandidateSource::Ann { k: 9 }
+                }),
+                ("candidate_source.kind", |p| {
+                    p.candidate_source = ContextCandidateSource::Edges {
+                        gather: ContextEdgeGather {
+                            edge_source: ContextEdgeSource::NeighborGraph {
+                                table_name: "g".into(),
+                            },
+                            hops: 1,
+                            fanout: None,
+                            direction: PropagationDirection::Out,
+                            edge_types: None,
+                            min_weight_bits: None,
+                            as_of: None,
+                        },
+                    }
+                }),
+                ("value_columns", |p| p.value_columns.push("extra".into())),
+                ("aggregator", |p| p.aggregator = ContextAggregator::Max),
+                ("exclude_self", |p| p.exclude_self = false),
+                ("split", |p| p.split = Some("split = 'train'".into())),
+                ("dimensions", |p| p.dimensions = 64),
+            ],
+        );
+    }
+
+    #[test]
+    fn context_edge_gather_each_knob_moves_the_hash() {
+        // The edge gather is a determinant set in its own right; flip each of its
+        // knobs (with the gather embedded in a ContextSet) and assert the hash
+        // moves, so a lossy gather mirror is caught too.
+        let base = ContextSetFields {
+            candidate_source: ContextCandidateSource::Edges {
+                gather: ContextEdgeGather {
+                    edge_source: ContextEdgeSource::Registered {
+                        source_id: "edges".into(),
+                        src_column: "from".into(),
+                        dst_column: "to".into(),
+                        type_column: None,
+                        weight_column: None,
+                        as_of_column: None,
+                    },
+                    hops: 1,
+                    fanout: None,
+                    direction: PropagationDirection::Out,
+                    edge_types: None,
+                    min_weight_bits: None,
+                    as_of: None,
+                },
+            },
+            value_columns: Vec::new(),
+            aggregator: ContextAggregator::Mean,
+            exclude_self: true,
+            split: None,
+            dimensions: 32,
+        };
+        let with_gather = |mutate: fn(&mut ContextEdgeGather)| {
+            let mut f = base.clone();
+            if let ContextCandidateSource::Edges { gather } = &mut f.candidate_source {
+                mutate(gather);
+            }
+            f
+        };
+        let base_hash = definition_hash(&context_set_descriptor(&base), &no_model_env()).unwrap();
+        let cases: &[LabelledMutation<ContextEdgeGather>] = &[
+            ("hops", |g| g.hops = 3),
+            ("fanout", |g| g.fanout = Some(8)),
+            ("direction", |g| g.direction = PropagationDirection::In),
+            ("edge_types", |g| g.edge_types = Some(vec!["cites".into()])),
+            ("min_weight", |g| {
+                g.min_weight_bits = Some(0.5_f64.to_bits())
+            }),
+            ("as_of", |g| g.as_of = Some("2026-01-01".into())),
+            ("edge_source", |g| {
+                g.edge_source = ContextEdgeSource::NeighborGraph {
+                    table_name: "g".into(),
+                }
+            }),
+        ];
+        for (label, mutate) in cases {
+            let f = with_gather(*mutate);
+            assert_ne!(
+                base_hash,
+                definition_hash(&context_set_descriptor(&f), &no_model_env()).unwrap(),
+                "changing gather `{label}` must change the definition hash"
+            );
+        }
+    }
+
+    fn asof_descriptor(direction: AsofDirection) -> ProducingDescriptor {
+        ProducingDescriptor::AsofJoin {
+            spine: "spine".into(),
+            facts: "facts".into(),
+            spine_by: vec!["acct".into()],
+            facts_by: vec!["acct".into()],
+            spine_time: "ts".into(),
+            facts_time: "ts".into(),
+            direction,
+            boundary: AsofBoundary::Inclusive,
+            tolerance: None,
+            tie_break_column: None,
+            project: vec!["px".into()],
+        }
+    }
+
+    #[test]
+    fn asof_join_each_knob_moves_the_hash() {
+        let env = no_model_env();
+        let base_d = asof_descriptor(AsofDirection::Backward);
+        let base = definition_hash(&base_d, &env).unwrap();
+
+        // direction
+        assert_ne!(
+            base,
+            definition_hash(&asof_descriptor(AsofDirection::Forward), &env).unwrap()
+        );
+
+        // boundary, tolerance, tie-break, project, keys — flip each on a clone.
+        let variants: Vec<(&str, ProducingDescriptor)> = vec![
+            ("boundary", {
+                let mut d = base_d.clone();
+                if let ProducingDescriptor::AsofJoin { boundary, .. } = &mut d {
+                    *boundary = AsofBoundary::Exclusive;
+                }
+                d
+            }),
+            ("tolerance", {
+                let mut d = base_d.clone();
+                if let ProducingDescriptor::AsofJoin { tolerance, .. } = &mut d {
+                    *tolerance = Some(AsofTolerance::Steps(3));
+                }
+                d
+            }),
+            ("tie_break_column", {
+                let mut d = base_d.clone();
+                if let ProducingDescriptor::AsofJoin {
+                    tie_break_column, ..
+                } = &mut d
+                {
+                    *tie_break_column = Some("seq".into());
+                }
+                d
+            }),
+            ("project", {
+                let mut d = base_d.clone();
+                if let ProducingDescriptor::AsofJoin { project, .. } = &mut d {
+                    project.push("py".into());
+                }
+                d
+            }),
+            ("spine_by", {
+                let mut d = base_d.clone();
+                if let ProducingDescriptor::AsofJoin { spine_by, .. } = &mut d {
+                    spine_by.push("region".into());
+                }
+                d
+            }),
+        ];
+        for (label, d) in variants {
+            assert_ne!(
+                base,
+                definition_hash(&d, &env).unwrap(),
+                "changing asof `{label}` must change the definition hash"
+            );
+        }
     }
 
     #[test]

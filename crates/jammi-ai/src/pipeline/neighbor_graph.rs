@@ -247,7 +247,7 @@ impl<'a> NeighborGraphPipeline<'a> {
 
         let nodes = self.read_nodes(&source_table).await?;
         let edges = self.build_edges(&source_table, &nodes, params).await?;
-        self.write_edge_table(&source_table, edges, params.k).await
+        self.write_edge_table(&source_table, edges, params).await
     }
 
     /// Read every `(_row_id, vector)` pair from the embedding table's Parquet,
@@ -366,7 +366,7 @@ impl<'a> NeighborGraphPipeline<'a> {
         &self,
         source_table: &ResultTableRecord,
         edges: Vec<Edge>,
-        k: usize,
+        params: &BuildNeighborGraph,
     ) -> Result<ResultTableRecord> {
         // The edge table is a derivation: its `task` rides the source's so the
         // NOT NULL column round-trips, but `kind = NeighborGraph` excludes it
@@ -399,10 +399,17 @@ impl<'a> NeighborGraphPipeline<'a> {
         // The materialization contract: a neighbor-graph derivation invokes no
         // model, so the environment carries the engine version + device with an
         // empty model set; its sole input is the source embedding table, pinned
-        // by its immutable content digest (`ResultDigest`).
+        // by its immutable content digest (`ResultDigest`). The descriptor
+        // records every output-affecting build parameter so two graphs that
+        // differ in any of them hash differently.
         let descriptor = jammi_db::store::manifest::ProducingDescriptor::NeighborGraph {
             source_table: source_table.table_name.clone(),
-            k,
+            k: params.k,
+            min_similarity_bits: params.min_similarity.map(f32::to_bits),
+            mutual: params.mutual,
+            self_exclude: params.self_exclude,
+            exact: params.exact,
+            exact_max_rows: params.exact_max_rows,
         };
         let env = jammi_db::store::manifest::MaterializationEnv::new(
             self.session.compute_device(),

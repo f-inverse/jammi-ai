@@ -335,16 +335,28 @@ impl InferenceSession {
 
         // The materialization contract: graph propagation invokes no model (a
         // pure kernel over the source vectors + adjacency), so the environment
-        // carries the engine version + device with an empty model set; its input
-        // is the source embedding table, pinned by its content digest.
+        // carries the engine version + device with an empty model set. It reads
+        // TWO inputs — the source embedding table holding X⁽⁰⁾ and the edge
+        // relation defining the graph — so both are anchored; the kernel knobs
+        // that change the propagated vectors (direction, effective hops, the
+        // teleport α, weighting, output mode) are recorded in the descriptor.
         let descriptor = jammi_db::store::manifest::ProducingDescriptor::GraphPropagation {
             source_table: table.table_name.clone(),
+            edge_source: edge_source_id(&request.edge_source),
             kernel_id: PROPAGATE_MODEL_ID.to_string(),
+            direction: propagation_direction(request.direction),
+            hops: request.effective_hops(),
+            alpha_bits: request.alpha.to_bits(),
+            weighting: propagation_weighting(request.weighting),
+            output: propagation_output(request.output),
             dimensions: out_dim,
         };
         let env =
             jammi_db::store::manifest::MaterializationEnv::new(self.compute_device(), Vec::new());
-        let inputs = vec![self.result_store().result_digest_anchor(&table).await?];
+        let inputs = vec![
+            self.result_store().result_digest_anchor(&table).await?,
+            self.edge_source_anchor(&request.edge_source).await?,
+        ];
 
         self.result_store()
             .materialize_embedding_table(
@@ -683,6 +695,38 @@ impl InferenceSession {
         Ok(edges)
     }
 
+    /// Resolve the input anchor for the edge relation a propagation reads — the
+    /// second input alongside the embedding table. A `NeighborGraph` edge source
+    /// is an immutable result table, pinned by its content digest
+    /// (`ResultDigest`); a `Registered` external source has no version surface in
+    /// open-core, so it is anchored as `UnpinnedAtInstant` — honest about the
+    /// reproducibility gap rather than fabricating a pin.
+    async fn edge_source_anchor(
+        self: &Arc<Self>,
+        edge_source: &EdgeSourceRef,
+    ) -> Result<jammi_db::store::manifest::InputAnchor> {
+        match edge_source {
+            EdgeSourceRef::NeighborGraph { table_name } => {
+                let record = self
+                    .catalog()
+                    .get_result_table(table_name)
+                    .await?
+                    .ok_or_else(|| {
+                        JammiError::Catalog(format!(
+                            "propagate: edge relation '{table_name}' not found in the catalog"
+                        ))
+                    })?;
+                self.result_store().result_digest_anchor(&record).await
+            }
+            EdgeSourceRef::Registered { source_id, .. } => {
+                Ok(jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
+                    source_id.clone(),
+                    chrono::Utc::now().to_rfc3339(),
+                ))
+            }
+        }
+    }
+
     /// Build the tenant-scoped edge-scan SQL for a [`EdgeSourceRef`], projecting
     /// canonical `_src`/`_dst`[/`_weight`] aliases. Returns the SQL plus the
     /// weight alias when the source carries one.
@@ -913,6 +957,49 @@ fn l2_normalize(block: &[f64]) -> Vec<f32> {
         return block.iter().map(|&x| x as f32).collect();
     }
     block.iter().map(|&x| (x / norm) as f32).collect()
+}
+
+/// The id of the edge relation a propagation read, for the descriptor's
+/// `edge_source` determinant: the neighbor-graph table name, or the registered
+/// source id.
+fn edge_source_id(edge_source: &EdgeSourceRef) -> String {
+    match edge_source {
+        EdgeSourceRef::NeighborGraph { table_name } => table_name.clone(),
+        EdgeSourceRef::Registered { source_id, .. } => source_id.clone(),
+    }
+}
+
+/// Map the AI-crate [`EdgeDirection`] to the manifest's transport-neutral mirror.
+fn propagation_direction(
+    direction: EdgeDirection,
+) -> jammi_db::store::manifest::PropagationDirection {
+    use jammi_db::store::manifest::PropagationDirection as M;
+    match direction {
+        EdgeDirection::Out => M::Out,
+        EdgeDirection::In => M::In,
+        EdgeDirection::Undirected => M::Undirected,
+    }
+}
+
+/// Map the AI-crate [`PropagationWeighting`] to the manifest's mirror.
+fn propagation_weighting(
+    weighting: PropagationWeighting,
+) -> jammi_db::store::manifest::PropagationWeighting {
+    use jammi_db::store::manifest::PropagationWeighting as M;
+    match weighting {
+        PropagationWeighting::Uniform => M::Uniform,
+        PropagationWeighting::DegreeNormalized => M::DegreeNormalized,
+        PropagationWeighting::EdgeSimilarity => M::EdgeSimilarity,
+    }
+}
+
+/// Map the AI-crate [`PropagationOutput`] to the manifest's mirror.
+fn propagation_output(output: PropagationOutput) -> jammi_db::store::manifest::PropagationOutput {
+    use jammi_db::store::manifest::PropagationOutput as M;
+    match output {
+        PropagationOutput::Final => M::Final,
+        PropagationOutput::JumpingKnowledge => M::JumpingKnowledge,
+    }
 }
 
 /// Read the `_row_id` column of an embedding batch into owned strings, casting

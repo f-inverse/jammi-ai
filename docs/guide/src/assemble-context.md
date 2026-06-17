@@ -115,10 +115,13 @@ table, with its own sidecar ANN index:
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# use jammi_ai::pipeline::context_set::MaterializedContext;
+# use jammi_ai::pipeline::context_set::{ContextRequest, MaterializedContext};
 # async fn ex(session: &std::sync::Arc<InferenceSession>, rows: Vec<(String, Vec<f32>)>) -> jammi_db::error::Result<()> {
+// The recipe carries *how* every row was pooled — the source, candidate set,
+// value columns, aggregator, self-exclusion, and split — and names the source.
+let recipe = ContextRequest::new("patents", vec![0.0_f32; 32], 5);
 let table = session
-    .materialize_context("patents", MaterializedContext { rows: &rows, dimensions: 32 })
+    .materialize_context(MaterializedContext { rows: &rows, dimensions: 32, recipe: &recipe })
     .await?;
 // `table` is a normal embedding result table: search it, join it, index it.
 let _ = table;
@@ -127,4 +130,7 @@ let _ = table;
 
 Each target's key becomes the table's `_row_id`; the pooled context vector
 becomes its `vector`. A materialised context set is a first-class member of the
-same table family every embedding table belongs to.
+same table family every embedding table belongs to. The recipe `materialize_context`
+takes is the batch's shared assembly definition (the source comes from it); the
+per-target query vectors are the inputs the recipe ran over, which is why they are
+the `rows`, not part of the recipe.

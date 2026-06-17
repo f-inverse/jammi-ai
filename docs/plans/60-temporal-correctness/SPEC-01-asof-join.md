@@ -38,7 +38,7 @@ Dispatch in a single message:
 
 ### 2.C — Sequential integration (~60 min, main session)
 
-1. Route `EdgeGather::as_of` through the shared `Boundary`/comparison helper (§6.3).
+1. **DEFERRED** (tracked follow-up — see §6.3): route `EdgeGather::as_of` through the shared `Boundary`/comparison helper. This rewrites an existing, tested edge-load path (the string-cast `WHERE` predicate in `graph_neighbourhood.rs`), so it carries its own rigor unit (its own pressure-test + audit + the lexicographic-vs-typed disagreement test of exit-criterion #6) rather than riding the new-module work. The typed `Boundary`/comparison helper shipped; only the edge-gather *call-through* is deferred.
 2. Add `asof_join` to the embedded `Database` and the remote `RemoteDatabase`, then to `_PIPELINE_VERBS` in `crates/jammi-python/tests/test_conformance.py` (§7).
 3. `cargo clippy --all-features -- -D warnings`, `cargo fmt --check`. No `#[allow(...)]`.
 
@@ -242,9 +242,11 @@ These are the choices every engine gets subtly different; the engine fixes them 
 
 Per group (one hash partition may hold several groups; the merge resets at each `by` boundary): two cursors over the sorted runs. For `Backward`/`Inclusive`, advance the fact cursor while `fact.time <= spine.time`, remembering the last eligible fact; emit it (or null) when the spine cursor advances. `Exclusive` uses `<`. `Forward` mirrors. `Nearest` keeps the straddling pair and picks by absolute distance. Because there is at most one match, the cursor never backtracks — O(n+m) per group after the sort. This is the DuckDB/kdb/ClickHouse sort-merge shape[^duckdb-blog][^kdb-aj].
 
-### 6.3 Unifying the edge-gather pin
+### 6.3 Unifying the edge-gather pin — DEFERRED to a tracked follow-up
 
-`EdgeGather::as_of` + `EdgeSourceRef::as_of_column` (in `graph_neighbourhood.rs`) today implement a backward-inclusive pin as a hand-built SQL string: `WHERE arrow_cast("col",'Utf8') <= 'asof'`. That is a *lexicographic* comparison — it happens to work for ISO-8601 timestamps but is silently wrong for any temporal key whose string order differs from its value order (e.g. unpadded integers, or `Date32` rendered without zero-padding). SPEC-01's typed `Boundary`/comparison helper is the single, type-correct source of "at or before" semantics; the edge-gather predicate is rewritten to call that helper instead of formatting a string cast, so the engine has one definition of "as of," and the more-correct one. This is the *right-abstraction* fix from [`../../CLAUDE.md` — *Clean, functional style*](../../CLAUDE.md) ("two things that are the same thing at a different scale are one thing"): the edge pin and the relational join are the same comparison at different scales.
+> **Status: DEFERRED — NOT shipped in this spec's delivery.** The typed `Boundary`/comparison helper and the `AsofJoinExec` operator shipped, but the edge-gather *call-through* below did not. Rationale: routing `EdgeGather::as_of` through the shared helper rewrites an **existing, tested edge-load path** (the string-cast `WHERE` predicate in `graph_neighbourhood.rs`), which is a distinct change with its own failure modes — it owns its own rigor unit (pressure-test → implement → independent audit → CI), including the lexicographic-vs-typed disagreement test of exit-criterion #6, rather than riding the new-module work. The string-cast pin remains in place until that follow-up lands. The paragraph below describes the *intended* end state, not the current one.
+
+`EdgeGather::as_of` + `EdgeSourceRef::as_of_column` (in `graph_neighbourhood.rs`) today implement a backward-inclusive pin as a hand-built SQL string: `WHERE arrow_cast("col",'Utf8') <= 'asof'`. That is a *lexicographic* comparison — it happens to work for ISO-8601 timestamps but is silently wrong for any temporal key whose string order differs from its value order (e.g. unpadded integers, or `Date32` rendered without zero-padding). SPEC-01's typed `Boundary`/comparison helper is the single, type-correct source of "at or before" semantics; the edge-gather predicate is to be rewritten to call that helper instead of formatting a string cast, so the engine has one definition of "as of," and the more-correct one. This is the *right-abstraction* fix from [`../../CLAUDE.md` — *Clean, functional style*](../../CLAUDE.md) ("two things that are the same thing at a different scale are one thing"): the edge pin and the relational join are the same comparison at different scales.
 
 ## 7. Verb conventions (embed == remote)
 
@@ -264,7 +266,7 @@ crates/jammi-ai/src/pipeline/asof/
   exec.rs      +new  AsofJoinExec + ExecutionPlan impl
   merge.rs     +new  merge_partition — the per-group sort-merge core
   verb.rs      +new  asof_join verb body
-crates/jammi-ai/src/pipeline/graph_neighbourhood.rs   CHANGED  route as_of through the shared comparison (§6.3)
+crates/jammi-ai/src/pipeline/graph_neighbourhood.rs   DEFERRED route as_of through the shared comparison (§6.3 — tracked follow-up, NOT in this delivery)
 crates/jammi-ai/src/session.rs                         CHANGED  expose asof_join
 crates/jammi-python/src/lib.rs                         CHANGED  PyO3 binding
 clients/python/jammi_client/_database.py               CHANGED  remote stub
@@ -306,7 +308,7 @@ This passes the discipline test. None of *"trade," "quote," "slippage," "lookahe
 3. **Tolerance suppresses stale matches.** A fact just outside the tolerance yields a null match; just inside yields a hit. Both `Duration` and `Steps`.
 4. **Ambiguity is loud.** Duplicate facts at the matched instant with `TieBreak::Error` returns `AsofError::AmbiguousMatch`; with `ByColumnDesc` returns the newest. No test observes a non-deterministic pick.
 5. **Null + preservation.** Null-time spine rows preserved with null facts; null-time facts never matched; spine never shrinks.
-6. **Edge-gather unified.** A `graph_neighbourhood` test exercising `EdgeGather::as_of` now passes through the typed shared comparison (not the string cast) and returns rows at-or-before the pin, including a case where lexicographic and typed order disagree (proving the old string-cast was wrong and the unified path is right).
+6. **Edge-gather unified — DEFERRED (tracked follow-up, see §6.3).** Not an exit criterion of this delivery. When the deferred §6.3 work lands, a `graph_neighbourhood` test must exercise `EdgeGather::as_of` passing through the typed shared comparison (not the string cast) and returning rows at-or-before the pin, including a case where lexicographic and typed order disagree (proving the old string-cast was wrong and the unified path is right). Until then the string-cast pin stands and this criterion is intentionally not met.
 7. **Embed == remote.** `asof_join` callable with identical signature on `Database` and `RemoteDatabase`; conformance guard green.
 8. **Scale sanity.** 1M-row facts × 100k-row spine over 10k groups completes within the operator's sort-merge bound (O((n+m) log) dominated by the sort), not the `NestedLoopJoinExec` quadratic path DataFusion falls back to for plain inequality joins[^df-8393]. Asserted as a wall-clock ceiling in a `#[ignore]`-free bench-style integration test.
 9. **No band-aids.** Zero net new `#[allow(...)]`, `let _ =`, `// TODO`, `#[ignore]`. `cargo clippy --all-features -- -D warnings` and `cargo fmt --check` pass.

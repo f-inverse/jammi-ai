@@ -31,7 +31,7 @@ use datafusion::prelude::{col, lit};
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 
-use crate::pipeline::graph_neighbourhood::EdgeGather;
+use crate::pipeline::graph_neighbourhood::{EdgeDirection, EdgeGather, EdgeSourceRef};
 use crate::session::InferenceSession;
 
 /// How a context set's candidate members were assembled — a *fact* about the
@@ -647,16 +647,27 @@ fn extract_single_vector(batches: &[RecordBatch], table: &str) -> Result<Option<
     Ok(Some((0..floats.len()).map(|i| floats.value(i)).collect()))
 }
 
-/// A pooled context vector keyed by its target, the materialised form of an
-/// [`assemble_context`](InferenceSession::assemble_context) result for batch
-/// workflows. The unique target keys carried here become the `_row_id` of a
-/// normal embedding-shaped result table.
+/// A batch of pooled context vectors keyed by target, the materialised form of
+/// [`assemble_context`](InferenceSession::assemble_context) over many targets
+/// that all shared one assembly recipe. The unique target keys become the
+/// `_row_id` of a normal embedding-shaped result table.
+///
+/// The whole batch is pooled under one [`ContextRequest`] recipe — the
+/// determinant set of *how* every row was produced (candidate source, value
+/// columns, aggregator, self-exclusion, split). That recipe is carried here so
+/// the materialization descriptor records the real producer completely; the
+/// per-target `query` / `exclude_key` of each individual request are the inputs
+/// the recipe ran over (and become the row keys), not the recipe's definition,
+/// so they are not part of the shared recipe.
 #[derive(Debug)]
 pub struct MaterializedContext<'a> {
     /// Each target's key paired with its pooled context vector.
     pub rows: &'a [(String, Vec<f32>)],
     /// The pooled vectors' fixed width.
     pub dimensions: usize,
+    /// The assembly recipe every row in the batch was pooled under — the
+    /// `ContextSet` descriptor's determinant set.
+    pub recipe: &'a ContextRequest,
 }
 
 impl InferenceSession {
@@ -671,7 +682,6 @@ impl InferenceSession {
     /// set is a first-class member of the same table family.
     pub async fn materialize_context(
         &self,
-        source_id: &str,
         context: MaterializedContext<'_>,
     ) -> Result<ResultTableRecord> {
         // De-duplicate target keys so the table's `_row_id` stays a key: a
@@ -683,15 +693,27 @@ impl InferenceSession {
             ));
         }
 
+        let recipe = context.recipe;
+        let source_id = recipe.source_id.as_str();
+
         // The materialization contract: a context set pools from the source's
         // raw rows (no model invoked here — the encoder is the pooling kernel),
         // so the environment carries the engine version + device with an empty
-        // model set. There is no single source result table the batch derives
-        // from, so the input is the source itself, which has no version surface
-        // in open-core → `UnpinnedAtInstant` (honest, not a fabricated pin).
+        // model set. The descriptor records the full assembly recipe — the real
+        // producer — so two materialisations under different recipes (a different
+        // candidate source, value columns, aggregator, self-exclusion, or split)
+        // hash differently. There is no single source result table the batch
+        // derives from, so the input is the source itself, which has no version
+        // surface in open-core → `UnpinnedAtInstant` (honest, not a fabricated
+        // pin).
         let descriptor = jammi_db::store::manifest::ProducingDescriptor::ContextSet {
             encoder_id: "jammi:context-set".to_string(),
             source_id: source_id.to_string(),
+            candidate_source: candidate_source_for(&recipe.source),
+            value_columns: recipe.value_columns.clone(),
+            aggregator: aggregator_for(recipe.aggregator),
+            exclude_self: recipe.exclude_self,
+            split: recipe.split.clone(),
             dimensions: context.dimensions,
         };
         let env =
@@ -718,6 +740,105 @@ impl InferenceSession {
                 jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
             )
             .await
+    }
+}
+
+/// Map the AI-crate [`ContextSource`] to the manifest's transport-neutral
+/// candidate-source mirror — the determinant that selects which neighbours a
+/// target pools. The ANN neighbourhood size and the declared-edge gather knobs
+/// are output-affecting, so each is carried into the descriptor.
+fn candidate_source_for(
+    source: &ContextSource,
+) -> jammi_db::store::manifest::ContextCandidateSource {
+    use jammi_db::store::manifest::ContextCandidateSource as M;
+    match source {
+        ContextSource::Ann { k } => M::Ann { k: *k },
+        ContextSource::Edges(gather) => M::Edges {
+            gather: edge_gather_for(gather),
+        },
+        ContextSource::Hybrid {
+            ann_k,
+            edges,
+            merge,
+        } => M::Hybrid {
+            ann_k: *ann_k,
+            gather: edge_gather_for(edges),
+            // `merge` is an output-determinant (it selects which keys survive
+            // into the pool). With only `Union` today a variance test can't yet
+            // distinguish two merges, but it is recorded for forward-completeness
+            // so the next merge channel can't silently regress the descriptor.
+            merge: merge_for(*merge),
+        },
+    }
+}
+
+/// Map the AI-crate [`HybridMerge`] to the manifest's merge-channel mirror.
+fn merge_for(merge: HybridMerge) -> jammi_db::store::manifest::ContextHybridMerge {
+    use jammi_db::store::manifest::ContextHybridMerge as M;
+    match merge {
+        HybridMerge::Union => M::Union,
+    }
+}
+
+/// Map the AI-crate [`SetAggregator`] to the manifest's pooling mirror.
+fn aggregator_for(aggregator: SetAggregator) -> jammi_db::store::manifest::ContextAggregator {
+    use jammi_db::store::manifest::ContextAggregator as M;
+    match aggregator {
+        SetAggregator::Mean => M::Mean,
+        SetAggregator::Sum => M::Sum,
+        SetAggregator::Max => M::Max,
+    }
+}
+
+/// Map the AI-crate [`EdgeGather`] to the manifest's transport-neutral mirror,
+/// carrying every output-affecting knob of the walk. `hops` is recorded as the
+/// *effective* (post-clamp) depth, so the descriptor never needs the cap; the
+/// minimum edge weight is recorded by its IEEE-754 bit pattern so the descriptor
+/// stays bit-exact and `Eq`/`Hash`-able.
+fn edge_gather_for(gather: &EdgeGather) -> jammi_db::store::manifest::ContextEdgeGather {
+    jammi_db::store::manifest::ContextEdgeGather {
+        edge_source: edge_source_for(&gather.edge_source),
+        hops: gather.effective_hops(),
+        fanout: gather.fanout,
+        direction: edge_direction_for(gather.direction),
+        edge_types: gather.edge_types.clone(),
+        min_weight_bits: gather.min_weight.map(f64::to_bits),
+        as_of: gather.as_of.clone(),
+    }
+}
+
+/// Map the AI-crate [`EdgeSourceRef`] to the manifest's edge-source mirror.
+fn edge_source_for(edge_source: &EdgeSourceRef) -> jammi_db::store::manifest::ContextEdgeSource {
+    use jammi_db::store::manifest::ContextEdgeSource as M;
+    match edge_source {
+        EdgeSourceRef::NeighborGraph { table_name } => M::NeighborGraph {
+            table_name: table_name.clone(),
+        },
+        EdgeSourceRef::Registered {
+            source_id,
+            src_column,
+            dst_column,
+            type_column,
+            weight_column,
+            as_of_column,
+        } => M::Registered {
+            source_id: source_id.clone(),
+            src_column: src_column.clone(),
+            dst_column: dst_column.clone(),
+            type_column: type_column.clone(),
+            weight_column: weight_column.clone(),
+            as_of_column: as_of_column.clone(),
+        },
+    }
+}
+
+/// Map the AI-crate [`EdgeDirection`] to the manifest's walk-direction mirror.
+fn edge_direction_for(direction: EdgeDirection) -> jammi_db::store::manifest::PropagationDirection {
+    use jammi_db::store::manifest::PropagationDirection as M;
+    match direction {
+        EdgeDirection::Out => M::Out,
+        EdgeDirection::In => M::In,
+        EdgeDirection::Undirected => M::Undirected,
     }
 }
 

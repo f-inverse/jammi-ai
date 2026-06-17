@@ -174,11 +174,17 @@ pub fn synthetic_seed_contract(
     Vec<jammi_db::store::manifest::InputAnchor>,
 ) {
     use jammi_db::store::manifest::{
-        ComputeDevice, InputAnchor, MaterializationEnv, ProducingDescriptor,
+        ComputeDevice, ContextAggregator, ContextCandidateSource, InputAnchor, MaterializationEnv,
+        ProducingDescriptor,
     };
     let descriptor = ProducingDescriptor::ContextSet {
         encoder_id: encoder_id.to_string(),
         source_id: source_id.to_string(),
+        candidate_source: ContextCandidateSource::Ann { k: 5 },
+        value_columns: Vec::new(),
+        aggregator: ContextAggregator::Mean,
+        exclude_self: true,
+        split: None,
         dimensions,
     };
     let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());
@@ -203,8 +209,8 @@ pub async fn write_manifest_sidecar_for(
     dimensions: usize,
 ) {
     use jammi_db::store::manifest::{
-        ArtifactDigest, ComputeDevice, InputAnchor, MaterializationEnv, MaterializationManifest,
-        ProducingDescriptor,
+        ArtifactDigest, ComputeDevice, ContextAggregator, ContextCandidateSource, InputAnchor,
+        MaterializationEnv, MaterializationManifest, ProducingDescriptor,
     };
     let handle = store.open_parquet(parquet_url).unwrap();
     let path = handle.data_path().unwrap();
@@ -213,6 +219,11 @@ pub async fn write_manifest_sidecar_for(
         &ProducingDescriptor::ContextSet {
             encoder_id: "synthetic-embed".into(),
             source_id: source_id.into(),
+            candidate_source: ContextCandidateSource::Ann { k: 5 },
+            value_columns: Vec::new(),
+            aggregator: ContextAggregator::Mean,
+            exclude_self: true,
+            split: None,
             dimensions,
         },
         &MaterializationEnv::new(ComputeDevice::Cpu, Vec::new()),

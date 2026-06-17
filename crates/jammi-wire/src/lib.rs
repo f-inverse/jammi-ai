@@ -57,9 +57,10 @@ pub use transport::{SessionChannel, SessionHeader, SessionTransport, SESSION_HEA
 
 pub use audit::{parse_query_id, record_from_wire};
 pub use catalog::{
-    match_verdict_from_proto, match_verdict_to_proto, model_from_proto, model_to_proto,
-    source_descriptor_from_proto, source_type_from_proto, source_type_to_proto, topic_from_proto,
-    topic_to_proto,
+    derives_from_edge_from_proto, derives_from_edge_to_proto, match_verdict_from_proto,
+    match_verdict_to_proto, model_from_proto, model_to_proto, source_descriptor_from_proto,
+    source_type_from_proto, source_type_to_proto, staleness_from_proto, staleness_to_proto,
+    topic_from_proto, topic_to_proto,
 };
 pub use channel::{
     channel_from_proto, channel_to_proto, columns_from_proto, columns_to_proto, parse_channel_id,

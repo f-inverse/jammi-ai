@@ -427,9 +427,9 @@ fn anchor_kind_from_proto(kind: i32) -> Result<jammi_db::store::AnchorKind, Stat
         Ok(pb::AnchorKind::MutableVersion) => Ok(AnchorKind::MutableVersion),
         Ok(pb::AnchorKind::SourceVersion) => Ok(AnchorKind::SourceVersion),
         Ok(pb::AnchorKind::UnpinnedAtInstant) => Ok(AnchorKind::UnpinnedAtInstant),
-        Ok(pb::AnchorKind::Unspecified) | Err(_) => {
-            Err(Status::internal("DerivesFromEdge carried an unspecified anchor kind"))
-        }
+        Ok(pb::AnchorKind::Unspecified) | Err(_) => Err(Status::internal(
+            "DerivesFromEdge carried an unspecified anchor kind",
+        )),
     }
 }
 

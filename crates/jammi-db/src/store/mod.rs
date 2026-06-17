@@ -6,7 +6,7 @@ pub mod schema;
 pub mod vectors;
 
 pub use artifact::{ArtifactStore, LocalArtifact};
-pub use freshness::{CurrentAnchor, DerivesFromEdge, Staleness, StaleReason};
+pub use freshness::{CurrentAnchor, DerivesFromEdge, StaleReason, Staleness};
 pub use manifest::{
     AnchorKind, AnchorValue, ArtifactDigest, ComputeDevice, DefinitionHash, InputAnchor,
     ManifestError, MatchVerdict, Materialization, MaterializationEnv, MaterializationManifest,

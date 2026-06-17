@@ -42,8 +42,8 @@ use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::store::manifest::{DefinitionHash, MatchVerdict};
-use jammi_db::store::{DerivesFromEdge, Staleness};
 use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
+use jammi_db::store::{DerivesFromEdge, Staleness};
 use jammi_db::trigger::{DeliveredBatch, Offset, Predicate, TopicDefinition, TriggerError};
 use jammi_db::{ModelTask, PerQueryAudit, ServerInfo, TenantId, TopicId};
 

@@ -23,8 +23,8 @@ use jammi_db::config::AnnIndexConfig;
 use jammi_db::error::JammiError;
 use jammi_db::model_task::ModelTask;
 use jammi_db::store::manifest::{
-    ArtifactDigest, ComputeDevice, DefinitionHash, InputAnchor, Materialization, MaterializationEnv,
-    MaterializationManifest, ModelIdentity, ProducingDescriptor,
+    ArtifactDigest, ComputeDevice, DefinitionHash, InputAnchor, Materialization,
+    MaterializationEnv, MaterializationManifest, ModelIdentity, ProducingDescriptor,
 };
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{ResultStore, ResultTableInfo, StaleReason, Staleness};
@@ -203,7 +203,10 @@ async fn stale_when_a_parent_is_recomputed_to_a_new_digest() {
     let parent_anchor = store.result_digest_anchor(&parent).await.unwrap();
     let recorded_digest = parent_anchor.anchor.0.clone();
     let (child, def) = materialize(&store, &ctx, vec![parent_anchor]).await;
-    assert_eq!(store.staleness(&child, &def).await.unwrap(), Staleness::Fresh);
+    assert_eq!(
+        store.staleness(&child, &def).await.unwrap(),
+        Staleness::Fresh
+    );
 
     // The parent is recomputed: its manifest now attests a NEW artifact digest.
     // (`current_anchor` reads the parent's manifest digest, so re-attesting the
@@ -317,7 +320,9 @@ async fn unpinned_input_is_never_fresh() {
                 "definition unchanged, so no decided reasons — only the cloud"
             );
         }
-        other => panic!("expected Undecidable, got {other:?} (an unpinned input must never be Fresh)"),
+        other => {
+            panic!("expected Undecidable, got {other:?} (an unpinned input must never be Fresh)")
+        }
     }
 }
 
@@ -434,8 +439,12 @@ async fn derives_from_reports_the_one_hop_dependents() {
     let parent_anchor = store.result_digest_anchor(&parent).await.unwrap();
     let (child, _) = materialize(&store, &ctx, vec![parent_anchor.clone()]).await;
     // A second, unrelated table anchored on a DIFFERENT source must NOT appear.
-    let (_other, _) =
-        materialize(&store, &ctx, vec![InputAnchor::mutable_version("elsewhere", 1)]).await;
+    let (_other, _) = materialize(
+        &store,
+        &ctx,
+        vec![InputAnchor::mutable_version("elsewhere", 1)],
+    )
+    .await;
 
     let edges = store.derives_from(&parent.table_name).await.unwrap();
     assert_eq!(edges.len(), 1, "exactly one table derives from the parent");

@@ -72,6 +72,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "021_materialization_contract",
         schema::MIGRATION_021_MATERIALIZATION_CONTRACT,
     ),
+    (
+        "022_definition_hash_index",
+        schema::MIGRATION_022_DEFINITION_HASH_INDEX,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

@@ -1,10 +1,12 @@
 pub mod artifact;
+pub mod freshness;
 pub mod manifest;
 pub mod mutable;
 pub mod schema;
 pub mod vectors;
 
 pub use artifact::{ArtifactStore, LocalArtifact};
+pub use freshness::{CurrentAnchor, DerivesFromEdge, Staleness, StaleReason};
 pub use manifest::{
     AnchorKind, AnchorValue, ArtifactDigest, ComputeDevice, DefinitionHash, InputAnchor,
     ManifestError, MatchVerdict, Materialization, MaterializationEnv, MaterializationManifest,

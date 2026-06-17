@@ -78,3 +78,34 @@ jobs:
 
       - name: arxiv (held-out ANN-vs-exact recall over the committed corpus)
         run: ./target/release/jammi-bench arxiv
+
+      - name: Prove the gate bites (teeth-proof — must exit non-zero)
+        # The lane above is only meaningful if a regression actually reds it.
+        # Mirror the unit-level `committed_baseline_gates_with_teeth` at the
+        # WORKFLOW layer: temporarily inflate a committed baseline 100x in this
+        # ephemeral checkout so the derived floor (`baseline·(1−0.30)`) is
+        # unreachable, run the tier, and assert it exits NON-ZERO. A future
+        # reader thus knows the lane is not decorative — the exit-code gate is
+        # wired through. graph-train-scale is the cheapest tier (pure CPU
+        # sampling, no model load), so this stays fast and hermetic. The
+        # checkout is discarded with the runner; restoring the file is belt-and
+        # -braces so a later step never sees the perturbation.
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline=crates/jammi-bench/baselines/graph_train.json
+          python3 - "$baseline" <<'PY'
+          import json, sys
+          p = sys.argv[1]
+          d = json.load(open(p))
+          d["baseline_pairs_per_s"] *= 100
+          json.dump(d, open(p, "w"), indent=2)
+          print(f"inflated baseline_pairs_per_s to {d['baseline_pairs_per_s']} (floor now unreachable)")
+          PY
+          if ./target/release/jammi-bench graph-train-scale; then
+            echo "::error::teeth-proof FAILED — graph-train-scale exited 0 against a 100x-inflated baseline; the workflow rate gate is decorative"
+            git checkout -- "$baseline"
+            exit 1
+          fi
+          echo "teeth-proof held: graph-train-scale exited non-zero against the inflated baseline (the gate has teeth)"
+          git checkout -- "$baseline"

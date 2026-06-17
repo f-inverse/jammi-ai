@@ -483,3 +483,50 @@ async fn large_batch_embedding_completes_without_oom() {
     assert_eq!(record.row_count, 5000);
     assert_eq!(record.status, "ready");
 }
+
+// ─── Opt-in memoization: embeddings are honestly NEVER cacheable ─────────────
+//
+// An embedding pipeline anchors its raw source `UnpinnedAtInstant` (no version
+// surface in open-core), so `probe_cache` never hits: a `Use` request always
+// computes. The cache is honestly OFF here, not silently broken.
+
+#[tokio::test]
+async fn cache_use_on_embeddings_always_recomputes_unpinned_source() {
+    use jammi_db::store::{CacheOutcome, CachePolicy};
+
+    let (session, _dir) = session_with_patents().await;
+
+    let (first, first_outcome) = session
+        .generate_text_embeddings(
+            "patents",
+            &tiny_bert_model(),
+            &["abstract".to_string()],
+            "id",
+            CachePolicy::Use,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_outcome, CacheOutcome::Computed);
+
+    // A byte-identical second Use request still computes — the source is unpinned,
+    // so the probe is honestly always a miss and a fresh table is materialised.
+    let (second, second_outcome) = session
+        .generate_text_embeddings(
+            "patents",
+            &tiny_bert_model(),
+            &["abstract".to_string()],
+            "id",
+            CachePolicy::Use,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second_outcome,
+        CacheOutcome::Computed,
+        "an unpinned-anchored producer never reuses — caching is honestly off"
+    );
+    assert_ne!(
+        first.table_name, second.table_name,
+        "each Use embedding run materialises a fresh table (no reuse)"
+    );
+}

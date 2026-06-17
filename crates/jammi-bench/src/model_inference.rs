@@ -325,8 +325,14 @@ async fn serve_embed(
     model_id: &str,
 ) -> Result<(String, f64, usize), Box<dyn std::error::Error>> {
     let start = Instant::now();
-    let table = session
-        .generate_text_embeddings(SOURCE_ID, model_id, &[TEXT_COLUMN.to_string()], KEY_COLUMN)
+    let (table, _) = session
+        .generate_text_embeddings(
+            SOURCE_ID,
+            model_id,
+            &[TEXT_COLUMN.to_string()],
+            KEY_COLUMN,
+            jammi_db::store::CachePolicy::Bypass,
+        )
         .await?;
     let serve_ms = start.elapsed().as_secs_f64() * 1_000.0;
 
@@ -358,13 +364,14 @@ async fn serve_infer(
 ) -> Result<(String, f64, usize), Box<dyn std::error::Error>> {
     let source = ModelSource::parse(model_id);
     let start = Instant::now();
-    let batches = session
+    let (batches, _) = session
         .infer(
             SOURCE_ID,
             &source,
             ModelTask::Classification,
             &[TEXT_COLUMN.to_string()],
             KEY_COLUMN,
+            jammi_db::store::CachePolicy::Bypass,
         )
         .await?;
     let serve_ms = start.elapsed().as_secs_f64() * 1_000.0;

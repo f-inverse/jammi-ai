@@ -32,8 +32,11 @@ RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_
 RUN cargo install mdbook --locked --version 0.5.2 \
     && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
 
-# maturin — PyO3 wheel builds
-RUN cargo install maturin --locked \
+# maturin — PyO3 wheel builds. Pinned: maturin >=1.13.2 raised its MSRV to
+# rustc 1.89, but this image (and the workspace) pins 1.88.0 — an unpinned
+# `cargo install` pulls a maturin that refuses to build. 1.13.1 is the last
+# release whose MSRV is 1.88.
+RUN cargo install maturin --locked --version 1.13.1 \
     && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
 
 # Quarto — renders + executes the in-repo cookbook (cookbook/book/). The binary

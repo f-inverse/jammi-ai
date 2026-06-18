@@ -1,8 +1,9 @@
 # Open-Core Hardening Roadmap — to a Mainstream-Ready Release, and the Path to 1.0
 
-Status: living roadmap. Scope: the **open-core engine only**. Enterprise capabilities
-(authentication, RBAC/SSO, governed/audited conformal, ownership & approval
-semantics, cross-org federation policy) are **BYO** — out of scope here by design.
+Status: living roadmap. Scope: the **open-core engine only**. Capabilities above the
+open-core engine (authentication, RBAC/SSO, governed/audited conformal, ownership &
+approval semantics, cross-org federation policy — governance, policy, BYO) remain
+out of scope by design: the engine ships the seam and the contract, not the policy.
 The engine's job is to provide the *primitives* and the *extension seams* a consumer
 builds those on; it names no consumer and ships no security boundary of its own.
 
@@ -345,7 +346,8 @@ expressed as a *measured* result.
    schemas versioned and forward-compatible; a documented upgrade path.
 6. **Security posture (open-core).** The trusted-network boundary fully documented + a
    published threat model + a stable BYO-auth seam. (Auth/RBAC/SSO impls themselves
-   remain enterprise/BYO — the engine ships the seam and the contract, not the policy.)
+   are capabilities above the open-core engine and remain out of scope — the engine
+   ships the seam and the contract, not the policy.)
 
 ---
 

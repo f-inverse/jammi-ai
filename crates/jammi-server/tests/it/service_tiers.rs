@@ -120,7 +120,7 @@ async fn serve_plus_train_advertises_train_and_mounts_the_verb() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn event_only_advertises_core_and_event() {
-    // Core + the event tier (the surface enterprise builds on).
+    // Core + the event tier (the surface a downstream consumer builds on).
     let server = start_engine_server_with_tiers(
         TierSet::resolve([ServiceTier::Event]).expect("event resolves"),
     )

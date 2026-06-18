@@ -1326,8 +1326,8 @@ impl PyTenantScope {
 /// `None` when no `edge_source` was given (the ANN-only default). Covers the
 /// "bring your own graph" case: a registered external edge source with the
 /// common gather knobs. (The S9 `neighbor_graph` edge source and as-of pinning
-/// are reachable through the Rust surface; the governance / continual half is the
-/// enterprise SDK.)
+/// are reachable through the Rust surface; the governance / continual half is a
+/// downstream SDK.)
 #[allow(clippy::too_many_arguments)]
 fn edge_gather_from_kwargs(
     edge_source: Option<String>,

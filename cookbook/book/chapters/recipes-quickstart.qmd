@@ -1,0 +1,46 @@
+---
+title: "Engine recipes & quickstart"
+---
+
+This book is the long-form, measured companion to the engine's own
+**recipes** and **quickstart** — the short, copy-paste task snippets that ship
+in the `jammi-ai` repo alongside this book. They live one level up from the
+book, under `cookbook/recipes/` and `cookbook/quickstart/`, and are exercised by
+the engine's `cookbook.yml` workflow and the `it/cookbook.rs` integration test.
+This page is a thin index that links each one; it does not move or duplicate the
+gated recipe scripts (they stay engine-owned and engine-gated).
+
+Where this book *explains* a primitive end-to-end (one recipe = one equation =
+one line of the GNN canon, executed against a committed golden), the engine
+recipes are the minimal "how do I call this verb" reference.
+
+The links point at the in-repo sources on GitHub: Quarto does not follow file
+links above the book's project root, and the recipes deliberately stay outside
+it (engine-owned, not part of the rendered book).
+
+## 5-minute quickstart
+
+A fresh user from `pip install jammi-ai` to a vector query in five minutes.
+
+- [Quickstart overview](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/quickstart)
+- [1 · Install](https://github.com/f-inverse/jammi-ai/blob/main/cookbook/quickstart/01_install.md)
+- [2 · Connect](https://github.com/f-inverse/jammi-ai/blob/main/cookbook/quickstart/02_connect.md)
+- [3 · Register a source](https://github.com/f-inverse/jammi-ai/blob/main/cookbook/quickstart/03_register_source.md)
+- [4 · Generate embeddings + search](https://github.com/f-inverse/jammi-ai/blob/main/cookbook/quickstart/04_vector_search.md)
+- End-to-end script: [`quickstart.py`](https://github.com/f-inverse/jammi-ai/blob/main/cookbook/quickstart/quickstart.py)
+
+## Task recipes
+
+Minimal, runnable snippets for a single verb or workflow:
+
+- [Audio search](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/audio_search)
+- [Image search](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/image_search)
+- [Fine-tune an encoder](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/fine_tune)
+- [Evaluate retrieval quality](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/eval_embeddings)
+- [Evaluate inference (classification)](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/eval_inference)
+- [Evaluate inference (NER)](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/eval_inference_ner)
+- [Per-query search audit](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/search_audit)
+- [Mutable companion tables](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/mutable_tables)
+- [Trigger streams](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/trigger_streams)
+- [Ephemeral session storage](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/session_lifecycle)
+- [Connect via Flight SQL](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/flight_sql)

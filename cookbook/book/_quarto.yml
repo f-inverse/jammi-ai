@@ -7,10 +7,13 @@ book:
   subtitle: "Graph signal processing and the GNN canon, executed and measured on the jammi_ai engine"
   author: "F-Inverse"
   search: true
-  repo-url: https://github.com/f-inverse/jammi-cookbook
+  repo-url: https://github.com/f-inverse/jammi-ai
   chapters:
     - index.qmd
     - chapters/datasets.qmd
+    - part: "Engine recipes & quickstart"
+      chapters:
+        - chapters/recipes-quickstart.qmd
     - part: "The ogbn-arxiv keystone vertical"
       chapters:
         - chapters/01-construct/construct.qmd

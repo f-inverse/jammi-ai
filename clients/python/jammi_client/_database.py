@@ -56,7 +56,12 @@ from ._assembly import (
     build_search_request,
     recompute_report_to_dict,
 )
-from ._credentials import AnonymousCredentials, ChannelCredentials
+from ._credentials import (
+    AnonymousCredentials,
+    BearerCredentials,
+    ChannelCredentials,
+    _bearer_metadata,
+)
 from ._errors import TrainingError
 from ._generated.jammi.v1 import catalog_pb2, catalog_pb2_grpc
 from ._generated.jammi.v1 import embedding_pb2, embedding_pb2_grpc
@@ -654,11 +659,18 @@ class RemoteDatabase:
         session_id: str,
         endpoint: str,
         tls: bool,
+        auth_metadata: Optional[tuple[str, str]] = None,
     ) -> None:
         self._channel = channel
         self._session_id = session_id
         self._endpoint = endpoint
         self._tls = tls
+        # The bearer header the Flight SQL lane appends alongside the session
+        # header. The typed gRPC verbs carry the bearer via the channel
+        # credentials; Flight is a separate transport that does not share those,
+        # so the header is threaded here from the credential at `open_remote`.
+        # `None` (an anonymous credential) means Flight sends no bearer.
+        self._auth_metadata = auth_metadata
         self._metadata = ((SESSION_HEADER, session_id),)
         self._embedding = embedding_pb2_grpc.EmbeddingServiceStub(channel)
         self._catalog = catalog_pb2_grpc.CatalogServiceStub(channel)
@@ -2141,9 +2153,12 @@ class RemoteDatabase:
 
         The same `jammi-session-id` that scopes this connection's tenant on the
         typed gRPC verbs is sent on the Flight SQL query, so SQL reads observe
-        the same tenant scope. Returns a `pyarrow.Table`. The embedded
-        `Database.sql` is the in-process peer of this verb — same SQL, same
-        `annotate` function, transport apart.
+        the same tenant scope; when the connection carries a bearer, the same
+        `authorization: Bearer <token>` header rides this query alongside it.
+        Server-side enforcement of the BYO-auth seam over Flight is tracked at
+        https://github.com/f-inverse/jammi-ai/issues/220. Returns a
+        `pyarrow.Table`. The embedded `Database.sql` is the in-process peer of
+        this verb — same SQL, same `annotate` function, transport apart.
         """
         client = self._flight_client()
         options = self._flight_options()
@@ -2155,22 +2170,23 @@ class RemoteDatabase:
         return reader.read_all()
 
     def _flight_client(self):
-        # The Flight SQL lane is a separate pyarrow.flight transport that does
-        # not flow through the gRPC channel credentials, so a channel-level
-        # bearer does not reach it yet; tracked at
-        # https://github.com/f-inverse/jammi-ai/issues/96. It still carries the
-        # session header below.
+        # The Flight SQL lane is a separate pyarrow.flight transport from the
+        # typed gRPC channel; the bearer it carries is appended per call in
+        # `_flight_options`, not derived from the channel credentials here.
         if self._flight is None:
             scheme = "grpc+tls" if self._tls else "grpc+tcp"
             self._flight = pa.flight.FlightClient(f"{scheme}://{self._endpoint}")
         return self._flight
 
     def _flight_options(self):
-        # Carry the connection's session id as the tenant-scoping header, the
-        # same key the typed gRPC verbs send.
-        return pa.flight.FlightCallOptions(
-            headers=[(SESSION_HEADER.encode(), self._session_id.encode())]
-        )
+        # Carry the connection's session id as the tenant-scoping header (the
+        # same key the typed gRPC verbs send), and the bearer alongside it when
+        # the connection was opened with a credential that supplies one.
+        headers = [(SESSION_HEADER.encode(), self._session_id.encode())]
+        if self._auth_metadata is not None:
+            key, value = self._auth_metadata
+            headers.append((key.encode(), value.encode()))
+        return pa.flight.FlightCallOptions(headers=headers)
 
     # --- Lifecycle ---------------------------------------------------------------
 
@@ -2203,14 +2219,31 @@ def open_remote(
     the credential, not here. Mints a fresh per-connection session id, mirroring
     the Rust `RemoteSession::connect` (each connection tenant-isolated).
 
-    The channel-level bearer covers the typed gRPC verbs. The Flight SQL lane
-    (:meth:`RemoteDatabase.sql`) is a separate `pyarrow.flight` transport that
-    does not yet carry the channel-level bearer — see
-    https://github.com/f-inverse/jammi-ai/issues/96.
+    The bearer covers both transports: the typed gRPC verbs carry it on the
+    channel credentials, and the Flight SQL lane (:meth:`RemoteDatabase.sql`)
+    carries the same header per call, threaded here from the credential. An
+    anonymous channel sends no bearer on either. Server-side enforcement of the
+    BYO-auth seam over Flight is tracked at
+    https://github.com/f-inverse/jammi-ai/issues/220.
     """
     session_id = str(uuid.uuid4())
-    channel = (credentials or AnonymousCredentials()).open_channel(endpoint, tls=tls)
-    return RemoteDatabase(channel, session_id=session_id, endpoint=endpoint, tls=tls)
+    resolved = credentials or AnonymousCredentials()
+    channel = resolved.open_channel(endpoint, tls=tls)
+    # The typed verbs get the bearer from the channel; Flight is a separate
+    # transport, so reuse the credential's own header pair — the single source
+    # for the key and the `Bearer <token>` value — rather than re-spelling it.
+    auth_metadata = (
+        _bearer_metadata(resolved.token)
+        if isinstance(resolved, BearerCredentials)
+        else None
+    )
+    return RemoteDatabase(
+        channel,
+        session_id=session_id,
+        endpoint=endpoint,
+        tls=tls,
+        auth_metadata=auth_metadata,
+    )
 
 
 # `google.protobuf.empty_pb2.Empty` is what the no-argument session RPCs take;

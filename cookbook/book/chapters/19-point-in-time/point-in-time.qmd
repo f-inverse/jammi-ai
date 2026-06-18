@@ -322,8 +322,8 @@ This chapter proves the primitive composes into a **leakage-free, skew-free trai
 surface** — on CPU, against the committed cache. It does **not** serve those features from
 a low-latency online tier behind auth with a live coverage SLA; carrying the
 materialization contract across that boundary so an online read can assert "what I serve
-matches what trained this, as of $T$" is the platform closure chapter, not the engine
-cookbook. The seam — `verify_materialization` returning a verdict — is here; the boundary
+matches what trained this, as of $T$" is a production online-serving concern, not something
+this engine cookbook covers. The seam — `verify_materialization` returning a verdict — is here; the boundary
 that acts on the verdict is the consumer's to build.
 
 > **Why the as-of join *is* the feature store.** A plain `JOIN` federates current-state

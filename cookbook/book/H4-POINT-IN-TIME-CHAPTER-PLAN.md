@@ -10,7 +10,7 @@ Chapter 12 (`12-feature-store/feature-store.qmd`) demonstrates the *easy half* o
 
 This chapter demonstrates the **hard half**, the half that makes a feature store a feature store rather than a join: **point-in-time correctness**. It is built on the engine's `asof_join` and `verify_materialization` primitives (jammi-ai `docs/plans/60-temporal-correctness/`). The measured lesson is sharp and uncomfortable: assembling a labelled set with a current-state join silently inflates a downstream metric *and* inflates conformal coverage, while the as-of join keeps both honest. The chapter ends in real numbers that show the leak and show it closed.
 
-This is the cookbook half of the engine↔cookbook evolution: the chapter is the forcing function that proves the new primitive composes into a real workload. It proves the **primitive**; it does **not** build the closure against a live online serving tier — that, with a co-deployed KV store and an auth interceptor, is the Part II platform chapter (`jammi-enterprise/docs/plans/platform-cookbook/PV-closure.md`). Stated upfront and honestly, per house discipline.
+This is the cookbook half of the engine↔cookbook evolution: the chapter is the forcing function that proves the new primitive composes into a real workload. It proves the **primitive**; it does **not** build the closure against a live online serving tier — that, with a co-deployed KV store and an auth interceptor, is a production online-serving concern (a low-latency serving tier behind auth with a live coverage SLA), out of scope for this engine cookbook. Stated upfront and honestly, per house discipline.
 
 ## Gate (do not claim before this holds)
 
@@ -66,7 +66,7 @@ Follows the house skeleton: state the recipe and the honest limit upfront, then 
 
 6. **The artifact knows what it is.** `verify_materialization` on the materialized as-of training table returns `Match` against its own `definition_hash`; re-deriving with a changed query yields a different hash (a stale copy is detectable); an input with no version surface surfaces `MatchWithUnpinnedInputs` honestly. Golden: `pit.definition_hash` committed (exact); the mismatch case asserted as a flow event.
 
-7. **The honest limit (closing).** This chapter proves the primitive composes into a leakage-free, skew-free training surface — on CPU, against the committed cache. It does **not** serve those features from a low-latency online tier behind auth with a live coverage SLA; carrying the materialization contract across that boundary so the online read can assert "what I serve matches what trained this, as of T" is the platform closure chapter, not the engine cookbook. One sentence, pointing forward; no overclaim.
+7. **The honest limit (closing).** This chapter proves the primitive composes into a leakage-free, skew-free training surface — on CPU, against the committed cache. It does **not** serve those features from a low-latency online tier behind auth with a live coverage SLA; carrying the materialization contract across that boundary so the online read can assert "what I serve matches what trained this, as of T" is a production online-serving concern, not something this engine cookbook covers. One sentence, pointing forward; no overclaim.
 
 ## Determinism, cache, and CI (non-negotiables)
 
@@ -95,7 +95,7 @@ Each verified against the primary source before commit (per the bib header disci
 ## `EXECUTION-STATUS.md` row (add before implementation)
 
 ```
-| H4-PIT point-in-time / leakage-free training set | open | `feat/h4-point-in-time` | — | chapter 19: `asof_join` (backward/inclusive/by-entity/tolerance) + `verify_materialization`; time-stamped citation-edge facts (graph-derived, committed parquet); measures leakage delta (naive vs as-of), conformal coverage honesty (leaky vs as-of calibration), train/serve skew = 0 across embedded==grpc, and the materialization definition-hash round-trip; `scripts/build_point_in_time_cache.py` + `tests/test_point_in_time_cache.py`; pin → jammi_ai==0.31.x. Closure against a live online tier is platform Part II (PV-closure), out of scope here. |
+| H4-PIT point-in-time / leakage-free training set | open | `feat/h4-point-in-time` | — | chapter 19: `asof_join` (backward/inclusive/by-entity/tolerance) + `verify_materialization`; time-stamped citation-edge facts (graph-derived, committed parquet); measures leakage delta (naive vs as-of), conformal coverage honesty (leaky vs as-of calibration), train/serve skew = 0 across embedded==grpc, and the materialization definition-hash round-trip; `scripts/build_point_in_time_cache.py` + `tests/test_point_in_time_cache.py`; pin → jammi_ai==0.31.x. Closure against a live online tier is a production online-serving concern, out of scope here. |
 ```
 
 ## Discipline check

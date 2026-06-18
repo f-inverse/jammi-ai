@@ -53,6 +53,9 @@ dev = [
     "grpcio-tools==1.80.0",
     "pytest>=7",
     "tomli>=2; python_version < '3.11'",
+    # Test-only: the Flight SQL bearer test (`test_flight_bearer.py`) generates a
+    # self-signed loopback cert for its `grpc+tls` leg. Not a runtime dependency.
+    "cryptography>=42",
 ]
 
 [project.urls]

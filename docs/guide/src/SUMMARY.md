@@ -56,5 +56,7 @@
 - [Configuration](./configuration.md)
 - [Catalog Backend and Trigger Broker](./catalog-and-broker.md)
 - [Format Stability](./format-stability.md)
+- [API Stability](./api-stability.md)
+- [Security Posture](./security.md)
 - [Performance SLOs](./performance-slos.md)
 - [Architecture](./architecture.md)

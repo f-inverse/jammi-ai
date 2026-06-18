@@ -39,6 +39,7 @@ use crate::pipeline::graph_propagation::{
     PropagateRequest, PropagationOutput, PropagationWeighting,
 };
 use crate::pipeline::neighbor_graph::BuildNeighborGraph;
+use crate::pipeline::recompute::{Cascade, RecomputeReport};
 use crate::wire::edge_gather_from_proto;
 use jammi_wire::proto::pipeline as pb;
 use jammi_wire::proto::trigger::ArrowBatch;
@@ -469,6 +470,82 @@ fn context_source_kind_from_tag(tag: &str) -> Result<ContextSourceKind, Status> 
             "unknown context source tag '{other}'"
         ))),
     }
+}
+
+// ─── Recompute ───────────────────────────────────────────────────────────────
+
+/// The decoded recompute target + cascade a `Recompute` request carries. The
+/// engine method takes the table name and the [`Cascade`] separately, so the
+/// decode returns them as a struct the handler destructures.
+pub struct RecomputeArgs {
+    /// The result table to recompute, by registered name.
+    pub table: String,
+    /// Whether to also sweep the bounded downstream DAG.
+    pub cascade: Cascade,
+}
+
+/// Decode a serialized [`pb::RecomputeRequest`] body into the engine's recompute
+/// args. The embedded binding builds the request with the same pure-Python
+/// assembly the remote client uses, serializes it, and hands the bytes here — so
+/// the in-process and remote paths decode through one shared seam
+/// ([`recompute_from_proto`]). A body that is not a valid request is a client
+/// error (`InvalidArgument`).
+pub fn recompute_from_bytes(body: &[u8]) -> Result<RecomputeArgs, Status> {
+    let req = pb::RecomputeRequest::decode(body)
+        .map_err(|e| Status::invalid_argument(format!("malformed Recompute request: {e}")))?;
+    recompute_from_proto(req)
+}
+
+/// Decode a [`pb::RecomputeRequest`] into the engine's recompute args. An empty
+/// `table` is a client error; the `cascade` `UNSPECIFIED` arm resolves to the
+/// engine default ([`Cascade::ReportOnly`]), so an omitted cascade never silently
+/// triggers a downstream sweep.
+pub fn recompute_from_proto(req: pb::RecomputeRequest) -> Result<RecomputeArgs, Status> {
+    if req.table.is_empty() {
+        return Err(Status::invalid_argument("table is required"));
+    }
+    Ok(RecomputeArgs {
+        table: req.table,
+        cascade: cascade_from_proto(req.cascade)?,
+    })
+}
+
+/// Map the wire [`pb::Cascade`]; `UNSPECIFIED` keeps the engine default
+/// ([`Cascade::ReportOnly`]). An out-of-range value is rejected loudly rather
+/// than silently fall through to a sweep.
+pub fn cascade_from_proto(cascade: i32) -> Result<Cascade, Status> {
+    match pb::Cascade::try_from(cascade) {
+        Ok(pb::Cascade::Unspecified) | Ok(pb::Cascade::ReportOnly) => Ok(Cascade::ReportOnly),
+        Ok(pb::Cascade::Downstream) => Ok(Cascade::Downstream),
+        Err(_) => Err(Status::invalid_argument("unknown cascade")),
+    }
+}
+
+/// Encode a [`RecomputeReport`] onto the wire response. Each recomputed table
+/// carries its original→recomputed name pair and the replay's cache outcome
+/// (always `Computed`); the downstream-stale set rides as a string list.
+pub fn recompute_report_to_proto(report: RecomputeReport) -> pb::RecomputeReport {
+    pb::RecomputeReport {
+        recomputed: report
+            .recomputed
+            .into_iter()
+            .map(|t| pb::RecomputedTable {
+                original: t.original,
+                recomputed: t.recomputed,
+                outcome: crate::wire::cache_outcome_to_proto(&t.outcome),
+            })
+            .collect(),
+        downstream_stale: report.downstream_stale,
+    }
+}
+
+/// Encode a [`RecomputeReport`] to serialized [`pb::RecomputeReport`] proto bytes
+/// — the shape the embedded PyO3 binding hands back to its thin Python wrapper,
+/// which parses it with the *same* proto the remote client receives over gRPC.
+/// `prost` lives in this crate (the embed wheel decodes through this wire seam,
+/// not its own `prost`), so the encode is owned here, never in `jammi-python`.
+pub fn recompute_report_to_bytes(report: RecomputeReport) -> Vec<u8> {
+    recompute_report_to_proto(report).encode_to_vec()
 }
 
 #[cfg(test)]

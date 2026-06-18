@@ -65,6 +65,7 @@ mod model_inference;
 mod propagate;
 mod rate_gate;
 mod recall;
+mod recompute_scale;
 mod report;
 mod rss;
 mod search_rss;
@@ -309,6 +310,15 @@ enum Command {
     /// JSON report with the `cache_slo` tier set and exits non-zero if the warm hit
     /// did not short-circuit (wrong outcome) or did not clear the floor.
     CacheSloScale,
+    /// The CPU-hermetic recompute tier: drives the engine's `recompute(Downstream)`
+    /// bounded topological sweep over a synthetic derived-table DAG (an embedding
+    /// table → a neighbour-graph → a graph propagation). Gates the sweep's
+    /// CORRECTNESS — every DAG node recomputed exactly once, in topological
+    /// (parent-before-child) order, a box-independent invariant — with the sweep
+    /// wall-time at the named DAG size as an un-gated reference. Emits the JSON
+    /// report with the `recompute` tier set and exits non-zero if the sweep
+    /// dropped a node, double-counted one, or mis-ordered a parent/child.
+    RecomputeScale,
 }
 
 #[tokio::main]
@@ -352,6 +362,7 @@ async fn main() -> std::process::ExitCode {
         Command::ModelInferenceScale => run_model_inference_scale().await,
         Command::RebuildModelInferenceSpec => run_rebuild_model_inference_spec().await,
         Command::CacheSloScale => run_cache_slo_scale().await,
+        Command::RecomputeScale => run_recompute_scale().await,
     }
 }
 
@@ -391,6 +402,7 @@ async fn run_cache_slo_scale() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: None,
             cache_slo: Some(tier),
+            recompute: None,
         },
     };
     emit(&report);
@@ -400,6 +412,57 @@ async fn run_cache_slo_scale() -> std::process::ExitCode {
         eprintln!(
             "the cache hit did NOT clear the committed speed-up floor — the \
              top-of-producer probe did not short-circuit; see tiers.cache_slo.speedup"
+        );
+        std::process::ExitCode::FAILURE
+    }
+}
+
+/// The `recompute-scale` tier: build the synthetic derived-table DAG, run the
+/// `recompute(Downstream)` topological sweep, and gate that it recomputed every
+/// node once in topological order. Emits the JSON report and exits non-zero if the
+/// sweep's correctness invariant did not hold.
+async fn run_recompute_scale() -> std::process::ExitCode {
+    let spec = match recompute_scale::RecomputeSpec::load() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("recompute-scale could not load the committed spec: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let tier = match recompute_scale::run(&spec).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("recompute-scale run failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let passed = recompute_scale::gate_passed(&tier);
+    let report = Report {
+        engine_version: ENGINE_VERSION,
+        host: Host::detect(),
+        subcommand: "recompute-scale",
+        tiers: Tiers {
+            arxiv: None,
+            binding: None,
+            recall_sweep: None,
+            training: None,
+            conformal: None,
+            eval: None,
+            propagate: None,
+            graph_train: None,
+            context_predictor: None,
+            model_inference: None,
+            cache_slo: None,
+            recompute: Some(tier),
+        },
+    };
+    emit(&report);
+    if passed {
+        std::process::ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "the Downstream recompute sweep did NOT recompute every DAG node once in \
+             topological order; see tiers.recompute"
         );
         std::process::ExitCode::FAILURE
     }
@@ -492,6 +555,7 @@ async fn run_train_scale() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: None,
             cache_slo: None,
+            recompute: None,
         },
     };
     emit(&report);
@@ -552,6 +616,7 @@ fn run_conformal_scale() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: None,
             cache_slo: None,
+            recompute: None,
         },
     };
     emit(&report);
@@ -602,6 +667,7 @@ fn run_eval_scale() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: None,
             cache_slo: None,
+            recompute: None,
         },
     };
     emit(&report);
@@ -653,6 +719,7 @@ async fn run_propagate_scale() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: None,
             cache_slo: None,
+            recompute: None,
         },
     };
     emit(&report);
@@ -860,6 +927,7 @@ fn run_graph_train_scale() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: None,
             cache_slo: None,
+            recompute: None,
         },
     };
     emit(&report);
@@ -958,6 +1026,7 @@ async fn run_context_predictor_scale() -> std::process::ExitCode {
             context_predictor: Some(tier),
             model_inference: None,
             cache_slo: None,
+            recompute: None,
         },
     };
     emit(&report);
@@ -1063,6 +1132,7 @@ async fn run_model_inference_scale() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: Some(tier),
             cache_slo: None,
+            recompute: None,
         },
     };
     emit(&report);
@@ -1175,6 +1245,7 @@ async fn run_search_rss() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: None,
             cache_slo: None,
+            recompute: None,
         },
     };
     emit(&report);
@@ -1227,6 +1298,7 @@ async fn run_arxiv() -> std::process::ExitCode {
             context_predictor: None,
             model_inference: None,
             cache_slo: None,
+            recompute: None,
         },
     };
     emit(&report);
@@ -1285,6 +1357,7 @@ async fn run_recall_sweep(
             context_predictor: None,
             model_inference: None,
             cache_slo: None,
+            recompute: None,
         },
     };
     emit(&report);

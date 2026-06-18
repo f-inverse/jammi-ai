@@ -50,7 +50,9 @@ pub use pipeline::{
     asof_join_from_bytes, asof_join_from_proto, assemble_context_from_proto,
     assemble_context_request_from_bytes, assemble_context_request_from_proto,
     assemble_context_to_proto, build_neighbor_graph_from_bytes, build_neighbor_graph_from_proto,
-    context_source_tag, propagate_request_from_bytes, propagate_request_from_proto, AsofJoinArgs,
-    BuildNeighborGraphArgs,
+    cascade_from_proto, context_source_tag, propagate_request_from_bytes,
+    propagate_request_from_proto, recompute_from_bytes, recompute_from_proto,
+    recompute_report_to_bytes, recompute_report_to_proto, AsofJoinArgs, BuildNeighborGraphArgs,
+    RecomputeArgs,
 };
 pub use training::{training_spec_from_bytes, training_spec_from_proto, training_spec_to_proto};

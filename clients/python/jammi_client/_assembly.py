@@ -34,6 +34,14 @@ _MODALITY = {
     "audio": embedding_pb2.Modality.AUDIO,
 }
 
+# snake-case cascade string → the `Cascade` enum the wire carries. `recompute`
+# defaults to report-only; the explicit forms select either arm. Left unset on
+# the request resolves to the engine default (report-only) via UNSPECIFIED.
+_CASCADE = {
+    "report_only": pipeline_pb2.Cascade.CASCADE_REPORT_ONLY,
+    "downstream": pipeline_pb2.Cascade.CASCADE_DOWNSTREAM,
+}
+
 # Wire `SourceKind` enum value → the snake-case string the embed wheel's
 # `SourceType` serialises to, so a descriptor dict is shaped identically whether
 # it crossed the gRPC wire or came back from the in-process engine.
@@ -968,6 +976,57 @@ def build_asof_join_request(
     if tie_break_column is not None:
         request.tie_break_column = tie_break_column
     return request
+
+
+# snake-case cache-outcome string the report exposes, keyed by the wire enum —
+# the same vocabulary the engine's `CacheOutcome` serialises to.
+_CACHE_OUTCOME_NAME = {
+    inference_pb2.CacheOutcome.CACHE_OUTCOME_COMPUTED: "computed",
+    inference_pb2.CacheOutcome.CACHE_OUTCOME_REUSED: "reused",
+}
+
+
+def build_recompute_request(
+    table: str,
+    *,
+    cascade: Optional[str] = None,
+) -> pipeline_pb2.RecomputeRequest:
+    """Assemble the `RecomputeRequest` for a recompute from the binding's flat
+    kwargs.
+
+    `table` is the result table to recompute. `cascade` is `"report_only"`
+    (default, left unset so the engine resolves it) or `"downstream"` (the one
+    bounded topological sweep of the named table and every transitive dependent).
+    The same request the embed binding submits in-process.
+    """
+    request = pipeline_pb2.RecomputeRequest(table=table)
+    if cascade is not None:
+        try:
+            request.cascade = _CASCADE[cascade]
+        except KeyError:
+            raise ValueError(
+                f"cascade must be 'report_only' or 'downstream' (got {cascade!r})"
+            ) from None
+    return request
+
+
+def recompute_report_to_dict(report: pipeline_pb2.RecomputeReport) -> Dict[str, Any]:
+    """Shape a `RecomputeReport` into the plain dict the binding returns —
+    identical whether it crossed the gRPC wire or came back from the in-process
+    engine. `recomputed` is a list of `{original, recomputed, outcome}` dicts (the
+    outcome a snake-case string); `downstream_stale` is a list of table names.
+    """
+    return {
+        "recomputed": [
+            {
+                "original": t.original,
+                "recomputed": t.recomputed,
+                "outcome": _CACHE_OUTCOME_NAME.get(t.outcome, "computed"),
+            }
+            for t in report.recomputed
+        ],
+        "downstream_stale": list(report.downstream_stale),
+    }
 
 
 def build_assemble_context_request(

@@ -318,7 +318,7 @@ impl InferenceSession {
         };
         let descriptor = jammi_db::store::manifest::ProducingDescriptor::GraphPropagation {
             source_table: table.table_name.clone(),
-            edge_source: edge_source_id(&request.edge_source),
+            edge_source: request.edge_source.to_binding(),
             kernel_id: PROPAGATE_MODEL_ID.to_string(),
             direction: propagation_direction(request.direction),
             hops: request.effective_hops(),
@@ -992,16 +992,6 @@ fn l2_normalize(block: &[f64]) -> Vec<f32> {
         return block.iter().map(|&x| x as f32).collect();
     }
     block.iter().map(|&x| (x / norm) as f32).collect()
-}
-
-/// The id of the edge relation a propagation read, for the descriptor's
-/// `edge_source` determinant: the neighbor-graph table name, or the registered
-/// source id.
-fn edge_source_id(edge_source: &EdgeSourceRef) -> String {
-    match edge_source {
-        EdgeSourceRef::NeighborGraph { table_name } => table_name.clone(),
-        EdgeSourceRef::Registered { source_id, .. } => source_id.clone(),
-    }
 }
 
 /// Map the AI-crate [`EdgeDirection`] to the manifest's transport-neutral mirror.

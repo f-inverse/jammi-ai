@@ -50,14 +50,19 @@ use sha2::{Digest, Sha256};
 use crate::model_task::ModelTask;
 
 /// Manifest format version. A change to the [`ProducingDescriptor`] shape — the
-/// determinant set a producer folds into its [`DefinitionHash`] — bumps this so
-/// a reader detects an incompatible older manifest as a typed
-/// [`ManifestError::UnsupportedManifestVersion`] rather than comparing a stale
-/// hash computed over a different determinant set. The hash is opaque in the
-/// persisted manifest (the descriptor is folded away, not stored), so a version
-/// mismatch is the *only* signal that an on-disk hash is incomparable: a reader
-/// must reject it, never silently trust it.
-pub const MANIFEST_VERSION: u32 = 2;
+/// determinant set a producer folds into its [`DefinitionHash`] *and* records
+/// verbatim for replay — bumps this so a reader detects an incompatible older
+/// manifest as a typed [`ManifestError::UnsupportedManifestVersion`] rather than
+/// comparing a stale hash computed over a different determinant set, or replaying
+/// a recorded descriptor whose shape this build no longer understands. The
+/// version is the *authoritative* signal that an on-disk manifest was written
+/// under a different determinant set and is therefore incomparable/un-replayable
+/// — but not the only line of defence: a genuinely old (pre-contract) manifest
+/// whose JSON predates a since-added field is also rejected serde-first as a
+/// typed [`ManifestError`] before the version is even read. Either rejection is
+/// clean (the signal to re-emit); a reader must never silently trust a
+/// version-mismatched or shape-mismatched manifest.
+pub const MANIFEST_VERSION: u32 = 3;
 
 /// Content hash of *how* a table was produced: a canonical encoding of the
 /// [`ProducingDescriptor`] plus the [`MaterializationEnv`] that affects its
@@ -265,11 +270,14 @@ pub enum ProducingDescriptor {
     GraphPropagation {
         /// The embedding result table whose features were propagated.
         source_table: String,
-        /// The edge relation the propagation read, by id — the second input
-        /// anchor's source. A staleness/lineage determinant independent of the
-        /// kernel knobs: the same knobs over a different graph yield a different
-        /// output.
-        edge_source: String,
+        /// The edge relation the propagation read, with its full column
+        /// bindings — the second input anchor's source. A staleness/lineage
+        /// determinant independent of the kernel knobs: the same knobs over a
+        /// different graph (or the same registered source read through different
+        /// `src`/`dst`/weight/type/as-of columns) yield a different output, so
+        /// the whole binding — not just the source id — is part of the
+        /// definition and must replay losslessly.
+        edge_source: EdgeSourceBinding,
         /// The propagation kernel's canonical id.
         kernel_id: String,
         /// Edge-direction the walk followed.
@@ -306,6 +314,20 @@ pub enum ProducingDescriptor {
         encoder_id: String,
         /// The source whose rows were pooled per target.
         source_id: String,
+        /// The **resolved** source embedding table the recipe actually pooled
+        /// against — the concrete table name, never the user's `Option`. Even
+        /// when the recipe left the table unset (resolve the source's newest
+        /// embedding table), the producer records the table that resolution
+        /// selected, so a recompute re-pools over the **same** table the recipe
+        /// ran on. This matters because a materialised context set is itself a
+        /// `kind=model` table for the same source: had the descriptor recorded
+        /// the user's `None`, the default resolution on replay would re-select
+        /// the newer context-set output and shadow the original source table,
+        /// pooling over the wrong rows. An output-affecting determinant: the same
+        /// recipe over a different source embedding table pools different vectors.
+        /// (`Option` only because a pre-resolution descriptor fixture may carry
+        /// `None`; every producer-written descriptor records `Some`.)
+        embedding_table: Option<String>,
         /// Where each target's candidate members came from — ANN retrieval, a
         /// declared-edge walk, or both — the determinant that selects which
         /// neighbours are pooled.
@@ -502,7 +524,7 @@ pub enum ContextCandidateSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextEdgeGather {
     /// The edge relation walked.
-    pub edge_source: ContextEdgeSource,
+    pub edge_source: EdgeSourceBinding,
     /// The effective (post-clamp) number of hops walked.
     pub hops: usize,
     /// Per-node per-hop neighbour sample cap (GraphSAGE). `None` = exact.
@@ -518,12 +540,17 @@ pub struct ContextEdgeGather {
     pub as_of: Option<String>,
 }
 
-/// Which edge relation a context gather walked, recorded in a
-/// [`ContextEdgeGather`] — the transport-neutral mirror of the AI crate's
-/// `EdgeSourceRef`.
+/// Which edge relation an edge-reading verb walked, with its full column
+/// bindings — the transport-neutral mirror of the AI crate's `EdgeSourceRef`,
+/// shared by every descriptor that records an edge source (a
+/// [`ProducingDescriptor::GraphPropagation`] and the gather of a
+/// [`ContextEdgeGather`]). The `Registered` bindings are output-affecting (the
+/// same source read through different `src`/`dst`/weight/type/as-of columns is a
+/// different graph), so the mirror carries them all and a replay reconstructs
+/// them losslessly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "edge_source", rename_all = "snake_case")]
-pub enum ContextEdgeSource {
+pub enum EdgeSourceBinding {
     /// A `neighbor_graph` result table, by registered name.
     NeighborGraph {
         /// The registered result-table name.
@@ -679,6 +706,14 @@ pub struct MaterializationManifest {
     pub artifact: ArtifactDigest,
     /// How it was produced (the "definition"): hash of descriptor + environment.
     pub definition_hash: DefinitionHash,
+    /// The producing descriptor recorded **verbatim** — the typed verb + its
+    /// output-affecting parameters. The [`definition_hash`](Self::definition_hash)
+    /// folds this away into an opaque digest for comparison; the descriptor is
+    /// also kept in the clear so a reader can **replay** the producer over the
+    /// inputs' current state (the recompute action), which an opaque hash cannot
+    /// drive. A reader that only verifies reads the hash; a reader that recomputes
+    /// reads the descriptor.
+    pub descriptor: ProducingDescriptor,
     /// The as-of state of every input, in producer order.
     pub input_anchors: Vec<InputAnchor>,
     /// Producing-run identity (a per-process id) — provenance, never the
@@ -714,6 +749,7 @@ impl MaterializationManifest {
         Ok(Self {
             artifact,
             definition_hash,
+            descriptor: descriptor.clone(),
             input_anchors: inputs,
             produced_by,
             produced_at,
@@ -755,16 +791,21 @@ impl MaterializationManifest {
     /// Parse a manifest from its sidecar bytes, rejecting any format version this
     /// build does not support.
     ///
-    /// The persisted manifest carries an *opaque* [`DefinitionHash`] — the
-    /// [`ProducingDescriptor`] is folded into it, not stored — so the manifest's
-    /// JSON shape does not change when the descriptor's determinant set changes.
-    /// That makes the version the *only* signal that an on-disk hash was computed
-    /// over a different determinant set and is therefore incomparable. The
-    /// version is validated **before** the parsed manifest is handed back, so a
-    /// reader never silently trusts a stale hash: any version that is not exactly
-    /// [`MANIFEST_VERSION`] — older (a different, now-superseded determinant set)
-    /// or newer (a format this build cannot read) — is a typed
-    /// [`ManifestError::UnsupportedManifestVersion`], the signal to re-emit.
+    /// The persisted manifest carries both the *opaque* [`DefinitionHash`] (for
+    /// comparison) and the [`ProducingDescriptor`] in the clear (for replay). When
+    /// the descriptor's determinant set changes, the recorded descriptor's JSON
+    /// shape changes. Two independent guards keep a stale shape from being
+    /// trusted. **First**, serde itself: a genuinely old manifest whose JSON
+    /// predates a since-added field (e.g. a pre-`descriptor` manifest) fails the
+    /// `serde_json::from_slice` decode with a typed [`ManifestError`] before the
+    /// version is even inspected. **Second**, the version guard, for a shape that
+    /// still deserialises but was written under a different determinant set: any
+    /// version that is not exactly [`MANIFEST_VERSION`] — older (a different,
+    /// now-superseded determinant set) or newer (a format this build cannot
+    /// read) — is a typed [`ManifestError::UnsupportedManifestVersion`]. The
+    /// version is checked **before** the parsed manifest is handed back, so a
+    /// reader never silently trusts a stale hash or replays a stale descriptor;
+    /// whichever guard fires, the typed error is the signal to re-emit.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, ManifestError> {
         let manifest: Self = serde_json::from_slice(bytes)?;
         if manifest.manifest_version != MANIFEST_VERSION {
@@ -1021,22 +1062,50 @@ mod tests {
         ));
     }
 
+    /// A genuinely old-shape manifest JSON: the current manifest with the
+    /// `descriptor` field removed (an old manifest predates the recorded
+    /// descriptor) and an older `manifest_version`. Models what is actually on
+    /// disk from a prior format, not a current-shape struct with a flipped int.
+    fn old_shape_manifest_without_descriptor(version: u32) -> Vec<u8> {
+        let manifest = MaterializationManifest::compute(
+            &embedding_descriptor(),
+            &cpu_env(),
+            vec![],
+            ArtifactDigest::of_bytes(b"x"),
+            "run".into(),
+            "2026-06-17T00:00:00Z".into(),
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(&manifest).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("descriptor");
+        object.insert("manifest_version".into(), serde_json::json!(version));
+        serde_json::to_vec(&value).unwrap()
+    }
+
     #[test]
     fn older_manifest_version_is_rejected_cleanly() {
-        // An old (v1) manifest's opaque definition hash was computed over a
-        // now-superseded descriptor determinant set, so it is incomparable.
-        // The reader must reject it as a typed error — the signal to re-emit —
-        // never a panic, never a silent stale-hash match. (v1 predates this
-        // build's MANIFEST_VERSION = 2.)
-        assert_eq!(
-            MANIFEST_VERSION, 2,
-            "this guard assumes v1 is the prior format"
+        // An old (v1) manifest predates the recorded `ProducingDescriptor`, so a
+        // real on-disk old manifest has *no* `descriptor` field. Decoding it
+        // therefore fails serde-first (`missing field 'descriptor'`) — before the
+        // version guard is even reached. That is still a clean rejection: a typed
+        // `ManifestError`, the signal to re-emit, never a panic or a silent
+        // stale-hash match. The version guard is the *second* line of defence (for
+        // a shape that still deserialises under a superseded determinant set); a
+        // truly old manifest is caught by the first. Either typed error is
+        // acceptable — what must never happen is a silent accept.
+        let err =
+            MaterializationManifest::from_json_bytes(&old_shape_manifest_without_descriptor(1))
+                .expect_err(
+                    "an old descriptor-less manifest must be rejected, not silently accepted",
+                );
+        assert!(
+            matches!(
+                err,
+                ManifestError::Serde(_) | ManifestError::UnsupportedManifestVersion { .. }
+            ),
+            "expected a clean typed rejection (serde or version guard), got {err:?}"
         );
-        assert!(matches!(
-            MaterializationManifest::from_json_bytes(&manifest_at_version(1)),
-            Err(ManifestError::UnsupportedManifestVersion { found: 1, supported })
-                if supported == MANIFEST_VERSION
-        ));
     }
 
     // ---- Non-vacuity guard: every output-affecting param of every data-producer
@@ -1124,7 +1193,7 @@ mod tests {
 
     #[derive(Clone)]
     struct GraphPropagationFields {
-        edge_source: String,
+        edge_source: EdgeSourceBinding,
         direction: PropagationDirection,
         hops: usize,
         alpha_bits: u64,
@@ -1150,7 +1219,9 @@ mod tests {
     #[test]
     fn graph_propagation_each_param_moves_the_hash() {
         let base = GraphPropagationFields {
-            edge_source: "graph".into(),
+            edge_source: EdgeSourceBinding::NeighborGraph {
+                table_name: "graph".into(),
+            },
             direction: PropagationDirection::Out,
             hops: 2,
             alpha_bits: 0.1_f64.to_bits(),
@@ -1163,7 +1234,11 @@ mod tests {
             &no_model_env(),
             graph_propagation_descriptor,
             &[
-                ("edge_source", |p| p.edge_source = "other_graph".into()),
+                ("edge_source", |p| {
+                    p.edge_source = EdgeSourceBinding::NeighborGraph {
+                        table_name: "other_graph".into(),
+                    }
+                }),
                 ("direction", |p| {
                     p.direction = PropagationDirection::Undirected
                 }),
@@ -1178,8 +1253,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn graph_propagation_registered_edge_columns_move_the_hash() {
+        // The proven HIGH bug: a registered edge source's column bindings are
+        // output-affecting (the same source read through swapped `src`/`dst`,
+        // or with a weight/type/as-of column, is a different graph). The
+        // descriptor now carries the full binding, so flipping any of those
+        // columns must move the definition hash — two propagations over the
+        // *same* registered source with *different* columns must not collide.
+        let base = GraphPropagationFields {
+            edge_source: EdgeSourceBinding::Registered {
+                source_id: "edges".into(),
+                src_column: "from".into(),
+                dst_column: "to".into(),
+                type_column: None,
+                weight_column: None,
+                as_of_column: None,
+            },
+            direction: PropagationDirection::Out,
+            hops: 2,
+            alpha_bits: 0.1_f64.to_bits(),
+            weighting: PropagationWeighting::DegreeNormalized,
+            output: PropagationOutput::Final,
+            dimensions: 384,
+        };
+        // The load-bearing case: swapping src/dst (the proven collision) must
+        // move the hash — under the old `edge_source: String` descriptor both
+        // recorded the bare source id and collided.
+        let swapped = GraphPropagationFields {
+            edge_source: EdgeSourceBinding::Registered {
+                source_id: "edges".into(),
+                src_column: "to".into(),
+                dst_column: "from".into(),
+                type_column: None,
+                weight_column: None,
+                as_of_column: None,
+            },
+            ..base.clone()
+        };
+        assert_ne!(
+            definition_hash(&graph_propagation_descriptor(&base), &no_model_env()).unwrap(),
+            definition_hash(&graph_propagation_descriptor(&swapped), &no_model_env()).unwrap(),
+            "swapping src/dst on the registered edge source must move the hash — \
+             two propagations over the same source with swapped columns are different graphs"
+        );
+        assert_each_change_moves_hash(
+            &base,
+            &no_model_env(),
+            graph_propagation_descriptor,
+            &[
+                ("src_column", |p| {
+                    if let EdgeSourceBinding::Registered { src_column, .. } = &mut p.edge_source {
+                        *src_column = "s".into();
+                    }
+                }),
+                ("dst_column", |p| {
+                    if let EdgeSourceBinding::Registered { dst_column, .. } = &mut p.edge_source {
+                        *dst_column = "d".into();
+                    }
+                }),
+                ("type_column", |p| {
+                    if let EdgeSourceBinding::Registered { type_column, .. } = &mut p.edge_source {
+                        *type_column = Some("etype".into());
+                    }
+                }),
+                ("weight_column", |p| {
+                    if let EdgeSourceBinding::Registered { weight_column, .. } = &mut p.edge_source
+                    {
+                        *weight_column = Some("w".into());
+                    }
+                }),
+                ("as_of_column", |p| {
+                    if let EdgeSourceBinding::Registered { as_of_column, .. } = &mut p.edge_source {
+                        *as_of_column = Some("valid_at".into());
+                    }
+                }),
+            ],
+        );
+    }
+
     #[derive(Clone)]
     struct ContextSetFields {
+        embedding_table: Option<String>,
         candidate_source: ContextCandidateSource,
         value_columns: Vec<String>,
         aggregator: ContextAggregator,
@@ -1192,6 +1347,7 @@ mod tests {
         ProducingDescriptor::ContextSet {
             encoder_id: "jammi:context-set".into(),
             source_id: "patents".into(),
+            embedding_table: p.embedding_table.clone(),
             candidate_source: p.candidate_source.clone(),
             value_columns: p.value_columns.clone(),
             aggregator: p.aggregator,
@@ -1204,6 +1360,7 @@ mod tests {
     #[test]
     fn context_set_each_param_moves_the_hash() {
         let base = ContextSetFields {
+            embedding_table: None,
             candidate_source: ContextCandidateSource::Ann { k: 5 },
             value_columns: vec!["label".into()],
             aggregator: ContextAggregator::Mean,
@@ -1216,13 +1373,16 @@ mod tests {
             &no_model_env(),
             context_set_descriptor,
             &[
+                ("embedding_table", |p| {
+                    p.embedding_table = Some("pinned_source_table".into())
+                }),
                 ("candidate_source.k", |p| {
                     p.candidate_source = ContextCandidateSource::Ann { k: 9 }
                 }),
                 ("candidate_source.kind", |p| {
                     p.candidate_source = ContextCandidateSource::Edges {
                         gather: ContextEdgeGather {
-                            edge_source: ContextEdgeSource::NeighborGraph {
+                            edge_source: EdgeSourceBinding::NeighborGraph {
                                 table_name: "g".into(),
                             },
                             hops: 1,
@@ -1249,9 +1409,10 @@ mod tests {
         // knobs (with the gather embedded in a ContextSet) and assert the hash
         // moves, so a lossy gather mirror is caught too.
         let base = ContextSetFields {
+            embedding_table: None,
             candidate_source: ContextCandidateSource::Edges {
                 gather: ContextEdgeGather {
-                    edge_source: ContextEdgeSource::Registered {
+                    edge_source: EdgeSourceBinding::Registered {
                         source_id: "edges".into(),
                         src_column: "from".into(),
                         dst_column: "to".into(),
@@ -1291,7 +1452,7 @@ mod tests {
             }),
             ("as_of", |g| g.as_of = Some("2026-01-01".into())),
             ("edge_source", |g| {
-                g.edge_source = ContextEdgeSource::NeighborGraph {
+                g.edge_source = EdgeSourceBinding::NeighborGraph {
                     table_name: "g".into(),
                 }
             }),

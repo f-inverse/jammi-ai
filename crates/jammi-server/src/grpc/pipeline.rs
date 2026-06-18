@@ -24,15 +24,17 @@ use std::sync::Arc;
 use jammi_ai::session::InferenceSession;
 use jammi_ai::wire::{
     asof_join_from_proto, assemble_context_request_from_proto, assemble_context_to_proto,
-    build_neighbor_graph_from_proto, propagate_request_from_proto,
+    build_neighbor_graph_from_proto, propagate_request_from_proto, recompute_from_proto,
+    recompute_report_to_proto,
 };
+use jammi_db::error::JammiError;
 use tonic::{Request, Response, Status};
 
 use crate::grpc::proto::embedding::ResultTable;
 use crate::grpc::proto::pipeline::pipeline_service_server::PipelineService;
 use crate::grpc::proto::pipeline::{
     AsofJoinRequest, AssembleContextRequest, AssembleContextResponse, BuildNeighborGraphRequest,
-    PropagateEmbeddingsRequest,
+    PropagateEmbeddingsRequest, RecomputeReport as ProtoRecomputeReport, RecomputeRequest,
 };
 use crate::grpc::wire::{map_engine_error, scoped, session_tenant_traced};
 
@@ -131,5 +133,34 @@ impl PipelineService for PipelineServer {
         .map_err(map_engine_error)?;
 
         Ok(Response::new(record.into()))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
+    async fn recompute(
+        &self,
+        request: Request<RecomputeRequest>,
+    ) -> Result<Response<ProtoRecomputeReport>, Status> {
+        let tenant = session_tenant_traced(&request);
+        let args = recompute_from_proto(request.into_inner())?;
+
+        // Resolve the target table and recompute inside the request's tenant
+        // scope: the catalog read is tenant-filtered, so a peer that names another
+        // tenant's table resolves no row and the recompute refuses — the same
+        // boundary `verify_materialization` / `staleness` ride.
+        let report = scoped(&self.session, tenant, || async {
+            let record = self
+                .session
+                .catalog()
+                .get_result_table(&args.table)
+                .await?
+                .ok_or_else(|| {
+                    JammiError::Catalog(format!("Result table '{}' not found", args.table))
+                })?;
+            self.session.recompute(&record, args.cascade).await
+        })
+        .await
+        .map_err(map_engine_error)?;
+
+        Ok(Response::new(recompute_report_to_proto(report)))
     }
 }

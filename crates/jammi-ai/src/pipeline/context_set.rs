@@ -31,7 +31,7 @@ use datafusion::prelude::{col, lit};
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 
-use crate::pipeline::graph_neighbourhood::{EdgeDirection, EdgeGather, EdgeSourceRef};
+use crate::pipeline::graph_neighbourhood::{EdgeDirection, EdgeGather};
 use crate::session::InferenceSession;
 
 /// How a context set's candidate members were assembled — a *fact* about the
@@ -148,6 +148,13 @@ pub struct ContextRequest {
     /// Source whose embedding table is retrieved against and whose rows the
     /// context members are pooled and hydrated from.
     pub source_id: String,
+    /// The specific embedding table to retrieve/pool/hydrate against, or `None`
+    /// to resolve the source's default (newest) embedding table. Pinning it makes
+    /// a recompute faithful: a materialised context set is itself a `kind=model`
+    /// table for the same source, so re-resolving the *default* after it exists
+    /// would shadow the original source table — the pin holds the pooling on the
+    /// table the recipe actually ran over.
+    pub embedding_table: Option<String>,
     /// The target's query vector — the point whose neighbourhood is the ANN /
     /// hybrid context. (A pure-edge context anchors on `exclude_key` instead.)
     pub query: Vec<f32>,
@@ -177,6 +184,7 @@ impl ContextRequest {
     pub fn new(source_id: impl Into<String>, query: Vec<f32>, k: usize) -> Self {
         Self {
             source_id: source_id.into(),
+            embedding_table: None,
             query,
             source: ContextSource::Ann { k },
             value_columns: Vec::new(),
@@ -244,7 +252,7 @@ impl InferenceSession {
     ) -> Result<ContextRepresentation> {
         let table = self
             .catalog()
-            .resolve_embedding_table(&request.source_id, None)
+            .resolve_embedding_table(&request.source_id, request.embedding_table.as_deref())
             .await?;
 
         // The candidate set — the only part that differs by source. Everything
@@ -273,7 +281,12 @@ impl InferenceSession {
         // keeps graph-adjacent rows on one side of the train/eval line.
         if let Some(split) = request.split.as_deref() {
             context_keys = self
-                .filter_keys_by_split(&request.source_id, &context_keys, split)
+                .filter_keys_by_split(
+                    &request.source_id,
+                    request.embedding_table.as_deref(),
+                    &context_keys,
+                    split,
+                )
                 .await?;
         }
 
@@ -290,8 +303,13 @@ impl InferenceSession {
         let value_rows = if request.value_columns.is_empty() {
             Vec::new()
         } else {
-            self.hydrate_value_columns(&request.source_id, &context_keys, &request.value_columns)
-                .await?
+            self.hydrate_value_columns(
+                &request.source_id,
+                request.embedding_table.as_deref(),
+                &context_keys,
+                &request.value_columns,
+            )
+            .await?
         };
 
         Ok(ContextRepresentation {
@@ -458,6 +476,7 @@ impl InferenceSession {
     async fn filter_keys_by_split(
         &self,
         source_id: &str,
+        embedding_table: Option<&str>,
         context_keys: &[String],
         split: &str,
     ) -> Result<Vec<String>> {
@@ -466,7 +485,7 @@ impl InferenceSession {
         }
         let table = self
             .catalog()
-            .resolve_embedding_table(source_id, None)
+            .resolve_embedding_table(source_id, embedding_table)
             .await?;
         let key_col = table.key_column.as_deref().ok_or_else(|| {
             JammiError::Other(format!(
@@ -512,6 +531,7 @@ impl InferenceSession {
     async fn hydrate_value_columns(
         &self,
         source_id: &str,
+        embedding_table: Option<&str>,
         context_keys: &[String],
         value_columns: &[String],
     ) -> Result<Vec<RecordBatch>> {
@@ -520,7 +540,7 @@ impl InferenceSession {
         }
         let table = self
             .catalog()
-            .resolve_embedding_table(source_id, None)
+            .resolve_embedding_table(source_id, embedding_table)
             .await?;
         let key_col = table.key_column.as_deref().ok_or_else(|| {
             JammiError::Other(format!(
@@ -697,6 +717,22 @@ impl InferenceSession {
         let recipe = context.recipe;
         let source_id = recipe.source_id.as_str();
 
+        // Pin the **resolved** source embedding table into the descriptor, not the
+        // recipe's `Option`. The recipe may carry `None` (resolve the source's
+        // newest embedding table), but a materialised context set is itself a
+        // `kind=model` table for the same source — so on a later recompute the
+        // default resolution would re-select *this* output and shadow the original
+        // source table, pooling over the wrong rows (a non-byte-identical replay).
+        // Recording the concrete name the recipe actually pooled over makes the
+        // replay re-pool over the same table regardless of any newer shadowing
+        // table. This output table does not exist yet at this point, so resolving
+        // `None` here returns the same source table the assembly pooled over.
+        let resolved_embedding_table = self
+            .catalog()
+            .resolve_embedding_table(source_id, recipe.embedding_table.as_deref())
+            .await?
+            .table_name;
+
         // The materialization contract: a context set pools from the source's
         // raw rows (no model invoked here — the encoder is the pooling kernel),
         // so the environment carries the engine version + device with an empty
@@ -710,6 +746,7 @@ impl InferenceSession {
         let descriptor = jammi_db::store::manifest::ProducingDescriptor::ContextSet {
             encoder_id: "jammi:context-set".to_string(),
             source_id: source_id.to_string(),
+            embedding_table: Some(resolved_embedding_table),
             candidate_source: candidate_source_for(&recipe.source),
             value_columns: recipe.value_columns.clone(),
             aggregator: aggregator_for(recipe.aggregator),
@@ -821,38 +858,13 @@ fn aggregator_for(aggregator: SetAggregator) -> jammi_db::store::manifest::Conte
 /// stays bit-exact and `Eq`/`Hash`-able.
 fn edge_gather_for(gather: &EdgeGather) -> jammi_db::store::manifest::ContextEdgeGather {
     jammi_db::store::manifest::ContextEdgeGather {
-        edge_source: edge_source_for(&gather.edge_source),
+        edge_source: gather.edge_source.to_binding(),
         hops: gather.effective_hops(),
         fanout: gather.fanout,
         direction: edge_direction_for(gather.direction),
         edge_types: gather.edge_types.clone(),
         min_weight_bits: gather.min_weight.map(f64::to_bits),
         as_of: gather.as_of.clone(),
-    }
-}
-
-/// Map the AI-crate [`EdgeSourceRef`] to the manifest's edge-source mirror.
-fn edge_source_for(edge_source: &EdgeSourceRef) -> jammi_db::store::manifest::ContextEdgeSource {
-    use jammi_db::store::manifest::ContextEdgeSource as M;
-    match edge_source {
-        EdgeSourceRef::NeighborGraph { table_name } => M::NeighborGraph {
-            table_name: table_name.clone(),
-        },
-        EdgeSourceRef::Registered {
-            source_id,
-            src_column,
-            dst_column,
-            type_column,
-            weight_column,
-            as_of_column,
-        } => M::Registered {
-            source_id: source_id.clone(),
-            src_column: src_column.clone(),
-            dst_column: dst_column.clone(),
-            type_column: type_column.clone(),
-            weight_column: weight_column.clone(),
-            as_of_column: as_of_column.clone(),
-        },
     }
 }
 

@@ -137,6 +137,7 @@ _PIPELINE_VERBS = {
     "propagate_embeddings",
     "asof_join",
     "assemble_context",
+    "recompute",
     "verify_materialization",
     "staleness",
     "derives_from",

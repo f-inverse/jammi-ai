@@ -50,9 +50,11 @@ from ._assembly import (
     build_infer_request,
     build_neighbor_graph_request,
     build_propagate_embeddings_request,
+    build_recompute_request,
     build_register_channel_request,
     build_register_topic_request,
     build_search_request,
+    recompute_report_to_dict,
 )
 from ._credentials import AnonymousCredentials, ChannelCredentials
 from ._errors import TrainingError
@@ -1644,6 +1646,28 @@ class RemoteDatabase:
         )
         resp = self._pipeline.AsofJoin(request, metadata=self._metadata)
         return resp.table_name
+
+    def recompute(
+        self,
+        table: str,
+        *,
+        cascade: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Re-invoke a result table's recorded producer over the inputs' current
+        state and return the recompute report.
+
+        ``table`` is the result table to recompute; ``cascade`` is
+        ``"report_only"`` (default — recompute the named table only and report the
+        transitive downstream-stale set) or ``"downstream"`` (additionally sweep
+        every transitive dependent once, in dependency order). A pre-contract
+        table (no recorded producing descriptor) raises. Maps to
+        `PipelineService.Recompute`; the report is a dict
+        ``{"recomputed": [{"original", "recomputed", "outcome"}], "downstream_stale": [...]}``.
+        Read each recomputed table via :meth:`sql`.
+        """
+        request = build_recompute_request(table, cascade=cascade)
+        resp = self._pipeline.Recompute(request, metadata=self._metadata)
+        return recompute_report_to_dict(resp)
 
     def assemble_context(
         self,

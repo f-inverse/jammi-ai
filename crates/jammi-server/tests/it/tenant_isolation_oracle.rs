@@ -1028,6 +1028,17 @@ fn cases() -> Vec<IsolationCase> {
         case!("PipelineService", "AsofJoin", CaseKind::Hermetic, None, {
             assert_source_resolver_isolated().await;
         }),
+        // `recompute` resolves its target through the tenant-filtered
+        // `get_result_table` before it reads the recorded descriptor and replays
+        // the producer — the same gate `verify_materialization` / `staleness`
+        // ride. A peer that names tenant A's table resolves no row and the
+        // recompute refuses (a not-found `Catalog` error), never replaying or
+        // leaking A's artifact. Hermetic, CPU-only: a synthetic embedding table is
+        // materialised under A through the single funnel (so it carries a real
+        // descriptor), then `Session::recompute` runs under each tenant's scope.
+        case!("PipelineService", "Recompute", CaseKind::Hermetic, None, {
+            assert_recompute_isolated().await;
+        }),
         case!(
             "TrainingService",
             "StartTraining",
@@ -1484,6 +1495,54 @@ async fn assert_derives_from_isolated() {
         b_result.is_err(),
         "CROSS-TENANT LEAK: tenant B read tenant A's lineage: {b_result:?}"
     );
+}
+
+/// `recompute` resolves its target through the tenant-filtered `get_result_table`
+/// before it reads the recorded descriptor and replays the producer — so a peer
+/// that names another tenant's table is refused at resolution, never replaying or
+/// leaking the artifact.
+///
+/// Tenant B recomputing A's table name resolves no row and errors with the
+/// not-found `Catalog` arm — the same resolution gate `verify_materialization` /
+/// `staleness` ride. Tenant A gets *past* resolution (its own row resolves): the
+/// replay of the synthetic embedding descriptor then fails on the absent model
+/// (`Inference`/`Catalog`-model error), which is the point — A resolved its own
+/// table and reached the producer, B never did. The cross-tenant claim is B's
+/// refusal; A's positive is that its error is not the resolution not-found.
+async fn assert_recompute_isolated() {
+    use jammi_ai::pipeline::recompute::Cascade;
+
+    let (engine, session, table_name, _dir) = materialize_table_for_tenant_a().await;
+
+    // Tenant B: refused at resolution (`get_result_table` returns no row), so the
+    // recompute never reads A's descriptor or replays anything.
+    let b_result = engine
+        .with_tenant_scoped(tenant_b(), |_scope| {
+            session.recompute(&table_name, Cascade::ReportOnly)
+        })
+        .await;
+    let b_err = b_result
+        .expect_err("CROSS-TENANT LEAK: tenant B recomputed (or resolved) tenant A's table");
+    assert!(
+        b_err.to_string().contains("not found"),
+        "tenant B's recompute must be refused at resolution (not-found), got: {b_err}"
+    );
+
+    // Tenant A: resolves its own row and reaches the producer replay. The
+    // synthetic embedding descriptor names a model that was never loaded in this
+    // hermetic harness, so the replay fails — but with a producer/model error,
+    // NOT the resolution not-found B hit. (Proving A got past the tenant gate.)
+    let a_result = engine
+        .with_tenant_scoped(tenant_a(), |_scope| {
+            session.recompute(&table_name, Cascade::ReportOnly)
+        })
+        .await;
+    if let Err(a_err) = a_result {
+        assert!(
+            !a_err.to_string().contains("not found"),
+            "tenant A must resolve its OWN table (not a not-found refusal), got: {a_err}"
+        );
+    }
 }
 
 /// Infer / Predict / EncodeQuery / GenerateEmbeddings resolve the model through

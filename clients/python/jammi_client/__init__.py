@@ -58,10 +58,11 @@ def connect(
     `credentials` decides what identity rides the channel. ``None`` opens an
     anonymous channel; a :class:`BearerCredentials` attaches
     `authorization: Bearer <token>` to every call on both TLS and plaintext
-    transports — the bearer rides the channel, not each verb. The channel-level
-    bearer covers the typed gRPC verbs; :meth:`RemoteDatabase.sql` (the Flight
-    SQL lane) does not yet carry it — see
-    https://github.com/f-inverse/jammi-ai/issues/96.
+    transports — the bearer rides the channel, not each verb. The bearer covers
+    both transports: the typed gRPC verbs on the channel credentials, and
+    :meth:`RemoteDatabase.sql` (the Flight SQL lane) per call. Server-side
+    enforcement of the BYO-auth seam over Flight is tracked at
+    https://github.com/f-inverse/jammi-ai/issues/220.
 
     Scaling local→remote is an env flip (``connect(os.environ["JAMMI_TARGET"])``)
     with no code change; productionising from the embed wheel to this lean client

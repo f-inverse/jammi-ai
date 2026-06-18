@@ -134,7 +134,7 @@ Jammi authenticates nothing on its own — it is a substrate, and identity is a
 consumer's vocabulary. To put a tenant boundary in front of untrusted callers,
 you supply the authentication and authorization yourself and bind the result to
 the engine's per-request tenant scope. The seam is a **custom tonic
-interceptor** that runs ahead of every engine verb:
+interceptor** that runs ahead of the **typed gRPC verbs**:
 
 1. **Authenticate the principal.** Read the caller's credential — a bearer token,
    a session cookie your gateway exchanges, a service-to-service token — and
@@ -144,13 +144,26 @@ interceptor** that runs ahead of every engine verb:
    from a header the caller controls. This is where your policy lives: which
    tenant this principal may act as.
 3. **Bind it.** Attach the resolved tenant as a `SessionTenant` request
-   extension. Every engine-backed verb reads that extension and scopes its work
+   extension. Every typed verb handler reads that extension and scopes its work
    to that tenant — the same extension the built-in interceptor sets, now sourced
    from an authenticated claim instead of an unauthenticated session lookup.
 
 Because authentication and authorization run *in front of* session resolution,
 the tenant the engine acts on is the one the credential proves, not one the
 caller asserts. The `jammi-session-id` header plays no part in this path.
+
+This seam covers the typed gRPC verbs. The Flight SQL lane (`db.sql`) is a
+separate transport mounted without the interceptor: its `TenantBoundProvider`
+resolves the tenant from the `jammi-session-id` header directly, not the
+`SessionTenant` extension, so this in-engine interceptor does not bind the
+verified claim over Flight. The remote client does carry the bearer on the
+Flight lane (alongside the session header), so a boundary in front sees the
+credential on every transport. The engine enforces auth on no transport by
+design: authenticating every transport — the Flight lane included — is your
+job, typically a governing gateway ahead of the trusted-network engine. Whether
+the *in-engine* interceptor should also extend to the Flight transport is a
+mechanism question tracked at
+[#220](https://github.com/f-inverse/jammi-ai/issues/220).
 
 ```rust,ignore
 use tonic::{Request, Status, service::Interceptor};
@@ -178,7 +191,7 @@ impl Interceptor for AuthInterceptor {
         let tenant: TenantId = verify_credential(credential)
             .ok_or_else(|| Status::unauthenticated("invalid credential"))?;
 
-        // 3. Bind: every engine verb downstream scopes to this tenant.
+        // 3. Bind: every typed verb downstream scopes to this tenant.
         request.extensions_mut().insert(SessionTenant(Some(tenant)));
         Ok(request)
     }

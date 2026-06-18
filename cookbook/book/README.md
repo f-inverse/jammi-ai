@@ -27,17 +27,27 @@ chapters/         the book (Quarto .qmd with executable Python cells)
 artifacts/        the committed golden-sample cache (small subset only)
 data/ids/         committed seeded subset _row_id lists
 scripts/          the API-reference guard + the no-deferral grep
-.github/workflows the --execute CI harness (PR-gating) + the opt-in full-scale run
 ```
+
+The book lives in the engine monorepo at `cookbook/book/`; the engine CI builds
+the HEAD embed wheel and runs this book's gate against it (see
+`.github/workflows/cookbook-book.yml` at the repo root).
 
 ## Develop
 
+From the repo root, build the HEAD engine wheel, then install the book against it:
+
 ```bash
-python -m venv .venv && . .venv/bin/activate
-pip install -e ".[book,dev]"          # jammi_ai is pinned to ==0.31.0 (CPU embed wheel)
-python scripts/check_api_reference.py # confirm the API reference matches the wheel
-pytest                                # lib unit tests
-quarto render                         # build + execute the book (reads the committed cache)
+# HEAD embed wheel (CPU): maturin reads Cargo.toml at the repo root
+pip install -e 'clients/python[dev]' && make -C clients/python generate
+maturin build --release
+pip install --force-reinstall --no-deps target/wheels/jammi_ai-*.whl
+
+pip install -e 'cookbook/book[book,dev]'   # jammi_ai is unpinned; the HEAD wheel above wins
+cd cookbook/book
+python scripts/check_api_reference.py      # confirm the API reference matches the wheel
+pytest                                     # lib unit tests
+quarto render                              # build + execute the book (reads the committed cache)
 ```
 
 The book's spine is **`connect(target)` parity**: a recipe is written once and the

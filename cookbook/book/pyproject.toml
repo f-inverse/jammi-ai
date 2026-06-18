@@ -7,10 +7,20 @@ requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "F-Inverse" }]
 
-# jammi_ai is pinned exactly: the cookbook authors against one engine version and
-# never vendors or edits engine source. numpy/pyarrow are the data substrate the
-# chapters manipulate. 0.31.0 (the H4 horizon) adds the point-in-time + materialization
-# surface: asof_join (as-of / point-in-time temporal join: spine_by/spine_time/facts_by/
+# jammi_ai is consumed at HEAD, not pinned to a PyPI release: the book now lives
+# in the engine monorepo (cookbook/book/) and proves the engine built from THIS
+# repo's source. CI builds the HEAD embed wheel with maturin and force-installs it
+# (`--force-reinstall --no-deps`) over this unpinned declaration, so the book always
+# tests the engine commit it ships alongside — a feature and its proof land
+# atomically. (A separate nightly release-recipe leg installs the last PUBLISHED
+# jammi_ai wheel from PyPI and runs the CPU pytest subset, preserving the
+# published-artifact signal that HEAD-testing alone would lose.) The book authors
+# against the engine API and never vendors or edits engine source; jammi_client is
+# carried transitively by the embed wheel, not pinned separately. numpy/pyarrow are
+# the data substrate the chapters manipulate. The engine surface the chapters rely
+# on (and which scripts/check_api_reference.py guards against the installed wheel)
+# includes the point-in-time + materialization tier: asof_join (as-of / point-in-time
+# temporal join: spine_by/spine_time/facts_by/
 # facts_time/direction/boundary/tolerance_duration_micros/tie_break_column/project),
 # verify_materialization(expected_definition), staleness(current_definition),
 # derives_from() and recompute(cascade), plus a cache= kwarg on the embedding/inference
@@ -31,7 +41,7 @@ authors = [{ name = "F-Inverse" }]
 # header carries only the major version, so a floated 2.25.x would load silently and could
 # drift recall. The chapter asserts usearch.__version__ matches the manifest before recomputing.
 dependencies = [
-    "jammi_ai==0.31.0",
+    "jammi_ai",
     "numpy>=1.26,<3",
     "pyarrow>=15",
     "requests>=2.31",

@@ -162,6 +162,19 @@ jobs:
             && { echo "::error::the jammi CLI compiled jammi-ai — the strict-client boundary regressed"; exit 1; } \
             || echo "jammi-cli build set carries no jammi-ai edge"
 
+  cookbook-one-way:
+    name: Guard (cookbook one-way)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The book (cookbook/book/) consumes the engine; the engine never consumes
+      # the book. Engine crates may depend on the engine-owned cookbook/fixtures/
+      # (that edge stays) but no crate may reference cookbook/book/. Plain ubuntu:
+      # this is a text guard, not a build.
+      - name: Assert no crate references the book subtree
+        run: bash ci/scripts/check_cookbook_one_way.sh
+
   dep-direction:
     name: Guard (engine dep-direction)
     runs-on: ubuntu-latest

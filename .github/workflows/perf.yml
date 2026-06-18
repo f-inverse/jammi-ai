@@ -94,6 +94,11 @@ jobs:
         run: |
           set -euo pipefail
           baseline=crates/jammi-bench/baselines/graph_train.json
+          # Restore via cp/mv, NOT git: a bare `git` in a container `run:` step
+          # hits "fatal: detected dubious ownership" (exit 128) — the safe.directory
+          # actions/checkout sets isn't visible here. The ephemeral checkout is
+          # discarded with the runner anyway; this keeps the perturbation local.
+          cp "$baseline" "$baseline.orig"
           python3 - "$baseline" <<'PY'
           import json, sys
           p = sys.argv[1]
@@ -103,9 +108,9 @@ jobs:
           print(f"inflated baseline_pairs_per_s to {d['baseline_pairs_per_s']} (floor now unreachable)")
           PY
           if ./target/release/jammi-bench graph-train-scale; then
+            mv -f "$baseline.orig" "$baseline"
             echo "::error::teeth-proof FAILED — graph-train-scale exited 0 against a 100x-inflated baseline; the workflow rate gate is decorative"
-            git checkout -- "$baseline"
             exit 1
           fi
+          mv -f "$baseline.orig" "$baseline"
           echo "teeth-proof held: graph-train-scale exited non-zero against the inflated baseline (the gate has teeth)"
-          git checkout -- "$baseline"

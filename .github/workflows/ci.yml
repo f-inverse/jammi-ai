@@ -229,7 +229,7 @@ jobs:
       # snapshot — and knowingly-carried advisories live as documented exceptions
       # in `deny.toml`, never a blanket silence.
       - name: Install cargo-deny
-        run: cargo install cargo-deny@0.16.4 --locked
+        run: cargo install cargo-deny --locked
       - name: cargo deny (advisories + licenses + bans + sources)
         run: cargo deny check advisories licenses bans sources
 

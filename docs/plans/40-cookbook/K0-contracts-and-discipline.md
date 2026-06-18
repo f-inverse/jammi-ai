@@ -68,7 +68,7 @@ CI executes the notebooks (`--execute`) on the **small fixed subset**, loading t
 
 - **Names no consumer.** Public datasets only (Air Routes, ogbn-arxiv); neutral framing; no AccuRisk/Lace/HCC/crosswalk vocabulary. (`philosophy.md:10-12`.)
 - **Runnable + measured.** Every recipe executes in CI and ends in a real number from the committed artifacts — never a placeholder. The book *is* the closed eval loop (`construct→propagate→learn→MEASURE`).
-- **Conformal doctrine respected.** Tier-04 uses the **marginal** OSS Python conformal (`conformalize*`), demonstrates it *under-covers* on the citation graph, then applies the graph-aware repair **inline in the notebook** (the consumer makes the cohort/weight choice — "choosing the cohort is governance", `conformal-prediction.md:29-30`), and points to enterprise **E8** for the productionized governed version. It does **not** expose or expect Mondrian/weighted in OSS Python.
+- **Conformal doctrine respected.** Tier-04 uses the **marginal** OSS Python conformal (`conformalize*`), demonstrates it *under-covers* on the citation graph, then applies the graph-aware repair **inline in the notebook** (the consumer makes the cohort/weight choice — "choosing the cohort is governance", `conformal-prediction.md:29-30`), and points to a productionized, governed version that lives **above the open-core engine** for the full treatment. It does **not** expose or expect Mondrian/weighted in OSS Python.
 - **Engine untouched.** No edits to jammi engine repos — the cookbook only *calls* the `jammi_ai` API. A recipe that needs an engine change is a fork to escalate, not patch.
 
 ## 5. Scope boundary

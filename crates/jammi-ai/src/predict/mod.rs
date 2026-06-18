@@ -7,7 +7,7 @@
 //! with a finite-sample marginal coverage guarantee, deterministic given a
 //! calibration set. It is a *serving* output (it must work with a dead
 //! license), so it lives in the open engine; the governed coverage-SLA layer
-//! built atop it is enterprise.
+//! built atop it is a downstream/governing layer.
 
 pub mod conformal;
 

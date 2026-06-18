@@ -15,8 +15,8 @@
 //!   There is no useful Jammi server without them.
 //! - [`ServiceTier::Train`] — `TrainingService` (`StartTraining` /
 //!   `TrainingStatus`). A serve-only box does not train.
-//! - [`ServiceTier::Event`] — `TriggerService` (publish / subscribe). The
-//!   enterprise tier builds on this trigger stream. (Topic *admin* is a
+//! - [`ServiceTier::Event`] — `TriggerService` (publish / subscribe). A
+//!   downstream tier builds on this trigger stream. (Topic *admin* is a
 //!   control-plane catalog verb, always present; only the publish/subscribe
 //!   compute stream is event-gated.)
 //! - [`ServiceTier::Eval`] — `EvalService` (per-query eval arrays). A tooling

@@ -189,9 +189,11 @@ jobs:
       # Jammi depends on no consumer. This guard walks the resolved
       # normal-dependency closure of the shippable OSS crates (the workspace
       # default-members) and fails, naming the offender, if any crate is from
-      # an enterprise namespace or from a non-crates.io source (git / private
-      # registry). It reads `cargo metadata`'s resolved graph — the source of
-      # truth — so a transitive dep cannot slip past a text grep of Cargo.toml.
+      # a non-crates.io source (a path outside the workspace, a git source, or a
+      # private/alternate registry) — a proprietary crate is caught by its
+      # source, not its name. It reads `cargo metadata`'s resolved graph — the
+      # source of truth — so a transitive dep cannot slip past a text grep of
+      # Cargo.toml.
       - name: Assert no proprietary crate in the OSS engine dep tree
         run: cargo metadata --format-version 1 --locked | python3 ci/scripts/check_dep_direction.py
 

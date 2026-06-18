@@ -4,8 +4,9 @@
 The open-core boundary is one-way: a consumer may depend on Jammi; Jammi
 depends on no consumer. Every crate resolved into the shippable OSS surface is
 either a local workspace path or comes from the public crates.io registry —
-nothing from an enterprise namespace, a git source, or a private registry is
-allowed to be linked into the engine.
+nothing from a path outside the workspace, a git source, or a private/alternate
+registry is allowed to be linked into the engine. A proprietary crate is caught
+by its SOURCE, not its name.
 
 Scope is the NORMAL-dependency closure of the workspace default-members (the
 shippable OSS crates). jammi-python (a PyO3 cdylib built via maturin, not
@@ -15,13 +16,11 @@ edges, because a git-sourced dev tool is not proprietary runtime linkage and
 must not produce a false positive. If runtime-vs-dev coverage ever needs to
 widen, the closure walk below is the single place to adjust.
 
-Two independent filters run over that closure:
-  - SOURCE filter (load-bearing, prefix-independent): any crate with a non-null
-    source that is not the crates.io registry is an offender. This catches any
-    git or private-registry crate regardless of its name.
-  - NAME filter (defense-in-depth): any crate whose name starts with
-    `jammi-enterprise` is an offender, so a proprietary crate is caught even if
-    it were somehow published to crates.io.
+The enforcement is by SOURCE, which names no consumer: any crate with a non-null
+source that is not the crates.io registry is an offender. This catches any git,
+path-outside-workspace, or private/alternate-registry crate regardless of its
+name — a proprietary crate is identified by where it comes from, not by what it
+is called. (Local workspace path crates carry a null source and are allowed.)
 
 Input is `cargo metadata --format-version 1` JSON on stdin. Any offender prints
 a `::error::` annotation naming the crate and its source, and the script exits
@@ -32,7 +31,6 @@ import json
 import sys
 
 CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
-ENTERPRISE_PREFIX = "jammi-enterprise"
 
 
 def main() -> int:
@@ -58,30 +56,23 @@ def main() -> int:
                 if dep["pkg"] not in closure:
                     work.append(dep["pkg"])
 
-    name_offenders = []
     source_offenders = []
     for pkg_id in closure:
         pkg = packages_by_id[pkg_id]
         name = pkg["name"]
         source = pkg["source"]  # null/None for local path crates
-        if name.startswith(ENTERPRISE_PREFIX):
-            name_offenders.append((name, source))
         if source is not None and source != CRATES_IO_SOURCE:
             source_offenders.append((name, source))
 
-    for name, source in name_offenders:
-        print(
-            f"::error::OSS engine dep closure contains enterprise-namespaced "
-            f"crate '{name}' (source: {source}) — Jammi must depend on no consumer"
-        )
     for name, source in source_offenders:
         print(
-            f"::error::OSS engine dep closure contains non-crates.io crate "
-            f"'{name}' (source: {source}) — the OSS edition links only local "
-            f"workspace paths and crates.io"
+            f"::error::OSS engine dep closure contains a non-public / path / git "
+            f"/ private-registry crate '{name}' (source: {source}) — the OSS "
+            f"edition links only local workspace paths and crates.io; Jammi "
+            f"depends on no consumer"
         )
 
-    if name_offenders or source_offenders:
+    if source_offenders:
         return 1
 
     print(

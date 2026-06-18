@@ -1227,10 +1227,10 @@ context set. All data-plane primitives + offline eval — no governance.
 
 - `TriggerBroker::list_consumers(topic_id) -> Vec<ConsumerOffsetSnapshot>`
   returns one snapshot per consumer currently bound to the topic, carrying
-  the broker's last-delivered and ack-floor stream sequences. Unblocks
-  the OSS broker listing gap noted in jammi-enterprise's E5 CHANGELOG
-  entry; the enterprise backup path will adopt it once this release
-  publishes. Wired through both the JetStream driver (via
+  the broker's last-delivered and ack-floor stream sequences. Closes the
+  gap where the broker exposed no way to enumerate bound consumers and
+  their per-consumer stream positions. Wired through both the JetStream
+  driver (via
   `stream.consumers()`) and the in-memory broker (each subscription
   registers a tracker that's pruned when the subscription drops).
 
@@ -1245,8 +1245,7 @@ context set. All data-plane primitives + offline eval — no governance.
 
 - `jammi_numerics::retrieval::AggregateMetrics::field_by_name` — the
   transitional helper flagged for removal in the v0.9.0 entry below. The
-  jammi-enterprise Gate now routes its metric selection through its typed
-  `MetricName` enum, leaving only test consumers, which iterate over a
+  only remaining callers were test consumers, which iterate over a
   `[(&'static str, f64); 4]` array built from the struct's fields directly.
 
 ## v0.9.0 — 2026-05-26
@@ -1278,9 +1277,8 @@ context set. All data-plane primitives + offline eval — no governance.
 ### Added
 
 - `AggregateMetrics::field_by_name(&str) -> Option<f64>` (`#[doc(hidden)]`)
-  in `jammi-numerics::retrieval`. Transitional helper for the
-  jammi-enterprise Gate config; removed in E2 once the Gate switches to a
-  typed metric enum.
+  in `jammi-numerics::retrieval`. Transitional helper for name-keyed metric
+  selection; removed once callers switch to a typed metric enum.
 - `jammi_ai::eval::report` module exporting the new typed report types
   (`EmbeddingEvalReport`, `PerQueryRecord`, `InferenceEvalReport`,
   `InferenceAggregate`, `PerRecordPrediction`, `CompareEvalReport`,

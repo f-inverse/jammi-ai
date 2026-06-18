@@ -155,10 +155,14 @@ caller asserts. The `jammi-session-id` header plays no part in this path.
 This seam covers the typed gRPC verbs. The Flight SQL lane (`db.sql`) is a
 separate transport mounted without the interceptor: its `TenantBoundProvider`
 resolves the tenant from the `jammi-session-id` header directly, not the
-`SessionTenant` extension, so a BYO-auth deployment does not yet bind the
-verified claim over Flight server-side. The remote client does carry the bearer
-on the Flight lane (alongside the session header), but server-side enforcement
-of this seam over Flight is tracked at
+`SessionTenant` extension, so this in-engine interceptor does not bind the
+verified claim over Flight. The remote client does carry the bearer on the
+Flight lane (alongside the session header), so a boundary in front sees the
+credential on every transport. The engine enforces auth on no transport by
+design: authenticating every transport — the Flight lane included — is your
+job, typically a governing gateway ahead of the trusted-network engine. Whether
+the *in-engine* interceptor should also extend to the Flight transport is a
+mechanism question tracked at
 [#220](https://github.com/f-inverse/jammi-ai/issues/220).
 
 ```rust,ignore

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jammi-client"
-version = "0.30.0"
+version = "0.31.0"
 description = "Pure-Python gRPC client for a remote Jammi engine — the deploy half of jammi-ai"
 readme = "README.md"
 license = { text = "Apache-2.0" }

@@ -148,6 +148,13 @@ pub struct ContextRequest {
     /// Source whose embedding table is retrieved against and whose rows the
     /// context members are pooled and hydrated from.
     pub source_id: String,
+    /// The specific embedding table to retrieve/pool/hydrate against, or `None`
+    /// to resolve the source's default (newest) embedding table. Pinning it makes
+    /// a recompute faithful: a materialised context set is itself a `kind=model`
+    /// table for the same source, so re-resolving the *default* after it exists
+    /// would shadow the original source table — the pin holds the pooling on the
+    /// table the recipe actually ran over.
+    pub embedding_table: Option<String>,
     /// The target's query vector — the point whose neighbourhood is the ANN /
     /// hybrid context. (A pure-edge context anchors on `exclude_key` instead.)
     pub query: Vec<f32>,
@@ -177,6 +184,7 @@ impl ContextRequest {
     pub fn new(source_id: impl Into<String>, query: Vec<f32>, k: usize) -> Self {
         Self {
             source_id: source_id.into(),
+            embedding_table: None,
             query,
             source: ContextSource::Ann { k },
             value_columns: Vec::new(),
@@ -244,7 +252,7 @@ impl InferenceSession {
     ) -> Result<ContextRepresentation> {
         let table = self
             .catalog()
-            .resolve_embedding_table(&request.source_id, None)
+            .resolve_embedding_table(&request.source_id, request.embedding_table.as_deref())
             .await?;
 
         // The candidate set — the only part that differs by source. Everything
@@ -273,7 +281,12 @@ impl InferenceSession {
         // keeps graph-adjacent rows on one side of the train/eval line.
         if let Some(split) = request.split.as_deref() {
             context_keys = self
-                .filter_keys_by_split(&request.source_id, &context_keys, split)
+                .filter_keys_by_split(
+                    &request.source_id,
+                    request.embedding_table.as_deref(),
+                    &context_keys,
+                    split,
+                )
                 .await?;
         }
 
@@ -290,8 +303,13 @@ impl InferenceSession {
         let value_rows = if request.value_columns.is_empty() {
             Vec::new()
         } else {
-            self.hydrate_value_columns(&request.source_id, &context_keys, &request.value_columns)
-                .await?
+            self.hydrate_value_columns(
+                &request.source_id,
+                request.embedding_table.as_deref(),
+                &context_keys,
+                &request.value_columns,
+            )
+            .await?
         };
 
         Ok(ContextRepresentation {
@@ -458,6 +476,7 @@ impl InferenceSession {
     async fn filter_keys_by_split(
         &self,
         source_id: &str,
+        embedding_table: Option<&str>,
         context_keys: &[String],
         split: &str,
     ) -> Result<Vec<String>> {
@@ -466,7 +485,7 @@ impl InferenceSession {
         }
         let table = self
             .catalog()
-            .resolve_embedding_table(source_id, None)
+            .resolve_embedding_table(source_id, embedding_table)
             .await?;
         let key_col = table.key_column.as_deref().ok_or_else(|| {
             JammiError::Other(format!(
@@ -512,6 +531,7 @@ impl InferenceSession {
     async fn hydrate_value_columns(
         &self,
         source_id: &str,
+        embedding_table: Option<&str>,
         context_keys: &[String],
         value_columns: &[String],
     ) -> Result<Vec<RecordBatch>> {
@@ -520,7 +540,7 @@ impl InferenceSession {
         }
         let table = self
             .catalog()
-            .resolve_embedding_table(source_id, None)
+            .resolve_embedding_table(source_id, embedding_table)
             .await?;
         let key_col = table.key_column.as_deref().ok_or_else(|| {
             JammiError::Other(format!(
@@ -710,6 +730,7 @@ impl InferenceSession {
         let descriptor = jammi_db::store::manifest::ProducingDescriptor::ContextSet {
             encoder_id: "jammi:context-set".to_string(),
             source_id: source_id.to_string(),
+            embedding_table: recipe.embedding_table.clone(),
             candidate_source: candidate_source_for(&recipe.source),
             value_columns: recipe.value_columns.clone(),
             aggregator: aggregator_for(recipe.aggregator),

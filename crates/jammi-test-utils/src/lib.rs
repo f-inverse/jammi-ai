@@ -180,6 +180,7 @@ pub fn synthetic_seed_contract(
     let descriptor = ProducingDescriptor::ContextSet {
         encoder_id: encoder_id.to_string(),
         source_id: source_id.to_string(),
+        embedding_table: None,
         candidate_source: ContextCandidateSource::Ann { k: 5 },
         value_columns: Vec::new(),
         aggregator: ContextAggregator::Mean,
@@ -219,6 +220,7 @@ pub async fn write_manifest_sidecar_for(
         &ProducingDescriptor::ContextSet {
             encoder_id: "synthetic-embed".into(),
             source_id: source_id.into(),
+            embedding_table: None,
             candidate_source: ContextCandidateSource::Ann { k: 5 },
             value_columns: Vec::new(),
             aggregator: ContextAggregator::Mean,

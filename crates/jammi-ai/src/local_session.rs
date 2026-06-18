@@ -44,6 +44,8 @@ use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::store::manifest::{DefinitionHash, MatchVerdict};
 use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
 use jammi_db::store::{DerivesFromEdge, Staleness};
+
+use crate::pipeline::recompute::{Cascade, RecomputeReport};
 use jammi_db::trigger::{DeliveredBatch, Offset, Predicate, TopicDefinition, TriggerError};
 use jammi_db::{ModelTask, PerQueryAudit, ServerInfo, TenantId, TopicId};
 
@@ -405,6 +407,36 @@ impl Session {
             .result_store()
             .derives_from(&record.table_name)
             .await
+    }
+
+    /// Re-invoke a result table's recorded producer over the inputs' *current*
+    /// state — the action half of incremental recompute.
+    ///
+    /// Reads the table's recorded
+    /// [`ProducingDescriptor`](jammi_db::store::manifest::ProducingDescriptor),
+    /// reconstructs the producing verb call from its typed parameters, and runs it
+    /// through the unmodified materialization funnel with
+    /// [`CachePolicy::Bypass`](jammi_db::store::CachePolicy::Bypass) (a recompute
+    /// always recomputes). A pre-contract table (no recorded descriptor) is the
+    /// typed [`JammiError::NotRecomputable`] — a loud refusal, never a re-run
+    /// guessed from columns.
+    ///
+    /// [`Cascade::ReportOnly`] (default) recomputes the named table only and
+    /// reports the transitive downstream-stale set; [`Cascade::Downstream`]
+    /// additionally sweeps every transitive dependent in dependency order, in one
+    /// bounded topological pass (no re-check or schedule — that is a consumer's
+    /// platform, not the engine).
+    ///
+    /// Tenant-scoped: the table is resolved through the tenant-filtered
+    /// `get_result_table`, so a peer cannot recompute a table it cannot resolve.
+    pub async fn recompute(&self, table: &str, cascade: Cascade) -> Result<RecomputeReport> {
+        let record = self
+            .engine
+            .catalog()
+            .get_result_table(table)
+            .await?
+            .ok_or_else(|| JammiError::Catalog(format!("Result table '{table}' not found")))?;
+        self.engine.recompute(&record, cascade).await
     }
 
     // --- fine-tune -------------------------------------------------------

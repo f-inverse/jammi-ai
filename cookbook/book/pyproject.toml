@@ -1,0 +1,73 @@
+[project]
+name = "jammi_cookbook"
+version = "0.1.0"
+description = "Shared library for the Theory↔Computation Cookbook — composes the jammi_ai engine and enforces the cookbook's artifact contracts and rails."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "F-Inverse" }]
+
+# jammi_ai is pinned exactly: the cookbook authors against one engine version and
+# never vendors or edits engine source. numpy/pyarrow are the data substrate the
+# chapters manipulate. 0.31.0 (the H4 horizon) adds the point-in-time + materialization
+# surface: asof_join (as-of / point-in-time temporal join: spine_by/spine_time/facts_by/
+# facts_time/direction/boundary/tolerance_duration_micros/tie_break_column/project),
+# verify_materialization(expected_definition), staleness(current_definition),
+# derives_from() and recompute(cascade), plus a cache= kwarg on the embedding/inference
+# verbs (generate_embeddings/infer/build_neighbor_graph/propagate_embeddings) that opts a
+# call into the engine's incremental-recompute cache. It carries forward 0.30.0's
+# model-catalog verbs (list_models/describe_model/delete_model) on the embedded + remote
+# Python clients, and (via the transport-parity collapse) forwards every non-migrated verb
+# through the thin Database wrapper's __getattr__ to the native handle — so the
+# api-reference guard introspects the wrapper COMPOSITION on an instance, the way a caller
+# invokes a verb. It carries forward the remote eval + channel verbs chapter 14 exercises
+# (eval_embeddings/eval_compare/eval_inference + register_channel/add_channel_columns/
+# list_channels on RemoteDatabase), the scale tier (search(embedding_table=) +
+# ANN-vs-exact recall the 14-scale chapter cross-checks), and the consumer-usable,
+# scale-robust regression fine-tune surface (fine_tune(task="regression", regression_loss,
+# regression_beta, quantile_levels, seed)) the fine_tune_regression chapter exercises.
+# usearch loads the frozen scale-tier ANN index. Pinned EXACTLY: the serialized graph
+# format and the recall it yields are backend-version dependent, and the usearch file
+# header carries only the major version, so a floated 2.25.x would load silently and could
+# drift recall. The chapter asserts usearch.__version__ matches the manifest before recomputing.
+dependencies = [
+    "jammi_ai==0.31.0",
+    "numpy>=1.26,<3",
+    "pyarrow>=15",
+    "requests>=2.31",
+    "usearch==2.25.1",
+]
+
+[project.optional-dependencies]
+# The book toolchain. Quarto itself is a system binary installed separately
+# (see .github/workflows/ci.yml); jupyter is the execution engine Quarto drives.
+book = [
+    "jupyter>=1.0",
+    "nbclient>=0.9",
+    "ipykernel>=6.29",
+]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["jammi_cookbook"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Put the repo root on sys.path so the one pure-Python primitive test that imports
+# an emit script (scripts.build_tenancy_h3_cache) resolves under a bare `pytest`
+# invocation too, not only `python -m pytest` (which adds cwd implicitly).
+pythonpath = ["."]

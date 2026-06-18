@@ -1,0 +1,46 @@
+{
+  "parity.all_modes_class_equal": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "taxonomy.all_modes_typed_not_internal": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "taxonomy.bad_argument_class_parity": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "taxonomy.bad_argument_wire_code_matches": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "taxonomy.client_dtype_guard_client_side": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "taxonomy.column_conflict_class_parity": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "taxonomy.column_conflict_wire_code_matches": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "taxonomy.duplicate_class_parity": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "taxonomy.duplicate_wire_code_matches": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "taxonomy.unknown_class_parity": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "taxonomy.unknown_wire_code_matches": {
+    "tol": 0.0,
+    "value": 1.0
+  }
+}

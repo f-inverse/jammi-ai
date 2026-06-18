@@ -1,0 +1,113 @@
+---
+title: "The two datasets"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook  # applies the determinism contract on import
+```
+
+The book runs on two public graphs, each used where it is strongest.
+
+- **Air Routes** — Neptune's own teaching dataset: ~3.4k airports, a `route`
+  graph (airport↔airport) and a `contains` hierarchy (continent→airport). Numeric
+  and categorical features, thin text. It carries the **tiers 01–02 on-ramp**.
+- **ogbn-arxiv** — ~169k CS papers, ~1.16M citation edges, 40 subject classes,
+  rich title+abstract text. It carries the **tiers 03–04 spine**, and is the
+  dataset the graph-conformal literature reports on, so tier-04 is directly
+  comparable to published results.
+
+Both are fetched on demand and **checksum-gated**: a silently reissued source
+fails loudly rather than drifting the book's numbers. Only the committed subset
+ID lists (`data/ids/`) ship in the repo — subset identity is committed, not
+reproduced from a seed.
+
+The book's teaching spine is **`connect(target)` parity**: a recipe is written
+once and the only thing that changes between a laptop and a GPU server is the
+target. Here we open the embedded engine on CPU with a `file://` target; the
+keystone's heavy emit opens a GPU server with `connect("grpc://…")` and runs the
+*same* verbs.
+
+```{python}
+import tempfile
+
+import jammi_ai
+from jammi_cookbook import datasets
+
+db = jammi_ai.connect(f"file://{tempfile.mkdtemp()}")
+air = datasets.load_air_routes(db)
+arxiv = datasets.load_ogbn_arxiv(db)
+```
+
+## Air Routes
+
+A registered source is queried as `<source>.public.<source>`.
+
+```{python}
+def count(src):
+    return db.sql(f"SELECT COUNT(*) AS n FROM {src}.public.{src}").to_pylist()[0]["n"]
+
+print(f"airports:       {count(air.airports_source)}")
+print(f"route edges:    {count(air.route_edges_source)}")
+print(f"contains edges: {count(air.contains_edges_source)}")
+
+# Each airport's continent is resolved from the continent→airport hierarchy.
+atl = db.sql(
+    f"SELECT code, city, country, continent "
+    f"FROM {air.airports_source}.public.{air.airports_source} WHERE code = 'ATL'"
+).to_pylist()
+print("ATL:", atl[0])
+```
+
+```{python}
+# | echo: false
+assert count(air.airports_source) == len(air.airport_codes) == 3504
+assert count(air.route_edges_source) == 50637
+assert count(air.contains_edges_source) == 7008
+assert atl[0]["continent"] == "NA"
+```
+
+## ogbn-arxiv
+
+The committed subset is a connected induced citation subgraph — a connected ball
+preserves the citation density and label homophily the tier-04 coverage crux
+depends on.
+
+```{python}
+papers = arxiv.papers_source
+print(f"papers (subset):     {count(papers)}")
+print(f"citation edges:      {count(arxiv.cite_edges_source)}")
+print("time-split sizes:    ", {k: len(v) for k, v in arxiv.split.items()})
+
+top = db.sql(
+    f"SELECT subject, COUNT(*) AS c FROM {papers}.public.{papers} "
+    f"GROUP BY subject ORDER BY c DESC LIMIT 3"
+).to_pylist()
+print("top subjects:", [(r["subject"], r["c"]) for r in top])
+```
+
+The citation graph is **homophilous** on the subject label — adjacent papers tend
+to share a subject far more than chance. That correlation, together with the
+dataset's time-split, is exactly what breaks conformal exchangeability in tier 04 —
+where marginal subject-classification conformal under-covers and the textbook
+weighted-conformal remedy turns out to be a no-op (the shift is orthogonal to the
+score).
+
+```{python}
+edges = db.sql(
+    f"SELECT e.src AS s, e.dst AS d, a.subject AS sa, b.subject AS sb "
+    f"FROM {arxiv.cite_edges_source}.public.{arxiv.cite_edges_source} e "
+    f"JOIN {papers}.public.{papers} a ON e.src = a.paper_id "
+    f"JOIN {papers}.public.{papers} b ON e.dst = b.paper_id"
+).to_pylist()
+homophily = sum(r["sa"] == r["sb"] for r in edges) / len(edges)
+print(f"citation-edge subject homophily: {homophily:.3f}  (random ≈ {1 / 40:.3f})")
+```
+
+```{python}
+# | echo: false
+assert count(papers) == len(arxiv.paper_ids) == 4000
+assert count(arxiv.cite_edges_source) == 9595
+assert all(len(v) > 0 for v in arxiv.split.values())
+assert homophily > 0.4  # strongly homophilous — the tier-04 precondition
+```

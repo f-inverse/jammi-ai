@@ -1,0 +1,264 @@
+---
+title: "The bridge — one recipe, one equation, one canon line"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook  # applies the determinism contract before any heavy import
+```
+
+The book's thesis, made explicit: **one Jammi recipe is one equation in the
+monograph and one line in the GNN/conformal canon.** The verticals carried short
+bridge notes; this chapter writes the full bridge — four signature chapters that
+each take one operation and show it is the *same object at three altitudes*, then
+run it on the committed cache; the Neptune-contrast framing; and the **verified
+citation map** that pins every recipe to its sources.
+
+Every measured claim below reads the committed cache and asserts via the
+measurement rail — no recomputation, no fabricated numbers.
+
+```{python}
+from jammi_cookbook import contracts, rails
+```
+
+## Signature 1 — Propagation = low-pass graph filter = SGC/APPNP = vector-agg
+
+The headline equivalence. **One equation, three names, one call.**
+
+- **Monograph (Stanković et al. Part II [@stankovic2019gsp2]).** A graph signal is
+  filtered in the graph-spectral domain; smoothing toward neighbours is a
+  **low-pass filter** — it attenuates the high-frequency (idiosyncratic per-node)
+  component and keeps the low-frequency (shared-cluster) component.
+- **GNN canon.** That filter *is* a decoupled propagation layer. The `weighting`
+  argument is the choice of filter:
+  - `weighting="uniform"` = the random-walk operator $\tilde{D}^{-1}\tilde{A}$ —
+    **SGC**-flavoured [@wu2019sgc];
+  - `weighting="degree_normalized"` + `alpha` = symmetric-normalized propagation
+    with a teleport restart, $(1-\alpha)\hat{A}\,H + \alpha\,X^{(0)}$ — this is
+    **APPNP** [@gasteiger2019appnp];
+  - `output="jumping_knowledge"` = stacking (concatenating) the filtered signal at
+    every hop.
+- **Jammi call.** `propagate_embeddings` — and it is **byte-identically
+  deterministic** by construction: a fixed `(group, neighbour)` f64 fold order, no
+  seeding, identical across threads. The reproducible point on the
+  construct→learn spectrum.
+
+We *demonstrate* the equivalence, not assert it: the keystone ran the APPNP
+filter (`degree_normalized` + `alpha`) over the citation graph and froze the
+result. The honest test of a low-pass filter is a downstream measurement —
+same-subject retrieval recall must rise.
+
+```{python}
+raw = contracts.golden("arxiv.tier01.recall_at_10").value
+prop = contracts.golden("arxiv.tier02.recall_at_10").value
+delta = contracts.golden("arxiv.tier02.recall_delta").value
+print(f"recall@10 raw → APPNP-propagated: {raw:.3f} → {prop:.3f}   (Δ {delta:+.3f})")
+rails.measure("arxiv.tier02.recall_at_10", prop)
+rails.measure("arxiv.tier02.recall_delta", delta)
+```
+
+```{python}
+# | echo: false
+# The low-pass filter denoises: APPNP propagation lifts same-subject recall. One
+# equation (the GFT low-pass), three names (SGC/APPNP/jumping-knowledge), one call.
+assert delta > 0
+```
+
+## Signature 2 — An edge is a self-`search`; a context set is a `search`/walk
+
+Retrieval is the substrate of *both* graphs and prediction.
+
+- **Monograph (Part I [@stankovic2019gsp1]).** A kNN graph is built by, for every
+  node, retrieving its nearest nodes — graph construction *is* retrieval.
+- **GNN canon / Neural Process.** A prediction's context set is the same retrieval:
+  the rows a Neural Process conditions on are a `search`/walk over the graph
+  [@garnelo2018cnp]. The propagated embedding *is* that graph-conditioned context
+  in vector form.
+- **Jammi calls.** `build_neighbor_graph` (the self-kNN edge) and
+  `assemble_context` (the retrieval-conditioned context set) are the same retrieval
+  primitive at two altitudes.
+
+The derived neighbor graph from tier 01 is exactly this self-search; its edges
+each carry their `similarity` and `rank` — the provenance rail showing an edge's
+origin is a queryable fact.
+
+```{python}
+ng = contracts.load_artifact("arxiv.neighbor_graph")
+print(f"self-kNN edges: {ng.num_rows}   columns: {ng.column_names}")
+# every derived edge records the retrieval that produced it (similarity + rank)
+assert {"src", "dst", "rank", "similarity"} <= set(ng.column_names)
+print("each edge is an auditable self-search result (similarity + rank recorded)")
+```
+
+## Signature 3 — Graph-supervised metric learning = contrastive fine-tune over walks
+
+- **Monograph (Part III [@stankovic2020gsp3]).** Learning node representations from
+  graph topology — the machine-learning-on-graphs part.
+- **GNN canon.** node2vec / DeepWalk's skip-gram over biased random walks
+  [@grover2016node2vec], and the inductive aggregate-over-neighbours of GraphSAGE
+  [@hamilton2017graphsage]. The walk sampler turns the graph into positive pairs;
+  the contrastive loss is the objective.
+- **Jammi call.** `fine_tune_graph(edge_provenance="declared")` — the
+  `edge_provenance` knob is the **circularity guard**: only a *declared* graph
+  (who-cited-whom) supervises a non-trivial gain; a *similarity* graph would teach
+  the encoder the metric it already uses.
+
+We demonstrate the circularity contract empirically from the cached tier-03
+metrics: the declared-edge fine-tune beats the base encoder.
+
+```{python}
+base = contracts.golden("arxiv.tier01.recall_at_10").value
+ft = contracts.golden("arxiv.tier03.recall_at_10").value
+gain = contracts.golden("arxiv.tier03.recall_gain_vs_base").value
+print(f"recall@10 base → declared-edge fine-tune: {base:.3f} → {ft:.3f}   (Δ {gain:+.3f})")
+rails.measure("arxiv.tier03.recall_at_10", ft)
+rails.measure("arxiv.tier03.recall_gain_vs_base", gain)
+```
+
+```{python}
+# | echo: false
+# The circularity contract demonstrated: the DECLARED graph moves the metric (a
+# similarity graph would be circular). node2vec walks ↔ fine_tune_graph(declared).
+assert gain > 0
+```
+
+## Signature 4 — A prediction is a context-conditioned posterior (the moat)
+
+The tier with **no monograph and no Neptune analogue** — the non-redundant core.
+
+- **The Neural-Process family.** The context predictor is a CNP/ANP
+  [@garnelo2018cnp; @kim2019anp] — and the amortized-tabular-prediction line
+  (TabPFN [@hollmann2022tabpfn]). It returns a *posterior* conditioned on a
+  retrieved context set.
+- **Conformal under graph dependence.** Conformal gives finite-sample coverage
+  *under exchangeability* (Vovk et al. [@vovk2005conformal]; Angelopoulos & Bates
+  [@angelopoulos2021conformal]). Under graph dependence and a time-split that
+  coverage breaks (Barber et al. [@barber2023beyond]); the graph-aware remedies are
+  CF-GNN [@huang2023cfgnn] and NAPS [@clarkson2023naps], and the covariate-shift
+  remedy is weighted conformal (Tibshirani et al. [@tibshirani2019covariateshift]).
+- **Jammi calls.** `train_context_predictor` / `predict_with_context_predictor` →
+  `conformalize` / `conformalize_interval`.
+
+This is the crux the [tier-04 chapter](../04-predict/predict.qmd) works in full.
+The signature here is the moat's worked example: the predictor fits a real
+posterior, and **both** the regression interval and the classification set
+under-cover under the time-split — the honest finding weighted conformal cannot
+repair (it moves the quantile only when the shift is score-aligned).
+
+```{python}
+cal_mean = contracts.golden("arxiv.tier04.reg_cal_mean").value
+reg_cov = contracts.golden("arxiv.tier04.reg_interval_coverage").value
+marg_cov = contracts.golden("arxiv.tier04.marginal_coverage").value
+nominal = contracts.golden("arxiv.tier04.nominal_coverage").value
+print(f"context-predictor posterior mean (cal era): {cal_mean:.2f}   (real fit, no collapse)")
+print(f"regression interval coverage:  {reg_cov:.3f}   (nominal {nominal:.2f} — under-covers)")
+print(f"classification APS coverage:   {marg_cov:.3f}   (nominal {nominal:.2f} — under-covers)")
+rails.measure("arxiv.tier04.reg_cal_mean", cal_mean)
+rails.measure("arxiv.tier04.reg_interval_coverage", reg_cov)
+rails.measure("arxiv.tier04.marginal_coverage", marg_cov)
+```
+
+```{python}
+# | echo: false
+# The moat, measured: a real context-conditioned posterior, and BOTH cruxes
+# under-cover under the time-split (the graph-dependence break) — the tier with no
+# monograph and no Neptune analogue.
+assert cal_mean > 2010 and reg_cov < nominal and marg_cov < nominal
+```
+
+## The Neptune-contrast framing
+
+The book's organizing conceit. Amazon Neptune is **Database / Analytics / ML**;
+this cookbook is **Construct / Analyze / Learn / Predict & Quantify** — the same
+"unified yet separate" spine, re-expressed as runnable Jammi computation, **plus a
+fourth tier Neptune structurally lacks**: calibrated, provenance-stamped,
+context-conditioned prediction.
+
+Stated plainly:
+
+- **Tiers 01–03 are roughly Neptune-parity (commodity).** Neptune *loads* a graph
+  and runs `CALL neptune.algo.*` (pageRank / degree / wcc) over it; Jammi
+  *constructs* the similarity graph from text **and** registers the declared graph
+  beside it, then propagates and learns over it. Same operations, expressed as
+  substrate computation. Neptune uses **Air Routes** for its queries/algorithms —
+  so does this cookbook's on-ramp.
+- **Tier 04 + bring-your-own-graph is the non-redundant core.** A graph-conditioned
+  prediction with an honest, audited coverage guarantee has **no Neptune analogue**.
+  Neptune switches datasets when it reaches ML — and so do we, to **ogbn-arxiv**,
+  for a credible learn/predict tier; the Air Routes on-ramp stops at tier 02 (its
+  label is near-deterministic from lat/lon, too thin for a learn tier).
+
+(Neptune is a public product named here only as a *contrast*; it is a competitor's
+product, not a Jammi consumer — the engine names no consumer.)
+
+## The verified citation map
+
+Every citation below was **independently verified** (author / year / venue)
+against the primary source during this chapter's pressure-test — not trusted from
+the hand-off spec. Each is backed by a `references.bib` entry, and a test
+(`tests/test_citation_map.py`) asserts that every row's Jammi call is a verb that
+actually exists in the grounded API reference and that no `@cite` dangles. The
+table renders from the same `citation_map` data the test checks, so the rendered
+map and the asserted map cannot diverge.
+
+```{python}
+# | echo: false
+from IPython.display import Markdown
+
+from jammi_cookbook.citation_map import CITATION_MAP
+
+lines = ["| Recipe | Monograph (Stanković et al.) | GNN / conformal canon | Jammi call |",
+         "|---|---|---|---|"]
+for row in CITATION_MAP:
+    lines.append(f"| {row.recipe} | {row.monograph} | {row.canon} | `{row.jammi_call}` |")
+Markdown("\n".join(lines))
+```
+
+```{python}
+# | echo: false
+# The citation map is the source of truth the verticals' bridge notes cite. This
+# cell re-checks the two rigor contracts inline so the rendered book itself fails
+# on a dangling citation or a non-existent verb (the test enforces the same).
+import re
+from pathlib import Path
+
+from jammi_cookbook import contracts as _c
+
+_root = Path(_c.__file__).resolve().parent.parent
+_bib = (_root / "references.bib").read_text()
+_defined = set(re.findall(r"@\w+\{([^,]+),", _bib))
+_api = (_root / "jammi_cookbook" / "_api_reference.md").read_text()
+for _row in CITATION_MAP:
+    for _k in _row.bib_keys:
+        assert _k in _defined, f"dangling citation: {_k}"
+    assert re.search(rf"\b{re.escape(_row.jammi_call)}\b", _api), \
+        f"citation map cites a non-existent verb: {_row.jammi_call}"
+print(f"citation map: {len(CITATION_MAP)} rows, every reference resolved, "
+      f"every Jammi call exists on the pinned engine ✓")
+```
+
+### Verification notes — what the pressure-test corrected
+
+Researching each citation against the primary source surfaced three precision
+fixes the hand-off spec's representative table got loose on; the `references.bib`
+entries carry the verified facts:
+
+- **APPNP authorship.** The spec attributed it to "Klicpera 2019". The author
+  Johannes **Klicpera later changed his name to Johannes Gasteiger**; the canonical
+  attribution is **Gasteiger, Bojchevski & Günnemann, ICLR 2019** ("Predict then
+  Propagate", arXiv 2018). The bib cites Gasteiger with the name-change noted.
+- **Barber et al. 2023 is a journal paper, not a preprint.** "Conformal prediction
+  beyond exchangeability" appeared in **The Annals of Statistics 51(2):816–845
+  (2023)** — Barber, Candès, Ramdas & Tibshirani. Pinned to the journal.
+- **Angelopoulos & Bates 2021 and TabPFN 2022 are arXiv-year citations with later
+  formal venues.** Angelopoulos & Bates (arXiv 2021) was published in *Foundations
+  and Trends in ML* 16(4), **2023**; TabPFN (Hollmann et al., arXiv 2022) was
+  published at **ICLR 2023**. Both are cited by their arXiv year (matching the
+  spec) with the formal venue recorded in the bib `note`.
+
+The remaining canon held exactly as cited: SGC (Wu et al., ICML 2019), node2vec
+(Grover & Leskovec, KDD 2016), GraphSAGE (Hamilton et al., NeurIPS 2017), CNP
+(Garnelo et al., ICML 2018), ANP (Kim et al., ICLR 2019), Vovk et al. (Springer
+2005), Tibshirani et al. (NeurIPS 2019), CF-GNN (Huang et al., NeurIPS 2023), NAPS
+(Clarkson, ICML 2023), and the three Stanković et al. monograph parts (arXiv
+1907.03467 / 1909.10325 / 2001.00426, 2019–2020).

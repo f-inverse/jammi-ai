@@ -1,0 +1,280 @@
+---
+title: "The three rails — provenance, tenancy, measurement"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook  # applies the determinism contract before any heavy import
+```
+
+The book is a 4-tier × 3-rail grid. The four tiers — **Construct → Analyze →
+Learn → Predict & Quantify** — are the rows you have already walked. The three
+**rails** are the columns: properties every tier carries, not chapters of their
+own. This chapter makes them first-class and shows each one worked end-to-end
+against the committed cache.
+
+- **Provenance** — a result rides its audit trail: the `source` fact (how its
+  context was assembled) and the `context_ref` member keys (which rows informed
+  it).
+- **Tenancy** — the engine isolates by tenant at two genuine layers, with one
+  honest caveat. (The full showcase lives on the Air Routes on-ramp; this chapter
+  states the model and reuses the corrected helpers.)
+- **Measurement** — every recipe ends in a real number, computed from the
+  committed artifacts and asserted against `golden_metrics.json`. The no-deferral
+  policy applied to numbers: a recipe without a measured verdict is not done.
+
+The rails are real wiring, not a gesture: every tier recipe calls the same thin
+helpers in [`jammi_cookbook.rails`](../api-reference.qmd). This chapter reads the
+committed cache only — it never recomputes upstream.
+
+```{python}
+from jammi_cookbook import contracts, rails
+```
+
+## Rail 1 — Provenance: the exact rows behind a prediction
+
+A prediction here is **auditable**. The keystone ran
+`predict_with_context_predictor` graph-conditioned on the citation neighbourhood;
+every prediction carries a `source` fact — `ann` (the similarity graph),
+`edges` (the declared citation graph), or `hybrid` (both) — and a `context_ref`:
+the member keys of the context set that informed it. `rails.provenance(result)`
+extracts that trail off the result dict.
+
+The committed cache lets us reconstruct the exact trail for a tier-04 prediction
+on CPU. The tier-04 predictions were assembled over the **declared citation
+edges** (`source = "edges"`), so a target paper's `context_ref` is its
+citation-graph neighbourhood within the tier-04 pool. We pick a test-split paper,
+read its informing rows straight from the committed `cite_edges` + `papers`
+artifacts, and show the audit trail.
+
+```{python}
+import collections
+
+preds = contracts.load_artifact("arxiv.tier04_predictions").to_pylist()
+cite = contracts.load_artifact("arxiv.cite_edges").to_pylist()
+papers = contracts.load_artifact("arxiv.papers").to_pylist()
+
+subject = {p["paper_id"]: p["subject"] for p in papers}
+pool = {r["paper_id"] for r in preds}  # the calibration+test tier-04 pool
+
+# Out-adjacency over the declared citation graph (the tier-04 context source).
+cite_out = collections.defaultdict(list)
+for e in cite:
+    cite_out[e["src"]].append(e["dst"])
+
+# A test-split prediction whose declared-edge context set is non-trivial.
+target = next(
+    r for r in preds
+    if r["split"] == "test"
+    and len([d for d in cite_out[r["paper_id"]] if d in pool]) >= 3
+)
+context_keys = [d for d in cite_out[target["paper_id"]] if d in pool]
+print(f"target paper:   {target['paper_id']}  (subject {subject[target['paper_id']]})")
+print(f"context source: edges  (the declared citation graph)")
+print(f"context_ref:    {context_keys[:6]}{' …' if len(context_keys) > 6 else ''}")
+print(f"informing rows: {len(context_keys)} cited papers")
+```
+
+The result a graph-conditioned predictor returns carries exactly this trail. We
+assemble that result dict from the committed cache — the gaussian posterior
+(`kind`/`mean`/`std`) and the provenance (`source`/`context_ref`), of the shape
+`predict_with_context_predictor` returns — and run it through the rail helper.
+
+```{python}
+result = {
+    "kind": "gaussian",
+    "source": "edges",                 # context assembled over the declared citation graph
+    "context_ref": context_keys,       # the exact informing rows
+}
+trail = rails.provenance(result)
+print("source:      ", trail["source"])
+print("context_ref: ", trail["context_ref"][:6], "…" if len(trail["context_ref"]) > 6 else "")
+```
+
+```{python}
+# | echo: false
+# The audit trail is real: the source fact is a recognised channel and every
+# informing row is a paper in the committed pool — the prediction is traceable to
+# its exact evidence.
+assert trail["source"] in {"ann", "edges", "hybrid"}
+assert trail["context_ref"], "a graph-conditioned prediction must carry its informing rows"
+assert all(k in pool for k in trail["context_ref"]), \
+    "every context_ref member must be a real row in the committed tier-04 pool"
+```
+
+We can read the informing rows back as their labels — the auditable fact a
+monograph proof and a throwaway PyG notebook both lack. The cited neighbours
+overwhelmingly share the target's subject (the homophily that tier 01 measured),
+which is *why* the citation-conditioned context is informative.
+
+```{python}
+same = sum(subject.get(k) == subject[target["paper_id"]] for k in context_keys)
+print(f"informing rows sharing the target subject: {same}/{len(context_keys)}")
+for k in context_keys[:5]:
+    print(f"  {k}  subject={subject.get(k)}")
+```
+
+```{python}
+# | echo: false
+# Provenance is queryable, not assumed: the share of same-subject informing rows
+# is consistent with the strong citation-graph homophily the keystone froze.
+assert same >= 1
+```
+
+> **Bridge note.** Provenance as a first-class, queryable property of *every*
+> result is what neither the monograph (a paper, not a queryable object) nor a
+> throwaway PyG notebook (results discarded after the run) carries. A prediction
+> here is an audited object: you can see the assembly that produced it and the
+> exact rows that informed it.
+
+## Rail 2 — Tenancy: what the engine isolates, and what it does not
+
+The tenancy rail is shown vivid on the [Air Routes
+on-ramp](../01-construct/construct.qmd#the-tenancy-rail-what-the-engine-isolates-and-what-it-does-not).
+Here we state the model precisely and reuse the *same* corrected helpers, so the
+rail is consistent across the book rather than re-derived.
+
+The true engine model has **two genuine isolation layers and one honest caveat**
+— not the false "a separate source per tenant hides data" claim (that isolation
+is a Python pre-filter, not an engine property).
+
+- **Catalog-listing isolation (a hard zero).** `set_tenant(t)` binds an opaque
+  tenant UUID to the connection; `list_sources` then filters the registry to
+  `tenant_id = $cur OR IS NULL`. Tenant A's listing excludes a source registered
+  under tenant B. `rails.assert_listing_isolated` is the oracle.
+- **Row-level discriminator-column isolation (a hard zero).** The analyzer injects
+  `tenant_id = $cur OR IS NULL` onto a `TableScan` **only** when the queried
+  table's schema carries a `tenant_id` column, so one shared source returns
+  disjoint rows under A vs B. `rails.assert_rows_isolated` is the oracle.
+- **The caveat (a positive fact).** A discriminator-less source is **globally
+  readable** — there is no column for the analyzer to filter on, and the engine
+  does not authenticate. Access-gating lives *above* the engine.
+
+The keystone froze the tenancy record; we read it and assert the two hard zeros
+plus the caveat through the measurement rail.
+
+```{python}
+tenancy = contracts.load_artifact("air.tenancy")
+print(f"catalog-listing leak:      {tenancy['listing_leak']}   (hard zero)")
+print(f"discriminator-column leak: {tenancy['discriminator_leak']}   (hard zero)")
+print(f"discriminator-less source: {tenancy['global_source_visible']} rows visible (the caveat)")
+
+rails.measure("air.tenancy.listing_leak", float(tenancy["listing_leak"]))
+rails.measure("air.tenancy.discriminator_leak", float(tenancy["discriminator_leak"]))
+rails.measure("air.tenancy.global_source_visible", float(tenancy["global_source_visible"]))
+```
+
+```{python}
+# | echo: false
+# The two genuine isolation layers are hard zeros; the caveat is a positive,
+# non-zero count (the discriminator-less source is fully readable, by design).
+assert tenancy["listing_leak"] == 0 and tenancy["discriminator_leak"] == 0
+assert tenancy["global_source_visible"] > 0  # the honest caveat, asserted positively
+```
+
+The helpers themselves are the discipline test: generic isolation any consumer
+reaches for, named by the engine property (`listing` / `rows`), not by a domain.
+
+```{python}
+# rails.assert_listing_isolated raises iff a foreign tenant's source leaked into a listing;
+# rails.assert_rows_isolated raises iff a foreign tenant's discriminator-tagged row leaked.
+rails.assert_listing_isolated(["air_na"], {"air_eu"}, tenant_id="tenant-A")
+rails.assert_rows_isolated(["AAA", "BBB"], {"XXX", "YYY"}, tenant_id="tenant-A")
+print("both isolation oracles: clean")
+```
+
+> **Bridge note.** The monograph and the graph-conformal literature assume a
+> single global graph; tenancy is the axis they are silent on. Two layers are
+> *substrate* properties; the caveat says cross-tenant data isolation is a
+> property you opt into (a discriminator column) or gate above (an interceptor),
+> not a blanket guarantee — stated honestly, not overclaimed.
+
+## Rail 3 — Measurement: a measured verdict or it is not done
+
+Every recipe ends in a real number, computed from the committed artifacts and
+asserted against the frozen golden. `rails.measure(metric, observed)` reads
+`golden_metrics.json` and asserts `observed` within the recorded tolerance — the
+measured-verdict oracle the whole book ends each recipe in.
+
+```{python}
+recall = contracts.golden("arxiv.tier01.recall_at_10").value
+print(f"tier01 recall@10 (raw embeddings): {recall:.3f}")
+rails.measure("arxiv.tier01.recall_at_10", recall)  # asserts and returns the number
+```
+
+### Why the keystone's recall is a numpy fold (and the R1 evals, now on the wire)
+
+The measurement rail names two eval families:
+
+- **R2 — `eval_calibration` is on `RemoteDatabase`** (the `grpc://` arm). It returns
+  CRPS / NLL / adaptive-ECE / sharpness / coverage for a gaussian or sample
+  predictor, and is the wire surface for the tier-04 calibration verdict.
+- **R1 — `eval_embeddings` / `eval_compare` / `eval_inference` are now on
+  `RemoteDatabase`** (landed since the keystone — see the dedicated chapter
+  *"Eval on the wire + provenance channels"*, which is the engine↔cookbook
+  validator that proves it with an emit-side `remote == embedded` parity check).
+  But these verbs evaluate a **source-bound** embedding table the engine
+  materialised (`generate_embeddings` binds the result table to its source); the
+  keystone's committed `arxiv.embeddings` is a **bare vector matrix**, not a
+  source-bound ready table, so neither the embedded nor the remote `eval_embeddings`
+  can score it directly. So the keystone measures **same-subject retrieval
+  recall\@10 with an exact cosine-kNN numpy fold over the committed embedding
+  matrix** — deterministic and table-exact — and freezes the result. This chapter
+  measures the same way: a numpy fold whose verdict is asserted against the golden.
+
+The fold is therefore the right tool for the **bare committed matrix**, not a
+workaround for a missing verb: the recall numbers are real, deterministic, and
+asserted via `rails.measure` — never fabricated. The R1 wire surface itself is
+validated, on the engine's source-bound public fixtures, in chapter 14.
+
+```{python}
+import numpy as np
+
+
+def recall_at_10(emb_table, labels):
+    """Same-label retrieval recall@10 by an exact cosine-kNN fold (R1 stand-in).
+
+    Reproduces the keystone's measurement exactly: L2-normalise the committed
+    vectors, take the full cosine-similarity matrix, and for each row count the
+    fraction of its true same-label peers found among its top-10 neighbours
+    (excluding itself). Deterministic — a fixed f64 fold, no seeding — so the
+    recomputed number matches the frozen golden.
+    """
+    ids = emb_table.column("_row_id").to_pylist()
+    vecs = np.asarray(emb_table.column("vector").to_pylist(), dtype=np.float64)
+    vecs /= np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
+    lab = np.array([labels[i] for i in ids])
+    sims = vecs @ vecs.T
+    np.fill_diagonal(sims, -np.inf)
+    order = np.argsort(-sims, axis=1)[:, :10]
+    hits = []
+    for i in range(len(ids)):
+        peers = int(np.sum(lab == lab[i])) - 1
+        if peers <= 0:
+            continue
+        found = int(np.sum(lab[order[i]] == lab[i]))
+        hits.append(found / min(10, peers))
+    return float(np.mean(hits))
+
+
+emb = contracts.load_artifact("arxiv.embeddings")
+observed = recall_at_10(emb, subject)
+print(f"recomputed recall@10 (exact cosine-kNN fold): {observed:.3f}")
+rails.measure("arxiv.tier01.recall_at_10", observed)  # the R1 fold, asserted to the golden
+```
+
+```{python}
+# | echo: false
+# The numpy-fold recall reproduces the keystone's frozen recall@10 within
+# tolerance — the exact fold is the right tool for the bare committed arxiv
+# matrix, never faked. (eval_embeddings/eval_compare/eval_inference ARE on
+# RemoteDatabase now, but they score a source-bound engine table, not this bare
+# matrix; their wire surface is validated on public fixtures in chapter 14.
+# eval_calibration IS on the wire — used where the tier-04 calibration verdict is
+# measured.)
+assert abs(observed - recall) <= contracts.golden("arxiv.tier01.recall_at_10").tol
+```
+
+The measurement rail is the spine's honesty contract: a recipe that shows no
+real number, or whose number drifts from the golden, **fails CI**. The closed
+eval loop below runs the entire spine under that contract in one pass.

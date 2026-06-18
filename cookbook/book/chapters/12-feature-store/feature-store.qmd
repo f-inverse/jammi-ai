@@ -1,0 +1,223 @@
+---
+title: "A mutable companion table — a feature store you federate into queries"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `create_mutable_table` · `list_mutable_tables` · `sql`
+(`INSERT` / `SELECT` / the `mutable.public.<name>` address) · the federating `JOIN`
+· **Theory:** the append-only result log vs mutable companion state
+[@kleppmann2017ddia], the feature store as the substrate that federates features
+into queries [@orr2021featurestore] · **Rail:** measurement (the subject-level
+`SUM(in_degree)` JOIN aggregate, asserted against the frozen golden).
+
+The engine's result tables are **append-only** — a query writes a new immutable
+Parquet result; nothing is edited in place. That is the right default for a result
+log [@kleppmann2017ddia]. But a practitioner often needs the other half: a small
+piece of *mutable companion state* registered alongside those results — a feature
+column keyed by an entity id — that they populate and then **federate into queries**
+by name. That companion state is what a feature store is [@orr2021featurestore], and
+the engine's primitive for it is the **mutable companion table**: you provision it
+with a schema and a primary key, populate it, and JOIN it into a query over a
+registered source.
+
+This chapter builds one honestly, on CPU, over the committed ogbn-arxiv cache. The
+feature is real and graph-derived — each paper's **citation in-degree** over the
+committed declared citation graph (how many committed citation edges point *to* it) —
+committed as a feature parquet by the build script. The chapter loads those rows,
+provisions a live mutable table, `INSERT`s them, round-trips a `SELECT`, and ends in
+a **measured** subject-level `SUM(in_degree)` JOIN aggregate asserted against the
+golden.
+
+```{python}
+from jammi_cookbook import contracts
+
+record = contracts.load_artifact("feature_store.record")
+print(f"feature:          {record['feature']} (over {record['feature_source']})")
+print(f"feature rows:     {record['rows']}  ({record['cited_papers']} cited)")
+print(f"populated rows:   {record['populated_rows']}")
+print(f"total in-degree:  {record['join_total_in_degree']} (the JOIN aggregate's grand total)")
+print(f"top subject:      {record['top_subject']} = {record['top_subject_total']}")
+```
+
+## The honest limit, stated first
+
+On the embedded `Database` surface the mutable companion table is **append-only**.
+`INSERT` and `SELECT` round-trip cleanly, and that is what makes it a usable feature
+store here: you register the table, append a feature column keyed by entity id, and
+federate it into queries. But the *mutating* operations a full feature store
+eventually wants — editing a feature value in place, deleting a row, or
+`INSERT`-ing a duplicate key as an upsert — are **not wired through** on this
+surface: `UPDATE` and `DELETE` raise, and a duplicate-key `INSERT` hits the
+primary-key `UNIQUE` constraint. In-place upsert is a forthcoming engine capability
+not yet exposed here.
+
+So this chapter teaches the honest shape — **register → populate (append) →
+federate into a JOIN** — and measures the append-only property directly rather than
+narrating it. It does *not* demonstrate "edit a feature in place and watch the join
+change," because that path does not exist on this surface yet.
+
+```{python}
+probe = record["append_only"]
+print(f"UPDATE rejected:           {probe['update_rejected']}")
+print(f"DELETE rejected:           {probe['delete_rejected']}")
+print(f"duplicate-key INSERT rejected: {probe['duplicate_insert_rejected']}")
+```
+
+## Provision the mutable companion table
+
+A fresh ephemeral catalog per render keeps this hermetic — sources persist in the
+catalog, so a fixed path would collide on re-execution. We register the committed
+`papers` parquet as a source, then provision the mutable table with a `pyarrow`
+schema and a primary key. A mutable table is addressed in SQL as
+`mutable.public.<name>`; a registered parquet source as `<name>.public.<name>`.
+
+```{python}
+import tempfile
+
+import jammi_ai
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+work = tempfile.mkdtemp(prefix="jammi_feature_store_")
+db = jammi_ai.connect(f"file://{tempfile.mkdtemp(prefix='jammi_fs_catalog_')}")
+
+# Register the committed papers parquet as a federatable source.
+papers_path = f"{work}/papers.parquet"
+pq.write_table(contracts.load_artifact("arxiv.papers"), papers_path)
+db.add_source("papers", url=papers_path, format="parquet")
+
+# Provision the mutable companion table: a schema + a primary key.
+feature_schema = pa.schema([("paper_id", pa.string()), ("in_degree", pa.int64())])
+created = db.create_mutable_table("paper_features", schema=feature_schema,
+                                  primary_key=["paper_id"])
+print(f"created mutable table: {created!r}")
+```
+
+`list_mutable_tables()` is the control-plane catalog read — it reflects the
+registration, the schema, and the declared primary key.
+
+```{python}
+for t in db.list_mutable_tables():
+    print(f"  id={t['id']}  primary_key={t['primary_key']}  chunk_size={t['chunk_size']}")
+```
+
+## Populate (append) the feature, then round-trip a SELECT
+
+We load the committed feature rows — the per-paper citation in-degree the build
+script derived from the committed cache — and `INSERT` them into the table. Then we
+`SELECT` the top few back to show the round-trip is real.
+
+```{python}
+feature = contracts.load_artifact("feature_store.paper_features").to_pylist()
+in_degree = {r["paper_id"]: r["in_degree"] for r in feature}
+rows = sorted(in_degree)
+
+values = ",".join(f"('{pid}', {in_degree[pid]})" for pid in rows)
+db.sql(f"INSERT INTO mutable.public.paper_features (paper_id, in_degree) VALUES {values}")
+
+populated = db.sql(
+    "SELECT COUNT(*) AS n FROM mutable.public.paper_features").to_pylist()[0]["n"]
+top3 = db.sql(
+    "SELECT paper_id, in_degree FROM mutable.public.paper_features "
+    "ORDER BY in_degree DESC, paper_id LIMIT 3").to_pylist()
+print(f"populated {populated} feature rows")
+for r in top3:
+    print(f"  {r['paper_id']}  in_degree={r['in_degree']}")
+```
+
+```{python}
+from jammi_cookbook import rails
+
+# The populated row count, measured against the frozen golden.
+rails.measure("feature_store.populated_rows", float(populated))
+```
+
+## The append-only property, measured
+
+The honest limit, asserted directly: each mutating op that is not a fresh-key append
+must be rejected. We try an `UPDATE`, a `DELETE`, and a duplicate-key `INSERT` live,
+and confirm the engine rejects each — the append-only property holds on this surface.
+
+```{python}
+def rejected(stmt):
+    try:
+        db.sql(stmt)
+    except RuntimeError:
+        return True
+    return False
+
+
+sample = rows[0]
+update_rejected = rejected(
+    f"UPDATE mutable.public.paper_features SET in_degree = 999 WHERE paper_id = '{sample}'")
+delete_rejected = rejected(
+    f"DELETE FROM mutable.public.paper_features WHERE paper_id = '{sample}'")
+dup_rejected = rejected(
+    f"INSERT INTO mutable.public.paper_features (paper_id, in_degree) VALUES ('{sample}', 0)")
+print(f"UPDATE rejected: {update_rejected}  DELETE rejected: {delete_rejected}  "
+      f"duplicate INSERT rejected: {dup_rejected}")
+assert update_rejected and delete_rejected and dup_rejected, (
+    "the surface is append-only — every non-append mutation must be rejected")
+```
+
+The feature mass is therefore unchanged by the probe: the table holds exactly the
+rows we appended, and the JOIN below reads them intact.
+
+## Federate the companion table into a query — the measured aggregate
+
+The payoff: the companion table JOINs into a query over the registered `papers`
+source. We group by subject and `SUM` the feature, ending in a measured aggregate —
+the total citation in-degree per subject, asserted against the golden.
+
+```{python}
+agg = db.sql(
+    "SELECT p.subject AS subject, SUM(f.in_degree) AS total "
+    "FROM papers.public.papers p "
+    "JOIN mutable.public.paper_features f ON p.paper_id = f.paper_id "
+    "GROUP BY p.subject ORDER BY total DESC, subject"
+).to_pylist()
+
+join_total = int(sum(r["total"] for r in agg))
+top = agg[0]
+print(f"{'subject':<16}{'SUM(in_degree)':>16}")
+for r in agg[:6]:
+    print(f"{r['subject']:<16}{int(r['total']):>16}")
+print(f"\n{len(agg)} subjects · grand total in-degree {join_total} · "
+      f"top {top['subject']!r} = {int(top['total'])}")
+```
+
+```{python}
+# | echo: false
+# The JOIN aggregate, recomputed LIVE through the mutable companion table, asserted
+# against the frozen goldens — the grand total and the top subject's total.
+rails.measure("feature_store.total_in_degree", float(join_total))
+rails.measure("feature_store.top_subject_total", float(int(top["total"])))
+# The feature mass is conserved: every populated row joins exactly once, so the
+# subject-level totals sum back to the grand total the build script committed.
+assert join_total == record["join_total_in_degree"], (
+    "the live JOIN aggregate must reproduce the committed feature mass")
+assert top["subject"] == record["top_subject"]
+```
+
+The grand total printed above is the full committed citation-edge count — every edge's
+destination is a paper in the subset, so the JOIN conserves the feature mass exactly,
+and the subject totals sum back to it. The aggregate is recomputed **live** through
+the mutable companion table on every render, asserted against the frozen golden: a
+real number, not a transcribed one.
+
+## Bridge note
+
+> **A result log and a feature store are two sides of one storage primitive.** The
+> engine writes query results as an **append-only** log of immutable Parquet — the
+> right default for derived results [@kleppmann2017ddia]. A **mutable companion
+> table** is the complement: a small piece of registered state, keyed by an entity
+> id, that you populate and **federate** into queries by name — exactly the role a
+> feature store plays [@orr2021featurestore]. On this surface the companion table is
+> append-only (populate then JOIN); in-place upsert is a forthcoming engine
+> capability. The measured lesson is that the *federation* — a feature column you
+> register and JOIN — already works end to end, and its aggregate is reproducible to
+> the committed golden.

@@ -1,0 +1,40 @@
+{
+  "base_delete_referenced": {
+    "error_class": "referenced",
+    "raised": true
+  },
+  "delete_absent_if_exists": {
+    "error_class": null,
+    "raised": false
+  },
+  "delete_absent_strict": {
+    "error_class": "not_found",
+    "raised": true
+  },
+  "delete_referenced": {
+    "error_class": "referenced",
+    "raised": true
+  },
+  "every_catalog_model_is_referenced": true,
+  "ft_delete_referenced": {
+    "error_class": "referenced",
+    "raised": true
+  },
+  "list_after_register": [
+    {
+      "backend": "candle",
+      "status": "registered",
+      "task": "text_embedding"
+    },
+    {
+      "backend": "candle",
+      "status": "registered",
+      "task": "text_embedding"
+    }
+  ],
+  "registered": {
+    "backend": "candle",
+    "status": "registered",
+    "task": "text_embedding"
+  }
+}

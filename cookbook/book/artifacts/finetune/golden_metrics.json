@@ -1,0 +1,70 @@
+{
+  "base_recall_at_10": {
+    "tol": 0.03,
+    "value": 0.538
+  },
+  "cosent.recall_at_10": {
+    "tol": 0.03,
+    "value": 0.54
+  },
+  "cosent.recall_gain_vs_base": {
+    "tol": 0.03,
+    "value": 0.002
+  },
+  "graph_declared.recall_at_10": {
+    "tol": 0.03,
+    "value": 0.5485
+  },
+  "graph_declared.recall_gain_vs_base": {
+    "tol": 0.03,
+    "value": 0.0105
+  },
+  "matryoshka.dim_256_recall": {
+    "tol": 0.03,
+    "value": 0.5225
+  },
+  "matryoshka.dim_64_recall": {
+    "tol": 0.03,
+    "value": 0.4645
+  },
+  "matryoshka.dim_768_recall": {
+    "tol": 0.03,
+    "value": 0.54
+  },
+  "matryoshka.recall_at_10": {
+    "tol": 0.03,
+    "value": 0.54
+  },
+  "matryoshka.recall_gain_vs_base": {
+    "tol": 0.03,
+    "value": 0.002
+  },
+  "method_recall_spread": {
+    "tol": 0.03,
+    "value": 0.009
+  },
+  "mnrl_t0.05.recall_at_10": {
+    "tol": 0.03,
+    "value": 0.5405
+  },
+  "mnrl_t0.05.recall_gain_vs_base": {
+    "tol": 0.03,
+    "value": 0.0025
+  },
+  "mnrl_t0.20.recall_at_10": {
+    "tol": 0.03,
+    "value": 0.542
+  },
+  "mnrl_t0.20.recall_gain_vs_base": {
+    "tol": 0.03,
+    "value": 0.004
+  },
+  "triplet.recall_at_10": {
+    "tol": 0.03,
+    "value": 0.5395
+  },
+  "triplet.recall_gain_vs_base": {
+    "tol": 0.03,
+    "value": 0.0015
+  }
+}

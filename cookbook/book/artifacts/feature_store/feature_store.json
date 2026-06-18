@@ -1,0 +1,53 @@
+{
+  "feature": "citation_in_degree",
+  "feature_source": "arxiv.cite_edges (declared citation graph)",
+  "rows": 4000,
+  "cited_papers": 1173,
+  "total_citations": 9595,
+  "mutable_table": "paper_features",
+  "primary_key": [
+    "paper_id"
+  ],
+  "populated_rows": 4000,
+  "join_total_in_degree": 9595,
+  "top_subject": "arxiv cs lg",
+  "top_subject_total": 5716,
+  "subject_totals": {
+    "arxiv cs lg": 5716,
+    "arxiv cs cv": 2143,
+    "arxiv cs cl": 1186,
+    "arxiv cs ne": 262,
+    "arxiv cs ai": 82,
+    "arxiv cs sd": 48,
+    "arxiv cs ro": 47,
+    "arxiv cs ir": 39,
+    "arxiv cs it": 25,
+    "arxiv cs gr": 13,
+    "arxiv cs cr": 10,
+    "arxiv cs db": 8,
+    "arxiv cs dc": 3,
+    "arxiv cs ma": 3,
+    "arxiv cs si": 3,
+    "arxiv cs hc": 2,
+    "arxiv cs mm": 2,
+    "arxiv cs sy": 2,
+    "arxiv cs gt": 1,
+    "arxiv cs ce": 0,
+    "arxiv cs cy": 0,
+    "arxiv cs et": 0,
+    "arxiv cs fl": 0,
+    "arxiv cs lo": 0,
+    "arxiv cs ms": 0,
+    "arxiv cs na": 0,
+    "arxiv cs ni": 0,
+    "arxiv cs oh": 0,
+    "arxiv cs pl": 0,
+    "arxiv cs se": 0
+  },
+  "append_only": {
+    "update_rejected": true,
+    "delete_rejected": true,
+    "duplicate_insert_rejected": true
+  },
+  "note": "A mutable companion table provisioned alongside the append-only result tables, populated with a per-paper citation-in-degree feature derived from the committed declared citation graph, and federated into a JOIN over the papers source. The feature is graph-derived and deterministic. The table is APPEND-ONLY on this surface: INSERT and SELECT round-trip, but UPDATE / DELETE / duplicate-key INSERT are not wired through (they raise or hit the primary-key UNIQUE constraint). In-place upsert is a forthcoming engine capability not yet exposed on this surface \u2014 the teaching is register -> populate (append) -> federate, never edit-in-place. The measured verdict is the subject-level SUM(in_degree) JOIN aggregate (top subject + grand total), which the chapter reproduces live against this golden."
+}

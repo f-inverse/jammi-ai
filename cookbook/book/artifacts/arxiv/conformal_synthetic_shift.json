@@ -1,0 +1,15 @@
+{
+  "construction": "transparently-synthetic, score-aligned covariate shift (teaching device)",
+  "seed": 0,
+  "gamma": 1.2,
+  "calibration_size": 500,
+  "nominal_coverage": 0.9,
+  "shift_feature": "1-D least-squares projection of the propagated embedding onto the APS nonconformity (a real covariate that correlates with the score)",
+  "corr_nonconformity_shift_feature": 0.73,
+  "marginal_coverage": 0.8333,
+  "weighted_coverage": 0.9389,
+  "weighting_delta": 0.1056,
+  "cal_mean_nonconformity": 0.1053,
+  "test_mean_nonconformity": 0.1356,
+  "note": "A TRANSPARENTLY-SYNTHETIC teaching device, NOT a property of the real ogbn-arxiv time-split. The calibration subsample is deliberately biased along a real embedding covariate that correlates with the APS nonconformity (corr +0.73), MOVING the score distribution. Marginal split-conformal then UNDER-covers (0.833) and weighted split-conformal (Tibshirani 2019) RESTORES coverage to >= nominal (0.939). This is the COMPLEMENT of the keystone's tier-04 result, where the real time-split shift is ORTHOGONAL to the score (corr -0.12) and weighting is a no-op. The two halves: weighted conformal repairs a shift IFF the shift moves the nonconformity-score distribution."
+}

@@ -1,0 +1,8 @@
+{
+  "emb_matryoshka.parquet": "881e0987b953a7bd",
+  "golden_metrics.json": "c6613dfd50111ce7",
+  "matryoshka_curve.parquet": "9bf1cee684713802",
+  "method_recall.parquet": "e90ef4bd662f5719",
+  "methods.json": "d871b85c7fc77116",
+  "subject_golden.parquet": "2d3b15a37bd08835"
+}

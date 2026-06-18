@@ -1,0 +1,83 @@
+{
+  "base_model": "answerdotai/ModernBERT-base",
+  "base_recall_at_10": 0.538,
+  "epochs": 2,
+  "n_supervised_pairs": 1500,
+  "golden_queries": 200,
+  "matryoshka_dims": [
+    768,
+    256,
+    64
+  ],
+  "methods": [
+    {
+      "method": "cosent",
+      "model_id": "jammi:fine-tuned:fe0ccd44-1a63-485b-aa91-f2d186993912",
+      "recall_at_10": 0.54,
+      "dim": 768,
+      "recall_gain_vs_base": 0.002
+    },
+    {
+      "method": "mnrl_t0.05",
+      "model_id": "jammi:fine-tuned:17792441-fb8a-414f-9fb1-986cc89d4fa6",
+      "recall_at_10": 0.5405,
+      "dim": 768,
+      "recall_gain_vs_base": 0.0025
+    },
+    {
+      "method": "mnrl_t0.20",
+      "model_id": "jammi:fine-tuned:c627e7dd-4fae-48e1-a012-f369352a999d",
+      "recall_at_10": 0.542,
+      "dim": 768,
+      "recall_gain_vs_base": 0.004
+    },
+    {
+      "method": "triplet",
+      "model_id": "jammi:fine-tuned:fe234f9f-e743-423f-a4e1-8ac27a7618c0",
+      "recall_at_10": 0.5395,
+      "dim": 768,
+      "recall_gain_vs_base": 0.0015
+    },
+    {
+      "method": "matryoshka",
+      "model_id": "jammi:fine-tuned:2b2ffe67-a751-408f-a691-4b8b8924b3a4",
+      "recall_at_10": 0.54,
+      "dim": 768,
+      "recall_gain_vs_base": 0.002
+    },
+    {
+      "method": "graph_declared",
+      "model_id": "jammi:fine-tuned:fde86a8d-4691-4cb9-9df5-ee1c851a1d0d",
+      "recall_at_10": 0.5485,
+      "dim": 768,
+      "recall_gain_vs_base": 0.0105
+    }
+  ],
+  "matryoshka_curve": [
+    {
+      "dim": 768,
+      "recall_at_10": 0.54
+    },
+    {
+      "dim": 256,
+      "recall_at_10": 0.5225
+    },
+    {
+      "dim": 64,
+      "recall_at_10": 0.4645
+    }
+  ],
+  "best_method": "graph_declared",
+  "worst_method": "triplet",
+  "recall_spread": 0.009,
+  "hard_negatives": {
+    "method": "hard_neg",
+    "status": "oom_at_full_scale",
+    "full_scale_pairs": 1500,
+    "small_scale_pairs": 300,
+    "small_scale_status": "completed",
+    "small_scale_recall_at_10": 0.537,
+    "error": "Fine-tune error: Encode: Inference error: ModernBERT forward pass failed: Tensor: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")",
+    "note": "mine_hard_negatives=True OOMs on the A10G (23 GB) in the corpus-encode pass at the cookbook's full supervised scale, failing before training starts and independent of batch_size; it completes at a ~300-pair corpus. A real memory-scale limit of the 0.26.2 hard-negative miner, recorded \u2014 not a fabricated recall."
+  }
+}

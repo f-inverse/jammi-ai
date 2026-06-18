@@ -1,0 +1,11 @@
+{
+  "arxiv_ann.manifest.json": "5dceb29290eefa2e",
+  "arxiv_ann.rowmap": "31c110929c96b57a",
+  "arxiv_ann.usearch": "d7e9d2b97b3bee10",
+  "arxiv_vectors.parquet": "d46b9d752ce6fa0e",
+  "golden_metrics.json": "be8d50c7ed5f62d8",
+  "recall_sweep_build.json": "1bbe24c59b06fdd8",
+  "scale_manifest.json": "84c654c594830f3a",
+  "scale_queries.txt": "34959c8e17f35e17",
+  "scale_query_vectors.parquet": "aecf86ff5e3c3e6e"
+}

@@ -1,0 +1,17 @@
+{
+  "builder": "scale-emit (jammi-db SidecarIndex::build, one-time on-box freeze)",
+  "corpus_rows": 168343,
+  "dim": 768,
+  "engine_git_sha": "ae166eb659a9ae78d7bf7b90850555e2e86fa082",
+  "frozen_bundle": [
+    "arxiv_ann.usearch",
+    "arxiv_ann.rowmap",
+    "arxiv_ann.manifest.json"
+  ],
+  "held_out_queries": 1000,
+  "metric": "cos",
+  "quantization": "f32",
+  "recall_note": "ANN-vs-exact recall@k over HELD-OUT queries; floors = measured − margin; load-frozen-only, never rebuilt in CI.",
+  "split": "deterministic: last 1000 paper_ids by ascending sorted paper_id held out as queries; the rest indexed. Disjoint by construction.",
+  "usearch_version": "2.25.1"
+}

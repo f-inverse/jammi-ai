@@ -1,0 +1,333 @@
+---
+title: "Scale: does the frozen ANN index still find the right neighbours at 170k?"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook  # first line: pins the determinism regime before BLAS/usearch
+```
+
+**Recipe:** the frozen `usearch` HNSW sidecar [@malkov2020hnsw] · an exact cosine-kNN
+numpy oracle · set-intersection recall@k · **Theory:** approximate vs exact nearest-neighbour
+search and the recall-vs-speed trade-off [@johnson2021billion] · **Rail:** measurement (the
+ANN-vs-exact recall floor over a held-out query set, recomputed on CPU at render time).
+
+Every other chapter in this book folds the **4 000-paper keystone** slice. This one is the
+cross-check at realistic scale: the **full ogbn-arxiv corpus** — every node carrying an
+embeddable title+abstract, embedded with ModernBERT [@warner2024modernbert] — is committed
+as a 168 343-vector cache (Git LFS), alongside the **frozen** approximate-nearest-neighbour
+(ANN) index the engine's `usearch` sidecar built over it. The question a practitioner asks
+before trusting ANN in production is exactly this one: *how much recall does the approximate
+index give up versus exact search, on my real embeddings, at my real scale?* We answer it by
+recomputing the recall here, on CPU, from the committed cache.
+
+::: {.callout-note}
+## What this chapter is — and what it is not
+
+This is the **at-scale CPU cross-check** of ANN recall *quality*. It validates that a frozen
+HNSW index over 168 343 **real, clustered ModernBERT embeddings** returns nearly the same
+neighbours as exact search, over a genuinely **held-out** query set (queries disjoint from
+the indexed corpus, so recall@1 is a real ≈0.97 — not the structural ≈1.0 a self-query split
+would fake). Synthetic random vectors cannot exhibit this: ANN recall depends on the *cluster
+geometry* of real embeddings, which only real text produces.
+
+It is **not** a bounded-memory proof — holding the 168k×768 matrix in RAM for the exact
+oracle is the opposite of streaming; the engine's streamed-exact lane is where memory-bounded
+scale is proven. And it is **not** the authoritative recall *gate*. That gate lives in the
+engine's `jammi-bench` (Rust), which drives the engine's own `exact_vector_search` oracle
+against the `SidecarIndex` wrapper over a real fixture slice. This chapter is the *library +
+data* cross-check: it reads the same committed frozen index through the public `usearch`
+Python package and an independent numpy oracle, over the **full** 168k cache, and ends in a
+real recomputed number that must clear the committed floor. Two independent implementations
+agreeing on the recall is the cross-check's whole point.
+:::
+
+## The committed cache and its provenance
+
+The cache was emitted **once**, on a GPU box, and committed; nothing here re-embeds. The
+manifest records the split rule and the exact engine + `usearch` versions the frozen sidecar
+was built with, so the index a CI box loads is byte-identical to the one that was measured.
+
+```{python}
+import usearch
+
+from jammi_cookbook import contracts
+
+manifest = contracts.load_artifact("scale.manifest")
+print(f"corpus rows (indexed):  {manifest['corpus_rows']:,}")
+print(f"held-out queries:       {manifest['held_out_queries']:,}")
+print(f"embedding dim:          {manifest['dim']}")
+print(f"metric:                 {manifest['metric']}")
+print(f"frozen by:              {manifest['builder']}")
+print(f"engine git sha:         {manifest['engine_git_sha'][:12]}")
+print(f"usearch version:        {manifest['usearch_version']}")
+print(f"split:                  {manifest['split']}")
+
+# The frozen graph's recall — and its serialized format — are backend-version
+# dependent, and the usearch file header carries only the MAJOR version, so a
+# 2.25.x → 2.25.y drift loads silently and could shift recall with no provenance.
+# Assert the loading backend is the exact one the index was built with, so a
+# floated dependency fails loudly here rather than producing a quietly-different
+# recall three cells down. (The pin in pyproject.toml keeps CI on this version.)
+assert usearch.__version__ == manifest["usearch_version"], (
+    f"usearch {usearch.__version__} != the {manifest['usearch_version']} the frozen "
+    "index was built with — recall is backend-version dependent; pin usearch to match."
+)
+print(f"backend check:          usearch {usearch.__version__} matches the frozen index")
+```
+
+### Checksum-verify before recomputing
+
+A wrong number from a silently-corrupted LFS pull is worse than a loud failure. We verify
+every cache file against its committed `sha256[:16]` before touching the vectors — if a file
+drifted, this raises here, not three cells down with a mysterious recall.
+
+```{python}
+import hashlib
+import json
+
+scale_dir = contracts._dataset_dir("scale")
+checksums = contracts.load_artifact("scale.checksums")
+for name, expected in sorted(checksums.items()):
+    digest = hashlib.sha256((scale_dir / name).read_bytes()).hexdigest()[:16]
+    assert digest == expected, f"{name}: checksum {digest} != committed {expected}"
+print(f"checksum-verified {len(checksums)} cache files (sha256[:16]) — cache intact.")
+```
+
+## Loading the corpus, the held-out queries, and the frozen index
+
+The corpus and query vectors are `(_row_id, vector)` parquet — the engine's embedding-table
+shape. The frozen sidecar is a `usearch` index plus a `rowmap` that turns the index's
+sequential integer keys back into corpus paper_ids.
+
+```{python}
+import numpy as np
+import pyarrow.parquet as pq
+
+
+def _vectors(name):
+    """Load a committed (_row_id, vector) matrix as (ids, float32 array)."""
+    table = contracts.load_artifact(name)  # registered parquet → pyarrow.Table
+    ids = [str(x) for x in table.column("_row_id").to_pylist()]
+    vecs = np.asarray(table.column("vector").to_pylist(), dtype=np.float32)
+    return ids, vecs
+
+
+corpus_ids, corpus = _vectors("scale.corpus_vectors")
+query_ids, queries = _vectors("scale.query_vectors")
+print(f"corpus:  {corpus.shape[0]:,} × {corpus.shape[1]}")
+print(f"queries: {queries.shape[0]:,} × {queries.shape[1]}")
+
+# The held-out guarantee, asserted — not assumed. Queries must be disjoint from the
+# indexed corpus, or recall@1 is meaningless (a self-query is its own neighbour).
+assert not (set(corpus_ids) & set(query_ids)), "queries must be held out of the corpus"
+print(f"held-out check: {len(set(corpus_ids) & set(query_ids))} query ids in the corpus (must be 0)")
+```
+
+The `rowmap` is a small binary format: a `u32` version header, then length-prefixed
+(`u32` little-endian) ASCII paper_id records in index-key order. We decode it once.
+
+```{python}
+import struct
+
+
+def load_rowmap(path):
+    """Decode the sidecar key→paper_id rowmap (u32 version, then u32-len-prefixed ids)."""
+    data = path.read_bytes()
+    offset = 4  # skip the u32 version header
+    ids = []
+    while offset < len(data):
+        (length,) = struct.unpack_from("<I", data, offset)
+        offset += 4
+        ids.append(data[offset:offset + length].decode())
+        offset += length
+    return ids
+
+
+rowmap = load_rowmap(contracts.load_artifact("scale.ann_rowmap"))
+assert len(rowmap) == corpus.shape[0], "rowmap must cover every indexed corpus row"
+print(f"rowmap: {len(rowmap):,} key→paper_id entries")
+```
+
+## The exact oracle — numpy cosine-kNN over the full 168k corpus
+
+The deterministic ground truth: for each held-out query, the true top-100 nearest corpus
+papers by cosine similarity. This is a single normalized `queries @ corpus.T` matmul (a
+1000 × 168 343 score matrix) and a per-row top-k — a few seconds of BLAS on CPU. **This is
+the cheap recall measurement, not re-embedding** — recomputing the recall from the committed
+vectors is exactly what the cross-check is allowed (and required) to do; what it never does
+is re-run the GPU embedding pass.
+
+```{python}
+K_MAX = 100
+
+
+def normalize(matrix):
+    return matrix / (np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-12)
+
+
+corpus_unit = normalize(corpus)
+query_unit = normalize(queries)
+
+sims = query_unit @ corpus_unit.T                       # (n_queries, n_corpus) cosine scores
+topk = np.argpartition(-sims, K_MAX, axis=1)[:, :K_MAX]  # unordered top-100 corpus positions
+rows = np.arange(queries.shape[0])[:, None]
+order = np.argsort(-sims[rows, topk], axis=1)           # sort each row's 100 by score desc
+exact_idx = topk[rows, order]                            # (n_queries, 100) corpus positions
+exact = [[corpus_ids[j] for j in exact_idx[i]] for i in range(queries.shape[0])]
+print(f"exact oracle: top-{K_MAX} computed for {len(exact):,} held-out queries")
+```
+
+## The ANN result — searching the frozen index, never rebuilding
+
+We **load** the committed `usearch` index (memory-mapped, no copy) and `.search` each
+held-out query. We never call `Index()` / `.add` — the default HNSW build options are
+non-deterministic, so rebuilding would invent a *different* index than the one whose recall
+was measured. Loading the frozen artifact is the contract.
+
+```{python}
+from usearch.index import Index
+
+index = Index.restore(str(contracts.load_artifact("scale.ann_index")), view=True)
+assert len(index) == corpus.shape[0], "frozen index must cover every corpus row"
+assert index.ndim == corpus.shape[1], "frozen index dim must match the corpus"
+
+ann_matches = index.search(queries, K_MAX)               # batch ANN search, all queries
+ann = [[rowmap[k] for k in ann_matches.keys[i]] for i in range(queries.shape[0])]
+print(f"frozen ANN: usearch {index.metric}, {index.ndim}-dim, "
+      f"{len(index):,} vectors — searched {len(ann):,} held-out queries")
+```
+
+## Recall@k — the ANN-vs-exact agreement, and the measured verdict
+
+Recall@k is the mean fraction of the exact top-k that the ANN top-k also returned —
+`mean |ANN_topk ∩ EXACT_topk| / k`, an order-insensitive set-intersection over the held-out
+queries. We compute it at k ∈ {1, 10, 100} and assert each against the committed floor
+(`measured − margin`). The floor is one-sided: ANN recall *above* the floor is a pass — a
+frozen index searched on a different box may return a slightly different but equally valid
+neighbour set, and higher recall is never a regression.
+
+```{python}
+from jammi_cookbook import rails
+
+
+def recall_at(k):
+    total = 0.0
+    for i in range(queries.shape[0]):
+        hit = set(exact[i][:k]) & set(ann[i][:k])
+        total += len(hit) / k
+    return total / queries.shape[0]
+
+
+print(f"{'k':>5}{'recall@k':>12}{'floor':>10}{'emit-box':>11}")
+for k in (1, 10, 100):
+    observed = recall_at(k)
+    fl = contracts.recall_floor(f"scale.recall_at_{k}")
+    contracts.assert_recall_floor(f"scale.recall_at_{k}", observed)
+    print(f"{k:>5}{observed:>12.4f}{fl.floor:>10.4f}{fl.measured:>11.4f}")
+```
+
+Every recall clears its committed floor. The recomputed numbers sit at or above the emit-box
+readings recorded in the manifest — the cross-check and the original emit agree, over the
+full 168k cache, through two independent kNN implementations (an exact numpy oracle and the
+`usearch` HNSW library) and an independent checksum-verified read of the same frozen index.
+That agreement is the property the chapter exists to demonstrate: at 170k scale, on real
+ModernBERT geometry, the approximate index gives up only a few points of recall@1 versus
+exact search — and none at all that drops below the floor.
+
+## The recall-vs-cost trade — re-dialing `ef_search` over the same frozen index
+
+The recall above is at the index's *default* search effort. But recall is a knob, not a
+constant: `search_expansion` (USearch's `ef_search`) is the **query-time** dial — it widens
+the HNSW candidate list each search explores. Higher `ef` finds more of the true neighbours
+(higher recall) at the cost of more graph hops (lower throughput). Crucially it mutates a
+**loaded** graph — no rebuild — so we re-dial it on the *same* frozen index and recompute
+recall@10 against the *same* numpy oracle, measuring throughput as we go. This is the
+recall-vs-cost curve a practitioner tunes against an SLA: pick the lowest `ef` whose recall
+still clears the bar.
+
+```{python}
+import time
+
+EF_GRID = [8, 16, 32, 64, 128, 256]
+K_REDIAL = 10  # the breadth the ef curve and its committed floor are reported at
+
+
+def recall_for(ann_ids, k):
+    """Mean set-intersection recall@k of an ANN result against the numpy oracle."""
+    total = 0.0
+    for i in range(queries.shape[0]):
+        total += len(set(exact[i][:k]) & set(ann_ids[i][:k])) / k
+    return total / queries.shape[0]
+
+
+# Warm the memory-mapped index once so the first timed search does not eat the
+# page-in cost — the QPS column then reflects steady-state search, not cold faults.
+index.search(queries, K_REDIAL)
+
+print(f"{'ef_search':>10}{'recall@10':>12}{'floor':>10}{'QPS (ref)':>12}")
+for ef in EF_GRID:
+    index.expansion_search = ef                       # query-time re-dial, no rebuild
+    t0 = time.perf_counter()
+    matches = index.search(queries, K_REDIAL)
+    qps = queries.shape[0] / (time.perf_counter() - t0)
+    ann_ef = [[rowmap[k] for k in matches.keys[i]] for i in range(queries.shape[0])]
+    observed = recall_for(ann_ef, K_REDIAL)
+    fl = contracts.recall_floor(f"scale.ef{ef}_at_{K_REDIAL}")
+    contracts.assert_recall_floor(f"scale.ef{ef}_at_{K_REDIAL}", observed)
+    print(f"{ef:>10}{observed:>12.4f}{fl.floor:>10.4f}{qps:>12.0f}")
+```
+
+The curve is the trade made visible: recall climbs monotonically with `ef_search` toward the
+exact answer while throughput falls. Each point clears its committed floor — the re-dial is a
+*genuine* re-derivation (the numpy oracle recomputes the ground truth at render time, and the
+re-dialed index is searched fresh), so this axis is a real gate, not a recorded number. The
+`QPS` column is an **un-gated** reference: it is measured here on the CI box, so it tracks the
+*shape* of the cost (it falls as `ef` rises) but its absolute value is machine-dependent and
+carries no floor.
+
+## The build-cost reference — `connectivity` and `build_expansion` at scale
+
+The other two knobs are **build-time**: `connectivity` (HNSW *M*, edges per node) and
+`build_expansion` (`ef_construction`, the candidate width during construction). They trade
+build time and index size for graph quality. Unlike `ef_search`, each setting is a
+*separately built* graph — at 168k each is hundreds of MiB, so committing one per sweep point
+would blow the Git-LFS budget. Instead the engine's `jammi-bench recall-sweep` builds them
+**once** on the emit box and we commit only the measured cost curve. Unlike the `ef` curve
+above, this one is **not re-derivable** in CI (the swept graphs are not committed), so it is
+an un-gated reference — the build-cost columns are the deliverable; recall rides along as
+provenance (at this corpus and default `ef` it stays saturated, which is exactly why it is a
+reference, not a floor).
+
+```{python}
+build = contracts.load_artifact("scale.recall_sweep_build")
+print(f"backend usearch {build['backend_version']} · "
+      f"corpus {build['corpus_rows']:,} × {build['dim']}\n")
+print(f"{'connectivity':>13}{'build_exp':>11}{'build (s)':>11}{'size (MiB)':>12}{'recall@10':>11}")
+for p in build["build_sweep"]:
+    secs = p["build_time_ms"]["value"] / 1000.0
+    mib = p["index_size_bytes"]["value"] / (1024 * 1024)
+    r10 = p["recall"]["10"]["value"]
+    conn = p["connectivity"] or "default"
+    print(f"{str(conn):>13}{p['build_expansion']:>11}{secs:>11.1f}{mib:>12.1f}{r10:>11.4f}")
+```
+
+Build time and index size rise with the knobs while recall holds — the cost of a
+higher-quality graph, paid once at build and amortized over every search. A `0`/`default`
+knob is USearch's built-in (M=16, `ef_construction`=128); the engine exposes all three as the
+typed `AnnIndexConfig` a deployment sets once, named for the HNSW primitive rather than the
+backing library.
+
+## Bridge note
+
+> **Approximate search is a recall *trade*, and the trade must be measured, not assumed.**
+> HNSW [@malkov2020hnsw] navigates a hierarchical proximity graph to find near-neighbours in
+> logarithmic time instead of the linear scan exact search demands — and it pays for that
+> speed in recall it can only be *measured* to have given up, never assumed [@johnson2021billion].
+> The exact numpy oracle here is the same kNN fold the keystone retrieval chapter runs at 4k;
+> at 168k it becomes the *yardstick* the frozen ANN index is held to. The lesson the scale
+> tier adds to the book: the recall a production ANN index actually delivers is a property of
+> the **real embedding geometry** — clustered ModernBERT representations of real text
+> [@warner2024modernbert] — which is exactly what a synthetic-vector benchmark cannot tell
+> you, and exactly why this cross-check folds the committed real cache rather than a generated
+> one.

@@ -1,0 +1,22 @@
+{
+  "caveat_visible": {
+    "tol": 0.0,
+    "value": 1451.0
+  },
+  "discriminator_leak": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "listing_leak": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "parity_a_recall_at_10": {
+    "tol": 0.03,
+    "value": 0.756
+  },
+  "parity_b_recall_at_10": {
+    "tol": 0.03,
+    "value": 0.698
+  }
+}

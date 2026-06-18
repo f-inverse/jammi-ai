@@ -1,0 +1,575 @@
+{
+  "aggregate": {
+    "f1": 0.0,
+    "per_type": {
+      "ORG": {
+        "f1": 0.0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "support": 23
+      },
+      "PER": {
+        "f1": 0.0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "support": 18
+      }
+    },
+    "precision": 0.0,
+    "recall": 0.0,
+    "task": "ner"
+  },
+  "per_record": [
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 13,
+          "label": "PER",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 30,
+          "label": "ORG",
+          "start": 21,
+          "text": ""
+        }
+      ],
+      "predicted": [],
+      "record_id": "1",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 11,
+          "label": "PER",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 41,
+          "label": "ORG",
+          "start": 26,
+          "text": ""
+        }
+      ],
+      "predicted": [
+        {
+          "confidence": 0.22689499,
+          "end": 41,
+          "label": "PER",
+          "start": 21,
+          "text": "from Massive Dynamic"
+        },
+        {
+          "confidence": 0.22527553,
+          "end": 54,
+          "label": "PER",
+          "start": 42,
+          "text": "this morning"
+        }
+      ],
+      "record_id": "10",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 8,
+          "label": "ORG",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 54,
+          "label": "ORG",
+          "start": 42,
+          "text": ""
+        }
+      ],
+      "predicted": [
+        {
+          "confidence": 0.22870044,
+          "end": 54,
+          "label": "PER",
+          "start": 39,
+          "text": "of Soylent Corp"
+        }
+      ],
+      "record_id": "11",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 8,
+          "label": "PER",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 23,
+          "label": "PER",
+          "start": 13,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 54,
+          "label": "ORG",
+          "start": 35,
+          "text": ""
+        }
+      ],
+      "predicted": [
+        {
+          "confidence": 0.21538687,
+          "end": 12,
+          "label": "ORG",
+          "start": 9,
+          "text": "and"
+        }
+      ],
+      "record_id": "12",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 10,
+          "label": "PER",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 54,
+          "label": "ORG",
+          "start": 38,
+          "text": ""
+        }
+      ],
+      "predicted": [],
+      "record_id": "13",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 11,
+          "label": "PER",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 39,
+          "label": "ORG",
+          "start": 29,
+          "text": ""
+        }
+      ],
+      "predicted": [
+        {
+          "confidence": 0.2269157,
+          "end": 39,
+          "label": "PER",
+          "start": 24,
+          "text": "from Black Mesa"
+        },
+        {
+          "confidence": 0.21808624,
+          "end": 48,
+          "label": "ORG",
+          "start": 43,
+          "text": "a new"
+        }
+      ],
+      "record_id": "14",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 8,
+          "label": "PER",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 36,
+          "label": "ORG",
+          "start": 21,
+          "text": ""
+        }
+      ],
+      "predicted": [],
+      "record_id": "15",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 10,
+          "label": "PER",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 50,
+          "label": "ORG",
+          "start": 36,
+          "text": ""
+        }
+      ],
+      "predicted": [],
+      "record_id": "16",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 10,
+          "label": "PER",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 42,
+          "label": "ORG",
+          "start": 31,
+          "text": ""
+        }
+      ],
+      "predicted": [
+        {
+          "confidence": 0.22769885,
+          "end": 34,
+          "label": "PER",
+          "start": 28,
+          "text": "of Buy"
+        }
+      ],
+      "record_id": "17",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 12,
+          "label": "PER",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 54,
+          "label": "ORG",
+          "start": 40,
+          "text": ""
+        }
+      ],
+      "predicted": [
+        {
+          "confidence": 0.22691911,
+          "end": 54,
+          "label": "PER",
+          "start": 35,
+          "text": "from Gringotts Bank"
+        }
+      ],
+      "record_id": "18",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 11,
+          "label": "PER",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 45,
+          "label": "ORG",
+          "start": 38,
+          "text": ""
+        }
+      ],
+      "predicted": [],
+      "record_id": "19",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 25,
+          "label": "ORG",
+          "start": 19,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 37,
+          "label": "ORG",
+          "start": 30,
+          "text": ""
+        }
+      ],
+      "predicted": [
+        {
+          "confidence": 0.21546236,
+          "end": 29,
+          "label": "ORG",
+          "start": 26,
+          "text": "and"
+        }
+      ],
+      "record_id": "2",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 12,
+          "label": "PER",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 45,
+          "label": "ORG",
+          "start": 38,
+          "text": ""
+        }
+      ],
+      "predicted": [
+        {
+          "confidence": 0.22385557,
+          "end": 23,
+          "label": "ORG",
+          "start": 22,
+          "text": "a"
+        }
+      ],
+      "record_id": "20",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 7,
+          "label": "PER",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 31,
+          "label": "ORG",
+          "start": 26,
+          "text": ""
+        }
+      ],
+      "predicted": [
+        {
+          "confidence": 0.22385557,
+          "end": 14,
+          "label": "ORG",
+          "start": 13,
+          "text": "a"
+        }
+      ],
+      "record_id": "3",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 10,
+          "label": "ORG",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 28,
+          "label": "PER",
+          "start": 17,
+          "text": ""
+        }
+      ],
+      "predicted": [],
+      "record_id": "4",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 10,
+          "label": "PER",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 58,
+          "label": "ORG",
+          "start": 42,
+          "text": ""
+        }
+      ],
+      "predicted": [],
+      "record_id": "5",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 17,
+          "label": "ORG",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 28,
+          "label": "ORG",
+          "start": 22,
+          "text": ""
+        }
+      ],
+      "predicted": [
+        {
+          "confidence": 0.21546388,
+          "end": 21,
+          "label": "ORG",
+          "start": 18,
+          "text": "and"
+        },
+        {
+          "confidence": 0.22392069,
+          "end": 40,
+          "label": "ORG",
+          "start": 39,
+          "text": "a"
+        }
+      ],
+      "record_id": "6",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 12,
+          "label": "PER",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 31,
+          "label": "ORG",
+          "start": 18,
+          "text": ""
+        }
+      ],
+      "predicted": [
+        {
+          "confidence": 0.25377035,
+          "end": 35,
+          "label": "ORG",
+          "start": 32,
+          "text": "for"
+        },
+        {
+          "confidence": 0.22381319,
+          "end": 37,
+          "label": "ORG",
+          "start": 36,
+          "text": "a"
+        }
+      ],
+      "record_id": "7",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 12,
+          "label": "PER",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 52,
+          "label": "ORG",
+          "start": 35,
+          "text": ""
+        }
+      ],
+      "predicted": [
+        {
+          "confidence": 0.22440474,
+          "end": 53,
+          "label": "ORG",
+          "start": 51,
+          "text": "s."
+        }
+      ],
+      "record_id": "8",
+      "task": "ner"
+    },
+    {
+      "gold": [
+        {
+          "confidence": 0.0,
+          "end": 12,
+          "label": "PER",
+          "start": 0,
+          "text": ""
+        },
+        {
+          "confidence": 0.0,
+          "end": 39,
+          "label": "ORG",
+          "start": 21,
+          "text": ""
+        }
+      ],
+      "predicted": [],
+      "record_id": "9",
+      "task": "ner"
+    }
+  ]
+}

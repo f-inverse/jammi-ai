@@ -1,0 +1,215 @@
+---
+title: "The channel error taxonomy — each failure speaks its true gRPC code"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `register_channel` · `add_channel_columns` · `list_channels` (the
+evidence-channel registry; chapter 14 exercises the happy path) ·
+**Theory:** a typed error vocabulary on the wire — a failure with a *known* cause
+carries the gRPC status code that *names* it [@grpcstatuscodes], so a caller can
+branch on the cause instead of pattern-matching a free-text `Internal` message ·
+**Rail:** measurement (every `(failure mode → status code)` cell asserted against
+a frozen golden) + the cross-transport **parity contract** (the same failure
+raises the same *normalized class* on both transports).
+
+The evidence-channel registry verbs are on **both** the embedded
+`jammi_ai.Database` and the remote `jammi_client.RemoteDatabase`. Chapter 14
+measures the *happy path* — register, append columns, list, the tenant-isolation
+property. This chapter measures the **failure surface**: each way a channel
+operation can fail, and the **typed gRPC status code** it maps to on the wire.
+
+The engine change `§3.8` (`#193`) typed that taxonomy. Before it, a channel
+failure tended to collapse to a single catch-all `Internal` status — the caller
+saw "something went wrong" and had to scrape the message to learn *what*. After
+it, **each failure speaks its true gRPC code**: a duplicate registration is
+`ALREADY_EXISTS`, an operation on a channel that was never registered is
+`NOT_FOUND`, a column-redeclare conflict is `FAILED_PRECONDITION`, a malformed
+argument is `INVALID_ARGUMENT`. This chapter is the engine↔cookbook validator
+that **measures** that mapping.
+
+## What this chapter validates — and the honesty contract
+
+Read the framing plainly:
+
+- **The status codes only exist on the wire.** A gRPC `StatusCode` is what the
+  `grpc://` transport puts on an RPC's terminating status; the in-process embedded
+  engine raises a native Python exception (a `RuntimeError` for a catalog error, a
+  `ValueError` for a client-side argument guard) with **no** status code. So the
+  taxonomy is **measured on the `grpc://` transport**, where the codes live, with
+  the embedded **error class** as the cross-transport companion.
+- **The honest cross-transport observable is the normalized error CLASS.** The two
+  transports raise different Python exception *types* by construction. So for each
+  failure mode the cookbook derives one normalized class from each native error
+  (`ALREADY_EXISTS` / "already exists" → `duplicate`; `NOT_FOUND` / "not
+  registered" → `unknown`; `FAILED_PRECONDITION` / "cannot redeclare" →
+  `conflict`; `INVALID_ARGUMENT` / "is required" → `bad_argument`) and asserts the
+  two transports agree on the *class*.
+- **`INTERNAL` is the documented RESIDUAL, not a fabricated cell.** The whole point
+  of `#193` is that a failure with a *known* cause no longer collapses to
+  `Internal`. There is no honest, hermetic way to induce a *genuine* storage/DB
+  fault from the public channel surface, so the cookbook does **not** manufacture
+  one — `INTERNAL` stays the bucket for a true unexpected fault, recorded as the
+  documented residual.
+
+The cache is emitted once by `scripts/build_channels_taxonomy_cache.py`, which
+drives each failure mode on **both** the embedded engine and a live remote
+`grpc://` `jammi-server`, asserts each maps to its `#193`-intended wire code and
+that `remote == embedded` on the class, and freezes the matrix to
+`artifacts/channels/`. This chapter reads that cache on CPU and asserts every cell
+against the frozen golden — it never re-drives.
+
+## The committed taxonomy matrix
+
+```{python}
+from jammi_cookbook import contracts
+
+matrix = contracts.load_artifact("channels.matrix")
+record = contracts.load_artifact("channels.channels_taxonomy")
+print("transports:", " | ".join(record["transports"]))
+print("parity observable:", record["parity_observable"].split(" — ")[0])
+```
+
+## The taxonomy — each failure mode → its typed gRPC code
+
+The matrix has four headline cells. Each is a real failure driven on the
+`grpc://` transport; the `wire_code` is the gRPC `StatusCode` the client raised,
+and the embedded `error_class` is the same normalized class on the in-process
+engine.
+
+```{python}
+modes = list(matrix["modes"])
+remote = matrix["remote"]
+embedded = matrix["embedded"]
+expected = matrix["expected_wire"]
+
+label = {
+    "duplicate": "duplicate registration (channel id already exists)",
+    "unknown": "operation on a channel never registered",
+    "column_conflict": "redeclare a column with a different dtype",
+    "bad_argument": "an empty channel id",
+}
+
+print(f"{'failure mode':40s} {'gRPC status code':22s} {'embedded class':14s} match")
+print("-" * 92)
+for mode in modes:
+    wire = remote[mode]["wire_code"]
+    cls = embedded[mode]["error_class"]
+    match = "yes" if wire == expected[mode] else f"NO (intended {expected[mode]})"
+    print(f"{label[mode]:40s} {wire:22s} {cls:14s} {match}")
+```
+
+### Each cell, asserted to golden
+
+```{python}
+# duplicate → ALREADY_EXISTS
+assert remote["duplicate"]["wire_code"] == "ALREADY_EXISTS"
+assert embedded["duplicate"]["error_class"] == "duplicate"
+contracts.assert_close("channels.taxonomy.duplicate_wire_code_matches", 1.0)
+contracts.assert_close("channels.taxonomy.duplicate_class_parity", 1.0)
+
+# unknown → NOT_FOUND
+assert remote["unknown"]["wire_code"] == "NOT_FOUND"
+assert embedded["unknown"]["error_class"] == "unknown"
+contracts.assert_close("channels.taxonomy.unknown_wire_code_matches", 1.0)
+contracts.assert_close("channels.taxonomy.unknown_class_parity", 1.0)
+
+# column conflict → FAILED_PRECONDITION
+assert remote["column_conflict"]["wire_code"] == "FAILED_PRECONDITION"
+assert embedded["column_conflict"]["error_class"] == "conflict"
+contracts.assert_close("channels.taxonomy.column_conflict_wire_code_matches", 1.0)
+contracts.assert_close("channels.taxonomy.column_conflict_class_parity", 1.0)
+
+# bad argument → INVALID_ARGUMENT
+assert remote["bad_argument"]["wire_code"] == "INVALID_ARGUMENT"
+assert embedded["bad_argument"]["error_class"] == "bad_argument"
+contracts.assert_close("channels.taxonomy.bad_argument_wire_code_matches", 1.0)
+contracts.assert_close("channels.taxonomy.bad_argument_class_parity", 1.0)
+
+print("every failure mode maps to its #193-intended typed gRPC code")
+```
+
+## The `#193` guarantee — not `Internal`-for-everything
+
+The headline property is that **none** of these typed failures collapses to
+`INTERNAL` (or `UNKNOWN`) on the wire. Each speaks its true cause, so a caller can
+branch — retry an `ALREADY_EXISTS` as idempotent, surface a `NOT_FOUND` as a
+client mistake, treat a `FAILED_PRECONDITION` as a schema conflict to resolve —
+without scraping a free-text message.
+
+```{python}
+for mode in modes:
+    assert remote[mode]["wire_code"] not in (None, "INTERNAL", "UNKNOWN"), mode
+contracts.assert_close("channels.taxonomy.all_modes_typed_not_internal", 1.0)
+print("no failure mode collapses to INTERNAL / UNKNOWN — each speaks its true gRPC code")
+
+# INTERNAL is the documented residual, not a fabricated cell.
+assert "residual" in record["internal_residual"].lower()
+print("\nINTERNAL residual:", record["internal_residual"].split(":")[0])
+```
+
+### The client-side argument guard — validation that never hits the wire
+
+One nuance the matrix records honestly: an invalid *dtype string* (a column typed
+`"NotAType"`) is rejected **client-side** on both transports — a `ValueError` that
+never reaches the wire, so it carries no status code at all. The honest wire
+`INVALID_ARGUMENT` cell is therefore an **empty channel id**, which the *server*
+rejects. The dtype guard is a distinct, measured property: validation caught
+before the RPC is even sent.
+
+```{python}
+guard = matrix["client_side_dtype_guard"]
+for arm in ("embedded", "remote"):
+    assert guard[arm]["raised"] is True
+    assert guard[arm]["wire_code"] is None        # never reaches the wire
+    assert guard[arm]["native_type"] == "ValueError"
+    assert guard[arm]["error_class"] == "bad_argument"
+contracts.assert_close("channels.taxonomy.client_dtype_guard_client_side", 1.0)
+print("invalid dtype string → a client-side ValueError on both transports "
+      "(no StatusCode — caught before the RPC)")
+```
+
+## The cross-transport parity contract — `remote == embedded` class
+
+The engine's spine is that the channel verbs carry the **same call surface and the
+same observable behaviour** on both transports. For a *failure*, the observable is
+the normalized error **class** — because the two transports raise different Python
+exception *types* (embedded a `RuntimeError`/`ValueError`, the gRPC client a
+`grpc.RpcError` carrying a `StatusCode`). The emit drove every failure mode on both
+and asserted `remote == embedded` on the class **live**.
+
+```{python}
+parity = record["parity"]
+n = len(parity)
+all_equal = all(p["class_equal"] for p in parity)
+print(f"remote == embedded class: {sum(p['class_equal'] for p in parity)}/{n} modes agree")
+for p in parity:
+    print(f"  {p['mode']:16s} embedded({p['embedded_native']}) == "
+          f"remote({p['remote_native']}, {p['wire_code']}) → class {p['embedded_class']!r}")
+print("verdict:", record["parity_verdict"])
+assert all_equal and n == 4
+contracts.assert_close("channels.parity.all_modes_class_equal", 1.0)
+```
+
+## The measured taxonomy, at a glance
+
+```{python}
+print("measured (mode → wire code), versus #193 intent:")
+for mode in modes:
+    print(f"  {mode:16s} → {record['taxonomy'][mode]:20s} "
+          f"(intended {record['expected_taxonomy'][mode]})")
+assert record["taxonomy"] == record["expected_taxonomy"], "every mode must map as #193 intended"
+assert record["deviations"] == [], record["deviations"]
+print("\ndeviations from #193:", record["deviations"] or "none — every mode maps as intended")
+```
+
+The channel error taxonomy is a real, asserted property of the engine: each
+evidence-channel failure mode maps to the gRPC status code that *names* its cause
+[@grpcstatuscodes] — `ALREADY_EXISTS`, `NOT_FOUND`, `FAILED_PRECONDITION`,
+`INVALID_ARGUMENT` — and the same normalized class on the embedded engine, with
+`INTERNAL` reserved as the documented residual for a genuine fault. Every cell
+holds **identically** across the embedded and remote transports — the
+cross-transport contract for a *typed* failure, measured.

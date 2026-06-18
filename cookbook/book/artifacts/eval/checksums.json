@@ -1,0 +1,11 @@
+{
+  "channels.json": "b4ccbd796bfaf54242504b38846ed51d72eef7ed26f990a0cfd8cabc49a81ada",
+  "compare_self.json": "1123a59cc19ecea35a2707e072e4067417a05da9774a41a91f51205d6a6d79da",
+  "compare_two.json": "07384a195387ccd82bdd11413410f4706499f9739934fc9ec425b58950226cd8",
+  "embeddings.json": "871155cba5f5f52db9dde2ffcdf517f432fd3de1943dafd4aa6fdc7f72c1d96d",
+  "eval.json": "ee6e7541b47cd2d923297fa68f06cb859f0d2a34f0d00cda274e808ea120ff20",
+  "golden_metrics.json": "67a87e39c82365c126eb56f23e8092873ff042bb965425fd3ab56d1e1303a80a",
+  "inference_cls.json": "a8d0a4acc64140ad10d7e38422b05a8fcc9aa384957126ed38778a2ccf29f82d",
+  "inference_ner.json": "b123ea1311c0a4b371367cc50a8be9c2bdf94e6a16cbe0052bc71a6c8cf87515",
+  "per_query.json": "1e59a7a5a9fe96f5ddaf3c7619fcdb3da21d4b43fe262bb16d0cfce588f752f0"
+}

@@ -1,0 +1,70 @@
+{
+  "channel.a_channel_count": {
+    "tol": 0.0,
+    "value": 5.0
+  },
+  "channel.annotated_column_count": {
+    "tol": 0.0,
+    "value": 3.0
+  },
+  "channel.collision": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "channel.tenant_leak": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "compare.self_max_abs_delta": {
+    "tol": 1e-09,
+    "value": 0.0
+  },
+  "compare.self_significance_present": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "compare.two_recall_delta_abs": {
+    "tol": 1e-06,
+    "value": 0.23333333333333328
+  },
+  "compare.two_significance_present": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "embeddings.mrr": {
+    "tol": 1e-06,
+    "value": 0.27222222222222225
+  },
+  "embeddings.ndcg": {
+    "tol": 1e-06,
+    "value": 0.22621527526420274
+  },
+  "embeddings.precision_at_k": {
+    "tol": 1e-06,
+    "value": 0.1
+  },
+  "embeddings.recall_at_k": {
+    "tol": 1e-06,
+    "value": 0.2833333333333333
+  },
+  "inference_cls.accuracy": {
+    "tol": 1e-06,
+    "value": 0.4
+  },
+  "inference_cls.f1": {
+    "tol": 1e-06,
+    "value": 0.28571428571428575
+  },
+  "inference_ner.f1": {
+    "tol": 1e-06,
+    "value": 0.0
+  },
+  "inference_ner.precision": {
+    "tol": 1e-06,
+    "value": 0.0
+  },
+  "inference_ner.recall": {
+    "tol": 1e-06,
+    "value": 0.0
+  }
+}

@@ -1,0 +1,100 @@
+{
+  "byo_auth": {
+    "a_isolated": true,
+    "a_seen": [
+      "auth_a_emb",
+      "nodisc_emb",
+      "pairs_a_emb",
+      "src_a_emb",
+      "tagged_emb"
+    ],
+    "b_isolated": true,
+    "b_seen": [
+      "auth_b_emb",
+      "nodisc_emb",
+      "tagged_emb"
+    ],
+    "invalid_rejected": true,
+    "legit_after_forgery": true,
+    "missing_rejected": true
+  },
+  "byo_auth_note": "The engine authenticates nothing on its own; the jammi-session-id header is a transport correlation id, NOT a trust boundary. The engine ships a SEAM (a custom interceptor ahead of every verb that authenticates the caller and binds the tenant from the verified claim) and a worked example (grpc_byo_auth.rs). This is the consumer-side mirror: a generic HMAC-signed bearer token verified by an AuthGateway that maps the verified claim to a tenant and binds the engine's tenant_scope. A missing/invalid credential is rejected BEFORE any engine verb runs \u2014 it never falls through to an unscoped read. The engine ships the seam; it never ships the auth. Names no consumer, no real IdP.",
+  "leak_finding": "NONE \u2014 every hard-zero verb measured 0; every destructive verb left A's resource intact (no cross-tenant destruction); duplicate ids ERROR or isolate, never clobber. The drop_mutable_table cross-tenant-destruction defect flagged during scouting is NOT present on the pinned 0.30.0 engine: B's drop of a name A registered resolves in B's own namespace (not found), and A's table survives (mt_survives_foreign_drop=True, measured).",
+  "matrix": {
+    "b_drop_mt_raised": true,
+    "b_drop_tp_raised": false,
+    "builtin_channels_visible": 3,
+    "caveat_visible": 3,
+    "channel_dup_isolated": true,
+    "channel_listing_leak": 0,
+    "describe_source_leak": 0,
+    "model_listing_leak": 0,
+    "mt_survives_foreign_drop": true,
+    "mutable_dup_errored": true,
+    "mutable_listing_leak": 0,
+    "source_listing_leak": 0,
+    "sql_row_leak": 0,
+    "topic_dup_isolated": true,
+    "topic_listing_leak": 0,
+    "tp_survives_foreign_drop": true,
+    "transport": "embedded"
+  },
+  "parity": [
+    {
+      "equal": true,
+      "observable": "source_listing_leak",
+      "value": 0
+    },
+    {
+      "equal": true,
+      "observable": "describe_source_leak",
+      "value": 0
+    },
+    {
+      "equal": true,
+      "observable": "mutable_listing_leak",
+      "value": 0
+    },
+    {
+      "equal": true,
+      "observable": "topic_listing_leak",
+      "value": 0
+    },
+    {
+      "equal": true,
+      "observable": "channel_listing_leak",
+      "value": 0
+    },
+    {
+      "equal": true,
+      "observable": "model_listing_leak",
+      "value": 0
+    },
+    {
+      "equal": true,
+      "observable": "sql_row_leak",
+      "value": 0
+    },
+    {
+      "equal": true,
+      "observable": "caveat_visible",
+      "value": 3
+    },
+    {
+      "equal": true,
+      "observable": "mt_survives_foreign_drop",
+      "value": true
+    },
+    {
+      "equal": true,
+      "observable": "tp_survives_foreign_drop",
+      "value": true
+    }
+  ],
+  "parity_verdict": "remote == embedded for every cross-transport observable",
+  "purpose": "The engine\u2194cookbook validator for the \u00a73.5 standing isolation oracle: for every tenant-scoped verb, tenant B cannot see or reach tenant A's resource, measured from the consumer side as a per-verb matrix of hard zeros and documented stated-positives, on the embedded engine and a live grpc:// jammi-server. Plus the BYO-auth seam, demonstrated from the consumer side as a generic HMAC-bearer-token gateway in front of the engine's tenant binding.",
+  "transports": [
+    "embedded (file://, in-process)",
+    "remote (grpc://, live jammi-server) \u2014 the catalog reads + the discriminator sql row read"
+  ]
+}

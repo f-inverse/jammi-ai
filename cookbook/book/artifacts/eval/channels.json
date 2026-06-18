@@ -1,0 +1,296 @@
+{
+  "list_a": [
+    {
+      "channel_id": "vector",
+      "columns": [
+        {
+          "data_type": "Float32",
+          "name": "similarity"
+        }
+      ],
+      "priority": 1
+    },
+    {
+      "channel_id": "inference",
+      "columns": [
+        {
+          "data_type": "Utf8",
+          "name": "inference_model"
+        },
+        {
+          "data_type": "Utf8",
+          "name": "inference_task"
+        },
+        {
+          "data_type": "Float32",
+          "name": "inference_confidence"
+        }
+      ],
+      "priority": 2
+    },
+    {
+      "channel_id": "bm25",
+      "columns": [
+        {
+          "data_type": "Float32",
+          "name": "bm25_score"
+        },
+        {
+          "data_type": "Int64",
+          "name": "bm25_rank"
+        }
+      ],
+      "priority": 3
+    },
+    {
+      "channel_id": "annotated_by",
+      "columns": [
+        {
+          "data_type": "Utf8",
+          "name": "label"
+        },
+        {
+          "data_type": "Float32",
+          "name": "confidence"
+        },
+        {
+          "data_type": "Int32",
+          "name": "rank"
+        }
+      ],
+      "priority": 10
+    },
+    {
+      "channel_id": "scored_by",
+      "columns": [
+        {
+          "data_type": "Float64",
+          "name": "score"
+        },
+        {
+          "data_type": "Utf8",
+          "name": "model"
+        }
+      ],
+      "priority": 50
+    }
+  ],
+  "list_a_again": [
+    {
+      "channel_id": "vector",
+      "columns": [
+        {
+          "data_type": "Float32",
+          "name": "similarity"
+        }
+      ],
+      "priority": 1
+    },
+    {
+      "channel_id": "inference",
+      "columns": [
+        {
+          "data_type": "Utf8",
+          "name": "inference_model"
+        },
+        {
+          "data_type": "Utf8",
+          "name": "inference_task"
+        },
+        {
+          "data_type": "Float32",
+          "name": "inference_confidence"
+        }
+      ],
+      "priority": 2
+    },
+    {
+      "channel_id": "bm25",
+      "columns": [
+        {
+          "data_type": "Float32",
+          "name": "bm25_score"
+        },
+        {
+          "data_type": "Int64",
+          "name": "bm25_rank"
+        }
+      ],
+      "priority": 3
+    },
+    {
+      "channel_id": "annotated_by",
+      "columns": [
+        {
+          "data_type": "Utf8",
+          "name": "label"
+        },
+        {
+          "data_type": "Float32",
+          "name": "confidence"
+        },
+        {
+          "data_type": "Int32",
+          "name": "rank"
+        }
+      ],
+      "priority": 10
+    },
+    {
+      "channel_id": "scored_by",
+      "columns": [
+        {
+          "data_type": "Float64",
+          "name": "score"
+        },
+        {
+          "data_type": "Utf8",
+          "name": "model"
+        }
+      ],
+      "priority": 50
+    }
+  ],
+  "list_b_after": [
+    {
+      "channel_id": "vector",
+      "columns": [
+        {
+          "data_type": "Float32",
+          "name": "similarity"
+        }
+      ],
+      "priority": 1
+    },
+    {
+      "channel_id": "inference",
+      "columns": [
+        {
+          "data_type": "Utf8",
+          "name": "inference_model"
+        },
+        {
+          "data_type": "Utf8",
+          "name": "inference_task"
+        },
+        {
+          "data_type": "Float32",
+          "name": "inference_confidence"
+        }
+      ],
+      "priority": 2
+    },
+    {
+      "channel_id": "bm25",
+      "columns": [
+        {
+          "data_type": "Float32",
+          "name": "bm25_score"
+        },
+        {
+          "data_type": "Int64",
+          "name": "bm25_rank"
+        }
+      ],
+      "priority": 3
+    },
+    {
+      "channel_id": "scored_by",
+      "columns": [
+        {
+          "data_type": "Utf8",
+          "name": "note"
+        }
+      ],
+      "priority": 3
+    }
+  ],
+  "list_b_before": [
+    {
+      "channel_id": "vector",
+      "columns": [
+        {
+          "data_type": "Float32",
+          "name": "similarity"
+        }
+      ],
+      "priority": 1
+    },
+    {
+      "channel_id": "inference",
+      "columns": [
+        {
+          "data_type": "Utf8",
+          "name": "inference_model"
+        },
+        {
+          "data_type": "Utf8",
+          "name": "inference_task"
+        },
+        {
+          "data_type": "Float32",
+          "name": "inference_confidence"
+        }
+      ],
+      "priority": 2
+    },
+    {
+      "channel_id": "bm25",
+      "columns": [
+        {
+          "data_type": "Float32",
+          "name": "bm25_score"
+        },
+        {
+          "data_type": "Int64",
+          "name": "bm25_rank"
+        }
+      ],
+      "priority": 3
+    }
+  ],
+  "unbound": [
+    {
+      "channel_id": "vector",
+      "columns": [
+        {
+          "data_type": "Float32",
+          "name": "similarity"
+        }
+      ],
+      "priority": 1
+    },
+    {
+      "channel_id": "inference",
+      "columns": [
+        {
+          "data_type": "Utf8",
+          "name": "inference_model"
+        },
+        {
+          "data_type": "Utf8",
+          "name": "inference_task"
+        },
+        {
+          "data_type": "Float32",
+          "name": "inference_confidence"
+        }
+      ],
+      "priority": 2
+    },
+    {
+      "channel_id": "bm25",
+      "columns": [
+        {
+          "data_type": "Float32",
+          "name": "bm25_score"
+        },
+        {
+          "data_type": "Int64",
+          "name": "bm25_rank"
+        }
+      ],
+      "priority": 3
+    }
+  ]
+}

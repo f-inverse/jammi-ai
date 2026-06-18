@@ -1,0 +1,89 @@
+{
+  "client_dtype_guard_client_side": true,
+  "client_side_dtype_guard": "An invalid column dtype STRING is rejected CLIENT-SIDE on both transports (a ValueError that never reaches the wire \u2014 no StatusCode), so the honest wire INVALID_ARGUMENT cell is an empty channel id (server-rejected). The dtype guard is recorded as a measured property: validation that never hits the wire.",
+  "deviations": [],
+  "expected_taxonomy": {
+    "bad_argument": "INVALID_ARGUMENT",
+    "column_conflict": "FAILED_PRECONDITION",
+    "duplicate": "ALREADY_EXISTS",
+    "unknown": "NOT_FOUND"
+  },
+  "internal_residual": "INTERNAL is the documented residual of the taxonomy: there is no honest, hermetic way to induce a genuine storage/DB fault from the public channel surface, so it is NOT fabricated. The point of #193 is that a failure with a KNOWN cause no longer collapses to Internal \u2014 the four typed codes above are the measured proof; INTERNAL remains the bucket for a true unexpected fault.",
+  "measured": {
+    "bad_argument": {
+      "embedded_class": "bad_argument",
+      "embedded_native": "ValueError",
+      "remote_native": "_InactiveRpcError",
+      "wire_code": "INVALID_ARGUMENT"
+    },
+    "column_conflict": {
+      "embedded_class": "conflict",
+      "embedded_native": "RuntimeError",
+      "remote_native": "_InactiveRpcError",
+      "wire_code": "FAILED_PRECONDITION"
+    },
+    "duplicate": {
+      "embedded_class": "duplicate",
+      "embedded_native": "RuntimeError",
+      "remote_native": "_InactiveRpcError",
+      "wire_code": "ALREADY_EXISTS"
+    },
+    "unknown": {
+      "embedded_class": "unknown",
+      "embedded_native": "RuntimeError",
+      "remote_native": "_InactiveRpcError",
+      "wire_code": "NOT_FOUND"
+    }
+  },
+  "parity": [
+    {
+      "class_equal": true,
+      "embedded_class": "duplicate",
+      "embedded_native": "RuntimeError",
+      "mode": "duplicate",
+      "remote_class": "duplicate",
+      "remote_native": "_InactiveRpcError",
+      "wire_code": "ALREADY_EXISTS"
+    },
+    {
+      "class_equal": true,
+      "embedded_class": "unknown",
+      "embedded_native": "RuntimeError",
+      "mode": "unknown",
+      "remote_class": "unknown",
+      "remote_native": "_InactiveRpcError",
+      "wire_code": "NOT_FOUND"
+    },
+    {
+      "class_equal": true,
+      "embedded_class": "conflict",
+      "embedded_native": "RuntimeError",
+      "mode": "column_conflict",
+      "remote_class": "conflict",
+      "remote_native": "_InactiveRpcError",
+      "wire_code": "FAILED_PRECONDITION"
+    },
+    {
+      "class_equal": true,
+      "embedded_class": "bad_argument",
+      "embedded_native": "ValueError",
+      "mode": "bad_argument",
+      "remote_class": "bad_argument",
+      "remote_native": "_InactiveRpcError",
+      "wire_code": "INVALID_ARGUMENT"
+    }
+  ],
+  "parity_observable": "the NORMALIZED channel-error CLASS (embedded RuntimeError/ValueError message / wire StatusCode \u2192 duplicate | unknown | conflict | bad_argument) \u2014 the honest cross-transport contract for a typed error.",
+  "parity_verdict": "remote == embedded class for every channel failure mode",
+  "purpose": "The engine\u2194cookbook validator for the \u00a73.8 channel error taxonomy (engine #193): each evidence-channel failure maps to its CORRECT typed gRPC status code on the wire, not Internal-for-everything. The channel registry verbs (register_channel / add_channel_columns / list_channels) run the failure modes on BOTH the embedded engine and a live remote grpc:// jammi-server; the wire StatusCode is measured on the grpc:// transport (where the codes exist), with the embedded normalized error CLASS as the cross-transport companion. PR CI reads the committed matrix and asserts the (mode \u2192 code) taxonomy-to-golden, never a live re-drive.",
+  "taxonomy": {
+    "bad_argument": "INVALID_ARGUMENT",
+    "column_conflict": "FAILED_PRECONDITION",
+    "duplicate": "ALREADY_EXISTS",
+    "unknown": "NOT_FOUND"
+  },
+  "transports": [
+    "embedded (file://, in-process \u2014 the error-class companion)",
+    "remote (grpc://, live jammi-server \u2014 the typed wire codes)"
+  ]
+}

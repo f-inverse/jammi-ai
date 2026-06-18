@@ -1,0 +1,337 @@
+---
+title: "Tier 01 — Construct"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook  # applies the determinism contract before any heavy import
+```
+
+**Recipe:** `build_neighbor_graph` · **Theory:** topology from data — graph
+construction and the Laplacian (Stanković et al. 2020, Part I) · **Rail:**
+provenance (where each edge came from) + measurement (recall\@10).
+
+A graph is the substrate of everything downstream. Tier 01 builds two of them
+over the same 4000 ogbn-arxiv papers and contrasts them — the contrast that seeds
+the whole book.
+
+- A **derived** graph: the self-kNN similarity graph the engine builds from the
+  text embeddings (`build_neighbor_graph`). This is a *commodity* — any two papers
+  with similar title+abstract become neighbours.
+- A **declared** graph: the citation edges that ship with the dataset
+  (`cite_edges`). This carries signal the embeddings cannot reconstruct — who
+  actually cited whom.
+
+This chapter reads the committed cache (the keystone slice emitted it once on the
+GPU server); it never recomputes the embeddings. The `connect("file://…")` arm is
+the CPU read-path; the same verbs ran `connect("grpc://…")` on the GPU to produce
+the cache.
+
+```{python}
+from jammi_cookbook import contracts
+
+embeddings = contracts.load_artifact("arxiv.embeddings")
+neighbor_graph = contracts.load_artifact("arxiv.neighbor_graph")
+cite_edges = contracts.load_artifact("arxiv.cite_edges")
+
+print(f"papers (embedded):    {embeddings.num_rows}")
+print(f"neighbor-graph edges: {neighbor_graph.num_rows}")
+print(f"citation edges:       {cite_edges.num_rows}")
+print("neighbor-graph cols: ", neighbor_graph.column_names)
+```
+
+The neighbor graph is an edge table `(src, dst, rank, similarity)` — the
+**provenance rail** at the construct tier: every derived edge records its
+`similarity` and its `rank` among a node's neighbours, so an edge's origin is a
+queryable fact, not an assumption.
+
+## The contrast: homophily on the subject label
+
+The two graphs differ in *what they encode*. We recompute each graph's
+**homophily** on the 40-class `subject` label — the fraction of edges whose
+endpoints share a subject — directly from the committed cache (the labels ride in
+`arxiv.papers`; no re-embedding). The citation graph is strongly homophilous; that
+correlation is exactly what later breaks conformal exchangeability in tier 04.
+
+```{python}
+papers = contracts.load_artifact("arxiv.papers")
+subject = dict(zip(papers.column("paper_id").to_pylist(),
+                   papers.column("subject").to_pylist()))
+
+
+def homophily(edges):
+    rows = edges.to_pylist()
+    same = sum(subject.get(r["src"]) == subject.get(r["dst"]) for r in rows
+               if r["src"] in subject and r["dst"] in subject)
+    return same / len(rows)
+
+
+cite_homophily = homophily(cite_edges)
+neighbor_homophily = homophily(neighbor_graph)
+
+print(f"citation-graph homophily:  {cite_homophily:.3f}")
+print(f"neighbor-graph homophily:  {neighbor_homophily:.3f}")
+print(f"random baseline (1/40):    {1 / 40:.3f}")
+```
+
+```{python}
+# | echo: false
+# Measured verdict: the citation graph is strongly homophilous on the subject
+# label (the tier-04 precondition); the recomputed numbers are asserted to
+# tolerance against the golden metrics the keystone emitted on the GPU server.
+from jammi_cookbook import rails
+
+rails.measure("arxiv.tier01.cite_homophily", cite_homophily)
+rails.measure("arxiv.tier01.neighbor_homophily", neighbor_homophily)
+assert cite_homophily > 0.4  # strongly homophilous — the tier-04 precondition
+```
+
+## The measurement rail: retrieval recall from the embeddings
+
+The construct tier ends in a **real number** (the measurement rail): same-subject
+retrieval recall\@10 over the raw embeddings, measured by the keystone on the GPU
+server and frozen as a golden metric. The relevance target is the subject label —
+independent of the embedding similarity — so it is a fair baseline that tiers
+02–03 must *beat*.
+
+```{python}
+recall = contracts.golden("arxiv.tier01.recall_at_10").value
+print(f"tier01 recall@10 (raw embeddings): {recall:.3f}")
+rails.measure("arxiv.tier01.recall_at_10", recall)
+```
+
+## Bridge note (deepened in the bridge chapters)
+
+> **An edge is a self-`search`.** The derived neighbor graph is S9 self-kNN:
+> kNN-graph construction (monograph Part I) expressed as the engine retrieving,
+> for every row, its nearest rows. The *derived* similarity graph is the
+> commodity; the *declared* citation graph carries the signal embeddings cannot
+> reconstruct — the circularity contract that the whole book turns on.
+
+---
+
+# Air Routes — the on-ramp
+
+The keystone above runs on ogbn-arxiv. The book *opens*, though, on **Air
+Routes** — Neptune's own teaching dataset: 3504 airports, a declared `route`
+graph (airport↔airport) and a `contains` hierarchy (continent→airport). It is
+small enough to run *exactly*, legible, and maps one-to-one onto the
+"two graphs side by side" move. The same `build_neighbor_graph` recipe runs here
+unchanged; its cache was emitted once on the GPU server (`connect("grpc://…")`)
+and is read here on CPU.
+
+> **Neptune-contrast.** Neptune *loads* a given graph and runs `CALL
+> neptune.algo.*` over it. Jammi *constructs* the similarity graph from the
+> airport text **and** *registers* the declared `route`/`contains` graphs beside
+> it — the two-graphs contrast in miniature.
+
+```{python}
+air_emb = contracts.load_artifact("air.embeddings")
+air_ng = contracts.load_artifact("air.neighbor_graph")
+route = contracts.load_artifact("air.route_edges")
+contains = contracts.load_artifact("air.contains_edges")
+
+print(f"airports (embedded):  {air_emb.num_rows}")
+print(f"neighbor-graph edges: {air_ng.num_rows}")
+print(f"route edges:          {route.num_rows}")
+print(f"contains edges:       {contains.num_rows}")
+```
+
+## Homophily of `route` vs `contains` on the continent label
+
+The two declared graphs encode different structure. We recompute each one's
+**homophily** on the `continent` label — the fraction of edges whose endpoints
+share a continent — directly from the committed labels (`air.airports`; no
+re-embedding).
+
+- `route` connects airport↔airport; its homophily is the share of flights that
+  stay intracontinental.
+- `contains` is the continent→country→airport hierarchy. The source carries no
+  continent→country edge (a country's continent is *not* declared by the graph,
+  and is genuinely ambiguous for transcontinental countries like Russia or
+  Turkey), so the honest, non-circular continent-homophily of the *declared*
+  hierarchy is measured over the edges whose parent **is** a continent code: the
+  fraction whose child airport's continent matches that parent.
+
+```{python}
+airports = contracts.load_artifact("air.airports")
+continent = dict(zip(airports.column("code").to_pylist(),
+                     airports.column("continent").to_pylist()))
+continent_codes = {c for c in continent.values() if c}
+
+
+def route_homophily(edges):
+    rows = [(r["src"], r["dst"]) for r in edges.to_pylist()
+            if continent.get(r["src"]) and continent.get(r["dst"])]
+    return sum(continent[s] == continent[d] for s, d in rows) / len(rows)
+
+
+def contains_homophily(edges):
+    # parent IS a continent code → compare to the child airport's continent.
+    rows = [(r["src"], continent.get(r["dst"])) for r in edges.to_pylist()
+            if r["src"] in continent_codes and continent.get(r["dst"])]
+    return sum(p == c for p, c in rows) / len(rows)
+
+
+route_h = route_homophily(route)
+contains_h = contains_homophily(contains)
+print(f"route homophily (continent):    {route_h:.3f}")
+print(f"contains homophily (continent): {contains_h:.3f}")
+```
+
+```{python}
+# | echo: false
+# Measured verdict: the declared containment hierarchy is near-perfectly
+# continent-consistent (~0.99 — the few sub-1.0 cases are airports the source
+# lists under two continents), while the route topology is highly but not fully
+# intracontinental (~0.83). A declared hierarchy carries clean structure the
+# similarity/route graphs only approximate — the construct-tier contrast.
+rails.measure("air.tier01.route_homophily", route_h)
+rails.measure("air.tier01.contains_homophily", contains_h)
+assert contains_h > route_h
+```
+
+## The tenancy rail: what the engine isolates — and what it does not
+
+Air Routes is the clean place to make the **tenancy rail** honest. The engine
+isolates by tenant at **two layers**, and there is a caveat that matters. We
+demonstrate all three on the *same* engine handle, binding a tenant scope with
+`set_tenant` (an opaque UUID — the engine validates the form, never who the
+tenant is). `set_tenant` binds the scope to the connection *in place*; the
+[`rails.tenant`](#) context manager wraps the engine's `tenant_scope` and
+restores the prior scope on exit.
+
+The load-bearing fact, stated plainly: **"a separate source per tenant" is not
+data isolation.** Registering region A's airports as one source and region B's as
+another keeps them apart only because they were *split in Python before
+registration*. The genuine engine properties are the two below — and the third
+block shows where isolation stops.
+
+### Layer 1 — catalog-listing isolation (a hard zero)
+
+`list_sources` filters the registry to the bound tenant: `tenant_id = $cur OR
+tenant_id IS NULL`. A source registered under tenant B does **not** appear in
+tenant A's listing.
+
+```{python}
+import jammi_ai
+import os
+import tempfile
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+# A fresh embedded engine just for the tenancy showcase (the cache above is
+# read-only). The same verbs run `connect("grpc://…")` against a deployed
+# multi-tenant server unchanged.
+work = tempfile.mkdtemp()
+db = jammi_ai.connect(f"file://{tempfile.mkdtemp()}")
+
+TENANT_A = "11111111-1111-1111-1111-111111111111"  # North America
+TENANT_B = "22222222-2222-2222-2222-222222222222"  # Europe
+
+airports = contracts.load_artifact("air.airports").to_pylist()
+na = sorted(r["code"] for r in airports if r["continent"] == "NA")
+eu = sorted(r["code"] for r in airports if r["continent"] == "EU")
+
+
+def register(name, table):
+    path = os.path.join(work, f"{name}.parquet")
+    pq.write_table(table, path)
+    db.add_source(name, url=path, format="parquet")
+
+
+with rails.tenant(db, TENANT_A):
+    register("air_na", pa.table({"code": na}))
+with rails.tenant(db, TENANT_B):
+    register("air_eu", pa.table({"code": eu}))
+
+with rails.tenant(db, TENANT_A):
+    a_listed = sorted(s["source_id"] for s in db.list_sources())
+print(f"tenant A lists: {a_listed}")
+print(f"B's 'air_eu' visible to A: {'air_eu' in a_listed}")
+```
+
+```{python}
+# | echo: false
+# Catalog-listing isolation: tenant A's listing excludes B's source — a hard zero.
+rails.assert_listing_isolated(a_listed, {"air_eu"}, tenant_id=TENANT_A)
+rails.measure("air.tenancy.listing_leak", float(len({"air_eu"} & set(a_listed))))
+```
+
+### Layer 2 — row-level isolation via a discriminator column (a hard zero)
+
+The analyzer injects `tenant_id = $cur OR IS NULL` onto a `TableScan` **only when
+the queried table's schema carries a `tenant_id` column.** So two tenants reading
+the *same* discriminator-tagged source get disjoint rows. We tag every NA airport
+for tenant A and every EU airport for tenant B in one shared source, register it
+globally, and query it under each tenant.
+
+```{python}
+with rails.tenant(db, ""):  # register the shared source as a global (tenant_id IS NULL)
+    register("air_tagged", pa.table({
+        "code": na + eu,
+        "tenant_id": [TENANT_A] * len(na) + [TENANT_B] * len(eu),
+    }))
+
+with rails.tenant(db, TENANT_A):
+    seen_a = sorted(r["code"] for r in db.sql(
+        "SELECT code FROM air_tagged.public.air_tagged").to_pylist())
+with rails.tenant(db, TENANT_B):
+    seen_b = sorted(r["code"] for r in db.sql(
+        "SELECT code FROM air_tagged.public.air_tagged").to_pylist())
+
+print(f"tenant A reads {len(seen_a)} rows from the SAME source (expect NA = {len(na)})")
+print(f"tenant B reads {len(seen_b)} rows from the SAME source (expect EU = {len(eu)})")
+print(f"overlap: {len(set(seen_a) & set(seen_b))}")
+```
+
+```{python}
+# | echo: false
+# Row-level isolation: the auto-injected discriminator filter makes the one
+# tagged source return disjoint rows — tenant A surfaces no B-tagged row.
+rails.assert_rows_isolated(seen_a, set(eu), tenant_id=TENANT_A)
+assert set(seen_a) == set(na) and set(seen_b) == set(eu)
+rails.measure("air.tenancy.discriminator_leak", float(len(set(seen_a) & set(eu))))
+```
+
+### The caveat — a discriminator-less source is globally readable
+
+This is the honest limit. A source with **no `tenant_id` column** is **globally
+readable** by any tenant that names it: there is no column for the analyzer to
+filter on, and the engine does not authenticate — access-gating lives *above* the
+engine (a Flight SQL / gRPC interceptor). We register region B's airports under
+tenant B with no discriminator column, then read them under tenant A.
+
+```{python}
+with rails.tenant(db, TENANT_B):
+    register("air_eu_nodisc", pa.table({"code": eu}))
+
+with rails.tenant(db, TENANT_A):
+    seen_global = sorted(r["code"] for r in db.sql(
+        "SELECT code FROM air_eu_nodisc.public.air_eu_nodisc").to_pylist())
+
+print(f"tenant A reads B's discriminator-less source: {len(seen_global)} of "
+      f"{len(eu)} EU rows (by design — no discriminator column)")
+```
+
+```{python}
+# | echo: false
+# The documented caveat as a POSITIVE assertion: with no discriminator column,
+# tenant A sees ALL of tenant B's rows. The remedy is a discriminator column (as
+# in layer 2) or an access gate above the engine.
+assert set(seen_global) == set(eu), "a discriminator-less source is globally readable"
+rails.measure("air.tenancy.global_source_visible", float(len(set(seen_global) & set(eu))))
+tenancy = contracts.load_artifact("air.tenancy")
+assert tenancy["listing_leak"] == 0 and tenancy["discriminator_leak"] == 0
+assert tenancy["global_source_visible"] == len(eu)
+```
+
+> **Neptune-contrast.** Multi-tenant isolation on a property graph is a
+> deployment-and-governance concern Neptune leaves to IAM/VPC around the
+> database. Here, two layers are *substrate* properties: `set_tenant` scopes
+> catalog listing, and a `tenant_id` discriminator column row-filters a shared
+> source. But the engine does not authenticate — a discriminator-less source any
+> tenant can name is global by design, so cross-tenant data isolation is a
+> property you *opt into* (a discriminator column) or *gate above* (an
+> interceptor), not a blanket guarantee.

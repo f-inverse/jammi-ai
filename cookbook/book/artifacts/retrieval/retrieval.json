@@ -1,0 +1,58 @@
+{
+  "queries": 200,
+  "candidate_depth": 200,
+  "best_dense_method": "dense_propagated",
+  "best_dense_recall_at_10": 0.556,
+  "best_single_recall_at_10": 0.556,
+  "best_fusion_recall_at_10": 0.55,
+  "fusion_vs_best_dense": -0.006,
+  "fusion_vs_raw": 0.012,
+  "hybrid_vs_dense": 0.004,
+  "fusion_helps": false,
+  "methods": [
+    {
+      "method": "dense_raw",
+      "family": "dense",
+      "recall_at_10": 0.538,
+      "ndcg_at_10": 0.5468
+    },
+    {
+      "method": "dense_propagated",
+      "family": "dense",
+      "recall_at_10": 0.556,
+      "ndcg_at_10": 0.5634
+    },
+    {
+      "method": "lexical_bm25",
+      "family": "lexical",
+      "recall_at_10": 0.4165,
+      "ndcg_at_10": 0.3691
+    },
+    {
+      "method": "rrf_raw_prop",
+      "family": "fusion",
+      "recall_at_10": 0.55,
+      "ndcg_at_10": 0.559
+    },
+    {
+      "method": "rrf_raw_lex",
+      "family": "fusion",
+      "recall_at_10": 0.542,
+      "ndcg_at_10": 0.5557
+    },
+    {
+      "method": "rrf_prop_lex",
+      "family": "fusion",
+      "recall_at_10": 0.5285,
+      "ndcg_at_10": 0.5507
+    }
+  ],
+  "search_finding": {
+    "verb": "search",
+    "reachable_on_cpu": false,
+    "reason": "search / assemble_context resolve a source's single ready embedding table; a committed embedding parquet is not a source-bound ready embedding table (search raises 'No ready embedding table for source'), and the signature search(source, *, query, k, filter, select) carries no table= argument, so once a source has several embedding tables (raw / propagated / fine-tuned) there is no way to name which one to search.",
+    "measurement_used": "exact cosine-kNN numpy fold over each committed matrix",
+    "candidate": "an explicit table= argument on search(source, ...)"
+  },
+  "note": "Dense beats lexical on this same-subject target by a wide margin; RRF fusion of the two dense arms beats the weaker arm (raw) but does NOT beat the stronger single arm (propagated), and the hybrid dense+lexical fusion is DRAGGED DOWN by the weaker lexical arm. The measured verdict: fusion does not help here \u2014 RRF cannot exceed the best single arm when one arm dominates. Reported as the data shows, not assumed. The search-multi-table ambiguity is recorded in search_finding."
+}

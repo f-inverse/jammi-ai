@@ -1,0 +1,46 @@
+---
+title: "Preface"
+---
+
+```{python}
+# | echo: false
+# The first line of every chapter: importing the cookbook applies the
+# determinism contract (single-threaded BLAS, tokenizers off, pinned seed)
+# before any heavy native library is touched.
+import jammi_cookbook  # noqa: F401
+```
+
+This is a **runnable book**. It bridges *applied theory* — Stanković et al.'s
+*Data Analytics on Graphs* (Foundations & Trends in ML, 2020) and the modern GNN
+canon — with *software and computation*: the `jammi_ai` engine. The signature
+move of every recipe is to show that **one Jammi recipe = one equation in the
+monograph = one line in the GNN canon**, *executed and measured*.
+
+## How the book is organized
+
+It **reads** as **4 tiers × 3 rails**, echoing AWS Neptune's "unified yet
+separate" Database / Analytics / ML split — and adds a **fourth tier Neptune
+structurally lacks**: calibrated, provenance-stamped, context-conditioned
+prediction.
+
+| Tier | Recipe | Theory |
+|---|---|---|
+| 01 Construct | `build_neighbor_graph` | topology from data (monograph Part I) |
+| 02 Analyze | `propagate_embeddings` | graph signal processing / low-pass filtering = SGC/APPNP (Part II) |
+| 03 Learn | `fine_tune_graph` | representation learning on graphs (Part III) |
+| 04 Predict & Quantify | `train_context_predictor` + conformal | context-conditioned posterior + honest coverage (no Neptune analogue) |
+
+The three **rails** are woven through every tier: **provenance** (the audit
+trail on every result), **tenancy** (the engine's two isolation layers —
+catalog-listing and discriminator-column row filtering — and the honest caveat
+where they stop), and **measurement** (every recipe ends in a real number). The
+book *is* the closed evaluation loop: `construct → propagate → learn → MEASURE`.
+
+## How it stays honest
+
+Every recipe executes in continuous integration and ends in a **real number**
+computed from committed artifacts — never a stand-in figure. The heavy work runs
+**once** in the keystone slice and is committed as a small-subset cache; every
+later chapter *reads* that cache and asserts its measured verdict against frozen
+golden metrics within a tolerance. The engine itself is never edited — the book
+only *calls* the pinned `jammi_ai` API, listed in the [API reference](chapters/api-reference.qmd).

@@ -1,0 +1,62 @@
+{
+  "dense_propagated.ndcg_at_10": {
+    "tol": 0.03,
+    "value": 0.5634
+  },
+  "dense_propagated.recall_at_10": {
+    "tol": 0.03,
+    "value": 0.556
+  },
+  "dense_raw.ndcg_at_10": {
+    "tol": 0.03,
+    "value": 0.5468
+  },
+  "dense_raw.recall_at_10": {
+    "tol": 0.03,
+    "value": 0.538
+  },
+  "fusion_vs_best_dense": {
+    "tol": 0.02,
+    "value": -0.006
+  },
+  "fusion_vs_raw": {
+    "tol": 0.02,
+    "value": 0.012
+  },
+  "hybrid_vs_dense": {
+    "tol": 0.02,
+    "value": 0.004
+  },
+  "lexical_bm25.ndcg_at_10": {
+    "tol": 0.03,
+    "value": 0.3691
+  },
+  "lexical_bm25.recall_at_10": {
+    "tol": 0.03,
+    "value": 0.4165
+  },
+  "rrf_prop_lex.ndcg_at_10": {
+    "tol": 0.03,
+    "value": 0.5507
+  },
+  "rrf_prop_lex.recall_at_10": {
+    "tol": 0.03,
+    "value": 0.5285
+  },
+  "rrf_raw_lex.ndcg_at_10": {
+    "tol": 0.03,
+    "value": 0.5557
+  },
+  "rrf_raw_lex.recall_at_10": {
+    "tol": 0.03,
+    "value": 0.542
+  },
+  "rrf_raw_prop.ndcg_at_10": {
+    "tol": 0.03,
+    "value": 0.559
+  },
+  "rrf_raw_prop.recall_at_10": {
+    "tol": 0.03,
+    "value": 0.55
+  }
+}

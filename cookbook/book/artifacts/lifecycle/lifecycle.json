@@ -1,0 +1,54 @@
+{
+  "catalog_property": "Every model in the catalog is trained-and-referenced (the fine-tuned by training_jobs.output_model_id, its base by training_jobs.base_model_id), so delete_model on either is correctly refused with the typed ModelReferenced guard. The delete-unreferenced-succeeds path is therefore unreachable here: there is no bare unreferenced model in the catalog to delete. A measured property of the engine's catalog, not a gap.",
+  "measured": {
+    "delete_absent_if_exists_raised": false,
+    "delete_absent_strict_class": "not_found",
+    "delete_referenced_class": "referenced",
+    "every_catalog_model_is_referenced": true,
+    "registered_backend": "candle",
+    "registered_status": "registered",
+    "registered_task": "text_embedding"
+  },
+  "parity": [
+    {
+      "equal": true,
+      "observable": "registered"
+    },
+    {
+      "equal": true,
+      "observable": "list_after_register"
+    },
+    {
+      "equal": true,
+      "observable": "ft_delete_referenced"
+    },
+    {
+      "equal": true,
+      "observable": "base_delete_referenced"
+    },
+    {
+      "equal": true,
+      "observable": "every_catalog_model_is_referenced"
+    },
+    {
+      "equal": true,
+      "observable": "delete_absent_strict"
+    },
+    {
+      "equal": true,
+      "observable": "delete_absent_if_exists"
+    },
+    {
+      "equal": true,
+      "observable": "delete_referenced"
+    }
+  ],
+  "parity_observable": "model projections (model_id UUID excluded) and the NORMALIZED delete-error CLASS (embedded RuntimeError message / wire StatusCode \u2192 referenced | not_found) \u2014 the honest cross-transport contract for a typed error.",
+  "parity_verdict": "remote == embedded for every catalog observable",
+  "purpose": "The engine\u2194cookbook validator for the \u00a73.6 model-catalog surface: the model verbs (list/describe/delete) run on BOTH the embedded engine and a live remote grpc:// jammi-server, asserted remote == embedded live (the real cross-transport parity check). The committed matrix is the embedded-canonical one; PR CI reads it and asserts the verdicts-to-golden, never a static re-diff of two artifacts.",
+  "registration_path": "TRAINING \u2014 the only public path that puts a model row in the catalog. A tiny CPU fine_tune(method='lora', task='text_embedding') over a 12-row in-memory (anchor, positive) pairs corpus with the engine's public tiny_modernbert fixture registers the model. CPU/hermetic \u2014 no GPU, no keystone corpus.",
+  "transports": [
+    "embedded (file://, in-process)",
+    "remote (grpc://, live jammi-server)"
+  ]
+}

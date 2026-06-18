@@ -1,0 +1,12 @@
+{
+  "backend": "usearch",
+  "count": 168343,
+  "created_at": "2026-06-13T08:17:14.422788726+00:00",
+  "dimensions": 768,
+  "files": {
+    "index": "arxiv_ann.usearch",
+    "rowmap": "arxiv_ann.rowmap"
+  },
+  "metric": "cosine",
+  "version": 1
+}

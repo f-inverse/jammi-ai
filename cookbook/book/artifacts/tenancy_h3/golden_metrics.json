@@ -1,0 +1,82 @@
+{
+  "byo_auth.a_isolated": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "byo_auth.b_isolated": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "byo_auth.invalid_rejected": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "byo_auth.legit_after_forgery": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "byo_auth.missing_rejected": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "collision.channel_dup_isolated": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "collision.mutable_dup_errored": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "collision.topic_dup_isolated": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "destructive.mt_survives_foreign_drop": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "destructive.tp_survives_foreign_drop": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "hard_zero.channel_listing_leak": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "hard_zero.describe_source_leak": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "hard_zero.model_listing_leak": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "hard_zero.mutable_listing_leak": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "hard_zero.source_listing_leak": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "hard_zero.sql_row_leak": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "hard_zero.topic_listing_leak": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "parity.cross_transport_equal": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "stated_positive.builtin_channels_visible": {
+    "tol": 0.0,
+    "value": 3.0
+  },
+  "stated_positive.caveat_visible": {
+    "tol": 0.0,
+    "value": 3.0
+  }
+}

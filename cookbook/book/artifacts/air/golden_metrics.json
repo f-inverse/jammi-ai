@@ -1,0 +1,34 @@
+{
+  "tenancy.discriminator_leak": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "tenancy.global_source_visible": {
+    "tol": 0.0,
+    "value": 605.0
+  },
+  "tenancy.listing_leak": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "tier01.contains_homophily": {
+    "tol": 0.02,
+    "value": 0.99
+  },
+  "tier01.recall_at_10": {
+    "tol": 0.03,
+    "value": 0.747
+  },
+  "tier01.route_homophily": {
+    "tol": 0.02,
+    "value": 0.826
+  },
+  "tier02.recall_at_10": {
+    "tol": 0.03,
+    "value": 0.919
+  },
+  "tier02.recall_delta": {
+    "tol": 0.03,
+    "value": 0.173
+  }
+}

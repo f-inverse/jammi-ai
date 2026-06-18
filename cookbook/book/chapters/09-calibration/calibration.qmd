@@ -1,0 +1,216 @@
+---
+title: "Calibration & uncertainty — proper scores, ECE, sharpness, and the PIT"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `eval_calibration(shape="gaussian")` + a client-local PIT / reliability
+fold · **Theory:** proper scoring rules (CRPS, NLL) [@gneiting2007; @matheson1976],
+the sharpness-subject-to-calibration paradigm [@gneiting2007sharpness], expected
+calibration error [@guo2017], and PIT uniformity as the prequential calibration test
+[@dawid1984] · **Rails:** measurement (the honesty of the uncertainty channel).
+
+A prediction with a number is half a prediction; the other half is *how sure*. This
+chapter audits the uncertainty channel of the committed tier-04 gaussian year
+predictor — does its stated spread match reality? It runs on CPU against the cache (no
+GPU, no recompute): the engine's `eval_calibration` produces the proper-score and ECE
+headline, and an independent numpy PIT/reliability fold cross-checks every number and
+draws the diagnostic the aggregate summarizes.
+
+## The predictive distributions
+
+The cache holds the gaussian context predictor's per-row `pred_mean` and `pred_std`
+on the test era, paired with the realised `true_year`. `eval_calibration` wants a
+*golden source* pairing each predictive distribution with its outcome, so we
+materialize the committed rows into a registered source with the gaussian schema
+(`record_id, mean, sd, outcome`).
+
+```{python}
+import tempfile
+
+import numpy as np
+import pyarrow as pa
+
+import jammi_ai
+from jammi_cookbook import contracts, datasets, rails
+
+reg = contracts.load_artifact("arxiv.tier04_regression").to_pylist()
+test = [r for r in reg if r["split"] == "test"]
+print(f"test-era predictive distributions: {len(test)}")
+
+golden = pa.table({
+    "record_id": [r["paper_id"] for r in test],
+    "mean": [float(r["pred_mean"]) for r in test],
+    "sd": [float(r["pred_std"]) for r in test],
+    "outcome": [float(r["true_year"]) for r in test],
+})
+golden_url = datasets._write_parquet(golden, "arxiv_calibration_golden")
+
+# A fresh artifact dir each run, so re-execution never collides with a
+# previously-registered source (the catalog persists registrations per artifact dir).
+db = jammi_ai.connect(f"file://{tempfile.mkdtemp(prefix='jammi_calibration_')}")  # CPU embed arm
+db.add_source("arxiv_calibration_golden", url=golden_url, format="parquet")
+```
+
+## The engine's calibration report
+
+`eval_calibration(shape="gaussian")` returns the proper-score headline (`crps`,
+`nll`), the calibration diagnostic (`adaptive_ece`), `sharpness`, and central
+`coverage`. The `golden_source` is addressed by its full catalog path.
+
+```{python}
+report = db.eval_calibration(
+    source="arxiv_calibration_golden",
+    golden_source="arxiv_calibration_golden.public.arxiv_calibration_golden",
+    shape="gaussian",
+)
+agg = report["aggregate"]
+crps = float(agg["crps"])
+nll = float(agg["nll"])
+ece = float(agg["adaptive_ece"])
+sharpness = float(agg["sharpness"])
+central_cov = float(agg["coverage"])
+print(f"CRPS (proper score):     {crps:.3f}")
+print(f"NLL  (proper score):     {nll:.3f}")
+print(f"adaptive ECE:            {ece:.3f}")
+print(f"sharpness (mean spread): {sharpness:.3f}")
+print(f"central coverage:        {central_cov:.3f}")
+```
+
+```{python}
+# | echo: false
+rails.measure("arxiv.calibration.crps", crps)
+rails.measure("arxiv.calibration.nll", nll)
+rails.measure("arxiv.calibration.adaptive_ece", ece)
+rails.measure("arxiv.calibration.sharpness", sharpness)
+rails.measure("arxiv.calibration.central_coverage", central_cov)
+```
+
+The **proper scores** are the headline. CRPS [@matheson1976] and NLL [@gneiting2007]
+are *strictly proper*: they are optimized in expectation only by the true predictive
+distribution, so they reward a forecast that is both accurate **and** honestly spread
+— you cannot game them by being over-confident. CRPS ≈ 0.39 (in years; lower is
+better) and NLL ≈ 1.08 summarize the predictor's distributional quality in one number
+each.
+
+## Proper scoring, cross-checked
+
+A proper score is only trustworthy if we know what it computes. We recompute CRPS and
+NLL independently with the gaussian closed forms over the same committed predictions,
+and confirm they match the engine to the digit.
+
+```{python}
+from math import erf, pi
+
+mu = np.array([r["pred_mean"] for r in test])
+sd = np.array([r["pred_std"] for r in test])
+y = np.array([float(r["true_year"]) for r in test])
+
+
+def std_normal_cdf(z):
+    return 0.5 * (1.0 + np.vectorize(erf)(z / np.sqrt(2.0)))
+
+
+z = (y - mu) / sd
+phi = np.exp(-(z ** 2) / 2.0) / np.sqrt(2.0 * pi)  # standard-normal pdf at z
+Phi = std_normal_cdf(z)
+
+# Gaussian CRPS closed form (Gneiting & Raftery 2007).
+crps_manual = float(np.mean(sd * (z * (2.0 * Phi - 1.0) + 2.0 * phi - 1.0 / np.sqrt(pi))))
+# Gaussian NLL.
+nll_manual = float(np.mean(0.5 * np.log(2.0 * pi * sd ** 2) + 0.5 * z ** 2))
+print(f"manual CRPS {crps_manual:.4f}  vs engine {crps:.4f}")
+print(f"manual NLL  {nll_manual:.4f}  vs engine {nll:.4f}")
+```
+
+```{python}
+# | echo: false
+# The engine's proper scores are exactly the gaussian closed forms — verified, not
+# trusted. (Tight tolerance: this is an identity, not a tolerance-band metric.)
+assert abs(crps_manual - crps) < 1e-3
+assert abs(nll_manual - nll) < 1e-3
+```
+
+## The PIT: is the predictive distribution honest?
+
+The sharpest test of calibration is the **probability integral transform** (PIT): if
+the predictive distribution is honest, then $u_i = F_i(y_i)$ — the predictive CDF
+evaluated at the realised outcome — is **uniform on $[0,1]$** [@dawid1984]. A PIT
+histogram that bulges in the middle means the predictor is *under-confident* (too
+wide); one that piles up at the ends means *over-confident* (too narrow). We quantify
+the departure with the Kolmogorov–Smirnov statistic against the uniform.
+
+```{python}
+pit = std_normal_cdf((y - mu) / sd)
+order = np.sort(pit)
+n = len(order)
+ecdf = np.arange(1, n + 1) / n
+pit_ks = float(np.max(np.abs(ecdf - order)))  # KS distance from Uniform(0,1)
+print(f"PIT KS statistic (departure from uniform): {pit_ks:.3f}")
+
+# Reliability (binned PIT): the fraction of outcomes below each predictive quantile.
+quantile_levels = np.linspace(0.1, 0.9, 9)
+observed_below = np.array([float(np.mean(pit <= q)) for q in quantile_levels])
+for q, obs in zip(quantile_levels, observed_below):
+    bar = "#" * int(round(obs * 40))
+    print(f"  predicted ≤ q={q:.1f}:  observed {obs:.3f}  {bar}")
+```
+
+```{python}
+# | echo: false
+rails.measure("arxiv.calibration.pit_ks", pit_ks)
+# The honest verdict: the PIT is FAR from uniform (KS ≈ 0.42). The predictor is sharp
+# but miscalibrated under the time-split — the same non-exchangeability the conformal
+# tier reports. A well-calibrated predictor would have a small KS; this one does not.
+assert pit_ks > 0.2, "the PIT must register the miscalibration (it is not uniform)"
+```
+
+The verdict is honest and negative: the PIT is **far from uniform** (KS ≈ 0.42), and
+the reliability curve shows the outcomes are not spread across the predictive
+quantiles as a calibrated forecast would place them. The predictor is **sharp but
+miscalibrated** under the time-split — exactly the non-exchangeability the conformal
+tier reports from the other direction (under-coverage). The proper scores already
+*penalize* this (a calibrated predictor of the same sharpness would score better); the
+PIT *localizes* it.
+
+## The sharpness-vs-calibration tradeoff
+
+Sharpness and calibration are two distinct virtues, and the order matters: the
+guiding principle is to **maximize sharpness subject to calibration**
+[@gneiting2007sharpness]. Sharpness (a narrow predictive spread) is desirable *only*
+once the forecast is calibrated — a confident-but-wrong forecast is worse than an
+honest-but-vague one, and a strictly proper score is precisely the instrument that
+refuses to reward the former.
+
+```{python}
+report_record = contracts.load_artifact("arxiv.calibration_report")
+print(f"sharpness (mean predictive σ): {sharpness:.3f} years")
+print(f"central coverage:              {central_cov:.3f}")
+print(report_record["note"])
+```
+
+```{python}
+# | echo: false
+# This predictor sits on the wrong side of the tradeoff: it IS sharp (a narrow ~2.9y
+# spread) but NOT calibrated (high ECE, non-uniform PIT) — sharpness bought at the cost
+# of honesty. The committed record matches the live recomputation.
+assert abs(report_record["crps"] - crps) < 1e-2
+assert abs(report_record["pit_ks"] - pit_ks) < 1e-2
+assert ece > 0.05, "the adaptive ECE registers the miscalibration"
+```
+
+## Bridge note
+
+> **Uncertainty is a first-class output, and its honesty is measurable.** A predictive
+> distribution earns trust through *proper scores* (CRPS, NLL) that no over-confident
+> forecast can game [@gneiting2007; @matheson1976], and its calibration is read off the
+> *PIT* — uniform iff the distribution is honest [@dawid1984] — and summarized by the
+> ECE [@guo2017]. The principle is to maximize **sharpness subject to calibration**
+> [@gneiting2007sharpness]: this tier-04 predictor is sharp (≈ 2.9-year spread) but
+> *not* calibrated (PIT KS ≈ 0.42) under the dataset's time-split — the same
+> non-exchangeability the conformal chapter reports as under-coverage, here read as a
+> non-uniform PIT. The two views are one finding: an honest engine reports the
+> miscalibration rather than hiding it.

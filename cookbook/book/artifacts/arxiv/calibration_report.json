@@ -1,0 +1,12 @@
+{
+  "shape": "gaussian",
+  "n": 2115,
+  "split": "test (2019-2020 era)",
+  "crps": 0.3863,
+  "nll": 1.0764,
+  "adaptive_ece": 0.1603,
+  "sharpness": 2.9349,
+  "central_coverage": 0.9518,
+  "pit_ks": 0.417,
+  "note": "eval_calibration(shape='gaussian') on the committed tier-04 gaussian year predictions (pred_mean, pred_std, true_year) for the test era. The proper scores (CRPS 0.386, NLL 1.076) and the sharpness (2.93) headline the predictor; the adaptive ECE (0.160) and the PIT KS statistic (0.417) are the calibration diagnostics \u2014 the PIT is far from uniform, so the predictive distribution is miscalibrated under the time-split (the same non-exchangeability the conformal tier reports). Sharpness without calibration: the predictor is confident (narrow) but its quantiles are not honest. All values cross-checked against an independent numpy PIT/CRPS/NLL fold over the same committed predictions."
+}

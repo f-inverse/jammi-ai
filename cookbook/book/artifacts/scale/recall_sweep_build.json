@@ -1,0 +1,322 @@
+{
+  "backend_version": "2.25.1",
+  "build_sweep": [
+    {
+      "build_expansion": 64,
+      "build_time_ms": {
+        "unit": "ms",
+        "value": 143979.915801
+      },
+      "connectivity": 0,
+      "index_size_bytes": {
+        "unit": "bytes",
+        "value": 542152800.0
+      },
+      "recall": {
+        "1": {
+          "unit": "fraction",
+          "value": 0.968
+        },
+        "10": {
+          "unit": "fraction",
+          "value": 0.9492999999999957
+        },
+        "100": {
+          "unit": "fraction",
+          "value": 0.9035500000000029
+        }
+      },
+      "search_expansion": 0,
+      "search_qps": {
+        "unit": "queries_per_s",
+        "value": 1214.9059798476594
+      }
+    },
+    {
+      "build_expansion": 128,
+      "build_time_ms": {
+        "unit": "ms",
+        "value": 250872.99958
+      },
+      "connectivity": 0,
+      "index_size_bytes": {
+        "unit": "bytes",
+        "value": 542152800.0
+      },
+      "recall": {
+        "1": {
+          "unit": "fraction",
+          "value": 0.971
+        },
+        "10": {
+          "unit": "fraction",
+          "value": 0.956399999999996
+        },
+        "100": {
+          "unit": "fraction",
+          "value": 0.9153500000000035
+        }
+      },
+      "search_expansion": 0,
+      "search_qps": {
+        "unit": "queries_per_s",
+        "value": 1144.4686069743275
+      }
+    },
+    {
+      "build_expansion": 256,
+      "build_time_ms": {
+        "unit": "ms",
+        "value": 423714.425156
+      },
+      "connectivity": 0,
+      "index_size_bytes": {
+        "unit": "bytes",
+        "value": 542152800.0
+      },
+      "recall": {
+        "1": {
+          "unit": "fraction",
+          "value": 0.973
+        },
+        "10": {
+          "unit": "fraction",
+          "value": 0.957599999999996
+        },
+        "100": {
+          "unit": "fraction",
+          "value": 0.917850000000004
+        }
+      },
+      "search_expansion": 0,
+      "search_qps": {
+        "unit": "queries_per_s",
+        "value": 1102.5128814269963
+      }
+    },
+    {
+      "build_expansion": 128,
+      "build_time_ms": {
+        "unit": "ms",
+        "value": 318581.45383
+      },
+      "connectivity": 32,
+      "index_size_bytes": {
+        "unit": "bytes",
+        "value": 563629728.0
+      },
+      "recall": {
+        "1": {
+          "unit": "fraction",
+          "value": 0.986
+        },
+        "10": {
+          "unit": "fraction",
+          "value": 0.9778999999999974
+        },
+        "100": {
+          "unit": "fraction",
+          "value": 0.9594500000000074
+        }
+      },
+      "search_expansion": 0,
+      "search_qps": {
+        "unit": "queries_per_s",
+        "value": 786.7755028430743
+      }
+    }
+  ],
+  "corpus_rows": 168343,
+  "dim": 768,
+  "engine_version": "0.26.5",
+  "note": "build-knob recall-vs-cost reference: jammi-bench recall-sweep over the full 168k corpus, RAYON_NUM_THREADS=1, on-box. The swept graphs are NOT committed (LFS-prohibitive); only this measured cost curve is. Un-gated reference. search_sweep included as the engine-side ef cross-check: its recall@10 agrees with the chapter Python re-dial over the committed index within 1e-3 across the grid.",
+  "query_rows": 1000,
+  "search_sweep": [
+    {
+      "build_expansion": 0,
+      "build_time_ms": {
+        "unit": "ms",
+        "value": null
+      },
+      "connectivity": 0,
+      "index_size_bytes": {
+        "unit": "bytes",
+        "value": null
+      },
+      "recall": {
+        "1": {
+          "unit": "fraction",
+          "value": 0.726
+        },
+        "10": {
+          "unit": "fraction",
+          "value": 0.6892999999999978
+        },
+        "100": {
+          "unit": "fraction",
+          "value": 0.9153500000000035
+        }
+      },
+      "search_expansion": 8,
+      "search_qps": {
+        "unit": "queries_per_s",
+        "value": 4046.4479294764983
+      }
+    },
+    {
+      "build_expansion": 0,
+      "build_time_ms": {
+        "unit": "ms",
+        "value": null
+      },
+      "connectivity": 0,
+      "index_size_bytes": {
+        "unit": "bytes",
+        "value": null
+      },
+      "recall": {
+        "1": {
+          "unit": "fraction",
+          "value": 0.849
+        },
+        "10": {
+          "unit": "fraction",
+          "value": 0.7802999999999963
+        },
+        "100": {
+          "unit": "fraction",
+          "value": 0.9153500000000035
+        }
+      },
+      "search_expansion": 16,
+      "search_qps": {
+        "unit": "queries_per_s",
+        "value": 3095.1006794002883
+      }
+    },
+    {
+      "build_expansion": 0,
+      "build_time_ms": {
+        "unit": "ms",
+        "value": null
+      },
+      "connectivity": 0,
+      "index_size_bytes": {
+        "unit": "bytes",
+        "value": null
+      },
+      "recall": {
+        "1": {
+          "unit": "fraction",
+          "value": 0.937
+        },
+        "10": {
+          "unit": "fraction",
+          "value": 0.8928999999999958
+        },
+        "100": {
+          "unit": "fraction",
+          "value": 0.9153500000000035
+        }
+      },
+      "search_expansion": 32,
+      "search_qps": {
+        "unit": "queries_per_s",
+        "value": 1943.736290560679
+      }
+    },
+    {
+      "build_expansion": 0,
+      "build_time_ms": {
+        "unit": "ms",
+        "value": null
+      },
+      "connectivity": 0,
+      "index_size_bytes": {
+        "unit": "bytes",
+        "value": null
+      },
+      "recall": {
+        "1": {
+          "unit": "fraction",
+          "value": 0.971
+        },
+        "10": {
+          "unit": "fraction",
+          "value": 0.956399999999996
+        },
+        "100": {
+          "unit": "fraction",
+          "value": 0.9153500000000035
+        }
+      },
+      "search_expansion": 64,
+      "search_qps": {
+        "unit": "queries_per_s",
+        "value": 1140.0403247083373
+      }
+    },
+    {
+      "build_expansion": 0,
+      "build_time_ms": {
+        "unit": "ms",
+        "value": null
+      },
+      "connectivity": 0,
+      "index_size_bytes": {
+        "unit": "bytes",
+        "value": null
+      },
+      "recall": {
+        "1": {
+          "unit": "fraction",
+          "value": 0.995
+        },
+        "10": {
+          "unit": "fraction",
+          "value": 0.9865999999999981
+        },
+        "100": {
+          "unit": "fraction",
+          "value": 0.9405600000000055
+        }
+      },
+      "search_expansion": 128,
+      "search_qps": {
+        "unit": "queries_per_s",
+        "value": 647.9271051165414
+      }
+    },
+    {
+      "build_expansion": 0,
+      "build_time_ms": {
+        "unit": "ms",
+        "value": null
+      },
+      "connectivity": 0,
+      "index_size_bytes": {
+        "unit": "bytes",
+        "value": null
+      },
+      "recall": {
+        "1": {
+          "unit": "fraction",
+          "value": 0.997
+        },
+        "10": {
+          "unit": "fraction",
+          "value": 0.9958999999999992
+        },
+        "100": {
+          "unit": "fraction",
+          "value": 0.9816100000000064
+        }
+      },
+      "search_expansion": 256,
+      "search_qps": {
+        "unit": "queries_per_s",
+        "value": 373.1878148055201
+      }
+    }
+  ]
+}

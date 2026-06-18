@@ -1,0 +1,413 @@
+% Bibliography for the Theory↔Computation Cookbook.
+% Every entry here was independently verified (author / year / venue) against the
+% primary source during the K-bridge pressure-test — not transcribed from the spec.
+% The citation map (chapters/07-bridge) cites these keys and the verticals' bridge
+% notes draw on them; Quarto fails the render on any dangling @cite.
+
+% --- The monograph: Graph Signal Processing (Stanković et al.) -----------------
+% Three parts; Parts I/II are 2019, Part III is 2020 (the series is commonly cited
+% as "Stanković et al. 2020" for the complete set). Authors per arXiv: L. Stanković,
+% D. Mandic, M. Daković, M. Brajović, B. Scalzo, A. G. Constantinides (Part III
+% adds S. Li). Verified arXiv IDs 1907.03467 / 1909.10325 / 2001.00426.
+
+@article{stankovic2019gsp1,
+  title   = {Graph Signal Processing -- Part {I}: Graphs, Graph Spectra, and Spectral Clustering},
+  author  = {Stankovi{\'c}, Ljubi{\v{s}}a and Mandic, Danilo and Dakovi{\'c}, Milo{\v{s}} and Brajovi{\'c}, Milo{\v{s}} and Scalzo, Bruno and Constantinides, Anthony G.},
+  journal = {arXiv preprint arXiv:1907.03467},
+  year    = {2019}
+}
+
+@article{stankovic2019gsp2,
+  title   = {Graph Signal Processing -- Part {II}: Processing and Analyzing Signals on Graphs},
+  author  = {Stankovi{\'c}, Ljubi{\v{s}}a and Mandic, Danilo and Dakovi{\'c}, Milo{\v{s}} and Brajovi{\'c}, Milo{\v{s}} and Scalzo, Bruno and Constantinides, Anthony G.},
+  journal = {arXiv preprint arXiv:1909.10325},
+  year    = {2019}
+}
+
+@article{stankovic2020gsp3,
+  title   = {Graph Signal Processing -- Part {III}: Machine Learning on Graphs, from Graph Topology to Applications},
+  author  = {Stankovi{\'c}, Ljubi{\v{s}}a and Mandic, Danilo and Dakovi{\'c}, Milo{\v{s}} and Brajovi{\'c}, Milo{\v{s}} and Scalzo, Bruno and Li, Shengxi and Constantinides, Anthony G.},
+  journal = {arXiv preprint arXiv:2001.00426},
+  year    = {2020}
+}
+
+% --- The GNN canon ------------------------------------------------------------
+
+@inproceedings{wu2019sgc,
+  title     = {Simplifying Graph Convolutional Networks},
+  author    = {Wu, Felix and Souza, Amauri and Zhang, Tianyi and Fifty, Christopher and Yu, Tao and Weinberger, Kilian Q.},
+  booktitle = {Proceedings of the 36th International Conference on Machine Learning (ICML)},
+  pages     = {6861--6871},
+  year      = {2019}
+}
+
+% Author Johannes Klicpera later changed his name to Johannes Gasteiger; cited here
+% as Gasteiger (the current name) with the arXiv "Klicpera" record acknowledged.
+@inproceedings{gasteiger2019appnp,
+  title     = {Predict then Propagate: Graph Neural Networks meet Personalized {PageRank}},
+  author    = {Gasteiger, Johannes and Bojchevski, Aleksandar and G{\"u}nnemann, Stephan},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2019},
+  note      = {arXiv:1810.05997, 2018; published as Klicpera et al.}
+}
+
+@inproceedings{grover2016node2vec,
+  title     = {node2vec: Scalable Feature Learning for Networks},
+  author    = {Grover, Aditya and Leskovec, Jure},
+  booktitle = {Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining (KDD)},
+  pages     = {855--864},
+  year      = {2016}
+}
+
+@inproceedings{hamilton2017graphsage,
+  title     = {Inductive Representation Learning on Large Graphs},
+  author    = {Hamilton, William L. and Ying, Rex and Leskovec, Jure},
+  booktitle = {Advances in Neural Information Processing Systems 30 (NeurIPS)},
+  pages     = {1024--1034},
+  year      = {2017}
+}
+
+% --- The Neural-Process / amortized-prediction family -------------------------
+
+@inproceedings{garnelo2018cnp,
+  title     = {Conditional Neural Processes},
+  author    = {Garnelo, Marta and Rosenbaum, Dan and Maddison, Christopher and Ramalho, Tiago and Saxton, David and Shanahan, Murray and Teh, Yee Whye and Rezende, Danilo and Eslami, S. M. Ali},
+  booktitle = {Proceedings of the 35th International Conference on Machine Learning (ICML)},
+  pages     = {1704--1713},
+  year      = {2018}
+}
+
+@inproceedings{kim2019anp,
+  title     = {Attentive Neural Processes},
+  author    = {Kim, Hyunjik and Mnih, Andriy and Schwarz, Jonathan and Garnelo, Marta and Eslami, Ali and Rosenbaum, Dan and Vinyals, Oriol and Teh, Yee Whye},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2019}
+}
+
+% arXiv 2207.01848 (2022); published at ICLR 2023. Cited as "Hollmann 2022" by the
+% arXiv year per the spec; the venue note records the official publication.
+@article{hollmann2022tabpfn,
+  title   = {{TabPFN}: A Transformer That Solves Small Tabular Classification Problems in a Second},
+  author  = {Hollmann, Noah and M{\"u}ller, Samuel and Eggensperger, Katharina and Hutter, Frank},
+  journal = {arXiv preprint arXiv:2207.01848},
+  year    = {2022},
+  note    = {Published at ICLR 2023}
+}
+
+% --- The conformal canon ------------------------------------------------------
+
+@book{vovk2005conformal,
+  title     = {Algorithmic Learning in a Random World},
+  author    = {Vovk, Vladimir and Gammerman, Alexander and Shafer, Glenn},
+  publisher = {Springer},
+  year      = {2005}
+}
+
+% arXiv 2107.07511 (2021); published in Foundations and Trends in Machine Learning,
+% 16(4):494--591, 2023. Cited as "Angelopoulos & Bates 2021" by the arXiv year.
+@article{angelopoulos2021conformal,
+  title   = {A Gentle Introduction to Conformal Prediction and Distribution-Free Uncertainty Quantification},
+  author  = {Angelopoulos, Anastasios N. and Bates, Stephen},
+  journal = {arXiv preprint arXiv:2107.07511},
+  year    = {2021},
+  note    = {Published in Foundations and Trends in Machine Learning, 16(4):494--591, 2023}
+}
+
+@inproceedings{tibshirani2019covariateshift,
+  title     = {Conformal Prediction Under Covariate Shift},
+  author    = {Tibshirani, Ryan J. and Barber, Rina Foygel and Cand{\`e}s, Emmanuel J. and Ramdas, Aaditya},
+  booktitle = {Advances in Neural Information Processing Systems 32 (NeurIPS)},
+  pages     = {2526--2536},
+  year      = {2019}
+}
+
+@article{barber2023beyond,
+  title   = {Conformal Prediction Beyond Exchangeability},
+  author  = {Barber, Rina Foygel and Cand{\`e}s, Emmanuel J. and Ramdas, Aaditya and Tibshirani, Ryan J.},
+  journal = {The Annals of Statistics},
+  volume  = {51},
+  number  = {2},
+  pages   = {816--845},
+  year    = {2023}
+}
+
+@inproceedings{huang2023cfgnn,
+  title     = {Uncertainty Quantification over Graph with Conformalized Graph Neural Networks},
+  author    = {Huang, Kexin and Jin, Ying and Cand{\`e}s, Emmanuel and Leskovec, Jure},
+  booktitle = {Advances in Neural Information Processing Systems 36 (NeurIPS)},
+  year      = {2023}
+}
+
+@inproceedings{clarkson2023naps,
+  title     = {Distribution Free Prediction Sets for Node Classification},
+  author    = {Clarkson, Jase},
+  booktitle = {Proceedings of the 40th International Conference on Machine Learning (ICML)},
+  year      = {2023}
+}
+
+% --- Conformal score families (the expansion verticals) -----------------------
+
+@inproceedings{romano2020classification,
+  title     = {Classification with Valid and Adaptive Coverage},
+  author    = {Romano, Yaniv and Sesia, Matteo and Cand{\`e}s, Emmanuel J.},
+  booktitle = {Advances in Neural Information Processing Systems 33 (NeurIPS)},
+  year      = {2020}
+}
+
+% arXiv 2009.14193 (2020); published at ICLR 2021 (the RAPS regularized-APS score).
+@inproceedings{angelopoulos2021raps,
+  title     = {Uncertainty Sets for Image Classifiers using Conformal Prediction},
+  author    = {Angelopoulos, Anastasios N. and Bates, Stephen and Malik, Jitendra and Jordan, Michael I.},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2021}
+}
+
+@inproceedings{romano2019cqr,
+  title     = {Conformalized Quantile Regression},
+  author    = {Romano, Yaniv and Patterson, Evan and Cand{\`e}s, Emmanuel J.},
+  booktitle = {Advances in Neural Information Processing Systems 32 (NeurIPS)},
+  year      = {2019}
+}
+
+% --- Proper scoring, calibration & the PIT (the calibration vertical) ----------
+
+@article{gneiting2007,
+  title   = {Strictly Proper Scoring Rules, Prediction, and Estimation},
+  author  = {Gneiting, Tilmann and Raftery, Adrian E.},
+  journal = {Journal of the American Statistical Association},
+  volume  = {102},
+  number  = {477},
+  pages   = {359--378},
+  year    = {2007}
+}
+
+@article{gneiting2007sharpness,
+  title   = {Probabilistic Forecasts, Calibration and Sharpness},
+  author  = {Gneiting, Tilmann and Balabdaoui, Fadoua and Raftery, Adrian E.},
+  journal = {Journal of the Royal Statistical Society: Series B},
+  volume  = {69},
+  number  = {2},
+  pages   = {243--268},
+  year    = {2007}
+}
+
+@inproceedings{guo2017,
+  title     = {On Calibration of Modern Neural Networks},
+  author    = {Guo, Chuan and Pleiss, Geoff and Sun, Yu and Weinberger, Kilian Q.},
+  booktitle = {Proceedings of the 34th International Conference on Machine Learning (ICML)},
+  year      = {2017}
+}
+
+% PIT uniformity as the prequential calibration test.
+@article{dawid1984,
+  title   = {Present Position and Potential Developments: Some Personal Views: Statistical Theory: The Prequential Approach},
+  author  = {Dawid, A. Philip},
+  journal = {Journal of the Royal Statistical Society: Series A},
+  volume  = {147},
+  number  = {2},
+  pages   = {278--290},
+  year    = {1984}
+}
+
+% The continuous-ranked-probability-score (CRPS) origin.
+@article{matheson1976,
+  title   = {Scoring Rules for Continuous Probability Distributions},
+  author  = {Matheson, James E. and Winkler, Robert L.},
+  journal = {Management Science},
+  volume  = {22},
+  number  = {10},
+  pages   = {1087--1096},
+  year    = {1976}
+}
+
+% --- Retrieval: rank fusion and the lexical baseline --------------------------
+
+% Reciprocal Rank Fusion — the engine's rrf_fuse helper. A two-page SIGIR note;
+% the score for a document is sum over rankers of 1 / (k_rrf + rank).
+@inproceedings{cormack2009rrf,
+  title     = {Reciprocal Rank Fusion Outperforms {Condorcet} and Individual Rank Learning Methods},
+  author    = {Cormack, Gordon V. and Clarke, Charles L. A. and B{\"u}ttcher, Stefan},
+  booktitle = {Proceedings of the 32nd International ACM SIGIR Conference on Research and Development in Information Retrieval},
+  pages     = {758--759},
+  year      = {2009},
+  note      = {DOI 10.1145/1571941.1572114}
+}
+
+% BM25 — the probabilistic-relevance lexical scoring the hybrid arm uses.
+@article{robertson2009bm25,
+  title   = {The Probabilistic Relevance Framework: {BM25} and Beyond},
+  author  = {Robertson, Stephen and Zaragoza, Hugo},
+  journal = {Foundations and Trends in Information Retrieval},
+  volume  = {3},
+  number  = {4},
+  pages   = {333--389},
+  year    = {2009},
+  note    = {DOI 10.1561/1500000019}
+}
+
+% --- Feature stores / data systems canon (the mutable companion table) ---------
+% Designing Data-Intensive Applications — the data-systems reference for the
+% append-only-log vs mutable-state distinction this chapter measures.
+@book{kleppmann2017ddia,
+  title     = {Designing Data-Intensive Applications: The Big Ideas Behind Reliable, Scalable, and Maintainable Systems},
+  author    = {Kleppmann, Martin},
+  publisher = {O'Reilly Media},
+  year      = {2017},
+  isbn      = {978-1449373320}
+}
+
+% Operationalizing ML feature stores — the canonical articulation of a feature
+% store as the shared substrate that federates features into training and serving.
+@inproceedings{orr2021featurestore,
+  title     = {Managing {ML} Pipelines: Feature Stores and the Coming Wave of Embedding Ecosystems},
+  author    = {Orr, Laurel and Sanyal, Atindriyo and Ling, Xiao and Goel, Karan and Leszczynski, Megan},
+  booktitle = {Proceedings of the VLDB Endowment},
+  volume    = {14},
+  number    = {12},
+  pages     = {3178--3181},
+  year      = {2021},
+  note      = {DOI 10.14778/3476311.3476402}
+}
+
+% The canonical log-based publish/subscribe substrate: a partitioned, offset-addressed
+% append-only commit log that a consumer replays from a stored offset — the model the
+% trigger stream's publish → offset-addressed replay-collect mirrors.
+@inproceedings{kreps2011kafka,
+  title     = {Kafka: A Distributed Messaging System for Log Processing},
+  author    = {Kreps, Jay and Narkhede, Neha and Rao, Jun},
+  booktitle = {Proceedings of the NetDB Workshop on Networking Meets Databases},
+  pages     = {1--7},
+  year      = {2011}
+}
+
+% --- Scale tier: approximate nearest neighbours + the embedding model ----------
+% HNSW (Hierarchical Navigable Small World): the graph-based ANN index the engine's
+% usearch sidecar implements. The scale-tier cross-check measures this index's
+% recall against an exact cosine-kNN oracle. Verified: Malkov & Yashunin, IEEE TPAMI
+% 42(4):824–836, 2020 (the journal version of the 2016 arXiv preprint 1603.09320).
+@article{malkov2020hnsw,
+  title   = {Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs},
+  author  = {Malkov, Yu A. and Yashunin, Dmitry A.},
+  journal = {IEEE Transactions on Pattern Analysis and Machine Intelligence},
+  volume  = {42},
+  number  = {4},
+  pages   = {824--836},
+  year    = {2020},
+  note    = {DOI 10.1109/TPAMI.2018.2889473; arXiv:1603.09320}
+}
+
+% Billion-scale similarity search: the framing that ANN recall must be MEASURED
+% against exact ground truth, not assumed — the recall-vs-speed trade-off the scale
+% tier quantifies. Verified: Johnson, Douze & Jégou, IEEE Trans. Big Data 7(3):535–547,
+% 2021 (the Faiss / GPU-kNN paper; journal version of arXiv:1702.08734).
+@article{johnson2021billion,
+  title   = {Billion-Scale Similarity Search with {GPU}s},
+  author  = {Johnson, Jeff and Douze, Matthijs and J{\'e}gou, Herv{\'e}},
+  journal = {IEEE Transactions on Big Data},
+  volume  = {7},
+  number  = {3},
+  pages   = {535--547},
+  year    = {2021},
+  note    = {DOI 10.1109/TBDATA.2019.2921572; arXiv:1702.08734}
+}
+
+% ModernBERT: the encoder the keystone and scale corpus are embedded with. The
+% scale-tier embeddings are real, clustered ModernBERT representations of paper
+% title+abstract text — the realistic geometry synthetic vectors cannot reproduce.
+% Verified: Warner et al., arXiv:2412.13663, 2024.
+@article{warner2024modernbert,
+  title   = {{ModernBERT}: A Modern Bidirectional Encoder for Fast, Memory Efficient, and Long Context Finetuning and Inference},
+  author  = {Warner, Benjamin and Chaffin, Antoine and Clavi{\'e}, Benjamin and Cooper, Orion and Adams, Griffin and Howard, Jeremy and others},
+  journal = {arXiv preprint arXiv:2412.13663},
+  year    = {2024}
+}
+
+% Mean-variance Gaussian regression head: the parameterization that predicts both a
+% mean and a variance and trains by Gaussian negative log-likelihood — the head the
+% regression chapter's gaussian_nll / beta_nll objectives optimize. Verified: Nix &
+% Weigend, Proc. IEEE ICNN 1994, vol. 1, pp. 55--60.
+@inproceedings{nix1994,
+  title     = {Estimating the Mean and Variance of the Target Probability Distribution},
+  author    = {Nix, David A. and Weigend, Andreas S.},
+  booktitle = {Proceedings of the 1994 IEEE International Conference on Neural Networks (ICNN'94)},
+  volume    = {1},
+  pages     = {55--60},
+  year      = {1994},
+  note      = {DOI 10.1109/ICNN.1994.374138}
+}
+
+% beta-NLL: the engine's default regression objective. A stop-gradient sigma^{2*beta}
+% re-weighting of the Gaussian NLL that restores the mean's gradient on high-variance
+% rows, fixing the mean-starvation pathology of joint mean/variance NLL. Verified:
+% Seitzer, Tavakoli, Antic & Martius, ICLR 2022, arXiv:2203.09168.
+@inproceedings{seitzer2022,
+  title     = {On the Pitfalls of Heteroscedastic Uncertainty Estimation with Probabilistic Neural Networks},
+  author    = {Seitzer, Maximilian and Tavakoli, Arash and Antic, Dimitrije and Martius, Georg},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2022},
+  note      = {arXiv:2203.09168}
+}
+
+% Quantile (pinball) regression: the loss the pinball objective minimizes to predict
+% conditional quantiles directly (the engine's quantile head), giving a distribution-
+% free predictive interval. Verified: Koenker & Bassett, Econometrica 46(1):33--50,
+% 1978.
+@article{koenker1978,
+  title   = {Regression Quantiles},
+  author  = {Koenker, Roger and Bassett, Gilbert},
+  journal = {Econometrica},
+  volume  = {46},
+  number  = {1},
+  pages   = {33--50},
+  year    = {1978},
+  note    = {DOI 10.2307/1913643}
+}
+
+% --- The wire contract: gRPC status codes --------------------------------------
+% The canonical typed-error vocabulary on the wire. The §3.8 channel error-taxonomy
+% chapter cites this for the semantics of ALREADY_EXISTS (the entity a client
+% tried to create already exists), NOT_FOUND (the requested entity was not found),
+% FAILED_PRECONDITION (the operation was rejected because the system is not in the
+% state the operation requires), and INVALID_ARGUMENT (a problematic argument
+% regardless of system state) — the four codes the channel registry maps its
+% failures onto under #193, instead of INTERNAL (an internal-invariant fault).
+% Verified against the official gRPC documentation (grpc.io/docs/guides/status-codes),
+% which mirrors the google.rpc.Code enum.
+@misc{grpcstatuscodes,
+  title        = {Status Codes},
+  author       = {{The gRPC Authors}},
+  howpublished = {gRPC documentation, \url{https://grpc.io/docs/guides/status-codes/}},
+  year         = {2024}
+}
+
+% --- BYO-auth seam: the generic credential primitives -------------------------
+
+% HMAC — the keyed-hash the §3.5 BYO-auth worked example signs its generic bearer
+% token with (HMAC-SHA256 over "<subject>.<tenant>"). The construction is what
+% makes the tenant claim INSIDE the token unforgeable without the shared key, so a
+% verified claim — not a caller-asserted header — derives the tenant. Cited for the
+% MAC primitive the gateway verifies; verified against the RFC Editor record
+% (rfc-editor.org/info/rfc2104): H. Krawczyk, M. Bellare, R. Canetti, February 1997.
+@misc{rfc2104,
+  title        = {{HMAC}: Keyed-Hashing for Message Authentication},
+  author       = {Krawczyk, Hugo and Bellare, Mihir and Canetti, Ran},
+  howpublished = {RFC 2104, Internet Engineering Task Force},
+  month        = feb,
+  year         = {1997},
+  note         = {DOI 10.17487/RFC2104, \url{https://www.rfc-editor.org/info/rfc2104}}
+}
+
+% Bearer Token Usage — the credential presentation pattern the §3.5 BYO-auth seam
+% uses: the caller presents an opaque bearer token on the Authorization header, and
+% any party in possession of it can use it (so it is carried over a protected
+% channel and verified by the gateway). Cited for the bearer-token usage the generic
+% credential follows; verified against the RFC Editor record
+% (rfc-editor.org/info/rfc6750): M. Jones, D. Hardt, October 2012.
+@misc{rfc6750,
+  title        = {The {OAuth} 2.0 Authorization Framework: Bearer Token Usage},
+  author       = {Jones, Michael B. and Hardt, Dick},
+  howpublished = {RFC 6750, Internet Engineering Task Force},
+  month        = oct,
+  year         = {2012},
+  note         = {DOI 10.17487/RFC6750, \url{https://www.rfc-editor.org/info/rfc6750}}
+}

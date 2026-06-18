@@ -1,0 +1,69 @@
+[
+  {
+    "cohorts": {
+      "split": "val"
+    },
+    "metrics": {
+      "distance": 0.16128316521644592,
+      "mrr": 1.0,
+      "ndcg": 0.787702056960637,
+      "recall@1": 0.25,
+      "recall@10": 0.75,
+      "recall@3": 0.5,
+      "recall@5": 0.75
+    },
+    "query_id": "q1"
+  },
+  {
+    "cohorts": {},
+    "metrics": {
+      "distance": 0.1967291533946991,
+      "mrr": 0.25,
+      "ndcg": 0.20210734650054757,
+      "recall@1": 0.0,
+      "recall@10": 0.3333333333333333,
+      "recall@3": 0.0,
+      "recall@5": 0.3333333333333333
+    },
+    "query_id": "q2"
+  },
+  {
+    "cohorts": {},
+    "metrics": {
+      "distance": 0.13757941126823425,
+      "mrr": 0.0,
+      "ndcg": 0.0,
+      "recall@1": 0.0,
+      "recall@10": 0.0,
+      "recall@3": 0.0,
+      "recall@5": 0.0
+    },
+    "query_id": "q3"
+  },
+  {
+    "cohorts": {},
+    "metrics": {
+      "distance": 0.15734463930130005,
+      "mrr": 0.0,
+      "ndcg": 0.0,
+      "recall@1": 0.0,
+      "recall@10": 0.0,
+      "recall@3": 0.0,
+      "recall@5": 0.0
+    },
+    "query_id": "q4"
+  },
+  {
+    "cohorts": {},
+    "metrics": {
+      "distance": 0.18315736949443817,
+      "mrr": 0.1111111111111111,
+      "ndcg": 0.14126697285982898,
+      "recall@1": 0.0,
+      "recall@10": 0.3333333333333333,
+      "recall@3": 0.0,
+      "recall@5": 0.0
+    },
+    "query_id": "q5"
+  }
+]

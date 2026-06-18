@@ -15,7 +15,7 @@ keywords = ["embeddings", "vector-search", "fine-tuning", "inference", "machine-
 # arm of `connect(target)`, bundled so local→remote scaling is zero-friction.
 # An extra could only *add* the client, never *subtract* the compiled engine —
 # and the embed wheel is the engine. Lockstep version with the workspace.
-dependencies = ["jammi-client==0.31.0"]
+dependencies = ["jammi-client==0.32.0"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

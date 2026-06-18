@@ -6,6 +6,28 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-06-18
+
+A client-side correctness release, shipped in lockstep across the workspace. The
+only behavioral change is in the Python `jammi-client`; the engine, Rust crates,
+TypeScript client, and server images are republished at `0.32.0` unchanged, so
+every published artifact stays on a single workspace version.
+
+### Fixed
+- **`jammi-client` carries the bearer on the Flight SQL lane.** A `RemoteDatabase`
+  opened with `BearerCredentials` now attaches the `authorization: Bearer …`
+  header to `db.sql()` calls (the `pyarrow.flight` transport), matching the typed
+  gRPC verbs, which already carried it. Previously the bearer rode only the typed
+  path, so an authenticating gateway in front of the Flight lane would reject
+  `db.sql()`. Anonymous and credential-less sessions are unchanged — no
+  authorization header is sent.
+
+### Documentation
+- Clarified the BYO-auth boundary in the security and multi-tenancy guides: the
+  engine enforces authentication on no transport by design; authenticating every
+  transport — the Flight lane included — is the consumer's responsibility,
+  typically a governing gateway ahead of the trusted-network engine.
+
 ## [0.31.0] - 2026-06-18
 
 **H4 — the 1.0 engineering bar, shipped as a terminal 0.x.** This release raises

@@ -210,6 +210,57 @@ async fn recompute_graph_propagation_with_non_default_params_is_byte_identical()
 }
 
 #[tokio::test]
+async fn recompute_graph_propagation_over_registered_non_default_columns_is_byte_identical() {
+    use jammi_ai::pipeline::graph_neighbourhood::{EdgeDirection, EdgeSourceRef};
+    use jammi_ai::pipeline::graph_propagation::PropagateRequest;
+
+    let (session, _dir, emb) = session_with_synthetic_embeddings().await;
+    register_edges_source(&session, &_dir).await;
+    let svc = Session::new(Arc::clone(&session));
+
+    // A propagation over a REGISTERED edge source with NON-DEFAULT columns
+    // (`from`/`to`, not the `src`/`dst` defaults). The proven HIGH bug: the
+    // GraphPropagation descriptor recorded only the source id, and the replay
+    // reconstructed with hardcoded `src`/`dst` — so a propagation over `from`/`to`
+    // either replayed over a different graph or failed. The fix records the full
+    // edge-source binding, so the replay reads the exact same columns and is
+    // byte-identical.
+    let request = PropagateRequest::new(
+        "points",
+        EdgeSourceRef::Registered {
+            source_id: "edges".into(),
+            src_column: "from".into(),
+            dst_column: "to".into(),
+            type_column: None,
+            weight_column: None,
+            as_of_column: None,
+        },
+    )
+    .with_embedding_table(emb.table_name.clone())
+    .with_direction(EdgeDirection::Undirected)
+    .with_hops(2);
+
+    let (propagated, _) = session
+        .propagate_embeddings(&request, CachePolicy::Bypass)
+        .await
+        .unwrap();
+
+    let before = artifact_digest(&session, &propagated.table_name).await;
+    let report = svc
+        .recompute(&propagated.table_name, Cascade::ReportOnly)
+        .await
+        .unwrap();
+    let after = artifact_digest(&session, &report.recomputed[0].recomputed).await;
+
+    assert_eq!(
+        before, after,
+        "a graph-propagation recompute over a registered source with non-default \
+         (`from`/`to`) columns must be byte-identical — the descriptor records the full \
+         edge-source binding and the replay reconstructs it losslessly"
+    );
+}
+
+#[tokio::test]
 async fn recompute_context_set_pair_with_non_default_params_is_byte_identical() {
     use jammi_ai::pipeline::context_set::{
         ContextRequest, ContextSource, MaterializedContext, SetAggregator,
@@ -224,7 +275,7 @@ async fn recompute_context_set_pair_with_non_default_params_is_byte_identical() 
     // candidate source for the context-set's edge gather. An *edge*-sourced
     // context (vs ANN) makes the pooling fully reproducible (the index-assisted
     // ANN path is non-deterministic), and the Registered shape exercises the
-    // richest descriptor path: the `ContextEdgeSource::Registered { columns }`
+    // richest descriptor path: the `EdgeSourceBinding::Registered { columns }`
     // the descriptor records and recompute must reconstruct losslessly.
     //
     // NON-DEFAULT recipe: Sum pooling (default Mean), exclude_self off (default

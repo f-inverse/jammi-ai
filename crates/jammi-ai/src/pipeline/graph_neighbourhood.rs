@@ -248,6 +248,64 @@ pub enum EdgeSourceRef {
     },
 }
 
+impl EdgeSourceRef {
+    /// The transport-neutral manifest mirror of this edge source — the descriptor
+    /// binding a producer records so a recompute can reconstruct the *exact* same
+    /// edge read. `jammi-db` cannot depend on this AI-crate enum, so the mirror
+    /// ([`jammi_db::store::manifest::EdgeSourceBinding`]) lives there; this is the
+    /// single forward mapping,
+    /// shared by every edge-reading producer (graph propagation, the context-set
+    /// edge gather).
+    pub fn to_binding(&self) -> jammi_db::store::manifest::EdgeSourceBinding {
+        use jammi_db::store::manifest::EdgeSourceBinding as Binding;
+        match self {
+            EdgeSourceRef::NeighborGraph { table_name } => Binding::NeighborGraph {
+                table_name: table_name.clone(),
+            },
+            EdgeSourceRef::Registered {
+                source_id,
+                src_column,
+                dst_column,
+                type_column,
+                weight_column,
+                as_of_column,
+            } => Binding::Registered {
+                source_id: source_id.clone(),
+                src_column: src_column.clone(),
+                dst_column: dst_column.clone(),
+                type_column: type_column.clone(),
+                weight_column: weight_column.clone(),
+                as_of_column: as_of_column.clone(),
+            },
+        }
+    }
+
+    /// Reconstruct an edge source from its recorded manifest mirror — the lossless
+    /// inverse of [`Self::to_binding`], the single reverse mapping a recompute
+    /// uses to replay the exact edge read the descriptor recorded.
+    pub fn from_binding(binding: jammi_db::store::manifest::EdgeSourceBinding) -> Self {
+        use jammi_db::store::manifest::EdgeSourceBinding as Binding;
+        match binding {
+            Binding::NeighborGraph { table_name } => EdgeSourceRef::NeighborGraph { table_name },
+            Binding::Registered {
+                source_id,
+                src_column,
+                dst_column,
+                type_column,
+                weight_column,
+                as_of_column,
+            } => EdgeSourceRef::Registered {
+                source_id,
+                src_column,
+                dst_column,
+                type_column,
+                weight_column,
+                as_of_column,
+            },
+        }
+    }
+}
+
 /// A bounded, target-anchored declared-edge gather: which edge source, how far
 /// (`hops`, capped), how wide (`fanout`), which direction, and the optional
 /// type / weight / as-of filters. The discipline boundary — depth- and

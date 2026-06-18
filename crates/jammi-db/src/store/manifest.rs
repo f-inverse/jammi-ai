@@ -266,11 +266,14 @@ pub enum ProducingDescriptor {
     GraphPropagation {
         /// The embedding result table whose features were propagated.
         source_table: String,
-        /// The edge relation the propagation read, by id — the second input
-        /// anchor's source. A staleness/lineage determinant independent of the
-        /// kernel knobs: the same knobs over a different graph yield a different
-        /// output.
-        edge_source: String,
+        /// The edge relation the propagation read, with its full column
+        /// bindings — the second input anchor's source. A staleness/lineage
+        /// determinant independent of the kernel knobs: the same knobs over a
+        /// different graph (or the same registered source read through different
+        /// `src`/`dst`/weight/type/as-of columns) yield a different output, so
+        /// the whole binding — not just the source id — is part of the
+        /// definition and must replay losslessly.
+        edge_source: EdgeSourceBinding,
         /// The propagation kernel's canonical id.
         kernel_id: String,
         /// Edge-direction the walk followed.
@@ -512,7 +515,7 @@ pub enum ContextCandidateSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextEdgeGather {
     /// The edge relation walked.
-    pub edge_source: ContextEdgeSource,
+    pub edge_source: EdgeSourceBinding,
     /// The effective (post-clamp) number of hops walked.
     pub hops: usize,
     /// Per-node per-hop neighbour sample cap (GraphSAGE). `None` = exact.
@@ -528,12 +531,17 @@ pub struct ContextEdgeGather {
     pub as_of: Option<String>,
 }
 
-/// Which edge relation a context gather walked, recorded in a
-/// [`ContextEdgeGather`] — the transport-neutral mirror of the AI crate's
-/// `EdgeSourceRef`.
+/// Which edge relation an edge-reading verb walked, with its full column
+/// bindings — the transport-neutral mirror of the AI crate's `EdgeSourceRef`,
+/// shared by every descriptor that records an edge source (a
+/// [`ProducingDescriptor::GraphPropagation`] and the gather of a
+/// [`ContextEdgeGather`]). The `Registered` bindings are output-affecting (the
+/// same source read through different `src`/`dst`/weight/type/as-of columns is a
+/// different graph), so the mirror carries them all and a replay reconstructs
+/// them losslessly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "edge_source", rename_all = "snake_case")]
-pub enum ContextEdgeSource {
+pub enum EdgeSourceBinding {
     /// A `neighbor_graph` result table, by registered name.
     NeighborGraph {
         /// The registered result-table name.
@@ -1144,7 +1152,7 @@ mod tests {
 
     #[derive(Clone)]
     struct GraphPropagationFields {
-        edge_source: String,
+        edge_source: EdgeSourceBinding,
         direction: PropagationDirection,
         hops: usize,
         alpha_bits: u64,
@@ -1170,7 +1178,9 @@ mod tests {
     #[test]
     fn graph_propagation_each_param_moves_the_hash() {
         let base = GraphPropagationFields {
-            edge_source: "graph".into(),
+            edge_source: EdgeSourceBinding::NeighborGraph {
+                table_name: "graph".into(),
+            },
             direction: PropagationDirection::Out,
             hops: 2,
             alpha_bits: 0.1_f64.to_bits(),
@@ -1183,7 +1193,11 @@ mod tests {
             &no_model_env(),
             graph_propagation_descriptor,
             &[
-                ("edge_source", |p| p.edge_source = "other_graph".into()),
+                ("edge_source", |p| {
+                    p.edge_source = EdgeSourceBinding::NeighborGraph {
+                        table_name: "other_graph".into(),
+                    }
+                }),
                 ("direction", |p| {
                     p.direction = PropagationDirection::Undirected
                 }),
@@ -1194,6 +1208,85 @@ mod tests {
                 }),
                 ("output", |p| p.output = PropagationOutput::JumpingKnowledge),
                 ("dimensions", |p| p.dimensions = 768),
+            ],
+        );
+    }
+
+    #[test]
+    fn graph_propagation_registered_edge_columns_move_the_hash() {
+        // The proven HIGH bug: a registered edge source's column bindings are
+        // output-affecting (the same source read through swapped `src`/`dst`,
+        // or with a weight/type/as-of column, is a different graph). The
+        // descriptor now carries the full binding, so flipping any of those
+        // columns must move the definition hash — two propagations over the
+        // *same* registered source with *different* columns must not collide.
+        let base = GraphPropagationFields {
+            edge_source: EdgeSourceBinding::Registered {
+                source_id: "edges".into(),
+                src_column: "from".into(),
+                dst_column: "to".into(),
+                type_column: None,
+                weight_column: None,
+                as_of_column: None,
+            },
+            direction: PropagationDirection::Out,
+            hops: 2,
+            alpha_bits: 0.1_f64.to_bits(),
+            weighting: PropagationWeighting::DegreeNormalized,
+            output: PropagationOutput::Final,
+            dimensions: 384,
+        };
+        // The load-bearing case: swapping src/dst (the proven collision) must
+        // move the hash — under the old `edge_source: String` descriptor both
+        // recorded the bare source id and collided.
+        let swapped = GraphPropagationFields {
+            edge_source: EdgeSourceBinding::Registered {
+                source_id: "edges".into(),
+                src_column: "to".into(),
+                dst_column: "from".into(),
+                type_column: None,
+                weight_column: None,
+                as_of_column: None,
+            },
+            ..base.clone()
+        };
+        assert_ne!(
+            definition_hash(&graph_propagation_descriptor(&base), &no_model_env()).unwrap(),
+            definition_hash(&graph_propagation_descriptor(&swapped), &no_model_env()).unwrap(),
+            "swapping src/dst on the registered edge source must move the hash — \
+             two propagations over the same source with swapped columns are different graphs"
+        );
+        assert_each_change_moves_hash(
+            &base,
+            &no_model_env(),
+            graph_propagation_descriptor,
+            &[
+                ("src_column", |p| {
+                    if let EdgeSourceBinding::Registered { src_column, .. } = &mut p.edge_source {
+                        *src_column = "s".into();
+                    }
+                }),
+                ("dst_column", |p| {
+                    if let EdgeSourceBinding::Registered { dst_column, .. } = &mut p.edge_source {
+                        *dst_column = "d".into();
+                    }
+                }),
+                ("type_column", |p| {
+                    if let EdgeSourceBinding::Registered { type_column, .. } = &mut p.edge_source {
+                        *type_column = Some("etype".into());
+                    }
+                }),
+                ("weight_column", |p| {
+                    if let EdgeSourceBinding::Registered { weight_column, .. } = &mut p.edge_source
+                    {
+                        *weight_column = Some("w".into());
+                    }
+                }),
+                ("as_of_column", |p| {
+                    if let EdgeSourceBinding::Registered { as_of_column, .. } = &mut p.edge_source {
+                        *as_of_column = Some("valid_at".into());
+                    }
+                }),
             ],
         );
     }
@@ -1248,7 +1341,7 @@ mod tests {
                 ("candidate_source.kind", |p| {
                     p.candidate_source = ContextCandidateSource::Edges {
                         gather: ContextEdgeGather {
-                            edge_source: ContextEdgeSource::NeighborGraph {
+                            edge_source: EdgeSourceBinding::NeighborGraph {
                                 table_name: "g".into(),
                             },
                             hops: 1,
@@ -1278,7 +1371,7 @@ mod tests {
             embedding_table: None,
             candidate_source: ContextCandidateSource::Edges {
                 gather: ContextEdgeGather {
-                    edge_source: ContextEdgeSource::Registered {
+                    edge_source: EdgeSourceBinding::Registered {
                         source_id: "edges".into(),
                         src_column: "from".into(),
                         dst_column: "to".into(),
@@ -1318,7 +1411,7 @@ mod tests {
             }),
             ("as_of", |g| g.as_of = Some("2026-01-01".into())),
             ("edge_source", |g| {
-                g.edge_source = ContextEdgeSource::NeighborGraph {
+                g.edge_source = EdgeSourceBinding::NeighborGraph {
                     table_name: "g".into(),
                 }
             }),

@@ -46,9 +46,9 @@ use std::sync::Arc;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::manifest::{
-    AnchorKind, AsofBoundary, AsofDirection, AsofTolerance, ContextAggregator,
-    ContextCandidateSource, ContextEdgeGather, ContextEdgeSource, InputAnchor, ProducingDescriptor,
-    PropagationDirection, PropagationOutput, PropagationWeighting,
+    AsofBoundary, AsofDirection, AsofTolerance, ContextAggregator, ContextCandidateSource,
+    ContextEdgeGather, ProducingDescriptor, PropagationDirection, PropagationOutput,
+    PropagationWeighting,
 };
 use jammi_db::store::{CacheOutcome, CachePolicy};
 
@@ -270,7 +270,7 @@ impl InferenceSession {
                 output,
                 dimensions: _,
             } => {
-                let edge_source_ref = self.edge_source_ref_for_replay(table, &edge_source).await?;
+                let edge_source_ref = EdgeSourceRef::from_binding(edge_source);
                 let request = PropagateRequest::new(table.source_id.clone(), edge_source_ref)
                     .with_embedding_table(source_table)
                     .with_direction(edge_direction_from_manifest(direction))
@@ -425,60 +425,6 @@ impl InferenceSession {
             }
         }
         Ok(rows)
-    }
-
-    /// Reconstruct the [`EdgeSourceRef`] a graph propagation read, for replay. The
-    /// `GraphPropagation` descriptor records the edge relation by id; the kind of
-    /// the recorded edge **input anchor** disambiguates the two edge-source
-    /// shapes: an immutable `neighbor_graph` table anchors as
-    /// [`AnchorKind::ResultDigest`], while a registered external edge source
-    /// anchors as [`AnchorKind::UnpinnedAtInstant`].
-    ///
-    /// A registered edge source's column bindings are not part of the propagation
-    /// descriptor (only its id is), so they are reconstructed from the engine's
-    /// single-source defaults (`src`/`dst`, no type/weight/as-of) — the same
-    /// defaults the wire decode applies when a remote propagate omits them.
-    async fn edge_source_ref_for_replay(
-        &self,
-        table: &ResultTableRecord,
-        edge_source: &str,
-    ) -> Result<EdgeSourceRef> {
-        let recorded = self.recorded_edge_anchor_kind(table, edge_source).await?;
-        Ok(match recorded {
-            Some(AnchorKind::ResultDigest) => EdgeSourceRef::NeighborGraph {
-                table_name: edge_source.to_string(),
-            },
-            // An unpinned (or, defensively, any non-result-digest) edge anchor is
-            // a registered external edge source; its column bindings carry the
-            // engine defaults.
-            _ => EdgeSourceRef::Registered {
-                source_id: edge_source.to_string(),
-                src_column: "src".to_string(),
-                dst_column: "dst".to_string(),
-                type_column: None,
-                weight_column: None,
-                as_of_column: None,
-            },
-        })
-    }
-
-    /// The recorded anchor kind of the propagation's edge-source input, read from
-    /// the table's manifest `input_anchors`. `None` when the edge source is not
-    /// among the recorded anchors (it should always be, for a propagation).
-    async fn recorded_edge_anchor_kind(
-        &self,
-        table: &ResultTableRecord,
-        edge_source: &str,
-    ) -> Result<Option<AnchorKind>> {
-        let Some(ref anchors_json) = table.input_anchors_json else {
-            return Ok(None);
-        };
-        let anchors: Vec<InputAnchor> = serde_json::from_str(anchors_json)
-            .map_err(|e| JammiError::Other(format!("decode input anchors: {e}")))?;
-        Ok(anchors
-            .into_iter()
-            .find(|a| a.source == edge_source)
-            .map(|a| a.kind))
     }
 
     /// Resolve the newest `ready` result table for a `(source_id, task,
@@ -696,7 +642,7 @@ fn context_source_from_manifest(source: ContextCandidateSource) -> ContextSource
 /// the gather's `hop_cap` is set to it (the depth is already clamped) and the
 /// builder default cap is irrelevant to the replay.
 fn edge_gather_from_manifest(gather: ContextEdgeGather) -> EdgeGather {
-    let mut rebuilt = EdgeGather::new(edge_source_ref_from_manifest(gather.edge_source));
+    let mut rebuilt = EdgeGather::new(EdgeSourceRef::from_binding(gather.edge_source));
     rebuilt.hops = gather.hops;
     rebuilt.fanout = gather.fanout;
     rebuilt.direction = edge_direction_from_manifest(gather.direction);
@@ -707,33 +653,6 @@ fn edge_gather_from_manifest(gather: ContextEdgeGather) -> EdgeGather {
     // cap to it: a replay must not re-clamp a faithfully-recorded depth.
     rebuilt.hop_cap = gather.hops.max(1);
     rebuilt
-}
-
-/// Map the manifest's edge-source mirror back onto the AI-crate [`EdgeSourceRef`]
-/// — the reverse of `edge_source_for`. The `ContextSet` descriptor records the
-/// full registered-source column bindings, so this reconstruction is lossless
-/// (unlike the propagation edge source, whose columns are not in its descriptor).
-fn edge_source_ref_from_manifest(source: ContextEdgeSource) -> EdgeSourceRef {
-    match source {
-        ContextEdgeSource::NeighborGraph { table_name } => {
-            EdgeSourceRef::NeighborGraph { table_name }
-        }
-        ContextEdgeSource::Registered {
-            source_id,
-            src_column,
-            dst_column,
-            type_column,
-            weight_column,
-            as_of_column,
-        } => EdgeSourceRef::Registered {
-            source_id,
-            src_column,
-            dst_column,
-            type_column,
-            weight_column,
-            as_of_column,
-        },
-    }
 }
 
 /// Map the manifest [`ContextAggregator`] mirror back onto the AI-crate

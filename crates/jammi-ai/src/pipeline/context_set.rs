@@ -31,7 +31,7 @@ use datafusion::prelude::{col, lit};
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 
-use crate::pipeline::graph_neighbourhood::{EdgeDirection, EdgeGather, EdgeSourceRef};
+use crate::pipeline::graph_neighbourhood::{EdgeDirection, EdgeGather};
 use crate::session::InferenceSession;
 
 /// How a context set's candidate members were assembled — a *fact* about the
@@ -842,38 +842,13 @@ fn aggregator_for(aggregator: SetAggregator) -> jammi_db::store::manifest::Conte
 /// stays bit-exact and `Eq`/`Hash`-able.
 fn edge_gather_for(gather: &EdgeGather) -> jammi_db::store::manifest::ContextEdgeGather {
     jammi_db::store::manifest::ContextEdgeGather {
-        edge_source: edge_source_for(&gather.edge_source),
+        edge_source: gather.edge_source.to_binding(),
         hops: gather.effective_hops(),
         fanout: gather.fanout,
         direction: edge_direction_for(gather.direction),
         edge_types: gather.edge_types.clone(),
         min_weight_bits: gather.min_weight.map(f64::to_bits),
         as_of: gather.as_of.clone(),
-    }
-}
-
-/// Map the AI-crate [`EdgeSourceRef`] to the manifest's edge-source mirror.
-fn edge_source_for(edge_source: &EdgeSourceRef) -> jammi_db::store::manifest::ContextEdgeSource {
-    use jammi_db::store::manifest::ContextEdgeSource as M;
-    match edge_source {
-        EdgeSourceRef::NeighborGraph { table_name } => M::NeighborGraph {
-            table_name: table_name.clone(),
-        },
-        EdgeSourceRef::Registered {
-            source_id,
-            src_column,
-            dst_column,
-            type_column,
-            weight_column,
-            as_of_column,
-        } => M::Registered {
-            source_id: source_id.clone(),
-            src_column: src_column.clone(),
-            dst_column: dst_column.clone(),
-            type_column: type_column.clone(),
-            weight_column: weight_column.clone(),
-            as_of_column: as_of_column.clone(),
-        },
     }
 }
 

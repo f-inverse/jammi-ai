@@ -1065,6 +1065,27 @@ impl PyDatabase {
         Ok(record.table_name)
     }
 
+    /// Re-invoke a result table's recorded producer over the inputs' current
+    /// state, from a serialized `RecomputeRequest` body. The thin Python
+    /// `Database` wrapper builds this request with the same pure-Python assembly
+    /// the remote client uses (`jammi_client._assembly`), serializes it, and hands
+    /// the bytes here, so the embedded and remote paths share one request assembly
+    /// and one decode seam (`jammi_ai::wire::recompute_from_bytes`). The target is
+    /// resolved through the tenant-filtered catalog (via the local `Session`), so
+    /// a peer cannot recompute a table it cannot resolve. Returns the serialized
+    /// `RecomputeReport` proto the Python wrapper parses — the same message the
+    /// remote client receives over gRPC. A malformed or invalid body raises
+    /// `ValueError`; a pre-contract table raises the typed `NotRecomputable`.
+    fn _recompute_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        let args = jammi_ai::wire::recompute_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
+        let report = self
+            .runtime
+            .block_on(self.local_session().recompute(&args.table, args.cascade))
+            .map_err(to_pyerr)?;
+        let bytes = jammi_ai::wire::recompute_report_to_bytes(report);
+        Ok(pyo3::types::PyBytes::new(py, &bytes).into())
+    }
+
     /// Conformalize a classification predictor into prediction sets.
     ///
     /// Split (inductive) conformal: `calibration` holds one row of per-class

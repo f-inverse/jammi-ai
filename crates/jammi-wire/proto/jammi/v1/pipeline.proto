@@ -52,6 +52,65 @@ service PipelineService {
   // group. Peer of the engine's `asof_join`; the compute stays server-side and
   // the client reads the materialised table via `sql(...)`.
   rpc AsofJoin(AsofJoinRequest) returns (jammi.v1.embedding.ResultTable);
+
+  // Re-invoke a result table's recorded producer over the inputs' current state
+  // (the action half of incremental recompute). Peer of the engine's
+  // `recompute`: it reads the named table's recorded producing descriptor,
+  // replays the producing verb, and — under `cascade = DOWNSTREAM` — sweeps every
+  // transitive dependent once in topological order. The compute stays
+  // server-side; the report names the recomputed tables (read via `sql(...)`)
+  // and the transitive downstream-stale set.
+  rpc Recompute(RecomputeRequest) returns (RecomputeReport);
+}
+
+// Whether a `Recompute` sweeps the bounded downstream DAG or only reports it.
+// Mirrors the engine's `Cascade`; UNSPECIFIED maps to the engine default
+// (`ReportOnly`) — the engine never re-runs a transitive dependent unless the
+// caller explicitly asks.
+enum Cascade {
+  CASCADE_UNSPECIFIED = 0;
+  // Recompute the named table only; report the transitive downstream-stale set
+  // without recomputing any of it.
+  CASCADE_REPORT_ONLY = 1;
+  // One bounded topological sweep: recompute the named table, then every
+  // transitive dependent in dependency order.
+  CASCADE_DOWNSTREAM = 2;
+}
+
+// Re-invoke a result table's recorded producer. Mirrors the engine's
+// `recompute(table, cascade)` binding: `table` is the result table to recompute;
+// `cascade` selects report-only (default) or the one bounded downstream sweep.
+message RecomputeRequest {
+  // The result table to recompute, by registered name.
+  string table = 1;
+  // Whether to also sweep the bounded downstream DAG. UNSPECIFIED maps to the
+  // engine default (`REPORT_ONLY`).
+  Cascade cascade = 2;
+}
+
+// One table a recompute re-produced: the original name it replayed from, the new
+// table the replay wrote, and the cache outcome of that replay (always
+// `COMPUTED` — a recompute bypasses the cache). Mirrors the engine's
+// `RecomputedTable`.
+message RecomputedTable {
+  // The original table name the recompute replayed.
+  string original = 1;
+  // The freshly materialised table the replay wrote.
+  string recomputed = 2;
+  // The cache outcome of the replay. Always `COMPUTED` for a recompute.
+  jammi.v1.inference.CacheOutcome outcome = 3;
+}
+
+// The outcome of a recompute. Mirrors the engine's `RecomputeReport`: the tables
+// re-produced (one for `REPORT_ONLY`; the named table plus its transitive
+// dependents, in topological order, for `DOWNSTREAM`) and the transitive
+// downstream-stale set (reported-not-acted-on for `REPORT_ONLY`; the set the
+// sweep covered for `DOWNSTREAM`).
+message RecomputeReport {
+  // The tables re-produced, in recompute order.
+  repeated RecomputedTable recomputed = 1;
+  // The transitive set of tables downstream of the named table.
+  repeated string downstream_stale = 2;
 }
 
 // Match direction for an as-of join. Mirrors the engine's `MatchDirection`;

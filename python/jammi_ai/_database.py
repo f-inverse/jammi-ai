@@ -50,10 +50,13 @@ from jammi_client._assembly import (
     build_infer_request,
     build_neighbor_graph_request,
     build_propagate_embeddings_request,
+    build_recompute_request,
     build_register_channel_request,
     build_register_topic_request,
     build_search_request,
+    recompute_report_to_dict,
 )
+from jammi_client._generated.jammi.v1 import pipeline_pb2
 
 
 class Database:
@@ -452,6 +455,31 @@ class Database:
             project=project,
         )
         return self._native._asof_join_proto(request.SerializeToString())
+
+    def recompute(
+        self,
+        table: str,
+        *,
+        cascade: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Re-invoke a result table's recorded producer over the inputs' current
+        state and return the recompute report.
+
+        ``table`` is the result table to recompute; ``cascade`` is
+        ``"report_only"`` (default — recompute the named table only and report the
+        transitive downstream-stale set) or ``"downstream"`` (additionally sweep
+        every transitive dependent once, in dependency order). A pre-contract
+        table (no recorded producing descriptor) raises. Mirrors the remote
+        `RemoteDatabase.recompute`; the request is assembled with the shared
+        `RecomputeRequest` builder and submitted through the engine's wire seam.
+        The report is a dict
+        ``{"recomputed": [{"original", "recomputed", "outcome"}], "downstream_stale": [...]}``.
+        Read each recomputed table via :meth:`sql`.
+        """
+        request = build_recompute_request(table, cascade=cascade)
+        report = pipeline_pb2.RecomputeReport()
+        report.ParseFromString(self._native._recompute_proto(request.SerializeToString()))
+        return recompute_report_to_dict(report)
 
     def assemble_context(
         self,

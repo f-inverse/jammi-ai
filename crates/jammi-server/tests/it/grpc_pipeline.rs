@@ -232,7 +232,10 @@ async fn recompute_over_the_wire_replays_a_derived_table() {
         "the Downstream sweep recomputes the propagation dependent too: {originals:?}"
     );
     // The graph (parent) is recomputed before the propagation (child).
-    let graph_pos = originals.iter().position(|n| *n == graph.table_name).unwrap();
+    let graph_pos = originals
+        .iter()
+        .position(|n| *n == graph.table_name)
+        .unwrap();
     let prop_pos = originals
         .iter()
         .position(|n| *n == propagated.table_name)

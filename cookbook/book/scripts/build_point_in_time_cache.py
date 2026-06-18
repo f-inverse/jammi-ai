@@ -559,7 +559,7 @@ def emit(target: str, server_bin: str | None) -> None:
             "training surface on CPU against the committed cache. It does NOT serve "
             "those features from a low-latency online tier behind auth with a live "
             "coverage SLA; carrying the materialization contract across that boundary is "
-            "the platform closure chapter, not the engine cookbook."
+            "a production online-serving concern, not something this engine cookbook covers."
         ),
     }
 

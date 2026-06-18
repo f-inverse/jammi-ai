@@ -4,7 +4,7 @@
 > and `v0.30.0` published; the 3 cookbook H3 chapters (ch16 model catalog / ch17
 > channel-error taxonomy / ch18 two-tenant isolation + BYO-auth) merged in cookbook
 > **#21**. Boundary correction landed: model promotion/retirement/registry are
-> enterprise governance, removed from open-core (engine #203) — the §3.6 chapter was
+> governance functionality that lives above the open-core engine (removed from open-core in engine #203) — the §3.6 chapter was
 > reframed to the catalog (`list`/`describe`/`delete`). Next horizon = **H4** (the 1.0
 > engineering bar); this plan is kept for the record. The wave detail below is the
 > as-derived H3 plan and is not maintained post-close.

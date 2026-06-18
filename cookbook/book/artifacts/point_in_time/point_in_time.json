@@ -21,7 +21,7 @@
     "n_edges": 9595,
     "n_leaked": 7022
   },
-  "honest_limit": "This chapter proves the primitive composes into a leakage-free, skew-free training surface on CPU against the committed cache. It does NOT serve those features from a low-latency online tier behind auth with a live coverage SLA; carrying the materialization contract across that boundary is the platform closure chapter, not the engine cookbook.",
+  "honest_limit": "This chapter proves the primitive composes into a leakage-free, skew-free training surface on CPU against the committed cache. It does NOT serve those features from a low-latency online tier behind auth with a live coverage SLA; carrying the materialization contract across that boundary is a production online-serving concern, not something this engine cookbook covers.",
   "leak": {
     "asof_auc": 0.7952203001627388,
     "coverage_asof": 0.9125,

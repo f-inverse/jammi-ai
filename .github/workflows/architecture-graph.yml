@@ -1,0 +1,58 @@
+name: architecture-graph
+
+# Keeps a compiler-derived structural map of the workspace current. `build-graph`
+# extracts the crate/file/symbol graph from the compiler's own view (ground truth,
+# not prose) and refreshes the generated block in `ARCHITECTURE.md`. It runs weekly
+# and on demand, and opens a PR when the facts change — it never pushes to protected
+# `main`. Only the marked block is regenerated; hand-written narrative is preserved.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * 1"   # Mondays 09:00 UTC
+
+permissions:
+  contents: write          # create the refresh branch
+  pull-requests: write     # open the refresh PR
+
+jobs:
+  architecture:
+    runs-on: ubuntu-latest
+    env:
+      # This repo's .cargo/config.toml hard-wires sccache (rustc-wrapper) and mold
+      # (-fuse-ld=mold); neither exists on a vanilla runner. This job only needs a
+      # one-shot debug build to harvest cargo's JSON artifact stream, so disable both:
+      # an empty RUSTC_WRAPPER drops sccache, and setting RUSTFLAGS overrides the
+      # config.toml rustflags (env wins over config — see CLAUDE.md) to drop mold.
+      # If a future runner image makes sccache active anyway, install sccache+mold
+      # here instead and remove these two lines.
+      RUSTC_WRAPPER: ""
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc (jammi-wire build.rs needs it)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Refresh the architecture graph
+        uses: d-tietjen/build-graph@master
+        with:
+          manifest-path: Cargo.toml
+          architecture-path: ARCHITECTURE.md
+
+      - name: Open a PR if the architecture changed
+        uses: peter-evans/create-pull-request@v6
+        with:
+          add-paths: ARCHITECTURE.md
+          branch: chore/architecture-graph-refresh
+          delete-branch: true
+          commit-message: "chore(docs): refresh build-graph architecture"
+          title: "chore(docs): refresh build-graph architecture"
+          labels: docs
+          body: |
+            Automated structural refresh from the compiler's view of the workspace
+            (`build-graph`). Only the generated block in `ARCHITECTURE.md` between the
+            `build-graph:architecture` markers changed; hand-written narrative is preserved.
+
+            Opened by `.github/workflows/architecture-graph.yml`. Review the diff — if the
+            topology changed in a way that isn't expected, that's a signal worth reading.

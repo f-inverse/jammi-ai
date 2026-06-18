@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 # segment, which PyPI rejects. This package ships at the same lockstep version as
 # the CPU `jammi-server` package and the rest of the workspace.
 name = "jammi-server-cu12"
-version = "0.30.0"
+version = "0.31.0"
 description = "CUDA (cu12) build of the Jammi engine server — GPU-accelerated `jammi-server` binary, pip-installable"
 readme = "README.md"
 license = { text = "Apache-2.0" }

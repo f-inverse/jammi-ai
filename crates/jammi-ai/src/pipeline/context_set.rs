@@ -717,6 +717,22 @@ impl InferenceSession {
         let recipe = context.recipe;
         let source_id = recipe.source_id.as_str();
 
+        // Pin the **resolved** source embedding table into the descriptor, not the
+        // recipe's `Option`. The recipe may carry `None` (resolve the source's
+        // newest embedding table), but a materialised context set is itself a
+        // `kind=model` table for the same source — so on a later recompute the
+        // default resolution would re-select *this* output and shadow the original
+        // source table, pooling over the wrong rows (a non-byte-identical replay).
+        // Recording the concrete name the recipe actually pooled over makes the
+        // replay re-pool over the same table regardless of any newer shadowing
+        // table. This output table does not exist yet at this point, so resolving
+        // `None` here returns the same source table the assembly pooled over.
+        let resolved_embedding_table = self
+            .catalog()
+            .resolve_embedding_table(source_id, recipe.embedding_table.as_deref())
+            .await?
+            .table_name;
+
         // The materialization contract: a context set pools from the source's
         // raw rows (no model invoked here — the encoder is the pooling kernel),
         // so the environment carries the engine version + device with an empty
@@ -730,7 +746,7 @@ impl InferenceSession {
         let descriptor = jammi_db::store::manifest::ProducingDescriptor::ContextSet {
             encoder_id: "jammi:context-set".to_string(),
             source_id: source_id.to_string(),
-            embedding_table: recipe.embedding_table.clone(),
+            embedding_table: Some(resolved_embedding_table),
             candidate_source: candidate_source_for(&recipe.source),
             value_columns: recipe.value_columns.clone(),
             aggregator: aggregator_for(recipe.aggregator),

@@ -310,14 +310,19 @@ pub enum ProducingDescriptor {
         encoder_id: String,
         /// The source whose rows were pooled per target.
         source_id: String,
-        /// The specific source embedding table the recipe pooled against, or
-        /// `None` when the source's default (newest) embedding table was
-        /// resolved. Recorded so a recompute re-pools over the **same** table the
-        /// recipe ran on — a materialised context set is itself a `kind=model`
-        /// table for the same source, so the default would otherwise shadow the
-        /// original source table on replay. An output-affecting determinant: the
-        /// same recipe over a different source embedding table pools different
-        /// vectors.
+        /// The **resolved** source embedding table the recipe actually pooled
+        /// against — the concrete table name, never the user's `Option`. Even
+        /// when the recipe left the table unset (resolve the source's newest
+        /// embedding table), the producer records the table that resolution
+        /// selected, so a recompute re-pools over the **same** table the recipe
+        /// ran on. This matters because a materialised context set is itself a
+        /// `kind=model` table for the same source: had the descriptor recorded
+        /// the user's `None`, the default resolution on replay would re-select
+        /// the newer context-set output and shadow the original source table,
+        /// pooling over the wrong rows. An output-affecting determinant: the same
+        /// recipe over a different source embedding table pools different vectors.
+        /// (`Option` only because a pre-resolution descriptor fixture may carry
+        /// `None`; every producer-written descriptor records `Some`.)
         embedding_table: Option<String>,
         /// Where each target's candidate members came from — ANN retrieval, a
         /// declared-edge walk, or both — the determinant that selects which

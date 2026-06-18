@@ -345,6 +345,94 @@ async fn recompute_context_set_pair_with_non_default_params_is_byte_identical() 
     );
 }
 
+#[tokio::test]
+async fn recompute_context_set_over_default_embedding_table_is_byte_identical() {
+    use jammi_ai::pipeline::context_set::{
+        ContextRequest, ContextSource, MaterializedContext, SetAggregator,
+    };
+    use jammi_ai::pipeline::graph_neighbourhood::{EdgeDirection, EdgeGather, EdgeSourceRef};
+
+    let (session, _dir, emb) = session_with_synthetic_embeddings().await;
+    register_edges_source(&session, &_dir).await;
+    let svc = Session::new(Arc::clone(&session));
+
+    // The DEFAULT path: the recipe leaves `embedding_table = None`, so the
+    // producer resolves the source's newest embedding table (here `emb`). The
+    // proven HIGH bug: the descriptor used to record the user's `None`, and on
+    // replay `resolve_embedding_table(None)` would re-select the *context-set's
+    // own output* (itself a `kind=model` table for `points`, written newer than
+    // `emb`) and pool over the wrong rows. The fix pins the resolved table name
+    // into the descriptor, so the replay re-pools over `emb` regardless of the
+    // shadowing output table. This test exercises exactly that default path.
+    let recipe_proto = {
+        let mut r = ContextRequest::new("points", Vec::new(), 0);
+        let mut gather = EdgeGather::new(EdgeSourceRef::Registered {
+            source_id: "edges".into(),
+            src_column: "from".into(),
+            dst_column: "to".into(),
+            type_column: None,
+            weight_column: None,
+            as_of_column: None,
+        });
+        gather.hops = 2;
+        gather.direction = EdgeDirection::Undirected;
+        r.source = ContextSource::Edges(gather);
+        r.aggregator = SetAggregator::Sum;
+        r.exclude_self = false;
+        // embedding_table left None — the default-resolution path under test.
+        r
+    };
+
+    let source_rows = read_embedding_rows(&session, &emb).await;
+    let mut rows: Vec<(String, Vec<f32>)> = Vec::new();
+    for (row_id, vector) in &source_rows {
+        let mut req = recipe_proto.clone();
+        req.query = vector.clone();
+        req.exclude_key = Some(row_id.clone());
+        if let Some(v) = session.assemble_context(&req).await.unwrap().context_vector {
+            rows.push((row_id.clone(), v));
+        }
+    }
+    assert!(
+        !rows.is_empty(),
+        "the edge-sourced context must pool some targets"
+    );
+    let (context_table, _) = session
+        .materialize_context(
+            MaterializedContext {
+                rows: &rows,
+                dimensions: DIM,
+                recipe: &recipe_proto,
+            },
+            CachePolicy::Bypass,
+        )
+        .await
+        .unwrap();
+
+    // The context-set output is now the newest `kind=model` table for `points` —
+    // the exact shadowing condition. `resolve_embedding_table("points", None)`
+    // would now return `context_table`, not `emb`. Only a descriptor that pinned
+    // the resolved `emb` name re-pools correctly on replay.
+    assert_ne!(
+        context_table.table_name, emb.table_name,
+        "the context set is a distinct, newer model table for the source"
+    );
+
+    let before = artifact_digest(&session, &context_table.table_name).await;
+    let report = svc
+        .recompute(&context_table.table_name, Cascade::ReportOnly)
+        .await
+        .unwrap();
+    let after = artifact_digest(&session, &report.recomputed[0].recomputed).await;
+
+    assert_eq!(
+        before, after,
+        "a context-set recompute over the DEFAULT (None) embedding table must be byte-identical — \
+         the descriptor pins the resolved source table, so the replay re-pools over it rather than \
+         shadowing it with the context-set's own newer output"
+    );
+}
+
 // ── Staleness: advance a parent → child recomputes to match ──
 
 #[tokio::test]

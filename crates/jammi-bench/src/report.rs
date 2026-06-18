@@ -144,6 +144,15 @@ pub struct Tiers {
     /// `cache-slo-scale`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_slo: Option<CacheSloTier>,
+    /// The CPU-hermetic recompute tier: the engine's `recompute(Downstream)`
+    /// bounded topological sweep over a synthetic derived-table DAG (an embedding
+    /// table → a neighbour-graph → a graph propagation). The gated property is the
+    /// sweep's CORRECTNESS — every DAG node is recomputed exactly once, in
+    /// topological (parent-before-child) order — a box-independent invariant; the
+    /// sweep wall-time at the named DAG size rides along as an un-gated,
+    /// machine-dependent reference. Populated by `recompute-scale`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recompute: Option<RecomputeScaleTier>,
 }
 
 /// The k values the recall curve is reported at: recall@1, recall@10, recall@100.
@@ -1054,4 +1063,36 @@ impl SpeedupGate {
             passed: measured_speedup >= min_speedup,
         }
     }
+}
+
+/// The CPU-hermetic recompute tier: a `recompute(Downstream)` bounded topological
+/// sweep over a synthetic derived-table DAG, measured at the committed node count.
+///
+/// The gated property is the sweep's **correctness**, not a wall-time: the
+/// Downstream sweep must recompute every transitive dependent of the named table
+/// exactly once, in topological order (a parent strictly before each child that
+/// anchors on it). That invariant is box-independent — it is the engine's
+/// contract — so gating it has teeth (a sweep that skipped a node, double-counted
+/// a diamond descendant, or mis-ordered a parent/child would fail) without pinning
+/// a machine-dependent absolute. The sweep wall-time rides along as an un-gated
+/// reference, the discipline every scale tier's timing lane follows.
+#[derive(Debug, Serialize)]
+pub struct RecomputeScaleTier {
+    /// Number of synthetic source nodes the DAG's embedding table holds.
+    pub nodes: usize,
+    /// The number of tables the Downstream sweep recomputed — the named table
+    /// plus its transitive dependents.
+    pub recomputed_count: usize,
+    /// The number of tables the sweep was expected to recompute (the DAG's node
+    /// count). The gate is `recomputed_count == expected_count`.
+    pub expected_count: usize,
+    /// Whether every recomputed table landed after all of its in-DAG parents — the
+    /// topological-order invariant the sweep guarantees.
+    pub topological_order_held: bool,
+    /// Whether the correctness gate held: the right node count, each once, in
+    /// topological order.
+    pub passed: bool,
+    /// The whole Downstream sweep's wall-time, milliseconds. Machine-dependent
+    /// reference only — never gated.
+    pub sweep_ms: Measurement,
 }

@@ -33,7 +33,7 @@ use jammi_server::grpc::proto::embedding::{GenerateEmbeddingsRequest, Modality};
 use jammi_server::grpc::proto::pipeline::pipeline_service_client::PipelineServiceClient;
 use jammi_server::grpc::proto::pipeline::{
     propagate_embeddings_request::Graph, AssembleContextRequest, BuildNeighborGraphRequest,
-    PropagateEmbeddingsRequest,
+    Cascade, PropagateEmbeddingsRequest, RecomputeRequest,
 };
 use jammi_test_utils::{cookbook_fixture, fixture};
 use tonic::codegen::Body;
@@ -164,6 +164,92 @@ async fn build_propagate_assemble_over_the_wire() {
         context.context_size,
         "context_size matches the member count"
     );
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
+#[tokio::test]
+async fn recompute_over_the_wire_replays_a_derived_table() {
+    let server: EngineServer = start_engine_server().await;
+    embed_patents(
+        CatalogServiceClient::new(channel(server.addr).await),
+        EmbeddingServiceClient::new(channel(server.addr).await),
+    )
+    .await;
+
+    let mut pipeline = PipelineServiceClient::new(channel(server.addr).await);
+
+    // A neighbour-graph derived from the patents embeddings — a recomputable
+    // derived table anchored on the immutable embedding-table digest.
+    let graph = pipeline
+        .build_neighbor_graph(BuildNeighborGraphRequest {
+            source_id: "patents".into(),
+            k: 5,
+            exact: true,
+            ..Default::default()
+        })
+        .await
+        .expect("build_neighbor_graph")
+        .into_inner();
+
+    // A propagation over the graph, so the graph has a downstream dependent the
+    // Downstream sweep must also recompute.
+    let propagated = pipeline
+        .propagate_embeddings(PropagateEmbeddingsRequest {
+            source_id: "patents".into(),
+            graph: Some(Graph::EdgeGraphTable(graph.table_name.clone())),
+            ..Default::default()
+        })
+        .await
+        .expect("propagate_embeddings")
+        .into_inner();
+
+    // Recompute the graph with a Downstream sweep over the wire: the report names
+    // the recomputed tables (graph + its propagation dependent) and the
+    // downstream-stale set. The compute stays server-side; the report crosses the
+    // wire as the faithful `RecomputeReport`.
+    let report = pipeline
+        .recompute(RecomputeRequest {
+            table: graph.table_name.clone(),
+            cascade: Cascade::Downstream as i32,
+        })
+        .await
+        .expect("recompute")
+        .into_inner();
+
+    let originals: Vec<&str> = report
+        .recomputed
+        .iter()
+        .map(|t| t.original.as_str())
+        .collect();
+    assert!(
+        originals.contains(&graph.table_name.as_str()),
+        "the named graph is recomputed: {originals:?}"
+    );
+    assert!(
+        originals.contains(&propagated.table_name.as_str()),
+        "the Downstream sweep recomputes the propagation dependent too: {originals:?}"
+    );
+    // The graph (parent) is recomputed before the propagation (child).
+    let graph_pos = originals.iter().position(|n| *n == graph.table_name).unwrap();
+    let prop_pos = originals
+        .iter()
+        .position(|n| *n == propagated.table_name)
+        .unwrap();
+    assert!(
+        graph_pos < prop_pos,
+        "topological order over the wire: parent before child ({originals:?})"
+    );
+    // Every recomputed table reports the COMPUTED outcome — a recompute bypasses
+    // the cache (never a wire-default UNSPECIFIED or a fabricated REUSED).
+    for t in &report.recomputed {
+        assert_eq!(
+            t.outcome,
+            jammi_wire::proto::inference::CacheOutcome::Computed as i32,
+            "a recompute always Computes (bypasses the cache)"
+        );
+    }
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;

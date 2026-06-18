@@ -27,6 +27,7 @@ mod neighbor_graph;
 mod parallel_train;
 mod pipeline;
 mod read_vectors;
+mod recompute;
 mod regression_surface;
 mod scheduling;
 mod search;

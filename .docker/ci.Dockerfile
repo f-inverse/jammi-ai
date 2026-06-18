@@ -35,3 +35,12 @@ RUN cargo install mdbook --locked --version 0.5.2 \
 # maturin — PyO3 wheel builds
 RUN cargo install maturin --locked \
     && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
+
+# Quarto — renders + executes the in-repo cookbook (cookbook/book/). The binary
+# only; jupyter (its execution engine) is a per-job pip install from the book's
+# `[book]` extra against the freshly-built wheel, so the engine version it runs
+# against is never baked into the image.
+ARG QUARTO_VERSION=1.6.40
+RUN curl -fsSL "https://github.com/quarto-dev/quarto-cli/releases/download/v${QUARTO_VERSION}/quarto-${QUARTO_VERSION}-linux-amd64.tar.gz" \
+        | tar -xz -C /opt \
+    && ln -s "/opt/quarto-${QUARTO_VERSION}/bin/quarto" /usr/local/bin/quarto

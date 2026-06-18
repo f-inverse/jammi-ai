@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jammi-server"
-version = "0.30.0"
+version = "0.31.0"
 description = "CPU build of the Jammi engine server — `jammi-server` console binary, pip-installable"
 readme = "README.md"
 license = { text = "Apache-2.0" }

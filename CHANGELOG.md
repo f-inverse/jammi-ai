@@ -6,6 +6,103 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-06-18
+
+**H4 — the 1.0 engineering bar, shipped as a terminal 0.x.** This release raises
+the engine to its production-completeness bar: a published, enforced API-stability
+and format-stability policy; harder operational guarantees with crash-consistency
+and at-least-once proofs; CI-gated performance SLOs including a release-blocking
+lane; a stated threat model with a dependency-audit lane; and the final engine
+features — point-in-time joins, a verifiable materialization contract, and
+incremental recompute with opt-in caching.
+
+### Added
+- **As-of temporal join — `asof_join` (SPEC-01).** A point-in-time join verb that
+  matches each probe row against the most recent (or nearest) row of another
+  relation at-or-before its timestamp, implemented as one verb-centric hand-built
+  sort-merge operator. Typed `MatchDirection`/`Boundary`/`Tolerance`/`TieBreak`
+  controls, SQL `NULL ≠ NULL` semantics, float temporal keys rejected at schema
+  validation, and bit-reproducible tie-breaking. Available `embed == remote`
+  through `Database.asof_join` and `RemoteDatabase.asof_join`.
+- **Verifiable materialization contract + `verify_materialization` (SPEC-02).**
+  Every produced result table now records a `.materialization.json` sidecar
+  capturing a `ProducingDescriptor` (the verb and all output-affecting parameters)
+  and a `MaterializationEnv` (identities and backend kinds, including compute
+  device) folded into a `definition_hash`. A single `finalize_with_manifest` funnel
+  is the sole `building → ready` transition, `recover()` reconciles the sidecar on
+  startup (no new crash window), and the `verify_materialization` verb
+  (`embed == remote`) confirms a table against its recorded determinants, returning
+  a typed `MatchVerdict`. The descriptor folds every output-affecting parameter of
+  all data variants (neighbor-graph, graph-propagation, context-set, as-of join),
+  so a one-bit parameter change is a distinct identity.
+- **Incremental-recompute sensing + recompute + caching (W-61).** A read-only
+  sensing layer — `staleness`, `derives_from` lineage with a stack-safe transitive
+  closure, and `lookup_cached` — over result-table lineage (`embed == remote`),
+  with `Undecidable` returned honestly where no current-version surface exists.
+  An opt-in `CachePolicy` (default `Bypass`) threads through the five result-table
+  producers: under `Use`, a producer probes for a byte-identical recorded
+  definition before computing and returns an observable `CacheOutcome`
+  (`Computed`/`Reused`), so reuse is always requested and observable, never
+  inferred — neighbor-graph and graph-propagation are genuinely cacheable, the
+  unpinned-source producers honestly never hit. A `recompute(table, cascade)` verb
+  replays the recorded `ProducingDescriptor` (always recomputing, `CachePolicy::
+  Bypass`); `Cascade::Downstream` sweeps every transitive dependent once in a
+  stack-safe topological order. A typed `NotRecomputable` refuses a pre-contract
+  table and a typed `DependencyCycle` refuses a lineage cycle.
+- **Breadth-grid scale benchmarks + rate-regression gate (W1).** Scale-benchmark
+  cells for every scale-relevant public verb (training, conformal, eval, propagate,
+  graph-train, context-predictor, model-inference, search/recall/RSS), each driving
+  the real engine path with non-vacuous gates: fraction floors, metric goldens,
+  in-process determinism + relative-perturbation digests, and a reusable same-box
+  throughput regression-net harness with committed, re-derivable baselines.
+- **API-stability policy + wire-surface freeze-guard (§4.1).** A published
+  API-stability page documenting the three frozen stable surfaces — the conformance
+  verb sets, the nine `jammi.v1.*` wire packages, and the persisted-format versions
+  — plus the terminal-0.x semver commitment. The freeze is enforceable: a
+  `jammi-server` freeze-guard decodes the live descriptor set into the served
+  `(Service, Method)` and package set and asserts it equals a committed baseline, so
+  removing or renaming a stable rpc reds CI and adding one requires an explicit
+  baseline edit in the same change.
+- **Security posture + threat model + dependency-audit lane (§4.6).** A published
+  threat-model page stating what the engine defends (format-version reject-newer,
+  tenant-scope filtering on every catalog query, typed error surfaces, the
+  bring-your-own-auth interceptor seam) and what it explicitly does not
+  (no authentication/authorization, `jammi-session-id` is a correlation id not a
+  credential, no TLS/secrets), the trusted-network assumption, and the consumer's
+  authenticate → authorize → bind responsibility. A `cargo-deny` CI lane
+  (`deny.toml`) enforces RustSec advisories, a license allowlist, and the one-way
+  dependency direction.
+
+### Changed
+- **Performance SLOs are CI-gated (W3-b, §4.4).** A release-tag-blocking `perf-gate`
+  in the crates workflow runs the CPU-hermetic `*-scale` tiers on every `v*` tag;
+  a structural throughput regression below the committed floor or a determinism
+  drift reds the gate and blocks the publish + GitHub release. A nightly
+  early-warning `perf.yml` lane runs the same tiers without gating any merge.
+- **Format stability — version-stamp validation on load (W3-a, §4.5).** Sidecar
+  formats now reject incompatible on-disk artifacts on load through one shared
+  typed `IncompatibleFormat` error: the `.rowmap` and ANN manifest versions
+  reject-newer, and the USearch `backend_version` is strict-compared so a backend
+  format bump can no longer silently mis-deserialize a neighbor graph. The
+  materialization manifest rejects any non-current `MANIFEST_VERSION` before use.
+
+### Fixed
+- **Trigger at-least-once across the replay/live seam (W2 T1).** The subscribe seam
+  no longer conflates the engine `_offset` with the broker's native sequence:
+  subscription keys the live tail in engine-offset space and dedups the merged
+  replay+live stream by `_offset`, so a post-commit broker fan-out failure can no
+  longer skew the counters and drop boundary events. At-least-once delivery and
+  replay-completeness are proven (including a randomized-state property test).
+- **Catalog ↔ result-table crash-consistency + tenant-scoped recovery (W2 T2).**
+  Proven crash-recovery of the `building → ready/failed` status gate across both
+  backends; the startup `recover()` sweep is now admin-scoped and preserves each
+  orphan's `tenant_id` rather than running unscoped and stranding tenant-owned
+  building rows.
+- **Mutable-table and topic lifecycle crash-consistency (W2 T3).** `register`,
+  `register_topic`, `drop_table`, and `drop_topic` each run as a single database
+  transaction (catalog row + storage DDL share the catalog database), so a crash
+  leaves an all-or-nothing result; proven with SIGKILL crash tests.
+
 ## [0.30.0] - 2026-06-16
 
 **H3 — operability & contracts.** This release hardens the engine for production

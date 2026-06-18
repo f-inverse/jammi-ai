@@ -1,0 +1,159 @@
+name: Cookbook book
+
+# The in-repo Theory↔Computation book (cookbook/book/) gated against the engine
+# at HEAD. The monorepo couples the book to the engine commit it ships beside:
+# the PR job builds the HEAD embed wheel and runs the book's gate against it, so a
+# feature and its proof land atomically. Quarto render + the live-server chapters
+# are heavy and run nightly, alongside a release-recipe leg that re-runs the gate
+# against the LAST PUBLISHED PyPI wheel (preserving the published-artifact signal
+# HEAD-testing alone would lose).
+#
+# The engine's own SDK-recipes smoke (cookbook.yml) and it/cookbook.rs are
+# separate and unchanged.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Nightly: full quarto render + live-server chapters + the release-recipe leg.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: cookbook-book-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The determinism regime (K0 §3): jammi_cookbook also sets these on import, but
+  # pinning them in the job env covers anything that reads them first.
+  OMP_NUM_THREADS: "1"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  TOKENIZERS_PARALLELISM: "false"
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
+jobs:
+  gate:
+    name: Book gate (HEAD wheel, no render)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The scale-tier vector cache (cookbook/book/artifacts/scale/) lives in
+          # Git LFS; pull it so the gate reads the real cache, not LFS pointers.
+          lfs: true
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Build + install the HEAD embed wheel
+        # The CI base image ships maturin + a system python3; venv-isolate so
+        # `python` resolves to the venv interpreter for the book gate. The embed
+        # wheel hard-deps jammi-client (not on PyPI for an unreleased commit) —
+        # install it from in-repo source (the dev extra carries the pinned
+        # grpcio-tools generator), generate stubs, build the wheel, then
+        # force-reinstall it (a fresh wheel, never a copy) so the book runs the
+        # engine built from THIS commit.
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install maturin
+          pip install -e 'clients/python[dev]'
+          make -C clients/python generate
+          maturin build --release --out target/wheels
+          pip install --force-reinstall --no-deps target/wheels/jammi_ai-*.whl
+
+      - name: Install the book (against the HEAD wheel)
+        run: |
+          . .venv/bin/activate
+          pip install -e 'cookbook/book[book,dev]'
+
+      - name: API reference matches the HEAD wheel
+        working-directory: cookbook/book
+        run: |
+          . "$GITHUB_WORKSPACE/.venv/bin/activate"
+          python scripts/check_api_reference.py
+
+      - name: Lint
+        working-directory: cookbook/book
+        run: |
+          . "$GITHUB_WORKSPACE/.venv/bin/activate"
+          ruff check jammi_cookbook scripts tests
+
+      - name: Shared-lib unit tests
+        working-directory: cookbook/book
+        run: |
+          . "$GITHUB_WORKSPACE/.venv/bin/activate"
+          pytest -q
+
+      - name: No-deferral gate
+        working-directory: cookbook/book
+        run: bash scripts/no_deferral_grep.sh
+
+      - name: No dangling citations
+        working-directory: cookbook/book
+        run: |
+          . "$GITHUB_WORKSPACE/.venv/bin/activate"
+          python scripts/check_citations.py
+
+  render:
+    name: Render + live-server + release recipe (nightly)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Build the HEAD wheel + jammi-server binary
+        # The grpc:// / live-server chapters shell out to jammi-server; build it
+        # alongside the HEAD embed wheel.
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install maturin
+          pip install -e 'clients/python[dev]'
+          make -C clients/python generate
+          maturin build --release --out target/wheels
+          pip install --force-reinstall --no-deps target/wheels/jammi_ai-*.whl
+          cargo build --release -p jammi-server
+
+      - name: Install the book (against the HEAD wheel)
+        run: |
+          . .venv/bin/activate
+          pip install -e 'cookbook/book[book,dev]'
+
+      - name: Render + execute the book (reads the committed cache)
+        # The new CI image ships quarto (landing via the separate CI-image PR);
+        # render re-executes every chapter against the committed cache and fails on
+        # any drifted or moved artifact. jammi-server is on the path for the
+        # grpc:// chapters.
+        working-directory: cookbook/book
+        run: |
+          . "$GITHUB_WORKSPACE/.venv/bin/activate"
+          export PATH="$GITHUB_WORKSPACE/target/release:$PATH"
+          quarto render
+
+      - name: Release recipe — last PUBLISHED wheel + CPU pytest subset
+        # Preserve the published-artifact signal HEAD-testing loses: install the
+        # last released jammi_ai from PyPI into a clean venv and re-run the book's
+        # CPU gate (the pytest suite reads the committed cache; it never retrains
+        # or re-embeds). A drift between HEAD and the published surface shows here.
+        run: |
+          python3 -m venv .venv-release
+          . .venv-release/bin/activate
+          pip install --upgrade pip
+          pip install jammi_ai
+          pip install -e 'cookbook/book[book,dev]'
+          cd cookbook/book
+          python scripts/check_api_reference.py
+          pytest -q

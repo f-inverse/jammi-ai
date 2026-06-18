@@ -1,0 +1,269 @@
+---
+title: "Retrieval: dense, hybrid, and RRF-fused — does fusion help?"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `search` (the multi-table gotcha) · `rrf_fuse` · `assemble_context(hybrid=True)`
+· **Theory:** dense vs sparse retrieval, reciprocal rank fusion [@cormack2009rrf],
+the BM25 probabilistic-relevance baseline [@robertson2009bm25] · **Rail:**
+measurement (per-method recall@10 / nDCG@10 + the honest fusion delta).
+
+The keystone measured a *single* recall number per embedding matrix. This vertical asks
+the retrieval question a practitioner actually asks: **given dense embeddings, a lexical
+index, and a graph-propagated variant, which retriever — and which fusion — should I
+reach for?** We hold the task fixed (same-subject retrieval over the committed ogbn-arxiv
+subset, scored by the keystone's embedding-independent same-subject golden) and sweep the
+*retriever*: dense cosine-kNN over each committed matrix, a BM25 lexical arm over the
+titles, and the engine's own `rrf_fuse` over pairs of those rankings.
+
+The numbers below are all folded on CPU from the committed cache — no GPU, no
+re-embedding. The dense numbers reproduce the keystone's per-table recall exactly.
+
+```{python}
+from jammi_cookbook import contracts
+
+finding = contracts.load_artifact("retrieval.finding")
+print(f"queries:          {finding['queries']} (same-subject golden, with query text)")
+print(f"candidate depth:  {finding['candidate_depth']} per ranked list before fusion")
+print(f"best single arm:  {finding['best_single_recall_at_10']:.3f} recall@10")
+print(f"best fusion arm:  {finding['best_fusion_recall_at_10']:.3f} recall@10")
+```
+
+## The `search` multi-table gotcha — and why we fold in numpy
+
+The natural verb for dense retrieval is `db.search(source, query=…, k=…)`. On this cache
+it does **not** reach, and the reason is a genuine engine-surface finding worth stating
+plainly rather than papering over.
+
+`search` (and `assemble_context`) resolve a *source's* ready embedding table — the one
+`generate_embeddings` bound to that source on the GPU server. A committed embedding
+parquet registered as a file source is **not** a source-bound ready embedding table, so
+`search` raises `No ready embedding table for source`. And even on a live source, the
+signature is `search(source, *, query, k, filter=None, select=None)` — it carries **no
+`table=` argument**. Once a source has several embedding tables (raw, graph-propagated, a
+fine-tuned variant), there is no way to name *which* table to search: `search(source, …)`
+is ambiguous.
+
+```{python}
+sf = finding["search_finding"]
+print(f"verb:               {sf['verb']}")
+print(f"reachable on CPU:   {sf['reachable_on_cpu']}")
+print(f"measurement used:   {sf['measurement_used']}")
+print(f"engine candidate:   {sf['candidate']}")
+```
+
+The proven measurement is therefore the keystone's exact cosine-kNN numpy fold over each
+committed matrix — deterministic, and table-exact (it targets exactly one matrix, with no
+ambiguity). We report the ambiguity as a real candidate for an explicit `table=` argument
+on `search`, and use the fold for every dense number below.
+
+## Dense kNN — recall@10 and nDCG@10 per matrix
+
+Dense retrieval ranks by cosine similarity to the query vector. We score it over the two
+committed dense matrices the keystone emits in full — raw ModernBERT embeddings and the
+graph-propagated variant — with both recall@10 and nDCG@10 (which credits rank position,
+not just presence in the top 10).
+
+The keystone's tier-03 fine-tune commits a model-id record (`arxiv.ft_model`, recall
+0.548), not a fine-tuned *matrix*; the standalone fine-tuned matrix lives in the
+fine-tuning-methods vertical. We measure the two matrices this cache carries in full and
+do not fabricate a fine-tuned-matrix arm we cannot read here.
+
+```{python}
+metrics = contracts.load_artifact("retrieval.method_metrics").to_pylist()
+by_family = {}
+for r in metrics:
+    by_family.setdefault(r["family"], []).append(r)
+
+print(f"{'method':<16}{'recall@10':>11}{'nDCG@10':>10}")
+for r in by_family["dense"]:
+    print(f"{r['method']:<16}{r['recall_at_10']:>11.3f}{r['ndcg_at_10']:>10.3f}")
+```
+
+## Lexical BM25 — the sparse arm of a hybrid retriever
+
+BM25 [@robertson2009bm25] is the probabilistic-relevance lexical score — term
+frequency saturated and length-normalized, weighted by inverse document frequency. It is
+the sparse arm of a hybrid retriever, and a fair contrast to the dense arms here because
+it scores the *same* documents against the *same* same-subject relevance target, using
+the query's own title+abstract text (committed in the golden).
+
+```{python}
+for r in by_family["lexical"]:
+    print(f"{r['method']:<16}{r['recall_at_10']:>11.3f}{r['ndcg_at_10']:>10.3f}")
+```
+
+On this same-subject target, lexical retrieval is markedly weaker than dense: subject
+membership is a semantic relation that title-word overlap only partially captures. This
+matters for the fusion question — RRF mixes rankers, and mixing in a much weaker ranker is
+exactly the case where fusion can *hurt*.
+
+## RRF fusion — the engine's own `rrf_fuse`, measured honestly
+
+Reciprocal rank fusion [@cormack2009rrf] combines ranked lists by summing
+`1 / (k_rrf + rank)` across rankers — a rank-only fusion that needs no score calibration.
+It is a client-local numeric, and the engine ships it as `db.rrf_fuse(ranked_lists)`; we
+reuse that helper rather than re-implement it. We fuse two pairs: the two dense arms
+(raw + propagated), and the **hybrid** dense + lexical.
+
+```{python}
+for r in by_family["fusion"]:
+    print(f"{r['method']:<16}{r['recall_at_10']:>11.3f}{r['ndcg_at_10']:>10.3f}")
+```
+
+We re-fuse **live** from the committed rankings to prove the fused numbers are real, not
+transcribed — the same `rrf_fuse` call, asserted against the frozen golden.
+
+```{python}
+import math
+import re
+import tempfile
+from collections import Counter, defaultdict
+
+import jammi_ai
+import numpy as np
+from jammi_cookbook import rails
+
+# A fresh ephemeral artifact dir per render — sources persist in the catalog, so a
+# fixed path would raise "Source already registered" on re-execution.
+db = jammi_ai.connect(f"file://{tempfile.mkdtemp(prefix='jammi_retrieval_')}")
+
+# the committed same-subject golden + its query text
+golden = contracts.load_artifact("arxiv.subject_golden").to_pylist()
+relevant: dict[str, set[str]] = defaultdict(set)
+query_text: dict[str, str] = {}
+for g in golden:
+    relevant[g["query_id"]].add(g["relevant_id"])
+    query_text[g["query_id"]] = g["query_text"]
+qids = sorted(relevant)
+
+
+def dense_ranker(name):
+    table = contracts.load_artifact(name)
+    ids = [str(x) for x in table.column("_row_id").to_pylist()]
+    vecs = np.asarray([list(v) for v in table.column("vector").to_pylist()], dtype=np.float32)
+    pos = {i: n for n, i in enumerate(ids)}
+    norm = vecs / (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12)
+
+    def rank(qid, depth=200):
+        sims = norm @ norm[pos[qid]]
+        sims[pos[qid]] = -np.inf
+        top = np.argpartition(-sims, depth)[:depth]
+        return [ids[t] for t in top[np.argsort(-sims[top])]]
+
+    return rank
+
+
+raw_rank = dense_ranker("arxiv.embeddings")
+prop_rank = dense_ranker("arxiv.propagated")
+
+
+def recall_ndcg(ranked_for):
+    rec = ndcg = tot = 0.0
+    for qid, ranked in ranked_for.items():
+        rel = relevant[qid]
+        hits = [1.0 if r in rel else 0.0 for r in ranked[:10]]
+        rec += sum(hits) / min(10, len(rel))
+        ideal = sum(1.0 / math.log2(i + 2) for i in range(min(10, len(rel))))
+        ndcg += sum(h / math.log2(i + 2) for i, h in enumerate(hits)) / ideal
+        tot += 1
+    return rec / tot, ndcg / tot
+
+
+# live RRF fusion of the two dense arms via the engine helper
+fused = {qid: [doc for doc, _ in db.rrf_fuse([raw_rank(qid), prop_rank(qid)])] for qid in qids}
+live_recall, live_ndcg = recall_ndcg(fused)
+print(f"live RRF(raw+prop): recall@10 {live_recall:.4f}  nDCG@10 {live_ndcg:.4f}")
+rails.measure("retrieval.rrf_raw_prop.recall_at_10", round(live_recall, 4))
+rails.measure("retrieval.rrf_raw_prop.ndcg_at_10", round(live_ndcg, 4))
+```
+
+```{python}
+# | echo: false
+# Every committed per-method metric is asserted against its frozen golden.
+for r in metrics:
+    rails.measure(f"retrieval.{r['method']}.recall_at_10", r["recall_at_10"])
+    rails.measure(f"retrieval.{r['method']}.ndcg_at_10", r["ndcg_at_10"])
+```
+
+## `assemble_context(hybrid=True)` — reachability
+
+The engine exposes a hybrid path on `assemble_context(source, …, hybrid=True)`, which
+fuses ANN retrieval with a lexical signal inside one context-assembly call. On this CPU
+cache it shares the `search` constraint exactly: it resolves a source's ready embedding
+table, which a committed parquet is not.
+
+```{python}
+qvec = [float(x) for x in contracts.load_artifact("arxiv.embeddings").column("vector")[0].as_py()]
+db.add_source("arxiv_emb_probe",
+              url=str(contracts._dataset_dir("arxiv") / "embeddings.parquet"),
+              format="parquet")
+try:
+    db.assemble_context("arxiv_emb_probe", query=qvec, k=5, hybrid=True)
+    reachable = True
+    detail = "reached"
+except RuntimeError as exc:
+    reachable = False
+    detail = str(exc).splitlines()[0]
+print(f"assemble_context(hybrid=True) reachable on CPU cache: {reachable}")
+print(f"  detail: {detail}")
+```
+
+`hybrid=True` needs the same source-bound ready embedding table as `search`. The hybrid
+*retrieval* result we can measure on this cache is therefore the RRF dense+lexical fusion
+above — built from the same two arms the engine's hybrid path would fuse, scored against
+the same golden. Both point at the same finding.
+
+## The honest fusion finding
+
+This is the part a benchmark table would quietly drop. We report the deltas as the data
+shows them.
+
+```{python}
+print(f"best single arm overall:          {finding['best_single_recall_at_10']:.4f}")
+print(f"best fusion arm:                   {finding['best_fusion_recall_at_10']:.4f}")
+print(f"RRF(raw+prop) vs raw (weak arm):   {finding['fusion_vs_raw']:+.4f}")
+print(f"RRF(raw+prop) vs best dense arm:   {finding['fusion_vs_best_dense']:+.4f}")
+print(f"hybrid RRF(raw+lex) vs raw:        {finding['hybrid_vs_dense']:+.4f}")
+print(f"fusion helps (beats best single arm)? {finding['fusion_helps']}")
+```
+
+```{python}
+# | echo: false
+# The measured verdict: fusion does NOT beat the best single arm on this target.
+assert finding["fusion_helps"] is False, "fusion must be reported as the data shows"
+rails.measure("retrieval.fusion_vs_best_dense", finding["fusion_vs_best_dense"])
+rails.measure("retrieval.fusion_vs_raw", finding["fusion_vs_raw"])
+rails.measure("retrieval.hybrid_vs_dense", finding["hybrid_vs_dense"])
+```
+
+The measured verdict on this cache: **fusion does not help.** RRF of the two dense arms
+beats the *weaker* arm (raw, +0.012) but sits *below* the *stronger* single arm
+(propagated, −0.006); the hybrid dense+lexical fusion edges past raw (+0.004) but is
+dragged well below propagated by the weaker lexical ranker. No fused list exceeds the best
+single arm. The reason is structural, not a tuning miss: **RRF cannot exceed the best
+single ranker it already contains when one ranker dominates** — mixing in a weaker list
+only dilutes the strong list's top ranks. Fusion pays off when the arms are *complementary
+and comparably strong* (each finds relevant documents the other misses); here the
+propagated dense arm already dominates, so the strongest move is to use it alone — which
+is the same lesson tier-02 taught from the other side: **graph propagation, not fusion, is
+the lever on this same-subject target.**
+
+The honest practitioner reading: do not reach for fusion reflexively. Measure each arm
+first; fuse only when a weaker arm contributes relevant documents the strong arm misses,
+and confirm the fused list actually beats the best single arm — which, on this cache, it
+does not.
+
+## Bridge note
+
+> **Retrieval is one primitive at three resolutions.** A dense kNN, a lexical BM25 scan,
+> and a graph-propagated kNN are all *rank documents by a relevance signal*; RRF
+> [@cormack2009rrf] is a rank-only combiner over those lists, and the engine's
+> `assemble_context(hybrid=True)` folds the ANN and lexical signals inside one call. The
+> measured spread says the *signal* — dense-semantic vs lexical vs graph-propagated — is
+> the large lever and the combiner is the small one. Propagation (a low-pass graph filter,
+> the tier-02 / bridge result) moves recall more than any fusion of the unpropagated arms.

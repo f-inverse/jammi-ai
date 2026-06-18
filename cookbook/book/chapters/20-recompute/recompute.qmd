@@ -1,0 +1,276 @@
+---
+title: "Incremental recompute and opt-in caching — sensing and bounded action over the materialization contract"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `generate_embeddings` → `build_neighbor_graph` → `propagate_embeddings`
+under `cache="use"` · `staleness` · `derives_from` · `recompute(table, cascade=…)`
+· `verify_materialization` (the definition probe) · **Theory:** a materialized
+artifact is the output of a recorded *definition* over a recorded *input state*
+[@kleppmann2017ddia]; memoization reuses an exact prior derivation, and recompute
+re-runs it over the inputs' *current* state — the two bounded actions a recompute
+decision takes, with the engine never becoming the loop that decides *when* ·
+**Rail:** measurement (every cell a name-identity / outcome verdict frozen to
+golden, tol 0).
+
+A materialized feature table whose source advanced is silently stale; a
+downstream calibration built on it inherits the staleness with no signal. The
+engine answers this with three pure **sensing** reads over the recorded
+contract — *is this artifact still fresh?* (`staleness`), *what derives from this
+table?* (`derives_from`), *what is its recorded definition?* (the
+`verify_materialization` probe) — and two bounded **actions** a consumer invokes
+explicitly: opt-in memoization on the producers (`cache="use"` → reuse an exact
+prior materialisation) and `recompute(table, cascade)` (re-invoke the recorded
+producer over the inputs' current state, optionally sweeping the bounded
+downstream DAG once). This chapter measures all of it on CPU, hermetically, over
+an ~8-row ephemeral `file://` catalog.
+
+Everything here is observed by **table-name identity**. A result-table producer
+returns a bare table-name string; a cache **hit** returns the *same* name, a
+**miss** a new timestamped name. That is the only honest, deterministic signal —
+a wall-clock measurement is non-reproducible and forbidden by the determinism
+contract — so every verdict is a name-equality boolean (1.0/0.0), never a
+duration.
+
+```{python}
+from jammi_cookbook import contracts
+
+matrix = contracts.load_artifact("recompute.matrix")
+record = contracts.load_artifact("recompute.record")
+print("families measured:", ", ".join(sorted(matrix)))
+```
+
+## The chain, and the two recipe gotchas
+
+The cacheable producers are the two whose inputs are immutable result tables
+(`ResultDigest` anchors) — the neighbor graph and the propagation — over the
+embeddings. The unpinned `generate_embeddings` (anchored on a raw source with no
+version surface) rounds out the chain:
+
+```
+add_source("docs", file://…parquet)
+  → generate_embeddings(...)                          → emb   (UnpinnedAtInstant — never hits)
+  → build_neighbor_graph("docs", k=3, exact=True)     → g     (ResultDigest — cacheable)
+  → propagate_embeddings("docs", embedding_table=emb,
+        edge_graph_table=g, hops=1, alpha=0.5)        → prop  (ResultDigest ×2 — cacheable)
+```
+
+::: {.callout-warning title="Gotcha 1 — the graph verbs take the original source id, not the embedding table"}
+`build_neighbor_graph` and `propagate_embeddings` take the **original** `source`
+id (`"docs"`), **not** the embedding-table name. They resolve the latest ready
+embedding *for the named source* internally; passing the embedding-table id
+instead raises `Catalog error: No ready embedding table for source '<table>'`.
+The embedding table is supplied separately, via `embedding_table=emb`.
+:::
+
+::: {.callout-warning title="Gotcha 2 — pin `embedding_table=emb` or propagation is not cacheable"}
+`propagate_embeddings` **must** pin `embedding_table=emb` explicitly to be
+cacheable. Left unpinned, it resolves *"the latest ready embedding for docs"* —
+and once any prior propagate has run, that latest-ready anchor shifts, so the
+`ResultDigest` differs and the probe misses. Pinning the exact embedding table
+fixes the anchor, so the same build keys to the same materialisation.
+:::
+
+## Obtaining the recorded definition — purely from Python
+
+`staleness(table, current_definition)` needs the table's own recorded
+`DefinitionHash`. There is no `get_definition` verb — but `verify_materialization`
+returns the recorded hash as its `found` field on a deliberate mismatch. A probe
+with a sentinel `expected_definition` yields the real recorded hash, off the
+public surface, touching no engine internals:
+
+```{python}
+print("how current_definition is obtained:")
+print(" ", record["current_definition_method"])
+```
+
+## Family 1 — opt-in memoization reuses an exact derivation
+
+Memoization is **opt-in** (default bypass) and **honest**: a producer never
+silently hands back a table the caller did not just compute. Reuse is both
+explicitly requested (`cache="use"`) and explicitly observable (the returned name
+is the prior table's). Building `build_neighbor_graph(k=3)` under `cache="bypass"`
+then `cache="use"` returns the *same* name — the exact materialisation is reused;
+the pinned-embedding `propagate_embeddings(hops=1)` reuses across two calls
+[@kleppmann2017ddia]:
+
+```{python}
+cache = matrix["cache"]
+names = cache["names"]
+print(f"bng  k=3 bypass == k=3 use : {cache['bng_reused']}   "
+      f"({names['g_bypass'] == names['g_use']})")
+print(f"prop hops=1 reuse          : {cache['prop_reused']}   "
+      f"({names['prop_h1_a'] == names['prop_h1_b']})")
+assert cache["bng_reused"] and cache["prop_reused"]
+contracts.assert_close("recompute.cache.bng_reused", 1.0)
+contracts.assert_close("recompute.cache.prop_reused", 1.0)
+print("\nexact derivation REUSED (by table-name identity)")
+```
+
+The probe keys on the **full** producing descriptor, not just one knob. A
+different `k`, a `min_similarity`, or a different `hops` is a different
+definition — a miss, a new name. This is what makes reuse *sound*: only a
+byte-for-byte equivalent build is ever reused.
+
+```{python}
+print(f"bng  k=4          recomputed : {cache['bng_k4_recomputed']}")
+print(f"bng  min_sim=0.5  recomputed : {cache['bng_minsim_recomputed']}")
+print(f"prop hops=2       recomputed : {cache['prop_hops_recomputed']}")
+for cell in ("bng_k4_recomputed", "bng_minsim_recomputed", "prop_hops_recomputed"):
+    contracts.assert_close(f"recompute.cache.{cell}", 1.0)
+print("\nany full-descriptor change RECOMPUTES — the probe keys on the whole definition")
+```
+
+And the unpinned producer is honestly *off*. `generate_embeddings` is anchored on
+an `UnpinnedAtInstant` source — a raw source with no version surface, so its read
+instant is not a reproducible id and can never yield a sound hit. Calling it
+twice under `cache="use"` returns two *different* names: the cache is honestly
+off there, never silently broken.
+
+```{python}
+print(f"generate_embeddings reused : {cache['unpinned_reused']}   "
+      f"(names differ: {names['emb_a'] != names['emb_b']})")
+contracts.assert_close("recompute.cache.unpinned_reused", 0.0)
+print("\nUnpinnedAtInstant producer HONESTLY NEVER HITS")
+```
+
+## Family 2 — staleness senses a changed definition
+
+`staleness(table, current_definition)` is a pure read over the recorded contract.
+Against the table's *own* recorded hash it is `fresh` (the only verdict that
+asserts reuse is safe); against a *different* hash it is `stale`, with a reason
+`definition_changed` naming both the `recorded` and the `current` hash:
+
+```{python}
+s = matrix["staleness"]
+print("fresh against own recorded hash :", s["fresh_verdict"])
+print("stale against a different hash  :", s["stale_verdict"]["staleness"],
+      "—", s["stale_verdict"]["reasons"][0]["reason"])
+assert s["is_fresh"] and s["is_stale_on_definition_change"]
+contracts.assert_close("recompute.staleness.fresh", 1.0)
+contracts.assert_close("recompute.staleness.stale_on_definition_change", 1.0)
+print("\nstaleness senses a CHANGED DEFINITION (the definition_changed arm)")
+```
+
+::: {.callout-note title="Build-or-cut — the `result_digest` input-drift staleness arm is CUT"}
+`staleness` has a sibling arm: a child senses a *parent whose artifact digest
+moved* and reports `stale` for reason `result_digest`. That arm is **cut here**,
+with this rationale (no half-shipped fake demo — the no-deferral policy):
+
+A `recompute` over **unmoved** inputs is byte-identical (Family 3 proves it) *and*
+produces a uniquely-named **new** table. So a child anchored on the original
+parent stays honestly `fresh`: its recorded parent digest still matches that
+parent's current digest — nothing drifted. And there is no Python-surface verb to
+re-anchor an *existing* child onto a moved-digest parent in a hermetic chain
+(re-anchoring happens only when a producer runs and records a fresh anchor, which
+produces a *new* child, not a drift on the old one). Fabricating a drift would
+require reaching past the public surface into the manifest store.
+
+The arm is therefore **described, not measured**. The manifest-anchor model
+(SPEC-02 §3.2) makes it precise: each input carries a typed `InputAnchor`; for a
+`ResultDigest` input the *current* anchor is the input's current artifact digest,
+read from the input's own manifest. A recomputed parent gets a new digest, so a
+child anchored on the old one is detected stale by the **same per-input
+comparison** — recursion falls out with no special case [@kleppmann2017ddia]. The
+record states the cut explicitly:
+:::
+
+```{python}
+print(record["staleness_result_digest_drift_cut"])
+```
+
+## Family 3 — recompute restores, over the inputs' current state
+
+`recompute(table, cascade)` dispatches on the table's recorded
+`ProducingDescriptor`, reconstructs the producing verb call from its recorded
+typed parameters over the inputs' **current** state, and runs it. Because the
+descriptor is complete, the replay is **byte-identical** when the inputs have not
+moved: the recompute's verdict against the original's recorded hash is `match`,
+and its own recorded definition hash equals the original's [@orr2021featurestore]:
+
+```{python}
+rc = matrix["recompute"]
+print(f"child recompute outcome      : {rc['child_recompute_outcome']}")
+print(f"child recompute byte-identical: {rc['child_recompute_byte_identical']}")
+assert rc["child_recompute_byte_identical"]
+contracts.assert_close("recompute.recompute.byte_identical", 1.0)
+print("\nrecompute over unmoved inputs is BYTE-IDENTICAL")
+```
+
+The cascade dial is the bounded sweep. `cascade="report_only"` (the default)
+recomputes only the named table and **reports** the downstream-stale set (via the
+stack-safe transitive lineage walk), recomputing none of it — the consumer
+decides. `cascade="downstream"` is **one** bounded topological sweep on **one**
+explicit request: the named parent, then each transitive dependent in order, each
+once.
+
+```{python}
+print(f"parent report_only — downstream_stale count : {rc['downstream_stale_count']} "
+      f"(the child is in it: {rc['child_in_downstream_stale']})")
+print(f"parent report_only — recomputes only parent : {rc['report_only_recomputes_only_parent']}")
+print(f"parent cascade=downstream — recomputed count : {rc['cascade_recomputed_count']} "
+      f"(parent + child)")
+contracts.assert_close("recompute.recompute.downstream_stale_count", 1.0)
+contracts.assert_close("recompute.recompute.report_only_recomputes_only_parent", 1.0)
+contracts.assert_close("recompute.recompute.cascade_recomputed_count", 2.0)
+print("\nreport_only REPORTS; downstream SWEEPS parent + child once")
+```
+
+The sweep stands on the lineage view. `derives_from(emb)` returns the one-hop
+reverse-dependency edges — every ready table whose recorded input anchors name
+`emb` (here the neighbor graph and the propagation) — each a `result_digest`
+edge, the cacheable immutable-input lineage:
+
+```{python}
+print(f"derives_from(emb) edges : {rc['derives_from_edge_count']}  "
+      f"kinds: {rc['derives_from_kinds']}")
+assert rc["derives_from_all_result_digest"]
+contracts.assert_close("recompute.recompute.derives_from_edge_count", 2.0)
+contracts.assert_close("recompute.recompute.derives_from_all_result_digest", 1.0)
+print("\nlineage is one-hop RESULT_DIGEST edges — the relation the sweep walks")
+```
+
+## The boundary — mechanism, not the loop
+
+The engine ships the bounded **mechanism**: one cache probe per producer call,
+one recompute on one explicit request, one bounded downstream sweep on
+`cascade="downstream"`. It ships **no** scheduler, no staleness-monitor that
+*triggers* recompute, no cache eviction or TTL. Re-running the mechanism on a
+schedule, or wiring a sensor (`staleness`) to an actuator (`recompute`) into a
+control loop, is the consumer's composition — a governing platform built on a
+published engine version. The line is sharp: *one bounded sweep on one explicit
+request is engine; re-running it on a schedule or a monitor is platform.* The
+engine ships the actuator, never the control loop that pulls it.
+
+```{python}
+print(record["boundary"])
+```
+
+```{python}
+# | echo: false
+# The final measured verdict — every family's golden re-asserted in one fold, so a
+# drift in any committed cell fails this chapter's render.
+_ALL = {
+    "recompute.cache.bng_reused": 1.0,
+    "recompute.cache.bng_k4_recomputed": 1.0,
+    "recompute.cache.bng_minsim_recomputed": 1.0,
+    "recompute.cache.prop_reused": 1.0,
+    "recompute.cache.prop_hops_recomputed": 1.0,
+    "recompute.cache.unpinned_reused": 0.0,
+    "recompute.staleness.fresh": 1.0,
+    "recompute.staleness.stale_on_definition_change": 1.0,
+    "recompute.recompute.byte_identical": 1.0,
+    "recompute.recompute.report_only_recomputes_only_parent": 1.0,
+    "recompute.recompute.downstream_stale_count": 1.0,
+    "recompute.recompute.cascade_recomputed_count": 2.0,
+    "recompute.recompute.derives_from_edge_count": 2.0,
+    "recompute.recompute.derives_from_all_result_digest": 1.0,
+}
+for _metric, _value in _ALL.items():
+    contracts.assert_close(_metric, _value)
+print(f"all {len(_ALL)} measured verdicts match golden (tol 0) — sensing + bounded action")
+```

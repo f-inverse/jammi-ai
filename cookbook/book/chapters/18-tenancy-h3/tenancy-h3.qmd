@@ -1,0 +1,499 @@
+---
+title: "Per-verb tenant isolation — the standing oracle, measured + the BYO-auth seam"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `set_tenant` / `tenant_scope` across the tenant-scoped verb surface
+(`list_sources` · `describe_source` · `list_mutable_tables` · `list_topics` ·
+`list_channels` · `list_models` · `sql` / Flight SQL · the `create_*` / `drop_*`
+verbs) · **Theory:** tenant isolation as a *per-verb* property of the catalog and
+the query analyzer — a standing oracle the engine guards, measured here from the
+consumer side as hard zeros · **Rail:** tenancy (`rails.tenant` /
+`assert_listing_isolated` / `assert_rows_isolated`, reused verbatim) + measurement.
+
+Chapter 11 established the engine's *true* tenancy contract as two layers and one
+honest caveat: catalog-listing isolation and discriminator-column row isolation,
+both as hard zeros, plus the discriminator-less-source caveat as a positive
+visible count. This chapter does not restate it — it **extends** it to the full
+**per-verb surface**. For each tenant-scoped verb the engine exposes, we measure
+the standing-oracle property from the consumer side: tenant B cannot see or reach
+tenant A's resource. Every cell is a verdict — a hard zero where isolation must
+hold, a documented stated-positive where the engine is honest about visibility.
+
+We measure on the embedded engine and, for every verb reachable on the wire, on a
+live `grpc://` `jammi-server` — and freeze the matrix to golden. Then we
+demonstrate the engine's **BYO-auth seam** from the consumer side, over the **real
+Flight SQL wire** (`jammi-client` `0.32.0` carries the bearer on `db.sql()`'s
+Flight lane — jammi #96): a generic HMAC-signed bearer token, read off a genuine
+`db.sql()` call by an authenticating gateway that maps the verified claim to a
+tenant and binds it *in front of* the engine. The engine enforces auth on no
+transport; the gateway in front is the consumer's.
+
+```{python}
+from jammi_cookbook import contracts
+
+matrix = contracts.load_artifact("tenancy_h3.matrix")
+record = contracts.load_artifact("tenancy_h3.record")
+print(f"transport (canonical): {matrix['transport']}")
+print(f"cross-transport parity: {record['parity_verdict']}")
+```
+
+The tenant ids are opaque UUIDs — the engine validates the form, never who the
+tenant is. There IS a tenant; nothing about who.
+
+## Part A — the per-verb isolation matrix
+
+For every verb, tenant A creates or registers a resource under its own scope, and
+tenant B's listing / read / reach is measured. We reuse `jammi_cookbook.rails`
+verbatim — `tenant` (the bind-in-place/restore context manager),
+`assert_listing_isolated`, and `assert_rows_isolated`, the corrected helpers from
+chapter 11, not a re-implementation.
+
+### The hard zeros — B sees none of A's resource
+
+The catalog reads (`list_sources` / `list_mutable_tables` / `list_topics` /
+`list_models`) filter the registry to `tenant_id = $cur OR IS NULL`, so B's
+listing excludes A's registration. For `list_models` the emit registers a **real**
+model under tenant A first — training is the only public path into the model
+catalog, so a tiny CPU `fine_tune` (the §3.6 pattern) puts A's base and fine-tuned
+models in the catalog — and then measures that B's `list_models` carries **none**
+of them: a true cross-tenant model-isolation zero, not an empty catalog.
+`describe_source` on a foreign id returns `None` — B cannot even confirm the
+resource exists. And the load-bearing data layer: a `sql` / Flight SQL read of a
+discriminator-tagged source is rewritten by the analyzer to
+`tenant_id = $cur OR IS NULL`, so A reads only its own rows. Every one is a
+**hard zero leak**.
+
+```{python}
+HARD_ZEROS = {
+    "source_listing_leak":    "list_sources — B's listing excludes A's source",
+    "describe_source_leak":   "describe_source — a foreign source is None (not visible)",
+    "mutable_listing_leak":   "list_mutable_tables — B excludes A's mutable table",
+    "topic_listing_leak":     "list_topics — B excludes A's topic",
+    "channel_listing_leak":   "list_channels — B excludes A's registered channel",
+    "model_listing_leak":     "list_models — B's catalog carries none of A's (real, fine-tuned) models",
+    "sql_row_leak":           "sql / Flight SQL — A reads none of B's discriminator-tagged rows",
+}
+for cell, label in HARD_ZEROS.items():
+    print(f"  {matrix[cell]}   {label}")
+assert all(matrix[c] == 0 for c in HARD_ZEROS), "a hard-zero verb leaked"
+print("\nevery tenant-scoped verb is a HARD ZERO — B reaches none of A's resource")
+```
+
+```{python}
+# | echo: false
+from jammi_cookbook import rails
+
+# Every hard zero asserted to its frozen golden (tol 0 — a leak is not a tolerance).
+for cell in HARD_ZEROS:
+    rails.measure(f"tenancy_h3.hard_zero.{cell}", float(matrix[cell]))
+    assert contracts.golden(f"tenancy_h3.hard_zero.{cell}").tol == 0.0
+```
+
+### The stated-positives — the honest visibility, as real counts
+
+Two cells are *not* zero, and the chapter asserts them as the positive counts they
+are rather than hiding them. `list_channels` surfaces the engine's **built-in
+global channels** (`vector` / `inference` / `bm25`) to every tenant — they are
+globally scoped, the discriminator-less-global analog. And the chapter-11 caveat:
+a source with **no** `tenant_id` column is globally readable — A sees it whole.
+
+```{python}
+print(f"builtin_channels_visible = {matrix['builtin_channels_visible']}  "
+      f"(B sees the engine's global channels — vector / inference / bm25)")
+print(f"caveat_visible           = {matrix['caveat_visible']}  "
+      f"(A reads a discriminator-less source whole — the engine does not authenticate)")
+assert matrix["builtin_channels_visible"] > 0 and matrix["caveat_visible"] > 0
+```
+
+```{python}
+# | echo: false
+rails.measure("tenancy_h3.stated_positive.builtin_channels_visible",
+              float(matrix["builtin_channels_visible"]))
+rails.measure("tenancy_h3.stated_positive.caveat_visible", float(matrix["caveat_visible"]))
+```
+
+These are the same two honest limits chapter 11 measured, now located precisely on
+the verb surface: the listing layer hides a *separate* per-tenant resource, but a
+*globally-scoped* one (a built-in channel, a discriminator-less source) is visible
+by design. Data isolation is the discriminator column, not source separation.
+
+### The collisions — error or isolate, never a cross-tenant clobber
+
+What happens when tenant B registers a resource under the *same id* tenant A
+already used? The engine never silently overwrites A's resource. A duplicate
+mutable-table name ERRORS on the global catalog primary key; a duplicate topic or
+channel id resolves in B's **own** per-tenant namespace as B's resource, A's
+untouched. Either way: no cross-tenant clobber.
+
+```{python}
+print(f"create_mutable_table dup → errored: {matrix['mutable_dup_errored']}  "
+      f"(global PK collision — does NOT clobber A's table)")
+print(f"register_topic dup       → isolated: {matrix['topic_dup_isolated']}  "
+      f"(per-tenant namespace — B's own topic)")
+print(f"register_channel dup     → isolated: {matrix['channel_dup_isolated']}  "
+      f"(per-tenant namespace — B's own channel)")
+assert matrix["mutable_dup_errored"] is True
+assert matrix["topic_dup_isolated"] is True and matrix["channel_dup_isolated"] is True
+```
+
+### The destructive verbs — A's resource survives B's drop
+
+The highest-stakes property the standing oracle guards: a destructive verb named
+by the wrong tenant must not reach across tenants. When B calls
+`drop_mutable_table` / `drop_topic` on a name A registered, B's call resolves in
+B's **own** namespace — a not-found for the mutable table, a no-op on B's own
+topic — and **A's resource survives**. We measure it directly: A's mutable table
+and topic are still listed after B's destructive call.
+
+```{python}
+print(f"mt_survives_foreign_drop = {matrix['mt_survives_foreign_drop']}  "
+      f"(A's mutable table survives B's drop_mutable_table)")
+print(f"tp_survives_foreign_drop = {matrix['tp_survives_foreign_drop']}  "
+      f"(A's topic survives B's drop_topic)")
+print(f"  (B's drop of A's mutable-table name raised in B's namespace: "
+      f"{matrix['b_drop_mt_raised']})")
+assert matrix["mt_survives_foreign_drop"] is True
+assert matrix["tp_survives_foreign_drop"] is True
+```
+
+```{python}
+# | echo: false
+for cell in ("collision.mutable_dup_errored", "collision.topic_dup_isolated",
+             "collision.channel_dup_isolated", "destructive.mt_survives_foreign_drop",
+             "destructive.tp_survives_foreign_drop"):
+    rails.measure(f"tenancy_h3.{cell}", 1.0)
+```
+
+### No leak found
+
+The headline of the whole matrix: **no verb leaks**. Every hard zero is `0`; A's
+resource survives every foreign destructive call; every collision errors or
+isolates. The `drop_mutable_table` cross-tenant-destruction defect that early
+scouting flagged as a candidate is **not present** on the pinned engine — B's drop
+resolves in B's own namespace and A's table survives, measured above. The record
+states the finding explicitly.
+
+```{python}
+print(record["leak_finding"])
+assert record["leak_finding"].startswith("NONE")
+```
+
+### Cross-transport — remote == embedded on the wire
+
+Every verb reachable on the wire (the catalog reads + the discriminator-column sql
+row read) was measured a second time on a live `grpc://` `jammi-server` and
+asserted `remote == embedded` live at emit time. The verdict is recorded; the
+matrix above is the embedded-canonical one.
+
+```{python}
+parity = record["parity"]
+print(f"cross-transport observables checked: {len(parity)}")
+assert all(p["equal"] for p in parity), "a cross-transport observable diverged"
+for p in parity:
+    print(f"  {p['observable']:28s} embedded == remote  (value {p['value']})")
+```
+
+```{python}
+# | echo: false
+rails.measure("tenancy_h3.parity.cross_transport_equal", 1.0)
+```
+
+## Part B — the BYO-auth seam, from the consumer side
+
+The engine authenticates **nothing** on its own. The `jammi-session-id` header the
+stock interceptor reads is a client-minted, opaque transport correlation id — it
+identifies a *connection*, not a *principal*. Anyone who presents another session's
+id assumes that session's tenant. It is the right trade-off on a trusted network
+and the wrong one the moment an untrusted caller can reach the port. **It is not a
+trust boundary.**
+
+Verifying a caller is the consumer's job — a gateway placed **in front of** the
+engine. The engine's `grpc_byo_auth.rs` worked example shows that seam for the
+**typed gRPC verbs**; the Flight SQL lane (`db.sql()`) is a separate
+`pyarrow.flight` transport and is the gateway-in-front's responsibility there too
+(engine issue #220, by design). On `jammi-client` `0.32.0` the client carries the
+channel's bearer on the **Flight SQL lane** as well as the typed verbs (jammi #96;
+on `0.31.0` the bearer rode only the typed path). So here is the consumer-side
+seam over that **real Flight wire**: a `pyarrow.flight` gateway reads the inbound
+bearer off a genuine `db.sql()` call, a **generic** HMAC-signed bearer token (no
+identity provider, no product name) it verifies, and a real-engine tenant-scoped
+read it returns — the credential binds the engine's `tenant_scope` in front of the
+engine.
+
+The credential is generic on purpose: an opaque subject plus a tenant claim,
+HMAC-SHA256 [@rfc2104] over both under a key only the consumer's issuer and gateway
+share, presented as a bearer token [@rfc6750]. The tenant claim is **inside** the
+signed payload, so it cannot be forged without the key. It stands in for whatever a
+consumer's identity system mints; the seam only needs the gateway to turn a
+verified claim into a tenant.
+
+```{python}
+import hashlib
+import hmac
+
+# The CONSUMER's shared signing key — the engine never sees it. A real deployment
+# rotates this; here it is fixed so the example is reproducible.
+SIGNING_KEY = b"consumer-issuer-signing-key-not-jammi"
+
+
+def mint_token(subject: str, tenant_id: str) -> str:
+    """A generic signed token '<subject>.<tenant>.<hex-mac>' — BARE, no 'Bearer '
+    prefix. BearerCredentials prepends 'Bearer ' itself on the wire, so minting it
+    here too would double it to 'Bearer Bearer …' and never verify."""
+    claim = f"{subject}.{tenant_id}"
+    sig = hmac.new(SIGNING_KEY, claim.encode(), hashlib.sha256).hexdigest()
+    return f"{claim}.{sig}"
+
+
+def verify_token(authorization):
+    """Verify the wire's 'authorization' header; return its tenant claim, or None
+    if missing / malformed / failing the constant-time signature check. Strips the
+    one 'Bearer ' the wire carries. Only a VERIFIED claim yields a tenant — a
+    forged tenant the signature does not cover returns None."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    claim, _, sig_hex = authorization[len("Bearer "):].rpartition(".")
+    subject, _, tenant_id = claim.partition(".")
+    if not claim or not sig_hex or not subject or not tenant_id:
+        return None
+    expected = hmac.new(SIGNING_KEY, claim.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig_hex):
+        return None
+    return tenant_id
+```
+
+The **gateway** is the seam, as a real `pyarrow.flight` server. A `db.sql()` call
+presents its bearer on the Flight lane; a `ServerMiddlewareFactory` reads the
+inbound `authorization` header (pyarrow lowercases the key and hands each value as
+a list), the handlers verify it, derive the tenant from the *verified* claim, and
+bind it via the engine's `tenant_scope` for the read. `db.sql()` makes **two**
+Flight calls (`get_flight_info` then `do_get`), each re-presenting the bearer, so
+the gateway verifies in **both** — rejecting in `get_flight_info` short-circuits
+the whole `sql()` before any read runs. A missing or invalid credential raises
+`FlightUnauthenticatedError`; the request reads nothing, it does not fall through
+to an unscoped global read.
+
+```{python}
+import socket
+import tempfile
+
+import jammi_ai
+import jammi_client
+import pyarrow as pa
+import pyarrow.flight as flight
+import pyarrow.parquet as pq
+from jammi_cookbook.rails import tenant
+
+TENANT_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+TENANT_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+
+def _free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class AuthMiddleware(flight.ServerMiddleware):
+    def __init__(self, authorization):
+        self.authorization = authorization
+
+
+class AuthMiddlewareFactory(flight.ServerMiddlewareFactory):
+    """Records the inbound 'authorization' header of every Flight call — the exact
+    value db.sql() put on the wire (the value is a LIST; take the first)."""
+
+    def __init__(self):
+        self.observed = []
+
+    def start_call(self, info, headers):
+        auth = headers.get("authorization")
+        value = auth[0] if auth else None
+        self.observed.append(value)
+        return AuthMiddleware(value)
+
+
+class AuthGatewayServer(flight.FlightServerBase):
+    """The seam: a Flight server that verifies the bearer in front of the engine."""
+
+    def __init__(self, location, db, factory):
+        super().__init__(location, middleware={"auth": factory})
+        self._db = db
+        self._schema = pa.schema([("source_id", pa.string())])
+
+    def _verified_tenant(self, context):
+        mw = context.get_middleware("auth")
+        tenant_id = verify_token(mw.authorization if mw is not None else None)
+        if tenant_id is None:                                  # reject — never bind None
+            raise flight.FlightUnauthenticatedError("missing or invalid credential")
+        return tenant_id
+
+    def get_flight_info(self, context, descriptor):
+        self._verified_tenant(context)                         # short-circuits sql()
+        endpoint = flight.FlightEndpoint(b"sources", [])
+        return flight.FlightInfo(self._schema, descriptor, [endpoint], -1, -1)
+
+    def do_get(self, context, ticket):
+        tenant_id = self._verified_tenant(context)
+        with self._db.tenant_scope(tenant_id):                 # bind the VERIFIED tenant
+            rows = [s["source_id"] for s in self._db.list_sources()]
+        return flight.RecordBatchStream(pa.table({"source_id": rows}))
+
+
+catalog = tempfile.mkdtemp()
+work = tempfile.mkdtemp()
+db = jammi_ai.connect(f"file://{catalog}")
+
+
+def write_src(name, tenant_id):
+    path = f"{work}/{name}.parquet"
+    pq.write_table(pa.table({"id": [1]}), path)
+    with tenant(db, tenant_id):
+        db.add_source(name, url=path, format="parquet")
+
+
+write_src("auth_a", TENANT_A)
+write_src("auth_b", TENANT_B)
+
+factory = AuthMiddlewareFactory()
+gateway = AuthGatewayServer(
+    flight.Location.for_grpc_tcp("127.0.0.1", _free_port()), db, factory
+)
+gateway_endpoint = f"127.0.0.1:{gateway.port}"
+
+
+def gateway_sources(token):
+    """The production db.sql() Flight path: the bearer rides the REAL Flight wire
+    (BearerCredentials prepends 'Bearer '); anonymous when token is None."""
+    credentials = jammi_client.BearerCredentials(token) if token is not None else None
+    conn = jammi_client.connect(f"grpc://{gateway_endpoint}", credentials=credentials)
+    try:
+        return conn.sql("SELECT source_id FROM sources").column("source_id").to_pylist()
+    finally:
+        conn.close()
+```
+
+The bearer rides the real Flight wire: an authenticated `db.sql()` puts
+`Bearer <minted>` on every Flight call the gateway's middleware sees, while an
+anonymous `db.sql()` carries no `authorization` header at all.
+
+```{python}
+minted_a = mint_token("subject-a", TENANT_A)
+a_seen = gateway_sources(minted_a)
+bearer_on_flight = bool(factory.observed) and all(
+    obs == f"Bearer {minted_a}" for obs in factory.observed
+)
+print(f"the gateway saw on the Flight wire: {factory.observed[0]}")
+print(f"bearer rides the real Flight lane: {bearer_on_flight}")
+assert bearer_on_flight
+```
+
+Two authenticated callers, two valid tokens for two distinct tenants — each
+`db.sql()` over Flight sees only its own tenant's source. The tenant is *inside*
+the signed claim; neither caller asserts it in a plain header.
+
+```{python}
+b_seen = gateway_sources(mint_token("subject-b", TENANT_B))
+a_isolated = "auth_a" in a_seen and "auth_b" not in a_seen
+b_isolated = "auth_b" in b_seen and "auth_a" not in b_seen
+print(f"caller A sees {a_seen}  isolated: {a_isolated}")
+print(f"caller B sees {b_seen}  isolated: {b_isolated}")
+assert a_isolated and b_isolated
+```
+
+An anonymous `db.sql()` carries no bearer, and the gateway rejects it in
+`get_flight_info` before any engine read runs — the caller reads nothing. It does
+**not** fall through to an unscoped read that could surface a global
+(`tenant_id IS NULL`) row.
+
+```{python}
+before = len(factory.observed)
+try:
+    gateway_sources(None)
+    missing_rejected = False
+except flight.FlightUnauthenticatedError:
+    missing_rejected = True
+anon_no_bearer = all(obs is None for obs in factory.observed[before:])
+print(f"anonymous db.sql() carried no bearer: {anon_no_bearer}")
+print(f"missing credential rejected (not run unscoped): {missing_rejected}")
+assert missing_rejected and anon_no_bearer
+```
+
+An invalid credential — a forged tenant claim the signature does not cover — is
+rejected too. And the forgery buys nothing: a *valid* token for the same tenant the
+forgery claimed still resolves, proving the rejection was the signature, not a
+tenant blocklist. The seam authenticates the claim.
+
+```{python}
+forged = f"subject-mallory.{TENANT_A}.deadbeef"
+try:
+    gateway_sources(forged)
+    forged_rejected = False
+except flight.FlightUnauthenticatedError:
+    forged_rejected = True
+legit_after = "auth_a" in gateway_sources(mint_token("subject-a", TENANT_A))
+print(f"invalid (forged) credential rejected: {forged_rejected}")
+print(f"a valid token for the same tenant still resolves: {legit_after}")
+assert forged_rejected and legit_after
+gateway.shutdown()
+```
+
+The gateway's tenant-scoped read over Flight is the same isolation as the embedded
+`list_sources` under the same tenant — the seam puts the wire bearer in front of
+the engine's binding without changing what the engine returns.
+
+```{python}
+with tenant(db, TENANT_A):
+    embedded_a = sorted(s["source_id"] for s in db.list_sources())
+over_flight_eq_embedded = sorted(a_seen) == embedded_a
+print(f"over-Flight read == embedded read under the same tenant: {over_flight_eq_embedded}")
+assert over_flight_eq_embedded
+```
+
+```{python}
+# | echo: false
+# The seam verdict, asserted against the frozen committed cache (the same recipe
+# run live at emit time over a REAL jammi-server Flight wire).
+byo = record["byo_auth"]
+assert byo["bearer_on_flight_observed"] is True and byo["anonymous_no_bearer"] is True
+assert byo["a_isolated_over_flight"] is True and byo["b_isolated_over_flight"] is True
+assert byo["missing_rejected_over_flight"] is True
+assert byo["forged_rejected_over_flight"] is True and byo["over_flight_eq_embedded"] is True
+for cell, observed in (
+    ("bearer_on_flight_observed", bearer_on_flight),
+    ("anonymous_no_bearer", anon_no_bearer),
+    ("a_isolated_over_flight", a_isolated),
+    ("b_isolated_over_flight", b_isolated),
+    ("missing_rejected_over_flight", missing_rejected),
+    ("forged_rejected_over_flight", forged_rejected),
+    ("legit_after_forgery_over_flight", legit_after),
+    ("over_flight_eq_embedded", over_flight_eq_embedded),
+):
+    rails.measure(f"tenancy_h3.byo_auth.{cell}", 1.0 if observed else 0.0)
+```
+
+## What this chapter establishes
+
+The engine isolates **per verb**: every tenant-scoped catalog read, describe, and
+discriminator-column row read is a hard zero, on both transports, and every
+destructive verb is tenant-scoped so a foreign tenant cannot reach across to
+destroy A's resource. The two honest limits — a globally-scoped resource (a
+built-in channel, a discriminator-less source) is visible to every tenant — are
+measured as positive counts, not glossed. No verb leaks.
+
+And the engine's BYO-auth seam, demonstrated from the consumer side **over the
+real Flight SQL wire**: the credential now rides the actual `db.sql()` Flight lane
+(`jammi-client` `0.32.0`, jammi #96), not an in-process call — the gateway reads
+the bearer the client put on the wire and binds the engine's `tenant_scope` in
+front of the read. The engine ships the *credential plumbing* (the bearer on both
+the typed gRPC verbs and the Flight lane) and the *per-request tenant binding*; the
+consumer supplies the *auth* (the generic credential, the gateway that verifies it
+and binds the verified tenant). Authentication runs *in front of* the engine, so
+the tenant the engine acts on is the one the credential proves — and a rejected
+caller fails the request in `get_flight_info`, never running unscoped. The engine
+enforces auth on no transport by design; the gateway in front is the consumer's.

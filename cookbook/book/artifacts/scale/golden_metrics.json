@@ -1,0 +1,54 @@
+{
+  "ann_search_qps": 1115.2,
+  "ann_search_qps_note": "recorded, un-gated; machine-dependent perf reference (emit box A10G), not a portable floor",
+  "corpus_rows": 168343,
+  "dim": 768,
+  "held_out_queries": 1000,
+  "recall": {
+    "recall_at_1": {
+      "floor": 0.931,
+      "margin": 0.04,
+      "measured": 0.971
+    },
+    "recall_at_10": {
+      "floor": 0.9164,
+      "margin": 0.04,
+      "measured": 0.9564
+    },
+    "recall_at_100": {
+      "floor": 0.87535,
+      "margin": 0.04,
+      "measured": 0.91535
+    },
+    "ef8_at_10": {
+      "floor": 0.6493,
+      "margin": 0.04,
+      "measured": 0.6893
+    },
+    "ef16_at_10": {
+      "floor": 0.7403,
+      "margin": 0.04,
+      "measured": 0.7803
+    },
+    "ef32_at_10": {
+      "floor": 0.8529,
+      "margin": 0.04,
+      "measured": 0.8929
+    },
+    "ef64_at_10": {
+      "floor": 0.9164,
+      "margin": 0.04,
+      "measured": 0.9564
+    },
+    "ef128_at_10": {
+      "floor": 0.9467,
+      "margin": 0.04,
+      "measured": 0.9867
+    },
+    "ef256_at_10": {
+      "floor": 0.956,
+      "margin": 0.04,
+      "measured": 0.996
+    }
+  }
+}

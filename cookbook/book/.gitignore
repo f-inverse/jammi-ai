@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.jupyter_cache/
+_book/
+.quarto/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Downloaded datasets are fetched on demand (checksum-gated) and never committed;
+# only the small committed subset artifacts under artifacts/ and the ID lists
+# under data/ids/ are tracked.
+data/raw/
+data/cache/
+
+/.quarto/
+/_freeze/

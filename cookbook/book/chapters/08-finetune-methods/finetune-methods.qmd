@@ -1,0 +1,235 @@
+---
+title: "Fine-tuning methods, measured side-by-side"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `fine_tune` (the loss / hard-negative / Matryoshka knobs) + `fine_tune_graph`
+· **Theory:** contrastive metric learning — in-batch softmax (MNRL / InfoNCE, van den
+Oord et al. 2018), triplet margin (Schroff et al. 2015 FaceNet), CoSENT, hard-negative
+mining, Matryoshka representation learning (Kusupati et al. 2022) · **Rail:** measurement
+(per-method same-subject recall@10).
+
+Tier 03 fine-tuned the encoder over the *declared citation graph* and measured a
+single recall gain. This vertical asks the next question a practitioner actually
+asks: **of the fine-tuning methods the engine exposes, which one should I reach
+for?** We hold the task fixed — same-subject retrieval over the committed
+ogbn-arxiv subset, measured by the keystone's embedding-independent recall@10 — and
+sweep the *method*: the contrastive loss, hard-negative mining, the Matryoshka
+nesting, and (for contrast) the declared-edge graph fine-tune. Every method is a
+short LoRA run on the same ModernBERT-base, on the **same** same-subject supervision
+mined from the subject labels, so the only thing that varies is the method itself.
+
+The keystone ran every fine-tune on the GPU server and froze the per-method recall;
+this chapter reads that cache on CPU and asserts each number against its golden.
+
+```{python}
+from jammi_cookbook import contracts
+
+methods = contracts.load_artifact("finetune.methods")
+print(f"base model:        {methods['base_model']}")
+print(f"supervised pairs:  {methods['n_supervised_pairs']}")
+print(f"epochs per method: {methods['epochs']}")
+print(f"golden queries:    {methods['golden_queries']}")
+print(f"frozen-base recall@10: {methods['base_recall_at_10']:.3f}")
+```
+
+## The supervision and the measurement
+
+Plain `fine_tune` does not invent its own pairs: it reads a supervised schema from
+the source columns — contrastive `(text_a, text_b, score)`, triplet
+`(anchor, positive, negative)`, or pairs `(anchor, positive)`. We mine all three
+from the **same** signal — the committed subset's subject labels: an anchor's
+positive is a same-subject paper, its negative a different-subject paper. That is
+the *same* label signal the recall target scores, so a recall gain here is a real
+metric-learning gain on the subject supervision, not a circular artifact of the
+embedding's own geometry (the tier-03 circularity contract, extended to the loss
+spectrum). recall@10 is folded by the keystone's exact cosine-kNN numpy routine over
+each method's committed embedding matrix.
+
+## The method spectrum
+
+```{python}
+import numpy as np
+from jammi_cookbook import rails
+
+recall = contracts.load_artifact("finetune.method_recall").to_pylist()
+base = contracts.golden("finetune.base_recall_at_10").value
+
+order = sorted(recall, key=lambda r: -r["recall_at_10"])
+print(f"{'method':<16}{'recall@10':>11}{'Δ vs base':>12}")
+print(f"{'(frozen base)':<16}{base:>11.3f}{'':>12}")
+for r in order:
+    print(f"{r['method']:<16}{r['recall_at_10']:>11.3f}{r['recall_gain_vs_base']:>+12.3f}")
+```
+
+```{python}
+# | echo: false
+# Every per-method recall is asserted against its frozen golden — the measured
+# verdict. The gain column is internally consistent with the recorded base.
+for r in recall:
+    rails.measure(f"finetune.{r['method']}.recall_at_10", r["recall_at_10"])
+    assert abs((r["recall_at_10"] - base) - r["recall_gain_vs_base"]) < 1e-6
+spread = max(r["recall_at_10"] for r in recall) - min(r["recall_at_10"] for r in recall)
+rails.measure("finetune.method_recall_spread", round(spread, 4))
+```
+
+## Hard-negative mining: a real memory-scale limit, reported honestly
+
+One requested method is **absent from the recall table above on purpose**. Hard-negative
+mining (`mine_hard_negatives=True`) builds its negatives by *encoding the supervised
+corpus* to find the closest wrong answers. On 0.26.2, that corpus-encode pass runs out
+of GPU memory on the A10G (23 GB) at the cookbook's full supervised scale — it fails in
+the ModernBERT forward pass **before training starts**, and (as the keystone's probe
+established) the failure is independent of `batch_size`. The kwarg itself is sound: the
+miner completes on a small corpus and fails as the corpus grows. The keystone records
+that finding rather than fabricating a recall for a run that did not happen — the
+no-deferral policy applied to a negative result.
+
+```{python}
+hn = methods["hard_negatives"]
+print(f"hard_neg status:           {hn['status']}")
+if hn["status"] == "oom_at_full_scale":
+    print(f"full-scale corpus (OOM):   {hn['full_scale_pairs']} pairs")
+    print(f"small-scale corpus:        {hn['small_scale_pairs']} pairs "
+          f"({hn['small_scale_status']})")
+    if hn.get("small_scale_recall_at_10") is not None:
+        print(f"small-scale recall@10:     {hn['small_scale_recall_at_10']:.3f}")
+```
+
+```{python}
+# | echo: false
+# The honest record: hard-negatives is reported as an engine memory-scale finding,
+# not a faked recall. Either it completed (then it carries a recall) or it OOM'd at
+# full scale (then it carries the threshold evidence that the kwarg works smaller).
+assert hn["status"] in ("completed", "oom_at_full_scale")
+if hn["status"] == "oom_at_full_scale":
+    assert "out of memory" in hn["error"].lower()
+    assert hn["small_scale_pairs"] < hn["full_scale_pairs"]
+```
+
+The lesson is practical, not a defect verdict: hard-negative mining is materially more
+memory-hungry than an in-batch loss, because it holds a corpus encoding to mine from.
+On a 23 GB device at this corpus scale it does not fit; a smaller supervised cohort (or
+a larger device) is the cost of the method.
+
+## The Matryoshka recall-vs-truncated-dim curve
+
+Matryoshka representation learning (Kusupati et al. 2022) trains the embedding so
+that a *prefix* of its coordinates is itself a usable embedding — you can truncate
+768 → 256 → 64 and still retrieve, trading recall for index size and latency. The
+keystone committed the Matryoshka-trained matrix; we read recall@10 off each nested
+prefix on CPU (truncate → renormalize → fold).
+
+```{python}
+curve = contracts.load_artifact("finetune.matryoshka_curve").to_pylist()
+for c in sorted(curve, key=lambda c: -c["dim"]):
+    print(f"dim {c['dim']:>4}:  recall@10 {c['recall_at_10']:.3f}")
+```
+
+We recompute the curve **live** from the committed embedding matrix to prove the
+truncation is real, not a transcribed constant: slice the first `dim` coordinates,
+renormalize, fold the exact same cosine-kNN recall.
+
+```{python}
+emb = contracts.load_artifact("finetune.emb_matryoshka")
+ids = [str(x) for x in emb.column("_row_id").to_pylist()]
+vecs = np.asarray([list(v) for v in emb.column("vector").to_pylist()], dtype=np.float32)
+
+# rebuild the same-subject relevance + query set from the committed golden.
+sub_golden = contracts.load_artifact("finetune.subject_golden").to_pylist()
+relevant: dict[str, set[str]] = {}
+for g in sub_golden:
+    relevant.setdefault(g["query_id"], set()).add(g["relevant_id"])
+query_ids = sorted(relevant)
+pos = {i: n for n, i in enumerate(ids)}
+
+
+def recall_at_dim(dim):
+    mat = vecs[:, :dim]
+    norm = mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12)
+    scored = total = 0.0
+    for qid in query_ids:
+        if qid not in pos or qid not in relevant:
+            continue
+        sims = norm @ norm[pos[qid]]
+        sims[pos[qid]] = -np.inf
+        top = np.argpartition(-sims, 10)[:10]
+        rel = relevant[qid]
+        scored += sum(1 for t in top if ids[t] in rel) / min(10, len(rel))
+        total += 1
+    return scored / total
+
+
+for c in sorted(curve, key=lambda c: -c["dim"]):
+    live = recall_at_dim(c["dim"])
+    print(f"dim {c['dim']:>4}: frozen {c['recall_at_10']:.3f}  live {live:.3f}")
+    rails.measure(f"finetune.matryoshka.dim_{c['dim']}_recall", round(live, 4))
+```
+
+```{python}
+# | echo: false
+# The curve is monotone non-increasing in the truncation (a prefix carries no more
+# information than the whole), and the 64-dim slice — 12x smaller — still retrieves.
+dims_sorted = sorted(curve, key=lambda c: -c["dim"])
+recalls_by_dim = [c["recall_at_10"] for c in dims_sorted]
+assert recalls_by_dim == sorted(recalls_by_dim, reverse=True), "recall must not rise as dim shrinks"
+```
+
+## The honest finding
+
+This is the part a marketing table would fake. The numbers are reported as the data
+shows them — including ties and no-improvements.
+
+```{python}
+best = methods["best_method"]
+worst = methods["worst_method"]
+spread = methods["recall_spread"]
+movers = [r["method"] for r in recall if r["recall_gain_vs_base"] > 0.01]
+flat = [r["method"] for r in recall if abs(r["recall_gain_vs_base"]) <= 0.01]
+print(f"best method:  {best}")
+print(f"worst method: {worst}")
+print(f"recall spread across the method spectrum: {spread:.3f}")
+print(f"methods that move recall > +0.01 vs base: {movers or 'none'}")
+print(f"methods flat vs base (|Δ| ≤ 0.01):        {flat or 'none'}")
+```
+
+The honest reading: on this same-subject supervision, over a short LoRA budget, the
+choice of contrastive loss (CoSENT, MNRL at either temperature, triplet) and the
+Matryoshka nesting move recall only within a **narrow band** — the spread across the
+whole runnable method spectrum is small, and several methods sit within a tolerance of
+one another and of the frozen base. This is the same lesson the tier-03 circularity
+contract teaches, generalized from the *graph* to the *loss*: **the supervision signal
+caps the achievable gain.** When the relevance target (same subject) is already well
+separated by the base ModernBERT geometry, fine-tuning on that same signal — by *any*
+loss — has little headroom to move it. A method is reported as "best" here only by the
+literal recall number; the honest verdict is that the method choice is not the lever on
+this task — the *supervision* is.
+
+Three findings stand on their own regardless of the ranking:
+
+- **Matryoshka is a free axis, not a free lunch.** It does not (and is not meant to)
+  raise full-dim recall; its win is that the 64-dim prefix — a 12× smaller index —
+  retains most of the recall, which the committed curve demonstrates directly.
+- **Declared-edge graph fine-tune is a *different* supervision, not a better loss.**
+  `fine_tune_graph` trains on who-cited-whom (a signal the embeddings cannot
+  reconstruct); it is included for contrast, and its recall is reported against the
+  same target, but it is answering a different question than the same-subject losses.
+- **Hard-negative mining is a memory-scale limit on this device**, reported as the
+  engine finding above rather than a fabricated recall — the no-deferral policy applied
+  to a negative result.
+
+## Bridge note
+
+> **The contrastive losses are one objective with different negative policies.**
+> MNRL / InfoNCE (van den Oord et al. 2018) is in-batch softmax over positives;
+> triplet margin (Schroff et al. 2015) is the same pull-together/push-apart with an
+> explicit margin and chosen negatives; hard-negative mining changes *which*
+> negatives, not the objective; CoSENT scores graded pairs. Matryoshka (Kusupati et
+> al. 2022) is orthogonal — a nesting constraint on the representation, not a new
+> loss. On a task whose relevance signal the base geometry already separates, the
+> loss is a small lever and the supervision is the large one — the measured spread
+> says so.

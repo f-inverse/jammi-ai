@@ -1,0 +1,82 @@
+project:
+  type: book
+  output-dir: _book
+
+book:
+  title: "The Theory↔Computation Cookbook"
+  subtitle: "Graph signal processing and the GNN canon, executed and measured on the jammi_ai engine"
+  author: "F-Inverse"
+  search: true
+  repo-url: https://github.com/f-inverse/jammi-ai
+  chapters:
+    - index.qmd
+    - chapters/datasets.qmd
+    - part: "Engine recipes & quickstart"
+      chapters:
+        - chapters/recipes-quickstart.qmd
+    - part: "The ogbn-arxiv keystone vertical"
+      chapters:
+        - chapters/01-construct/construct.qmd
+        - chapters/02-analyze/analyze.qmd
+        - chapters/03-learn/learn.qmd
+        - chapters/04-predict/predict.qmd
+    - part: "The fine-tuning methods vertical"
+      chapters:
+        - chapters/08-finetune-methods/finetune-methods.qmd
+        - chapters/15-finetune-regression/finetune-regression.qmd
+    - part: "The rails and the closed eval loop"
+      chapters:
+        - chapters/05-rails/rails.qmd
+        - chapters/06-closed-loop/closed-loop.qmd
+    - part: "The bridge — theory, canon, and the citation map"
+      chapters:
+        - chapters/07-bridge/bridge.qmd
+    - part: "Expansion verticals"
+      chapters:
+        - chapters/08-conformal/conformal.qmd
+        - chapters/09-calibration/calibration.qmd
+        - chapters/10-retrieval/retrieval.qmd
+        - chapters/11-tenancy/tenancy.qmd
+        - chapters/18-tenancy-h3/tenancy-h3.qmd
+    - part: "Streaming & mutable state"
+      chapters:
+        - chapters/12-feature-store/feature-store.qmd
+        - chapters/13-cdc/cdc.qmd
+    - part: "Evaluation and provenance channels"
+      chapters:
+        - chapters/14-eval-channels/eval-channels.qmd
+        - chapters/17-channels-taxonomy/channels-taxonomy.qmd
+    - part: "The model catalog"
+      chapters:
+        - chapters/16-lifecycle/lifecycle.qmd
+    - part: "Temporal correctness"
+      chapters:
+        - chapters/19-point-in-time/point-in-time.qmd
+    - part: "Temporal correctness — incremental recompute"
+      chapters:
+        - chapters/20-recompute/recompute.qmd
+    - part: "The scale-tier cross-check"
+      chapters:
+        - chapters/14-scale/scale.qmd
+  appendices:
+    - chapters/api-reference.qmd
+
+bibliography: references.bib
+
+format:
+  html:
+    theme: cosmo
+    code-copy: true
+    code-overflow: wrap
+    toc: true
+
+# Every chapter executes in CI, every run — no freeze. The contract (K0 §3) is
+# that CI re-executes the cells and asserts measured verdicts against the committed
+# cache: a moved or drifted artifact must FAIL CI, which a frozen result would
+# silently mask. The determinism contract (jammi_cookbook.determinism, applied on
+# import) is what keeps fresh re-execution reproducible.
+execute:
+  freeze: false
+  error: false
+
+jupyter: python3

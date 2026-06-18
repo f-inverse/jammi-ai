@@ -1,0 +1,86 @@
+{
+  "client_side_dtype_guard": {
+    "embedded": {
+      "error_class": "bad_argument",
+      "native_type": "ValueError",
+      "raised": true,
+      "wire_code": null
+    },
+    "remote": {
+      "error_class": "bad_argument",
+      "native_type": "ValueError",
+      "raised": true,
+      "wire_code": null
+    }
+  },
+  "embedded": {
+    "bad_argument": {
+      "error_class": "bad_argument",
+      "native_type": "ValueError",
+      "raised": true,
+      "wire_code": null
+    },
+    "column_conflict": {
+      "error_class": "conflict",
+      "native_type": "RuntimeError",
+      "raised": true,
+      "wire_code": null
+    },
+    "duplicate": {
+      "error_class": "duplicate",
+      "native_type": "RuntimeError",
+      "raised": true,
+      "wire_code": null
+    },
+    "unknown": {
+      "error_class": "unknown",
+      "native_type": "RuntimeError",
+      "raised": true,
+      "wire_code": null
+    }
+  },
+  "expected_class": {
+    "bad_argument": "bad_argument",
+    "column_conflict": "conflict",
+    "duplicate": "duplicate",
+    "unknown": "unknown"
+  },
+  "expected_wire": {
+    "bad_argument": "INVALID_ARGUMENT",
+    "column_conflict": "FAILED_PRECONDITION",
+    "duplicate": "ALREADY_EXISTS",
+    "unknown": "NOT_FOUND"
+  },
+  "modes": [
+    "duplicate",
+    "unknown",
+    "column_conflict",
+    "bad_argument"
+  ],
+  "remote": {
+    "bad_argument": {
+      "error_class": "bad_argument",
+      "native_type": "_InactiveRpcError",
+      "raised": true,
+      "wire_code": "INVALID_ARGUMENT"
+    },
+    "column_conflict": {
+      "error_class": "conflict",
+      "native_type": "_InactiveRpcError",
+      "raised": true,
+      "wire_code": "FAILED_PRECONDITION"
+    },
+    "duplicate": {
+      "error_class": "duplicate",
+      "native_type": "_InactiveRpcError",
+      "raised": true,
+      "wire_code": "ALREADY_EXISTS"
+    },
+    "unknown": {
+      "error_class": "unknown",
+      "native_type": "_InactiveRpcError",
+      "raised": true,
+      "wire_code": "NOT_FOUND"
+    }
+  }
+}

@@ -1,0 +1,359 @@
+{
+  "per_table": [
+    {
+      "delta": null,
+      "embedding_eval": {
+        "aggregate": {
+          "mrr": 0.27222222222222225,
+          "ndcg": 0.22621527526420274,
+          "precision_at_k": 0.1,
+          "recall_at_k": 0.2833333333333333
+        },
+        "per_query": [
+          {
+            "cohorts": {},
+            "distance": 0.16128316521644592,
+            "metrics": {
+              "mrr": 1.0,
+              "ndcg": 0.787702056960637,
+              "precision": 0.3,
+              "recall": 0.75
+            },
+            "query_id": "q1",
+            "recall_at_ks": [
+              [
+                1,
+                0.25
+              ],
+              [
+                3,
+                0.5
+              ],
+              [
+                5,
+                0.75
+              ],
+              [
+                10,
+                0.75
+              ]
+            ]
+          },
+          {
+            "cohorts": {},
+            "distance": 0.1967291533946991,
+            "metrics": {
+              "mrr": 0.25,
+              "ndcg": 0.20210734650054757,
+              "precision": 0.1,
+              "recall": 0.3333333333333333
+            },
+            "query_id": "q2",
+            "recall_at_ks": [
+              [
+                1,
+                0.0
+              ],
+              [
+                3,
+                0.0
+              ],
+              [
+                5,
+                0.3333333333333333
+              ],
+              [
+                10,
+                0.3333333333333333
+              ]
+            ]
+          },
+          {
+            "cohorts": {},
+            "distance": 0.13757941126823425,
+            "metrics": {
+              "mrr": 0.0,
+              "ndcg": 0.0,
+              "precision": 0.0,
+              "recall": 0.0
+            },
+            "query_id": "q3",
+            "recall_at_ks": [
+              [
+                1,
+                0.0
+              ],
+              [
+                3,
+                0.0
+              ],
+              [
+                5,
+                0.0
+              ],
+              [
+                10,
+                0.0
+              ]
+            ]
+          },
+          {
+            "cohorts": {},
+            "distance": 0.15734463930130005,
+            "metrics": {
+              "mrr": 0.0,
+              "ndcg": 0.0,
+              "precision": 0.0,
+              "recall": 0.0
+            },
+            "query_id": "q4",
+            "recall_at_ks": [
+              [
+                1,
+                0.0
+              ],
+              [
+                3,
+                0.0
+              ],
+              [
+                5,
+                0.0
+              ],
+              [
+                10,
+                0.0
+              ]
+            ]
+          },
+          {
+            "cohorts": {},
+            "distance": 0.18315736949443817,
+            "metrics": {
+              "mrr": 0.1111111111111111,
+              "ndcg": 0.14126697285982898,
+              "precision": 0.1,
+              "recall": 0.3333333333333333
+            },
+            "query_id": "q5",
+            "recall_at_ks": [
+              [
+                1,
+                0.0
+              ],
+              [
+                3,
+                0.0
+              ],
+              [
+                5,
+                0.0
+              ],
+              [
+                10,
+                0.3333333333333333
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "delta": {
+        "mrr": {
+          "absolute": 0.0,
+          "relative": 0.0
+        },
+        "ndcg": {
+          "absolute": 0.0,
+          "relative": 0.0
+        },
+        "precision_at_k": {
+          "absolute": 0.0,
+          "relative": 0.0
+        },
+        "recall_at_k": {
+          "absolute": 0.0,
+          "relative": 0.0
+        },
+        "significance": {
+          "mrr": {
+            "ci_lower": 0.0,
+            "ci_upper": 0.0,
+            "p_value": 1.0
+          },
+          "ndcg": {
+            "ci_lower": 0.0,
+            "ci_upper": 0.0,
+            "p_value": 1.0
+          },
+          "precision_at_k": {
+            "ci_lower": 0.0,
+            "ci_upper": 0.0,
+            "p_value": 1.0
+          },
+          "recall_at_k": {
+            "ci_lower": 0.0,
+            "ci_upper": 0.0,
+            "p_value": 1.0
+          }
+        }
+      },
+      "embedding_eval": {
+        "aggregate": {
+          "mrr": 0.27222222222222225,
+          "ndcg": 0.22621527526420274,
+          "precision_at_k": 0.1,
+          "recall_at_k": 0.2833333333333333
+        },
+        "per_query": [
+          {
+            "cohorts": {},
+            "distance": 0.16128316521644592,
+            "metrics": {
+              "mrr": 1.0,
+              "ndcg": 0.787702056960637,
+              "precision": 0.3,
+              "recall": 0.75
+            },
+            "query_id": "q1",
+            "recall_at_ks": [
+              [
+                1,
+                0.25
+              ],
+              [
+                3,
+                0.5
+              ],
+              [
+                5,
+                0.75
+              ],
+              [
+                10,
+                0.75
+              ]
+            ]
+          },
+          {
+            "cohorts": {},
+            "distance": 0.1967291533946991,
+            "metrics": {
+              "mrr": 0.25,
+              "ndcg": 0.20210734650054757,
+              "precision": 0.1,
+              "recall": 0.3333333333333333
+            },
+            "query_id": "q2",
+            "recall_at_ks": [
+              [
+                1,
+                0.0
+              ],
+              [
+                3,
+                0.0
+              ],
+              [
+                5,
+                0.3333333333333333
+              ],
+              [
+                10,
+                0.3333333333333333
+              ]
+            ]
+          },
+          {
+            "cohorts": {},
+            "distance": 0.13757941126823425,
+            "metrics": {
+              "mrr": 0.0,
+              "ndcg": 0.0,
+              "precision": 0.0,
+              "recall": 0.0
+            },
+            "query_id": "q3",
+            "recall_at_ks": [
+              [
+                1,
+                0.0
+              ],
+              [
+                3,
+                0.0
+              ],
+              [
+                5,
+                0.0
+              ],
+              [
+                10,
+                0.0
+              ]
+            ]
+          },
+          {
+            "cohorts": {},
+            "distance": 0.15734463930130005,
+            "metrics": {
+              "mrr": 0.0,
+              "ndcg": 0.0,
+              "precision": 0.0,
+              "recall": 0.0
+            },
+            "query_id": "q4",
+            "recall_at_ks": [
+              [
+                1,
+                0.0
+              ],
+              [
+                3,
+                0.0
+              ],
+              [
+                5,
+                0.0
+              ],
+              [
+                10,
+                0.0
+              ]
+            ]
+          },
+          {
+            "cohorts": {},
+            "distance": 0.18315736949443817,
+            "metrics": {
+              "mrr": 0.1111111111111111,
+              "ndcg": 0.14126697285982898,
+              "precision": 0.1,
+              "recall": 0.3333333333333333
+            },
+            "query_id": "q5",
+            "recall_at_ks": [
+              [
+                1,
+                0.0
+              ],
+              [
+                3,
+                0.0
+              ],
+              [
+                5,
+                0.0
+              ],
+              [
+                10,
+                0.3333333333333333
+              ]
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

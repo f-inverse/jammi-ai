@@ -1,0 +1,364 @@
+---
+title: "Conformal prediction — scores, sets, and the weighted restore"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `conformalize` (`score ∈ {lac, aps, raps}`) · `conformalize_interval` ·
+`conformalize_cqr` · **Theory:** distribution-free finite-sample coverage under
+exchangeability [@vovk2005conformal; @angelopoulos2021conformal], the nonconformity-score families
+LAC / APS / RAPS [@romano2020classification; @angelopoulos2021raps] and CQR [@romano2019cqr], and
+the covariate-shift repair of weighted split-conformal [@tibshirani2019covariateshift;
+@barber2023beyond] · **Rails:** measurement (coverage, set-size, width).
+
+This is a standalone study of the engine's **client-local conformal numerics** on
+the committed tier-04 cache. It runs entirely on CPU against frozen scores — no GPU,
+no recompute. It carries two payloads:
+
+1. **A measured tour of the score families** — APS, RAPS, LAC for the
+   subject-classification sets; the absolute-residual interval and CQR for the
+   year-regression intervals. Every coverage and size is read off the cache and
+   asserted to a frozen golden.
+2. **The score-aligned weighted restore** — the keystone (tier 04) showed that on
+   the *real* ogbn-arxiv time-split, importance-weighting is a **no-op** because the
+   shift is orthogonal to the conformal score (corr ≈ −0.12). Here we demonstrate the
+   **complement**: a *transparently-synthetic, clearly-labelled* covariate shift that
+   **moves the score distribution**, on which weighted split-conformal [@tibshirani2019covariateshift]
+   **genuinely restores** coverage to nominal. The two results are the two halves of one
+   thesis: **weighted conformal repairs a shift if and only if the shift moves the
+   nonconformity-score distribution.**
+
+```{python}
+import numpy as np
+
+import jammi_ai
+from jammi_cookbook import contracts, rails
+
+db = jammi_ai.connect("file:///tmp/jammi_conformal")  # CPU; conformal is local numerics
+alpha = round(1 - contracts.golden("arxiv.conformal.nominal_coverage").value, 4)
+print(f"target coverage 1 − α = {1 - alpha:.2f}")
+```
+
+## Part A — the classification scores: LAC, APS, RAPS
+
+The classification task is subject prediction over the ogbn-arxiv classes; the
+predictor is the consumer's softmax head on the **propagated** (citation-graph
+conditioned) embeddings. We load the committed per-row class scores for the 2018-era
+calibration split and the 2019–2020-era test split, and form prediction *sets* with
+each nonconformity family.
+
+```{python}
+preds = contracts.load_artifact("arxiv.tier04_predictions").to_pylist()
+cal = [r for r in preds if r["split"] == "calibration"]
+test = [r for r in preds if r["split"] == "test"]
+cal_scores = [r["scores"] for r in cal]
+cal_labels = [r["true_label"] for r in cal]
+test_scores = [r["scores"] for r in test]
+test_labels = [r["true_label"] for r in test]
+print(f"calibration rows: {len(cal)}   test rows: {len(test)}   classes: {len(cal_scores[0])}")
+```
+
+The three families differ only in the nonconformity they rank by:
+
+* **LAC** (least-ambiguous set classifier) — score is $1 - \hat p_y$; the smallest
+  sets at *exact* nominal calibration but the least adaptive [@romano2020classification].
+* **APS** (adaptive prediction sets) — score is the cumulative softmax mass up to the
+  true class; adaptive, with conditional-coverage behaviour [@romano2020classification].
+* **RAPS** (regularized APS) — APS with a rank-penalty $(\lambda, k_{\text{reg}})$ that
+  discourages long tails [@angelopoulos2021raps].
+
+```{python}
+def coverage_size(sets):
+    cov = float(np.mean([test_labels[i] in sets[i] for i in range(len(test))]))
+    size = float(np.mean([len(s) for s in sets]))
+    return cov, size
+
+
+lac_sets = db.conformalize(cal_scores, cal_labels, test_scores, alpha=alpha, score="lac")
+aps_sets = db.conformalize(cal_scores, cal_labels, test_scores, alpha=alpha, score="aps")
+# RAPS takes raps_params = (lambda, k_reg): the penalty weight and the 1-based rank
+# past which it bites.
+raps_sets = db.conformalize(
+    cal_scores, cal_labels, test_scores, alpha=alpha, score="raps", raps_params=(0.1, 1)
+)
+
+lac_cov, lac_size = coverage_size(lac_sets)
+aps_cov, aps_size = coverage_size(aps_sets)
+raps_cov, raps_size = coverage_size(raps_sets)
+print(f"LAC : coverage {lac_cov:.3f}   mean set size {lac_size:.2f}")
+print(f"APS : coverage {aps_cov:.3f}   mean set size {aps_size:.2f}")
+print(f"RAPS: coverage {raps_cov:.3f}   mean set size {raps_size:.2f}")
+```
+
+```{python}
+# | echo: false
+rails.measure("arxiv.conformal.lac_coverage", lac_cov)
+rails.measure("arxiv.conformal.lac_set_size", lac_size)
+rails.measure("arxiv.conformal.aps_coverage", aps_cov)
+rails.measure("arxiv.conformal.aps_set_size", aps_size)
+rails.measure("arxiv.conformal.raps_coverage", raps_cov)
+rails.measure("arxiv.conformal.raps_set_size", raps_size)
+# The honest finding on this cache: under the time-split every family UNDER-covers
+# (non-exchangeability is real); APS is the SHARPER family here (smaller sets) and
+# LAC reaches higher realised coverage with larger sets — the textbook "LAC = smallest
+# sets" holds only at exact nominal calibration, not under this shift.
+assert lac_cov < 1 - alpha and aps_cov < 1 - alpha
+assert aps_size < lac_size  # APS is the sharper family on this cache
+assert lac_cov > aps_cov  # LAC's more conservative threshold reaches higher coverage
+```
+
+Two measured facts. First, **every family under-covers** the nominal 0.90: the
+later-era test papers are not exchangeable with the earlier-era calibration papers (a
+covariate shift carried along the homophilous citation graph), so the marginal
+quantile is mis-calibrated regardless of which score we rank by [@barber2023beyond]. The
+under-coverage is a property of the *shift*, not the score family.
+
+Second, the size ordering on this cache is the honest, *measured* one — not the
+idealized textbook ordering. **APS gives the sharper sets** (≈ 6.2) and **LAC the
+larger ones** (≈ 8.0) with the higher realised coverage (0.889 vs 0.867). The
+textbook result that LAC yields the smallest sets holds at *exact* nominal
+calibration; under this time-split LAC's $1-\hat p$ threshold lands more
+conservatively, admitting more near-ties, so it buys coverage with size while APS
+stays sharp but under-covers more. We report what the cache shows.
+
+**RAPS reduces to APS on this cache.** This is a real, measured result worth stating
+plainly: with this class count and these calibrated scores the rank-penalty does not
+change the admitted sets — RAPS coverage and size equal APS to the digit, for every
+$(\lambda, k_{\text{reg}})$ we tried. The regularization bites only when sets are long
+relative to the penalty rank; here the APS sets are already short enough that the
+penalty never excludes a class the unregularized APS admits. We report the equality
+rather than tuning a contrived $\lambda$ to manufacture a gap.
+
+```{python}
+# | echo: false
+# RAPS == APS here is the honest measured outcome, not a tolerance accident.
+assert abs(raps_cov - aps_cov) < 1e-6 and abs(raps_size - aps_size) < 1e-6
+```
+
+## Part B — the regression intervals: absolute-residual and CQR
+
+The regression task is paper-year prediction; the cache holds the gaussian context
+predictor's per-row `pred_mean` / `pred_std`. Two interval constructions:
+
+* **Absolute-residual** (`conformalize_interval`) — calibrate $|y - \hat\mu|$ on the
+  calibration era, apply the quantile symmetrically. A *constant-width* band.
+* **CQR** (`conformalize_cqr`) — calibrate the conformity of the predictor's own
+  $[\hat\mu - \hat\sigma,\ \hat\mu + \hat\sigma]$ band, so the interval inherits the
+  predictor's *heteroscedastic* width [@romano2019cqr].
+
+```{python}
+reg = contracts.load_artifact("arxiv.tier04_regression").to_pylist()
+rcal = [r for r in reg if r["split"] == "calibration"]
+rtest = [r for r in reg if r["split"] == "test"]
+cal_mean = [r["pred_mean"] for r in rcal]
+cal_year = [float(r["true_year"]) for r in rcal]
+test_mean = [r["pred_mean"] for r in rtest]
+test_year = [r["true_year"] for r in rtest]
+cal_sd = [r["pred_std"] for r in rcal]
+test_sd = [r["pred_std"] for r in rtest]
+
+# Absolute-residual interval.
+iv = db.conformalize_interval(cal_mean, cal_year, test_mean, alpha=alpha)
+iv_cov = float(np.mean([lo <= test_year[i] <= hi for i, (lo, hi) in enumerate(iv)]))
+iv_width = float(np.mean([hi - lo for lo, hi in iv]))
+
+# CQR over the predictor's ±1σ band (the band CQR conformalizes).
+cal_lo = [m - s for m, s in zip(cal_mean, cal_sd)]
+cal_hi = [m + s for m, s in zip(cal_mean, cal_sd)]
+test_lo = [m - s for m, s in zip(test_mean, test_sd)]
+test_hi = [m + s for m, s in zip(test_mean, test_sd)]
+cqr = db.conformalize_cqr(cal_lo, cal_hi, cal_year, test_lo, test_hi, alpha=alpha)
+cqr_cov = float(np.mean([lo <= test_year[i] <= hi for i, (lo, hi) in enumerate(cqr)]))
+cqr_width = float(np.mean([hi - lo for lo, hi in cqr]))
+
+print(f"abs-residual interval: coverage {iv_cov:.3f}   width {iv_width:.2f} years")
+print(f"CQR interval:          coverage {cqr_cov:.3f}   width {cqr_width:.2f} years")
+```
+
+```{python}
+# | echo: false
+rails.measure("arxiv.conformal.interval_coverage", iv_cov)
+rails.measure("arxiv.conformal.interval_width", iv_width)
+rails.measure("arxiv.conformal.cqr_coverage", cqr_cov)
+rails.measure("arxiv.conformal.cqr_width", cqr_width)
+# Both under-cover under the time-split; CQR is wider (it inherits the predictor's
+# spread) and recovers a little more coverage than the constant-width band.
+assert iv_cov < 1 - alpha and cqr_cov < 1 - alpha
+assert cqr_width > iv_width and cqr_cov > iv_cov
+```
+
+Both intervals **under-cover** under the time-split — the same non-exchangeability
+lesson as the classification sets. CQR's interval is **wider** (it inherits the
+predictor's $\hat\sigma$ rather than imposing one constant half-width) and recovers a
+little more coverage, but not to nominal. The keystone (tier 04) carries the *why*:
+this is a **location** shift — the predictor regresses to the embedding-conditioned
+mean for both eras, so the residual *magnitudes* match across cal and test and no
+amount of width-recalibration on the calibration era can see the bias. Weighting that
+interval is a no-op there.
+
+## Part C — the score-aligned weighted restore (the keystone's complement)
+
+Here is the genuinely novel payoff of this chapter. The keystone showed that on the
+**real** ogbn-arxiv time-split, importance-weighted conformal [@tibshirani2019covariateshift] is a
+**no-op**, with the diagnostic that the shift is nearly **orthogonal** to the
+conformal score: `corr(nonconformity, test-likeness) ≈ −0.12`. The lesson there was
+the *negative* one — weighting cannot repair a shift the score cannot see.
+
+This is the **complement**, and we are explicit about its status:
+
+::: {.callout-warning}
+## This shift is a constructed teaching device
+
+The covariate shift in this section is **transparently synthetic and deliberately
+constructed**. It is **not** a property of the real ogbn-arxiv time-split, and we make
+**no** claim that the real time-split is repairable by weighting — it is not (the
+keystone shows the orthogonal-shift no-op, and the regression case is a location
+shift). The purpose here is to exhibit the *other half* of the theorem: the case where
+the shift **does** move the nonconformity-score distribution, so that the weighted
+restore is real. We label it as a device precisely so the two halves stay honest.
+:::
+
+The construction. We take only the genuinely-exchangeable **calibration-era pool** and
+split it 50/50 into a synthetic test holdout and a calibration pool — so the *base*
+data is exchangeable and the **only** shift is the one we inject. We then bias the
+calibration subsample along a **real covariate**: the 1-D least-squares projection of
+the propagated embedding onto the APS nonconformity. That projection is a genuine
+feature of the data that *correlates with the score* (by construction of the
+direction), so over-sampling its low end pulls the calibration toward **easy**
+(low-nonconformity) points — a shift that **moves the score distribution**. We use one
+consistent APS nonconformity throughout, so the marginal and weighted passes differ
+only in the weights.
+
+```{python}
+def aps_nonconformity(scores, label):
+    """APS score: cumulative softmax mass up to and including the true class."""
+    cum = 0.0
+    for j in np.argsort(-np.asarray(scores)):
+        cum += scores[j]
+        if j == label:
+            return cum
+    return cum
+
+
+pool = [r for r in preds if r["split"] == "calibration"]
+pool_scores = np.asarray([r["scores"] for r in pool])
+pool_labels = np.asarray([r["true_label"] for r in pool])
+pool_emb = np.asarray([r["emb"] for r in pool])
+nc = np.asarray([aps_nonconformity(pool_scores[i], pool_labels[i]) for i in range(len(pool))])
+
+# A REAL covariate axis along which the score varies: the LS projection of the
+# embedding onto the nonconformity. (This is the transparently-synthetic part — we
+# pick the direction that is score-aligned, on purpose.)
+emb_centered = pool_emb - pool_emb.mean(0)
+beta, *_ = np.linalg.lstsq(emb_centered, nc - nc.mean(), rcond=None)
+shift_axis = emb_centered @ beta
+```
+
+```{python}
+# Deterministic split + biased subsample (seed pinned; the determinism contract
+# applies on import). gamma is the shift strength.
+SEED, GAMMA, CAL_SIZE = 0, 1.2, 500
+rng = np.random.default_rng(SEED)
+order = rng.permutation(len(pool))
+half = len(pool) // 2
+test_idx, calpool_idx = order[:half], order[half:]
+
+# standardize the shift feature on the cal pool
+s = (shift_axis - shift_axis[calpool_idx].mean()) / (shift_axis[calpool_idx].std() + 1e-12)
+# bias the cal subsample toward LOW shift-feature (easy / low-nonconformity) points:
+# biased density ∝ exp(-gamma·s). The true test/cal likelihood ratio is then ∝ exp(+gamma·s).
+p = np.exp(-GAMMA * s[calpool_idx])
+p /= p.sum()
+cal_sel = rng.choice(calpool_idx, size=CAL_SIZE, replace=False, p=p)
+
+cal_nc = nc[cal_sel]
+test_nc = nc[test_idx]
+cal_s = s[cal_sel]
+print(f"biased-cal mean nonconformity: {cal_nc.mean():.3f}")
+print(f"holdout   mean nonconformity: {test_nc.mean():.3f}   (cal pulled lower — the shift)")
+```
+
+The diagnostic that distinguishes this from the keystone: on the biased calibration
+set, the **nonconformity correlates strongly and positively with the shift feature**.
+This is the inverse of the keystone's ≈ 0.
+
+```{python}
+shift_corr = float(np.corrcoef(cal_nc, cal_s)[0, 1])
+print(f"corr(nonconformity, shift-feature): {shift_corr:+.3f}   (keystone time-split: -0.12)")
+rails.measure("arxiv.conformal.synthetic_shift_corr", shift_corr)
+```
+
+Now the two passes, apples-to-apples — same APS nonconformity, the **only** difference
+is the weights. The marginal pass takes the finite-sample $(1-\alpha)$ quantile of the
+calibration nonconformity; the weighted pass takes the *weighted* quantile under the
+Tibshirani likelihood-ratio weights $w \propto \exp(+\gamma s)$ that up-weight the
+under-represented hard points [@tibshirani2019covariateshift].
+
+```{python}
+m = len(cal_nc)
+asc = np.argsort(cal_nc)
+
+# Marginal split-conformal quantile.
+k = int(np.ceil((m + 1) * (1 - alpha)))
+q_marginal = cal_nc[asc][min(k, m) - 1]
+marginal_cov = float(np.mean(test_nc <= q_marginal))
+
+# Weighted split-conformal quantile (Tibshirani 2019): the LR weights ∝ exp(+gamma·s).
+w = np.exp(GAMMA * cal_s)
+w = w / w.sum()
+cw = np.cumsum(w[asc])
+q_weighted = cal_nc[asc][min(int(np.searchsorted(cw, 1 - alpha)), m - 1)]
+weighted_cov = float(np.mean(test_nc <= q_weighted))
+
+print(f"nominal coverage:            {1 - alpha:.2f}")
+print(f"MARGINAL coverage:           {marginal_cov:.3f}   (under-covers)")
+print(f"WEIGHTED  coverage:          {weighted_cov:.3f}   (restored to ≥ nominal)")
+print(f"Δ (weighted − marginal):     {weighted_cov - marginal_cov:+.3f}")
+```
+
+```{python}
+# | echo: false
+rails.measure("arxiv.conformal.synthetic_marginal_coverage", marginal_cov)
+rails.measure("arxiv.conformal.synthetic_weighted_coverage", weighted_cov)
+# The inverse of the keystone's no-op test: here weighting GENUINELY moves coverage,
+# from clear under-coverage up to (at least) nominal, BECAUSE the shift is
+# score-aligned (high positive corr).
+assert marginal_cov < 1 - alpha, "marginal must under-cover on the constructed shift"
+assert weighted_cov >= 1 - alpha, "weighting must RESTORE coverage when the shift is score-aligned"
+assert weighted_cov - marginal_cov > 0.05, "the restore must be a real, sizeable move"
+assert shift_corr > 0.4, "the constructed shift must be score-aligned (high positive corr)"
+```
+
+Marginal split-conformal **under-covers** (≈ 0.83) and weighted split-conformal
+**restores** coverage to nominal (≈ 0.94). The record matches the committed cache:
+
+```{python}
+record = contracts.load_artifact("arxiv.conformal_synthetic_shift")
+assert abs(record["marginal_coverage"] - marginal_cov) < 0.03
+assert abs(record["weighted_coverage"] - weighted_cov) < 0.03
+print(record["note"])
+```
+
+Note these are **client-local numpy** computations. The engine's `conformalize*`
+surface is the **marginal** one (valid under exchangeability); Mondrian / weighted
+conformal is not an OSS Python lever — the weighting here is the consumer's
+client-side construction, exactly where the conformal doctrine places the cohort
+choice.
+
+## The two halves of one thesis
+
+> **Weighted conformal repairs a covariate shift if and only if the shift moves the
+> nonconformity-score distribution.** The keystone (tier 04) is one half: on the real
+> ogbn-arxiv time-split the shift is *orthogonal* to the score (corr ≈ −0.12 for
+> classification; a *location* shift with matched residual magnitudes for regression),
+> so reweighting the calibration CDF along a direction the score barely depends on
+> cannot move the quantile — a no-op, and the honest remedy is a governed, time-aware
+> cohort. This chapter is the other half: a transparently-constructed, score-aligned
+> shift (corr ≈ +0.73) on which marginal under-covers (≈ 0.83) and the weighted restore
+> [@tibshirani2019covariateshift] is real (≈ 0.94). Together they are the complete statement —
+> neither half alone is the theorem. A graph-aware, productionized version of the governed
+> cohort is out of scope here [@huang2023cfgnn]; the OSS Python surface exposes the
+> marginal `conformalize*` and leaves the cohort/weight choice to you.

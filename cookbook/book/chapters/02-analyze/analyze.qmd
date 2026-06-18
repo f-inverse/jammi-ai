@@ -1,0 +1,157 @@
+---
+title: "Tier 02 — Analyze"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `propagate_embeddings` · **Theory:** graph signal processing —
+low-pass filtering on the graph (Stanković et al. 2020, Part II) = SGC/APPNP
+decoupled propagation · **Rail:** measurement (does propagation help retrieval?).
+
+Tier 01 produced raw text embeddings. Tier 02 **propagates** them over the
+declared citation graph — smoothing each paper's vector toward its neighbours'.
+In graph-signal-processing terms this is a **low-pass filter on the graph**: it
+attenuates the high-frequency component (idiosyncratic per-paper noise) and keeps
+the low-frequency component (the shared topic signal a citation cluster agrees
+on).
+
+The keystone ran one call on the GPU server:
+
+```python
+db.propagate_embeddings(
+    source=papers, embedding_table=embeddings, edge_source=cite_edges,
+    edge_src_column="src", edge_dst_column="dst",
+    direction="out", hops=2, weighting="degree_normalized", alpha=0.1,
+)
+```
+
+and committed the result. This chapter reads it on CPU and measures whether the
+propagation helped.
+
+```{python}
+from jammi_cookbook import contracts, rails
+
+embeddings = contracts.load_artifact("arxiv.embeddings")
+propagated = contracts.load_artifact("arxiv.propagated")
+print(f"raw embedding rows:        {embeddings.num_rows}")
+print(f"propagated embedding rows: {propagated.num_rows}")
+print("same dimension preserved:  ",
+      len(embeddings.column("vector")[0]) == len(propagated.column("vector")[0]))
+```
+
+## The measurement rail: propagation as a denoiser
+
+The honest test of a low-pass filter is whether it improves a *downstream*
+measurement. We compare same-subject retrieval recall\@10 before and after
+propagation. Both numbers were measured by the keystone on the GPU server (search
+over each embedding table) and frozen; the delta is the denoising gain.
+
+```{python}
+raw_recall = contracts.golden("arxiv.tier01.recall_at_10").value
+prop_recall = contracts.golden("arxiv.tier02.recall_at_10").value
+delta = contracts.golden("arxiv.tier02.recall_delta").value
+
+print(f"recall@10 raw:        {raw_recall:.3f}")
+print(f"recall@10 propagated: {prop_recall:.3f}")
+print(f"Δ (denoising gain):   {delta:+.3f}")
+```
+
+```{python}
+# | echo: false
+rails.measure("arxiv.tier02.recall_at_10", prop_recall)
+rails.measure("arxiv.tier02.recall_delta", delta)
+# the propagated recall is the propagated number plus the raw baseline, consistent.
+assert abs((prop_recall - raw_recall) - delta) < 1e-6
+```
+
+## Bridge note (a signature chapter — deepened in the bridge chapters)
+
+> **Propagation = one low-pass graph filter = one SGC/APPNP layer = the
+> vector-agg over neighbours.** One equation, three names, one
+> `propagate_embeddings` call — and the `weighting` knob *is* the method choice:
+>
+> - `weighting="uniform"` = the random-walk operator $\tilde{D}^{-1}\tilde{A}$
+>   (SGC-flavoured, Wu et al. 2019);
+> - `weighting="degree_normalized"` + `alpha` = symmetric-normalized propagation
+>   with a teleport restart, $(1-\alpha)\hat{A}\,H + \alpha\,X^{(0)}$ — this is
+>   **APPNP** (Gasteiger/Klicpera et al. 2019), which the keystone used;
+> - `output="jumping_knowledge"` = concatenating the signal at every hop.
+>
+> The propagation is **deterministic by construction** — a fixed `(group,
+> neighbour)` f64 fold order, byte-identical across threads, no seeding — so it is
+> the reproducible point on the construct→learn spectrum.
+
+---
+
+# Air Routes — propagation over the route graph
+
+The same low-pass filter runs on **Air Routes**. The keystone propagated the raw
+airport embeddings over the declared `route` graph (the airport↔airport flight
+network) and committed the result; here we read it and measure whether smoothing a
+node toward its flight-neighbours improves a label-target retrieval.
+
+The keystone ran one call on the GPU server:
+
+```python
+db.propagate_embeddings(
+    source=airports, embedding_table=embeddings, edge_source=route_edges,
+    edge_src_column="src", edge_dst_column="dst",
+    direction="undirected", hops=2, weighting="degree_normalized",
+)
+```
+
+> **Neptune-contrast.** Neptune Analytics ships `pageRank`/`degree`/`wcc` as
+> `CALL`s over the Air Routes graph; here, propagation-as-low-pass-filter is a
+> Jammi recipe — the *same* operation over the *same* route graph, expressed as
+> substrate computation.
+
+```{python}
+air_raw = contracts.load_artifact("air.embeddings")
+air_prop = contracts.load_artifact("air.propagated")
+print(f"raw airport embedding rows:        {air_raw.num_rows}")
+print(f"propagated airport embedding rows: {air_prop.num_rows}")
+print("same dimension preserved:  ",
+      len(air_raw.column("vector")[0]) == len(air_prop.column("vector")[0]))
+```
+
+## The measurement rail: raw → propagated
+
+The honest test is a downstream measurement. We compare **same-continent**
+retrieval recall\@10 before and after propagation. The relevance target is the
+continent label — independent of the embedding similarity — so a gain is a real
+denoising result. Continent is near-solved by lat/lon, so this is honestly a
+*teaching* label, not a literature benchmark; but the raw→propagated delta over it
+is a legitimate measured number.
+
+```{python}
+air_raw_recall = contracts.golden("air.tier01.recall_at_10").value
+air_prop_recall = contracts.golden("air.tier02.recall_at_10").value
+air_delta = contracts.golden("air.tier02.recall_delta").value
+
+print(f"recall@10 raw:        {air_raw_recall:.3f}")
+print(f"recall@10 propagated: {air_prop_recall:.3f}")
+print(f"Δ (denoising gain):   {air_delta:+.3f}")
+```
+
+```{python}
+# | echo: false
+# Measured verdict: propagating over the route graph lifts same-continent recall
+# (the flight network is strongly intracontinental, so a node's route-neighbours
+# sharpen its continent signal). Asserted to tolerance against the golden metrics
+# the keystone emitted on the GPU server.
+rails.measure("air.tier02.recall_at_10", air_prop_recall)
+rails.measure("air.tier02.recall_delta", air_delta)
+# raw/prop/delta are each committed rounded to 3dp, so the recomputed delta agrees
+# with the recorded delta within one rounding ULP.
+assert abs((air_prop_recall - air_raw_recall) - air_delta) <= 1e-3
+assert air_delta > 0  # propagation over the route graph helps continent recovery
+```
+
+This is where the Air Routes on-ramp **stops** (tier 02). Its text is too thin
+and its label too near-deterministic for a credible learn/predict tier — those
+live on the ogbn-arxiv keystone above. The on-ramp's job is done: two graphs
+constructed and contrasted, a low-pass filter measured, and the tenancy rail made
+vivid.

@@ -1,0 +1,104 @@
+{
+  "fixtures": "engine public deterministic fixtures (patents.parquet + golden_relevance.csv + tiny_modernbert/tiny_bert; tiny_modernbert_classifier + tiny_labels.csv; tiny_modernbert_ner + tiny_ner_corpus.parquet + tiny_ner_gold.csv) \u2014 NOT the arxiv keystone corpus; this measures the wire SURFACE, not corpus coverage.",
+  "measured": {
+    "channel_a_count": 5,
+    "channel_collision": 0.0,
+    "channel_tenant_leak": 0,
+    "compare_self_max_abs_delta": 0.0,
+    "compare_two_recall_delta_abs": 0.23333333333333328,
+    "compare_two_recall_p_value": 0.2858128695675637,
+    "embeddings_aggregate": {
+      "mrr": 0.27222222222222225,
+      "ndcg": 0.22621527526420274,
+      "precision_at_k": 0.1,
+      "recall_at_k": 0.2833333333333333
+    },
+    "inference_cls_aggregate": {
+      "accuracy": 0.4,
+      "f1": 0.28571428571428575
+    },
+    "inference_ner_aggregate": {
+      "f1": 0.0,
+      "precision": 0.0,
+      "recall": 0.0
+    }
+  },
+  "parity": [
+    {
+      "shape_equal": true,
+      "tol": 1e-09,
+      "values_close": true,
+      "verb": "eval.embeddings"
+    },
+    {
+      "shape_equal": true,
+      "tol": 1e-09,
+      "values_close": true,
+      "verb": "eval.per_query"
+    },
+    {
+      "shape_equal": true,
+      "tol": 1e-09,
+      "values_close": true,
+      "verb": "eval.compare_self"
+    },
+    {
+      "shape_equal": true,
+      "tol": 1e-09,
+      "values_close": true,
+      "verb": "eval.compare_two"
+    },
+    {
+      "shape_equal": true,
+      "tol": 1e-09,
+      "values_close": true,
+      "verb": "eval.inference_cls"
+    },
+    {
+      "shape_equal": true,
+      "tol": 1e-09,
+      "values_close": true,
+      "verb": "eval.inference_ner"
+    },
+    {
+      "shape_equal": true,
+      "tol": 1e-09,
+      "values_close": true,
+      "verb": "channel.list_a"
+    },
+    {
+      "shape_equal": true,
+      "tol": 1e-09,
+      "values_close": true,
+      "verb": "channel.list_b_before"
+    },
+    {
+      "shape_equal": true,
+      "tol": 1e-09,
+      "values_close": true,
+      "verb": "channel.list_b_after"
+    },
+    {
+      "shape_equal": true,
+      "tol": 1e-09,
+      "values_close": true,
+      "verb": "channel.list_a_again"
+    },
+    {
+      "shape_equal": true,
+      "tol": 1e-09,
+      "values_close": true,
+      "verb": "channel.unbound"
+    }
+  ],
+  "parity_tol": 1e-09,
+  "parity_tol_by_key": {
+    "confidence": 1e-06
+  },
+  "parity_verdict": "remote == embedded for every eval verb and every channel listing",
+  "purpose": "The engine\u2194cookbook validator for the H1 residual: the eval + channel verbs run on BOTH the embedded engine and a live remote grpc:// jammi-server, asserted remote == embedded live (the real cross-transport parity check). The committed reports are the embedded-canonical reports; PR CI reads them and asserts aggregates-to-golden + shape, never a static re-diff of two artifacts.",
+  "transports": [
+    "embedded (file://, in-process)",
+    "remote (grpc://, live jammi-server)"
+  ]
+}

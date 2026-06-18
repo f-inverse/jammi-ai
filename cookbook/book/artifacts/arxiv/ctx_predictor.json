@@ -1,0 +1,8 @@
+{
+  "model_id": "arxiv_papers-context-predictor",
+  "architecture": "attncnp",
+  "output": "gaussian",
+  "task_column": "subject",
+  "value_column": "year",
+  "note": "Graph-conditioned context predictor for the year-regression-conformal win; predict_with_context_predictor carries the source + context_ref provenance rail."
+}

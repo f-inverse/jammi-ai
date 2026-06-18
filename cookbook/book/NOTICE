@@ -1,0 +1,28 @@
+jammi-cookbook
+Copyright F-Inverse
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It depends on, and is published separately from, the jammi_ai engine
+(https://pypi.org/project/jammi_ai/, Apache-2.0). The cookbook imports jammi_ai
+as a pinned dependency and contains no engine source.
+
+Dataset attributions are recorded by the loaders that fetch them, in
+jammi_cookbook/datasets.py and below.
+
+--------------------------------------------------------------------------------
+Datasets (fetched on demand, checksum-gated; not redistributed in this repo)
+
+Air Routes
+  Source: https://github.com/krlawrence/graph (sample-data), pinned to commit
+    efd3b1ae636f602577cfbccb16ecfe358a02ee36 (graph version 0.89).
+  Author: Kelvin R. Lawrence. Permissive use as published with the book
+    "Practical Gremlin." Used here as a graph-construction/algorithms teaching set.
+
+ogbn-arxiv
+  Source: Open Graph Benchmark (https://ogb.stanford.edu/), arxiv.zip +
+    titleabs.tsv.gz from snap.stanford.edu/ogb.
+  License: ODC-BY 1.0 (Open Data Commons Attribution License). Built on the
+    Microsoft Academic Graph. Citation: Hu et al., "Open Graph Benchmark:
+    Datasets for Machine Learning on Graphs," NeurIPS 2020.
+

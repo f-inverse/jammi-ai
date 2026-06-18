@@ -1,0 +1,10 @@
+---
+title: "`jammi_ai` API reference"
+---
+
+The recipes call exactly these `jammi_ai` signatures, grounded against the pinned
+`jammi_ai==0.26.4` wheel. The reference is maintained as a single source of truth
+in the shared library and rendered here; `scripts/check_api_reference.py` fails
+CI if the installed wheel's signatures drift from it.
+
+{{< include ../jammi_cookbook/_api_reference.md >}}

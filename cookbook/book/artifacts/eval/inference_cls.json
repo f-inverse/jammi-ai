@@ -1,0 +1,141 @@
+{
+  "aggregate": {
+    "accuracy": 0.4,
+    "f1": 0.28571428571428575,
+    "per_class": {
+      "biology": {
+        "f1": 0.0,
+        "precision": 0.0,
+        "recall": 0.0
+      },
+      "physics": {
+        "f1": 0.5714285714285715,
+        "precision": 0.4,
+        "recall": 1.0
+      }
+    },
+    "task": "classification"
+  },
+  "per_record": [
+    {
+      "gold": "physics",
+      "predicted": "physics",
+      "record_id": "1",
+      "task": "classification"
+    },
+    {
+      "gold": "biology",
+      "predicted": "physics",
+      "record_id": "10",
+      "task": "classification"
+    },
+    {
+      "gold": "physics",
+      "predicted": "physics",
+      "record_id": "11",
+      "task": "classification"
+    },
+    {
+      "gold": "biology",
+      "predicted": "physics",
+      "record_id": "12",
+      "task": "classification"
+    },
+    {
+      "gold": "biology",
+      "predicted": "physics",
+      "record_id": "13",
+      "task": "classification"
+    },
+    {
+      "gold": "biology",
+      "predicted": "physics",
+      "record_id": "14",
+      "task": "classification"
+    },
+    {
+      "gold": "physics",
+      "predicted": "physics",
+      "record_id": "15",
+      "task": "classification"
+    },
+    {
+      "gold": "physics",
+      "predicted": "physics",
+      "record_id": "16",
+      "task": "classification"
+    },
+    {
+      "gold": "biology",
+      "predicted": "physics",
+      "record_id": "17",
+      "task": "classification"
+    },
+    {
+      "gold": "biology",
+      "predicted": "physics",
+      "record_id": "18",
+      "task": "classification"
+    },
+    {
+      "gold": "physics",
+      "predicted": "physics",
+      "record_id": "19",
+      "task": "classification"
+    },
+    {
+      "gold": "biology",
+      "predicted": "physics",
+      "record_id": "2",
+      "task": "classification"
+    },
+    {
+      "gold": "biology",
+      "predicted": "physics",
+      "record_id": "20",
+      "task": "classification"
+    },
+    {
+      "gold": "biology",
+      "predicted": "physics",
+      "record_id": "3",
+      "task": "classification"
+    },
+    {
+      "gold": "physics",
+      "predicted": "physics",
+      "record_id": "4",
+      "task": "classification"
+    },
+    {
+      "gold": "biology",
+      "predicted": "physics",
+      "record_id": "5",
+      "task": "classification"
+    },
+    {
+      "gold": "physics",
+      "predicted": "physics",
+      "record_id": "6",
+      "task": "classification"
+    },
+    {
+      "gold": "physics",
+      "predicted": "physics",
+      "record_id": "7",
+      "task": "classification"
+    },
+    {
+      "gold": "biology",
+      "predicted": "physics",
+      "record_id": "8",
+      "task": "classification"
+    },
+    {
+      "gold": "biology",
+      "predicted": "physics",
+      "record_id": "9",
+      "task": "classification"
+    }
+  ]
+}

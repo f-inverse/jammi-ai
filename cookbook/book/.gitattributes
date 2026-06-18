@@ -1,0 +1,8 @@
+# Scale-tier vector cache (H2): the ~170k×768 ogbn-arxiv embedding corpus, the
+# held-out query vectors, and the frozen ANN sidecar bundle are large binary
+# artifacts emitted once on the GPU box (commit-once, read-forever). They live in
+# Git LFS, off the git object store. The small JSON/txt sidecars (manifests,
+# golden metrics, checksums, id lists) stay as plain tracked text.
+artifacts/scale/*.parquet  filter=lfs diff=lfs merge=lfs -text
+artifacts/scale/*.usearch  filter=lfs diff=lfs merge=lfs -text
+artifacts/scale/*.rowmap   filter=lfs diff=lfs merge=lfs -text

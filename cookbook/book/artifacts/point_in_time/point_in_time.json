@@ -1,0 +1,70 @@
+{
+  "asof": {
+    "asof_cited_papers": 1003,
+    "definition": "asof_join(spine='spine', facts='facts', spine_by=['paper_id'], spine_time='as_of', facts_by=['paper_id'], facts_time='cited_at', direction='backward', boundary='inclusive', tie_break_column='fact_year', project=['fact_year'])",
+    "embedded_output_table": "spine__text_embedding__asof-join__20260618T071812591748491_181d3dc4",
+    "embedded_verdict": {
+      "unpinned": [
+        "spine",
+        "facts"
+      ],
+      "verdict": "match_with_unpinned_inputs"
+    },
+    "matched_rows": 1003
+  },
+  "definition_hash_note": "The Match-case definition_hash is recorded here as PROVENANCE ONLY, never pinned as a golden: it embeds the embeddings result table's content digest (a ResultDigest input anchor), and the embedding output is not bit-reproducible across runs, so the literal hash varies. What IS reproducible and asserted: the four verdicts and the within-run round-trip (the Match table verifies against its own hash). See EXECUTION-STATUS (the fork-4 refinement + the definition_hash cut).",
+  "facts": {
+    "cited_at": "the citing paper's publication year",
+    "horizon_years": 1,
+    "label": "future_citations = naive_in_degree - asof_in_degree >= 1 (a genuinely independent future event, NOT a threshold on the feature)",
+    "leak_fraction": 0.7318,
+    "n_edges": 9595,
+    "n_leaked": 7022
+  },
+  "honest_limit": "This chapter proves the primitive composes into a leakage-free, skew-free training surface on CPU against the committed cache. It does NOT serve those features from a low-latency online tier behind auth with a live coverage SLA; carrying the materialization contract across that boundary is the platform closure chapter, not the engine cookbook.",
+  "leak": {
+    "asof_auc": 0.7952203001627388,
+    "coverage_asof": 0.9125,
+    "coverage_leaky": 0.87,
+    "label_prevalence": 0.1295,
+    "leakage_delta": 0.1621360978843952,
+    "n_cal": 822,
+    "n_test": 800,
+    "n_train": 2378,
+    "naive_auc": 0.957356398047134,
+    "nominal_coverage": 0.9
+  },
+  "purpose": "The engine\u2194cookbook validator for the H4 temporal-correctness surface: asof_join (SPEC-01) assembles a leakage-free training set and verify_materialization (SPEC-02) attests it. The leak the as-of join closes is measured (a downstream AUC and a conformal-coverage honesty result), the train==serve skew is measured across embedded == live grpc:// RemoteDatabase, and the four-verdict materialization matrix is frozen. Reuses the committed ogbn-arxiv keystone (papers + cite_edges); the heavy embeddings are NOT re-emitted.",
+  "skew_measured": true,
+  "train_serve_skew": 0.0,
+  "verdict_matrix": {
+    "definition_hash": "8cc03179439b32ca0c307ace8a82c8949d7d170abaf4274857e29b412cb40063",
+    "match": {
+      "verdict": "match"
+    },
+    "match_expected": {
+      "verdict": "match"
+    },
+    "match_input_anchors": [
+      {
+        "anchor": "445a1f6efd3d7894e774dabb198517c7119b60b9a30f2d101a14df7f66dabd73",
+        "kind": "result_digest",
+        "source": "docs__text_embedding__sentence-transformers_all-MiniLM-L6-v2__20260618T071813053626311_60ff65ad"
+      }
+    ],
+    "match_with_unpinned_inputs": {
+      "unpinned": [
+        "docs"
+      ],
+      "verdict": "match_with_unpinned_inputs"
+    },
+    "mismatch": {
+      "expected": "0000000000000000000000000000000000000000000000000000000000000000",
+      "found": "8cc03179439b32ca0c307ace8a82c8949d7d170abaf4274857e29b412cb40063",
+      "verdict": "mismatch"
+    },
+    "missing_manifest": {
+      "verdict": "missing_manifest"
+    }
+  }
+}

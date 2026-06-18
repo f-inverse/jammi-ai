@@ -1,0 +1,19 @@
+{
+  "cal_split.json": "723dec22d8728539",
+  "calibration_report.json": "e720a68e24461e57",
+  "cite_edges.parquet": "f58267d6d8e0ceaf",
+  "conformal_synthetic_shift.json": "96b4ad363f4ad75b",
+  "ctx_predictor.json": "93d88b18f4446849",
+  "embeddings.parquet": "d392e82aecbb9803",
+  "ft_model.json": "1343106c647a38fc",
+  "golden_metrics.json": "0d16f3514347535d",
+  "neighbor_graph.parquet": "208c239b3bd093de",
+  "papers.parquet": "b7816479e9ab7ea5",
+  "propagated.parquet": "176cdcc20bc92389",
+  "subject_golden.parquet": "9c0c3da7736c5a7e",
+  "tier04_classes.json": "d3f72f7cd68ba342",
+  "tier04_predictions.parquet": "a2409292d38557bc",
+  "tier04_regression.parquet": "fdcb1970cbf3122d",
+  "tier04_regression_weighting.json": "e98a66999c7ad375",
+  "tier04_weighting.json": "a0a4824c605da774"
+}

@@ -1,0 +1,83 @@
+---
+title: "Tier 03 — Learn"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `fine_tune_graph` · **Theory:** representation learning on graphs —
+node2vec / contrastive (Stanković et al. 2020, Part III; Hamilton 2017) · **Rail:**
+measurement (declared-edge gain).
+
+Tier 02 *propagated* fixed embeddings; tier 03 **learns** new ones. `fine_tune_graph`
+samples random walks over the declared citation graph and fine-tunes the encoder
+contrastively: papers that co-occur on a walk are pulled together, others pushed
+apart. The graph supervises the metric.
+
+The keystone ran this on the GPU server with `edge_provenance="declared"`:
+
+```python
+db.fine_tune_graph(
+    node_source=papers, id_column="paper_id", text_column="abstract",
+    edge_source=cite_edges, src_column="src", dst_column="dst",
+    base_model="answerdotai/ModernBERT-base", edge_provenance="declared",
+    epochs=1,
+)
+```
+
+and committed the resulting checkpoint id. The requested `epochs` is honored
+exactly by the engine. This chapter reads the cache on CPU.
+
+```{python}
+from jammi_cookbook import contracts, rails
+
+ft = contracts.load_artifact("arxiv.ft_model")
+print("fine-tuned model id:", ft["model_id"])
+print("edge provenance:    ", ft["edge_provenance"])
+print("base model:         ", ft["base_model"])
+```
+
+## The measurement rail: did the declared graph help?
+
+The honest test of graph supervision is whether the fine-tuned encoder retrieves
+same-subject papers better than the base encoder. The keystone measured recall\@10
+for the declared-edge fine-tune and froze it; the gain over the tier-01 base is the
+learned signal.
+
+```{python}
+base_recall = contracts.golden("arxiv.tier01.recall_at_10").value
+ft_recall = contracts.golden("arxiv.tier03.recall_at_10").value
+gain = contracts.golden("arxiv.tier03.recall_gain_vs_base").value
+
+print(f"recall@10 base encoder:        {base_recall:.3f}")
+print(f"recall@10 declared-edge FT:    {ft_recall:.3f}")
+print(f"Δ (graph-supervised gain):     {gain:+.3f}")
+```
+
+```{python}
+# | echo: false
+rails.measure("arxiv.tier03.recall_at_10", ft_recall)
+rails.measure("arxiv.tier03.recall_gain_vs_base", gain)
+assert abs((ft_recall - base_recall) - gain) < 1e-6
+```
+
+## The circularity contract
+
+Why `edge_provenance="declared"` and not `"similarity"`? Fine-tuning on a
+similarity graph trains the encoder to reproduce the metric it was *already* using
+— a circular objective that learns nothing new. The **declared** citation graph
+carries who-cited-whom, a signal the embeddings cannot reconstruct, so it can
+actually move the metric. This is the circularity contract: only a *declared*
+graph supervises a non-trivial gain. The keystone's positive declared-edge gain
+is that contract demonstrated, not asserted.
+
+## Bridge note (a signature chapter — deepened in the bridge chapters)
+
+> **Graph-supervised metric learning = contrastive fine-tune over walk-sampled
+> declared-edge pairs.** node2vec / DeepWalk's skip-gram over random walks (Grover
+> & Leskovec 2016; the monograph's Part III graph embeddings; Hamilton et al.
+> 2017) ↔ `fine_tune_graph(edge_provenance="declared")`. The walk sampler turns
+> the citation graph into positive pairs; the contrastive loss is the learning
+> objective; `edge_provenance` is the circularity guard.

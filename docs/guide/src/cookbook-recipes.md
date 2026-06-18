@@ -6,6 +6,13 @@ into CI via `tests/cookbook_smoke.py` — a broken recipe blocks the
 merge. The cookbook is the OSS source of truth; this page mirrors each
 README below.
 
+For the long-form, *measured* companion — the Theory↔Computation book that
+shows one recipe = one equation in the graph-signal-processing monograph = one
+line of the GNN canon, executed against committed goldens — see
+[`cookbook/book/`](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/book),
+which now lives in this repo and is gated against the engine at HEAD. The short
+task recipes below are the minimal "how do I call this verb" reference.
+
 The recipes shipped at MVP:
 
 | Recipe | Demonstrates |

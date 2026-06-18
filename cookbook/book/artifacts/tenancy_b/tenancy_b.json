@@ -1,0 +1,17 @@
+{
+  "tenant_a": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+  "tenant_b": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+  "tenant_a_papers": 2549,
+  "tenant_b_papers": 1451,
+  "listing_leak": 0,
+  "discriminator_leak": 0,
+  "discriminator_rows_seen": 2549,
+  "caveat_visible": 1451,
+  "parity_a_recall_at_10": 0.7558,
+  "parity_b_recall_at_10": 0.6977,
+  "parity_a_visible": 2549,
+  "parity_b_visible": 1451,
+  "parity_a_queries": 113,
+  "parity_b_queries": 87,
+  "note": "Tenant isolation measured live on CPU as a property of the engine. (1) Catalog-listing isolation: tenant A's list_sources excludes B's source (hard zero). (2) Discriminator-column row isolation: the analyzer injects tenant_id = $cur OR IS NULL onto a TableScan only when the table carries a tenant_id column, so the SAME tagged source returns disjoint rows under A vs B (hard zero). Caveat: a discriminator-LESS source is GLOBALLY READABLE \u2014 tenant A sees all of B's rows when it names the source (the engine does not authenticate). Parity: the same recall recipe under each tenant yields each its own scoped result over a disjoint row partition. No false 'separate source hides data' claim: a separate source is hidden from the LISTING, not from a direct named read."
+}

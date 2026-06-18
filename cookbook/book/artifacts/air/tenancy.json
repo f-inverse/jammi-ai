@@ -1,0 +1,13 @@
+{
+  "tenant_a": "11111111-1111-1111-1111-111111111111",
+  "tenant_b": "22222222-2222-2222-2222-222222222222",
+  "tenant_a_continent": "NA",
+  "tenant_b_continent": "EU",
+  "tenant_a_airports": 989,
+  "tenant_b_airports": 605,
+  "listing_leak": 0,
+  "discriminator_leak": 0,
+  "discriminator_rows_seen": 989,
+  "global_source_visible": 605,
+  "note": "The engine's two genuine tenant-isolation layers + the honest caveat. (1) Catalog-listing isolation: tenant A's list_sources excludes B's registered source (hard zero). (2) Row-level discriminator-column isolation: the analyzer injects tenant_id = $cur OR IS NULL onto a TableScan only when the table carries a tenant_id column, so the SAME tagged source returns disjoint rows under A vs B (zero B-tagged rows surfaced to A). Caveat: a discriminator-less source is GLOBALLY READABLE \u2014 tenant A sees all of B's rows when it names the source. The engine does not authenticate; access-gating lives above it. with_tenant binds the scope in place (returns None) and does NOT make a discriminator-less source's data invisible."
+}

@@ -1,0 +1,19 @@
+{
+  "b_drop_mt_raised": true,
+  "b_drop_tp_raised": false,
+  "builtin_channels_visible": 3,
+  "caveat_visible": 3,
+  "channel_dup_isolated": true,
+  "channel_listing_leak": 0,
+  "describe_source_leak": 0,
+  "model_listing_leak": 0,
+  "mt_survives_foreign_drop": true,
+  "mutable_dup_errored": true,
+  "mutable_listing_leak": 0,
+  "source_listing_leak": 0,
+  "sql_row_leak": 0,
+  "topic_dup_isolated": true,
+  "topic_listing_leak": 0,
+  "tp_survives_foreign_drop": true,
+  "transport": "embedded"
+}

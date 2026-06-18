@@ -1,0 +1,78 @@
+{
+  "engine_version": "0.29.0",
+  "base_model": "answerdotai/ModernBERT-base",
+  "epochs": 3,
+  "seed": 0,
+  "n_train": 3200,
+  "n_test": 800,
+  "target": "year",
+  "target_year_lo": 2014,
+  "target_year_hi": 2020,
+  "target_std_years": 1.0497,
+  "quantile_levels": [
+    0.05,
+    0.5,
+    0.95
+  ],
+  "losses": [
+    {
+      "rmse_years": 1.0497,
+      "mae_years": 0.8515,
+      "coverage_90": 0.7362,
+      "std_mean": 0.7462,
+      "std_min": 0.742216,
+      "pred_mean_lo": 2018.34,
+      "pred_mean_hi": 2018.34,
+      "n_test": 800,
+      "loss": "beta_nll",
+      "model_id": "jammi:fine-tuned:8acf881b-5e53-44a4-83cc-66d94132d3cc",
+      "head": "gaussian",
+      "predictions": "pred_beta_nll.parquet"
+    },
+    {
+      "rmse_years": 1.0497,
+      "mae_years": 0.8516,
+      "coverage_90": 0.7362,
+      "std_mean": 0.7643,
+      "std_min": 0.755032,
+      "pred_mean_lo": 2018.33,
+      "pred_mean_hi": 2018.34,
+      "n_test": 800,
+      "loss": "gaussian_nll",
+      "model_id": "jammi:fine-tuned:e994dc2a-8e84-4be4-9f60-9ce199ed1a78",
+      "head": "gaussian",
+      "predictions": "pred_gaussian_nll.parquet"
+    },
+    {
+      "rmse_years": 1.0496,
+      "mae_years": 0.8503,
+      "coverage_90": 0.7362,
+      "std_mean": 0.772,
+      "std_min": 0.760193,
+      "pred_mean_lo": 2018.35,
+      "pred_mean_hi": 2018.36,
+      "n_test": 800,
+      "loss": "crps",
+      "model_id": "jammi:fine-tuned:3e2b3e25-49da-4a74-bd72-ee69eb06f121",
+      "head": "gaussian",
+      "predictions": "pred_crps.parquet"
+    },
+    {
+      "rmse_years": 1.0499,
+      "mae_years": 0.8492,
+      "coverage_90": 0.0,
+      "interval_width": 0.2155,
+      "pred_med_lo": 2018.36,
+      "pred_med_hi": 2018.38,
+      "n_test": 800,
+      "loss": "pinball",
+      "model_id": "jammi:fine-tuned:b0b22567-3a0b-443d-a1c2-774ff257b87d",
+      "head": "quantile",
+      "predictions": "pred_pinball.parquet"
+    }
+  ],
+  "best_loss": "crps",
+  "best_rmse_years": 1.0496,
+  "min_gaussian_std_mean": 0.7462,
+  "fits_without_collapse": true
+}

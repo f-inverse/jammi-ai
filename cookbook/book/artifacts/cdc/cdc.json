@@ -1,0 +1,25 @@
+{
+  "topic": "changes",
+  "key_source": "arxiv.papers (paper_id)",
+  "num_published": 60,
+  "op_cycle": [
+    "add",
+    "update",
+    "remove"
+  ],
+  "op_counts": {
+    "add": 20,
+    "update": 20,
+    "remove": 20
+  },
+  "predicate": "op = 'add'",
+  "checkpoint_offset": 24,
+  "replay_count": 60,
+  "add_count": 20,
+  "add_batches": 20,
+  "tail_count": 36,
+  "tail_batches": 36,
+  "tail_add_count": 12,
+  "tail_add_batches": 12,
+  "note": "A change-data-capture stream over a trigger topic: N discrete record-change events (op add/update/remove on a key, keyed by a committed arxiv paper_id) published as single-row batches at offsets 0..N-1, then drained by bounded offset-addressed replay-collect. The load-bearing property: max_batches is the TERMINATOR, not a ceiling \u2014 subscribe_collect replays the backing table from from_offset then tails the live broker, and the in-memory broker tail blocks forever, so the call returns synchronously IFF max_batches equals the exact number of YIELDED batches from from_offset. With no predicate that is num_published - from_offset; with a predicate it is the count of published batches at offset >= from_offset with at least one matching row (empty-filtered batches are dropped, not yielded). Every collect here pins max_batches to that programmatically-derived count. The measured verdicts are the full backing-table replay count, the predicate-filtered add count, the checkpoint-resumed tail count, and the resume+filter count \u2014 each reproduced live by the chapter against this golden."
+}

@@ -1,0 +1,398 @@
+---
+title: "Tier 04 — Predict & Quantify (the crux)"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `train_context_predictor` + `predict_with_context_predictor` +
+`conformalize_interval` + `conformalize` · **Theory:** context-conditioned
+posterior (Garnelo et al. 2018 CNP; Kim et al. 2019 ANP) + conformal coverage and
+its break under graph dependence (Vovk; Angelopoulos & Bates 2021; Barber et al.
+2023; Tibshirani et al. 2019; CF-GNN, Huang et al. 2023; NAPS, Clarkson et al.
+2023) · **Rails:** provenance (which rows informed each prediction) + measurement
+(coverage).
+
+This is the tier Neptune structurally lacks: a **graph-conditioned prediction**
+with an honest coverage guarantee. It carries two results, both real and both
+measured against the committed cache:
+
+1. **The bidirectional win** — a year-regression-conformal *workflow* that an engine
+   bug once made impossible now **runs end-to-end**. The headline is the loop:
+   authoring this keystone surfaced the gaussian-collapse bug, and the engine fix
+   made the whole recipe executable.
+2. **The conformal-under-shift lesson** — under the dataset's time-split, **both**
+   the year-regression interval *and* the subject-classification set *under-cover*,
+   and the textbook weighted-conformal remedy is a **no-op in both cases**, for two
+   complementary reasons (a location shift; an orthogonal shift) — each with a
+   diagnostic that explains exactly why.
+
+The keystone ran the heavy work on the GPU server and committed the per-row
+predictor outputs and class scores. The conformal math below is cheap numpy — it
+runs on CPU against the cache.
+
+## Part A — the bidirectional win: year-regression conformal
+
+Authoring this keystone surfaced an engine bug. Training the gaussian context
+predictor on the paper *year* used to collapse — `predict_with_context_predictor`
+returned a near-zero spread (std ≈ 0.001) and a badly biased mean (~2163 for a
+2014–2020 target), so a regression-conformal interval was meaningless. The fix
+landed in two parts: 0.26.1 standardized the fine-tune projection head's target, but
+the *amortized context predictor* still collapsed; 0.26.2 completed it with z-space
+standardization of the predictor's target. **The bidirectional win is that this
+workflow now runs end-to-end at all**: the predictor fits a real mean (≈ 2018.6)
+with real spread (≈ 0.9), and the previously-impossible regression-conformal recipe
+executes. That is the cookbook → engine → cookbook loop: writing the recipe found
+the bug, the engine fix made the recipe work.
+
+What the recipe then *measures* is the honest part, and it is the same lesson as
+Part B: the interval **under-covers** under the time-split, and weighting it is a
+**no-op** — here for an especially clean reason (a location shift).
+
+```{python}
+import numpy as np
+
+from jammi_cookbook import contracts, rails
+
+reg = contracts.load_artifact("arxiv.tier04_regression").to_pylist()
+reg_cal = [r for r in reg if r["split"] == "calibration"]
+reg_test = [r for r in reg if r["split"] == "test"]
+
+cal_mean = float(np.mean([r["pred_mean"] for r in reg_cal]))
+test_mean = float(np.mean([r["pred_mean"] for r in reg_test]))
+pred_std = float(np.mean([r["pred_std"] for r in reg]))
+print(f"predictor cal-era mean:  {cal_mean:.2f}")
+print(f"predictor test-era mean: {test_mean:.2f}")
+print(f"mean predictive std:     {pred_std:.3f}   (real spread — no collapse)")
+# The predictor regresses to the embedding-conditioned mean (~2018.6) for BOTH eras:
+# the cal/test mean gap is tiny. That is the location-shift signature used below.
+```
+
+```{python}
+# | echo: false
+rails.measure("arxiv.tier04.reg_cal_mean", cal_mean)
+rails.measure("arxiv.tier04.reg_test_mean", test_mean)
+rails.measure("arxiv.tier04.reg_pred_std", pred_std)
+assert pred_std > 0.05  # the bidirectional win: the gaussian predictor did not collapse
+```
+
+The interval comes straight from the engine: calibrate the absolute residual on the
+calibration era, apply the quantile to the test era. We rerun `conformalize_interval`
+on CPU against the committed per-row means.
+
+```{python}
+import jammi_ai
+
+db = jammi_ai.connect("file:///tmp/jammi_tier04")  # CPU embed arm; conformal is local math
+alpha = round(1 - contracts.golden("arxiv.tier04.nominal_coverage").value, 4)
+
+cal_mean_v = [r["pred_mean"] for r in reg_cal]
+cal_year = [float(r["true_year"]) for r in reg_cal]
+test_mean_v = [r["pred_mean"] for r in reg_test]
+test_year = [r["true_year"] for r in reg_test]
+
+intervals = db.conformalize_interval(cal_mean_v, cal_year, test_mean_v, alpha=alpha)
+reg_cov = float(np.mean([lo <= test_year[i] <= hi for i, (lo, hi) in enumerate(intervals)]))
+reg_width = float(np.mean([hi - lo for lo, hi in intervals]))
+print(f"nominal coverage:        {1 - alpha:.2f}")
+print(f"interval coverage:       {reg_cov:.3f}")
+print(f"mean interval width:     {reg_width:.2f} years")
+```
+
+```{python}
+# | echo: false
+# Measured verdict: the regression-conformal interval UNDER-covers under the
+# time-split (below nominal). The workflow was impossible under the gaussian-collapse
+# bug; it now runs, and what it measures is an honest under-coverage.
+rails.measure("arxiv.tier04.reg_interval_coverage", reg_cov)
+rails.measure("arxiv.tier04.reg_interval_width", reg_width)
+assert reg_cov < 1 - alpha  # under-coverage — the honest finding under the time-split
+```
+
+The interval **under-covers**: realised coverage falls below the nominal 0.90. The
+win is that this workflow *runs at all*; what it then measures is the honest lesson.
+
+### Weighting the regression interval is a no-op — it's a location shift
+
+The textbook covariate-shift fix is importance-weighted conformal: reweight the
+calibration residuals toward the test era before taking the quantile. Here it cannot
+help, for a clean reason. The predictor regresses to the embedding-conditioned mean
+(~2018.6) for *both* eras, so the absolute residuals $|y-\hat y|$ have essentially
+the **same magnitude** on the calibration and test sets — the under-coverage is
+point-prediction *bias*, not a residual-magnitude shift. Reweighting *which*
+residuals count cannot move a quantile when the magnitudes don't differ.
+
+```{python}
+cal_resid = np.abs(np.asarray(cal_mean_v) - np.asarray(cal_year))
+test_resid = np.abs(np.asarray(test_mean_v) - np.asarray(test_year, dtype=float))
+print(f"cal  mean |y−ŷ|: {cal_resid.mean():.3f}")
+print(f"test mean |y−ŷ|: {test_resid.mean():.3f}   (≈ equal → location shift)")
+
+# test-era-likeness weights over the committed per-row graph-conditioned embeddings.
+emb_rows = contracts.load_artifact("arxiv.tier04_predictions").to_pylist()
+emb_by_id = {r["paper_id"]: np.asarray(r["emb"]) for r in emb_rows}
+cal_emb_r = np.asarray([emb_by_id[r["paper_id"]] for r in reg_cal])
+test_emb_r = np.asarray([emb_by_id[r["paper_id"]] for r in reg_test])
+tcentre = test_emb_r.mean(0)
+tcentre /= np.linalg.norm(tcentre) + 1e-12
+likeness = cal_emb_r @ tcentre
+w = np.exp(5.0 * likeness)
+w = w / w.sum()
+
+order = np.argsort(cal_resid)
+q = float(cal_resid[order][min(int(np.searchsorted(np.cumsum(w[order]), 1 - alpha)),
+                                len(cal_resid) - 1)])
+wt_reg_cov = float(np.mean(test_resid <= q))
+reg_corr = float(np.corrcoef(cal_resid, likeness)[0, 1])
+print(f"weighted regression coverage: {wt_reg_cov:.3f}   (Δ {wt_reg_cov - reg_cov:+.4f})")
+print(f"corr(|residual|, test-likeness): {reg_corr:+.3f}   (≈ 0)")
+```
+
+```{python}
+# | echo: false
+# The location-shift diagnostics: cal/test residual magnitudes ≈ equal, the weighting
+# moves coverage by ≈ 0, and corr(|residual|, test-likeness) ≈ 0 — reweighting cannot
+# move the |residual| quantile. (The keystone froze the same numbers.)
+rails.measure("arxiv.tier04.reg_cal_resid_mag", float(cal_resid.mean()))
+rails.measure("arxiv.tier04.reg_test_resid_mag", float(test_resid.mean()))
+rails.measure("arxiv.tier04.reg_weighted_coverage", wt_reg_cov)
+rails.measure("arxiv.tier04.reg_resid_corr", reg_corr)
+assert abs(wt_reg_cov - reg_cov) <= contracts.golden("arxiv.tier04.reg_weighting_delta").tol
+```
+
+Coverage barely moves, and the correlation between a calibration row's residual
+magnitude and its test-era likeness is near zero — the diagnostic that proves the
+shift is a *location* shift the residual quantile cannot see. The honest remedy is
+the same one Part B reaches: a governed, time-aware cohort, not a client-side
+reweight. This is *not* conformal magically working; it is conformal honestly
+reporting a shift the OSS marginal surface cannot repair alone.
+
+The **provenance rail**: the keystone also ran `predict_with_context_predictor`
+graph-conditioned on the citation neighbourhood — each prediction rode its `source`
+fact (`ann | edges | hybrid`) and `context_ref` (which neighbours informed it), the
+audit trail behind a prediction. That is the queryable provenance neither a
+monograph proof nor a throwaway notebook carries.
+
+## Part B — the conformal-under-shift lesson: subject classification
+
+The same lesson on a second task, with a complementary mechanism. The task is
+subject classification over the 40 ogbn-arxiv classes; the predictor is the
+consumer's nearest-centroid softmax head on
+the **propagated** (citation-graph-conditioned, tier 02) embeddings. We use the
+dataset's own time-split (calibrate on the 2018 era, test on 2019–2020) — a
+genuinely non-exchangeable shift carried along the homophilous citation graph.
+
+```{python}
+preds = contracts.load_artifact("arxiv.tier04_predictions").to_pylist()
+cal = [r for r in preds if r["split"] == "calibration"]
+test = [r for r in preds if r["split"] == "test"]
+print(f"calibration (2018 era) rows:    {len(cal)}")
+print(f"test (2019–2020 era) rows:      {len(test)}")
+
+cal_split = contracts.load_artifact("arxiv.cal_split")
+assert set(cal_split["calibration"]).isdisjoint(cal_split["test"])
+assert set(cal_split["calibration"]).isdisjoint(cal_split["train"])
+```
+
+```{python}
+def acc(rows):
+    return float(np.mean([int(np.argmax(r["scores"])) == r["true_label"] for r in rows]))
+
+test_acc = acc(test)
+print(f"graph-conditioned classifier accuracy (test era): {test_acc:.3f}")
+rails.measure("arxiv.tier04.classifier_accuracy", test_acc)
+```
+
+### Marginal conformal under-covers on the graph
+
+Marginal split-APS conformal (`conformalize`, the OSS surface) takes the calibration
+scores, finds the finite-sample $(1-\alpha)$ APS quantile, and forms a prediction
+*set* per test point. It is exactly valid **under exchangeability**. We ask for 90%
+coverage ($\alpha = 0.10$).
+
+```{python}
+cal_scores = [r["scores"] for r in cal]
+cal_labels = [r["true_label"] for r in cal]
+test_scores = [r["scores"] for r in test]
+test_labels = [r["true_label"] for r in test]
+
+marg_sets = db.conformalize(cal_scores, cal_labels, test_scores, alpha=alpha, score="aps")
+marg_cov = float(np.mean([test_labels[i] in marg_sets[i] for i in range(len(test))]))
+marg_size = float(np.mean([len(s) for s in marg_sets]))
+print(f"nominal coverage:  {1 - alpha:.2f}")
+print(f"engine APS marginal coverage: {marg_cov:.3f}   (mean set size {marg_size:.2f})")
+```
+
+```{python}
+# | echo: false
+# Measured verdict: marginal APS UNDER-covers under the time-split. The citation
+# graph correlation breaks exchangeability (Barber et al. 2023), so realised
+# coverage falls below nominal.
+rails.measure("arxiv.tier04.marginal_coverage", marg_cov)
+rails.measure("arxiv.tier04.marginal_set_size", marg_size)
+assert marg_cov < 1 - alpha  # under-coverage — the honest lesson
+```
+
+Realised coverage falls **below** the nominal 0.90: the later-era test papers are
+not exchangeable with the earlier-era calibration papers (a covariate shift carried
+along the homophilous citation graph), so the marginal quantile is mis-calibrated.
+
+### The textbook remedy moves coverage but does not restore it
+
+The textbook fix for covariate shift is **weighted** split-conformal (Tibshirani et
+al. 2019): reweight the calibration nonconformity scores toward the test era, so the
+quantile is taken under a calibration distribution that looks like the test
+distribution. To test it apples-to-apples we use a **local APS routine that
+reproduces the engine's marginal exactly** — so the only difference between the
+marginal and the weighted pass is the *weights*, never the APS convention.
+
+```{python}
+def aps_nc(scores, label):
+    cum = 0.0
+    for j in np.argsort(-np.asarray(scores)):
+        cum += scores[j]
+        if j == label:
+            return cum
+    return cum
+
+
+def aps_coverage(weights):
+    """Split-APS coverage + mean set size; weights=None is the unweighted marginal.
+
+    Admit class c iff the cumulative softmax mass up to and INCLUDING c (ranked
+    most- to least-probable) is ≤ q̂ — the class that *crosses* q̂ is excluded. This
+    matches the engine's deterministic-APS admission rule, so the local marginal
+    reproduces conformalize(score="aps"); only the weights differ between passes.
+    """
+    cal_nc = np.array([aps_nc(cal[i]["scores"], cal_labels[i]) for i in range(len(cal))])
+    n = len(cal_nc)
+    order = np.argsort(cal_nc)
+    if weights is None:
+        q = float(cal_nc[order][min(int(np.ceil((n + 1) * (1 - alpha))), n) - 1])
+    else:
+        w = np.asarray(weights, float)
+        w = w / w.sum()
+        cw = np.cumsum(w[order])
+        q = float(cal_nc[order][min(int(np.searchsorted(cw, 1 - alpha)), n - 1)])
+    cov = size = 0
+    for i in range(len(test)):
+        cum, s = 0.0, set()
+        for j in sorted(range(len(test_scores[i])), key=lambda c: (-test_scores[i][c], c)):
+            cum += test_scores[i][j]
+            if cum <= q:
+                s.add(int(j))
+        cov += int(test_labels[i] in s)
+        size += len(s)
+    return cov / len(test), size / len(test)
+
+
+local_marg_cov, _ = aps_coverage(None)
+print(f"local APS marginal coverage (engine-identical): {local_marg_cov:.3f}")
+assert abs(local_marg_cov - marg_cov) <= 0.01  # the local routine reproduces the engine
+```
+
+```{python}
+cal_emb = np.asarray([r["emb"] for r in cal])
+test_emb = np.asarray([r["emb"] for r in test])
+test_centre = test_emb.mean(0)
+test_centre /= np.linalg.norm(test_centre) + 1e-12
+
+# Centroid-likeness importance weights (one of three schemes the keystone ran).
+weights = np.exp(5.0 * (cal_emb @ test_centre))  # test-era likeness (the cohort choice)
+wt_cov, wt_size = aps_coverage(weights)
+print(f"weighted (centroid-likeness) coverage: {wt_cov:.3f}   (mean set size {wt_size:.2f})")
+print(f"Δ vs marginal: {wt_cov - local_marg_cov:+.4f}")
+```
+
+```{python}
+# | echo: false
+# The keystone ran THREE weighting schemes (centroid-likeness, kNN density ratio,
+# Tibshirani domain-classifier LR). The movements are small and NOT consistently
+# toward nominal — one scheme even moves coverage *down*. Crucially, none reaches
+# the nominal 0.90: weighting does not repair the under-coverage.
+weighting = contracts.load_artifact("arxiv.tier04_weighting")
+deltas = [s["delta_vs_marginal"] for s in weighting["schemes"].values()]
+coverages = [s["coverage"] for s in weighting["schemes"].values()]
+max_delta = max(abs(d) for d in deltas)
+rails.measure("arxiv.tier04.weighting_max_abs_delta", max_delta)
+assert max_delta <= contracts.golden("arxiv.tier04.weighting_max_abs_delta").value + 1e-6
+assert all(c < 1 - alpha for c in coverages)  # no scheme reaches nominal — not a repair
+assert min(deltas) < 0  # movements are not systematically toward nominal (≈ orthogonal)
+```
+
+Weighting does not repair the under-coverage. Across the three schemes the keystone
+ran (centroid-likeness, a kNN density ratio, and a Tibshirani domain-classifier
+logistic regression) the coverage changes are small and **not even consistently
+toward nominal** — the centroid scheme nudges it *down*, the kNN scheme up by about
+0.02 — and **no scheme reaches the nominal 0.90**. The largest mover (kNN) recovers
+roughly two-thirds of the gap yet the set still under-covers; the others move little
+or the wrong way. Weighting nudges coverage but cannot **restore** it here — this is
+a shift importance weighting cannot repair, not a tweak away from nominal.
+
+### Why: the shift is orthogonal to the conformal score
+
+Weighted conformal can only move the quantile if test-era-like calibration points
+have *systematically different* nonconformity scores. They do not here: the
+correlation between a calibration point's nonconformity and its test-era likeness is
+near zero.
+
+```{python}
+cal_nc = np.array([aps_nc(cal[i]["scores"], cal_labels[i]) for i in range(len(cal))])
+likeness = cal_emb @ test_centre
+corr = float(np.corrcoef(cal_nc, likeness)[0, 1])
+print(f"corr(nonconformity, test-likeness): {corr:+.3f}")
+rails.measure("arxiv.tier04.score_shift_corr", corr)
+```
+
+```{python}
+# | echo: false
+# The diagnostic that explains the no-op: |corr| is small, so the time-split shift is
+# nearly orthogonal to the conformal score. Reweighting the calibration CDF along a
+# direction that does not move the score cannot move the quantile.
+assert abs(corr) < 0.25
+```
+
+A near-zero correlation means the time-split shift lies almost entirely **orthogonal
+to the conformal score**. Reweighting the calibration distribution toward the test
+era redistributes mass along a direction the nonconformity barely depends on, so the
+weighted quantile is essentially the marginal quantile — hence the no-op. This is a
+*deeper* lesson than a textbook restore: weighted conformal is not a universal
+patch; it repairs under-coverage only when the shift is score-aligned.
+
+> Weighted conformal *does* genuinely repair coverage on data where the shift is
+> aligned with the nonconformity score — that case is taught in the planned
+> conformal vertical, on data chosen to make the score-aligned repair real. Here,
+> on this time-split, the honest finding is the negative one plus the diagnostic.
+
+## The honest remedy: a governed calibration cohort
+
+If a client-side reweight cannot restore coverage in *either* crux — the regression
+interval (a location shift) or the classification set (an orthogonal shift) — what
+does? A **governed, time-aware (or simply larger) calibration cohort**: choose the
+calibration set so it
+is exchangeable with the deployment era — a Mondrian / time-stratified cohort the
+consumer owns and registers. The OSS Python surface exposes the **marginal**
+`conformalize*`; the governed cohort choice is the consumer's, exactly where the
+doctrine puts it. The point stands: honest coverage on a shifting graph requires
+*someone* to own the cohort, and a reweight alone is not that someone.
+
+## Bridge note (a signature chapter — deepened in the bridge chapters)
+
+> **A prediction is a context-conditioned posterior; honest coverage needs the
+> consumer to own the cohort.** The context predictor is a Neural Process (Garnelo
+> et al. 2018 CNP; Kim et al. 2019 ANP; the TabPFN/PFN line) — the context set is a
+> `search`/walk over the citation graph (the propagated embedding *is* that
+> graph-conditioned context). Conformal gives finite-sample coverage *under
+> exchangeability* (Vovk; Angelopoulos & Bates 2021); under this dataset's
+> time-split both the regression interval and the classification set under-cover
+> (Barber et al. 2023). The textbook remedy is weighted / stratified conformal
+> (Tibshirani et al. 2019; NAPS, Clarkson et al. 2023; CF-GNN, Huang et al. 2023) —
+> but it repairs only a shift the nonconformity score can *see*: it is a no-op for a
+> location shift (the regression case, where cal and test residual magnitudes match)
+> and for a shift orthogonal to the score (the classification case). The unifying
+> lesson: weighted conformal repairs a covariate shift only when the shift moves the
+> nonconformity-score distribution; a location/orthogonal shift needs a governed
+> time-aware cohort, not a client-side reweight. This is the tier with **no
+> monograph and no Neptune analogue** — the moat.

@@ -26,7 +26,7 @@ It **reads** as **4 tiers × 3 rails**:
 
 ## This is NOT the S6 cookbook
 
-A separate minimal cookbook lives **inside** `jammi-ai/cookbook/` (spec `10-substrate/S6-cookbook.md`). **This is a different, larger, consumer-facing book in its own repo** that *imports* `jammi_ai` as a dependency and **does not touch** `jammi-ai/cookbook/` or any jammi engine source — it only *calls* the `jammi_ai` API. Do not edit the engine repos to make a recipe work; a recipe that needs an engine change is a fork to escalate, not to patch (see "Fork-resolution").
+The minimal SDK-recipes cookbook lives at `cookbook/{recipes,quickstart,fixtures}/` (spec `10-substrate/S6-cookbook.md`) and is engine-owned (78 refs in `crates/**`, plus the `cookbook.yml` smoke + `it/cookbook.rs`). **This is a different, larger, consumer-facing book that now lives in this same repo at `cookbook/book/`** — it *imports* `jammi_ai` as a dependency and **does not touch** the engine source under `crates/` or the engine-owned `cookbook/{recipes,quickstart,fixtures}/`; it only *calls* the `jammi_ai` API. The dependency points one way: the book consumes the engine, never the reverse (the `ci/scripts/check_cookbook_one_way.sh` guard enforces that no crate references `cookbook/book/`). Consolidating the book in-repo couples it to the engine at HEAD — its CI (`.github/workflows/cookbook-book.yml`) builds the HEAD embed wheel and runs the book's gate against it, so a feature and its proof land atomically — but the discipline is unchanged: a recipe that needs an engine change is still a fork to resolve through the API, not a reason to bend a primitive (see "Fork-resolution").
 
 ## The artifact set (build these, in this order)
 

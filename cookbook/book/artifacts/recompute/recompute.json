@@ -1,0 +1,62 @@
+{
+  "boundary": "The engine ships the bounded MECHANISM \u2014 one cache probe per producer call, one recompute on one explicit request, one bounded downstream sweep on cascade='downstream'. The scheduled / monitored recompute LOOP (a staleness-monitor that triggers recompute, a cron sweep, cache eviction/TTL) is the consumer's composition, built on a published engine version. Names no consumer.",
+  "current_definition_method": "The recorded DefinitionHash is read purely off the Python surface: verify_materialization(table, expected_definition='deadbeef') returns the recorded hash as its 'found' field on a deliberate mismatch. No get_definition verb exists; no engine internals are touched.",
+  "gotchas": [
+    "build_neighbor_graph / propagate_embeddings take the ORIGINAL source id ('docs'), NOT the embedding-table name; passing the table id raises 'Catalog error: No ready embedding table for source <table>'. The embedding table is passed separately via embedding_table=.",
+    "propagate_embeddings MUST pin embedding_table=emb explicitly to be cacheable; left unpinned it resolves 'the latest ready embedding for docs', and once a prior propagate has run that latest-ready anchor shifts \u2192 a different ResultDigest \u2192 a cache miss."
+  ],
+  "matrix": {
+    "cache": {
+      "bng_k4_recomputed": true,
+      "bng_minsim_recomputed": true,
+      "bng_reused": true,
+      "names": {
+        "emb_a": "docs__text_embedding___home_sagemaker-user_git_f-inverse_jammi-ai_tests_fixtures_tiny___20260618T071754278301472_8b48e6bb",
+        "emb_b": "docs__text_embedding___home_sagemaker-user_git_f-inverse_jammi-ai_tests_fixtures_tiny___20260618T071754282067008_243adde8",
+        "g_bypass": "docs__text_embedding__neighbor_graph__20260618T071754256281522_c40c7d13",
+        "g_k4": "docs__text_embedding__neighbor_graph__20260618T071754261110972_fec58938",
+        "g_minsim": "docs__text_embedding__neighbor_graph__20260618T071754264361726_0e9b1f55",
+        "g_use": "docs__text_embedding__neighbor_graph__20260618T071754256281522_c40c7d13",
+        "prop_h1_a": "docs__text_embedding__graph_propagate__20260618T071754269214156_143cc385",
+        "prop_h1_b": "docs__text_embedding__graph_propagate__20260618T071754269214156_143cc385",
+        "prop_h2": "docs__text_embedding__graph_propagate__20260618T071754275715684_808a212e"
+      },
+      "prop_hops_recomputed": true,
+      "prop_reused": true,
+      "unpinned_reused": false
+    },
+    "recompute": {
+      "cascade_recomputed_count": 2,
+      "child_in_downstream_stale": true,
+      "child_recompute_byte_identical": true,
+      "child_recompute_outcome": "computed",
+      "derives_from_all_result_digest": true,
+      "derives_from_edge_count": 2,
+      "derives_from_kinds": [
+        "result_digest"
+      ],
+      "downstream_stale_count": 1,
+      "report_only_recomputes_only_parent": true
+    },
+    "staleness": {
+      "fresh_verdict": {
+        "staleness": "fresh"
+      },
+      "is_fresh": true,
+      "is_stale_on_definition_change": true,
+      "recorded_definition": "b42f8d0ddfdc9ad46ec478fd831f1e6279c650ade8df773b0e9f5d25d7da9ea4",
+      "stale_verdict": {
+        "reasons": [
+          {
+            "current": "00000000",
+            "reason": "definition_changed",
+            "recorded": "b42f8d0ddfdc9ad46ec478fd831f1e6279c650ade8df773b0e9f5d25d7da9ea4"
+          }
+        ],
+        "staleness": "stale"
+      }
+    }
+  },
+  "purpose": "The engine\u2194cookbook validator for SPEC-03's two bounded actions over the materialization contract \u2014 opt-in producer memoization (cache='use') and recompute(table, cascade) \u2014 and the sensing reads they stand on (staleness, derives_from, the verify_materialization definition probe). Measured on CPU over an ~8-row ephemeral file:// catalog, with reuse observed by table-name identity (a producer returns a bare name str; a hit returns the SAME name).",
+  "staleness_result_digest_drift_cut": "The definition_changed staleness arm is measured. The sibling result_digest input-drift arm is CUT (not half-shipped). A recompute over unmoved inputs is byte-identical AND produces a uniquely-named new table, so a child stays honestly fresh (its recorded parent digest still matches the parent's current digest \u2014 nothing drifted), and there is no Python-surface verb to re-anchor an existing child onto a moved-digest parent in a hermetic chain. Rather than fabricate an input-drift demo, the arm is described via the SPEC-02 manifest-anchor model in prose and only the definition_changed arm is measured."
+}

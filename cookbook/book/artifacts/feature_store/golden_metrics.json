@@ -1,0 +1,18 @@
+{
+  "cited_papers": {
+    "tol": 0.0,
+    "value": 1173.0
+  },
+  "populated_rows": {
+    "tol": 0.0,
+    "value": 4000.0
+  },
+  "top_subject_total": {
+    "tol": 0.0,
+    "value": 5716.0
+  },
+  "total_in_degree": {
+    "tol": 0.0,
+    "value": 9595.0
+  }
+}

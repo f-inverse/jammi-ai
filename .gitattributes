@@ -1,0 +1,13 @@
+# Git LFS routing for the in-repo Theory↔Computation book (cookbook/book/).
+#
+# The book commits its emitted artifacts once and reads them forever: the
+# small-subset goldens every chapter asserts against (~77 MB of Parquet) and
+# the H2 scale tier — the ~170k×768 ogbn-arxiv embedding corpus, the held-out
+# query vectors, and the frozen ANN sidecar bundle (~982 MB, .usearch/.rowmap/
+# .parquet). These are large binary blobs that drift the git object store if
+# packed inline, so they live in Git LFS, off the object store. The small
+# JSON/txt sidecars (manifests, golden metrics, checksums, id lists) stay as
+# plain tracked text and are NOT routed here.
+cookbook/book/artifacts/**/*.parquet  filter=lfs diff=lfs merge=lfs -text
+cookbook/book/artifacts/**/*.usearch  filter=lfs diff=lfs merge=lfs -text
+cookbook/book/artifacts/**/*.rowmap   filter=lfs diff=lfs merge=lfs -text

@@ -1,0 +1,245 @@
+---
+title: "Multi-tenancy as a measured property"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `set_tenant` · `list_sources` · `sql` (the analyzer's discriminator rewrite)
+· **Theory:** tenant isolation as a property of the catalog + the query analyzer, not a
+feature flag · **Rail:** tenancy (`rails.tenant` / `assert_listing_isolated` /
+`assert_rows_isolated`) + measurement.
+
+The KV-air on-ramp established the engine's *true* tenancy contract. This chapter does not
+restate it as prose — it **measures** it, live on CPU against the committed ogbn-arxiv
+cache, as three isolation properties plus one consequence. Every number is a verdict: a
+hard zero where isolation must hold, a positive count where the honest caveat says data is
+visible.
+
+The model has exactly two genuine isolation layers and one honest caveat:
+
+1. **catalog-listing isolation** — `list_sources` filters the registry to
+   `tenant_id = $cur OR IS NULL`; tenant A's listing excludes B's registration.
+2. **row-level discriminator-column isolation** — the analyzer injects
+   `tenant_id = $cur OR IS NULL` onto a `TableScan` *only when* the queried table carries
+   a `tenant_id` column, so the SAME tagged source returns disjoint rows under A vs B.
+3. **the caveat** — a discriminator-**less** source is globally readable: A sees ALL of
+   B's rows when it names the source. The engine does not authenticate; access-gating
+   lives above it.
+
+```{python}
+from jammi_cookbook import contracts
+
+record = contracts.load_artifact("tenancy_b.record")
+print(f"tenant A papers:  {record['tenant_a_papers']}")
+print(f"tenant B papers:  {record['tenant_b_papers']}")
+print(f"listing leak:     {record['listing_leak']} (must be 0)")
+print(f"discriminator leak: {record['discriminator_leak']} (must be 0)")
+print(f"caveat visible:   {record['caveat_visible']} (B's rows visible under A, by design)")
+```
+
+The two tenants are an honest, disjoint partition of the committed cache: every paper
+belongs to exactly one tenant by its subject class. The tenant ids are opaque UUIDs — the
+engine validates the form, never who the tenant is.
+
+## The setup — two tenants over the committed cache
+
+We reuse `jammi_cookbook.rails` verbatim — `tenant` (the bind-in-place/restore context
+manager), `assert_listing_isolated`, and `assert_rows_isolated`, the corrected helpers,
+not a re-implementation. `set_tenant` binds the scope to the connection *in place*; the
+bound scope drives both isolation layers (`tenant_scope` is the block-scoped form the
+`tenant` helper delegates to).
+
+```{python}
+import tempfile
+
+import jammi_ai
+import pyarrow as pa
+import pyarrow.parquet as pq
+from jammi_cookbook.rails import assert_listing_isolated, assert_rows_isolated, tenant
+
+TENANT_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+TENANT_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+catalog = tempfile.mkdtemp()
+work = tempfile.mkdtemp()
+db = jammi_ai.connect(f"file://{catalog}")
+
+papers = contracts.load_artifact("arxiv.papers").to_pylist()
+subject = {p["paper_id"]: p["subject"] for p in papers}
+subjects = sorted({p["subject"] for p in papers})
+a_subjects = set(subjects[::2])
+a_papers = sorted(pid for pid in subject if subject[pid] in a_subjects)
+b_papers = sorted(pid for pid in subject if subject[pid] not in a_subjects)
+
+
+def write_src(name, table):
+    path = f"{work}/{name}.parquet"
+    pq.write_table(table, path)
+    db.add_source(name, url=path, format="parquet")
+
+
+print(f"partition: A {len(a_papers)} / B {len(b_papers)} papers (disjoint, tiles the cache)")
+```
+
+## Property 1 — catalog-listing isolation (a hard zero)
+
+Each tenant registers its own source under its own scope. Under tenant A, `list_sources`
+must not surface B's registration.
+
+```{python}
+with tenant(db, TENANT_A):
+    write_src("papers_a", pa.table({"paper_id": a_papers}))
+with tenant(db, TENANT_B):
+    write_src("papers_b", pa.table({"paper_id": b_papers}))
+
+with tenant(db, TENANT_A):
+    a_listed = [s["source_id"] for s in db.list_sources()]
+
+assert_listing_isolated(a_listed, {"papers_b"}, tenant_id=TENANT_A)
+listing_leak = len(set(a_listed) & {"papers_b"})
+print(f"tenant A lists: {sorted(a_listed)}")
+print(f"B's 'papers_b' leaked into A's listing: {listing_leak}")
+```
+
+## Property 2 — discriminator-column row isolation (a hard zero)
+
+Now the load-bearing layer. We register **one shared source** as a global
+(`tenant_id IS NULL`), carrying a `tenant_id` discriminator column that tags each row to a
+tenant. When tenant A reads it, the analyzer injects `tenant_id = $cur OR IS NULL` onto the
+scan, so A sees only its own rows — none of B's.
+
+```{python}
+db.set_tenant("")  # register the shared tagged source as a global
+write_src("papers_tagged", pa.table({
+    "paper_id": a_papers + b_papers,
+    "tenant_id": [TENANT_A] * len(a_papers) + [TENANT_B] * len(b_papers),
+}))
+
+with tenant(db, TENANT_A):
+    seen_a = [r["paper_id"] for r in db.sql(
+        "SELECT paper_id FROM papers_tagged.public.papers_tagged").to_pylist()]
+
+assert_rows_isolated(seen_a, set(b_papers), tenant_id=TENANT_A)
+discriminator_leak = len(set(seen_a) & set(b_papers))
+print(f"tenant A reads the shared tagged source: {len(seen_a)} rows")
+print(f"B-tagged rows that leaked to A: {discriminator_leak}")
+```
+
+This is the isolation layer that actually scopes *data*: one physical source, disjoint
+reads, enforced by the analyzer because the discriminator column exists.
+
+## Property 3 — the caveat: a discriminator-less source is globally readable
+
+The honest limit, asserted as a *positive* count, not hidden. A source with **no**
+`tenant_id` column gets no scan rewrite — it is globally readable by any tenant that names
+it. We register B's papers under B with no discriminator column, then read it under A: A
+sees **all** of B's rows.
+
+```{python}
+with tenant(db, TENANT_B):
+    write_src("papers_b_nodisc", pa.table({"paper_id": b_papers}))
+
+with tenant(db, TENANT_A):
+    seen_global = [r["paper_id"] for r in db.sql(
+        "SELECT paper_id FROM papers_b_nodisc.public.papers_b_nodisc").to_pylist()]
+
+caveat_visible = len(set(seen_global) & set(b_papers))
+print(f"tenant A reads B's discriminator-less source: {caveat_visible} of {len(b_papers)} "
+      f"B rows visible")
+print("the engine does not authenticate — access-gating lives above it")
+```
+
+This is the claim the KV-air audit corrected and that this chapter must not re-break: a
+*separate per-tenant source* is hidden from the **listing** (Property 1), but its rows are
+**not** hidden from a direct named read. Data isolation is the discriminator column
+(Property 2), not source separation.
+
+```{python}
+# | echo: false
+from jammi_cookbook import rails
+
+# The three properties asserted against the frozen goldens — two hard zeros and the
+# positive caveat count.
+rails.measure("tenancy_b.listing_leak", float(listing_leak))
+rails.measure("tenancy_b.discriminator_leak", float(discriminator_leak))
+rails.measure("tenancy_b.caveat_visible", float(caveat_visible))
+assert contracts.golden("tenancy_b.listing_leak").tol == 0.0
+assert contracts.golden("tenancy_b.discriminator_leak").tol == 0.0
+```
+
+## Property 4 — tenant-conditioned metric parity
+
+The consequence worth measuring directly: the **same recipe** under two tenants gives each
+its own scoped result. We run the keystone's recall@10 recipe under each tenant, scoped to
+that tenant's rows by the discriminator filter — same recipe, two scopes, two answers.
+
+```{python}
+import numpy as np
+
+emb = contracts.load_artifact("arxiv.embeddings")
+ids = [str(x) for x in emb.column("_row_id").to_pylist()]
+vecs = np.asarray([list(v) for v in emb.column("vector").to_pylist()], dtype=np.float32)
+pos = {i: n for n, i in enumerate(ids)}
+
+golden = contracts.load_artifact("arxiv.subject_golden").to_pylist()
+relevant: dict[str, set[str]] = {}
+for g in golden:
+    relevant.setdefault(g["query_id"], set()).add(g["relevant_id"])
+
+
+def scoped_recall(tenant_id):
+    with tenant(db, tenant_id):
+        visible = {r["paper_id"] for r in db.sql(
+            "SELECT paper_id FROM papers_tagged.public.papers_tagged").to_pylist()}
+    local_ids = [i for i in ids if i in visible]
+    sub = vecs[[pos[i] for i in local_ids]]
+    norm = sub / (np.linalg.norm(sub, axis=1, keepdims=True) + 1e-12)
+    local_pos = {i: n for n, i in enumerate(local_ids)}
+    scored = total = 0.0
+    for qid in sorted(relevant):
+        if qid not in local_pos:
+            continue
+        rel = {r for r in relevant[qid] if r in visible}
+        if not rel:
+            continue
+        sims = norm @ norm[local_pos[qid]]
+        sims[local_pos[qid]] = -np.inf
+        top = np.argpartition(-sims, 10)[:10]
+        scored += len({local_ids[t] for t in top} & rel) / min(10, len(rel))
+        total += 1
+    return scored / total, len(visible), int(total)
+
+
+a_recall, a_visible, a_queries = scoped_recall(TENANT_A)
+b_recall, b_visible, b_queries = scoped_recall(TENANT_B)
+print(f"tenant A: recall@10 {a_recall:.3f}  over {a_visible} rows / {a_queries} queries")
+print(f"tenant B: recall@10 {b_recall:.3f}  over {b_visible} rows / {b_queries} queries")
+print(f"scopes tile the cache: {a_visible} + {b_visible} = {a_visible + b_visible}")
+```
+
+```{python}
+# | echo: false
+# Each tenant's scoped recall recomputes live to its frozen golden; the scopes are a
+# disjoint partition (they tile the full cache, with no overlap).
+rails.measure("tenancy_b.parity_a_recall_at_10", round(a_recall, 3))
+rails.measure("tenancy_b.parity_b_recall_at_10", round(b_recall, 3))
+assert a_visible + b_visible == len(subject), "the tenant scopes must tile the cache"
+```
+
+The two recalls differ (tenant A's larger cohort vs tenant B's smaller one), and each is
+higher than the global recall because restricting to a tenant's subject subset shrinks the
+candidate pool — but the point is the **parity**: one recipe, the engine scoping the data
+per tenant, each tenant getting its own measured answer over rows it alone can see.
+
+## What this chapter does not claim
+
+The engine isolates at the catalog listing and at a discriminator-column scan rewrite.
+It does **not** authenticate, and a discriminator-less source is globally readable — the
+caveat is measured (Property 3), not glossed. Tenant isolation as a complete access-control
+story is built *above* the engine (a discriminator column on every tenant-scoped table, or
+a Flight SQL / gRPC interceptor that binds the scope from an authenticated principal). What
+the engine guarantees — and what this chapter measures as hard zeros and a positive caveat
+count — is exactly those two layers and that one honest limit.

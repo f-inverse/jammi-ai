@@ -1,0 +1,9 @@
+{
+  "marginal_coverage": 0.8298,
+  "weighted_coverage": 0.8298,
+  "weighting_delta": 0.0,
+  "cal_resid_magnitude": 0.5602,
+  "test_resid_magnitude": 0.5428,
+  "resid_likeness_corr": 0.001,
+  "note": "Importance-weighted conformal on the |y\u2212\u0177| residual is a no-op: the time-split is a LOCATION shift (predictor regresses to the embedding-conditioned mean for both eras), so cal and test residual magnitudes are \u2248equal and corr(|residual|, test-likeness) \u2248 0 \u2014 reweighting which residuals count cannot move the quantile. The under-coverage is point-prediction bias, not a residual-distribution shift."
+}

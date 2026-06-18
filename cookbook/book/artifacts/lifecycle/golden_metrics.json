@@ -1,0 +1,26 @@
+{
+  "delete.absent_if_exists_noop": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "delete.absent_strict_not_found": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "delete.every_catalog_model_referenced": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "delete.referenced_raises": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "parity.all_observables_equal": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "register.status_registered": {
+    "tol": 0.0,
+    "value": 1.0
+  }
+}

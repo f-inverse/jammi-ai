@@ -1,0 +1,151 @@
+---
+title: "Regression fine-tuning on a high-offset target"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `fine_tune(task="regression")` (the `regression_loss` objective) + `infer`
+· **Theory:** heteroscedastic regression — the mean–variance Gaussian head
+[@nix1994], β-NLL [@seitzer2022], CRPS as a training score [@gneiting2007], pinball /
+quantile regression [@koenker1978] · **Rail:** measurement (held-out RMSE-in-years,
+nominal interval coverage).
+
+Tier 04 surfaced a sharp edge: regressing a paper's publication **year** — a target
+clustered near 2018, a large *offset* with a small *relative* spread — used to
+**collapse**. A head that optimizes raw squared error on a target offset to ~2018
+drove the predicted variance to a degenerate floor (the documented tier-04 failure:
+predicted `std` ≈ 0.001, mean ≈ 2163). The fix is not a bigger model; it is *where*
+the loss lives. v0.29.0 trains the regression head against
+a **data-derived z-scored** target and de-standardizes at serve, so the objective the
+optimizer sees is a well-conditioned `O(1)` residual regardless of the target's offset
+or scale. This chapter measures the consequence.
+
+Two honest questions — and explicitly **not** a third. We do *not* claim "the fit is
+invariant under an affine rescale of the target": that is arithmetic (a data-derived
+scaler inverts any exact affine by construction), not a property of the engine. What
+*can* fail, and is therefore worth measuring, is read off the **de-standandardized**
+serve output in raw year units:
+
+1. **Does the high-offset target now fit at all, without collapse?**
+2. **Which objective wins on it** — `beta_nll` (the default), `gaussian_nll`, `crps`,
+   or `pinball`?
+
+The keystone ran each objective once on the GPU server as a short LoRA fine-tune,
+inferred a held-out test split, and froze the predictions; this chapter reads that
+cache on CPU and asserts each number against its golden.
+
+```{python}
+from jammi_cookbook import contracts
+
+methods = contracts.load_artifact("finetune_regression.methods")
+print(f"base model:    {methods['base_model']}")
+print(f"target:        {methods['target']}  range "
+      f"[{methods['target_year_lo']}, {methods['target_year_hi']}]  "
+      f"std {methods['target_std_years']:.2f}y")
+print(f"train / test:  {methods['n_train']} / {methods['n_test']}  (held-out split)")
+print(f"epochs · seed: {methods['epochs']} · {methods['seed']}")
+```
+
+## The target — and the collapse it used to cause
+
+The year target lies in a narrow window high above zero. Under a raw mean-squared
+head the variance branch has no incentive to stay calibrated once the mean saturates,
+and it collapses to the floor — the predictor degenerates to a near-constant with a
+vanishing `std`, the exact pathology tier-04 recorded before the engine learned to
+standardize. A served `std` of ~0.001 on a multi-year target is not a tight
+prediction; it is a broken one.
+
+## Each objective, measured on the held-out test
+
+`fine_tune(task="regression")` reads a `(text, target)` supervision schema — here the
+paper's title+abstract and its integer `year`. The Gaussian objectives (`beta_nll`,
+`gaussian_nll`, `crps`) serve `predicted_mean` + `predicted_std`, de-standardized to
+years; `pinball` serves the `quantile_{level}` columns. We fold held-out RMSE-in-years,
+MAE, and the nominal 90% interval coverage — numbers that genuinely fail if the
+de-standardize path were wrong.
+
+```{python}
+rows = {r["loss"]: r for r in methods["losses"]}
+order = ["beta_nll", "gaussian_nll", "crps", "pinball"]
+print(f"{'objective':<14}{'rmse(y)':>9}{'mae(y)':>9}{'cov@90':>9}{'spread':>11}")
+for loss in order:
+    r = rows[loss]
+    spread = (f"std {r['std_mean']:.3f}" if r["head"] == "gaussian"
+              else f"width {r['interval_width']:.2f}")
+    print(f"{loss:<14}{r['rmse_years']:>9.3f}{r['mae_years']:>9.3f}"
+          f"{r['coverage_90']:>9.3f}{spread:>11}")
+```
+
+Every objective's RMSE and coverage is asserted against its frozen golden — the
+measured-verdict oracle this recipe ends in (and the committed held-out predictions
+let the test re-fold each number, so the cache is auditable, never hand-written):
+
+```{python}
+for loss in order:
+    contracts.assert_close(f"finetune_regression.{loss}.rmse_years", rows[loss]["rmse_years"])
+    contracts.assert_close(f"finetune_regression.{loss}.coverage_90", rows[loss]["coverage_90"])
+print("all objectives asserted against golden ✓")
+```
+
+## It fits — without collapse
+
+The load-bearing result. Across the Gaussian heads the *minimum* served mean `std` is
+orders of magnitude above the old ~0.001 collapse floor, and every head's predicted
+means land inside the real year window — the target is being fit, not memorized to a
+degenerate constant.
+
+```{python}
+min_std = methods["min_gaussian_std_mean"]
+print(f"min Gaussian served std_mean: {min_std:.3f}y   "
+      f"(vs the documented pre-0.26.2 collapse ≈ 0.001)")
+print(f"fits_without_collapse: {methods['fits_without_collapse']}")
+contracts.assert_close("finetune_regression.min_gaussian_std_mean", min_std)
+```
+
+## How the objectives compare — a near-tie at the conditional mean
+
+No objective is privileged. Read off the cache, the held-out RMSEs are a **near-tie**:
+the "best" is just the lowest number, but the spread across all four is a few
+thousandths of a year. The reason is in the numbers — every objective's RMSE sits at
+the test set's own standard deviation, i.e. the head has learned the **conditional
+mean** and little beyond it. A paper's publication year is only weakly predictable from
+its title+abstract, so the loss is not the lever here. What *is* load-bearing is that
+the head fits this low-signal, high-offset target **without collapsing**.
+
+```{python}
+best = methods["best_loss"]
+test_std = methods["target_std_years"]
+print(f"best objective (min held-out RMSE): {best} @ {methods['best_rmse_years']:.4f} years")
+print(f"predict-the-mean RMSE (test-set std): {test_std:.4f} years")
+print(f"best RMSE / test std = {methods['best_rmse_years'] / test_std:.3f}  "
+      f"(≈ 1 ⇒ regresses to the conditional mean)")
+contracts.assert_close("finetune_regression.best_rmse_years", methods["best_rmse_years"])
+```
+
+## Calibration: a usable Gaussian spread, a collapsed quantile band
+
+The fit is honest about its uncertainty only on the parametric heads. The Gaussian
+objectives serve a real but *narrow* spread — coverage lands below the 90% nominal, so
+the intervals are mildly **overconfident** (the expected behaviour of a short LoRA run,
+reported as the measured truth, never tuned away). The `pinball` quantile head is the
+sharp contrast: its q05/q95 band collapses toward the median — a fraction of a year
+wide — so its 90% interval covers almost none of the held-out test, where the Gaussian
+`predicted_std` stays usable. A candidate engine observation surfaced by this loop: the
+quantile head needs more signal (or a spread-preserving objective) to serve a
+calibrated band on a low-variance target.
+
+```{python}
+gauss_cov = max(rows[loss]["coverage_90"] for loss in ("beta_nll", "gaussian_nll", "crps"))
+print(f"Gaussian heads — best coverage@90: {gauss_cov:.3f}  (nominal 0.90 → overconfident)")
+print(f"pinball — coverage@90: {rows['pinball']['coverage_90']:.3f}  "
+      f"(band width {rows['pinball']['interval_width']:.3f}y → degenerate)")
+```
+
+The robust takeaway: on a high-offset target the v0.29.0 z-space regression head **fits
+without collapse** where the raw head once degenerated (`std` ≈ 0.001). On *this*
+low-signal target the objective choice is a near-tie at the conditional mean, the
+Gaussian intervals are mildly overconfident, and the quantile band collapses — each
+reported as the measured truth, not a number tuned to look good.

@@ -50,14 +50,15 @@ use sha2::{Digest, Sha256};
 use crate::model_task::ModelTask;
 
 /// Manifest format version. A change to the [`ProducingDescriptor`] shape — the
-/// determinant set a producer folds into its [`DefinitionHash`] — bumps this so
-/// a reader detects an incompatible older manifest as a typed
-/// [`ManifestError::UnsupportedManifestVersion`] rather than comparing a stale
-/// hash computed over a different determinant set. The hash is opaque in the
-/// persisted manifest (the descriptor is folded away, not stored), so a version
-/// mismatch is the *only* signal that an on-disk hash is incomparable: a reader
-/// must reject it, never silently trust it.
-pub const MANIFEST_VERSION: u32 = 2;
+/// determinant set a producer folds into its [`DefinitionHash`] *and* records
+/// verbatim for replay — bumps this so a reader detects an incompatible older
+/// manifest as a typed [`ManifestError::UnsupportedManifestVersion`] rather than
+/// comparing a stale hash computed over a different determinant set, or replaying
+/// a recorded descriptor whose shape this build no longer understands. The
+/// version is the *only* signal that an on-disk manifest was written under a
+/// different determinant set and is therefore incomparable/un-replayable: a
+/// reader must reject it, never silently trust it.
+pub const MANIFEST_VERSION: u32 = 3;
 
 /// Content hash of *how* a table was produced: a canonical encoding of the
 /// [`ProducingDescriptor`] plus the [`MaterializationEnv`] that affects its
@@ -306,6 +307,15 @@ pub enum ProducingDescriptor {
         encoder_id: String,
         /// The source whose rows were pooled per target.
         source_id: String,
+        /// The specific source embedding table the recipe pooled against, or
+        /// `None` when the source's default (newest) embedding table was
+        /// resolved. Recorded so a recompute re-pools over the **same** table the
+        /// recipe ran on — a materialised context set is itself a `kind=model`
+        /// table for the same source, so the default would otherwise shadow the
+        /// original source table on replay. An output-affecting determinant: the
+        /// same recipe over a different source embedding table pools different
+        /// vectors.
+        embedding_table: Option<String>,
         /// Where each target's candidate members came from — ANN retrieval, a
         /// declared-edge walk, or both — the determinant that selects which
         /// neighbours are pooled.
@@ -679,6 +689,14 @@ pub struct MaterializationManifest {
     pub artifact: ArtifactDigest,
     /// How it was produced (the "definition"): hash of descriptor + environment.
     pub definition_hash: DefinitionHash,
+    /// The producing descriptor recorded **verbatim** — the typed verb + its
+    /// output-affecting parameters. The [`definition_hash`](Self::definition_hash)
+    /// folds this away into an opaque digest for comparison; the descriptor is
+    /// also kept in the clear so a reader can **replay** the producer over the
+    /// inputs' current state (the recompute action), which an opaque hash cannot
+    /// drive. A reader that only verifies reads the hash; a reader that recomputes
+    /// reads the descriptor.
+    pub descriptor: ProducingDescriptor,
     /// The as-of state of every input, in producer order.
     pub input_anchors: Vec<InputAnchor>,
     /// Producing-run identity (a per-process id) — provenance, never the
@@ -714,6 +732,7 @@ impl MaterializationManifest {
         Ok(Self {
             artifact,
             definition_hash,
+            descriptor: descriptor.clone(),
             input_anchors: inputs,
             produced_by,
             produced_at,
@@ -755,13 +774,16 @@ impl MaterializationManifest {
     /// Parse a manifest from its sidecar bytes, rejecting any format version this
     /// build does not support.
     ///
-    /// The persisted manifest carries an *opaque* [`DefinitionHash`] — the
-    /// [`ProducingDescriptor`] is folded into it, not stored — so the manifest's
-    /// JSON shape does not change when the descriptor's determinant set changes.
-    /// That makes the version the *only* signal that an on-disk hash was computed
-    /// over a different determinant set and is therefore incomparable. The
-    /// version is validated **before** the parsed manifest is handed back, so a
-    /// reader never silently trusts a stale hash: any version that is not exactly
+    /// The persisted manifest carries both the *opaque* [`DefinitionHash`] (for
+    /// comparison) and the [`ProducingDescriptor`] in the clear (for replay). When
+    /// the descriptor's determinant set changes, the recorded descriptor's JSON
+    /// shape changes — but a serde-tolerant decode could still accept a
+    /// now-superseded shape silently. The version guard forecloses that: it is the
+    /// authoritative signal that an on-disk manifest was written under a different
+    /// determinant set and is therefore incomparable (stale hash) and
+    /// un-replayable (stale descriptor shape). The version is validated **before**
+    /// the parsed manifest is handed back, so a reader never silently trusts a
+    /// stale hash or replays a stale descriptor: any version that is not exactly
     /// [`MANIFEST_VERSION`] — older (a different, now-superseded determinant set)
     /// or newer (a format this build cannot read) — is a typed
     /// [`ManifestError::UnsupportedManifestVersion`], the signal to re-emit.
@@ -1024,18 +1046,16 @@ mod tests {
     #[test]
     fn older_manifest_version_is_rejected_cleanly() {
         // An old (v1) manifest's opaque definition hash was computed over a
-        // now-superseded descriptor determinant set, so it is incomparable.
-        // The reader must reject it as a typed error — the signal to re-emit —
-        // never a panic, never a silent stale-hash match. (v1 predates this
-        // build's MANIFEST_VERSION = 2.)
-        assert_eq!(
-            MANIFEST_VERSION, 2,
-            "this guard assumes v1 is the prior format"
-        );
+        // now-superseded descriptor determinant set, so it is incomparable. The
+        // reader must reject it as a typed error — the signal to re-emit — never a
+        // panic, never a silent stale-hash match. This guard assumes v1 is a
+        // prior, superseded format (the current build is well past it); the
+        // assertion that `supported == MANIFEST_VERSION` below pins the verdict to
+        // whatever the current version is, so it stays correct across bumps.
         assert!(matches!(
             MaterializationManifest::from_json_bytes(&manifest_at_version(1)),
             Err(ManifestError::UnsupportedManifestVersion { found: 1, supported })
-                if supported == MANIFEST_VERSION
+                if supported == MANIFEST_VERSION && MANIFEST_VERSION != 1
         ));
     }
 
@@ -1180,6 +1200,7 @@ mod tests {
 
     #[derive(Clone)]
     struct ContextSetFields {
+        embedding_table: Option<String>,
         candidate_source: ContextCandidateSource,
         value_columns: Vec<String>,
         aggregator: ContextAggregator,
@@ -1192,6 +1213,7 @@ mod tests {
         ProducingDescriptor::ContextSet {
             encoder_id: "jammi:context-set".into(),
             source_id: "patents".into(),
+            embedding_table: p.embedding_table.clone(),
             candidate_source: p.candidate_source.clone(),
             value_columns: p.value_columns.clone(),
             aggregator: p.aggregator,
@@ -1204,6 +1226,7 @@ mod tests {
     #[test]
     fn context_set_each_param_moves_the_hash() {
         let base = ContextSetFields {
+            embedding_table: None,
             candidate_source: ContextCandidateSource::Ann { k: 5 },
             value_columns: vec!["label".into()],
             aggregator: ContextAggregator::Mean,
@@ -1216,6 +1239,9 @@ mod tests {
             &no_model_env(),
             context_set_descriptor,
             &[
+                ("embedding_table", |p| {
+                    p.embedding_table = Some("pinned_source_table".into())
+                }),
                 ("candidate_source.k", |p| {
                     p.candidate_source = ContextCandidateSource::Ann { k: 9 }
                 }),
@@ -1249,6 +1275,7 @@ mod tests {
         // knobs (with the gather embedded in a ContextSet) and assert the hash
         // moves, so a lossy gather mirror is caught too.
         let base = ContextSetFields {
+            embedding_table: None,
             candidate_source: ContextCandidateSource::Edges {
                 gather: ContextEdgeGather {
                     edge_source: ContextEdgeSource::Registered {

@@ -52,7 +52,7 @@ use crate::catalog::result_repo::ResultTableRecord;
 use crate::error::{JammiError, Result};
 use crate::storage::StorageUrl;
 
-use super::manifest::{AnchorKind, DefinitionHash, InputAnchor};
+use super::manifest::{AnchorKind, DefinitionHash, InputAnchor, ProducingDescriptor};
 use super::ResultStore;
 
 /// Whether a producer reuses an already-materialised result for its exact
@@ -427,6 +427,30 @@ impl ResultStore {
             AnchorKind::UnpinnedAtInstant
             | AnchorKind::MutableVersion
             | AnchorKind::SourceVersion => Ok(CurrentAnchor::Undecidable),
+        }
+    }
+
+    /// The [`ProducingDescriptor`] a `ready` result table recorded — the verbatim
+    /// verb + typed parameters a recompute replays the producer from. Reads the
+    /// table's `.materialization.json` sidecar (the contract's source of truth)
+    /// and returns its descriptor.
+    ///
+    /// A table with no manifest sidecar (`definition_hash IS NULL` — a
+    /// pre-contract table created before the materialization contract landed) has
+    /// no recorded descriptor to replay, so it is a typed
+    /// [`JammiError::NotRecomputable`] — a loud refusal, never a re-run guessed
+    /// from the table's columns. A reader that only wants to *verify* reads the
+    /// opaque hash; a reader that wants to *recompute* reads the descriptor here.
+    pub async fn producing_descriptor(
+        &self,
+        table: &ResultTableRecord,
+    ) -> Result<ProducingDescriptor> {
+        let parquet_url = StorageUrl::parse(&table.parquet_path)?;
+        match self.read_materialization_manifest(&parquet_url).await? {
+            Some(manifest) => Ok(manifest.descriptor),
+            None => Err(JammiError::NotRecomputable {
+                table: table.table_name.clone(),
+            }),
         }
     }
 

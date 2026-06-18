@@ -55,9 +55,13 @@ use crate::model_task::ModelTask;
 /// manifest as a typed [`ManifestError::UnsupportedManifestVersion`] rather than
 /// comparing a stale hash computed over a different determinant set, or replaying
 /// a recorded descriptor whose shape this build no longer understands. The
-/// version is the *only* signal that an on-disk manifest was written under a
-/// different determinant set and is therefore incomparable/un-replayable: a
-/// reader must reject it, never silently trust it.
+/// version is the *authoritative* signal that an on-disk manifest was written
+/// under a different determinant set and is therefore incomparable/un-replayable
+/// — but not the only line of defence: a genuinely old (pre-contract) manifest
+/// whose JSON predates a since-added field is also rejected serde-first as a
+/// typed [`ManifestError`] before the version is even read. Either rejection is
+/// clean (the signal to re-emit); a reader must never silently trust a
+/// version-mismatched or shape-mismatched manifest.
 pub const MANIFEST_VERSION: u32 = 3;
 
 /// Content hash of *how* a table was produced: a canonical encoding of the
@@ -790,16 +794,18 @@ impl MaterializationManifest {
     /// The persisted manifest carries both the *opaque* [`DefinitionHash`] (for
     /// comparison) and the [`ProducingDescriptor`] in the clear (for replay). When
     /// the descriptor's determinant set changes, the recorded descriptor's JSON
-    /// shape changes — but a serde-tolerant decode could still accept a
-    /// now-superseded shape silently. The version guard forecloses that: it is the
-    /// authoritative signal that an on-disk manifest was written under a different
-    /// determinant set and is therefore incomparable (stale hash) and
-    /// un-replayable (stale descriptor shape). The version is validated **before**
-    /// the parsed manifest is handed back, so a reader never silently trusts a
-    /// stale hash or replays a stale descriptor: any version that is not exactly
-    /// [`MANIFEST_VERSION`] — older (a different, now-superseded determinant set)
-    /// or newer (a format this build cannot read) — is a typed
-    /// [`ManifestError::UnsupportedManifestVersion`], the signal to re-emit.
+    /// shape changes. Two independent guards keep a stale shape from being
+    /// trusted. **First**, serde itself: a genuinely old manifest whose JSON
+    /// predates a since-added field (e.g. a pre-`descriptor` manifest) fails the
+    /// `serde_json::from_slice` decode with a typed [`ManifestError`] before the
+    /// version is even inspected. **Second**, the version guard, for a shape that
+    /// still deserialises but was written under a different determinant set: any
+    /// version that is not exactly [`MANIFEST_VERSION`] — older (a different,
+    /// now-superseded determinant set) or newer (a format this build cannot
+    /// read) — is a typed [`ManifestError::UnsupportedManifestVersion`]. The
+    /// version is checked **before** the parsed manifest is handed back, so a
+    /// reader never silently trusts a stale hash or replays a stale descriptor;
+    /// whichever guard fires, the typed error is the signal to re-emit.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, ManifestError> {
         let manifest: Self = serde_json::from_slice(bytes)?;
         if manifest.manifest_version != MANIFEST_VERSION {
@@ -1056,20 +1062,50 @@ mod tests {
         ));
     }
 
+    /// A genuinely old-shape manifest JSON: the current manifest with the
+    /// `descriptor` field removed (an old manifest predates the recorded
+    /// descriptor) and an older `manifest_version`. Models what is actually on
+    /// disk from a prior format, not a current-shape struct with a flipped int.
+    fn old_shape_manifest_without_descriptor(version: u32) -> Vec<u8> {
+        let manifest = MaterializationManifest::compute(
+            &embedding_descriptor(),
+            &cpu_env(),
+            vec![],
+            ArtifactDigest::of_bytes(b"x"),
+            "run".into(),
+            "2026-06-17T00:00:00Z".into(),
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(&manifest).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("descriptor");
+        object.insert("manifest_version".into(), serde_json::json!(version));
+        serde_json::to_vec(&value).unwrap()
+    }
+
     #[test]
     fn older_manifest_version_is_rejected_cleanly() {
-        // An old (v1) manifest's opaque definition hash was computed over a
-        // now-superseded descriptor determinant set, so it is incomparable. The
-        // reader must reject it as a typed error — the signal to re-emit — never a
-        // panic, never a silent stale-hash match. This guard assumes v1 is a
-        // prior, superseded format (the current build is well past it); the
-        // assertion that `supported == MANIFEST_VERSION` below pins the verdict to
-        // whatever the current version is, so it stays correct across bumps.
-        assert!(matches!(
-            MaterializationManifest::from_json_bytes(&manifest_at_version(1)),
-            Err(ManifestError::UnsupportedManifestVersion { found: 1, supported })
-                if supported == MANIFEST_VERSION && MANIFEST_VERSION != 1
-        ));
+        // An old (v1) manifest predates the recorded `ProducingDescriptor`, so a
+        // real on-disk old manifest has *no* `descriptor` field. Decoding it
+        // therefore fails serde-first (`missing field 'descriptor'`) — before the
+        // version guard is even reached. That is still a clean rejection: a typed
+        // `ManifestError`, the signal to re-emit, never a panic or a silent
+        // stale-hash match. The version guard is the *second* line of defence (for
+        // a shape that still deserialises under a superseded determinant set); a
+        // truly old manifest is caught by the first. Either typed error is
+        // acceptable — what must never happen is a silent accept.
+        let err =
+            MaterializationManifest::from_json_bytes(&old_shape_manifest_without_descriptor(1))
+                .expect_err(
+                    "an old descriptor-less manifest must be rejected, not silently accepted",
+                );
+        assert!(
+            matches!(
+                err,
+                ManifestError::Serde(_) | ManifestError::UnsupportedManifestVersion { .. }
+            ),
+            "expected a clean typed rejection (serde or version guard), got {err:?}"
+        );
     }
 
     // ---- Non-vacuity guard: every output-affecting param of every data-producer

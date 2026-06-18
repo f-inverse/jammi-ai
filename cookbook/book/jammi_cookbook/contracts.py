@@ -747,6 +747,73 @@ ARTIFACTS: dict[str, Artifact] = {
         "authenticated tenants isolated, a missing/invalid credential rejected not run "
         "unscoped). PR CI reads the committed matrix and asserts verdicts-to-golden.",
     ),
+    # --- point-in-time correctness (H4: asof_join + verify_materialization) ---
+    "point_in_time.record": Artifact(
+        name="point_in_time.record",
+        kind="model_id",
+        filename="point_in_time.json",
+        produced_by="point_in_time",
+        note="The H4 temporal-correctness record: asof_join (SPEC-01) assembles a "
+        "leakage-free training set over the committed ogbn-arxiv keystone (papers + "
+        "cite_edges — NOT re-embedded), and verify_materialization (SPEC-02) attests "
+        "it. Each citing edge carries the citing paper's publication year as cited_at; "
+        "the as-of in-degree counts only edges known at-or-before a paper's one-year "
+        "horizon (the leakage-safe feature), the naive in-degree every edge (the "
+        "majority are future leakage). Carries: the leak (naive vs as-of downstream AUC "
+        "on a genuinely-independent future-citation label, and the conformal coverage "
+        "honesty result — leaky calibration breaks nominal, as-of holds it); the "
+        "asof_join definition + matched-fact mass; the train==serve skew measured "
+        "across embedded == live grpc:// RemoteDatabase; and the four-verdict "
+        "materialization matrix (match anchored by build_neighbor_graph over an "
+        "embeddings result table — ResultDigest input; match_with_unpinned_inputs for "
+        "a file source; mismatch for a wrong expected hash; missing_manifest for a "
+        "removed sidecar). Names no consumer — ogbn-arxiv, generic verbs.",
+    ),
+    # --- incremental-recompute + opt-in caching, measured (H4 SPEC-03 / W-61) -
+    "recompute.matrix": Artifact(
+        name="recompute.matrix",
+        kind="model_id",
+        filename="matrix.json",
+        produced_by="recompute",
+        note="The embedded-canonical incremental-recompute + caching matrix (SPEC-03's "
+        "two bounded actions over the materialization contract). Three families, all "
+        "measured as name-identity / outcome verdicts over an ~8-row ephemeral file:// "
+        "catalog (reuse observed by table-name identity — a producer returns a bare name "
+        "str, a cache HIT returns the SAME name, a MISS a new timestamped name): "
+        "(1) cache-hit-reuses — build_neighbor_graph(k=3) under cache='use' reuses the "
+        "cache='bypass' materialisation; a different k or min_similarity recomputes (the "
+        "probe keys on the FULL descriptor); propagate_embeddings(pinned emb, hops=1) "
+        "reuses while hops=2 recomputes; the UnpinnedAtInstant generate_embeddings "
+        "honestly never hits. (2) staleness — the definition_changed arm "
+        "(staleness(child, own hash)=fresh; staleness(child, a different hash)=stale, "
+        "reason 'definition_changed' naming recorded/current); the result_digest "
+        "input-drift arm is CUT (described in prose, not measured — see recompute.json). "
+        "(3) recompute-restores — recompute(child, report_only) is byte-identical "
+        "(verify_materialization verdict 'match' + equal recorded hash); "
+        "recompute(parent, report_only).downstream_stale lists the child; "
+        "cascade='downstream' recomputes parent + child once; derives_from(emb) is "
+        "one-hop result_digest edges. Generic GSP/GNN text corpus — names no consumer.",
+    ),
+    "recompute.record": Artifact(
+        name="recompute.record",
+        kind="model_id",
+        filename="recompute.json",
+        produced_by="recompute",
+        note="The provenance + method + boundary record for SPEC-03 / W-61: how the "
+        "recorded DefinitionHash is obtained purely off the Python surface "
+        "(verify_materialization(table, expected_definition='deadbeef')['found'] on a "
+        "deliberate mismatch — no get_definition verb, no engine internals), the two "
+        "recipe gotchas (build_neighbor_graph/propagate_embeddings take the ORIGINAL "
+        "source id not the embedding-table name; propagate_embeddings must pin "
+        "embedding_table=emb to be cacheable), the build-or-cut rationale for the CUT "
+        "result_digest input-drift staleness arm (a recompute over unmoved inputs is "
+        "byte-identical and uniquely-named so a child stays honestly fresh, and there is "
+        "no Python-surface verb to re-anchor a child onto a moved-digest parent in a "
+        "hermetic chain — never half-shipped as a fake demo), and the engine/platform "
+        "boundary (the engine ships the bounded mechanism — one probe per call, one "
+        "recompute per request, one bounded sweep; the scheduled/monitored recompute LOOP "
+        "is the consumer's, names no consumer).",
+    ),
     # --- tenant isolation as a measured property (B2) ------------------------
     "tenancy_b.record": Artifact(
         name="tenancy_b.record",

@@ -31,6 +31,9 @@ and a per-branch audit history.
 | Chapter 17 — the channel error taxonomy, each failure → its typed gRPC code (H3 §3.8) | merged | `feat/h3-cookbook-chapters` | #21 | chapter 17 (`17-channels-taxonomy/channels-taxonomy.qmd`): the engine `§3.8` channel error taxonomy (engine `#193`) MEASURED — each evidence-channel failure (`register_channel`/`add_channel_columns`) maps to its **CORRECT typed gRPC status code** on the wire instead of `Internal`-for-everything, validated cross-transport. `scripts/build_channels_taxonomy_cache.py` drives each failure mode on BOTH the embedded engine and a live remote `grpc://` `jammi-server`, measures the wire `StatusCode` on the `grpc://` arm (where the codes exist) with the embedded normalized error CLASS as the companion, asserts each maps as `#193` intended + `remote == embedded` on the class live; committed `artifacts/channels/matrix.json` + `golden_metrics.json` + `channels_taxonomy.json` + `checksums.json`. **CPU/hermetic** — channel ops are catalog ops, no GPU. **Measured taxonomy (all to golden, tol 0, ZERO deviation from #193):** duplicate registration → `ALREADY_EXISTS`; op on an unregistered channel → `NOT_FOUND`; column-redeclare conflict (different dtype) → `FAILED_PRECONDITION`; empty channel id → `INVALID_ARGUMENT`; **none collapses to `INTERNAL`/`UNKNOWN`**. `INTERNAL` recorded as the documented residual (a genuine DB fault is NOT fabricated). Honest nuance measured: an invalid dtype STRING is a CLIENT-SIDE `ValueError` (never reaches the wire), so the wire `INVALID_ARGUMENT` cell is an empty channel id (server-rejected). `remote == embedded` class for all 4 modes. `scripts/build_channels_taxonomy_cache.py` + `tests/test_channels_taxonomy.py`; `references.bib` (`grpcstatuscodes`, verified vs grpc.io). Gate green: api-ref **43**, ruff, pytest **111**, no-deferral, check_citations **36**; quarto via CI. |
 | Chapter 16 — the model catalog, measured remote == embedded (H3 §3.6) | merged | `feat/h3-cookbook-chapters` | #21 | chapter 16 (`16-lifecycle/lifecycle.qmd`): the engine `§3.6` model-catalog surface (`list_models`/`describe_model`/`delete_model`, on BOTH the embedded `Database` and the remote `RemoteDatabase`) MEASURED as the **referential-integrity matrix**, validated `remote == embedded` for every observable. The catalog lets you **see** the models the engine resolves and trains, and **clean them up**; pre-trained models are served by **id**. `scripts/build_lifecycle_cache.py` runs the whole catalog interaction on BOTH the embedded engine and a live remote `grpc://` `jammi-server` and asserts parity live; committed embedded-canonical `artifacts/lifecycle/matrix.json` + `golden_metrics.json` + `lifecycle.json` + `checksums.json`. **CPU/hermetic** — registration via a tiny CPU `fine_tune` (the only public path that puts a model row in the catalog), candle falls back off CUDA. Measured matrix (all to golden, tol 0): register→`registered` (2 rows: base + fine-tuned), reflected by describe+list as the minimal projection `{model_id, backend, task, status}`; delete-referenced→typed `referenced` (FAILED_PRECONDITION on wire); delete-absent-strict→`not_found` (the typed **ModelNotFound** — NOT invalid-argument); delete-absent-`if_exists`→no-op; `every_catalog_model_is_referenced=True`; **`remote == embedded` for all 8 observables**. Measured catalog property: every model in the catalog is trained-and-referenced, so there is no bare unreferenced model to delete (the delete-unreferenced-succeeds path simply does not arise) — a property of the engine's catalog, not a gap. `scripts/build_lifecycle_cache.py` + `tests/test_lifecycle_cache.py`. Gate green: api-ref **43**, ruff, no-deferral, check_citations; quarto via CI. |
 | Chapter 18 — per-verb tenant isolation + the BYO-auth seam (H3 §3.5) | merged | `feat/h3-cookbook-chapters` | #21 | chapter 18 (`18-tenancy-h3/tenancy-h3.qmd`): the engine `§3.5` **standing isolation oracle** MEASURED per-verb from the consumer side as **hard zeros**, plus the **BYO-auth seam** as a consumer-side worked example. Extends ch11's two-layer model to the full tenant-scoped verb surface. `scripts/build_tenancy_h3_cache.py` drives every verb on the embedded engine + (for the wire verbs) a live remote `grpc://` `jammi-server`, asserts `remote == embedded` live for all 10 cross-transport observables; committed `artifacts/tenancy_h3/matrix.json` + `golden_metrics.json` + `tenancy_h3.json` + `checksums.json`. **CPU/hermetic** — isolation is catalog/SQL behavior, no GPU. Reuses `rails.tenant`/`assert_listing_isolated`/`assert_rows_isolated` verbatim. **Measured matrix (all to golden, tol 0): 7 HARD ZEROS — `list_sources`/`describe_source`/`list_mutable_tables`/`list_topics`/`list_channels`/`list_models`/`sql` (discriminator-column Flight SQL row read) all leak 0 of A's resource to B.** Two STATED-POSITIVES (honest, not hidden): B sees the 3 built-in global channels (`vector`/`inference`/`bm25`); A reads a discriminator-less source whole (3 rows) — the engine does not authenticate. COLLISIONS never clobber: a duplicate `create_mutable_table` name across tenants ERRORS on the global PK; duplicate `register_topic`/`register_channel` ids isolate per-tenant (B's own). DESTRUCTIVE verbs are tenant-scoped: A's mutable table + topic SURVIVE B's `drop_mutable_table`/`drop_topic` (no cross-tenant destruction). **NO LEAK FOUND** — and notably the `drop_mutable_table` cross-tenant-destruction defect flagged in H3 scouting is **NOT present on the pinned 0.30.0 engine** (B's drop resolves in B's own namespace, A's table survives, measured). **BYO-auth seam (Part B):** a generic HMAC-SHA256 signed bearer token + an `AuthGateway` verifying it and binding the engine's `tenant_scope` IN FRONT of the verb — two authenticated tenants get isolated reads, a missing credential is rejected (not run unscoped), an invalid/forged credential is rejected (legit-same-tenant still resolves). NO real IdP, no product name — mirrors the engine's `grpc_byo_auth.rs` seam. `scripts/build_tenancy_h3_cache.py` + `tests/test_tenancy_h3_cache.py`; `references.bib` (`rfc2104` HMAC, `rfc6750` bearer-token — both RFC-Editor verified). Gate green: api-ref **43**, ruff, pytest **120**, no-deferral, check_citations **38**; quarto via CI. Names-no-consumer confirmed: opaque tenant UUIDs, generic verbs, no tenant/consumer vocabulary. |
+| Chapter 19 — point-in-time correctness (`asof_join` + `verify_materialization`) | in progress | `h4-ch19-point-in-time` | — | chapter 19 (`19-point-in-time/point-in-time.qmd`): the flagship H4 measured chapter — a leakage-free training set built with `asof_join` (the four pinned knobs each shown changing the result) and verified with `verify_materialization` (the four-verdict matrix folded in here, NOT a separate chapter). Reuses the committed `artifacts/arxiv/` keystone (papers + cite_edges) for the time-stamped citation-edge facts (each citing edge carries the citing paper's `year` as `cited_at`); the heavy embeddings are NOT re-emitted. The leak is honest and non-circular: label = a genuinely independent future event (`future_citations = naive_in_degree − asof_in_degree ≥ 1`), feature = in-degree; the leaky pipeline serves the current (full) in-degree → peeks at the future → inflated reported AUC; the as-of pipeline serves the leakage-free as-of in-degree. **Measured (all to golden):** `pit.leakage_delta = naive_auc − asof_auc = 0.1621` (naive 0.9574, asof 0.7952, strictly > 0); `pit.coverage_leaky = 0.8700` (breaks nominal 0.90) vs `pit.coverage_asof = 0.9125` (holds nominal) — the [@barber2023beyond] non-exchangeability failure; `pit.train_serve_skew == 0.0` (embedded `Database` == live `grpc://` `RemoteDatabase`, byte-identical asof output); the four verdicts + the within-run definition-hash round-trip. **CUT:** `pit.definition_hash` is NOT a pinned golden (not bit-reproducible across runs — it folds the embeddings result table's content digest; recorded as provenance only). The four-verdict matrix is CPU-hermetic over a tiny 6-row text corpus in an ephemeral `file://` catalog (Match anchored by `build_neighbor_graph` over an embeddings result table — `ResultDigest` input; see the four+ forks in the decisions log). `scripts/build_point_in_time_cache.py` (dual-transport `--target`) + `tests/test_point_in_time_cache.py` + `references.bib` (`kaufman2012leakage`, `snodgrass1999temporal`, `barber2023beyond`; reuses `orr2021featurestore`). Closure against a live online tier is platform Part II, out of scope. Pinned `jammi_ai==0.31.0`. |
+| Chapter 20 — incremental recompute + opt-in caching (H4 SPEC-03 / W-61) | in progress | `h4-ch20-recompute` | — | chapter 20 (`20-recompute/recompute.qmd`): SPEC-03's two bounded actions over the materialization contract MEASURED — **opt-in producer memoization** (`cache="use"`) and **`recompute(table, cascade)`** — plus the **sensing** reads they stand on (`staleness` / `derives_from` / the `verify_materialization` definition probe). **CPU/hermetic** over an ~8-row ephemeral `file://` catalog + the `tiny_modernbert` fixture (no GPU, no server). Reuse is observed by **table-name identity** (a producer returns a bare name `str`; a cache HIT returns the SAME name, a MISS a new timestamped name) — frozen as a name-equality boolean (1.0/0.0), never a wall-clock. **`current_definition` obtained purely from Python:** `verify_materialization(table, expected_definition="deadbeef")["found"]` returns the recorded `DefinitionHash` on a deliberate mismatch (no `get_definition` verb, no engine internals). **Two recipe gotchas (callout boxes + decisions log):** (1) `build_neighbor_graph`/`propagate_embeddings` take the ORIGINAL source id (`"docs"`), NOT the embedding-table name (passing the table → `Catalog error: No ready embedding table`); the embedding table is passed via `embedding_table=`. (2) `propagate_embeddings` MUST pin `embedding_table=emb` to be cacheable, else it resolves "latest ready embedding for docs" and a prior propagate shifts the anchor → cache miss. **Measured (all to golden, tol 0): FAMILY 1 cache-hit-reuses** — `bng(k=3)` use reuses bypass (`bng_reused=1.0`); `k=4` and `min_similarity=0.5` each recompute (the probe keys on the FULL descriptor); `propagate(pinned emb, hops=1)` reuses, `hops=2` recomputes; `generate_embeddings` (UnpinnedAtInstant) HONESTLY NEVER hits (`unpinned_reused=0.0`). **FAMILY 2 staleness** — `staleness(child, own hash)=fresh` (`fresh=1.0`); `staleness(child, a different hash)=stale`, reason `definition_changed` naming recorded/current (`stale_on_definition_change=1.0`). **FAMILY 3 recompute-restores** — `recompute(child, report_only)` byte-identical (verdict `match` + equal recorded hash, `byte_identical=1.0`); `recompute(parent, report_only).downstream_stale` lists the child (`downstream_stale_count=1`); `cascade="downstream"` recomputes parent+child once (`cascade_recomputed_count=2`); `derives_from(emb)` = 2 one-hop `result_digest` edges. **CUT (build-or-cut, written rationale):** the `result_digest` input-drift staleness arm — a recompute over unmoved inputs is byte-identical AND uniquely-named so a child stays honestly `fresh`, and there is no Python-surface verb to re-anchor a child onto a moved-digest parent in a hermetic chain; described via the SPEC-02 manifest-anchor model in prose, NOT half-shipped as a fake demo. Boundary stated (engine ships the bounded mechanism — one probe/call, one recompute/request, one bounded sweep; the scheduled/monitored recompute LOOP is the consumer's), names no consumer (generic GSP/GNN text corpus). `scripts/build_recompute_cache.py` + `tests/test_recompute_cache.py` (11 golden-asserted) + 2-artifact contracts registry; citations reuse `kleppmann2017ddia` + `orr2021featurestore` (already in bib). Gate green: api-ref **48**, ruff, pytest (recompute suite 11 pass), no-deferral, check_citations; quarto render of ch20 → real numbers. Pinned `jammi_ai==0.31.0`. |
+| Chapter 18 upgrade — the bearer on the real Flight SQL wire (#96) | in progress | `ch18-bearer-flight` | — | re-pin `jammi_ai==0.32.0` (jammi-client now carries the channel bearer on the **Flight SQL lane** — `db.sql()` over `pyarrow.flight` — matching the typed gRPC verbs that already carried it, jammi #96; on 0.31.0 the bearer rode only the typed path) and upgrade ch18's **Part B** from an in-process gateway to a **Flight-fronted** one. Part A (the per-verb isolation matrix on embedded + live `grpc://`) is UNCHANGED. **Locked design (B):** the gateway is a real `pyarrow.flight` server with a `ServerMiddlewareFactory` that reads the inbound `authorization` header off a genuine `db.sql()` call; it verifies the bearer in **both** `get_flight_info` AND `do_get` (sql() makes two Flight calls), rejects missing/invalid with `FlightUnauthenticatedError`, and on success binds the verified tenant via `tenant_scope` for a **real-engine read** (the emit's read leg hits the live upstream `jammi-server` reused from Part A; the chapter's CI-runnable demo binds an embedded `jammi_ai` read, no server needed). The client under test opens `jammi_client.connect(gateway, credentials=BearerCredentials(mint_token(...)))` and calls `db.sql()` — the bearer rides the REAL Flight wire (no `db._flight` seeding, no Python-variable shortcut — that would re-mock #96). **`mint_token` returns a BARE token** (`<subject>.<tenant>.<hmac>`); `BearerCredentials` prepends `"Bearer "` itself, so minting it would double to `"Bearer Bearer …"` (the #1 silent bug) — `verify_token` strips the one `"Bearer "` the wire carries. **Measured (8 new over-Flight golden keys, all tol 0, REPLACING the 5 in-process `byo_auth.*` keys — greenfield, no compat shims):** `byo_auth.bearer_on_flight_observed` (gateway saw `Bearer <minted>` == 1), `byo_auth.anonymous_no_bearer` (anonymous `db.sql()` carried no header), `byo_auth.a_isolated_over_flight` / `b_isolated_over_flight`, `byo_auth.missing_rejected_over_flight`, `byo_auth.forged_rejected_over_flight`, `byo_auth.legit_after_forgery_over_flight`, `byo_auth.over_flight_eq_embedded` (gateway tenant-scoped read == embedded `list_sources` under the same tenant). **Prose boundary fix at all sites** (builder `run_byo_auth` docstring + record note, chapter Part B intro + the §259 "gateway is the seam" prose + the closing "what this establishes"): the in-engine `grpc_byo_auth.rs` interceptor scopes to the **TYPED gRPC verbs**; the Flight lane is the gateway-in-front's job (engine #220, by design); the engine enforces auth on **no** transport. Server-bin from the published `jammi-server==0.32.0` wheel. Re-emitted `artifacts/tenancy_h3/{golden_metrics,matrix,tenancy_h3,checksums}.json`. Gate green: api-ref **48**, ruff clean, pytest **139** (full suite; tenancy_h3 suite 9), no-deferral clean (31 files), check_citations **40** (all resolve), chapter cells execute end-to-end to real numbers from the committed cache (CI-equivalent, no `jammi-server`). |
 | H4 PR #0 — `jammi_ai==0.31.0` re-pin + broken-venv fix | in progress | `h4-pin-0.31.0` | — | the H4-batch reconcile: a **pure regression re-pin** (like #18), ZERO golden drift. (1) **Venv fix** — the repo `.venv` had a LOCAL EDITABLE `jammi_client` pointed at the engine repo `clients/python` shadowing the published wheel, its protobuf stale (`pipeline_pb2` had no `Cascade`), so even `import jammi_ai` failed; recreated `.venv` clean and `pip install -e ".[book,dev]"` so the PUBLISHED `jammi_ai==0.31.0` and its **vendored** (non-editable, site-packages) `jammi_client==0.31.0` install — no editable engine client on the path; `import jammi_ai, jammi_client` + `from jammi_client import RemoteDatabase` confirmed, all 5 H4 verbs present on a live `Database`. (2) **Pin** `pyproject` `0.30.0 → 0.31.0` (+ comment block naming the H4 verbs); `jammi-client` NOT separately pinned (vendored transitively); README dev-line corrected to `==0.31.0`. (3) **API guard re-introspected** against the 0.31.0 wheel — the 5 H4 verbs added (`asof_join` [spine_by/spine_time/facts_by/facts_time/direction/boundary/tolerance_duration_micros/tie_break_column/project], `verify_materialization` [expected_definition], `staleness` [current_definition], `derives_from` [none], `recompute` [cascade]) + the `cache` kwarg on `generate_embeddings`/`infer`/`build_neighbor_graph`/`propagate_embeddings`; guard **43 → 48 surfaces**; `_api_reference.md` re-grounded (header bumped, cache kwarg added to the 4 verbs, new H4 point-in-time + materialization section, every signature copied from the live wheel). Gate: api-ref **48 surfaces** (see below). No new chapters. |
 
 ## #45 expansion verticals — measured goldens
@@ -151,6 +154,163 @@ API — the bare id raises `table not found`.)
 | A1 fine-tune methods | in review | `v-finetune` | — | the fine-tuning-methods vertical: cosent / mnrl (two temps) / triplet / hard-negatives / matryoshka / fine_tune_graph(declared) measured side-by-side on the committed ogbn-arxiv subset; emits `artifacts/finetune/` + per-method goldens; the honest finding (the supervision caps the gain, tier-03 circularity from the graph to the loss) |
 
 ## Decisions log
+
+- **ch18 Flight-bearer upgrade — design + forks against the 0.32.0 wheel (2026-06-18).**
+  The PLAN + an independent PRESSURE-TEST locked design B (replace ONLY Part B's
+  in-process gateway with a Flight-fronted one; Part A unchanged). Resolutions made
+  while implementing, each verified live against the installed `0.32.0` wheel and the
+  engine's own proven harness (`clients/python/tests/test_flight_bearer.py`):
+  - **Fork 1 — bare token, single un-prefix.** `jammi_client.BearerCredentials`
+    prepends `"Bearer "` on the wire (confirmed: the gateway middleware observed
+    `Bearer <minted>` for a bare-minted token). `mint_token` therefore returns the
+    BARE `"<subject>.<tenant>.<hmac>"`; `verify_token` strips exactly one leading
+    `"Bearer "` the wire added. Double-prefixing (`mint_token` returning
+    `"Bearer …"`) would put `"Bearer Bearer …"` on the wire and never verify — the
+    #1 silent bug the pressure-test flagged, defended by a unit assertion
+    (`not token.startswith("Bearer ")` + `verify_token(token) is None` for the
+    un-prefixed form).
+  - **Fork 2 — verify in BOTH `get_flight_info` and `do_get`.** `db.sql()` makes two
+    separate Flight calls, each re-presenting the bearer (observed: the recording
+    middleware logged the header twice per `sql()`). The gateway verifies in both;
+    rejecting in `get_flight_info` short-circuits the whole `sql()` before any read.
+    The rejection raises `flight.FlightUnauthenticatedError` so the client surfaces a
+    clean `FlightUnauthenticatedError` (not a wrapped `FlightServerError`) — confirmed
+    by the anonymous/forged legs catching exactly that type.
+  - **Fork 3 — the real-engine read leg, and where the chapter runs.** The emit's
+    gateway `do_get` binds the verified tenant on the live upstream `jammi-server`
+    (Part A's real server reused) and returns its isolated `list_sources` — a real
+    cross-transport demonstration, not a stub. The committed golden is produced from
+    that real-server run. The CHAPTER (which must `--execute` in CI with no
+    `jammi-server`) runs the identical seam against an in-process `pyarrow.flight`
+    gateway whose read leg binds an embedded `jammi_ai` `tenant_scope` — the bearer
+    still rides the REAL Flight wire (production `jammi_client.connect(...).sql()`
+    path, no `db._flight` seeding), only the upstream engine is embedded. The cells
+    then assert the committed real-server over-Flight verdicts. This honors
+    read-the-cache (the live wire verdict is emit-side, one-time) while keeping the
+    chapter CI-runnable to real numbers.
+  - **Fork 4 — `over_flight_eq_embedded` baseline.** Computed as the gateway's
+    tenant-scoped Flight read == the SAME upstream connection's tenant-scoped
+    `list_sources` (emit) / the embedded `list_sources` (chapter), both non-empty.
+    Part A already proves remote==embedded for `list_sources`, so this is a
+    self-contained parity of the seam's read against the engine's own scoped listing.
+  - **Greenfield key replacement (no shims).** The 5 in-process `byo_auth.*` golden
+    keys (`a_isolated`/`b_isolated`/`missing_rejected`/`invalid_rejected`/
+    `legit_after_forgery`) were REMOVED and replaced by the 8 `*_over_flight` /
+    `bearer_on_flight_observed` / `anonymous_no_bearer` / `over_flight_eq_embedded`
+    keys; the test + chapter assert the new set only.
+  - **Boundary truth.** The in-engine `grpc_byo_auth.rs` interceptor scopes to the
+    TYPED gRPC verbs; the Flight lane is the gateway-in-front's job (engine #220, by
+    design); the engine enforces auth on no transport. Prose corrected at every site
+    (builder docstring + record note, chapter intro + Part B prose + closing) — no
+    "ahead of every verb" overclaim remains. Server-bin from the published
+    `jammi-server==0.32.0` wheel.
+
+- **H4-PIT point-in-time chapter — the live-verified `asof_join` / `verify_materialization`
+  forks against the 0.31.0 wheel (2026-06-18).** The drafted plan
+  (`H4-POINT-IN-TIME-CHAPTER-PLAN.md`) was written before the wheel shipped; four of its
+  surface assumptions were wrong and are corrected here, each re-introspected live against
+  the installed `jammi_ai==0.31.0` (not guessed).
+  - **Fork 1 — `direction`/`boundary` are lowercase strings, not capitalized enum names.**
+    The Rust spec writes `MatchDirection::Backward` / `Boundary::Inclusive`; the *Python*
+    surface takes lowercase strings `direction="backward"`, `boundary="inclusive"`. Passing
+    `"Backward"` raises `ValueError: direction must be 'backward', 'forward', or 'nearest'
+    (got 'Backward')`. The chapter passes the lowercase forms throughout.
+  - **Fork 2 — `asof_join` resolves the BARE registered source id (`"spine"`),
+    NOT a catalog-qualified id.** Passing `"jammi.spine"` raises `Source 'jammi.spine'
+    not found`. The verb resolves the bare id through the session's tenant-scoped SQL path.
+  - **Fork 3 — the OUTPUT result table is READ as `"jammi.<table>"` (single quoted
+    identifier).** `asof_join` returns a result-table name; reading it is the standard
+    `SELECT * FROM "jammi.<table>"` idiom. The bare returned name does not resolve alone.
+  - **Fork 4 — a file/registered source verifies as `match_with_unpinned_inputs`, NOT
+    `match`; and the `Match` case is anchored by a result-table-input PRODUCER, not by
+    asof-over-a-result-table.** A registered file source exposes no version surface, so its
+    anchor is `UnpinnedAtInstant` (SPEC-02 §3.2). Verified live: `asof_join` over two file
+    sources → `match_with_unpinned_inputs (unpinned: ['spine','facts'])`. **Refinement of
+    the plan's fork-4:** the plan suggested "re-derive/register a result table and asof over
+    THAT" — but (a) `asof_join` cannot take a result table as spine/facts (it resolves
+    *sources*; a result-table name raises `Source not found`), and (b) the `asof_join` verb
+    body HARDCODES both inputs as `UnpinnedAtInstant`
+    (`crates/jammi-ai/src/pipeline/asof/verb.rs:107-110`), so an as-of output can *never*
+    verify as `Match`. The producer that anchors over a **result-table input** is
+    `build_neighbor_graph` (`result_digest_anchor` over the embeddings result table,
+    `pipeline/neighbor_graph.rs:263`). The chapter anchors the four-verdict matrix this way,
+    CPU-hermetic over a tiny 6-row text corpus in the ephemeral `file://` catalog:
+    **Match** = `build_neighbor_graph` over its embeddings result table (`ResultDigest`
+    input → `{'verdict':'match'}`); **MatchWithUnpinnedInputs** = `generate_embeddings` /
+    `asof_join` over a file source; **Mismatch** = a wrong `expected_definition`;
+    **MissingManifest** = the `.materialization.json` sidecar removed. All four reproduced
+    live on 0.31.0.
+  - **Fork 5 (conformal-honesty framing refinement).** The plan's §4 predicts the leaky
+    calibration "over-covers." The honest measured reality is the sharper, more damning
+    result: the leaky calibration **breaks the nominal guarantee** — its nonconformity
+    scores look artificially easy (a smaller quantile), so its prediction sets are too tight
+    and it **under-covers** (empirical 0.8700 < 0.90 nominal), while the honest as-of
+    calibration tracks nominal (0.9125). The leak label is a genuinely independent future
+    event (`future_citations = naive_in_degree − asof_in_degree ≥ 1`), NOT a threshold on
+    the feature, so neither feature is a tautological perfect ranker; the leaky feature
+    (current in-degree) peeks at that future and inflates the reported AUC.
+  - **CUT (with rationale) — `pit.definition_hash` is NOT a pinned golden.** The plan asked
+    for `pit.definition_hash` committed exact. Measured live: the Match-case
+    `definition_hash` is **not bit-reproducible across runs** (re-running the
+    embed→neighbor-graph chain yields a different hash each time — e.g. `c4ec17da…`,
+    `f577a7fb…`, `8cc03179…`). The reason is sound: the neighbor-graph's `definition_hash`
+    folds in its sole input's `ResultDigest` anchor = the *content* digest of the embeddings
+    result table, and the candle CPU embedding output is not pinned to bit-equality. Pinning
+    the literal hash as a `tol 0` golden would break CI on every re-emit — the #1 failure
+    mode CLAUDE.md forbids. So the hash is recorded in `point_in_time.json` as **provenance
+    only** and the chapter prints it illustratively, never asserts it. What IS reproducible
+    and golden-asserted instead: the four verdicts (`pit.verdict_match` /
+    `…_match_with_unpinned` / `…_mismatch` / `…_missing_manifest`, all `tol 0`) and the
+    **within-run round-trip** (`pit.verdict_match_roundtrip` — the Match table verifies
+    against its own hash), all stable across re-emits. The verdict mechanics are pinned; the
+    per-run content digest is not.
+- **H4 chapter 20 — incremental-recompute + caching: the live-verified recipe, two
+  gotchas, the `current_definition` method, and the one CUT (2026-06-18).** All
+  surfaces re-introspected live against the installed `jammi_ai==0.31.0` (never guessed);
+  the chapter and `scripts/build_recompute_cache.py` teach exactly what the wheel does.
+  - **Gotcha 1 — the graph verbs resolve the ORIGINAL source id, not the embedding
+    table.** `build_neighbor_graph("docs", …)` / `propagate_embeddings("docs", …)` take
+    the registered source id `"docs"`; the embedding table is passed separately via
+    `embedding_table=`. Passing the embedding-table name as the first positional raises
+    `RuntimeError: Catalog error: No ready embedding table for source '<table>'` (the verb
+    looks for the latest ready embedding *for the named source*). Live-confirmed.
+  - **Gotcha 2 — `propagate_embeddings` must PIN `embedding_table=emb` to be cacheable.**
+    Unpinned, it resolves "the latest ready embedding for docs"; once any prior propagate
+    has run, that latest-ready anchor shifts → a different `ResultDigest` → a cache miss.
+    Pinning the exact embedding table fixes the anchor so the same build reuses the same
+    materialisation. Live-confirmed: pinned `hops=1` reuses across two `cache="use"` calls.
+  - **`current_definition` is obtained purely from Python.** No `get_definition` verb
+    exists; `verify_materialization(table, expected_definition="deadbeef")` returns
+    `{"verdict":"mismatch","expected":"deadbeef","found":"<recorded hash>"}` — read
+    `found`. No engine internals touched. This feeds `staleness(table, current_definition)`.
+  - **Reuse is observed by table-name identity, never wall-clock.** A producer returns a
+    bare table-name `str`; a hit returns the SAME name, a miss a new timestamped name. The
+    determinism contract forbids a wall-clock measurement, so every cache verdict is a
+    name-equality boolean (1.0/0.0). Counts (downstream-stale, cascade-recomputed,
+    derives-from edges) are measured on a FRESH ephemeral catalog per assertion so they are
+    deterministic (a shared catalog accumulates redundant recomputed tables and inflates
+    the counts). Locked goldens: `downstream_stale_count=1`, `cascade_recomputed_count=2`
+    (parent+child), `derives_from_edge_count=2` (bng + prop, both `result_digest`).
+  - **CUT (build-or-cut) — the `result_digest` input-drift staleness arm.** The
+    `definition_changed` arm IS measured (fresh vs a different hash). The sibling
+    input-drift arm (a child senses a parent whose artifact digest moved) is CUT, NOT
+    half-shipped: a `recompute` over UNMOVED inputs is byte-identical (Family 3) AND
+    produces a uniquely-named NEW table, so a child anchored on the original parent stays
+    honestly `fresh` (its recorded parent digest still matches the parent's current digest —
+    nothing drifted); and there is no Python-surface verb to re-anchor an EXISTING child
+    onto a moved-digest parent in a hermetic chain (re-anchoring only happens when a
+    producer runs and records a fresh anchor, producing a NEW child). Fabricating a drift
+    would require reaching past the public surface into the manifest store. The arm is
+    therefore DESCRIBED via the SPEC-02 manifest-anchor model in prose (a recomputed parent
+    gets a new digest; a child anchored on the old one is detected stale by the same
+    per-input comparison — recursion falls out with no special case) and only the
+    `definition_changed` arm is measured. `test_recompute_cache.py` asserts the cut is
+    recorded explicitly (the golden key is genuinely absent, not faked to 0).
+  - **Boundary (SPEC-03 §7) stated, names no consumer.** The engine ships the bounded
+    MECHANISM — one cache probe per producer call, one recompute on one explicit request,
+    one bounded downstream sweep on `cascade="downstream"`. The scheduled / monitored
+    recompute LOOP (a staleness-monitor that triggers recompute, a cron sweep, cache
+    eviction/TTL) is the consumer's composition on a published engine version.
 
 - **`§3.6` model-catalog chapter — the registration path + the referential matrix
   (2026-06-16).** The chapter MEASURES the engine's model catalog

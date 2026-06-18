@@ -17,9 +17,13 @@ authors = [{ name = "F-Inverse" }]
 # published-artifact signal that HEAD-testing alone would lose.) The book authors
 # against the engine API and never vendors or edits engine source; jammi_client is
 # carried transitively by the embed wheel, not pinned separately. numpy/pyarrow are
-# the data substrate the chapters manipulate. The engine surface the chapters rely
-# on (and which scripts/check_api_reference.py guards against the installed wheel)
-# includes the point-in-time + materialization tier: asof_join (as-of / point-in-time
+# the data substrate the chapters manipulate. The HEAD engine carries the bearer
+# token on the Flight SQL lane (RemoteDatabase.sql() / db.sql() over pyarrow.flight)
+# — matching the typed gRPC verbs that already carried it (jammi #96); the engine
+# enforces auth on no transport by design, so verifying the bearer is the consumer's
+# (a gateway in front). The engine surface the chapters rely on (and which
+# scripts/check_api_reference.py guards against the installed wheel) includes the
+# point-in-time + materialization tier: asof_join (as-of / point-in-time
 # temporal join: spine_by/spine_time/facts_by/
 # facts_time/direction/boundary/tolerance_duration_micros/tie_break_column/project),
 # verify_materialization(expected_definition), staleness(current_definition),

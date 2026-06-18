@@ -1,24 +1,26 @@
 {
   "byo_auth": {
-    "a_isolated": true,
+    "a_isolated_over_flight": true,
     "a_seen": [
-      "auth_a_emb",
-      "nodisc_emb",
-      "pairs_a_emb",
-      "src_a_emb",
-      "tagged_emb"
+      "auth_a_byo",
+      "nodisc_rem",
+      "pairs_a_rem",
+      "src_a_rem",
+      "tagged_rem"
     ],
-    "b_isolated": true,
+    "anonymous_no_bearer": true,
+    "b_isolated_over_flight": true,
     "b_seen": [
-      "auth_b_emb",
-      "nodisc_emb",
-      "tagged_emb"
+      "auth_b_byo",
+      "tagged_rem"
     ],
-    "invalid_rejected": true,
-    "legit_after_forgery": true,
-    "missing_rejected": true
+    "bearer_on_flight_observed": true,
+    "forged_rejected_over_flight": true,
+    "legit_after_forgery_over_flight": true,
+    "missing_rejected_over_flight": true,
+    "over_flight_eq_embedded": true
   },
-  "byo_auth_note": "The engine authenticates nothing on its own; the jammi-session-id header is a transport correlation id, NOT a trust boundary. The engine ships a SEAM (a custom interceptor ahead of every verb that authenticates the caller and binds the tenant from the verified claim) and a worked example (grpc_byo_auth.rs). This is the consumer-side mirror: a generic HMAC-signed bearer token verified by an AuthGateway that maps the verified claim to a tenant and binds the engine's tenant_scope. A missing/invalid credential is rejected BEFORE any engine verb runs \u2014 it never falls through to an unscoped read. The engine ships the seam; it never ships the auth. Names no consumer, no real IdP.",
+  "byo_auth_note": "The engine authenticates nothing on any transport; the jammi-session-id header is a transport correlation id, NOT a trust boundary. Verifying a caller is the consumer's job \u2014 a gateway in front of the engine. The engine's grpc_byo_auth.rs worked example shows that seam for the TYPED gRPC verbs; the Flight SQL lane (db.sql()) is the gateway-in-front's responsibility there too (engine #220, by design). On jammi-client 0.32.0 the client carries the channel's bearer on the Flight SQL lane as well as the typed verbs (jammi #96; on 0.31.0 it rode only the typed path). This is the consumer-side mirror over that real Flight wire: a pyarrow.flight gateway reads the inbound bearer off a genuine db.sql() call, a generic HMAC-signed bearer token it verifies and maps to a tenant, and a real-engine tenant_scope read it returns to the caller. A missing/invalid credential is rejected (FlightUnauthenticatedError) in get_flight_info BEFORE any engine read runs \u2014 it never falls through to an unscoped read. The engine ships the credential plumbing and the per-request tenant scope; it never ships the auth. Names no consumer, no real IdP.",
   "leak_finding": "NONE \u2014 every hard-zero verb measured 0; every destructive verb left A's resource intact (no cross-tenant destruction); duplicate ids ERROR or isolate, never clobber. The drop_mutable_table cross-tenant-destruction defect flagged during scouting is NOT present on the pinned 0.30.0 engine: B's drop of a name A registered resolves in B's own namespace (not found), and A's table survives (mt_survives_foreign_drop=True, measured).",
   "matrix": {
     "b_drop_mt_raised": true,
@@ -92,9 +94,10 @@
     }
   ],
   "parity_verdict": "remote == embedded for every cross-transport observable",
-  "purpose": "The engine\u2194cookbook validator for the \u00a73.5 standing isolation oracle: for every tenant-scoped verb, tenant B cannot see or reach tenant A's resource, measured from the consumer side as a per-verb matrix of hard zeros and documented stated-positives, on the embedded engine and a live grpc:// jammi-server. Plus the BYO-auth seam, demonstrated from the consumer side as a generic HMAC-bearer-token gateway in front of the engine's tenant binding.",
+  "purpose": "The engine\u2194cookbook validator for the \u00a73.5 standing isolation oracle: for every tenant-scoped verb, tenant B cannot see or reach tenant A's resource, measured from the consumer side as a per-verb matrix of hard zeros and documented stated-positives, on the embedded engine and a live grpc:// jammi-server. Plus the BYO-auth seam, demonstrated from the consumer side over the REAL Flight SQL wire: a generic HMAC-bearer-token gateway that reads the bearer off a genuine db.sql() Flight call and binds the verified tenant for a real-engine read, in front of the engine's tenant binding.",
   "transports": [
     "embedded (file://, in-process)",
-    "remote (grpc://, live jammi-server) \u2014 the catalog reads + the discriminator sql row read"
+    "remote (grpc://, live jammi-server) \u2014 the catalog reads + the discriminator sql row read",
+    "the BYO-auth seam over the real Flight SQL lane (pyarrow.flight) \u2014 a BearerCredentials db.sql() against a consumer-side gateway"
   ]
 }

@@ -26,10 +26,12 @@ hold, a documented stated-positive where the engine is honest about visibility.
 
 We measure on the embedded engine and, for every verb reachable on the wire, on a
 live `grpc://` `jammi-server` — and freeze the matrix to golden. Then we
-demonstrate the engine's **BYO-auth seam** from the consumer side: a generic
-HMAC-signed bearer token, verified by an authenticating gateway that maps the
-verified claim to a tenant and binds it *in front of* the engine. The engine
-ships the seam; it never ships the auth.
+demonstrate the engine's **BYO-auth seam** from the consumer side, over the **real
+Flight SQL wire** (`jammi-client` `0.32.0` carries the bearer on `db.sql()`'s
+Flight lane — jammi #96): a generic HMAC-signed bearer token, read off a genuine
+`db.sql()` call by an authenticating gateway that maps the verified claim to a
+tenant and binds it *in front of* the engine. The engine enforces auth on no
+transport; the gateway in front is the consumer's.
 
 ```{python}
 from jammi_cookbook import contracts
@@ -210,12 +212,18 @@ id assumes that session's tenant. It is the right trade-off on a trusted network
 and the wrong one the moment an untrusted caller can reach the port. **It is not a
 trust boundary.**
 
-To put a real tenant boundary in front of untrusted callers, the engine ships a
-**seam** — a custom interceptor that runs ahead of every verb, authenticates the
-caller's credential, derives the tenant from the *verified* claim, and binds it —
-and a worked example (`grpc_byo_auth.rs`). Here is the consumer-side mirror: a
-**generic** HMAC-signed bearer token (no identity provider, no product name) and an
-authenticating gateway that verifies it and binds the engine's tenant scope.
+Verifying a caller is the consumer's job — a gateway placed **in front of** the
+engine. The engine's `grpc_byo_auth.rs` worked example shows that seam for the
+**typed gRPC verbs**; the Flight SQL lane (`db.sql()`) is a separate
+`pyarrow.flight` transport and is the gateway-in-front's responsibility there too
+(engine issue #220, by design). On `jammi-client` `0.32.0` the client carries the
+channel's bearer on the **Flight SQL lane** as well as the typed verbs (jammi #96;
+on `0.31.0` the bearer rode only the typed path). So here is the consumer-side
+seam over that **real Flight wire**: a `pyarrow.flight` gateway reads the inbound
+bearer off a genuine `db.sql()` call, a **generic** HMAC-signed bearer token (no
+identity provider, no product name) it verifies, and a real-engine tenant-scoped
+read it returns — the credential binds the engine's `tenant_scope` in front of the
+engine.
 
 The credential is generic on purpose: an opaque subject plus a tenant claim,
 HMAC-SHA256 [@rfc2104] over both under a key only the consumer's issuer and gateway
@@ -234,19 +242,22 @@ SIGNING_KEY = b"consumer-issuer-signing-key-not-jammi"
 
 
 def mint_token(subject: str, tenant_id: str) -> str:
-    """A generic signed bearer token: 'Bearer <subject>.<tenant>.<hex-mac>'."""
+    """A generic signed token '<subject>.<tenant>.<hex-mac>' — BARE, no 'Bearer '
+    prefix. BearerCredentials prepends 'Bearer ' itself on the wire, so minting it
+    here too would double it to 'Bearer Bearer …' and never verify."""
     claim = f"{subject}.{tenant_id}"
     sig = hmac.new(SIGNING_KEY, claim.encode(), hashlib.sha256).hexdigest()
-    return f"Bearer {claim}.{sig}"
+    return f"{claim}.{sig}"
 
 
-def verify_token(token):
-    """Verify a bearer token; return its tenant claim, or None if missing /
-    malformed / failing the constant-time signature check. Only a VERIFIED claim
-    yields a tenant — a forged tenant the signature does not cover returns None."""
-    if not token or not token.startswith("Bearer "):
+def verify_token(authorization):
+    """Verify the wire's 'authorization' header; return its tenant claim, or None
+    if missing / malformed / failing the constant-time signature check. Strips the
+    one 'Bearer ' the wire carries. Only a VERIFIED claim yields a tenant — a
+    forged tenant the signature does not cover returns None."""
+    if not authorization or not authorization.startswith("Bearer "):
         return None
-    claim, _, sig_hex = token[len("Bearer "):].rpartition(".")
+    claim, _, sig_hex = authorization[len("Bearer "):].rpartition(".")
     subject, _, tenant_id = claim.partition(".")
     if not claim or not sig_hex or not subject or not tenant_id:
         return None
@@ -256,18 +267,25 @@ def verify_token(token):
     return tenant_id
 ```
 
-The **gateway** is the seam: it runs in front of every engine verb, authenticates
-the token, derives the tenant from the verified claim, and binds it via the
-engine's `tenant_scope` — the same scope the stock interceptor sets, here sourced
-from an authenticated claim instead of an unauthenticated session lookup. A missing
-or invalid credential is **rejected before the engine is touched** — the request
-reads nothing, it does not fall through to an unscoped global read.
+The **gateway** is the seam, as a real `pyarrow.flight` server. A `db.sql()` call
+presents its bearer on the Flight lane; a `ServerMiddlewareFactory` reads the
+inbound `authorization` header (pyarrow lowercases the key and hands each value as
+a list), the handlers verify it, derive the tenant from the *verified* claim, and
+bind it via the engine's `tenant_scope` for the read. `db.sql()` makes **two**
+Flight calls (`get_flight_info` then `do_get`), each re-presenting the bearer, so
+the gateway verifies in **both** — rejecting in `get_flight_info` short-circuits
+the whole `sql()` before any read runs. A missing or invalid credential raises
+`FlightUnauthenticatedError`; the request reads nothing, it does not fall through
+to an unscoped global read.
 
 ```{python}
+import socket
 import tempfile
 
 import jammi_ai
+import jammi_client
 import pyarrow as pa
+import pyarrow.flight as flight
 import pyarrow.parquet as pq
 from jammi_cookbook.rails import tenant
 
@@ -275,21 +293,56 @@ TENANT_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 TENANT_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
 
-class Unauthenticated(Exception):
-    """Raised by the gateway before any engine verb runs — the request reads
-    nothing, it never runs unscoped."""
+def _free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
-class AuthGateway:
-    def __init__(self, db):
+class AuthMiddleware(flight.ServerMiddleware):
+    def __init__(self, authorization):
+        self.authorization = authorization
+
+
+class AuthMiddlewareFactory(flight.ServerMiddlewareFactory):
+    """Records the inbound 'authorization' header of every Flight call — the exact
+    value db.sql() put on the wire (the value is a LIST; take the first)."""
+
+    def __init__(self):
+        self.observed = []
+
+    def start_call(self, info, headers):
+        auth = headers.get("authorization")
+        value = auth[0] if auth else None
+        self.observed.append(value)
+        return AuthMiddleware(value)
+
+
+class AuthGatewayServer(flight.FlightServerBase):
+    """The seam: a Flight server that verifies the bearer in front of the engine."""
+
+    def __init__(self, location, db, factory):
+        super().__init__(location, middleware={"auth": factory})
         self._db = db
+        self._schema = pa.schema([("source_id", pa.string())])
 
-    def list_sources(self, token):
-        tenant_id = verify_token(token)
-        if tenant_id is None:                       # reject — never bind None
-            raise Unauthenticated("missing or invalid credential")
-        with self._db.tenant_scope(tenant_id):      # bind the VERIFIED tenant
-            return [s["source_id"] for s in self._db.list_sources()]
+    def _verified_tenant(self, context):
+        mw = context.get_middleware("auth")
+        tenant_id = verify_token(mw.authorization if mw is not None else None)
+        if tenant_id is None:                                  # reject — never bind None
+            raise flight.FlightUnauthenticatedError("missing or invalid credential")
+        return tenant_id
+
+    def get_flight_info(self, context, descriptor):
+        self._verified_tenant(context)                         # short-circuits sql()
+        endpoint = flight.FlightEndpoint(b"sources", [])
+        return flight.FlightInfo(self._schema, descriptor, [endpoint], -1, -1)
+
+    def do_get(self, context, ticket):
+        tenant_id = self._verified_tenant(context)
+        with self._db.tenant_scope(tenant_id):                 # bind the VERIFIED tenant
+            rows = [s["source_id"] for s in self._db.list_sources()]
+        return flight.RecordBatchStream(pa.table({"source_id": rows}))
 
 
 catalog = tempfile.mkdtemp()
@@ -306,16 +359,46 @@ def write_src(name, tenant_id):
 
 write_src("auth_a", TENANT_A)
 write_src("auth_b", TENANT_B)
-gateway = AuthGateway(db)
+
+factory = AuthMiddlewareFactory()
+gateway = AuthGatewayServer(
+    flight.Location.for_grpc_tcp("127.0.0.1", _free_port()), db, factory
+)
+gateway_endpoint = f"127.0.0.1:{gateway.port}"
+
+
+def gateway_sources(token):
+    """The production db.sql() Flight path: the bearer rides the REAL Flight wire
+    (BearerCredentials prepends 'Bearer '); anonymous when token is None."""
+    credentials = jammi_client.BearerCredentials(token) if token is not None else None
+    conn = jammi_client.connect(f"grpc://{gateway_endpoint}", credentials=credentials)
+    try:
+        return conn.sql("SELECT source_id FROM sources").column("source_id").to_pylist()
+    finally:
+        conn.close()
 ```
 
-Two authenticated callers, two valid tokens for two distinct tenants — each sees
-only its own tenant's source. The tenant is *inside* the signed claim; neither
-caller asserts it in a plain header.
+The bearer rides the real Flight wire: an authenticated `db.sql()` puts
+`Bearer <minted>` on every Flight call the gateway's middleware sees, while an
+anonymous `db.sql()` carries no `authorization` header at all.
 
 ```{python}
-a_seen = gateway.list_sources(mint_token("subject-a", TENANT_A))
-b_seen = gateway.list_sources(mint_token("subject-b", TENANT_B))
+minted_a = mint_token("subject-a", TENANT_A)
+a_seen = gateway_sources(minted_a)
+bearer_on_flight = bool(factory.observed) and all(
+    obs == f"Bearer {minted_a}" for obs in factory.observed
+)
+print(f"the gateway saw on the Flight wire: {factory.observed[0]}")
+print(f"bearer rides the real Flight lane: {bearer_on_flight}")
+assert bearer_on_flight
+```
+
+Two authenticated callers, two valid tokens for two distinct tenants — each
+`db.sql()` over Flight sees only its own tenant's source. The tenant is *inside*
+the signed claim; neither caller asserts it in a plain header.
+
+```{python}
+b_seen = gateway_sources(mint_token("subject-b", TENANT_B))
 a_isolated = "auth_a" in a_seen and "auth_b" not in a_seen
 b_isolated = "auth_b" in b_seen and "auth_a" not in b_seen
 print(f"caller A sees {a_seen}  isolated: {a_isolated}")
@@ -323,18 +406,22 @@ print(f"caller B sees {b_seen}  isolated: {b_isolated}")
 assert a_isolated and b_isolated
 ```
 
-A missing credential is rejected — the gateway raises before the engine is
-touched, so the caller reads nothing. It does **not** fall through to an unscoped
-read that could surface a global (`tenant_id IS NULL`) row.
+An anonymous `db.sql()` carries no bearer, and the gateway rejects it in
+`get_flight_info` before any engine read runs — the caller reads nothing. It does
+**not** fall through to an unscoped read that could surface a global
+(`tenant_id IS NULL`) row.
 
 ```{python}
+before = len(factory.observed)
 try:
-    gateway.list_sources(None)
+    gateway_sources(None)
     missing_rejected = False
-except Unauthenticated:
+except flight.FlightUnauthenticatedError:
     missing_rejected = True
+anon_no_bearer = all(obs is None for obs in factory.observed[before:])
+print(f"anonymous db.sql() carried no bearer: {anon_no_bearer}")
 print(f"missing credential rejected (not run unscoped): {missing_rejected}")
-assert missing_rejected
+assert missing_rejected and anon_no_bearer
 ```
 
 An invalid credential — a forged tenant claim the signature does not cover — is
@@ -343,31 +430,49 @@ forgery claimed still resolves, proving the rejection was the signature, not a
 tenant blocklist. The seam authenticates the claim.
 
 ```{python}
-forged = f"Bearer subject-mallory.{TENANT_A}.deadbeef"
+forged = f"subject-mallory.{TENANT_A}.deadbeef"
 try:
-    gateway.list_sources(forged)
-    invalid_rejected = False
-except Unauthenticated:
-    invalid_rejected = True
-legit_after = "auth_a" in gateway.list_sources(mint_token("subject-a", TENANT_A))
-print(f"invalid (forged) credential rejected: {invalid_rejected}")
+    gateway_sources(forged)
+    forged_rejected = False
+except flight.FlightUnauthenticatedError:
+    forged_rejected = True
+legit_after = "auth_a" in gateway_sources(mint_token("subject-a", TENANT_A))
+print(f"invalid (forged) credential rejected: {forged_rejected}")
 print(f"a valid token for the same tenant still resolves: {legit_after}")
-assert invalid_rejected and legit_after
+assert forged_rejected and legit_after
+gateway.shutdown()
+```
+
+The gateway's tenant-scoped read over Flight is the same isolation as the embedded
+`list_sources` under the same tenant — the seam puts the wire bearer in front of
+the engine's binding without changing what the engine returns.
+
+```{python}
+with tenant(db, TENANT_A):
+    embedded_a = sorted(s["source_id"] for s in db.list_sources())
+over_flight_eq_embedded = sorted(a_seen) == embedded_a
+print(f"over-Flight read == embedded read under the same tenant: {over_flight_eq_embedded}")
+assert over_flight_eq_embedded
 ```
 
 ```{python}
 # | echo: false
 # The seam verdict, asserted against the frozen committed cache (the same recipe
-# run live at emit time on the embedded engine).
+# run live at emit time over a REAL jammi-server Flight wire).
 byo = record["byo_auth"]
-assert byo["a_isolated"] is True and byo["b_isolated"] is True
-assert byo["missing_rejected"] is True and byo["invalid_rejected"] is True
+assert byo["bearer_on_flight_observed"] is True and byo["anonymous_no_bearer"] is True
+assert byo["a_isolated_over_flight"] is True and byo["b_isolated_over_flight"] is True
+assert byo["missing_rejected_over_flight"] is True
+assert byo["forged_rejected_over_flight"] is True and byo["over_flight_eq_embedded"] is True
 for cell, observed in (
-    ("a_isolated", a_isolated),
-    ("b_isolated", b_isolated),
-    ("missing_rejected", missing_rejected),
-    ("invalid_rejected", invalid_rejected),
-    ("legit_after_forgery", legit_after),
+    ("bearer_on_flight_observed", bearer_on_flight),
+    ("anonymous_no_bearer", anon_no_bearer),
+    ("a_isolated_over_flight", a_isolated),
+    ("b_isolated_over_flight", b_isolated),
+    ("missing_rejected_over_flight", missing_rejected),
+    ("forged_rejected_over_flight", forged_rejected),
+    ("legit_after_forgery_over_flight", legit_after),
+    ("over_flight_eq_embedded", over_flight_eq_embedded),
 ):
     rails.measure(f"tenancy_h3.byo_auth.{cell}", 1.0 if observed else 0.0)
 ```
@@ -381,10 +486,14 @@ destroy A's resource. The two honest limits — a globally-scoped resource (a
 built-in channel, a discriminator-less source) is visible to every tenant — are
 measured as positive counts, not glossed. No verb leaks.
 
-And the engine's BYO-auth seam, demonstrated from the consumer side: the engine
-ships the *seam* (the per-request tenant binding every verb reads), and the
+And the engine's BYO-auth seam, demonstrated from the consumer side **over the
+real Flight SQL wire**: the credential now rides the actual `db.sql()` Flight lane
+(`jammi-client` `0.32.0`, jammi #96), not an in-process call — the gateway reads
+the bearer the client put on the wire and binds the engine's `tenant_scope` in
+front of the read. The engine ships the *credential plumbing* (the bearer on both
+the typed gRPC verbs and the Flight lane) and the *per-request tenant binding*; the
 consumer supplies the *auth* (the generic credential, the gateway that verifies it
-and binds the verified tenant). Authentication runs *in front of* the binding, so
+and binds the verified tenant). Authentication runs *in front of* the engine, so
 the tenant the engine acts on is the one the credential proves — and a rejected
-caller fails the request, never running unscoped. The engine ships the seam; it
-never ships the auth.
+caller fails the request in `get_flight_info`, never running unscoped. The engine
+enforces auth on no transport by design; the gateway in front is the consumer's.

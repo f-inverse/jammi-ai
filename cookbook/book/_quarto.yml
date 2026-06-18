@@ -49,6 +49,12 @@ book:
     - part: "The model catalog"
       chapters:
         - chapters/16-lifecycle/lifecycle.qmd
+    - part: "Temporal correctness"
+      chapters:
+        - chapters/19-point-in-time/point-in-time.qmd
+    - part: "Temporal correctness — incremental recompute"
+      chapters:
+        - chapters/20-recompute/recompute.qmd
     - part: "The scale-tier cross-check"
       chapters:
         - chapters/14-scale/scale.qmd

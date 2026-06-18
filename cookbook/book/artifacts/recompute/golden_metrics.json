@@ -1,0 +1,58 @@
+{
+  "cache.bng_k4_recomputed": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "cache.bng_minsim_recomputed": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "cache.bng_reused": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "cache.prop_hops_recomputed": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "cache.prop_reused": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "cache.unpinned_reused": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "recompute.byte_identical": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "recompute.cascade_recomputed_count": {
+    "tol": 0.0,
+    "value": 2.0
+  },
+  "recompute.derives_from_all_result_digest": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "recompute.derives_from_edge_count": {
+    "tol": 0.0,
+    "value": 2.0
+  },
+  "recompute.downstream_stale_count": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "recompute.report_only_recomputes_only_parent": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "staleness.fresh": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "staleness.stale_on_definition_change": {
+    "tol": 0.0,
+    "value": 1.0
+  }
+}

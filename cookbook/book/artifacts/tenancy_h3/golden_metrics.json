@@ -1,21 +1,33 @@
 {
-  "byo_auth.a_isolated": {
+  "byo_auth.a_isolated_over_flight": {
     "tol": 0.0,
     "value": 1.0
   },
-  "byo_auth.b_isolated": {
+  "byo_auth.anonymous_no_bearer": {
     "tol": 0.0,
     "value": 1.0
   },
-  "byo_auth.invalid_rejected": {
+  "byo_auth.b_isolated_over_flight": {
     "tol": 0.0,
     "value": 1.0
   },
-  "byo_auth.legit_after_forgery": {
+  "byo_auth.bearer_on_flight_observed": {
     "tol": 0.0,
     "value": 1.0
   },
-  "byo_auth.missing_rejected": {
+  "byo_auth.forged_rejected_over_flight": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "byo_auth.legit_after_forgery_over_flight": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "byo_auth.missing_rejected_over_flight": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "byo_auth.over_flight_eq_embedded": {
     "tol": 0.0,
     "value": 1.0
   },

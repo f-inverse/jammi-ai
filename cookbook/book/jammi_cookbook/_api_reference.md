@@ -1,7 +1,7 @@
-# `jammi_ai` API reference (grounded, pinned `jammi_ai==0.31.0`)
+# `jammi_ai` API reference (grounded, pinned `jammi_ai==0.32.0`)
 
 These are the `jammi_ai` Python signatures the chapters call, **confirmed by
-introspecting the installed `0.31.0` wheel** — `inspect.signature` resolved on a
+introspecting the installed `0.32.0` wheel** — `inspect.signature` resolved on a
 live `connect("file://…")` instance, the way a caller invokes a verb through the
 thin `Database` wrapper's composition (explicit methods on the wrapper, every
 other verb forwarded to the native handle via `__getattr__`) — not transcribed
@@ -11,7 +11,7 @@ the pin moves, re-introspect and update this file
 
 ## Two planes, one verb surface
 
-`0.31.0` splits provisioning from execution, and the book's teaching spine is the
+`0.32.0` splits provisioning from execution, and the book's teaching spine is the
 **`connect(target)` parity**: write a recipe once, swap only the target.
 
 - **Control plane** — provisioning (register sources/topics/mutable tables,
@@ -29,7 +29,12 @@ surface is identical across planes:
 - `jammi_ai.connect("grpc://host:port") -> RemoteDatabase` — the pure-Python
   client (`jammi_client`) over a running `jammi-server`. The **GPU** compute tier
   (embedding, fine-tune, context-predictor training) runs here; the CPU embed
-  wheel cannot do GPU.
+  wheel cannot do GPU. A `RemoteDatabase` may carry a bearer credential
+  (`jammi_client.connect(endpoint, credentials=jammi_client.BearerCredentials(token))`);
+  `0.32.0` threads that bearer onto **both** lanes the client uses — the typed
+  gRPC verbs (which already carried it) **and** the Flight SQL lane (`db.sql()`,
+  a separate `pyarrow.flight` transport). The engine enforces auth on no
+  transport by design; verifying the bearer is a gateway-in-front's job.
 
 A recipe written against either handle runs unchanged against the other — the
 keystone's heavy emit connects `grpc://` to the GPU server; every chapter loads
@@ -45,7 +50,7 @@ the committed cache and runs `file://` on CPU.
 - `db.get_server_info() -> dict` — `{"version", "features", "storage_backends", "services"}`.
 - `db.set_tenant(tenant_id) -> None` · `db.tenant_scope(tenant_id)` (context manager) · `db.tenant() -> Optional[str]` — `set_tenant` binds the tenant scope to the connection *in place* (pass `""` to clear); `tenant_scope` binds it for a `with` block and restores the prior scope on exit; `tenant` reads the current scope. The bound scope filters catalog listing (`list_sources`) and row reads from sources carrying a `tenant_id` discriminator column to `tenant_id = $cur OR IS NULL`; it does **not** gate a discriminator-less source (the engine does not authenticate). `tenant_id` is an opaque UUID.
 - `db.generate_embeddings(*, source, model, columns, key, modality=None, cache=None) -> str` — returns the embedding-table name; `modality ∈ {"text","image","audio"}`. `model` is a model-id string resolved from HuggingFace Hub. `cache` (H4) opts the call into the engine's incremental-recompute cache: a recorded producing descriptor lets a later `recompute`/`staleness`/`verify_materialization` reason about this output. (Runs on the GPU server when connected `grpc://`.)
-- `db.sql(query) -> pyarrow.Table` · `db.encode_query(*, model, query, modality=None) -> list[float]`
+- `db.sql(query) -> pyarrow.Table` · `db.encode_query(*, model, query, modality=None) -> list[float]` — on a `RemoteDatabase`, `db.sql()` runs over the Flight SQL lane (`pyarrow.flight`); from `0.32.0` it carries the connection's bearer credential on that lane too (`#96`).
 - `db.rrf_fuse(ranked_lists, *, k_rrf=None) -> list[(str, float)]`
 
 A registered file source is queried as `<source>.public.<source>`

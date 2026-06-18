@@ -14,15 +14,20 @@ no GPU, no recompute) and assert the chapter's load-bearing facts:
 * **the destructive-verb survival** — A's mutable table / topic SURVIVES a
   foreign-tenant drop: no cross-tenant data destruction (the property the standing
   oracle guards; the headline no-leak finding);
-* **the BYO-auth seam** — two authenticated tenants get isolated reads; a
-  missing/invalid credential is rejected, not run unscoped.
+* **the BYO-auth seam over the real Flight SQL wire** — the bearer is observed on
+  the Flight lane (anonymous carries none); two authenticated tenants get isolated
+  reads; a missing/forged credential is rejected, not run unscoped; the over-Flight
+  read matches the embedded read under the same tenant.
 
-The cross-transport ``remote == embedded`` parity is a ONE-TIME emit-side LIVE
-check (recorded in ``tenancy_h3.json``); PR CI never re-diffs two static artifacts.
+The cross-transport ``remote == embedded`` parity AND the BYO-auth-over-Flight
+verdicts are ONE-TIME emit-side LIVE checks (recorded in ``tenancy_h3.json``, the
+seam driven over a real ``jammi-server`` Flight wire); PR CI never re-diffs two
+static artifacts.
 
-The library-level BYO-auth seam primitives (``mint_token`` / ``verify_token`` /
-the gateway shape) are exercised here in pure Python with no engine — a forged
-token must NOT verify regardless of the committed cache.
+The library-level BYO-auth seam primitives (``mint_token`` / ``verify_token``)
+are exercised here in pure Python with no engine — ``mint_token`` returns a BARE
+token, ``verify_token`` strips the one ``"Bearer "`` the wire carries, and a
+forged token must NOT verify regardless of the committed cache.
 
 If the emitted cache is absent the matrix-backed checks skip; the committed golden
 metrics, once present, are always asserted.
@@ -88,11 +93,14 @@ def test_every_verdict_matches_golden():
         "destructive.mt_survives_foreign_drop",
         "destructive.tp_survives_foreign_drop",
         "parity.cross_transport_equal",
-        "byo_auth.a_isolated",
-        "byo_auth.b_isolated",
-        "byo_auth.missing_rejected",
-        "byo_auth.invalid_rejected",
-        "byo_auth.legit_after_forgery",
+        "byo_auth.bearer_on_flight_observed",
+        "byo_auth.anonymous_no_bearer",
+        "byo_auth.a_isolated_over_flight",
+        "byo_auth.b_isolated_over_flight",
+        "byo_auth.missing_rejected_over_flight",
+        "byo_auth.forged_rejected_over_flight",
+        "byo_auth.legit_after_forgery_over_flight",
+        "byo_auth.over_flight_eq_embedded",
     ):
         contracts.assert_close(f"tenancy_h3.{metric}", 1.0)
 
@@ -202,43 +210,54 @@ def test_remote_equals_embedded_for_cross_transport_verbs():
 
 @_needs_cache
 def test_byo_auth_seam_verdict():
-    """The committed BYO-auth verdict: two authenticated tenants get isolated
-    reads; a missing credential is rejected (not run unscoped); an invalid
-    credential is rejected, and a valid token for the same tenant still resolves
-    (the rejection was the signature, not a tenant blocklist)."""
+    """The committed BYO-auth verdict, over the REAL Flight SQL wire: the bearer is
+    observed on the Flight lane (anonymous carries none); two authenticated tenants
+    get isolated reads; a missing credential is rejected (not run unscoped); a
+    forged credential is rejected and a valid token for the same tenant still
+    resolves (the rejection was the signature, not a tenant blocklist); and the
+    over-Flight read matches the embedded read under the same tenant."""
     rec = _record()
     byo = rec["byo_auth"]
-    assert byo["a_isolated"] is True
-    assert byo["b_isolated"] is True
-    assert byo["missing_rejected"] is True
-    assert byo["invalid_rejected"] is True
-    assert byo["legit_after_forgery"] is True
-    # the seam is documented as the consumer's, never the engine's, auth
-    assert "engine ships the seam" in rec["byo_auth_note"].lower()
+    assert byo["bearer_on_flight_observed"] is True
+    assert byo["anonymous_no_bearer"] is True
+    assert byo["a_isolated_over_flight"] is True
+    assert byo["b_isolated_over_flight"] is True
+    assert byo["missing_rejected_over_flight"] is True
+    assert byo["forged_rejected_over_flight"] is True
+    assert byo["legit_after_forgery_over_flight"] is True
+    assert byo["over_flight_eq_embedded"] is True
+    # the auth is documented as the consumer's, never the engine's
+    assert "it never ships the auth" in rec["byo_auth_note"].lower()
 
 
 def test_byo_auth_primitives_reject_a_forged_token():
     """The library-level seam primitives are sound in pure Python (no engine, no
-    cache): a token whose signature does not cover its claim must NOT verify, and a
-    tampered tenant claim must change the required signature — the forgery the
-    signed claim defends against."""
+    cache): mint_token returns a BARE token (BearerCredentials adds the 'Bearer '
+    on the wire), verify_token strips the one 'Bearer ' the wire carries, a token
+    whose signature does not cover its claim must NOT verify, and a tampered tenant
+    claim must change the required signature — the forgery the signed claim
+    defends against."""
     from scripts.build_tenancy_h3_cache import mint_token, verify_token
 
     tenant_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     tenant_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
-    # a freshly minted token verifies to its tenant claim
+    # mint_token is BARE — no 'Bearer ' prefix (BearerCredentials prepends it).
     token = mint_token("subject-a", tenant_a)
-    assert verify_token(token) == tenant_a
+    assert not token.startswith("Bearer ")
 
-    # a missing token, a non-bearer token, and a malformed token all reject
+    # the wire value is 'Bearer <token>'; verify_token strips the one 'Bearer '
+    # and verifies the bare token to its tenant claim
+    assert verify_token(f"Bearer {token}") == tenant_a
+
+    # a missing header, a bare (un-prefixed) token, and a malformed token reject
     assert verify_token(None) is None
-    assert verify_token("subject-a." + tenant_a + ".deadbeef") is None
+    assert verify_token(token) is None  # no 'Bearer ' prefix — the wire adds it
     assert verify_token("Bearer no-dots-here") is None
 
     # a forged tenant claim (swap the tenant, keep the old signature) must NOT
     # verify — the signature covers the claim
-    claim, _, sig = token[len("Bearer "):].rpartition(".")
+    claim, _, sig = token.rpartition(".")
     forged_claim = claim.replace(tenant_a, tenant_b)
     forged = f"Bearer {forged_claim}.{sig}"
     assert verify_token(forged) is None

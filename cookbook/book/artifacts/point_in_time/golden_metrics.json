@@ -1,0 +1,54 @@
+{
+  "pit.asof_auc": {
+    "tol": 0.02,
+    "value": 0.7952
+  },
+  "pit.asof_matched_rows": {
+    "tol": 0.0,
+    "value": 1003.0
+  },
+  "pit.coverage_asof": {
+    "tol": 0.03,
+    "value": 0.9125
+  },
+  "pit.coverage_leaky": {
+    "tol": 0.03,
+    "value": 0.87
+  },
+  "pit.leakage_delta": {
+    "tol": 0.02,
+    "value": 0.1621
+  },
+  "pit.naive_auc": {
+    "tol": 0.02,
+    "value": 0.9574
+  },
+  "pit.nominal_coverage": {
+    "tol": 0.0,
+    "value": 0.9
+  },
+  "pit.train_serve_skew": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "pit.verdict_match": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "pit.verdict_match_roundtrip": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "pit.verdict_match_with_unpinned": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "pit.verdict_mismatch": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "pit.verdict_missing_manifest": {
+    "tol": 0.0,
+    "value": 1.0
+  }
+}

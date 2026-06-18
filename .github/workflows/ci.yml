@@ -202,6 +202,28 @@ jobs:
       - name: Build OSS workspace hermetically with no private source
         run: cargo build --workspace --exclude jammi-python --locked
 
+  dep-audit:
+    name: Guard (dependency audit)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      # `cargo deny` runs the supply-chain gate against `deny.toml`: the live
+      # RustSec advisory DB (a newly-published vulnerability against a crate in
+      # the resolved tree reds this job), the license allowlist, and the
+      # bans/sources lanes that formalize the engine's one-way dependency
+      # direction in the lockfile. The official action fetches and updates the
+      # RustSec DB itself, so the advisory check reads the current database, not
+      # a stale snapshot — and knowingly-carried advisories live as documented
+      # exceptions in `deny.toml`, never a blanket silence. Plain ubuntu (not the
+      # Rust CI container): this lane resolves `cargo metadata` + the advisory DB,
+      # it does not compile the workspace.
+      - name: cargo-deny (advisories + licenses + bans + sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
   ts-client:
     name: TS client (@f-inverse/jammi-client)
     runs-on: ubuntu-latest

@@ -1,0 +1,113 @@
+# cargo-deny configuration — the dependency-supply-chain gate.
+#
+# Three lanes, run in CI on every PR (see `.github/workflows/ci.yml`, the
+# `dep-audit` job):
+#
+#   * advisories — the live RustSec advisory DB. A new vulnerability/unsound
+#     advisory against a crate in the resolved tree reds CI. Knowingly-carried
+#     advisories are listed below with a written rationale; nothing is silenced
+#     blanket.
+#   * licenses   — an allowlist of permissive / acceptable licenses. A crate
+#     whose license is not on the list reds CI, so a copyleft or unknown license
+#     cannot enter the OSS engine unnoticed.
+#   * bans + sources — formalizes the engine's one-way dependency direction: the
+#     OSS engine depends only on crates.io crates (no git / private registry),
+#     which is the lockfile half of the `dep-direction` / `oss-only-build`
+#     guards already in CI.
+
+# ---------------------------------------------------------------------------
+# Advisories — the RustSec lane.
+# ---------------------------------------------------------------------------
+[advisories]
+# Resolve against the live RustSec database (cloned/updated by `cargo deny`),
+# so this genuinely flags a newly-published advisory, not a stale snapshot.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Fail on every severity by default; the only tolerated advisories are the
+# explicitly-listed exceptions below, each with a rationale.
+yanked = "deny"
+
+# Each entry here is an advisory the current tree carries that the terminal-0.x
+# freeze knowingly accepts rather than take a risky dependency bump that would
+# destabilize the release. Every one is justified; none is a blanket silence.
+ignore = [
+    # paste 1.0.15 — unmaintained (no security defect). Pulled transitively by
+    # arrow-flight (proc-macro, build-time only). RustSec records "No safe
+    # upgrade is available"; nothing in the resolved tree offers a maintained
+    # replacement, and paste is a compile-time proc-macro with no runtime
+    # surface. Re-evaluate when arrow-flight drops the dependency.
+    "RUSTSEC-2024-0436",
+    # pyo3 0.28.2 — out-of-bounds read in `nth`/`nth_back` for `PyList`/`PyTuple`
+    # iterators. The fix is pyo3 >= 0.29, a minor bump that cascades into a
+    # `pyo3-arrow` bump (the Arrow<->PyO3 bridge), i.e. a manifest change across
+    # the PyO3 binding — too risky to land at the format/API freeze, and not
+    # covered by this gate's build lanes (jammi-python builds via maturin, not
+    # `cargo build --workspace`). Crucially, the vulnerable API is NOT reached:
+    # the binding uses `PyList::empty` + `append`/`set_item`, never `.nth()` /
+    # `.nth_back()` iterator indexing on a `PyList`/`PyTuple`. Sequenced for a
+    # deliberate post-freeze pyo3/pyo3-arrow upgrade.
+    "RUSTSEC-2026-0176",
+    # pyo3 0.28.2 — missing `Sync` bound on `PyCFunction::new_closure` closures.
+    # Same fix (pyo3 >= 0.29) and same freeze rationale as above. The binding
+    # calls `new_closure` nowhere (grep-verified), so the unsound path is not
+    # reachable. Sequenced with RUSTSEC-2026-0176 for the post-freeze upgrade.
+    "RUSTSEC-2026-0177",
+]
+
+# ---------------------------------------------------------------------------
+# Licenses — the allowlist lane.
+# ---------------------------------------------------------------------------
+[licenses]
+# Permissive and acceptable-copyleft licenses present in the resolved OSS tree.
+# A crate whose SPDX expression is not satisfiable from this list reds CI.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "Zlib",
+    "zlib-acknowledgement",
+    "bzip2-1.0.6",
+    "Unicode-3.0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+    # Weak-copyleft, file-scoped — acceptable as a dependency of an OSS engine
+    # (the engine links them, it does not modify them): symphonia (audio codecs)
+    # and r-efi sit behind feature/target gates.
+    "MPL-2.0",
+    "LGPL-2.1-or-later",
+]
+# Workspace crates carry no `license` field (they are not published to a license
+# registry as OSS-licensed leaf crates in the conventional way); treat the
+# first-party workspace members as private so the allowlist applies only to
+# third-party dependencies.
+[licenses.private]
+ignore = true
+
+# ---------------------------------------------------------------------------
+# Bans + sources — the dependency-direction lane.
+# ---------------------------------------------------------------------------
+[bans]
+# Multiple versions of the same crate are common and benign in a large tree
+# (transitive minor skews); the dep-direction guard, not version-deduping, is
+# the boundary that matters here.
+multiple-versions = "allow"
+# A wildcard version requirement on a published (crates.io) dependency reds CI —
+# it is a release footgun. First-party workspace crates referenced by `path` are
+# exempt (`allow-wildcard-paths`): they are not published wildcards, they are the
+# workspace's own members.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# The OSS engine resolves only from crates.io. A git or private-registry source
+# in the lockfile reds CI — the lockfile half of the `oss-only-build` hermeticity
+# guard and the `dep-direction` proprietary-crate guard already in CI.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

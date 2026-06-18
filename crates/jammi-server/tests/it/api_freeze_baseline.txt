@@ -1,0 +1,73 @@
+# Frozen wire-surface baseline — the API-stability freeze-guard's source of truth.
+#
+# This file is the committed snapshot of the FROZEN stable wire surface. The
+# `api_freeze` integration test decodes the live `FILE_DESCRIPTOR_SET` and
+# asserts the served surface EQUALS this file, name-for-name. Removing or
+# renaming a stable rpc or package makes the live set diverge from this baseline
+# and reds CI; adding one requires explicitly appending it here in the same PR
+# (the additive, minor-compatible case). Editing this file to DROP a line is
+# exactly the breaking change the terminal-0.x semver commitment forbids outside
+# a major — so the change is visible and deliberate in the diff.
+#
+# Lines are `PACKAGE <pkg>` for each frozen `jammi.v1.*` proto package and
+# `RPC <Service>/<Method>` for each served rpc. Blank lines and `#` comments are
+# ignored. Order does not matter (the test compares as sets); kept sorted for a
+# readable diff.
+
+# --- the nine jammi.v1.* wire packages (the wire contract) ---
+PACKAGE jammi.v1.audit
+PACKAGE jammi.v1.catalog
+PACKAGE jammi.v1.embedding
+PACKAGE jammi.v1.error
+PACKAGE jammi.v1.eval
+PACKAGE jammi.v1.inference
+PACKAGE jammi.v1.pipeline
+PACKAGE jammi.v1.training
+PACKAGE jammi.v1.trigger
+
+# --- the served (Service/Method) rpc paths ---
+RPC AuditService/AuditFetchByQueryId
+RPC AuditService/AuditFetchRecent
+RPC AuditService/AuditLog
+RPC CatalogService/AddChannelColumns
+RPC CatalogService/AddSource
+RPC CatalogService/ClearTenant
+RPC CatalogService/CreateMutableTable
+RPC CatalogService/DeleteModel
+RPC CatalogService/DerivesFrom
+RPC CatalogService/DescribeModel
+RPC CatalogService/DescribeSource
+RPC CatalogService/DropMutableTable
+RPC CatalogService/DropTopic
+RPC CatalogService/GetServerInfo
+RPC CatalogService/GetTenant
+RPC CatalogService/ListChannels
+RPC CatalogService/ListModels
+RPC CatalogService/ListMutableTables
+RPC CatalogService/ListSources
+RPC CatalogService/ListTopics
+RPC CatalogService/RegisterChannel
+RPC CatalogService/RegisterTopic
+RPC CatalogService/RemoveSource
+RPC CatalogService/SetTenant
+RPC CatalogService/Staleness
+RPC CatalogService/VerifyMaterialization
+RPC EmbeddingService/EncodeQuery
+RPC EmbeddingService/GenerateEmbeddings
+RPC EmbeddingService/Search
+RPC EvalService/EvalCalibration
+RPC EvalService/EvalCompare
+RPC EvalService/EvalEmbeddings
+RPC EvalService/EvalInference
+RPC EvalService/EvalPerQuery
+RPC InferenceService/Infer
+RPC InferenceService/Predict
+RPC PipelineService/AsofJoin
+RPC PipelineService/AssembleContext
+RPC PipelineService/BuildNeighborGraph
+RPC PipelineService/PropagateEmbeddings
+RPC PipelineService/Recompute
+RPC TrainingService/StartTraining
+RPC TrainingService/TrainingStatus
+RPC TriggerService/Publish
+RPC TriggerService/Subscribe

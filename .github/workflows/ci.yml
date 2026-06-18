@@ -205,7 +205,18 @@ jobs:
   dep-audit:
     name: Guard (dependency audit)
     runs-on: ubuntu-latest
+    # Runs in the same gnu CI image as every other job: `cargo deny` resolves
+    # `cargo metadata`, which needs the repo's pinned toolchain (rust-toolchain.toml
+    # = 1.88.0) and respects `.cargo/config.toml`. The upstream cargo-deny *action*
+    # runs in its own Alpine/musl container, where that toolchain is absent and the
+    # sccache wrapper has no server — so we install + run the binary here instead.
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
     needs: check
+    env:
+      # `cargo metadata` needs no build cache; skip the sccache wrapper (this lane
+      # runs no sccache server) so metadata resolution doesn't try to invoke it.
+      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@v4
 
@@ -213,16 +224,14 @@ jobs:
       # RustSec advisory DB (a newly-published vulnerability against a crate in
       # the resolved tree reds this job), the license allowlist, and the
       # bans/sources lanes that formalize the engine's one-way dependency
-      # direction in the lockfile. The official action fetches and updates the
-      # RustSec DB itself, so the advisory check reads the current database, not
-      # a stale snapshot — and knowingly-carried advisories live as documented
-      # exceptions in `deny.toml`, never a blanket silence. Plain ubuntu (not the
-      # Rust CI container): this lane resolves `cargo metadata` + the advisory DB,
-      # it does not compile the workspace.
-      - name: cargo-deny (advisories + licenses + bans + sources)
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories licenses bans sources
+      # direction in the lockfile. cargo-deny fetches/updates the RustSec DB
+      # itself, so the advisory check reads the current database, not a stale
+      # snapshot — and knowingly-carried advisories live as documented exceptions
+      # in `deny.toml`, never a blanket silence.
+      - name: Install cargo-deny
+        run: cargo install cargo-deny@0.16.4 --locked
+      - name: cargo deny (advisories + licenses + bans + sources)
+        run: cargo deny check advisories licenses bans sources
 
   ts-client:
     name: TS client (@f-inverse/jammi-client)

@@ -59,8 +59,8 @@ The heavy work (embedding, fine-tune, context-predictor train) runs **once** in
 the keystone slice, on the GPU server (`scripts/build_arxiv_cache.py --target
 grpc://…`), and is committed as the small-subset cache; CI and every later chapter
 *read* that cache on CPU and assert measured verdicts against frozen golden metrics
-within a tolerance. See `CLAUDE.md` for the engineering standards and
-`EXECUTION-STATUS.md` for build state.
+within a tolerance. See `docs/plans/40-cookbook/` (in the monorepo) for the
+cookbook's specs and build state (`EXECUTION-STATUS.md`).
 
 ## License
 

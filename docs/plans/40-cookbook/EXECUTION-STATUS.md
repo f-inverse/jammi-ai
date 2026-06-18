@@ -1,5 +1,10 @@
 # EXECUTION-STATUS
 
+> **HISTORICAL — standalone-era build log.** The cookbook now lives in the
+> `jammi-ai` monorepo at `cookbook/book/`, built and gated against the engine at
+> HEAD. The entries below are point-in-time records from when it was a standalone
+> repository (since archived) — they are not current state.
+
 Build state for the Theory↔Computation Cookbook (spec set: `jammi-ai`
 `docs/plans/40-cookbook`). Mirrors the structure of the main tracker: a per-spec
 status table, a decisions log (every fork resolved + every cut with rationale),

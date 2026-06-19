@@ -39,6 +39,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mozilla-actions/sccache-action@v0.0.9
 
+      # The CI image does not ship cargo-build-graph; install it (pinned, so the
+      # rendered graph matches the committed block). Clear -D warnings for this
+      # step only — it compiles a third-party crate and its deps, where a single
+      # upstream warning would otherwise fail the build.
+      - name: Install build-graph (the dep-DAG generator's source of truth)
+        env:
+          RUSTFLAGS: ""
+        run: cargo install build-graph --version 0.1.0 --locked
+
       # The maintainer guide's crate-dependency DAG is generated from
       # build-graph (the maintainer-chosen source of truth, extracted from
       # `cargo build` artifacts — not `cargo metadata`). Re-render it from the

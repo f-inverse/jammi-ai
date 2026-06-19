@@ -1,0 +1,58 @@
+name: Dep-DAG freshness
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "crates/*/Cargo.toml"
+      - "crates/*/src/**"
+      - "docs/maintainer/**"
+      - "ci/scripts/gen_dep_dag.py"
+  pull_request:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "crates/*/Cargo.toml"
+      - "crates/*/src/**"
+      - "docs/maintainer/**"
+      - "ci/scripts/gen_dep_dag.py"
+  workflow_dispatch:
+
+concurrency:
+  group: dep-dag-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=mold"
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  dep-dag:
+    name: Guard (dep-DAG freshness)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      # The maintainer guide's crate-dependency DAG is generated from
+      # build-graph (the maintainer-chosen source of truth, extracted from
+      # `cargo build` artifacts — not `cargo metadata`). Re-render it from the
+      # current workspace; if the committed block is stale the `git diff` below
+      # reds the PR, naming the doc to regenerate.
+      - name: Regenerate the dep-DAG block
+        run: python3 ci/scripts/gen_dep_dag.py
+
+      # A bare `git` in a container `run:` step hits "fatal: detected dubious
+      # ownership" (exit 128) because the checkout is owned by a different user
+      # than the container's git; the safe.directory actions/checkout sets is not
+      # visible here. Mark the workspace safe before diffing.
+      - name: Assert the committed dep-DAG block is fresh
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git diff --exit-code -- docs/maintainer/MAINTAINER-GUIDE.md \
+            || { echo "::error::docs/maintainer/MAINTAINER-GUIDE.md dep-DAG block is stale — run 'python3 ci/scripts/gen_dep_dag.py' and commit the result"; exit 1; }

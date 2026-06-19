@@ -59,4 +59,3 @@
 - [API Stability](./api-stability.md)
 - [Security Posture](./security.md)
 - [Performance SLOs](./performance-slos.md)
-- [Architecture](./architecture.md)

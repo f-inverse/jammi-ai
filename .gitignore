@@ -62,7 +62,9 @@ packaging/*/build/
 # Claude
 .claude
 CLAUDE.md
-docs/plans/
+docs/plans/*
+# Maintainer roadmap / journey docs are tracked despite the docs/plans/ rule.
+!docs/plans/52-maintainer-roadmap/
 docs/superpowers/
 docs/IMPLEMENTATION.md
 docs/specs/

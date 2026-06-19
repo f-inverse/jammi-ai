@@ -2747,6 +2747,76 @@ list): `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, `pyproject.toml`, `clients/py
 **Disk pressure is a recurring real failure** — keep `CARGO_TARGET_DIR` on NVMe; the separate
 `compile-check-gated` job and `crates.yml --no-verify` exist for this reason.
 
+### 6.1 Navigating the rich graph (build-graph rich → graphify MCP)
+
+For navigating the workspace by *symbol* — who calls `Session::search`, what implements
+`VectorIndex`, every site that uses `merge_channels` — build the **rich** `build-graph` (item-level
+nodes + semantic reference edges) and serve it to an agent over `graphify`'s stdio MCP server. This is
+**local tooling, not a CI lane**: it is built on demand, never in CI, never as a committed artifact. It
+is deterministic (zero tokens — pure extraction from build artifacts + rustdoc + rust-analyzer), and on
+this workspace yields ~11.2k nodes / ~58k edges across the 13 crates.
+
+This is distinct from the §1.1 `dep-dag` block (crate-level dependency DAG, generated into this doc).
+The rich graph is **per-symbol**, lives only under `target/`, and is for interactive navigation.
+
+**One-time setup.** The rich (Layer 2) layer needs a nightly toolchain (for nightly rustdoc) plus
+`rust-analyzer` (for the `--references` reference edges); neither is the pinned `1.88.0` toolchain
+(`rust-toolchain.toml`), so install them alongside it:
+
+```
+rustup toolchain install nightly
+rustup component add rust-analyzer --toolchain nightly
+cargo install build-graph --version 0.1.0 --locked   # pin: graph schema is version-coupled
+pip install graphifyy                                 # note the double-y; the import name is `graphify`
+```
+
+**Build.** Run the wrapper — it builds the rich graph and **post-verifies it is actually rich**:
+
+```
+ci/scripts/build_graph_rich.sh
+```
+
+This wraps `cargo build-graph build --rich --references --no-compress --out target/build-graph-rich`.
+The `--out` is deliberately **not** `target/build-graph/` — that file belongs to the dep-dag automation
+(§1.1); both paths sit under `target/` and are already gitignored (`/target`), so nothing new needs
+ignoring. The verification is load-bearing: `cargo build-graph build --rich --references` **silently
+degrades to the Layer 1 crate/file graph and still exits 0** when nightly or rust-analyzer is missing
+(it logs "rich layer: skipped"). Exit 0 is *not* proof. The wrapper parses the emitted graph and asserts
+rich indicators are present — item-level node kinds (`struct`/`method`/`trait`) and semantic edge
+relations (`calls`/`implements`/`member_calls`) — and **fails loud** ("rich build degraded to Layer 1 —
+need nightly + rust-analyzer") if they are absent. A degraded graph has only `crate`/`file` nodes and
+`depends_on`/`contains` edges, so every required indicator is missing.
+
+**Serve.** Point `graphify`'s stdio MCP server at the emitted graph — it consumes `build-graph`'s JSON
+natively (find/refs/context/path over the symbol graph):
+
+```
+python -m graphify.serve target/build-graph-rich/graph.json
+```
+
+**Wire it into an agent.** MCP server configs are **per-agent**; the stanza below is the worked example
+for Claude Code (`.mcp.json` at the repo root). Other agents (Codex, Cursor, Gemini CLI, …) use a
+different config file and schema — adapt the `command`/`args` accordingly. Do **not** commit this file;
+it is a per-developer convenience pointing at a `target/` artifact:
+
+```json
+{
+  "mcpServers": {
+    "jammi-graph": {
+      "command": "python",
+      "args": ["-m", "graphify.serve", "target/build-graph-rich/graph.json"]
+    }
+  }
+}
+```
+
+**Notes / sharp edges.**
+- **Communities are advisory, not reproducible.** `graphify`'s community/cluster detection is
+  nondeterministic — useful for orientation, never a stable contract. Cite symbols and edges (which are
+  deterministic), not cluster ids.
+- **`merge-graphs` is unsupported on `build-graph` JSON.** Serve a single graph; do not attempt to merge
+  `build-graph` outputs through graphify.
+
 ---
 
 ## 7. Sharp edges, tech debt & roadmap

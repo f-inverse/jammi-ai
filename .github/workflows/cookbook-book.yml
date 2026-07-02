@@ -143,6 +143,15 @@ jobs:
           export PATH="$GITHUB_WORKSPACE/target/release:$PATH"
           quarto render
 
+      - name: Cache the rendered book for the Pages deploy
+        # The executed render only happens here (nightly / on demand). The Docs
+        # workflow restores this by prefix and serves it under /cookbook, so the
+        # Pages deploy never has to re-execute the book on the critical path.
+        uses: actions/cache/save@v4
+        with:
+          path: cookbook/book/_book
+          key: cookbook-book-render-${{ github.sha }}
+
       - name: Release recipe — last PUBLISHED wheel + CPU pytest subset
         # Preserve the published-artifact signal HEAD-testing loses: install the
         # last released jammi_ai from PyPI into a clean venv and re-run the book's

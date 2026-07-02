@@ -10,7 +10,7 @@
 - [Quickstart: Python](./quickstart-python.md)
 - [Quickstart: CLI](./quickstart-cli.md)
 
-# Cookbook
+# How-To Guides
 
 - [Runnable Recipes](./cookbook-recipes.md)
 - [Query Your Data with SQL](./query-data.md)

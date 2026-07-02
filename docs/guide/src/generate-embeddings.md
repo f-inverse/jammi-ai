@@ -1,5 +1,7 @@
 # Generate Embeddings
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Constructing the Graph](https://f-inverse.github.io/jammi-ai/cookbook/chapters/01-construct/construct.html).
+
 Generate vector embeddings by running a model over text columns from a registered source. Results are persisted to Parquet with sidecar ANN indexes for fast similarity search.
 
 ## Basic usage

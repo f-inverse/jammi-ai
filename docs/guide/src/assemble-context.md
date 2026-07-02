@@ -1,5 +1,7 @@
 # Assemble a Context Set for Conditioned Prediction
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Retrieval](https://f-inverse.github.io/jammi-ai/cookbook/chapters/10-retrieval/retrieval.html).
+
 A prediction is often best made *conditioned on a neighbourhood*: not "what is
 the label of this row" in the abstract, but "given the `k` most similar
 labelled rows, what is the label of this row." That neighbourhood is a **context

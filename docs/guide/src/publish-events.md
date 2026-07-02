@@ -1,5 +1,7 @@
 # Publish Events to a Topic
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Change Data Capture](https://f-inverse.github.io/jammi-ai/cookbook/chapters/13-cdc/cdc.html).
+
 A *trigger-stream topic* is a catalog-registered Arrow schema plus a
 backing mutable table. Publishers append `RecordBatch`es; subscribers
 filter and receive them. The engine owns the offset counter and the

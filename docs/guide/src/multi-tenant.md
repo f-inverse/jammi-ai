@@ -1,5 +1,7 @@
 # Scope a Session to a Tenant
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Tenancy](https://f-inverse.github.io/jammi-ai/cookbook/chapters/11-tenancy/tenancy.html).
+
 When more than one logical tenant shares a Jammi engine — a SaaS feature
 store serving two ML teams, a research workbench shared across three labs,
 a notebook product hosting one project per student — every catalog read and
@@ -252,5 +254,5 @@ A buggy caller that constructs a row with the wrong `tenant_id` gets
 ## See also
 
 - The discipline test in [`SPEC-03`](https://github.com/f-inverse/jammi-ai/blob/main/docs/plans/cp9-substrate-primitives/SPEC-03-tenant-scope.md)
-- [`Register a Mutable Companion Table`](./external-sources.md) for how a
+- [`Register a Mutable Companion Table`](./register-mutable-table.md) for how a
   mutable companion table also honours the tenant binding on write

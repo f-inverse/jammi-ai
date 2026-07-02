@@ -1,5 +1,7 @@
 # Propagate Embeddings over a Graph (Decoupled GNN)
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Graph Signal Processing](https://f-inverse.github.io/jammi-ai/cookbook/chapters/02-analyze/analyze.html).
+
 `propagate_embeddings` is the **forward pass of a graph convolution**, run as a
 data-plane operation. For every row of an embedding table it replaces the row's
 vector with an aggregate of its `k`-hop neighbourhood — `ÂᵏX` — and writes the

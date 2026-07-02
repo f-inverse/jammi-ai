@@ -1,5 +1,7 @@
 # Hybrid Retrieval: Lexical (BM25) + Reciprocal-Rank Fusion
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Retrieval](https://f-inverse.github.io/jammi-ai/cookbook/chapters/10-retrieval/retrieval.html).
+
 Dense vector search finds rows that *mean* the same thing as your query; lexical
 (BM25) search finds rows that contain the same *words*. Each misses what the
 other catches — dense search fumbles rare identifiers and exact phrases, lexical

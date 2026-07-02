@@ -1,5 +1,7 @@
 # Evaluate Uncertainty and Calibration
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Calibration & Uncertainty](https://f-inverse.github.io/jammi-ai/cookbook/chapters/09-calibration/calibration.html).
+
 `eval_embeddings` and `eval_inference` answer *"is the prediction accurate?"*.
 `eval_calibration` answers the orthogonal question — *"does the prediction know
 what it doesn't know?"*. The two are independent: a model can be accurate and

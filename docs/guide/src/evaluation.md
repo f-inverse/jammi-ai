@@ -1,5 +1,7 @@
 # Evaluate and Compare Models
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Evaluation & Provenance Channels](https://f-inverse.github.io/jammi-ai/cookbook/chapters/14-eval-channels/eval-channels.html).
+
 Measure embedding quality and classification accuracy against golden datasets. Results are recorded in the catalog for tracking over time.
 
 ## Prepare a golden dataset

@@ -41,7 +41,7 @@ not this CLI.
 
 ## Documentation
 
-See the [Jammi AI Cookbook](https://f-inverse.github.io/jammi-ai/) for the full guide.
+See the [Jammi AI Guide](https://f-inverse.github.io/jammi-ai/) for the full guide.
 
 ## License
 

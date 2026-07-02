@@ -67,7 +67,7 @@ cargo run --release --bin jammi-server --features jetstream-broker -- \
 
 ## Production deploy
 
-See [Deploy as a Server](https://f-inverse.github.io/jammi-ai/deploy-server.html) in the cookbook for the full guide. The short version:
+See [Deploy as a Server](https://f-inverse.github.io/jammi-ai/deploy-server.html) in the guide for the full walkthrough. The short version:
 
 1. Mount a persistent volume at `/var/lib/jammi` (or `chown 65532:65532` your bind mount — the distroless image runs as the nonroot user).
 2. Provide a config file at `/etc/jammi/jammi.toml`. The sample at `examples/jammi.toml` is the starting point.

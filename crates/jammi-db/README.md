@@ -25,7 +25,7 @@ let results = session.sql("SELECT * FROM data.public.data LIMIT 10").await?;
 
 ## Documentation
 
-See the [Jammi AI Cookbook](https://f-inverse.github.io/jammi-ai/) for the full guide.
+See the [Jammi AI Guide](https://f-inverse.github.io/jammi-ai/) for the full guide.
 
 ## License
 

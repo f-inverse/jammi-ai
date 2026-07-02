@@ -1,5 +1,7 @@
 # Fine-Tune from a Graph (Graph-Supervised)
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Representation Learning on Graphs](https://f-inverse.github.io/jammi-ai/cookbook/chapters/03-learn/learn.html).
+
 Fine-tune embeddings so that **graph-neighbours are close in embedding space**.
 This is node2vec / DeepWalk realised as Jammi config: it samples a graph into
 contrastive `(anchor, positive, [hard_negative])` pairs and feeds them through

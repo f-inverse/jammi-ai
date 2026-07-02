@@ -1,5 +1,7 @@
 # Fine-Tune for Your Domain
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Fine-Tuning Methods](https://f-inverse.github.io/jammi-ai/cookbook/chapters/08-finetune-methods/finetune-methods.html).
+
 Train LoRA adapters on your data to improve embedding quality for your domain. The base model stays frozen — only a small projection layer is trained and saved.
 
 ## Prepare training data

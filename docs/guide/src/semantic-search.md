@@ -1,5 +1,7 @@
 # Semantic Search
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Retrieval](https://f-inverse.github.io/jammi-ai/cookbook/chapters/10-retrieval/retrieval.html).
+
 Perform ANN vector similarity search over embedding tables. Results include all original source columns, similarity scores, and evidence provenance.
 
 ## Basic search

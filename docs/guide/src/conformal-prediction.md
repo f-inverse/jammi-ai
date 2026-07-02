@@ -1,5 +1,7 @@
 # Conformal Prediction: Distribution-Free Coverage
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Conformal Prediction](https://f-inverse.github.io/jammi-ai/cookbook/chapters/08-conformal/conformal.html).
+
 Conformal prediction wraps **any** existing predictor and turns a point output
 into a **prediction set** (classification) or **interval** (regression) carrying
 a finite-sample, distribution-free coverage guarantee. Given a held-out

@@ -1,5 +1,7 @@
 # Subscribe to a Topic with a SQL Predicate Filter
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Change Data Capture](https://f-inverse.github.io/jammi-ai/cookbook/chapters/13-cdc/cdc.html).
+
 A subscription tails a topic and yields only the batches whose rows
 satisfy a SQL `WHERE`-clause predicate. The predicate is parsed once
 through DataFusion at subscribe time; the broker delivers each batch,

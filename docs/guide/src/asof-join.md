@@ -1,5 +1,7 @@
 # Point-in-time joins: matching facts to the instant they were known
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Point-in-Time Correctness](https://f-inverse.github.io/jammi-ai/cookbook/chapters/19-point-in-time/point-in-time.html).
+
 An *as-of join* matches each row of a **spine** relation to the at-most-one row
 of a **facts** relation that was valid *as of* the spine row's instant, within
 the same group. It is the relational primitive for point-in-time correctness.

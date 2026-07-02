@@ -37,8 +37,6 @@
 - [Evaluate and Compare Models](./evaluation.md)
 - [Did Structure Help? A Graph-ML Evaluation Recipe](./graph-ml-eval.md)
 - [Evaluate Uncertainty and Calibration](./calibration-eval.md)
-- [Connect to PostgreSQL / MySQL](./external-sources.md)
-- [Store Sources and Results in Cloud Object Storage](./cloud-storage.md)
 - [Register a Mutable Companion Table](./register-mutable-table.md)
 - [Run Transactional Updates on a Mutable Table](./update-mutable-table.md)
 - [Publish Events to a Topic](./publish-events.md)
@@ -46,10 +44,15 @@
 - [Replay Events from the Backing Table](./replay-from-backing-table.md)
 - [Scope a Session to a Tenant](./multi-tenant.md)
 - [Scope a Federated Source by Tenant](./scope-source-by-tenant.md)
+- [Verify a Result Table's Materialization Identity](./materialization-contract.md)
+
+# Operations
+
+- [Connect to PostgreSQL / MySQL](./external-sources.md)
+- [Store Sources and Results in Cloud Object Storage](./cloud-storage.md)
 - [Deploy as a Server](./deploy-server.md)
 - [Monitor Inference](./monitor-inference.md)
 - [Operability: Health, Metrics, and Failure Modes](./operability.md)
-- [Verify a Result Table's Materialization Identity](./materialization-contract.md)
 
 # Reference
 

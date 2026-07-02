@@ -16,6 +16,12 @@ canon — with *software and computation*: the `jammi_ai` engine. The signature
 move of every recipe is to show that **one Jammi recipe = one equation in the
 monograph = one line in the GNN canon**, *executed and measured*.
 
+For the short, "how do I call this verb" reference — dual-language (Rust +
+Python) and compile-tested — see the
+[How-To Guides](https://f-inverse.github.io/jammi-ai/cookbook-recipes.html) in
+the engine Guide. This book is the long-form, Python, executed-and-measured
+companion to those recipes.
+
 ## How the book is organized
 
 It **reads** as **4 tiers × 3 rails**, echoing AWS Neptune's "unified yet

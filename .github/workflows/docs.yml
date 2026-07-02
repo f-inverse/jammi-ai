@@ -6,11 +6,21 @@ on:
     paths:
       - "docs/guide/**"
       - "crates/*/src/**"
+      # the READMEs the guide {{#include}}s (cookbook-recipes.md, quickstart-python.md)
+      - "cookbook/recipes/**"
+      - "cookbook/quickstart/**"
   pull_request:
     branches: [main]
     paths:
       - "docs/guide/**"
       - "crates/*/src/**"
+      - "cookbook/recipes/**"
+      - "cookbook/quickstart/**"
+  # Re-publish when the Cookbook book finishes a render (its output is the
+  # /cookbook subpath we serve). Gated to successful main renders in the build job.
+  workflow_run:
+    workflows: ["Cookbook book"]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -30,6 +40,12 @@ env:
 jobs:
   build:
     name: Build
+    # A workflow_run trigger fires for every Cookbook-book run (incl. PR-branch
+    # gate runs and failures); only republish on a successful render off main.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/f-inverse/jammi-ai-ci:latest
@@ -56,6 +72,24 @@ jobs:
           mkdir -p _site
           cp -r docs/guide/book/* _site/
           cp -r target/doc _site/api
+
+      - name: Restore the rendered cookbook
+        # Published under /cookbook. The executed render lives in the Cookbook
+        # book workflow (nightly / on demand); here we only restore its output by
+        # prefix — so an unrelated guide or crate change never re-executes the
+        # book, and the book never vanishes from the site between renders.
+        id: cookbook
+        if: github.event_name != 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: cookbook/book/_book
+          key: cookbook-book-render-
+          restore-keys: |
+            cookbook-book-render-
+
+      - name: Add the cookbook to the site
+        if: github.event_name != 'pull_request' && steps.cookbook.outputs.cache-matched-key != ''
+        run: cp -r cookbook/book/_book _site/cookbook
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

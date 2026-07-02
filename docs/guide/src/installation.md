@@ -57,6 +57,18 @@ That runs `jammi-server` with zero config. See
 [Deploy as a Server](./deploy-server.md#gpu-serving) for GPU configuration and
 persistence.
 
+Alternatively, install the CUDA server as a pip wheel — it ships the same
+`jammi-server` binary and pulls the CUDA runtime from `nvidia-*-cu12` wheels, so
+no system CUDA install is required (only an NVIDIA driver on the host):
+
+```bash
+pip install jammi-server-cu12
+jammi-server
+```
+
+The `jammi-ai` embed wheel is CPU-only; GPU inference runs in the server, reached
+from Python via `jammi_ai.connect("grpc://…")`.
+
 ### Build dependencies (Linux)
 
 If building from source, you need a C compiler and `protoc`:

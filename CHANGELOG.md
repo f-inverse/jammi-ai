@@ -6,6 +6,32 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.32.1] - 2026-07-03
+
+A bug-fix release, shipped in lockstep across the workspace.
+
+### Fixed
+- **`base_model` accepts local filesystem paths.** `db.fine_tune(base_model=…)`
+  now takes a `file://` URI or a filesystem path (`/abs`, `./rel`, `../rel`) in
+  addition to a HuggingFace Hub id, matching the `add_source(url=…)` convention. A
+  bare path or `file://` URI previously fell through to the Hub resolver and failed
+  with a 404. The path resolves against the filesystem of the host running the
+  engine (the server, for a remote client). `ModelSource::parse` and the fine-tune
+  worker's encoder-adapter load now share one interpretation of the id.
+- **Honest CPU-fallback GPU warning.** On a CPU-only build the log no longer claims
+  "CUDA requested … no usable GPU found" — which implied a runtime detection
+  failure; it now states the build has no GPU support compiled in and points at the
+  CUDA server build (or `gpu.device=-1` to silence). A CUDA build points at the
+  driver and loader path; a Metal build at the device. `gpu.device` and the
+  inference batch size remain configurable via env (`JAMMI_GPU__DEVICE`,
+  `JAMMI_INFERENCE__BATCH_SIZE`).
+
+### Documentation
+- The published documentation site is reorganized: the mdbook is the **Guide**
+  (Getting Started, How-To Guides, Operations, Reference), and the long-form,
+  *measured* **Cookbook** is now published under `/cookbook`. "Cookbook" names only
+  the measured book; the two cross-link.
+
 ## [0.32.0] - 2026-06-18
 
 A client-side correctness release, shipped in lockstep across the workspace. The

@@ -1576,13 +1576,16 @@ fn build_encoder_adapters(
 ) -> Result<(jammi_encoders::AnyEncoder, jammi_lora::AdapterConfig)> {
     use std::path::Path;
 
-    let catalog_model_id = base_model_id
-        .strip_prefix("hf://")
-        .or_else(|| base_model_id.strip_prefix("local:"))
-        .unwrap_or(base_model_id);
+    // Interpret the base-model id through the shared `ModelSource::parse`, so the
+    // catalog key here matches what the submit and load sites registered the
+    // backbone under (`local:`/`file://`/`/abs` → the path string;
+    // `hf://owner/repo` / `owner/repo` → the repo id).
+    let source = ModelSource::parse(base_model_id);
+    let catalog_model_id = source.to_string();
+    let is_hf = matches!(source, ModelSource::HuggingFace(_));
 
     let model_record = tokio::runtime::Handle::current()
-        .block_on(catalog.get_model(catalog_model_id))?
+        .block_on(catalog.get_model(&catalog_model_id))?
         .ok_or_else(|| {
             JammiError::FineTune(format!("Base model '{base_model_id}' not in catalog"))
         })?;
@@ -1616,13 +1619,10 @@ fn build_encoder_adapters(
             }
         }
         _ => {
-            let is_hf = base_model_id.starts_with("hf://")
-                || (!base_model_id.starts_with('/')
-                    && !std::path::Path::new(base_model_id).exists());
             if is_hf {
                 let api = hf_hub::api::sync::Api::new()
                     .map_err(|e| JammiError::FineTune(format!("HF hub init: {e}")))?;
-                let repo = api.model(catalog_model_id.to_string());
+                let repo = api.model(catalog_model_id.clone());
                 let weights = repo.get("model.safetensors").map_err(|e| {
                     JammiError::FineTune(format!(
                         "Cannot locate '{catalog_model_id}' in HF hub cache: {e}"

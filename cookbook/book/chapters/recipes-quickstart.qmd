@@ -2,21 +2,23 @@
 title: "Engine recipes & quickstart"
 ---
 
-This book is the long-form, measured companion to the engine's own
-**recipes** and **quickstart** — the short, copy-paste task snippets that ship
-in the `jammi-ai` repo alongside this book. They live one level up from the
-book, under `cookbook/recipes/` and `cookbook/quickstart/`, and are exercised by
-the engine's `cookbook.yml` workflow and the `it/cookbook.rs` integration test.
-This page is a thin index that links each one; it does not move or duplicate the
-gated recipe scripts (they stay engine-owned and engine-gated).
+This book is the long-form, measured companion to the engine's short,
+copy-paste task references. Those live — readable and compile-tested, in both
+Rust and Python — in the engine **Guide**: the
+[Getting Started](https://f-inverse.github.io/jammi-ai/quickstart-python.html)
+quickstart and the
+[How-To Guides](https://f-inverse.github.io/jammi-ai/cookbook-recipes.html). Their
+runnable scripts ship in the `jammi-ai` repo under `cookbook/recipes/` and
+`cookbook/quickstart/`, exercised by the engine's `cookbook.yml` workflow and the
+`it/cookbook.rs` integration test.
 
-Where this book *explains* a primitive end-to-end (one recipe = one equation =
-one line of the GNN canon, executed against a committed golden), the engine
-recipes are the minimal "how do I call this verb" reference.
+Where the Guide's How-To Guides are the minimal "how do I call this verb"
+reference, this book *explains* each primitive end-to-end — one recipe = one
+equation = one line of the GNN canon, executed against a committed golden.
 
-The links point at the in-repo sources on GitHub: Quarto does not follow file
-links above the book's project root, and the recipes deliberately stay outside
-it (engine-owned, not part of the rendered book).
+The links below point at the in-repo runnable sources on GitHub: Quarto does not
+follow file links above the book's project root, and the recipes deliberately
+stay outside it (engine-owned, not part of the rendered book).
 
 ## 5-minute quickstart
 

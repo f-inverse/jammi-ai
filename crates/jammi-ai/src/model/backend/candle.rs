@@ -1737,10 +1737,32 @@ fn gpu_unavailable(gpu_device: i32, require_gpu: bool) -> Result<Device> {
             "GPU required (gpu.device={gpu_device}, require_gpu=true) but no usable GPU was found"
         )));
     }
-    tracing::warn!(
-        gpu_device,
-        "CUDA requested (gpu.device={gpu_device}) but no usable GPU found; running on CPU"
-    );
+    // `cfg!` is a compile-time constant here, so the message distinguishes two
+    // genuinely different situations that the old text conflated: a GPU build
+    // whose driver/runtime wasn't reachable, versus a CPU-only build that has no
+    // accelerator backend compiled in at all (where the request could never
+    // succeed and no loader-path fix applies).
+    if cfg!(feature = "cuda") {
+        tracing::warn!(
+            gpu_device,
+            "GPU device {gpu_device} requested but no CUDA device could be initialized; \
+             running on CPU. Check the NVIDIA driver and that the CUDA runtime libraries are \
+             on the dynamic loader path (LD_LIBRARY_PATH / ldconfig)."
+        );
+    } else if cfg!(feature = "metal") {
+        tracing::warn!(
+            gpu_device,
+            "GPU device {gpu_device} requested but no Metal device could be initialized; \
+             running on CPU."
+        );
+    } else {
+        tracing::warn!(
+            gpu_device,
+            "GPU device {gpu_device} requested but this build has no GPU support compiled in \
+             (CPU-only build); running on CPU. Use the CUDA-enabled server build for GPU \
+             inference, or set gpu.device=-1 to select CPU explicitly and silence this warning."
+        );
+    }
     Ok(Device::Cpu)
 }
 

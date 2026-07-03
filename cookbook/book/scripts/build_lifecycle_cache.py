@@ -16,7 +16,7 @@ It runs the whole catalog interaction on BOTH transports and freezes the matrix:
   12-row in-memory `(anchor, positive)` pairs corpus with the engine's public
   `tiny_modernbert` fixture registers two rows: the base model (path-keyed) at
   submission and the fine-tuned model (`jammi:fine-tuned:<uuid>`) on completion.
-  CPU/hermetic — the candle backend logs `CUDA requested … running on CPU`; no
+  CPU/hermetic — the candle backend logs that it is running on CPU; no
   GPU, no keystone corpus.
 * **see** — `describe_model` / `list_models` reflect the registered models as the
   minimal client-facing projection.

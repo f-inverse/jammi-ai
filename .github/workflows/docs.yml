@@ -16,12 +16,12 @@ on:
       - "crates/*/src/**"
       - "cookbook/recipes/**"
       - "cookbook/quickstart/**"
-  # Re-publish when the Cookbook book finishes a render on main (its output is the
-  # /cookbook subpath we serve). `branches` filters on the triggering run's branch,
-  # so PR-branch Cookbook-book runs never fire this; the build-job `if` narrows it
-  # further to the render events that actually save a fresh _book cache.
+  # Re-publish when a Cookbook render finishes (its output is the /cookbook subpath
+  # we serve). The render is its own workflow — it runs only on schedule / manual
+  # dispatch and saves a fresh _book cache — so every completion is worth a
+  # republish; the cheap PR/push gate lives in a different workflow we don't watch.
   workflow_run:
-    workflows: ["Cookbook book"]
+    workflows: ["Cookbook render"]
     types: [completed]
     branches: [main]
   workflow_dispatch:
@@ -43,15 +43,12 @@ env:
 jobs:
   build:
     name: Build
-    # A `workflow_run` fires for every Cookbook-book completion on main — but only
-    # the render events (schedule / manual dispatch) save a fresh _book cache worth
-    # republishing. A main push runs only Cookbook-book's cheap gate (no cache) and
-    # already triggers this workflow directly, so skip those to avoid a redundant
-    # second build. (`branches: [main]` on the trigger handles the branch filter.)
+    # For a `workflow_run` trigger (a Cookbook render completed on main), only
+    # republish if that render succeeded — a failed render leaves the last good
+    # _book cache in place, which a direct push still serves.
     if: >-
       github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event.workflow_run.event))
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/f-inverse/jammi-ai-ci:latest

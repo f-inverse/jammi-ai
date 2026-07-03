@@ -1,0 +1,95 @@
+name: Cookbook render
+
+# The heavy leg of the Theory↔Computation book (cookbook/book/): a full quarto
+# render that re-executes every chapter (incl. the grpc:// live-server chapters)
+# against the committed cache, plus a release-recipe leg that re-runs the CPU gate
+# against the LAST PUBLISHED PyPI wheel. Runs nightly (and on demand) — never on a
+# PR — and caches the rendered `_book`, which the Docs workflow restores to publish
+# the /cookbook subpath. Split out from the fast PR/push gate (cookbook-book.yml) so
+# the Docs republish (keyed on this workflow via `workflow_run`) fires only on a
+# real render, never on the cheap gate.
+
+on:
+  schedule:
+    # Nightly: full quarto render + live-server chapters + the release-recipe leg.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: cookbook-render-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The determinism regime (K0 §3): jammi_cookbook also sets these on import, but
+  # pinning them in the job env covers anything that reads them first.
+  OMP_NUM_THREADS: "1"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  TOKENIZERS_PARALLELISM: "false"
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
+jobs:
+  render:
+    name: Render + live-server + release recipe (nightly)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Build the HEAD wheel + jammi-server binary
+        # The grpc:// / live-server chapters shell out to jammi-server; build it
+        # alongside the HEAD embed wheel.
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install maturin
+          pip install -e 'clients/python[dev]'
+          make -C clients/python generate
+          maturin build --release --out target/wheels
+          pip install --force-reinstall --no-deps target/wheels/jammi_ai-*.whl
+          cargo build --release -p jammi-server
+
+      - name: Install the book (against the HEAD wheel)
+        run: |
+          . .venv/bin/activate
+          pip install -e 'cookbook/book[book,dev]'
+
+      - name: Render + execute the book (reads the committed cache)
+        # Render re-executes every chapter against the committed cache and fails on
+        # any drifted or moved artifact. jammi-server is on the path for the
+        # grpc:// chapters.
+        working-directory: cookbook/book
+        run: |
+          . "$GITHUB_WORKSPACE/.venv/bin/activate"
+          export PATH="$GITHUB_WORKSPACE/target/release:$PATH"
+          quarto render
+
+      - name: Cache the rendered book for the Pages deploy
+        # The executed render only happens here (nightly / on demand). The Docs
+        # workflow restores this by prefix and serves it under /cookbook, so the
+        # Pages deploy never has to re-execute the book on the critical path.
+        uses: actions/cache/save@v4
+        with:
+          path: cookbook/book/_book
+          key: cookbook-book-render-${{ github.sha }}
+
+      - name: Release recipe — last PUBLISHED wheel + CPU pytest subset
+        # Preserve the published-artifact signal HEAD-testing loses: install the
+        # last released jammi_ai from PyPI into a clean venv and re-run the book's
+        # CPU gate (the pytest suite reads the committed cache; it never retrains
+        # or re-embeds). A drift between HEAD and the published surface shows here.
+        run: |
+          python3 -m venv .venv-release
+          . .venv-release/bin/activate
+          pip install --upgrade pip
+          pip install jammi_ai
+          pip install -e 'cookbook/book[book,dev]'
+          cd cookbook/book
+          python scripts/check_api_reference.py
+          pytest -q

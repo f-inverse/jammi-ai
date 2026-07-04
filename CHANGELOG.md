@@ -6,6 +6,20 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Added
+- **`ProducingDescriptor::External` — a generic producer for consumer-materialized
+  result tables.** A consumer that publishes its own rows behind the materialization
+  contract (`materialize_embedding_table` / `finalize_with_manifest`) but produces
+  them by a verb the engine does not own now records
+  `ProducingDescriptor::External { producer_id, params }` — an opaque producer id
+  plus its output-affecting parameters as canonical `BTreeMap<String, String>` pairs.
+  The definition hash folds these like any typed producer's, so the table stays
+  content-addressable; completeness of `params` is the producer's contract (an
+  omitted determinant is a silent false match). The engine cannot reconstruct an
+  external producer, so `recompute` of such a table is the loud typed
+  `JammiError::NotRecomputable` refusal (its message generalized to cover both the
+  pre-contract and external cases) — recomputation is the producing consumer's job.
+
 ## [0.32.1] - 2026-07-03
 
 A bug-fix release, shipped in lockstep across the workspace.

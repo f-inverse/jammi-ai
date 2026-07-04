@@ -44,6 +44,8 @@
 //! description, the environment (including the compute device), or the inputs
 //! changes the hash.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -382,6 +384,36 @@ pub enum ProducingDescriptor {
         /// Right-side projection columns, in output order. Empty = all non-key
         /// columns.
         project: Vec<String>,
+    },
+    /// A table produced by a verb the engine does not own: a consumer built the
+    /// rows through its own producer and asked the engine only to publish them
+    /// behind the materialization contract. The engine has no dispatch for a
+    /// producer it did not define, so a `recompute` of an external table is the
+    /// loud typed refusal [`crate::error::JammiError::NotRecomputable`], never a
+    /// re-run guessed from the table's columns. The rest of the contract still
+    /// holds unchanged: `verify_materialization` recomputes the artifact digest,
+    /// and the definition hash folds these fields exactly like any other
+    /// producer's.
+    ///
+    /// `params` carries the producer's full set of output-affecting parameters
+    /// as canonical key/value pairs. Their **completeness is the producer's
+    /// contract** — the same burden every variant above carries in its typed
+    /// fields: a parameter that changes the output but is absent here makes two
+    /// different productions serialise identically and therefore collide on one
+    /// hash (a silent false match). A `BTreeMap` so the canonical encoding is
+    /// key-ordered and stable regardless of insertion order.
+    External {
+        /// The canonical id of the verb the engine does not own — an opaque
+        /// label naming the external producer (e.g. its stable pipeline id).
+        /// Named `producer_id`, not `producer`, because the enum's serde tag key
+        /// is already `producer` (it holds the variant discriminant `external`);
+        /// a field also named `producer` would collide with it in the flattened
+        /// internally-tagged encoding.
+        producer_id: String,
+        /// Every output-affecting parameter of the external producer, as
+        /// canonical string key/value pairs. An omitted determinant is a silent
+        /// false match, so completeness is the producer's responsibility.
+        params: BTreeMap<String, String>,
     },
 }
 
@@ -977,6 +1009,54 @@ mod tests {
             columns.push("extra".into());
         }
         assert_ne!(base, definition_hash(&other, &env).unwrap());
+    }
+
+    fn external_descriptor() -> ProducingDescriptor {
+        ProducingDescriptor::External {
+            producer_id: "continual-context".into(),
+            params: BTreeMap::from([
+                ("purpose".into(), "rc".into()),
+                ("revision".into(), "7".into()),
+                ("dimensions".into(), "384".into()),
+            ]),
+        }
+    }
+
+    #[test]
+    fn external_descriptor_round_trips_and_tags_by_producer() {
+        let d = external_descriptor();
+        // The internally-tagged discriminant is snake_case `external`; the
+        // opaque producer id lives under the non-colliding `producer_id` key.
+        let value = serde_json::to_value(&d).unwrap();
+        assert_eq!(value["producer"], "external");
+        assert_eq!(value["producer_id"], "continual-context");
+        // A full round-trip preserves the producer id and every param.
+        let back: ProducingDescriptor = serde_json::from_value(value).unwrap();
+        assert_eq!(back, d);
+    }
+
+    #[test]
+    fn external_definition_hash_is_deterministic_and_param_complete() {
+        let env = cpu_env();
+        let base = definition_hash(&external_descriptor(), &env).unwrap();
+        // Deterministic: the same producer + params fold to the same hash.
+        assert_eq!(base, definition_hash(&external_descriptor(), &env).unwrap());
+
+        // Completeness: changing any recorded param changes the hash, so an
+        // external producer that records all its determinants never collides two
+        // distinct productions onto one identity.
+        let mut changed = external_descriptor();
+        if let ProducingDescriptor::External { params, .. } = &mut changed {
+            params.insert("revision".into(), "8".into());
+        }
+        assert_ne!(base, definition_hash(&changed, &env).unwrap());
+
+        // A different opaque producer id is likewise a different definition.
+        let mut other_producer = external_descriptor();
+        if let ProducingDescriptor::External { producer_id, .. } = &mut other_producer {
+            *producer_id = "resilience-perturbation".into();
+        }
+        assert_ne!(base, definition_hash(&other_producer, &env).unwrap());
     }
 
     #[test]

@@ -342,6 +342,13 @@ impl InferenceSession {
                 // replay is unconditionally a fresh `Computed`.
                 Ok((record.table_name, CacheOutcome::Computed))
             }
+            // An external producer is a verb the engine does not own, so there is
+            // no faithful call to reconstruct — a loud refusal, never a guessed
+            // re-run. Recomputing an external table is the producing consumer's
+            // job; the engine only ever republishes what it is handed.
+            ProducingDescriptor::External { .. } => Err(JammiError::NotRecomputable {
+                table: table.table_name.clone(),
+            }),
         }
     }
 

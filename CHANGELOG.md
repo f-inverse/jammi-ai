@@ -6,6 +6,10 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-07-04
+
+A feature release, shipped in lockstep across the workspace.
+
 ### Added
 - **`ProducingDescriptor::External` — a generic producer for consumer-materialized
   result tables.** A consumer that publishes its own rows behind the materialization

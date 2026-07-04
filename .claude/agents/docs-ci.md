@@ -16,6 +16,7 @@ owns:
   - .dockerignore
   - .gitattributes
   - .gitignore
+  - AGENTS.md
   - CHANGELOG.md
   - Cargo.lock
   - Cargo.toml

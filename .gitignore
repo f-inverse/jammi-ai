@@ -59,9 +59,17 @@ packaging/*/build/
 .target/
 .tmp/
 
-# Claude — personal settings stay local; the committed swarm agent cards are tracked.
+# Claude — personal settings stay local; the committed swarm files are tracked.
+# (settings.local.json and worktrees/ stay ignored by the .claude/* rule above.)
 .claude/*
 !.claude/agents/
+!.claude/hooks/
+!.claude/evals/
+!.claude/settings.json
+# Swarm runtime state: the escape ledger (.jammi/escapes.jsonl) is tracked; the
+# per-session facts ledger and domain mutex locks are ephemeral, never committed.
+.jammi/ledger/
+.jammi/locks/
 CLAUDE.md
 docs/plans/*
 # Maintainer roadmap / journey docs are tracked despite the docs/plans/ rule.

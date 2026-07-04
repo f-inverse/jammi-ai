@@ -106,18 +106,24 @@ dispatches and the gate it clears.
 | Phase | Name | Agent(s) | Gate |
 |---|---|---|---|
 | 0 | Ground | lead | facts ledger; load the constitution invariants the brief crosses + `SELF-FAILURE-MODES.md` |
+| 0.5 | Scope (all work) | `gap-analyzer` | enumerate exactly what's asked, flag ambiguities, name which invariants it crosses; verdict `clear / ambiguous / invariant-crossing` |
+| 0.7 | Triage (defect only) | `issue-triage` | ingest the RAW issue text; classify `valid-defect / misconception / constitution-challenge / enhancement`. **valid-defect EMITS the `symptom_spec` (intended/observable/control) as an `open` escape row — this is the RED that seeds red-green.** misconception → halt (+ optional non-bug golden); constitution-challenge → escalate to a human |
 | 1 | Plan + pressure-test | lead + `pressure-tester` | a written plan; pressure-test kills wrong designs *before code* |
-| 2 | Contract | lead | per-domain: files_in_scope, invariants_to_preserve, acceptance; the contract embeds CI's EXACT full gate (per-step `$?`, no pipe-masking) |
+| 2 | Contract | lead | per-domain: files_in_scope, invariants_to_preserve, **acceptance criteria (the *feature*'s RED oracle)**; embeds CI's EXACT full gate (per-step `$?`, no pipe-masking) |
 | 3 | Implement | owning **domain agent** (worktree, unique `CARGO_TARGET_DIR`) or `general-purpose` on an existing branch | the change + the full gate run locally |
 | 4 | Audit | `adversarial-audit` + `discipline-test-auditor` + `citation-checker` | independent refutation; BLOCK on any Stands |
 | 5 | Oracle | `oracle` | hard-block on frozen-seam / boundary / lockstep violation (not overridable) |
-| 6 | Verify-fix | `fix-verifier` | on a defect fix: red-green + non-finite control; the test must *bite*; cite `closes_escape` |
+| 6 | Verify red→green | **defect:** `fix-verifier` (the test asserts the triaged `symptom_spec.observable`; revert fix → RED → GREEN; non-finite control; cite `closes_escape`). **feature:** `acceptance-verifier` (the phase-2 acceptance test was RED at the base commit, GREEN on the branch; asserts the acceptance criterion, not an implementation detail) | the test must have been RED and now bites |
 | 6.5 | Cookbook | `cookbook` (`cookbook-emit`) | re-emit chapters whose goldens the diff could move; **block Ship on divergence** (route back as an engine bug) |
 | 7 | Ship + publish | lead | push, PR, watch CI green, merge, watch post-merge green; own the lockstep crates.io+PyPI publish |
-| — | Learn (out-of-band) | `retrospective` | periodic, not per-unit: cluster escapes → a *general* tightening PR (human-merged) |
+| — | Learn + hygiene (out-of-band) | `retrospective` | periodic, not per-unit: cluster escapes into a *principle* → **one** general tightening PR (human-merged); own escape-ledger **lifecycle** — promote `open→eval_added→closed`, cluster (never N narrow gates), and **archive** long-green `closed` escapes to `escapes-archive.jsonl` (never delete — the row is its golden's oracle) |
 
-The lead re-verifies every cited `path:line` and every "gate passed" claim — a
-subagent result is evidence to audit, never a fact to accept.
+Two front doors, symmetric on their RED oracle: a **defect** is triaged into a
+`symptom_spec` (0.7) that drives `fix-verifier`; a **feature** is scoped (0.5) and
+its `acceptance` criteria (phase 2) drive `acceptance-verifier`. A **question**
+mutates nothing → no phase machine. The lead re-verifies every cited `path:line`
+and every "gate passed" claim — a subagent result is evidence to audit, never a
+fact to accept.
 
 ## 5. Roles
 
@@ -127,6 +133,21 @@ ledger, phases, consensus, git/PR/publish; never edits on swarm work.
 **Verifiers** (read-only, main checkout, JSON verdict, audit an explicit
 `git diff <base>...<head>`). Each card is a **principle-level rubric** (§2.8), with
 its checklist lifted from `LESSONS.md` §Per-mechanism:
+- `gap-analyzer` — the scope front door (phase 0.5, feature *and* fix): re-reads the
+  brief, enumerates exactly what's asked, flags ambiguities, names which constitution
+  invariants it crosses. Verdict `clear / ambiguous / invariant-crossing`.
+- `issue-triage` — the defect front door (phase 0.7): ingests the RAW issue text
+  (the lead runs `gh issue view`; the agent has no Bash), classifies validity, and
+  for a valid-defect **emits the `symptom_spec` as an `open` escape row** — the RED
+  seed that `fix-verifier` later verifies faithfulness against.
+- `acceptance-verifier` — the *feature*-path exit gate (phase 6), symmetric to
+  `fix-verifier`: proves the phase-2 acceptance test was RED at the base commit and
+  GREEN on the branch, and asserts the acceptance criterion (not an implementation
+  detail). `fix-verifier` is the *defect*-path exit; both share the red-green primitive.
+- `retrospective` — out-of-band Learn + hygiene: clusters escapes into a principle
+  and opens **one** general tightening PR (human-merged; it *proposes*, it does not
+  self-modify a gate — `SWARM_GATE_TOUCHED` blocks that), and owns the escape-ledger
+  lifecycle (promote → cluster → archive, never delete).
 - `pressure-tester` — attacks the plan (spec-as-claim-to-reproduce; principle
   violations: wrong abstraction, band-aid shape, non-atomic split).
 - `adversarial-audit` — refutes the diff (states the happy path never constructs;

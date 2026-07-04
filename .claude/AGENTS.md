@@ -12,24 +12,36 @@ invariant index the swarm cites by ID is [`docs/swarm/CONSTITUTION.md`](../docs/
 The **lead** (the main loop) runs a fixed pipeline. Each phase clears a named gate before
 the next begins — skip a step and you ship the plausible-wrong version on green.
 
+Two front doors, symmetric on their RED oracle: a **defect** is triaged (0.7) into a
+`symptom_spec` that drives `fix-verifier`; a **feature** is scoped (0.5) and its `acceptance`
+criteria drive `acceptance-verifier`. A **question** mutates nothing → no phase machine.
+
 | Phase | Name | Agent(s) | Gate |
 |---|---|---|---|
 | 0 | Ground | `lead` | facts ledger; load the constitution invariants the brief crosses + `SELF-FAILURE-MODES.md` |
+| 0.5 | Scope (all mutating work) | [`gap-analyzer`](agents/gap-analyzer.md) | enumerate what's asked, flag ambiguities, name the invariants crossed; `clear / ambiguous / invariant-crossing` |
+| 0.7 | Triage (defect only) | [`issue-triage`](agents/issue-triage.md) | classify the RAW issue; **valid-defect emits the `symptom_spec` as an `open` escape row** (the RED for phase 6); misconception → halt; constitution-challenge → escalate |
 | 1 | Plan + pressure-test | `lead` + [`pressure-tester`](agents/pressure-tester.md) | a written plan; kill wrong designs *before code* |
-| 2 | Contract | `lead` | per-domain scope + invariants + acceptance; embed CI's exact full gate |
+| 2 | Contract | `lead` | per-domain scope + invariants + acceptance (the *feature*'s RED oracle); embed CI's exact full gate |
 | 3 | Implement | owning **domain agent** (worktree) or `general-purpose` | the change + the full gate run locally |
 | 4 | Audit | [`adversarial-audit`](agents/adversarial-audit.md) + [`discipline-test-auditor`](agents/discipline-test-auditor.md) + [`citation-checker`](agents/citation-checker.md) | independent refutation; BLOCK on any Stands |
 | 5 | Oracle | [`oracle`](agents/oracle.md) | hard-block on frozen-seam / boundary / lockstep / tenant-iso — **not overridable** |
-| 6 | Verify-fix | [`fix-verifier`](agents/fix-verifier.md) | on a defect fix: red-green + non-finite control; the test must bite |
+| 6 | Verify red→green | **defect:** [`fix-verifier`](agents/fix-verifier.md) · **feature:** [`acceptance-verifier`](agents/acceptance-verifier.md) | the test asserts the RED oracle, was RED at base, GREEN on branch |
 | 6.5 | Cookbook | `cookbook` | re-emit chapters whose goldens the diff could move; block Ship on divergence |
 | 7 | Ship + publish | `lead` | push, PR, watch CI green, merge, watch post-merge green; lockstep publish |
-| — | Learn | `retrospective` | periodic: cluster escapes → a *general* tightening PR (human-merged) |
+| — | Learn + hygiene | [`retrospective`](agents/retrospective.md) | periodic: cluster escapes → **one** general tightening PR (human-merged); own the escape-ledger lifecycle (promote → cluster → archive to `.jammi/escapes-archive.jsonl`, never delete) |
 
 ## The roster
 
 - **[`lead`](agents/lead.md)** — orchestrator; sole `Task` holder (no subagent spawns a
   subagent); owns the ledger, per-axis consensus, and git/PR/publish; **re-verifies every
   cited `path:line` and every "gate passed" claim**; never edits code on swarm work.
+- **[`gap-analyzer`](agents/gap-analyzer.md)** — the scope front door (phase 0.5, all
+  mutating work); enumerates exactly what's asked, flags ambiguities, names the invariants
+  crossed (`clear / ambiguous / invariant-crossing`).
+- **[`issue-triage`](agents/issue-triage.md)** — the defect front door (phase 0.7); classifies
+  the raw issue text and, for a valid-defect, emits the `symptom_spec` as the `open` escape row
+  that seeds red-green.
 - **[`pressure-tester`](agents/pressure-tester.md)** — attacks the *plan* before code;
   treats every spec premise as a claim to reproduce.
 - **[`adversarial-audit`](agents/adversarial-audit.md)** — refutes the *diff* across the
@@ -38,8 +50,14 @@ the next begins — skip a step and you ship the plausible-wrong version on gree
   judgment lens; pairs with the mechanical `check_no_consumer_names.py`.
 - **[`citation-checker`](agents/citation-checker.md)** — re-reads every cited location; catches
   fabricated or stale citations.
-- **[`fix-verifier`](agents/fix-verifier.md)** — the phase-6 exit gate; red-green + non-finite
-  control; requires a `closes_escape` id on a defect fix.
+- **[`fix-verifier`](agents/fix-verifier.md)** — the *defect*-path phase-6 exit gate; red-green
+  + non-finite control; requires a `closes_escape` id on a defect fix.
+- **[`acceptance-verifier`](agents/acceptance-verifier.md)** — the *feature*-path phase-6 exit
+  gate, symmetric to `fix-verifier`; proves the phase-2 acceptance test was RED at base and GREEN
+  on the branch, asserting the acceptance criterion (not an implementation detail).
+- **[`retrospective`](agents/retrospective.md)** — out-of-band Learn + escape-ledger hygiene;
+  clusters escapes into a principle and opens **one** general tightening PR (human-merged), and
+  owns the ledger lifecycle (promote → cluster → archive, never delete).
 - **[`oracle`](agents/oracle.md)** — the hard-blocks (dep-direction, lockstep, append-only
   migrations, embedded⇄remote parity, per-RPC tenant isolation, frozen surface); **not
   consensus-overridable**.

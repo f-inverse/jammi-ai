@@ -23,18 +23,22 @@ A subagent's report — an audit verdict, a "gate passed," a "pushed the commit,
 
 Run the fixed pipeline; each phase names the agent(s) you dispatch and the gate it clears. Do not skip a phase — the rigor chain is a bug-*discovery* mechanism; green CI is the floor, not the ceiling.
 
+**Route by work type first.** A **question** mutates nothing → **no phase machine** (answer it; nothing to verify). A **defect** takes the triage path (0.7 → the `symptom_spec` RED drives `fix-verifier` at phase 6). A **feature** takes the scope path (0.5 → the phase-2 `acceptance` criteria drive `acceptance-verifier` at phase 6). Both mutating doors are symmetric on their RED oracle.
+
 | Phase | Name | Dispatch | Gate you clear |
 |---|---|---|---|
 | 0 | Ground | you | seed the facts ledger; load the constitution invariants the brief crosses + `SELF-FAILURE-MODES.md` |
+| 0.5 | Scope (all mutating work) | `gap-analyzer` | enumerate exactly what's asked, flag ambiguities, name which invariants the brief crosses; verdict `clear / ambiguous / invariant-crossing` |
+| 0.7 | Triage (defect only) | `issue-triage` | **you run `gh issue view` and paste the RAW issue text in** (the agent has no Bash); it classifies `valid-defect / misconception / constitution-challenge / enhancement`. On **valid-defect** you APPEND the returned `symptom_spec{intended,observable,control}` as an `open` row to `.jammi/escapes.jsonl` — **that row is the RED the phase-6 test must assert.** misconception → halt (+ optional non-bug golden); constitution-challenge → escalate to a human |
 | 1 | Plan + pressure-test | you + `pressure-tester` | a written plan; kill wrong designs *before code* |
-| 2 | Contract | you | per-domain: `files_in_scope`, `invariants_to_preserve`, `acceptance`; embed CI's EXACT full gate (per-step `$?`, no pipe-masking) |
+| 2 | Contract | you | per-domain: `files_in_scope`, `invariants_to_preserve`, `acceptance` (the *feature*'s RED oracle); embed CI's EXACT full gate (per-step `$?`, no pipe-masking) |
 | 3 | Implement | owning **domain agent** (worktree + unique `CARGO_TARGET_DIR`) or `general-purpose` on an existing branch | the change + the full gate run locally |
 | 4 | Audit | `adversarial-audit` + `discipline-test-auditor` + `citation-checker` | independent refutation; BLOCK on any Stands |
 | 5 | Oracle | `oracle` | hard-block on frozen-seam / boundary / lockstep / tenant-iso violation — **not overridable** |
-| 6 | Verify-fix | `fix-verifier` | on a defect fix: red-green + non-finite control; the test must bite; cite `closes_escape` |
+| 6 | Verify red→green | **defect:** `fix-verifier` — the test asserts the triaged `symptom_spec.observable`; revert fix → RED → GREEN; non-finite control; cite `closes_escape`. **feature:** `acceptance-verifier` — the phase-2 acceptance test was RED at the base commit, GREEN on the branch; asserts the acceptance criterion, not an implementation detail | the test must have been RED and now bites |
 | 6.5 | Cookbook | `cookbook` | re-emit chapters whose goldens the diff could move; **block Ship on divergence** (route back as an engine bug) |
 | 7 | Ship + publish | you | push, PR, watch CI green, merge, watch post-merge green; own the lockstep crates.io + PyPI publish |
-| — | Learn (out-of-band) | `retrospective` | periodic: cluster escapes → a *general* tightening PR (human-merged) |
+| — | Learn + hygiene (out-of-band) | `retrospective` | periodic, not per-unit: cluster escapes into a *principle* → **one** general tightening PR (human-merged); own escape-ledger **lifecycle** — promote `open→eval_added→closed`, cluster (never N narrow gates), and **archive** long-green `closed` escapes to `.jammi/escapes-archive.jsonl` (**never delete** — the row is its golden's oracle) |
 
 ## Consensus — per-axis, never a vote
 

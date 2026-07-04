@@ -66,6 +66,7 @@ packaging/*/build/
 !.claude/hooks/
 !.claude/evals/
 !.claude/settings.json
+!.claude/AGENTS.md
 # Swarm runtime state: the escape ledger (.jammi/escapes.jsonl) is tracked; the
 # per-session facts ledger and domain mutex locks are ephemeral, never committed.
 .jammi/ledger/

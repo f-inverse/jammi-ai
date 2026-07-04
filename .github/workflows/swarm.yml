@@ -1,0 +1,94 @@
+name: Swarm gates
+
+# No `paths:` filter — every gate here is a trivial, hermetic pure-Python (or
+# git-diff) check with no Rust build and no toolchain, so it always runs on every
+# PR and push to main. A path-filtered workflow that is later set as a required
+# status check would hang unrelated PRs (the check never reports) — this is the
+# #245 trap. The TOUCHED guards below therefore detect their own touched set
+# *inside* the job (via `git diff`), never via a workflow `paths:` filter.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: swarm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  swarm-gates:
+    name: Guard (swarm constitution + boundary)
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 so the PR base ref is present for the git-diff-scoped
+      # guards and the diff-scoped governance tripwire.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # --- Always-run gates (fail-closed; pure-Python, no toolchain) ----------
+
+      # Total-ownership bijection over crates/ (authored separately).
+      - name: Assert the swarm domain manifests partition crates/ exactly
+        if: ${{ !cancelled() }}
+        run: python3 ci/scripts/check_swarm_bijection.py
+
+      # Every typed anchor in the constitution resolves; every boundary invariant
+      # is wired to a gate (or honestly flagged gate_script:UNENFORCED).
+      - name: Assert every constitution code anchor resolves
+        if: ${{ !cancelled() }}
+        run: python3 ci/scripts/check_constitution_anchors.py
+
+      # The mechanical half of the discipline test: no governance-verb leak in the
+      # diff, no philosophy leak-smell token in the engine tree. Advisory-labelled.
+      - name: Assert no consumer-name / governance leak in the engine tree
+        if: ${{ !cancelled() }}
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: python3 ci/scripts/check_no_consumer_names.py
+
+      # --- Human-amend-only guards (git-diff-scoped; PRs only) ----------------
+      # Each detects its touched set inside the job and exits green when untouched,
+      # red (admin-merge required) when touched. Every constitution/gate edit —
+      # tightening included — is human-amend-only (anti-Goodhart via human-in-the-
+      # loop, not a nonexistent tighten-vs-weaken direction classifier).
+
+      - name: Guard — CONSTITUTION is human-amend-only (CONSTITUTION_TOUCHED)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        run: |
+          git fetch --quiet origin "${{ github.base_ref }}"
+          base="origin/${{ github.base_ref }}"
+          changed="$(git diff --name-only "$base"...HEAD -- docs/swarm/CONSTITUTION.md)"
+          if [ -n "$changed" ]; then
+            echo "::error::CONSTITUTION_TOUCHED: docs/swarm/CONSTITUTION.md changed in this PR."
+            echo "The engine constitution is human-amend-only (anti-Goodhart, ARCHITECTURE §2.7/§7):"
+            echo "every edit — tightening included — must be human-reviewed and admin-merged."
+            echo "This PR must be human-reviewed and admin-merged."
+            exit 1
+          fi
+          echo "CONSTITUTION_TOUCHED: clean — constitution untouched."
+
+      - name: Guard — swarm gate definitions are human-amend-only (SWARM_GATE_TOUCHED)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        run: |
+          git fetch --quiet origin "${{ github.base_ref }}"
+          base="origin/${{ github.base_ref }}"
+          changed="$(git diff --name-only "$base"...HEAD -- \
+            ':(glob).claude/agents/*.md' \
+            ':(glob)ci/scripts/check_*.py' \
+            ':(glob)ci/scripts/check_*.sh' \
+            '.claude/settings.json' \
+            ':(glob).claude/evals/**' \
+            ':(glob).claude/hooks/**' \
+            '.github/workflows/swarm.yml')"
+          if [ -n "$changed" ]; then
+            echo "::error::SWARM_GATE_TOUCHED: a swarm gate definition changed in this PR:"
+            echo "$changed" | sed 's/^/    /'
+            echo "Gate definitions (agent cards, check_*.py gates, swarm.yml) are human-amend-only."
+            echo "Autonomously adding/altering a gate touches a gate definition and is blocked by design."
+            echo "This PR must be human-reviewed and admin-merged."
+            exit 1
+          fi
+          echo "SWARM_GATE_TOUCHED: clean — no swarm gate definition changed."

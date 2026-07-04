@@ -13,10 +13,16 @@ one).
 
 **How work enters:**
 - A **question** mutates nothing → skip the machine; answer directly.
-- A **defect** enters at **triage** (phase 0.7): `issue-triage` classifies validity
-  and emits the `symptom_spec` that seeds red-green (`fix-verifier`).
-- A **feature** enters at **scope** (phase 0.5): `gap-analyzer` bounds it; the
-  phase-2 acceptance criteria drive `acceptance-verifier`.
+- **Every** mutating change is **scoped** first — phase 0.5, `gap-analyzer`: the ask,
+  its ambiguities, the invariants it crosses (feature *and* fix alike).
+- A **defect** then *also* passes **triage** — phase 0.7, `issue-triage` (defect-only):
+  validity + the `symptom_spec` that seeds red-green (`fix-verifier`).
+- A **feature** proceeds from scope to a plan; its phase-2 acceptance criteria drive
+  `acceptance-verifier`.
+
+So the two doors aren't symmetric on *entry* (0.5 is universal); they're symmetric on
+their **RED oracle** — a defect's is a triaged `symptom_spec`, a feature's is its
+acceptance criteria.
 
 Design rationale lives in `docs/plans/53-agentic-swarm/ARCHITECTURE.md`. The
 enforcement is honest: the hard teeth are native per-agent `tools:` + fail-closed CI

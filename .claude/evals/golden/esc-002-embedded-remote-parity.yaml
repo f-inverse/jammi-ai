@@ -1,0 +1,29 @@
+# Golden eval — derived from a real escape. See ../README.md for the case shape.
+id: golden-esc-002-embedded-remote-parity
+escape: esc-002-remote-publish-multichunk-divergence
+principle: >-
+  Family H — cross-surface parity is byte-for-byte, on the divergence-prone case. When
+  one capability has two surfaces (embedded vs remote, local vs engine, CPU vs GPU) they
+  must agree byte-for-byte — not "both respond" — and the parity oracle must exercise the
+  divergence-prone input (multi-chunk, boundary, empty), never only the happy path.
+verifier: oracle
+expect: hard-block
+situation: >-
+  A remote publish path silently diverges from the embedded path on a multi-chunk table:
+  the server rejects a chunking the client accepts. The only parity test uses a
+  single-chunk table and passes. The oracle must hard-block on embedded⇄remote byte-parity
+  because no oracle exercises the multi-chunk (divergence-prone) input.
+mutation:
+  # SAME principle, a different capability + a different divergence-prone axis — not the
+  # publish/multi-chunk signature. Tests that the parity lens generalizes across surfaces.
+  description: >-
+    A new `search` verb ships both an embedded and a wire (Flight SQL) surface. The parity
+    oracle asserts both return the same top-1 row on a small single-batch fixture, but
+    never exercises an EMPTY result set or a tie at the k-th score — exactly where the two
+    tie-break/serialization paths can diverge. Two surfaces, one capability, no
+    divergence-prone parity case.
+  expect: hard-block
+notes: >-
+  Passing requires the oracle to demand a byte-parity case on the divergence-prone input
+  for ANY two-surface capability — the principle — not to look specifically for
+  publish_topic or multi-chunk. The empty/tie axis is the held-out mutant.

@@ -1,0 +1,29 @@
+# Golden eval — derived from a real escape. See ../README.md for the case shape.
+id: golden-esc-005-nonfinite-control
+escape: esc-005-nonfinite-control-vacuous
+principle: >-
+  Family F/G — a negative control must be non-vacuous: it must fail on EVERY way the bad
+  path can fail, including non-finite (NaN/±inf), and the fix's test must bite (red before
+  the fix, green after). A control that a NaN can slip through is tautological.
+verifier: fix-verifier
+expect: BLOCK   # verdict: tautological / non-symptom-faithful control
+situation: >-
+  A negative control asserts "the un-standardized path collapses" via
+  `mean > 100 || sigma < 0.05`. But the bad path diverges to NaN, and `NaN > 100 ||
+  NaN < 0.05` is `false || false`, so a divergence reads as a successful fit and the
+  control passes vacuously. fix-verifier must BLOCK: the control does not count the
+  non-finite failure mode.
+mutation:
+  # SAME principle (non-finite / unmodelled failure mode makes a control vacuous), a
+  # DIFFERENT predicate shape — not the mean/sigma comparison. Tests generalization.
+  description: >-
+    A regression control for a ranking fix asserts "the buggy scorer ranks the poison doc
+    below rank K" via `rank_of(poison) > K`. On the buggy path the scorer returns NaN for
+    the poison doc, so it sorts to the array tail and `rank_of` returns a large sentinel
+    that satisfies `> K` — the control passes on the exact failure it should catch. The
+    red-green also never actually goes RED pre-fix.
+  expect: BLOCK
+notes: >-
+  Passing requires fix-verifier to apply "does this control pass on NaN/±inf or any
+  unmodelled failure? and does the test actually go RED before the fix?" as the principle,
+  independent of the concrete predicate. The rank-sentinel-on-NaN is the held-out mutant.

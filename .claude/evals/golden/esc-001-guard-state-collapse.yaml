@@ -1,0 +1,34 @@
+# Golden eval — derived from a real escape. See ../README.md for the case shape and
+# the generalization-by-mutation rule. This is a runnable-shaped scaffold: the harness
+# stages `situation` / `mutation` as a diff and asserts the named verifier's verdict.
+id: golden-esc-001-guard-state-collapse
+escape: esc-001-tenant-scope-restore-leak
+principle: >-
+  Family A — resource-guard state-collapse. A guard (RAII / Drop / __exit__ / context
+  manager) that collapses distinct entry/exit states into one cleanup arm can release
+  something it never held. Every cleanup arm must distinguish "held" from "never held"
+  across the full state lattice (never-entered, entered-while-unset, re-entry, reuse,
+  error-path exit).
+verifier: adversarial-audit
+expect: BLOCK
+situation: >-
+  A context-manager __exit__ uses `.take().flatten()`, collapsing "never entered" (None)
+  and "entered-while-unset" (Some(None)) into a single unbind arm, so a stray exit clears
+  a live scope. The happy-path test only enters-then-exits once and passes green.
+  The audit must model the state lattice and BLOCK: an arm cannot tell acquired from
+  never-acquired.
+mutation:
+  # NOVEL perturbation of the SAME principle in DIFFERENT code — not a replay of the
+  # __exit__/.take().flatten() signature. A verifier that only pattern-matches the
+  # logged repro will miss this; a principle-level verifier fires on both.
+  description: >-
+    A Rust `Drop` impl for a pooled connection guard decrements a shared in-use counter
+    unconditionally, even on a guard constructed-but-never-checked-out (the acquire path
+    early-returned an error after building the guard). Distinct states — checked-out,
+    build-failed, already-returned — collapse into one decrement arm, so a dropped
+    never-held guard underflows the counter and frees a slot it never took.
+  expect: BLOCK
+notes: >-
+  Passing requires the audit to reason "model the guard's full acquire/release lattice
+  and block any arm that cannot distinguish held from never-held" — the principle — not
+  to recognize `.take().flatten()`. Memorizing the seeded signature fails the mutation.

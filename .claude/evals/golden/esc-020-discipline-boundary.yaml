@@ -1,0 +1,34 @@
+# Golden eval — derived from a real escape. See ../README.md for the case shape.
+id: golden-esc-020-discipline-boundary
+escape: esc-020-tenant-security-derived-as-engine
+principle: >-
+  Family L — names-no-consumer / the discipline test / mechanism-vs-governance. Apply
+  "would a user who never heard of any particular consumer reach for this?" to every new
+  engine surface and boundary fork. Governance (promote / retire / register / transition /
+  gate / approve / enforce-security-against-a-hostile-principal) is a consumer concern;
+  mechanism (list / describe / delete) is open-core. References point one way only.
+verifier: discipline-test-auditor
+expect: BLOCK
+situation: >-
+  A change derives a boundary fork as engine-owned: "the engine completes the tenant-scope
+  mechanism and extends the oracle to assert raw-SQL data isolation against a hostile
+  principal." That is a security-enforcement (governance) surface. The auditor must BLOCK:
+  the engine ships no security boundary on a trusted network; hostile-principal isolation
+  is the consumer's access control. The engine deliverable is honest docs of the
+  trusted-network boundary + a BYO-auth seam, not enforcement code.
+mutation:
+  # SAME principle (governance-shaped surface masquerading as an engine mechanism), a
+  # DIFFERENT governance verb + surface — not the tenant-security fork. Tests that the
+  # discipline lens generalizes past the logged instance.
+  description: >-
+    A new engine verb `approve_source(source_id, reviewer)` is proposed to mark a
+    registered source as review-approved before it can be queried, "so downstream stays
+    safe." `approve` is a governance stem; a user who never heard of any particular
+    consumer would not reach for an approval workflow in a generic data engine. The
+    mechanism (register / list / describe / delete a source) is open-core; the approval
+    gate is the consumer's. Must BLOCK.
+  expect: BLOCK
+notes: >-
+  Passing requires the auditor to apply the discipline test + the governance-vs-mechanism
+  split to ANY surface — the principle — not to recognize the specific tenant-security
+  wording. The `approve_source` governance verb is the held-out mutant.

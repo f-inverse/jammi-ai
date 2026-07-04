@@ -1,0 +1,32 @@
+# Golden eval — derived from a real escape. See ../README.md for the case shape.
+# This case's verifier is a STATIC gate (tier 1), so it is deterministic: the harness
+# stages the drift and asserts a non-zero exit.
+id: golden-esc-012-doc-parity-drift
+escape: esc-012-doc-parity-external-variant
+principle: >-
+  Family T — a documented enumeration must equal the code enum it mirrors (set-equality),
+  and each documented exception arm must match the code's actual arm. The gate asserts a
+  PROPERTY over the class (all drift), not a known-bad string, so it catches any variant
+  divergence — not just the one logged.
+verifier: check_doc_parity.py   # static/CI gate (fail-closed)
+expect: non-zero-exit           # gate fails red on drift
+situation: >-
+  The code enum gains a 7th variant (a deliberate no-replay exception arm) while the
+  guide keeps listing 6 and its recompute-invariant prose goes misleading. The static
+  parity gate must exit non-zero: the documented set != the code set, and the new
+  exception arm's replay behavior is unasserted.
+mutation:
+  # SAME parity property, a DIFFERENT drift direction and a DIFFERENT exception-arm
+  # mismatch — not the "guide missing the 7th variant" replay. A set-equality property
+  # gate catches this by construction; a grep for the one logged variant name would not.
+  description: >-
+    The reverse drift plus an exception flip: the code REMOVES a variant that the guide
+    still enumerates (documented ⊃ code), AND a variant the guide annotates "no replay
+    arm" now has a `replay_descriptor` arm that returns a real descriptor instead of
+    `NotRecomputable`. Both the set-inequality and the exception-arm mismatch must fail
+    the gate.
+  expect: non-zero-exit
+notes: >-
+  Because the gate asserts set-equality + per-arm exception matching (a class property),
+  it generalizes to added-variant, removed-variant, and flipped-exception drift alike.
+  The removed-variant + flipped-arm case is the held-out mutant a signature grep misses.

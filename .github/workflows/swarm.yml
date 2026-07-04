@@ -51,8 +51,9 @@ jobs:
 
       # --- Human-amend-only guards (git-diff-scoped; PRs only) ----------------
       # Each detects its touched set inside the job and exits green when untouched,
-      # red (admin-merge required) when touched. The swarm may not weaken the
-      # constitution or its own gate definitions autonomously (anti-Goodhart).
+      # red (admin-merge required) when touched. Every constitution/gate edit —
+      # tightening included — is human-amend-only (anti-Goodhart via human-in-the-
+      # loop, not a nonexistent tighten-vs-weaken direction classifier).
 
       - name: Guard — CONSTITUTION is human-amend-only (CONSTITUTION_TOUCHED)
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
@@ -62,8 +63,8 @@ jobs:
           changed="$(git diff --name-only "$base"...HEAD -- docs/swarm/CONSTITUTION.md)"
           if [ -n "$changed" ]; then
             echo "::error::CONSTITUTION_TOUCHED: docs/swarm/CONSTITUTION.md changed in this PR."
-            echo "The engine constitution is human-amend-only (anti-Goodhart, ARCHITECTURE §2.7):"
-            echo "the swarm may tighten itself but may not weaken the constitution that governs it."
+            echo "The engine constitution is human-amend-only (anti-Goodhart, ARCHITECTURE §2.7/§7):"
+            echo "every edit — tightening included — must be human-reviewed and admin-merged."
             echo "This PR must be human-reviewed and admin-merged."
             exit 1
           fi
@@ -77,6 +78,10 @@ jobs:
           changed="$(git diff --name-only "$base"...HEAD -- \
             ':(glob).claude/agents/*.md' \
             ':(glob)ci/scripts/check_*.py' \
+            ':(glob)ci/scripts/check_*.sh' \
+            '.claude/settings.json' \
+            ':(glob).claude/evals/**' \
+            ':(glob).claude/hooks/**' \
             '.github/workflows/swarm.yml')"
           if [ -n "$changed" ]; then
             echo "::error::SWARM_GATE_TOUCHED: a swarm gate definition changed in this PR:"

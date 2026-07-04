@@ -106,7 +106,7 @@ if printf '%s' "$CMD" | grep -Eq '(^|[^[:alnum:]_])maturin([[:space:]]|$)' ; the
   if [ -n "$PP" ]; then
     CWD="$(pwd 2>/dev/null || printf '%s' "$PWD")"
     case ":$PP:" in
-      *":$CWD"*|*":$CWD/"*|*":.:"*|*":.:"*) : ;;   # includes cwd — fine
+      *":$CWD"*|*":$CWD/"*|*":.:"*) : ;;   # includes cwd — fine
       *) warn "maturin invoked with PYTHONPATH='$PP' that does not include the current tree — a cross-worktree PYTHONPATH can shadow this worktree's built extension so tests import the wrong artifact. Pin PYTHONPATH to this worktree." ;;
     esac
   fi

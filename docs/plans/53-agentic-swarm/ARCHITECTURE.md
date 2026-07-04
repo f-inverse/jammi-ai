@@ -225,10 +225,13 @@ turning the anchor check into a completeness check over the enforcement surface.
 - **Facts ledger** — `.jammi/ledger/<session>.jsonl`, per-session, gitignored.
 - **Escape ledger** — `.jammi/escapes.jsonl`, tracked, engine-incidents-only (19
   seeded). Each row: `symptom_spec{intended,observable,control}`, `which_gate_missed`
-  (naming the mechanism that now catches it), `status`. **Citation gate (enforceable
-  direction):** if a diff transitions an escape to `closed`/`eval_added`, a golden
-  eval citing that escape id must be present in the same diff (grep the id in changed
-  eval files). Not "every test cites an escape."
+  (naming the mechanism that now catches it), `status`. **Citation discipline (not a wired
+  gate):** when a diff transitions an escape to `closed`/`eval_added`, a golden eval citing
+  that escape id should be present in the same diff (grep the id in changed eval files). This
+  is **discipline today**, enforced by the `fix-verifier` card's review — no committed script
+  checks it and no runner executes `.claude/evals/golden/*`. A mechanical
+  `check_escape_citations.py` grep gate is a **candidate tightening** (§12, G-e). Not "every
+  test cites an escape."
 
 ## 9a. Evals — the swarm's held-out test set
 
@@ -237,7 +240,9 @@ generalization test (§2.8). Layered like the engine's own test tiers:
 - **static** (`evals/static/*` — the CI gates above; deterministic, $0, every PR).
 - **golden set** (`evals/golden/*`) — each past **escape becomes a case**: given the
   situation, does the verifier that should catch it fire? An escape is only `closed`
-  when a golden eval proves the catch — this is the citation gate's teeth.
+  when a golden eval proves the catch — citation discipline enforced by the `fix-verifier`
+  card today (a mechanical `check_escape_citations.py` grep gate is a candidate tightening,
+  §12 G-e), not a wired gate.
 - **generalization by mutation** — cases hold out *novel* perturbations of each
   principle, not replays of the logged bug (shared red-green primitive with
   `fix-verifier`). A verifier passes only if it catches unseen mutants.
@@ -300,6 +305,9 @@ escape-close); **G-b** the honesty catches are audit judgment, not fail-closed
 invariants (supervision-ceiling, shift-geometry) stay discipline (no oracle, flagged
 so no one mistakes them for enforced); **G-d** the discipline-test semantic lens has
 no ground-truth oracle beyond dep-level (partially covered by the governance-verb-
-stem tripwire in `check_no_consumer_names.py`). These are labeled discipline today,
-tracked as candidate tightenings.
+stem tripwire in `check_no_consumer_names.py`); **G-e** the escape→golden citation is
+`fix-verifier` discipline, not a wired gate — candidate gate: on a PR that transitions an
+escape's status to `closed`/`eval_added` in `escapes.jsonl`, require a golden citing that id
+in the same diff (transition-only, so a newly-added row on genesis needs none). These are
+labeled discipline today, tracked as candidate tightenings.
 ```

@@ -207,13 +207,11 @@ def check_row(row: Row, swarm_text: str) -> list[str]:
             failure = resolve_doc_heading(anchor.value)
         elif anchor.kind == "discipline":
             # A conscious, human-gated declaration that this invariant has no
-            # mechanical gate (it is enforced by an auditor agent / review).
-            # It resolves iff it carries a non-empty rationale slug.
-            failure = (
-                None
-                if anchor.value.strip()
-                else "discipline anchor needs a rationale (`discipline:<why-no-gate>`)"
-            )
+            # mechanical gate (it is enforced by an auditor agent / review). It
+            # always carries a rationale slug: ANCHOR_RE requires >=1 non-space
+            # char after the colon, so an empty `discipline:` produces no anchor at
+            # all and is caught fail-closed by the "no typed anchor" rule above.
+            failure = None
         else:  # unreachable: ANCHOR_RE only matches the four kinds
             failure = f"unknown anchor kind `{anchor.kind}`"
 

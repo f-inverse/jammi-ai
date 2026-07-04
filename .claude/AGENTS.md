@@ -60,9 +60,10 @@ The only **hard** teeth are (a) native per-agent `tools:` — a verifier has no 
 *cannot* write — and (b) fail-closed CI gates, **and a CI gate only blocks once a human adds
 it to branch-protection required-checks.** Committing a workflow ≠ committing enforcement.
 Everything else — routing nudges, the build-env hook, file-scope conventions — is
-*discipline*, labeled as such. The swarm may *tighten* itself but never *weaken* itself: the
-constitution and every gate definition are human-amend-only (`CONSTITUTION_TOUCHED` /
-`SWARM_GATE_TOUCHED` fail closed → admin-merge).
+*discipline*, labeled as such. The swarm may *propose* to tighten itself via a human-merged
+PR but never *weakens* itself: the constitution and every gate definition are human-amend-only
+(`CONSTITUTION_TOUCHED` / `SWARM_GATE_TOUCHED` fail closed → admin-merge; anti-Goodhart is
+human-in-the-loop, not a direction classifier).
 
 ## The generalization principle (the overriding rule)
 

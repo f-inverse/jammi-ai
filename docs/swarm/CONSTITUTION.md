@@ -10,8 +10,10 @@ the canonical source wins and this row is the bug.
 
 **Amendment.** No agent may edit this file. Any diff touching it fails closed at the
 `CONSTITUTION_TOUCHED` CI gate and requires a human admin-merge. This is the
-anti-Goodhart rule (ARCHITECTURE §2.7): the swarm may *tighten* itself autonomously but
-may not *weaken* the constitution that governs it.
+anti-Goodhart rule (ARCHITECTURE §2.7/§7): the swarm may *propose* to tighten itself via a
+human-merged tightening PR; every constitution/gate edit — tightening included — is
+human-amend-only (anti-Goodhart is enforced by human-in-the-loop, not a nonexistent
+direction classifier).
 
 **Anchor freshness.** Every `code anchor` below is **typed** with a resolver kind —
 `rust_symbol:<path>:<Symbol>`, `gate_script:<path>`, or `doc_heading:<path>#<heading>` —

@@ -300,8 +300,9 @@ override, non-unique target dir, and disk pressure; domain agents are worktree-i
 unique dir; `SELF-FAILURE-MODES.md` host-traps. → **hook + domain-agent-invariant + self-failure-mode**
 
 ### T · The swarm obeys its own rules; the consumer swarm mirrors its shape
-**Principle.** The swarm may *tighten* itself but never *weaken* itself (constitution + every
-executable gate are human-amend-only, fail-closed — anti-Goodhart); a fact lives in exactly one
+**Principle.** The swarm may *propose* to tighten itself via a human-merged PR but never
+*weakens* itself (constitution + every executable gate are human-amend-only, fail-closed —
+anti-Goodhart via human-in-the-loop, not a tighten-vs-weaken classifier); a fact lives in exactly one
 place, and the constitution is an *anchor index* whose cited code anchors must resolve, so it
 can't become the next stale doc; ownership is a strict partition (an unowned source path is a P0).
 The consumer swarm mirrors the engine swarm's *shape* re-rooted in the consumer constitution — a

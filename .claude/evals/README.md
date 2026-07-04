@@ -10,19 +10,24 @@ the engine's own test tiers.
    `check_constitution_anchors.py`, `check_doc_parity.py`, the `*_TOUCHED` guards).
    Deterministic, $0, runs on every PR. See `static/README.md`.
 2. **golden set** (`golden/*`) — each past **escape** in `.jammi/escapes.jsonl` becomes a
-   case: given the situation, does the verifier that should catch it *fire*? These are the
-   citation gate's teeth (below). Runnable-shaped scaffold — one YAML per case.
+   case: given the situation, does the verifier that should catch it *fire*? These back the
+   citation discipline (below). Runnable-shaped scaffold — one YAML per case; note no runner
+   executes them yet.
 3. **judge / Monte-Carlo** (local / on-demand, not in the PR gate) — LLM-judge scoring of
    verifier verdicts and stochastic mutation sweeps. Runs when a human asks; never gates a
    PR, because a nondeterministic judge must not block merge.
 
-## The rule (citation gate → golden eval)
+## The rule (citation discipline → golden eval)
 
 > An escape is only `closed` when a **golden eval proves the catch.**
 
-A diff may transition an escape's `status` to `closed`/`eval_added` **only if the same
-diff adds a golden eval that cites that escape id** (`ARCHITECTURE.md §9`). A green test is
-not enough — the golden must demonstrate the *verifier fires on the situation*.
+A diff that transitions an escape's `status` to `closed`/`eval_added` **should add, in the
+same diff, a golden eval that cites that escape id** (`ARCHITECTURE.md §9`). A green test is
+not enough — the golden must demonstrate the *verifier fires on the situation*. This is
+**discipline today**, enforced by the `fix-verifier` card's review: there is no committed
+script that greps the transition, and no runner executes these goldens. A mechanical
+`check_escape_citations.py` grep gate (transition-only) is a **candidate tightening**
+(`ARCHITECTURE.md §12`, G-e), not a wired gate.
 
 ## Generalization by mutation (not replay)
 

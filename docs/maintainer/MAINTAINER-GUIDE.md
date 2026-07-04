@@ -1135,10 +1135,13 @@ from columns.
   (`topological_recompute_order`); a diamond recomputes the shared child once; a cycle
   in the recorded lineage is `JammiError::DependencyCycle`.
 
-`replay_descriptor` dispatches per `ProducingDescriptor` variant — `Inference`,
-`Embedding`, `NeighborGraph`, `GraphPropagation`, `ContextSet`, `AsofJoin` — each
-rebuilding its producer call from recorded typed params, all with
-`CachePolicy::Bypass`. The intricate case is `ContextSet`: its real producer is the
+`replay_descriptor` dispatches per `ProducingDescriptor` variant. The engine-owned
+producers each rebuild their producer call from recorded typed params, all with
+`CachePolicy::Bypass`; the one exception is `External`, a consumer-materialized producer
+the engine does not own, so it carries no replay arm and returns
+`JammiError::NotRecomputable` rather than a re-run guessed from columns (see the canonical
+variant list in §2.4e, *producing_descriptor and NotRecomputable*). The intricate case
+among the replayable producers is `ContextSet`: its real producer is the
 `assemble_context`→`materialize_context` **pair**, so `recompute_context_set`
 (`crates/jammi-ai/src/pipeline/recompute.rs`) re-pools every target's context over the
 source's *current* rows under the recorded recipe (`context_recipe_from_manifest`),
@@ -1211,10 +1214,13 @@ it on a surface is a feature, not a config flag.
   `assemble_context_request_from_proto` (`crates/jammi-ai/src/wire/pipeline.rs`) and
   the `ContextServeSource` serve mapping
   (`crates/jammi-ai/src/pipeline/context_predictor.rs`) for the predictor path.
-- **Recompute a new producer:** any new materialising verb must add a
-  `ProducingDescriptor` variant *and* a `replay_descriptor` arm
-  (`crates/jammi-ai/src/pipeline/recompute.rs`) — a producer with no replay arm is
-  not recomputable. The replay must use `CachePolicy::Bypass`.
+- **Recompute a new producer:** an engine-owned materialising verb must add a
+  `ProducingDescriptor` variant *and* a matching `replay_descriptor` arm
+  (`crates/jammi-ai/src/pipeline/recompute.rs`) that replays it with `CachePolicy::Bypass`.
+  The one deliberate exception is `External` — a consumer-materialized producer the engine
+  does not own: it carries a `ProducingDescriptor::External` variant but **no** replay arm,
+  returning `JammiError::NotRecomputable` by design (not recomputable, never a re-run guessed
+  from columns).
 
 > **Invariant (belongs in §5):** the `source` fact (`ContextSourceKind`) is
 > descriptive, never an exchangeability claim. Graph-assembled (`Edges`/`Hybrid`)
@@ -1591,10 +1597,21 @@ A verifier reads the opaque hash; a **recomputer** reads the descriptor.
 typed params, persisted **not** merely hashed away). A pre-contract table (no manifest) is
 the typed **`JammiError::NotRecomputable { table }`** — a loud refusal, never a re-run
 guessed from columns. `ProducingDescriptor` (`crates/jammi-db/src/store/manifest.rs`) is the
-`#[serde(tag="producer")]` enum with one variant per producer — `Inference` / `Embedding` /
-`NeighborGraph` / `GraphPropagation` / `ContextSet` / `AsofJoin` — each carrying every
+`#[serde(tag="producer")]` enum with one variant per producer, each carrying every
 output-affecting determinant (float knobs stored by IEEE-754 bit pattern so the descriptor
-stays `Eq`/`Hash`, e.g. `min_similarity_bits`, `alpha_bits`).
+stays `Eq`/`Hash`, e.g. `min_similarity_bits`, `alpha_bits`). The canonical variant set —
+bound to the code enum and to `recompute.rs` by `ci/scripts/check_doc_parity.py`, which fails
+CI if the guide and the code diverge:
+
+<!-- BEGIN PRODUCING-DESCRIPTOR-VARIANTS -->
+- `Inference` — a model run over a source's content columns, keyed by `key_column`.
+- `Embedding` — a model embedding over a source's columns.
+- `NeighborGraph` — a k-NN edge relation derived from an embedding table.
+- `GraphPropagation` — K hops of feature propagation over a neighbor graph.
+- `ContextSet` — per-target pooled context vectors materialised as an embedding table.
+- `AsofJoin` — a point-in-time temporal join, each spine row matched as-of within its group.
+- `External` — a consumer-materialized table for a verb the engine does not own; no replay arm (returns `NotRecomputable` by design).
+<!-- END PRODUCING-DESCRIPTOR-VARIANTS -->
 
 #### The recompute verb — descriptor replay + bounded cascade (`pipeline/recompute.rs`)
 

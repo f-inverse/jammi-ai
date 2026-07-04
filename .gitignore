@@ -59,12 +59,14 @@ packaging/*/build/
 .target/
 .tmp/
 
-# Claude
-.claude
+# Claude — personal settings stay local; the committed swarm agent cards are tracked.
+.claude/*
+!.claude/agents/
 CLAUDE.md
 docs/plans/*
 # Maintainer roadmap / journey docs are tracked despite the docs/plans/ rule.
 !docs/plans/52-maintainer-roadmap/
+!docs/plans/53-agentic-swarm/
 docs/superpowers/
 docs/IMPLEMENTATION.md
 docs/specs/

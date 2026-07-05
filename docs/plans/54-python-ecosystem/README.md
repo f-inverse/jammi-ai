@@ -1,13 +1,21 @@
 # Jammi Python ecosystem — the client-as-base unification
 
-Status: **PLAN — grounded + pressure-tested (Gate A).** A design + phased-migration plan
-for a disruptive, two-repo refactor. It was **grounded** against the current surfaces (an
-API-divergence inventory + a blast-radius/packaging inventory) and **survived an adversarial
-pressure-test** (verdict REFINE; every finding folded in — error-taxonomy §5.4, the 4 MB
-cap §5.9, the phasing-cycle repair §6, the two-stage split §8). No code has moved. Merging
-this doc *is* Gate A. Implementation then proceeds in phases — **Stage 1 (Phases 0–2, the
-capability, fully reversible)**, and **Stage 2 (Phases 3–4, the rename) gated behind Gate B**
-(see §8), whose default is to stop at Stage 1.
+Status: **PLAN — grounded + pressure-tested.** A design + build plan for a disruptive,
+two-repo refactor. It was **grounded** against the current surfaces (an API-divergence
+inventory + a blast-radius/packaging inventory) and **survived an adversarial pressure-test**
+(verdict REFINE; every correctness finding folded in — error-taxonomy §5.4, the 4 MB cap
+§5.9, the capability contract §5.6). No code has moved.
+
+> **Greenfield posture (per `CLAUDE.md`).** Jammi has **no production users** and takes a
+> strict no-backwards-compat stance: *"No shims, no deprecated paths, no keep-the-old-way-
+> around. Change it everywhere. Break and rebuild correctly. No `#[deprecated]`, no
+> compatibility re-exports."* This plan assumes that posture throughout. **Migration means
+> changing every call-site atomically in the same change — no shims, no aliases, no
+> deprecation windows.** This is a correction from the first draft of this plan, which wrongly
+> assumed backwards-compatibility (compat shims, deprecation timelines, a reversibility-gated
+> Stage-1/Stage-2 split). All of that machinery is removed here: the correctness work is
+> unchanged, the *phasing* is now purely about reviewable PR-sizing, and the rename is a
+> product/positioning call with no compat cost — not a risk gate.
 
 ## 1. Thesis
 
@@ -139,12 +147,12 @@ drop behind one trait with near-zero design.
    — removes the `__getattr__` duck-typing and the `Union[Database, RemoteDatabase]` return.
 2. **Unify the divergent handle families** under handle Protocols: `TrainingJob` (PyO3) vs
    `RemoteTrainingJob` (Python); `TenantScope` (PyO3) vs the `@contextmanager` generator.
-3. **`credentials` is a signature change to the single `connect` front door — scope into
-   Phase 0.** Today `jammi_ai.connect` takes no `credentials` and calls
+3. **`credentials` is a signature change to the single `connect` front door — lands with the
+   trait (Unit 1).** Today `jammi_ai.connect` takes no `credentials` and calls
    `jammi_client.connect` positionally, so the embedded front door cannot auth its own
    remote arm. The unified `connect` grows a `credentials=` parameter; the embedded backend
    accept-and-ignores it (and rejects it on a `file://` target). This changes the front-door
-   signature, so it lands in Phase 0 with the trait, not later.
+   signature, so it lands with the trait (Unit 1, §6), not later.
 4. **Normalize the error taxonomy (pressure-test find — a real seam, not a wrapper).**
    Embedded verbs raise `PyRuntimeError`/`PyValueError` (plus native `audit`/`ephemeral`
    sub-taxonomies); remote raises `grpc.RpcError` + `jammi_client.TrainingError`. The **same
@@ -190,51 +198,55 @@ drop behind one trait with near-zero design.
    papers over.
 
 **Packaging (mechanical but wide):** invert so the light pure-Python client is the base;
-reposition the native `jammi_ai` wheel as the `[embedded]` backend (module `jammi_ai._native`,
-abi3, Linux+macOS wheels); rework `jammi-ai-platform` from "re-exports `jammi_client`" to
-"plugs into `jammi`"; migrate the call-sites (**48 `jammi_ai` + 32 `jammi_client` + 27
-`jammi_ai_platform`**, mostly tests + cookbook) and ~700 doc lines behind compat shims.
+reposition the native `jammi_ai` wheel as the `[embedded]` backend (new native module
+namespace, abi3, Linux+macOS wheels); rework `jammi-ai-platform` from "re-exports
+`jammi_client`" to "plugs into `jammi`"; migrate the call-sites (**48 `jammi_ai` + 32
+`jammi_client` + 27 `jammi_ai_platform`**, mostly tests + cookbook) and ~700 doc lines.
+Every one of these sites is **in-repo**, so each rename rewrites all of its call-sites in
+the *same* change — the old names are deleted, not aliased.
 
-## 6. Phased migration (no big-bang; a compat shim at every step)
+## 6. Build units (clean greenfield, atomic rewrites — no shims)
 
-The end state is disruptive; the *path* must never break users overnight. Strategy — each
-phase is its own rigor-chain unit, ships independently, and leaves the tree working:
+There are no production users and every call-site is in-repo, so there is **no compat path
+to preserve** — a big-bang is safe. The only reason to split the work into units at all is
+**manageability**: each unit is a self-contained, reviewable, correct PR-sized change that
+runs the full rigor chain and leaves the tree working (all call-sites of anything it touches
+migrated, old names *deleted*). The unit count is a PR-sizing call, **not** a compat
+requirement — the whole thing could land in one PR if that were reviewable.
 
-- **Phase 0 — the backend trait, additive (direction of ownership matters).** Introduce the
-  `jammi` client + backend trait with the **GrpcBackend only**. Crucially, Phase 0 **moves**
-  `RemoteDatabase` + the shared `_assembly` layer **into** the new `jammi` package (their new
-  home), and `jammi_client` **re-exports from `jammi`** as a thin alias — NOT "`jammi` wraps
-  `jammi_client`". (The pressure-test caught this: a wrapping direction creates a
-  `jammi → jammi_client → jammi` import **cycle** the moment Phase 3 makes `jammi_client` a
-  shim that re-exports from `jammi`. Owning the code in `jammi` and aliasing downward avoids
-  the cycle.) `import jammi_client` still resolves via the re-export, and the native
-  `jammi-ai` wheel still bundles the client. This phase also introduces the trait, the error
-  hierarchy (§5.4), the `supports()`/`NotSupportedOnBackend` capability contract (§5.6), and
-  the `credentials=` front-door signature change (§5.3).
-- **Phase 1 — embedded backend (+ native-namespace move, fixes a collision).** Add the
-  EmbeddedBackend (direct-FFI over the native engine) behind the same trait; ship
-  `jammi[embedded]`. **Move the native extension module off `jammi_ai._native`** (maturin
-  `module-name`) to `jammi._native` / `jammi_embedded._native` **now**, so the future
-  `jammi-ai` deprecation shim and the `[embedded]` backend never collide on the `jammi_ai`
-  namespace. This migrates the direct native-import sites (e.g. `test_conformance.py`'s
-  `_NativeDatabase`) — a **tracked cost**, not a "mechanical" no-op. `import jammi_ai` still
-  works (unchanged) alongside.
-- **Phase 2 — platform plug-in.** Add the generic hook to `jammi`; rework
-  `jammi-ai-platform` → `jammi-platform` to register into it (keep `jammi_ai_platform`
-  as a deprecated alias).
-- **Phase 3 — native-free deprecation shims (gated — see §8).** `jammi` becomes canonical;
-  `jammi_ai` and `jammi_client` become **thin, native-free deprecation shims** (re-export
-  from `jammi`, emit a `DeprecationWarning`) with a removal version announced. Gated behind
-  Gate B.
-- **Phase 4 — remove shims** at the announced major, once telemetry/agreed window passes.
+A lean, sensible split is **three units**:
 
-Call-site counts to migrate (mostly tests + cookbook, so low product-code risk):
+- **Unit 1 — unified `jammi` base + shared trait + the §5 correctness work.** Establish the
+  `jammi` client and the shared `Backend`/`Session` trait as the canonical home by **moving**
+  `RemoteDatabase` + the shared `_assembly` layer **into** `jammi` and **deleting the old
+  locations** (`jammi_client` is renamed into `jammi`, not aliased from it — every
+  `jammi_client` import site is rewritten in this same change). This unit lands the trait, the
+  normalized error hierarchy (§5.4) with raised-type conformance, the
+  `supports()`/`NotSupportedOnBackend` capability contract (§5.6), and the `credentials=`
+  front-door signature change (§5.3). Because there is no downward alias, there is no import
+  cycle to design around — the code simply lives in `jammi` and the old module names cease to
+  exist. Ships with the GrpcBackend.
+- **Unit 2 — the `[embedded]` backend under the new native namespace.** Add the
+  EmbeddedBackend (direct-FFI over the native engine) behind the same trait and ship
+  `jammi[embedded]`. The native extension module moves off `jammi_ai._native` to the new
+  namespace (maturin `module-name`) and the old `jammi_ai._native` name is **gone** — every
+  direct native-import site (e.g. `test_conformance.py`'s `_NativeDatabase`) is rewritten in
+  this change. `jammi_ai` is not kept alongside; it is replaced.
+- **Unit 3 — `jammi-platform` plug-in + the rename/PyPI claim + docs.** Add the generic
+  extension hook to `jammi`; rework `jammi-ai-platform` → `jammi-platform` to register into
+  it (a rename + rework across the enterprise repo, **not** an alias — the 27
+  `jammi_ai_platform` sites are rewritten). This unit also carries the fresh `jammi` PyPI
+  claim and the ~700 doc-line migration. The rename is a product/positioning decision (§8),
+  so this unit can be sequenced whenever convenient — even first — since it carries no compat
+  cost that would force an ordering.
+
+Call-site counts to migrate (mostly tests + cookbook, so low product-code risk), all
+in-repo and all rewritten atomically within the unit that owns them:
 **48 `jammi_ai`** (2 library, ~35 cookbook, 11 tests), **32 `jammi_client`** (4 library —
 the local↔remote seam in `python/jammi_ai/`, the rest tests/cookbook), **27
-`jammi_ai_platform`** (4 library, 23 tests, all enterprise). Phase 3's shims cover them so
-none break at once. Note: `jammi-enterprise` imports **zero `jammi_ai`** (it goes through
-`jammi_client`), so the engine rename touches enterprise only via the `jammi-client`
-distribution dependency, not its code.
+`jammi_ai_platform`** (4 library, 23 tests, all enterprise). Note: `jammi-enterprise`
+imports **zero `jammi_ai`** (it goes through `jammi_client`), so the engine rename touches
+enterprise only via the `jammi-client` distribution dependency, not its code.
 
 ## 7. Cross-repo sequencing, releases, PyPI names (grounded)
 
@@ -263,43 +275,40 @@ Load-bearing coordination facts:
   package rename touches maturin config + `python/jammi_ai/__init__.py`, not just the dist.
 
 **Release order:** the OSS base (`jammi` + `jammi[embedded]`, engine repo, `py-v*` line)
-leads; `jammi-platform` (enterprise repo, `sdk-v*` line) follows the phase it depends on.
-Every phase keeps the old `py-v*`/`sdk-v*` artifacts publishing (aliases) until the
-deprecation window closes.
+leads; `jammi-platform` (enterprise repo, `sdk-v*` line) follows the unit it depends on. The
+rename retires the old `jammi-ai`/`jammi-client`/`jammi-ai-platform` distributions outright —
+there is no parallel-publishing window, because there are no users pinned to the old names to
+carry.
 
-## 8. Two stages, a gate between, rollback
+## 8. The substantive work vs. the rename (a product call, not a risk gate)
 
-The pressure-test separated two things the phases had bundled: the **value** (a shared
-trait, normalized errors, a decided capability contract, the credentials fix) and the
-**rename** (`jammi_ai`→`jammi`). They have opposite reversibility and buy different things,
-so they are split into two stages with a hard gate between.
+Two distinct things live in this plan: the **unification value** (a shared trait, normalized
+errors, the capability contract, the credentials fix, the embedded backend, the platform
+plug-in) and the **rename** (`jammi_ai`→`jammi` + the fresh `jammi` PyPI claim). The first
+draft gated the rename behind a reversibility "kill-switch" (stop at Stage 1, keep aliases so
+everything reverts). **Under greenfield posture that framing is void:** there are no users to
+disrupt and nothing to revert *to* (no shims, no aliases keeping the old names alive), so the
+rename carries no risk cost to gate against.
 
-- **Stage 1 = Phases 0–2 (the capability, fully reversible).** Delivers all of the actual
-  value: the shared `Backend`/`Session` trait, the normalized error hierarchy (§5.4), the
-  **decided** `supports()`/`NotSupportedOnBackend` capability contract (§5.6), the
-  `credentials=` front-door fix (§5.3), the embedded backend, and the platform plug-in hook.
-  Every step ships behind its own audit + green CI, and the aliases make it fully reversible
-  (revert a phase, `import jammi_client`/`jammi_ai` still resolve).
-- **Stage 2 = Phases 3–4 (positioning, least-reversible).** The rename buys **positioning,
-  not capability**: `jammi_ai`→`jammi`, a fresh `jammi` PyPI claim, the cross-repo `sdk-v*`
-  dance, ~700 doc lines, and the **48/32/27** call-site migrations. This is the
-  hardest-to-undo part of the whole plan and adds no capability Stage 1 didn't already ship.
+- **The unification is the work.** The shared `Backend`/`Session` trait, the normalized error
+  hierarchy (§5.4), the `supports()`/`NotSupportedOnBackend` capability contract (§5.6), the
+  `credentials=` front-door fix (§5.3), the embedded backend, and the platform plug-in hook
+  are the substance. Each ships behind its own audit + green CI.
+- **The rename is a product/positioning decision, standalone on its own merits.** Adopting
+  the flagship `jammi` import name and claiming the fresh `jammi` PyPI name buys
+  **positioning** — a single obvious name users write against. It adds no capability the
+  unification didn't already ship. Because it carries **no compat cost** (every call-site is
+  in-repo and rewritten atomically), it is not risk-gated: it can be sequenced whenever
+  convenient — bundled with the unification, done first, or done last — purely on whether the
+  positioning is worth the coordination (the cross-repo `sdk-v*` dance, the PyPI claim, the
+  ~700 doc lines). The only real precondition is external: that the `jammi` PyPI name is
+  actually available (§7, §9).
 
-**Gates:**
-- **Gate A (this doc → Phase 0):** the plan survives adversarial pressure-test — feasibility,
-  non-breaking phasing, naming/PyPI claim. (Passed the pressure-test whose findings are folded
-  in above.) Only then does Phase 0 start.
-- **Gate B (Stage 1 → Stage 2) — a kill-switch as the default boundary.** The **default is to
-  stop at Stage 1** and take Stage 2 as a deliberate, later decision. Crossing requires: the
-  trait **run in the wild** across an embedded install **and a real server**; the conformance
-  suite green **including raised-type parity** (§5.4); and the honest-edges (§5.9 4 MB cap,
-  §5.6 capability contract) validated in practice. Absent that proof, Stage 2 does not start —
-  and stopping at Stage 1 is a fully-shipped, fully-reversible win, not a failure.
-
-**Cross-repo caveat (confirm before Stage 2):** the enterprise-SDK facts that gate Stage 2 —
-the `jammi-client>=0.21` floor and the 27 `jammi_ai_platform` sites — live in the **other
-repo** and are **not verifiable from this tree**. They are load-bearing assumptions to
-re-confirm against the enterprise repo before committing to the rename, not established facts.
+**Cross-repo caveat (confirm before the rename):** the enterprise-SDK facts the rename
+depends on — the `jammi-client>=0.21` floor and the 27 `jammi_ai_platform` sites — live in
+the **other repo** and are **not verifiable from this tree**. They are load-bearing
+assumptions to re-confirm against the enterprise repo before executing the rename, not
+established facts.
 
 ## 9. Genuinely open questions
 
@@ -308,10 +317,9 @@ The pressure-test resolved most of what this section used to ask. *Is "seamless"
 signature-pinned; the one-sided capabilities are enumerable and now handled by the **decided**
 capability contract (§5.6). *Capability-probing vs. lying?* — **decided**: `supports()` +
 typed `NotSupportedOnBackend`, never a silent `AttributeError`. *Rename now vs. later?* —
-**decided**: the two-stage split with Gate B (§8) defaults to shipping Stage 1 first and
-proving parity in the wild before the rename. The divergence-completeness and non-breaking-
-phasing worries are addressed by the new §5 items (error taxonomy, 4 MB cap) and the §6
-cycle/namespace fixes.
+**decided** (§8): under greenfield posture the rename is a standalone product/positioning call
+with no compat cost, so it can be sequenced whenever convenient — it is not a risk gate. The
+divergence-completeness worry is addressed by the new §5 items (error taxonomy, 4 MB cap).
 
 What genuinely remains open:
 
@@ -321,5 +329,5 @@ What genuinely remains open:
 - **Does the `jammi.platform` namespace earn its restructure,** or does the generic plug-in
   hook alone suffice (likely the latter, per §4.2)? Open naming/structure call, low stakes.
 - **The enterprise-SDK cross-repo facts** — the `jammi-client>=0.21` floor and the 27
-  `jammi_ai_platform` sites — must be **confirmed against the enterprise repo** before Stage 2
-  (§8); they are not verifiable from this tree.
+  `jammi_ai_platform` sites — must be **confirmed against the enterprise repo** before the
+  rename (§8); they are not verifiable from this tree.

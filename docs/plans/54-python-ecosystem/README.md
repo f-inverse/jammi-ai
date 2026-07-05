@@ -250,10 +250,10 @@ A lean, sensible split is **three units**:
   `quickstart/01_install.md` + `02_connect.md` as the flagship client-as-base narrative (the
   single `jammi` front door, `connect()` as backend-relocation) and adds measured chapters for
   the capability contract (show `supports()` and catch `NotSupportedOnBackend` when an
-  embedded-only op is called on a remote handle) and the honest edges — per the no-silent-caps
-  rule, SHOW the 4 MB call that succeeds embedded but throws `RESOURCE_EXHAUSTED` remote
-  (§5.9). The unit merges only when these chapters and the cookbook harness are green against
-  the new surface.
+  embedded-only op is called on a remote handle) and the remote honest edge — per the
+  no-silent-caps rule, SHOW the 4 MB unary call returning `RESOURCE_EXHAUSTED` over the
+  GrpcBackend (§5.9). The unit merges only when these chapters and the cookbook harness are
+  green against the new surface.
 - **Unit 2 — the `[embedded]` backend under the new native namespace.** Add the
   EmbeddedBackend (direct-FFI over the native engine) behind the same trait and ship
   `jammi[embedded]`. The native extension module moves off `jammi_ai._native` to the new
@@ -262,16 +262,17 @@ A lean, sensible split is **three units**:
   this change. `jammi_ai` is not kept alongside; it is replaced. **Cookbook co-evolution:** the
   chapters that teach the embedded path — installing the `[embedded]` extra, the direct-FFI
   backend, and the embedded↔remote parity the trait now guarantees — co-evolve here, measured
-  green against the real embedded backend this unit ships.
+  green against the real embedded backend this unit ships. This unit also completes the §5.9
+  honest-edge chapter by showing the same 4 MB call *succeeding* embedded, closing the contrast
+  against the remote `RESOURCE_EXHAUSTED` half landed in Unit 1.
 - **Unit 3 — `jammi-platform` plug-in + the rename/PyPI claim + docs.** Add the generic
   extension hook to `jammi`; rework `jammi-ai-platform` → `jammi-platform` to register into
   it (a rename + rework across the enterprise repo, **not** an alias — the 27
   `jammi_ai_platform` sites are rewritten). This unit also carries the fresh `jammi` PyPI
   claim and the ~700 doc-line migration. **Cookbook co-evolution:** the governance chapters —
-  the plug-in lighting up `registry` / `experiments` / `gates` on an existing `jammi`
-  connection, named as generic primitives with no consumer — co-evolve here, and the whole
-  cookbook harness runs green end-to-end against the final surface. The rename is a
-  product/positioning decision (§8),
+  the plug-in lighting up `registry` / `experiments` / `gates` on a `jammi` connection, named
+  as generic primitives with no consumer — co-evolve here, and this unit gates on *those*
+  governance chapters green. The rename is a product/positioning decision (§8),
   so this unit can be sequenced whenever convenient — even first — since it carries no compat
   cost that would force an ordering.
 

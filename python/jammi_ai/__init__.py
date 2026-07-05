@@ -1,12 +1,12 @@
 """Jammi AI — embeddable inference engine for structured data.
 
 The **develop** half of the develop→deploy journey: a compiled, in-process
-engine (the `_native` extension) plus the bundled pure-Python `jammi-client` for
+engine (the `jammi_native` extension) plus the bundled pure-Python `jammi-client` for
 remote targets. One `connect(target)` is the single front door — the Python
 mirror of the Rust `Jammi::open(Target)` — where transport is config, not a code
 path:
 
-* ``connect("file:///data")`` → the compiled local engine (`_native`).
+* ``connect("file:///data")`` → the compiled local engine (`jammi_native`).
 * ``connect("https://host")`` / ``"grpc://host:8081"`` → the bundled
   `jammi-client`, by composition. The remote surface is DEFINED ONCE, in
   `jammi-client`; `jammi-ai`'s remote IS `jammi-client`'s, so the two agree by
@@ -32,7 +32,7 @@ from jammi_client import (
     parse_target,
 )
 
-from jammi_ai._native import (
+from jammi_native import (
     open_local,
     _NativeDatabase,
     TrainingJob,

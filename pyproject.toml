@@ -42,8 +42,21 @@ Repository = "https://github.com/f-inverse/jammi-ai"
 
 [tool.maturin]
 manifest-path = "crates/jammi-python/Cargo.toml"
-module-name = "jammi_ai._native"
+# The compiled engine is the top-level `jammi_native` extension: `import
+# jammi_native` yields the in-process engine directly, so a consumer can
+# discover the local backend on its own. Maturin's mixed layout places the
+# built `.so` beside `python/jammi_native/__init__.py` (which re-exports the
+# engine surface).
+module-name = "jammi_native"
 python-source = "python"
+# Maturin ships exactly one top-level module (the `module-name` package) from
+# `python-source`. The pure-Python `jammi_ai` front-end is a SEPARATE top-level
+# package that rides the same wheel — `connect(target)` dispatching a `file://`
+# target into `jammi_native` and a remote target into the bundled
+# `jammi-client`. `include` ships it alongside the compiled `jammi_native`; the
+# `python-source` prefix is stripped, so it installs at the site-packages root
+# as an importable top-level package.
+include = [{ path = "python/jammi_ai/**/*", format = "wheel" }]
 # `extension-module` is opt-in on the `jammi-python` crate so that
 # `cargo test --workspace` can link the integration test against
 # libpython. Maturin builds the extension module proper, so it activates

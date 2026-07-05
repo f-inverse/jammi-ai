@@ -23,9 +23,9 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use _native::PyDatabase;
 use jammi_db::config::JammiConfig;
 use jammi_db::TenantId;
+use jammi_native::PyDatabase;
 use tempfile::tempdir;
 
 fn test_config(artifact_dir: &std::path::Path) -> JammiConfig {

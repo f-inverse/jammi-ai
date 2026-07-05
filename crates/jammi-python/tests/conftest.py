@@ -1,10 +1,12 @@
-"""Pytest config — ensures the built `jammi_ai._native` module is importable.
+"""Pytest config — ensures the built `jammi_native` module is importable.
 
 `maturin develop --release` (run by the CI test-python job before pytest)
-drops `_native.abi3.so` into `python/jammi_ai/` next to the package's
-`__init__.py`. The `python-source = "python"` setting in `pyproject.toml`
-tells maturin where to put it; this `conftest.py` doesn't need to fiddle
-with `sys.path` because pytest auto-discovers the `python/` parent of the
-package once it's on `PYTHONPATH` (set by the workflow's
-`maturin develop` invocation).
+installs the top-level `jammi_native` package into the venv's site-packages,
+with the compiled extension beside its `__init__.py` as
+`jammi_native/jammi_native.abi3.so` (the package re-exports the engine surface,
+so `import jammi_native` yields it directly — a bare top-level import, not a
+submodule of `jammi_ai`). The `python-source = "python"` setting in
+`pyproject.toml` puts both `jammi_native/` and the pure-Python `jammi_ai/`
+package on the path; this `conftest.py` doesn't need to fiddle with `sys.path`
+because `maturin develop` installs them into the active environment.
 """

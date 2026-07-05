@@ -30,15 +30,15 @@ pub use crate::database::PyDatabase;
 /// `jammi_ai.Database`.
 pub use jammi_ai::session::InferenceSession;
 
-/// Module entry point for `jammi_ai._native`.
+/// Module entry point for the top-level `jammi_native` extension module.
 ///
-/// `_native` exposes only the LOCAL, in-process engine. There is no remote
+/// `jammi_native` exposes only the LOCAL, in-process engine. There is no remote
 /// transport here: the embed wheel links no tonic/proto, and its remote arm is
 /// the bundled pure-Python `jammi-client`, dispatched in `jammi_ai/__init__.py`.
 /// This is the runtime shape of the Rust build's `#[cfg(feature = "local")]`
 /// gate — the wheel cannot even name a remote transport.
 #[pymodule]
-fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn jammi_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open_local, m)?)?;
     m.add_class::<PyDatabase>()?;
     m.add_class::<crate::database::PyTenantScope>()?;

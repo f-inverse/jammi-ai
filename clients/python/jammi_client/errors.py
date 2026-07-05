@@ -66,10 +66,13 @@ class NotSupportedOnBackend(JammiError):
 class NoEmbeddedEngineError(NotSupportedOnBackend):
     """A `file://` (local) target was opened on a build with no embedded engine.
 
-    The pure `jammi-client` ships no compiled engine, so it cannot run a target
-    in-process — a local target is a capability this backend does not carry
-    (hence a :class:`NotSupportedOnBackend`). Install the embed wheel — `pip
-    install jammi-ai` — whose `connect` resolves both local and remote.
+    `jammi-client` is the base client; it discovers the compiled engine as an
+    optional in-process backend but does not carry it by default. Absent the
+    `jammi-client[embedded]` extra (which pulls `jammi-ai-native`, importable as
+    `jammi_native`), it cannot run a target in-process — a local target is a
+    capability this build does not carry (hence a :class:`NotSupportedOnBackend`).
+    Install the extra — `pip install jammi-client[embedded]` — and the SAME
+    `jammi_client.connect` resolves both local and remote.
     """
 
     def __init__(self, artifact_dir: str) -> None:
@@ -78,8 +81,9 @@ class NoEmbeddedEngineError(NotSupportedOnBackend):
         JammiError.__init__(
             self,
             f"no embedded engine in this build: cannot open the local target "
-            f"{artifact_dir!r} — `pip install jammi-ai` for the in-process engine, "
-            f"or point connect() at a remote https:// / grpc:// target.",
+            f"{artifact_dir!r} — `pip install jammi-client[embedded]` for the "
+            f"in-process engine, or point connect() at a remote https:// / grpc:// "
+            f"target.",
         )
         self.artifact_dir = artifact_dir
 

@@ -1,10 +1,29 @@
-"""The embedded `Database`: a thin Python wrapper over the `_NativeDatabase` handle.
+"""The `EmbeddedBackend`: the in-process engine as a :class:`~jammi_client.Session`.
 
-`connect("file://…")` returns one of these. It is the user-facing embedded
-surface, composed over the compiled `jammi_native._NativeDatabase` low-level handle:
+`jammi_client.connect("file://…")` returns one of these when the compiled engine
+(`jammi_native`, the `jammi-client[embedded]` extra) is installed. It is the base
+client discovering the native engine as an in-process backend — the direct-FFI
+peer of :class:`~jammi_client.RemoteDatabase`, driving the compiled
+`jammi_native._NativeDatabase` low-level handle by DIRECT PyO3 calls (never a
+gRPC loopback):
 
-* Every verb whose request is still assembled in Rust is forwarded verbatim to
-  the native handle by ``__getattr__`` — the embedded implementation is unchanged.
+**Native import is LAZY.** `jammi_native` is imported only inside
+:func:`_open_embedded` — the `file://` dispatch factory — never at module load,
+so `import jammi_client` stays native-free (the client-import guard): the base
+package carries no compiled dependency and discovers the engine on demand.
+
+The `serde_json` decode the introspection/eval verbs return (the engine's
+`serializable_to_pydict`) mirrors the SAME wire proto the remote
+:class:`~jammi_client.RemoteDatabase` decodes, so the embedded and remote dict
+shapes agree by construction — the anchor the §5.5 proto-shape pin
+(`test_conformance.py`) locks and the Rust it-suite (`grpc_remote_session.rs` /
+`grpc_remote_compute.rs`) checks for value.
+
+Composed over the compiled `jammi_native._NativeDatabase` low-level handle:
+
+* Every verb is an EXPLICIT method (there is no ``__getattr__`` forwarding): the
+  verbs whose request is still assembled in Rust delegate 1:1 to the native
+  handle's method of the same name.
 * The migrated verbs — the training verbs (`fine_tune`, `fine_tune_graph`,
   `train_context_predictor`), the bulk inference verb (`infer`), the
   engine-state pipeline verbs (`build_neighbor_graph`, `propagate_embeddings`,
@@ -32,9 +51,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import pyarrow as pa
 
-from jammi_client import Capability
-from jammi_client.errors import NotSupportedOnBackend
-from jammi_client._assembly import (
+from ._capability import Capability
+from .errors import NotSupportedOnBackend
+from ._assembly import (
     build_add_channel_columns_request,
     build_asof_join_request,
     build_assemble_context_request,
@@ -58,14 +77,14 @@ from jammi_client._assembly import (
     build_search_request,
     recompute_report_to_dict,
 )
-from jammi_client._generated.jammi.v1 import pipeline_pb2
+from ._generated.jammi.v1 import pipeline_pb2
 
 
 class _TenantScope:
-    """A block-scoped tenant binding for the embedded :class:`Database`.
+    """A block-scoped tenant binding for the embedded :class:`EmbeddedBackend`.
 
     Wraps the native scope guard: entering binds the target tenant (restoring the
-    prior on exit) and **yields the tenant-scoped** :class:`Database` **itself**,
+    prior on exit) and **yields the tenant-scoped** :class:`EmbeddedBackend` **itself**,
     so ``with db.tenant_scope(t) as s: s.search(...)`` works and matches the
     remote :meth:`~jammi_client.RemoteDatabase.tenant_scope`, which yields its own
     session. The native scope validates the id eagerly (a bad id raises where the
@@ -74,11 +93,11 @@ class _TenantScope:
     substituting the yielded object.
     """
 
-    def __init__(self, db: "Database", native_scope: object) -> None:
+    def __init__(self, db: "EmbeddedBackend", native_scope: object) -> None:
         self._db = db
         self._native_scope = native_scope
 
-    def __enter__(self) -> "Database":
+    def __enter__(self) -> "EmbeddedBackend":
         self._native_scope.__enter__()
         return self._db
 
@@ -86,7 +105,7 @@ class _TenantScope:
         return self._native_scope.__exit__(*exc)
 
 
-class Database:
+class EmbeddedBackend:
     """The embedded engine — a :class:`~jammi_client.Session` over a compiled handle.
 
     Holds the low-level `_NativeDatabase` handle by composition and exposes the
@@ -143,7 +162,7 @@ class Database:
         """Remote-only: the embedded engine releases its resources on drop (RAII)."""
         raise NotSupportedOnBackend(Capability.CLOSE)
 
-    def __enter__(self) -> "Database":
+    def __enter__(self) -> "EmbeddedBackend":
         return self
 
     def __exit__(self, *exc: object) -> bool:
@@ -163,7 +182,7 @@ class Database:
 
     def tenant_scope(self, tenant_id: str) -> "_TenantScope":
         """Scope this connection to `tenant_id` for a ``with`` block, restoring the
-        prior tenant on exit and yielding the tenant-scoped :class:`Database`."""
+        prior tenant on exit and yielding the tenant-scoped :class:`EmbeddedBackend`."""
         return _TenantScope(self, self._native.tenant_scope(tenant_id))
 
     def get_server_info(self) -> Dict[str, Any]:
@@ -1129,3 +1148,20 @@ class Database:
             cohorts=cohorts,
         )
         return self._native._eval_calibration_proto(request.SerializeToString())
+
+
+def _open_embedded(artifact_dir: str) -> EmbeddedBackend:
+    """Open the compiled in-process engine at `artifact_dir`, wrapped as a
+    :class:`EmbeddedBackend` — the `file://` dispatch factory.
+
+    This is the ONE site that imports `jammi_native`, and it does so LAZILY (at
+    call time, not module load): `import jammi_client` and `import
+    jammi_client._embedded` both stay native-free, so the base client carries no
+    compiled dependency and discovers the engine only when a caller actually opens
+    a local target. The probe/hint for the missing engine lives in
+    :func:`jammi_client.connect`; by the time control reaches here the extra is
+    known-importable, so the import is a plain call.
+    """
+    import jammi_native
+
+    return EmbeddedBackend(jammi_native.open_local(artifact_dir=artifact_dir))

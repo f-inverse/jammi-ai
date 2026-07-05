@@ -58,13 +58,16 @@ def test_unknown_scheme_raises_without_silent_default():
 
 
 def test_connect_local_raises_truthful_no_engine_error():
-    """The pure client carries no embedded engine; `file://` is a truthful
-    error pointing at the embed wheel — the runtime echo of the Rust
-    `#[cfg(feature = "local")]` gate, never a silent failure."""
+    """Absent the `[embedded]` extra, the base client carries no in-process
+    engine; `file://` is a truthful error pointing at the extra — the runtime
+    echo of the Rust `#[cfg(feature = "local")]` gate, never a silent failure.
+
+    Hermetic in this lane: the client-only install has no `jammi_native`, so the
+    `find_spec` probe in `connect` misses and this arm is taken."""
     with pytest.raises(NoEmbeddedEngineError) as info:
         jammi_client.connect("file:///tmp/data")
     msg = str(info.value)
-    assert "pip install jammi-ai" in msg
+    assert "pip install jammi-client[embedded]" in msg
     assert "/tmp/data" in msg
 
 

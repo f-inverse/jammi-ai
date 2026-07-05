@@ -76,13 +76,20 @@ def test_connect_routes_local_to_the_compiled_engine(tmp_path):
     assert not isinstance(db, jammi_client.RemoteDatabase)
 
 
-def test_pure_client_local_target_is_a_truthful_error():
-    """The pure client carries no engine; `file://` raises the no-engine error
-    pointing at the embed wheel, never a silent default to remote."""
-    import pytest
+def test_base_client_resolves_the_engine_when_the_extra_is_present():
+    """U2: with the `[embedded]` extra installed (this lane carries `jammi_native`),
+    the BASE client's `file://` front door resolves to the in-process engine — the
+    base discovers the native backend on its own, no `jammi_ai` needed.
 
-    with pytest.raises(jammi_client.NoEmbeddedEngineError):
-        jammi_client.connect("file:///tmp/x")
+    The truthful no-engine ERROR (the extra ABSENT) is pinned where it is real, in
+    the client-only lane `clients/python/tests/test_target.py` — that lane installs
+    `jammi-client` without the extra, so its `file://` raises; here, with the
+    engine present, the same call resolves it instead of raising."""
+    import tempfile
+
+    db = jammi_client.connect(f"file://{tempfile.mkdtemp()}")
+    assert isinstance(db, jammi_client.EmbeddedBackend)
+    assert isinstance(db, jammi_client.Session)
 
 
 # The remote verb vocabulary both wheels speak. These are the Stage-1 embedding
@@ -653,24 +660,28 @@ def test_both_backends_satisfy_the_session_protocol(tmp_path):
         remote.close()
 
 
-def test_connect_file_raises_no_embedded_engine_on_both_front_doors(tmp_path):
-    """Tier A — `file://` raises `NoEmbeddedEngineError` on both front doors: on
-    the pure client always (it ships no engine), and on the embed wheel when
-    credentials are supplied (meaningless for an in-process target — the mismatch
-    is rejected before an engine opens). Hermetic: no engine opened, no server
-    dialed. The error is a `NotSupportedOnBackend`, itself a `JammiError`."""
+def test_connect_file_with_credentials_raises_no_embedded_engine_on_both_front_doors(
+    tmp_path,
+):
+    """Tier A — a `file://` target opened WITH credentials raises
+    `NoEmbeddedEngineError` on both front doors, even in this native-present lane:
+    credentials are meaningless for an in-process engine (it has no channel to
+    authenticate), so the target-vs-credential mismatch is a caller error rejected
+    BEFORE an engine opens. Hermetic: no engine opened, no server dialed. The error
+    is a `NotSupportedOnBackend`, itself a `JammiError`.
+
+    (The extra-ABSENT `file://` error — no credentials — is a build-time condition
+    pinned in the client-only lane, `clients/python/tests/test_target.py`.)"""
     assert issubclass(
         jammi_client.NoEmbeddedEngineError, jammi_client.NotSupportedOnBackend
     )
     assert issubclass(jammi_client.NotSupportedOnBackend, jammi_client.JammiError)
 
+    bearer = jammi_client.BearerCredentials(token="tok")
     with pytest.raises(jammi_client.NoEmbeddedEngineError):
-        jammi_client.connect(f"file://{tmp_path}")
+        jammi_client.connect(f"file://{tmp_path}", credentials=bearer)
     with pytest.raises(jammi_client.NoEmbeddedEngineError):
-        jammi_ai.connect(
-            f"file://{tmp_path}",
-            credentials=jammi_client.BearerCredentials(token="tok"),
-        )
+        jammi_ai.connect(f"file://{tmp_path}", credentials=bearer)
 
 
 def test_bad_format_add_source_raises_invalid_argument_on_both_backends(tmp_path):
@@ -948,3 +959,196 @@ def test_remote_not_found_semantics_survive_the_taxonomy_mapping():
             remote.drop_mutable_table("nope", if_exists=False)
     finally:
         remote.close()
+
+
+# ---------------------------------------------------------------------------
+# The base client discovers the native engine as an in-process backend.
+#
+# `jammi_client` is the BASE (U2): `jammi_client.connect("file://…")` resolves
+# the local target to an `EmbeddedBackend` (direct FFI) when `jammi_native` is
+# importable — WITHOUT going through the `jammi_ai` convenience bundle. These
+# tests pin that base front door and the lazy-native discipline (`import
+# jammi_client` stays native-free; the engine loads only when a `file://` target
+# is opened), the positive complement of the CI negative import-direction guard.
+# ---------------------------------------------------------------------------
+
+
+def test_client_connect_file_returns_embedded_session_via_the_base_front_door(tmp_path):
+    """`jammi_client.connect("file://…")` — the BASE front door, not `jammi_ai` —
+    returns an `EmbeddedBackend` that satisfies the `Session` protocol and runs a
+    verb in-process (direct FFI, B4). This is the U2 feature: the base client
+    discovers `jammi_native` as an in-process backend on its own.
+
+    Hermetic: opens a local engine (`file://`), contacts no server."""
+    db = jammi_client.connect(f"file://{tmp_path}")
+    assert isinstance(db, jammi_client.EmbeddedBackend)
+    assert type(db).__module__ == "jammi_client._embedded"
+    assert isinstance(db, jammi_client.Session)
+    # It is the SAME object the convenience bundle re-exposes.
+    assert type(db) is jammi_ai.Database
+    # A verb runs in-process against the compiled engine (empty catalog → []).
+    assert db.list_models() == []
+
+
+def test_import_jammi_client_is_native_free_then_lazily_loads_the_engine(tmp_path):
+    """Positive import-direction guard (the complement of the CI negative guard):
+    in a FRESH interpreter, `import jammi_client` loads NO `jammi_native` (the base
+    package is native-free — the engine is imported lazily), and opening a
+    `file://` target THEN loads `jammi_native` while still pulling no `jammi_ai.*`
+    (the base discovers the engine without going through the convenience bundle).
+
+    Run in a subprocess because THIS test process already imported `jammi_ai` /
+    `jammi_native` at module load, so the clean import direction can only be
+    observed in an interpreter that has not."""
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        f"""
+        import sys
+        import jammi_client
+        assert "jammi_native" not in sys.modules, (
+            "import jammi_client eagerly pulled jammi_native: "
+            + str([m for m in sys.modules if m == "jammi_native"])
+        )
+        db = jammi_client.connect("file://" + {str(tmp_path)!r})
+        assert "jammi_native" in sys.modules, "file:// did not load the engine"
+        leaked = [m for m in sys.modules if m == "jammi_ai" or m.startswith("jammi_ai.")]
+        assert not leaked, "the base client pulled jammi_ai: " + str(leaked)
+        assert type(db).__name__ == "EmbeddedBackend"
+        print("POSITIVE_IMPORT_GUARD_OK")
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr}"
+    assert "POSITIVE_IMPORT_GUARD_OK" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# §5.5 — the projection shape pin, ANCHORED TO THE PROTO SCHEMA.
+#
+# The 20 `_*_to_dict` projections in `jammi_client._database` decode a wire proto
+# into the client-facing dict. The embedded engine returns the SAME dict shapes
+# by serialising the mirror serde structs (`serializable_to_pydict`). The proto
+# message is the single source of truth for that shape, so this pin asserts each
+# REMOTE projection's key-structure reconciles with its proto message's LIVE
+# descriptor (identity, plus a small DECLARED set of renames / oneof-tags / dropped
+# fields) — NOT against a hand-authored golden. A proto field added or removed
+# then forces the projection (or the declared delta) to change, so the two
+# projection paths, both anchored to the proto, cannot drift from each other.
+#
+# This is the honest FLOOR (§5.5 / K4): true per-VALUE equality on real data is
+# covered by the Rust it-suite (`grpc_remote_session.rs` / `grpc_remote_compute.rs`,
+# the CONSTITUTION K4 anchor) and — for the three eval reports — by the
+# Rust-serde-GENERATED golden the client's `tests/test_eval_projection.py` locks,
+# not hermetically constructible in Python (the native links no tonic/proto, so
+# there is no in-process Python value-parity oracle to stand up here).
+# ---------------------------------------------------------------------------
+
+
+def _ipc_schema_bytes():
+    import pyarrow as pa
+
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, pa.schema([("id", pa.int64()), ("v", pa.float32())])):
+        pass
+    return sink.getvalue().to_pybytes()
+
+
+def test_struct_projection_shapes_are_proto_anchored():
+    """Each non-oneof projection's output key-set == its proto message's field
+    set, minus a DECLARED drop-set, with DECLARED renames — read off the live
+    descriptor, so a proto change breaks this until the projection tracks it."""
+    from jammi_client import _database as D
+    from jammi_client._generated.jammi.v1 import catalog_pb2, embedding_pb2, eval_pb2
+
+    def _model():
+        return catalog_pb2.Model(model_id="m", backend="b", task=1, status="ready")
+
+    def _mutable():
+        return catalog_pb2.MutableTableDefinition(id="t", schema=_ipc_schema_bytes())
+
+    def _inference_report():
+        # `aggregate` is a oneof — a variant must be set or the projection raises.
+        r = eval_pb2.InferenceEvalReport()
+        r.aggregate.classification.SetInParent()
+        return r
+
+    # (projection, proto message, {output_key: proto_field} renames, {dropped fields}, fixture)
+    specs = [
+        (D._result_table_to_dict, embedding_pb2.ResultTable, {}, {"task", "cache_outcome"}, embedding_pb2.ResultTable),
+        (D._source_descriptor_to_dict, catalog_pb2.SourceDescriptor, {"source_type": "kind"}, set(), catalog_pb2.SourceDescriptor),
+        (D._model_to_dict, catalog_pb2.Model, {}, set(), _model),
+        (D._mutable_table_definition_to_dict, catalog_pb2.MutableTableDefinition, {}, {"user_metadata"}, _mutable),
+        (D._aggregate_metrics_to_dict, eval_pb2.AggregateMetrics, {}, set(), eval_pb2.AggregateMetrics),
+        (D._per_query_record_to_dict, eval_pb2.PerQueryRecord, {}, set(), eval_pb2.PerQueryRecord),
+        (D._embedding_report_to_dict, eval_pb2.EmbeddingEvalReport, {}, set(), eval_pb2.EmbeddingEvalReport),
+        (D._entity_to_dict, eval_pb2.Entity, {}, set(), eval_pb2.Entity),
+        (D._inference_report_to_dict, eval_pb2.InferenceEvalReport, {}, set(), _inference_report),
+        (D._metric_significance_to_dict, eval_pb2.MetricSignificance, {}, set(), eval_pb2.MetricSignificance),
+        (D._aggregate_delta_to_dict, eval_pb2.AggregateDelta, {}, set(), eval_pb2.AggregateDelta),
+        (D._compare_report_to_dict, eval_pb2.CompareEvalReport, {}, set(), eval_pb2.CompareEvalReport),
+        (D._calibration_report_to_dict, eval_pb2.CalibrationEvalReport, {}, set(), eval_pb2.CalibrationEvalReport),
+        (D._channel_spec_to_dict, catalog_pb2.Channel, {}, set(), catalog_pb2.Channel),
+    ]
+    for project, msg, renames, dropped, fixture in specs:
+        got = set(project(fixture()))
+        proto_fields = {f.name for f in msg.DESCRIPTOR.fields}
+        expected = set(proto_fields) - dropped
+        for out_key, proto_field in renames.items():
+            assert proto_field in proto_fields, f"{msg.DESCRIPTOR.name}: rename source {proto_field!r} not a proto field"
+            expected.discard(proto_field)
+            expected.add(out_key)
+        assert got == expected, (
+            f"{project.__name__} vs proto {msg.DESCRIPTOR.name}: "
+            f"got {sorted(got)} != proto-anchored {sorted(expected)} "
+            f"(proto fields {sorted(proto_fields)}, dropped {sorted(dropped)}, renames {renames})"
+        )
+
+    # The list projection: each edge dict reconciles with the `DerivesFromEdge`
+    # message's fields, anchored the same way.
+    resp = catalog_pb2.DerivesFromResponse()
+    edge = resp.edges.add()
+    edge.kind = catalog_pb2.ANCHOR_KIND_RESULT_DIGEST
+    got = set(D._derives_from_edges_to_list(resp)[0])
+    expected = {f.name for f in catalog_pb2.DerivesFromEdge.DESCRIPTOR.fields}
+    assert got == expected, f"_derives_from_edges_to_list edge: {sorted(got)} != {sorted(expected)}"
+
+
+def test_oneof_projection_shapes_are_proto_anchored():
+    """Each oneof projection flattens the SELECTED variant into `{tag} + variant
+    fields`. For every variant of every oneof message, the projection's output
+    key-set == the tag key plus the variant sub-message's LIVE descriptor fields
+    (read off the oneof, so a new variant field breaks this until projected)."""
+    from jammi_client import _database as D
+    from jammi_client._generated.jammi.v1 import catalog_pb2, eval_pb2
+
+    # (projection, proto message, oneof name, tag key, [variant field names])
+    specs = [
+        (D._inference_aggregate_to_dict, eval_pb2.InferenceAggregate, "aggregate", "task", ["classification", "ner"]),
+        (D._per_record_prediction_to_dict, eval_pb2.PerRecordPrediction, "prediction", "task", ["classification", "ner"]),
+        (D._verify_verdict_to_dict, catalog_pb2.VerifyMaterializationResponse, "verdict", "verdict", ["match", "mismatch", "match_with_unpinned_inputs", "missing_manifest"]),
+        (D._stale_reason_to_dict, catalog_pb2.StaleReason, "reason", "reason", ["definition_changed", "input_advanced", "input_vanished"]),
+        (D._staleness_verdict_to_dict, catalog_pb2.StalenessResponse, "staleness", "staleness", ["fresh", "stale", "undecidable", "missing_manifest"]),
+    ]
+    for project, msg, oneof_name, tag_key, variant_names in specs:
+        oneof = {o.name: o for o in msg.DESCRIPTOR.oneofs}[oneof_name]
+        variant_fields = {f.name: f for f in oneof.fields}
+        assert set(variant_fields) == set(variant_names), (
+            f"{msg.DESCRIPTOR.name}.{oneof_name}: proto variants {sorted(variant_fields)} "
+            f"!= pinned {sorted(variant_names)} — a variant was added or removed"
+        )
+        for variant in variant_names:
+            m = msg()
+            getattr(m, variant).SetInParent()
+            got = set(project(m))
+            sub = variant_fields[variant].message_type
+            sub_fields = {f.name for f in sub.fields} if sub is not None else set()
+            expected = {tag_key} | sub_fields
+            assert got == expected, (
+                f"{project.__name__}.{variant} vs proto {sub.name if sub else variant}: "
+                f"got {sorted(got)} != proto-anchored {sorted(expected)}"
+            )

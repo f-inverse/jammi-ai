@@ -41,6 +41,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The in-process engine, opt-in. `pip install jammi-client[embedded]` pulls the
+# compiled `jammi-ai-native` dist (importable as `jammi_native`); with it,
+# `jammi_client.connect("file://…")` resolves the local target to an
+# `EmbeddedBackend` (direct FFI). Without it, the base client is native-free and
+# a `file://` target raises `NoEmbeddedEngineError`. The `==` pin is lockstep
+# (K6): the client and the engine ship at one workspace version, and the
+# embedded backend drives the engine's wire seam by direct PyO3 — a version skew
+# between the two would desynchronise that seam, so the pin is EXACT, not a floor.
+embedded = ["jammi-ai-native==0.33.0"]
 # `make generate` regenerates the proto stubs. The wheel ships the
 # already-generated stubs; this extra is the generator toolchain for the
 # developer workflow AND every CI/publish lane — no workflow installs

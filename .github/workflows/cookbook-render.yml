@@ -41,18 +41,24 @@ jobs:
           lfs: true
       - uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Build the HEAD wheel + jammi-server binary
+      - name: Build the HEAD wheels + jammi-server binary
         # The grpc:// / live-server chapters shell out to jammi-server; build it
-        # alongside the HEAD embed wheel.
+        # alongside the HEAD wheels. `jammi_ai` is the pure-Python front-end over
+        # two lockstep dists: build the compiled `jammi-ai-native` wheel (maturin,
+        # from `packaging/native`) and the pure `jammi-ai` wheel (`python -m
+        # build`), then force-reinstall both.
         run: |
           python3 -m venv .venv
           . .venv/bin/activate
           pip install --upgrade pip
-          pip install maturin
+          pip install maturin build
           pip install -e 'clients/python[dev]'
           make -C clients/python generate
-          maturin build --release --out target/wheels
-          pip install --force-reinstall --no-deps target/wheels/jammi_ai-*.whl
+          ( cd packaging/native && maturin build --release --out "$GITHUB_WORKSPACE/target/wheels" )
+          python -m build --wheel --outdir target/wheels
+          pip install --force-reinstall --no-deps \
+            target/wheels/jammi_ai_native-*.whl \
+            target/wheels/jammi_ai-*.whl
           cargo build --release -p jammi-server
 
       - name: Install the book (against the HEAD wheel)

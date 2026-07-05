@@ -1,21 +1,29 @@
 [build-system]
-requires = ["maturin>=1.0,<2.0"]
-build-backend = "maturin"
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
 
 [project]
 name = "jammi-ai"
+version = "0.33.0"
 requires-python = ">=3.9"
-dynamic = ["version"]
 description = "Embeddable AI engine for inference, embeddings, vector search, and fine-tuning"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 authors = [{ name = "F-Inverse" }]
 keywords = ["embeddings", "vector-search", "fine-tuning", "inference", "machine-learning"]
-# `jammi-client` is a HARD dependency, not a `[client]` extra: it is the remote
-# arm of `connect(target)`, bundled so local→remote scaling is zero-friction.
-# An extra could only *add* the client, never *subtract* the compiled engine —
-# and the embed wheel is the engine. Lockstep version with the workspace.
-dependencies = ["jammi-client==0.33.0"]
+# `jammi-ai` is the pure-Python convenience front-end: the `connect(target)`
+# dispatcher that unifies the compiled local engine and the remote client behind
+# one front door. It ships no compiled code itself — it is the thin bundle of
+# the two arms, pinned in LOCKSTEP at the shared workspace version:
+#   * `jammi-ai-native` — the compiled in-process engine (`import jammi_native`),
+#     the `file://` arm of `connect`.
+#   * `jammi-client`     — the pure-Python gRPC client, the remote arm.
+# Both are HARD deps at an EXACT pin (not extras): an extra could only *add* an
+# arm, never *subtract* the engine, and the front-end IS the two arms composed.
+dependencies = [
+    "jammi-ai-native==0.33.0",
+    "jammi-client==0.33.0",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -29,7 +37,6 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Database",
 ]
@@ -40,25 +47,16 @@ Documentation = "https://f-inverse.github.io/jammi-ai/"
 Repository = "https://github.com/f-inverse/jammi-ai"
 "Bug Tracker" = "https://github.com/f-inverse/jammi-ai/issues"
 
-[tool.maturin]
-manifest-path = "crates/jammi-python/Cargo.toml"
-# The compiled engine is the top-level `jammi_native` extension: `import
-# jammi_native` yields the in-process engine directly, so a consumer can
-# discover the local backend on its own. Maturin's mixed layout places the
-# built `.so` beside `python/jammi_native/__init__.py` (which re-exports the
-# engine surface).
-module-name = "jammi_native"
-python-source = "python"
-# Maturin ships exactly one top-level module (the `module-name` package) from
-# `python-source`. The pure-Python `jammi_ai` front-end is a SEPARATE top-level
-# package that rides the same wheel — `connect(target)` dispatching a `file://`
-# target into `jammi_native` and a remote target into the bundled
-# `jammi-client`. `include` ships it alongside the compiled `jammi_native`; the
-# `python-source` prefix is stripped, so it installs at the site-packages root
-# as an importable top-level package.
-include = [{ path = "python/jammi_ai/**/*", format = "wheel" }]
-# `extension-module` is opt-in on the `jammi-python` crate so that
-# `cargo test --workspace` can link the integration test against
-# libpython. Maturin builds the extension module proper, so it activates
-# the feature explicitly here.
-features = ["extension-module"]
+[tool.hatch.build.targets.wheel]
+# The pure-Python front-end lives under `python/jammi_ai/`; `packages` strips the
+# `python/` source-root prefix so it installs as the top-level `jammi_ai`. The
+# compiled engine (`jammi_native`) is NOT here — it ships in the `jammi-ai-native`
+# wheel, pulled in via the exact dependency pin above.
+packages = ["python/jammi_ai"]
+
+[tool.hatch.build.targets.sdist]
+# The repo root is the workspace root, so an unconstrained sdist would sweep in
+# the whole tree. Ship only what builds the pure-Python front-end. The leading
+# `/` anchors `README.md`/`pyproject.toml` to the root — an unanchored pattern
+# matches every same-named file across the workspace.
+include = ["python/jammi_ai", "/README.md", "/pyproject.toml"]

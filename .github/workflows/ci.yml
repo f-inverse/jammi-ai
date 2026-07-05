@@ -363,19 +363,26 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Build wheel with maturin develop
+      - name: Install the three Python dists (client, native engine, front-end)
         # The CI base image ships maturin + a python3 toolchain; use a
         # venv to avoid polluting the system site-packages and to make
         # `python` resolve to the venv's interpreter for pytest.
         #
-        # The embed wheel hard-deps `jammi-client` (the remote arm, by
-        # composition). It is not on PyPI for an unreleased commit, so install
-        # it from the in-repo source first — `pip install -e` with the dev
-        # extra (which carries the pinned `grpcio-tools` generator and the
-        # client's real grpcio/protobuf floors), then generate its proto
-        # stubs — before `maturin develop` resolves the dep. This is also
-        # exactly what makes the conformance test (`jammi_ai.connect`'s
-        # remote IS `jammi_client.RemoteDatabase`) runnable in this lane.
+        # The pytest suite drives all three dists that ship in lockstep:
+        #   * `jammi-client` — the remote arm; install from in-repo source first
+        #     (`-e` with the dev extra, which carries the pinned `grpcio-tools`
+        #     generator and the client's real grpcio/protobuf floors) then
+        #     generate its proto stubs, since it is not on PyPI for an unreleased
+        #     commit.
+        #   * `jammi-ai-native` — the compiled engine (`import jammi_native`);
+        #     `maturin develop` on `packaging/native/pyproject.toml` builds it
+        #     into the venv.
+        #   * `jammi-ai` — the pure-Python front-end (`import jammi_ai`); an
+        #     editable install of the root, `--no-deps` because its exact pins
+        #     (`jammi-ai-native==`, `jammi-client==`) are already satisfied by
+        #     the two installs above (they are not on PyPI for this commit).
+        # This is what makes the conformance test (`jammi_ai.connect`'s remote IS
+        # `jammi_client.RemoteDatabase`) runnable in this lane.
         run: |
           python3 -m venv .venv
           . .venv/bin/activate
@@ -383,7 +390,8 @@ jobs:
           pip install maturin pytest
           pip install -e 'clients/python[dev]'
           make -C clients/python generate
-          maturin develop --release
+          ( cd packaging/native && maturin develop --release )
+          pip install -e . --no-deps
 
       - name: Run pytest
         run: |

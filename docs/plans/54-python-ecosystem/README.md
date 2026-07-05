@@ -291,15 +291,17 @@ Current distributions / versions / triggers:
 
 | PyPI name | Import | Ver | Repo | Kind | Publish trigger |
 |---|---|---|---|---|---|
-| `jammi-ai` | `jammi_ai` | 0.33.0 | jammi-ai | native abi3 wheels (Linux, macOS arm64/x86_64; Win disabled) | tag `py-v*` (`pypi.yml`) |
+| `jammi-ai` | `jammi_ai` | 0.33.0 | jammi-ai | pure-Python front-end (deps `jammi-ai-native==`, `jammi-client==`) | tag `py-v*` (`pypi.yml`) |
+| `jammi-ai-native` | `jammi_native` | 0.33.0 | jammi-ai `packaging/native` | native abi3 wheels (Linux, macOS arm64/x86_64; Win disabled) | **same `py-v*` tag** (`pypi.yml`) |
 | `jammi-client` | `jammi_client` | 0.33.0 | jammi-ai `clients/python` | pure-Python | **same `py-v*` tag** (`pypi-client.yml`) |
 | `jammi-server`(+`-cu12`) | `jammi_server` | 0.33.0 | jammi-ai `packaging/` | binary-carrying wheel | `pypi-server*.yml` |
 | `jammi-ai-platform` | `jammi_ai_platform` | 0.7.0 | jammi-enterprise | pure-Python (proprietary) | tag `sdk-v*` (`sdk-pypi.yml`) |
 
 Load-bearing coordination facts:
-- **`py-v*` publishes `jammi-ai` AND `jammi-client` together** (two workflows, one tag),
-  and `jammi-ai` pins `jammi-client==0.33.0` exactly. A rename must **retag + rewire both
-  atomically**.
+- **`py-v*` publishes `jammi-ai`, `jammi-ai-native` AND `jammi-client` together** (`pypi.yml`
+  builds the pure-Python front-end + the native engine wheels; `pypi-client.yml` the client —
+  one tag), and `jammi-ai` pins `jammi-ai-native==0.33.0` and `jammi-client==0.33.0` exactly.
+  A rename must **retag + rewire all three atomically**.
 - **`jammi-ai-platform` versions independently** (`0.7.0`, separate `sdk-v*`, separate
   repo) and depends on `jammi-client>=0.21` (a **floor**, not the exact pin). A
   `jammi-client` rename breaks the SDK's dependency string + its 4 library import sites —

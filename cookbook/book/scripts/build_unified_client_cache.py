@@ -4,9 +4,21 @@
 The engine<->cookbook validator for the one-front-door client contract: one
 ``connect(target)`` returns a transport-agnostic ``Session`` whose capability
 divergence, error taxonomy, and finite-cap honest edge are the SAME shape on the
-embedded ``jammi_ai.Database`` and the remote ``jammi_client.RemoteDatabase``.
-This script measures three families of surface facts and freezes them:
+embedded ``jammi_client.EmbeddedBackend`` (the base client's in-process,
+direct-FFI backend — the ``[embedded]`` extra) and the remote
+``jammi_client.RemoteDatabase``. This script measures five families of surface
+facts and freezes them:
 
+* **the install surface** — ``jammi-client`` carries the engine as the opt-in
+  ``[embedded]`` extra (the compiled ``jammi-ai-native`` dist, importable as
+  ``jammi_native``); with it, ``jammi_client.connect("file://…")`` resolves the
+  local target to an in-process ``EmbeddedBackend`` (direct FFI, no server),
+  ``connect("grpc://…")`` to a ``RemoteDatabase`` — one base package, two arms;
+* **embedded↔remote parity** — the shared ``Session`` Protocol enumerates the
+  verb vocabulary both transports carry; every one of its members is present on
+  BOTH concrete backends, and both concrete backends satisfy ``Session``
+  structurally (``isinstance`` runtime-checkable), so a program written against
+  the Protocol runs local or remote by target alone;
 * **the capability contract** — ``supports(Capability.X)`` is a hard boolean per
   backend (the two sets are exactly complementary across the CLOSED five), and
   invoking a one-sided feature on the backend that lacks it raises the typed
@@ -18,7 +30,8 @@ This script measures three families of surface facts and freezes them:
 * **the remote honest edge** — the remote channel raises its per-message receive
   cap to a finite 64 MiB (the embedded engine returns a result in-process,
   unbounded); a result exceeding the cap surfaces as ``BackendError`` mapped from
-  gRPC ``RESOURCE_EXHAUSTED``, exercised for real at a scaled-down configured cap.
+  gRPC ``RESOURCE_EXHAUSTED``, exercised for real at a scaled-down configured cap,
+  beside the embedded engine returning the same-scale payload whole in-process.
 
 Every fact is measured against the LIVE surface — no fact is transcribed. The
 remote server faults (a wire ``INVALID_ARGUMENT`` / ``RESOURCE_EXHAUSTED``) are
@@ -38,16 +51,17 @@ Usage::
 from __future__ import annotations
 
 import concurrent.futures
+import importlib.metadata as importlib_metadata
 import json
 import tempfile
+from importlib.util import find_spec
 from pathlib import Path
 
 import grpc
-import jammi_ai
 import jammi_client
 import pyarrow as pa
 import pyarrow.parquet as pq
-from jammi_client import Capability
+from jammi_client import Capability, Session
 from jammi_client._database import MAX_RECEIVE_MESSAGE_LENGTH, _rpc_to_jammi
 from jammi_client.errors import (
     BackendError,
@@ -110,6 +124,75 @@ def _remote_verb_status(code: grpc.StatusCode) -> JammiError:
         raise AssertionError(f"{code} did not raise")
     finally:
         remote.close()
+
+
+# --------------------------------------------------------------------------- #
+# 0. install surface — the [embedded] extra + the two connect arms
+# --------------------------------------------------------------------------- #
+
+
+def _install_record(embedded, remote) -> dict:
+    """The base client's install surface: the ``[embedded]`` extra (read off the
+    live dist metadata — never transcribed) and the concrete backend each URI
+    scheme resolves to."""
+    md = importlib_metadata.metadata("jammi-client")
+    extras = sorted(md.get_all("Provides-Extra") or [])
+    reqs = md.get_all("Requires-Dist") or []
+    embedded_pins = sorted(
+        r.split(";", 1)[0].strip()
+        for r in reqs
+        if "extra ==" in r and "'embedded'" in r
+    )
+    return {
+        "extras": extras,
+        "embedded_extra_name": "embedded",
+        "embedded_extra_pins": embedded_pins,
+        "native_dist": "jammi-ai-native",
+        "native_module": "jammi_native",
+        "native_importable": find_spec("jammi_native") is not None,
+        # The two arms of the ONE front door, by URI scheme.
+        "file_uri_backend": type(embedded).__name__,
+        "file_uri_backend_module": type(embedded).__module__,
+        "grpc_uri_backend": type(remote).__name__,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 0b. embedded↔remote parity — the shared Session Protocol vocabulary
+# --------------------------------------------------------------------------- #
+
+
+def _session_protocol_verbs() -> list[str]:
+    """The public members the runtime-checkable ``Session`` Protocol names — the
+    shared verb vocabulary both transports MUST carry. Read off the Protocol
+    itself (``__protocol_attrs__`` on 3.12+, the ``typing`` helper below it), so
+    the list is the live contract, never a transcription."""
+    attrs = getattr(Session, "__protocol_attrs__", None)
+    if attrs is None:  # pragma: no cover - <3.12 fallback
+        from typing import _get_protocol_attrs  # type: ignore[attr-defined]
+
+        attrs = _get_protocol_attrs(Session)
+    return sorted(a for a in attrs if not a.startswith("_"))
+
+
+def _parity_record(embedded, remote) -> dict:
+    """Every member the ``Session`` Protocol names is present on BOTH concrete
+    backends, and both backends satisfy ``Session`` structurally — the parity the
+    one-front-door thesis rests on, measured member-for-member."""
+    verbs = _session_protocol_verbs()
+    emb_missing = sorted(v for v in verbs if not hasattr(type(embedded), v))
+    rem_missing = sorted(v for v in verbs if not hasattr(type(remote), v))
+    return {
+        "session_protocol_verbs": verbs,
+        "verb_count": len(verbs),
+        "embedded_missing": emb_missing,
+        "remote_missing": rem_missing,
+        "both_complete": not emb_missing and not rem_missing,
+        "embedded_is_session": isinstance(embedded, Session),
+        "remote_is_session": isinstance(remote, Session),
+        "embedded_backend": type(embedded).__name__,
+        "remote_backend": type(remote).__name__,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -291,10 +374,15 @@ def _honest_edge_record(embedded) -> dict:
 
 def main() -> int:
     with tempfile.TemporaryDirectory() as artifact_dir:
-        embedded = jammi_ai.connect(f"file://{artifact_dir}")
+        # The base client discovers the in-process engine on demand: a `file://`
+        # target resolves to the direct-FFI EmbeddedBackend when the `[embedded]`
+        # extra is installed. This is the REAL new surface — no convenience bundle.
+        embedded = jammi_client.connect(f"file://{artifact_dir}")
         remote = jammi_client.connect("grpc://127.0.0.1:8081")  # lazy; supports() is local
         try:
             record = {
+                "install": _install_record(embedded, remote),
+                "parity": _parity_record(embedded, remote),
                 "capability": _capability_record(embedded, remote),
                 "taxonomy": _taxonomy_record(embedded),
                 "honest_edge": _honest_edge_record(embedded),

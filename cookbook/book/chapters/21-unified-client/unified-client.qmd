@@ -7,27 +7,40 @@ title: "The unified client surface — one connect, one Session, two honest tran
 import jammi_cookbook
 ```
 
-**Recipe:** `connect(target)` -> a transport-agnostic `Session` · `supports(Capability.X)`
-· the `JammiError` taxonomy (`InvalidArgument` / `NotSupportedOnBackend` / `TrainingError`
-/ `BackendError`) · `credentials=` on the front door. · **Theory:** the Liskov-substitutable
-transport [@liskov1994behavioral] — an embedded engine and a remote channel are two
-implementations of one behavioural contract, so a program written against the contract runs
-against either; and the leaky-abstraction principle [@spolsky2002leaky] — where the two
-transports genuinely diverge, the seam says so out loud (a typed capability, a finite cap),
-it does not paper over it. · **Rail:** measurement (every capability boolean, every raised
-class, and the receive-cap edge asserted against the frozen golden — booleans and class
-names exact, not transcribed).
+**Recipe:** `pip install jammi-client[embedded]` · `jammi_client.connect(target)` -> a
+transport-agnostic `Session` (`file://` -> an in-process `EmbeddedBackend`, direct FFI;
+`grpc://` -> a `RemoteDatabase`) · `supports(Capability.X)` · the `JammiError` taxonomy
+(`InvalidArgument` / `NotSupportedOnBackend` / `TrainingError` / `BackendError`) ·
+`credentials=` on the front door. · **Theory:** the Liskov-substitutable transport
+[@liskov1994behavioral] — an embedded engine and a remote channel are two implementations of
+one behavioural contract, so a program written against the contract runs against either; and
+the leaky-abstraction principle [@spolsky2002leaky] — where the two transports genuinely
+diverge, the seam says so out loud (a typed capability, a finite cap), it does not paper over
+it. · **Rail:** measurement (the shared verb vocabulary, every capability boolean, every
+raised class, and the receive-cap edge asserted against the frozen golden — names and
+booleans exact, not transcribed).
 
-Every earlier chapter opened a session with `jammi_ai.connect("file://…")` and, at the heavy
-emit, the same verbs ran `connect("grpc://…")` against a server. That substitution — local
-for remote without touching a call — is a *claim*, and this chapter measures it. One
-`connect(target)` returns a `Session`; the embedded `jammi_ai.Database` and the remote
-`jammi_client.RemoteDatabase` both satisfy it, so a program written against the `Session`
-surface runs in-process or behind a server by target alone.
+`jammi-client` is the **base**: one lean Python package that speaks to a Jammi engine, local
+or remote. Out of the box it carries the remote arm — `connect("grpc://…")` over the
+`jammi.v1` wire. The in-process engine is an *opt-in extra*: `pip install
+jammi-client[embedded]` pulls the compiled `jammi-ai-native` dist, and with it
+`connect("file://…")` resolves to an `EmbeddedBackend` that drives the engine in-process by
+direct FFI — no server, no socket. One package, two transports, selected by target alone.
 
-But two transports are not identical, and the honest thing is to name where they diverge
-rather than pretend they do not. This chapter measures the three seams that make the
-substitution *truthful* instead of merely convenient:
+The earlier chapters reach the engine through `jammi_ai` — the batteries-included convenience
+bundle that pins the `[embedded]` extra so a `file://` target always resolves. That bundle's
+`connect` *is* `jammi_client.connect`, and its `jammi_ai.Database` *is* this chapter's
+`jammi_client.EmbeddedBackend`. This chapter goes straight to the base client to measure the
+surface itself: one `connect(target)` returns a `Session`; the embedded
+`jammi_client.EmbeddedBackend` and the remote `jammi_client.RemoteDatabase` both satisfy it,
+so a program written against the `Session` surface runs in-process or behind a server by
+target alone.
+
+That substitution — local for remote without touching a call — is a *claim*, and this
+chapter measures it in four movements. First the foundation: the `[embedded]` install seam
+and the shared `Session` vocabulary both transports carry. Then the three seams that make the
+substitution *truthful* rather than merely convenient — because two transports are not
+identical, and the honest thing is to name where they diverge:
 
 1. **the capability contract** — the handful of features that exist on only one transport,
    answered by a predicate before the call and by a typed error if you skip the predicate;
@@ -41,12 +54,121 @@ substitution *truthful* instead of merely convenient:
 from jammi_cookbook import contracts
 
 rec = contracts.load_artifact("unified_client.record")
+inst = rec["install"]
+par = rec["parity"]
 cap = rec["capability"]
+print(f"[embedded] extra pins:     {inst['embedded_extra_pins']}")
+print(f"file:// -> backend:        {inst['file_uri_backend']}  ({inst['file_uri_backend_module']})")
+print(f"grpc:// -> backend:        {inst['grpc_uri_backend']}")
+print(f"shared Session verbs:      {par['verb_count']} — present on both backends: {par['both_complete']}")
 print(f"capability enum (CLOSED):  {cap['enum_values']}")
-print(f"embedded supports:         {cap['embedded_supports']}")
-print(f"remote   supports:         {cap['remote_supports']}")
-print(f"complementary:             {cap['complementary']}")
 ```
+
+## Installing the engine — the `[embedded]` extra
+
+The base package is native-free. `pip install jammi-client` gives you the remote arm alone —
+lean, dependency-light, exactly what a deploy image wants. The compiled engine ships as its
+own dist, `jammi-ai-native` (importable as `jammi_native`), and rides in as the opt-in
+`[embedded]` extra:
+
+```bash
+pip install jammi-client            # remote only — connect("grpc://…")
+pip install jammi-client[embedded]  # + the in-process engine — connect("file://…")
+```
+
+The extra is a real, declared edge, not folklore: `jammi-client`'s package metadata advertises
+`embedded` and pins the engine dist at the exact lockstep version (the embedded backend drives
+the engine's wire seam by direct PyO3, so a version skew would desynchronise that seam — the
+pin is `==`, not a floor). We read the extra straight off the installed dist's metadata rather
+than transcribe it, and confirm the engine it names is importable in this book's environment
+(the `[embedded]` extra is present, which is why every `file://` chapter has resolved).
+
+```{python}
+import importlib.metadata as importlib_metadata
+from importlib.util import find_spec
+
+md = importlib_metadata.metadata("jammi-client")
+extras = sorted(md.get_all("Provides-Extra") or [])
+reqs = md.get_all("Requires-Dist") or []
+embedded_pins = sorted(
+    r.split(";", 1)[0].strip() for r in reqs if "extra ==" in r and "'embedded'" in r
+)
+native_here = find_spec("jammi_native") is not None
+
+print(f"jammi-client extras:        {extras}")
+print(f"[embedded] pins:            {embedded_pins}")
+print(f"jammi_native importable:    {native_here}  (the extra is installed)")
+
+assert "embedded" in extras
+assert embedded_pins == inst["embedded_extra_pins"]
+assert any(p.startswith("jammi-ai-native==") for p in embedded_pins), "the extra pins the engine"
+assert native_here is inst["native_importable"] is True
+```
+
+Without the extra, the base client is honest about the absence: a `file://` target raises a
+typed `NoEmbeddedEngineError` pointing at exactly this extra — the runtime echo of the Rust
+`#[cfg]` gate — rather than importing a phantom engine. The lean build and the embed build are
+*one package*, differing only by whether `[embedded]` is present.
+
+## Two arms, one Session — the direct-FFI backend and its remote peer
+
+With the extra installed, the single front door resolves each target to its transport. A
+`file://` URL returns an `EmbeddedBackend` — the compiled engine driven in-process by direct
+FFI, no server stood up, no socket opened. A `grpc://` URL returns a `RemoteDatabase` over the
+wire. Both come off the *same* base `jammi_client` — no convenience bundle in sight — and both
+are a `Session`.
+
+```{python}
+import tempfile
+
+import jammi_client
+from jammi_client import Session
+
+embedded = jammi_client.connect(f"file://{tempfile.mkdtemp(prefix='jammi_uc_')}")
+remote = jammi_client.connect("grpc://127.0.0.1:8081")  # lazy — opens no socket
+
+print(f"connect('file://…') -> {type(embedded).__module__}.{type(embedded).__name__}")
+print(f"connect('grpc://…') -> {type(remote).__module__}.{type(remote).__name__}")
+print(f"both are a Session:  embedded={isinstance(embedded, Session)}  remote={isinstance(remote, Session)}")
+
+assert type(embedded).__name__ == inst["file_uri_backend"] == "EmbeddedBackend"
+assert type(embedded).__module__ == inst["file_uri_backend_module"]  # the base client, direct FFI
+assert type(remote).__name__ == inst["grpc_uri_backend"] == "RemoteDatabase"
+assert isinstance(embedded, Session) and isinstance(remote, Session)
+```
+
+"Both are a `Session`" is what makes the substitution a *type*, not a hope. The `Session`
+Protocol enumerates the shared verb vocabulary — sources, embeddings, search, inference,
+training, the engine-state pipeline, evaluation, channels, mutable tables, topics, the model
+lifecycle, tenant scope, SQL, the stateless numerics — and it is `runtime_checkable`, so the
+`isinstance` above is a structural check that both concrete classes carry every member the
+Protocol names. We read the Protocol's member list off the Protocol itself and assert both
+backends are complete against it: the parity is measured member-for-member, not asserted.
+
+```{python}
+attrs = getattr(Session, "__protocol_attrs__", None)
+if attrs is None:  # <3.12 fallback
+    from typing import _get_protocol_attrs
+
+    attrs = _get_protocol_attrs(Session)
+verbs = sorted(a for a in attrs if not a.startswith("_"))
+
+emb_missing = sorted(v for v in verbs if not hasattr(type(embedded), v))
+rem_missing = sorted(v for v in verbs if not hasattr(type(remote), v))
+
+print(f"Session Protocol names {len(verbs)} shared verbs")
+print(f"  missing on EmbeddedBackend: {emb_missing or 'none'}")
+print(f"  missing on RemoteDatabase:  {rem_missing or 'none'}")
+
+assert verbs == par["session_protocol_verbs"]
+assert len(verbs) == par["verb_count"] == 49
+assert emb_missing == rem_missing == [], "both backends carry the whole shared vocabulary"
+assert par["both_complete"] is True
+```
+
+Forty-nine verbs, both backends complete, no drift. A caller writes one program against the
+`Session` surface; the target picks the transport. What the Protocol deliberately leaves *off*
+this shared list — the one-sided, capability-gated members — is the subject of the next seam.
 
 ## The capability contract — a predicate, not a guess
 
@@ -65,15 +187,9 @@ sets are exactly complementary across the closed five: every capability is carri
 precisely one transport.
 
 ```{python}
-import tempfile
-
-import jammi_ai
-import jammi_client
 from jammi_client import Capability
 
-embedded = jammi_ai.connect(f"file://{tempfile.mkdtemp(prefix='jammi_uc_')}")
-remote = jammi_client.connect("grpc://127.0.0.1:8081")  # lazy — supports() opens no socket
-
+# `embedded` and `remote` are the two Sessions opened in the parity movement above.
 print(f"{'capability':<20}{'embedded':>10}{'remote':>10}")
 for c in Capability:
     print(f"{c.value:<20}{str(embedded.supports(c)):>10}{str(remote.supports(c)):>10}")

@@ -30,7 +30,6 @@ import jammi_client
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-
 from jammi_client import Capability
 from jammi_client._database import MAX_RECEIVE_MESSAGE_LENGTH, _rpc_to_jammi
 from jammi_client.errors import (
@@ -39,6 +38,7 @@ from jammi_client.errors import (
     JammiError,
     NotSupportedOnBackend,
 )
+
 from jammi_cookbook import contracts
 
 _UC = contracts._dataset_dir("unified_client")
@@ -84,9 +84,9 @@ def test_wrong_side_capability_raises_not_supported():
         remote = jammi_client.connect("grpc://127.0.0.1:8081")
         try:
             with pytest.raises(NotSupportedOnBackend) as emb_info:
-                embedded.session_id  # remote-only, on embedded
+                _ = embedded.session_id  # remote-only, on embedded
             with pytest.raises(NotSupportedOnBackend) as rem_info:
-                remote.audit  # embedded-only, on remote
+                _ = remote.audit  # embedded-only, on remote
         finally:
             remote.close()
     assert str(emb_info.value.capability) == rec["embedded_wrong_side"]["capability"]

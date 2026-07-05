@@ -47,8 +47,6 @@ import jammi_ai
 import jammi_client
 import pyarrow as pa
 import pyarrow.parquet as pq
-
-import jammi_cookbook  # noqa: F401  # applies the determinism env on import
 from jammi_client import Capability
 from jammi_client._database import MAX_RECEIVE_MESSAGE_LENGTH, _rpc_to_jammi
 from jammi_client.errors import (
@@ -57,6 +55,8 @@ from jammi_client.errors import (
     JammiError,
     NotSupportedOnBackend,
 )
+
+import jammi_cookbook  # noqa: F401  # applies the determinism env on import
 
 _OUT = Path(__file__).resolve().parent.parent / "artifacts" / "unified_client"
 

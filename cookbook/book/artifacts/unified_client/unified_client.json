@@ -1,0 +1,78 @@
+{
+  "capability": {
+    "complementary": true,
+    "embedded_supports": {
+      "audit": true,
+      "close": false,
+      "ephemeral_session": true,
+      "preload_model": true,
+      "session_id": false
+    },
+    "embedded_wrong_side": {
+      "capability": "session_id",
+      "raised": "NotSupportedOnBackend"
+    },
+    "enum_values": [
+      "audit",
+      "ephemeral_session",
+      "preload_model",
+      "close",
+      "session_id"
+    ],
+    "remote_supports": {
+      "audit": false,
+      "close": true,
+      "ephemeral_session": false,
+      "preload_model": false,
+      "session_id": true
+    },
+    "remote_wrong_side": {
+      "capability": "audit",
+      "raised": "NotSupportedOnBackend"
+    }
+  },
+  "honest_edge": {
+    "capped_channel_grpc_code": "RESOURCE_EXHAUSTED",
+    "capped_channel_is_backend_error": true,
+    "capped_channel_is_jammi_error": true,
+    "capped_channel_mapped": "BackendError",
+    "demo_cap_bytes": 65536,
+    "embedded_exceeds_demo_cap": true,
+    "embedded_returned_bytes": 160000,
+    "embedded_returned_rows": 40000,
+    "generous_channel_returned_bytes": 262144,
+    "payload_bytes": 262144,
+    "production_cap_bytes": 67108864,
+    "production_cap_mib": 64
+  },
+  "taxonomy": {
+    "embedded_bad_arg": {
+      "is_jammi_error": true,
+      "is_value_error": true,
+      "raised": "InvalidArgument"
+    },
+    "hierarchy": {
+      "BackendError": [
+        "JammiError",
+        "RuntimeError"
+      ],
+      "InvalidArgument": [
+        "JammiError",
+        "ValueError"
+      ],
+      "JammiError": [
+        "Exception"
+      ],
+      "NotSupportedOnBackend": [
+        "JammiError"
+      ]
+    },
+    "one_except_catches_both": true,
+    "remote_bad_arg": {
+      "is_jammi_error": true,
+      "is_value_error": true,
+      "raised": "InvalidArgument"
+    },
+    "two_sided_same_class": true
+  }
+}

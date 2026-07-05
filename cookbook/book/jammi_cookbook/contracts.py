@@ -826,6 +826,27 @@ ARTIFACTS: dict[str, Artifact] = {
         "count), and tenant-conditioned metric parity (the same recall recipe under two "
         "tenants yields each its own scoped result over a disjoint row partition).",
     ),
+    # --- the unified-client surface (U1: one connect(), one Session) ---------
+    "unified_client.record": Artifact(
+        name="unified_client.record",
+        kind="model_id",
+        filename="unified_client.json",
+        produced_by="unified_client",
+        note="The one-front-door client contract measured LIVE on CPU, hermetic (no "
+        "server socket): the capability contract (supports(Capability.X) is a hard "
+        "boolean per backend — the CLOSED-five sets are exactly complementary across "
+        "the embedded Database and the remote RemoteDatabase — and a one-sided feature "
+        "on the wrong backend raises the typed NotSupportedOnBackend); the JammiError "
+        "taxonomy two-sided (one except JammiError catches a failure on BOTH transports, "
+        "and a bad argument is the SAME InvalidArgument class whether the embedded engine "
+        "rejected it in-process or a server rejected it over the wire — the wire status "
+        "injected at the transport boundary, the U1 conformance technique); and the "
+        "remote honest edge (a real capped gRPC channel raises RESOURCE_EXHAUSTED mapped "
+        "onto BackendError for a payload above the cap, shown at a scaled-down configured "
+        "cap while the generous arm runs at the real 64 MiB production default, and the "
+        "embedded engine returns the same-scale payload in-process unbounded). Names no "
+        "consumer — every capability and error class is a generic engine feature.",
+    ),
 }
 
 

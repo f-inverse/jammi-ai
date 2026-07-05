@@ -1383,7 +1383,13 @@ fn context_source_tag(kind: ContextSourceKind) -> &'static str {
 }
 
 fn parse_file_format(s: &str) -> PyResult<FileFormat> {
-    s.parse().map_err(to_pyerr)
+    // A bad format token is unambiguously a caller argument error, so surface it
+    // as `InvalidArgument` — matching the remote client, which rejects an unknown
+    // format client-side as the same class. The `FileFormat` parse error is the
+    // generic `JammiError::Other`, which would otherwise land in the backend
+    // bucket, so the classification is pinned here at the caller-facing seam.
+    s.parse::<FileFormat>()
+        .map_err(|e| crate::error::client_error("InvalidArgument", e.to_string()))
 }
 
 /// Parse a classification conformal score family from its snake-case name.

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import inspect
 
+import grpc
 import pytest
 
 import jammi_ai
@@ -857,3 +858,92 @@ def test_capability_enum_is_the_closed_five():
         "close",
         "session_id",
     }
+
+
+class _FakeRpcError(grpc.RpcError):
+    """A `grpc.RpcError` carrying a chosen status code — lets a test drive the
+    remote error-mapping choke point without a live server."""
+
+    def __init__(self, code, details):
+        self._code = code
+        self._details = details
+
+    def code(self):
+        return self._code
+
+    def details(self):
+        return self._details
+
+
+class _RaisingStub:
+    """A gRPC service stub whose every method raises a fixed error — swapped onto
+    a `RemoteDatabase`'s `_catalog` so a verb's wire hop raises hermetically."""
+
+    def __init__(self, err):
+        self._err = err
+
+    def __getattr__(self, _name):
+        def _raise(*_args, **_kwargs):
+            raise self._err
+
+        return _raise
+
+
+def test_remote_rpc_status_errors_map_onto_the_taxonomy():
+    """A SERVER-detected fault the remote stub raises as a ``grpc.RpcError`` is
+    remapped onto the taxonomy by status code — so the whole remote surface, not
+    only client-constructed errors, descends from ``JammiError``:
+
+    * ``INVALID_ARGUMENT`` → :class:`InvalidArgument` — the SAME class the
+      embedded engine raises for a server-detected bad argument (``status_to_pyerr``),
+      the two-sided parity the client-side format pre-rejection could NOT prove;
+    * ``RESOURCE_EXHAUSTED`` (the 64 MiB receive-cap edge) / ``UNAVAILABLE`` /
+      ``DEADLINE_EXCEEDED`` / ``INTERNAL`` → :class:`BackendError`;
+    * ``UNIMPLEMENTED`` → :class:`NotSupportedOnBackend`.
+
+    Hermetic: the stub raises, so no server is dialed; the verb still reaches the
+    wire arm (``_call``), unlike a client-side pre-rejection."""
+    from jammi_client.errors import (
+        BackendError,
+        InvalidArgument,
+        NotSupportedOnBackend,
+    )
+
+    cases = [
+        (grpc.StatusCode.INVALID_ARGUMENT, InvalidArgument),
+        (grpc.StatusCode.RESOURCE_EXHAUSTED, BackendError),
+        (grpc.StatusCode.UNAVAILABLE, BackendError),
+        (grpc.StatusCode.DEADLINE_EXCEEDED, BackendError),
+        (grpc.StatusCode.INTERNAL, BackendError),
+        (grpc.StatusCode.UNIMPLEMENTED, NotSupportedOnBackend),
+    ]
+    for code, expected in cases:
+        remote = jammi_client.connect("grpc://127.0.0.1:8081")
+        try:
+            remote._catalog = _RaisingStub(_FakeRpcError(code, f"server said {code}"))
+            with pytest.raises(expected) as info:
+                remote.list_sources()  # a unary verb → routes through `_call`
+            assert type(info.value) is expected, f"{code}: {type(info.value)}"
+            assert isinstance(info.value, jammi_client.JammiError)
+            assert getattr(info.value, "code", None) == code
+        finally:
+            remote.close()
+
+
+def test_remote_not_found_semantics_survive_the_taxonomy_mapping():
+    """The mapping must not regress the ``NOT_FOUND`` special-cases: ``describe_*``
+    returns ``None`` and an ``if_exists`` drop is a no-op even though the raw
+    ``grpc.RpcError`` is now remapped to a ``JammiError`` first — the call-sites
+    branch on the status code carried on the mapped exception's ``.code``."""
+    not_found = _FakeRpcError(grpc.StatusCode.NOT_FOUND, "absent")
+    remote = jammi_client.connect("grpc://127.0.0.1:8081")
+    try:
+        remote._catalog = _RaisingStub(not_found)
+        assert remote.describe_source("nope") is None
+        assert remote.describe_model("nope") is None
+        remote.drop_mutable_table("nope", if_exists=True)  # no raise
+        # Without if_exists, the NOT_FOUND surfaces as a typed JammiError.
+        with pytest.raises(jammi_client.JammiError):
+            remote.drop_mutable_table("nope", if_exists=False)
+    finally:
+        remote.close()

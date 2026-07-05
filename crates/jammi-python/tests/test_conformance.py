@@ -29,6 +29,7 @@ import pytest
 
 import jammi_ai
 import jammi_client
+import jammi_native
 
 
 def _embed_method(verb: str):
@@ -46,14 +47,14 @@ def _embed_method(verb: str):
     caller actually invokes."""
     if verb in vars(jammi_ai.Database):
         return getattr(jammi_ai.Database, verb)
-    return getattr(jammi_ai._native._NativeDatabase, verb)
+    return getattr(jammi_native._NativeDatabase, verb)
 
 
 def _embed_has(verb: str) -> bool:
     """Whether the composed embedded surface carries `verb` — declared on the thin
     `Database` wrapper or on the `_NativeDatabase` handle behind it."""
     return verb in vars(jammi_ai.Database) or hasattr(
-        jammi_ai._native._NativeDatabase, verb
+        jammi_native._NativeDatabase, verb
     )
 
 

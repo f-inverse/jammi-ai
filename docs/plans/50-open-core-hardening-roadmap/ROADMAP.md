@@ -450,8 +450,8 @@ cargo test --workspace --exclude jammi-python --features live-hub-tests --no-run
 Proto/client changes also need `make -C clients/python generate` + a `jammi-python`
 rebuild + the TS client build. Embedded Python tests need `maturin develop` — beware the
 cross-worktree `jammi_ai` shadowing trap: pin `PYTHONPATH` to the worktree's `python/` +
-`clients/python` and confirm `jammi_ai.__file__` resolves into the worktree (and that its
-`_native.abi3.so` is the fresh build). The **Postgres** lane (`test-pg`,
+`clients/python` and confirm `jammi_ai.__file__` resolves into the worktree (and that the
+freshly built `jammi_native.abi3.so` is the one imported). The **Postgres** lane (`test-pg`,
 `--features live-postgres-tests`) is CI-only — compile-check `--no-run` locally; remote
 CI is the authoritative gate. Background long runs and poll; iterate with
 `cargo test … -- the::test::name` on the built binary (no recompile), never by re-running

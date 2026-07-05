@@ -1,7 +1,7 @@
 """The embedded `Database`: a thin Python wrapper over the `_NativeDatabase` handle.
 
 `connect("file://…")` returns one of these. It is the user-facing embedded
-surface, composed over the compiled `_native._NativeDatabase` low-level handle:
+surface, composed over the compiled `jammi_native._NativeDatabase` low-level handle:
 
 * Every verb whose request is still assembled in Rust is forwarded verbatim to
   the native handle by ``__getattr__`` — the embedded implementation is unchanged.

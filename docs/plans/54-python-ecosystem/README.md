@@ -256,10 +256,10 @@ A lean, sensible split is **three units**:
   green against the new surface.
 - **Unit 2 — the `[embedded]` backend under the new native namespace.** Add the
   EmbeddedBackend (direct-FFI over the native engine) behind the same trait and ship
-  `jammi[embedded]`. The native extension module moves off `jammi_ai._native` to the new
-  namespace (maturin `module-name`) and the old `jammi_ai._native` name is **gone** — every
-  direct native-import site (e.g. `test_conformance.py`'s `_NativeDatabase`) is rewritten in
-  this change. `jammi_ai` is not kept alongside; it is replaced. **Cookbook co-evolution:** the
+  `jammi[embedded]`. The native extension module lives at the top-level `jammi_native`
+  namespace (maturin `module-name`), moved off the old dotted submodule path which is now
+  **gone** — every direct native-import site (e.g. `test_conformance.py`'s `_NativeDatabase`)
+  imports it as a bare top-level module. `jammi_ai` is not kept alongside; it is replaced. **Cookbook co-evolution:** the
   chapters that teach the embedded path — installing the `[embedded]` extra, the direct-FFI
   backend, and the embedded↔remote parity the trait now guarantees — co-evolve here, measured
   green against the real embedded backend this unit ships. This unit also completes the §5.9
@@ -308,7 +308,7 @@ Load-bearing coordination facts:
   npm). A top-level `jammi` PyPI claim is external: check availability on pypi.org and
   register a **pending publisher** (all four workflows use OIDC Trusted Publishing under a
   `pypi` environment — a new name needs the pending-publisher set up before first publish).
-- The native module name `jammi_ai._native` is baked into `[tool.maturin] module-name`; a
+- The native module name `jammi_native` is set in `[tool.maturin] module-name`; a
   package rename touches maturin config + `python/jammi_ai/__init__.py`, not just the dist.
 
 **Release order:** the OSS base (`jammi` + `jammi[embedded]`, engine repo, `py-v*` line)

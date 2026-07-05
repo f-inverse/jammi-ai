@@ -19,6 +19,8 @@ points one way, native → client, never the reverse.
 
 from __future__ import annotations
 
+from ._capability import Capability
+
 
 class JammiError(Exception):
     """Base of every Jammi error. One ``except JammiError`` catches them all."""
@@ -39,16 +41,26 @@ class NotSupportedOnBackend(JammiError):
     ephemeral session on the embedded engine, an explicit channel ``close`` or
     connection ``session_id`` on the remote client. Invoking the wrong one raises
     this typed error rather than a bare ``AttributeError``, and
-    :meth:`Session.supports` answers the same question before the call. Carries
-    the :class:`~jammi_client.Capability` that was unavailable.
+    :meth:`Session.supports` answers the same question before the call.
+
+    Constructed one of two ways: with the :class:`~jammi_client.Capability` a
+    caller invoked on the wrong backend (the local, capability-shaped case), or
+    with a server ``UNIMPLEMENTED`` detail string (a verb the remote deployment
+    did not mount). ``capability`` is the enum member in the first case, ``None``
+    in the second.
     """
 
-    def __init__(self, capability: object) -> None:
-        super().__init__(
-            f"capability {capability!s} is not supported on this backend; "
-            f"call `supports({capability!s})` to check before invoking it"
-        )
-        self.capability = capability
+    def __init__(self, capability_or_detail: object) -> None:
+        if isinstance(capability_or_detail, Capability):
+            self.capability = capability_or_detail
+            super().__init__(
+                f"capability {capability_or_detail!s} is not supported on this "
+                f"backend; call `supports({capability_or_detail!s})` to check "
+                f"before invoking it"
+            )
+        else:
+            self.capability = None
+            super().__init__(str(capability_or_detail))
 
 
 class NoEmbeddedEngineError(NotSupportedOnBackend):

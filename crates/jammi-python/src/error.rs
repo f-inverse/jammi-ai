@@ -28,7 +28,16 @@ pub(crate) fn client_error(class: &str, message: String) -> PyErr {
             .and_then(|cls| cls.call1((message.as_str(),)));
         match built {
             Ok(instance) => PyErr::from_value(instance),
-            Err(_) => pyo3::exceptions::PyRuntimeError::new_err(message),
+            // A failure to import/construct the taxonomy class is a miswiring
+            // (a renamed/removed class, a broken install) — surface it LOUDLY,
+            // naming the class that could not be raised, rather than silently
+            // downgrading to a bare `RuntimeError` that would slip past an
+            // `except <TaxonomyClass>` and mask the real fault.
+            Err(import_err) => pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "jammi taxonomy miswiring: could not raise \
+                 jammi_client.errors.{class} ({import_err}); \
+                 original error was: {message}"
+            )),
         }
     })
 }

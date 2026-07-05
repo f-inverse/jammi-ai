@@ -19,10 +19,18 @@ swap (``import jammi_ai`` → ``import jammi_client``), `connect` unchanged.
 
 from __future__ import annotations
 
-from typing import Union
+from typing import Optional, Union
 
 import jammi_client
-from jammi_client import LocalTarget, RemoteDatabase, Target, parse_target
+from jammi_client import (
+    ChannelCredentials,
+    LocalTarget,
+    NoEmbeddedEngineError,
+    RemoteDatabase,
+    Session,
+    Target,
+    parse_target,
+)
 
 from jammi_ai._native import (
     open_local,
@@ -37,6 +45,7 @@ from jammi_ai._database import Database
 
 __all__ = [
     "connect",
+    "Session",
     "Database",
     "RemoteDatabase",
     "TrainingJob",
@@ -47,7 +56,11 @@ __all__ = [
 ]
 
 
-def connect(target: Union[str, Target]) -> Union[Database, RemoteDatabase]:
+def connect(
+    target: Union[str, Target],
+    *,
+    credentials: Optional[ChannelCredentials] = None,
+) -> Session:
     """Open a session against `target`, selecting its transport once.
 
     `target` is a URI string or a structured :class:`~jammi_client.Target`:
@@ -58,17 +71,23 @@ def connect(target: Union[str, Target]) -> Union[Database, RemoteDatabase]:
       ``grpc://host:8081`` → a remote engine over the `jammi.v1` gRPC wire (a
       :class:`~jammi_client.RemoteDatabase`), via the bundled `jammi-client`.
 
-    The remote arm delegates to `jammi_client.connect`, so the remote verb
-    surface here is exactly `jammi-client`'s — defined once, agreeing by
-    construction.
+    Both arms return a :class:`~jammi_client.Session` — the transport-agnostic
+    surface — so a caller writes one program and flips local↔remote by target
+    alone.
+
+    `credentials` rides a remote channel (see :func:`jammi_client.connect`). It
+    is meaningless on a `file://` target — an in-process engine has no channel to
+    authenticate — so a local target opened *with* credentials is rejected as a
+    :class:`~jammi_client.NoEmbeddedEngineError`: the target-vs-credential
+    mismatch is a caller error, caught before an engine is opened.
     """
     parsed = parse_target(target)
     if isinstance(parsed, LocalTarget):
-        # Wrap the low-level native handle in the thin Python `Database`: every
-        # un-migrated verb forwards to the handle, the training verbs drive the
-        # shared request assembly. The user-facing local surface is `Database`,
-        # never the raw `_NativeDatabase`.
+        if credentials is not None:
+            raise NoEmbeddedEngineError(parsed.artifact_dir)
+        # Wrap the low-level native handle in the thin Python `Database`: the
+        # user-facing local surface is `Database`, never the raw `_NativeDatabase`.
         return Database(open_local(artifact_dir=parsed.artifact_dir))
     # Remote — hand the original target to the bundled client; it re-parses to
     # the same RemoteTarget and opens the channel. One remote definition.
-    return jammi_client.connect(parsed)
+    return jammi_client.connect(parsed, credentials=credentials)

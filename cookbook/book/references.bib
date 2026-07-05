@@ -437,3 +437,37 @@
   year         = {2012},
   note         = {DOI 10.17487/RFC6750, \url{https://www.rfc-editor.org/info/rfc6750}}
 }
+
+% Behavioral subtyping — the formal contract behind "one connect(target), two
+% transports": a subtype must be substitutable for its supertype without a program
+% written against the supertype being able to tell, which is exactly the property
+% the embedded Database and the remote RemoteDatabase hold against the Session
+% surface. Cited for the substitutability contract the unified-client chapter
+% measures; verified against the ACM TOPLAS record (dl.acm.org/doi/10.1145/197320.197383):
+% B. Liskov and J. Wing, TOPLAS 16(6), November 1994.
+@article{liskov1994behavioral,
+  title     = {A Behavioral Notion of Subtyping},
+  author    = {Liskov, Barbara H. and Wing, Jeannette M.},
+  journal   = {ACM Transactions on Programming Languages and Systems},
+  volume    = {16},
+  number    = {6},
+  pages     = {1811--1841},
+  month     = nov,
+  year      = {1994},
+  note      = {DOI 10.1145/197320.197383}
+}
+
+% The Law of Leaky Abstractions — every non-trivial abstraction leaks some of the
+% detail it means to hide, so the honest engineering move is to name where the two
+% transports genuinely diverge (a typed capability, a finite receive cap) rather
+% than pretend the abstraction is total. Cited for the named-seam design the
+% unified-client chapter follows; verified against the essay of record
+% (joelonsoftware.com/2002/11/11/the-law-of-leaky-abstractions): J. Spolsky, 2002.
+@misc{spolsky2002leaky,
+  title        = {The Law of Leaky Abstractions},
+  author       = {Spolsky, Joel},
+  howpublished = {Joel on Software (essay)},
+  month        = nov,
+  year         = {2002},
+  note         = {\url{https://www.joelonsoftware.com/2002/11/11/the-law-of-leaky-abstractions/}}
+}

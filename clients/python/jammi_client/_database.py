@@ -56,13 +56,20 @@ from ._assembly import (
     build_search_request,
     recompute_report_to_dict,
 )
+from ._capability import Capability
 from ._credentials import (
     AnonymousCredentials,
     BearerCredentials,
     ChannelCredentials,
     _bearer_metadata,
 )
-from ._errors import TrainingError
+from .errors import (
+    BackendError,
+    InvalidArgument,
+    JammiError,
+    NotSupportedOnBackend,
+    TrainingError,
+)
 from ._generated.jammi.v1 import catalog_pb2, catalog_pb2_grpc
 from ._generated.jammi.v1 import embedding_pb2, embedding_pb2_grpc
 from ._generated.jammi.v1 import eval_pb2, eval_pb2_grpc
@@ -76,6 +83,48 @@ from ._generated.jammi.v1 import trigger_pb2, trigger_pb2_grpc
 # same key the Rust SDK and npm client use. Kept in one place so the value never
 # drifts across the seam.
 SESSION_HEADER = "jammi-session-id"
+
+# The gRPC per-message receive cap this client raises its channels to. A unary
+# verb whose whole result rides back as one message (e.g. `infer` returning one
+# `ArrowBatch`) is bounded by this cap on the receive side; gRPC's stock 4 MB
+# default is too small for realistic result tables. Raising it moves the
+# boundary without removing it — the cap stays finite and configurable, the
+# honest counterpart to the embedded engine's unbounded in-process return. 64 MB
+# is generous for a single unary result while still bounding a pathological one.
+MAX_RECEIVE_MESSAGE_LENGTH = 64 * 1024 * 1024
+
+
+def _rpc_to_jammi(exc: grpc.RpcError) -> JammiError:
+    """Map a gRPC transport/status fault onto the :class:`JammiError` taxonomy.
+
+    So every remote failure — not only the client-constructed validation and
+    malformed-response ones, but a live transport fault — descends from
+    ``JammiError``, and one ``except JammiError`` catches the whole remote
+    surface. The status code decides the class:
+
+    * ``INVALID_ARGUMENT`` → :class:`InvalidArgument` — a server-detected bad
+      argument, the SAME class the embedded engine raises for the same rejection
+      (two-sided parity, §5.4).
+    * ``UNIMPLEMENTED`` → :class:`NotSupportedOnBackend` — a verb this deployment
+      did not mount.
+    * everything else (``RESOURCE_EXHAUSTED`` — the receive-cap edge —,
+      ``UNAVAILABLE``, ``DEADLINE_EXCEEDED``, ``INTERNAL``, ``NOT_FOUND``, …) →
+      :class:`BackendError`.
+
+    The originating grpc ``StatusCode`` rides on the mapped exception's ``code``
+    attribute so the few call-sites that branch on ``NOT_FOUND`` (``describe_*``
+    → ``None``; ``*if_exists*`` drops → no-op) keep working after the remap.
+    """
+    code = exc.code()
+    detail = exc.details() or str(exc)
+    if code == grpc.StatusCode.INVALID_ARGUMENT:
+        mapped: JammiError = InvalidArgument(detail)
+    elif code == grpc.StatusCode.UNIMPLEMENTED:
+        mapped = NotSupportedOnBackend(detail)
+    else:
+        mapped = BackendError(detail)
+    mapped.code = code
+    return mapped
 
 
 def _result_table_to_dict(rt: embedding_pb2.ResultTable) -> Dict[str, Any]:
@@ -118,7 +167,7 @@ def _model_to_dict(m: catalog_pb2.Model) -> Dict[str, Any]:
     try:
         task = _MODEL_TASK_NAME[m.task]
     except KeyError:
-        raise ValueError(
+        raise InvalidArgument(
             f"unknown ModelTask enum value {m.task!r} on the wire — "
             "client and server proto versions disagree"
         ) from None
@@ -293,7 +342,7 @@ def _inference_aggregate_to_dict(agg: eval_pb2.InferenceAggregate) -> Dict[str, 
                 for t, m in n.per_type.items()
             },
         }
-    raise RuntimeError("InferenceEvalReport carried no aggregate")
+    raise BackendError("InferenceEvalReport carried no aggregate")
 
 
 def _entity_to_dict(e: eval_pb2.Entity) -> Dict[str, Any]:
@@ -332,7 +381,7 @@ def _per_record_prediction_to_dict(
             "predicted": [_entity_to_dict(e) for e in n.predicted],
             "gold": [_entity_to_dict(e) for e in n.gold],
         }
-    raise RuntimeError("PerRecordPrediction carried no prediction")
+    raise BackendError("PerRecordPrediction carried no prediction")
 
 
 def _inference_report_to_dict(report: eval_pb2.InferenceEvalReport) -> Dict[str, Any]:
@@ -479,7 +528,7 @@ def _verify_verdict_to_dict(
         }
     if which == "missing_manifest":
         return {"verdict": "missing_manifest"}
-    raise RuntimeError("VerifyMaterializationResponse carried no verdict")
+    raise BackendError("VerifyMaterializationResponse carried no verdict")
 
 
 def _stale_reason_to_dict(reason: "catalog_pb2.StaleReason") -> Dict[str, Any]:
@@ -504,7 +553,7 @@ def _stale_reason_to_dict(reason: "catalog_pb2.StaleReason") -> Dict[str, Any]:
             "reason": "input_vanished",
             "source": reason.input_vanished.source,
         }
-    raise RuntimeError("StaleReason carried no reason")
+    raise BackendError("StaleReason carried no reason")
 
 
 def _staleness_verdict_to_dict(
@@ -531,7 +580,7 @@ def _staleness_verdict_to_dict(
         }
     if which == "missing_manifest":
         return {"staleness": "missing_manifest"}
-    raise RuntimeError("StalenessResponse carried no staleness")
+    raise BackendError("StalenessResponse carried no staleness")
 
 
 # The wire `AnchorKind` enum value -> the serde snake_case tag the embed binding
@@ -556,7 +605,7 @@ def _derives_from_edges_to_list(
     for edge in resp.edges:
         kind = _ANCHOR_KIND_TO_TAG.get(edge.kind)
         if kind is None:
-            raise RuntimeError("DerivesFromEdge carried an unspecified anchor kind")
+            raise BackendError("DerivesFromEdge carried an unspecified anchor kind")
         out.append({"input": edge.input, "derived": edge.derived, "kind": kind})
     return out
 
@@ -619,10 +668,16 @@ class RemoteTrainingJob:
         return self._model_id
 
     def _status_response(self) -> training_pb2.TrainingStatusResponse:
-        return self._stub.TrainingStatus(
-            training_pb2.TrainingStatusRequest(job_id=self._job_id),
-            metadata=self._metadata,
-        )
+        try:
+            return self._stub.TrainingStatus(
+                training_pb2.TrainingStatusRequest(job_id=self._job_id),
+                metadata=self._metadata,
+            )
+        except grpc.RpcError as exc:
+            # A transport fault while polling maps onto the taxonomy, like every
+            # other remote hop; a `failed` terminal status (not an RpcError) is
+            # surfaced as `TrainingError` by `wait()`.
+            raise _rpc_to_jammi(exc) from exc
 
     def status(self) -> str:
         """The job's current status string. Maps to `TrainingService.TrainingStatus`."""
@@ -692,6 +747,51 @@ class RemoteDatabase:
         """The opaque session id the server keys this connection's tenant by."""
         return self._session_id
 
+    # --- The single wire choke point --------------------------------------------
+
+    def _call(self, method, request):
+        """Invoke a unary gRPC verb with this connection's metadata, mapping any
+        transport/status fault onto the :class:`JammiError` taxonomy.
+
+        Every typed verb routes its wire hop through here — the ONE place a
+        ``grpc.RpcError`` is caught and remapped (via :func:`_rpc_to_jammi`), so
+        the whole remote surface descends from ``JammiError`` without 40-odd
+        per-verb try/excepts. Call-sites that special-case ``NOT_FOUND`` catch the
+        mapped exception and branch on its ``.code`` (carried from the status).
+        """
+        try:
+            return method(request, metadata=self._metadata)
+        except grpc.RpcError as exc:
+            raise _rpc_to_jammi(exc) from exc
+
+    # --- Capability contract ----------------------------------------------------
+    #
+    # The remote transport carries `close` (real gRPC teardown) and `session_id`
+    # (the per-connection scoping key); it does NOT carry the embedded-only
+    # in-process primitives (`audit`, `ephemeral_session`, `preload_model`).
+    # `supports()` answers the divergence, and the one-sided members raise a typed
+    # `NotSupportedOnBackend` rather than a bare `AttributeError`, so a caller that
+    # ignores `supports()` still gets a legible error naming the capability.
+
+    _CAPABILITIES = frozenset({Capability.CLOSE, Capability.SESSION_ID})
+
+    def supports(self, capability: Capability) -> bool:
+        """Whether this (remote) backend carries `capability`."""
+        return capability in self._CAPABILITIES
+
+    @property
+    def audit(self):
+        """The per-query audit log — embedded only; unsupported over the wire."""
+        raise NotSupportedOnBackend(Capability.AUDIT)
+
+    def ephemeral_session(self, *, timeout_seconds: int):
+        """A session-scoped ephemeral store — embedded only; unsupported here."""
+        raise NotSupportedOnBackend(Capability.EPHEMERAL_SESSION)
+
+    def preload_model(self, model_id: str) -> None:
+        """Preload a model into the cache — embedded only; unsupported here."""
+        raise NotSupportedOnBackend(Capability.PRELOAD_MODEL)
+
     # --- Catalog: tenant trio + handshake ---------------------------------------
 
     def set_tenant(self, tenant_id: str) -> None:
@@ -707,13 +807,11 @@ class RemoteDatabase:
         connection's session id.
         """
         if tenant_id == "":
-            self._catalog.ClearTenant(
-                _empty(), metadata=self._metadata
-            )
+            self._call(self._catalog.ClearTenant, _empty())
             return
-        self._catalog.SetTenant(
+        self._call(
+            self._catalog.SetTenant,
             catalog_pb2.SetTenantRequest(tenant=catalog_pb2.Tenant(id=tenant_id)),
-            metadata=self._metadata,
         )
 
     @contextmanager
@@ -747,7 +845,7 @@ class RemoteDatabase:
 
         Maps to `CatalogService.GetTenant`.
         """
-        resp = self._catalog.GetTenant(_empty(), metadata=self._metadata)
+        resp = self._call(self._catalog.GetTenant, _empty())
         return resp.tenant.id or None
 
     def get_server_info(self) -> Dict[str, Any]:
@@ -765,7 +863,7 @@ class RemoteDatabase:
         The same keys the embedded `Database.get_server_info` returns, so the
         handshake shape agrees across transports.
         """
-        resp = self._catalog.GetServerInfo(_empty(), metadata=self._metadata)
+        resp = self._call(self._catalog.GetServerInfo, _empty())
         return {
             "version": resp.version,
             "features": list(resp.features),
@@ -785,10 +883,11 @@ class RemoteDatabase:
         try:
             file_format = _FILE_FORMAT[format]
         except KeyError:
-            raise ValueError(
+            raise InvalidArgument(
                 f"format must be one of {sorted(_FILE_FORMAT)} (got {format!r})"
             ) from None
-        self._catalog.AddSource(
+        self._call(
+            self._catalog.AddSource,
             catalog_pb2.AddSourceRequest(
                 source_id=name,
                 source_kind=catalog_pb2.SourceKind.SOURCE_KIND_FILE,
@@ -797,7 +896,6 @@ class RemoteDatabase:
                     format=file_format,
                 ),
             ),
-            metadata=self._metadata,
         )
 
     def list_sources(self) -> List[Dict[str, Any]]:
@@ -806,9 +904,7 @@ class RemoteDatabase:
         Maps to `CatalogService.ListSources`; same dict shape per entry as
         :meth:`describe_source`.
         """
-        resp = self._catalog.ListSources(
-            catalog_pb2.ListSourcesRequest(), metadata=self._metadata
-        )
+        resp = self._call(self._catalog.ListSources, catalog_pb2.ListSourcesRequest())
         return [_source_descriptor_to_dict(d) for d in resp.sources]
 
     def describe_source(self, source_id: str) -> Optional[Dict[str, Any]]:
@@ -818,12 +914,12 @@ class RemoteDatabase:
         status when no such source exists; that is surfaced here as ``None``.
         """
         try:
-            d = self._catalog.DescribeSource(
+            d = self._call(
+                self._catalog.DescribeSource,
                 catalog_pb2.DescribeSourceRequest(source_id=source_id),
-                metadata=self._metadata,
             )
-        except grpc.RpcError as exc:
-            if exc.code() == grpc.StatusCode.NOT_FOUND:
+        except JammiError as exc:
+            if getattr(exc, "code", None) == grpc.StatusCode.NOT_FOUND:
                 return None
             raise
         return _source_descriptor_to_dict(d)
@@ -834,9 +930,7 @@ class RemoteDatabase:
         Maps to `CatalogService.ListModels`; same dict shape per entry as
         :meth:`describe_model`. The peer of :meth:`list_sources`.
         """
-        resp = self._catalog.ListModels(
-            catalog_pb2.ListModelsRequest(), metadata=self._metadata
-        )
+        resp = self._call(self._catalog.ListModels, catalog_pb2.ListModelsRequest())
         return [_model_to_dict(m) for m in resp.models]
 
     def describe_model(self, model_id: str) -> Optional[Dict[str, Any]]:
@@ -846,12 +940,12 @@ class RemoteDatabase:
         status when no model with that id exists; that is surfaced as ``None``.
         """
         try:
-            m = self._catalog.DescribeModel(
+            m = self._call(
+                self._catalog.DescribeModel,
                 catalog_pb2.DescribeModelRequest(model_id=model_id),
-                metadata=self._metadata,
             )
-        except grpc.RpcError as exc:
-            if exc.code() == grpc.StatusCode.NOT_FOUND:
+        except JammiError as exc:
+            if getattr(exc, "code", None) == grpc.StatusCode.NOT_FOUND:
                 return None
             raise
         return _model_to_dict(m)
@@ -868,11 +962,11 @@ class RemoteDatabase:
         NotFound handling to do (unlike :meth:`drop_mutable_table`, whose request
         carries no ``if_exists`` flag). Maps to `CatalogService.DeleteModel`.
         """
-        self._catalog.DeleteModel(
+        self._call(
+            self._catalog.DeleteModel,
             catalog_pb2.DeleteModelRequest(
                 model_id=model_id, version=version, if_exists=if_exists
             ),
-            metadata=self._metadata,
         )
 
     # --- Mutable companion tables (control plane) --------------------------------
@@ -916,7 +1010,7 @@ class RemoteDatabase:
             order_column=order_column,
             chunk_size=chunk_size,
         )
-        resp = self._catalog.CreateMutableTable(request, metadata=self._metadata)
+        resp = self._call(self._catalog.CreateMutableTable, request)
         return resp.mutable_table_id
 
     def drop_mutable_table(self, name: str, *, if_exists: bool = False) -> None:
@@ -925,12 +1019,12 @@ class RemoteDatabase:
         NotFound is surfaced. Maps to `CatalogService.DropMutableTable`.
         """
         try:
-            self._catalog.DropMutableTable(
+            self._call(
+                self._catalog.DropMutableTable,
                 catalog_pb2.DropMutableTableRequest(mutable_table_id=name),
-                metadata=self._metadata,
             )
-        except grpc.RpcError as exc:
-            if if_exists and exc.code() == grpc.StatusCode.NOT_FOUND:
+        except JammiError as exc:
+            if if_exists and getattr(exc, "code", None) == grpc.StatusCode.NOT_FOUND:
                 return
             raise
 
@@ -941,8 +1035,8 @@ class RemoteDatabase:
         ``primary_key``, ``indexes``, ``order_column`` (empty when none), and
         ``chunk_size``. Maps to `CatalogService.ListMutableTables`.
         """
-        resp = self._catalog.ListMutableTables(
-            catalog_pb2.ListMutableTablesRequest(), metadata=self._metadata
+        resp = self._call(
+            self._catalog.ListMutableTables, catalog_pb2.ListMutableTablesRequest()
         )
         return [_mutable_table_definition_to_dict(d) for d in resp.definitions]
 
@@ -975,7 +1069,7 @@ class RemoteDatabase:
             schema=schema,
             broker_metadata=broker_metadata,
         )
-        resp = self._catalog.RegisterTopic(request, metadata=self._metadata)
+        resp = self._call(self._catalog.RegisterTopic, request)
         return resp.topic_id
 
     def drop_topic(self, name: str, *, if_exists: bool = False) -> None:
@@ -993,14 +1087,14 @@ class RemoteDatabase:
         if topic_id is None:
             if if_exists:
                 return
-            raise ValueError(f"topic '{name}' not found")
+            raise InvalidArgument(f"topic '{name}' not found")
         try:
-            self._catalog.DropTopic(
+            self._call(
+                self._catalog.DropTopic,
                 catalog_pb2.DropTopicRequest(topic_id=topic_id, if_exists=if_exists),
-                metadata=self._metadata,
             )
-        except grpc.RpcError as exc:
-            if if_exists and exc.code() == grpc.StatusCode.NOT_FOUND:
+        except JammiError as exc:
+            if if_exists and getattr(exc, "code", None) == grpc.StatusCode.NOT_FOUND:
                 return
             raise
 
@@ -1015,9 +1109,7 @@ class RemoteDatabase:
         """The full `Topic` messages for the current tenant — the shared read
         backing both :meth:`list_topics` (names) and the name→id resolution
         :meth:`drop_topic` needs."""
-        resp = self._catalog.ListTopics(
-            catalog_pb2.ListTopicsRequest(), metadata=self._metadata
-        )
+        resp = self._call(self._catalog.ListTopics, catalog_pb2.ListTopicsRequest())
         return list(resp.topics)
 
     def _resolve_topic_id(self, name: str) -> Optional[str]:
@@ -1050,7 +1142,7 @@ class RemoteDatabase:
             topic=trigger_pb2.TopicName(name=topic),
             batch=_table_to_arrow_batch(batch),
         )
-        resp = self._trigger.Publish(request, metadata=self._metadata)
+        resp = self._call(self._trigger.Publish, request)
         return resp.offset
 
     def subscribe_collect(
@@ -1095,6 +1187,11 @@ class RemoteDatabase:
                     delivered = next(stream)
                 except StopIteration:
                     break
+                except grpc.RpcError as exc:
+                    # A server-side stream fault (the streaming peer of a unary
+                    # `_call` fault) is mapped onto the taxonomy too, so the whole
+                    # remote surface — unary and streaming — descends from JammiError.
+                    raise _rpc_to_jammi(exc) from exc
                 collected.append(_arrow_batch_to_table(delivered.batch))
         finally:
             # Cancel client-side so the server's tail task observes the closed
@@ -1126,7 +1223,7 @@ class RemoteDatabase:
             query=query,
             modality=modality,
         )
-        resp = self._embedding.EncodeQuery(request, metadata=self._metadata)
+        resp = self._call(self._embedding.EncodeQuery, request)
         return list(resp.embedding)
 
     def generate_embeddings(
@@ -1153,7 +1250,7 @@ class RemoteDatabase:
             modality=modality,
             cache=cache,
         )
-        resp = self._embedding.GenerateEmbeddings(request, metadata=self._metadata)
+        resp = self._call(self._embedding.GenerateEmbeddings, request)
         return resp.table_name
 
     def search(
@@ -1183,7 +1280,7 @@ class RemoteDatabase:
             select=select,
             embedding_table=embedding_table,
         )
-        resp = self._embedding.Search(request, metadata=self._metadata)
+        resp = self._call(self._embedding.Search, request)
         return _hits_to_table(list(resp.hits))
 
     # --- Training (offloaded to the remote train tier) ---------------------------
@@ -1449,7 +1546,7 @@ class RemoteDatabase:
                 try:
                     gather.direction = _EDGE_DIRECTION[edge_direction]
                 except KeyError:
-                    raise ValueError(
+                    raise InvalidArgument(
                         f"edge_direction must be 'out', 'in', or 'undirected' "
                         f"(got {edge_direction!r})"
                     ) from None
@@ -1461,7 +1558,7 @@ class RemoteDatabase:
         if hybrid_ann_k is not None:
             request.hybrid_ann_k = hybrid_ann_k
 
-        resp = self._inference.Predict(request, metadata=self._metadata)
+        resp = self._call(self._inference.Predict, request)
         out: Dict[str, Any] = {}
         kind = resp.WhichOneof("distribution")
         if kind == "gaussian":
@@ -1472,7 +1569,7 @@ class RemoteDatabase:
             out["kind"] = "quantile"
             out["levels"] = [[p.level, p.value] for p in resp.quantile.points]
         else:
-            raise RuntimeError("Predict response carried no distribution")
+            raise BackendError("Predict response carried no distribution")
         out["source"] = resp.source
         out["context_ref"] = list(resp.context_ref)
         return out
@@ -1516,7 +1613,7 @@ class RemoteDatabase:
             key=key,
             cache=cache,
         )
-        resp = self._inference.Infer(request, metadata=self._metadata)
+        resp = self._call(self._inference.Infer, request)
         return _arrow_batch_to_table(resp.result)
 
     # --- Engine-state pipeline verbs (PipelineService) ----------------------------
@@ -1561,7 +1658,7 @@ class RemoteDatabase:
             table=table,
             cache=cache,
         )
-        resp = self._pipeline.BuildNeighborGraph(request, metadata=self._metadata)
+        resp = self._call(self._pipeline.BuildNeighborGraph, request)
         return resp.table_name
 
     def propagate_embeddings(
@@ -1609,7 +1706,7 @@ class RemoteDatabase:
             output=output,
             cache=cache,
         )
-        resp = self._pipeline.PropagateEmbeddings(request, metadata=self._metadata)
+        resp = self._call(self._pipeline.PropagateEmbeddings, request)
         return resp.table_name
 
     def asof_join(
@@ -1656,7 +1753,7 @@ class RemoteDatabase:
             tie_break_column=tie_break_column,
             project=project,
         )
-        resp = self._pipeline.AsofJoin(request, metadata=self._metadata)
+        resp = self._call(self._pipeline.AsofJoin, request)
         return resp.table_name
 
     def recompute(
@@ -1678,7 +1775,7 @@ class RemoteDatabase:
         Read each recomputed table via :meth:`sql`.
         """
         request = build_recompute_request(table, cascade=cascade)
-        resp = self._pipeline.Recompute(request, metadata=self._metadata)
+        resp = self._call(self._pipeline.Recompute, request)
         return recompute_report_to_dict(resp)
 
     def assemble_context(
@@ -1736,7 +1833,7 @@ class RemoteDatabase:
             min_weight=min_weight,
             hybrid=hybrid,
         )
-        resp = self._pipeline.AssembleContext(request, metadata=self._metadata)
+        resp = self._call(self._pipeline.AssembleContext, request)
         # The pooled vector is presence-wrapped so a degenerate empty context
         # (`None`) stays distinguishable from a present-but-empty vector — the
         # same correctness signal the embed binding's `None` carries.
@@ -1794,7 +1891,7 @@ class RemoteDatabase:
             k=k,
             cohorts=cohorts,
         )
-        resp = self._eval.EvalEmbeddings(request, metadata=self._metadata)
+        resp = self._call(self._eval.EvalEmbeddings, request)
         return _embedding_report_to_dict(resp)
 
     def eval_per_query(self, eval_run_id: str) -> List[Dict[str, Any]]:
@@ -1809,9 +1906,8 @@ class RemoteDatabase:
         here, exactly as the embed binding does. Maps to
         `EvalService.EvalPerQuery`.
         """
-        resp = self._eval.EvalPerQuery(
-            build_eval_per_query_request(eval_run_id),
-            metadata=self._metadata,
+        resp = self._call(
+            self._eval.EvalPerQuery, build_eval_per_query_request(eval_run_id)
         )
         return [
             {
@@ -1851,7 +1947,7 @@ class RemoteDatabase:
             golden_source=golden_source,
             label_column=label_column,
         )
-        resp = self._eval.EvalInference(request, metadata=self._metadata)
+        resp = self._call(self._eval.EvalInference, request)
         return _inference_report_to_dict(resp)
 
     def eval_compare(
@@ -1878,7 +1974,7 @@ class RemoteDatabase:
             golden_source=golden_source,
             k=k,
         )
-        resp = self._eval.EvalCompare(request, metadata=self._metadata)
+        resp = self._call(self._eval.EvalCompare, request)
         return _compare_report_to_dict(resp)
 
     def eval_calibration(
@@ -1903,7 +1999,7 @@ class RemoteDatabase:
             shape=shape,
             cohorts=cohorts,
         )
-        resp = self._eval.EvalCalibration(request, metadata=self._metadata)
+        resp = self._call(self._eval.EvalCalibration, request)
         return _calibration_report_to_dict(resp)
 
     # --- Channels ----------------------------------------------------------------
@@ -1931,7 +2027,7 @@ class RemoteDatabase:
             priority=priority,
             columns=columns,
         )
-        self._catalog.RegisterChannel(request, metadata=self._metadata)
+        self._call(self._catalog.RegisterChannel, request)
 
     def add_channel_columns(
         self,
@@ -1950,7 +2046,7 @@ class RemoteDatabase:
             channel_id,
             columns=columns,
         )
-        self._catalog.AddChannelColumns(request, metadata=self._metadata)
+        self._call(self._catalog.AddChannelColumns, request)
 
     def list_channels(self) -> List[Dict[str, Any]]:
         """List every evidence channel registered to the currently bound tenant,
@@ -1962,9 +2058,7 @@ class RemoteDatabase:
         declaration order. An unbound connection sees only the global
         (NULL-tenant) channels. Maps to `CatalogService.ListChannels`.
         """
-        resp = self._catalog.ListChannels(
-            catalog_pb2.ListChannelsRequest(), metadata=self._metadata
-        )
+        resp = self._call(self._catalog.ListChannels, catalog_pb2.ListChannelsRequest())
         return [_channel_spec_to_dict(c) for c in resp.channels]
 
     def verify_materialization(
@@ -1985,7 +2079,7 @@ class RemoteDatabase:
         request = catalog_pb2.VerifyMaterializationRequest(table=table)
         if expected_definition is not None:
             request.expected_definition = expected_definition
-        resp = self._catalog.VerifyMaterialization(request, metadata=self._metadata)
+        resp = self._call(self._catalog.VerifyMaterialization, request)
         return _verify_verdict_to_dict(resp)
 
     def staleness(self, table: str, current_definition: str) -> Dict[str, Any]:
@@ -2004,7 +2098,7 @@ class RemoteDatabase:
         request = catalog_pb2.StalenessRequest(
             table=table, current_definition=current_definition
         )
-        resp = self._catalog.Staleness(request, metadata=self._metadata)
+        resp = self._call(self._catalog.Staleness, request)
         return _staleness_verdict_to_dict(resp)
 
     def derives_from(self, table: str) -> List[Dict[str, Any]]:
@@ -2016,14 +2110,14 @@ class RemoteDatabase:
         caller walks transitively. Maps to `CatalogService.DerivesFrom`.
         """
         request = catalog_pb2.DerivesFromRequest(table=table)
-        resp = self._catalog.DerivesFrom(request, metadata=self._metadata)
+        resp = self._call(self._catalog.DerivesFrom, request)
         return _derives_from_edges_to_list(resp)
 
     def _start_training(
         self, request: training_pb2.StartTrainingRequest
     ) -> RemoteTrainingJob:
         """Submit a `StartTraining` request and wrap the response in a handle."""
-        resp = self._training.StartTraining(request, metadata=self._metadata)
+        resp = self._call(self._training.StartTraining, request)
         return RemoteTrainingJob(
             self._training,
             self._metadata,
@@ -2162,12 +2256,20 @@ class RemoteDatabase:
         """
         client = self._flight_client()
         options = self._flight_options()
-        info = client.get_flight_info(
-            pa.flight.FlightDescriptor.for_command(_command_statement_query(query)),
-            options,
-        )
-        reader = client.do_get(info.endpoints[0].ticket, options)
-        return reader.read_all()
+        # The Flight SQL lane is a separate transport whose faults surface as
+        # `pyarrow.flight.FlightError`, not `grpc.RpcError`; map them onto the
+        # taxonomy too so `sql()` — like every typed verb — raises only
+        # `JammiError`. A Flight fault is a transport/runtime failure of the
+        # compound-query lane, so it maps to `BackendError`.
+        try:
+            info = client.get_flight_info(
+                pa.flight.FlightDescriptor.for_command(_command_statement_query(query)),
+                options,
+            )
+            reader = client.do_get(info.endpoints[0].ticket, options)
+            return reader.read_all()
+        except pa.flight.FlightError as exc:
+            raise BackendError(str(exc)) from exc
 
     def _flight_client(self):
         # The Flight SQL lane is a separate pyarrow.flight transport from the
@@ -2228,7 +2330,13 @@ def open_remote(
     """
     session_id = str(uuid.uuid4())
     resolved = credentials or AnonymousCredentials()
-    channel = resolved.open_channel(endpoint, tls=tls)
+    # Raise the per-message receive cap off gRPC's 4 MB default so a unary verb
+    # returning one large `ArrowBatch` is not truncated at the stock boundary.
+    channel = resolved.open_channel(
+        endpoint,
+        tls=tls,
+        options=[("grpc.max_receive_message_length", MAX_RECEIVE_MESSAGE_LENGTH)],
+    )
     # The typed verbs get the bearer from the channel; Flight is a separate
     # transport, so reuse the credential's own header pair — the single source
     # for the key and the `Bearer <token>` value — rather than re-spelling it.

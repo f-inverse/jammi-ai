@@ -1,0 +1,326 @@
+---
+title: "The unified client surface — one connect, one Session, two honest transports"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `connect(target)` -> a transport-agnostic `Session` · `supports(Capability.X)`
+· the `JammiError` taxonomy (`InvalidArgument` / `NotSupportedOnBackend` / `TrainingError`
+/ `BackendError`) · `credentials=` on the front door. · **Theory:** the Liskov-substitutable
+transport [@liskov1994behavioral] — an embedded engine and a remote channel are two
+implementations of one behavioural contract, so a program written against the contract runs
+against either; and the leaky-abstraction principle [@spolsky2002leaky] — where the two
+transports genuinely diverge, the seam says so out loud (a typed capability, a finite cap),
+it does not paper over it. · **Rail:** measurement (every capability boolean, every raised
+class, and the receive-cap edge asserted against the frozen golden — booleans and class
+names exact, not transcribed).
+
+Every earlier chapter opened a session with `jammi_ai.connect("file://…")` and, at the heavy
+emit, the same verbs ran `connect("grpc://…")` against a server. That substitution — local
+for remote without touching a call — is a *claim*, and this chapter measures it. One
+`connect(target)` returns a `Session`; the embedded `jammi_ai.Database` and the remote
+`jammi_client.RemoteDatabase` both satisfy it, so a program written against the `Session`
+surface runs in-process or behind a server by target alone.
+
+But two transports are not identical, and the honest thing is to name where they diverge
+rather than pretend they do not. This chapter measures the three seams that make the
+substitution *truthful* instead of merely convenient:
+
+1. **the capability contract** — the handful of features that exist on only one transport,
+   answered by a predicate before the call and by a typed error if you skip the predicate;
+2. **the `JammiError` taxonomy** — one exception family both backends raise, so one
+   `except JammiError` holds whether the engine ran in-process or over the wire, and a bad
+   argument is the *same* class on both sides;
+3. **the remote honest edge** — the one place the remote transport carries a finite bound
+   the embedded engine does not, surfaced loudly rather than silently truncated.
+
+```{python}
+from jammi_cookbook import contracts
+
+rec = contracts.load_artifact("unified_client.record")
+cap = rec["capability"]
+print(f"capability enum (CLOSED):  {cap['enum_values']}")
+print(f"embedded supports:         {cap['embedded_supports']}")
+print(f"remote   supports:         {cap['remote_supports']}")
+print(f"complementary:             {cap['complementary']}")
+```
+
+## The capability contract — a predicate, not a guess
+
+Most of the verb vocabulary is shared: sources, embeddings, search, inference, training,
+evaluation, channels, mutable tables, SQL — every one present on both transports, which is
+what lets the earlier chapters swap `file://` for `grpc://` freely. A closed set of five
+features genuinely diverge. The embedded engine carries the in-process primitives — the
+per-query `audit` log, an `ephemeral_session` storage context, `preload_model` — because
+they only mean something in-process. The remote client carries the two that only mean
+something across a channel — an explicit `close` (the embedded engine releases on drop,
+RAII) and an opaque per-connection `session_id`.
+
+`supports(Capability.X)` answers "does *this* backend carry that feature?" — so a program
+that must run on either transport asks first, rather than guessing and catching. The two
+sets are exactly complementary across the closed five: every capability is carried by
+precisely one transport.
+
+```{python}
+import tempfile
+
+import jammi_ai
+import jammi_client
+from jammi_client import Capability
+
+embedded = jammi_ai.connect(f"file://{tempfile.mkdtemp(prefix='jammi_uc_')}")
+remote = jammi_client.connect("grpc://127.0.0.1:8081")  # lazy — supports() opens no socket
+
+print(f"{'capability':<20}{'embedded':>10}{'remote':>10}")
+for c in Capability:
+    print(f"{c.value:<20}{str(embedded.supports(c)):>10}{str(remote.supports(c)):>10}")
+
+emb_live = {c.value: embedded.supports(c) for c in Capability}
+rem_live = {c.value: remote.supports(c) for c in Capability}
+assert emb_live == cap["embedded_supports"], "embedded capability set drifted from the golden"
+assert rem_live == cap["remote_supports"], "remote capability set drifted from the golden"
+assert all(emb_live[k] != rem_live[k] for k in emb_live), "the two sets must be complementary"
+```
+
+Skip the predicate and invoke a one-sided feature on the backend that lacks it, and the seam
+still refuses to lie: it raises the typed `NotSupportedOnBackend` — naming the capability you
+reached for — rather than a bare `AttributeError` that would leave you guessing whether the
+method was misspelled or merely absent here.
+
+```{python}
+from jammi_client.errors import NotSupportedOnBackend
+
+# session_id is remote-only; reach for it on the embedded engine.
+try:
+    embedded.session_id
+    embedded_wrong = None
+except NotSupportedOnBackend as exc:
+    embedded_wrong = (type(exc).__name__, str(exc.capability))
+
+# audit is embedded-only; reach for it on the remote client.
+try:
+    remote.audit
+    remote_wrong = None
+except NotSupportedOnBackend as exc:
+    remote_wrong = (type(exc).__name__, str(exc.capability))
+
+print(f"embedded.session_id -> {embedded_wrong[0]} (capability: {embedded_wrong[1]})")
+print(f"remote.audit        -> {remote_wrong[0]} (capability: {remote_wrong[1]})")
+
+assert embedded_wrong[1] == cap["embedded_wrong_side"]["capability"]
+assert remote_wrong[1] == cap["remote_wrong_side"]["capability"]
+```
+
+## The JammiError taxonomy — one family, two transports
+
+A program that runs on either transport must handle failure on either transport. If the
+embedded engine raised one exception family and the remote client another, a caller would
+write two error-handling paths and the substitution would leak. It does not: every failure a
+session can raise descends from `JammiError`, and *both* backends raise that one family —
+the pure-Python client raises these classes directly, and the compiled engine imports the
+very same module and raises the very same classes. So one `except JammiError` holds
+regardless of where the engine ran.
+
+The taxonomy also refines the closest honest built-in, so an existing clause keeps working:
+a bad argument *is* a `ValueError` (`InvalidArgument`), a transport or runtime fault *is* a
+`RuntimeError` (`BackendError`). The extra base is never a compatibility shim — it states
+what kind of error each class is.
+
+```{python}
+from jammi_client.errors import BackendError, InvalidArgument, JammiError, TrainingError
+
+for cls in (JammiError, InvalidArgument, NotSupportedOnBackend, TrainingError, BackendError):
+    bases = ", ".join(b.__name__ for b in cls.__bases__)
+    print(f"{cls.__name__:<24} <- {bases}")
+
+assert issubclass(InvalidArgument, ValueError)   # a bad argument IS a ValueError
+assert issubclass(BackendError, RuntimeError)    # a backend fault IS a RuntimeError
+assert issubclass(InvalidArgument, JammiError) and issubclass(BackendError, JammiError)
+```
+
+The sharp test is two-sided parity: a *bad argument* must surface as the **same**
+`InvalidArgument` class whether the embedded engine rejected it in-process or a server
+rejected it over the wire. We provoke both under one `except JammiError` clause. The
+embedded side rejects a malformed tenant id in-process. The remote side receives a server
+`INVALID_ARGUMENT` status — injected at the transport boundary exactly as a live server's
+status would arrive (the same hermetic technique the engine's own conformance suite uses),
+so the verb still routes through the real client mapping without a socket being dialed.
+
+```{python}
+import grpc
+
+
+class _FakeRpcError(grpc.RpcError):
+    """A grpc.RpcError carrying a chosen status code, as a server would set it."""
+    def __init__(self, code, details):
+        self._code, self._details = code, details
+    def code(self):
+        return self._code
+    def details(self):
+        return self._details
+
+
+class _RaisingStub:
+    """A transport stub whose every verb raises a fixed status — the wire hop,
+    stubbed, so no server socket is opened."""
+    def __init__(self, err):
+        self._err = err
+    def __getattr__(self, _name):
+        def _raise(*_a, **_k):
+            raise self._err
+        return _raise
+
+
+caught = []
+
+# Embedded transport — the in-process engine rejects a malformed tenant id.
+try:
+    embedded.set_tenant("not-a-uuid")
+except JammiError as exc:
+    caught.append(("embedded", exc))
+
+# Remote transport — a server INVALID_ARGUMENT status, mapped by the client.
+remote._catalog = _RaisingStub(_FakeRpcError(grpc.StatusCode.INVALID_ARGUMENT, "bad arg"))
+try:
+    remote.list_sources()
+except JammiError as exc:  # the SAME clause catches the remote side
+    caught.append(("remote", exc))
+
+for where, exc in caught:
+    print(f"{where:<9} -> {type(exc).__name__:<16} "
+          f"JammiError={isinstance(exc, JammiError)} ValueError={isinstance(exc, ValueError)}")
+
+(_, emb_exc), (_, rem_exc) = caught
+assert type(emb_exc) is type(rem_exc) is InvalidArgument, "same class on both transports"
+assert len(caught) == 2, "one `except JammiError` caught both transports"
+```
+
+Both transports, one clause, one class. The develop→deploy substitution holds for the
+error-handling path, not only the happy path.
+
+## The remote honest edge — a finite cap, said out loud
+
+There is one place the two transports genuinely differ in what they can *return*. The
+embedded engine hands a result back in-process — a Python object, unbounded by any wire
+budget. The remote transport carries every result as a gRPC message, and gRPC caps the
+receive size. The client raises that cap off gRPC's stock 4 MB default to a generous but
+**finite** 64 MiB, sized for a realistic unary result table while still bounding a
+pathological one. The honest thing is that this bound is *finite and named*, not infinite
+and hidden: a result exceeding it does not silently truncate — it raises `BackendError`,
+mapped from gRPC's `RESOURCE_EXHAUSTED`.
+
+```{python}
+from jammi_client._database import MAX_RECEIVE_MESSAGE_LENGTH, _rpc_to_jammi
+
+edge = rec["honest_edge"]
+print(f"remote receive cap (production default): "
+      f"{MAX_RECEIVE_MESSAGE_LENGTH:,} bytes = {MAX_RECEIVE_MESSAGE_LENGTH // (1024*1024)} MiB")
+print(f"embedded in-process return:              unbounded (no wire message)")
+assert MAX_RECEIVE_MESSAGE_LENGTH == edge["production_cap_bytes"] == 64 * 1024 * 1024
+```
+
+We exercise the mechanism for real. A 64 MiB payload is impractical to move inside the book's
+CPU harness, so the *reject* arm is shown at a scaled-down configured cap — the mechanism is
+the channel's receive cap whatever its value — while the *generous* arm runs at the real
+64 MiB production default. A minimal in-process gRPC server returns a 256 KiB payload; a
+channel whose cap is 64 KiB rejects it with a real `RESOURCE_EXHAUSTED`, which the real
+client mapping turns into `BackendError`; a channel at the production 64 MiB returns it whole.
+
+```{python}
+import concurrent.futures
+
+_ECHO = "/jammi.probe.Echo/Get"
+
+
+def echo_server(payload):
+    def handler(_req, _ctx):
+        return payload
+    rpc = grpc.unary_unary_rpc_method_handler(
+        handler, request_deserializer=lambda b: b, response_serializer=lambda b: b)
+    generic = grpc.method_handlers_generic_handler("jammi.probe.Echo", {"Get": rpc})
+    server = grpc.server(concurrent.futures.ThreadPoolExecutor(max_workers=2), handlers=[generic])
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    return server, port
+
+
+def receive_at_cap(port, cap):
+    channel = grpc.insecure_channel(
+        f"127.0.0.1:{port}", options=[("grpc.max_receive_message_length", cap)])
+    stub = channel.unary_unary(
+        _ECHO, request_serializer=lambda b: b, response_deserializer=lambda b: b)
+    try:
+        return len(stub(b"go")), None
+    except grpc.RpcError as exc:
+        return None, exc
+    finally:
+        channel.close()
+
+
+payload = b"x" * edge["payload_bytes"]
+server, port = echo_server(payload)
+try:
+    generous_bytes, generous_err = receive_at_cap(port, MAX_RECEIVE_MESSAGE_LENGTH)
+    capped_bytes, capped_err = receive_at_cap(port, edge["demo_cap_bytes"])
+finally:
+    server.stop(0)
+
+mapped = _rpc_to_jammi(capped_err)
+print(f"payload:                    {len(payload):,} bytes")
+print(f"channel @ 64 MiB (prod):    returned {generous_bytes:,} bytes  (mirrors embedded)")
+print(f"channel @ {edge['demo_cap_bytes']//1024} KiB (demo cap):  grpc {capped_err.code().name} "
+      f"-> {type(mapped).__name__}")
+
+assert generous_err is None and generous_bytes == len(payload)
+assert capped_err.code() is grpc.StatusCode.RESOURCE_EXHAUSTED
+assert type(mapped) is BackendError and isinstance(mapped, JammiError)
+```
+
+The same payload the capped channel refused, the embedded engine returns in-process — no
+message, no cap. We build a same-scale result and read it back through the embedded `Session`
+to show the unbounded counterpart directly.
+
+```{python}
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+with tempfile.TemporaryDirectory() as d:
+    table = pa.table({"id": pa.array(range(edge["embedded_returned_rows"]), type=pa.int32())})
+    path = f"{d}/big.parquet"
+    pq.write_table(table, path)
+    embedded.add_source("big", url=path, format="parquet")
+    got = embedded.sql("SELECT id FROM big.public.big")
+
+print(f"embedded returned:          {got.num_rows:,} rows = {got.nbytes:,} bytes in-process")
+print(f"  exceeds the {edge['demo_cap_bytes']//1024} KiB remote cap: {got.nbytes > edge['demo_cap_bytes']}")
+assert got.num_rows == edge["embedded_returned_rows"]
+assert got.nbytes == edge["embedded_returned_bytes"]
+assert got.nbytes > edge["demo_cap_bytes"]
+```
+
+## The verdict
+
+```{python}
+tax = rec["taxonomy"]
+print("unified client surface — measured:")
+print(f"  capability sets complementary across the closed five:  {cap['complementary']}")
+print(f"  wrong-side capability -> NotSupportedOnBackend:         "
+      f"{cap['embedded_wrong_side']['raised'] == cap['remote_wrong_side']['raised'] == 'NotSupportedOnBackend'}")
+print(f"  bad argument -> same InvalidArgument on both transports: {tax['two_sided_same_class']}")
+print(f"  one except JammiError catches both transports:          {tax['one_except_catches_both']}")
+print(f"  remote receive cap finite (64 MiB) + loud on exceed:    "
+      f"{edge['capped_channel_mapped'] == 'BackendError'}")
+print(f"  embedded returns the same-scale payload unbounded:      {edge['embedded_exceeds_demo_cap']}")
+
+remote.close()
+```
+
+The substitution the whole book leans on — write once against `Session`, run in-process or
+behind a server by target alone — is not a convenience that quietly breaks at the edges. It
+is a contract with named seams: a capability predicate where features diverge, one error
+family across both transports, and a finite receive bound stated out loud rather than hidden.
+The develop→deploy journey holds because the seams are honest, not because the transports
+are secretly the same.

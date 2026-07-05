@@ -15,21 +15,24 @@ use jammi_ai::session::InferenceSession;
 use jammi_db::audit::{self, AuditError, EnvSigningKeyStore, PerQueryAudit};
 
 use crate::convert::serializable_to_pydict;
+use crate::error::client_error;
 
-/// Map a substrate [`AuditError`] to a Python exception.
+/// Map a substrate [`AuditError`] onto the `jammi_client.errors` taxonomy.
 ///
 /// `AuditError` is the audit module's own taxonomy and intentionally does not
 /// collapse into `JammiError` (that would force callers to substring-match on
-/// generic messages), so the binding maps it directly. Validation-shaped
-/// variants surface as `ValueError`; everything else as `RuntimeError`.
+/// generic messages), so the binding maps it directly onto the shared client
+/// taxonomy: validation-shaped variants surface as `InvalidArgument`; everything
+/// else as `BackendError` — the same classes the remote transport raises.
 fn audit_err(e: AuditError) -> PyErr {
-    match &e {
+    let class = match &e {
         AuditError::LengthMismatch { .. }
         | AuditError::LineageTooLarge { .. }
         | AuditError::SignatureMismatch(_)
-        | AuditError::NoTenantBinding => pyo3::exceptions::PyValueError::new_err(e.to_string()),
-        _ => pyo3::exceptions::PyRuntimeError::new_err(e.to_string()),
-    }
+        | AuditError::NoTenantBinding => "InvalidArgument",
+        _ => "BackendError",
+    };
+    client_error(class, e.to_string())
 }
 
 /// A per-query audit record. Mirrors the Rust `PerQueryAudit` struct.

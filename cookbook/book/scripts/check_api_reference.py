@@ -20,6 +20,13 @@ import jammi_ai
 
 # method -> kwargs the cookbook relies on existing in the signature.
 REQUIRED: dict[str, list[str]] = {
+    # unified-client surface (U1) — the capability predicate the chapter 21
+    # recipes call. The one-sided capability members (`session_id`, `close`) are
+    # deliberately NOT listed: they are properties that raise
+    # `NotSupportedOnBackend` on the embedded engine, so a getattr-based
+    # signature probe cannot introspect them — the capability contract itself is
+    # measured in `test_unified_client_cache.py`.
+    "supports": ["capability"],
     # setup / sources
     "add_source": ["url", "format"],
     "list_sources": [],
@@ -169,6 +176,18 @@ def main() -> int:
     for name in MODULE_FUNCTIONS:
         if not hasattr(jammi_ai, name):
             errors.append(f"jammi_ai.{name} is missing from the installed wheel")
+
+    # The unified front door (U1): `connect(target, *, credentials=...)`. The
+    # chapter-21 recipes pass `credentials=` to scale local->remote with an
+    # identity on the channel, so the kwarg must be a real parameter of `connect`.
+    if hasattr(jammi_ai, "connect"):
+        connect_params = set(inspect.signature(jammi_ai.connect).parameters)
+        for kw in ("target", "credentials"):
+            if kw not in connect_params:
+                errors.append(
+                    f"jammi_ai.connect: expected parameter '{kw}' not found in "
+                    f"signature {inspect.signature(jammi_ai.connect)}"
+                )
 
     # Introspect through the composition: open the embedded engine and resolve each
     # verb on the live instance, the way a caller invokes it.

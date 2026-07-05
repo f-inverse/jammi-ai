@@ -32,6 +32,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import pyarrow as pa
 
+from jammi_client import Capability
+from jammi_client.errors import NotSupportedOnBackend
 from jammi_client._assembly import (
     build_add_channel_columns_request,
     build_asof_join_request,
@@ -59,35 +61,301 @@ from jammi_client._assembly import (
 from jammi_client._generated.jammi.v1 import pipeline_pb2
 
 
-class Database:
-    """The embedded engine, wrapping a compiled `_NativeDatabase` handle.
+class _TenantScope:
+    """A block-scoped tenant binding for the embedded :class:`Database`.
 
-    Holds the low-level native handle by composition. Verbs not declared
-    explicitly here forward to it through ``__getattr__``, so the full embedded
-    vocabulary is reachable unchanged; the training verbs are explicit so they
-    drive the shared request assembly and so the conformance guard can introspect
-    them at the class level.
+    Wraps the native scope guard: entering binds the target tenant (restoring the
+    prior on exit) and **yields the tenant-scoped** :class:`Database` **itself**,
+    so ``with db.tenant_scope(t) as s: s.search(...)`` works and matches the
+    remote :meth:`~jammi_client.RemoteDatabase.tenant_scope`, which yields its own
+    session. The native scope validates the id eagerly (a bad id raises where the
+    caller names it), rejects re-entry, and no-ops a stray exit — this wrapper
+    preserves all three by delegating ``__enter__``/``__exit__`` to it while
+    substituting the yielded object.
+    """
+
+    def __init__(self, db: "Database", native_scope: object) -> None:
+        self._db = db
+        self._native_scope = native_scope
+
+    def __enter__(self) -> "Database":
+        self._native_scope.__enter__()
+        return self._db
+
+    def __exit__(self, *exc: object) -> bool:
+        return self._native_scope.__exit__(*exc)
+
+
+class Database:
+    """The embedded engine — a :class:`~jammi_client.Session` over a compiled handle.
+
+    Holds the low-level `_NativeDatabase` handle by composition and exposes the
+    transport-agnostic Session surface over it: every verb is an EXPLICIT method
+    that delegates to the native handle (or, for the training/pipeline/eval
+    verbs, drives the shared pure-Python request assembly and hands the bytes to
+    the native proto seam). There is no ``__getattr__`` forwarding — the surface
+    is the one the Session protocol names, pinned member-for-member so the
+    embedded and remote vocabularies cannot drift, and so `supports()` /
+    `NotSupportedOnBackend` speak for the capability divergence rather than a
+    silent `AttributeError`.
     """
 
     def __init__(self, native: object) -> None:
-        # Stored under a private name; ``__getattr__`` forwards every other
-        # attribute to it. Set via the instance dict directly so ``__getattr__``
-        # never recurses while resolving `_native` itself.
-        object.__setattr__(self, "_native", native)
+        # Held by composition; every verb delegates to it explicitly.
+        self._native = native
 
-    def __getattr__(self, name: str):
-        # Reached only for attributes NOT found on the wrapper (so never for the
-        # explicit training verbs, nor `_native` itself): forward to the native
-        # handle, which carries every un-migrated verb's embedded implementation.
-        return getattr(self._native, name)
+    # --- Capability contract ----------------------------------------------------
+    #
+    # The embedded engine carries the in-process primitives (`audit`,
+    # `ephemeral_session`, `preload_model`); it does NOT carry the remote-only
+    # `close` (it releases on drop — RAII) or `session_id` (no per-connection
+    # scoping key). `supports()` answers the divergence, and the remote-only
+    # members raise a typed `NotSupportedOnBackend` rather than a bare
+    # `AttributeError`, so parity with the remote capability surface holds.
 
-    def __dir__(self) -> list:
-        # The composed surface: the wrapper's own attributes (the explicit
-        # training verbs) UNION the native handle's, so introspection and REPL
-        # completion see every verb a caller can invoke — both the explicit ones
-        # here and the ones `__getattr__` forwards. Without this, `dir()` lists
-        # only the wrapper's statics and hides the delegated verbs.
-        return sorted(set(super().__dir__()) | set(dir(self._native)))
+    _CAPABILITIES = frozenset(
+        {Capability.AUDIT, Capability.EPHEMERAL_SESSION, Capability.PRELOAD_MODEL}
+    )
+
+    def supports(self, capability: Capability) -> bool:
+        """Whether this (embedded) backend carries `capability`."""
+        return capability in self._CAPABILITIES
+
+    @property
+    def audit(self):
+        """The per-query audit primitive (`db.audit.log([...])`)."""
+        return self._native.audit
+
+    def ephemeral_session(self, *, timeout_seconds: int):
+        """Open a session-scoped ephemeral storage context (a context manager)."""
+        return self._native.ephemeral_session(timeout_seconds=timeout_seconds)
+
+    def preload_model(self, model_id: str) -> None:
+        """Preload a model into the cache without running inference."""
+        return self._native.preload_model(model_id)
+
+    @property
+    def session_id(self) -> str:
+        """Remote-only: the embedded engine has no per-connection session id."""
+        raise NotSupportedOnBackend(Capability.SESSION_ID)
+
+    def close(self) -> None:
+        """Remote-only: the embedded engine releases its resources on drop (RAII)."""
+        raise NotSupportedOnBackend(Capability.CLOSE)
+
+    def __enter__(self) -> "Database":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        # RAII: the engine releases on drop, so block exit needs no explicit
+        # teardown. Does not suppress exceptions raised in the block.
+        return False
+
+    # --- Tenant scope + handshake ----------------------------------------------
+
+    def set_tenant(self, tenant_id: str) -> None:
+        """Set the sticky tenant scope on this connection; empty string clears."""
+        self._native.set_tenant(tenant_id)
+
+    def tenant(self) -> Optional[str]:
+        """The tenant currently bound to this connection, or ``None``."""
+        return self._native.tenant()
+
+    def tenant_scope(self, tenant_id: str) -> "_TenantScope":
+        """Scope this connection to `tenant_id` for a ``with`` block, restoring the
+        prior tenant on exit and yielding the tenant-scoped :class:`Database`."""
+        return _TenantScope(self, self._native.tenant_scope(tenant_id))
+
+    def get_server_info(self) -> Dict[str, Any]:
+        """The engine's capabilities handshake dict."""
+        return self._native.get_server_info()
+
+    def sql(self, query: str) -> pa.Table:
+        """Run a SQL query against the in-process engine. Returns a `pyarrow.Table`."""
+        return self._native.sql(query)
+
+    # --- Sources + model lifecycle ---------------------------------------------
+
+    def add_source(self, name: str, *, url: str, format: str) -> None:
+        """Register a file-shaped data source on the embedded engine."""
+        self._native.add_source(name, url=url, format=format)
+
+    def list_sources(self) -> List[Dict[str, Any]]:
+        """A descriptor for every source registered to the current tenant."""
+        return self._native.list_sources()
+
+    def describe_source(self, source_id: str) -> Optional[Dict[str, Any]]:
+        """Describe one registered source by id, or ``None`` if not visible."""
+        return self._native.describe_source(source_id)
+
+    def list_models(self) -> List[Dict[str, Any]]:
+        """A record for every model in the current tenant's catalog."""
+        return self._native.list_models()
+
+    def describe_model(self, model_id: str) -> Optional[Dict[str, Any]]:
+        """Describe one registered model by id, or ``None`` if not visible."""
+        return self._native.describe_model(model_id)
+
+    def delete_model(
+        self, model_id: str, *, version: Optional[int] = None, if_exists: bool = False
+    ) -> None:
+        """Hard-delete a model row. ``version=None`` targets the latest."""
+        self._native.delete_model(model_id, version=version, if_exists=if_exists)
+
+    # --- Mutable companion tables + topics (control/data plane) -----------------
+
+    def drop_mutable_table(self, name: str, *, if_exists: bool = False) -> None:
+        """Drop a mutable companion table by id."""
+        self._native.drop_mutable_table(name, if_exists=if_exists)
+
+    def list_mutable_tables(self) -> List[Dict[str, Any]]:
+        """A descriptor for every mutable companion table of the current tenant."""
+        return self._native.list_mutable_tables()
+
+    def drop_topic(self, name: str, *, if_exists: bool = False) -> None:
+        """Drop a trigger-stream topic by name."""
+        self._native.drop_topic(name, if_exists=if_exists)
+
+    def list_topics(self) -> List[str]:
+        """The name of every topic visible to the current tenant binding."""
+        return self._native.list_topics()
+
+    def publish_topic(self, topic: str, *, batch: pa.Table) -> int:
+        """Publish one batch of rows to a topic; return the engine-assigned offset."""
+        return self._native.publish_topic(topic, batch=batch)
+
+    def subscribe_collect(
+        self,
+        topic: str,
+        *,
+        predicate: Optional[str] = None,
+        from_offset: Optional[int] = None,
+        max_batches: int = 64,
+    ) -> pa.Table:
+        """Collect up to `max_batches` matching batches (replay + live tail)."""
+        return self._native.subscribe_collect(
+            topic,
+            predicate=predicate,
+            from_offset=from_offset,
+            max_batches=max_batches,
+        )
+
+    # --- Channels + materialization introspection -------------------------------
+
+    def list_channels(self) -> List[Dict[str, Any]]:
+        """List every evidence channel registered to the current tenant."""
+        return self._native.list_channels()
+
+    def verify_materialization(
+        self, table: str, expected_definition: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Recompute a materialised table's digest and check it against its manifest."""
+        return self._native.verify_materialization(table, expected_definition)
+
+    def staleness(self, table: str, current_definition: str) -> Dict[str, Any]:
+        """Report whether a ``ready`` result table is still fresh — the staleness sensor."""
+        return self._native.staleness(table, current_definition)
+
+    def derives_from(self, table: str) -> List[Dict[str, Any]]:
+        """The one-hop reverse-dependency edges of a result table."""
+        return self._native.derives_from(table)
+
+    def predict_with_context_predictor(
+        self,
+        model_id: str,
+        *,
+        source: str,
+        target_key: str,
+        split: Optional[str] = None,
+        edge_source: Optional[str] = None,
+        edge_src_column: Optional[str] = None,
+        edge_dst_column: Optional[str] = None,
+        edge_type_column: Optional[str] = None,
+        edge_weight_column: Optional[str] = None,
+        edge_hops: Optional[int] = None,
+        edge_fanout: Optional[int] = None,
+        edge_direction: Optional[str] = None,
+        edge_types: Optional[List[str]] = None,
+        min_weight: Optional[float] = None,
+        hybrid_ann_k: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Predict a target's distribution with a trained context predictor (S19)."""
+        return self._native.predict_with_context_predictor(
+            model_id,
+            source=source,
+            target_key=target_key,
+            split=split,
+            edge_source=edge_source,
+            edge_src_column=edge_src_column,
+            edge_dst_column=edge_dst_column,
+            edge_type_column=edge_type_column,
+            edge_weight_column=edge_weight_column,
+            edge_hops=edge_hops,
+            edge_fanout=edge_fanout,
+            edge_direction=edge_direction,
+            edge_types=edge_types,
+            min_weight=min_weight,
+            hybrid_ann_k=hybrid_ann_k,
+        )
+
+    # --- Stateless conformal / RRF numerics (computed in-process) ---------------
+
+    def conformalize(
+        self,
+        calibration: Sequence[Sequence[float]],
+        true_labels: Sequence[int],
+        test: Sequence[Sequence[float]],
+        *,
+        alpha: float,
+        score: Optional[str] = None,
+        raps_params: Optional[Tuple[float, int]] = None,
+    ) -> List[List[int]]:
+        """Conformalize a classification predictor into prediction sets."""
+        return self._native.conformalize(
+            calibration,
+            true_labels,
+            test,
+            alpha=alpha,
+            score=score,
+            raps_params=raps_params,
+        )
+
+    def conformalize_interval(
+        self,
+        predictions: Sequence[float],
+        observed: Sequence[float],
+        test_predictions: Sequence[float],
+        *,
+        alpha: float,
+    ) -> List[Tuple[float, float]]:
+        """Conformalize an absolute-residual regression predictor into intervals."""
+        return self._native.conformalize_interval(
+            predictions, observed, test_predictions, alpha=alpha
+        )
+
+    def conformalize_cqr(
+        self,
+        lower: Sequence[float],
+        upper: Sequence[float],
+        observed: Sequence[float],
+        test_lower: Sequence[float],
+        test_upper: Sequence[float],
+        *,
+        alpha: float,
+    ) -> List[Tuple[float, float]]:
+        """Conformalize a CQR predictor into adaptive-width intervals."""
+        return self._native.conformalize_cqr(
+            lower, upper, observed, test_lower, test_upper, alpha=alpha
+        )
+
+    def rrf_fuse(
+        self,
+        ranked_lists: Sequence[Sequence[str]],
+        *,
+        k_rrf: Optional[int] = None,
+    ) -> List[Tuple[str, float]]:
+        """Fuse several ranked retrieval lists by reciprocal-rank fusion."""
+        return self._native.rrf_fuse(ranked_lists, k_rrf=k_rrf)
 
     def fine_tune(
         self,

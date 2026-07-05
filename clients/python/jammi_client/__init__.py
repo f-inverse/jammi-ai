@@ -17,19 +17,42 @@ from __future__ import annotations
 from importlib.metadata import version
 from typing import Optional, Union
 
+from . import errors
+from ._backend import Backend, Session, TrainingJobHandle
+from ._capability import Capability
 from ._credentials import BearerCredentials, ChannelCredentials
 from ._database import RemoteDatabase, RemoteTrainingJob
-from ._errors import NoEmbeddedEngineError, TrainingError
 from ._target import LocalTarget, RemoteTarget, Target, parse_target
+from .errors import (
+    BackendError,
+    InvalidArgument,
+    JammiError,
+    NoEmbeddedEngineError,
+    NotSupportedOnBackend,
+    TrainingError,
+)
 
 __version__ = version("jammi-client")
 
 __all__ = [
     "connect",
+    # Protocols — the transport-agnostic surface a caller writes against.
+    "Session",
+    "Backend",
+    "TrainingJobHandle",
+    "Capability",
+    # Concrete remote transport.
     "RemoteDatabase",
     "RemoteTrainingJob",
+    # The JammiError taxonomy (also `jammi_client.errors`).
+    "errors",
+    "JammiError",
+    "InvalidArgument",
+    "NotSupportedOnBackend",
     "NoEmbeddedEngineError",
     "TrainingError",
+    "BackendError",
+    # Credentials + targets.
     "ChannelCredentials",
     "BearerCredentials",
     "LocalTarget",
@@ -44,7 +67,7 @@ def connect(
     target: Union[str, Target],
     *,
     credentials: Optional[ChannelCredentials] = None,
-) -> RemoteDatabase:
+) -> Session:
     """Open a session against `target`, selecting its transport once.
 
     `target` is a URI string or a structured :class:`Target`:

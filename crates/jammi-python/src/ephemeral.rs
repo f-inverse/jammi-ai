@@ -17,17 +17,20 @@ use pyo3_arrow::{PySchema, PyTable};
 use jammi_db::ephemeral::{EphemeralError, EphemeralSession};
 
 use crate::convert::batches_to_pyarrow;
+use crate::error::client_error;
 
-/// Map an [`EphemeralError`] to a Python exception. Validation-shaped variants
-/// surface as `ValueError`; everything else as `RuntimeError`.
+/// Map an [`EphemeralError`] onto the `jammi_client.errors` taxonomy.
+/// Validation-shaped variants surface as `InvalidArgument`; everything else as
+/// `BackendError` — the same classes the remote transport raises.
 pub(crate) fn ephemeral_err(e: EphemeralError) -> PyErr {
-    match &e {
+    let class = match &e {
         EphemeralError::NoTenantBinding
         | EphemeralError::NameTooLong { .. }
         | EphemeralError::DuplicateTable(_)
-        | EphemeralError::UnknownTable(_) => PyValueError::new_err(e.to_string()),
-        _ => PyRuntimeError::new_err(e.to_string()),
-    }
+        | EphemeralError::UnknownTable(_) => "InvalidArgument",
+        _ => "BackendError",
+    };
+    client_error(class, e.to_string())
 }
 
 /// A session-scoped storage context. Use as a context manager:

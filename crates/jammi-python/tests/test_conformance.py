@@ -24,6 +24,9 @@ from __future__ import annotations
 
 import inspect
 
+import grpc
+import pytest
+
 import jammi_ai
 import jammi_client
 
@@ -617,3 +620,330 @@ def _client_server_info_keys() -> set:
         return set(db.get_server_info())
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# The unified surface: one Session protocol, one JammiError taxonomy, one
+# capability contract — both transports map onto them.
+#
+# Raised-type conformance is TWO tiers, honest about hermeticity:
+#   * Tier A (end-to-end): connect/target/validation errors are driven on BOTH
+#     transports and asserted to raise the SAME taxonomy class — no server, no
+#     compute.
+#   * Tier B (converter-level): a failed training `wait()` needs the worker to
+#     actually run and fail, which is not hermetic (it would pull a base model /
+#     run compute), so the EMBEDDED arm cannot be driven end-to-end here. The
+#     remote raise-site is driven directly; the embedded raise-site is pinned at
+#     the shared class it is wired to. Neither is silently capped — the seam is
+#     named explicitly in the test.
+# ---------------------------------------------------------------------------
+
+
+def test_both_backends_satisfy_the_session_protocol(tmp_path):
+    """The embedded `Database` and the remote `RemoteDatabase` both structurally
+    satisfy `jammi_client.Session` — the transport-agnostic surface `connect`
+    returns is one protocol, not two parallel classes that might drift."""
+    embed = jammi_ai.connect(f"file://{tmp_path}")
+    remote = jammi_client.connect("grpc://127.0.0.1:8081")
+    try:
+        assert isinstance(embed, jammi_client.Session)
+        assert isinstance(remote, jammi_client.Session)
+    finally:
+        remote.close()
+
+
+def test_connect_file_raises_no_embedded_engine_on_both_front_doors(tmp_path):
+    """Tier A — `file://` raises `NoEmbeddedEngineError` on both front doors: on
+    the pure client always (it ships no engine), and on the embed wheel when
+    credentials are supplied (meaningless for an in-process target — the mismatch
+    is rejected before an engine opens). Hermetic: no engine opened, no server
+    dialed. The error is a `NotSupportedOnBackend`, itself a `JammiError`."""
+    assert issubclass(
+        jammi_client.NoEmbeddedEngineError, jammi_client.NotSupportedOnBackend
+    )
+    assert issubclass(jammi_client.NotSupportedOnBackend, jammi_client.JammiError)
+
+    with pytest.raises(jammi_client.NoEmbeddedEngineError):
+        jammi_client.connect(f"file://{tmp_path}")
+    with pytest.raises(jammi_client.NoEmbeddedEngineError):
+        jammi_ai.connect(
+            f"file://{tmp_path}",
+            credentials=jammi_client.BearerCredentials(token="tok"),
+        )
+
+
+def test_bad_format_add_source_raises_invalid_argument_on_both_backends(tmp_path):
+    """Tier A — an unknown source `format` is an `InvalidArgument` on BOTH
+    transports: the remote client rejects it client-side, the embedded engine at
+    its `parse_file_format` seam. Hermetic: the format is rejected before any I/O.
+    `InvalidArgument` refines `ValueError`, so an `except ValueError` still fires."""
+    assert issubclass(jammi_client.InvalidArgument, jammi_client.JammiError)
+    assert issubclass(jammi_client.InvalidArgument, ValueError)
+
+    remote = jammi_client.connect("grpc://127.0.0.1:8081")
+    try:
+        with pytest.raises(jammi_client.InvalidArgument):
+            remote.add_source("s", url="/tmp/x.parquet", format="bogus")
+    finally:
+        remote.close()
+
+    embed = jammi_ai.connect(f"file://{tmp_path}")
+    with pytest.raises(jammi_client.InvalidArgument):
+        embed.add_source("s", url="/tmp/x.parquet", format="bogus")
+
+
+def test_failed_training_wait_raises_training_error_on_both_raise_sites():
+    """Tier B (converter-level) — a failed training `wait()` maps to ONE class,
+    `jammi_client.errors.TrainingError`, on both transports.
+
+    Converter-level on the embedded arm BY NECESSITY: a failed embedded job needs
+    the training worker to run and fail, which is not hermetic (it would pull a
+    base model / run compute), so driving one here would violate test discipline.
+    We therefore pin the two raise-sites at the converter:
+      * the REMOTE raise-site is driven directly — a stubbed `TrainingStatus` of
+        `failed` makes `RemoteTrainingJob.wait()` raise, asserted to `TrainingError`;
+      * the EMBEDDED raise-site (`job.rs` failed `wait()` → `to_pyerr`'s
+        `JammiError::FineTune` → `TrainingError` variant-dispatch) is wired to the
+        SAME class object: the native engine imports `jammi_client.errors` and
+        raises `TrainingError` from there, so the class both produce is one and the
+        same. The seam is named here, not silently skipped."""
+    from jammi_client._generated.jammi.v1 import training_pb2
+
+    class _FailedTrainingStub:
+        def TrainingStatus(self, *_args, **_kwargs):
+            return training_pb2.TrainingStatusResponse(status="failed", error="boom")
+
+    job = jammi_client.RemoteTrainingJob(
+        _FailedTrainingStub(), (), job_id="job-1", model_id="model-1"
+    )
+    with pytest.raises(jammi_client.TrainingError) as info:
+        job.wait()
+    assert type(info.value) is jammi_client.TrainingError
+    assert "boom" in str(info.value)
+
+    # Both raise-sites bind to THIS class: a `JammiError` refining `RuntimeError`,
+    # so one `except JammiError` / `except RuntimeError` catches a failed job on
+    # either transport. The embedded `TrainingJob.wait` raises it by importing
+    # `jammi_client.errors.TrainingError` — the same object asserted above.
+    assert issubclass(jammi_client.TrainingError, jammi_client.JammiError)
+    assert issubclass(jammi_client.TrainingError, RuntimeError)
+    from jammi_client import errors as client_errors
+
+    assert client_errors.TrainingError is jammi_client.TrainingError
+
+
+def test_training_job_handle_protocol_is_satisfied_by_both_handles():
+    """Both `jammi_ai.TrainingJob` (native) and `jammi_client.RemoteTrainingJob`
+    satisfy the `TrainingJobHandle` protocol — a caller treats the two
+    interchangeably. The remote handle is checked by `isinstance` on a
+    stub-constructed instance; the native handle, which needs a live engine to
+    instantiate, is checked structurally at the class level for the same members
+    (no engine is opened here)."""
+    from jammi_client._generated.jammi.v1 import training_pb2
+
+    class _CompletedStub:
+        def TrainingStatus(self, *_args, **_kwargs):
+            return training_pb2.TrainingStatusResponse(status="completed")
+
+    remote_job = jammi_client.RemoteTrainingJob(
+        _CompletedStub(), (), job_id="job-1", model_id="model-1"
+    )
+    assert isinstance(remote_job, jammi_client.TrainingJobHandle)
+    for member in ("job_id", "model_id", "status", "wait"):
+        assert hasattr(jammi_ai.TrainingJob, member), member
+
+
+class _StubTenant:
+    id = ""
+
+
+class _StubTenantResp:
+    tenant = _StubTenant()
+
+
+class _StubTenantCatalog:
+    """A catalog stub for the remote tenant trio so `tenant_scope` enters without
+    a server: `GetTenant` reports the unscoped state, `SetTenant`/`ClearTenant`
+    are no-ops."""
+
+    def GetTenant(self, *_args, **_kwargs):
+        return _StubTenantResp()
+
+    def SetTenant(self, *_args, **_kwargs):
+        return None
+
+    def ClearTenant(self, *_args, **_kwargs):
+        return None
+
+
+def test_tenant_scope_yields_a_session_surface_on_both_backends(tmp_path):
+    """`with s.tenant_scope(t) as x` yields a Session-surface object — NOT an inert
+    scope token — on BOTH backends, so `x.search(...)` / `x.sql(...)` work inside
+    the block. This is the block-fix: the embedded wrapper yields itself (the
+    tenant-scoped `Database`), matching the remote generator, which yields the
+    `RemoteDatabase`. Embedded is driven on a real local engine; remote enters
+    over a stubbed catalog so no server is dialed."""
+    session_verbs = ("search", "sql", "add_source", "supports", "list_sources")
+    valid_tenant = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a"
+
+    embed = jammi_ai.connect(f"file://{tmp_path}")
+    with embed.tenant_scope(valid_tenant) as scoped:
+        assert scoped is embed
+        assert isinstance(scoped, jammi_client.Session)
+        for verb in session_verbs:
+            assert callable(getattr(scoped, verb)), verb
+
+    remote = jammi_client.connect("grpc://127.0.0.1:8081")
+    try:
+        remote._catalog = _StubTenantCatalog()
+        with remote.tenant_scope("tenant-x") as scoped:
+            assert scoped is remote
+            assert isinstance(scoped, jammi_client.Session)
+            for verb in session_verbs:
+                assert callable(getattr(scoped, verb)), verb
+    finally:
+        remote.close()
+
+
+def test_supports_and_not_supported_on_backend_contract(tmp_path):
+    """`supports(capability)` answers the one-sided divergence on both backends,
+    and invoking a capability the backend lacks raises the typed
+    `NotSupportedOnBackend` — never a bare `AttributeError`. The embedded engine
+    carries the in-process primitives (audit / ephemeral / preload); the remote
+    carries the transport lifecycle (close / session_id); each raises for the
+    other's."""
+    from jammi_client import Capability
+    from jammi_client.errors import NotSupportedOnBackend
+
+    embed = jammi_ai.connect(f"file://{tmp_path}")
+    remote = jammi_client.connect("grpc://127.0.0.1:8081")
+    try:
+        assert embed.supports(Capability.AUDIT) is True
+        assert embed.supports(Capability.EPHEMERAL_SESSION) is True
+        assert embed.supports(Capability.PRELOAD_MODEL) is True
+        assert embed.supports(Capability.CLOSE) is False
+        assert embed.supports(Capability.SESSION_ID) is False
+
+        assert remote.supports(Capability.CLOSE) is True
+        assert remote.supports(Capability.SESSION_ID) is True
+        assert remote.supports(Capability.AUDIT) is False
+        assert remote.supports(Capability.EPHEMERAL_SESSION) is False
+        assert remote.supports(Capability.PRELOAD_MODEL) is False
+
+        # A one-sided op on the wrong backend raises the typed error.
+        with pytest.raises(NotSupportedOnBackend):
+            embed.session_id
+        with pytest.raises(NotSupportedOnBackend):
+            embed.close()
+        with pytest.raises(NotSupportedOnBackend):
+            remote.audit
+        with pytest.raises(NotSupportedOnBackend):
+            remote.ephemeral_session(timeout_seconds=60)
+        with pytest.raises(NotSupportedOnBackend):
+            remote.preload_model("some-model")
+    finally:
+        remote.close()
+
+
+def test_capability_enum_is_the_closed_five():
+    """The capability set is CLOSED — exactly the five one-sided features that
+    diverge between the transports, no more. Pinned so a sixth is a deliberate
+    decision, not a silent addition."""
+    from jammi_client import Capability
+
+    assert {c.value for c in Capability} == {
+        "audit",
+        "ephemeral_session",
+        "preload_model",
+        "close",
+        "session_id",
+    }
+
+
+class _FakeRpcError(grpc.RpcError):
+    """A `grpc.RpcError` carrying a chosen status code — lets a test drive the
+    remote error-mapping choke point without a live server."""
+
+    def __init__(self, code, details):
+        self._code = code
+        self._details = details
+
+    def code(self):
+        return self._code
+
+    def details(self):
+        return self._details
+
+
+class _RaisingStub:
+    """A gRPC service stub whose every method raises a fixed error — swapped onto
+    a `RemoteDatabase`'s `_catalog` so a verb's wire hop raises hermetically."""
+
+    def __init__(self, err):
+        self._err = err
+
+    def __getattr__(self, _name):
+        def _raise(*_args, **_kwargs):
+            raise self._err
+
+        return _raise
+
+
+def test_remote_rpc_status_errors_map_onto_the_taxonomy():
+    """A SERVER-detected fault the remote stub raises as a ``grpc.RpcError`` is
+    remapped onto the taxonomy by status code — so the whole remote surface, not
+    only client-constructed errors, descends from ``JammiError``:
+
+    * ``INVALID_ARGUMENT`` → :class:`InvalidArgument` — the SAME class the
+      embedded engine raises for a server-detected bad argument (``status_to_pyerr``),
+      the two-sided parity the client-side format pre-rejection could NOT prove;
+    * ``RESOURCE_EXHAUSTED`` (the 64 MiB receive-cap edge) / ``UNAVAILABLE`` /
+      ``DEADLINE_EXCEEDED`` / ``INTERNAL`` → :class:`BackendError`;
+    * ``UNIMPLEMENTED`` → :class:`NotSupportedOnBackend`.
+
+    Hermetic: the stub raises, so no server is dialed; the verb still reaches the
+    wire arm (``_call``), unlike a client-side pre-rejection."""
+    from jammi_client.errors import (
+        BackendError,
+        InvalidArgument,
+        NotSupportedOnBackend,
+    )
+
+    cases = [
+        (grpc.StatusCode.INVALID_ARGUMENT, InvalidArgument),
+        (grpc.StatusCode.RESOURCE_EXHAUSTED, BackendError),
+        (grpc.StatusCode.UNAVAILABLE, BackendError),
+        (grpc.StatusCode.DEADLINE_EXCEEDED, BackendError),
+        (grpc.StatusCode.INTERNAL, BackendError),
+        (grpc.StatusCode.UNIMPLEMENTED, NotSupportedOnBackend),
+    ]
+    for code, expected in cases:
+        remote = jammi_client.connect("grpc://127.0.0.1:8081")
+        try:
+            remote._catalog = _RaisingStub(_FakeRpcError(code, f"server said {code}"))
+            with pytest.raises(expected) as info:
+                remote.list_sources()  # a unary verb → routes through `_call`
+            assert type(info.value) is expected, f"{code}: {type(info.value)}"
+            assert isinstance(info.value, jammi_client.JammiError)
+            assert getattr(info.value, "code", None) == code
+        finally:
+            remote.close()
+
+
+def test_remote_not_found_semantics_survive_the_taxonomy_mapping():
+    """The mapping must not regress the ``NOT_FOUND`` special-cases: ``describe_*``
+    returns ``None`` and an ``if_exists`` drop is a no-op even though the raw
+    ``grpc.RpcError`` is now remapped to a ``JammiError`` first — the call-sites
+    branch on the status code carried on the mapped exception's ``.code``."""
+    not_found = _FakeRpcError(grpc.StatusCode.NOT_FOUND, "absent")
+    remote = jammi_client.connect("grpc://127.0.0.1:8081")
+    try:
+        remote._catalog = _RaisingStub(not_found)
+        assert remote.describe_source("nope") is None
+        assert remote.describe_model("nope") is None
+        remote.drop_mutable_table("nope", if_exists=True)  # no raise
+        # Without if_exists, the NOT_FOUND surfaces as a typed JammiError.
+        with pytest.raises(jammi_client.JammiError):
+            remote.drop_mutable_table("nope", if_exists=False)
+    finally:
+        remote.close()

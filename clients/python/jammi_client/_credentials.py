@@ -20,9 +20,14 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import grpc
+
+# A gRPC channel-arguments list (`[(name, value), ...]`): the tuning knobs — the
+# receive-message cap among them — a channel is opened with. Threaded through
+# every `open_channel` so the caller sets them once at `open_remote`.
+ChannelOptions = Optional[Sequence[Tuple[str, object]]]
 
 # The header carrying the bearer credential. Single source so the value never
 # drifts between the secure (metadata plugin) and plaintext (interceptor) paths.
@@ -51,8 +56,14 @@ class ChannelCredentials(abc.ABC):
     """
 
     @abc.abstractmethod
-    def open_channel(self, endpoint: str, *, tls: bool) -> grpc.Channel:
-        """Open a channel to `endpoint`, secure when `tls` else plaintext."""
+    def open_channel(
+        self, endpoint: str, *, tls: bool, options: ChannelOptions = None
+    ) -> grpc.Channel:
+        """Open a channel to `endpoint`, secure when `tls` else plaintext.
+
+        `options` are gRPC channel arguments (e.g. the receive-message cap)
+        applied to the underlying channel.
+        """
 
 
 @dataclass(frozen=True)
@@ -67,10 +78,14 @@ class AnonymousCredentials(ChannelCredentials):
         _default_secure_credentials
     )
 
-    def open_channel(self, endpoint: str, *, tls: bool) -> grpc.Channel:
+    def open_channel(
+        self, endpoint: str, *, tls: bool, options: ChannelOptions = None
+    ) -> grpc.Channel:
         if tls:
-            return grpc.secure_channel(endpoint, self.secure_credentials())
-        return grpc.insecure_channel(endpoint)
+            return grpc.secure_channel(
+                endpoint, self.secure_credentials(), options=options
+            )
+        return grpc.insecure_channel(endpoint, options=options)
 
 
 @dataclass(frozen=True)
@@ -96,7 +111,9 @@ class BearerCredentials(ChannelCredentials):
             raise ValueError("BearerCredentials requires a non-empty token")
         object.__setattr__(self, "token", stripped)
 
-    def open_channel(self, endpoint: str, *, tls: bool) -> grpc.Channel:
+    def open_channel(
+        self, endpoint: str, *, tls: bool, options: ChannelOptions = None
+    ) -> grpc.Channel:
         if tls:
             call_creds = grpc.metadata_call_credentials(
                 _BearerMetadataPlugin(self.token)
@@ -104,9 +121,10 @@ class BearerCredentials(ChannelCredentials):
             composite = grpc.composite_channel_credentials(
                 self.secure_credentials(), call_creds
             )
-            return grpc.secure_channel(endpoint, composite)
+            return grpc.secure_channel(endpoint, composite, options=options)
         return grpc.intercept_channel(
-            grpc.insecure_channel(endpoint), _BearerCallInterceptor(self.token)
+            grpc.insecure_channel(endpoint, options=options),
+            _BearerCallInterceptor(self.token),
         )
 
 

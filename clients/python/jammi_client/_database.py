@@ -56,13 +56,19 @@ from ._assembly import (
     build_search_request,
     recompute_report_to_dict,
 )
+from ._capability import Capability
 from ._credentials import (
     AnonymousCredentials,
     BearerCredentials,
     ChannelCredentials,
     _bearer_metadata,
 )
-from ._errors import TrainingError
+from .errors import (
+    BackendError,
+    InvalidArgument,
+    NotSupportedOnBackend,
+    TrainingError,
+)
 from ._generated.jammi.v1 import catalog_pb2, catalog_pb2_grpc
 from ._generated.jammi.v1 import embedding_pb2, embedding_pb2_grpc
 from ._generated.jammi.v1 import eval_pb2, eval_pb2_grpc
@@ -76,6 +82,15 @@ from ._generated.jammi.v1 import trigger_pb2, trigger_pb2_grpc
 # same key the Rust SDK and npm client use. Kept in one place so the value never
 # drifts across the seam.
 SESSION_HEADER = "jammi-session-id"
+
+# The gRPC per-message receive cap this client raises its channels to. A unary
+# verb whose whole result rides back as one message (e.g. `infer` returning one
+# `ArrowBatch`) is bounded by this cap on the receive side; gRPC's stock 4 MB
+# default is too small for realistic result tables. Raising it moves the
+# boundary without removing it — the cap stays finite and configurable, the
+# honest counterpart to the embedded engine's unbounded in-process return. 64 MB
+# is generous for a single unary result while still bounding a pathological one.
+MAX_RECEIVE_MESSAGE_LENGTH = 64 * 1024 * 1024
 
 
 def _result_table_to_dict(rt: embedding_pb2.ResultTable) -> Dict[str, Any]:
@@ -118,7 +133,7 @@ def _model_to_dict(m: catalog_pb2.Model) -> Dict[str, Any]:
     try:
         task = _MODEL_TASK_NAME[m.task]
     except KeyError:
-        raise ValueError(
+        raise InvalidArgument(
             f"unknown ModelTask enum value {m.task!r} on the wire — "
             "client and server proto versions disagree"
         ) from None
@@ -293,7 +308,7 @@ def _inference_aggregate_to_dict(agg: eval_pb2.InferenceAggregate) -> Dict[str, 
                 for t, m in n.per_type.items()
             },
         }
-    raise RuntimeError("InferenceEvalReport carried no aggregate")
+    raise BackendError("InferenceEvalReport carried no aggregate")
 
 
 def _entity_to_dict(e: eval_pb2.Entity) -> Dict[str, Any]:
@@ -332,7 +347,7 @@ def _per_record_prediction_to_dict(
             "predicted": [_entity_to_dict(e) for e in n.predicted],
             "gold": [_entity_to_dict(e) for e in n.gold],
         }
-    raise RuntimeError("PerRecordPrediction carried no prediction")
+    raise BackendError("PerRecordPrediction carried no prediction")
 
 
 def _inference_report_to_dict(report: eval_pb2.InferenceEvalReport) -> Dict[str, Any]:
@@ -479,7 +494,7 @@ def _verify_verdict_to_dict(
         }
     if which == "missing_manifest":
         return {"verdict": "missing_manifest"}
-    raise RuntimeError("VerifyMaterializationResponse carried no verdict")
+    raise BackendError("VerifyMaterializationResponse carried no verdict")
 
 
 def _stale_reason_to_dict(reason: "catalog_pb2.StaleReason") -> Dict[str, Any]:
@@ -504,7 +519,7 @@ def _stale_reason_to_dict(reason: "catalog_pb2.StaleReason") -> Dict[str, Any]:
             "reason": "input_vanished",
             "source": reason.input_vanished.source,
         }
-    raise RuntimeError("StaleReason carried no reason")
+    raise BackendError("StaleReason carried no reason")
 
 
 def _staleness_verdict_to_dict(
@@ -531,7 +546,7 @@ def _staleness_verdict_to_dict(
         }
     if which == "missing_manifest":
         return {"staleness": "missing_manifest"}
-    raise RuntimeError("StalenessResponse carried no staleness")
+    raise BackendError("StalenessResponse carried no staleness")
 
 
 # The wire `AnchorKind` enum value -> the serde snake_case tag the embed binding
@@ -556,7 +571,7 @@ def _derives_from_edges_to_list(
     for edge in resp.edges:
         kind = _ANCHOR_KIND_TO_TAG.get(edge.kind)
         if kind is None:
-            raise RuntimeError("DerivesFromEdge carried an unspecified anchor kind")
+            raise BackendError("DerivesFromEdge carried an unspecified anchor kind")
         out.append({"input": edge.input, "derived": edge.derived, "kind": kind})
     return out
 
@@ -692,6 +707,34 @@ class RemoteDatabase:
         """The opaque session id the server keys this connection's tenant by."""
         return self._session_id
 
+    # --- Capability contract ----------------------------------------------------
+    #
+    # The remote transport carries `close` (real gRPC teardown) and `session_id`
+    # (the per-connection scoping key); it does NOT carry the embedded-only
+    # in-process primitives (`audit`, `ephemeral_session`, `preload_model`).
+    # `supports()` answers the divergence, and the one-sided members raise a typed
+    # `NotSupportedOnBackend` rather than a bare `AttributeError`, so a caller that
+    # ignores `supports()` still gets a legible error naming the capability.
+
+    _CAPABILITIES = frozenset({Capability.CLOSE, Capability.SESSION_ID})
+
+    def supports(self, capability: Capability) -> bool:
+        """Whether this (remote) backend carries `capability`."""
+        return capability in self._CAPABILITIES
+
+    @property
+    def audit(self):
+        """The per-query audit log — embedded only; unsupported over the wire."""
+        raise NotSupportedOnBackend(Capability.AUDIT)
+
+    def ephemeral_session(self, *, timeout_seconds: int):
+        """A session-scoped ephemeral store — embedded only; unsupported here."""
+        raise NotSupportedOnBackend(Capability.EPHEMERAL_SESSION)
+
+    def preload_model(self, model_id: str) -> None:
+        """Preload a model into the cache — embedded only; unsupported here."""
+        raise NotSupportedOnBackend(Capability.PRELOAD_MODEL)
+
     # --- Catalog: tenant trio + handshake ---------------------------------------
 
     def set_tenant(self, tenant_id: str) -> None:
@@ -785,7 +828,7 @@ class RemoteDatabase:
         try:
             file_format = _FILE_FORMAT[format]
         except KeyError:
-            raise ValueError(
+            raise InvalidArgument(
                 f"format must be one of {sorted(_FILE_FORMAT)} (got {format!r})"
             ) from None
         self._catalog.AddSource(
@@ -993,7 +1036,7 @@ class RemoteDatabase:
         if topic_id is None:
             if if_exists:
                 return
-            raise ValueError(f"topic '{name}' not found")
+            raise InvalidArgument(f"topic '{name}' not found")
         try:
             self._catalog.DropTopic(
                 catalog_pb2.DropTopicRequest(topic_id=topic_id, if_exists=if_exists),
@@ -1449,7 +1492,7 @@ class RemoteDatabase:
                 try:
                     gather.direction = _EDGE_DIRECTION[edge_direction]
                 except KeyError:
-                    raise ValueError(
+                    raise InvalidArgument(
                         f"edge_direction must be 'out', 'in', or 'undirected' "
                         f"(got {edge_direction!r})"
                     ) from None
@@ -1472,7 +1515,7 @@ class RemoteDatabase:
             out["kind"] = "quantile"
             out["levels"] = [[p.level, p.value] for p in resp.quantile.points]
         else:
-            raise RuntimeError("Predict response carried no distribution")
+            raise BackendError("Predict response carried no distribution")
         out["source"] = resp.source
         out["context_ref"] = list(resp.context_ref)
         return out
@@ -2228,7 +2271,13 @@ def open_remote(
     """
     session_id = str(uuid.uuid4())
     resolved = credentials or AnonymousCredentials()
-    channel = resolved.open_channel(endpoint, tls=tls)
+    # Raise the per-message receive cap off gRPC's 4 MB default so a unary verb
+    # returning one large `ArrowBatch` is not truncated at the stock boundary.
+    channel = resolved.open_channel(
+        endpoint,
+        tls=tls,
+        options=[("grpc.max_receive_message_length", MAX_RECEIVE_MESSAGE_LENGTH)],
+    )
     # The typed verbs get the bearer from the channel; Flight is a separate
     # transport, so reuse the credential's own header pair — the single source
     # for the key and the `Bearer <token>` value — rather than re-spelling it.

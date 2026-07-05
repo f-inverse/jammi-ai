@@ -201,9 +201,24 @@ drop behind one trait with near-zero design.
 reposition the native `jammi_ai` wheel as the `[embedded]` backend (new native module
 namespace, abi3, Linux+macOS wheels); rework `jammi-ai-platform` from "re-exports
 `jammi_client`" to "plugs into `jammi`"; migrate the call-sites (**48 `jammi_ai` + 32
-`jammi_client` + 27 `jammi_ai_platform`**, mostly tests + cookbook) and ~700 doc lines.
-Every one of these sites is **in-repo**, so each rename rewrites all of its call-sites in
-the *same* change — the old names are deleted, not aliased.
+`jammi_client` + 27 `jammi_ai_platform`**) and ~700 doc lines. Every one of these sites is
+**in-repo**, so each rename rewrites all of its call-sites in the *same* change — the old
+names are deleted, not aliased.
+
+**The cookbook is a co-evolution surface, not a find-replace.** The counts above are
+accurate — ~46 files under `cookbook/` touch the `jammi_ai`/`jammi_client` surface — but
+framing them as low-risk call-sites is *wrong*. Under the engine↔cookbook loop — *every new
+engine surface earns a measured cookbook chapter; the cookbook is the engine's validator* —
+sed-ing `jammi_ai`→`jammi` ships the rename but **fails to prove the new surface**, which
+violates the loop's law. This unification is not a rename dressed as a migration: it
+introduces genuinely new surface — the single `jammi` client, `connect()` as
+backend-relocation, the `supports()`/`NotSupportedOnBackend` capability contract (§5.6), the
+`JammiError` taxonomy (§5.4), the `credentials=` front door (§5.3), and the honest edges (the
+4 MB unary cap §5.9, the streaming asymmetry §5.7) — and **each earns a measured chapter**.
+The cookbook carries its own mechanized harness (`cookbook/book/scripts/check_api_reference.py`,
+`cookbook/book/tests/test_rails.py`, `test_closed_loop.py`, `test_channels.py`); those chapters
+are proven by that harness running green against the *new* surface. So the cookbook is a
+first-class per-unit deliverable and a merge gate (§6), not incidental blast radius.
 
 ## 6. Build units (clean greenfield, atomic rewrites — no shims)
 
@@ -213,6 +228,12 @@ to preserve** — a big-bang is safe. The only reason to split the work into uni
 runs the full rigor chain and leaves the tree working (all call-sites of anything it touches
 migrated, old names *deleted*). The unit count is a PR-sizing call, **not** a compat
 requirement — the whole thing could land in one PR if that were reviewable.
+
+Because the cookbook is the engine's validator (§5), **every unit's rigor chain gates on the
+cookbook loop closing** — `test_rails` / `test_closed_loop` / `check_api_reference` green
+against the *new* surface, not merely `cargo test` + `test_conformance.py` green. The cookbook
+co-evolves *inside* the unit that changes the surface it teaches; a unit is not done when the
+rename compiles, but when its measured chapters prove the new surface.
 
 A lean, sensible split is **three units**:
 
@@ -225,23 +246,39 @@ A lean, sensible split is **three units**:
   `supports()`/`NotSupportedOnBackend` capability contract (§5.6), and the `credentials=`
   front-door signature change (§5.3). Because there is no downward alias, there is no import
   cycle to design around — the code simply lives in `jammi` and the old module names cease to
-  exist. Ships with the GrpcBackend.
+  exist. Ships with the GrpcBackend. **Cookbook co-evolution:** this unit rewrites
+  `quickstart/01_install.md` + `02_connect.md` as the flagship client-as-base narrative (the
+  single `jammi` front door, `connect()` as backend-relocation) and adds measured chapters for
+  the capability contract (show `supports()` and catch `NotSupportedOnBackend` when an
+  embedded-only op is called on a remote handle) and the remote honest edge — per the
+  no-silent-caps rule, SHOW the 4 MB unary call returning `RESOURCE_EXHAUSTED` over the
+  GrpcBackend (§5.9). The unit merges only when these chapters and the cookbook harness are
+  green against the new surface.
 - **Unit 2 — the `[embedded]` backend under the new native namespace.** Add the
   EmbeddedBackend (direct-FFI over the native engine) behind the same trait and ship
   `jammi[embedded]`. The native extension module moves off `jammi_ai._native` to the new
   namespace (maturin `module-name`) and the old `jammi_ai._native` name is **gone** — every
   direct native-import site (e.g. `test_conformance.py`'s `_NativeDatabase`) is rewritten in
-  this change. `jammi_ai` is not kept alongside; it is replaced.
+  this change. `jammi_ai` is not kept alongside; it is replaced. **Cookbook co-evolution:** the
+  chapters that teach the embedded path — installing the `[embedded]` extra, the direct-FFI
+  backend, and the embedded↔remote parity the trait now guarantees — co-evolve here, measured
+  green against the real embedded backend this unit ships. This unit also completes the §5.9
+  honest-edge chapter by showing the same 4 MB call *succeeding* embedded, closing the contrast
+  against the remote `RESOURCE_EXHAUSTED` half landed in Unit 1.
 - **Unit 3 — `jammi-platform` plug-in + the rename/PyPI claim + docs.** Add the generic
   extension hook to `jammi`; rework `jammi-ai-platform` → `jammi-platform` to register into
   it (a rename + rework across the enterprise repo, **not** an alias — the 27
   `jammi_ai_platform` sites are rewritten). This unit also carries the fresh `jammi` PyPI
-  claim and the ~700 doc-line migration. The rename is a product/positioning decision (§8),
+  claim and the ~700 doc-line migration. **Cookbook co-evolution:** the governance chapters —
+  the plug-in lighting up `registry` / `experiments` / `gates` on a `jammi` connection, named
+  as generic primitives with no consumer — co-evolve here, and this unit gates on *those*
+  governance chapters green. The rename is a product/positioning decision (§8),
   so this unit can be sequenced whenever convenient — even first — since it carries no compat
   cost that would force an ordering.
 
-Call-site counts to migrate (mostly tests + cookbook, so low product-code risk), all
-in-repo and all rewritten atomically within the unit that owns them:
+Call-site counts to migrate (the tests are a mechanical rewrite; the cookbook share is *not*
+a find-replace — it co-evolves as a measured per-unit deliverable, §5 and each unit above),
+all in-repo and all rewritten atomically within the unit that owns them:
 **48 `jammi_ai`** (2 library, ~35 cookbook, 11 tests), **32 `jammi_client`** (4 library —
 the local↔remote seam in `python/jammi_ai/`, the rest tests/cookbook), **27
 `jammi_ai_platform`** (4 library, 23 tests, all enterprise). Note: `jammi-enterprise`

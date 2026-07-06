@@ -27,7 +27,7 @@ use crate::job::PyTrainingJob;
 
 /// The low-level embedded engine handle, wrapping `Arc<InferenceSession>` with a
 /// shared tokio runtime. Exposed to Python as `_NativeDatabase`: the thin Python
-/// `Database` wrapper (in `jammi_ai/_database.py`) holds one of these and is the
+/// `EmbeddedBackend` wrapper (in `jammi/_embedded.py`) holds one of these and is the
 /// user-facing surface. Every verb here is the embedded implementation the
 /// wrapper delegates to — directly (via `__getattr__`) for the verbs whose
 /// request is still assembled in Rust, and through the shared proto seam
@@ -94,7 +94,7 @@ impl PyDatabase {
     /// Wrap this database's engine as the transport-agnostic [`Session`] front
     /// door (the local arm). The unified `encode_query` / `generate_embeddings`
     /// verbs dispatch the `modality` onto the engine's concrete tower through
-    /// this one surface — the same shape the bundled `jammi-client` speaks
+    /// this one surface — the same shape the bundled `jammi` speaks
     /// remotely, so the embedded and remote verb vocabularies agree by sharing
     /// the `Session` abstraction rather than by a parallel reimplementation.
     fn local_session(&self) -> Session {
@@ -276,7 +276,7 @@ impl PyDatabase {
     /// The engine's capabilities handshake: a dict with `version`, `features`
     /// (compiled feature flags), and `storage_backends` (addressable storage
     /// URL schemes). A compile-time fact about the running build. Named to match
-    /// the bundled `jammi-client`'s `get_server_info` (and `SessionService.
+    /// the bundled `jammi`'s `get_server_info` (and `SessionService.
     /// GetServerInfo`) so the embedded and remote surfaces agree.
     fn get_server_info(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         serializable_to_pydict(py, &jammi_db::ServerInfo::current())
@@ -294,7 +294,7 @@ impl PyDatabase {
     /// Generate embeddings from a serialized `GenerateEmbeddingsRequest` body,
     /// persisting one L2-normalized vector per row. The thin Python `Database`
     /// wrapper builds this request with the same pure-Python assembly the remote
-    /// client uses (`jammi_client._assembly`), serializes it, and hands the bytes
+    /// client uses (`jammi._assembly`), serializes it, and hands the bytes
     /// here, so the embedded and remote embedding paths share one request
     /// assembly and one decode seam
     /// (`jammi_ai::wire::generate_embeddings_from_bytes`). Returns the result
@@ -318,7 +318,7 @@ impl PyDatabase {
 
     /// Run inference from a serialized `InferRequest` body. The thin Python
     /// `Database` wrapper builds this request with the same pure-Python assembly
-    /// the remote client uses (`jammi_client._assembly`), serializes it, and
+    /// the remote client uses (`jammi._assembly`), serializes it, and
     /// hands the bytes here, so the embedded and remote infer paths share one
     /// request assembly and one decode seam
     /// (`jammi_ai::wire::infer_from_bytes`). Returns a `pyarrow.Table`. A
@@ -447,7 +447,7 @@ impl PyDatabase {
     /// Register a new evidence-provenance channel from a serialized
     /// `RegisterChannelRequest` body. The thin Python `Database` wrapper builds
     /// this request with the same pure-Python assembly the remote client uses
-    /// (`jammi_client._assembly`), serializes it, and hands the bytes here, so the
+    /// (`jammi._assembly`), serializes it, and hands the bytes here, so the
     /// embedded and remote register-channel paths share one request assembly and
     /// one decode seam (`jammi_ai::wire::register_channel_from_bytes`). The
     /// channel id is unique PER TENANT, scoped to the session's currently bound
@@ -465,7 +465,7 @@ impl PyDatabase {
     /// Append columns to an already-registered channel from a serialized
     /// `AddChannelColumnsRequest` body. The thin Python `Database` wrapper builds
     /// this request with the same pure-Python assembly the remote client uses
-    /// (`jammi_client._assembly`), serializes it, and hands the bytes here, so the
+    /// (`jammi._assembly`), serializes it, and hands the bytes here, so the
     /// embedded and remote add-columns paths share one request assembly and one
     /// decode seam (`jammi_ai::wire::add_channel_columns_from_bytes`). The
     /// append-only invariant is enforced: redeclaring an existing column with a
@@ -573,7 +573,7 @@ impl PyDatabase {
     /// Register a mutable companion table from a serialized
     /// `CreateMutableTableRequest` body. The thin Python `Database` wrapper builds
     /// this request with the same pure-Python assembly the remote client uses
-    /// (`jammi_client._assembly`), serializes it, and hands the bytes here, so the
+    /// (`jammi._assembly`), serializes it, and hands the bytes here, so the
     /// embedded and remote create paths share one request assembly and one decode
     /// seam (`jammi_ai::wire::create_mutable_table_from_bytes`). The wire body is
     /// tenant-free — the decode stamps the session's currently bound tenant onto
@@ -641,7 +641,7 @@ impl PyDatabase {
 
     /// Register a trigger-stream topic from a serialized `RegisterTopicRequest`
     /// body. The thin Python `Database` wrapper builds this request with the same
-    /// pure-Python assembly the remote client uses (`jammi_client._assembly`),
+    /// pure-Python assembly the remote client uses (`jammi._assembly`),
     /// serializes it, and hands the bytes here, so the embedded and remote
     /// register-topic paths share one request assembly and one decode seam
     /// (`jammi_ai::wire::register_topic_from_bytes`). The wire body is tenant-free
@@ -702,9 +702,9 @@ impl PyDatabase {
 
     /// Nearest-neighbor search over a source's embedding table from a serialized
     /// `SearchRequest` body. Returns a `pyarrow.Table` directly — the same shape
-    /// the bundled `jammi-client`'s `search` returns. The thin Python `Database`
+    /// the bundled `jammi`'s `search` returns. The thin Python `Database`
     /// wrapper builds this request with the same pure-Python assembly the remote
-    /// client uses (`jammi_client._assembly`), serializes it, and hands the bytes
+    /// client uses (`jammi._assembly`), serializes it, and hands the bytes
     /// here, so the embedded and remote search paths share one request assembly
     /// and one decode seam (`jammi_ai::wire::search_from_bytes`); only the
     /// request is collapsed, the Arrow response wrapping stays here. A malformed
@@ -721,7 +721,7 @@ impl PyDatabase {
     /// Submit a training job from a serialized `StartTrainingRequest` body.
     ///
     /// The thin Python `Database` wrapper builds this request with the same
-    /// pure-Python assembly the remote client uses (`jammi_client._assembly`),
+    /// pure-Python assembly the remote client uses (`jammi._assembly`),
     /// serializes it, and hands the bytes here — so the embedded and remote
     /// training submits share one request assembly and one decode seam. The body
     /// decodes through `jammi_ai::wire::training_spec_from_bytes` into the engine
@@ -844,7 +844,7 @@ impl PyDatabase {
 
     /// Evaluate embedding quality from a serialized `EvalEmbeddingsRequest`
     /// body. The thin Python `Database` wrapper builds this request with the same
-    /// pure-Python assembly the remote client uses (`jammi_client._assembly`),
+    /// pure-Python assembly the remote client uses (`jammi._assembly`),
     /// serializes it, and hands the bytes here, so the embedded and remote
     /// eval-embeddings paths share one request assembly and one decode seam
     /// (`jammi_ai::wire::eval_embeddings_from_bytes`). Returns a dict with
@@ -870,7 +870,7 @@ impl PyDatabase {
     /// Read back the persisted per-query eval records for a run from a serialized
     /// `EvalPerQueryRequest` body (spec J9), scoped to the calling tenant. The
     /// thin Python `Database` wrapper builds this request with the same pure-Python
-    /// assembly the remote client uses (`jammi_client._assembly`), serializes it,
+    /// assembly the remote client uses (`jammi._assembly`), serializes it,
     /// and hands the bytes here, so the embedded and remote per-query readback
     /// paths share one request assembly and one decode seam
     /// (`jammi_ai::wire::eval_per_query_from_bytes`). Returns a list of dicts, each
@@ -904,7 +904,7 @@ impl PyDatabase {
 
     /// Evaluate inference quality from a serialized `EvalInferenceRequest` body.
     /// The thin Python `Database` wrapper builds this request with the same
-    /// pure-Python assembly the remote client uses (`jammi_client._assembly`),
+    /// pure-Python assembly the remote client uses (`jammi._assembly`),
     /// serializes it, and hands the bytes here, so the embedded and remote
     /// eval-inference paths share one request assembly and one decode seam
     /// (`jammi_ai::wire::eval_inference_from_bytes`). Returns a dict with
@@ -931,7 +931,7 @@ impl PyDatabase {
     /// Compare multiple embedding tables side-by-side from a serialized
     /// `EvalCompareRequest` body. The thin Python `Database` wrapper builds this
     /// request with the same pure-Python assembly the remote client uses
-    /// (`jammi_client._assembly`), serializes it, and hands the bytes here, so the
+    /// (`jammi._assembly`), serializes it, and hands the bytes here, so the
     /// embedded and remote eval-compare paths share one request assembly and one
     /// decode seam (`jammi_ai::wire::eval_compare_from_bytes`). Returns a dict with
     /// a `per_table` list; the first entry is the baseline (`delta: None`) and
@@ -954,7 +954,7 @@ impl PyDatabase {
     /// Evaluate whether a predictor's uncertainty is honest (spec R2) from a
     /// serialized `EvalCalibrationRequest` body. The thin Python `Database`
     /// wrapper builds this request with the same pure-Python assembly the remote
-    /// client uses (`jammi_client._assembly`), serializes it, and hands the bytes
+    /// client uses (`jammi._assembly`), serializes it, and hands the bytes
     /// here, so the embedded and remote eval-calibration paths share one request
     /// assembly and one decode seam (`jammi_ai::wire::eval_calibration_from_bytes`).
     /// Returns a dict with `aggregate` (the proper-score headline `crps`/`nll`,
@@ -979,7 +979,7 @@ impl PyDatabase {
     /// Encode a single query into an embedding vector from a serialized
     /// `EncodeQueryRequest` body. The thin Python `Database` wrapper builds this
     /// request with the same pure-Python assembly the remote client uses
-    /// (`jammi_client._assembly`), serializes it, and hands the bytes here, so
+    /// (`jammi._assembly`), serializes it, and hands the bytes here, so
     /// the embedded and remote encode paths share one request assembly and one
     /// decode seam (`jammi_ai::wire::encode_query_from_bytes`). Returns the
     /// L2-normalized embedding. A malformed or invalid body raises `ValueError`.
@@ -1009,7 +1009,7 @@ impl PyDatabase {
     /// Materialise the k-nearest-neighbour graph of a source's embedding table
     /// from a serialized `BuildNeighborGraphRequest` body. The thin Python
     /// `Database` wrapper builds this request with the same pure-Python assembly
-    /// the remote client uses (`jammi_client._assembly`), serializes it, and
+    /// the remote client uses (`jammi._assembly`), serializes it, and
     /// hands the bytes here, so the embedded and remote paths share one request
     /// assembly and one decode seam
     /// (`jammi_ai::wire::build_neighbor_graph_from_bytes`). Returns the new edge
@@ -1033,7 +1033,7 @@ impl PyDatabase {
     /// decoupled-GNN forward pass) into a new, searchable embedding table, from a
     /// serialized `PropagateEmbeddingsRequest` body. The thin Python `Database`
     /// wrapper builds this request with the same pure-Python assembly the remote
-    /// client uses (`jammi_client._assembly`), serializes it, and hands the bytes
+    /// client uses (`jammi._assembly`), serializes it, and hands the bytes
     /// here, so the embedded and remote paths share one request assembly and one
     /// decode seam (`jammi_ai::wire::propagate_request_from_bytes`). Returns the
     /// materialised embedding table's name. A malformed or invalid body raises
@@ -1051,7 +1051,7 @@ impl PyDatabase {
     /// Assemble a point-in-time-correct table by an as-of temporal join of two
     /// registered relations, from a serialized `AsofJoinRequest` body. The thin
     /// Python `Database` wrapper builds this request with the same pure-Python
-    /// assembly the remote client uses (`jammi_client._assembly`), serializes it,
+    /// assembly the remote client uses (`jammi._assembly`), serializes it,
     /// and hands the bytes here, so the embedded and remote paths share one
     /// request assembly and one decode seam
     /// (`jammi_ai::wire::asof_join_from_bytes`). Returns the materialised table's
@@ -1068,7 +1068,7 @@ impl PyDatabase {
     /// Re-invoke a result table's recorded producer over the inputs' current
     /// state, from a serialized `RecomputeRequest` body. The thin Python
     /// `Database` wrapper builds this request with the same pure-Python assembly
-    /// the remote client uses (`jammi_client._assembly`), serializes it, and hands
+    /// the remote client uses (`jammi._assembly`), serializes it, and hands
     /// the bytes here, so the embedded and remote paths share one request assembly
     /// and one decode seam (`jammi_ai::wire::recompute_from_bytes`). The target is
     /// resolved through the tenant-filtered catalog (via the local `Session`), so
@@ -1226,7 +1226,7 @@ impl PyDatabase {
     /// columns, and pool the neighbour vectors permutation-invariantly into one
     /// fixed-width context vector — the encode-and-aggregate half of a Neural
     /// Process. The thin Python `Database` wrapper builds this request with the
-    /// same pure-Python assembly the remote client uses (`jammi_client._assembly`),
+    /// same pure-Python assembly the remote client uses (`jammi._assembly`),
     /// serializes it, and hands the bytes here, so the embedded and remote paths
     /// share one request assembly and one decode seam
     /// (`jammi_ai::wire::assemble_context_request_from_bytes`).

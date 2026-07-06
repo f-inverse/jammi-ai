@@ -1,4 +1,4 @@
-"""jammi-client — the base Python client for a Jammi engine, local or remote.
+"""jammi — the base Python client for a Jammi engine, local or remote.
 
 The single front door: one `connect(target)`, the Python mirror of the Rust
 `Jammi::open(Target)`, where transport is config, not a code path.
@@ -6,18 +6,16 @@ The single front door: one `connect(target)`, the Python mirror of the Rust
 * ``https://`` / ``grpc://`` → a remote :class:`RemoteDatabase` over the
   `jammi.v1` gRPC wire — the lean, candle-free surface, always available.
 * ``file://`` → the compiled in-process engine (an :class:`EmbeddedBackend`,
-  direct FFI) when the ``jammi-client[embedded]`` extra is installed (it pulls
+  direct FFI) when the ``jammi-ai[embedded]`` extra is installed (it pulls
   the `jammi-ai-native` engine, importable as `jammi_native`); otherwise a
   truthful :class:`NoEmbeddedEngineError` pointing at that extra — the runtime
   echo of the Rust `#[cfg]` gate.
 
-`jammi-client` is the BASE: it discovers the native engine as an in-process
-backend without carrying it as a hard dependency. `import jammi_client` stays
+`jammi-ai` (import `jammi`) is the BASE: it discovers the native engine as an
+in-process backend without carrying it as a hard dependency. `import jammi` stays
 native-free — the engine is imported LAZILY, only when a `file://` target is
-opened (`jammi_client._embedded._open_embedded`) — so the lean deploy build and
+opened (`jammi._embedded._open_embedded`) — so the lean deploy build and
 the embed build are one package, differing only by whether the extra is present.
-`jammi-ai` remains a convenience bundle that pins the extra and re-exposes this
-surface until U3's rename retires it.
 """
 
 from __future__ import annotations
@@ -31,7 +29,7 @@ from ._capability import Capability
 from ._credentials import BearerCredentials, ChannelCredentials
 from ._database import RemoteDatabase, RemoteTrainingJob
 # `_embedded` is native-free at import (it imports `jammi_native` lazily, inside
-# `_open_embedded`), so naming `EmbeddedBackend` here keeps `import jammi_client`
+# `_open_embedded`), so naming `EmbeddedBackend` here keeps `import jammi`
 # native-free — the client-import guard the positive conformance test pins.
 from ._embedded import EmbeddedBackend
 from ._target import LocalTarget, RemoteTarget, Target, parse_target
@@ -44,7 +42,7 @@ from .errors import (
     TrainingError,
 )
 
-__version__ = version("jammi-client")
+__version__ = version("jammi-ai")
 
 __all__ = [
     "connect",
@@ -60,7 +58,7 @@ __all__ = [
     # but its module (`_embedded`) imports `jammi_native` lazily, so referencing
     # the name does not pull the engine — only opening a `file://` target does.
     "EmbeddedBackend",
-    # The JammiError taxonomy (also `jammi_client.errors`).
+    # The JammiError taxonomy (also `jammi.errors`).
     "errors",
     "JammiError",
     "InvalidArgument",
@@ -91,7 +89,7 @@ def connect(
     * ``https://host`` / ``grpcs://host:8081`` → a TLS :class:`RemoteDatabase`.
     * ``http://host`` / ``grpc://host:8081`` → a plaintext :class:`RemoteDatabase`.
     * ``file:///data`` → the compiled in-process engine (an
-      :class:`EmbeddedBackend`, direct FFI) when the ``jammi-client[embedded]``
+      :class:`EmbeddedBackend`, direct FFI) when the ``jammi-ai[embedded]``
       extra is installed (it makes `jammi_native` importable); otherwise a
       :class:`NoEmbeddedEngineError` pointing at that extra — the runtime echo of
       the Rust `#[cfg]` gate.
@@ -124,7 +122,7 @@ def connect(
             # mismatch is a caller error, caught before an engine is opened.
             raise NoEmbeddedEngineError(parsed.artifact_dir)
         # The base client discovers the engine on demand: probe the extra WITHOUT
-        # importing it into this module's namespace (keeps `import jammi_client`
+        # importing it into this module's namespace (keeps `import jammi`
         # native-free). If it is absent, this build carries no engine — raise the
         # truthful error hinting at the extra.
         from importlib.util import find_spec

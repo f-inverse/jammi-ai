@@ -19,7 +19,7 @@ use jammi_db::ephemeral::{EphemeralError, EphemeralSession};
 use crate::convert::batches_to_pyarrow;
 use crate::error::client_error;
 
-/// Map an [`EphemeralError`] onto the `jammi_client.errors` taxonomy.
+/// Map an [`EphemeralError`] onto the `jammi.errors` taxonomy.
 /// Validation-shaped variants surface as `InvalidArgument`; everything else as
 /// `BackendError` — the same classes the remote transport raises.
 pub(crate) fn ephemeral_err(e: EphemeralError) -> PyErr {

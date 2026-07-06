@@ -7,7 +7,7 @@ the LAC/APS/RAPS set differences, the CQR/absolute-residual interval widths, and
 the RRF ordering against hand-derived expected values.
 
 The module is loaded directly from its file rather than via ``import
-jammi_client`` so the numerics can be exercised on a machine that carries no
+jammi`` so the numerics can be exercised on a machine that carries no
 gRPC / Flight transport stack — they depend on nothing but the stdlib.
 """
 
@@ -21,9 +21,9 @@ import random
 import pytest
 
 _MODULE_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)), "jammi_client", "_conformal.py"
+    os.path.dirname(os.path.dirname(__file__)), "jammi", "_conformal.py"
 )
-_spec = importlib.util.spec_from_file_location("jammi_client._conformal", _MODULE_PATH)
+_spec = importlib.util.spec_from_file_location("jammi._conformal", _MODULE_PATH)
 conformal = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(conformal)
 

@@ -12,7 +12,7 @@ is honest, so an existing ``except`` clause keeps working: a bad argument IS a
 ``ValueError``; a transport or training failure IS a ``RuntimeError``. The extra
 base is never a compatibility shim — it states what kind of error each class is.
 
-This module is public (``jammi_client.errors``) because a consumer catches these
+This module is public (``jammi.errors``) because a consumer catches these
 types by name, and because the native engine imports them from here — the arrow
 points one way, native → client, never the reverse.
 """
@@ -43,7 +43,7 @@ class NotSupportedOnBackend(JammiError):
     this typed error rather than a bare ``AttributeError``, and
     :meth:`Session.supports` answers the same question before the call.
 
-    Constructed one of two ways: with the :class:`~jammi_client.Capability` a
+    Constructed one of two ways: with the :class:`~jammi.Capability` a
     caller invoked on the wrong backend (the local, capability-shaped case), or
     with a server ``UNIMPLEMENTED`` detail string (a verb the remote deployment
     did not mount). ``capability`` is the enum member in the first case, ``None``
@@ -66,13 +66,13 @@ class NotSupportedOnBackend(JammiError):
 class NoEmbeddedEngineError(NotSupportedOnBackend):
     """A `file://` (local) target was opened on a build with no embedded engine.
 
-    `jammi-client` is the base client; it discovers the compiled engine as an
+    `jammi-ai` is the base client; it discovers the compiled engine as an
     optional in-process backend but does not carry it by default. Absent the
-    `jammi-client[embedded]` extra (which pulls `jammi-ai-native`, importable as
+    `jammi-ai[embedded]` extra (which pulls `jammi-ai-native`, importable as
     `jammi_native`), it cannot run a target in-process — a local target is a
     capability this build does not carry (hence a :class:`NotSupportedOnBackend`).
-    Install the extra — `pip install jammi-client[embedded]` — and the SAME
-    `jammi_client.connect` resolves both local and remote.
+    Install the extra — `pip install jammi-ai[embedded]` — and the SAME
+    `jammi.connect` resolves both local and remote.
     """
 
     def __init__(self, artifact_dir: str) -> None:
@@ -81,7 +81,7 @@ class NoEmbeddedEngineError(NotSupportedOnBackend):
         JammiError.__init__(
             self,
             f"no embedded engine in this build: cannot open the local target "
-            f"{artifact_dir!r} — `pip install jammi-client[embedded]` for the "
+            f"{artifact_dir!r} — `pip install jammi-ai[embedded]` for the "
             f"in-process engine, or point connect() at a remote https:// / grpc:// "
             f"target.",
         )

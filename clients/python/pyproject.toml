@@ -3,9 +3,9 @@ requires = ["hatchling>=1.18"]
 build-backend = "hatchling.build"
 
 [project]
-name = "jammi-client"
+name = "jammi-ai"
 version = "0.33.0"
-description = "Pure-Python gRPC client for a remote Jammi engine — the deploy half of jammi-ai"
+description = "The Python client for a Jammi engine (import `jammi`) — one connect() for local (embedded) and remote targets"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
@@ -41,9 +41,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The in-process engine, opt-in. `pip install jammi-client[embedded]` pulls the
+# The in-process engine, opt-in. `pip install jammi-ai[embedded]` pulls the
 # compiled `jammi-ai-native` dist (importable as `jammi_native`); with it,
-# `jammi_client.connect("file://…")` resolves the local target to an
+# `jammi.connect("file://…")` resolves the local target to an
 # `EmbeddedBackend` (direct FFI). Without it, the base client is native-free and
 # a `file://` target raises `NoEmbeddedEngineError`. The `==` pin is lockstep
 # (K6): the client and the engine ship at one workspace version, and the
@@ -74,7 +74,7 @@ Repository = "https://github.com/f-inverse/jammi-ai"
 "Bug Tracker" = "https://github.com/f-inverse/jammi-ai/issues"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["jammi_client"]
+only-include = ["jammi"]
 # Sdist is excluded; we ship the universal py3-none-any wheel only.
 
 [tool.hatch.build.targets.sdist]

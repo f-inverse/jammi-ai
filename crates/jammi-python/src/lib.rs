@@ -16,7 +16,7 @@ use crate::job::PyTrainingJob;
 use crate::model_task::PyModelTask;
 
 /// The `_NativeDatabase` pyclass: the low-level embedded engine handle. The
-/// user-facing `Database` is the thin Python wrapper (`jammi_ai/_database.py`)
+/// user-facing surface is the thin Python wrapper (`jammi._embedded.EmbeddedBackend`)
 /// that holds one of these. Re-exported so native Rust consumers (such as
 /// downstream crates that layer their own bindings on top of this one) can
 /// hold and drive the same instance the Python interpreter sees, and call
@@ -27,14 +27,14 @@ pub use crate::database::PyDatabase;
 /// consumers need to name this to receive the `Arc<InferenceSession>`
 /// returned by [`PyDatabase::session_arc`] and share schema-upgrade lock,
 /// trigger broker, catalog cache, and tenant binding with the OSS
-/// `jammi_ai.Database`.
+/// `jammi.EmbeddedBackend`.
 pub use jammi_ai::session::InferenceSession;
 
 /// Module entry point for the top-level `jammi_native` extension module.
 ///
 /// `jammi_native` exposes only the LOCAL, in-process engine. There is no remote
 /// transport here: the embed wheel links no tonic/proto, and its remote arm is
-/// the bundled pure-Python `jammi-client`, dispatched in `jammi_ai/__init__.py`.
+/// the bundled pure-Python `jammi`, dispatched in `jammi/__init__.py`.
 /// This is the runtime shape of the Rust build's `#[cfg(feature = "local")]`
 /// gate — the wheel cannot even name a remote transport.
 #[pymodule]
@@ -52,9 +52,9 @@ fn jammi_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 /// Open the embedded, in-process engine and return a [`PyDatabase`].
 ///
-/// The local arm of the unified `connect(target)` — `jammi_ai.connect` calls
-/// this for a `file://` target and delegates a remote target to the bundled
-/// `jammi-client`. All parameters are optional keyword-only arguments that
+/// The local arm of the unified `connect(target)` — `jammi.connect` calls
+/// this for a `file://` target and delegates a remote target to the pure-Python
+/// `jammi` remote client. All parameters are optional keyword-only arguments that
 /// override the default or file-based configuration.
 #[pyfunction]
 #[pyo3(signature = (*, config=None, artifact_dir=None, gpu_device=None, inference_batch_size=None))]

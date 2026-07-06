@@ -13,8 +13,8 @@ assembly layer, so it is exercised directly with no transport.
 
 from __future__ import annotations
 
-from jammi_client import RemoteDatabase
-from jammi_client._assembly import build_fine_tune_config
+from jammi import RemoteDatabase
+from jammi._assembly import build_fine_tune_config
 
 # All-`None` kwargs: the empty config a caller builds when nothing is set.
 _UNSET = dict(

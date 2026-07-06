@@ -636,7 +636,7 @@ class RemoteTrainingJob:
     that blocks until a terminal state and raises on failure with the wire error.
     `model_id` is the deterministic output id `StartTraining` returned at submit
     time; `wait()` polls `TrainingStatus` and, on ``failed``, raises
-    :class:`jammi_client.TrainingError` carrying the worker's error message —
+    :class:`jammi.TrainingError` carrying the worker's error message —
     mirroring the embedded `TrainingJob.wait`.
     """
 
@@ -687,7 +687,7 @@ class RemoteTrainingJob:
         """Block until the job reaches a terminal state; raise on failure.
 
         Polls `TrainingStatus` until ``completed`` (returns) or ``failed`` (raises
-        :class:`jammi_client.TrainingError` with the wire error message) — the
+        :class:`jammi.TrainingError` with the wire error message) — the
         remote peer of the embedded `TrainingJob.wait`.
         """
         while True:

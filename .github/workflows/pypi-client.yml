@@ -1,12 +1,16 @@
-name: PyPI (jammi-client)
+name: PyPI (jammi-ai)
 
-# Publishes the pure-Python `jammi-client` to PyPI on a `py-v*` tag — the SAME
-# tag that publishes the `jammi-ai` embed wheel (pypi.yml). The two ship in
-# LOCKSTEP at one version so `jammi-ai`'s `dependencies = ["jammi-client==X"]`
-# always resolves to a published client. Uses PyPI Trusted Publishing (OIDC) —
-# no API token; the repo/workflow/environment is registered as a trusted
-# publisher (a "pending publisher" for the first release of the new
-# `jammi-client` project name) on pypi.org under the `pypi` environment.
+# Publishes the pure-Python base client `jammi-ai` (import `jammi`), built from
+# `clients/python`, to PyPI on a `py-v*` tag — the SAME tag that publishes the
+# `jammi-ai-native` engine wheels (pypi.yml). The two ship in LOCKSTEP at one
+# version so `jammi-ai`'s `[embedded]` extra (`jammi-ai-native==X`) always
+# resolves. Uses PyPI Trusted Publishing (OIDC) — no API token.
+#
+# NOTE (release-time, EXTERNAL — do not act in CI): the `jammi-ai` PyPI project's
+# Trusted-Publisher config must authorize THIS workflow (`pypi-client.yml`), which
+# builds the `jammi-ai` dist from `clients/python`. Confirm the re-point before the
+# first `py-v*` publish. CI only BUILDS the wheel; it does not publish on a PR, so
+# this is not a merge blocker.
 
 on:
   push:

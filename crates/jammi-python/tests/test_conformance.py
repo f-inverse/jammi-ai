@@ -1,14 +1,14 @@
-"""Conformance: the embed wheel's remote arm IS `jammi-client`, by construction.
+"""Conformance: the embed wheel's remote arm IS `jammi-ai`, by construction.
 
 The whole point of the composition (M2 §2) is that the remote surface is
-DEFINED ONCE — in `jammi-client` — and `jammi-ai`'s remote target delegates to
+DEFINED ONCE — in `jammi-ai` — and `jammi-ai`'s remote target delegates to
 it. So these tests assert the construction holds rather than re-listing a
 parallel surface that could drift:
 
-  1. `jammi_ai.connect(remote)` returns a `jammi_client.RemoteDatabase` — the
+  1. `jammi.connect(remote)` returns a `jammi.RemoteDatabase` — the
      embed wheel's remote-capable surface IS the client's, not a copy.
   2. `connect(target)` routes by scheme: `file://` → the compiled local engine
-     (`jammi_ai.Database`); `https://`/`grpc://` → the client's
+     (`jammi.EmbeddedBackend`); `https://`/`grpc://` → the client's
      `RemoteDatabase`.
   3. The pure client, asked for a `file://` local target, raises the truthful
      no-embedded-engine error (the runtime echo of the Rust `#[cfg]` gate).
@@ -27,14 +27,13 @@ import inspect
 import grpc
 import pytest
 
-import jammi_ai
-import jammi_client
+import jammi
 import jammi_native
 
 
 def _embed_method(verb: str):
     """Resolve `verb` against the COMPOSED embedded surface: the thin Python
-    `jammi_ai.Database`'s explicit method if it declares one, else the
+    `jammi.EmbeddedBackend`'s explicit method if it declares one, else the
     `_NativeDatabase` low-level handle's method it delegates to via
     ``__getattr__``.
 
@@ -45,51 +44,51 @@ def _embed_method(verb: str):
     introspection (which is what the conformance guard does) must look through the
     same composition — wrapper first, native handle behind it — to see the verb a
     caller actually invokes."""
-    if verb in vars(jammi_ai.Database):
-        return getattr(jammi_ai.Database, verb)
+    if verb in vars(jammi.EmbeddedBackend):
+        return getattr(jammi.EmbeddedBackend, verb)
     return getattr(jammi_native._NativeDatabase, verb)
 
 
 def _embed_has(verb: str) -> bool:
     """Whether the composed embedded surface carries `verb` — declared on the thin
     `Database` wrapper or on the `_NativeDatabase` handle behind it."""
-    return verb in vars(jammi_ai.Database) or hasattr(
+    return verb in vars(jammi.EmbeddedBackend) or hasattr(
         jammi_native._NativeDatabase, verb
     )
 
 
 def test_embed_remote_is_the_client_remote_database():
-    """`jammi_ai.connect(remote)` returns the client's `RemoteDatabase` — the
-    remote arm is defined once, in `jammi-client`, and reused by composition."""
-    db = jammi_ai.connect("grpc://127.0.0.1:8081")
+    """`jammi.connect(remote)` returns the client's `RemoteDatabase` — the
+    remote arm is defined once, in `jammi-ai`, and reused by composition."""
+    db = jammi.connect("grpc://127.0.0.1:8081")
     try:
-        assert isinstance(db, jammi_client.RemoteDatabase)
+        assert isinstance(db, jammi.RemoteDatabase)
     finally:
         db.close()
 
 
 def test_connect_routes_local_to_the_compiled_engine(tmp_path):
     """A `file://` target resolves to the in-process engine — a
-    `jammi_ai.Database`, never the remote client."""
-    db = jammi_ai.connect(f"file://{tmp_path}")
-    assert isinstance(db, jammi_ai.Database)
-    assert not isinstance(db, jammi_client.RemoteDatabase)
+    `jammi.EmbeddedBackend`, never the remote client."""
+    db = jammi.connect(f"file://{tmp_path}")
+    assert isinstance(db, jammi.EmbeddedBackend)
+    assert not isinstance(db, jammi.RemoteDatabase)
 
 
 def test_base_client_resolves_the_engine_when_the_extra_is_present():
     """U2: with the `[embedded]` extra installed (this lane carries `jammi_native`),
     the BASE client's `file://` front door resolves to the in-process engine — the
-    base discovers the native backend on its own, no `jammi_ai` needed.
+    base discovers the native backend on its own.
 
     The truthful no-engine ERROR (the extra ABSENT) is pinned where it is real, in
     the client-only lane `clients/python/tests/test_target.py` — that lane installs
-    `jammi-client` without the extra, so its `file://` raises; here, with the
+    `jammi-ai` without the extra, so its `file://` raises; here, with the
     engine present, the same call resolves it instead of raising."""
     import tempfile
 
-    db = jammi_client.connect(f"file://{tempfile.mkdtemp()}")
-    assert isinstance(db, jammi_client.EmbeddedBackend)
-    assert isinstance(db, jammi_client.Session)
+    db = jammi.connect(f"file://{tempfile.mkdtemp()}")
+    assert isinstance(db, jammi.EmbeddedBackend)
+    assert isinstance(db, jammi.Session)
 
 
 # The remote verb vocabulary both wheels speak. These are the Stage-1 embedding
@@ -115,7 +114,7 @@ _REMOTE_VERBS = {
 # The embedded `Database` submits/serves in the compiled engine; the client's
 # `RemoteDatabase` submits/serves over gRPC. The call surface must agree so a
 # caller swaps transports without changing the call — pinned here against the
-# embed `jammi_ai.Database`.
+# embed `jammi.EmbeddedBackend`.
 _TRAINING_VERBS = {
     "fine_tune",
     "fine_tune_graph",
@@ -130,7 +129,7 @@ _TRAINING_VERBS = {
 # embedded `Database` runs it in the compiled engine; the client's
 # `RemoteDatabase` drives it over gRPC. The call surface must agree so a caller
 # swaps transports without changing the call — pinned here against the embed
-# `jammi_ai.Database`.
+# `jammi.EmbeddedBackend`.
 _INFERENCE_VERBS = {
     "infer",
 }
@@ -142,7 +141,7 @@ _INFERENCE_VERBS = {
 # The embedded `Database` runs them in the compiled engine; the client's
 # `RemoteDatabase` drives them over gRPC. The call surface must agree so a
 # caller swaps transports without changing the call — pinned here against the
-# embed `jammi_ai.Database`.
+# embed `jammi.EmbeddedBackend`.
 _PIPELINE_VERBS = {
     "build_neighbor_graph",
     "propagate_embeddings",
@@ -161,7 +160,7 @@ _PIPELINE_VERBS = {
 # `Database` runs them in the compiled engine; the client's `RemoteDatabase`
 # drives them over gRPC. The call surface must agree so a caller swaps
 # transports without changing the call — pinned here against the embed
-# `jammi_ai.Database`.
+# `jammi.EmbeddedBackend`.
 _EVAL_VERBS = {
     "eval_embeddings",
     "eval_per_query",
@@ -177,7 +176,7 @@ _EVAL_VERBS = {
 # compiled engine's catalog; the client's `RemoteDatabase` drives them over
 # gRPC. The catalog is tenant-scoped, so both honour the session's bound tenant.
 # The call surface must agree so a caller swaps transports without changing the
-# call — pinned here against the embed `jammi_ai.Database`.
+# call — pinned here against the embed `jammi.EmbeddedBackend`.
 _CHANNEL_VERBS = {
     "register_channel",
     "add_channel_columns",
@@ -205,7 +204,7 @@ _NUMERIC_VERBS = {
 # data-plane (`TriggerService`). The embedded `Database` registers/publishes in
 # the compiled engine; the client's `RemoteDatabase` drives them over gRPC. The
 # call surface must agree so a caller swaps transports without changing the call —
-# pinned here against the embed `jammi_ai.Database`. `subscribe_collect` mirrors
+# pinned here against the embed `jammi.EmbeddedBackend`. `subscribe_collect` mirrors
 # the embedded replay+live-tail collect (bounded by `max_batches`), not a
 # replay-only drain.
 _MUTABLE_TOPIC_VERBS = {
@@ -226,7 +225,7 @@ _MUTABLE_TOPIC_VERBS = {
 # catalog; the client's `RemoteDatabase` drives them over gRPC. The catalog is
 # tenant-scoped, so both honour the session's bound tenant. The call surface must
 # agree so a caller swaps transports without changing the call — pinned here
-# against the embed `jammi_ai.Database`.
+# against the embed `jammi.EmbeddedBackend`.
 _LIFECYCLE_VERBS = {
     "list_models",
     "describe_model",
@@ -248,17 +247,17 @@ def test_remote_surface_has_every_verb():
         | _MUTABLE_TOPIC_VERBS
         | _LIFECYCLE_VERBS
     ):
-        assert callable(getattr(jammi_client.RemoteDatabase, verb)), verb
+        assert callable(getattr(jammi.RemoteDatabase, verb)), verb
 
 
 def test_lifecycle_verbs_have_identical_signatures_across_wheels():
     """The model-lifecycle verbs carry the SAME call surface on the client's
-    `RemoteDatabase` as on the embedded engine's `jammi_ai.Database`. Both drive
+    `RemoteDatabase` as on the embedded engine's `jammi.EmbeddedBackend`. Both drive
     over the same verb vocabulary (the client over gRPC, the embed in-process), so
     a caller swaps transports without changing the call — pinned name-for-name,
     kind-for-kind, and default-for-default so a divergence in either is caught."""
     for verb in _LIFECYCLE_VERBS:
-        client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
+        client = _call_surface(getattr(jammi.RemoteDatabase, verb))
         embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
 
@@ -278,7 +277,7 @@ def test_model_projection_is_minimal_and_leaks_no_internal_fields():
     to the projection (the leak the `ModelDescriptor` split prevents) fails here.
 
     Hermetic: reads the generated proto descriptor, never dialing a server."""
-    from jammi_client._generated.jammi.v1 import catalog_pb2
+    from jammi._generated.jammi.v1 import catalog_pb2
 
     proto_fields = {f.name for f in catalog_pb2.Model.DESCRIPTOR.fields}
     assert proto_fields == _MODEL_DICT_KEYS, (
@@ -294,7 +293,7 @@ def test_embed_list_models_returns_the_projection_shape(tmp_path):
     the key contract via the shared assertion.
 
     Hermetic: opens a local engine (`file://`), contacts no server."""
-    db = jammi_ai.connect(f"file://{tmp_path}")
+    db = jammi.connect(f"file://{tmp_path}")
     models = db.list_models()
     assert isinstance(models, list)
     for m in models:
@@ -305,49 +304,49 @@ def test_embed_list_models_returns_the_projection_shape(tmp_path):
 
 def test_mutable_topic_verbs_have_identical_signatures_across_wheels():
     """The mutable-table + topic + pub/sub verbs carry the SAME call surface on the
-    client's `RemoteDatabase` as on the embedded engine's `jammi_ai.Database`. Both
+    client's `RemoteDatabase` as on the embedded engine's `jammi.EmbeddedBackend`. Both
     drive over the same verb vocabulary (the client over gRPC, the embed
     in-process), so a caller swaps transports without changing the call — pinned
     name-for-name, kind-for-kind, and default-for-default so a divergence in either
     is caught."""
     for verb in _MUTABLE_TOPIC_VERBS:
-        client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
+        client = _call_surface(getattr(jammi.RemoteDatabase, verb))
         embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
 
 
 def test_inference_verbs_have_identical_signatures_across_wheels():
     """The bulk inference verb carries the SAME call surface on the client's
-    `RemoteDatabase` as on the embedded engine's `jammi_ai.Database`. Both drive
+    `RemoteDatabase` as on the embedded engine's `jammi.EmbeddedBackend`. Both drive
     over the same verb vocabulary (the client over gRPC, the embed in-process), so
     a caller swaps transports without changing the call — pinned name-for-name,
     kind-for-kind, and default-for-default so a divergence in either is caught."""
     for verb in _INFERENCE_VERBS:
-        client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
+        client = _call_surface(getattr(jammi.RemoteDatabase, verb))
         embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
 
 
 def test_pipeline_verbs_have_identical_signatures_across_wheels():
     """The engine-state pipeline verbs carry the SAME call surface on the client's
-    `RemoteDatabase` as on the embedded engine's `jammi_ai.Database`. Both drive
+    `RemoteDatabase` as on the embedded engine's `jammi.EmbeddedBackend`. Both drive
     over the same verb vocabulary (the client over gRPC, the embed in-process), so
     a caller swaps transports without changing the call — pinned name-for-name,
     kind-for-kind, and default-for-default so a divergence in either is caught."""
     for verb in _PIPELINE_VERBS:
-        client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
+        client = _call_surface(getattr(jammi.RemoteDatabase, verb))
         embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
 
 
 def test_eval_verbs_have_identical_signatures_across_wheels():
     """The evaluation verbs carry the SAME call surface on the client's
-    `RemoteDatabase` as on the embedded engine's `jammi_ai.Database`. Both drive
+    `RemoteDatabase` as on the embedded engine's `jammi.EmbeddedBackend`. Both drive
     over the same verb vocabulary (the client over gRPC, the embed in-process), so
     a caller swaps transports without changing the call — pinned name-for-name,
     kind-for-kind, and default-for-default so a divergence in either is caught."""
     for verb in _EVAL_VERBS:
-        client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
+        client = _call_surface(getattr(jammi.RemoteDatabase, verb))
         embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
 
@@ -359,7 +358,7 @@ def test_eval_verbs_have_identical_signatures_across_wheels():
 # drives it over gRPC. The call surface — including the `embedding_table=`
 # selector that names WHICH of a source's embedding tables to search — must
 # agree so a caller swaps transports without changing the call. Pinned against
-# the embed `jammi_ai.Database`.
+# the embed `jammi.EmbeddedBackend`.
 _SEARCH_VERBS = {
     "search",
 }
@@ -367,13 +366,13 @@ _SEARCH_VERBS = {
 
 def test_search_verb_has_identical_signature_across_wheels():
     """`search` carries the SAME call surface on the client's `RemoteDatabase`
-    as on the embedded engine's `jammi_ai.Database` — including the
+    as on the embedded engine's `jammi.EmbeddedBackend` — including the
     `embedding_table=` table selector. Both drive over the same verb vocabulary
     (the client over gRPC, the embed in-process), so a caller swaps transports
     without changing the call — pinned name-for-name, kind-for-kind, and
     default-for-default so a divergence in either is caught."""
     for verb in _SEARCH_VERBS:
-        client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
+        client = _call_surface(getattr(jammi.RemoteDatabase, verb))
         embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
         names = {p[0] for p in embed}
@@ -382,25 +381,25 @@ def test_search_verb_has_identical_signature_across_wheels():
 
 def test_channel_verbs_have_identical_signatures_across_wheels():
     """The evidence-channel registry verbs carry the SAME call surface on the
-    client's `RemoteDatabase` as on the embedded engine's `jammi_ai.Database`.
+    client's `RemoteDatabase` as on the embedded engine's `jammi.EmbeddedBackend`.
     Both drive over the same verb vocabulary (the client over gRPC, the embed
     in-process), so a caller swaps transports without changing the call — pinned
     name-for-name, kind-for-kind, and default-for-default so a divergence in
     either is caught."""
     for verb in _CHANNEL_VERBS:
-        client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
+        client = _call_surface(getattr(jammi.RemoteDatabase, verb))
         embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
 
 
 def test_training_verbs_have_identical_signatures_across_wheels():
     """The training + predict verbs carry the SAME call surface on the client's
-    `RemoteDatabase` as on the embedded engine's `jammi_ai.Database`. Both submit
+    `RemoteDatabase` as on the embedded engine's `jammi.EmbeddedBackend`. Both submit
     over the same verb vocabulary (the client over gRPC, the embed in-process), so
     a caller swaps transports without changing the call — pinned name-for-name,
     kind-for-kind, and default-for-default so a divergence in either is caught."""
     for verb in _TRAINING_VERBS:
-        client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
+        client = _call_surface(getattr(jammi.RemoteDatabase, verb))
         embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
 
@@ -411,8 +410,8 @@ def test_remote_training_job_matches_the_local_handle_shape():
     `status()` / `wait()` methods. A remote `wait()` polls `TrainingStatus` and
     raises on a failed job with the wire error, mirroring the local handle, so a
     caller treats the two interchangeably."""
-    local = jammi_ai.TrainingJob
-    remote = jammi_client.RemoteTrainingJob
+    local = jammi_native.TrainingJob
+    remote = jammi.RemoteTrainingJob
     for member in ("job_id", "model_id", "status", "wait"):
         assert hasattr(remote, member), member
         assert hasattr(local, member), member
@@ -440,12 +439,12 @@ def _call_surface(fn) -> list:
 
 def test_numeric_verbs_have_identical_signatures_across_wheels():
     """The conformal / RRF numerics carry the SAME call surface on the client's
-    `RemoteDatabase` as on the embedded engine's `jammi_ai.Database`. They are
+    `RemoteDatabase` as on the embedded engine's `jammi.EmbeddedBackend`. They are
     computed locally on both wheels (no wire hop), so the verb surface must agree
     name-for-name, kind-for-kind, and default-for-default — pinned here so a
     divergence in either implementation is caught."""
     for verb in _NUMERIC_VERBS:
-        client = _call_surface(getattr(jammi_client.RemoteDatabase, verb))
+        client = _call_surface(getattr(jammi.RemoteDatabase, verb))
         embed = _call_surface(_embed_method(verb))
         assert client == embed, f"{verb}: {embed} != {client}"
 
@@ -459,10 +458,10 @@ def test_numeric_verbs_compute_identically_across_wheels(tmp_path):
 
     Hermetic: the embedded side opens a local engine (`file://`); the client side
     runs entirely in process. No server is contacted by either."""
-    local = jammi_ai.connect(f"file://{tmp_path}")
-    remote = jammi_ai.connect("grpc://127.0.0.1:8081")
+    local = jammi.connect(f"file://{tmp_path}")
+    remote = jammi.connect("grpc://127.0.0.1:8081")
     try:
-        assert type(remote) is jammi_client.RemoteDatabase
+        assert type(remote) is jammi.RemoteDatabase
 
         # Classification: one row per family, shared calibration / test fixtures.
         calibration = [
@@ -522,15 +521,15 @@ def test_numeric_verbs_compute_identically_across_wheels(tmp_path):
 
 
 def test_embed_remote_and_client_share_identical_signatures():
-    """Because the embed wheel's remote arm IS `jammi_client.RemoteDatabase`,
+    """Because the embed wheel's remote arm IS `jammi.RemoteDatabase`,
     every verb's signature is identical by construction. Asserting it here pins
     the invariant so any future hand-rolled remote class in the embed wheel
     (which would re-introduce the very drift M2 removes) fails this test."""
-    embed_remote = jammi_ai.connect("grpc://127.0.0.1:8081")
+    embed_remote = jammi.connect("grpc://127.0.0.1:8081")
     try:
-        assert type(embed_remote) is jammi_client.RemoteDatabase
+        assert type(embed_remote) is jammi.RemoteDatabase
         for verb in _REMOTE_VERBS:
-            client_sig = inspect.signature(getattr(jammi_client.RemoteDatabase, verb))
+            client_sig = inspect.signature(getattr(jammi.RemoteDatabase, verb))
             embed_sig = inspect.signature(getattr(type(embed_remote), verb))
             assert client_sig == embed_sig, f"{verb}: {embed_sig} != {client_sig}"
     finally:
@@ -564,15 +563,15 @@ def test_tenant_surface_agrees_across_wheels():
     changing the call, and neither surface carries the footgun."""
     for verb in ("set_tenant", "tenant_scope", "tenant"):
         assert callable(_embed_method(verb)), verb
-        assert callable(getattr(jammi_client.RemoteDatabase, verb)), verb
+        assert callable(getattr(jammi.RemoteDatabase, verb)), verb
     assert not _embed_has("with_tenant"), "with_tenant must be hard-cut"
     assert not hasattr(
-        jammi_client.RemoteDatabase, "with_tenant"
+        jammi.RemoteDatabase, "with_tenant"
     ), "with_tenant must be hard-cut"
     # `tenant_scope(tenant_id)` takes the same caller-visible parameter on both —
     # the embedded native method and the client context manager agree name-for-name.
     embed = _call_surface(_embed_method("tenant_scope"))
-    client = _call_surface(jammi_client.RemoteDatabase.tenant_scope)
+    client = _call_surface(jammi.RemoteDatabase.tenant_scope)
     assert embed == client, f"tenant_scope: {embed} != {client}"
 
 
@@ -588,11 +587,11 @@ def test_get_server_info_shape_agrees_across_transports(tmp_path):
     Hermetic: the embedded side opens a real local engine; the remote side reads
     the generated proto descriptor, never dialing a server.
     """
-    from jammi_client._generated.jammi.v1 import catalog_pb2
+    from jammi._generated.jammi.v1 import catalog_pb2
 
     proto_fields = {f.name for f in catalog_pb2.ServerInfo.DESCRIPTOR.fields}
 
-    embedded = jammi_ai.connect(f"file://{tmp_path}").get_server_info()
+    embedded = jammi.connect(f"file://{tmp_path}").get_server_info()
     assert set(embedded) == proto_fields, (
         f"embedded get_server_info keys {set(embedded)} != proto ServerInfo "
         f"fields {proto_fields}"
@@ -608,7 +607,7 @@ def test_get_server_info_shape_agrees_across_transports(tmp_path):
 
 
 def _client_server_info_keys() -> set:
-    """The key set `jammi_client.RemoteDatabase.get_server_info` returns, read
+    """The key set `jammi.RemoteDatabase.get_server_info` returns, read
     off a stub response so the assertion sees what the method actually builds —
     no server contact."""
 
@@ -622,7 +621,7 @@ def _client_server_info_keys() -> set:
         def GetServerInfo(self, *_a, **_k):
             return _StubServerInfo()
 
-    db = jammi_client.connect("grpc://127.0.0.1:8081")
+    db = jammi.connect("grpc://127.0.0.1:8081")
     try:
         db._catalog = _StubCatalog()
         return set(db.get_server_info())
@@ -649,13 +648,13 @@ def _client_server_info_keys() -> set:
 
 def test_both_backends_satisfy_the_session_protocol(tmp_path):
     """The embedded `Database` and the remote `RemoteDatabase` both structurally
-    satisfy `jammi_client.Session` — the transport-agnostic surface `connect`
+    satisfy `jammi.Session` — the transport-agnostic surface `connect`
     returns is one protocol, not two parallel classes that might drift."""
-    embed = jammi_ai.connect(f"file://{tmp_path}")
-    remote = jammi_client.connect("grpc://127.0.0.1:8081")
+    embed = jammi.connect(f"file://{tmp_path}")
+    remote = jammi.connect("grpc://127.0.0.1:8081")
     try:
-        assert isinstance(embed, jammi_client.Session)
-        assert isinstance(remote, jammi_client.Session)
+        assert isinstance(embed, jammi.Session)
+        assert isinstance(remote, jammi.Session)
     finally:
         remote.close()
 
@@ -673,15 +672,15 @@ def test_connect_file_with_credentials_raises_no_embedded_engine_on_both_front_d
     (The extra-ABSENT `file://` error — no credentials — is a build-time condition
     pinned in the client-only lane, `clients/python/tests/test_target.py`.)"""
     assert issubclass(
-        jammi_client.NoEmbeddedEngineError, jammi_client.NotSupportedOnBackend
+        jammi.NoEmbeddedEngineError, jammi.NotSupportedOnBackend
     )
-    assert issubclass(jammi_client.NotSupportedOnBackend, jammi_client.JammiError)
+    assert issubclass(jammi.NotSupportedOnBackend, jammi.JammiError)
 
-    bearer = jammi_client.BearerCredentials(token="tok")
-    with pytest.raises(jammi_client.NoEmbeddedEngineError):
-        jammi_client.connect(f"file://{tmp_path}", credentials=bearer)
-    with pytest.raises(jammi_client.NoEmbeddedEngineError):
-        jammi_ai.connect(f"file://{tmp_path}", credentials=bearer)
+    bearer = jammi.BearerCredentials(token="tok")
+    with pytest.raises(jammi.NoEmbeddedEngineError):
+        jammi.connect(f"file://{tmp_path}", credentials=bearer)
+    with pytest.raises(jammi.NoEmbeddedEngineError):
+        jammi.connect(f"file://{tmp_path}", credentials=bearer)
 
 
 def test_bad_format_add_source_raises_invalid_argument_on_both_backends(tmp_path):
@@ -689,24 +688,24 @@ def test_bad_format_add_source_raises_invalid_argument_on_both_backends(tmp_path
     transports: the remote client rejects it client-side, the embedded engine at
     its `parse_file_format` seam. Hermetic: the format is rejected before any I/O.
     `InvalidArgument` refines `ValueError`, so an `except ValueError` still fires."""
-    assert issubclass(jammi_client.InvalidArgument, jammi_client.JammiError)
-    assert issubclass(jammi_client.InvalidArgument, ValueError)
+    assert issubclass(jammi.InvalidArgument, jammi.JammiError)
+    assert issubclass(jammi.InvalidArgument, ValueError)
 
-    remote = jammi_client.connect("grpc://127.0.0.1:8081")
+    remote = jammi.connect("grpc://127.0.0.1:8081")
     try:
-        with pytest.raises(jammi_client.InvalidArgument):
+        with pytest.raises(jammi.InvalidArgument):
             remote.add_source("s", url="/tmp/x.parquet", format="bogus")
     finally:
         remote.close()
 
-    embed = jammi_ai.connect(f"file://{tmp_path}")
-    with pytest.raises(jammi_client.InvalidArgument):
+    embed = jammi.connect(f"file://{tmp_path}")
+    with pytest.raises(jammi.InvalidArgument):
         embed.add_source("s", url="/tmp/x.parquet", format="bogus")
 
 
 def test_failed_training_wait_raises_training_error_on_both_raise_sites():
     """Tier B (converter-level) — a failed training `wait()` maps to ONE class,
-    `jammi_client.errors.TrainingError`, on both transports.
+    `jammi.errors.TrainingError`, on both transports.
 
     Converter-level on the embedded arm BY NECESSITY: a failed embedded job needs
     the training worker to run and fail, which is not hermetic (it would pull a
@@ -716,53 +715,53 @@ def test_failed_training_wait_raises_training_error_on_both_raise_sites():
         `failed` makes `RemoteTrainingJob.wait()` raise, asserted to `TrainingError`;
       * the EMBEDDED raise-site (`job.rs` failed `wait()` → `to_pyerr`'s
         `JammiError::FineTune` → `TrainingError` variant-dispatch) is wired to the
-        SAME class object: the native engine imports `jammi_client.errors` and
+        SAME class object: the native engine imports `jammi.errors` and
         raises `TrainingError` from there, so the class both produce is one and the
         same. The seam is named here, not silently skipped."""
-    from jammi_client._generated.jammi.v1 import training_pb2
+    from jammi._generated.jammi.v1 import training_pb2
 
     class _FailedTrainingStub:
         def TrainingStatus(self, *_args, **_kwargs):
             return training_pb2.TrainingStatusResponse(status="failed", error="boom")
 
-    job = jammi_client.RemoteTrainingJob(
+    job = jammi.RemoteTrainingJob(
         _FailedTrainingStub(), (), job_id="job-1", model_id="model-1"
     )
-    with pytest.raises(jammi_client.TrainingError) as info:
+    with pytest.raises(jammi.TrainingError) as info:
         job.wait()
-    assert type(info.value) is jammi_client.TrainingError
+    assert type(info.value) is jammi.TrainingError
     assert "boom" in str(info.value)
 
     # Both raise-sites bind to THIS class: a `JammiError` refining `RuntimeError`,
     # so one `except JammiError` / `except RuntimeError` catches a failed job on
     # either transport. The embedded `TrainingJob.wait` raises it by importing
-    # `jammi_client.errors.TrainingError` — the same object asserted above.
-    assert issubclass(jammi_client.TrainingError, jammi_client.JammiError)
-    assert issubclass(jammi_client.TrainingError, RuntimeError)
-    from jammi_client import errors as client_errors
+    # `jammi.errors.TrainingError` — the same object asserted above.
+    assert issubclass(jammi.TrainingError, jammi.JammiError)
+    assert issubclass(jammi.TrainingError, RuntimeError)
+    from jammi import errors as client_errors
 
-    assert client_errors.TrainingError is jammi_client.TrainingError
+    assert client_errors.TrainingError is jammi.TrainingError
 
 
 def test_training_job_handle_protocol_is_satisfied_by_both_handles():
-    """Both `jammi_ai.TrainingJob` (native) and `jammi_client.RemoteTrainingJob`
+    """Both `jammi_native.TrainingJob` (native) and `jammi.RemoteTrainingJob`
     satisfy the `TrainingJobHandle` protocol — a caller treats the two
     interchangeably. The remote handle is checked by `isinstance` on a
     stub-constructed instance; the native handle, which needs a live engine to
     instantiate, is checked structurally at the class level for the same members
     (no engine is opened here)."""
-    from jammi_client._generated.jammi.v1 import training_pb2
+    from jammi._generated.jammi.v1 import training_pb2
 
     class _CompletedStub:
         def TrainingStatus(self, *_args, **_kwargs):
             return training_pb2.TrainingStatusResponse(status="completed")
 
-    remote_job = jammi_client.RemoteTrainingJob(
+    remote_job = jammi.RemoteTrainingJob(
         _CompletedStub(), (), job_id="job-1", model_id="model-1"
     )
-    assert isinstance(remote_job, jammi_client.TrainingJobHandle)
+    assert isinstance(remote_job, jammi.TrainingJobHandle)
     for member in ("job_id", "model_id", "status", "wait"):
-        assert hasattr(jammi_ai.TrainingJob, member), member
+        assert hasattr(jammi_native.TrainingJob, member), member
 
 
 class _StubTenant:
@@ -798,19 +797,19 @@ def test_tenant_scope_yields_a_session_surface_on_both_backends(tmp_path):
     session_verbs = ("search", "sql", "add_source", "supports", "list_sources")
     valid_tenant = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a"
 
-    embed = jammi_ai.connect(f"file://{tmp_path}")
+    embed = jammi.connect(f"file://{tmp_path}")
     with embed.tenant_scope(valid_tenant) as scoped:
         assert scoped is embed
-        assert isinstance(scoped, jammi_client.Session)
+        assert isinstance(scoped, jammi.Session)
         for verb in session_verbs:
             assert callable(getattr(scoped, verb)), verb
 
-    remote = jammi_client.connect("grpc://127.0.0.1:8081")
+    remote = jammi.connect("grpc://127.0.0.1:8081")
     try:
         remote._catalog = _StubTenantCatalog()
         with remote.tenant_scope("tenant-x") as scoped:
             assert scoped is remote
-            assert isinstance(scoped, jammi_client.Session)
+            assert isinstance(scoped, jammi.Session)
             for verb in session_verbs:
                 assert callable(getattr(scoped, verb)), verb
     finally:
@@ -824,11 +823,11 @@ def test_supports_and_not_supported_on_backend_contract(tmp_path):
     carries the in-process primitives (audit / ephemeral / preload); the remote
     carries the transport lifecycle (close / session_id); each raises for the
     other's."""
-    from jammi_client import Capability
-    from jammi_client.errors import NotSupportedOnBackend
+    from jammi import Capability
+    from jammi.errors import NotSupportedOnBackend
 
-    embed = jammi_ai.connect(f"file://{tmp_path}")
-    remote = jammi_client.connect("grpc://127.0.0.1:8081")
+    embed = jammi.connect(f"file://{tmp_path}")
+    remote = jammi.connect("grpc://127.0.0.1:8081")
     try:
         assert embed.supports(Capability.AUDIT) is True
         assert embed.supports(Capability.EPHEMERAL_SESSION) is True
@@ -861,7 +860,7 @@ def test_capability_enum_is_the_closed_five():
     """The capability set is CLOSED — exactly the five one-sided features that
     diverge between the transports, no more. Pinned so a sixth is a deliberate
     decision, not a silent addition."""
-    from jammi_client import Capability
+    from jammi import Capability
 
     assert {c.value for c in Capability} == {
         "audit",
@@ -915,7 +914,7 @@ def test_remote_rpc_status_errors_map_onto_the_taxonomy():
 
     Hermetic: the stub raises, so no server is dialed; the verb still reaches the
     wire arm (``_call``), unlike a client-side pre-rejection."""
-    from jammi_client.errors import (
+    from jammi.errors import (
         BackendError,
         InvalidArgument,
         NotSupportedOnBackend,
@@ -930,13 +929,13 @@ def test_remote_rpc_status_errors_map_onto_the_taxonomy():
         (grpc.StatusCode.UNIMPLEMENTED, NotSupportedOnBackend),
     ]
     for code, expected in cases:
-        remote = jammi_client.connect("grpc://127.0.0.1:8081")
+        remote = jammi.connect("grpc://127.0.0.1:8081")
         try:
             remote._catalog = _RaisingStub(_FakeRpcError(code, f"server said {code}"))
             with pytest.raises(expected) as info:
                 remote.list_sources()  # a unary verb → routes through `_call`
             assert type(info.value) is expected, f"{code}: {type(info.value)}"
-            assert isinstance(info.value, jammi_client.JammiError)
+            assert isinstance(info.value, jammi.JammiError)
             assert getattr(info.value, "code", None) == code
         finally:
             remote.close()
@@ -948,14 +947,14 @@ def test_remote_not_found_semantics_survive_the_taxonomy_mapping():
     ``grpc.RpcError`` is now remapped to a ``JammiError`` first — the call-sites
     branch on the status code carried on the mapped exception's ``.code``."""
     not_found = _FakeRpcError(grpc.StatusCode.NOT_FOUND, "absent")
-    remote = jammi_client.connect("grpc://127.0.0.1:8081")
+    remote = jammi.connect("grpc://127.0.0.1:8081")
     try:
         remote._catalog = _RaisingStub(not_found)
         assert remote.describe_source("nope") is None
         assert remote.describe_model("nope") is None
         remote.drop_mutable_table("nope", if_exists=True)  # no raise
         # Without if_exists, the NOT_FOUND surfaces as a typed JammiError.
-        with pytest.raises(jammi_client.JammiError):
+        with pytest.raises(jammi.JammiError):
             remote.drop_mutable_table("nope", if_exists=False)
     finally:
         remote.close()
@@ -964,40 +963,39 @@ def test_remote_not_found_semantics_survive_the_taxonomy_mapping():
 # ---------------------------------------------------------------------------
 # The base client discovers the native engine as an in-process backend.
 #
-# `jammi_client` is the BASE (U2): `jammi_client.connect("file://…")` resolves
+# `jammi` is the BASE (U2): `jammi.connect("file://…")` resolves
 # the local target to an `EmbeddedBackend` (direct FFI) when `jammi_native` is
-# importable — WITHOUT going through the `jammi_ai` convenience bundle. These
-# tests pin that base front door and the lazy-native discipline (`import
-# jammi_client` stays native-free; the engine loads only when a `file://` target
-# is opened), the positive complement of the CI negative import-direction guard.
+# importable — discovering the native engine directly. These tests pin that base
+# front door and the lazy-native discipline (`import jammi` stays native-free;
+# the engine loads only when a `file://` target is opened), the positive
+# complement of the CI negative import-direction guard.
 # ---------------------------------------------------------------------------
 
 
 def test_client_connect_file_returns_embedded_session_via_the_base_front_door(tmp_path):
-    """`jammi_client.connect("file://…")` — the BASE front door, not `jammi_ai` —
-    returns an `EmbeddedBackend` that satisfies the `Session` protocol and runs a
-    verb in-process (direct FFI, B4). This is the U2 feature: the base client
+    """`jammi.connect("file://…")` — the BASE front door — returns an
+    `EmbeddedBackend` that satisfies the `Session` protocol and runs a verb
+    in-process (direct FFI, B4). This is the U2 feature: the base client
     discovers `jammi_native` as an in-process backend on its own.
 
     Hermetic: opens a local engine (`file://`), contacts no server."""
-    db = jammi_client.connect(f"file://{tmp_path}")
-    assert isinstance(db, jammi_client.EmbeddedBackend)
-    assert type(db).__module__ == "jammi_client._embedded"
-    assert isinstance(db, jammi_client.Session)
-    # It is the SAME object the convenience bundle re-exposes.
-    assert type(db) is jammi_ai.Database
+    db = jammi.connect(f"file://{tmp_path}")
+    assert isinstance(db, jammi.EmbeddedBackend)
+    assert type(db).__module__ == "jammi._embedded"
+    assert isinstance(db, jammi.Session)
+    assert type(db) is jammi.EmbeddedBackend
     # A verb runs in-process against the compiled engine (empty catalog → []).
     assert db.list_models() == []
 
 
-def test_import_jammi_client_is_native_free_then_lazily_loads_the_engine(tmp_path):
+def test_import_jammi_is_native_free_then_lazily_loads_the_engine(tmp_path):
     """Positive import-direction guard (the complement of the CI negative guard):
-    in a FRESH interpreter, `import jammi_client` loads NO `jammi_native` (the base
+    in a FRESH interpreter, `import jammi` loads NO `jammi_native` (the base
     package is native-free — the engine is imported lazily), and opening a
-    `file://` target THEN loads `jammi_native` while still pulling no `jammi_ai.*`
-    (the base discovers the engine without going through the convenience bundle).
+    `file://` target THEN loads `jammi_native` (the base discovers the engine
+    directly, on demand).
 
-    Run in a subprocess because THIS test process already imported `jammi_ai` /
+    Run in a subprocess because THIS test process already imported `jammi` /
     `jammi_native` at module load, so the clean import direction can only be
     observed in an interpreter that has not."""
     import subprocess
@@ -1007,15 +1005,13 @@ def test_import_jammi_client_is_native_free_then_lazily_loads_the_engine(tmp_pat
     script = textwrap.dedent(
         f"""
         import sys
-        import jammi_client
+        import jammi
         assert "jammi_native" not in sys.modules, (
-            "import jammi_client eagerly pulled jammi_native: "
+            "import jammi eagerly pulled jammi_native: "
             + str([m for m in sys.modules if m == "jammi_native"])
         )
-        db = jammi_client.connect("file://" + {str(tmp_path)!r})
+        db = jammi.connect("file://" + {str(tmp_path)!r})
         assert "jammi_native" in sys.modules, "file:// did not load the engine"
-        leaked = [m for m in sys.modules if m == "jammi_ai" or m.startswith("jammi_ai.")]
-        assert not leaked, "the base client pulled jammi_ai: " + str(leaked)
         assert type(db).__name__ == "EmbeddedBackend"
         print("POSITIVE_IMPORT_GUARD_OK")
         """
@@ -1030,7 +1026,7 @@ def test_import_jammi_client_is_native_free_then_lazily_loads_the_engine(tmp_pat
 # ---------------------------------------------------------------------------
 # §5.5 — the projection shape pin, ANCHORED TO THE PROTO SCHEMA.
 #
-# The 20 `_*_to_dict` projections in `jammi_client._database` decode a wire proto
+# The 20 `_*_to_dict` projections in `jammi._database` decode a wire proto
 # into the client-facing dict. The embedded engine returns the SAME dict shapes
 # by serialising the mirror serde structs (`serializable_to_pydict`). The proto
 # message is the single source of truth for that shape, so this pin asserts each
@@ -1062,8 +1058,8 @@ def test_struct_projection_shapes_are_proto_anchored():
     """Each non-oneof projection's output key-set == its proto message's field
     set, minus a DECLARED drop-set, with DECLARED renames — read off the live
     descriptor, so a proto change breaks this until the projection tracks it."""
-    from jammi_client import _database as D
-    from jammi_client._generated.jammi.v1 import catalog_pb2, embedding_pb2, eval_pb2
+    from jammi import _database as D
+    from jammi._generated.jammi.v1 import catalog_pb2, embedding_pb2, eval_pb2
 
     def _model():
         return catalog_pb2.Model(model_id="m", backend="b", task=1, status="ready")
@@ -1123,8 +1119,8 @@ def test_oneof_projection_shapes_are_proto_anchored():
     fields`. For every variant of every oneof message, the projection's output
     key-set == the tag key plus the variant sub-message's LIVE descriptor fields
     (read off the oneof, so a new variant field breaks this until projected)."""
-    from jammi_client import _database as D
-    from jammi_client._generated.jammi.v1 import catalog_pb2, eval_pb2
+    from jammi import _database as D
+    from jammi._generated.jammi.v1 import catalog_pb2, eval_pb2
 
     # (projection, proto message, oneof name, tag key, [variant field names])
     specs = [

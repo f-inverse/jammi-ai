@@ -30,12 +30,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from jammi_client._database import (
+from jammi._database import (
     _compare_report_to_dict,
     _embedding_report_to_dict,
     _inference_report_to_dict,
 )
-from jammi_client._generated.jammi.v1 import eval_pb2
+from jammi._generated.jammi.v1 import eval_pb2
 
 FIXTURE = (
     Path(__file__).resolve().parents[3]

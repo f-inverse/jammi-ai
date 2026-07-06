@@ -46,26 +46,23 @@ jobs:
 
       - name: Build + install the HEAD wheels
         # The CI base image ships maturin + a system python3; venv-isolate so
-        # `python` resolves to the venv interpreter for the book gate. `jammi_ai`
-        # is now the pure-Python front-end over two lockstep dists, none on PyPI
-        # for an unreleased commit: install `jammi-client` from in-repo source
-        # (the dev extra carries the pinned grpcio-tools generator), generate
-        # stubs, build the compiled `jammi-ai-native` wheel (maturin, from
-        # `packaging/native`) and the pure `jammi-ai` wheel (`python -m build`),
-        # then force-reinstall BOTH (fresh wheels, never a copy) so the book runs
-        # the engine built from THIS commit.
+        # `python` resolves to the venv interpreter for the book gate. The book
+        # runs against two lockstep dists, neither on PyPI for an unreleased
+        # commit: install the base client `jammi-ai` (import `jammi`) from in-repo
+        # source (the dev extra carries the pinned grpcio-tools generator),
+        # generate stubs, then build the compiled `jammi-ai-native` wheel (maturin,
+        # from `packaging/native`) and force-reinstall it (a fresh wheel, never a
+        # copy) so the book runs the engine built from THIS commit.
         run: |
           python3 -m venv .venv
           . .venv/bin/activate
           pip install --upgrade pip
-          pip install maturin build
+          pip install maturin
           pip install -e 'clients/python[dev]'
           make -C clients/python generate
           ( cd packaging/native && maturin build --release --out "$GITHUB_WORKSPACE/target/wheels" )
-          python -m build --wheel --outdir target/wheels
           pip install --force-reinstall --no-deps \
-            target/wheels/jammi_ai_native-*.whl \
-            target/wheels/jammi_ai-*.whl
+            target/wheels/jammi_ai_native-*.whl
 
       - name: Install the book (against the HEAD wheel)
         run: |

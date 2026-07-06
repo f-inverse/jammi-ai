@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-import jammi_client
-from jammi_client import (
+import jammi
+from jammi import (
     LocalTarget,
     NoEmbeddedEngineError,
     RemoteDatabase,
@@ -65,16 +65,16 @@ def test_connect_local_raises_truthful_no_engine_error():
     Hermetic in this lane: the client-only install has no `jammi_native`, so the
     `find_spec` probe in `connect` misses and this arm is taken."""
     with pytest.raises(NoEmbeddedEngineError) as info:
-        jammi_client.connect("file:///tmp/data")
+        jammi.connect("file:///tmp/data")
     msg = str(info.value)
-    assert "pip install jammi-client[embedded]" in msg
+    assert "pip install jammi-ai[embedded]" in msg
     assert "/tmp/data" in msg
 
 
 def test_connect_remote_returns_remote_database_without_dialing():
     """A remote target yields a `RemoteDatabase` over a lazy channel; no server
     contact happens until a verb is called, so this stays hermetic."""
-    db = jammi_client.connect("grpc://127.0.0.1:8081")
+    db = jammi.connect("grpc://127.0.0.1:8081")
     try:
         assert isinstance(db, RemoteDatabase)
         assert len(db.session_id) == 36  # a v4 UUID

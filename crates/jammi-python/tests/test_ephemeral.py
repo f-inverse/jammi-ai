@@ -1,6 +1,6 @@
 """Python `Database.ephemeral_session` round-trip (spec J6).
 
-Exercises the PyO3 surface end-to-end: a `jammi_ai.connect` session opens an
+Exercises the PyO3 surface end-to-end: a `jammi.connect` session opens an
 ephemeral, tenant-scoped storage context as a context manager; tables created
 inside are real federated mutable tables; on context exit `close()` drops them
 and publishes a `closed` lifecycle event to `jammi.audit.session_lifecycle.v1`.
@@ -14,7 +14,7 @@ import json
 import pyarrow as pa
 import pytest
 
-import jammi_ai
+import jammi
 
 
 TENANT_A = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a"
@@ -43,7 +43,7 @@ def _images_table(rows: list[tuple[str, str]]) -> pa.Table:
 def test_context_manager_creates_uses_and_deletes(tmp_path):
     """Open a session, store rows, read them back, and confirm the table is
     gone and a `closed` event landed once the `with` block exits."""
-    db = jammi_ai.connect(f"file://{tmp_path}")
+    db = jammi.connect(f"file://{tmp_path}")
     db.set_tenant(TENANT_A)
 
     phys = None
@@ -88,7 +88,7 @@ def test_context_manager_creates_uses_and_deletes(tmp_path):
 def test_persistent_lineage_survives_ephemeral_close(tmp_path):
     """A persistent table referencing a hash outlives the ephemeral session
     that also held it (success criterion 6)."""
-    db = jammi_ai.connect(f"file://{tmp_path}")
+    db = jammi.connect(f"file://{tmp_path}")
     db.set_tenant(TENANT_A)
 
     db.create_mutable_table(
@@ -113,7 +113,7 @@ def test_persistent_lineage_survives_ephemeral_close(tmp_path):
 
 def test_requires_tenant_binding(tmp_path):
     """Opening a session with no tenant bound raises ValueError."""
-    db = jammi_ai.connect(f"file://{tmp_path}")
+    db = jammi.connect(f"file://{tmp_path}")
     with pytest.raises(ValueError):
         db.ephemeral_session(timeout_seconds=60)
 
@@ -127,7 +127,7 @@ def test_tenant_isolation(tmp_path):
     proven the way the substrate enforces it: a query against the underlying
     physical table run under a *different* parent tenant scopes the rows out.
     """
-    db = jammi_ai.connect(f"file://{tmp_path}")
+    db = jammi.connect(f"file://{tmp_path}")
     db.set_tenant(TENANT_A)
 
     with db.ephemeral_session(timeout_seconds=3600) as ephem:

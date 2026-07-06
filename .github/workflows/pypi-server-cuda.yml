@@ -1,8 +1,8 @@
 name: PyPI (jammi-server-cu12, CUDA)
 
 # Publishes the CUDA (cu12) `jammi-server-cu12` wheel to PyPI on a `py-v*` tag —
-# the SAME lockstep tag as the CPU `jammi-server`, `jammi-ai`, and `jammi-client`
-# wheels. The wheel bundles the CUDA-enabled `jammi-server` binary behind a
+# the SAME lockstep tag as the CPU `jammi-server`, the base client `jammi-ai`,
+# and the `jammi-ai-native` engine wheels. The wheel bundles the CUDA-enabled `jammi-server` binary behind a
 # `jammi-server` console script and depends on `nvidia-*-cu12` wheels for the CUDA
 # runtime libraries; the console-script shim puts them on `LD_LIBRARY_PATH` before
 # exec. It is a platform wheel (manylinux_2_28_x86_64), not py3-none-any.

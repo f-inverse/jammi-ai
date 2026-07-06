@@ -1,9 +1,9 @@
 """Rewrite grpc_tools.protoc's package-style imports into relative imports.
 
-`python -m grpc_tools.protoc --python_out=jammi_client/_generated` emits
+`python -m grpc_tools.protoc --python_out=jammi/_generated` emits
 modules with `from jammi.v1 import inference_pb2` (and the `_pb2_grpc`
 companions emit `from jammi.v1 import embedding_pb2 as ...`). When those
-files are imported as part of `jammi_client._generated.jammi.v1.…`, Python
+files are imported as part of `jammi._generated.jammi.v1.…`, Python
 looks for a top-level `jammi` package — which does not exist — and the
 import fails.
 

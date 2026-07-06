@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pyarrow as pa
 
-import jammi_ai
+import jammi
 
 # Generic UUIDs — not coupled to any flagship tenant identity.
 TENANT_A = "00000000-0000-0000-0000-0000000000a1"
@@ -51,7 +51,7 @@ def _events_schema() -> pa.Schema:
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         artifact_dir = str(Path(tmp))
-        db = jammi_ai.connect(f"file://{artifact_dir}")
+        db = jammi.connect(f"file://{artifact_dir}")
 
         # Tenant A: register both primitives and insert one row.
         db.set_tenant(TENANT_A)

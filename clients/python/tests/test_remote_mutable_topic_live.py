@@ -11,7 +11,7 @@ drives the two cookbook-unblocking paths through the pure-Python
     `subscribe_collect(predicate, from_offset)` returns the published rows →
     backing-table replay via `sql()` over the topic's backing table.
 
-Each path runs the SAME calls against an embedded `jammi_ai.Database` and asserts
+Each path runs the SAME calls against an embedded `jammi.EmbeddedBackend` and asserts
 the two transports agree (parity). A two-tenant isolation assertion confirms each
 verb rides the session's `jammi-session-id` scope — a mutable table created under
 tenant A is invisible to tenant B.
@@ -19,7 +19,7 @@ tenant A is invisible to tenant B.
 Gated, not hermetic: the test needs a built server binary, so it is skipped
 unless `JAMMI_SERVER_BIN` points at a `jammi-server` executable. CI's
 python-test job sets it after building the binary; a bare `pytest` skips it. The
-embedded engine (`jammi_ai`) must also be importable (the parity peer).
+embedded engine (`jammi_native`) must also be importable (the parity peer).
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ import os
 import pyarrow as pa
 import pytest
 
-jammi_ai = pytest.importorskip("jammi_ai")
-import jammi_client  # noqa: E402
+pytest.importorskip("jammi_native")
+import jammi  # noqa: E402
 
 SERVER_BIN = os.environ.get("JAMMI_SERVER_BIN")
 
@@ -66,8 +66,8 @@ def _events_schema() -> pa.Schema:
 def test_c1_mutable_table_round_trip_matches_embedded(live_server, tmp_path):
     """C1: create a mutable table, write rows via Flight SQL DML, read them back,
     then drop — remote results equal the embedded engine's."""
-    remote = jammi_client.connect(live_server)
-    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    remote = jammi.connect(live_server)
+    embedded = jammi.connect(f"file://{tmp_path}")
     try:
         for db in (remote, embedded):
             db.create_mutable_table(
@@ -121,8 +121,8 @@ def test_c2_topic_pub_sub_round_trip_matches_embedded(live_server, tmp_path):
     """C2: register a topic, publish a batch, then `subscribe_collect` with a
     predicate + from_offset returns the published rows — remote equals embedded,
     and the topic's backing table replays the same rows via `sql()`."""
-    remote = jammi_client.connect(live_server)
-    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    remote = jammi.connect(live_server)
+    embedded = jammi.connect(f"file://{tmp_path}")
     try:
         batch = pa.table(
             {
@@ -183,8 +183,8 @@ def test_mutable_table_tenant_isolation_over_the_wire(live_server):
     every new verb rides the session's tenant scope (a verb missing
     `metadata=self._metadata` would silently run unscoped and leak across
     tenants). Two separate connections carry two distinct session ids."""
-    db_a = jammi_client.connect(live_server)
-    db_b = jammi_client.connect(live_server)
+    db_a = jammi.connect(live_server)
+    db_b = jammi.connect(live_server)
     try:
         db_a.set_tenant(TENANT_A)
         db_b.set_tenant(TENANT_B)
@@ -212,8 +212,8 @@ def test_tenant_scope_scopes_and_restores_over_the_wire(live_server):
     `GetTenant` on entry and rebinds it on exit. Nesting restores the outer tenant
     on inner exit, not a blind clear. Registry isolation (`list_mutable_tables`,
     proven session-scoped by the isolation test above) is the observable."""
-    db = jammi_client.connect(live_server)
-    other = jammi_client.connect(live_server)
+    db = jammi.connect(live_server)
+    other = jammi.connect(live_server)
     try:
         # `other` registers a B-only table the scoped `db` must not see under A.
         other.set_tenant(TENANT_B)

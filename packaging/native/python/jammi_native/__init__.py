@@ -1,8 +1,8 @@
 """The compiled native engine, importable as a top-level module.
 
 `jammi_native` is the in-process Jammi engine — the maturin-built PyO3
-extension. It is a bare top-level import so a consumer can discover the local
-backend on its own, without going through the `jammi_ai` convenience package.
+extension. It is a bare top-level import so the base client (`jammi`) can
+discover the local backend on its own, on demand.
 
 The compiled extension is shipped inside this package (maturin's mixed
 Rust/Python layout places it beside this file). This module re-exports the

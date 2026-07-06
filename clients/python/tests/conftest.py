@@ -1,7 +1,7 @@
 """Shared fixtures for the live remote round-trip tests.
 
 The live tests stand up a real CPU `jammi-server` and drive verbs through the
-pure-Python `RemoteDatabase` against an embedded `jammi_ai.Database` parity
+pure-Python `RemoteDatabase` against an embedded `jammi.EmbeddedBackend` parity
 peer. The server fixture lives here so every live module shares one
 implementation; each module still declares its own `pytest.mark.skipif` gate
 on `JAMMI_SERVER_BIN` so a bare `pytest` reports a loud per-module skip.
@@ -16,7 +16,7 @@ import time
 
 import pytest
 
-import jammi_client
+import jammi
 
 SERVER_BIN = os.environ.get("JAMMI_SERVER_BIN")
 
@@ -56,7 +56,7 @@ def live_server(tmp_path_factory):
             out = proc.stdout.read().decode(errors="replace") if proc.stdout else ""
             raise RuntimeError(f"jammi-server exited early:\n{out}")
         try:
-            db = jammi_client.connect(endpoint)
+            db = jammi.connect(endpoint)
             db.get_server_info()
             db.close()
             ready = True

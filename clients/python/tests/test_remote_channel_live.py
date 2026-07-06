@@ -29,7 +29,7 @@ embedded peer binds the SAME tenant so the two namespaces line up.
 Gated, not hermetic: the test needs a built server binary, so it is skipped
 unless `JAMMI_SERVER_BIN` points at a `jammi-server` executable. CI's
 python-test job sets it after building the binary; a bare `pytest` skips it. The
-embedded engine (`jammi_ai`) must also be importable (the parity peer).
+embedded engine (`jammi_native`) must also be importable (the parity peer).
 """
 
 from __future__ import annotations
@@ -39,8 +39,8 @@ import uuid
 
 import pytest
 
-jammi_ai = pytest.importorskip("jammi_ai")
-import jammi_client  # noqa: E402
+pytest.importorskip("jammi_native")
+import jammi  # noqa: E402
 
 SERVER_BIN = os.environ.get("JAMMI_SERVER_BIN")
 
@@ -60,8 +60,8 @@ def test_register_then_list_matches_embedded(live_server, tmp_path):
     """Register a channel on both transports, then `list_channels` on the remote
     equals the embedded engine's — the same dict shape, the global seed channels
     plus the freshly-registered one, ordered by `(priority, channel_id)`."""
-    remote = jammi_client.connect(live_server)
-    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    remote = jammi.connect(live_server)
+    embedded = jammi.connect(f"file://{tmp_path}")
     tenant = _fresh_tenant()
     try:
         for db in (remote, embedded):
@@ -96,8 +96,8 @@ def test_register_then_list_matches_embedded(live_server, tmp_path):
 def test_add_columns_appends_in_order_matches_embedded(live_server, tmp_path):
     """`add_channel_columns` appends new columns after the originals, in
     declaration order — a re-`list` agrees across transports."""
-    remote = jammi_client.connect(live_server)
-    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    remote = jammi.connect(live_server)
+    embedded = jammi.connect(f"file://{tmp_path}")
     tenant = _fresh_tenant()
     try:
         for db in (remote, embedded):
@@ -130,8 +130,8 @@ def test_add_columns_appends_in_order_matches_embedded(live_server, tmp_path):
 def test_reregister_same_id_rejected_on_both_transports(live_server, tmp_path):
     """Re-registering an already-registered channel id raises on BOTH transports
     — the per-tenant uniqueness "already exists" path."""
-    remote = jammi_client.connect(live_server)
-    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    remote = jammi.connect(live_server)
+    embedded = jammi.connect(f"file://{tmp_path}")
     tenant = _fresh_tenant()
     try:
         for db in (remote, embedded):
@@ -157,8 +157,8 @@ def test_reregister_same_id_rejected_on_both_transports(live_server, tmp_path):
 def test_redeclare_column_different_dtype_rejected_on_both(live_server, tmp_path):
     """Redeclaring an existing column with a DIFFERENT dtype raises the
     append-only violation on BOTH transports."""
-    remote = jammi_client.connect(live_server)
-    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    remote = jammi.connect(live_server)
+    embedded = jammi.connect(f"file://{tmp_path}")
     tenant = _fresh_tenant()
     try:
         for db in (remote, embedded):
@@ -186,8 +186,8 @@ def test_redeclare_column_same_dtype_rejected_on_both(live_server, tmp_path):
     """Redeclaring an existing column with the SAME dtype raises "already
     declared" on BOTH transports — the engine rejects an idempotent redeclare,
     it does not silently no-op, and the client mirrors that exactly."""
-    remote = jammi_client.connect(live_server)
-    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    remote = jammi.connect(live_server)
+    embedded = jammi.connect(f"file://{tmp_path}")
     tenant = _fresh_tenant()
     try:
         for db in (remote, embedded):
@@ -217,8 +217,8 @@ def test_tenant_scoping_over_the_wire_matches_embedded(live_server, tmp_path):
     server's accumulated state; the unbound assertion checks only that the
     tenant's channel is absent and the seeds are present (the unbound list also
     carries sibling tests' global-tenant rows, which is irrelevant here)."""
-    remote = jammi_client.connect(live_server)
-    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    remote = jammi.connect(live_server)
+    embedded = jammi.connect(f"file://{tmp_path}")
     tenant_a = _fresh_tenant()
     tenant_b = _fresh_tenant()
     try:

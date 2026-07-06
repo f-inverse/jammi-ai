@@ -5,7 +5,7 @@ The engine↔cookbook validator for the `§3.8` channel error taxonomy (engine
 `#193`): each evidence-channel failure maps to its **correct typed gRPC status
 code** on the wire, instead of the `Internal`-for-everything that a thin
 catch-all would produce. The channel registry verbs (`register_channel` /
-`add_channel_columns` / `list_channels`) are on BOTH the embedded `jammi_ai`
+`add_channel_columns` / `list_channels`) are on BOTH the embedded `jammi`
 engine and the remote `jammi.RemoteDatabase` (chapter 14 exercises the
 happy path); this script MEASURES the FAILURE surface — the `(failure_mode →
 status_code)` matrix — on the `grpc://` transport, where the status codes only
@@ -68,7 +68,6 @@ import time
 from pathlib import Path
 
 import jammi
-import jammi_ai
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
 
@@ -324,7 +323,7 @@ def emit(server_bin: str) -> None:
 
     # --- embedded transport (the error-class companion) --------------------- #
     with tempfile.TemporaryDirectory() as catalog:
-        embedded = jammi_ai.connect(f"file://{catalog}")
+        embedded = jammi.connect(f"file://{catalog}")
         print("== embedded engine: channel error taxonomy ==", flush=True)
         embedded_run = run_taxonomy(embedded, tenant_a, tag="emb")
 

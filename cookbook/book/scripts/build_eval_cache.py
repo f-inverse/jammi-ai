@@ -66,7 +66,6 @@ import time
 from pathlib import Path
 
 import jammi
-import jammi_ai
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
 
@@ -470,7 +469,7 @@ def emit(fx: Fixtures, server_bin: str) -> None:
 
     # --- embedded transport (the canonical reports) -------------------------- #
     with tempfile.TemporaryDirectory() as catalog:
-        embedded = jammi_ai.connect(f"file://{catalog}")
+        embedded = jammi.connect(f"file://{catalog}")
         print("== embedded engine: eval suite ==", flush=True)
         embedded_reports = run_eval_suite(embedded, fx, tag="emb")
         print("== embedded engine: channel sequence ==", flush=True)

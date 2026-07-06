@@ -34,7 +34,7 @@ import tempfile
 import numpy as np
 import pyarrow as pa
 
-import jammi_ai
+import jammi
 from jammi_cookbook import contracts, datasets, rails
 
 reg = contracts.load_artifact("arxiv.tier04_regression").to_pylist()
@@ -51,7 +51,7 @@ golden_url = datasets._write_parquet(golden, "arxiv_calibration_golden")
 
 # A fresh artifact dir each run, so re-execution never collides with a
 # previously-registered source (the catalog persists registrations per artifact dir).
-db = jammi_ai.connect(f"file://{tempfile.mkdtemp(prefix='jammi_calibration_')}")  # CPU embed arm
+db = jammi.connect(f"file://{tempfile.mkdtemp(prefix='jammi_calibration_')}")  # CPU embed arm
 db.add_source("arxiv_calibration_golden", url=golden_url, format="parquet")
 ```
 

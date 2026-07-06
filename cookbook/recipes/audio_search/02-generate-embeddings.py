@@ -13,7 +13,7 @@ The model is auto-detected from its CLAP config. Default is the hermetic
 
 from __future__ import annotations
 
-import jammi_ai
+import jammi
 
 from _shared import ARTIFACT_DIR, CORPUS_PARQUET, MODEL, ensure_source
 
@@ -21,7 +21,7 @@ from _shared import ARTIFACT_DIR, CORPUS_PARQUET, MODEL, ensure_source
 def main() -> int:
     assert CORPUS_PARQUET.exists(), "run 01-load-corpus.py first"
 
-    db = jammi_ai.connect(f"file://{str(ARTIFACT_DIR)}")
+    db = jammi.connect(f"file://{str(ARTIFACT_DIR)}")
     ensure_source(db, "corpus", str(CORPUS_PARQUET))
 
     print(f"generating audio embeddings with {MODEL} ...")

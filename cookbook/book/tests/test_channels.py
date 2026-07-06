@@ -1,6 +1,6 @@
 """Hermetic embedded-live checks for the provenance-channel vertical (chapter 14).
 
-These run the channel sequence LIVE against the embedded ``jammi_ai`` engine each
+These run the channel sequence LIVE against the embedded ``jammi`` engine each
 time (a fresh ``file://`` temp catalog, no server, no GPU) and assert the channel
 family's load-bearing facts — the embedded-live half that catches an embedded
 regression on every PR (the cross-transport parity is the emit-side check):
@@ -29,7 +29,7 @@ import uuid
 
 import pytest
 
-jammi_ai = pytest.importorskip("jammi_ai")
+jammi = pytest.importorskip("jammi")
 
 from jammi_cookbook import contracts  # noqa: E402
 
@@ -38,7 +38,7 @@ _HAVE_GOLDEN = (_EVAL / "golden_metrics.json").exists()
 
 
 def _fresh_db():
-    return jammi_ai.connect(f"file://{tempfile.mkdtemp(prefix='jammi_ch14_chan_')}")
+    return jammi.connect(f"file://{tempfile.mkdtemp(prefix='jammi_ch14_chan_')}")
 
 
 def _fresh_tenant() -> str:

@@ -4,7 +4,7 @@ project:
 
 book:
   title: "The Theory↔Computation Cookbook"
-  subtitle: "Graph signal processing and the GNN canon, executed and measured on the jammi_ai engine"
+  subtitle: "Graph signal processing and the GNN canon, executed and measured on the jammi engine"
   author: "F-Inverse"
   search: true
   site-url: https://f-inverse.github.io/jammi-ai/cookbook/

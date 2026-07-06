@@ -1,18 +1,17 @@
 # 2. Connect
 
 ```python
-import jammi_ai
+import jammi
 
-db = jammi_ai.connect("file:///tmp/jammi-quickstart")
+db = jammi.connect("file:///tmp/jammi-quickstart")
 ```
 
-`jammi_ai.connect(target)` is the one front door. A `file://` target returns a
-`Database` handle backed by a shared tokio runtime and a SQLite catalog rooted
+`jammi.connect(target)` is the one front door. A `file://` target returns a
+`Session` handle (an `EmbeddedBackend`) backed by a shared tokio runtime and a SQLite catalog rooted
 at the target's path; everything you do through it — registered sources,
 embedding tables, mutable companions, trigger topics — is persisted under that
 directory. Flip the target to `https://host` or `grpc://host:8081` — no code
-change — and the same `connect(target)` returns a remote handle over the
-bundled `jammi-client`.
+change — and the same `connect(target)` returns a remote handle (a `RemoteDatabase`).
 
 ## The target
 

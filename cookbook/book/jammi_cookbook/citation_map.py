@@ -3,7 +3,7 @@
 This is the source of truth for the bridge chapters' citation table and the
 verticals' bridge notes. Each :class:`CitationRow` pins a recipe to its monograph
 reference(s) (Stanković et al. Parts I/II/III), its GNN- or conformal-canon
-reference(s), and the exact ``jammi_ai`` verb it runs.
+reference(s), and the exact ``jammi`` verb it runs.
 
 Two contracts hold this honest, both enforced by ``tests/test_citation_map.py``:
 

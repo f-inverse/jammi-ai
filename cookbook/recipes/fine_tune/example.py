@@ -10,7 +10,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-import jammi_ai
+import jammi
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 FIXTURES = REPO_ROOT / "cookbook" / "fixtures"
@@ -20,7 +20,7 @@ BASE_MODEL = f"local:{FIXTURES / 'tiny_bert'}"
 
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
-        db = jammi_ai.connect(f"file://{tmp}")
+        db = jammi.connect(f"file://{tmp}")
 
         # 1. Register the contrastive training pairs.
         db.add_source("training", url=str(PAIRS_PATH), format="csv")

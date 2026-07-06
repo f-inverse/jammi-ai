@@ -197,9 +197,9 @@ emit-side check recorded in `eval.json`).
 import tempfile
 import uuid
 
-import jammi_ai
+import jammi
 
-db = jammi_ai.connect(f"file://{tempfile.mkdtemp(prefix='jammi_ch14_chan_')}")
+db = jammi.connect(f"file://{tempfile.mkdtemp(prefix='jammi_ch14_chan_')}")
 tenant_a = str(uuid.uuid4())
 tenant_b = str(uuid.uuid4())
 ```

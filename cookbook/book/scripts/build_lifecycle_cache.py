@@ -3,7 +3,7 @@
 
 The engine↔cookbook validator for the `§3.6` model-catalog surface: the model
 verbs (`list_models` / `describe_model` / `delete_model`) that the engine carries
-on BOTH the embedded `jammi_ai.Database` and the remote
+on BOTH the embedded `jammi.EmbeddedBackend` and the remote
 `jammi.RemoteDatabase`. The engine's catalog lets you **see** the models it
 resolves and trains, and **clean them up**; this script measures that surface as a
 real, asserted property — the **referential-integrity matrix** for `delete_model`,
@@ -68,7 +68,6 @@ import time
 from pathlib import Path
 
 import jammi
-import jammi_ai
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -354,7 +353,7 @@ def emit(fixtures_root: Path, server_bin: str) -> None:
 
         # --- embedded transport (the canonical matrix) ---------------------- #
         with tempfile.TemporaryDirectory() as catalog:
-            embedded = jammi_ai.connect(f"file://{catalog}")
+            embedded = jammi.connect(f"file://{catalog}")
             print("== embedded engine: model catalog ==", flush=True)
             embedded_matrix = run_catalog(embedded, corpus_path, base_model, tag="emb")
 

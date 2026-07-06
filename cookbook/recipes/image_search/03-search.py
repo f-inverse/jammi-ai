@@ -10,7 +10,7 @@ results with `annotate(...)`) is `db.sql(...)`. Here we keep it to a plain top-K
 
 from __future__ import annotations
 
-import jammi_ai
+import jammi
 
 from _shared import ARTIFACT_DIR, CORPUS_PARQUET, IMAGE_CORPUS_DIR, MODEL, ensure_source
 
@@ -18,7 +18,7 @@ from _shared import ARTIFACT_DIR, CORPUS_PARQUET, IMAGE_CORPUS_DIR, MODEL, ensur
 def main() -> int:
     assert CORPUS_PARQUET.exists(), "run 01-load-corpus.py and 02 first"
 
-    db = jammi_ai.connect(f"file://{str(ARTIFACT_DIR)}")
+    db = jammi.connect(f"file://{str(ARTIFACT_DIR)}")
     ensure_source(db, "corpus", str(CORPUS_PARQUET))
 
     # Encode an image query (the held-out "circle" query) and search.

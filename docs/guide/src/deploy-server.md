@@ -18,8 +18,8 @@ jammi --target grpc://127.0.0.1:8081 \
 
 # 3. Generate embeddings (library or Python — not available over Flight SQL)
 python3 -c '
-import jammi_ai
-db = jammi_ai.connect("file:///var/lib/jammi")
+import jammi
+db = jammi.connect("file:///var/lib/jammi")
 db.generate_embeddings(source="patents", model="sentence-transformers/all-MiniLM-L6-v2", columns=["abstract"], key="id", modality="text")
 '
 ```

@@ -116,9 +116,9 @@ let id = session.create_mutable_table(def).await?;
 
 ```python
 import pyarrow as pa
-import jammi_ai
+import jammi
 
-db = jammi_ai.connect("file:///var/lib/jammi")
+db = jammi.connect("file:///var/lib/jammi")
 # The Python wrapper exposes mutable-table registration through the
 # `create_mutable_table` accessor (see `jammi.mutable`). The recipe below
 # is illustrative; consult the API reference for the binding shape your

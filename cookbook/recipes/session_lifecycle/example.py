@@ -21,7 +21,7 @@ import tempfile
 
 import pyarrow as pa
 
-import jammi_ai
+import jammi
 
 TENANT = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a"
 
@@ -43,7 +43,7 @@ def _images_table(rows: list[tuple[str, str]]) -> pa.Table:
 
 def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
-        db = jammi_ai.connect(f"file://{tmp}")
+        db = jammi.connect(f"file://{tmp}")
         db.set_tenant(TENANT)
 
         # A persistent table that will keep the *hash* lineage after the raw

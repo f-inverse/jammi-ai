@@ -73,12 +73,12 @@ The Python surface takes **lowercase** `direction` / `boundary` strings, resolve
 ```{python}
 import tempfile
 
-import jammi_ai
+import jammi
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 work = tempfile.mkdtemp(prefix="jammi_pit_")
-db = jammi_ai.connect(f"file://{tempfile.mkdtemp(prefix='jammi_pit_catalog_')}")
+db = jammi.connect(f"file://{tempfile.mkdtemp(prefix='jammi_pit_catalog_')}")
 
 # A tiny spine (one entity 'p', as-of horizon T = 20) and four facts at increasing
 # event times, one of them stamped EXACTLY at the spine instant (t = 20).

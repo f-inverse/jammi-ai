@@ -29,11 +29,11 @@ with a runnable [`quickstart.py`](./cookbook/quickstart/quickstart.py)
 gated by CI. The condensed version:
 
 ```python
-import jammi_ai
+import jammi
 
 # One front door. `file://` runs the in-process engine; flip to a
 # `https://` / `grpc://` target — no code change — to talk to a remote server.
-db = jammi_ai.connect("file://.jammi")
+db = jammi.connect("file://.jammi")
 db.add_source("corpus", url="cookbook/fixtures/tiny_corpus.parquet", format="parquet")
 
 MODEL = "sentence-transformers/all-MiniLM-L6-v2"

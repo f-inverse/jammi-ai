@@ -127,7 +127,6 @@ import time
 from pathlib import Path
 
 import jammi
-import jammi_ai
 import pyarrow as pa
 import pyarrow.flight as flight
 import pyarrow.parquet as pq
@@ -708,7 +707,7 @@ def emit(fixtures_root: Path, server_bin: str) -> None:
 
         # --- embedded transport (the canonical matrix) ---------------------- #
         with tempfile.TemporaryDirectory() as catalog:
-            embedded = jammi_ai.connect(f"file://{catalog}")
+            embedded = jammi.connect(f"file://{catalog}")
             print("== embedded engine: per-verb isolation matrix ==", flush=True)
             embedded_matrix = run_matrix(
                 embedded, work, base_model, tag="emb", cross_transport=False

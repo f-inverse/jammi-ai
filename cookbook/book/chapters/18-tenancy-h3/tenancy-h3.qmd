@@ -282,7 +282,7 @@ to an unscoped global read.
 import socket
 import tempfile
 
-import jammi_ai
+import jammi
 import jammi
 import pyarrow as pa
 import pyarrow.flight as flight
@@ -347,7 +347,7 @@ class AuthGatewayServer(flight.FlightServerBase):
 
 catalog = tempfile.mkdtemp()
 work = tempfile.mkdtemp()
-db = jammi_ai.connect(f"file://{catalog}")
+db = jammi.connect(f"file://{catalog}")
 
 
 def write_src(name, tenant_id):

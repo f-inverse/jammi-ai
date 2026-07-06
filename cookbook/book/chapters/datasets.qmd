@@ -31,10 +31,10 @@ keystone's heavy emit opens a GPU server with `connect("grpc://…")` and runs t
 ```{python}
 import tempfile
 
-import jammi_ai
+import jammi
 from jammi_cookbook import datasets
 
-db = jammi_ai.connect(f"file://{tempfile.mkdtemp()}")
+db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 air = datasets.load_air_routes(db)
 arxiv = datasets.load_ogbn_arxiv(db)
 ```

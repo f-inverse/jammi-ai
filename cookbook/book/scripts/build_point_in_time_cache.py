@@ -70,7 +70,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-import jammi_ai
+import jammi
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -306,7 +306,7 @@ def verdict_matrix(work: str) -> dict:
     docs_path = os.path.join(work, "tiny_docs.parquet")
     pq.write_table(pa.table(_TINY_DOCS), docs_path)
     catalog = tempfile.mkdtemp(prefix="jammi_pit_matrix_")
-    db = jammi_ai.connect(f"file://{catalog}")
+    db = jammi.connect(f"file://{catalog}")
     db.add_source("docs", url=f"file://{docs_path}", format="parquet")
 
     # MatchWithUnpinnedInputs: embedding over a file source.
@@ -367,7 +367,6 @@ class LiveServer:
         self.endpoint = None
 
     def __enter__(self) -> str:
-        import jammi
 
         artifact_dir = tempfile.mkdtemp(prefix="jammi_srv_pit_")
         flight_port, health_port = _free_port(), _free_port()
@@ -435,13 +434,12 @@ def emit(target: str, server_bin: str | None) -> None:
 
         # --- embedded asof (the canonical feature rows) --------------------- #
         with tempfile.TemporaryDirectory() as catalog:
-            embedded = jammi_ai.connect(f"file://{catalog}")
+            embedded = jammi.connect(f"file://{catalog}")
             print("== embedded asof_join ==", flush=True)
             e_out, e_rows, e_verdict = run_asof(embedded, spine_path, facts_path)
 
         # --- remote asof (live grpc:// skew check) -------------------------- #
         if target == "dual":
-            import jammi
 
             with LiveServer(server_bin) as endpoint:
                 print(f"== remote asof_join at {endpoint} ==", flush=True)

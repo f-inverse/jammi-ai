@@ -2,7 +2,7 @@
 
 The rails are the columns of the book's 4-tier × 3-rail grid — woven through
 every tier, not a chapter of their own. This module keeps them *thin*: it
-composes ``jammi_ai`` and enforces the cookbook's contracts; it implements no
+composes ``jammi`` and enforces the cookbook's contracts; it implements no
 graph or ML logic. The dedicated rails chapter (K-rails) deepens the prose and
 the worked examples, but every tier recipe calls these same helpers, so the
 rails are real wiring rather than a gesture.

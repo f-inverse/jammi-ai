@@ -7,7 +7,7 @@ title: "The unified client surface — one connect, one Session, two honest tran
 import jammi_cookbook
 ```
 
-**Recipe:** `pip install jammi-client[embedded]` · `jammi_client.connect(target)` -> a
+**Recipe:** `pip install jammi-ai[embedded]` · `jammi.connect(target)` -> a
 transport-agnostic `Session` (`file://` -> an in-process `EmbeddedBackend`, direct FFI;
 `grpc://` -> a `RemoteDatabase`) · `supports(Capability.X)` · the `JammiError` taxonomy
 (`InvalidArgument` / `NotSupportedOnBackend` / `TrainingError` / `BackendError`) ·
@@ -20,19 +20,17 @@ it. · **Rail:** measurement (the shared verb vocabulary, every capability boole
 raised class, and the receive-cap edge asserted against the frozen golden — names and
 booleans exact, not transcribed).
 
-`jammi-client` is the **base**: one lean Python package that speaks to a Jammi engine, local
+`jammi-ai` (import `jammi`) is the **base**: one lean Python package that speaks to a Jammi engine, local
 or remote. Out of the box it carries the remote arm — `connect("grpc://…")` over the
 `jammi.v1` wire. The in-process engine is an *opt-in extra*: `pip install
-jammi-client[embedded]` pulls the compiled `jammi-ai-native` dist, and with it
+jammi-ai[embedded]` pulls the compiled `jammi-ai-native` dist, and with it
 `connect("file://…")` resolves to an `EmbeddedBackend` that drives the engine in-process by
 direct FFI — no server, no socket. One package, two transports, selected by target alone.
 
-The earlier chapters reach the engine through `jammi_ai` — the batteries-included convenience
-bundle that pins the `[embedded]` extra so a `file://` target always resolves. That bundle's
-`connect` *is* `jammi_client.connect`, and its `jammi_ai.Database` *is* this chapter's
-`jammi_client.EmbeddedBackend`. This chapter goes straight to the base client to measure the
-surface itself: one `connect(target)` returns a `Session`; the embedded
-`jammi_client.EmbeddedBackend` and the remote `jammi_client.RemoteDatabase` both satisfy it,
+The earlier chapters reach the engine through the same `jammi` client with a `file://` target
+and the `[embedded]` extra installed, so `connect` always resolves the in-process engine. This
+chapter measures that surface itself: one `connect(target)` returns a `Session`; the embedded
+`jammi.EmbeddedBackend` and the remote `jammi.RemoteDatabase` both satisfy it,
 so a program written against the `Session` surface runs in-process or behind a server by
 target alone.
 
@@ -115,7 +113,7 @@ typed `NoEmbeddedEngineError` pointing at exactly this extra — the runtime ech
 With the extra installed, the single front door resolves each target to its transport. A
 `file://` URL returns an `EmbeddedBackend` — the compiled engine driven in-process by direct
 FFI, no server stood up, no socket opened. A `grpc://` URL returns a `RemoteDatabase` over the
-wire. Both come off the *same* base `jammi_client` — no convenience bundle in sight — and both
+wire. Both come off the *same* base `jammi` client, and both
 are a `Session`.
 
 ```{python}

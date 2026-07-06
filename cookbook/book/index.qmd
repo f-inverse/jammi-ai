@@ -12,7 +12,7 @@ import jammi_cookbook  # noqa: F401
 
 This is a **runnable book**. It bridges *applied theory* — Stanković et al.'s
 *Data Analytics on Graphs* (Foundations & Trends in ML, 2020) and the modern GNN
-canon — with *software and computation*: the `jammi_ai` engine. The signature
+canon — with *software and computation*: the `jammi` engine. The signature
 move of every recipe is to show that **one Jammi recipe = one equation in the
 monograph = one line in the GNN canon**, *executed and measured*.
 
@@ -49,4 +49,4 @@ computed from committed artifacts — never a stand-in figure. The heavy work ru
 **once** in the keystone slice and is committed as a small-subset cache; every
 later chapter *reads* that cache and asserts its measured verdict against frozen
 golden metrics within a tolerance. The engine itself is never edited — the book
-only *calls* the pinned `jammi_ai` API, listed in the [API reference](chapters/api-reference.qmd).
+only *calls* the pinned `jammi` API, listed in the [API reference](chapters/api-reference.qmd).

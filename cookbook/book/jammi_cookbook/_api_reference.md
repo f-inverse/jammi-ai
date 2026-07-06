@@ -1,9 +1,9 @@
-# `jammi_ai` API reference (grounded, pinned `jammi_ai==0.32.0`)
+# `jammi` API reference (grounded, pinned `jammi-ai==0.32.0`)
 
-These are the `jammi_ai` Python signatures the chapters call, **confirmed by
+These are the `jammi` Python signatures the chapters call, **confirmed by
 introspecting the installed `0.32.0` wheel** — `inspect.signature` resolved on a
 live `connect("file://…")` instance, the way a caller invokes a verb through the
-thin `Database` wrapper's composition (explicit methods on the wrapper, every
+thin `Session` wrapper's composition (explicit methods on the wrapper, every
 other verb forwarded to the native handle via `__getattr__`) — not transcribed
 from a spec. Call them exactly as written. The cookbook pins this one version; if
 the pin moves, re-introspect and update this file
@@ -16,7 +16,7 @@ the pin moves, re-introspect and update this file
 
 - **Control plane** — provisioning (register sources/topics/mutable tables,
   `list_*`, `describe_*`). In a deployment this is the `jammi` CLI; in the book it
-  is the same `Database`/`RemoteDatabase` handle.
+  is the same `Session` handle.
 - **Data plane** — the ML/data verbs (`generate_embeddings`, `propagate_embeddings`,
   `search`, `fine_tune*`, `train_context_predictor`, `predict*`, `eval_*`,
   `conformalize*`).
@@ -24,9 +24,9 @@ the pin moves, re-introspect and update this file
 `connect(target)` selects the transport **once** and returns a handle whose verb
 surface is identical across planes:
 
-- `jammi_ai.connect("file:///path")  -> Database` — embedded, in-process engine
+- `jammi.connect("file:///path")  -> EmbeddedBackend` — embedded, in-process engine
   (CPU). The committed cache and CI read the book on this arm.
-- `jammi_ai.connect("grpc://host:port") -> RemoteDatabase` — the pure-Python
+- `jammi.connect("grpc://host:port") -> RemoteDatabase` — the pure-Python
   client (`jammi`) over a running `jammi-server`. The **GPU** compute tier
   (embedding, fine-tune, context-predictor training) runs here; the CPU embed
   wheel cannot do GPU. A `RemoteDatabase` may carry a bearer credential
@@ -42,9 +42,8 @@ the committed cache and runs `file://` on CPU.
 
 ## Setup / sources
 
-- `jammi_ai.connect(target) -> Union[Database, RemoteDatabase]` — open a session against a target; `target` is a URL string (`file://` local, `grpc://`/`grpcs://` remote) or a parsed `Target`. Selects transport once.
-- `jammi_ai.open_local(*, config=None, artifact_dir=None, gpu_device=None, inference_batch_size=None) -> Database` — the embedded engine directly (equivalent to `connect("file://<artifact_dir>")`).
-- `jammi_ai.parse_target(target) -> Target` · `LocalTarget(artifact_dir)` / `RemoteTarget(endpoint, tls)`.
+- `jammi.connect(target) -> Session` — open a session against a target; `target` is a URL string (`file://` local, `grpc://`/`grpcs://` remote) or a parsed `Target`. Selects transport once.
+- `jammi.parse_target(target) -> Target` · `LocalTarget(artifact_dir)` / `RemoteTarget(endpoint, tls)`.
 - `db.add_source(name, *, url, format)` — register a file-shaped source; `format ∈ {"parquet","csv","json"}`; `url` may be local or `s3://`/`gs://`/`azure://`. Re-registering a name raises (`Source already registered`).
 - `db.list_sources() -> list[dict]` · `db.describe_source(source_id) -> Optional[dict]` — control-plane catalog reads.
 - `db.get_server_info() -> dict` — `{"version", "features", "storage_backends", "services"}`.

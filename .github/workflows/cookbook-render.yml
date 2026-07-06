@@ -43,7 +43,7 @@ jobs:
 
       - name: Build the HEAD wheels + jammi-server binary
         # The grpc:// / live-server chapters shell out to jammi-server; build it
-        # alongside the HEAD wheels. `jammi_ai` is the pure-Python front-end over
+        # alongside the HEAD wheels. `jammi` is the pure-Python front-end over
         # two lockstep dists: build the compiled `jammi-ai-native` wheel (maturin,
         # from `packaging/native`) and the pure `jammi-ai` wheel (`python -m
         # build`), then force-reinstall both.
@@ -55,7 +55,7 @@ jobs:
           pip install -e 'clients/python[dev]'
           make -C clients/python generate
           ( cd packaging/native && maturin build --release --out "$GITHUB_WORKSPACE/target/wheels" )
-          python -m build --wheel --outdir target/wheels
+          ( cd clients/python && python -m build --wheel --outdir "$GITHUB_WORKSPACE/target/wheels" )
           pip install --force-reinstall --no-deps \
             target/wheels/jammi_ai_native-*.whl \
             target/wheels/jammi_ai-*.whl
@@ -87,14 +87,14 @@ jobs:
 
       - name: Release recipe — last PUBLISHED wheel + CPU pytest subset
         # Preserve the published-artifact signal HEAD-testing loses: install the
-        # last released jammi_ai from PyPI into a clean venv and re-run the book's
+        # last released jammi-ai from PyPI into a clean venv and re-run the book's
         # CPU gate (the pytest suite reads the committed cache; it never retrains
         # or re-embeds). A drift between HEAD and the published surface shows here.
         run: |
           python3 -m venv .venv-release
           . .venv-release/bin/activate
           pip install --upgrade pip
-          pip install jammi_ai
+          pip install jammi-ai
           pip install -e 'cookbook/book[book,dev]'
           cd cookbook/book
           python scripts/check_api_reference.py

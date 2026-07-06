@@ -1,6 +1,6 @@
 """Unit tests for the three rails (provenance, tenancy, measurement).
 
-The tenancy rail is exercised against a *real* embedded ``jammi_ai`` engine —
+The tenancy rail is exercised against a *real* embedded ``jammi`` engine —
 hermetic (no network, no GPU). It asserts the engine's two genuine isolation
 layers and the honest caveat the Air Routes showcase teaches:
 
@@ -18,7 +18,7 @@ import os
 import tempfile
 import uuid
 
-import jammi_ai
+import jammi
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -39,7 +39,7 @@ def _register(db, name: str, table: pa.Table, *, root: str) -> None:
 
 def test_tenant_context_restores_prior_scope():
     """``rails.tenant`` binds the scope in place and restores it on exit."""
-    db = jammi_ai.connect(f"file://{tempfile.mkdtemp()}")
+    db = jammi.connect(f"file://{tempfile.mkdtemp()}")
     assert db.tenant() is None
     with rails.tenant(db, TENANT_A) as scoped:
         assert scoped is db  # binds in place, yields the same handle
@@ -54,7 +54,7 @@ def test_catalog_listing_isolation():
     IS NULL``. Would fail if listing leaked a foreign tenant's registration.
     """
     root = tempfile.mkdtemp()
-    db = jammi_ai.connect(f"file://{tempfile.mkdtemp()}")
+    db = jammi.connect(f"file://{tempfile.mkdtemp()}")
     with rails.tenant(db, TENANT_A):
         _register(db, "src_a", pa.table({"code": ["AAA", "BBB"]}), root=root)
     with rails.tenant(db, TENANT_B):
@@ -74,7 +74,7 @@ def test_discriminator_column_row_isolation():
     Would fail if the analyzer did not filter (both tenants would see all rows).
     """
     root = tempfile.mkdtemp()
-    db = jammi_ai.connect(f"file://{tempfile.mkdtemp()}")
+    db = jammi.connect(f"file://{tempfile.mkdtemp()}")
     with rails.tenant(db, ""):  # register the shared source globally
         _register(db, "tagged", pa.table({
             "code": ["AAA", "BBB", "XXX", "YYY"],
@@ -101,7 +101,7 @@ def test_discriminator_less_source_is_globally_readable():
     remedy is a discriminator column or an access gate above the engine.
     """
     root = tempfile.mkdtemp()
-    db = jammi_ai.connect(f"file://{tempfile.mkdtemp()}")
+    db = jammi.connect(f"file://{tempfile.mkdtemp()}")
     with rails.tenant(db, TENANT_B):
         _register(db, "b_open", pa.table({"code": ["XXX", "YYY"]}), root=root)
 

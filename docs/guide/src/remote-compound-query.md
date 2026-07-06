@@ -24,12 +24,12 @@ the prefix `_row_id` / `_source` / `_model` / `_status` / `_error` /
 columns (e.g. a `vector` FixedSizeList for an embedding task). Join it back to the
 source on `_row_id` to place inference columns alongside source columns.
 
-## Remote: `jammi-client` over Flight SQL
+## Remote: `jammi` over Flight SQL
 
 ```python
-import jammi_client
+import jammi
 
-db = jammi_client.connect("grpc://engine.internal:8081")
+db = jammi.connect("grpc://engine.internal:8081")
 
 # Compound retrieval + inference in one Flight SQL round-trip:
 table = db.sql("""
@@ -51,9 +51,9 @@ The embed wheel runs the identical SQL against its in-process DataFusion engine 
 the `annotate` function is registered on the same context:
 
 ```python
-import jammi_ai
+import jammi
 
-db = jammi_ai.connect("file:///var/lib/jammi")
+db = jammi.connect("file:///var/lib/jammi")
 table = db.sql("""
     SELECT a._row_id, a.vector
     FROM annotate('local:/models/all-MiniLM-L6-v2', 'text_embedding',
@@ -61,8 +61,8 @@ table = db.sql("""
 """)
 ```
 
-Productionising from the embed wheel to the remote client is the M2 one-line import
-swap (`import jammi_ai` → `import jammi_client`); the `sql` call is unchanged.
+Productionising from the embed wheel to the remote client changes only the target
+(`file://` → `grpc://`) — the `import jammi` and the `sql` call are unchanged.
 
 ## In-process Rust: the fluent builder
 

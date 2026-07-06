@@ -2,7 +2,7 @@
 
 A **runnable book** that bridges *applied theory* — Stanković et al.'s *Data
 Analytics on Graphs* (Foundations & Trends in ML, 2020) and the modern GNN canon
-— with *software and computation*: the [`jammi_ai`](https://pypi.org/project/jammi_ai/)
+— with *software and computation*: the [`jammi`](https://pypi.org/project/jammi-ai/)
 engine. The signature move of every recipe: **one Jammi recipe = one equation in
 the monograph = one line in the GNN canon**, executed and measured.
 
@@ -22,7 +22,7 @@ Rails woven through every tier: **provenance**, **tenancy**, **measurement**.
 ## Repository layout
 
 ```
-jammi_cookbook/   the shared lib: composes jammi_ai, enforces contracts + rails
+jammi_cookbook/   the shared lib: composes jammi, enforces contracts + rails
 chapters/         the book (Quarto .qmd with executable Python cells)
 artifacts/        the committed golden-sample cache (small subset only)
 data/ids/         committed seeded subset _row_id lists
@@ -38,12 +38,13 @@ the HEAD embed wheel and runs this book's gate against it (see
 From the repo root, build the HEAD engine wheel, then install the book against it:
 
 ```bash
-# HEAD embed wheel (CPU): maturin reads Cargo.toml at the repo root
+# HEAD embed engine (CPU): install the base client (import `jammi`), generate
+# stubs, then build + install the compiled native wheel from packaging/native.
 pip install -e 'clients/python[dev]' && make -C clients/python generate
-maturin build --release
-pip install --force-reinstall --no-deps target/wheels/jammi_ai-*.whl
+(cd packaging/native && maturin build --release --out ../../target/wheels)
+pip install --force-reinstall --no-deps target/wheels/jammi_ai_native-*.whl
 
-pip install -e 'cookbook/book[book,dev]'   # jammi_ai is unpinned; the HEAD wheel above wins
+pip install -e 'cookbook/book[book,dev]'   # the jammi-ai client is unpinned; the HEAD engine above wins
 cd cookbook/book
 python scripts/check_api_reference.py      # confirm the API reference matches the wheel
 pytest                                     # lib unit tests
@@ -65,4 +66,4 @@ cookbook's specs and build state (`EXECUTION-STATUS.md`).
 ## License
 
 Apache-2.0 (see `LICENSE`). Depends on, and is published separately from, the
-`jammi_ai` engine. Dataset attributions are in `NOTICE` and the loader docstrings.
+`jammi` engine. Dataset attributions are in `NOTICE` and the loader docstrings.

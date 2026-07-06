@@ -2,7 +2,7 @@
 
 Walks the four steps from `cookbook/quickstart/`'s README:
 
-1. `jammi_ai.connect("file://…")` — open a local in-process session
+1. `jammi.connect("file://…")` — open a local in-process session
 2. `db.add_source` — attach the tiny corpus fixture
 3. `db.generate_embeddings(..., modality="text")` — build a 32-dim USEARCH-backed index
 4. `db.encode_query(...)` + `db.search(...)` — execute a similarity query (returns a table)
@@ -30,7 +30,7 @@ from pathlib import Path
 os.environ.setdefault("JAMMI_GPU__DEVICE", "-1")
 os.environ.setdefault("JAMMI_ENGINE__BATCH_SIZE", "8")
 
-import jammi_ai
+import jammi
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 FIXTURES = REPO_ROOT / "cookbook" / "fixtures"
@@ -41,7 +41,7 @@ MODEL = f"local:{FIXTURES / 'tiny_bert'}"
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         # 1. Connect to a local, in-process engine rooted at the temp dir.
-        db = jammi_ai.connect(f"file://{tmp}")
+        db = jammi.connect(f"file://{tmp}")
 
         # 2. Register the tiny corpus as a Parquet source.
         db.add_source("corpus", url=str(CORPUS_PATH), format="parquet")

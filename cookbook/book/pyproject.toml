@@ -15,7 +15,7 @@ authors = [{ name = "F-Inverse" }]
 # atomically. (A separate nightly release-recipe leg installs the last PUBLISHED
 # jammi_ai wheel from PyPI and runs the CPU pytest subset, preserving the
 # published-artifact signal that HEAD-testing alone would lose.) The book authors
-# against the engine API and never vendors or edits engine source; jammi_client is
+# against the engine API and never vendors or edits engine source; jammi is
 # carried transitively by the embed wheel, not pinned separately. numpy/pyarrow are
 # the data substrate the chapters manipulate. The HEAD engine carries the bearer
 # token on the Flight SQL lane (RemoteDatabase.sql() / db.sql() over pyarrow.flight)

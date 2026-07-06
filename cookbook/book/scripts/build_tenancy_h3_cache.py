@@ -69,7 +69,7 @@ seam for the TYPED gRPC verbs; the Flight SQL lane (`db.sql()`) is a separate
 `pyarrow.flight` transport and is the gateway-in-front's responsibility there too
 (engine issue #220, by design).
 
-On `jammi-client` `0.32.0` the client carries the channel's bearer on the Flight
+On `jammi-ai` `0.32.0` the client carries the channel's bearer on the Flight
 SQL lane as well as the typed gRPC verbs (jammi #96); on `0.31.0` the bearer rode
 only the typed path. This script demonstrates the consumer-side seam over that
 **real Flight wire**: a `pyarrow.flight` gateway server reads the inbound bearer
@@ -126,8 +126,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import jammi
 import jammi_ai
-import jammi_client
 import pyarrow as pa
 import pyarrow.flight as flight
 import pyarrow.parquet as pq
@@ -396,7 +396,7 @@ def mint_token(subject: str, tenant_id: str) -> str:
     ``"<subject>.<tenant>"`` under :data:`_SIGNING_KEY`. The tenant claim is INSIDE
     the signed payload, so it cannot be forged without the key.
 
-    The bare form is deliberate: :class:`jammi_client.BearerCredentials` prepends
+    The bare form is deliberate: :class:`jammi.BearerCredentials` prepends
     ``"Bearer "`` itself when it puts the credential on the wire, so the token the
     gateway observes is ``"Bearer <subject>.<tenant>.<hex-mac>"``. Minting with the
     prefix already attached would double it to ``"Bearer Bearer …"`` and never
@@ -411,7 +411,7 @@ def verify_token(authorization: str | None) -> str | None:
     """The consumer's authentication step, run on the value the WIRE carries.
 
     The gateway reads the inbound ``authorization`` header, whose value is the
-    ``"Bearer <token>"`` :class:`jammi_client.BearerCredentials` put on the Flight
+    ``"Bearer <token>"`` :class:`jammi.BearerCredentials` put on the Flight
     lane. This strips exactly one leading ``"Bearer "`` the wire added, then
     verifies the bare token [@rfc6750] and returns its tenant claim, or ``None`` if
     the header is missing, malformed, or fails the constant-time signature check.
@@ -499,7 +499,7 @@ class _GatewayFlightServer(flight.FlightServerBase):
         tenant_id = self._verified_tenant(context)
         # The verified read leg hits the REAL engine: bind the tenant from the
         # authenticated claim and return only that tenant's sources.
-        upstream = jammi_client.connect(self._upstream)
+        upstream = jammi.connect(self._upstream)
         try:
             with upstream.tenant_scope(tenant_id):
                 sources = [s["source_id"] for s in upstream.list_sources()]
@@ -513,8 +513,8 @@ def _gateway_sources(endpoint: str, token: str | None) -> list[str]:
     given bearer (or anonymous when ``token`` is ``None``) and return the tenant's
     sources. The bearer rides the REAL Flight wire — no ``db._flight`` seeding, no
     Python-variable shortcut."""
-    credentials = jammi_client.BearerCredentials(token) if token is not None else None
-    db = jammi_client.connect(f"grpc://{endpoint}", credentials=credentials)
+    credentials = jammi.BearerCredentials(token) if token is not None else None
+    db = jammi.connect(f"grpc://{endpoint}", credentials=credentials)
     try:
         table = db.sql("SELECT source_id FROM sources")
         return table.column("source_id").to_pylist()
@@ -530,7 +530,7 @@ def run_byo_auth(upstream_endpoint: str, work: Path, *, tag: str) -> dict:
     tenant for a real-engine read. Mirrors ``grpc_byo_auth.rs`` for the Flight lane."""
     a_src = f"auth_a_{tag}"
     b_src = f"auth_b_{tag}"
-    upstream = jammi_client.connect(upstream_endpoint)
+    upstream = jammi.connect(upstream_endpoint)
     try:
         with tenant(upstream, TENANT_A):
             _write_src(upstream, work, a_src, pa.table({"id": [1]}))
@@ -645,7 +645,7 @@ class LiveServer:
                 out = self.proc.stdout.read().decode(errors="replace") if self.proc.stdout else ""
                 raise RuntimeError(f"jammi-server exited early:\n{out}")
             try:
-                handshake = jammi_client.connect(self.endpoint)
+                handshake = jammi.connect(self.endpoint)
                 handshake.get_server_info()
                 handshake.close()
                 return self.endpoint
@@ -717,7 +717,7 @@ def emit(fixtures_root: Path, server_bin: str) -> None:
         # --- remote transport (live grpc:// parity for the wire verbs) ------ #
         with LiveServer(server_bin) as endpoint:
             print(f"== remote engine up at {endpoint} ==", flush=True)
-            remote = jammi_client.connect(endpoint)
+            remote = jammi.connect(endpoint)
             try:
                 print("== remote engine: per-verb isolation matrix ==", flush=True)
                 remote_matrix = run_matrix(
@@ -837,7 +837,7 @@ def emit(fixtures_root: Path, server_bin: str) -> None:
             "consumer's job — a gateway in front of the engine. The engine's grpc_byo_auth.rs "
             "worked example shows that seam for the TYPED gRPC verbs; the Flight SQL lane "
             "(db.sql()) is the gateway-in-front's responsibility there too (engine #220, by "
-            "design). On jammi-client 0.32.0 the client carries the channel's bearer on the "
+            "design). On jammi-ai 0.32.0 the client carries the channel's bearer on the "
             "Flight SQL lane as well as the typed verbs (jammi #96; on 0.31.0 it rode only "
             "the typed path). This is the consumer-side mirror over that real Flight wire: a "
             "pyarrow.flight gateway reads the inbound bearer off a genuine db.sql() call, a "

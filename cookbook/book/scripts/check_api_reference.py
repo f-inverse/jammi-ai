@@ -144,7 +144,7 @@ def _signature(db: object, name: str) -> inspect.Signature | None:
     the composed embedded surface, on an instance.
 
     `jammi_ai.connect("file://…")` returns the embedded `Session` — the
-    `EmbeddedBackend`, defined once in `jammi_client._embedded` and re-exposed as
+    `EmbeddedBackend`, defined once in `jammi._embedded` and re-exposed as
     `jammi_ai.Database` — which holds a compiled `_NativeDatabase` handle by
     composition. Every verb is an explicit Python method on the wrapper that
     delegates to the native handle (the migrated verbs — `fine_tune`, `search`,

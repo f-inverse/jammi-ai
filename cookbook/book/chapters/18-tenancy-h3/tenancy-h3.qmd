@@ -283,7 +283,7 @@ import socket
 import tempfile
 
 import jammi_ai
-import jammi_client
+import jammi
 import pyarrow as pa
 import pyarrow.flight as flight
 import pyarrow.parquet as pq
@@ -370,8 +370,8 @@ gateway_endpoint = f"127.0.0.1:{gateway.port}"
 def gateway_sources(token):
     """The production db.sql() Flight path: the bearer rides the REAL Flight wire
     (BearerCredentials prepends 'Bearer '); anonymous when token is None."""
-    credentials = jammi_client.BearerCredentials(token) if token is not None else None
-    conn = jammi_client.connect(f"grpc://{gateway_endpoint}", credentials=credentials)
+    credentials = jammi.BearerCredentials(token) if token is not None else None
+    conn = jammi.connect(f"grpc://{gateway_endpoint}", credentials=credentials)
     try:
         return conn.sql("SELECT source_id FROM sources").column("source_id").to_pylist()
     finally:

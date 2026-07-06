@@ -3,7 +3,7 @@
 
 The engine↔cookbook validator for the H4 temporal-correctness surface: `asof_join`
 (SPEC-01) and `verify_materialization` (SPEC-02), carried on BOTH the embedded
-`jammi_ai.Database` and the remote `jammi_client.RemoteDatabase`. This script
+`jammi` and the remote `jammi.RemoteDatabase`. This script
 assembles a **leakage-free training set** with `asof_join`, measures the leak it
 closes, and freezes the materialization-contract verdict matrix.
 
@@ -367,7 +367,7 @@ class LiveServer:
         self.endpoint = None
 
     def __enter__(self) -> str:
-        import jammi_client
+        import jammi
 
         artifact_dir = tempfile.mkdtemp(prefix="jammi_srv_pit_")
         flight_port, health_port = _free_port(), _free_port()
@@ -386,7 +386,7 @@ class LiveServer:
                 out = self.proc.stdout.read().decode(errors="replace") if self.proc.stdout else ""
                 raise RuntimeError(f"jammi-server exited early:\n{out}")
             try:
-                handshake = jammi_client.connect(self.endpoint)
+                handshake = jammi.connect(self.endpoint)
                 handshake.get_server_info()
                 handshake.close()
                 return self.endpoint
@@ -441,11 +441,11 @@ def emit(target: str, server_bin: str | None) -> None:
 
         # --- remote asof (live grpc:// skew check) -------------------------- #
         if target == "dual":
-            import jammi_client
+            import jammi
 
             with LiveServer(server_bin) as endpoint:
                 print(f"== remote asof_join at {endpoint} ==", flush=True)
-                remote = jammi_client.connect(endpoint)
+                remote = jammi.connect(endpoint)
                 try:
                     r_out, r_rows, r_verdict = run_asof(remote, spine_path, facts_path)
                 finally:

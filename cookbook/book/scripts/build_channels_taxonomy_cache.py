@@ -6,7 +6,7 @@ The engine↔cookbook validator for the `§3.8` channel error taxonomy (engine
 code** on the wire, instead of the `Internal`-for-everything that a thin
 catch-all would produce. The channel registry verbs (`register_channel` /
 `add_channel_columns` / `list_channels`) are on BOTH the embedded `jammi_ai`
-engine and the remote `jammi_client.RemoteDatabase` (chapter 14 exercises the
+engine and the remote `jammi.RemoteDatabase` (chapter 14 exercises the
 happy path); this script MEASURES the FAILURE surface — the `(failure_mode →
 status_code)` matrix — on the `grpc://` transport, where the status codes only
 exist on the wire, with the embedded error class as the cross-transport
@@ -67,8 +67,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import jammi
 import jammi_ai
-import jammi_client
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
 
@@ -275,7 +275,7 @@ class LiveServer:
                 out = self.proc.stdout.read().decode(errors="replace") if self.proc.stdout else ""
                 raise RuntimeError(f"jammi-server exited early:\n{out}")
             try:
-                handshake = jammi_client.connect(self.endpoint)
+                handshake = jammi.connect(self.endpoint)
                 handshake.get_server_info()
                 handshake.close()
                 return self.endpoint
@@ -331,7 +331,7 @@ def emit(server_bin: str) -> None:
     # --- remote transport (live grpc:// — the typed wire codes) ------------- #
     with LiveServer(server_bin) as endpoint:
         print(f"== remote engine up at {endpoint} ==", flush=True)
-        remote = jammi_client.connect(endpoint)
+        remote = jammi.connect(endpoint)
         try:
             print("== remote engine: channel error taxonomy ==", flush=True)
             remote_run = run_taxonomy(remote, tenant_b, tag="rem")

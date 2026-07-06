@@ -27,10 +27,10 @@ surface is identical across planes:
 - `jammi_ai.connect("file:///path")  -> Database` — embedded, in-process engine
   (CPU). The committed cache and CI read the book on this arm.
 - `jammi_ai.connect("grpc://host:port") -> RemoteDatabase` — the pure-Python
-  client (`jammi_client`) over a running `jammi-server`. The **GPU** compute tier
+  client (`jammi`) over a running `jammi-server`. The **GPU** compute tier
   (embedding, fine-tune, context-predictor training) runs here; the CPU embed
   wheel cannot do GPU. A `RemoteDatabase` may carry a bearer credential
-  (`jammi_client.connect(endpoint, credentials=jammi_client.BearerCredentials(token))`);
+  (`jammi.connect(endpoint, credentials=jammi.BearerCredentials(token))`);
   `0.32.0` threads that bearer onto **both** lanes the client uses — the typed
   gRPC verbs (which already carried it) **and** the Flight SQL lane (`db.sql()`,
   a separate `pyarrow.flight` transport). The engine enforces auth on no

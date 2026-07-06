@@ -4,14 +4,14 @@
 The engine<->cookbook validator for the one-front-door client contract: one
 ``connect(target)`` returns a transport-agnostic ``Session`` whose capability
 divergence, error taxonomy, and finite-cap honest edge are the SAME shape on the
-embedded ``jammi_client.EmbeddedBackend`` (the base client's in-process,
+embedded ``jammi.EmbeddedBackend`` (the base client's in-process,
 direct-FFI backend — the ``[embedded]`` extra) and the remote
-``jammi_client.RemoteDatabase``. This script measures five families of surface
+``jammi.RemoteDatabase``. This script measures five families of surface
 facts and freezes them:
 
-* **the install surface** — ``jammi-client`` carries the engine as the opt-in
+* **the install surface** — ``jammi-ai`` carries the engine as the opt-in
   ``[embedded]`` extra (the compiled ``jammi-ai-native`` dist, importable as
-  ``jammi_native``); with it, ``jammi_client.connect("file://…")`` resolves the
+  ``jammi_native``); with it, ``jammi.connect("file://…")`` resolves the
   local target to an in-process ``EmbeddedBackend`` (direct FFI, no server),
   ``connect("grpc://…")`` to a ``RemoteDatabase`` — one base package, two arms;
 * **embedded↔remote parity** — the shared ``Session`` Protocol enumerates the
@@ -58,12 +58,12 @@ from importlib.util import find_spec
 from pathlib import Path
 
 import grpc
-import jammi_client
+import jammi
 import pyarrow as pa
 import pyarrow.parquet as pq
-from jammi_client import Capability, Session
-from jammi_client._database import MAX_RECEIVE_MESSAGE_LENGTH, _rpc_to_jammi
-from jammi_client.errors import (
+from jammi import Capability, Session
+from jammi._database import MAX_RECEIVE_MESSAGE_LENGTH, _rpc_to_jammi
+from jammi.errors import (
     BackendError,
     InvalidArgument,
     JammiError,
@@ -114,7 +114,7 @@ class _RaisingStub:
 def _remote_verb_status(code: grpc.StatusCode) -> JammiError:
     """Drive a real ``RemoteDatabase`` unary verb whose wire hop raises ``code``;
     return the mapped taxonomy exception (through the real ``_call`` path)."""
-    remote = jammi_client.connect("grpc://127.0.0.1:8081")  # lazy; opens no socket
+    remote = jammi.connect("grpc://127.0.0.1:8081")  # lazy; opens no socket
     try:
         remote._catalog = _RaisingStub(_FakeRpcError(code, f"server said {code}"))
         try:
@@ -135,7 +135,7 @@ def _install_record(embedded, remote) -> dict:
     """The base client's install surface: the ``[embedded]`` extra (read off the
     live dist metadata — never transcribed) and the concrete backend each URI
     scheme resolves to."""
-    md = importlib_metadata.metadata("jammi-client")
+    md = importlib_metadata.metadata("jammi-ai")
     extras = sorted(md.get_all("Provides-Extra") or [])
     reqs = md.get_all("Requires-Dist") or []
     embedded_pins = sorted(
@@ -377,8 +377,8 @@ def main() -> int:
         # The base client discovers the in-process engine on demand: a `file://`
         # target resolves to the direct-FFI EmbeddedBackend when the `[embedded]`
         # extra is installed. This is the REAL new surface — no convenience bundle.
-        embedded = jammi_client.connect(f"file://{artifact_dir}")
-        remote = jammi_client.connect("grpc://127.0.0.1:8081")  # lazy; supports() is local
+        embedded = jammi.connect(f"file://{artifact_dir}")
+        remote = jammi.connect("grpc://127.0.0.1:8081")  # lazy; supports() is local
         try:
             record = {
                 "install": _install_record(embedded, remote),

@@ -4,7 +4,7 @@
 The engine↔cookbook validator for the `§3.6` model-catalog surface: the model
 verbs (`list_models` / `describe_model` / `delete_model`) that the engine carries
 on BOTH the embedded `jammi_ai.Database` and the remote
-`jammi_client.RemoteDatabase`. The engine's catalog lets you **see** the models it
+`jammi.RemoteDatabase`. The engine's catalog lets you **see** the models it
 resolves and trains, and **clean them up**; this script measures that surface as a
 real, asserted property — the **referential-integrity matrix** for `delete_model`,
 validated `remote == embedded` for every observable.
@@ -67,8 +67,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import jammi
 import jammi_ai
-import jammi_client
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -281,7 +281,7 @@ class LiveServer:
                 out = self.proc.stdout.read().decode(errors="replace") if self.proc.stdout else ""
                 raise RuntimeError(f"jammi-server exited early:\n{out}")
             try:
-                handshake = jammi_client.connect(self.endpoint)
+                handshake = jammi.connect(self.endpoint)
                 handshake.get_server_info()
                 handshake.close()
                 return self.endpoint
@@ -361,7 +361,7 @@ def emit(fixtures_root: Path, server_bin: str) -> None:
         # --- remote transport (live grpc:// parity) ------------------------- #
         with LiveServer(server_bin) as endpoint:
             print(f"== remote engine up at {endpoint} ==", flush=True)
-            remote = jammi_client.connect(endpoint)
+            remote = jammi.connect(endpoint)
             try:
                 print("== remote engine: model catalog ==", flush=True)
                 remote_matrix = run_catalog(remote, corpus_path, base_model, tag="rem")

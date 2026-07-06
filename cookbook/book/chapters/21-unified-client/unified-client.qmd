@@ -87,7 +87,7 @@ than transcribe it, and confirm the engine it names is importable in this book's
 import importlib.metadata as importlib_metadata
 from importlib.util import find_spec
 
-md = importlib_metadata.metadata("jammi-client")
+md = importlib_metadata.metadata("jammi-ai")
 extras = sorted(md.get_all("Provides-Extra") or [])
 reqs = md.get_all("Requires-Dist") or []
 embedded_pins = sorted(
@@ -95,7 +95,7 @@ embedded_pins = sorted(
 )
 native_here = find_spec("jammi_native") is not None
 
-print(f"jammi-client extras:        {extras}")
+print(f"jammi-ai extras:        {extras}")
 print(f"[embedded] pins:            {embedded_pins}")
 print(f"jammi_native importable:    {native_here}  (the extra is installed)")
 
@@ -121,11 +121,11 @@ are a `Session`.
 ```{python}
 import tempfile
 
-import jammi_client
-from jammi_client import Session
+import jammi
+from jammi import Session
 
-embedded = jammi_client.connect(f"file://{tempfile.mkdtemp(prefix='jammi_uc_')}")
-remote = jammi_client.connect("grpc://127.0.0.1:8081")  # lazy — opens no socket
+embedded = jammi.connect(f"file://{tempfile.mkdtemp(prefix='jammi_uc_')}")
+remote = jammi.connect("grpc://127.0.0.1:8081")  # lazy — opens no socket
 
 print(f"connect('file://…') -> {type(embedded).__module__}.{type(embedded).__name__}")
 print(f"connect('grpc://…') -> {type(remote).__module__}.{type(remote).__name__}")
@@ -187,7 +187,7 @@ sets are exactly complementary across the closed five: every capability is carri
 precisely one transport.
 
 ```{python}
-from jammi_client import Capability
+from jammi import Capability
 
 # `embedded` and `remote` are the two Sessions opened in the parity movement above.
 print(f"{'capability':<20}{'embedded':>10}{'remote':>10}")
@@ -207,7 +207,7 @@ reached for — rather than a bare `AttributeError` that would leave you guessin
 method was misspelled or merely absent here.
 
 ```{python}
-from jammi_client.errors import NotSupportedOnBackend
+from jammi.errors import NotSupportedOnBackend
 
 # session_id is remote-only; reach for it on the embedded engine.
 try:
@@ -246,7 +246,7 @@ a bad argument *is* a `ValueError` (`InvalidArgument`), a transport or runtime f
 what kind of error each class is.
 
 ```{python}
-from jammi_client.errors import BackendError, InvalidArgument, JammiError, TrainingError
+from jammi.errors import BackendError, InvalidArgument, JammiError, TrainingError
 
 for cls in (JammiError, InvalidArgument, NotSupportedOnBackend, TrainingError, BackendError):
     bases = ", ".join(b.__name__ for b in cls.__bases__)
@@ -329,7 +329,7 @@ and hidden: a result exceeding it does not silently truncate — it raises `Back
 mapped from gRPC's `RESOURCE_EXHAUSTED`.
 
 ```{python}
-from jammi_client._database import MAX_RECEIVE_MESSAGE_LENGTH, _rpc_to_jammi
+from jammi._database import MAX_RECEIVE_MESSAGE_LENGTH, _rpc_to_jammi
 
 edge = rec["honest_edge"]
 print(f"remote receive cap (production default): "

@@ -3,18 +3,29 @@ name: PyPI
 on:
   push:
     tags: ["py-v*"]
-  # Manual re-run to finish a release whose embed-wheel publish was interrupted.
-  # The wheel version comes from the checked-out source (maturin reads
-  # Cargo.toml), so dispatch from the release commit / `main` at the release
-  # version; PyPI rejects a re-upload of an existing version, so this is safe.
+  # Manual re-run to finish a release whose publish was interrupted. The native
+  # wheel version comes from the checked-out source (maturin reads the crate's
+  # `version.workspace` from Cargo.toml); the pure-Python `jammi-ai` version is
+  # the static workspace version in `pyproject.toml`. Dispatch from the release
+  # commit / `main` at the release version; PyPI rejects a re-upload of an
+  # existing version, so this is safe.
   workflow_dispatch:
 
+# Two dists ship from this workflow, in lockstep at the shared workspace version:
+#   * `jammi-ai-native` — the compiled engine (maturin abi3 wheels, per-platform),
+#     built from `packaging/native/pyproject.toml` (module `jammi_native`).
+#   * `jammi-ai`        — the pure-Python front-end (one universal wheel + sdist),
+#     built from the root `pyproject.toml` (hatchling), depending on
+#     `jammi-ai-native==` + `jammi-client==` at that same version.
 jobs:
-  build-linux:
-    name: Build wheel (Linux)
+  build-native-linux:
+    name: Build native wheel (Linux)
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/f-inverse/jammi-ai-ci:latest
+    defaults:
+      run:
+        working-directory: packaging/native
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
@@ -22,26 +33,29 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Build wheel
+      - name: Build native wheel
         run: maturin build --release --out dist
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-linux
-          path: dist
+          name: wheels-native-linux
+          path: packaging/native/dist
 
-  build-macos:
-    name: Build wheel (macOS ${{ matrix.target }})
+  build-native-macos:
+    name: Build native wheel (macOS ${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: packaging/native
     strategy:
       matrix:
         include:
           - runner: macos-latest
             target: aarch64-apple-darwin
-            artifact: wheels-macos-arm64
+            artifact: wheels-native-macos-arm64
           - runner: macos-15-intel
             target: x86_64-apple-darwin
-            artifact: wheels-macos-x86_64
+            artifact: wheels-native-macos-x86_64
     steps:
       - uses: actions/checkout@v4
 
@@ -49,18 +63,21 @@ jobs:
         with:
           python-version: "3.12"
 
-      # The embed wheel depends on `jammi-wire`, whose `build.rs` compiles the
+      # The native wheel depends on `jammi-wire`, whose `build.rs` compiles the
       # `jammi.v1` protos with `protoc` on every build (it is the proto/stub
       # owner). The Linux leg gets `protoc` from the CI base image; the macOS
-      # runners do not ship it, so install it here. (The remote arm is still the
-      # pure-Python `jammi-client`, published in lockstep by pypi-client.yml.)
+      # runners do not ship it, so install it here.
       - name: Install protoc (macOS)
         run: brew install protobuf
 
-      - name: Build wheel
+      - name: Build native wheel
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
+          # `working-directory` points the action at `packaging/native/pyproject.toml`,
+          # whose `[tool.maturin] manifest-path` already resolves the crate — no
+          # `--manifest-path` in args.
+          working-directory: packaging/native
           args: --release --out dist
         env:
           RUSTC_WRAPPER: ""
@@ -68,14 +85,38 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist
+          path: packaging/native/dist
 
   # Windows wheel disabled: usearch 2.24.0 uses POSIX mmap APIs
   # (MAP_FAILED) that MSVC does not support.
 
+  build-pure:
+    name: Build pure-Python wheel + sdist (jammi-ai)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The pure-Python front-end has no compiled code — a plain hatchling build
+      # produces the universal `py3-none-any` wheel and an sdist. Its exact
+      # dependency pins (`jammi-ai-native==`, `jammi-client==`) resolve from PyPI
+      # at install time, published in lockstep by the other lanes / pypi-client.yml.
+      - name: Build wheel + sdist
+        run: |
+          python -m pip install --upgrade build
+          python -m build --outdir dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pure-dist
+          path: dist
+
   publish:
     name: Publish to PyPI
-    needs: [build-linux, build-macos]
+    needs: [build-native-linux, build-native-macos, build-pure]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -83,8 +124,13 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: wheels-*
+          pattern: wheels-native-*
           merge-multiple: true
+          path: dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: pure-dist
           path: dist
 
       - name: Publish to PyPI

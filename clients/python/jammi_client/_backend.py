@@ -3,9 +3,10 @@
 `connect(target)` returns a :class:`Session` — the transport-agnostic surface a
 caller writes against. Two concrete classes satisfy it structurally: the remote
 :class:`~jammi_client.RemoteDatabase` (over a gRPC channel) and the embedded
-`jammi_ai.Database` (over the compiled in-process engine). Because both expose
-the same verb vocabulary, a caller swaps transports without touching a call —
-that is the one-front-door thesis made a type.
+:class:`~jammi_client.EmbeddedBackend` (over the compiled in-process engine,
+direct FFI; also re-exposed as `jammi_ai.Database`). Because both expose the same
+verb vocabulary, a caller swaps transports without touching a call — that is the
+one-front-door thesis made a type.
 
 The protocols are :func:`~typing.runtime_checkable` so a test can assert
 ``isinstance(db, Session)`` structurally, and so the two implementations are

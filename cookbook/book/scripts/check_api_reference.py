@@ -143,14 +143,15 @@ def _signature(db: object, name: str) -> inspect.Signature | None:
     """Resolve `name`'s signature the way a CALLER actually invokes it — through
     the composed embedded surface, on an instance.
 
-    `jammi_ai.connect("file://…")` returns a thin `Database` wrapper that holds a
-    compiled `_NativeDatabase` handle by composition (see `jammi_ai/_database.py`):
-    the migrated verbs (`fine_tune`, `search`, `register_topic`, …) are explicit
-    Python methods on the wrapper, while every un-migrated verb (`sql`,
-    `drop_mutable_table`, `list_models`, …) lives on the native handle and is
-    forwarded at runtime via `__getattr__`. Introspecting the bare wrapper CLASS
-    therefore sees the explicit methods without a `__text_signature__` (they are
-    plain Python functions) and misses the forwarded verbs entirely.
+    `jammi_ai.connect("file://…")` returns the embedded `Session` — the
+    `EmbeddedBackend`, defined once in `jammi_client._embedded` and re-exposed as
+    `jammi_ai.Database` — which holds a compiled `_NativeDatabase` handle by
+    composition. Every verb is an explicit Python method on the wrapper that
+    delegates to the native handle (the migrated verbs — `fine_tune`, `search`,
+    `register_topic`, … — drive the shared request assembly; the rest forward 1:1).
+    Introspecting the bare wrapper CLASS sees these as plain Python functions
+    without a `__text_signature__`, so it misses the native keyword surface behind
+    the delegation.
 
     Resolving the bound method on an INSTANCE looks through that composition —
     wrapper attribute first, native handle behind it — exactly as the engine's own

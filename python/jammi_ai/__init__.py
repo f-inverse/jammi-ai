@@ -19,75 +19,48 @@ swap (``import jammi_ai`` → ``import jammi_client``), `connect` unchanged.
 
 from __future__ import annotations
 
-from typing import Optional, Union
-
-import jammi_client
+# The one front door — DEFINED ONCE in `jammi-client`, re-exported here. `jammi_ai`
+# is a convenience bundle, not a parallel implementation: `jammi_ai.connect` IS
+# `jammi_client.connect` (same function object), which dispatches `file://` to the
+# in-process engine and remote targets to the gRPC client. The only thing this
+# bundle adds is that it PINS the `[embedded]` extra (see this dist's
+# `pyproject.toml`), so `jammi_native` is always present and a `file://` target
+# always resolves — the "batteries-included" develop half of develop→deploy.
 from jammi_client import (
-    ChannelCredentials,
-    LocalTarget,
     NoEmbeddedEngineError,
     RemoteDatabase,
     Session,
-    Target,
-    parse_target,
+    connect,
 )
 
+# The embedded backend — the local `Session` a `file://` target returns. Defined
+# once in `jammi_client._embedded`; re-exposed here under its historical name
+# `jammi_ai.Database` for the convenience surface (retired in U3's rename).
+from jammi_client import EmbeddedBackend as Database
+
+# The compiled engine's handle + primitive types, re-exported so a caller reaches
+# them off `jammi_ai` without naming `jammi_native`. `jammi_ai` carries the engine
+# by construction (it pins the extra), so this eager native import is honest here
+# — unlike `jammi_client`, whose native import is lazy.
 from jammi_native import (
-    open_local,
-    _NativeDatabase,
-    TrainingJob,
-    ModelTask,
-    PerQueryAudit,
     AuditHandle,
     EphemeralSession,
+    ModelTask,
+    PerQueryAudit,
+    TrainingJob,
+    open_local,
 )
-from jammi_ai._database import Database
 
 __all__ = [
     "connect",
     "Session",
     "Database",
     "RemoteDatabase",
+    "NoEmbeddedEngineError",
     "TrainingJob",
     "ModelTask",
     "PerQueryAudit",
     "AuditHandle",
     "EphemeralSession",
+    "open_local",
 ]
-
-
-def connect(
-    target: Union[str, Target],
-    *,
-    credentials: Optional[ChannelCredentials] = None,
-) -> Session:
-    """Open a session against `target`, selecting its transport once.
-
-    `target` is a URI string or a structured :class:`~jammi_client.Target`:
-
-    * ``file:///data`` → the compiled, in-process engine (a :class:`Database`),
-      rooted at the target's path.
-    * ``https://host`` / ``grpcs://host:8081`` / ``http://host`` /
-      ``grpc://host:8081`` → a remote engine over the `jammi.v1` gRPC wire (a
-      :class:`~jammi_client.RemoteDatabase`), via the bundled `jammi-client`.
-
-    Both arms return a :class:`~jammi_client.Session` — the transport-agnostic
-    surface — so a caller writes one program and flips local↔remote by target
-    alone.
-
-    `credentials` rides a remote channel (see :func:`jammi_client.connect`). It
-    is meaningless on a `file://` target — an in-process engine has no channel to
-    authenticate — so a local target opened *with* credentials is rejected as a
-    :class:`~jammi_client.NoEmbeddedEngineError`: the target-vs-credential
-    mismatch is a caller error, caught before an engine is opened.
-    """
-    parsed = parse_target(target)
-    if isinstance(parsed, LocalTarget):
-        if credentials is not None:
-            raise NoEmbeddedEngineError(parsed.artifact_dir)
-        # Wrap the low-level native handle in the thin Python `Database`: the
-        # user-facing local surface is `Database`, never the raw `_NativeDatabase`.
-        return Database(open_local(artifact_dir=parsed.artifact_dir))
-    # Remote — hand the original target to the bundled client; it re-parses to
-    # the same RemoteTarget and opens the channel. One remote definition.
-    return jammi_client.connect(parsed, credentials=credentials)

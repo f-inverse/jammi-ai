@@ -33,9 +33,11 @@ pytestmark = pytest.mark.skipif(
 
 def _connect(tmp_path: Path):
     db = jammi_ai.connect(f"file://{tmp_path}")
-    # connect("file://") returns the thin Python wrapper, not the raw handle.
-    assert type(db).__name__ == "Database"
-    assert type(db).__module__ == "jammi_ai._database"
+    # connect("file://") returns the embedded `Session` (the migrated
+    # `EmbeddedBackend`, defined once in `jammi_client._embedded` and re-exposed as
+    # `jammi_ai.Database`), not the raw native handle.
+    assert type(db).__name__ == "EmbeddedBackend"
+    assert type(db).__module__ == "jammi_client._embedded"
     return db
 
 

@@ -1,4 +1,4 @@
-"""Cache-backed checks for the unified-client surface (U1) — CPU, hermetic.
+"""Cache-backed checks for the unified-client surface (U1/U2) — CPU, hermetic.
 
 These re-derive the chapter's load-bearing surface facts LIVE (no server socket,
 no GPU, no upstream recompute) and assert they equal the committed
@@ -6,6 +6,13 @@ no GPU, no upstream recompute) and assert they equal the committed
 re-derivation is cheap and self-contained — there is no heavy upstream cache to
 recompute, only the client contract to hold to its frozen shape:
 
+* **the install surface** — `jammi-client` carries the engine as the opt-in
+  `[embedded]` extra (the `jammi-ai-native` dist), and `connect("file://…")`
+  resolves the local target to a direct-FFI `EmbeddedBackend` while
+  `connect("grpc://…")` resolves to a `RemoteDatabase` — one base package,
+  two arms;
+* **embedded↔remote parity** — every member the shared `Session` Protocol names
+  is present on BOTH concrete backends, and both satisfy `Session` structurally;
 * **the capability contract** — `supports(Capability.X)` is the committed boolean
   per backend (the two CLOSED-five sets are exactly complementary), and a
   one-sided feature on the wrong backend raises `NotSupportedOnBackend`;
@@ -15,22 +22,25 @@ recompute, only the client contract to hold to its frozen shape:
   mapped onto `BackendError` for a payload above the cap, while the embedded
   engine returns the same-scale payload in-process.
 
-If the emitted cache is absent the checks skip; the committed record, once
-present, is always asserted equal to the live surface.
+The embedded backend under test is the REAL base-client `EmbeddedBackend` that
+`jammi_client.connect("file://…")` returns (the `[embedded]` extra's direct-FFI
+engine), not a convenience-bundle alias. If the emitted cache is absent the
+checks skip; the committed record, once present, is always asserted equal to the
+live surface.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
+import importlib.metadata as importlib_metadata
 import tempfile
 
 import grpc
-import jammi_ai
 import jammi_client
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from jammi_client import Capability
+from jammi_client import Capability, Session
 from jammi_client._database import MAX_RECEIVE_MESSAGE_LENGTH, _rpc_to_jammi
 from jammi_client.errors import (
     BackendError,
@@ -50,6 +60,87 @@ def _record() -> dict:
     return contracts.load_artifact("unified_client.record")
 
 
+def _session_protocol_verbs() -> list[str]:
+    """The public members the runtime-checkable `Session` Protocol names — read
+    off the live Protocol, the same way the emit script does."""
+    attrs = getattr(Session, "__protocol_attrs__", None)
+    if attrs is None:  # pragma: no cover - <3.12 fallback
+        from typing import _get_protocol_attrs  # type: ignore[attr-defined]
+
+        attrs = _get_protocol_attrs(Session)
+    return sorted(a for a in attrs if not a.startswith("_"))
+
+
+# --------------------------------------------------------------------------- #
+# 0. install surface — the [embedded] extra + the two connect arms
+# --------------------------------------------------------------------------- #
+
+
+@_needs_cache
+def test_embedded_extra_pins_the_native_engine():
+    """`jammi-client` declares the opt-in `[embedded]` extra, pinning the compiled
+    `jammi-ai-native` dist — read off the live dist metadata, matching the golden."""
+    rec = _record()["install"]
+    md = importlib_metadata.metadata("jammi-client")
+    extras = sorted(md.get_all("Provides-Extra") or [])
+    reqs = md.get_all("Requires-Dist") or []
+    pins = sorted(
+        r.split(";", 1)[0].strip()
+        for r in reqs
+        if "extra ==" in r and "'embedded'" in r
+    )
+    assert "embedded" in extras
+    assert pins == rec["embedded_extra_pins"]
+    assert any(p.startswith("jammi-ai-native==") for p in pins), "the extra pins the engine"
+    assert extras == rec["extras"]
+
+
+@_needs_cache
+def test_file_uri_returns_embedded_backend_grpc_returns_remote():
+    """The ONE front door, two arms: `connect("file://…")` returns the in-process
+    `EmbeddedBackend` (direct FFI, no server), `connect("grpc://…")` a
+    `RemoteDatabase` — both off the base `jammi_client`, no convenience bundle."""
+    rec = _record()["install"]
+    with tempfile.TemporaryDirectory() as d:
+        embedded = jammi_client.connect(f"file://{d}")
+        remote = jammi_client.connect("grpc://127.0.0.1:8081")
+        try:
+            assert type(embedded).__name__ == rec["file_uri_backend"] == "EmbeddedBackend"
+            assert type(embedded).__module__ == rec["file_uri_backend_module"]
+            assert type(remote).__name__ == rec["grpc_uri_backend"] == "RemoteDatabase"
+        finally:
+            remote.close()
+
+
+# --------------------------------------------------------------------------- #
+# 0b. embedded↔remote parity — the shared Session Protocol vocabulary
+# --------------------------------------------------------------------------- #
+
+
+@_needs_cache
+def test_session_protocol_vocabulary_present_on_both_backends():
+    """Every member the shared `Session` Protocol names is present on BOTH concrete
+    backends, and both satisfy `Session` structurally — the parity the one-front-
+    door thesis rests on, measured member-for-member against the golden."""
+    rec = _record()["parity"]
+    verbs = _session_protocol_verbs()
+    assert verbs == rec["session_protocol_verbs"]
+    assert len(verbs) == rec["verb_count"]
+    with tempfile.TemporaryDirectory() as d:
+        embedded = jammi_client.connect(f"file://{d}")
+        remote = jammi_client.connect("grpc://127.0.0.1:8081")
+        try:
+            emb_missing = sorted(v for v in verbs if not hasattr(type(embedded), v))
+            rem_missing = sorted(v for v in verbs if not hasattr(type(remote), v))
+            assert isinstance(embedded, Session) is rec["embedded_is_session"] is True
+            assert isinstance(remote, Session) is rec["remote_is_session"] is True
+        finally:
+            remote.close()
+    assert emb_missing == rec["embedded_missing"] == []
+    assert rem_missing == rec["remote_missing"] == []
+    assert rec["both_complete"] is True
+
+
 # --------------------------------------------------------------------------- #
 # 1. capability contract
 # --------------------------------------------------------------------------- #
@@ -61,7 +152,7 @@ def test_supports_booleans_match_and_are_complementary():
     CLOSED-five capability sets are exactly complementary."""
     rec = _record()["capability"]
     with tempfile.TemporaryDirectory() as d:
-        embedded = jammi_ai.connect(f"file://{d}")
+        embedded = jammi_client.connect(f"file://{d}")
         remote = jammi_client.connect("grpc://127.0.0.1:8081")
         try:
             emb = {c.value: embedded.supports(c) for c in Capability}
@@ -80,7 +171,7 @@ def test_wrong_side_capability_raises_not_supported():
     `NotSupportedOnBackend` (never a bare `AttributeError`), naming the capability."""
     rec = _record()["capability"]
     with tempfile.TemporaryDirectory() as d:
-        embedded = jammi_ai.connect(f"file://{d}")
+        embedded = jammi_client.connect(f"file://{d}")
         remote = jammi_client.connect("grpc://127.0.0.1:8081")
         try:
             with pytest.raises(NotSupportedOnBackend) as emb_info:
@@ -146,7 +237,7 @@ def test_one_except_jammi_error_catches_both_transports():
 
     # Embedded side — the in-process engine rejects a malformed tenant id.
     with tempfile.TemporaryDirectory() as d:
-        embedded = jammi_ai.connect(f"file://{d}")
+        embedded = jammi_client.connect(f"file://{d}")
         try:
             embedded.set_tenant("not-a-uuid")
         except JammiError as exc:
@@ -269,7 +360,7 @@ def test_embedded_returns_the_same_scale_payload_unbounded():
     demo cap the remote channel rejected — the unbounded in-process counterpart."""
     rec = _record()["honest_edge"]
     with tempfile.TemporaryDirectory() as d:
-        embedded = jammi_ai.connect(f"file://{d}")
+        embedded = jammi_client.connect(f"file://{d}")
         table = pa.table({"id": pa.array(range(rec["embedded_returned_rows"]), type=pa.int32())})
         path = f"{d}/big.parquet"
         pq.write_table(table, path)

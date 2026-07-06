@@ -3,10 +3,15 @@
 Pure-Python gRPC client for a remote [Jammi](https://github.com/f-inverse/jammi-ai)
 engine — the **deploy** half of the develop→deploy journey.
 
-`jammi-ai` runs an embedded engine in-process and bundles this client for its
-remote targets. `jammi-client` is the lean variant: a universal
-`py3-none-any` wheel that links no candle/ML stack — just `grpcio` + `protobuf`
-+ `pyarrow` — for production where the engine runs behind a server.
+`jammi-client` is the **base** client: a universal `py3-none-any` wheel that
+links no candle/ML stack — just `grpcio` + `protobuf` + `pyarrow` — for
+production where the engine runs behind a server. It also discovers the compiled
+in-process engine as an OPTIONAL backend: `pip install jammi-client[embedded]`
+pulls `jammi-ai-native`, and then `connect("file://…")` resolves the local target
+to an in-process engine (direct FFI) through the SAME front door. Absent the
+extra, the base stays native-free and a `file://` target raises a truthful
+`NoEmbeddedEngineError`. `jammi-ai` is the batteries-included bundle that pins the
+extra so the local target always resolves.
 
 ## One front door
 
@@ -45,12 +50,12 @@ lane) does not yet carry it — tracked at
 |---|---|
 | `https://host` / `grpcs://host:8081` | secure remote |
 | `http://host` / `grpc://host:8081` | plaintext remote |
-| `file:///data` | local engine — **not in this build**; raises `NoEmbeddedEngineError` pointing at `pip install jammi-ai` |
+| `file:///data` | in-process engine (direct FFI) with the `[embedded]` extra installed; otherwise raises `NoEmbeddedEngineError` pointing at `pip install jammi-client[embedded]` |
 
 Scaling local→remote is an env flip (`connect(os.environ["JAMMI_TARGET"])`)
-with no code change. Productionising from the embed wheel to this lean client is
-a one-line import swap (`import jammi_ai` → `import jammi_client`), `connect`
-unchanged.
+with no code change. The lean deploy build and the embedded build are ONE
+package — the same `import jammi_client`, `connect` unchanged — differing only by
+whether the `[embedded]` extra is present.
 
 ## Generated from the canonical proto
 

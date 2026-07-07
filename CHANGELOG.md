@@ -6,7 +6,9 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
-A feature release adding the platform-composability seam and the lifecycle wire contract.
+## [0.35.0] - 2026-07-07
+
+A feature release adding the platform-composability seam and the lifecycle wire contract, shipped in lockstep across the workspace.
 
 ### Added
 - **gRPC composability seam (`jammi-server`).** `assemble_grpc_chain` returns an

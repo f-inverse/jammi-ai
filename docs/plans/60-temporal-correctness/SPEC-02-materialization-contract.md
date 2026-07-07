@@ -315,7 +315,7 @@ crates/jammi-wire/proto/jammi/v1/catalog.proto  CHANGED  VerifyMaterialization r
 crates/jammi-wire/src/catalog.rs                CHANGED  match_verdict_{to,from}_proto
 crates/jammi-server/src/grpc/catalog.rs         CHANGED  VerifyMaterialization handler
 crates/jammi-python/src/database.rs             CHANGED  PyO3 verify_materialization binding
-clients/python/jammi_client/_database.py        CHANGED  remote stub + verdict projection
+clients/python/jammi/_database.py               CHANGED  remote stub + verdict projection
 crates/jammi-python/tests/test_conformance.py   CHANGED  _PIPELINE_VERBS += verify_materialization
 crates/jammi-db/tests/it/materialization.rs                +new  adversarial oracle (the §11 verdicts) + funnel + recovery
 crates/jammi-db/tests/it/materialization_crash_recovery.rs +new  SIGKILL crash-injection (manifest window)

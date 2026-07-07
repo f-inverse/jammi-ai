@@ -260,8 +260,8 @@ A second instance of the same "records-but-ignores, no consumer reaches it" patt
 Following the established path (`crates/jammi-python/tests/test_conformance.py` pins name-for-name + signature-for-signature parity across transports):
 
 1. Rust impl: `Database::asof_join` (`crates/jammi-ai/src/session.rs`) over the operator.
-2. PyO3 binding: `jammi_ai.Database.asof_join` (`crates/jammi-python/src/lib.rs`).
-3. gRPC handler + `RemoteDatabase.asof_join` stub (`clients/python/jammi_client/_database.py`) — submits through the existing pipeline service.
+2. PyO3 binding: `asof_join` on the embedded `Session` (`EmbeddedBackend`; `crates/jammi-python/src/lib.rs`).
+3. gRPC handler + `RemoteDatabase.asof_join` stub (`clients/python/jammi/_database.py`) — submits through the existing pipeline service.
 4. Add `"asof_join"` to `_PIPELINE_VERBS` in `test_conformance.py`; the guard then asserts both surfaces callable with identical signatures.
 
 ## 8. Module layout
@@ -276,7 +276,7 @@ crates/jammi-ai/src/pipeline/asof/
 crates/jammi-ai/src/pipeline/graph_neighbourhood.rs   DEFERRED route as_of through the shared comparison (§6.3 — tracked follow-up, NOT in this delivery)
 crates/jammi-ai/src/session.rs                         CHANGED  expose asof_join
 crates/jammi-python/src/lib.rs                         CHANGED  PyO3 binding
-clients/python/jammi_client/_database.py               CHANGED  remote stub
+clients/python/jammi/_database.py                      CHANGED  remote stub
 crates/jammi-python/tests/test_conformance.py          CHANGED  _PIPELINE_VERBS += asof_join
 crates/jammi-ai/tests/it/asof_merge.rs                 +new
 crates/jammi-ai/tests/it/asof_verb.rs                  +new

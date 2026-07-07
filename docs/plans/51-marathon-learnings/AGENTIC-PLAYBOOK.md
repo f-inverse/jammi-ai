@@ -149,9 +149,9 @@ Detail and recipes live in roadmap §7 and the memory files; the agent-facing su
   `df -h /mnt/sagemaker-nvme`. A worktree checked out under a full disk silently dropped a
   tracked fixture and produced a *spurious* test failure — treat remote CI (full checkout)
   as authoritative.
-- **`maturin`/embedded `jammi_ai` cross-worktree shadowing.** `import jammi_ai` can resolve
+- **`maturin`/embedded `jammi_native` cross-worktree shadowing.** `import jammi_native` can resolve
   to a *different* worktree's install; pin `PYTHONPATH` to the worktree's `python/` and
-  confirm `jammi_ai.__file__` + that the freshly built `jammi_native.abi3.so` is the one imported.
+  confirm `jammi_native.__file__` + that the freshly built `jammi_native.abi3.so` is the one imported.
 - **The server's JSON log writes nothing to a non-TTY stdout** — prove GPU use with
   `nvidia-smi` compute-apps, not the log.
 - **Recalled memory reflects when it was written.** Verify any file/flag/path a memory

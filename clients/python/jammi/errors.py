@@ -117,6 +117,26 @@ class NoEmbeddedEngineError(NotSupportedOnBackend):
         return err
 
 
+class PlatformNotInstalledError(JammiError):
+    """`jammi.platform` was accessed but no platform extension is installed.
+
+    `jammi` surfaces an out-of-package plug-in as `jammi.platform` through a
+    generic extension slot — an entry point named `platform` in the
+    `jammi.extensions` group. The plug-in registers itself there; it never writes
+    into the `jammi` namespace. Absent any registered extension, this build
+    carries only the open surface, and accessing `jammi.platform` raises this
+    error rather than a bare `AttributeError`. Install the platform SDK —
+    `pip install jammi-ai-platform` — and the SAME `jammi.platform` resolves to it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "no platform extension is installed: `jammi.platform` is provided by "
+            "an out-of-package plug-in registered under the `jammi.extensions` "
+            "entry-point group — `pip install jammi-ai-platform` to surface it."
+        )
+
+
 class TrainingError(JammiError, RuntimeError):
     """A training job reached a ``failed`` terminal state.
 

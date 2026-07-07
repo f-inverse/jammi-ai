@@ -69,9 +69,9 @@ seam for the TYPED gRPC verbs; the Flight SQL lane (`db.sql()`) is a separate
 `pyarrow.flight` transport and is the gateway-in-front's responsibility there too
 (engine issue #220, by design).
 
-On `jammi-ai` `0.32.0` the client carries the channel's bearer on the Flight
-SQL lane as well as the typed gRPC verbs (jammi #96); on `0.31.0` the bearer rode
-only the typed path. This script demonstrates the consumer-side seam over that
+The `jammi-ai` client carries the channel's bearer on the Flight
+SQL lane as well as the typed gRPC verbs (jammi #96). This script demonstrates
+the consumer-side seam over that
 **real Flight wire**: a `pyarrow.flight` gateway server reads the inbound bearer
 off a genuine `db.sql()` call (the production token-threading runs — no mock), a
 **HMAC-signed bearer token** (no real IdP, no product name) it verifies and maps
@@ -465,9 +465,10 @@ class _GatewayFlightServer(flight.FlightServerBase):
     Flight lane; the gateway reads it (via the recording middleware), verifies it,
     derives the tenant from the *verified* claim, and binds it via the engine's
     per-request ``tenant_scope`` on a real upstream ``jammi-server`` — returning
-    only that tenant's rows. A missing or invalid credential raises
-    :class:`pyarrow.flight.FlightUnauthenticatedError` so the client surfaces a
-    clean ``FlightUnauthenticatedError`` (not a wrapped ``FlightServerError``).
+    only that tenant's rows. On a missing or invalid credential the gateway raises
+    :class:`pyarrow.flight.FlightUnauthenticatedError`, which the jammi client
+    surfaces through the ``JammiError`` taxonomy as ``jammi.BackendError`` (detail:
+    ``Unauthenticated``).
 
     ``db.sql()`` makes TWO Flight calls (``get_flight_info`` then ``do_get``), each
     re-presenting the bearer, so the gateway verifies in BOTH — rejecting in
@@ -566,7 +567,7 @@ def run_byo_auth(upstream_endpoint: str, work: Path, *, tag: str) -> dict:
         try:
             _gateway_sources(gateway_endpoint, None)
             missing_rejected = False
-        except flight.FlightUnauthenticatedError:
+        except jammi.BackendError:
             missing_rejected = True
         anon_calls = factory.observed[before:]
         anonymous_no_bearer = bool(anon_calls) and all(obs is None for obs in anon_calls)
@@ -576,7 +577,7 @@ def run_byo_auth(upstream_endpoint: str, work: Path, *, tag: str) -> dict:
         try:
             _gateway_sources(gateway_endpoint, forged)
             forged_rejected = False
-        except flight.FlightUnauthenticatedError:
+        except jammi.BackendError:
             forged_rejected = True
 
         # and the forgery bought nothing: a VALID token for the same tenant still
@@ -836,9 +837,9 @@ def emit(fixtures_root: Path, server_bin: str) -> None:
             "consumer's job — a gateway in front of the engine. The engine's grpc_byo_auth.rs "
             "worked example shows that seam for the TYPED gRPC verbs; the Flight SQL lane "
             "(db.sql()) is the gateway-in-front's responsibility there too (engine #220, by "
-            "design). On jammi-ai 0.32.0 the client carries the channel's bearer on the "
-            "Flight SQL lane as well as the typed verbs (jammi #96; on 0.31.0 it rode only "
-            "the typed path). This is the consumer-side mirror over that real Flight wire: a "
+            "design). The jammi-ai client carries the channel's bearer on the "
+            "Flight SQL lane as well as the typed verbs (jammi #96). "
+            "This is the consumer-side mirror over that real Flight wire: a "
             "pyarrow.flight gateway reads the inbound bearer off a genuine db.sql() call, a "
             "generic HMAC-signed bearer token it verifies and maps to a tenant, and a "
             "real-engine tenant_scope read it returns to the caller. A missing/invalid "

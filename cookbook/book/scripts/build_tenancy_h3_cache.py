@@ -70,7 +70,8 @@ seam for the TYPED gRPC verbs; the Flight SQL lane (`db.sql()`) is a separate
 (engine issue #220, by design).
 
 The `jammi-ai` client carries the channel's bearer on the Flight
-SQL lane as well as the typed gRPC verbs (jammi #96). This script demonstrates the consumer-side seam over that
+SQL lane as well as the typed gRPC verbs (jammi #96). This script demonstrates
+the consumer-side seam over that
 **real Flight wire**: a `pyarrow.flight` gateway server reads the inbound bearer
 off a genuine `db.sql()` call (the production token-threading runs — no mock), a
 **HMAC-signed bearer token** (no real IdP, no product name) it verifies and maps

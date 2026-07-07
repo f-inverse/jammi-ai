@@ -449,8 +449,8 @@ cargo test --workspace --exclude jammi-python --features live-hub-tests --no-run
 ```
 Proto/client changes also need `make -C clients/python generate` + a `jammi-python`
 rebuild + the TS client build. Embedded Python tests need `maturin develop` — beware the
-cross-worktree `jammi_ai` shadowing trap: pin `PYTHONPATH` to the worktree's `python/` +
-`clients/python` and confirm `jammi_ai.__file__` resolves into the worktree (and that the
+cross-worktree `jammi_native` shadowing trap: pin `PYTHONPATH` to the worktree's `python/` +
+`clients/python` and confirm `jammi_native.__file__` resolves into the worktree (and that the
 freshly built `jammi_native.abi3.so` is the one imported). The **Postgres** lane (`test-pg`,
 `--features live-postgres-tests`) is CI-only — compile-check `--no-run` locally; remote
 CI is the authoritative gate. Background long runs and poll; iterate with
@@ -515,7 +515,7 @@ Entry points for §3 (not exhaustive; confirm against the current tree).
 | 3.1 Scale / bounded passes | `crates/jammi-ai/src/fine_tune/hard_negative_miner.rs`; `…/fine_tune/trainer.rs` (`mine_hard_negative_loader`); `…/pipeline/graph_propagation.rs`; `crates/jammi-db/src/index/{exact,sidecar}.rs`; the embed pass in `…/model/backend/candle.rs` |
 | 3.2 Search / retrieval | `crates/jammi-db/src/index/{exact,sidecar}.rs`; the `search`/`assemble_context` session methods; `crates/jammi-numerics` (RRF) |
 | 3.3 Training robustness | `crates/jammi-ai/src/fine_tune/{trainer,hard_negative_miner,regression_loss,target}.rs`; `…/pipeline/context_predictor.rs`; oracle tests `crates/jammi-ai/tests/it/ft_correctness_sweep.rs` |
-| 3.4 Remote parity / streaming | `clients/python/jammi_client/_database.py`; conformance guard `crates/jammi-python/tests/test_conformance.py`; server handlers `crates/jammi-server/src/grpc/`; trigger framing `crates/jammi-wire/src/trigger.rs` |
+| 3.4 Remote parity / streaming | `clients/python/jammi/_database.py`; conformance guard `crates/jammi-python/tests/test_conformance.py`; server handlers `crates/jammi-server/src/grpc/`; trigger framing `crates/jammi-wire/src/trigger.rs` |
 | 3.5 Multi-tenant | `crates/jammi-db/src/tenant_scope.rs` (analyzer rule); `…/session.rs` (`bind_tenant`/`with_tenant_scoped`); BYO-auth seam = the Flight/gRPC interceptor in `crates/jammi-server/src/`; `docs/guide/src/multi-tenant.md` |
 | 3.6 Catalog lifecycle | `crates/jammi-db/src/catalog/model_repo.rs` (`delete_model`, `model_pk`); the append-only migrations in `crates/jammi-db/src/catalog/backend*.rs` |
 | 3.7 Operability | server + worker logging; `crates/jammi-ai/src/fine_tune/worker.rs` (lease / recovery / crash-window) |

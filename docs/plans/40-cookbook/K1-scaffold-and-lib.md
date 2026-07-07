@@ -44,12 +44,12 @@ Encodes the local half of the fork-resolution harness (README §3.1):
 - **Conformal doctrine**: marginal in OSS Python; graph-aware repair inline; governed version is E8 (K0 §4).
 - **Don't touch engine repos.** Engine changes are forks to escalate, not patch.
 
-## 5. `jammi_ai` Python API reference (embed verbatim)
+## 5. `jammi` Python API reference (embed verbatim)
 
-These are the `jammi_ai` Python signatures the chapters call. Pin the `jammi_ai` version in `pyproject.toml`; call these exactly — confirm against the installed package (the bindings live in `crates/jammi-python/src/`), never invent or assume a signature.
+These are the `jammi` Python signatures the chapters call. Pin the `jammi-ai` dist version in `pyproject.toml`; call these exactly — confirm against the installed package (the bindings live in `crates/jammi-python/src/`), never invent or assume a signature.
 
 **Setup / sources**
-- `jammi_ai.connect(target) -> Database` · `jammi_ai.open_local(*, config=None, artifact_dir=None, gpu_device=None, inference_batch_size=None) -> Database`
+- `jammi.connect(target) -> Session` — a `file://<artifact_dir>` target opens the in-process embedded engine (an `EmbeddedBackend`, via the `jammi-ai[embedded]` extra); `grpc://`/`https://` opens a remote `RemoteDatabase`. Both arms return a `Session`.
 - `db.add_source(name, *, url, format)` — `format ∈ {"parquet","csv","json"}`; url may be local or `s3://`/`gs://`/`azure://`.
 - `db.with_tenant(tenant_id)` · `db.tenant() -> Optional[str]`
 - `db.generate_embeddings(*, source, model, columns, key, modality=None) -> str` (returns embedding table name; `modality ∈ {"text","image","audio"}`).

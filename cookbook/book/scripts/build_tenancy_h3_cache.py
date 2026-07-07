@@ -69,9 +69,8 @@ seam for the TYPED gRPC verbs; the Flight SQL lane (`db.sql()`) is a separate
 `pyarrow.flight` transport and is the gateway-in-front's responsibility there too
 (engine issue #220, by design).
 
-On `jammi-ai` `0.32.0` the client carries the channel's bearer on the Flight
-SQL lane as well as the typed gRPC verbs (jammi #96); on `0.31.0` the bearer rode
-only the typed path. This script demonstrates the consumer-side seam over that
+The `jammi-ai` client carries the channel's bearer on the Flight
+SQL lane as well as the typed gRPC verbs (jammi #96). This script demonstrates the consumer-side seam over that
 **real Flight wire**: a `pyarrow.flight` gateway server reads the inbound bearer
 off a genuine `db.sql()` call (the production token-threading runs — no mock), a
 **HMAC-signed bearer token** (no real IdP, no product name) it verifies and maps
@@ -836,9 +835,9 @@ def emit(fixtures_root: Path, server_bin: str) -> None:
             "consumer's job — a gateway in front of the engine. The engine's grpc_byo_auth.rs "
             "worked example shows that seam for the TYPED gRPC verbs; the Flight SQL lane "
             "(db.sql()) is the gateway-in-front's responsibility there too (engine #220, by "
-            "design). On jammi-ai 0.32.0 the client carries the channel's bearer on the "
-            "Flight SQL lane as well as the typed verbs (jammi #96; on 0.31.0 it rode only "
-            "the typed path). This is the consumer-side mirror over that real Flight wire: a "
+            "design). The jammi-ai client carries the channel's bearer on the "
+            "Flight SQL lane as well as the typed verbs (jammi #96). "
+            "This is the consumer-side mirror over that real Flight wire: a "
             "pyarrow.flight gateway reads the inbound bearer off a genuine db.sql() call, a "
             "generic HMAC-signed bearer token it verifies and maps to a tenant, and a "
             "real-engine tenant_scope read it returns to the caller. A missing/invalid "

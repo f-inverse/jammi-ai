@@ -6,6 +6,28 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+A feature release adding the platform-composability seam and the lifecycle wire contract.
+
+### Added
+- **gRPC composability seam (`jammi-server`).** `assemble_grpc_chain` returns an
+  `AssembledChain` a downstream can `mount` further services onto before serving, or split
+  via `into_axum_router` to compose one multiplexed listener beside its own HTTP routes.
+  `serve_grpc_chain` is now a thin `assemble + serve`, so there is no parallel assembly to
+  drift. The transport layer stack (grpc-web framing + trailer repair + metrics) applies at
+  `serve`; the seam contract a single-listener consumer must honour is documented on
+  `into_axum_router`.
+- **`jammi.v1.lifecycle` wire contract** — a **contract-only** package (license apply /
+  bootstrap / status / login) defined in the descriptor so the candle-free client can call a
+  platform server that implements it; the OSS engine mounts no handler and answers
+  `UNIMPLEMENTED`. A candle-free `jammi_admin::LifecycleClient` calls it.
+- **`SessionTransport::with_bearer`** — stamps an opaque `authorization: Bearer <token>`
+  beside the session id, so the client can authenticate against an auth-protected server.
+
+### Changed
+- The frozen wire surface is now the **ten** `jammi.v1.*` packages (the tenth,
+  `jammi.v1.lifecycle`, is contract-only and may exceed what a given build mounts); the
+  freeze-guard baseline and the api-stability page reflect it.
+
 ## [0.34.0] - 2026-07-07
 
 The Python client-as-base unification, shipped in lockstep across the workspace.

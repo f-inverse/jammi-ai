@@ -274,8 +274,10 @@ a list), the handlers verify it, derive the tenant from the *verified* claim, an
 bind it via the engine's `tenant_scope` for the read. `db.sql()` makes **two**
 Flight calls (`get_flight_info` then `do_get`), each re-presenting the bearer, so
 the gateway verifies in **both** — rejecting in `get_flight_info` short-circuits
-the whole `sql()` before any read runs. A missing or invalid credential raises
-`FlightUnauthenticatedError`; the request reads nothing, it does not fall through
+the whole `sql()` before any read runs. On a missing or invalid credential the
+gateway raises `FlightUnauthenticatedError`, which the jammi client surfaces
+through the `JammiError` taxonomy as `jammi.BackendError` (detail:
+`Unauthenticated`); the request reads nothing, it does not fall through
 to an unscoped global read.
 
 ```{python}
@@ -416,7 +418,7 @@ before = len(factory.observed)
 try:
     gateway_sources(None)
     missing_rejected = False
-except flight.FlightUnauthenticatedError:
+except jammi.BackendError:
     missing_rejected = True
 anon_no_bearer = all(obs is None for obs in factory.observed[before:])
 print(f"anonymous db.sql() carried no bearer: {anon_no_bearer}")
@@ -434,7 +436,7 @@ forged = f"subject-mallory.{TENANT_A}.deadbeef"
 try:
     gateway_sources(forged)
     forged_rejected = False
-except flight.FlightUnauthenticatedError:
+except jammi.BackendError:
     forged_rejected = True
 legit_after = "auth_a" in gateway_sources(mint_token("subject-a", TENANT_A))
 print(f"invalid (forged) credential rejected: {forged_rejected}")

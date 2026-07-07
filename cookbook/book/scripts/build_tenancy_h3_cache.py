@@ -465,9 +465,10 @@ class _GatewayFlightServer(flight.FlightServerBase):
     Flight lane; the gateway reads it (via the recording middleware), verifies it,
     derives the tenant from the *verified* claim, and binds it via the engine's
     per-request ``tenant_scope`` on a real upstream ``jammi-server`` — returning
-    only that tenant's rows. A missing or invalid credential raises
-    :class:`pyarrow.flight.FlightUnauthenticatedError` so the client surfaces a
-    clean ``FlightUnauthenticatedError`` (not a wrapped ``FlightServerError``).
+    only that tenant's rows. On a missing or invalid credential the gateway raises
+    :class:`pyarrow.flight.FlightUnauthenticatedError`, which the jammi client
+    surfaces through the ``JammiError`` taxonomy as ``jammi.BackendError`` (detail:
+    ``Unauthenticated``).
 
     ``db.sql()`` makes TWO Flight calls (``get_flight_info`` then ``do_get``), each
     re-presenting the bearer, so the gateway verifies in BOTH — rejecting in
@@ -566,7 +567,7 @@ def run_byo_auth(upstream_endpoint: str, work: Path, *, tag: str) -> dict:
         try:
             _gateway_sources(gateway_endpoint, None)
             missing_rejected = False
-        except flight.FlightUnauthenticatedError:
+        except jammi.BackendError:
             missing_rejected = True
         anon_calls = factory.observed[before:]
         anonymous_no_bearer = bool(anon_calls) and all(obs is None for obs in anon_calls)
@@ -576,7 +577,7 @@ def run_byo_auth(upstream_endpoint: str, work: Path, *, tag: str) -> dict:
         try:
             _gateway_sources(gateway_endpoint, forged)
             forged_rejected = False
-        except flight.FlightUnauthenticatedError:
+        except jammi.BackendError:
             forged_rejected = True
 
         # and the forgery bought nothing: a VALID token for the same tenant still

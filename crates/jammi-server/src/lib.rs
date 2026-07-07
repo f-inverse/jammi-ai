@@ -5,6 +5,14 @@
 //! `flight::*`, `grpc::*`) so test fixtures and downstream binaries
 //! (e.g. the `jammi` CLI's `serve` subcommand) can compose the same
 //! pieces without reimplementing them.
+//!
+//! For downstream *composition*, [`runtime::assemble_grpc_chain`] returns an
+//! [`runtime::AssembledChain`] with the engine's services pre-mounted; a
+//! downstream chains [`runtime::AssembledChain::mount`] to add its own services
+//! beside the engine's on one listener, then serves — or splits via
+//! [`runtime::AssembledChain::into_axum_router`] to compose a single axum
+//! listener of its own. `serve_grpc_chain` is the thin OSS-only path over the
+//! same seam.
 
 pub mod error;
 pub mod flight;

@@ -1,5 +1,6 @@
 mod api_freeze;
 mod common;
+mod composability_seam;
 mod flight_annotate;
 mod flight_tenant;
 mod grpc_byo_auth;

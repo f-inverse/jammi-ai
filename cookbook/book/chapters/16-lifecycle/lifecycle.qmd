@@ -18,8 +18,8 @@ transports without changing the call).
 
 The engine's model catalog lets you **see** the models it resolves and trains —
 `list_models` and `describe_model` — and **clean them up** — `delete_model`. The
-three verbs are on **both** the embedded `jammi_ai.Database` and the remote
-`jammi_client.RemoteDatabase`. This chapter is the engine↔cookbook validator that
+three verbs are on **both** the embedded `jammi.EmbeddedBackend` and the remote
+`jammi.RemoteDatabase`. This chapter is the engine↔cookbook validator that
 **measures** that surface as a real, asserted property: the
 **referential-integrity matrix** for `delete_model`, validated identical across
 the two transports.
@@ -36,7 +36,7 @@ Read the framing plainly:
   back off CUDA), so the whole emit is GPU-free and hermetic. No keystone corpus,
   no external services.
 - **There is no public `register_model` verb** (introspected against the wheel and
-  the `jammi_client`). The only public path that puts a model row in the catalog
+  the `jammi` client). The only public path that puts a model row in the catalog
   is **training**: a `fine_tune` registers the base model (path-keyed) at
   submission and the fine-tuned model (`jammi:fine-tuned:<uuid>`) on completion.
   Pre-trained models are served by **id** — the resolver loads an HF or local

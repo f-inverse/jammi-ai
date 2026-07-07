@@ -12,9 +12,9 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "F-Inverse" }]
 keywords = ["embeddings", "vector-search", "fine-tuning", "inference", "machine-learning"]
 # The native engine is a self-contained compiled `.so`; it carries no Python
-# runtime dependency. `jammi-ai` (pure-Python) is the convenience front-end that
-# bundles this wheel plus `jammi-client`; the dependency edge points that way,
-# never from the engine outward.
+# runtime dependency. `jammi-ai` (pure-Python, `import jammi`) is the base client
+# that carries this wheel via its `[embedded]` extra; the dependency edge points
+# that way, never from the engine outward.
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -50,8 +50,7 @@ manifest-path = "../../crates/jammi-python/Cargo.toml"
 # re-exports the engine surface).
 module-name = "jammi_native"
 # The `jammi_native` re-export shim lives HERE, under this dist's own
-# `python/` source root (NOT the repo-root `python/`, which now holds only the
-# pure-Python `jammi_ai/`). `python-source` must resolve at or below the project
+# `python/` source root. `python-source` must resolve at or below the project
 # dir: maturin copies the `module-name` package's Python files from a local
 # `python-source` but NOT from one above the project root, so co-locating the
 # shim is what makes the wheel ship `jammi_native/__init__.py` (the engine

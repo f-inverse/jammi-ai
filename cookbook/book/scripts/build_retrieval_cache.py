@@ -55,7 +55,7 @@ import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
-import jammi_ai
+import jammi
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -348,7 +348,7 @@ def main() -> None:
     ap.add_argument("--target", default="file:///tmp/jammi-retrieval",
                     help="connect() target — file:// for the embedded CPU engine.")
     args = ap.parse_args()
-    db = jammi_ai.connect(args.target)
+    db = jammi.connect(args.target)
     emit(db)
 
 

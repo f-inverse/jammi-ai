@@ -5,18 +5,17 @@ on:
     tags: ["py-v*"]
   # Manual re-run to finish a release whose publish was interrupted. The native
   # wheel version comes from the checked-out source (maturin reads the crate's
-  # `version.workspace` from Cargo.toml); the pure-Python `jammi-ai` version is
-  # the static workspace version in `pyproject.toml`. Dispatch from the release
-  # commit / `main` at the release version; PyPI rejects a re-upload of an
-  # existing version, so this is safe.
+  # `version.workspace` from Cargo.toml). Dispatch from the release commit /
+  # `main` at the release version; PyPI rejects a re-upload of an existing
+  # version, so this is safe.
   workflow_dispatch:
 
-# Two dists ship from this workflow, in lockstep at the shared workspace version:
-#   * `jammi-ai-native` — the compiled engine (maturin abi3 wheels, per-platform),
-#     built from `packaging/native/pyproject.toml` (module `jammi_native`).
-#   * `jammi-ai`        — the pure-Python front-end (one universal wheel + sdist),
-#     built from the root `pyproject.toml` (hatchling), depending on
-#     `jammi-ai-native==` + `jammi-client==` at that same version.
+# This workflow ships the `jammi-ai-native` dist — the compiled engine (maturin
+# abi3 wheels, per-platform), built from `packaging/native/pyproject.toml`
+# (module `jammi_native`). The pure-Python base client `jammi-ai` (import
+# `jammi`) is built and published from `clients/python` by `pypi-client.yml` on
+# the SAME `py-v*` tag, so the two ship in lockstep at the shared workspace
+# version.
 jobs:
   build-native-linux:
     name: Build native wheel (Linux)
@@ -90,33 +89,9 @@ jobs:
   # Windows wheel disabled: usearch 2.24.0 uses POSIX mmap APIs
   # (MAP_FAILED) that MSVC does not support.
 
-  build-pure:
-    name: Build pure-Python wheel + sdist (jammi-ai)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      # The pure-Python front-end has no compiled code — a plain hatchling build
-      # produces the universal `py3-none-any` wheel and an sdist. Its exact
-      # dependency pins (`jammi-ai-native==`, `jammi-client==`) resolve from PyPI
-      # at install time, published in lockstep by the other lanes / pypi-client.yml.
-      - name: Build wheel + sdist
-        run: |
-          python -m pip install --upgrade build
-          python -m build --outdir dist
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pure-dist
-          path: dist
-
   publish:
     name: Publish to PyPI
-    needs: [build-native-linux, build-native-macos, build-pure]
+    needs: [build-native-linux, build-native-macos]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -126,11 +101,6 @@ jobs:
         with:
           pattern: wheels-native-*
           merge-multiple: true
-          path: dist
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: pure-dist
           path: dist
 
       - name: Publish to PyPI

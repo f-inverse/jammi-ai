@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import collections
 
-import jammi_ai
+import jammi
 import numpy as np
 import pytest
 
@@ -50,7 +50,7 @@ def test_recall_chain_reads_in_order():
 @_needs_cache
 def test_marginal_classification_conformal_recomputes_to_golden():
     """Live engine APS marginal coverage matches the frozen 0.867 — under-covers."""
-    db = jammi_ai.connect("file:///tmp/jammi_test_cel_cls")
+    db = jammi.connect("file:///tmp/jammi_test_cel_cls")
     preds = contracts.load_artifact("arxiv.tier04_predictions").to_pylist()
     cal = [r for r in preds if r["split"] == "calibration"]
     test = [r for r in preds if r["split"] == "test"]
@@ -65,7 +65,7 @@ def test_marginal_classification_conformal_recomputes_to_golden():
 @_needs_cache
 def test_regression_interval_conformal_recomputes_to_golden():
     """Live conformalize_interval coverage matches the frozen 0.830 — under-covers."""
-    db = jammi_ai.connect("file:///tmp/jammi_test_cel_reg")
+    db = jammi.connect("file:///tmp/jammi_test_cel_reg")
     reg = contracts.load_artifact("arxiv.tier04_regression").to_pylist()
     cal = [r for r in reg if r["split"] == "calibration"]
     test = [r for r in reg if r["split"] == "test"]

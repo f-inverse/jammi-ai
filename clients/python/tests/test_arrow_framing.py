@@ -7,7 +7,7 @@ RecordBatch message — is a property of the byte stream alone.
 
 import pyarrow as pa
 
-from jammi_client._database import _arrow_batch_to_table, _table_to_arrow_batch
+from jammi._database import _arrow_batch_to_table, _table_to_arrow_batch
 
 
 def _batch_count(body: bytes) -> int:

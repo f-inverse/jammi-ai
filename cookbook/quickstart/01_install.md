@@ -14,7 +14,7 @@ over gRPC (see [step 2](./02_connect.md)):
 
 ```bash
 pip install jammi-server-cu12   # ships the CUDA jammi-server binary
-jammi-server                    # then connect with jammi_ai.connect("grpc://…")
+jammi-server                    # then connect with jammi.connect("grpc://…")
 ```
 
 To build from source (e.g. you cloned the repo and are iterating on the
@@ -36,9 +36,9 @@ storage layer).
 ## Verify
 
 ```python
-import jammi_ai
-print(jammi_ai.__name__)
-# jammi_ai
+import jammi
+print(jammi.__name__)
+# jammi
 ```
 
-If `import jammi_ai` works, you're ready for [step 2](./02_connect.md).
+If `import jammi` works, you're ready for [step 2](./02_connect.md).

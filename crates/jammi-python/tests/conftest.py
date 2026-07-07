@@ -4,9 +4,8 @@
 installs the top-level `jammi_native` package into the venv's site-packages,
 with the compiled extension beside its `__init__.py` as
 `jammi_native/jammi_native.abi3.so` (the package re-exports the engine surface,
-so `import jammi_native` yields it directly — a bare top-level import, not a
-submodule of `jammi_ai`). The `python-source = "python"` setting in
-`pyproject.toml` puts both `jammi_native/` and the pure-Python `jammi_ai/`
-package on the path; this `conftest.py` doesn't need to fiddle with `sys.path`
-because `maturin develop` installs them into the active environment.
+so `import jammi_native` yields it directly — a bare top-level import). The
+`python-source = "python"` setting in `packaging/native/pyproject.toml` puts
+`jammi_native/` on the path; this `conftest.py` doesn't need to fiddle with
+`sys.path` because `maturin develop` installs it into the active environment.
 """

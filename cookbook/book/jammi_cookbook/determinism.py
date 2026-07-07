@@ -33,7 +33,7 @@ def _apply_env() -> None:
 
     Set before any heavy native library (BLAS, tokenizers, torch) reads these on
     its first use. Importing the cookbook is therefore the first thing a chapter
-    does, ahead of importing jammi_ai.
+    does, ahead of importing jammi.
     """
     pinned = {
         "OMP_NUM_THREADS": "1",

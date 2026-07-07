@@ -6,8 +6,7 @@ front door dispatches on, rather than two `connect_local` / `connect_remote`
 constructors. Transport is chosen here, at open time, and never leaks into the
 call site of any verb.
 
-Parsing lives in `jammi-client` — the always-present dependency of the embed
-wheel — so BOTH `jammi_client.connect` and `jammi_ai.connect` classify a target
+Parsing lives in `jammi` — so every `jammi.connect` classifies a target
 through the *same* code. The scheme→transport mapping is defined exactly once.
 """
 
@@ -23,7 +22,7 @@ class LocalTarget:
     """An embedded, in-process engine rooted at `artifact_dir`.
 
     Resolved by the compiled engine in the `jammi-ai` wheel; the pure-Python
-    `jammi-client` cannot honour it and raises a truthful no-engine error — the
+    `jammi-ai` cannot honour it and raises a truthful no-engine error — the
     runtime echo of the Rust build's `#[cfg(feature = "local")]` gate.
     """
 

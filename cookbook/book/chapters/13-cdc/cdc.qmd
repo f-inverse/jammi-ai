@@ -85,7 +85,7 @@ the 0-based offset the batch landed at.
 ```{python}
 import tempfile
 
-import jammi_ai
+import jammi
 import pyarrow as pa
 
 OP_CYCLE = tuple(record["op_cycle"])
@@ -109,7 +109,7 @@ events = [
     for i in range(NUM_EVENTS)
 ]
 
-db = jammi_ai.connect(f"file://{tempfile.mkdtemp(prefix='jammi_cdc_catalog_')}")
+db = jammi.connect(f"file://{tempfile.mkdtemp(prefix='jammi_cdc_catalog_')}")
 topic_id = db.register_topic("changes", schema=TOPIC_SCHEMA)
 print(f"registered topic: {topic_id!r}")
 print(f"list_topics:      {db.list_topics()}")

@@ -19,8 +19,8 @@ baseline, so the freeze is enforceable rather than aspirational (see [Enforcemen
 ### 1. The verb set — the call surface
 
 The public verb vocabulary a caller invokes — identical name-for-name and
-signature-for-signature across the embedded (`jammi_ai.Database`) and remote
-(`jammi_client.RemoteDatabase`) transports. It is pinned, set-by-set, in
+signature-for-signature across the embedded (`jammi.EmbeddedBackend`) and remote
+(`jammi.RemoteDatabase`) transports. It is pinned, set-by-set, in
 `crates/jammi-python/tests/test_conformance.py`; those sets **are** the frozen
 verb list:
 

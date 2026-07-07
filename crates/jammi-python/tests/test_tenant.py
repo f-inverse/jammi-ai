@@ -1,6 +1,6 @@
 """SPEC-03 §12 #6 — Python `Database` tenant surface end-to-end.
 
-Tests the PyO3 binding from the consumer's seat: a `jammi_ai.connect`
+Tests the PyO3 binding from the consumer's seat: a `jammi.connect`
 yields a Database; `set_tenant` mutates the underlying engine binding
 in place, while `tenant_scope` binds for the duration of a `with` block and
 restores the prior tenant on exit; subsequent `sql` / `list_sources` calls
@@ -9,7 +9,7 @@ injects. Mirrors the engine-side SPEC-03 §12 #2 federated split (Parquet local
 source with a tenant_id column, 10 rows split 6/4) but reaches it through the
 Python API.
 
-The tests do not call `jammi_ai.connect` from a fixture because the engine's
+The tests do not call `jammi.connect` from a fixture because the engine's
 catalog is path-scoped — each test takes its own `tmp_path` for a fresh
 catalog.
 
@@ -24,7 +24,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import jammi_ai
+import jammi
 
 
 TENANT_A = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a"
@@ -53,14 +53,14 @@ def test_set_tenant_filters_federated_source(tmp_path):
 
     # Register the source once with an unbound session. Both per-tenant
     # sessions reload it from the catalog on connect.
-    registrar = jammi_ai.connect(f"file://{artifact_dir}")
+    registrar = jammi.connect(f"file://{artifact_dir}")
     registrar.add_source("notes", url=str(pq_path), format="parquet")
     del registrar
 
-    db_a = jammi_ai.connect(f"file://{artifact_dir}")
+    db_a = jammi.connect(f"file://{artifact_dir}")
     db_a.set_tenant(TENANT_A)
 
-    db_b = jammi_ai.connect(f"file://{artifact_dir}")
+    db_b = jammi.connect(f"file://{artifact_dir}")
     db_b.set_tenant(TENANT_B)
 
     count_a = (
@@ -92,7 +92,7 @@ def test_set_tenant_filters_federated_source(tmp_path):
 def test_set_tenant_rejects_invalid_uuid(tmp_path):
     """ADR-00 invariant: a non-UUID tenant id raises `ValueError`
     (PyO3 mapping of `JammiError::Tenant`)."""
-    db = jammi_ai.connect(f"file://{tmp_path}")
+    db = jammi.connect(f"file://{tmp_path}")
     with pytest.raises((ValueError, RuntimeError)) as info:
         db.set_tenant("not-a-uuid")
     msg = str(info.value).lower()
@@ -104,7 +104,7 @@ def test_set_tenant_rejects_invalid_uuid(tmp_path):
 def test_tenant_scope_rejects_invalid_uuid_at_call_site(tmp_path):
     """`tenant_scope` validates its id eagerly: a malformed id raises where the
     caller names it, not on `__enter__`."""
-    db = jammi_ai.connect(f"file://{tmp_path}")
+    db = jammi.connect(f"file://{tmp_path}")
     with pytest.raises((ValueError, RuntimeError)) as info:
         db.tenant_scope("not-a-uuid")
     msg = str(info.value).lower()
@@ -116,7 +116,7 @@ def test_tenant_scope_rejects_invalid_uuid_at_call_site(tmp_path):
 def test_empty_tenant_clears_binding(tmp_path):
     """`set_tenant('')` clears the binding — the engine's API contract
     treats empty string as unbind."""
-    db = jammi_ai.connect(f"file://{tmp_path}")
+    db = jammi.connect(f"file://{tmp_path}")
     db.set_tenant(TENANT_A)
     assert db.tenant() == TENANT_A
     db.set_tenant("")
@@ -132,11 +132,11 @@ def test_tenant_scope_scopes_and_restores(tmp_path):
     pq_path = tmp_path / "notes.parquet"
     _write_split_parquet(str(pq_path))
 
-    registrar = jammi_ai.connect(f"file://{artifact_dir}")
+    registrar = jammi.connect(f"file://{artifact_dir}")
     registrar.add_source("notes", url=str(pq_path), format="parquet")
     del registrar
 
-    db = jammi_ai.connect(f"file://{artifact_dir}")
+    db = jammi.connect(f"file://{artifact_dir}")
     assert db.tenant() is None  # starts unscoped
 
     def count() -> int:
@@ -165,11 +165,11 @@ def test_tenant_scope_nests_and_restores_prior(tmp_path):
     pq_path = tmp_path / "notes.parquet"
     _write_split_parquet(str(pq_path))
 
-    registrar = jammi_ai.connect(f"file://{artifact_dir}")
+    registrar = jammi.connect(f"file://{artifact_dir}")
     registrar.add_source("notes", url=str(pq_path), format="parquet")
     del registrar
 
-    db = jammi_ai.connect(f"file://{artifact_dir}")
+    db = jammi.connect(f"file://{artifact_dir}")
 
     def count() -> int:
         return (
@@ -193,7 +193,7 @@ def test_tenant_scope_nests_and_restores_prior(tmp_path):
 def test_tenant_scope_restores_on_exception(tmp_path):
     """A `tenant_scope` block restores the prior tenant even when the body
     raises — the restore rides `__exit__`, which fires on the exceptional path."""
-    db = jammi_ai.connect(f"file://{tmp_path}")
+    db = jammi.connect(f"file://{tmp_path}")
     db.set_tenant(TENANT_A)
     with pytest.raises(RuntimeError):
         with db.tenant_scope(TENANT_B):
@@ -206,7 +206,7 @@ def test_tenant_scope_reuse_is_rejected(tmp_path):
     """One scope object enters once. Re-entering the same object would clobber
     the captured prior and lose it on exit, so a second `__enter__` raises and
     the live scope is left untouched. Nesting uses a fresh object per `with`."""
-    db = jammi_ai.connect(f"file://{tmp_path}")
+    db = jammi.connect(f"file://{tmp_path}")
     db.set_tenant(TENANT_A)
     scope = db.tenant_scope(TENANT_B)
     with scope:
@@ -223,7 +223,7 @@ def test_tenant_scope_stray_exit_is_a_noop(tmp_path):
     """`__exit__` on a never-entered scope is a no-op — it must not clear a live
     scope. The two-level prior distinguishes 'not entered' from 'entered while
     unscoped', so a stray exit cannot unbind the connection's current tenant."""
-    db = jammi_ai.connect(f"file://{tmp_path}")
+    db = jammi.connect(f"file://{tmp_path}")
     db.set_tenant(TENANT_A)
     db.tenant_scope(TENANT_B).__exit__(None, None, None)
     assert db.tenant() == TENANT_A
@@ -233,7 +233,7 @@ def test_register_channel_round_trips_through_python(tmp_path):
     """SPEC-01 §7 dual-language hook landed in this iteration: register
     a new evidence-provenance channel from Python; merging in the engine
     sees the declared columns."""
-    db = jammi_ai.connect(f"file://{tmp_path}")
+    db = jammi.connect(f"file://{tmp_path}")
     db.register_channel(
         "scored_by",
         priority=3,

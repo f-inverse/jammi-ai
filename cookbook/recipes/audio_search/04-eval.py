@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pyarrow.parquet as pq
 
-import jammi_ai
+import jammi
 
 from _shared import (
     ARTIFACT_DIR,
@@ -29,7 +29,7 @@ from _shared import (
 def main() -> int:
     assert CORPUS_PARQUET.exists(), "run 01..03 first"
 
-    db = jammi_ai.connect(f"file://{str(ARTIFACT_DIR)}")
+    db = jammi.connect(f"file://{str(ARTIFACT_DIR)}")
     ensure_source(db, "corpus", str(CORPUS_PARQUET))
 
     pq.write_table(build_audio_golden_table(), GOLDEN_PARQUET)

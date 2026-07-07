@@ -44,7 +44,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-import jammi_ai
+import jammi
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 FIXTURES = REPO_ROOT / "cookbook" / "fixtures"
@@ -157,7 +157,7 @@ def main() -> int:
     print(f"audio_search: model = {MODEL}")
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        db = jammi_ai.connect(f"file://{str(tmp_path)}")
+        db = jammi.connect(f"file://{str(tmp_path)}")
 
         # 1. Load the corpus clips into a Parquet source (inline audio bytes).
         corpus_parquet = tmp_path / "corpus.parquet"

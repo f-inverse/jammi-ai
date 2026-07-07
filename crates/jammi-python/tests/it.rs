@@ -16,9 +16,9 @@
 //!      reading it back through a second clone).
 //!
 //! The remote transport is NOT exercised here: the embed wheel is local-only,
-//! and its remote arm is the bundled pure-Python `jammi-client`. The remote
+//! and its remote arm is the bundled pure-Python `jammi`. The remote
 //! wire surface is proven by the `jammi-server` crate's own data-plane client tests
-//! (under `--features wire`) plus the `jammi-client` conformance test.
+//! (under `--features wire`) plus the `jammi` conformance test.
 
 use std::str::FromStr;
 use std::sync::Arc;

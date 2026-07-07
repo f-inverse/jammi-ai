@@ -67,7 +67,7 @@ jammi-server
 ```
 
 The `jammi-ai` embed wheel is CPU-only; GPU inference runs in the server, reached
-from Python via `jammi_ai.connect("grpc://…")`.
+from Python via `jammi.connect("grpc://…")`.
 
 ### Build dependencies (Linux)
 

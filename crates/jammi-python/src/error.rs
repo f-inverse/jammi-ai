@@ -6,13 +6,13 @@ use jammi_db::catalog::channel_repo::ChannelCatalogError;
 use jammi_db::error::JammiError;
 use jammi_db::store::mutable::MutableTableError;
 
-/// Raise a `jammi_client.errors` exception class by name, carrying `message`.
+/// Raise a `jammi.errors` exception class by name, carrying `message`.
 ///
-/// The `JammiError` taxonomy is defined once, in the pure-Python `jammi-client`
-/// (`jammi_client.errors`); the compiled engine RAISES those classes rather than
+/// The `JammiError` taxonomy is defined once, in the pure-Python `jammi`
+/// (`jammi.errors`); the compiled engine RAISES those classes rather than
 /// owning a parallel native taxonomy — so the embedded and remote transports map
 /// a failure onto one class, and the dependency arrow stays native → client (the
-/// engine imports the client, never the reverse). `jammi-client` is a hard
+/// engine imports the client, never the reverse). `jammi` is a hard
 /// dependency of this wheel, so the import always resolves at runtime; a failure
 /// to import it is a broken environment, surfaced loudly with the same message.
 pub(crate) fn client_error(class: &str, message: String) -> PyErr {
@@ -22,7 +22,7 @@ pub(crate) fn client_error(class: &str, message: String) -> PyErr {
     // pymethod maps its result, so this is a cheap re-borrow, not a fresh acquire.
     Python::attach(|py| {
         let built = py
-            .import("jammi_client")
+            .import("jammi")
             .and_then(|m| m.getattr("errors"))
             .and_then(|errors| errors.getattr(class))
             .and_then(|cls| cls.call1((message.as_str(),)));
@@ -35,14 +35,14 @@ pub(crate) fn client_error(class: &str, message: String) -> PyErr {
             // `except <TaxonomyClass>` and mask the real fault.
             Err(import_err) => pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "jammi taxonomy miswiring: could not raise \
-                 jammi_client.errors.{class} ({import_err}); \
+                 jammi.errors.{class} ({import_err}); \
                  original error was: {message}"
             )),
         }
     })
 }
 
-/// Classify a [`JammiError`] onto the `jammi_client.errors` class name it maps to.
+/// Classify a [`JammiError`] onto the `jammi.errors` class name it maps to.
 ///
 /// The partition mirrors the server's gRPC status mapping (`map_engine_error`)
 /// so the embedded and remote transports agree on which failures are caller
@@ -78,7 +78,7 @@ fn jammi_error_class(err: &JammiError) -> &'static str {
 }
 
 /// Convert any error that maps into `JammiError` to a Python exception in the
-/// `jammi_client.errors` taxonomy.
+/// `jammi.errors` taxonomy.
 ///
 /// Accepting `Into<JammiError>` lets call sites surface typed engine errors
 /// (`MutableTableError`, `TriggerError`, …) without re-wrapping each one in a

@@ -83,9 +83,9 @@ calibration era, apply the quantile to the test era. We rerun `conformalize_inte
 on CPU against the committed per-row means.
 
 ```{python}
-import jammi_ai
+import jammi
 
-db = jammi_ai.connect("file:///tmp/jammi_tier04")  # CPU embed arm; conformal is local math
+db = jammi.connect("file:///tmp/jammi_tier04")  # CPU embed arm; conformal is local math
 alpha = round(1 - contracts.golden("arxiv.tier04.nominal_coverage").value, 4)
 
 cal_mean_v = [r["pred_mean"] for r in reg_cal]

@@ -45,7 +45,7 @@ import argparse
 import json
 from pathlib import Path
 
-import jammi_ai
+import jammi
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -195,7 +195,7 @@ def main() -> None:
     ap.add_argument("--target", default="grpc://127.0.0.1:50051",
                     help="connect() target — grpc://host:port for the GPU server.")
     args = ap.parse_args()
-    db = jammi_ai.connect(args.target)
+    db = jammi.connect(args.target)
     emit(db)
 
 

@@ -12,7 +12,7 @@ fails loudly rather than drifting the book's numbers.
 * **ogbn-arxiv** (ODC-BY; Open Graph Benchmark) — ~169k CS papers, ~1.16M
   citation edges, 40 subject classes, title+abstract text. The tiers 03–04 spine.
 
-The loaders register file-shaped sources into a ``jammi_ai`` database and return
+The loaders register file-shaped sources into a ``jammi`` database and return
 the committed subset; subset identity comes from the committed ID lists
 (:func:`jammi_cookbook.determinism.committed_ids`), not from replaying a seed.
 Both datasets are read with the standard library + pyarrow from their pinned,

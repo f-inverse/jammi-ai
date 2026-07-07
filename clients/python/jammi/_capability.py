@@ -4,7 +4,7 @@ A :class:`Session` runs behind one of two transports (an in-process embedded
 engine or a remote gRPC channel), and a handful of features exist on only one of
 them. :meth:`Session.supports` answers "does this backend carry that feature?"
 against this enum, and invoking a feature the backend lacks raises
-:class:`~jammi_client.errors.NotSupportedOnBackend` — never a silent
+:class:`~jammi.errors.NotSupportedOnBackend` — never a silent
 ``AttributeError``.
 
 The set is CLOSED: exactly the features that genuinely diverge between the two

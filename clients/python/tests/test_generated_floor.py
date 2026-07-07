@@ -25,7 +25,7 @@ except ImportError:  # Python < 3.11 — the package supports >= 3.9
     import tomli as tomllib
 
 CLIENT_ROOT = Path(__file__).resolve().parents[1]
-GENERATED_DIR = CLIENT_ROOT / "jammi_client" / "_generated" / "jammi" / "v1"
+GENERATED_DIR = CLIENT_ROOT / "jammi" / "_generated" / "jammi" / "v1"
 PYPROJECT = CLIENT_ROOT / "pyproject.toml"
 
 # The grpc guard in generated code, e.g. GRPC_GENERATED_VERSION = '1.80.0'.

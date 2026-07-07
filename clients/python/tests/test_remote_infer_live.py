@@ -15,7 +15,7 @@ same schema-less empty table, so the transports agree on the degenerate shape.
 
 Gated, not hermetic: the test needs a built server binary, so it is skipped
 unless `JAMMI_SERVER_BIN` points at a `jammi-server` executable. The embedded
-engine (`jammi_ai`) must also be importable (the parity peer).
+engine (`jammi_native`) must also be importable (the parity peer).
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-jammi_ai = pytest.importorskip("jammi_ai")
-import jammi_client  # noqa: E402
+pytest.importorskip("jammi_native")
+import jammi  # noqa: E402
 
 SERVER_BIN = os.environ.get("JAMMI_SERVER_BIN")
 
@@ -49,8 +49,8 @@ def test_infer_round_trip_matches_embedded(live_server, tmp_path):
     """`infer` over the same source with the same deterministic fixture model
     returns the same table on both transports: same column names and types, and
     value-equal rows for every column except the wall-clock `_latency_ms`."""
-    remote = jammi_client.connect(live_server)
-    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    remote = jammi.connect(live_server)
+    embedded = jammi.connect(f"file://{tmp_path}")
     try:
         results = {}
         for name, db in (("remote", remote), ("embedded", embedded)):
@@ -102,8 +102,8 @@ def test_infer_empty_source_is_a_schema_less_empty_table(live_server, tmp_path):
         empty_path,
     )
 
-    remote = jammi_client.connect(live_server)
-    embedded = jammi_ai.connect(f"file://{tmp_path / 'engine'}")
+    remote = jammi.connect(live_server)
+    embedded = jammi.connect(f"file://{tmp_path / 'engine'}")
     try:
         results = {}
         for name, db in (("remote", remote), ("embedded", embedded)):

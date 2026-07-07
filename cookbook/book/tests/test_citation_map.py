@@ -44,7 +44,7 @@ def test_every_jammi_call_exists_in_the_api_reference():
 
     Every recipe's ``jammi_call`` must appear in the grounded API reference
     (``_api_reference.md``), which ``scripts/check_api_reference.py`` in turn keeps
-    in lockstep with the installed ``jammi_ai`` wheel.
+    in lockstep with the installed ``jammi`` wheel.
     """
     reference = _API_REFERENCE.read_text()
     for row in CITATION_MAP:

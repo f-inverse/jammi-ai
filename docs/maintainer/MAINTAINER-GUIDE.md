@@ -137,7 +137,7 @@ Workspace membership (`Cargo.toml`, `[workspace] members`): 13 members;
   service impls over the shared engine.
 - **`jammi-python` depends on `jammi-ai`, `jammi-db`, `jammi-lora`** — no
   client-substrate crate. Local-only; its remote arm is the bundled pure-Python
-  `jammi_client` (`crates/jammi-python/src/lib.rs`, the module setup), so the
+  `jammi` (`crates/jammi-python/src/lib.rs`, the module setup), so the
   embed wheel links no gRPC transport.
 - **`jammi-numerics` depends on nothing internal** — the leaf. Downstream depends
   on it, never the reverse (`crates/jammi-numerics/src/lib.rs`, the crate root).
@@ -152,7 +152,7 @@ Workspace membership (`Cargo.toml`, `[workspace] members`): 13 members;
    v                           v                             v
  jammi-python PyDatabase   jammi-server grpc/* handlers   jammi-client DataClient
  (file:// local arm)       (Flight SQL + typed gRPC)      jammi-admin CatalogClient
-                                                          jammi-cli, pure-py jammi_client
+                                                          jammi-cli, pure-py jammi
 ```
 
 Server handlers, the embedded Python `Database`, and the embedded SDK **all drive
@@ -371,18 +371,18 @@ enforced by a dedicated CI gate, `cookbook-one-way` /
 **The four coupling artifacts.**
 
 1. **The API-surface guard — `cookbook/book/scripts/check_api_reference.py`.** This
-   is the staleness oracle. It introspects the *live installed* `jammi_ai` wheel
+   is the staleness oracle. It introspects the *live installed* `jammi` wheel
    and asserts every verb the chapters call still exists with the kwargs the
    recipes pass. The mechanism (worth reading; it mirrors the transport-parity
    collapse this guide documents in §2.1/§4.1): it opens an embedded engine
-   (`jammi_ai.connect("file://…")`, in `main`) and resolves each verb as a *bound
+   (`jammi.connect("file://…")`, in `main`) and resolves each verb as a *bound
    method on the live instance* (the `_signature` helper) rather than introspecting
    the wrapper class — because the thin `Database` wrapper holds the native
    `_NativeDatabase` by composition and forwards un-migrated verbs through
    `__getattr__` (documented in `_signature`, corroborated by the engine at
-   `crates/jammi-python/src/database.rs`). The contract is the `REQUIRED` dict (46
-   verbs) plus `MODULE_FUNCTIONS = ["open_local", "connect"]`; the gate prints
-   "`API reference matches installed jammi_ai (N surfaces checked)`" where
+   `crates/jammi-python/src/database.rs`). The contract is the `REQUIRED` dict (47
+   verbs) plus `MODULE_FUNCTIONS = ["connect"]`; the gate prints
+   "`API reference matches installed jammi (N surfaces checked)`" where
    `N = len(REQUIRED) + len(MODULE_FUNCTIONS) = 48`. This guide should be validated
    against this list — it is the authoritative enumeration of the consumer-facing
    Python verb surface (e.g. `asof_join`, `verify_materialization`, `staleness`,
@@ -421,7 +421,7 @@ enforced by a dedicated CI gate, `cookbook-one-way` /
 against the engine commit it ships beside. The PR gate
 (`.github/workflows/cookbook-book.yml`, the PR job) builds the HEAD embed wheel
 with `maturin`, force-reinstalls it (`--force-reinstall --no-deps`) over the
-unpinned `jammi_ai` dependency, then runs `check_api_reference.py`, the shared-lib
+unpinned `jammi-ai` dependency, then runs `check_api_reference.py`, the shared-lib
 pytest suite including `test_closed_loop.py`, the no-deferral grep, and the
 citation check. The nightly `render` job additionally runs `quarto render` over the
 committed cache and a release-recipe leg that re-installs the last published PyPI
@@ -437,9 +437,9 @@ new typed verb's Python leg is exactly what this guard checks; adding the verb
 without touching `REQUIRED` leaves the surface unproven, and adding a recipe that
 calls it without bumping the wheel fails the gate.
 
-**Note on the pin.** The chapters are not pinned to an exact `jammi_ai==X.Y.Z`
-PyPI release: `jammi_ai` is consumed **at HEAD**, declared unpinned in
-`cookbook/book/pyproject.toml` (the `jammi_ai` dependency) and force-installed from
+**Note on the pin.** The chapters are not pinned to an exact `jammi-ai==X.Y.Z`
+PyPI release: `jammi-ai` is consumed **at HEAD**, declared unpinned in
+`cookbook/book/pyproject.toml` (the `jammi-ai` dependency) and force-installed from
 the maturin HEAD build in CI. The only exact pin is `usearch==2.25.1`
 (`cookbook/book/pyproject.toml`), because the serialized ANN graph format is
 backend-version-dependent.
@@ -2209,7 +2209,7 @@ halves that meet at the proto**:
   `infer_from_proto`); both exported from `crates/jammi-ai/src/wire/mod.rs`.
 
 So the kwargs→proto map lives **once** in Python
-(`clients/python/jammi_client/_assembly.py`, shared by remote *and* embedded) and the
+(`clients/python/jammi/_assembly.py`, shared by remote *and* embedded) and the
 proto→engine map lives **once** in Rust (`jammi_ai::wire`). The PyO3 layer is a thin set of
 `_<verb>_proto(bytes)` primitives.
 
@@ -2270,11 +2270,11 @@ proto→engine map lives **once** in Rust (`jammi_ai::wire`). The PyO3 layer is 
 
 8. **Python — both wheels, one assembly.**
    - **Shared request assembly (the field map, written once):** add a
-     `build_<verb>_request(...)` to `clients/python/jammi_client/_assembly.py`. Both wheels
-     import it (remote: `clients/python/jammi_client/_database.py`; embedded:
-     `python/jammi_ai/_database.py`). Surface-only validation (e.g. the graph-only
+     `build_<verb>_request(...)` to `clients/python/jammi/_assembly.py`. Both wheels
+     import it (remote: `clients/python/jammi/_database.py`; embedded:
+     `clients/python/jammi/_embedded.py`). Surface-only validation (e.g. the graph-only
      embedding-loss guard, `output='quantile' requires levels`) lives here too.
-   - **Embedded (`jammi_ai`):** the thin Python `Database` (`python/jammi_ai/_database.py`)
+   - **Embedded (`jammi`):** the `EmbeddedBackend` (`clients/python/jammi/_embedded.py`)
      calls `build_<verb>_request(...)`, serializes, and hands the bytes to **one** PyO3
      primitive `_<verb>_proto(bytes)` on `crates/jammi-python/src/database.rs` (e.g.
      `_infer_proto`, `_start_training_proto`), which decodes via
@@ -2282,12 +2282,12 @@ proto→engine map lives **once** in Rust (`jammi_ai::wire`). The PyO3 layer is 
      stack** — it depends on tonic **only for the `tonic::Status` type** the wire-decode seam
      returns (`crates/jammi-python/Cargo.toml`), plus the wire converters + `prost` (behind
      jammi-ai's `local`).
-   - **Remote (`jammi_client.RemoteDatabase`):** the matching method in
-     `clients/python/jammi_client/_database.py` builds via the same `build_<verb>_request`
-     then sends over gRPC. **`jammi_client` imports no `jammi_ai`** — a CI import-direction
-     guard enforces this.
-   - `jammi_ai.connect("file://…")` returns the composed `Database`; `connect("grpc://…")`
-     returns `RemoteDatabase` (`python/jammi_ai/__init__.py`).
+   - **Remote (`jammi.RemoteDatabase`):** the matching method in
+     `clients/python/jammi/_database.py` builds via the same `build_<verb>_request`
+     then sends over gRPC. **`import jammi` stays native-free** (it imports `jammi_native` lazily, only when a
+     `file://` target is opened) — a CI import-direction guard enforces this.
+   - `jammi.connect("file://…")` returns the `EmbeddedBackend`; `connect("grpc://…")`
+     returns `RemoteDatabase` (`clients/python/jammi/__init__.py`).
 
 9. **Tests + the four guards.** Integration test in `crates/jammi-server/tests/it/` (one file
    per service, registered in `crates/jammi-server/tests/it/main.rs`). Then update the guards a
@@ -2328,10 +2328,10 @@ returns `Option<SidecarIndex>` and names no lexical/hybrid/RRF mode. **`LexicalI
 module and tests. **`rrf_fuse`** (`crates/jammi-ai/src/query/rrf.rs`, re-exported
 `crates/jammi-ai/src/query/mod.rs`) is **CALLER-DRIVEN client-side numerics**, not part of the
 served search path: exposed as a stateless verb (`crates/jammi-python/src/database.rs`) computed
-locally (`clients/python/jammi_client/_conformal.py`). **Conformal** (`conformalize` /
+locally (`clients/python/jammi/_conformal.py`). **Conformal** (`conformalize` /
 `conformalize_interval` / `conformalize_cqr`) is likewise **CALLER-DRIVEN client-side numerics**
 (`crates/jammi-python/src/database.rs`; remote computes locally via
-`clients/python/jammi_client/_conformal.py`) — it does **not** ride the wire and does **not** wrap
+`clients/python/jammi/_conformal.py`) — it does **not** ride the wire and does **not** wrap
 the served `Predict` predictor [cf. §3.9]. These three sit in `check_api_reference.py`'s `REQUIRED`
 (they are real instance methods) but are not gRPC verbs, so they need **no**
 proto/handler/mount/freeze-baseline work — only steps 8 and 10.
@@ -2394,7 +2394,7 @@ files [§6 release].
 **Wiring-status caveat — `test_generated_floor.py` is NOT a TS guard.**
 `clients/python/tests/test_generated_floor.py` is a **Python-client** structural guard: it parses
 the grpcio/protobuf import-time version guards out of the freshly generated `*_pb2.py`/`*_pb2_grpc.py`
-stubs (`clients/python/jammi_client/_generated/jammi/v1/`) and asserts `pyproject.toml`'s declared
+stubs (`clients/python/jammi/_generated/jammi/v1/`) and asserts `pyproject.toml`'s declared
 floors satisfy them. It has **nothing to do with the TypeScript client** (protoc-gen-es emits no
 runtime version guard). The TS guard is `surface.test.ts` alone.
 

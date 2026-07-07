@@ -1,8 +1,8 @@
 name: PyPI (jammi-server, CPU)
 
 # Publishes the CPU `jammi-server` wheel to PyPI on a `py-v*` tag — the SAME tag
-# that publishes the `jammi-ai` embed wheel and the `jammi-client` wheel, so the
-# whole Python surface ships in LOCKSTEP at one version. The wheel bundles the
+# that publishes the base client `jammi-ai` and the `jammi-ai-native` engine
+# wheels, so the whole Python surface ships in LOCKSTEP at one version. The wheel bundles the
 # prebuilt `jammi-server` binary behind a `jammi-server` console script; it is
 # therefore a platform wheel (manylinux_2_28_x86_64), not the universal
 # py3-none-any the pure-Python clients ship.

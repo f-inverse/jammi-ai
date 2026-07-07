@@ -65,8 +65,7 @@ import tempfile
 import time
 from pathlib import Path
 
-import jammi_ai
-import jammi_client
+import jammi
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
 
@@ -423,7 +422,7 @@ class LiveServer:
                 out = self.proc.stdout.read().decode(errors="replace") if self.proc.stdout else ""
                 raise RuntimeError(f"jammi-server exited early:\n{out}")
             try:
-                handshake = jammi_client.connect(self.endpoint)
+                handshake = jammi.connect(self.endpoint)
                 handshake.get_server_info()
                 handshake.close()
                 return self.endpoint
@@ -470,7 +469,7 @@ def emit(fx: Fixtures, server_bin: str) -> None:
 
     # --- embedded transport (the canonical reports) -------------------------- #
     with tempfile.TemporaryDirectory() as catalog:
-        embedded = jammi_ai.connect(f"file://{catalog}")
+        embedded = jammi.connect(f"file://{catalog}")
         print("== embedded engine: eval suite ==", flush=True)
         embedded_reports = run_eval_suite(embedded, fx, tag="emb")
         print("== embedded engine: channel sequence ==", flush=True)
@@ -479,7 +478,7 @@ def emit(fx: Fixtures, server_bin: str) -> None:
     # --- remote transport (live grpc:// parity) ------------------------------ #
     with LiveServer(server_bin) as endpoint:
         print(f"== remote engine up at {endpoint} ==", flush=True)
-        remote = jammi_client.connect(endpoint)
+        remote = jammi.connect(endpoint)
         try:
             print("== remote engine: eval suite ==", flush=True)
             remote_reports = run_eval_suite(remote, fx, tag="rem")

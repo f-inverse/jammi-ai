@@ -281,7 +281,7 @@ jobs:
         run: npm run test
 
   py-client:
-    name: Python client (jammi-client)
+    name: Python client (jammi-ai)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -293,9 +293,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      # `jammi-client` is the pure-Python (no-Rust) deploy half: generated from
-      # the canonical `crates/jammi-wire/proto` by `make generate`, then installed
-      # and tested. Running it on every PR catches a proto change that breaks the
+      # `jammi-ai` (import `jammi`) is the pure-Python (no-Rust) base client:
+      # generated from the canonical `crates/jammi-wire/proto` by `make generate`,
+      # then installed and tested. Running it on every PR catches a proto change that breaks the
       # Python codegen — or a regression in the hand-written `connect` /
       # `RemoteDatabase` seam — here, not only at the `py-v*` publish in
       # `pypi-client.yml`. Plain ubuntu (not the Rust CI container): this lane
@@ -309,9 +309,9 @@ jobs:
       - name: Test (hermetic)
         run: make test
 
-      - name: Guard — client imports no embed wheel
+      - name: Guard — base client stays native-free at import
         run: |
-          python -c "import sys, jammi_client; bad=[m for m in sys.modules if m=='jammi_ai' or m.startswith('jammi_ai.')]; assert not bad, f'jammi_client must not import jammi_ai: {bad}'; print('client import-direction OK')"
+          python -c "import sys, jammi; bad=[m for m in sys.modules if m=='jammi_native' or m.startswith('jammi_native.')]; assert not bad, f'import jammi eagerly pulled jammi_native: {bad}'; print('client import-direction OK')"
 
   test-broker:
     name: Test (NATS JetStream)
@@ -363,26 +363,24 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Install the three Python dists (client, native engine, front-end)
+      - name: Install the base client + native engine
         # The CI base image ships maturin + a python3 toolchain; use a
         # venv to avoid polluting the system site-packages and to make
         # `python` resolve to the venv's interpreter for pytest.
         #
-        # The pytest suite drives all three dists that ship in lockstep:
-        #   * `jammi-client` — the remote arm; install from in-repo source first
-        #     (`-e` with the dev extra, which carries the pinned `grpcio-tools`
-        #     generator and the client's real grpcio/protobuf floors) then
-        #     generate its proto stubs, since it is not on PyPI for an unreleased
-        #     commit.
+        # The pytest suite drives two dists that ship in lockstep:
+        #   * `jammi-ai` (import `jammi`) — the base client; install from in-repo
+        #     source (`-e` with the dev extra, which carries the pinned
+        #     `grpcio-tools` generator and the client's real grpcio/protobuf
+        #     floors) then generate its proto stubs, since it is not on PyPI for
+        #     an unreleased commit.
         #   * `jammi-ai-native` — the compiled engine (`import jammi_native`);
         #     `maturin develop` on `packaging/native/pyproject.toml` builds it
-        #     into the venv.
-        #   * `jammi-ai` — the pure-Python front-end (`import jammi_ai`); an
-        #     editable install of the root, `--no-deps` because its exact pins
-        #     (`jammi-ai-native==`, `jammi-client==`) are already satisfied by
-        #     the two installs above (they are not on PyPI for this commit).
-        # This is what makes the conformance test (`jammi_ai.connect`'s remote IS
-        # `jammi_client.RemoteDatabase`) runnable in this lane.
+        #     into the venv, and the base client discovers it as its `file://`
+        #     backend.
+        # This is what makes the conformance test (`jammi.connect`'s remote IS
+        # `jammi.RemoteDatabase`, its `file://` arm the native engine) runnable
+        # in this lane.
         run: |
           python3 -m venv .venv
           . .venv/bin/activate
@@ -391,7 +389,6 @@ jobs:
           pip install -e 'clients/python[dev]'
           make -C clients/python generate
           ( cd packaging/native && maturin develop --release )
-          pip install -e . --no-deps
 
       - name: Run pytest
         run: |

@@ -4,7 +4,7 @@
 Air Routes is Neptune's own teaching dataset: 3504 airports, a declared
 ``route`` graph and a ``contains`` continent→country→airport hierarchy. It is
 small enough to run *exactly* and fast — the clean 01–02 on-ramp. The heavy
-pipeline (embed → neighbor graph → propagate) runs the real ``jammi_ai`` API
+pipeline (embed → neighbor graph → propagate) runs the real ``jammi`` API
 end-to-end on the committed airport subset and writes ``artifacts/air/*`` +
 ``golden_metrics.json``; every chapter (and CI) READS that cache on CPU and never
 recomputes it.
@@ -36,7 +36,7 @@ import hashlib
 import json
 from pathlib import Path
 
-import jammi_ai
+import jammi
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -311,7 +311,7 @@ def tenancy_showcase(target: str, airport_rows: list[dict]) -> dict:
     work = ARTIFACTS / "_tenancy_work"
     work.mkdir(parents=True, exist_ok=True)
 
-    db = jammi_ai.connect(target)
+    db = jammi.connect(target)
 
     def write_src(name: str, table: pa.Table) -> None:
         path = work / f"{name}.parquet"
@@ -389,7 +389,7 @@ def main() -> None:
     ap.add_argument("--target", default="grpc://127.0.0.1:50051",
                     help="connect() target — grpc://host:port for the GPU server.")
     args = ap.parse_args()
-    db = jammi_ai.connect(args.target)
+    db = jammi.connect(args.target)
     emit(db, args.target)
 
 

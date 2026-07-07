@@ -10,7 +10,7 @@ import tempfile
 
 import pyarrow as pa
 
-import jammi_ai
+import jammi
 
 
 def events_schema() -> pa.Schema:
@@ -24,7 +24,7 @@ def events_schema() -> pa.Schema:
 
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
-        db = jammi_ai.connect(f"file://{tmp}")
+        db = jammi.connect(f"file://{tmp}")
 
         # 1. Register a topic with a typed schema. `broker_metadata`
         #    flows through to the broker driver — the in-process broker

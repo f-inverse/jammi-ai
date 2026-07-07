@@ -17,7 +17,7 @@ use jammi_db::audit::{self, AuditError, EnvSigningKeyStore, PerQueryAudit};
 use crate::convert::serializable_to_pydict;
 use crate::error::client_error;
 
-/// Map a substrate [`AuditError`] onto the `jammi_client.errors` taxonomy.
+/// Map a substrate [`AuditError`] onto the `jammi.errors` taxonomy.
 ///
 /// `AuditError` is the audit module's own taxonomy and intentionally does not
 /// collapse into `JammiError` (that would force callers to substring-match on

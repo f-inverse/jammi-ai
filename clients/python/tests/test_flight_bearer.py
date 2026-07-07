@@ -27,9 +27,9 @@ import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
 
-from jammi_client import BearerCredentials
-from jammi_client._credentials import AnonymousCredentials
-from jammi_client._database import open_remote
+from jammi import BearerCredentials
+from jammi._credentials import AnonymousCredentials
+from jammi._database import open_remote
 
 _TOKEN = "good-token"
 

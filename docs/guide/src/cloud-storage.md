@@ -59,9 +59,9 @@ If the `cloud` field is `None` and the URL is a cloud scheme, the driver falls b
 ### Python
 
 ```python
-from jammi_ai import Database
+import jammi
 
-db = Database()
+db = jammi.connect("file:///var/lib/jammi")
 db.add_source("papers", url="s3://benchmarks/snapshots/2026/papers.parquet", format="parquet")
 db.sql("SELECT id, title FROM papers.public.papers LIMIT 10")
 ```

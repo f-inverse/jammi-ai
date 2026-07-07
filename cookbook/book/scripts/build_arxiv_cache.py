@@ -2,7 +2,7 @@
 """Emit the ogbn-arxiv keystone cache (K0 layer 2) — run ONCE on the GPU server.
 
 This is the heavy pipeline: embed → neighbor graph → propagate → fine-tune →
-context-predictor → conformal. It runs the real ``jammi_ai`` API end-to-end on
+context-predictor → conformal. It runs the real ``jammi`` API end-to-end on
 the committed 4000-paper subset and writes ``artifacts/arxiv/*`` +
 ``golden_metrics.json``. Every later chapter (and CI) READS that cache and never
 recomputes it.
@@ -34,7 +34,7 @@ import hashlib
 import json
 from pathlib import Path
 
-import jammi_ai
+import jammi
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -758,7 +758,7 @@ def main() -> None:
     ap.add_argument("--target", default="grpc://127.0.0.1:50051",
                     help="connect() target — grpc://host:port for the GPU server.")
     args = ap.parse_args()
-    db = jammi_ai.connect(args.target)
+    db = jammi.connect(args.target)
     emit(db)
 
 

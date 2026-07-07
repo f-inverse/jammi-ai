@@ -23,11 +23,11 @@ measurement rail.
 import collections
 
 import numpy as np
-import jammi_ai
+import jammi
 
 from jammi_cookbook import contracts, rails
 
-db = jammi_ai.connect("file:///tmp/jammi_closed_loop")  # CPU arm; conformal is local math
+db = jammi.connect("file:///tmp/jammi_closed_loop")  # CPU arm; conformal is local math
 alpha = round(1 - contracts.golden("arxiv.tier04.nominal_coverage").value, 4)
 print(f"nominal coverage target: {1 - alpha:.2f}   (alpha = {alpha})")
 ```

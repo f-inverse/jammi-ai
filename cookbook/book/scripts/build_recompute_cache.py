@@ -125,7 +125,7 @@ import os
 import tempfile
 from pathlib import Path
 
-import jammi_ai
+import jammi
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -185,7 +185,7 @@ def _fresh_chain(catalog_root: Path, model: str, src_path: Path) -> tuple:
     redundant recomputed tables and inflates the downstream / edge counts). Returns
     `(db, emb, g, prop)`."""
     catalog = tempfile.mkdtemp(prefix="jammi_recompute_", dir=catalog_root)
-    db = jammi_ai.connect(f"file://{catalog}")
+    db = jammi.connect(f"file://{catalog}")
     emb, g, prop = _build_chain(db, model, src_path)
     return db, emb, g, prop
 
@@ -201,7 +201,7 @@ def run_cache(catalog_root: Path, model: str, src_path: Path) -> dict:
     A producer returns a bare table-name str; a cache HIT returns the SAME name, a
     MISS a new timestamped name. Every cell is the boolean of that identity."""
     catalog = tempfile.mkdtemp(prefix="jammi_recompute_cache_", dir=catalog_root)
-    db = jammi_ai.connect(f"file://{catalog}")
+    db = jammi.connect(f"file://{catalog}")
     db.add_source("docs", url=f"file://{src_path}", format="parquet")
     emb = db.generate_embeddings(source="docs", model=model, columns=["text"], key="_row_id")
 

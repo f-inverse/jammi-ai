@@ -11,7 +11,7 @@ import json
 import tempfile
 from pathlib import Path
 
-import jammi_ai
+import jammi
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 FIXTURES = REPO_ROOT / "cookbook" / "fixtures"
@@ -36,7 +36,7 @@ def expand_golden_to_csv(json_path: Path, out_path: Path) -> None:
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        db = jammi_ai.connect(f"file://{str(tmp_path)}")
+        db = jammi.connect(f"file://{str(tmp_path)}")
 
         # 1. Register the corpus and build the embedding index.
         db.add_source("corpus", url=str(CORPUS_PATH), format="parquet")

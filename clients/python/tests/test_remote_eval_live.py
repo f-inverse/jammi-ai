@@ -3,7 +3,7 @@
 Stands up a real CPU `jammi-server` (the shared `live_server` fixture in
 `conftest.py`) and drives the eval family through the pure-Python
 `RemoteDatabase`, asserting the remote reports agree with an embedded
-`jammi_ai.Database`'s over the same fixtures: the `patents.parquet` corpus
+`jammi.EmbeddedBackend`'s over the same fixtures: the `patents.parquet` corpus
 embedded with the deterministic `tiny_modernbert` encoder, evaluated against
 the `golden_relevance.csv` golden set; and the deterministic
 `tiny_modernbert_classifier` run over the same corpus against the
@@ -38,8 +38,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-jammi_ai = pytest.importorskip("jammi_ai")
-import jammi_client  # noqa: E402
+pytest.importorskip("jammi_native")
+import jammi  # noqa: E402
 
 SERVER_BIN = os.environ.get("JAMMI_SERVER_BIN")
 
@@ -178,8 +178,8 @@ def test_eval_embeddings_and_per_query_round_trip_matches_embedded(
     on both transports (cohort tags included), and `eval_per_query` reads back
     one structurally identical persisted row per golden query."""
     tag = "emb"
-    remote = jammi_client.connect(live_server)
-    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    remote = jammi.connect(live_server)
+    embedded = jammi.connect(f"file://{tmp_path}")
     try:
         cohorts = {"q1": {"split": "val"}}
         reports = {}
@@ -236,8 +236,8 @@ def test_eval_compare_round_trip_matches_embedded(live_server, tmp_path):
     same report shape on both transports: a baseline with `delta: None` and a
     treatment whose deltas are zero with `significance` present."""
     tag = "cmp"
-    remote = jammi_client.connect(live_server)
-    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    remote = jammi.connect(live_server)
+    embedded = jammi.connect(f"file://{tmp_path}")
     try:
         reports = {}
         for name, db in (("remote", remote), ("embedded", embedded)):
@@ -306,8 +306,8 @@ def test_eval_compare_nondegenerate_significance_matches_embedded(
     multiset, so it must agree across transports and reproduce within a transport.
     """
     tag = "cmpnd"
-    remote = jammi_client.connect(live_server)
-    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    remote = jammi.connect(live_server)
+    embedded = jammi.connect(f"file://{tmp_path}")
     try:
         reports = {}
         for name, db in (("remote", remote), ("embedded", embedded)):
@@ -380,8 +380,8 @@ def test_eval_inference_ner_round_trip_matches_embedded(live_server, tmp_path):
     tag = "infner"
     source = f"patents_ner_{tag}"
     golden_source = f"golden_ner_{tag}"
-    remote = jammi_client.connect(live_server)
-    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    remote = jammi.connect(live_server)
+    embedded = jammi.connect(f"file://{tmp_path}")
     try:
         reports = {}
         for name, db in (("remote", remote), ("embedded", embedded)):
@@ -427,8 +427,8 @@ def test_eval_inference_classification_round_trip_matches_embedded(
     tag = "infcls"
     source = f"patents_{tag}"
     golden_source = f"golden_lbl_{tag}"
-    remote = jammi_client.connect(live_server)
-    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    remote = jammi.connect(live_server)
+    embedded = jammi.connect(f"file://{tmp_path}")
     try:
         reports = {}
         for name, db in (("remote", remote), ("embedded", embedded)):
@@ -485,8 +485,8 @@ def test_eval_embeddings_empty_golden_set_zero_aggregate_matches_embedded(
     )
     empty_url = f"file://{empty_golden}"
 
-    remote = jammi_client.connect(live_server)
-    embedded = jammi_ai.connect(f"file://{tmp_path / 'embed'}")
+    remote = jammi.connect(live_server)
+    embedded = jammi.connect(f"file://{tmp_path / 'embed'}")
     try:
         reports = {}
         for name, db in (("remote", remote), ("embedded", embedded)):
@@ -533,8 +533,8 @@ def test_eval_error_paths_match_embedded(live_server, tmp_path):
     """
     tag = "err"
     source = f"patents_{tag}"
-    remote = jammi_client.connect(live_server)
-    embedded = jammi_ai.connect(f"file://{tmp_path}")
+    remote = jammi.connect(live_server)
+    embedded = jammi.connect(f"file://{tmp_path}")
     try:
         for db in (remote, embedded):
             db.add_source(source, url=PATENTS_URL, format="parquet")

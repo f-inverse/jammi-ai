@@ -49,7 +49,7 @@ import json
 import tempfile
 from pathlib import Path
 
-import jammi_ai
+import jammi
 import pyarrow as pa
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
@@ -265,7 +265,7 @@ def main() -> None:
                          "(a fresh temp catalog is used if omitted).")
     args = ap.parse_args()
     with tempfile.TemporaryDirectory() as catalog, tempfile.TemporaryDirectory() as work:
-        db = jammi_ai.connect(args.target or f"file://{catalog}")
+        db = jammi.connect(args.target or f"file://{catalog}")
         emit(db, Path(work))
 
 

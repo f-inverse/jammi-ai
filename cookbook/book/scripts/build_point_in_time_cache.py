@@ -3,7 +3,7 @@
 
 The engine↔cookbook validator for the H4 temporal-correctness surface: `asof_join`
 (SPEC-01) and `verify_materialization` (SPEC-02), carried on BOTH the embedded
-`jammi_ai.Database` and the remote `jammi_client.RemoteDatabase`. This script
+`jammi` and the remote `jammi.RemoteDatabase`. This script
 assembles a **leakage-free training set** with `asof_join`, measures the leak it
 closes, and freezes the materialization-contract verdict matrix.
 
@@ -70,7 +70,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-import jammi_ai
+import jammi
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -306,7 +306,7 @@ def verdict_matrix(work: str) -> dict:
     docs_path = os.path.join(work, "tiny_docs.parquet")
     pq.write_table(pa.table(_TINY_DOCS), docs_path)
     catalog = tempfile.mkdtemp(prefix="jammi_pit_matrix_")
-    db = jammi_ai.connect(f"file://{catalog}")
+    db = jammi.connect(f"file://{catalog}")
     db.add_source("docs", url=f"file://{docs_path}", format="parquet")
 
     # MatchWithUnpinnedInputs: embedding over a file source.
@@ -367,7 +367,6 @@ class LiveServer:
         self.endpoint = None
 
     def __enter__(self) -> str:
-        import jammi_client
 
         artifact_dir = tempfile.mkdtemp(prefix="jammi_srv_pit_")
         flight_port, health_port = _free_port(), _free_port()
@@ -386,7 +385,7 @@ class LiveServer:
                 out = self.proc.stdout.read().decode(errors="replace") if self.proc.stdout else ""
                 raise RuntimeError(f"jammi-server exited early:\n{out}")
             try:
-                handshake = jammi_client.connect(self.endpoint)
+                handshake = jammi.connect(self.endpoint)
                 handshake.get_server_info()
                 handshake.close()
                 return self.endpoint
@@ -435,17 +434,16 @@ def emit(target: str, server_bin: str | None) -> None:
 
         # --- embedded asof (the canonical feature rows) --------------------- #
         with tempfile.TemporaryDirectory() as catalog:
-            embedded = jammi_ai.connect(f"file://{catalog}")
+            embedded = jammi.connect(f"file://{catalog}")
             print("== embedded asof_join ==", flush=True)
             e_out, e_rows, e_verdict = run_asof(embedded, spine_path, facts_path)
 
         # --- remote asof (live grpc:// skew check) -------------------------- #
         if target == "dual":
-            import jammi_client
 
             with LiveServer(server_bin) as endpoint:
                 print(f"== remote asof_join at {endpoint} ==", flush=True)
-                remote = jammi_client.connect(endpoint)
+                remote = jammi.connect(endpoint)
                 try:
                     r_out, r_rows, r_verdict = run_asof(remote, spine_path, facts_path)
                 finally:

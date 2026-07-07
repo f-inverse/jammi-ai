@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Guard the grounded API reference against the installed `jammi_ai` wheel.
+"""Guard the grounded API reference against the installed `jammi` wheel.
 
 The embedded reference (`jammi_cookbook/_api_reference.md`) is only trustworthy if
 it tracks the pinned engine. This asserts that every method the chapters call
-exists on the installed `jammi_ai` surface and still carries the keyword
+exists on the installed `jammi` surface and still carries the keyword
 arguments the recipes pass. If the pin moves and a signature drifts, CI fails
 here — loudly — rather than a chapter calling a stale kwarg at execute time.
 
@@ -16,7 +16,7 @@ import inspect
 import sys
 import tempfile
 
-import jammi_ai
+import jammi
 
 # method -> kwargs the cookbook relies on existing in the signature.
 REQUIRED: dict[str, list[str]] = {
@@ -136,16 +136,16 @@ REQUIRED: dict[str, list[str]] = {
     "subscribe_collect": ["predicate", "from_offset", "max_batches"],
 }
 
-MODULE_FUNCTIONS = ["open_local", "connect"]
+MODULE_FUNCTIONS = ["connect"]
 
 
 def _signature(db: object, name: str) -> inspect.Signature | None:
     """Resolve `name`'s signature the way a CALLER actually invokes it — through
     the composed embedded surface, on an instance.
 
-    `jammi_ai.connect("file://…")` returns the embedded `Session` — the
-    `EmbeddedBackend`, defined once in `jammi_client._embedded` and re-exposed as
-    `jammi_ai.Database` — which holds a compiled `_NativeDatabase` handle by
+    `jammi.connect("file://…")` returns the embedded `Session` — the
+    `EmbeddedBackend`, defined once in `jammi._embedded` — which holds a
+    compiled `_NativeDatabase` handle by
     composition. Every verb is an explicit Python method on the wrapper that
     delegates to the native handle (the migrated verbs — `fine_tune`, `search`,
     `register_topic`, … — drive the shared request assembly; the rest forward 1:1).
@@ -175,25 +175,25 @@ def main() -> int:
     errors: list[str] = []
 
     for name in MODULE_FUNCTIONS:
-        if not hasattr(jammi_ai, name):
-            errors.append(f"jammi_ai.{name} is missing from the installed wheel")
+        if not hasattr(jammi, name):
+            errors.append(f"jammi.{name} is missing from the installed wheel")
 
     # The unified front door (U1): `connect(target, *, credentials=...)`. The
     # chapter-21 recipes pass `credentials=` to scale local->remote with an
     # identity on the channel, so the kwarg must be a real parameter of `connect`.
-    if hasattr(jammi_ai, "connect"):
-        connect_params = set(inspect.signature(jammi_ai.connect).parameters)
+    if hasattr(jammi, "connect"):
+        connect_params = set(inspect.signature(jammi.connect).parameters)
         for kw in ("target", "credentials"):
             if kw not in connect_params:
                 errors.append(
-                    f"jammi_ai.connect: expected parameter '{kw}' not found in "
-                    f"signature {inspect.signature(jammi_ai.connect)}"
+                    f"jammi.connect: expected parameter '{kw}' not found in "
+                    f"signature {inspect.signature(jammi.connect)}"
                 )
 
     # Introspect through the composition: open the embedded engine and resolve each
     # verb on the live instance, the way a caller invokes it.
     with tempfile.TemporaryDirectory() as artifact_dir:
-        db = jammi_ai.connect(f"file://{artifact_dir}")
+        db = jammi.connect(f"file://{artifact_dir}")
 
         for name, kwargs in REQUIRED.items():
             sig = _signature(db, name)
@@ -211,13 +211,13 @@ def main() -> int:
                     )
 
     if errors:
-        print("API reference drifted from the installed jammi_ai wheel:")
+        print("API reference drifted from the installed jammi wheel:")
         for e in errors:
             print(f"  - {e}")
         return 1
 
     checked = len(REQUIRED) + len(MODULE_FUNCTIONS)
-    print(f"API reference matches installed jammi_ai ({checked} surfaces checked).")
+    print(f"API reference matches installed jammi ({checked} surfaces checked).")
     return 0
 
 

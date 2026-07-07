@@ -55,7 +55,7 @@ bound scope drives both isolation layers (`tenant_scope` is the block-scoped for
 ```{python}
 import tempfile
 
-import jammi_ai
+import jammi
 import pyarrow as pa
 import pyarrow.parquet as pq
 from jammi_cookbook.rails import assert_listing_isolated, assert_rows_isolated, tenant
@@ -65,7 +65,7 @@ TENANT_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
 catalog = tempfile.mkdtemp()
 work = tempfile.mkdtemp()
-db = jammi_ai.connect(f"file://{catalog}")
+db = jammi.connect(f"file://{catalog}")
 
 papers = contracts.load_artifact("arxiv.papers").to_pylist()
 subject = {p["paper_id"]: p["subject"] for p in papers}

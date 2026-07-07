@@ -12,7 +12,7 @@ is honest, so an existing ``except`` clause keeps working: a bad argument IS a
 ``ValueError``; a transport or training failure IS a ``RuntimeError``. The extra
 base is never a compatibility shim — it states what kind of error each class is.
 
-This module is public (``jammi_client.errors``) because a consumer catches these
+This module is public (``jammi.errors``) because a consumer catches these
 types by name, and because the native engine imports them from here — the arrow
 points one way, native → client, never the reverse.
 """
@@ -43,7 +43,7 @@ class NotSupportedOnBackend(JammiError):
     this typed error rather than a bare ``AttributeError``, and
     :meth:`Session.supports` answers the same question before the call.
 
-    Constructed one of two ways: with the :class:`~jammi_client.Capability` a
+    Constructed one of two ways: with the :class:`~jammi.Capability` a
     caller invoked on the wrong backend (the local, capability-shaped case), or
     with a server ``UNIMPLEMENTED`` detail string (a verb the remote deployment
     did not mount). ``capability`` is the enum member in the first case, ``None``
@@ -64,15 +64,22 @@ class NotSupportedOnBackend(JammiError):
 
 
 class NoEmbeddedEngineError(NotSupportedOnBackend):
-    """A `file://` (local) target was opened on a build with no embedded engine.
+    """The embedded engine was needed on a build that does not carry it.
 
-    `jammi-client` is the base client; it discovers the compiled engine as an
+    `jammi-ai` is the base client; it discovers the compiled engine as an
     optional in-process backend but does not carry it by default. Absent the
-    `jammi-client[embedded]` extra (which pulls `jammi-ai-native`, importable as
-    `jammi_native`), it cannot run a target in-process — a local target is a
-    capability this build does not carry (hence a :class:`NotSupportedOnBackend`).
-    Install the extra — `pip install jammi-client[embedded]` — and the SAME
-    `jammi_client.connect` resolves both local and remote.
+    `jammi-ai[embedded]` extra (which pulls `jammi-ai-native`, importable as
+    `jammi_native`), two things this build cannot do raise this one error: open a
+    `file://` (local) target in-process, and surface an embedded-only value-type
+    (`jammi.PerQueryAudit`, …) the engine exports. Either way a capability this
+    build does not carry was reached (hence a :class:`NotSupportedOnBackend`).
+    Install the extra — `pip install jammi-ai[embedded]` — and the SAME
+    `jammi.connect` / `jammi.<Type>` resolve.
+
+    Constructed for whichever thing was reached: the default form names the
+    unopenable local target and exposes it as :attr:`artifact_dir`;
+    :meth:`for_symbol` names the embedded-only attribute that was accessed. Only
+    the target form carries an :attr:`artifact_dir` (``None`` on the symbol form).
     """
 
     def __init__(self, artifact_dir: str) -> None:
@@ -81,11 +88,53 @@ class NoEmbeddedEngineError(NotSupportedOnBackend):
         JammiError.__init__(
             self,
             f"no embedded engine in this build: cannot open the local target "
-            f"{artifact_dir!r} — `pip install jammi-client[embedded]` for the "
+            f"{artifact_dir!r} — `pip install jammi-ai[embedded]` for the "
             f"in-process engine, or point connect() at a remote https:// / grpc:// "
             f"target.",
         )
         self.artifact_dir = artifact_dir
+
+    @classmethod
+    def for_symbol(cls, symbol: str) -> "NoEmbeddedEngineError":
+        """An embedded-only attribute (`jammi.<symbol>`) was accessed with no engine.
+
+        The value-types the in-process engine exports (`PerQueryAudit`,
+        `TrainingJob`, …) are surfaced lazily on `jammi`; reaching one without the
+        `[embedded]` extra is this error, naming the attribute and the extra rather
+        than a bare `AttributeError`. Alternate constructor: it bypasses the
+        target-shaped ``__init__`` (there is no `artifact_dir` here) and leaves
+        :attr:`artifact_dir` ``None``.
+        """
+        err = cls.__new__(cls)
+        JammiError.__init__(
+            err,
+            f"no embedded engine in this build: `jammi.{symbol}` is an "
+            f"embedded-only type provided by the in-process engine — "
+            f"`pip install jammi-ai[embedded]` to surface it, or use the remote "
+            f"transport, which does not carry it.",
+        )
+        err.artifact_dir = None
+        return err
+
+
+class PlatformNotInstalledError(JammiError):
+    """`jammi.platform` was accessed but no platform extension is installed.
+
+    `jammi` surfaces an out-of-package plug-in as `jammi.platform` through a
+    generic extension slot — an entry point named `platform` in the
+    `jammi.extensions` group. The plug-in registers itself there; it never writes
+    into the `jammi` namespace. Absent any registered extension, this build
+    carries only the open surface, and accessing `jammi.platform` raises this
+    error rather than a bare `AttributeError`. Install the platform SDK —
+    `pip install jammi-ai-platform` — and the SAME `jammi.platform` resolves to it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "no platform extension is installed: `jammi.platform` is provided by "
+            "an out-of-package plug-in registered under the `jammi.extensions` "
+            "entry-point group — `pip install jammi-ai-platform` to surface it."
+        )
 
 
 class TrainingError(JammiError, RuntimeError):

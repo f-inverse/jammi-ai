@@ -1,20 +1,20 @@
-"""The `EmbeddedBackend`: the in-process engine as a :class:`~jammi_client.Session`.
+"""The `EmbeddedBackend`: the in-process engine as a :class:`~jammi.Session`.
 
-`jammi_client.connect("file://…")` returns one of these when the compiled engine
-(`jammi_native`, the `jammi-client[embedded]` extra) is installed. It is the base
+`jammi.connect("file://…")` returns one of these when the compiled engine
+(`jammi_native`, the `jammi-ai[embedded]` extra) is installed. It is the base
 client discovering the native engine as an in-process backend — the direct-FFI
-peer of :class:`~jammi_client.RemoteDatabase`, driving the compiled
+peer of :class:`~jammi.RemoteDatabase`, driving the compiled
 `jammi_native._NativeDatabase` low-level handle by DIRECT PyO3 calls (never a
 gRPC loopback):
 
 **Native import is LAZY.** `jammi_native` is imported only inside
 :func:`_open_embedded` — the `file://` dispatch factory — never at module load,
-so `import jammi_client` stays native-free (the client-import guard): the base
+so `import jammi` stays native-free (the client-import guard): the base
 package carries no compiled dependency and discovers the engine on demand.
 
 The `serde_json` decode the introspection/eval verbs return (the engine's
 `serializable_to_pydict`) mirrors the SAME wire proto the remote
-:class:`~jammi_client.RemoteDatabase` decodes, so the embedded and remote dict
+:class:`~jammi.RemoteDatabase` decodes, so the embedded and remote dict
 shapes agree by construction — the anchor the §5.5 proto-shape pin
 (`test_conformance.py`) locks and the Rust it-suite (`grpc_remote_session.rs` /
 `grpc_remote_compute.rs`) checks for value.
@@ -34,15 +34,15 @@ Composed over the compiled `jammi_native._NativeDatabase` low-level handle:
   `eval_calibration`) — are explicit
   methods here. They build their request
   with the SAME pure-Python assembly the remote client uses
-  (`jammi_client._assembly.build_*_request`), serialize it, and hand the bytes to
+  (`jammi._assembly.build_*_request`), serialize it, and hand the bytes to
   the native handle's `_*_proto` primitive — which decodes through the engine's
   shared wire seam and runs the verb in-process. So the embedded and remote
   paths share one request assembly and one decode, differing only in the
   transport primitive (a PyO3 call here, a gRPC call there). The signatures
-  mirror `jammi_client.RemoteDatabase`'s — the conformance contract.
+  mirror `jammi.RemoteDatabase`'s — the conformance contract.
 
 The kwargs→struct assembly the native handle used to carry for these verbs is
-gone from Rust; it lives once in `jammi_client._assembly`.
+gone from Rust; it lives once in `jammi._assembly`.
 """
 
 from __future__ import annotations
@@ -86,7 +86,7 @@ class _TenantScope:
     Wraps the native scope guard: entering binds the target tenant (restoring the
     prior on exit) and **yields the tenant-scoped** :class:`EmbeddedBackend` **itself**,
     so ``with db.tenant_scope(t) as s: s.search(...)`` works and matches the
-    remote :meth:`~jammi_client.RemoteDatabase.tenant_scope`, which yields its own
+    remote :meth:`~jammi.RemoteDatabase.tenant_scope`, which yields its own
     session. The native scope validates the id eagerly (a bad id raises where the
     caller names it), rejects re-entry, and no-ops a stray exit — this wrapper
     preserves all three by delegating ``__enter__``/``__exit__`` to it while
@@ -106,7 +106,7 @@ class _TenantScope:
 
 
 class EmbeddedBackend:
-    """The embedded engine — a :class:`~jammi_client.Session` over a compiled handle.
+    """The embedded engine — a :class:`~jammi.Session` over a compiled handle.
 
     Holds the low-level `_NativeDatabase` handle by composition and exposes the
     transport-agnostic Session surface over it: every verb is an EXPLICIT method
@@ -1155,11 +1155,11 @@ def _open_embedded(artifact_dir: str) -> EmbeddedBackend:
     :class:`EmbeddedBackend` — the `file://` dispatch factory.
 
     This is the ONE site that imports `jammi_native`, and it does so LAZILY (at
-    call time, not module load): `import jammi_client` and `import
-    jammi_client._embedded` both stay native-free, so the base client carries no
+    call time, not module load): `import jammi` and `import
+    jammi._embedded` both stay native-free, so the base client carries no
     compiled dependency and discovers the engine only when a caller actually opens
     a local target. The probe/hint for the missing engine lives in
-    :func:`jammi_client.connect`; by the time control reaches here the extra is
+    :func:`jammi.connect`; by the time control reaches here the extra is
     known-importable, so the import is a plain call.
     """
     import jammi_native

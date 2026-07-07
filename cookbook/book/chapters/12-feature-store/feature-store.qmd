@@ -78,12 +78,12 @@ schema and a primary key. A mutable table is addressed in SQL as
 ```{python}
 import tempfile
 
-import jammi_ai
+import jammi
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 work = tempfile.mkdtemp(prefix="jammi_feature_store_")
-db = jammi_ai.connect(f"file://{tempfile.mkdtemp(prefix='jammi_fs_catalog_')}")
+db = jammi.connect(f"file://{tempfile.mkdtemp(prefix='jammi_fs_catalog_')}")
 
 # Register the committed papers parquet as a federatable source.
 papers_path = f"{work}/papers.parquet"

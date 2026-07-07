@@ -19,10 +19,10 @@ from contextlib import contextmanager
 import grpc
 import pytest
 
-from jammi_client import BearerCredentials
-from jammi_client._credentials import AUTHORIZATION_HEADER
-from jammi_client._database import SESSION_HEADER, open_remote
-from jammi_client._generated.jammi.v1 import catalog_pb2, catalog_pb2_grpc
+from jammi import BearerCredentials
+from jammi._credentials import AUTHORIZATION_HEADER
+from jammi._database import SESSION_HEADER, open_remote
+from jammi._generated.jammi.v1 import catalog_pb2, catalog_pb2_grpc
 
 
 class _RecordingCatalogService(catalog_pb2_grpc.CatalogServiceServicer):

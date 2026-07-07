@@ -124,13 +124,13 @@ import re
 import tempfile
 from collections import Counter, defaultdict
 
-import jammi_ai
+import jammi
 import numpy as np
 from jammi_cookbook import rails
 
 # A fresh ephemeral artifact dir per render — sources persist in the catalog, so a
 # fixed path would raise "Source already registered" on re-execution.
-db = jammi_ai.connect(f"file://{tempfile.mkdtemp(prefix='jammi_retrieval_')}")
+db = jammi.connect(f"file://{tempfile.mkdtemp(prefix='jammi_retrieval_')}")
 
 # the committed same-subject golden + its query text
 golden = contracts.load_artifact("arxiv.subject_golden").to_pylist()

@@ -34,10 +34,10 @@ no recompute. It carries two payloads:
 ```{python}
 import numpy as np
 
-import jammi_ai
+import jammi
 from jammi_cookbook import contracts, rails
 
-db = jammi_ai.connect("file:///tmp/jammi_conformal")  # CPU; conformal is local numerics
+db = jammi.connect("file:///tmp/jammi_conformal")  # CPU; conformal is local numerics
 alpha = round(1 - contracts.golden("arxiv.conformal.nominal_coverage").value, 4)
 print(f"target coverage 1 − α = {1 - alpha:.2f}")
 ```

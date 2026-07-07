@@ -54,9 +54,9 @@ across all references.
 ## Python
 
 ```python
-import jammi_ai
+import jammi
 
-db = jammi_ai.connect("file:///tmp/jammi")
+db = jammi.connect("file:///tmp/jammi")
 db.set_tenant("018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9a")
 
 # Subsequent calls observe Alice's tenant scope.
@@ -79,7 +79,7 @@ with db.tenant_scope("018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9a"):
 ```
 
 The same surface is available on a remote connection
-(`jammi_client.RemoteDatabase`), where the prior tenant is captured client-side
+(`jammi.RemoteDatabase`), where the prior tenant is captured client-side
 and rebound on exit.
 
 ## CLI

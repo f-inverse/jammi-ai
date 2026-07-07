@@ -1,7 +1,7 @@
 """Functional end-to-end test for the embedded training collapse.
 
 The embedded `Database.fine_tune` drives the SAME pure-Python request assembly
-(`jammi_client._assembly`) the remote client uses, serializes the proto, and
+(`jammi._assembly`) the remote client uses, serializes the proto, and
 hands the bytes to the `_start_training_proto` PyO3 primitive, which decodes
 through the shared `jammi_ai::wire` seam into a `TrainingSpec` and runs it on the
 in-process session (`InferenceSession::run_training_spec`). Signature parity is
@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-import jammi_ai
+import jammi
 
 # crates/jammi-python/tests/this_file -> repo root is three parents up.
 _ROOT = Path(__file__).resolve().parents[3]
@@ -32,12 +32,12 @@ pytestmark = pytest.mark.skipif(
 
 
 def _connect(tmp_path: Path):
-    db = jammi_ai.connect(f"file://{tmp_path}")
+    db = jammi.connect(f"file://{tmp_path}")
     # connect("file://") returns the embedded `Session` (the migrated
-    # `EmbeddedBackend`, defined once in `jammi_client._embedded` and re-exposed as
-    # `jammi_ai.Database`), not the raw native handle.
+    # `EmbeddedBackend`, defined once in `jammi._embedded` and re-exposed as
+    # `jammi.EmbeddedBackend`), not the raw native handle.
     assert type(db).__name__ == "EmbeddedBackend"
-    assert type(db).__module__ == "jammi_client._embedded"
+    assert type(db).__module__ == "jammi._embedded"
     return db
 
 

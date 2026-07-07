@@ -2,9 +2,9 @@
 
 `connect(target)` returns a :class:`Session` — the transport-agnostic surface a
 caller writes against. Two concrete classes satisfy it structurally: the remote
-:class:`~jammi_client.RemoteDatabase` (over a gRPC channel) and the embedded
-:class:`~jammi_client.EmbeddedBackend` (over the compiled in-process engine,
-direct FFI; also re-exposed as `jammi_ai.Database`). Because both expose the same
+:class:`~jammi.RemoteDatabase` (over a gRPC channel) and the embedded
+:class:`~jammi.EmbeddedBackend` (over the compiled in-process engine,
+direct FFI). Because both expose the same
 verb vocabulary, a caller swaps transports without touching a call — that is the
 one-front-door thesis made a type.
 
@@ -14,7 +14,7 @@ pinned to one surface rather than drifting as parallel classes. They enumerate
 only the SHARED surface both transports carry; the one-sided, capability-gated
 members (`audit`, `ephemeral_session`, `preload_model`, `session_id`) live off
 the protocol and are guarded by :meth:`Session.supports` +
-:class:`~jammi_client.errors.NotSupportedOnBackend` instead.
+:class:`~jammi.errors.NotSupportedOnBackend` instead.
 """
 
 from __future__ import annotations
@@ -29,9 +29,9 @@ class TrainingJobHandle(Protocol):
     """A handle to a submitted training job — poll it, or block on it.
 
     Both the embedded engine's `TrainingJob` and the remote
-    :class:`~jammi_client.RemoteTrainingJob` satisfy this, so a caller treats the
+    :class:`~jammi.RemoteTrainingJob` satisfy this, so a caller treats the
     two interchangeably: read the ids, poll :meth:`status`, or :meth:`wait` for a
-    terminal state (which raises :class:`~jammi_client.errors.TrainingError` on a
+    terminal state (which raises :class:`~jammi.errors.TrainingError` on a
     failed job with the worker's message).
     """
 

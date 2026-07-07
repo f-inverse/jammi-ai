@@ -55,7 +55,7 @@
       "embedded"
     ],
     "file_uri_backend": "EmbeddedBackend",
-    "file_uri_backend_module": "jammi_client._embedded",
+    "file_uri_backend_module": "jammi._embedded",
     "grpc_uri_backend": "RemoteDatabase",
     "native_dist": "jammi-ai-native",
     "native_importable": true,

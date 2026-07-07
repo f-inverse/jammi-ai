@@ -17,7 +17,7 @@ a frozen golden) + the cross-transport **parity contract** (the same failure
 raises the same *normalized class* on both transports).
 
 The evidence-channel registry verbs are on **both** the embedded
-`jammi_ai.Database` and the remote `jammi_client.RemoteDatabase`. Chapter 14
+`jammi.EmbeddedBackend` and the remote `jammi.RemoteDatabase`. Chapter 14
 measures the *happy path* — register, append columns, list, the tenant-isolation
 property. This chapter measures the **failure surface**: each way a channel
 operation can fail, and the **typed gRPC status code** it maps to on the wire.

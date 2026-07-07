@@ -81,10 +81,10 @@ let topic = TopicDefinition {
 The CLI exposes the same shape via `jammi trigger register --name … --schema …`.
 
 ```python
-import jammi_ai
+import jammi
 import pyarrow as pa
 
-db = jammi_ai.connect("file:///var/lib/jammi")
+db = jammi.connect("file:///var/lib/jammi")
 db.register_topic(
     "cdc.orders",
     schema=pa.schema([

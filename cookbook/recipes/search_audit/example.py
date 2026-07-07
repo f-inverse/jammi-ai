@@ -20,7 +20,6 @@ import tempfile
 import uuid
 
 import jammi
-import jammi_native
 
 TENANT = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a"
 
@@ -39,7 +38,7 @@ def main() -> None:
         # 1. Build an audit record for a (hypothetical) search. query_lineage
         #    holds hashes / IDs — never raw payloads (there is a size cap).
         query_id = str(uuid.uuid4())
-        record = jammi_native.PerQueryAudit(
+        record = jammi.PerQueryAudit(
             query_id=query_id,
             model_id="patentclip/PatentCLIP_Vit_B",
             model_version="3aa649a",

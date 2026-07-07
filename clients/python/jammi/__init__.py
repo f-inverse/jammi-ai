@@ -137,3 +137,49 @@ def connect(
     from ._database import open_remote
 
     return open_remote(parsed.endpoint, tls=parsed.tls, credentials=credentials)
+
+
+# The value-types the in-process engine exports but the lean surface does not
+# define itself. Surfaced lazily on `jammi` (below) so a caller writes
+# `jammi.PerQueryAudit(...)` without importing the internal `jammi_native`
+# package; absent the `[embedded]` extra, reaching one is a truthful
+# `NoEmbeddedEngineError`, never a raw `ImportError`. Kept in lockstep with
+# `jammi_native.__all__` — every name here is one the engine actually exports.
+_EMBEDDED_ONLY = (
+    "AuditHandle",
+    "EphemeralSession",
+    "ModelTask",
+    "PerQueryAudit",
+    "TrainingJob",
+)
+
+
+def __getattr__(name: str) -> object:
+    """Resolve `jammi`'s optional, out-of-package surfaces on first access.
+
+    An embedded-only value-type (`PerQueryAudit`, …) resolves here so it is not
+    imported at module load — the reason `import jammi` stays native-free (the
+    client-import guard the conformance lane pins): probe the engine with
+    `find_spec` — the same idiom `connect()` uses — and import it from
+    `jammi_native` only when the `[embedded]` extra is present, else a truthful
+    :class:`NoEmbeddedEngineError` naming the attribute and the extra.
+
+    Any other name is genuinely absent — raise :class:`AttributeError` so normal
+    attribute semantics (and `hasattr`) hold.
+    """
+    if name in _EMBEDDED_ONLY:
+        from importlib.util import find_spec
+
+        if find_spec("jammi_native") is None:
+            raise NoEmbeddedEngineError.for_symbol(name)
+        # Known-importable — the lazy `import jammi_native` happens only now.
+        import jammi_native
+
+        return getattr(jammi_native, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list:
+    """Include the lazily-resolved names so introspection / tab-completion see
+    the embedded-only types alongside the eagerly-bound surface."""
+    return sorted({*globals(), *_EMBEDDED_ONLY})

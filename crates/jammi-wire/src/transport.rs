@@ -22,13 +22,27 @@ use jammi_db::error::{JammiError, Result};
 /// definition shared by both sides so the header name cannot drift.
 pub const SESSION_HEADER: &str = "jammi-session-id";
 
+/// The standard `authorization` header an authenticated client stamps its
+/// bearer under (via [`SessionTransport::with_bearer`]). Named once so the
+/// header cannot drift.
+pub const AUTHORIZATION_HEADER: &str = "authorization";
+
 /// Injects the [`SESSION_HEADER`] carrying this client's opaque session id on
 /// every outbound request, so the server's tenant interceptor resolves the same
 /// binding the tenant trio set. One per [`SessionTransport`]; cheap to clone (a
 /// pre-parsed metadata value).
+///
+/// When the transport was built with [`SessionTransport::with_bearer`], it also
+/// carries a pre-parsed `authorization: Bearer <token>` value and stamps it
+/// alongside the session id. The two headers are orthogonal — both are stamped
+/// with no precedence — and the bearer is opaque: it is carried, never
+/// interpreted.
 #[derive(Clone)]
 pub struct SessionHeader {
     id: MetadataValue<tonic::metadata::Ascii>,
+    /// Pre-parsed `authorization` value (`Bearer <token>`), stamped on every
+    /// request when present. `None` for an unauthenticated transport.
+    bearer: Option<MetadataValue<tonic::metadata::Ascii>>,
 }
 
 impl Interceptor for SessionHeader {
@@ -36,6 +50,11 @@ impl Interceptor for SessionHeader {
         request
             .metadata_mut()
             .insert(SESSION_HEADER, self.id.clone());
+        if let Some(bearer) = &self.bearer {
+            request
+                .metadata_mut()
+                .insert(AUTHORIZATION_HEADER, bearer.clone());
+        }
         Ok(request)
     }
 }
@@ -75,9 +94,28 @@ impl SessionTransport {
             .map_err(|e| JammiError::Config(format!("session id metadata: {e}")))?;
         Ok(Self {
             channel,
-            header: SessionHeader { id },
+            header: SessionHeader { id, bearer: None },
             session_id,
         })
+    }
+
+    /// Return this transport with an `authorization: Bearer <bearer>` header
+    /// stamped on every request, alongside the session id.
+    ///
+    /// The bearer is an opaque credential the transport carries and never
+    /// interprets — no signature check, no expiry math. Any authenticated
+    /// client (a CLI, a downstream service, a test fixture) reuses this; the
+    /// wire substrate names no consumer and encodes no auth policy.
+    ///
+    /// Fallible exactly like [`Self::connect`]: the bearer must parse as an
+    /// ASCII gRPC metadata value, and a value that does not surfaces as
+    /// [`JammiError::Config`] — never a panic, never a silently dropped header.
+    pub fn with_bearer(mut self, bearer: impl AsRef<str>) -> Result<Self> {
+        let value: MetadataValue<tonic::metadata::Ascii> = format!("Bearer {}", bearer.as_ref())
+            .parse()
+            .map_err(|e| JammiError::Config(format!("bearer metadata: {e}")))?;
+        self.header.bearer = Some(value);
+        Ok(self)
     }
 
     /// The opaque session id this client minted. The server keys the tenant

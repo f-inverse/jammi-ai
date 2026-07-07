@@ -366,17 +366,178 @@ pub struct GrpcChain {
     pub metrics: Arc<MetricsRegistry>,
 }
 
-/// Build and run the gRPC chain on `chain.addr`, mounting services per the
-/// resolved [`TierSet`], and sharing the supplied `SessionStore` between every
-/// service.
+/// The engine's fully-assembled gRPC chain, ready for a downstream to mount
+/// additional services onto before serving.
+///
+/// Holds a [`tonic::service::Routes`] with the engine's services pre-added
+/// (Flight SQL + `CatalogService` + the tier/engine services, including
+/// `AuditService`) and any resource whose lifetime must span the serve loop (the
+/// embedded training worker). A downstream chains [`Self::mount`] to add its own
+/// services beside the engine's, then [`Self::serve`]s — or splits via
+/// [`Self::into_axum_router`] to compose one listener of its own.
+///
+/// The transport layer stack (`accept_http1` + `MetricsLayer` +
+/// `GrpcWebTrailersLayer` + `GrpcWebLayer`) is applied by [`Self::serve`], not
+/// baked into the routes — see that method and [`Self::into_axum_router`] for the
+/// seam contract a single-listener consumer must honour.
+pub struct AssembledChain {
+    addr: SocketAddr,
+    routes: tonic::service::Routes,
+    mounted: Vec<String>,
+    // The metrics handle the `MetricsLayer` needs at serve time. Carried forward
+    // because the layer stack is deferred to `serve` — the outermost layer
+    // observes every request by method path.
+    metrics: Arc<MetricsRegistry>,
+    // The embedded training worker the `train` tier owns, held RAII for the serve
+    // loop. Owned by the chain (not the assemble frame) so it survives the
+    // assemble→serve split; `serve` keeps it alive across the serve future and
+    // `into_axum_router` hands it onward in [`ChainParts`]. `#[cfg]`-gated so a
+    // serve-only build carries no worker field.
+    #[cfg(feature = "train")]
+    _train_worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
+}
+
+/// The non-routing remainder of an [`AssembledChain`] after
+/// [`AssembledChain::into_axum_router`] splits the routes off: the resolved bind
+/// address, the mounted-service ledger (for the downstream's startup log), the
+/// engine metrics handle (so a single-listener downstream can re-apply the
+/// engine's [`MetricsLayer`] on its own listener), and the training-worker guard
+/// the downstream must keep alive for the lifetime of its own serve loop.
+pub struct ChainParts {
+    pub addr: SocketAddr,
+    pub mounted: Vec<String>,
+    pub metrics: Arc<MetricsRegistry>,
+    /// The embedded training worker guard. The downstream MUST hold this for the
+    /// lifetime of its serve loop — dropping it stops the worker and submitted
+    /// jobs stop running.
+    #[cfg(feature = "train")]
+    pub train_worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
+}
+
+impl AssembledChain {
+    /// Mount a downstream service beside the engine's. Delegates
+    /// [`tonic::service::Routes::add_service`] (by value, chainable) and records
+    /// the service's `NamedService::NAME` in the mounted ledger for the startup
+    /// tracing line — so the ledger cannot drift from what is actually mounted.
+    /// Generic: the engine names no consumer. The service inherits the transport
+    /// layer stack [`Self::serve`] applies, exactly as the engine's own services
+    /// do.
+    pub fn mount<S>(mut self, svc: S) -> Self
+    where
+        S: tonic::codegen::Service<
+                tonic::codegen::http::Request<tonic::body::Body>,
+                Error = std::convert::Infallible,
+            > + tonic::server::NamedService
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        S::Response: axum::response::IntoResponse,
+        S::Future: Send + 'static,
+    {
+        self.mounted.push(S::NAME.to_string());
+        self.routes = self.routes.add_service(svc);
+        self
+    }
+
+    /// The bind address the engine resolved from config. The downstream serves here.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// The ledger of mounted service names, in mount order (engine's first, then
+    /// any the downstream added via [`Self::mount`]). Read for a startup log; the
+    /// ledger cannot drift from what is actually on the routes.
+    pub fn mounted(&self) -> &[String] {
+        &self.mounted
+    }
+
+    /// Serve the assembled chain (engine core + any downstream-mounted services)
+    /// until `shutdown` resolves. Consumes `self`, keeping the training-worker
+    /// guard alive for the whole serve loop.
+    ///
+    /// The transport layers apply HERE, in this order: `accept_http1(true)` then
+    /// `MetricsLayer` (outermost — observes every request by method path before
+    /// routing) then `GrpcWebTrailersLayer` (wraps `GrpcWebLayer`, repairing the
+    /// trailers-only error response into the in-body trailer frame a gRPC-web
+    /// client requires) then `GrpcWebLayer`. Every service mounted via
+    /// [`Self::mount`], engine or downstream, inherits gRPC-web framing + trailer
+    /// repair with no per-service opt-in.
+    pub async fn serve(
+        self,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), ServerError> {
+        tracing::info!(
+            "gRPC chain ({}) listening on {}",
+            self.mounted.join(" + "),
+            self.addr
+        );
+        // The layer stack is deferred to here (G1): `accept_http1` is a listener
+        // property, and holding the post-layer `Router<L>` would leak the
+        // concrete `Stack<…>` layer types into `AssembledChain`. `Routes` is the
+        // layer-free accumulation point; `add_routes` attaches it behind the
+        // stack at serve time.
+        let mut server = Server::builder()
+            .accept_http1(true)
+            .layer(MetricsLayer::new(self.metrics))
+            .layer(GrpcWebTrailersLayer::new())
+            .layer(GrpcWebLayer::new());
+        server
+            .add_routes(self.routes)
+            .serve_with_shutdown(self.addr, shutdown)
+            .await
+            .map_err(ServerError::from)
+        // `self._train_worker` (train build) is dropped here, after the serve
+        // future resolves — its RAII lifetime spans the whole serve loop.
+    }
+
+    /// Split into a plain [`axum::Router`] (via
+    /// [`tonic::service::Routes::into_axum_router`]) plus the [`ChainParts`]
+    /// remainder, for a downstream that composes ONE listener of its own (the
+    /// gRPC routes nested beside its other HTTP routes).
+    ///
+    /// SEAM CONTRACT: the returned router is LAYER-FREE. The gRPC-web +
+    /// trailer-repair layers are applied by [`Self::serve`], NOT baked into the
+    /// routes — a downstream serving this router MUST re-apply
+    /// `accept_http1(true)` + [`GrpcWebTrailersLayer`] + [`GrpcWebLayer`] (and the
+    /// engine's [`MetricsLayer`], via [`ChainParts::metrics`]) at its own
+    /// listener, or gRPC-web clients break: a trailers-only error response would
+    /// miss the in-body trailer frame. `accept_http1` is a listener property, so
+    /// the layers deliberately are NOT baked into the routes — baking them would
+    /// double-frame a downstream that nests under its own grpc-web-layered
+    /// listener.
+    ///
+    /// The router also carries a gRPC `unimplemented` fallback (from
+    /// `Routes`' default), so a composing consumer must nest it under a path
+    /// prefix or reconcile its own fallback, NOT blind-`.merge()` it.
+    ///
+    /// The downstream must hold [`ChainParts`] (specifically its training-worker
+    /// guard) alive for the lifetime of its own serve loop.
+    pub fn into_axum_router(self) -> (axum::Router, ChainParts) {
+        let router = self.routes.into_axum_router();
+        let parts = ChainParts {
+            addr: self.addr,
+            mounted: self.mounted,
+            metrics: self.metrics,
+            #[cfg(feature = "train")]
+            train_worker: self._train_worker,
+        };
+        (router, parts)
+    }
+}
+
+/// Assemble the engine's gRPC chain from `chain` **without serving it**, so a
+/// downstream can [`AssembledChain::mount`] additional services onto the
+/// engine's fully-assembled core chain before serving. This is the composability
+/// seam.
 ///
 /// **Always mounted** (the core tier + the Flight SQL transport): Flight SQL and
 /// the control-plane `CatalogService` (its engine-free tenant trio +
 /// `GetServerInfo` answer even when no engine is mounted; its catalog /
 /// lifecycle verbs are backed by `engine` when present). When `engine` is
 /// `Some`, the core data-plane services also mount: `EmbeddingService`,
-/// `InferenceService`, `AuditService`. These are the serve-path primitives every
-/// deployment needs.
+/// `InferenceService`, `PipelineService`, `AuditService`. These are the
+/// serve-path primitives every deployment needs.
 ///
 /// **Mounted by tier** (only when `tiers` selected them):
 /// - `EvalService` ← [`ServiceTier::Eval`]
@@ -392,12 +553,10 @@ pub struct GrpcChain {
 /// what is actually mounted — the caller is responsible for that agreement
 /// (production goes through [`OssServer`], which derives both from one config).
 ///
-/// This is also the test-fixture entry-point. Both paths build the same Tonic
-/// chain — there is no parallel API to drift.
-pub async fn serve_grpc_chain(
-    chain: GrpcChain,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) -> Result<(), ServerError> {
+/// The engine mounts NO `LifecycleService` — the `jammi.v1.lifecycle` contract
+/// is answered by a platform server, not the OSS engine; an OSS server answers
+/// `UNIMPLEMENTED` for those verbs.
+pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerError> {
     let GrpcChain {
         addr,
         flight_ctx,
@@ -425,28 +584,15 @@ pub async fn serve_grpc_chain(
         interceptor.clone(),
     );
 
-    // Layer order matters. `GrpcWebTrailersLayer` is added first, so in the
-    // tower `ServiceBuilder` stack it wraps `GrpcWebLayer` and post-processes
-    // the gRPC-Web-framed response: tonic encodes a unary handler error as a
-    // trailers-only response (grpc-status in the HTTP headers, empty body) that
-    // `GrpcWebLayer` passes through untouched, leaving a gRPC-Web client with no
-    // in-body trailer frame to read. The repair layer rewrites that into the
-    // in-body `0x80` trailer frame the gRPC-Web wire format requires. Raw gRPC
-    // over HTTP/2 (the Rust data-plane client) is unaffected — those responses are
-    // not gRPC-Web and the layer skips them.
-    // `MetricsLayer` is added first, so it is the outermost layer in the tower
-    // stack: it observes every request (Flight + all gRPC services, including
-    // their gRPC-Web framing) by its method path before any routing, driving the
-    // substrate counters and the Search latency histogram from one site.
-    let mut builder = Server::builder()
-        .accept_http1(true)
-        .layer(MetricsLayer::new(metrics))
-        .layer(GrpcWebTrailersLayer::new())
-        .layer(GrpcWebLayer::new())
-        .add_service(flight_svc)
-        .add_service(catalog_svc);
-
-    let mut mounted = vec!["Flight SQL", "CatalogService"];
+    // Accumulate the services layer-free on a `tonic::service::Routes`. The
+    // transport layer stack is deferred to `AssembledChain::serve` (G1): holding
+    // the post-`add_service` `Router<L>` would leak the concrete layer-stack type
+    // into the seam and cannot grow in place (its `add_service` is by-value with
+    // no `Default`). `Routes` is the composition point tonic provides for exactly
+    // this — every service mounted onto it, engine or downstream, then inherits
+    // the gRPC-web framing + trailer repair the serve path applies.
+    let mut routes = tonic::service::Routes::new(flight_svc).add_service(catalog_svc);
+    let mut mounted = vec!["Flight SQL".to_string(), "CatalogService".to_string()];
 
     // Event tier: TriggerService. Driven by the caller having supplied handles
     // (it does so iff the event tier is mounted).
@@ -455,16 +601,15 @@ pub async fn serve_grpc_chain(
             TriggerServer::new(handles.topic_repo, handles.publisher, handles.subscriber),
             interceptor.clone(),
         );
-        builder = builder.add_service(trigger_svc);
-        mounted.push("TriggerService");
+        routes = routes.add_service(trigger_svc);
+        mounted.push("TriggerService".to_string());
     }
 
-    // The embedded training worker the `train` tier owns. Held for the lifetime
-    // of the serve loop (RAII): it is stopped when this future resolves on
-    // shutdown, just like every other server-owned resource. A serve-only build
-    // never sets it.
+    // The embedded training worker the `train` tier owns. Moved into the returned
+    // `AssembledChain` so it outlives the assemble frame and spans the serve loop
+    // (RAII). A serve-only build never sets it.
     #[cfg(feature = "train")]
-    let mut _train_worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker> = None;
+    let mut train_worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker> = None;
 
     if let Some(session) = engine {
         // Core tier engine services: always mounted when an engine is present.
@@ -472,29 +617,29 @@ pub async fn serve_grpc_chain(
             EmbeddingServer::new(Arc::clone(&session)),
             interceptor.clone(),
         );
-        builder = builder.add_service(embedding_svc);
-        mounted.push("EmbeddingService");
+        routes = routes.add_service(embedding_svc);
+        mounted.push("EmbeddingService".to_string());
 
         let inference_svc = InferenceServiceServer::with_interceptor(
             InferenceServer::new(Arc::clone(&session)),
             interceptor.clone(),
         );
-        builder = builder.add_service(inference_svc);
-        mounted.push("InferenceService");
+        routes = routes.add_service(inference_svc);
+        mounted.push("InferenceService".to_string());
 
         let pipeline_svc = PipelineServiceServer::with_interceptor(
             PipelineServer::new(Arc::clone(&session)),
             interceptor.clone(),
         );
-        builder = builder.add_service(pipeline_svc);
-        mounted.push("PipelineService");
+        routes = routes.add_service(pipeline_svc);
+        mounted.push("PipelineService".to_string());
 
         let audit_svc = AuditServiceServer::with_interceptor(
             AuditServer::new(Arc::clone(&session)),
             interceptor.clone(),
         );
-        builder = builder.add_service(audit_svc);
-        mounted.push("AuditService");
+        routes = routes.add_service(audit_svc);
+        mounted.push("AuditService".to_string());
 
         // Eval tier: EvalService.
         if tiers.contains(ServiceTier::Eval) {
@@ -502,8 +647,8 @@ pub async fn serve_grpc_chain(
                 EvalServer::new(Arc::clone(&session)),
                 interceptor.clone(),
             );
-            builder = builder.add_service(eval_svc);
-            mounted.push("EvalService");
+            routes = routes.add_service(eval_svc);
+            mounted.push("EvalService".to_string());
         }
 
         // Train tier: TrainingService (all three training kinds — fine-tune,
@@ -515,23 +660,41 @@ pub async fn serve_grpc_chain(
         if tiers.contains(ServiceTier::Train) {
             // Start the worker that runs submitted jobs: a "GPU worker pool" is
             // just N processes claiming from the shared catalog, and the server
-            // `train` tier runs one of them. It stops when this future resolves
-            // on shutdown (the guard drops with the function frame).
-            _train_worker = Some(jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(
+            // `train` tier runs one of them. `spawn` borrows `session` before it
+            // is moved into `TrainingServer::new`; the worker is stored in
+            // `AssembledChain` so it stops when the serve future resolves.
+            train_worker = Some(jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(
                 &session,
             )?);
             let training_svc =
                 TrainingServiceServer::with_interceptor(TrainingServer::new(session), interceptor);
-            builder = builder.add_service(training_svc);
-            mounted.push("TrainingService");
+            routes = routes.add_service(training_svc);
+            mounted.push("TrainingService".to_string());
         }
     }
 
-    tracing::info!("gRPC chain ({}) listening on {addr}", mounted.join(" + "));
-    builder
-        .serve_with_shutdown(addr, shutdown)
-        .await
-        .map_err(ServerError::from)
+    Ok(AssembledChain {
+        addr,
+        routes,
+        mounted,
+        metrics,
+        #[cfg(feature = "train")]
+        _train_worker: train_worker,
+    })
+}
+
+/// Build and serve the engine's gRPC chain on `chain.addr` (the OSS-only path).
+///
+/// A thin composition of the D1 seam: `assemble_grpc_chain(chain)?.serve(...)`.
+/// There is no parallel assembly logic to drift — every existing caller
+/// ([`OssServer`]'s internal serve path, the test fixtures) keeps this exact
+/// signature and behaviour. Downstreams that need to mount their own services go
+/// through [`assemble_grpc_chain`] + [`AssembledChain::mount`] instead.
+pub async fn serve_grpc_chain(
+    chain: GrpcChain,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), ServerError> {
+    assemble_grpc_chain(chain)?.serve(shutdown).await
 }
 
 /// Install OS shutdown handlers and resolve when SIGINT or SIGTERM

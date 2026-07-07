@@ -13,6 +13,9 @@
 //! — never a lossy gRPC-code-category guess. Tenant scope rides on the session
 //! header the transport stamps, never in a request body.
 
+pub mod lifecycle;
+pub use lifecycle::{Bearer, Bootstrapped, LicenseApplied, LifecycleClient, PlatformStatus};
+
 use std::str::FromStr;
 
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelSpec};

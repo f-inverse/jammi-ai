@@ -46,7 +46,10 @@ would carry elsewhere.
 
 ### 2. The wire contract — `package jammi.v1.*`
 
-The gRPC/Flight SQL wire surface is the nine `jammi.v1.*` proto packages:
+The gRPC/Flight SQL wire surface is the ten `jammi.v1.*` proto packages (nine
+served by the OSS engine; `jammi.v1.lifecycle` is a **contract-only** surface —
+defined in the wire descriptor so the candle-free client can call a platform
+server that implements it, but answered by no OSS handler):
 
 | Package | Surface |
 |---|---|
@@ -56,14 +59,16 @@ The gRPC/Flight SQL wire surface is the nine `jammi.v1.*` proto packages:
 | `jammi.v1.error` | the typed wire-error message (no rpcs) |
 | `jammi.v1.eval` | the evaluation rpcs |
 | `jammi.v1.inference` | bulk inference + predict |
+| `jammi.v1.lifecycle` | license apply / bootstrap / status / login — **contract-only**, answered by a platform server (the OSS engine returns `UNIMPLEMENTED`) |
 | `jammi.v1.pipeline` | graph / context / as-of / recompute / materialization rpcs |
 | `jammi.v1.training` | training submit + status |
 | `jammi.v1.trigger` | topic publish + subscribe |
 
 The contract is the full set of `(Service, Method)` rpc paths these packages
-serve — decoded from the compiled `FILE_DESCRIPTOR_SET`, the authoritative
-machine-readable description of what the binary actually serves, not a
-hand-maintained list. The `v1` in the package path is the wire-stability stamp:
+*define* — decoded from the compiled `FILE_DESCRIPTOR_SET`, the authoritative
+machine-readable description of the frozen wire surface, which may exceed what a
+given build mounts (`jammi.v1.lifecycle` is defined here yet served by no OSS
+handler), not a hand-maintained list. The `v1` in the package path is the wire-stability stamp:
 a breaking change to a message or an rpc shape requires a `jammi.v2.*` package,
 not an in-place edit of `v1`.
 

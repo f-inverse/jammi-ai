@@ -9,8 +9,10 @@
 //!    that global rows are visible / a global-namespace key collision errors
 //!    rather than silently clobbering a peer).
 //!
-//! 2. **Structural coverage** — the live rpc inventory is DERIVED from the
-//!    compiled proto [`FILE_DESCRIPTOR_SET`], not a hand-maintained constant.
+//! 2. **Structural coverage** — the rpc inventory is DERIVED from the compiled
+//!    `jammi.v1` wire surface in [`FILE_DESCRIPTOR_SET`] (the frozen contract,
+//!    which may exceed what a given build mounts), not a hand-maintained
+//!    constant.
 //!    A new `jammi.v1` rpc that lands without an isolation case and is not on
 //!    the explicit control-plane allowlist makes [`every_rpc_is_covered`] fail,
 //!    naming the rpc. Coverage cannot rot into an illusory guarantee: the
@@ -56,9 +58,12 @@ use tempfile::{tempdir, TempDir};
 // Derived wire surface
 // ---------------------------------------------------------------------------
 
-/// Prefix of every package whose services this engine serves on the wire. The
-/// descriptor also carries `google.*` / `arrow.*` imports; only `jammi.v1.*`
-/// services define the engine's own rpc surface, so the bind scopes to them.
+/// Prefix of every package in the compiled `jammi.v1` wire surface — the frozen
+/// contract, which may exceed what a given build mounts (a contract-only
+/// service like `jammi.v1.lifecycle` is in the descriptor yet served by no OSS
+/// handler; it is accounted for on the control-plane allowlist). The descriptor
+/// also carries `google.*` / `arrow.*` imports; only `jammi.v1.*` services
+/// define the engine's own rpc surface, so the bind scopes to them.
 const WIRE_PACKAGE_PREFIX: &str = "jammi.v1";
 
 /// Decode [`FILE_DESCRIPTOR_SET`] into the set of `Service/Method` paths every
@@ -108,6 +113,20 @@ const CONTROL_PLANE_ALLOWLIST: &[(&str, &str)] = &[
     // Handshake metadata — reports the server's mounted service tiers and
     // version. Tenant-independent.
     ("CatalogService", "GetServerInfo"),
+    // Lifecycle/auth contract — defined in the shared `jammi.v1` wire
+    // descriptor so the candle-free `jammi-admin` / CLI client can call a
+    // PLATFORM server that implements them, but NOT served by the OSS engine:
+    // `assemble_grpc_chain` mounts no `LifecycleService`, so an OSS server
+    // answers UNIMPLEMENTED. They touch no tenant-scoped row here because there
+    // is no handler here at all — the platform implementation owns their auth +
+    // governance semantics (and their own isolation proof), off in the platform
+    // repo. They appear in the descriptor (which is the frozen contract, not the
+    // per-build mount set), so they must be accounted for; being defined-but-
+    // unmounted is exactly why they are allowlisted rather than cased.
+    ("LifecycleService", "ApplyLicense"),
+    ("LifecycleService", "Bootstrap"),
+    ("LifecycleService", "Login"),
+    ("LifecycleService", "Status"),
 ];
 
 // ---------------------------------------------------------------------------

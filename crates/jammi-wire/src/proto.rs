@@ -33,3 +33,6 @@ pub mod training {
 pub mod audit {
     tonic::include_proto!("jammi.v1.audit");
 }
+pub mod lifecycle {
+    tonic::include_proto!("jammi.v1.lifecycle");
+}

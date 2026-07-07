@@ -1,13 +1,15 @@
 //! The API-stability freeze-guard.
 //!
-//! The terminal-0.x engineering bar freezes the public wire surface: the nine
-//! `jammi.v1.*` proto packages and the `(Service, Method)` rpc paths they serve
+//! The terminal-0.x engineering bar freezes the public wire surface: the ten
+//! `jammi.v1.*` proto packages and the `(Service, Method)` rpc paths they define
 //! (see `docs/guide/src/api-stability.md`). This guard makes that freeze
 //! enforceable rather than aspirational: it decodes the compiled
 //! [`FILE_DESCRIPTOR_SET`] — the authoritative machine-readable description of
-//! what the binary actually serves, the same source the tenant-isolation oracle
-//! derives its rpc inventory from — and asserts the live surface EQUALS the
-//! committed baseline in `api_freeze_baseline.txt`.
+//! the compiled `jammi.v1` wire surface (the frozen contract, which may exceed
+//! what a given build mounts — `jammi.v1.lifecycle` is a contract-only service
+//! the OSS engine mounts no handler for), the same source the tenant-isolation
+//! oracle derives its rpc inventory from — and asserts the live surface EQUALS
+//! the committed baseline in `api_freeze_baseline.txt`.
 //!
 //! Teeth: removing or renaming a stable rpc (or dropping a `jammi.v1.*` package)
 //! makes the live set decoded from the descriptor diverge from the baseline, and

@@ -29,11 +29,15 @@ pub mod proto;
 
 /// The compiled `jammi.v1` proto `FileDescriptorSet`, emitted by `build.rs`.
 ///
-/// This is the authoritative, machine-readable description of the wire surface:
-/// every service and every rpc the binary actually serves, decoded with
-/// [`prost_types::FileDescriptorSet`]. The tenant-isolation oracle derives its
-/// rpc inventory from this rather than a hand-maintained list, so a newly added
-/// rpc cannot escape coverage by being forgotten in a constant.
+/// This is the authoritative, machine-readable description of the compiled
+/// `jammi.v1` wire surface — the frozen contract, decoded with
+/// [`prost_types::FileDescriptorSet`]. It describes every service and rpc
+/// *defined* in the proto set, which may exceed what a given build mounts: a
+/// contract-only service (e.g. `jammi.v1.lifecycle`, answered by a platform
+/// server, not the OSS engine) is present here yet served by no OSS handler.
+/// The tenant-isolation oracle derives its rpc inventory from this rather than a
+/// hand-maintained list, so a newly added rpc cannot escape coverage by being
+/// forgotten in a constant.
 pub const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/jammi_descriptor.bin"));
 
@@ -184,4 +188,40 @@ pub fn decode_ipc_stream(data_header: &[u8], data_body: &[u8]) -> Result<Vec<Rec
     reader
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| Status::invalid_argument(format!("batch decode: {e}")))
+}
+
+#[cfg(test)]
+mod descriptor_tests {
+    use super::FILE_DESCRIPTOR_SET;
+    use prost::Message;
+    use prost_types::FileDescriptorSet;
+
+    /// The emitted descriptor covers the whole `jammi.v1` proto set — adding
+    /// `lifecycle.proto` to `build.rs`'s list extends it automatically (D6). A
+    /// downstream that mounts gRPC reflection over `FILE_DESCRIPTOR_SET` covers
+    /// both the engine's own services (`jammi.v1.catalog`) and the contract-only
+    /// `jammi.v1.lifecycle` service the platform answers — the property S4's
+    /// single reflection registration relies on.
+    #[test]
+    fn descriptor_covers_lifecycle_and_catalog_services() {
+        let set = FileDescriptorSet::decode(FILE_DESCRIPTOR_SET)
+            .expect("the compiled jammi.v1 descriptor must decode");
+        let services: Vec<String> = set
+            .file
+            .iter()
+            .filter(|f| f.package().starts_with("jammi.v1"))
+            .flat_map(|f| {
+                let pkg = f.package().to_string();
+                f.service.iter().map(move |s| format!("{pkg}.{}", s.name()))
+            })
+            .collect();
+        assert!(
+            services.contains(&"jammi.v1.lifecycle.LifecycleService".to_string()),
+            "descriptor must carry the lifecycle contract service: {services:?}"
+        );
+        assert!(
+            services.contains(&"jammi.v1.catalog.CatalogService".to_string()),
+            "descriptor must carry the engine's own CatalogService: {services:?}"
+        );
+    }
 }

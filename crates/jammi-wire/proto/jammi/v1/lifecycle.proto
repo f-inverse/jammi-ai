@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package jammi.v1.lifecycle;
+
+import "google/protobuf/empty.proto";
+
+// LifecycleService — the platform on/off + bootstrap + auth boundary.
+//
+// CONTRACT ONLY. These rpcs are defined here so a candle-free client
+// (`jammi-admin` / the `jammi` CLI) can CALL them against a server that
+// implements them, without pulling any implementation dependency. The OSS
+// engine mounts NO implementation of this service: an OSS `jammi-server`
+// answers UNIMPLEMENTED for every rpc below. The server that answers these
+// owns their meaning; the messages here carry only the envelope — opaque
+// bytes, a credential to seed, and a bearer string — never any policy the
+// engine interprets.
+service LifecycleService {
+  // Apply a signed offline entitlement file. `signed_entitlement` is opaque
+  // bytes on the wire; the request carries them verbatim and does not
+  // interpret them. Whether the file is accepted, and what acceptance means,
+  // is the answering server's decision, reported in the response.
+  rpc ApplyLicense(ApplyLicenseRequest) returns (ApplyLicenseResponse);
+
+  // Seed the first administrator and return where the dashboard lives plus a
+  // one-time first-login credential the operator changes on first login.
+  // `admin_name` is an optional display name. `bootstrap_token` is an optional
+  // shared secret the answering server MAY require; it is compared server-side
+  // and opaque here. Both empty strings map to the proto3 default (field
+  // absent on the wire).
+  rpc Bootstrap(BootstrapRequest) returns (BootstrapResponse);
+
+  // Report the answering server's liveness / licensed / bootstrapped state —
+  // the governance-state analogue of CatalogService.GetServerInfo. The engine
+  // has no such state, so an OSS server answers UNIMPLEMENTED.
+  rpc Status(google.protobuf.Empty) returns (PlatformStatus);
+
+  // Exchange an email/password for a bearer. Not OAuth: no device flow, no
+  // redirect — a credential in, a bearer out. The bearer is opaque; the
+  // answering server decides expiry policy (see LoginResponse).
+  rpc Login(LoginRequest) returns (LoginResponse);
+}
+
+message ApplyLicenseRequest {
+  // The signed entitlement file, opaque bytes. Not interpreted on the wire.
+  bytes signed_entitlement = 1;
+}
+message ApplyLicenseResponse {
+  bool accepted = 1;
+  // Human-readable server verdict, printed on rejection.
+  string detail = 2;
+}
+
+message BootstrapRequest {
+  string admin_email = 1;
+  string admin_password = 2;
+  // Optional display name for the seeded administrator.
+  string admin_name = 3;
+  // Optional shared secret the answering server MAY require. Opaque here.
+  string bootstrap_token = 4;
+}
+message BootstrapResponse {
+  string dashboard_url = 1;
+  // One-time credential; the operator changes it on first login.
+  string first_login_credential = 2;
+}
+
+message PlatformStatus {
+  bool bootstrapped = 1;
+  bool licensed = 2;
+  // A server-defined state string (the answering server's vocabulary).
+  string license_state = 3;
+  string platform_version = 4;
+}
+
+message LoginRequest {
+  string email = 1;
+  string password = 2;
+}
+message LoginResponse {
+  // The issued bearer, opaque to the client.
+  string bearer = 1;
+  // Expiry as epoch microseconds. 0 means non-expiring; the issuing server
+  // decides expiry policy.
+  int64 expires_at_micros = 2;
+}

@@ -94,7 +94,11 @@ jobs:
           python3 -m venv .venv-release
           . .venv-release/bin/activate
           pip install --upgrade pip
-          pip install jammi-ai
+          # The published base client `jammi-ai` is native-free; the recipes open
+          # `file://` (embedded) targets, so pull the `[embedded]` extra (the
+          # published `jammi-ai-native` engine). Pre-unification `jammi-ai` WAS the
+          # engine wheel, so a bare install used to resolve `file://`; it no longer does.
+          pip install 'jammi-ai[embedded]'
           pip install -e 'cookbook/book[book,dev]'
           cd cookbook/book
           python scripts/check_api_reference.py

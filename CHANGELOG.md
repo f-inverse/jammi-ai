@@ -6,6 +6,35 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-07-07
+
+The Python client-as-base unification, shipped in lockstep across the workspace.
+
+### Changed
+- **The Python client is the base; the engine is a relocatable backend.** `jammi-ai`
+  is now the pure-Python base client (import `jammi`) exposing one
+  `connect(target) -> Session` for local (`file://`) and remote (`grpc://` / `https://`)
+  targets — transport is configuration, not a code path. The compiled in-process engine
+  ships separately as **`jammi-ai-native`** (import `jammi_native`), pulled by the
+  `jammi-ai[embedded]` extra; `import jammi` stays native-free until a `file://` target
+  is opened. The old `jammi_ai` convenience bundle is removed.
+
+### Added
+- **Unified transport-agnostic surface:** a shared `Backend`/`Session` trait, one
+  `JammiError` taxonomy (raised-type pinned per verb across the embedded and remote
+  transports), a `Capability` / `supports()` contract with `NotSupportedOnBackend`, and
+  credentials as a `connect()` argument.
+- **Generic extension hook:** an out-of-package plug-in registers under the
+  `jammi.extensions` entry-point group and surfaces lazily as `jammi.platform`, naming no
+  consumer; absent one, `jammi.platform` raises `PlatformNotInstalledError`.
+- **Lazy embedded-only value-types on `jammi`** (`PerQueryAudit`, `EphemeralSession`,
+  `AuditHandle`, `ModelTask`, `TrainingJob`) resolved through the base client without
+  eagerly importing the engine — raising `NoEmbeddedEngineError` when the extra is absent.
+
+### Security
+- Bumped `crossbeam-epoch` to 0.9.20, clearing **RUSTSEC-2026-0204** (invalid pointer
+  dereference in its `fmt::Pointer` impl).
+
 ## [0.33.0] - 2026-07-04
 
 A feature release, shipped in lockstep across the workspace.

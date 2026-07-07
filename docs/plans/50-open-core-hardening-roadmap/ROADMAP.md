@@ -478,12 +478,17 @@ published `jammi-server-cu12` wheel (bundles the `nvidia-*-cu12` runtime + an
 
 ### 7.5 Release machinery (lockstep bump + 8 publishes)
 A release is a PR bumping `0.X.Y → 0.X.(Y+1)` across **8 files** — `Cargo.toml`,
-`Cargo.lock` (via `cargo update --workspace`), `CHANGELOG.md`, `pyproject.toml`,
-`clients/python/pyproject.toml`, `clients/typescript/package.json`,
-`packaging/server-cpu/pyproject.toml`, `packaging/server-cu12/pyproject.toml` — every
-publishable crate ships at the same `workspace.package.version`. On merge, tag
-**`vX.Y.Z`** (crates ×12 / npm / GHCR CPU+cu12 images / release binaries) **and
-`py-vX.Y.Z`** (PyPI: `jammi-ai`, `jammi-client`, `jammi-server`, `jammi-server-cu12`) on
+`Cargo.lock` (via `cargo update --workspace`), `CHANGELOG.md`,
+`clients/python/pyproject.toml` (the base-client `jammi-ai` version + its
+`jammi-ai-native==` embed pin), `clients/typescript/package.json`,
+`packaging/server-cpu/pyproject.toml`, `packaging/server-cu12/pyproject.toml`, and the
+cookbook golden `cookbook/book/artifacts/unified_client/unified_client.json` (which
+captures the `jammi-ai-native==` pin) — every publishable crate ships at the same
+`workspace.package.version`. (`packaging/native/pyproject.toml` for `jammi-ai-native`
+is version-dynamic — maturin reads `workspace.package.version` — so it needs no manual
+bump.) On merge, tag **`vX.Y.Z`** (crates ×12 / npm / GHCR CPU+cu12 images / release
+binaries) **and `py-vX.Y.Z`** (PyPI: `jammi-ai`, `jammi-ai-native`, `jammi-server`,
+`jammi-server-cu12`) on
 the merge commit. All channels use OIDC trusted publishing (no tokens); crates.yml waits
 for sparse-index propagation between dependent publishes; release-binaries creates the
 release if missing. Release pre-authorization is standing for engine patches; only the

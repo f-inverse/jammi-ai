@@ -64,17 +64,17 @@ print(f"capability enum (CLOSED):  {cap['enum_values']}")
 
 ## Installing the engine — the `[embedded]` extra
 
-The base package is native-free. `pip install jammi-client` gives you the remote arm alone —
+The base package is native-free. `pip install jammi-ai` gives you the remote arm alone —
 lean, dependency-light, exactly what a deploy image wants. The compiled engine ships as its
 own dist, `jammi-ai-native` (importable as `jammi_native`), and rides in as the opt-in
 `[embedded]` extra:
 
 ```bash
-pip install jammi-client            # remote only — connect("grpc://…")
-pip install jammi-client[embedded]  # + the in-process engine — connect("file://…")
+pip install jammi-ai            # remote only — connect("grpc://…")
+pip install jammi-ai[embedded]  # + the in-process engine — connect("file://…")
 ```
 
-The extra is a real, declared edge, not folklore: `jammi-client`'s package metadata advertises
+The extra is a real, declared edge, not folklore: `jammi-ai`'s package metadata advertises
 `embedded` and pins the engine dist at the exact lockstep version (the embedded backend drives
 the engine's wire seam by direct PyO3, so a version skew would desynchronise that seam — the
 pin is `==`, not a floor). We read the extra straight off the installed dist's metadata rather

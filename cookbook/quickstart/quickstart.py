@@ -9,7 +9,7 @@ Walks the four steps from `cookbook/quickstart/`'s README:
 
 `connect(target)` is the one front door: a `file://` target runs the engine
 in-process; flipping to a `https://` / `grpc://` target — no code change —
-talks to a remote server via the bundled `jammi-client`.
+talks to a remote server via the `jammi-ai` client.
 
 Uses the local `cookbook/fixtures/tiny_bert` encoder so the script runs
 without network access. Swap `MODEL` for a Hugging Face Hub model ID like

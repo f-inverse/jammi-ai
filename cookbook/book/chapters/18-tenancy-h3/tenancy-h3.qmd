@@ -27,7 +27,7 @@ hold, a documented stated-positive where the engine is honest about visibility.
 We measure on the embedded engine and, for every verb reachable on the wire, on a
 live `grpc://` `jammi-server` — and freeze the matrix to golden. Then we
 demonstrate the engine's **BYO-auth seam** from the consumer side, over the **real
-Flight SQL wire** (`jammi-client` `0.32.0` carries the bearer on `db.sql()`'s
+Flight SQL wire** (`jammi-ai` carries the bearer on `db.sql()`'s
 Flight lane — jammi #96): a generic HMAC-signed bearer token, read off a genuine
 `db.sql()` call by an authenticating gateway that maps the verified claim to a
 tenant and binds it *in front of* the engine. The engine enforces auth on no
@@ -216,7 +216,7 @@ Verifying a caller is the consumer's job — a gateway placed **in front of** th
 engine. The engine's `grpc_byo_auth.rs` worked example shows that seam for the
 **typed gRPC verbs**; the Flight SQL lane (`db.sql()`) is a separate
 `pyarrow.flight` transport and is the gateway-in-front's responsibility there too
-(engine issue #220, by design). On `jammi-client` `0.32.0` the client carries the
+(engine issue #220, by design). On `jammi-ai` the client carries the
 channel's bearer on the **Flight SQL lane** as well as the typed verbs (jammi #96;
 on `0.31.0` the bearer rode only the typed path). So here is the consumer-side
 seam over that **real Flight wire**: a `pyarrow.flight` gateway reads the inbound
@@ -488,7 +488,7 @@ measured as positive counts, not glossed. No verb leaks.
 
 And the engine's BYO-auth seam, demonstrated from the consumer side **over the
 real Flight SQL wire**: the credential now rides the actual `db.sql()` Flight lane
-(`jammi-client` `0.32.0`, jammi #96), not an in-process call — the gateway reads
+(`jammi-ai`, jammi #96), not an in-process call — the gateway reads
 the bearer the client put on the wire and binds the engine's `tenant_scope` in
 front of the read. The engine ships the *credential plumbing* (the bearer on both
 the typed gRPC verbs and the Flight lane) and the *per-request tenant binding*; the

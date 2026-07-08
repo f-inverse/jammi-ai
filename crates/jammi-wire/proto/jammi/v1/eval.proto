@@ -17,9 +17,10 @@ package jammi.v1.eval;
 // (`EmbeddingEvalReport`, `InferenceEvalReport`, `CompareEvalReport`, and the
 // catalog's `PerQueryEvalRecord`) with typed fields, not opaque JSON.
 //
-// Tenant scope is read from the request's `SessionTenant` extension, set by the
-// shared TenantInterceptor from the `jammi-session-id` header — the same
-// mechanism every other gRPC service and Flight SQL already use.
+// Tenant scope is read from the request's `SessionTenant` extension, set by
+// the single async tenant-binding layer driven by the engine's
+// `TenantResolver` (default: the `jammi-session-id` header → shared session
+// store) — the one mechanism every gRPC service and Flight SQL bind through.
 service EvalService {
   // Evaluate embedding retrieval quality against a golden relevance set.
   // Peer of the abstraction's `eval_embeddings`.

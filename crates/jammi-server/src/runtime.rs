@@ -358,7 +358,8 @@ pub struct GrpcChain {
     pub flight_ctx: SessionContext,
     /// Tenant binding the Flight SQL provider mutates per request.
     pub flight_binding: jammi_db::tenant_scope::TenantBinding,
-    /// Session store shared between every service via the tenant interceptor.
+    /// Session store shared between the `CatalogService` tenant trio (writers)
+    /// and the engine-default `SessionIdTenantResolver` (reader).
     pub store: SessionStore,
     /// Trigger handles — `Some` iff the event tier is mounted.
     pub trigger: Option<crate::TriggerHandles>,

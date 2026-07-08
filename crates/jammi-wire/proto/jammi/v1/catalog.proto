@@ -19,10 +19,11 @@ import "jammi/v1/embedding.proto";
 // service spans five control concerns. Session: `SetTenant` / `GetTenant` /
 // `ClearTenant` bind, read, and clear the calling session's tenant, and
 // `GetServerInfo` is the capability handshake — the tenant trio is stateless
-// w.r.t. the engine (it updates an in-process session table the
-// TenantInterceptor reads on every downstream request) and `GetServerInfo`
-// reports compile-time facts plus the runtime tier set, so both mount on the
-// always-present core tier. Sources / models: `AddSource` / `RemoveSource` /
+// w.r.t. the engine (it updates an in-process session table the engine's
+// default `TenantResolver` reads, via the tenant-binding layer, on every
+// downstream request) and `GetServerInfo` reports compile-time facts plus the
+// runtime tier set, so both mount on the always-present core tier. Sources /
+// models: `AddSource` / `RemoveSource` /
 // `ListSources` / `DescribeSource` register and introspect data sources, and
 // `ListModels` / `DescribeModel` introspect the model catalog while
 // `DeleteModel` removes a model row. Channels:
@@ -34,8 +35,9 @@ import "jammi/v1/embedding.proto";
 // compute verbs stay on TriggerService).
 //
 // Tenant scope is read from the request's `SessionTenant` extension, set by
-// the shared TenantInterceptor from the `jammi-session-id` header — the same
-// mechanism every other gRPC service and Flight SQL use.
+// the single async tenant-binding layer driven by the engine's
+// `TenantResolver` (default: the `jammi-session-id` header → shared session
+// store) — the one mechanism every gRPC service and Flight SQL bind through.
 service CatalogService {
   // --- session -----------------------------------------------------------
 

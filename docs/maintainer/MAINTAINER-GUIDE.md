@@ -1895,8 +1895,13 @@ describing a removed surface.
   SQL.
 - **Session/tenant boundary** — `crates/jammi-server/src/grpc/session.rs`:
   `SESSION_HEADER`, `SessionStore` (in-process `HashMap<SessionId, Option<TenantId>>`),
-  `TenantInterceptor`. **Invariant: a request with no/unknown session header runs unscoped
-  (all-tenants), never an error** — the load-bearing gotcha behind "bind first" [§5].
+  `TenantResolver` (the async resolver trait, `&MetadataMap` → `Result<TenantScope, Status>`),
+  `TenantScope` (`Tenant`/`Global`), `SessionIdTenantResolver` (the engine default —
+  `jammi-session-id` header → `SessionStore`). The single async tower layer that applies
+  the resolved scope to every gRPC service and the Flight SQL provider is
+  `TenantResolverLayer`, in `crates/jammi-server/src/tenant_resolver_layer.rs`. **Invariant:
+  a request with no/unknown session header runs unscoped (all-tenants — the explicit
+  `Global` scope), never an error** — the load-bearing gotcha behind "bind first" [§5].
 - **Per-handler helpers** — `crates/jammi-server/src/grpc/wire.rs`: `session_tenant`,
   **`scoped`** (the concurrency-safe per-task-local tenant scope — handlers must use this,
   never sticky `bind_tenant`), `require_nonempty`, `map_engine_error`/`map_trigger_error`.
@@ -2060,7 +2065,8 @@ to exact search.
 
 - **Remote `infer`:** `DataClient::infer` (`crates/jammi-client/src/lib.rs`) →
   `transport.service` builds the stub, the `SessionHeader` interceptor stamps the session id
-  → server `TenantInterceptor` inserts `SessionTenant` → `InferenceServer::infer`
+  → the async `TenantResolverLayer` resolves the scope and inserts `SessionTenant` →
+  `InferenceServer::infer`
   (`crates/jammi-server/src/grpc/inference.rs`): `session_tenant` → `require_nonempty` →
   `scoped(&self.session, tenant, || session.infer(...))` → `infer_result_to_proto` → client
   `decode_ipc_stream` (or `error_from_status`).

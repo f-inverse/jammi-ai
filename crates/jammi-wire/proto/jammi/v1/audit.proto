@@ -19,9 +19,10 @@ import "google/protobuf/empty.proto";
 // `PerQueryAudit` message mirrors the Rust record field for field, including
 // its server-computed `signature`.
 //
-// Tenant scope is read from the request's `SessionTenant` extension, set by the
-// shared TenantInterceptor. The audit primitive requires a bound tenant — an
-// unscoped call is rejected by the engine.
+// Tenant scope is read from the request's `SessionTenant` extension, set by
+// the single async tenant-binding layer driven by the engine's
+// `TenantResolver`. The audit primitive requires a bound tenant — an unscoped
+// call is rejected by the engine.
 service AuditService {
   // Sign and persist a batch of audit records under the session's tenant,
   // publishing them to the audit topic. Peer of the abstraction's `audit_log`.

@@ -23,9 +23,10 @@ import "jammi/v1/inference.proto";
 // reimplements no training, LoRA, sampling, or scan logic; it is purely a wire
 // adapter.
 //
-// Tenant scope is read from the request's `SessionTenant` extension, set by the
-// shared TenantInterceptor from the `jammi-session-id` header — the same
-// mechanism every other gRPC service and Flight SQL already use.
+// Tenant scope is read from the request's `SessionTenant` extension, set by
+// the single async tenant-binding layer driven by the engine's
+// `TenantResolver` (default: the `jammi-session-id` header → shared session
+// store) — the one mechanism every gRPC service and Flight SQL bind through.
 service TrainingService {
   // Submit a training job over a registered source and return its id + output
   // model id. The job trains asynchronously; poll `TrainingStatus` with the

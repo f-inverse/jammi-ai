@@ -6,6 +6,25 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Added
+- **`AssembledChain::into_layered_axum_router` (`jammi-server`).** A single-call
+  seam helper that splits the assembled gRPC chain into an `axum::Router` with the
+  engine's canonical transport stack already applied — the whole-server
+  `MetricsLayer` (outermost) over `GrpcWebTrailersLayer` over `GrpcWebLayer`, in
+  the order that reproduces `serve()`'s semantics on the axum path — plus the
+  `ChainParts` remainder. The returned router is a plain `axum::Router` that
+  `axum::serve` accepts directly (the layer stack's body-type rewrite is
+  normalized internally), so a single-listener consumer re-applies nothing. The
+  existing layer-free `into_axum_router` stays as the expert split for nesting
+  under a listener that already frames gRPC-web.
+
+### Changed
+- **`into_axum_router` rustdoc** now splits the layer guidance cleanly across the
+  three paths (`serve` / layer-free `into_axum_router` / `into_layered_axum_router`):
+  `accept_http1(true)` is a `tonic::transport::Server` builder method that has no
+  analogue on the axum path (HTTP/1 is implicit in `axum::serve`), and the layered
+  helper is pointed to as the default.
+
 ## [0.35.0] - 2026-07-07
 
 A feature release adding the platform-composability seam and the lifecycle wire contract, shipped in lockstep across the workspace.

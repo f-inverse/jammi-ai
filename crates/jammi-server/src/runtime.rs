@@ -373,13 +373,16 @@ pub struct GrpcChain {
 /// (Flight SQL + `CatalogService` + the tier/engine services, including
 /// `AuditService`) and any resource whose lifetime must span the serve loop (the
 /// embedded training worker). A downstream chains [`Self::mount`] to add its own
-/// services beside the engine's, then [`Self::serve`]s — or splits via
-/// [`Self::into_axum_router`] to compose one listener of its own.
+/// services beside the engine's, then [`Self::serve`]s — or splits to compose one
+/// listener of its own: [`Self::into_layered_axum_router`] is the safe default
+/// (the engine's transport stack pre-applied, ready for [`axum::serve()`]), and
+/// [`Self::into_axum_router`] is the expert, layer-free split for nesting under a
+/// listener that already frames gRPC-web.
 ///
 /// The transport layer stack (`accept_http1` + `MetricsLayer` +
 /// `GrpcWebTrailersLayer` + `GrpcWebLayer`) is applied by [`Self::serve`], not
-/// baked into the routes — see that method and [`Self::into_axum_router`] for the
-/// seam contract a single-listener consumer must honour.
+/// baked into the routes — see that method, [`Self::into_layered_axum_router`],
+/// and [`Self::into_axum_router`] for the seam contract each path honours.
 pub struct AssembledChain {
     addr: SocketAddr,
     routes: tonic::service::Routes,
@@ -491,21 +494,33 @@ impl AssembledChain {
         // future resolves — its RAII lifetime spans the whole serve loop.
     }
 
-    /// Split into a plain [`axum::Router`] (via
+    /// Split into a plain, **LAYER-FREE** [`axum::Router`] (via
     /// [`tonic::service::Routes::into_axum_router`]) plus the [`ChainParts`]
-    /// remainder, for a downstream that composes ONE listener of its own (the
-    /// gRPC routes nested beside its other HTTP routes).
+    /// remainder — the EXPERT split, for a downstream that nests the engine's
+    /// gRPC routes UNDER a listener that ALREADY carries its own gRPC-web layer
+    /// stack. Most single-listener consumers want [`Self::into_layered_axum_router`]
+    /// instead (the safe default — see below).
     ///
-    /// SEAM CONTRACT: the returned router is LAYER-FREE. The gRPC-web +
-    /// trailer-repair layers are applied by [`Self::serve`], NOT baked into the
-    /// routes — a downstream serving this router MUST re-apply
-    /// `accept_http1(true)` + [`GrpcWebTrailersLayer`] + [`GrpcWebLayer`] (and the
-    /// engine's [`MetricsLayer`], via [`ChainParts::metrics`]) at its own
-    /// listener, or gRPC-web clients break: a trailers-only error response would
-    /// miss the in-body trailer frame. `accept_http1` is a listener property, so
-    /// the layers deliberately are NOT baked into the routes — baking them would
-    /// double-frame a downstream that nests under its own grpc-web-layered
-    /// listener.
+    /// SEAM CONTRACT: the returned router carries NO transport layers. The
+    /// gRPC-web framing + trailer-repair + metrics layers are applied by
+    /// [`Self::serve`] on the serve path, NOT baked into the routes. A downstream
+    /// that serves this router on its OWN listener must therefore re-apply the
+    /// full stack itself — [`GrpcWebLayer`] + [`GrpcWebTrailersLayer`] + the
+    /// engine's [`MetricsLayer`] (via [`ChainParts::metrics`]) — or gRPC-web
+    /// clients break: a trailers-only error response would miss the in-body
+    /// trailer frame.
+    ///
+    /// PATH-SPECIFIC LAYERING: `accept_http1(true)` is a
+    /// [`tonic::transport::Server`] builder method and applies ONLY on the
+    /// [`Self::serve`] path — there is no `accept_http1` to call on the axum
+    /// path; HTTP/1 is implicit in [`axum::serve()`]. On axum, re-apply the layers
+    /// with `Router::layer` in inner→outer call order (axum runs the LAST
+    /// `.layer` call as the outermost service, the inverse of the tonic builder),
+    /// i.e. `.layer(GrpcWebLayer::new()).layer(GrpcWebTrailersLayer::new())
+    /// .layer(MetricsLayer::new(metrics))`. This is exactly what
+    /// [`Self::into_layered_axum_router`] does for you — reach for the layer-free
+    /// split only when your outer listener already frames gRPC-web (re-applying
+    /// here would double-frame).
     ///
     /// The router also carries a gRPC `unimplemented` fallback (from
     /// `Routes`' default), so a composing consumer must nest it under a path
@@ -515,6 +530,66 @@ impl AssembledChain {
     /// guard) alive for the lifetime of its own serve loop.
     pub fn into_axum_router(self) -> (axum::Router, ChainParts) {
         let router = self.routes.into_axum_router();
+        let parts = ChainParts {
+            addr: self.addr,
+            mounted: self.mounted,
+            metrics: self.metrics,
+            #[cfg(feature = "train")]
+            train_worker: self._train_worker,
+        };
+        (router, parts)
+    }
+
+    /// Split into a **layered** [`axum::Router`] plus the [`ChainParts`]
+    /// remainder — the SAFE DEFAULT for a downstream that composes ONE listener
+    /// of its own. The returned router is ready to hand to [`axum::serve()`]
+    /// DIRECTLY: it carries the engine's full transport contract, so the consumer
+    /// re-applies nothing.
+    ///
+    /// CANONICAL LAYER STACK: this applies the SAME stack [`Self::serve`] applies
+    /// — the whole-server [`MetricsLayer`] (outermost, observing every method
+    /// path) wrapping [`GrpcWebTrailersLayer`] (the trailers-only error repair)
+    /// wrapping [`GrpcWebLayer`] (gRPC-web framing) wrapping the routes. axum runs
+    /// the LAST `.layer` call as the OUTERMOST service — the inverse of the tonic
+    /// [`tonic::transport::Server`] builder, where the FIRST `.layer` is
+    /// outermost — so the calls are ordered inner→outer here to land the exact
+    /// same outermost→innermost stack `serve` builds. `accept_http1` has no axum
+    /// analogue: HTTP/1 is implicit in [`axum::serve()`].
+    ///
+    /// ERGONOMIC GUARANTEE: the returned value is a plain `axum::Router` (state
+    /// `()`, request body [`axum::body::Body`]) that [`axum::serve()`] accepts with
+    /// no further ceremony. The layer stack rewrites the response body type; that
+    /// normalization is resolved INTERNALLY (the layered routes are re-nested
+    /// under a fresh [`axum::Router`]), so the consumer needs no
+    /// `Router::<()>::new().merge(...)` re-nest of its own.
+    ///
+    /// Prefer this over [`Self::into_axum_router`] unless you are nesting under a
+    /// listener that ALREADY frames gRPC-web — that expert path is layer-free
+    /// precisely so it does not double-frame in that case.
+    ///
+    /// The downstream must hold [`ChainParts`] (specifically its training-worker
+    /// guard) alive for the lifetime of its own serve loop.
+    pub fn into_layered_axum_router(self) -> (axum::Router, ChainParts) {
+        // The `MetricsLayer` holds a clone; the original moves into `ChainParts`
+        // so the downstream can still scrape the same registry from its own
+        // `/metrics` route.
+        let metrics = Arc::clone(&self.metrics);
+        // Apply the canonical stack in axum's inner→outer call order. axum runs
+        // the last `.layer` as the outermost service, so ordering the calls
+        // GrpcWebLayer → GrpcWebTrailersLayer → MetricsLayer reproduces `serve`'s
+        // outermost→innermost stack: Metrics → GrpcWebTrailers → GrpcWebLayer →
+        // routes.
+        let layered = self
+            .routes
+            .into_axum_router()
+            .layer(GrpcWebLayer::new())
+            .layer(GrpcWebTrailersLayer::new())
+            .layer(MetricsLayer::new(metrics));
+        // Re-nest the layered routes under a fresh `Router` so the returned type
+        // is a plain `axum::Router` whose request body is `axum::body::Body` —
+        // the layer stack's response-body rewrite is absorbed here, and
+        // `axum::serve` accepts the result directly with no consumer-side merge.
+        let router = axum::Router::new().merge(layered);
         let parts = ChainParts {
             addr: self.addr,
             mounted: self.mounted,

@@ -6,6 +6,8 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-07-08
+
 ### Changed
 - **Unified, resolver-driven tenant binding (`jammi-server`).** Tenant binding at
   the gRPC composability seam and the bring-your-own-auth seam are now one seam. A

@@ -18,9 +18,13 @@ use std::sync::Arc;
 
 use jammi_admin::{CatalogClient, LifecycleClient};
 use jammi_db::session::JammiSession;
+use jammi_db::TenantId;
+use jammi_server::grpc::session::{TenantResolver, TenantScope};
 use jammi_server::routes::health::MetricsRegistry;
 use jammi_server::runtime::{assemble_grpc_chain, GrpcChain};
 use jammi_server::tiers::TierSet;
+
+use super::common::grpc::{tenant_a, tenant_b};
 use jammi_test_utils::test_config;
 use jammi_wire::proto::lifecycle::lifecycle_service_server::{
     LifecycleService, LifecycleServiceServer,
@@ -132,6 +136,9 @@ async fn transport_only_chain(addr: SocketAddr) -> (GrpcChain, TempDir, Arc<Jamm
         engine: None,
         tiers: TierSet::resolve(std::iter::empty()).expect("core-only tier set resolves"),
         metrics: Arc::new(MetricsRegistry::new().unwrap()),
+        tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(
+            jammi_server::grpc::session::SessionStore::new(),
+        ),
     };
     (chain, dir, session)
 }
@@ -515,6 +522,9 @@ async fn into_layered_axum_router_serves_directly_with_grpc_web_trailer_repair()
         engine: Some(session),
         tiers: TierSet::resolve(std::iter::empty()).expect("core-only tier set resolves"),
         metrics: Arc::new(MetricsRegistry::new().unwrap()),
+        tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(
+            jammi_server::grpc::session::SessionStore::new(),
+        ),
     };
 
     let assembled = assemble_grpc_chain(chain)
@@ -603,6 +613,326 @@ async fn into_layered_axum_router_serves_directly_with_grpc_web_trailer_repair()
     // Hold the worker guard (if any) alive until after serving, per the contract.
     #[cfg(feature = "train")]
     let _keep = parts.train_worker;
+
+    let _ = shutdown_tx.send(());
+    let _ = handle.await;
+}
+
+// ---------------------------------------------------------------------------
+// The tenant-resolver seam: `assemble_grpc_chain` with `resolver: Some(...)`
+// ---------------------------------------------------------------------------
+
+/// A test [`TenantResolver`] standing in for a downstream's identity system: it
+/// maps a fake bearer credential (`authorization: Bearer tenant-a|tenant-b`) to
+/// the tenant it authorizes, and REJECTS a missing or unknown credential with
+/// `UNAUTHENTICATED`. It returns `Tenant`/`Err` and NEVER `Global` — the
+/// authenticating-resolver contract. It reads only the `authorization`
+/// metadata; it never trusts `jammi-session-id` for identity.
+struct BearerTenantResolver;
+
+#[tonic::async_trait]
+impl TenantResolver for BearerTenantResolver {
+    async fn resolve(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<TenantScope, tonic::Status> {
+        let token = metadata
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| tonic::Status::unauthenticated("missing bearer token"))?;
+        match token {
+            "Bearer tenant-a" => Ok(TenantScope::Tenant(tenant_a())),
+            "Bearer tenant-b" => Ok(TenantScope::Tenant(tenant_b())),
+            _ => Err(tonic::Status::unauthenticated("unknown credential")),
+        }
+    }
+}
+
+/// Write a one-row Parquet so a File source registers against a real, readable
+/// path (registration validates the path).
+fn write_probe_parquet(path: &std::path::Path) {
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(path).expect("create parquet");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
+    writer.write(&batch).expect("write");
+    writer.close().expect("close");
+}
+
+/// A catalog client that attaches `authorization: <cred>` on every request (or
+/// nothing when `cred` is `None`) — the data-plane analogue of a consumer's
+/// gateway stamping the caller's credential.
+async fn catalog_client_with_cred(
+    addr: SocketAddr,
+    cred: Option<&'static str>,
+) -> jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient<
+    tonic::service::interceptor::InterceptedService<
+        tonic::transport::Channel,
+        impl tonic::service::Interceptor,
+    >,
+> {
+    use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+        .expect("uri")
+        .connect()
+        .await
+        .expect("connect");
+    let header: Option<tonic::metadata::MetadataValue<_>> =
+        cred.map(|c| c.parse().expect("cred is ascii"));
+    let attach = move |mut req: Request<()>| {
+        if let Some(h) = header.clone() {
+            req.metadata_mut().insert("authorization", h);
+        }
+        Ok(req)
+    };
+    CatalogServiceClient::with_interceptor(channel, attach)
+}
+
+/// Pull the source ids a caller can see over the wire.
+async fn list_source_ids_over_wire(
+    client: &mut jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient<
+        tonic::service::interceptor::InterceptedService<
+            tonic::transport::Channel,
+            impl tonic::service::Interceptor,
+        >,
+    >,
+) -> Result<Vec<String>, Status> {
+    use jammi_server::grpc::proto::catalog::ListSourcesRequest;
+    let resp = client.list_sources(ListSourcesRequest {}).await?;
+    Ok(resp
+        .into_inner()
+        .sources
+        .into_iter()
+        .map(|s| s.source_id)
+        .collect())
+}
+
+/// Run one Flight SQL `SELECT` scoped by the resolver credential and return the
+/// `id` rows it observes.
+async fn flight_select_ids(
+    addr: SocketAddr,
+    cred: &str,
+) -> Result<Vec<i64>, arrow_flight::error::FlightError> {
+    use arrow::array::Int64Array;
+    use arrow_flight::sql::client::FlightSqlServiceClient;
+    use futures::TryStreamExt;
+
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+        .expect("uri")
+        .connect()
+        .await
+        .expect("connect");
+    let mut client = FlightSqlServiceClient::new(channel);
+    client.set_header("authorization", cred);
+    let info = client
+        .execute(
+            "SELECT id FROM mutable.public.widgets ORDER BY id".to_string(),
+            None,
+        )
+        .await?;
+    let endpoint = info.endpoint.first().cloned().expect("flight endpoint");
+    let ticket = endpoint.ticket.expect("endpoint ticket");
+    let mut stream = client.do_get(ticket).await?;
+    let mut ids = Vec::new();
+    while let Some(batch) = stream.try_next().await? {
+        let col = batch
+            .column_by_name("id")
+            .expect("id column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 id column");
+        for i in 0..col.len() {
+            ids.push(col.value(i));
+        }
+    }
+    Ok(ids)
+}
+
+/// THE SEAM PROOF — assemble an engine-backed chain with `resolver: Some(...)`
+/// and assert, over ONE served listener and on BOTH transports (gRPC data-plane
+/// + Flight `db.sql`):
+///
+/// (i)   an engine data-plane verb runs scoped to the RESOLVED tenant — tenant
+///       A's credential lists A's source; the Flight lane returns A's row;
+/// (ii)  CROSS-TENANT DENIAL — tenant A's data is invisible to tenant B's
+///       credential (B lists only B's source; the Flight lane returns only B's
+///       row);
+/// (iii) a MISSING/invalid credential is `UNAUTHENTICATED` and the handler never
+///       runs — for a gRPC verb AND the Flight `db.sql` lane — so the engine
+///       plane no longer runs unscoped when a resolver is present.
+///
+/// The resolver REPLACES the stock `jammi-session-id` interceptor (single
+/// binder): the tenant is the one the credential authorizes, never one a header
+/// asserts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolver_seam_scopes_both_transports_and_rejects_missing_credential() {
+    use jammi_ai::session::InferenceSession;
+    use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+    use jammi_db::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
+
+    let addr = bind_addr().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session = InferenceSession::open(test_config(dir.path()))
+        .await
+        .expect("session");
+
+    // gRPC data-plane fixture: one File source per tenant, each registered under
+    // its own tenant scope so `list_sources` returns disjoint results per
+    // authenticated caller.
+    let register_source = |tenant: TenantId, id: &'static str| {
+        let session = Arc::clone(&session);
+        let dir = dir.path().to_path_buf();
+        async move {
+            let pq = dir.join(format!("{id}.parquet"));
+            write_probe_parquet(&pq);
+            let conn = SourceConnection {
+                url: Some(format!("file://{}", pq.display())),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            };
+            let local = jammi_ai::Session::new(Arc::clone(&session));
+            session
+                .with_tenant_scoped(tenant, |_scope| {
+                    local.add_source(id, SourceType::File, conn)
+                })
+                .await
+                .expect("tenant-scoped add_source");
+        }
+    };
+    register_source(tenant_a(), "a_source").await;
+    register_source(tenant_b(), "b_source").await;
+
+    // Flight `db.sql` fixture: one mutable table addressed by both tenants; the
+    // write-side tenant guard stamps each insert, so a scoped SELECT sees only
+    // its own row.
+    let def = MutableTableDefinitionBuilder::new(
+        MutableTableId::new("widgets").unwrap(),
+        Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )])),
+    )
+    .primary_key(vec!["id".into()])
+    .build()
+    .unwrap();
+    session.create_mutable_table(def).await.unwrap();
+    for (tenant, id) in [(tenant_a(), 1_i64), (tenant_b(), 2_i64)] {
+        session
+            .with_tenant_scoped(tenant, |scope| async move {
+                scope
+                    .sql(&format!(
+                        "INSERT INTO mutable.public.widgets (id) VALUES ({id})"
+                    ))
+                    .await
+                    .unwrap();
+            })
+            .await;
+    }
+
+    let flight_ctx = session.context().clone();
+    let flight_binding = session.tenant_binding_arc();
+    let chain = GrpcChain {
+        addr,
+        flight_ctx,
+        flight_binding,
+        store: jammi_server::grpc::session::SessionStore::new(),
+        trigger: None,
+        engine: Some(session),
+        tiers: TierSet::resolve(std::iter::empty()).expect("core-only tier set resolves"),
+        metrics: Arc::new(MetricsRegistry::new().unwrap()),
+        // The seam under test: a downstream supplies its own authenticating
+        // resolver, which binds every engine service and the Flight lane through
+        // the one tenant-binding mechanism.
+        tenant_resolver: Arc::new(BearerTenantResolver),
+    };
+
+    let assembled = assemble_grpc_chain(chain).expect("assemble");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        assembled
+            .serve(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("serve");
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // (i) + (ii) gRPC data-plane, scoped to the resolved tenant, cross-tenant
+    // denial. A's credential lists A's source and NOT B's; B's the inverse.
+    let mut client_a = catalog_client_with_cred(addr, Some("Bearer tenant-a")).await;
+    let mut client_b = catalog_client_with_cred(addr, Some("Bearer tenant-b")).await;
+    let sources_a = list_source_ids_over_wire(&mut client_a)
+        .await
+        .expect("a lists");
+    let sources_b = list_source_ids_over_wire(&mut client_b)
+        .await
+        .expect("b lists");
+    assert!(
+        sources_a.contains(&"a_source".to_string()) && !sources_a.contains(&"b_source".to_string()),
+        "tenant A's credential must scope the gRPC verb to A's source only; got {sources_a:?}"
+    );
+    assert!(
+        sources_b.contains(&"b_source".to_string()) && !sources_b.contains(&"a_source".to_string()),
+        "tenant B's credential must scope the gRPC verb to B's source only; got {sources_b:?}"
+    );
+
+    // (iii) gRPC — a MISSING credential is UNAUTHENTICATED; the handler never
+    // runs (no unscoped fall-through).
+    let mut anon = catalog_client_with_cred(addr, None).await;
+    let err = list_source_ids_over_wire(&mut anon)
+        .await
+        .expect_err("a gRPC verb with no credential must be rejected");
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unauthenticated,
+        "missing credential on the gRPC plane is Unauthenticated, got {:?}: {}",
+        err.code(),
+        err.message()
+    );
+
+    // (i) + (ii) Flight `db.sql`, scoped to the resolved tenant, cross-tenant
+    // denial. A's credential returns only A's row; B's returns only B's.
+    let ids_a = flight_select_ids(addr, "Bearer tenant-a")
+        .await
+        .expect("A flight query");
+    let ids_b = flight_select_ids(addr, "Bearer tenant-b")
+        .await
+        .expect("B flight query");
+    assert_eq!(
+        ids_a,
+        vec![1],
+        "tenant A's Flight lane returns only A's row"
+    );
+    assert_eq!(
+        ids_b,
+        vec![2],
+        "tenant B's Flight lane returns only B's row"
+    );
+
+    // (iii) Flight — a MISSING credential is rejected before any query binds, so
+    // the `db.sql` lane never runs unscoped (the #220 cross-transport bypass is
+    // closed).
+    let flight_err = flight_select_ids(addr, "Bogus nonsense")
+        .await
+        .expect_err("an invalid credential must reject the Flight query");
+    // The rejected status surfaces through the Flight client (its variant differs
+    // by which leg fails — `execute` vs `do_get` — but the code is the resolver's
+    // `Unauthenticated`). Assert on the carried status, not the wrapper variant.
+    assert!(
+        format!("{flight_err:?}").contains("Unauthenticated"),
+        "an invalid credential on the Flight lane must be Unauthenticated, got {flight_err:?}"
+    );
 
     let _ = shutdown_tx.send(());
     let _ = handle.await;

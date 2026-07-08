@@ -129,11 +129,12 @@ pub async fn start_engine_server_with_tiers(tiers: jammi_server::tiers::TierSet)
                 addr,
                 flight_ctx,
                 flight_binding: binding,
-                store,
+                store: store.clone(),
                 trigger,
                 engine: Some(session),
                 tiers,
                 metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
+                tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
             },
             async move {
                 let _ = shutdown_rx.await;
@@ -169,7 +170,7 @@ pub async fn catalog_client(
 
 /// Build a request-extending interceptor closure that injects the
 /// `jammi-session-id` header on every outgoing request. This is the test
-/// counterpart to [`jammi_server::grpc::session::TenantInterceptor`]: the
+/// counterpart to the engine-default `SessionIdTenantResolver`: the
 /// server reads the header and binds the tenant; the test passes the same
 /// session id on every call so the binding is observable.
 pub fn with_session(

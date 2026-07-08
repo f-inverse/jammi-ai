@@ -1,6 +1,6 @@
 //! SPEC-03 §12 #5 — gRPC `CatalogService.SetTenant` + `CatalogService.ListTopics`
 //! end-to-end isolation. An in-process server hosts the control plane behind the
-//! shared [`SessionStore`] + [`TenantInterceptor`]. Two clients distinguished by
+//! shared `SessionStore` + `SessionIdTenantResolver`. Two clients distinguished by
 //! `jammi-session-id` headers bind different tenants and observe the
 //! corresponding `ListTopics` filter; an unbound client sees only globally
 //! scoped topics; an invalid UUID is rejected with `InvalidArgument`.
@@ -105,7 +105,7 @@ async fn start_grpc_test_server() -> (
                 addr,
                 flight_ctx,
                 flight_binding: binding,
-                store: store_for_server,
+                store: store_for_server.clone(),
                 trigger: Some(trigger),
                 engine: Some(engine),
                 tiers: jammi_server::tiers::TierSet::resolve([
@@ -113,6 +113,9 @@ async fn start_grpc_test_server() -> (
                 ])
                 .expect("event tier resolves"),
                 metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
+                tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(
+                    store_for_server,
+                ),
             },
             async move {
                 let _ = shutdown_rx.await;

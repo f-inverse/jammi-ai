@@ -2,14 +2,22 @@
 //!
 //! Jammi authenticates nothing on its own: a deployment runs the gRPC surface
 //! on a trusted network and a consumer in front of it decides *who* a caller is
-//! and *which tenant* they may act as. The `jammi-session-id` header the stock
-//! [`TenantInterceptor`](jammi_server::grpc::session::TenantInterceptor) reads is
-//! a client-minted, opaque transport correlation id — not a credential. Anyone
-//! who presents another session's id assumes that session's tenant. It is a
-//! convenience for the trusted-network case, never a trust boundary.
+//! and *which tenant* they may act as. The `jammi-session-id` header the
+//! engine-default
+//! [`SessionIdTenantResolver`](jammi_server::grpc::session::SessionIdTenantResolver)
+//! reads is a client-minted, opaque transport correlation id — not a credential.
+//! Anyone who presents another session's id assumes that session's tenant. It is
+//! a convenience for the trusted-network case, never a trust boundary.
 //!
-//! This file proves the seam a real consumer plugs into: a **custom tonic
-//! [`Interceptor`]** that runs *in front of* every engine-backed verb,
+//! A consumer that needs a real trust boundary supplies its own authenticating
+//! [`TenantResolver`](jammi_server::grpc::session::TenantResolver) at the
+//! composability seam ([`assemble_grpc_chain`](jammi_server::runtime::assemble_grpc_chain)),
+//! which then binds every engine verb and the Flight lane — the BYO-auth seam and
+//! the composability seam are the SAME seam. The
+//! `resolver_seam_binds_the_engine_and_rejects_missing_credential` test below
+//! proves exactly that; the rest of this file proves the equivalent contract with
+//! a **custom tonic [`Interceptor`]** in front of a single service, the
+//! lower-level shape a consumer reaches for when it fronts its own server:
 //! authenticates the caller's credential, derives the tenant from the *verified*
 //! claim, and binds it by inserting the
 //! [`SessionTenant`](jammi_server::grpc::session::SessionTenant) extension every
@@ -157,7 +165,7 @@ struct AuthServer {
 }
 
 /// Stand up an in-process `CatalogService` fronted by the consumer's
-/// [`BearerAuthInterceptor`] (in place of the stock `TenantInterceptor`). The
+/// [`BearerAuthInterceptor`] (in place of the engine-default resolver). The
 /// fixture pre-registers one source per tenant — each under its own tenant scope
 /// via the engine's per-request `with_tenant_scoped`, exactly as a tenant-bound
 /// `add_source` verb would — so a later `list_sources` returns disjoint results
@@ -372,4 +380,108 @@ async fn invalid_credential_is_rejected() {
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;
+}
+
+// --- the same contract, now through the engine's composability seam ----------
+
+/// The consumer's authenticating [`TenantResolver`] — the resolver form of
+/// [`BearerAuthInterceptor`]. Supplied at [`assemble_grpc_chain`], it binds every
+/// engine verb (and the Flight lane) through the ONE tenant-binding mechanism. It
+/// returns `Tenant` for a verified claim and `Err(unauthenticated)` for a missing
+/// or invalid one — NEVER `Global`, so a rejected caller can never fall through
+/// to an unscoped read.
+struct HmacBearerResolver;
+
+#[tonic::async_trait]
+impl jammi_server::grpc::session::TenantResolver for HmacBearerResolver {
+    async fn resolve(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<jammi_server::grpc::session::TenantScope, Status> {
+        let token = metadata
+            .get(AUTH_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| Status::unauthenticated("missing bearer token"))?;
+        let tenant =
+            verify_token(token).ok_or_else(|| Status::unauthenticated("invalid bearer token"))?;
+        Ok(jammi_server::grpc::session::TenantScope::Tenant(tenant))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolver_seam_binds_the_engine_and_rejects_missing_credential() {
+    use jammi_server::runtime::{assemble_grpc_chain, GrpcChain};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session = Arc::new(
+        InferenceSession::new(test_config(dir.path()))
+            .await
+            .expect("session"),
+    );
+    register_source_for(&session, tenant_a(), "a_source", &dir).await;
+    register_source_for(&session, tenant_b(), "b_source", &dir).await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    drop(listener);
+
+    let flight_ctx = session.context().clone();
+    let flight_binding = session.tenant_binding_arc();
+    let chain = GrpcChain {
+        addr,
+        flight_ctx,
+        flight_binding,
+        store: jammi_server::grpc::session::SessionStore::new(),
+        trigger: None,
+        engine: Some(Arc::clone(&session)),
+        tiers: jammi_server::tiers::TierSet::resolve(std::iter::empty()).expect("core tier"),
+        metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
+        // The consumer's authenticating resolver, plugged into the engine seam.
+        tenant_resolver: Arc::new(HmacBearerResolver),
+    };
+    let assembled = assemble_grpc_chain(chain).expect("assemble");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        assembled
+            .serve(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("serve");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Two valid tokens for two tenants: each authenticated caller sees only its
+    // own tenant's source, now through the ACTUAL engine seam (`assemble_grpc_chain`).
+    let mut client_a = client_with_token(addr, Some(mint_token("alice", TENANT_A))).await;
+    let mut client_b = client_with_token(addr, Some(mint_token("bob", TENANT_B))).await;
+    assert_eq!(
+        list_source_ids(&mut client_a).await.expect("a lists"),
+        vec!["a_source".to_string()],
+        "tenant A's credential scopes the engine verb to A's source"
+    );
+    assert_eq!(
+        list_source_ids(&mut client_b).await.expect("b lists"),
+        vec!["b_source".to_string()],
+        "tenant B's credential scopes the engine verb to B's source"
+    );
+
+    // reject-don't-default: a missing credential is Unauthenticated and the
+    // handler never runs — no unscoped fall-through through the seam.
+    let mut anon = client_with_token(addr, None).await;
+    let err = list_source_ids(&mut anon)
+        .await
+        .expect_err("a missing credential must be rejected at the seam");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // A forged token (signature does not cover its tenant claim) is Unauthenticated.
+    let forged = format!("Bearer mallory.{TENANT_A}.deadbeef");
+    let mut mallory = client_with_token(addr, Some(forged)).await;
+    let err = list_source_ids(&mut mallory)
+        .await
+        .expect_err("a forged credential must be rejected at the seam");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    let _ = shutdown_tx.send(());
+    let _ = handle.await;
 }

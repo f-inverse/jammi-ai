@@ -375,7 +375,7 @@ pub struct GrpcChain {
 /// embedded training worker). A downstream chains [`Self::mount`] to add its own
 /// services beside the engine's, then [`Self::serve`]s — or splits to compose one
 /// listener of its own: [`Self::into_layered_axum_router`] is the safe default
-/// (the engine's transport stack pre-applied, ready for [`axum::serve`]), and
+/// (the engine's transport stack pre-applied, ready for [`axum::serve()`]), and
 /// [`Self::into_axum_router`] is the expert, layer-free split for nesting under a
 /// listener that already frames gRPC-web.
 ///
@@ -513,7 +513,7 @@ impl AssembledChain {
     /// PATH-SPECIFIC LAYERING: `accept_http1(true)` is a
     /// [`tonic::transport::Server`] builder method and applies ONLY on the
     /// [`Self::serve`] path — there is no `accept_http1` to call on the axum
-    /// path; HTTP/1 is implicit in [`axum::serve`]. On axum, re-apply the layers
+    /// path; HTTP/1 is implicit in [`axum::serve()`]. On axum, re-apply the layers
     /// with `Router::layer` in inner→outer call order (axum runs the LAST
     /// `.layer` call as the outermost service, the inverse of the tonic builder),
     /// i.e. `.layer(GrpcWebLayer::new()).layer(GrpcWebTrailersLayer::new())
@@ -542,7 +542,7 @@ impl AssembledChain {
 
     /// Split into a **layered** [`axum::Router`] plus the [`ChainParts`]
     /// remainder — the SAFE DEFAULT for a downstream that composes ONE listener
-    /// of its own. The returned router is ready to hand to [`axum::serve`]
+    /// of its own. The returned router is ready to hand to [`axum::serve()`]
     /// DIRECTLY: it carries the engine's full transport contract, so the consumer
     /// re-applies nothing.
     ///
@@ -554,10 +554,10 @@ impl AssembledChain {
     /// [`tonic::transport::Server`] builder, where the FIRST `.layer` is
     /// outermost — so the calls are ordered inner→outer here to land the exact
     /// same outermost→innermost stack `serve` builds. `accept_http1` has no axum
-    /// analogue: HTTP/1 is implicit in [`axum::serve`].
+    /// analogue: HTTP/1 is implicit in [`axum::serve()`].
     ///
     /// ERGONOMIC GUARANTEE: the returned value is a plain `axum::Router` (state
-    /// `()`, request body [`axum::body::Body`]) that [`axum::serve`] accepts with
+    /// `()`, request body [`axum::body::Body`]) that [`axum::serve()`] accepts with
     /// no further ceremony. The layer stack rewrites the response body type; that
     /// normalization is resolved INTERNALLY (the layered routes are re-nested
     /// under a fresh [`axum::Router`]), so the consumer needs no

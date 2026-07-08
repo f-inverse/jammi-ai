@@ -22,6 +22,7 @@ pub mod metrics_layer;
 pub mod routes;
 pub mod runtime;
 pub mod telemetry;
+pub mod tenant_resolver_layer;
 pub mod tiers;
 
 use std::future::Future;

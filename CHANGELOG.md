@@ -6,6 +6,10 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-07-08
+
+A feature release adding the `into_layered_axum_router` seam helper, shipped in lockstep across the workspace.
+
 ### Added
 - **`AssembledChain::into_layered_axum_router` (`jammi-server`).** A single-call
   seam helper that splits the assembled gRPC chain into an `axum::Router` with the

@@ -33,6 +33,7 @@ use tokio::signal;
 use tokio::sync::broadcast;
 use tonic::transport::Server;
 use tonic_web::GrpcWebLayer;
+use tower::Layer;
 
 use crate::error::fallback_handler;
 use crate::flight::TenantBoundProvider;
@@ -51,13 +52,14 @@ use crate::grpc::proto::pipeline::pipeline_service_server::PipelineServiceServer
 #[cfg(feature = "train")]
 use crate::grpc::proto::training::training_service_server::TrainingServiceServer;
 use crate::grpc::proto::trigger::trigger_service_server::TriggerServiceServer;
-use crate::grpc::session::{SessionStore, TenantInterceptor};
+use crate::grpc::session::{SessionIdTenantResolver, SessionStore, TenantResolver};
 #[cfg(feature = "train")]
 use crate::grpc::training::TrainingServer;
 use crate::grpc::trigger::TriggerServer;
 use crate::grpc_web_trailers::GrpcWebTrailersLayer;
 use crate::metrics_layer::MetricsLayer;
 use crate::routes::health::{self, MetricsRegistry};
+use crate::tenant_resolver_layer::TenantResolverLayer;
 use crate::tiers::{ServiceTier, TierSet};
 
 /// Errors `OssServer::run` can surface to the binary's `main`.
@@ -329,6 +331,11 @@ impl OssServer {
                 engine: Some(Arc::clone(&self.session)),
                 tiers: self.tiers.clone(),
                 metrics: Arc::clone(&self.metrics),
+                // The OSS binary binds tenants with the engine-default
+                // `jammi-session-id` resolver — the OSS-cooperative multitenancy
+                // behavior, now a first-class resolver rather than an implicit
+                // interceptor.
+                tenant_resolver: SessionIdTenantResolver::arc(self.session_store.clone()),
             },
             shutdown,
         )
@@ -351,7 +358,8 @@ pub struct GrpcChain {
     pub flight_ctx: SessionContext,
     /// Tenant binding the Flight SQL provider mutates per request.
     pub flight_binding: jammi_db::tenant_scope::TenantBinding,
-    /// Session store shared between every service via the tenant interceptor.
+    /// Session store shared between the `CatalogService` tenant trio (writers)
+    /// and the engine-default `SessionIdTenantResolver` (reader).
     pub store: SessionStore,
     /// Trigger handles — `Some` iff the event tier is mounted.
     pub trigger: Option<crate::TriggerHandles>,
@@ -364,6 +372,16 @@ pub struct GrpcChain {
     /// drives the substrate counters / latency histogram from the request path;
     /// the Axum `/metrics` route reads the same registry to scrape it.
     pub metrics: Arc<MetricsRegistry>,
+    /// The one tenant-binding resolver. Every engine service (and Flight SQL)
+    /// binds its request's tenant through THIS resolver via the async
+    /// [`crate::tenant_resolver_layer::TenantResolverLayer`] — the single binder,
+    /// no interceptor path. Production and the OSS binary pass
+    /// [`SessionIdTenantResolver::arc`] (the OSS-cooperative `jammi-session-id`
+    /// default); a downstream composing the seam passes its own authenticating
+    /// resolver to unify the composability seam with its BYO-auth seam. Only the
+    /// services `assemble_grpc_chain` itself builds are bound by it — downstream
+    /// services later [`AssembledChain::mount`]ed are NOT wrapped.
+    pub tenant_resolver: Arc<dyn TenantResolver>,
 }
 
 /// The engine's fully-assembled gRPC chain, ready for a downstream to mount
@@ -641,23 +659,38 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
         engine,
         tiers,
         metrics,
+        tenant_resolver,
     } = chain;
-    let interceptor = TenantInterceptor::new(store.clone());
 
-    let provider = TenantBoundProvider::new(flight_ctx.state(), flight_binding, store.clone());
+    // Flight SQL — MUST-FIX 2: cover the `db.sql` lane through the SAME resolver
+    // as the gRPC plane. The provider resolves each query's scope and binds it,
+    // closing the cross-transport bypass where an authenticated gRPC plane would
+    // still let Flight bind from an unauthenticated header (#220).
+    let provider = TenantBoundProvider::new(
+        flight_ctx.state(),
+        flight_binding,
+        Arc::clone(&tenant_resolver),
+    );
     let flight = FlightSqlService::new_with_provider(Box::new(provider));
     let flight_svc = FlightServiceServer::new(flight);
 
-    // The control plane: one `CatalogService` on the always-present core tier.
-    // Its engine-free verbs (the tenant trio + `GetServerInfo`) ride the
-    // `SessionStore` + `TierSet`, so it mounts even on an engine-light
-    // deployment; its catalog / lifecycle verbs delegate to the shared engine
-    // when one is present (`engine.clone()` here, with the original moved into
-    // the engine-services block below).
-    let catalog_svc = CatalogServiceServer::with_interceptor(
-        CatalogServer::new(store, tiers.clone(), engine.clone()),
-        interceptor.clone(),
-    );
+    // The single binder. One `TenantResolverLayer` (holding the one resolver)
+    // wraps every engine service uniformly — no branch, no separate interceptor,
+    // so nothing can double-bind or clobber the resolved tenant. MUST-FIX 1 — the
+    // wrapping applies only to the services THIS function builds; downstream
+    // services mounted via `AssembledChain::mount` (a platform's own pre-auth
+    // `Login`/`Bootstrap`, etc.) stay un-gated by the engine resolver.
+    let resolver_layer = TenantResolverLayer::new(tenant_resolver);
+
+    // Bind one engine service onto `routes` under the resolver layer. `$server`
+    // is the bare `*ServiceServer::new(inner)`; the layer forwards its
+    // `NamedService::NAME` so tonic routing keeps it.
+    macro_rules! mount_engine {
+        ($routes:expr, $mounted:expr, $name:literal, $server:expr) => {{
+            $routes = $routes.add_service(resolver_layer.layer($server));
+            $mounted.push($name.to_string());
+        }};
+    }
 
     // Accumulate the services layer-free on a `tonic::service::Routes`. The
     // transport layer stack is deferred to `AssembledChain::serve` (G1): holding
@@ -665,19 +698,38 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
     // into the seam and cannot grow in place (its `add_service` is by-value with
     // no `Default`). `Routes` is the composition point tonic provides for exactly
     // this — every service mounted onto it, engine or downstream, then inherits
-    // the gRPC-web framing + trailer repair the serve path applies.
-    let mut routes = tonic::service::Routes::new(flight_svc).add_service(catalog_svc);
-    let mut mounted = vec!["Flight SQL".to_string(), "CatalogService".to_string()];
+    // the gRPC-web framing + trailer repair the serve path applies. Flight SQL is
+    // NOT wrapped by the layer: its `db.sql` lane binds inside the
+    // `TenantBoundProvider` (threaded with the same resolver above).
+    let mut routes = tonic::service::Routes::new(flight_svc);
+    let mut mounted = vec!["Flight SQL".to_string()];
+
+    // The control plane: one `CatalogService` on the always-present core tier.
+    // Its engine-free verbs (the tenant trio + `GetServerInfo`) ride the
+    // `SessionStore` + `TierSet`, so it mounts even on an engine-light
+    // deployment; its catalog / lifecycle verbs delegate to the shared engine
+    // when one is present (`engine.clone()` here, with the original moved into
+    // the engine-services block below).
+    mount_engine!(
+        routes,
+        mounted,
+        "CatalogService",
+        CatalogServiceServer::new(CatalogServer::new(store, tiers.clone(), engine.clone()))
+    );
 
     // Event tier: TriggerService. Driven by the caller having supplied handles
     // (it does so iff the event tier is mounted).
     if let Some(handles) = trigger {
-        let trigger_svc = TriggerServiceServer::with_interceptor(
-            TriggerServer::new(handles.topic_repo, handles.publisher, handles.subscriber),
-            interceptor.clone(),
+        mount_engine!(
+            routes,
+            mounted,
+            "TriggerService",
+            TriggerServiceServer::new(TriggerServer::new(
+                handles.topic_repo,
+                handles.publisher,
+                handles.subscriber,
+            ))
         );
-        routes = routes.add_service(trigger_svc);
-        mounted.push("TriggerService".to_string());
     }
 
     // The embedded training worker the `train` tier owns. Moved into the returned
@@ -688,42 +740,39 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
 
     if let Some(session) = engine {
         // Core tier engine services: always mounted when an engine is present.
-        let embedding_svc = EmbeddingServiceServer::with_interceptor(
-            EmbeddingServer::new(Arc::clone(&session)),
-            interceptor.clone(),
+        mount_engine!(
+            routes,
+            mounted,
+            "EmbeddingService",
+            EmbeddingServiceServer::new(EmbeddingServer::new(Arc::clone(&session)))
         );
-        routes = routes.add_service(embedding_svc);
-        mounted.push("EmbeddingService".to_string());
-
-        let inference_svc = InferenceServiceServer::with_interceptor(
-            InferenceServer::new(Arc::clone(&session)),
-            interceptor.clone(),
+        mount_engine!(
+            routes,
+            mounted,
+            "InferenceService",
+            InferenceServiceServer::new(InferenceServer::new(Arc::clone(&session)))
         );
-        routes = routes.add_service(inference_svc);
-        mounted.push("InferenceService".to_string());
-
-        let pipeline_svc = PipelineServiceServer::with_interceptor(
-            PipelineServer::new(Arc::clone(&session)),
-            interceptor.clone(),
+        mount_engine!(
+            routes,
+            mounted,
+            "PipelineService",
+            PipelineServiceServer::new(PipelineServer::new(Arc::clone(&session)))
         );
-        routes = routes.add_service(pipeline_svc);
-        mounted.push("PipelineService".to_string());
-
-        let audit_svc = AuditServiceServer::with_interceptor(
-            AuditServer::new(Arc::clone(&session)),
-            interceptor.clone(),
+        mount_engine!(
+            routes,
+            mounted,
+            "AuditService",
+            AuditServiceServer::new(AuditServer::new(Arc::clone(&session)))
         );
-        routes = routes.add_service(audit_svc);
-        mounted.push("AuditService".to_string());
 
         // Eval tier: EvalService.
         if tiers.contains(ServiceTier::Eval) {
-            let eval_svc = EvalServiceServer::with_interceptor(
-                EvalServer::new(Arc::clone(&session)),
-                interceptor.clone(),
+            mount_engine!(
+                routes,
+                mounted,
+                "EvalService",
+                EvalServiceServer::new(EvalServer::new(Arc::clone(&session)))
             );
-            routes = routes.add_service(eval_svc);
-            mounted.push("EvalService".to_string());
         }
 
         // Train tier: TrainingService (all three training kinds — fine-tune,
@@ -741,10 +790,12 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
             train_worker = Some(jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(
                 &session,
             )?);
-            let training_svc =
-                TrainingServiceServer::with_interceptor(TrainingServer::new(session), interceptor);
-            routes = routes.add_service(training_svc);
-            mounted.push("TrainingService".to_string());
+            mount_engine!(
+                routes,
+                mounted,
+                "TrainingService",
+                TrainingServiceServer::new(TrainingServer::new(session))
+            );
         }
     }
 

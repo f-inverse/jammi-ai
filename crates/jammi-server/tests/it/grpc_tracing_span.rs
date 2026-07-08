@@ -3,7 +3,7 @@
 //! Each tenant-aware gRPC handler opens a `#[tracing::instrument]` span named
 //! for the request kind (the handler method) and stamps its resolved `tenant_id`
 //! onto the span once `session_tenant_traced` reads it from the request — a tower
-//! layer cannot, because the per-service `TenantInterceptor` deposits the
+//! layer cannot, because the per-service async tenant-binding layer deposits the
 //! `SessionTenant` extension *post*-routing, after a pre-routing layer has
 //! already run. This drives one instrumented handler directly on the test task
 //! (NOT through the real TCP server, whose spawned per-connection tasks a
@@ -160,7 +160,7 @@ fn handler_span_carries_tenant() {
         let server = TrainingServer::new(Arc::clone(&session));
 
         // A request carrying the `SessionTenant` extension exactly as the
-        // per-service `TenantInterceptor` deposits it post-routing — the only
+        // per-service async tenant-binding layer deposits it post-routing — the only
         // place the tenant is in scope for the handler to read and record.
         let tenant =
             TenantId::from_str("018f5a0e-c4c8-7e10-9c4f-3b6f7c5a8e9a").expect("valid tenant uuid");

@@ -16,7 +16,7 @@
 //! reason. There is no progress stream — the abstraction exposes none.
 //!
 //! Tenant scope is read from the request's [`crate::grpc::session::
-//! SessionTenant`] extension (set upstream by the shared `TenantInterceptor`)
+//! SessionTenant`] extension (set upstream by the async tenant-binding layer)
 //! and applied via [`scoped`], matching every other engine-backed gRPC surface.
 
 use std::sync::Arc;

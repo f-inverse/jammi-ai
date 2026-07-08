@@ -139,11 +139,12 @@ async fn start_embedding_server() -> (
                 addr,
                 flight_ctx,
                 flight_binding: binding,
-                store,
+                store: store.clone(),
                 trigger: None,
                 engine: Some(session),
                 tiers: jammi_server::tiers::TierSet::all_compiled(),
                 metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
+                tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
             },
             async move {
                 let _ = shutdown_rx.await;

@@ -4,7 +4,7 @@
 //! The engine-level trigger tests in `crates/jammi-db/tests/it/trigger.rs`
 //! exercise the publisher/subscriber surface directly; this module verifies
 //! the wire path: an in-process Tonic server hosting `CatalogService` +
-//! `TriggerService` behind the shared `TenantInterceptor`, two client
+//! `TriggerService` behind the shared tenant-binding layer, two client
 //! channels driven through the proto-generated stubs, and the IPC
 //! round-trip on the `ArrowBatch` payload.
 //!
@@ -226,7 +226,7 @@ async fn start_grpc_test_server(seeds: &[TopicSeed]) -> ServerFixture {
                 addr,
                 flight_ctx,
                 flight_binding: binding,
-                store: store_for_server,
+                store: store_for_server.clone(),
                 trigger: Some(trigger),
                 engine: None,
                 tiers: jammi_server::tiers::TierSet::resolve([
@@ -234,6 +234,9 @@ async fn start_grpc_test_server(seeds: &[TopicSeed]) -> ServerFixture {
                 ])
                 .expect("event tier resolves"),
                 metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
+                tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(
+                    store_for_server,
+                ),
             },
             async move {
                 let _ = shutdown_rx.await;

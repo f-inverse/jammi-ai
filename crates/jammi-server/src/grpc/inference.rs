@@ -11,7 +11,7 @@
 //! [`jammi_wire::infer_result_to_proto`] helper.
 //!
 //! Tenant scope is read from the request's [`crate::grpc::session::
-//! SessionTenant`] extension (set upstream by the shared `TenantInterceptor`)
+//! SessionTenant`] extension (set upstream by the async tenant-binding layer)
 //! and applied via `with_tenant_scoped`, matching every other engine-backed
 //! gRPC surface.
 

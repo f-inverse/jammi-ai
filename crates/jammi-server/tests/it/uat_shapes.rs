@@ -187,6 +187,9 @@ async fn shape_c_multi_tenant_server_isolates_two_tenants_across_primitives() {
                 ])
                 .expect("event tier resolves"),
                 metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
+                tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(
+                    store.clone(),
+                ),
             },
             async move {
                 let _ = shutdown_rx.await;

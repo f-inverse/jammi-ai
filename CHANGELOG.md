@@ -6,6 +6,26 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Changed
+- **Unified, resolver-driven tenant binding (`jammi-server`).** Tenant binding at
+  the gRPC composability seam and the bring-your-own-auth seam are now one seam. A
+  new `TenantResolver` trait (`async fn resolve(&MetadataMap) -> Result<TenantScope,
+  Status>`, with `TenantScope::{Tenant, Global}` — `Global` the *explicit* unscoped
+  choice, never a silent default) is the single tenant-binding mechanism: a new
+  async tenant-binding tower layer (`tenant_resolver_layer`) wraps every engine
+  service and drives the resolver, and `flight::TenantBoundProvider` drives the
+  *same* resolver for the Flight SQL `db.sql` lane. `GrpcChain` gains a non-optional
+  `tenant_resolver: Arc<dyn TenantResolver>` field. The engine ships
+  `SessionIdTenantResolver` (the OSS-cooperative `jammi-session-id` → `SessionStore`
+  default, made a first-class resolver); a downstream composing via
+  `assemble_grpc_chain` supplies its own authenticating resolver (returning
+  `Tenant`/`Err`, never `Global`) to gate both transports at once. The legacy sync
+  `TenantInterceptor` is removed. This closes the cross-transport gap where an
+  authenticated gRPC plane still bound Flight from the unauthenticated
+  `jammi-session-id` header ([#220](https://github.com/f-inverse/jammi-ai/issues/220)).
+  No wire-surface change; the `api_freeze` and `tenant_isolation_oracle` inventories
+  are unaffected.
+
 ## [0.36.0] - 2026-07-08
 
 A feature release adding the `into_layered_axum_router` seam helper, shipped in lockstep across the workspace.

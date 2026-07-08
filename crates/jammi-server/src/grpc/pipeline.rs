@@ -14,7 +14,7 @@
 //! `Vec<f32>`), the hydrated value rows as one Arrow IPC stream.
 //!
 //! Tenant scope is read from the request's [`crate::grpc::session::
-//! SessionTenant`] extension (set upstream by the shared `TenantInterceptor`)
+//! SessionTenant`] extension (set upstream by the async tenant-binding layer)
 //! and applied via [`scoped`], matching every other engine-backed gRPC surface.
 //! `build_neighbor_graph` self-scopes internally too; calling it inside [`scoped`]
 //! is an idempotent same-tenant re-scope, not a special case.

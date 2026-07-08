@@ -4,7 +4,7 @@
 //! `CatalogService` — plus the `AuditService` data-plane verbs.
 //!
 //! Each test drives an in-process Tonic server hosting the engine-backed chain
-//! behind the shared `TenantInterceptor`, exercises the wire path through the
+//! behind the shared tenant-binding layer, exercises the wire path through the
 //! proto-generated client stubs, and asserts the engine-side effect (a Flight-
 //! SQL / engine read for the mutable table, the catalog for the channel, the
 //! typed fetch + `.verify()` for audit, `ListTopics` for the topic). The broker
@@ -102,11 +102,12 @@ async fn start_fixture() -> Fixture {
                 addr,
                 flight_ctx,
                 flight_binding: binding,
-                store,
+                store: store.clone(),
                 trigger: Some(trigger),
                 engine: Some(session),
                 tiers: jammi_server::tiers::TierSet::all_compiled(),
                 metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
+                tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
             },
             async move {
                 let _ = shutdown_rx.await;

@@ -18,7 +18,7 @@
 //!   truthful `Unavailable` rather than a faked empty result.
 //!
 //! Tenant scope is read from the request's [`SessionTenant`] extension (set
-//! upstream by [`crate::grpc::session::TenantInterceptor`]).
+//! upstream by the async tenant-binding layer, [`crate::tenant_resolver_layer`]).
 //!
 //! [`SessionTenant`]: crate::grpc::session::SessionTenant
 //! [`SessionStore`]: crate::grpc::session::SessionStore

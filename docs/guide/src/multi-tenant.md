@@ -97,8 +97,10 @@ A programmatic client (Python, Go, Java) binds the tenant once per
 connection via the `jammi.v1.catalog.CatalogService.SetTenant` RPC. The
 server records the tenant against the `jammi-session-id` request metadata
 header; every Flight SQL query the same connection issues afterwards
-inherits the binding through the `TenantInterceptor` that fronts both
-services. Browser clients reach the same `CatalogService` over HTTP/1.1
+inherits the binding through the same resolver — the engine-default
+`SessionIdTenantResolver` — applied by the single async tenant-binding layer
+(`TenantResolverLayer`) that fronts both the `CatalogService` and the Flight
+SQL provider. Browser clients reach the same `CatalogService` over HTTP/1.1
 via the gRPC-Web shim (`application/grpc-web+proto`) — no separate REST
 surface, same `jammi-session-id` header semantics.
 
@@ -134,55 +136,52 @@ authentication or authorization boundary.**
 
 Jammi authenticates nothing on its own — it is a substrate, and identity is a
 consumer's vocabulary. To put a tenant boundary in front of untrusted callers,
-you supply the authentication and authorization yourself and bind the result to
-the engine's per-request tenant scope. The seam is a **custom tonic
-interceptor** that runs ahead of the **typed gRPC verbs**:
+you supply the authentication and authorization yourself by implementing a
+`TenantResolver` and passing it to `GrpcChain.tenant_resolver` when you
+assemble the chain via `assemble_grpc_chain`. One resolver, plugged in once,
+binds **every engine gRPC verb AND the Flight SQL `db.sql` lane** — the same
+async tenant-binding layer (`TenantResolverLayer`) applies the resolved scope
+to both transports, so there is nothing separate to wire up for Flight.
 
-1. **Authenticate the principal.** Read the caller's credential — a bearer token,
-   a session cookie your gateway exchanges, a service-to-service token — and
-   verify it. A missing or invalid credential is rejected here, before any
-   handler runs.
-2. **Authorize the tenant.** Derive the tenant from the *verified* claim — never
-   from a header the caller controls. This is where your policy lives: which
-   tenant this principal may act as.
-3. **Bind it.** Attach the resolved tenant as a `SessionTenant` request
-   extension. Every typed verb handler reads that extension and scopes its work
-   to that tenant — the same extension the built-in interceptor sets, now sourced
-   from an authenticated claim instead of an unauthenticated session lookup.
+1. **Authenticate the principal.** In `resolve`, read the caller's credential —
+   a bearer token, a session cookie your gateway exchanges, a
+   service-to-service token — and verify it. A missing or invalid credential
+   returns `Err(Status::unauthenticated(..))` here, before any handler runs.
+2. **Authorize the tenant from the verified claim.** Derive the tenant from the
+   *verified* claim — never from a header the caller controls. This is where
+   your policy lives: which tenant this principal may act as. Return
+   `Ok(TenantScope::Tenant(t))`.
+3. **The engine binds it.** The async `TenantResolverLayer` maps the resolved
+   scope onto the `SessionTenant` request extension every verb handler reads,
+   and the Flight SQL provider (`TenantBoundProvider`) binds the same scope for
+   `db.sql` — you write only `resolve`.
 
-Because authentication and authorization run *in front of* session resolution,
-the tenant the engine acts on is the one the credential proves, not one the
-caller asserts. The `jammi-session-id` header plays no part in this path.
-
-This seam covers the typed gRPC verbs. The Flight SQL lane (`db.sql`) is a
-separate transport mounted without the interceptor: its `TenantBoundProvider`
-resolves the tenant from the `jammi-session-id` header directly, not the
-`SessionTenant` extension, so this in-engine interceptor does not bind the
-verified claim over Flight. The remote client does carry the bearer on the
-Flight lane (alongside the session header), so a boundary in front sees the
-credential on every transport. The engine enforces auth on no transport by
-design: authenticating every transport — the Flight lane included — is your
-job, typically a governing gateway ahead of the trusted-network engine. Whether
-the *in-engine* interceptor should also extend to the Flight transport is a
-mechanism question tracked at
-[#220](https://github.com/f-inverse/jammi-ai/issues/220).
+Because `resolve` runs *in front of* every handler, the tenant the engine acts
+on is the one the credential proves, not one the caller asserts. The
+`jammi-session-id` header plays no part in this path. **Reject, don't
+default:** an authenticating resolver returns `Tenant`/`Err` and NEVER
+`TenantScope::Global` — returning `Global` on a failed check runs the request
+*unscoped*, which for a `tenant_id IS NULL`-bearing catalog is a global read,
+so a rejected caller must fail the request. `TenantScope::Global` is the
+*explicit* unscoped choice the engine-default resolver
+(`SessionIdTenantResolver`) returns when no tenant is bound — never a value a
+rejection falls through to.
 
 ```rust,ignore
-use tonic::{Request, Status, service::Interceptor};
+use tonic::{Status, metadata::MetadataMap};
 use jammi_db::TenantId;
-use jammi_server::grpc::session::SessionTenant;
+use jammi_server::grpc::session::{TenantResolver, TenantScope};
 
-/// A consumer's authenticating interceptor. `verify_credential` is the
+/// A consumer's authenticating resolver. `verify_credential` is the
 /// consumer's own identity logic — it authenticates the caller and returns the
 /// tenant the verified claim authorizes, or `None` to reject the request.
-#[derive(Clone)]
-struct AuthInterceptor;
+struct AuthResolver;
 
-impl Interceptor for AuthInterceptor {
-    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+#[tonic::async_trait]
+impl TenantResolver for AuthResolver {
+    async fn resolve(&self, metadata: &MetadataMap) -> Result<TenantScope, Status> {
         // 1. Authenticate: pull the credential the caller presented.
-        let credential = request
-            .metadata()
+        let credential = metadata
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| Status::unauthenticated("missing credential"))?;
@@ -193,22 +192,36 @@ impl Interceptor for AuthInterceptor {
         let tenant: TenantId = verify_credential(credential)
             .ok_or_else(|| Status::unauthenticated("invalid credential"))?;
 
-        // 3. Bind: every typed verb downstream scopes to this tenant.
-        request.extensions_mut().insert(SessionTenant(Some(tenant)));
-        Ok(request)
+        // 3. Bind: return the resolved scope. The engine's tenant-binding layer
+        //    applies it to every gRPC verb and to Flight SQL.
+        Ok(TenantScope::Tenant(tenant))
     }
 }
 # fn verify_credential(_c: &str) -> Option<TenantId> { None }
 ```
 
-Mount it the same way the built-in interceptor is mounted — wrap each service
-with `ServiceServer::with_interceptor(server, AuthInterceptor)` in place of the
-stock `TenantInterceptor`. The seam types are
-[`SessionTenant`](https://docs.rs/jammi-server) (the per-request binding every
-verb reads) and any `tonic::service::Interceptor`. Reject, don't default: an
-interceptor that binds `None` on a failed check runs the request *unscoped*,
-which for a `tenant_id IS NULL`-bearing catalog is a global read — so a rejected
-caller must fail the request, not bind nothing.
+Plug it in at assembly time, in place of the engine default:
+
+```rust,ignore
+use std::sync::Arc;
+use jammi_server::runtime::{assemble_grpc_chain, GrpcChain};
+
+let chain = GrpcChain {
+    // .. addr, flight_ctx, flight_binding, store, trigger, engine, tiers, metrics ..
+    tenant_resolver: Arc::new(AuthResolver),
+    ..chain_defaults
+};
+let assembled = assemble_grpc_chain(chain)?;
+```
+
+The seam types are [`TenantResolver`](https://docs.rs/jammi-server) (the trait
+you implement), `TenantScope` (`Tenant`/`Global`), and `SessionTenant` (the
+per-request binding every verb reads, which the engine sets for you). This one
+resolver replaces the engine-default `SessionIdTenantResolver` for the whole
+chain — the gRPC verbs and the Flight `db.sql` lane both read the scope it
+resolves, closing the cross-transport gap where a boundary authenticated the
+gRPC plane but Flight still bound from the unauthenticated
+`jammi-session-id` header.
 
 ## Disjoint views — what to expect
 

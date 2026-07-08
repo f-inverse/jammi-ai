@@ -14,7 +14,7 @@
 //! audit table's storage form).
 //!
 //! Tenant scope is read from the request's [`crate::grpc::session::
-//! SessionTenant`] extension (set upstream by the shared `TenantInterceptor`)
+//! SessionTenant`] extension (set upstream by the async tenant-binding layer)
 //! and applied via `with_tenant_scoped`, matching every other engine-backed
 //! gRPC surface. The audit primitive requires a bound tenant — an unscoped call
 //! surfaces as `failed_precondition`.

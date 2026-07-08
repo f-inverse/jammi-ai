@@ -16,9 +16,10 @@ import "jammi/v1/trigger.proto";
 // abstraction; the service reimplements no model loading, scan, or forward
 // logic — it is purely a wire adapter over the in-process engine.
 //
-// Tenant scope is read from the request's `SessionTenant` extension, set by the
-// shared TenantInterceptor from the `jammi-session-id` header — the same
-// mechanism every other gRPC service and Flight SQL already use.
+// Tenant scope is read from the request's `SessionTenant` extension, set by
+// the single async tenant-binding layer driven by the engine's
+// `TenantResolver` (default: the `jammi-session-id` header → shared session
+// store) — the one mechanism every gRPC service and Flight SQL bind through.
 service InferenceService {
   // Scan `columns` on a registered source, run `model_id` over every row for
   // `task`, and return the result as Arrow IPC. Peer of the abstraction's

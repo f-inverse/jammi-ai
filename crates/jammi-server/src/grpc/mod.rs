@@ -7,7 +7,8 @@
 //! observability verb, including the tenant trio. The data plane is the
 //! per-capability services (embedding / inference / training / eval / pipeline /
 //! trigger / audit). Both Flight SQL and the gRPC services share a
-//! [`session::SessionStore`] via the [`session::TenantInterceptor`] so a tenant
+//! [`session::SessionStore`] via the async tenant-binding layer
+//! ([`crate::tenant_resolver_layer`]) so a tenant
 //! bound through `CatalogService.SetTenant` is observable on any downstream
 //! request — including SQL queries issued against Flight SQL.
 //!

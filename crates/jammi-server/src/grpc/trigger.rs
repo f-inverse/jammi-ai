@@ -17,7 +17,7 @@
 //! Both verbs resolve the topic by name against the `TopicRepo` (a read), then
 //! act on the engine's publisher / subscriber. Tenant scope is read from the
 //! request's `SessionTenant` extension (set upstream by
-//! [`crate::grpc::session::TenantInterceptor`]). Per-request tenant overrides on
+//! the async tenant-binding layer, [`crate::tenant_resolver_layer`]). Per-request tenant overrides on
 //! the proto messages are accepted but only honoured when the session tenant is
 //! unset — a session-bound tenant cannot sidestep its scope by setting
 //! `tenant_id` on the body.

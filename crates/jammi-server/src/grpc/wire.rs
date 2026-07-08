@@ -10,8 +10,8 @@
 //! everything that touches a tonic [`Request`] extension or maps an engine error
 //! to a tonic [`Status`]:
 //!
-//! * [`session_tenant`] — read the tenant the [`crate::grpc::session::
-//!   TenantInterceptor`] attached to the request.
+//! * [`session_tenant`] — read the tenant the async tenant-binding layer
+//!   ([`crate::tenant_resolver_layer`]) attached to the request.
 //! * [`scoped`] — run a session call under that tenant via the
 //!   concurrency-safe `with_tenant_scoped` task-local.
 //! * [`require_nonempty`] — reject a missing required string field.
@@ -31,8 +31,8 @@ use tonic::{Code, Request, Status};
 
 use crate::grpc::session::SessionTenant;
 
-/// Read the bound tenant the [`crate::grpc::session::TenantInterceptor`]
-/// attached to the request.
+/// Read the bound tenant the async tenant-binding layer
+/// ([`crate::tenant_resolver_layer`]) attached to the request.
 pub fn session_tenant<T>(request: &Request<T>) -> Option<TenantId> {
     request
         .extensions()
@@ -43,9 +43,9 @@ pub fn session_tenant<T>(request: &Request<T>) -> Option<TenantId> {
 /// Read the request's bound tenant and stamp it onto the current request span's
 /// `tenant_id` field.
 ///
-/// The tenant only becomes known *inside* a handler — the per-service
-/// `TenantInterceptor` deposits the [`SessionTenant`] extension post-routing, so
-/// a pre-routing tower layer cannot see it. Each tenant-aware handler therefore
+/// The tenant only becomes known *inside* a handler — the per-service async
+/// tenant-binding layer deposits the [`SessionTenant`] extension post-routing,
+/// so a pre-routing tower layer cannot see it. Each tenant-aware handler therefore
 /// opens its span with `tenant_id` empty and calls this once it has the request
 /// in hand to fill it in, so a trace ties the gRPC request to the tenant scope
 /// the call runs under. Returns the resolved tenant for the handler to scope on.

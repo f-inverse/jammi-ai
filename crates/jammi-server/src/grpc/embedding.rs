@@ -24,7 +24,7 @@
 //! text/bytes-vs-modality mismatch are rejected with `invalid_argument`.
 //!
 //! Tenant scope is read from the request's [`SessionTenant`] extension (set
-//! upstream by [`crate::grpc::session::TenantInterceptor`]) and applied to the
+//! upstream by the async tenant-binding layer, [`crate::tenant_resolver_layer`]) and applied to the
 //! call via [`crate::grpc::wire::scoped`] — the same task-local the engine the
 //! [`Session`] wraps observes — matching how the Flight SQL and Trigger
 //! surfaces resolve their tenant.

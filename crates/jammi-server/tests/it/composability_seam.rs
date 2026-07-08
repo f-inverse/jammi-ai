@@ -424,3 +424,186 @@ async fn into_axum_router_composes_one_listener_with_a_plain_http_route() {
     let _ = shutdown_tx.send(());
     let _ = handle.await;
 }
+
+/// Wrap a proto-encoded payload in a single gRPC-Web data frame: 1 flag byte
+/// (`0x00` — not a trailer), a big-endian u32 length, then the payload. This is
+/// the on-the-wire shape a browser gRPC-web client POSTs.
+fn frame_grpc_web(payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(5 + payload.len());
+    buf.push(0x00);
+    buf.extend_from_slice(
+        &u32::try_from(payload.len())
+            .expect("payload fits in u32")
+            .to_be_bytes(),
+    );
+    buf.extend_from_slice(payload);
+    buf
+}
+
+/// Scan a gRPC-Web response body for its in-body trailer frame (flag `0x80`) and
+/// return the decoded trailer text. Returns `None` if the body carries no
+/// trailer frame — which for an error response is itself the failure the seam's
+/// trailer-repair layer exists to prevent.
+fn grpc_web_trailer_block(body: &[u8]) -> Option<String> {
+    let mut cursor = 0;
+    while cursor + 5 <= body.len() {
+        let flag = body[cursor];
+        let len = u32::from_be_bytes([
+            body[cursor + 1],
+            body[cursor + 2],
+            body[cursor + 3],
+            body[cursor + 4],
+        ]) as usize;
+        let start = cursor + 5;
+        let end = start + len;
+        assert!(end <= body.len(), "grpc-web frame extends past body");
+        if flag & 0x80 != 0 {
+            return Some(
+                std::str::from_utf8(&body[start..end])
+                    .expect("trailer block is utf-8")
+                    .to_string(),
+            );
+        }
+        cursor = end;
+    }
+    None
+}
+
+/// TEST — the single-listener `into_layered_axum_router` path: assemble an
+/// engine-backed chain, mount the stub service, split into a LAYERED
+/// `axum::Router` + `ChainParts`, and hand the router to `axum::serve`
+/// DIRECTLY — no manual re-layering, no `Router::<()>::new().merge(...)`
+/// re-nest. Over one listener this proves the helper is both CORRECT and
+/// ERGONOMIC:
+///
+/// (i)  a gRPC verb answers through the pre-applied framing (native HTTP/2
+///      `GetServerInfo`), and
+/// (ii) the trailer-repair layer is live: a unary handler error
+///      (`EmbeddingService.EncodeQuery` against a nonexistent model → an
+///      `invalid_argument` Status) comes back to a gRPC-web client as an
+///      in-body `0x80` trailer frame carrying `grpc-status: 3`, with the status
+///      absent from the HTTP headers — mirroring the engine's `grpc_web`
+///      trailer-repair oracle, but reached through the layered-router helper
+///      rather than `serve`.
+///
+/// If the returned router needed a re-nest to make `axum::serve` accept it, this
+/// test would not compile — that is the ergonomic half of the proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn into_layered_axum_router_serves_directly_with_grpc_web_trailer_repair() {
+    use jammi_ai::session::InferenceSession;
+    use jammi_server::grpc::proto::embedding::{
+        encode_query_request::Input, EncodeQueryRequest, Modality,
+    };
+    use prost::Message as _;
+
+    let addr = bind_addr().await;
+
+    // An engine-backed chain so a real unary handler (`EncodeQuery`) can return
+    // a structured error — the transport-only chain has no such data-plane verb.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session = InferenceSession::open(test_config(dir.path()))
+        .await
+        .expect("session");
+    let flight_ctx = session.context().clone();
+    let flight_binding = session.tenant_binding_arc();
+    let chain = GrpcChain {
+        addr,
+        flight_ctx,
+        flight_binding,
+        store: jammi_server::grpc::session::SessionStore::new(),
+        trigger: None,
+        engine: Some(session),
+        tiers: TierSet::resolve(std::iter::empty()).expect("core-only tier set resolves"),
+        metrics: Arc::new(MetricsRegistry::new().unwrap()),
+    };
+
+    let assembled = assemble_grpc_chain(chain)
+        .expect("assemble")
+        .mount(LifecycleServiceServer::new(EchoLifecycle));
+
+    // The whole point: the returned router is served DIRECTLY. No `.layer(...)`
+    // re-application, no `Router::<()>::new().merge(...)` re-nest.
+    let (router, parts) = assembled.into_layered_axum_router();
+    assert_eq!(parts.addr, addr);
+    assert!(parts
+        .mounted
+        .iter()
+        .any(|m| m == "jammi.v1.lifecycle.LifecycleService"));
+
+    let listener = TcpListener::bind(addr).await.expect("rebind");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("axum serve");
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // (i) A gRPC verb answers through the pre-applied layer stack (native HTTP/2).
+    let catalog = CatalogClient::connect(endpoint(addr))
+        .await
+        .expect("catalog connect");
+    let info = catalog
+        .server_info()
+        .await
+        .expect("server_info over layered listener");
+    assert!(
+        !info.version.is_empty(),
+        "engine core answers GetServerInfo"
+    );
+
+    // (ii) The trailer-repair layer is live: an engine error reaches a gRPC-web
+    // client as an in-body `0x80` trailer frame, not a trailers-only HTTP header
+    // set with an empty body.
+    let request_proto = EncodeQueryRequest {
+        model_id: "local:/does/not/exist".into(),
+        modality: Modality::Text as i32,
+        input: Some(Input::Text("a query".into())),
+    };
+    let mut payload = Vec::new();
+    request_proto.encode(&mut payload).expect("encode proto");
+    let body = frame_grpc_web(&payload);
+
+    let client = reqwest::Client::builder()
+        .http1_only()
+        .build()
+        .expect("reqwest client");
+    let response = client
+        .post(format!(
+            "http://{addr}/jammi.v1.embedding.EmbeddingService/EncodeQuery"
+        ))
+        .header("content-type", "application/grpc-web+proto")
+        .header("accept", "application/grpc-web+proto")
+        .header("x-grpc-web", "1")
+        .header("jammi-session-id", "layered-grpc-web-error")
+        .body(body)
+        .send()
+        .await
+        .expect("grpc-web POST");
+
+    // gRPC-web reports application errors as HTTP 200; the status rides the
+    // in-body trailer frame, never a trailers-only HTTP header.
+    assert_eq!(response.status(), 200, "gRPC-Web shim returns 200 OK");
+    assert!(
+        response.headers().get("grpc-status").is_none(),
+        "grpc-status must be repaired into the in-body trailer frame, not left as an HTTP header"
+    );
+
+    let body_bytes = response.bytes().await.expect("response body");
+    let trailers = grpc_web_trailer_block(&body_bytes)
+        .expect("an error response must carry an in-body 0x80 trailer frame");
+    assert!(
+        trailers.contains("grpc-status: 3") || trailers.contains("grpc-status:3"),
+        "the in-body trailer frame must carry the engine error's status (3 = invalid_argument), got {trailers:?}"
+    );
+
+    // Hold the worker guard (if any) alive until after serving, per the contract.
+    #[cfg(feature = "train")]
+    let _keep = parts.train_worker;
+
+    let _ = shutdown_tx.send(());
+    let _ = handle.await;
+}

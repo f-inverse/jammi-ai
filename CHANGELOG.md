@@ -6,6 +6,24 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-07-09
+
+### Fixed
+- **Text-embedding pooling is now model-declared, read from the model's
+  `1_Pooling/config.json` (`jammi-ai`).** The embedding path previously
+  mean-pooled every encoder unconditionally, silently mis-pooling CLS-pooled
+  sentence-transformers models (BGE, GTE, many E5/BGE-family) and degrading
+  their retrieval quality. On model load the resolver now reads the
+  sentence-transformers `1_Pooling/config.json` (in all three resolution paths,
+  with fine-tuned-base carry-through) and the BERT-family embedding wrappers
+  pool with the declared strategy (`Cls`/`Mean`/`Max`/`WeightedMean`) via the
+  shared `jammi_encoders::pool_and_normalize`. Selection is fail-loud: a
+  genuinely absent file falls back to mean (logged), `mean_sqrt_len_tokens` maps
+  to mean (an exact post-L2-normalize equivalence), and an unrepresentable mode
+  (e.g. `pooling_mode_lasttoken`), an ambiguous multi-mode declaration, or a
+  present-but-unparseable file is a hard error rather than a silent wrong
+  embedding. Embedded and remote select the same mode for the same model.
+
 ## [0.38.0] - 2026-07-09
 
 ### Added

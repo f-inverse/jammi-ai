@@ -159,12 +159,12 @@ print(f"  missing on EmbeddedBackend: {emb_missing or 'none'}")
 print(f"  missing on RemoteDatabase:  {rem_missing or 'none'}")
 
 assert verbs == par["session_protocol_verbs"]
-assert len(verbs) == par["verb_count"] == 49
+assert len(verbs) == par["verb_count"]
 assert emb_missing == rem_missing == [], "both backends carry the whole shared vocabulary"
 assert par["both_complete"] is True
 ```
 
-Forty-nine verbs, both backends complete, no drift. A caller writes one program against the
+Every shared verb is present on both backends, no drift. A caller writes one program against the
 `Session` surface; the target picks the transport. What the Protocol deliberately leaves *off*
 this shared list — the one-sided, capability-gated members — is the subject of the next seam.
 

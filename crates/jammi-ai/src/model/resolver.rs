@@ -107,6 +107,7 @@ impl ModelResolver {
                     tokenizer: base_resolved.tokenizer,
                     model_config: base_resolved.model_config,
                     preprocessor_config: base_resolved.preprocessor_config,
+                    pooling_config: base_resolved.pooling_config,
                     base_model_id: Some(ModelId(base_id.clone())),
                     adapter_path,
                     estimated_memory: base_resolved.estimated_memory,
@@ -192,6 +193,7 @@ impl ModelResolver {
             tokenizer,
             model_config,
             preprocessor_config: read_local_preprocessor_config(&artifact_dir),
+            pooling_config: read_local_pooling_config(&artifact_dir),
             base_model_id: record.base_model_id.map(ModelId),
             adapter_path: None,
             estimated_memory,
@@ -301,6 +303,7 @@ impl ModelResolver {
             tokenizer,
             model_config: config,
             preprocessor_config: read_local_preprocessor_config(path),
+            pooling_config: read_local_pooling_config(path),
             base_model_id: None,
             adapter_path: None,
             estimated_memory,
@@ -332,6 +335,15 @@ impl ModelResolver {
         // an error — only audio models read it downstream.
         let preprocessor_config: Option<serde_json::Value> = repo
             .get("preprocessor_config.json")
+            .ok()
+            .and_then(|p| std::fs::File::open(p).ok())
+            .and_then(|f| serde_json::from_reader(f).ok());
+
+        // Sentence-transformers pooling declaration. Optional: bare BERT repos
+        // don't ship it — a missing file is not an error, only the mean
+        // fallback applies downstream.
+        let pooling_config: Option<serde_json::Value> = repo
+            .get("1_Pooling/config.json")
             .ok()
             .and_then(|p| std::fs::File::open(p).ok())
             .and_then(|f| serde_json::from_reader(f).ok());
@@ -377,6 +389,7 @@ impl ModelResolver {
             tokenizer,
             model_config: config,
             preprocessor_config,
+            pooling_config,
             base_model_id: None,
             adapter_path: None,
             estimated_memory,
@@ -440,6 +453,16 @@ impl ModelResolver {
 /// front-end is driven by; absent for text/vision models, which don't use it.
 fn read_local_preprocessor_config(dir: &Path) -> Option<serde_json::Value> {
     let path = dir.join("preprocessor_config.json");
+    std::fs::File::open(path)
+        .ok()
+        .and_then(|f| serde_json::from_reader(f).ok())
+}
+
+/// Read and parse `1_Pooling/config.json` from a local model directory, if
+/// present. This is the sentence-transformers pooling declaration; absent for
+/// bare BERT repos, which fall back to mean pooling.
+fn read_local_pooling_config(dir: &Path) -> Option<serde_json::Value> {
+    let path = dir.join("1_Pooling/config.json");
     std::fs::File::open(path)
         .ok()
         .and_then(|f| serde_json::from_reader(f).ok())

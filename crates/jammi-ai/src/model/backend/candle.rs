@@ -29,10 +29,13 @@ pub struct CandleBackend;
 /// `forward_hidden` returns `[batch, seq, hidden]` per-token hidden states
 /// for classification / NER paths. `forward_pooled` returns the final
 /// `[batch, output_dim]` pooled-and-L2-normalized embedding used by the
-/// embedding path; BERT-family encoders fall through to the provided
-/// default (mean-pool + L2-normalize over `forward_hidden`), while the
+/// embedding path; the three BERT-family wrappers override it to pool with
+/// the strategy their model's `1_Pooling/config.json` declares (mean
+/// fallback when the file is absent — see `pooling_from_config`), while the
 /// OpenCLIP text tower overrides it to expose its pre-pooled projected
-/// output directly.
+/// output directly. The trait-default implementation (mean-pool +
+/// L2-normalize over `forward_hidden`) is the base for any future wrapper
+/// that doesn't need model-declared pooling.
 pub(crate) trait CandleTextForward: Send + Sync {
     fn forward_hidden(
         &self,
@@ -44,8 +47,9 @@ pub(crate) trait CandleTextForward: Send + Sync {
 
     /// Pooled and L2-normalized `[batch, output_dim]` embedding. Default
     /// implementation mean-pools the masked output of `forward_hidden` and
-    /// L2-normalizes it; encoders whose `forward_hidden` is already pooled
-    /// (e.g. OpenCLIP text) override this directly.
+    /// L2-normalizes it; encoders that need a different or model-declared
+    /// strategy (the BERT family) or whose `forward_hidden` is already
+    /// pooled (e.g. OpenCLIP text) override this directly.
     fn forward_pooled(
         &self,
         input_ids: &Tensor,
@@ -108,8 +112,21 @@ impl CandleAudioForward for HtsatAudio {
     }
 }
 
-/// BERT-family forward pass (bert, roberta, camembert, xlm-roberta).
-struct BertForward(Bert);
+/// Pool+L2-normalize `hidden` per `strategy`, via the single shared
+/// implementation in `jammi_encoders` — DRY across every BERT-family
+/// embedding wrapper's `forward_pooled` override.
+fn pool_via(hidden: &Tensor, attention_mask: &Tensor, strategy: Pooling) -> Result<Tensor> {
+    jammi_encoders::pool_and_normalize(hidden, attention_mask, strategy)
+        .map_err(|e| JammiError::Inference(format!("pooling failed: {e}")))
+}
+
+/// BERT-family forward pass (bert, roberta, camembert, xlm-roberta). Carries
+/// the pooling strategy the model's `1_Pooling/config.json` declares (mean
+/// fallback if the file is absent) and pools+normalizes with it.
+struct BertForward {
+    model: Bert,
+    pooling: Pooling,
+}
 
 impl CandleTextForward for BertForward {
     fn forward_hidden(
@@ -119,14 +136,30 @@ impl CandleTextForward for BertForward {
         _encoding: &BatchEncoding,
         _device: &Device,
     ) -> Result<Tensor> {
-        self.0
+        self.model
             .forward_hidden(input_ids, attention_mask)
             .map_err(|e| JammiError::Inference(format!("BERT forward pass failed: {e}")))
+    }
+
+    fn forward_pooled(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+        encoding: &BatchEncoding,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let hidden = self.forward_hidden(input_ids, attention_mask, encoding, device)?;
+        pool_via(&hidden, attention_mask, self.pooling)
     }
 }
 
 /// ModernBERT forward pass (rotary embeddings, GeGLU, no token_type_ids).
-struct ModernBertForward(ModernBert);
+/// Carries the pooling strategy the model's `1_Pooling/config.json` declares
+/// (mean fallback if the file is absent) and pools+normalizes with it.
+struct ModernBertForward {
+    model: ModernBert,
+    pooling: Pooling,
+}
 
 impl CandleTextForward for ModernBertForward {
     fn forward_hidden(
@@ -136,14 +169,31 @@ impl CandleTextForward for ModernBertForward {
         _encoding: &BatchEncoding,
         _device: &Device,
     ) -> Result<Tensor> {
-        self.0
+        self.model
             .forward_hidden(input_ids, attention_mask)
             .map_err(|e| JammiError::Inference(format!("ModernBERT forward pass failed: {e}")))
     }
+
+    fn forward_pooled(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+        encoding: &BatchEncoding,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let hidden = self.forward_hidden(input_ids, attention_mask, encoding, device)?;
+        pool_via(&hidden, attention_mask, self.pooling)
+    }
 }
 
-/// DistilBERT forward pass (no token_type_ids, different architecture from BERT).
-struct DistilBertForward(DistilBert);
+/// DistilBERT forward pass (no token_type_ids, different architecture from
+/// BERT). Carries the pooling strategy the model's `1_Pooling/config.json`
+/// declares (mean fallback if the file is absent) and pools+normalizes with
+/// it.
+struct DistilBertForward {
+    model: DistilBert,
+    pooling: Pooling,
+}
 
 impl CandleTextForward for DistilBertForward {
     fn forward_hidden(
@@ -153,9 +203,20 @@ impl CandleTextForward for DistilBertForward {
         _encoding: &BatchEncoding,
         _device: &Device,
     ) -> Result<Tensor> {
-        self.0
+        self.model
             .forward_hidden(input_ids, attention_mask)
             .map_err(|e| JammiError::Inference(format!("DistilBERT forward pass failed: {e}")))
+    }
+
+    fn forward_pooled(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+        encoding: &BatchEncoding,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let hidden = self.forward_hidden(input_ids, attention_mask, encoding, device)?;
+        pool_via(&hidden, attention_mask, self.pooling)
     }
 }
 
@@ -336,6 +397,107 @@ pub(crate) fn l2_normalize(tensor: &Tensor) -> Result<Tensor> {
     tensor
         .broadcast_div(&norm)
         .map_err(|e| JammiError::Inference(e.to_string()))
+}
+
+/// Map a parsed `1_Pooling/config.json` to the engine's [`Pooling`] strategy,
+/// failing loudly rather than silently mean-pooling a model whose declared
+/// mode the engine cannot represent.
+///
+/// - `cfg == None` (the file is genuinely absent) → `Mean`, the historical
+///   sentence-transformers default for bare BERT repos — observable via
+///   `tracing::info!`, never silent.
+/// - a present file must declare at least one recognized `pooling_mode_*`
+///   flag as `true`, all recognized true flags must map to the *same*
+///   [`Pooling`] strategy, and no true flag may be one the enum cannot
+///   represent (e.g. `pooling_mode_lasttoken`) — any violation is a hard
+///   error, because silently choosing `Mean` for an unrepresentable or
+///   ambiguous declaration is exactly the confident-wrong-embedding bug this
+///   mechanism exists to kill.
+fn pooling_from_config(cfg: Option<&serde_json::Value>, model_id: &str) -> Result<Pooling> {
+    let cfg = match cfg {
+        None => {
+            tracing::info!(
+                model_id,
+                "no 1_Pooling/config.json found; defaulting to mean pooling \
+                 (the sentence-transformers default for bare BERT repos)"
+            );
+            return Ok(Pooling::Mean);
+        }
+        Some(cfg) => cfg,
+    };
+
+    let obj = cfg.as_object().ok_or_else(|| JammiError::Model {
+        model_id: model_id.to_string(),
+        message: "1_Pooling/config.json is not a JSON object".into(),
+    })?;
+
+    // `pooling_mode_mean_sqrt_len_tokens` divides the token sum by sqrt(len)
+    // rather than len; both are positive scalar multiples of the same token
+    // sum, and `pool_and_normalize` mandatorily L2-normalizes its output, so
+    // the two are byte-identical post-normalization. This maps to `Mean`
+    // deliberately — it is an exact equivalence, not an approximation.
+    const RECOGNIZED: &[(&str, Pooling)] = &[
+        ("pooling_mode_cls_token", Pooling::Cls),
+        ("pooling_mode_mean_tokens", Pooling::Mean),
+        ("pooling_mode_max_tokens", Pooling::Max),
+        ("pooling_mode_weightedmean_tokens", Pooling::WeightedMean),
+        ("pooling_mode_mean_sqrt_len_tokens", Pooling::Mean),
+    ];
+
+    let true_flags: Vec<&str> = obj
+        .iter()
+        .filter(|(k, v)| k.starts_with("pooling_mode_") && v.as_bool() == Some(true))
+        .map(|(k, _)| k.as_str())
+        .collect();
+
+    if true_flags.is_empty() {
+        return Err(JammiError::Model {
+            model_id: model_id.to_string(),
+            message: "1_Pooling/config.json is present but declares no true pooling_mode_* flag"
+                .into(),
+        });
+    }
+
+    let unsupported: Vec<&str> = true_flags
+        .iter()
+        .copied()
+        .filter(|k| !RECOGNIZED.iter().any(|(name, _)| name == k))
+        .collect();
+    if !unsupported.is_empty() {
+        return Err(JammiError::Model {
+            model_id: model_id.to_string(),
+            message: format!(
+                "unsupported pooling mode(s) {unsupported:?} declared in 1_Pooling/config.json \
+                 — the engine cannot serve this encoder correctly"
+            ),
+        });
+    }
+
+    let mut distinct: Vec<Pooling> = Vec::new();
+    for flag in &true_flags {
+        let strategy = RECOGNIZED
+            .iter()
+            .find(|(name, _)| name == flag)
+            .map(|(_, p)| *p)
+            .expect("flag already checked against RECOGNIZED above");
+        if !distinct.contains(&strategy) {
+            distinct.push(strategy);
+        }
+    }
+
+    if distinct.len() > 1 {
+        return Err(JammiError::Model {
+            model_id: model_id.to_string(),
+            message: format!(
+                "1_Pooling/config.json declares {} distinct pooling strategies from \
+                 {true_flags:?} — sentence-transformers concatenates enabled modes (output \
+                 dim = n·hidden), which this engine's single-mode path cannot represent",
+                distinct.len()
+            ),
+        });
+    }
+
+    Ok(distinct[0])
 }
 
 impl CandleModel {
@@ -601,10 +763,11 @@ impl CandleModel {
             let input_ids = self.tokens_to_tensor(&encoding.input_ids)?;
             let attention_mask = self.tokens_to_tensor(&encoding.attention_masks)?;
 
-            // Each encoder controls its own pooling: BERT-family uses the
-            // default (mean-pool over `forward_hidden` masked by attention),
-            // OpenCLIP text returns its pre-pooled projected output. The
-            // result is already L2-normalized.
+            // Each encoder controls its own pooling: BERT-family pools with
+            // the strategy the model declares in `1_Pooling/config.json`
+            // (mean fallback when the file is absent), OpenCLIP text returns
+            // its pre-pooled projected output. The result is already
+            // L2-normalized.
             let normalized = self.text_forward()?.forward_pooled(
                 &input_ids,
                 &attention_mask,
@@ -1135,6 +1298,13 @@ impl ModelBackend for CandleBackend {
             resolved.weights_paths.iter().map(|p| p.as_path()).collect();
         let dummy_varmap = VarMap::new();
 
+        // The pooling strategy the text-embedding path uses for the three
+        // BERT-family wrappers, selected once from the model's declared
+        // `1_Pooling/config.json` (mean fallback if the file is absent). Read
+        // before the model-type match so every embedding wrapper below shares
+        // the identical resolved strategy.
+        let pooling = pooling_from_config(resolved.pooling_config.as_ref(), &resolved.model_id.0)?;
+
         // Branch: cross-modal model selection.
         //   - HF-CLAP (`clap_audio_model`): a single HTSAT-Swin audio tower
         //     producing shared-latent embeddings; routed in `forward()` by
@@ -1241,7 +1411,6 @@ impl ModelBackend for CandleBackend {
                             message: format!("Failed to parse DistilBERT config: {e}"),
                         })?;
                     let model = DistilBert::builder()
-                        .pooling(Pooling::Mean)
                         .lora(lora_build)
                         .backbone_dtype(encoder_backbone_dtype)
                         .adapter(encoder_adapter_file)
@@ -1250,7 +1419,7 @@ impl ModelBackend for CandleBackend {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to construct DistilBERT model: {e}"),
                         })?;
-                    Box::new(DistilBertForward(model))
+                    Box::new(DistilBertForward { model, pooling })
                 }
                 "bert" | "roberta" | "camembert" | "xlm-roberta" if is_classification => {
                     let bert_config: BertConfig = serde_json::from_value(model_config.clone())
@@ -1286,7 +1455,6 @@ impl ModelBackend for CandleBackend {
                             message: format!("Failed to parse BERT config: {e}"),
                         })?;
                     let bert = Bert::builder()
-                        .pooling(Pooling::Mean)
                         .lora(lora_build)
                         .backbone_dtype(encoder_backbone_dtype)
                         .adapter(encoder_adapter_file)
@@ -1295,7 +1463,10 @@ impl ModelBackend for CandleBackend {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to construct BERT model: {e}"),
                         })?;
-                    Box::new(BertForward(bert))
+                    Box::new(BertForward {
+                        model: bert,
+                        pooling,
+                    })
                 }
                 "modernbert" if is_classification => {
                     let mb_config: ModernBertConfig = serde_json::from_value(model_config.clone())
@@ -1328,7 +1499,6 @@ impl ModelBackend for CandleBackend {
                             message: format!("Failed to parse ModernBERT config: {e}"),
                         })?;
                     let model = ModernBert::builder()
-                        .pooling(Pooling::Mean)
                         .lora(lora_build)
                         .backbone_dtype(encoder_backbone_dtype)
                         .adapter(encoder_adapter_file)
@@ -1337,7 +1507,7 @@ impl ModelBackend for CandleBackend {
                             model_id: resolved.model_id.0.clone(),
                             message: format!("Failed to construct ModernBERT model: {e}"),
                         })?;
-                    Box::new(ModernBertForward(model))
+                    Box::new(ModernBertForward { model, pooling })
                 }
                 unsupported => {
                     return Err(JammiError::Model {
@@ -1859,5 +2029,87 @@ mod device_tests {
             flag.load(Ordering::SeqCst),
             "expected a loud warn-level CPU-fallback log"
         );
+    }
+}
+
+#[cfg(test)]
+mod pooling_from_config_tests {
+    use super::*;
+
+    #[test]
+    fn absent_file_falls_back_to_mean() {
+        assert_eq!(
+            pooling_from_config(None, "test-model").unwrap(),
+            Pooling::Mean
+        );
+    }
+
+    #[test]
+    fn cls_flag_selects_cls() {
+        let cfg = serde_json::json!({
+            "pooling_mode_cls_token": true,
+            "pooling_mode_mean_tokens": false,
+        });
+        assert_eq!(
+            pooling_from_config(Some(&cfg), "test-model").unwrap(),
+            Pooling::Cls
+        );
+    }
+
+    #[test]
+    fn mean_sqrt_len_alone_maps_to_mean() {
+        let cfg = serde_json::json!({
+            "pooling_mode_cls_token": false,
+            "pooling_mode_mean_sqrt_len_tokens": true,
+        });
+        assert_eq!(
+            pooling_from_config(Some(&cfg), "test-model").unwrap(),
+            Pooling::Mean
+        );
+    }
+
+    #[test]
+    fn lasttoken_flag_is_a_hard_error() {
+        let cfg = serde_json::json!({
+            "pooling_mode_cls_token": false,
+            "pooling_mode_lasttoken": true,
+        });
+        match pooling_from_config(Some(&cfg), "test-model") {
+            Err(JammiError::Model { model_id, message }) => {
+                assert_eq!(model_id, "test-model");
+                assert!(
+                    message.contains("pooling_mode_lasttoken"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected a hard error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cls_and_mean_both_true_is_a_hard_error() {
+        let cfg = serde_json::json!({
+            "pooling_mode_cls_token": true,
+            "pooling_mode_mean_tokens": true,
+        });
+        assert!(
+            pooling_from_config(Some(&cfg), "test-model").is_err(),
+            "an ambiguous multi-mode declaration must fail loudly, not silently pick one"
+        );
+    }
+
+    #[test]
+    fn present_file_with_no_true_flag_is_a_hard_error() {
+        let cfg = serde_json::json!({
+            "pooling_mode_cls_token": false,
+            "pooling_mode_mean_tokens": false,
+        });
+        assert!(pooling_from_config(Some(&cfg), "test-model").is_err());
+    }
+
+    #[test]
+    fn structurally_unparseable_file_is_a_hard_error() {
+        let cfg = serde_json::json!(["not", "an", "object"]);
+        assert!(pooling_from_config(Some(&cfg), "test-model").is_err());
     }
 }

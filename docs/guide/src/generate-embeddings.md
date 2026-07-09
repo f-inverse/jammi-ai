@@ -212,6 +212,23 @@ Use a local model:
 let model = ModelSource::local("/path/to/my-model");
 ```
 
+## Pooling
+
+Pooling — how per-token hidden states collapse into one sentence vector — is
+**model-declared**, not hardcoded. On load, the engine reads the model's
+`1_Pooling/config.json` (the sentence-transformers convention) and pools with
+the strategy it declares: `pooling_mode_cls_token` selects CLS pooling (first
+token — the mode BGE, GTE, and many E5-family models require), and
+`pooling_mode_mean_tokens` (or `pooling_mode_mean_sqrt_len_tokens`, which is
+exactly equivalent after the mandatory L2 normalization) selects mean
+pooling. Max and weighted-mean pooling are also supported.
+
+A model whose repository ships no `1_Pooling/` directory — many bare BERT
+checkpoints — falls back to mean pooling, the historical
+sentence-transformers default. A model whose `1_Pooling/config.json` declares
+a mode the engine cannot represent (e.g. last-token pooling, or more than one
+enabled mode at once) fails to load rather than silently pooling incorrectly.
+
 ## Raw inference (no persistence)
 
 To get embeddings as `RecordBatch` without writing to disk:

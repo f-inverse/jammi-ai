@@ -164,6 +164,12 @@ pub struct ResolvedModel {
     /// window, hop, mel-filter band, max length) the audio path needs so the
     /// bytes-to-spectrogram transform is config-driven, not hardcoded.
     pub preprocessor_config: Option<serde_json::Value>,
+    /// Parsed contents of `1_Pooling/config.json`, if present. Carries the
+    /// sentence-transformers pooling declaration (`pooling_mode_cls_token`,
+    /// `pooling_mode_mean_tokens`, etc.) so the text-embedding path pools the
+    /// way the model actually declares. Absent for bare BERT repos that ship
+    /// no `1_Pooling/` subfolder, in which case the mean default applies.
+    pub pooling_config: Option<serde_json::Value>,
     /// Parent model ID for fine-tuned variants.
     pub base_model_id: Option<ModelId>,
     /// Path to LoRA adapter directory (for fine-tuned models).

@@ -6,6 +6,26 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-07-09
+
+### Added
+- **`EmbeddingService.ImportEmbeddings` — register precomputed vectors without
+  re-running the model (`jammi-server`/`jammi-ai`).** A generic wire RPC that
+  promotes the in-process `materialize_embedding_table` so an SDK/gRPC consumer
+  can register precomputed doc vectors as a first-class `(source, model)` ready
+  embedding table — remote vector upsert / migration / recompute-avoidance. The
+  vectors arrive as a `StorageUrl` Parquet (`(_row_id, vector)`); the engine
+  validates each vector's width, **L2-normalizes** it (upholding the cosine-ANN
+  unit-vector invariant every embedding table carries, rejecting zero/non-finite
+  norms), and lands it through the single materialization funnel with a
+  content-complete `ProducingDescriptor::External` (its `params` fold every
+  determinant, including a digest of the normalized vectors, so distinct imports
+  never collide on one definition hash). `model_id` is canonicalized, never
+  loaded, so the import runs GPU-free; the resulting table is recompute-inert.
+  Available on both the remote and embedded (`Session::import_embeddings`) paths.
+  The catalog provenance (`key_column`, `text_columns`) carried on
+  `EmbeddingTableSpec` is now parameterized; the physical key stays `_row_id`.
+
 ## [0.37.0] - 2026-07-08
 
 ### Changed

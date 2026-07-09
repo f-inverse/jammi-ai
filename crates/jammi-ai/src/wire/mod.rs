@@ -32,8 +32,9 @@ pub use catalog::{
 };
 pub use embedding::{
     encode_query_from_bytes, encode_query_from_proto, generate_embeddings_from_bytes,
-    generate_embeddings_from_proto, search_from_bytes, search_from_proto, EncodeQueryArgs,
-    GenerateEmbeddingsArgs,
+    generate_embeddings_from_proto, import_embeddings_from_bytes, import_embeddings_from_proto,
+    search_from_bytes, search_from_proto, EncodeQueryArgs, GenerateEmbeddingsArgs,
+    ImportEmbeddingsArgs,
 };
 pub use eval::{
     eval_calibration_from_bytes, eval_calibration_from_proto, eval_compare_from_bytes,

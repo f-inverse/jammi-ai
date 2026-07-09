@@ -117,6 +117,16 @@ class Session(Protocol):
         modality: Optional[str] = None,
         cache: Optional[str] = None,
     ) -> str: ...
+    def import_embeddings(
+        self,
+        *,
+        source: str,
+        model: str,
+        vectors_url: str,
+        key: str,
+        text_columns: Optional[List[str]] = None,
+        dimensions: int,
+    ) -> str: ...
     def search(
         self,
         source: str,

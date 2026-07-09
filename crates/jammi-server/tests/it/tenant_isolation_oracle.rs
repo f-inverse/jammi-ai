@@ -992,6 +992,21 @@ fn cases() -> Vec<IsolationCase> {
                 assert_embedding_resolver_isolated().await;
             }
         ),
+        // ImportEmbeddings writes a tenant-scoped ready embedding table from
+        // PRECOMPUTED vectors — no GPU, no source scan — so it is covered as a
+        // real Hermetic case (not a resolver stand-in): tenant A drives the whole
+        // import under its scope through the single materialization funnel, and
+        // tenant B can neither resolve the resulting table nor read its catalog
+        // row.
+        case!(
+            "EmbeddingService",
+            "ImportEmbeddings",
+            CaseKind::Hermetic,
+            None,
+            {
+                assert_import_isolated().await;
+            }
+        ),
         case!(
             "InferenceService",
             "Infer",
@@ -1260,6 +1275,105 @@ async fn assert_embedding_resolver_isolated() {
     assert!(
         cat_b.resolve_embedding_table("src_a", None).await.is_err(),
         "CROSS-TENANT LEAK: tenant B resolved tenant A's embedding table"
+    );
+}
+
+/// Write a small `(_row_id: Utf8, vector: FixedSizeList<Float32>[dims])` Parquet
+/// of precomputed vectors and return its `file://` StorageUrl — the input an
+/// `ImportEmbeddings` call reads. Vectors are non-zero (import L2-normalizes them
+/// and rejects zero-norm), so the import lands a real ready table.
+fn write_import_vectors_parquet(dir: &TempDir, dims: usize) -> String {
+    use parquet::arrow::ArrowWriter;
+
+    let path = dir.path().join("import_vectors.parquet");
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_row_id", DataType::Utf8, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(item.clone(), dims as i32),
+            false,
+        ),
+    ]));
+    let n = 3usize;
+    let row_id = StringArray::from_iter_values((0..n).map(|i| format!("doc-{i}")));
+    // Distinct, non-zero vectors so each row is L2-normalizable.
+    let flat: Vec<f32> = (0..n)
+        .flat_map(|i| (0..dims).map(move |d| (i * dims + d + 1) as f32))
+        .collect();
+    let vectors =
+        FixedSizeListArray::try_new(item, dims as i32, Arc::new(Float32Array::from(flat)), None)
+            .unwrap();
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(row_id), Arc::new(vectors)]).unwrap();
+    let file = std::fs::File::create(&path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    format!("file://{}", path.display())
+}
+
+/// `import_embeddings` writes a ready embedding table from precomputed vectors,
+/// stamping the catalog row with the scoped tenant. It resolves nothing at
+/// write time except the storage object it is handed, so the tenant boundary is
+/// the row it writes: a peer can neither resolve the source's embedding table
+/// nor read the imported row. Tenant A drives the real import under its scope;
+/// tenant B is refused on both reads.
+async fn assert_import_isolated() {
+    const DIMS: usize = 4;
+    let source_id = "import-src";
+
+    let dir = tempdir().unwrap();
+    let engine = Arc::new(
+        InferenceSession::new(test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let session = Session::new(Arc::clone(&engine));
+    let vectors_url = write_import_vectors_parquet(&dir, DIMS);
+    let text_columns = vec!["body".to_string()];
+
+    // Tenant A imports its own embedding table; `materialize_embedding_table`
+    // stamps the catalog row with tenant A (the scoped tenant).
+    let table_name = engine
+        .with_tenant_scoped(tenant_a(), |_scope| {
+            session.import_embeddings(
+                source_id,
+                "import-model",
+                &vectors_url,
+                "doc_id",
+                &text_columns,
+                DIMS,
+            )
+        })
+        .await
+        .expect("tenant A must import its own embedding table")
+        .table_name;
+
+    let cat_a = engine.catalog().pinned_to_tenant(Some(tenant_a()));
+    let cat_b = engine.catalog().pinned_to_tenant(Some(tenant_b()));
+
+    // Tenant A resolves the source's ready embedding table and reads the row.
+    assert!(
+        cat_a.resolve_embedding_table(source_id, None).await.is_ok(),
+        "tenant A must resolve its own imported embedding table"
+    );
+    assert!(
+        cat_a.get_result_table(&table_name).await.unwrap().is_some(),
+        "tenant A must read its own imported table row"
+    );
+
+    // Tenant B can neither resolve the source's embedding table nor read the row.
+    assert!(
+        cat_b
+            .resolve_embedding_table(source_id, None)
+            .await
+            .is_err(),
+        "CROSS-TENANT LEAK: tenant B resolved tenant A's imported embedding table"
+    );
+    assert!(
+        cat_b.get_result_table(&table_name).await.unwrap().is_none(),
+        "CROSS-TENANT LEAK: tenant B read tenant A's imported table row"
     );
 }
 

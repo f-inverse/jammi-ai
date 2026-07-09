@@ -316,6 +316,32 @@ impl PyDatabase {
         Ok(record.table_name)
     }
 
+    /// Register precomputed embeddings from a serialized
+    /// `ImportEmbeddingsRequest` body, promoting the vectors at the request's
+    /// `vectors_url` into a ready embedding table without re-running the model.
+    /// The thin Python `Database` wrapper builds this request with the same
+    /// pure-Python assembly the remote client uses (`jammi._assembly`),
+    /// serializes it, and hands the bytes here, so the embedded and remote import
+    /// paths share one request assembly and one decode seam
+    /// (`jammi_ai::wire::import_embeddings_from_bytes`). Returns the result table
+    /// name. A malformed or invalid body raises `ValueError`.
+    fn _import_embeddings_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
+        let args =
+            jammi_ai::wire::import_embeddings_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
+        let record = self
+            .runtime
+            .block_on(self.local_session().import_embeddings(
+                &args.source_id,
+                &args.model_id,
+                &args.vectors_url,
+                &args.key_column,
+                &args.text_columns,
+                args.dimensions,
+            ))
+            .map_err(to_pyerr)?;
+        Ok(record.table_name)
+    }
+
     /// Run inference from a serialized `InferRequest` body. The thin Python
     /// `Database` wrapper builds this request with the same pure-Python assembly
     /// the remote client uses (`jammi._assembly`), serializes it, and

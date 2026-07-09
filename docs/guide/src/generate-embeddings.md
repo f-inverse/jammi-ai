@@ -122,6 +122,71 @@ session.generate_text_embeddings("patents", "bge-small-en-v1.5", &["title".into(
 
 When searching, the latest ready embedding table is used by default.
 
+## Import precomputed embeddings
+
+When the vectors already exist — computed by an offline batch, migrated from
+another store, or upserted from a remote encoder — register them directly as a
+ready embedding table instead of re-running the model. The input is a Parquet
+object with a `_row_id` (Utf8) column and a `vector` (`FixedSizeList<Float32>`
+of width `dimensions`) column, one row per key.
+
+### Rust
+
+```rust,no_run
+# extern crate jammi_db;
+# extern crate jammi_ai;
+# extern crate tokio;
+# use jammi_ai::session::InferenceSession;
+# async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
+use jammi_db::storage::StorageUrl;
+
+let vectors = StorageUrl::parse("file:///data/precomputed.parquet")?;
+let record = session.import_embeddings(
+    "patents",
+    "sentence-transformers/all-MiniLM-L6-v2",
+    &vectors,
+    "id",
+    &["abstract".to_string()],
+    384,
+).await?;
+
+println!("Imported {} rows, {} dimensions", record.row_count, record.dimensions.unwrap());
+# Ok(()) }
+```
+
+### Python
+
+```python
+db.import_embeddings(
+    source="patents",
+    model="sentence-transformers/all-MiniLM-L6-v2",
+    vectors_url="file:///data/precomputed.parquet",
+    key="id",
+    text_columns=["abstract"],
+    dimensions=384,
+)
+```
+
+The result is indistinguishable from a generated table — same
+`(_row_id, _source_id, _model_id, vector)` schema, same sidecar ANN index — so
+`search` queries it exactly like any other embedding table. Three behaviours are
+specific to import:
+
+- **Vectors are L2-normalized on import.** Every embedding table holds unit
+  vectors (the cosine ANN sidecar assumes it), so each incoming vector is
+  normalized and a zero-norm vector is rejected — it cannot be cosine-searched.
+- **The model is validated, not loaded.** `model` is parsed to its canonical
+  form and recorded as the table's derivation provenance; import never loads the
+  encoder or downloads weights, so it needs no GPU. `key` and `text_columns` are
+  recorded as catalog provenance (which source column the keys came from, which
+  content columns produced the vectors); the physical key stays `_row_id`.
+- **The table is recompute-inert.** The engine did not compute these vectors, so
+  a `recompute` of an imported table is a typed refusal rather than a re-run
+  guessed from its columns.
+
+The input vectors are read fully into memory; a streaming variant is future
+work.
+
 ## Supported models
 
 Any encoder model on HuggingFace Hub with safetensors weights. Supported architectures:

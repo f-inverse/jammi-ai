@@ -55,6 +55,7 @@ RPC CatalogService/Staleness
 RPC CatalogService/VerifyMaterialization
 RPC EmbeddingService/EncodeQuery
 RPC EmbeddingService/GenerateEmbeddings
+RPC EmbeddingService/ImportEmbeddings
 RPC EmbeddingService/Search
 RPC EvalService/EvalCalibration
 RPC EvalService/EvalCompare

@@ -47,6 +47,7 @@ from ._assembly import (
     build_fine_tune_graph_request,
     build_fine_tune_request,
     build_generate_embeddings_request,
+    build_import_embeddings_request,
     build_infer_request,
     build_neighbor_graph_request,
     build_propagate_embeddings_request,
@@ -1251,6 +1252,37 @@ class RemoteDatabase:
             cache=cache,
         )
         resp = self._call(self._embedding.GenerateEmbeddings, request)
+        return resp.table_name
+
+    def import_embeddings(
+        self,
+        *,
+        source: str,
+        model: str,
+        vectors_url: str,
+        key: str,
+        text_columns: Optional[List[str]] = None,
+        dimensions: int,
+    ) -> str:
+        """Register precomputed per-row vectors as a ready `(source, model)`
+        embedding table without re-running the encoder.
+
+        `vectors_url` is the StorageUrl of a Parquet holding one row per key (a
+        `_row_id` Utf8 column and a `vector` FixedSizeList<Float32> column of
+        width `dimensions`); each vector is L2-normalized on import (a zero-norm
+        vector is rejected). `key` / `text_columns` are recorded as catalog
+        provenance while the physical key stays `_row_id`. Returns the result
+        table name. Maps to `EmbeddingService.ImportEmbeddings`.
+        """
+        request = build_import_embeddings_request(
+            source=source,
+            model=model,
+            vectors_url=vectors_url,
+            key=key,
+            text_columns=text_columns,
+            dimensions=dimensions,
+        )
+        resp = self._call(self._embedding.ImportEmbeddings, request)
         return resp.table_name
 
     def search(

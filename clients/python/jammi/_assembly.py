@@ -1135,6 +1135,35 @@ def build_generate_embeddings_request(
     )
 
 
+def build_import_embeddings_request(
+    *,
+    source: str,
+    model: str,
+    vectors_url: str,
+    key: str,
+    text_columns: Optional[List[str]] = None,
+    dimensions: int,
+) -> embedding_pb2.ImportEmbeddingsRequest:
+    """Assemble the `ImportEmbeddingsRequest` for a precomputed-vector import from
+    the binding's flat kwargs.
+
+    `vectors_url` is the StorageUrl of a Parquet holding one row per key (a
+    `_row_id` Utf8 column and a `vector` FixedSizeList<Float32> column of width
+    `dimensions`); `key` names the source key column recorded as provenance;
+    `text_columns` names the source content columns the vectors were computed
+    from (provenance, defaulting to none). The same request the embed binding
+    submits in-process.
+    """
+    return embedding_pb2.ImportEmbeddingsRequest(
+        source_id=source,
+        model_id=model,
+        vectors_url=vectors_url,
+        key_column=key,
+        text_columns=list(text_columns or []),
+        dimensions=dimensions,
+    )
+
+
 def build_encode_query_request(
     *,
     model: str,

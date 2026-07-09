@@ -150,6 +150,8 @@ async fn graph_session(
                 model_id: "synthetic-embed",
                 derived_from: None,
                 dimensions: DIM,
+                key_column: "_row_id",
+                text_columns: None,
             },
             &pairs,
             jammi_db::store::manifest::Materialization::new(&__d, &__e, __i),

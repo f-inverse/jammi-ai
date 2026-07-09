@@ -44,8 +44,8 @@ use arrow::util::display::{ArrayFormatter, FormatOptions};
 
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingService;
 use crate::grpc::proto::embedding::{
-    EncodeQueryRequest, EncodeQueryResponse, GenerateEmbeddingsRequest, ResultTable, SearchHit,
-    SearchRequest, SearchResponse,
+    EncodeQueryRequest, EncodeQueryResponse, GenerateEmbeddingsRequest, ImportEmbeddingsRequest,
+    ResultTable, SearchHit, SearchRequest, SearchResponse,
 };
 use crate::grpc::wire::{map_engine_error, scoped, session_tenant_traced};
 
@@ -100,6 +100,39 @@ impl EmbeddingService for EmbeddingServer {
         Ok(Response::new(jammi_wire::result_table_with_outcome(
             record,
             jammi_ai::wire::cache_outcome_to_proto(&outcome),
+        )))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
+    async fn import_embeddings(
+        &self,
+        request: Request<ImportEmbeddingsRequest>,
+    ) -> Result<Response<ResultTable>, Status> {
+        let tenant = session_tenant_traced(&request);
+        // Decode through the shared `jammi_ai::wire` seam — the same decode the
+        // embedded binding's `_import_embeddings_proto` drives — so both
+        // transports validate and submit an identical request.
+        let args = jammi_ai::wire::import_embeddings_from_proto(request.into_inner())?;
+        let session = self.local();
+
+        let record = scoped(&self.session, tenant, || {
+            session.import_embeddings(
+                &args.source_id,
+                &args.model_id,
+                &args.vectors_url,
+                &args.key_column,
+                &args.text_columns,
+                args.dimensions,
+            )
+        })
+        .await
+        .map_err(map_engine_error)?;
+
+        // A fresh import always computes (no producer cache); carry the honest
+        // `COMPUTED` outcome so the wire shape matches `GenerateEmbeddings`.
+        Ok(Response::new(jammi_wire::result_table_with_outcome(
+            record,
+            jammi_ai::wire::cache_outcome_to_proto(&jammi_db::store::CacheOutcome::Computed),
         )))
     }
 

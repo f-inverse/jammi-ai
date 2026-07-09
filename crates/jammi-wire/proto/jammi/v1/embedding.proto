@@ -41,6 +41,22 @@ service EmbeddingService {
   // abstraction's `encode_query`.
   rpc EncodeQuery(EncodeQueryRequest) returns (EncodeQueryResponse);
 
+  // Register a set of PRECOMPUTED per-row vectors as a first-class ready
+  // embedding table WITHOUT re-running any encoder. The producer already ran
+  // the model elsewhere (a remote vector upsert, a migration off another store,
+  // or an offline recompute-avoidance batch); this promotes those vectors into
+  // a `(source, model)` embedding table the engine's `Search` can query, keyed
+  // and indexed exactly like a `GenerateEmbeddings` output. Each incoming vector
+  // is L2-normalized on import (every embedding table holds normalized vectors —
+  // the cosine ANN sidecar assumes it); a zero-norm vector is rejected. The
+  // `model_id` is recorded as the table's derivation provenance after being
+  // parsed to its canonical form — it is validated as a well-formed encoder
+  // reference, not loaded, so import needs no GPU. The resulting table is
+  // recompute-inert: the engine did not compute it, so a `Recompute` of it is a
+  // typed refusal, never a guessed re-run. Peer of the abstraction's
+  // `import_embeddings`.
+  rpc ImportEmbeddings(ImportEmbeddingsRequest) returns (ResultTable);
+
   // Nearest-neighbor search over a source's embedding table. The query is
   // either a precomputed vector (encode-then-search) or an existing row's key
   // (query-by-example; the engine resolves that row's stored vector
@@ -106,6 +122,31 @@ message ResultTable {
   // catalog `DescribeSource` projection), so reuse is observable without
   // claiming a producer ran. Mirrors the engine's `CacheOutcome`.
   jammi.v1.inference.CacheOutcome cache_outcome = 8;
+}
+
+message ImportEmbeddingsRequest {
+  // Source the imported rows belong to (recorded as the result table's
+  // `source_id`, the same handle `Search` resolves the table by).
+  string source_id = 1;
+  // Encoder that produced these vectors. `local:<path>`, an HF repo id, or a
+  // fine-tuned id — recorded as the table's derivation provenance in its
+  // canonical form. Validated as a well-formed reference only; never loaded, so
+  // import runs GPU-free.
+  string model_id = 2;
+  // StorageUrl of a Parquet object holding the precomputed vectors, one row per
+  // key: a `_row_id` (Utf8) column and a `vector` (`FixedSizeList<Float32>` of
+  // width `dimensions`) column. Read fully into memory on import.
+  string vectors_url = 3;
+  // The source key-column name recorded as catalog provenance (which column of
+  // the origin the `_row_id` values came from). The physical key stays
+  // `_row_id`; this is lineage, not a schema change.
+  string key_column = 4;
+  // The source content columns these vectors were computed from, recorded as
+  // catalog provenance. Empty when the producer does not attribute source
+  // columns.
+  repeated string text_columns = 5;
+  // Width of every incoming vector. Each row is validated to this width.
+  uint32 dimensions = 6;
 }
 
 message EncodeQueryRequest {

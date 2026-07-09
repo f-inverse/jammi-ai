@@ -236,6 +236,39 @@ impl Session {
         }
     }
 
+    /// Register precomputed per-row vectors as a ready `(source, model)`
+    /// embedding table without re-running the encoder.
+    ///
+    /// `vectors_url` is the StorageUrl of a Parquet object holding one row per
+    /// key — a `_row_id` (Utf8) column and a `vector` (`FixedSizeList<Float32>`
+    /// of width `dimensions`) column. Each vector is L2-normalized on import (a
+    /// zero-norm vector is rejected — it cannot be cosine-searched);
+    /// `key_column` / `text_columns` are recorded as catalog provenance while
+    /// the physical key stays `_row_id`. `model_id` is canonicalized and
+    /// recorded as derivation provenance without being loaded (GPU-free). The
+    /// resulting table is recompute-inert. Returns the result-table record.
+    pub async fn import_embeddings(
+        &self,
+        source_id: &str,
+        model_id: &str,
+        vectors_url: &str,
+        key_column: &str,
+        text_columns: &[String],
+        dimensions: usize,
+    ) -> Result<ResultTableRecord> {
+        let url = jammi_db::storage::StorageUrl::parse(vectors_url)?;
+        self.engine
+            .import_embeddings(
+                source_id,
+                model_id,
+                &url,
+                key_column,
+                text_columns,
+                dimensions,
+            )
+            .await
+    }
+
     /// Encode a single query into a vector with the given model. The `modality`
     /// selects the tower; `input` must match it (text for [`Modality::Text`],
     /// bytes for image/audio).

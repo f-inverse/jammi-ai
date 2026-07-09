@@ -63,6 +63,16 @@ pub struct EmbeddingTableSpec<'a> {
     pub derived_from: Option<&'a str>,
     /// The embedding width of every output vector.
     pub dimensions: usize,
+    /// The source key-column name recorded as catalog provenance (the catalog
+    /// `key_column`). The *physical* key of every embedding table is always
+    /// `_row_id`; this names which column of the origin those keys came from,
+    /// so lineage survives without changing the output schema. Producers that
+    /// key straight off `_row_id` pass `"_row_id"`.
+    pub key_column: &'a str,
+    /// The source content columns these vectors were computed from, recorded as
+    /// the catalog `text_columns` provenance (joined). `None` when no source
+    /// columns are attributed (a pooled or externally-produced batch).
+    pub text_columns: Option<&'a str>,
 }
 
 /// Returned by [`ResultStore::create_table`] — the generated paths and name
@@ -862,10 +872,14 @@ impl ResultStore {
             model_id,
             derived_from,
             dimensions,
+            key_column,
+            text_columns,
         } = spec;
 
         // A normal embedding result table (S9 vocabulary: kind='model'); the
         // task is the embedding task that drives the sidecar-index sidecar URL.
+        // The physical key stays `_row_id` (the output schema is invariant);
+        // `key_column` / `text_columns` are the caller's source-side provenance.
         let table_info = self
             .create_table(
                 source_id,
@@ -874,8 +888,8 @@ impl ResultStore {
                 derived_from,
                 model_id,
                 Some(dimensions as i32),
-                Some("_row_id"),
-                None,
+                Some(key_column),
+                text_columns,
             )
             .await?;
 

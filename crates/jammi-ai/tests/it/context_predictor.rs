@@ -163,6 +163,8 @@ async fn session_with_meta_dataset_named(
                 model_id: "synthetic-embed",
                 derived_from: None,
                 dimensions: FEATURE_DIM,
+                key_column: "_row_id",
+                text_columns: None,
             },
             &pairs,
             jammi_db::store::manifest::Materialization::new(&__d, &__e, __i),

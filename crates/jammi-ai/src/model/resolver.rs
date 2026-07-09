@@ -184,6 +184,8 @@ impl ModelResolver {
             .map(|m| m.len() as usize)
             .sum();
 
+        let pooling_config = read_local_pooling_config(&artifact_dir, &model_id.0)?;
+
         Ok(Some(ResolvedModel {
             model_id,
             backend,
@@ -193,7 +195,7 @@ impl ModelResolver {
             tokenizer,
             model_config,
             preprocessor_config: read_local_preprocessor_config(&artifact_dir),
-            pooling_config: read_local_pooling_config(&artifact_dir),
+            pooling_config,
             base_model_id: record.base_model_id.map(ModelId),
             adapter_path: None,
             estimated_memory,
@@ -303,7 +305,7 @@ impl ModelResolver {
             tokenizer,
             model_config: config,
             preprocessor_config: read_local_preprocessor_config(path),
-            pooling_config: read_local_pooling_config(path),
+            pooling_config: read_local_pooling_config(path, &source.to_string())?,
             base_model_id: None,
             adapter_path: None,
             estimated_memory,
@@ -340,13 +342,23 @@ impl ModelResolver {
             .and_then(|f| serde_json::from_reader(f).ok());
 
         // Sentence-transformers pooling declaration. Optional: bare BERT repos
-        // don't ship it — a missing file is not an error, only the mean
-        // fallback applies downstream.
-        let pooling_config: Option<serde_json::Value> = repo
-            .get("1_Pooling/config.json")
-            .ok()
-            .and_then(|p| std::fs::File::open(p).ok())
-            .and_then(|f| serde_json::from_reader(f).ok());
+        // don't ship it — the repo not having the file is not an error, only
+        // the mean fallback applies downstream. But once the file HAS been
+        // downloaded, it must be readable and parseable JSON — a corrupt
+        // pooling declaration must never collapse into the same "absent"
+        // case that drives the mean fallback.
+        let pooling_config: Option<serde_json::Value> = match repo.get("1_Pooling/config.json") {
+            Err(_) => None,
+            Ok(downloaded_path) => {
+                let file = std::fs::File::open(&downloaded_path)?;
+                Some(
+                    serde_json::from_reader(file).map_err(|e| JammiError::Model {
+                        model_id: source.to_string(),
+                        message: format!("1_Pooling/config.json is present but unparseable: {e}"),
+                    })?,
+                )
+            }
+        };
 
         let backend = backend_hint.unwrap_or_else(|| self.select_backend_hf(&repo));
 
@@ -458,14 +470,32 @@ fn read_local_preprocessor_config(dir: &Path) -> Option<serde_json::Value> {
         .and_then(|f| serde_json::from_reader(f).ok())
 }
 
-/// Read and parse `1_Pooling/config.json` from a local model directory, if
-/// present. This is the sentence-transformers pooling declaration; absent for
-/// bare BERT repos, which fall back to mean pooling.
-fn read_local_pooling_config(dir: &Path) -> Option<serde_json::Value> {
+/// Read and parse `1_Pooling/config.json` from a local model directory.
+///
+/// Returns `Ok(None)` iff the file is genuinely absent — the historical bare
+/// BERT repo shape with no `1_Pooling/` subfolder at all, which falls back to
+/// mean pooling downstream. A file that is *present* but cannot be opened or
+/// parsed as JSON is a hard error: collapsing "corrupt" into the same `None`
+/// that drives the mean fallback would let a truncated pooling declaration
+/// silently produce a confident-wrong embedding.
+fn read_local_pooling_config(dir: &Path, model_id: &str) -> Result<Option<serde_json::Value>> {
     let path = dir.join("1_Pooling/config.json");
-    std::fs::File::open(path)
-        .ok()
-        .and_then(|f| serde_json::from_reader(f).ok())
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(JammiError::Model {
+                model_id: model_id.to_string(),
+                message: format!("1_Pooling/config.json is present but could not be opened: {e}"),
+            })
+        }
+    };
+    serde_json::from_reader(file)
+        .map(Some)
+        .map_err(|e| JammiError::Model {
+            model_id: model_id.to_string(),
+            message: format!("1_Pooling/config.json is present but unparseable: {e}"),
+        })
 }
 
 /// Locate a tokenizer artifact inside a local model directory, preferring

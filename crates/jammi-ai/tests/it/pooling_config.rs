@@ -202,6 +202,35 @@ async fn cls_declared_pooling_differs_from_mean_declared_pooling() {
     );
 }
 
+/// A present-but-syntactically-invalid `1_Pooling/config.json` must hard-error
+/// at resolve time, never silently collapse into the "genuinely absent" case
+/// that drives the mean-pooling fallback. Reproduces the real failure mode: a
+/// truncated/corrupt write of the pooling declaration.
+#[tokio::test]
+async fn corrupt_pooling_config_json_is_a_hard_error_at_resolve() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path().join("corrupt_pooling_model");
+    // Reuses the same fixture-copy helper as the mean/CLS cases, then
+    // overwrites the (well-formed) `1_Pooling/config.json` it wrote with
+    // syntactically invalid JSON — not merely the wrong shape.
+    build_local_model_dir(&dir, Some(&mean_pooling_config()));
+    std::fs::write(dir.join("1_Pooling/config.json"), b"{ not valid json").unwrap();
+
+    let catalog_dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store()).unwrap();
+    let source = ModelSource::local(&dir);
+    let result = resolver
+        .resolve(&source, ModelTask::TextEmbedding, None)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a present-but-unparseable 1_Pooling/config.json must hard-error at \
+         resolve time, never silently fall back to mean pooling"
+    );
+}
+
 #[tokio::test]
 async fn unsupported_pooling_mode_fails_model_load() {
     let tmp = tempdir().unwrap();

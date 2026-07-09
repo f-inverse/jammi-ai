@@ -2108,7 +2108,13 @@ mod pooling_from_config_tests {
     }
 
     #[test]
-    fn structurally_unparseable_file_is_a_hard_error() {
+    fn wrong_shape_json_is_a_hard_error() {
+        // Syntactically valid JSON of the wrong shape (an array, not an
+        // object) — caught by `as_object()`. This is a different code path
+        // from a syntactically unparseable file (see the integration test
+        // covering an actually-corrupt `1_Pooling/config.json` at the
+        // resolver, since `pooling_from_config` only ever sees already-parsed
+        // `serde_json::Value`s and can never observe a parse failure itself).
         let cfg = serde_json::json!(["not", "an", "object"]);
         assert!(pooling_from_config(Some(&cfg), "test-model").is_err());
     }

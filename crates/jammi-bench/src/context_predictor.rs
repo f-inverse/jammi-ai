@@ -331,6 +331,8 @@ async fn dataset_session(
                 model_id: EMBED_MODEL_ID,
                 derived_from: None,
                 dimensions: FEATURE_DIM,
+                key_column: "_row_id",
+                text_columns: None,
             },
             &pairs,
             jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),

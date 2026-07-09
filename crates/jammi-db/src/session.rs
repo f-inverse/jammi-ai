@@ -820,6 +820,22 @@ impl JammiSession {
             .await
     }
 
+    /// Read the paired `(_row_id, vector)` rows of a precomputed-embedding
+    /// Parquet object at `url` — a Utf8 `_row_id` column alongside a
+    /// `FixedSizeList<Float32>` `vector` column — in file order.
+    ///
+    /// Resolves the object through this session's [`StorageRegistry`] (so cloud
+    /// credentials registered with the session are inherited) and reads it fully
+    /// into memory. Surfaces [`JammiError::Schema`] when the object does not
+    /// carry a Utf8 `_row_id` and a `FixedSizeList<Float32>` `vector` column, so
+    /// a caller importing vectors sees a typed signal instead of a downcast
+    /// panic. The read path behind `import_embeddings`.
+    pub async fn read_keyed_vectors(&self, url: &StorageUrl) -> Result<Vec<(String, Vec<f32>)>> {
+        let driver = self.storage_registry.driver_for(url, None)?;
+        let handle = crate::storage::JammiObjectStore::new(driver, url.clone());
+        crate::store::vectors::read_keyed_vectors_f32(&handle, "import", "_row_id", "vector").await
+    }
+
     /// Read a single row's stored `vector` from an embedding result table by
     /// its `_row_id` (the key-column value set at embedding time).
     ///

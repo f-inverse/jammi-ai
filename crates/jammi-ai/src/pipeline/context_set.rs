@@ -795,6 +795,8 @@ impl InferenceSession {
                     // derives from, so there is no FK-lineage anchor to record.
                     derived_from: None,
                     dimensions: context.dimensions,
+                    key_column: "_row_id",
+                    text_columns: None,
                 },
                 context.rows,
                 jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),

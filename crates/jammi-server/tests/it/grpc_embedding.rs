@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{ArrayRef, BinaryArray, StringArray};
+use arrow::array::{ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use jammi_ai::session::InferenceSession;
@@ -32,7 +32,8 @@ use jammi_server::grpc::proto::embedding::embedding_service_client::EmbeddingSer
 use jammi_server::grpc::proto::embedding::encode_query_request::Input as EncodeInput;
 use jammi_server::grpc::proto::embedding::search_request::Query as SearchQuery;
 use jammi_server::grpc::proto::embedding::{
-    EncodeQueryRequest, GenerateEmbeddingsRequest, Modality, QueryVector, SearchRequest,
+    EncodeQueryRequest, GenerateEmbeddingsRequest, ImportEmbeddingsRequest, Modality, QueryVector,
+    SearchRequest,
 };
 use jammi_server::grpc::session::SessionStore;
 use jammi_test_utils::{cookbook_fixture, fixture, test_config};
@@ -581,6 +582,219 @@ async fn catalog_service_rejects_unspecified_source_kind() {
         })
         .await
         .expect_err("unspecified source kind must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// The `_row_id` keys the imported vectors are keyed by — the values a
+/// registered source's key column must carry for search hydration to join.
+const IMPORT_DOC_IDS: [&str; 3] = ["doc-0", "doc-1", "doc-2"];
+
+/// Width of the precomputed import vectors.
+const IMPORT_DIMS: usize = 4;
+
+/// Write a `(doc_id: Utf8, body: Utf8)` source parquet whose `doc_id` values are
+/// [`IMPORT_DOC_IDS`] — the source the imported embeddings are keyed into, so a
+/// hydrating search can join `_row_id` back to `doc_id` and project `body`.
+fn write_docs_source_parquet(dir: &TempDir) -> std::path::PathBuf {
+    let path = dir.path().join("docs.parquet");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("doc_id", DataType::Utf8, false),
+        Field::new("body", DataType::Utf8, false),
+    ]));
+    let ids = Arc::new(StringArray::from_iter_values(IMPORT_DOC_IDS)) as ArrayRef;
+    let bodies = Arc::new(StringArray::from_iter_values(
+        IMPORT_DOC_IDS.iter().map(|id| format!("body of {id}")),
+    )) as ArrayRef;
+    let batch = RecordBatch::try_new(schema.clone(), vec![ids, bodies]).unwrap();
+    let file = std::fs::File::create(&path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    path
+}
+
+/// Write a `(_row_id: Utf8, vector: FixedSizeList<Float32>[IMPORT_DIMS])` parquet
+/// of precomputed vectors keyed by [`IMPORT_DOC_IDS`]. Each doc gets a distinct
+/// unit basis direction (`doc-i` → `e_i`), so a nearest-neighbor query by one
+/// doc's direction resolves that doc unambiguously. The vectors are non-zero, so
+/// import L2-normalizes them without rejecting any.
+fn write_import_vectors_parquet(dir: &TempDir) -> std::path::PathBuf {
+    let path = dir.path().join("precomputed.parquet");
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_row_id", DataType::Utf8, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(item.clone(), IMPORT_DIMS as i32),
+            false,
+        ),
+    ]));
+    let ids = Arc::new(StringArray::from_iter_values(IMPORT_DOC_IDS)) as ArrayRef;
+    // doc-i → basis vector e_i (scaled by 3 so it is clearly non-normalized on
+    // input; import normalizes it).
+    let flat: Vec<f32> = (0..IMPORT_DOC_IDS.len())
+        .flat_map(|i| (0..IMPORT_DIMS).map(move |d| if d == i { 3.0 } else { 0.0 }))
+        .collect();
+    let vectors = Arc::new(
+        FixedSizeListArray::try_new(
+            item,
+            IMPORT_DIMS as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        )
+        .unwrap(),
+    ) as ArrayRef;
+    let batch = RecordBatch::try_new(schema.clone(), vec![ids, vectors]).unwrap();
+    let file = std::fs::File::create(&path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    path
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_embeddings_registers_a_ready_searchable_table_over_the_wire() {
+    let (addr, shutdown, dir, handle) = start_embedding_server().await;
+    let mut client = EmbeddingServiceClient::new(channel(addr).await);
+
+    // A registered source whose key column carries the ids the imports are keyed
+    // by — the realistic "precompute offline, register the vectors for an
+    // existing source" flow.
+    let source_parquet = write_docs_source_parquet(&dir);
+    catalog_client(addr)
+        .await
+        .add_source(AddSourceRequest {
+            source_id: "docs".into(),
+            source_kind: SourceKind::File as i32,
+            connection: Some(SourceConnection {
+                url: format!("file://{}", source_parquet.display()),
+                format: FileFormat::Parquet as i32,
+            }),
+        })
+        .await
+        .expect("add_source");
+
+    // ImportEmbeddings — promote the precomputed vectors into a ready table
+    // WITHOUT re-running any model (the model id is never loaded).
+    let vectors_parquet = write_import_vectors_parquet(&dir);
+    let table = client
+        .import_embeddings(ImportEmbeddingsRequest {
+            source_id: "docs".into(),
+            model_id: "import-model".into(),
+            vectors_url: format!("file://{}", vectors_parquet.display()),
+            key_column: "doc_id".into(),
+            text_columns: vec!["body".into()],
+            dimensions: IMPORT_DIMS as u32,
+        })
+        .await
+        .expect("import_embeddings")
+        .into_inner();
+
+    assert_eq!(table.status, "ready", "imported table must be ready");
+    assert_eq!(table.source_id, "docs");
+    assert_eq!(
+        table.model_id, "import-model",
+        "model id recorded canonical"
+    );
+    assert_eq!(
+        table.row_count,
+        IMPORT_DOC_IDS.len() as u64,
+        "every precomputed row is imported"
+    );
+    assert_eq!(
+        table.dimensions, IMPORT_DIMS as i32,
+        "the imported table records its embedding width"
+    );
+
+    // Search by doc-1's direction (`e_1`): the imported doc-1 row is its own
+    // nearest neighbor under cosine, so it ranks first. `select` projects the
+    // hydrated `body` column, proving the imported table joins back to its
+    // source exactly like a generated one.
+    let mut query = vec![0.0_f32; IMPORT_DIMS];
+    query[1] = 1.0;
+    let resp = client
+        .search(SearchRequest {
+            source_id: "docs".into(),
+            query: Some(SearchQuery::QueryVector(QueryVector { values: query })),
+            k: IMPORT_DOC_IDS.len() as u32,
+            embedding_table: None,
+            filter: None,
+            select: vec!["body".into()],
+        })
+        .await
+        .expect("search over the imported table")
+        .into_inner();
+
+    assert_eq!(
+        resp.hits.len(),
+        IMPORT_DOC_IDS.len(),
+        "k over the imported corpus returns every row"
+    );
+    assert_eq!(
+        resp.hits[0].key, "doc-1",
+        "the query row is its own nearest neighbor"
+    );
+    assert!(
+        resp.hits[0].score >= resp.hits[1].score && resp.hits[1].score >= resp.hits[2].score,
+        "hits ordered by descending score, got {:?}",
+        resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        resp.hits[0].columns.get("body").map(String::as_str),
+        Some("body of doc-1"),
+        "the imported table hydrates its source's projected columns"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_embeddings_rejects_dimension_mismatch_over_the_wire() {
+    let (addr, shutdown, dir, handle) = start_embedding_server().await;
+    let mut client = EmbeddingServiceClient::new(channel(addr).await);
+
+    // The vectors are width IMPORT_DIMS; claiming a different width is a caller
+    // error rejected before any table is materialized.
+    let vectors_parquet = write_import_vectors_parquet(&dir);
+    let err = client
+        .import_embeddings(ImportEmbeddingsRequest {
+            source_id: "docs".into(),
+            model_id: "import-model".into(),
+            vectors_url: format!("file://{}", vectors_parquet.display()),
+            key_column: "doc_id".into(),
+            text_columns: Vec::new(),
+            dimensions: (IMPORT_DIMS + 1) as u32,
+        })
+        .await
+        .expect_err("a width mismatch must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_embeddings_requires_core_fields_over_the_wire() {
+    let (addr, shutdown, _dir, handle) = start_embedding_server().await;
+    let mut client = EmbeddingServiceClient::new(channel(addr).await);
+
+    // A zero `dimensions` is rejected at the wire edge (as are the empty
+    // required-string fields), before any storage read.
+    let err = client
+        .import_embeddings(ImportEmbeddingsRequest {
+            source_id: "docs".into(),
+            model_id: "import-model".into(),
+            vectors_url: "file:///tmp/whatever.parquet".into(),
+            key_column: "doc_id".into(),
+            text_columns: Vec::new(),
+            dimensions: 0,
+        })
+        .await
+        .expect_err("dimensions must be > 0");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
     let _ = shutdown.send(());

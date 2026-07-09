@@ -96,6 +96,7 @@
       "fine_tune_graph",
       "generate_embeddings",
       "get_server_info",
+      "import_embeddings",
       "infer",
       "list_channels",
       "list_models",
@@ -120,7 +121,7 @@
       "train_context_predictor",
       "verify_materialization"
     ],
-    "verb_count": 49
+    "verb_count": 50
   },
   "taxonomy": {
     "embedded_bad_arg": {

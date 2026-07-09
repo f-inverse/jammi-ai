@@ -79,6 +79,67 @@ pub fn generate_embeddings_from_proto(
     })
 }
 
+/// The decoded identity + provenance an `ImportEmbeddings` request carries. The
+/// engine method (`Session::import_embeddings`) takes these separately, so the
+/// decode returns them as a struct the binding destructures.
+pub struct ImportEmbeddingsArgs {
+    pub source_id: String,
+    pub model_id: String,
+    pub vectors_url: String,
+    pub key_column: String,
+    pub text_columns: Vec<String>,
+    pub dimensions: usize,
+}
+
+/// Decode a serialized [`pb::ImportEmbeddingsRequest`] body into the engine
+/// [`ImportEmbeddingsArgs`]. The embedded binding builds the request with the
+/// same pure-Python assembly the remote client uses, serializes it, and hands
+/// the bytes here — so the in-process and remote import paths decode through one
+/// shared seam ([`import_embeddings_from_proto`]). A body that is not a valid
+/// `ImportEmbeddingsRequest` is a client error (`InvalidArgument`).
+pub fn import_embeddings_from_bytes(body: &[u8]) -> Result<ImportEmbeddingsArgs, Status> {
+    let req = pb::ImportEmbeddingsRequest::decode(body).map_err(|e| {
+        Status::invalid_argument(format!("malformed ImportEmbeddings request: {e}"))
+    })?;
+    import_embeddings_from_proto(req)
+}
+
+/// Decode a [`pb::ImportEmbeddingsRequest`] into the engine
+/// [`ImportEmbeddingsArgs`]. The required identity fields (`source_id` /
+/// `model_id` / `vectors_url` / `key_column`) and a positive `dimensions` are
+/// validated at decode rather than deferred to the engine, matching the gRPC
+/// handler's edge checks. `text_columns` is optional provenance and carries
+/// through as-is.
+pub fn import_embeddings_from_proto(
+    req: pb::ImportEmbeddingsRequest,
+) -> Result<ImportEmbeddingsArgs, Status> {
+    if req.source_id.is_empty() {
+        return Err(Status::invalid_argument("source_id is required"));
+    }
+    if req.model_id.is_empty() {
+        return Err(Status::invalid_argument("model_id is required"));
+    }
+    if req.vectors_url.is_empty() {
+        return Err(Status::invalid_argument("vectors_url is required"));
+    }
+    if req.key_column.is_empty() {
+        return Err(Status::invalid_argument("key_column is required"));
+    }
+    if req.dimensions == 0 {
+        return Err(Status::invalid_argument(
+            "dimensions must be greater than 0",
+        ));
+    }
+    Ok(ImportEmbeddingsArgs {
+        source_id: req.source_id,
+        model_id: req.model_id,
+        vectors_url: req.vectors_url,
+        key_column: req.key_column,
+        text_columns: req.text_columns,
+        dimensions: req.dimensions as usize,
+    })
+}
+
 /// The decoded model, tower, and resolved input an `EncodeQuery` request
 /// carries. The engine method (`Session::encode_query`) takes the model id, the
 /// [`QueryInput`], and the [`Modality`] separately, so the decode returns them

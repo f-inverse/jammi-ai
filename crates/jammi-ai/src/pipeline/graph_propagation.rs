@@ -400,6 +400,8 @@ impl InferenceSession {
                     model_id: PROPAGATE_MODEL_ID,
                     derived_from: Some(table.table_name.as_str()),
                     dimensions: out_dim,
+                    key_column: "_row_id",
+                    text_columns: None,
                 },
                 &rows,
                 jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),

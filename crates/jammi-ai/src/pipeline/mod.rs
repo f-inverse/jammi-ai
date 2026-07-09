@@ -4,6 +4,7 @@ pub mod context_set;
 pub mod embedding;
 pub mod graph_neighbourhood;
 pub mod graph_propagation;
+pub mod import;
 pub mod neighbor_graph;
 pub mod parallel_train;
 pub mod recompute;

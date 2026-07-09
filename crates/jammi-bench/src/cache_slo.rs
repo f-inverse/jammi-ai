@@ -220,6 +220,8 @@ async fn embedding_session(
                 model_id: INPUT_MODEL_ID,
                 derived_from: None,
                 dimensions: dim,
+                key_column: "_row_id",
+                text_columns: None,
             },
             &features,
             jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),

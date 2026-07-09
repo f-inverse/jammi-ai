@@ -580,6 +580,53 @@ impl InferenceSession {
         self.inner.read_vectors(table).await
     }
 
+    /// Read the paired `(_row_id, vector)` rows of a precomputed-embedding
+    /// Parquet object at `url`, resolved through the session's storage registry.
+    /// The read leg of [`Self::import_embeddings`]; delegates to
+    /// [`jammi_db::session::JammiSession::read_keyed_vectors`].
+    pub(crate) async fn read_keyed_vectors(
+        &self,
+        url: &jammi_db::storage::StorageUrl,
+    ) -> Result<Vec<(String, Vec<f32>)>> {
+        self.inner.read_keyed_vectors(url).await
+    }
+
+    /// Register precomputed per-row vectors at `vectors_url` as a ready
+    /// `(source_id, TextEmbedding, model_id)` embedding table without re-running
+    /// any encoder — a thin promotion of precomputed vectors through the single
+    /// materialization funnel.
+    ///
+    /// Each incoming vector is L2-normalized (every embedding table holds
+    /// normalized vectors — the cosine ANN sidecar assumes it); a zero-norm
+    /// vector is rejected. `model_id` is validated as a well-formed encoder
+    /// reference and canonicalized, never loaded, so import runs GPU-free.
+    /// `key_column` / `text_columns` are recorded as catalog provenance; the
+    /// physical key stays `_row_id`. The resulting table is recompute-inert (its
+    /// `External` descriptor refuses replay). Reads the input object fully into
+    /// memory.
+    pub async fn import_embeddings(
+        &self,
+        source_id: &str,
+        model_id: &str,
+        vectors_url: &jammi_db::storage::StorageUrl,
+        key_column: &str,
+        text_columns: &[String],
+        dimensions: usize,
+    ) -> Result<ResultTableRecord> {
+        let record = crate::pipeline::import::ImportPipeline::new(self, &self.result_store)
+            .run(
+                source_id,
+                model_id,
+                vectors_url,
+                key_column,
+                text_columns,
+                dimensions,
+            )
+            .await?;
+        self.ann_cache.invalidate_source(source_id)?;
+        Ok(record)
+    }
+
     /// Generate image embeddings for a source and persist to Jammi DB.
     pub async fn generate_image_embeddings(
         &self,

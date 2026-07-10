@@ -6,6 +6,38 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-07-10
+
+### Fixed
+- **Typed `NULL` bind — Postgres binds a null by the column's type, not as text
+  (`jammi-db`).** A null cell in a mutable/backing-table batch (and in catalog
+  writes via `From<Option<T>>`) was bound as a text null regardless of the column's
+  type, so any nullable non-text column failed on Postgres (`column is of type
+  double precision but expression is of type text`); SQLite's dynamic typing hid it.
+  `SqlValue::Null` now carries a `SqlNullType {Bool, Int, Float, Text, Bytes}`;
+  `bind_sqlite`/`bind_postgres` bind the correctly-typed `Option::<_>::None`,
+  `extract_value` derives the null kind from the column's Arrow type (mirroring the
+  non-null arm), and `From<Option<T>>` recovers T's null kind via a `HasSqlNull`
+  trait. Anti-regression on the live-Postgres lane: a nullable `Float64` mutable
+  column and a nullable `INTEGER` catalog column round-trip their nulls.
+- **Trigger live-subscribe no longer leaks across tenants on a globally-registered
+  topic (`jammi-db`, `jammi-server`).** On a topic whose `TopicDefinition::tenant`
+  is `None` — one `topic.id` shared by every tenant — the live tail delivered every
+  tenant's events to any subscriber, because the broker fan-out is tenant-blind and
+  the broadcast batch carries no tenant. The publish-scoped tenant now rides as an
+  opaque tag on `DeliveredBatch` (never wire-encoded; a JetStream `HDR_TENANT`
+  header mirrors the existing offset/produced-at headers), and the subscribe seam
+  filters the live tail by `tag == tenant || tag is null` — the same predicate the
+  replay prefix already used. The broker stays tenant-blind by contract; the wire
+  surface is unchanged.
+- **Mutable `Timestamp` columns round-trip on both backends (`jammi-db`).**
+  Registering a `Timestamp` column previously failed at catalog schema-encode, and
+  even past that the Postgres DDL (`TIMESTAMPTZ`) rejected the bound integer tick and
+  the provider read path had no timestamp handling. Timestamps are now stored as
+  their integer tick in a plain integer column (`BIGINT` on Postgres, `INTEGER` on
+  SQLite) and DataFusion reconstructs the typed Arrow `Timestamp(unit, tz)` at read
+  time, so the backend column never needs to be a SQL timestamp type.
+
 ## [0.40.0] - 2026-07-10
 
 ### Added

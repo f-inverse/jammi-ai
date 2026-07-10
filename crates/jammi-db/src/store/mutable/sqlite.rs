@@ -173,7 +173,8 @@ fn sqlite_type(ty: &DataType) -> &'static str {
         DataType::Float16 | DataType::Float32 | DataType::Float64 => "REAL",
         DataType::Utf8 | DataType::LargeUtf8 => "TEXT",
         DataType::Binary | DataType::LargeBinary => "BLOB",
-        DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => "TEXT",
+        DataType::Date32 | DataType::Date64 => "TEXT",
+        DataType::Timestamp(_, _) => "INTEGER",
         _ => "BLOB",
     }
 }

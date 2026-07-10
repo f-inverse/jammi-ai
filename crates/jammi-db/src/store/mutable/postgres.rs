@@ -171,7 +171,7 @@ fn pg_type(ty: &DataType) -> &'static str {
         DataType::Float64 => "DOUBLE PRECISION",
         DataType::Utf8 | DataType::LargeUtf8 => "TEXT",
         DataType::Binary | DataType::LargeBinary => "BYTEA",
-        DataType::Timestamp(_, _) => "TIMESTAMPTZ",
+        DataType::Timestamp(_, _) => "BIGINT",
         DataType::Date32 | DataType::Date64 => "DATE",
         _ => "JSONB",
     }

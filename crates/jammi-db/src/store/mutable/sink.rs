@@ -227,12 +227,11 @@ fn extract_value(
             .downcast_ref::<LargeBinaryArray>()
             .map(|a| SqlValue::BytesOwned(a.value(idx).to_vec()))
             .ok_or("expected LargeBinaryArray"),
-        // Timestamps map to their numeric tick (i64). The mutable-table DDL
-        // stores them as TEXT on SQLite and TIMESTAMPTZ on Postgres;
-        // consumers that need wall-clock formatting do the conversion at
-        // read time. This honors SPEC-02 §"Define the schema" which
-        // explicitly lists `Timestamp(Microsecond, _)` as a supported
-        // column shape on the `register-mutable-table.md` recipe.
+        // Timestamps are stored as their integer tick in the column's
+        // declared `TimeUnit` — `INTEGER` on SQLite, `BIGINT` on Postgres.
+        // DataFusion reconstructs the Arrow `Timestamp` array (and performs
+        // all temporal operations) at read time, so the backend column
+        // itself never needs to be a SQL timestamp type.
         Timestamp(arrow_schema::TimeUnit::Second, _) => arr
             .as_any()
             .downcast_ref::<TimestampSecondArray>()

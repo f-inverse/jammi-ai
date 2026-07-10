@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow::array::{Array, BinaryArray, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Array, BinaryArray, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use futures::StreamExt;
 use jammi_db::catalog::backend::{BackendKind, TxOptions};
@@ -244,6 +244,72 @@ async fn registered_mutable_tables_reload_across_sessions(backend: BackendKind) 
 
     // Clean up the persistent row so a re-run doesn't surface stale state on
     // the shared Postgres catalog.
+    session.drop_mutable_table(&id).await.unwrap();
+}
+
+/// A NULL in a nullable non-text column (`score FLOAT64`) must round-trip
+/// through the DML insert path as a typed SQL null, not a bare text null —
+/// Postgres rejects a text null bound into a `DOUBLE PRECISION` column
+/// (`column is of type double precision but expression is of type text`).
+/// This is the mutable-table-side anti-regression oracle for the shared
+/// `SqlValue::Null` typed-bind fix; the catalog-side oracle lives in
+/// `store.rs::result_table_none_dimensions_round_trips_as_null`.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nullable_float_column_round_trips_typed_null(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = skip_if_no_backend!(backend, dir.path());
+
+    let id = unique_id("readings");
+    let def = MutableTableDefinitionBuilder::new(id.clone(), widget_schema())
+        .primary_key(vec!["id".into()])
+        .build()
+        .unwrap();
+    session.create_mutable_table(def).await.unwrap();
+
+    session
+        .sql(&format!(
+            "INSERT INTO mutable.public.{name} (id, name, score) VALUES \
+             (1, 'unscored', NULL), (2, 'scored', 3.75)",
+            name = id.as_str(),
+        ))
+        .await
+        .unwrap();
+
+    let batches = session
+        .sql(&format!(
+            "SELECT id, score FROM mutable.public.{name} ORDER BY id",
+            name = id.as_str()
+        ))
+        .await
+        .unwrap();
+    let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    let scores = batch
+        .column_by_name("score")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap_or_else(|| {
+            panic!(
+                "score column is not Float64Array; got {:?}",
+                batch.column_by_name("score").unwrap().data_type()
+            )
+        });
+    assert!(
+        scores.is_null(0),
+        "row 1's NULL score must round-trip as null, not error or coerce to a value"
+    );
+    assert_eq!(
+        scores.value(1),
+        3.75,
+        "row 2's non-null score must be exact"
+    );
+
     session.drop_mutable_table(&id).await.unwrap();
 }
 

@@ -328,11 +328,24 @@ impl<'tx> Transaction<'tx> {
     }
 }
 
+/// The SQL type a bound `NULL` must carry so a dynamically-typed backend
+/// (SQLite) and a statically-typed one (Postgres) bind the same column kind
+/// whether a given cell is null or not — Postgres rejects a text null bound
+/// into a non-text column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlNullType {
+    Bool,
+    Int,
+    Float,
+    Text,
+    Bytes,
+}
+
 /// Engine-owned parameter value. Backend impls translate to driver-native
 /// types in `bind_sqlite` / `bind_postgres`.
 #[derive(Debug, Clone)]
 pub enum SqlValue<'v> {
-    Null,
+    Null(SqlNullType),
     Bool(bool),
     Int(i64),
     Float(f64),
@@ -400,12 +413,45 @@ impl From<chrono::DateTime<chrono::Utc>> for SqlValue<'_> {
         SqlValue::Timestamp(v)
     }
 }
+/// Declares the [`SqlNullType`] a bound `NULL` must carry when `Option<T>`
+/// is `None` — the null must bind the same SQL type `T`'s `Into<SqlValue>`
+/// impl produces for `Some`, so a Postgres column sees one consistent type
+/// across null and non-null rows.
+pub trait HasSqlNull {
+    const NULL_TYPE: SqlNullType;
+}
+
+impl HasSqlNull for String {
+    const NULL_TYPE: SqlNullType = SqlNullType::Text;
+}
+impl HasSqlNull for &str {
+    const NULL_TYPE: SqlNullType = SqlNullType::Text;
+}
+impl HasSqlNull for i64 {
+    const NULL_TYPE: SqlNullType = SqlNullType::Int;
+}
+impl HasSqlNull for i32 {
+    const NULL_TYPE: SqlNullType = SqlNullType::Int;
+}
+impl HasSqlNull for f64 {
+    const NULL_TYPE: SqlNullType = SqlNullType::Float;
+}
+impl HasSqlNull for bool {
+    const NULL_TYPE: SqlNullType = SqlNullType::Bool;
+}
+impl HasSqlNull for Vec<u8> {
+    const NULL_TYPE: SqlNullType = SqlNullType::Bytes;
+}
+impl HasSqlNull for &[u8] {
+    const NULL_TYPE: SqlNullType = SqlNullType::Bytes;
+}
+
 impl<'v, T> From<Option<T>> for SqlValue<'v>
 where
-    T: Into<SqlValue<'v>>,
+    T: Into<SqlValue<'v>> + HasSqlNull,
 {
     fn from(v: Option<T>) -> Self {
-        v.map(Into::into).unwrap_or(SqlValue::Null)
+        v.map(Into::into).unwrap_or(SqlValue::Null(T::NULL_TYPE))
     }
 }
 
@@ -643,7 +689,11 @@ fn bind_sqlite<'q>(
     v: &'q SqlValue<'_>,
 ) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
     match v {
-        SqlValue::Null => q.bind(Option::<String>::None),
+        SqlValue::Null(SqlNullType::Bool) => q.bind(Option::<bool>::None),
+        SqlValue::Null(SqlNullType::Int) => q.bind(Option::<i64>::None),
+        SqlValue::Null(SqlNullType::Float) => q.bind(Option::<f64>::None),
+        SqlValue::Null(SqlNullType::Text) => q.bind(Option::<String>::None),
+        SqlValue::Null(SqlNullType::Bytes) => q.bind(Option::<Vec<u8>>::None),
         SqlValue::Bool(b) => q.bind(*b),
         SqlValue::Int(i) => q.bind(*i),
         SqlValue::Float(f) => q.bind(*f),
@@ -662,7 +712,11 @@ fn bind_postgres<'q>(
     v: &'q SqlValue<'_>,
 ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
     match v {
-        SqlValue::Null => q.bind(Option::<String>::None),
+        SqlValue::Null(SqlNullType::Bool) => q.bind(Option::<bool>::None),
+        SqlValue::Null(SqlNullType::Int) => q.bind(Option::<i64>::None),
+        SqlValue::Null(SqlNullType::Float) => q.bind(Option::<f64>::None),
+        SqlValue::Null(SqlNullType::Text) => q.bind(Option::<String>::None),
+        SqlValue::Null(SqlNullType::Bytes) => q.bind(Option::<Vec<u8>>::None),
         SqlValue::Bool(b) => q.bind(*b),
         SqlValue::Int(i) => q.bind(*i),
         SqlValue::Float(f) => q.bind(*f),

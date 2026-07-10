@@ -1,19 +1,24 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::result_repo::CreateResultTableParams;
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::model_task::ModelTask;
+use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::{
     reader::{count_parquet_rows, is_valid_parquet},
     JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl,
 };
 use jammi_db::store::ResultStore;
+use jammi_test_utils::make_test_session;
 use tempfile::tempdir;
+use test_case::test_case;
 
 // ─── ObjectParquetWriter roundtrip ───────────────────────────────────────────
 
@@ -582,4 +587,84 @@ async fn recovery_promotes_valid_parquet_to_ready() {
     let record = catalog.get_result_table("stuck").await.unwrap().unwrap();
     assert_eq!(record.status, "ready");
     assert_eq!(record.row_count, 3);
+}
+
+// ─── typed-null catalog bind (dimensions: Option<i32> -> INTEGER) ───────────
+
+/// Backend-unique id suffix, so the Postgres lane (one shared database
+/// across the whole test run) never collides with a sibling test's rows.
+fn unique_suffix() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let epoch_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{epoch_ns:x}_{n:x}")
+}
+
+/// A dimensionless result table (e.g. a classifier, whose output isn't a
+/// fixed-width vector) writes `dimensions: None`. That `None` must bind a
+/// typed SQL null (`INTEGER` on the `dimensions` column), not a bare text
+/// null — Postgres rejects a text null bound into an `INTEGER` column, so
+/// this is the catalog-side anti-regression oracle for the shared
+/// `SqlValue::Null` typed-bind fix; the mutable-table-side oracle lives in
+/// `mutable_tables.rs`.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn result_table_none_dimensions_round_trips_as_null(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = match make_test_session(backend, dir.path()).await {
+        Some(s) => s,
+        None => {
+            eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+            return;
+        }
+    };
+    let catalog = session.catalog();
+
+    let suffix = unique_suffix();
+    let source_id = format!("classifier_src_{suffix}");
+    let table_name = format!("classifier_out_{suffix}");
+
+    catalog
+        .register_source(
+            &source_id,
+            SourceType::File,
+            &SourceConnection {
+                url: Some(format!("file:///tmp/{source_id}.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    catalog
+        .create_result_table(CreateResultTableParams {
+            table_name: &table_name,
+            source_id: &source_id,
+            model_id: "acme/sentiment-classifier",
+            task: ModelTask::Classification,
+            kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
+            derived_from: None,
+            parquet_path: &format!("file:///tmp/{table_name}.parquet"),
+            index_path: None,
+            dimensions: None,
+            key_column: None,
+            text_columns: None,
+        })
+        .await
+        .unwrap();
+
+    let record = catalog
+        .get_result_table(&table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.dimensions, None,
+        "a dimensionless result table must round-trip NULL, not error binding a typed null"
+    );
 }

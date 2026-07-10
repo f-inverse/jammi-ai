@@ -6,6 +6,31 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-07-10
+
+### Added
+- **`ResultStore::materialize_computed_embedding_table` — register consumer-computed
+  embedding vectors as a searchable embedding table (`jammi-db`).** The promotion path
+  for a producer the engine does not dispatch itself (a perturbation pass, a
+  reconditioning pass, a migration off another store, any in-process
+  recompute-avoidance batch), generalizing what `ImportEmbeddings` (URL-only) covers.
+  The caller supplies a `ComputedEmbeddingProvenance { producer_id, params, env, inputs }`
+  bundle; the engine owns only the mechanism — it validates each vector's width,
+  L2-normalizes into an owned copy (rejecting zero/non-finite norm — the storage/search
+  contract is cosine/direction-only), and auto-folds a content digest of the normalized
+  rows into the `External` descriptor's `params` (reserved key `content_digest`,
+  fail-loud on a caller collision) so two registrations sharing every scalar determinant
+  but different vectors never collide on one definition hash. `ImportPipeline` is
+  refactored onto this verb with byte-identical output.
+- **`AssembledChain::mount_tenant_scoped` — opt a downstream gRPC service into the
+  engine's tenant binding (`jammi-server`).** Wraps a downstream service in the engine's
+  single `TenantResolverLayer` (the same resolver every engine service uses), so the
+  service gets `SessionTenant` bound uniformly (resolve-per-request; on rejection the
+  handler never runs) and can drop its own per-handler tenant resolution. Plain `mount`
+  stays un-gated for a pre-auth service that must run before a tenant is known. The
+  single-binder invariant is preserved — there is still exactly one resolver, retained
+  on the assembled chain.
+
 ## [0.39.0] - 2026-07-09
 
 ### Fixed

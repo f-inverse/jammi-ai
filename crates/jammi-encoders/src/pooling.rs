@@ -48,11 +48,14 @@ fn mask_f32(hidden: &Tensor, attention_mask: &Tensor) -> Result<Tensor, EncoderE
 }
 
 fn mean_pool(hidden: &Tensor, attention_mask: &Tensor) -> Result<Tensor, EncoderError> {
+    // The mask (and its eps-clamped sum) stay F32 for the clamp's precision;
+    // cast to `hidden`'s dtype only at the point each combines with `hidden`
+    // (a no-op when hidden is already F32).
     let mask = mask_f32(hidden, attention_mask)?;
-    let masked = hidden.broadcast_mul(&mask)?;
+    let masked = hidden.broadcast_mul(&mask.to_dtype(hidden.dtype())?)?;
     let summed = masked.sum(1)?;
-    let count = mask.sum(1)?;
-    Ok((summed.broadcast_div(&count.clamp(1e-9, f32::MAX as f64)?))?)
+    let count = mask.sum(1)?.clamp(1e-9, f32::MAX as f64)?;
+    Ok(summed.broadcast_div(&count.to_dtype(hidden.dtype())?)?)
 }
 
 fn cls_pool(hidden: &Tensor) -> Result<Tensor, EncoderError> {
@@ -62,10 +65,14 @@ fn cls_pool(hidden: &Tensor) -> Result<Tensor, EncoderError> {
 fn max_pool(hidden: &Tensor, attention_mask: &Tensor) -> Result<Tensor, EncoderError> {
     // Push padding positions to a very negative value so they lose the max.
     // Multiplying neg_inf by 0 yields NaN, so we add a large finite negative
-    // bias instead: 0 at real tokens, -1e30 at padding.
+    // bias instead: 0 at real tokens, -1e30 at padding. The affine stays F32
+    // (0 and -1e30 are exact there); cast to `hidden`'s dtype only at the
+    // add, since `-1e30` legitimately saturates to that dtype's own -inf.
     let mask = mask_f32(hidden, attention_mask)?;
     let bias = mask.affine(1e30, -1e30)?;
-    Ok(hidden.broadcast_add(&bias)?.max(1)?)
+    Ok(hidden
+        .broadcast_add(&bias.to_dtype(hidden.dtype())?)?
+        .max(1)?)
 }
 
 fn weighted_mean_pool(hidden: &Tensor, attention_mask: &Tensor) -> Result<Tensor, EncoderError> {
@@ -76,10 +83,12 @@ fn weighted_mean_pool(hidden: &Tensor, attention_mask: &Tensor) -> Result<Tensor
         .unsqueeze(2)?;
     let mask = mask_f32(hidden, attention_mask)?;
     let effective = mask.broadcast_mul(&weights)?;
-    let weighted_hidden = hidden.broadcast_mul(&effective)?;
+    // `effective` (position-weighted mask) and its eps-clamped sum stay F32;
+    // cast to `hidden`'s dtype only where each combines with `hidden`.
+    let weighted_hidden = hidden.broadcast_mul(&effective.to_dtype(hidden.dtype())?)?;
     let numerator = weighted_hidden.sum(1)?;
-    let denominator = effective.sum(1)?;
-    Ok(numerator.broadcast_div(&denominator.clamp(1e-9, f32::MAX as f64)?)?)
+    let denominator = effective.sum(1)?.clamp(1e-9, f32::MAX as f64)?;
+    Ok(numerator.broadcast_div(&denominator.to_dtype(hidden.dtype())?)?)
 }
 
 fn l2_normalize(pooled: &Tensor) -> Result<Tensor, EncoderError> {

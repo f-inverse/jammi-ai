@@ -204,6 +204,49 @@ fn bert_forward_f16_backbone_with_padding() {
     );
 }
 
+/// `forward` runs the pooled path (`forward_hidden` + `pool_and_normalize`).
+/// The pooling mask is built in F32 (`pooling.rs`); a F16 backbone yields F16
+/// hidden states, so every mask-combine site inside mean/max/weighted-mean
+/// pooling must also cast to match. Real padding (not an all-ones mask) is
+/// required to exercise a non-trivial mask in each strategy.
+#[test]
+fn bert_forward_pooled_f16_backbone_with_padding() {
+    let device = Device::Cpu;
+    let config = load_config();
+    let weights = weights_path();
+
+    let input_ids = Tensor::new(&[[1u32, 2, 3, 4, 5], [6, 7, 8, 0, 0]], &device).unwrap();
+    let mask = Tensor::new(&[[1u32, 1, 1, 1, 1], [1, 1, 1, 0, 0]], &device).unwrap();
+
+    for strategy in [Pooling::Mean, Pooling::Max, Pooling::WeightedMean] {
+        let varmap = VarMap::new();
+        let bert = Bert::builder()
+            .pooling(strategy)
+            .lora(LoraBuildConfig::frozen())
+            .backbone_dtype(DType::F16)
+            .adapter(None)
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .unwrap_or_else(|e| panic!("build F16 BERT for {strategy:?} pooling: {e}"));
+
+        let pooled = bert
+            .forward(&input_ids, &mask)
+            .unwrap_or_else(|e| panic!("F16 pooled forward with padding ({strategy:?}): {e}"));
+        assert_eq!(pooled.dims(), &[2, config.hidden_size]);
+
+        let values = pooled
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            values.iter().all(|v| v.is_finite()),
+            "F16 pooled forward ({strategy:?}) produced non-finite values"
+        );
+    }
+}
+
 #[test]
 fn bert_max_seq_length_check() {
     let device = Device::Cpu;

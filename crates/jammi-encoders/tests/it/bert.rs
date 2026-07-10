@@ -247,6 +247,73 @@ fn bert_forward_pooled_f16_backbone_with_padding() {
     }
 }
 
+/// An all-padding row (`attention_mask` entirely `0` for one batch item)
+/// drives `mean_pool`'s and `weighted_mean_pool`'s divisor to `0` and removes
+/// every real token from `max_pool`'s reduce. On base commit `4acad0f`, the
+/// F32 eps floors (`1e-9` for the divisors, `-1e30` for the max-pool bias)
+/// silently lose their guarantee once cast to F16: `1e-9` underflows to
+/// `0.0` (giving `0 / 0 = NaN` for mean/weighted-mean) and `-1e30` overflows
+/// to `-inf` (max-pool). This test is RED (NaN/-inf) on `4acad0f` and GREEN
+/// on the fix, which floors the divisor at `1.0` (exact in every dtype) and
+/// replaces the max-pool bias with a `where_cond` select against a
+/// dtype-exact finite sentinel.
+#[test]
+fn bert_forward_pooled_f16_backbone_all_padding_row() {
+    let device = Device::Cpu;
+    let config = load_config();
+    let weights = weights_path();
+
+    // Row 0 is a normal, fully-real sequence. Row 1 is entirely padding.
+    let input_ids = Tensor::new(&[[1u32, 2, 3, 4, 5], [0, 0, 0, 0, 0]], &device).unwrap();
+    let mask = Tensor::new(&[[1u32, 1, 1, 1, 1], [0, 0, 0, 0, 0]], &device).unwrap();
+
+    for strategy in [Pooling::Mean, Pooling::Max, Pooling::WeightedMean] {
+        let varmap = VarMap::new();
+        let bert = Bert::builder()
+            .pooling(strategy)
+            .lora(LoraBuildConfig::frozen())
+            .backbone_dtype(DType::F16)
+            .adapter(None)
+            .build(&[weights.as_path()], &config, &device, &varmap)
+            .unwrap_or_else(|e| panic!("build F16 BERT for {strategy:?} pooling: {e}"));
+
+        let pooled = bert.forward(&input_ids, &mask).unwrap_or_else(|e| {
+            panic!("F16 pooled forward with all-padding row ({strategy:?}): {e}")
+        });
+        assert_eq!(pooled.dims(), &[2, config.hidden_size]);
+
+        let values = pooled
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            values.iter().all(|v| v.is_finite()),
+            "F16 pooled forward ({strategy:?}) produced non-finite values for an all-padding row: {values:?}"
+        );
+
+        // Row 1 (all-padding) must collapse to the exact zero vector for
+        // mean/weighted-mean, not merely "some finite value".
+        if matches!(strategy, Pooling::Mean | Pooling::WeightedMean) {
+            let row1: Vec<f32> = pooled
+                .narrow(0, 1, 1)
+                .unwrap()
+                .squeeze(0)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert!(
+                row1.iter().all(|v| v.abs() < 1e-6),
+                "F16 all-padding row ({strategy:?}) expected the zero vector, got {row1:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn bert_max_seq_length_check() {
     let device = Device::Cpu;

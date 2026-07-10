@@ -390,10 +390,12 @@ pub struct GrpcChain {
 /// Holds a [`tonic::service::Routes`] with the engine's services pre-added
 /// (Flight SQL + `CatalogService` + the tier/engine services, including
 /// `AuditService`) and any resource whose lifetime must span the serve loop (the
-/// embedded training worker). A downstream chains [`Self::mount`] to add its own
-/// services beside the engine's, then [`Self::serve`]s — or splits to compose one
-/// listener of its own: [`Self::into_layered_axum_router`] is the safe default
-/// (the engine's transport stack pre-applied, ready for [`axum::serve()`]), and
+/// embedded training worker). A downstream chains [`Self::mount`] (un-gated) or
+/// [`Self::mount_tenant_scoped`] (bound by the engine's single tenant resolver)
+/// to add its own services beside the engine's, then [`Self::serve`]s — or
+/// splits to compose one listener of its own: [`Self::into_layered_axum_router`]
+/// is the safe default (the engine's transport stack pre-applied, ready for
+/// [`axum::serve()`]), and
 /// [`Self::into_axum_router`] is the expert, layer-free split for nesting under a
 /// listener that already frames gRPC-web.
 ///
@@ -409,6 +411,12 @@ pub struct AssembledChain {
     // because the layer stack is deferred to `serve` — the outermost layer
     // observes every request by method path.
     metrics: Arc<MetricsRegistry>,
+    // The SAME `TenantResolverLayer` (holding the same `Arc<dyn TenantResolver>`)
+    // that wraps every engine service in `assemble_grpc_chain`. Retained
+    // (`#[derive(Clone)]`, a cheap `Arc` clone) so `mount_tenant_scoped` can wrap
+    // a downstream service through it too — the single-binder invariant holds:
+    // there is still exactly ONE resolver, never a second one forked off here.
+    tenant_resolver_layer: TenantResolverLayer,
     // The embedded training worker the `train` tier owns, held RAII for the serve
     // loop. Owned by the chain (not the assemble frame) so it survives the
     // assemble→serve split; `serve` keeps it alive across the serve future and
@@ -436,13 +444,20 @@ pub struct ChainParts {
 }
 
 impl AssembledChain {
-    /// Mount a downstream service beside the engine's. Delegates
-    /// [`tonic::service::Routes::add_service`] (by value, chainable) and records
-    /// the service's `NamedService::NAME` in the mounted ledger for the startup
-    /// tracing line — so the ledger cannot drift from what is actually mounted.
-    /// Generic: the engine names no consumer. The service inherits the transport
-    /// layer stack [`Self::serve`] applies, exactly as the engine's own services
-    /// do.
+    /// Mount a downstream service beside the engine's, **un-gated by the engine's
+    /// tenant resolver**. Delegates [`tonic::service::Routes::add_service`] (by
+    /// value, chainable) and records the service's `NamedService::NAME` in the
+    /// mounted ledger for the startup tracing line — so the ledger cannot drift
+    /// from what is actually mounted. Generic: the engine names no consumer. The
+    /// service inherits the transport layer stack [`Self::serve`] applies,
+    /// exactly as the engine's own services do — but NOT the tenant-binding
+    /// layer, so no `SessionTenant` extension is bound on its requests.
+    ///
+    /// Reach for this for a service that must run BEFORE a tenant is known — a
+    /// pre-auth handshake (e.g. a login/bootstrap verb) that a caller reaches
+    /// without a resolvable credential yet. Use [`Self::mount_tenant_scoped`]
+    /// instead for a service that wants the engine's resolved tenant bound
+    /// uniformly.
     pub fn mount<S>(mut self, svc: S) -> Self
     where
         S: tonic::codegen::Service<
@@ -458,6 +473,61 @@ impl AssembledChain {
     {
         self.mounted.push(S::NAME.to_string());
         self.routes = self.routes.add_service(svc);
+        self
+    }
+
+    /// Mount a downstream service beside the engine's, wrapped by the engine's
+    /// SAME single [`TenantResolverLayer`] every engine service is wrapped with
+    /// (retained on `self` from [`assemble_grpc_chain`] — there is still exactly
+    /// ONE `Arc<dyn TenantResolver>`, never a second resolver forked off here).
+    /// Per request, the wrapper resolves the tenant BEFORE the service's handler
+    /// runs: `Ok(scope)` binds the `SessionTenant` extension the handler reads
+    /// ([`TenantScope::Tenant`](crate::grpc::session::TenantScope::Tenant) →
+    /// `Some`, [`TenantScope::Global`](crate::grpc::session::TenantScope::Global)
+    /// → `None`) and calls it; `Err(status)` returns that status and the handler
+    /// NEVER runs — see [`crate::tenant_resolver_layer`] for the full per-request
+    /// contract. The wrapper forwards the inner service's `NamedService::NAME`,
+    /// so the mounted ledger and the proto route both stay keyed to the
+    /// service's own name, exactly as [`Self::mount`] records it.
+    ///
+    /// Reach for this so a downstream service gets `SessionTenant` bound
+    /// uniformly with every engine service, dropping its own per-handler
+    /// resolve. Use plain [`Self::mount`] instead for a service that must stay
+    /// un-gated (e.g. a pre-auth login/bootstrap handshake reached before any
+    /// tenant is known).
+    ///
+    /// **Do NOT** mount a service here that already binds its own
+    /// `SessionTenant` internally (or resolves tenant identity some other way)
+    /// — the two binds would race and the later one silently wins
+    /// (last-writer-wins on the request extension), which is exactly the
+    /// double-bind the engine's single-binder invariant exists to prevent. Wrap
+    /// a service with this method at most once, and never alongside a
+    /// self-resolving service.
+    ///
+    /// PRE-SPLIT ONLY: this method lives on [`AssembledChain`], before
+    /// [`Self::into_axum_router`] / [`Self::into_layered_axum_router`] split the
+    /// routes off. [`ChainParts`] does NOT carry the layer forward — a
+    /// downstream that splits to compose its own listener re-applies the
+    /// (already `pub`) [`TenantResolverLayer`] itself via [`tower::Layer::layer`]
+    /// before nesting its service, exactly as this method does internally.
+    pub fn mount_tenant_scoped<S, ResBody>(mut self, svc: S) -> Self
+    where
+        S: tonic::codegen::Service<
+                tonic::codegen::http::Request<tonic::body::Body>,
+                Response = tonic::codegen::http::Response<ResBody>,
+                Error = std::convert::Infallible,
+            > + tonic::server::NamedService
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        S::Future: Send + 'static,
+        ResBody: Default + 'static,
+        tonic::codegen::http::Response<ResBody>: axum::response::IntoResponse,
+    {
+        let scoped = self.tenant_resolver_layer.clone().layer(svc);
+        self.mounted.push(S::NAME.to_string());
+        self.routes = self.routes.add_service(scoped);
         self
     }
 
@@ -804,6 +874,10 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
         routes,
         mounted,
         metrics,
+        // The SAME layer `mount_engine!` wrapped every engine service with above
+        // — retained so `AssembledChain::mount_tenant_scoped` can wrap a
+        // downstream service through the identical single resolver.
+        tenant_resolver_layer: resolver_layer,
         #[cfg(feature = "train")]
         _train_worker: train_worker,
     })

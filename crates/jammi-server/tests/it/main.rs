@@ -19,6 +19,7 @@ mod grpc_training;
 mod grpc_trigger;
 mod grpc_web;
 mod health;
+mod mount_tenant_scoped;
 mod serve_e2e;
 mod server;
 mod service_tiers;

@@ -28,7 +28,7 @@ use datafusion::physical_plan::DisplayAs;
 use datafusion::physical_plan::DisplayFormatType;
 use futures::StreamExt;
 
-use crate::catalog::backend::{SqlValue, TxOptions};
+use crate::catalog::backend::{SqlNullType, SqlValue, TxOptions};
 
 use super::definition::MutableTableDefinition;
 use super::MutableBackend;
@@ -149,7 +149,7 @@ pub(crate) fn batch_to_params(
     let arrays: Vec<&dyn Array> = batch.columns().iter().map(|c| c.as_ref()).collect();
     let tenant_value = match tenant {
         Some(t) => SqlValue::TextOwned(t.to_string()),
-        None => SqlValue::Null,
+        None => SqlValue::Null(SqlNullType::Text),
     };
     let mut out = Vec::with_capacity(n_rows * (arrays.len() + 1));
     for r in 0..n_rows {
@@ -169,7 +169,22 @@ fn extract_value(
 ) -> Result<SqlValue<'static>, &'static str> {
     use arrow_schema::DataType::*;
     if arr.is_null(idx) {
-        return Ok(SqlValue::Null);
+        // A null cell must bind the same SqlNullType the non-null arm below
+        // produces for this column's Arrow type, so Postgres sees one
+        // consistent SQL type across null and non-null rows.
+        let null_type = match ty {
+            Boolean => SqlNullType::Bool,
+            Int32 | Int64 => SqlNullType::Int,
+            Float32 | Float64 => SqlNullType::Float,
+            Utf8 => SqlNullType::Text,
+            Binary | LargeBinary => SqlNullType::Bytes,
+            // A null timestamp mirrors the non-null arm's bind-kind so a
+            // column binds one consistent SQL type across null and
+            // non-null rows.
+            Timestamp(_, _) => SqlNullType::Int,
+            _ => return Err("unsupported arrow type for mutable-table insert"),
+        };
+        return Ok(SqlValue::Null(null_type));
     }
     match ty {
         Boolean => arr
@@ -212,12 +227,12 @@ fn extract_value(
             .downcast_ref::<LargeBinaryArray>()
             .map(|a| SqlValue::BytesOwned(a.value(idx).to_vec()))
             .ok_or("expected LargeBinaryArray"),
-        // Timestamps map to their numeric tick (i64). The catalog backend
-        // stores them as INTEGER for SQLite portability; consumers that
-        // need wall-clock formatting do the conversion at read time. This
-        // honors SPEC-02 §"Define the schema" which explicitly lists
-        // `Timestamp(Microsecond, _)` as a supported column shape on the
-        // `register-mutable-table.md` recipe.
+        // Timestamps map to their numeric tick (i64). The mutable-table DDL
+        // stores them as TEXT on SQLite and TIMESTAMPTZ on Postgres;
+        // consumers that need wall-clock formatting do the conversion at
+        // read time. This honors SPEC-02 §"Define the schema" which
+        // explicitly lists `Timestamp(Microsecond, _)` as a supported
+        // column shape on the `register-mutable-table.md` recipe.
         Timestamp(arrow_schema::TimeUnit::Second, _) => arr
             .as_any()
             .downcast_ref::<TimestampSecondArray>()

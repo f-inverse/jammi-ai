@@ -18,6 +18,7 @@ mod ft_determinism;
 mod graph_context;
 mod graph_finetune;
 mod graph_propagation;
+mod import_pipeline;
 mod inference;
 mod jammi;
 mod local_session;

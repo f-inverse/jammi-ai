@@ -22,6 +22,7 @@ mod mutable_federation;
 mod mutable_tables;
 mod read_vectors;
 mod recovery;
+mod register_computed_embedding;
 mod sources;
 mod storage_cloud;
 mod store;

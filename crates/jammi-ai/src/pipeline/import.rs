@@ -5,30 +5,28 @@
 //!
 //! A producer that already ran the model elsewhere (a remote vector upsert, a
 //! migration off another store, an offline recompute-avoidance batch) hands the
-//! engine a Parquet of `(_row_id, vector)` rows; this reads them, upholds the
-//! embedding-table invariants (every vector L2-normalized so the cosine ANN
-//! sidecar is valid), and lands the result through the single
-//! [`ResultStore::materialize_embedding_table`] funnel so it is searchable and
+//! engine a Parquet of `(_row_id, vector)` rows; this reads them and lands the
+//! result through [`ResultStore::materialize_computed_embedding_table`], which
+//! upholds the embedding-table invariants (every vector L2-normalized so the
+//! cosine ANN sidecar is valid) and folds a content digest of the normalized
+//! rows into the descriptor's `params`, so the result is searchable and
 //! joinable exactly like a `GenerateEmbeddings` output.
 //!
 //! The table is recompute-inert: the engine did not compute it, so its
-//! [`ProducingDescriptor::External`] descriptor returns the typed
-//! [`JammiError::NotRecomputable`] refusal on replay rather than a re-run
-//! guessed from the columns. The
-//! descriptor's `params` fold every output-affecting determinant — including a
-//! content digest of the normalized vectors — so two distinct imports never
-//! collide on one definition hash.
+//! [`jammi_db::store::manifest::ProducingDescriptor::External`] descriptor
+//! returns the typed [`jammi_db::error::JammiError::NotRecomputable`] refusal
+//! on replay rather than a re-run guessed from the columns. The descriptor's
+//! `params` fold every output-affecting scalar determinant — the content
+//! digest of the normalized vectors is auto-folded in by the materialization
+//! verb — so two distinct imports never collide on one definition hash.
 
 use std::collections::BTreeMap;
 
 use jammi_db::catalog::result_repo::ResultTableRecord;
-use jammi_db::error::{JammiError, Result};
+use jammi_db::error::Result;
 use jammi_db::storage::StorageUrl;
-use jammi_db::store::manifest::{
-    ArtifactDigest, InputAnchor, Materialization, MaterializationEnv, ModelIdentity,
-    ProducingDescriptor,
-};
-use jammi_db::store::{EmbeddingTableSpec, ResultStore};
+use jammi_db::store::manifest::{InputAnchor, MaterializationEnv, ModelIdentity};
+use jammi_db::store::{ComputedEmbeddingProvenance, EmbeddingTableSpec, ResultStore};
 
 use crate::model::ModelSource;
 use crate::session::InferenceSession;
@@ -45,8 +43,9 @@ const IMPORT_PRODUCER_ID: &str = "external_import";
 const IMPORT_BACKEND: &str = "external_import";
 
 /// Orchestrates a precomputed-vector import: read `(_row_id, vector)` rows →
-/// L2-normalize (rejecting zero-norm) → land a ready embedding table through the
-/// materialization funnel with a content-complete [`ProducingDescriptor::External`].
+/// materialize them through [`ResultStore::materialize_computed_embedding_table`],
+/// which lands a ready embedding table with a content-complete
+/// [`jammi_db::store::manifest::ProducingDescriptor::External`].
 pub struct ImportPipeline<'a> {
     session: &'a InferenceSession,
     result_store: &'a ResultStore,
@@ -60,7 +59,7 @@ impl<'a> ImportPipeline<'a> {
         }
     }
 
-    /// Register the precomputed vectors at `vectors_url` as a ready
+    /// Materialize the precomputed vectors at `vectors_url` as a ready
     /// `(source_id, TextEmbedding, model_id)` embedding table.
     ///
     /// `key_column` and `text_columns` are recorded as catalog provenance (which
@@ -71,8 +70,8 @@ impl<'a> ImportPipeline<'a> {
     /// loaded, so the import runs GPU-free.
     ///
     /// Reads the whole input object into memory (a thin promotion of
-    /// [`ResultStore::materialize_embedding_table`], which takes the rows
-    /// eagerly); a streaming variant is future work.
+    /// [`ResultStore::materialize_computed_embedding_table`], which takes the
+    /// rows eagerly); a streaming variant is future work.
     pub async fn run(
         &self,
         source_id: &str,
@@ -87,51 +86,23 @@ impl<'a> ImportPipeline<'a> {
         // the generate path canonicalizes at `pipeline/embedding.rs`.
         let canonical_model_id = ModelSource::parse(model_id).to_string();
 
-        // Read the precomputed rows, then uphold the embedding-table invariants:
-        // every vector is `dimensions` wide and L2-normalized (the cosine ANN
-        // sidecar assumes unit vectors); a zero-norm vector cannot be
-        // cosine-searched, so it is rejected.
-        let mut rows = self.session.read_keyed_vectors(vectors_url).await?;
-        for (key, vector) in rows.iter_mut() {
-            if vector.len() != dimensions {
-                return Err(JammiError::Schema {
-                    table: source_id.to_string(),
-                    column: "vector".to_string(),
-                    expected: format!("FixedSizeList<Float32> width {dimensions}"),
-                    actual: format!("row '{key}' has width {}", vector.len()),
-                });
-            }
-            let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if !(norm.is_finite() && norm > 0.0) {
-                return Err(JammiError::Schema {
-                    table: source_id.to_string(),
-                    column: "vector".to_string(),
-                    expected: "a non-zero-norm, L2-normalizable vector".to_string(),
-                    actual: format!("row '{key}' has norm {norm}"),
-                });
-            }
-            for x in vector.iter_mut() {
-                *x /= norm;
-            }
-        }
+        // Read the precomputed rows; the verb below upholds the embedding-table
+        // invariants (width == dimensions, L2-normalized, rejecting a zero or
+        // non-finite norm) and auto-folds a content digest of the normalized
+        // rows into `params`, so no import-side duplication is needed here.
+        let rows = self.session.read_keyed_vectors(vectors_url).await?;
 
-        // A content-complete `External` descriptor: `params` folds every
-        // output-affecting determinant — the scalar identity AND a digest of the
-        // normalized vectors — so two distinct imports under the same scalars
-        // never serialise identically and collide on one definition hash.
+        // The scalar identity of this import — every output-affecting
+        // determinant *except* the content digest, which the verb folds in
+        // itself. An omitted determinant here is a silent false hash match, so
+        // this set must stay complete.
         let joined_text = text_columns.join(",");
-        let content_digest = content_digest(&rows);
         let mut params = BTreeMap::new();
         params.insert("source_id".to_string(), source_id.to_string());
         params.insert("model_id".to_string(), canonical_model_id.clone());
         params.insert("dimensions".to_string(), dimensions.to_string());
         params.insert("key_column".to_string(), key_column.to_string());
         params.insert("text_columns".to_string(), joined_text.clone());
-        params.insert("content_digest".to_string(), content_digest);
-        let descriptor = ProducingDescriptor::External {
-            producer_id: IMPORT_PRODUCER_ID.to_string(),
-            params,
-        };
 
         let env = MaterializationEnv::new(
             self.session.compute_device(),
@@ -151,7 +122,7 @@ impl<'a> ImportPipeline<'a> {
 
         let text_columns = (!joined_text.is_empty()).then_some(joined_text.as_str());
         self.result_store
-            .materialize_embedding_table(
+            .materialize_computed_embedding_table(
                 self.session.context(),
                 EmbeddingTableSpec {
                     source_id,
@@ -162,25 +133,13 @@ impl<'a> ImportPipeline<'a> {
                     text_columns,
                 },
                 &rows,
-                Materialization::new(&descriptor, &env, inputs),
+                ComputedEmbeddingProvenance {
+                    producer_id: IMPORT_PRODUCER_ID.to_string(),
+                    params,
+                    env,
+                    inputs,
+                },
             )
             .await
     }
-}
-
-/// A stable content digest over the normalized rows: the hex of a hash folding
-/// each row's key bytes and vector bytes in file order. Distinguishes two
-/// imports that share every scalar determinant but carry different vectors, so
-/// they do not alias on one definition hash.
-fn content_digest(rows: &[(String, Vec<f32>)]) -> String {
-    let mut buf = Vec::new();
-    for (key, vector) in rows {
-        buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        buf.extend_from_slice(key.as_bytes());
-        buf.extend_from_slice(&(vector.len() as u64).to_le_bytes());
-        for x in vector {
-            buf.extend_from_slice(&x.to_le_bytes());
-        }
-    }
-    ArtifactDigest::of_bytes(&buf).0
 }

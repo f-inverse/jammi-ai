@@ -15,6 +15,7 @@ pub use manifest::{
     ModelIdentity, ProducingDescriptor,
 };
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -73,6 +74,44 @@ pub struct EmbeddingTableSpec<'a> {
     /// the catalog `text_columns` provenance (joined). `None` when no source
     /// columns are attributed (a pooled or externally-produced batch).
     pub text_columns: Option<&'a str>,
+}
+
+/// The reserved [`ProducingDescriptor::External`] `params` key
+/// [`ResultStore::materialize_computed_embedding_table`] folds a content digest of
+/// the normalized rows into. Bare (unnamespaced) so it matches the key
+/// `jammi-ai`'s import pipeline has always used for the same purpose —
+/// namespacing it would change the `params` `BTreeMap`'s canonical bytes and
+/// therefore the [`DefinitionHash`] of every table an existing caller already
+/// produced under the old key.
+pub const CONTENT_DIGEST_PARAM_KEY: &str = "content_digest";
+
+/// Caller-supplied provenance for a computed embedding table materialized
+/// through [`ResultStore::materialize_computed_embedding_table`] — the
+/// [`ProducingDescriptor::External`] producer's vocabulary. The engine owns
+/// only the *mechanism* (normalize, digest, materialize); the caller owns the
+/// *meaning* of `producer_id`, `params`, `env`, and `inputs`, so this struct
+/// carries no consumer-specific field.
+#[derive(Debug, Clone)]
+pub struct ComputedEmbeddingProvenance {
+    /// The caller's stable identifier for the producing verb it does not ask
+    /// the engine to own — an opaque label naming the external producer (its
+    /// own pipeline id, e.g. `"external_import"`).
+    pub producer_id: String,
+    /// Every output-affecting parameter of the caller's producer, as
+    /// canonical string key/value pairs. Completeness is the caller's
+    /// contract — an omitted determinant silently aliases two different
+    /// productions on one hash. Must **not** contain
+    /// [`CONTENT_DIGEST_PARAM_KEY`]: the verb folds that key in itself from
+    /// the normalized rows, and a caller-supplied value there would either be
+    /// silently overwritten (a footgun) or collide — so this is rejected
+    /// loudly instead.
+    pub params: BTreeMap<String, String>,
+    /// The output-affecting environment (engine version, compute device,
+    /// invoked models) the caller's producer ran under.
+    pub env: MaterializationEnv,
+    /// The as-of state of every input the caller's producer read, in producer
+    /// order.
+    pub inputs: Vec<InputAnchor>,
 }
 
 /// Returned by [`ResultStore::create_table`] — the generated paths and name
@@ -932,6 +971,100 @@ impl ResultStore {
                 ))
             })
     }
+
+    /// Materialize consumer-computed, in-memory vectors as a ready, searchable
+    /// embedding table under a caller-supplied [`ProducingDescriptor::External`]
+    /// provenance — the promotion path for a producer the engine does not
+    /// dispatch itself (a perturbation, a reconditioning pass, a migration off
+    /// another store, any in-process recompute-avoidance batch).
+    ///
+    /// Every engine embedding table's storage/search contract is
+    /// **cosine/direction-only**: rows are read back only through
+    /// [`crate::index::VectorIndex`] cosine search, never as raw-vector reads,
+    /// so a vector's *magnitude* is unobservable — only its *direction*
+    /// carries meaning. Unit-normalizing the caller's rows before storing and
+    /// digesting them is therefore invariant-upholding, never observably
+    /// lossy, even for a caller's already-perturbed or reconditioned vectors:
+    /// two vectors that differ only in magnitude are the same point under this
+    /// contract, so collapsing that unobservable degree of freedom cannot lose
+    /// information the table's own read path could ever expose. (This is a
+    /// per-call normalization the caller's *rows* undergo, not a claim that
+    /// every table this engine stores is unit-norm end-to-end — a graph
+    /// propagation landed through [`Self::materialize_embedding_table`]
+    /// directly may legitimately carry zero rows it declines to normalize.)
+    ///
+    /// Upholds the embedding-table invariant the same way
+    /// [`Self::materialize_embedding_table`] callers had to hand-roll before
+    /// this verb existed: each row is validated to `spec.dimensions` wide
+    /// (typed [`JammiError::Schema`] on mismatch) and L2-normalized, rejecting
+    /// a zero or non-finite norm (also [`JammiError::Schema`] — such a vector
+    /// cannot be cosine-searched). The **normalized copy** — never the
+    /// caller's borrowed input — is what gets stored and digested.
+    ///
+    /// Auto-folds a [`CONTENT_DIGEST_PARAM_KEY`] content digest of the
+    /// normalized rows into `provenance.params`, so two materializations
+    /// sharing every scalar determinant but different vectors never collide
+    /// on one [`DefinitionHash`] (K7 completeness). Fails loud
+    /// ([`JammiError::Schema`]) if the caller's `params` already carries that
+    /// reserved key — never a silent overwrite.
+    pub async fn materialize_computed_embedding_table(
+        &self,
+        ctx: &SessionContext,
+        spec: EmbeddingTableSpec<'_>,
+        rows: &[(String, Vec<f32>)],
+        mut provenance: ComputedEmbeddingProvenance,
+    ) -> Result<ResultTableRecord> {
+        if provenance.params.contains_key(CONTENT_DIGEST_PARAM_KEY) {
+            return Err(JammiError::Schema {
+                table: spec.source_id.to_string(),
+                column: CONTENT_DIGEST_PARAM_KEY.to_string(),
+                expected: "provenance.params without a caller-supplied content_digest".to_string(),
+                actual: "provenance.params already carries the reserved content_digest key"
+                    .to_string(),
+            });
+        }
+
+        let dimensions = spec.dimensions;
+        let mut normalized: Vec<(String, Vec<f32>)> = Vec::with_capacity(rows.len());
+        for (key, vector) in rows {
+            if vector.len() != dimensions {
+                return Err(JammiError::Schema {
+                    table: spec.source_id.to_string(),
+                    column: "vector".to_string(),
+                    expected: format!("FixedSizeList<Float32> width {dimensions}"),
+                    actual: format!("row '{key}' has width {}", vector.len()),
+                });
+            }
+            let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if !(norm.is_finite() && norm > 0.0) {
+                return Err(JammiError::Schema {
+                    table: spec.source_id.to_string(),
+                    column: "vector".to_string(),
+                    expected: "a non-zero-norm, L2-normalizable vector".to_string(),
+                    actual: format!("row '{key}' has norm {norm}"),
+                });
+            }
+            normalized.push((key.clone(), vector.iter().map(|x| x / norm).collect()));
+        }
+
+        provenance.params.insert(
+            CONTENT_DIGEST_PARAM_KEY.to_string(),
+            content_digest(&normalized),
+        );
+
+        let descriptor = ProducingDescriptor::External {
+            producer_id: provenance.producer_id,
+            params: provenance.params,
+        };
+
+        self.materialize_embedding_table(
+            ctx,
+            spec,
+            &normalized,
+            Materialization::new(&descriptor, &provenance.env, provenance.inputs),
+        )
+        .await
+    }
 }
 
 /// Build the `(_row_id, _source_id, _model_id, vector)` batch for a
@@ -980,6 +1113,23 @@ fn embedding_batch(
         ],
     )
     .map_err(|e| JammiError::Other(format!("materialize: build batch: {e}")))
+}
+
+/// A stable content digest over normalized embedding rows: the hex of a
+/// SHA-256 folding each row's key bytes and vector bytes in file order.
+/// Distinguishes two productions that share every scalar determinant but
+/// carry different vectors, so they never alias on one [`DefinitionHash`].
+fn content_digest(rows: &[(String, Vec<f32>)]) -> String {
+    let mut buf = Vec::new();
+    for (key, vector) in rows {
+        buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        buf.extend_from_slice(key.as_bytes());
+        buf.extend_from_slice(&(vector.len() as u64).to_le_bytes());
+        for x in vector {
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    ArtifactDigest::of_bytes(&buf).0
 }
 
 /// The per-process producing-run identity stamped on every manifest's

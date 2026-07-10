@@ -209,7 +209,11 @@ impl ModernBertAttention {
         let scale = (d as f64).sqrt();
         let scores = q.matmul(&k.transpose(D::Minus1, D::Minus2)?)?;
         let scores = (scores / scale)?;
-        let scores = scores.broadcast_add(extended_mask)?;
+        // The additive mask is always built in F32 (see `extended_attention_mask`);
+        // cast to the scores' dtype so a F16/BF16 backbone can add it (a no-op
+        // when scores are already F32).
+        let extended_mask = extended_mask.to_dtype(scores.dtype())?;
+        let scores = scores.broadcast_add(&extended_mask)?;
 
         let attn = candle_nn::ops::softmax(&scores, D::Minus1)?;
 

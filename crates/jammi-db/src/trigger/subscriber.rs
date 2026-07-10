@@ -67,11 +67,12 @@ impl Subscriber {
     /// broker stream, which overlaps the replayed prefix and is deduped by
     /// engine `_offset` (see the module docs). No engine `_offset` is skipped.
     ///
-    /// Resolves the tenant binding once, here, to filter the backing-table
-    /// replay. The resulting stream contains data only from that tenant
-    /// (plus globally-scoped rows), even if the caller polls it after the
-    /// surrounding [`crate::session::JammiSession::with_tenant_scoped`]
-    /// closure has returned and the task-local binding has cleared.
+    /// Resolves the tenant binding once, here, to filter both the
+    /// backing-table replay and the live broker tail. The resulting stream
+    /// contains data only from that tenant (plus globally-scoped rows), even
+    /// if the caller polls it after the surrounding
+    /// [`crate::session::JammiSession::with_tenant_scoped`] closure has
+    /// returned and the task-local binding has cleared.
     ///
     /// For server-streaming gRPC handlers that return the stream past the
     /// closure boundary, prefer [`Self::subscribe_scoped`]: it takes the
@@ -94,10 +95,20 @@ impl Subscriber {
     /// The replay's tenant predicate is computed from `tenant` at subscribe
     /// time and the resulting rows are materialised inside this call — no
     /// subsequent `poll_next` consults `current_tenant()` for replay. The
-    /// live broker tail is keyed by `topic.id`, which is itself
-    /// tenant-partitioned via [`TopicDefinition::tenant`]; together these
-    /// guarantee the returned stream stays inside `tenant`'s data even when
-    /// polled outside any surrounding `with_tenant_scoped` block.
+    /// live broker tail is filtered the same way, per delivered event: each
+    /// live [`DeliveredBatch`] carries the publish-scoped tenant tag the
+    /// broker stamped on it opaquely (see
+    /// [`crate::trigger::broker::TriggerBroker::publish`]), and this seam
+    /// yields it only when that tag equals `tenant` or is absent (a
+    /// globally-scoped publish) — mirroring the replay's own
+    /// `tenant_id = $current OR tenant_id IS NULL` predicate. `topic.id` is
+    /// NOT itself a tenant partition: a globally-registered topic
+    /// (`TopicDefinition::tenant == None`) shares one `topic.id` across every
+    /// tenant, so without this per-event filter the live tail would deliver
+    /// every tenant's events to every subscriber. Together the replay filter
+    /// and this live filter guarantee the returned stream stays inside
+    /// `tenant`'s data even when polled outside any surrounding
+    /// `with_tenant_scoped` block.
     ///
     /// This is the safe primitive for gRPC server-streaming handlers that
     /// return the stream to tonic past the request closure boundary:
@@ -148,6 +159,17 @@ impl Subscriber {
             }
             while let Some(item) = live.next().await {
                 let delivered = item?;
+                // Tenant filter on the live tail: a globally-registered topic
+                // shares one `topic.id` across every tenant, so the broker's
+                // `subscribe` (tenant-blind by contract) delivers every
+                // tenant's events indiscriminately. Yield only what this
+                // subscriber is scoped to see — its own tenant's events plus
+                // globally-scoped ones (`delivered.tenant.is_none()`) —
+                // mirroring the replay's `tenant_id = $current OR tenant_id
+                // IS NULL` predicate.
+                if delivered.tenant != tenant && delivered.tenant.is_some() {
+                    continue;
+                }
                 // Dedup the replay/live overlap by engine `_offset`: only
                 // advance past what replay already covered. Equality is a
                 // duplicate from the seam overlap; anything lower is a stale
@@ -240,6 +262,12 @@ impl Subscriber {
                     offset: event.offset,
                     produced_at: event.produced_at,
                     batch: filtered,
+                    // The replay path is already tenant-filtered by the
+                    // `scan_after_for_tenant` predicate above, so this tag
+                    // carries no further meaning here and is not authoritative
+                    // — unlike the live tail, which relies on it (see
+                    // `subscribe_scoped`'s live-branch filter).
+                    tenant: None,
                 });
             }
         }

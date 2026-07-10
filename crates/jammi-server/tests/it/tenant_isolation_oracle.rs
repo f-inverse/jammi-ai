@@ -46,7 +46,7 @@ use jammi_db::catalog::Catalog;
 use jammi_db::session::JammiSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
-use jammi_db::trigger::{TopicDefinition, TopicId, TriggerError};
+use jammi_db::trigger::{Predicate, TopicDefinition, TopicId, TriggerError};
 use jammi_db::{BackendImpl, ChannelId, ModelTask, TenantId};
 use jammi_test_utils::{fixture_url, test_config};
 use jammi_wire::FILE_DESCRIPTOR_SET;
@@ -845,11 +845,10 @@ fn cases() -> Vec<IsolationCase> {
                 "CROSS-TENANT READ LEAK: tenant B lists tenant A's topic"
             );
         }),
-        // Publish / Subscribe ride the same tenant-scoped backing table the
-        // topic catalog provisions; the read-side isolation is proven by the
-        // subscribe-scoped stream test in the engine, and the topic-row scope
-        // is proven by the topic cases above. The hermetic assertion here pins
-        // that a tenant cannot resolve a peer's topic to publish/subscribe to.
+        // Publish rides the same tenant-scoped backing table the topic catalog
+        // provisions; the topic-row scope is proven by the topic cases above.
+        // The hermetic assertion here pins that a tenant cannot resolve a
+        // peer's topic to publish to it.
         case!("TriggerService", "Publish", CaseKind::Hermetic, None, {
             let (_dir, sess_a, sess_b, _g) = session_ab().await;
             let owned_a = TopicDefinition {
@@ -870,25 +869,16 @@ fn cases() -> Vec<IsolationCase> {
                 "tenant B must not resolve tenant A's topic to publish to it"
             );
         }),
+        // The replay prefix is proven tenant-clean by
+        // `subscribe_scoped_stream_remains_tenant_filtered_after_closure_returns`
+        // in `jammi-db`'s own test suite; this case drives the LIVE broker tail
+        // on a GLOBALLY-registered topic (`TopicDefinition::tenant == None`,
+        // one shared `topic.id` across every tenant) — the shape the replay-only
+        // test cannot exercise, and the shape where the tenant leak actually
+        // lived: the live tail used to be keyed by `topic.id` and a
+        // caller-supplied predicate only, with no tenant filter at all.
         case!("TriggerService", "Subscribe", CaseKind::Hermetic, None, {
-            let (_dir, sess_a, sess_b, _g) = session_ab().await;
-            let owned_a = TopicDefinition {
-                id: TopicId::new(),
-                name: "a.events".into(),
-                schema: topic_schema(),
-                tenant: Some(tenant_a()),
-                broker_metadata: Default::default(),
-            };
-            sess_a.topic_repo().register_topic(&owned_a).await.unwrap();
-            assert!(
-                sess_b
-                    .topic_repo()
-                    .lookup_by_name("a.events", Some(tenant_b()))
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "tenant B must not resolve tenant A's topic to subscribe to it"
-            );
+            assert_live_subscribe_tenant_isolated().await;
         }),
         // --- eval + result tables --------------------------------------------
         case!("EvalService", "EvalEmbeddings", CaseKind::Hermetic, None, {
@@ -1143,6 +1133,125 @@ async fn list_topic_ids(sess: &JammiSession, tenant: Option<TenantId>) -> Vec<To
 // ---------------------------------------------------------------------------
 // Shared assertion bodies (used by multiple cases that share one resolver)
 // ---------------------------------------------------------------------------
+
+/// Proves the LIVE trigger-stream tail stays tenant-filtered on a GLOBALLY-
+/// registered topic (`TopicDefinition::tenant == None`, one shared `topic.id`
+/// across every tenant) — the exact shape that used to leak, because the
+/// live tail is keyed by `topic.id` + a caller-supplied predicate only, with
+/// no tenant dimension of its own. One `JammiSession` (one shared broker +
+/// backing table, the realistic single-process topology) registers the
+/// topic; tenant B opens a pure-live subscribe (`from_offset: None`, so no
+/// replay window contributes); tenant A publishes a tenant-scoped event;
+/// tenant B must never observe it. A GLOBAL (tenant `None`) publish IS
+/// visible to every tenant. Tenant A observing its own published event is
+/// the positive control proving the harness itself delivers live events at
+/// all (a broken subscribe wiring would otherwise pass the negative
+/// assertion vacuously).
+async fn assert_live_subscribe_tenant_isolated() {
+    use futures::StreamExt;
+    use std::time::Duration;
+
+    let dir = tempdir().unwrap();
+    let session = JammiSession::new(test_config(dir.path())).await.unwrap();
+
+    let topic = TopicDefinition {
+        id: TopicId::new(),
+        name: "global.live_events".into(),
+        schema: topic_schema(),
+        tenant: None,
+        broker_metadata: Default::default(),
+    };
+    session
+        .trigger_broker()
+        .register_topic(&topic)
+        .await
+        .unwrap();
+    session.topic_repo().register_topic(&topic).await.unwrap();
+
+    // Subscribe BEFORE publishing anything — the in-memory broker's
+    // broadcast channel only delivers to receivers already attached at send
+    // time, exactly like a real live tail.
+    let mut sub_a = session
+        .subscriber()
+        .subscribe_scoped(&topic, Some(tenant_a()), Predicate::match_all(), None)
+        .await
+        .unwrap();
+    let mut sub_b = session
+        .subscriber()
+        .subscribe_scoped(&topic, Some(tenant_b()), Predicate::match_all(), None)
+        .await
+        .unwrap();
+
+    session
+        .publisher()
+        .publish_scoped(&topic, Some(tenant_a()), live_event_batch(1, "a-private"))
+        .await
+        .unwrap();
+
+    // Positive control: tenant A's own live subscribe sees its own event.
+    let a_seen = tokio::time::timeout(Duration::from_millis(500), sub_a.next())
+        .await
+        .expect("tenant A's own live subscribe must observe its own published event")
+        .expect("stream ended early")
+        .unwrap();
+    assert_eq!(
+        live_event_label(&a_seen.batch),
+        "a-private",
+        "positive control: tenant A must see its own published event"
+    );
+
+    // The leak this case guards: tenant B's live subscribe must NOT observe
+    // tenant A's tenant-scoped event.
+    let b_leak = tokio::time::timeout(Duration::from_millis(300), sub_b.next()).await;
+    assert!(
+        b_leak.is_err(),
+        "CROSS-TENANT LIVE-SUBSCRIBE LEAK: tenant B received tenant A's event on a \
+         globally-registered topic's live tail"
+    );
+
+    // A GLOBAL (tenant `None`) publish IS visible to every tenant, including B.
+    session
+        .publisher()
+        .publish_scoped(&topic, None, live_event_batch(2, "global-announcement"))
+        .await
+        .unwrap();
+    let b_seen = tokio::time::timeout(Duration::from_millis(500), sub_b.next())
+        .await
+        .expect("tenant B must receive a GLOBAL event on the live tail")
+        .expect("stream ended early")
+        .unwrap();
+    assert_eq!(
+        live_event_label(&b_seen.batch),
+        "global-announcement",
+        "a globally-scoped publish must be visible to every tenant's live subscribe"
+    );
+}
+
+/// One `(event_id, label)` row on [`topic_schema`], the payload
+/// [`assert_live_subscribe_tenant_isolated`] publishes.
+fn live_event_batch(event_id: i64, label: &str) -> RecordBatch {
+    RecordBatch::try_new(
+        topic_schema(),
+        vec![
+            Arc::new(Int64Array::from(vec![event_id])),
+            Arc::new(StringArray::from(vec![label])),
+        ],
+    )
+    .unwrap()
+}
+
+/// Read back the single `label` value of a batch built by
+/// [`live_event_batch`].
+fn live_event_label(batch: &RecordBatch) -> String {
+    batch
+        .column_by_name("label")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0)
+        .to_string()
+}
 
 /// An eval run carries a `tenant_id`; the read path is tenant-filtered, so a
 /// peer cannot fetch a tenant's run. The `eval_runs.model_id` FK is satisfied

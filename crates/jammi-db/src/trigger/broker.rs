@@ -3,6 +3,7 @@
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 
+use crate::tenant::TenantId;
 use crate::trigger::consumer::ConsumerOffsetSnapshot;
 use crate::trigger::error::TriggerError;
 use crate::trigger::ids::TopicId;
@@ -13,9 +14,16 @@ use crate::trigger::topic::TopicDefinition;
 
 /// A pluggable pub/sub backend. Implementations are responsible only for
 /// *transport* — fan-out from publisher to live subscribers. Persistence is
-/// the engine's concern via the Phase-2 backing table; the broker never
-/// sees `tenant_id` (catalog lookup and the engine's predicate injection
-/// enforce tenant scope upstream).
+/// the engine's concern via the Phase-2 backing table.
+///
+/// The broker carries `publish_tenant` OPAQUELY: it stamps the value onto
+/// every [`crate::trigger::subscription::DeliveredBatch`] it later delivers
+/// and never inspects, compares, or routes on it. Tenant scope is enforced
+/// at the engine's subscribe seam ([`crate::trigger::Subscriber::subscribe_scoped`]),
+/// which filters the live tail by the delivered tag; the broker itself stays
+/// tenant-blind, matching `subscribe`'s unchanged signature below (adding a
+/// tenant filter to the broker's own subscribe would duplicate the seam's
+/// filtering across every driver instead of once at the engine boundary).
 #[async_trait]
 pub trait TriggerBroker: Send + Sync + 'static {
     /// Idempotently register a topic. Re-registering an existing topic
@@ -30,12 +38,19 @@ pub trait TriggerBroker: Send + Sync + 'static {
     /// Fan out a batch to currently-attached subscribers. Returns the
     /// offset the driver assigned. MUST NOT persist — the backing table
     /// is the engine's authoritative log.
+    ///
+    /// `publish_tenant` is the tenant the publish was scoped to (see
+    /// [`crate::trigger::Publisher::publish_scoped`]), `None` for a
+    /// globally-scoped publish. The broker carries it opaquely and stamps it
+    /// onto the [`crate::trigger::subscription::DeliveredBatch::tenant`] of
+    /// every delivery this publish produces; it never interprets the value.
     async fn publish(
         &self,
         topic_id: TopicId,
         batch: RecordBatch,
         produced_at: chrono::DateTime<chrono::Utc>,
         offset: u64,
+        publish_tenant: Option<TenantId>,
     ) -> Result<Offset, TriggerError>;
 
     /// Attach a subscriber to the live tail.
@@ -61,6 +76,12 @@ pub trait TriggerBroker: Send + Sync + 'static {
     /// retains, the broker returns [`TriggerError::OffsetEvicted`] — the
     /// engine's subscribe path falls back to backing-table replay for the
     /// missing prefix.
+    ///
+    /// This signature carries no tenant parameter: the broker delivers every
+    /// event matching `predicate` regardless of which tenant published it.
+    /// Tenant scope is enforced one layer up, by the engine's subscribe seam
+    /// filtering on `DeliveredBatch.tenant` (the opaque tag `publish` stamped
+    /// on) — never here.
     async fn subscribe(
         &self,
         topic_id: TopicId,

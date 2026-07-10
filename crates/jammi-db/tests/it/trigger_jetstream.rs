@@ -89,7 +89,7 @@ async fn publish_subscribe_filter() {
         let kind = if i % 2 == 0 { "X" } else { "Y" };
         let batch = batch_of(&[i], &[kind], &[i as f64]);
         broker
-            .publish(topic.id, batch, chrono::Utc::now(), i as u64)
+            .publish(topic.id, batch, chrono::Utc::now(), i as u64, None)
             .await
             .unwrap();
     }
@@ -147,7 +147,7 @@ async fn list_consumers_returns_jetstream_consumer_info() {
     for i in 0..3i64 {
         let batch = batch_of(&[i], &["X"], &[i as f64]);
         broker
-            .publish(topic.id, batch, chrono::Utc::now(), i as u64)
+            .publish(topic.id, batch, chrono::Utc::now(), i as u64, None)
             .await
             .unwrap();
     }
@@ -208,7 +208,10 @@ async fn publish_to_unregistered_topic_is_not_found() {
     let broker = open_broker().await;
     let stray = TopicId::new();
     let batch = batch_of(&[1], &["X"], &[1.0]);
-    match broker.publish(stray, batch, chrono::Utc::now(), 0).await {
+    match broker
+        .publish(stray, batch, chrono::Utc::now(), 0, None)
+        .await
+    {
         Err(TriggerError::TopicNotFound(_)) => {}
         other => panic!("expected TopicNotFound, got {other:?}"),
     }
@@ -255,7 +258,7 @@ async fn consumer_recreate_resumes_engine_offsets_with_no_loss() {
         let off = BASE + k;
         let batch = batch_of(&[off as i64], &["X"], &[off as f64]);
         broker
-            .publish(topic.id, batch, chrono::Utc::now(), off)
+            .publish(topic.id, batch, chrono::Utc::now(), off, None)
             .await
             .unwrap();
     }

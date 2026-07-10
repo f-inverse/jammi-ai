@@ -14,7 +14,9 @@ pub enum Pooling {
     /// First token's hidden state (\[CLS\] for BERT-family backbones).
     Cls,
     /// Element-wise max over real tokens (padding positions are excluded by
-    /// substituting `-inf` before the reduce).
+    /// substituting the compute dtype's own finite most-negative value
+    /// before the reduce, so an all-padding row still yields a finite
+    /// result).
     Max,
     /// Linear-position-weighted mean — token at position `i` (1-indexed) is
     /// weighted by `i`, normalised by the sum of effective weights. Matches
@@ -48,13 +50,18 @@ fn mask_f32(hidden: &Tensor, attention_mask: &Tensor) -> Result<Tensor, EncoderE
 }
 
 fn mean_pool(hidden: &Tensor, attention_mask: &Tensor) -> Result<Tensor, EncoderError> {
-    // The mask (and its eps-clamped sum) stay F32 for the clamp's precision;
-    // cast to `hidden`'s dtype only at the point each combines with `hidden`
-    // (a no-op when hidden is already F32).
+    // The divisor floor must survive the cast to `hidden`'s dtype, not just
+    // look right in F32: a `1e-9` eps underflows to `0.0` once cast to F16
+    // (whose smallest subnormal is ~6e-8), turning an all-padding row's
+    // `0 / 0` into NaN instead of a finite zero. `1.0` is exact in every
+    // supported dtype and semantically correct — `count` is always a
+    // non-negative integer (a sum of 0/1 mask entries), so a real row's count
+    // is already >=1 and the floor only ever engages on the all-padding case,
+    // where a `0`-sum divided by `1.0` is the finite zero vector.
     let mask = mask_f32(hidden, attention_mask)?;
     let masked = hidden.broadcast_mul(&mask.to_dtype(hidden.dtype())?)?;
     let summed = masked.sum(1)?;
-    let count = mask.sum(1)?.clamp(1e-9, f32::MAX as f64)?;
+    let count = mask.sum(1)?.clamp(1.0, f32::MAX as f64)?;
     Ok(summed.broadcast_div(&count.to_dtype(hidden.dtype())?)?)
 }
 
@@ -63,16 +70,34 @@ fn cls_pool(hidden: &Tensor) -> Result<Tensor, EncoderError> {
 }
 
 fn max_pool(hidden: &Tensor, attention_mask: &Tensor) -> Result<Tensor, EncoderError> {
-    // Push padding positions to a very negative value so they lose the max.
-    // Multiplying neg_inf by 0 yields NaN, so we add a large finite negative
-    // bias instead: 0 at real tokens, -1e30 at padding. The affine stays F32
-    // (0 and -1e30 are exact there); cast to `hidden`'s dtype only at the
-    // add, since `-1e30` legitimately saturates to that dtype's own -inf.
-    let mask = mask_f32(hidden, attention_mask)?;
-    let bias = mask.affine(1e30, -1e30)?;
-    Ok(hidden
-        .broadcast_add(&bias.to_dtype(hidden.dtype())?)?
-        .max(1)?)
+    // Padding positions must lose the max via *selection*, not an additive
+    // bias: a bias of `-1e30` is only finite in F32/F64 — once cast to F16
+    // (max magnitude ~65504) it silently saturates to `-inf`, and even a
+    // narrower bias risks `hidden + bias` itself overflowing past the
+    // dtype's own range. `where_cond` instead keeps every real-token value
+    // untouched and substitutes the dtype's own exact, finite sentinel at
+    // padding positions, so an all-padding row's max is that finite
+    // sentinel, never `-inf`.
+    let is_real = attention_mask
+        .to_dtype(DType::U8)?
+        .unsqueeze(2)?
+        .broadcast_as(hidden.shape())?;
+    let sentinel = Tensor::new(neg_sentinel(hidden.dtype()), hidden.device())?
+        .to_dtype(hidden.dtype())?
+        .broadcast_as(hidden.shape())?;
+    Ok(is_real.where_cond(hidden, &sentinel)?.max(1)?)
+}
+
+/// The most-negative value that is finite and exactly representable in
+/// `dtype`, used as the padding sentinel for [`max_pool`]. F16's max
+/// magnitude (~65504) is far narrower than F32/F64's, so a universal
+/// `-1e30` sentinel would saturate to `-inf` once cast to F16; F16 gets its
+/// own dtype-exact floor instead.
+fn neg_sentinel(dtype: DType) -> f32 {
+    match dtype {
+        DType::F16 => -65504.0,
+        _ => -1e30,
+    }
 }
 
 fn weighted_mean_pool(hidden: &Tensor, attention_mask: &Tensor) -> Result<Tensor, EncoderError> {
@@ -83,19 +108,41 @@ fn weighted_mean_pool(hidden: &Tensor, attention_mask: &Tensor) -> Result<Tensor
         .unsqueeze(2)?;
     let mask = mask_f32(hidden, attention_mask)?;
     let effective = mask.broadcast_mul(&weights)?;
-    // `effective` (position-weighted mask) and its eps-clamped sum stay F32;
-    // cast to `hidden`'s dtype only where each combines with `hidden`.
     let weighted_hidden = hidden.broadcast_mul(&effective.to_dtype(hidden.dtype())?)?;
     let numerator = weighted_hidden.sum(1)?;
-    let denominator = effective.sum(1)?.clamp(1e-9, f32::MAX as f64)?;
+    // Same divisor-floor invariant as `mean_pool`: `1.0` is exact in every
+    // supported dtype (unlike a `1e-9` eps, which underflows to `0.0` in
+    // F16). Every real token's position weight is `>=1` (positions are
+    // 1-indexed), so a non-empty row's denominator is already `>=1` and the
+    // floor only engages on the all-padding case, giving a finite zero
+    // vector instead of `0 / 0`.
+    let denominator = effective.sum(1)?.clamp(1.0, f32::MAX as f64)?;
     Ok(numerator.broadcast_div(&denominator.to_dtype(hidden.dtype())?)?)
 }
 
 fn l2_normalize(pooled: &Tensor) -> Result<Tensor, EncoderError> {
+    // Same cast-survival invariant as the pooling divisors: `Tensor::clamp`
+    // casts its scalar bound to `pooled`'s own dtype before comparing, so a
+    // `1e-12` floor (exact in F32/F64) underflows to `0.0` once cast to F16
+    // (min positive subnormal ~6e-8). A genuinely-zero pooled row (e.g. an
+    // all-padding row through `mean_pool`/`weighted_mean_pool`) would then
+    // hit `0 / 0 = NaN` instead of the intended `0 / floor = 0`. `norm_floor`
+    // picks a value that is nonzero once cast to `pooled`'s dtype and still
+    // far below any real embedding's norm, so it never perturbs a genuine
+    // non-degenerate row.
     let norm = pooled
         .sqr()?
         .sum_keepdim(D::Minus1)?
         .sqrt()?
-        .clamp(1e-12, f32::MAX as f64)?;
+        .clamp(norm_floor(pooled.dtype()) as f64, f32::MAX as f64)?;
     Ok(pooled.broadcast_div(&norm)?)
+}
+
+/// The smallest strictly-positive L2-norm floor that survives the cast to
+/// `dtype` performed inside [`Tensor::clamp`]. See [`l2_normalize`].
+fn norm_floor(dtype: DType) -> f32 {
+    match dtype {
+        DType::F16 => 1e-4,
+        _ => 1e-12,
+    }
 }

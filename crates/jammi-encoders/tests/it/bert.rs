@@ -170,6 +170,40 @@ fn bert_pooling_variants() {
     }
 }
 
+/// The additive attention mask is built in F32 (`mask.rs`); a F16 backbone
+/// produces F16 attention scores, so the mask-add must cast to match or the
+/// forward errors on a dtype mismatch. Real padding (not an all-ones mask)
+/// is required to exercise a non-trivial additive mask.
+#[test]
+fn bert_forward_f16_backbone_with_padding() {
+    let device = Device::Cpu;
+    let config = load_config();
+    let varmap = VarMap::new();
+    let weights = weights_path();
+
+    let bert = Bert::builder()
+        .pooling(Pooling::Mean)
+        .lora(LoraBuildConfig::frozen())
+        .backbone_dtype(DType::F16)
+        .adapter(None)
+        .build(&[weights.as_path()], &config, &device, &varmap)
+        .expect("build F16 BERT on tiny_bert");
+
+    let input_ids = Tensor::new(&[[1u32, 2, 3, 4, 5], [6, 7, 8, 0, 0]], &device).unwrap();
+    let mask = Tensor::new(&[[1u32, 1, 1, 1, 1], [1, 1, 1, 0, 0]], &device).unwrap();
+
+    let hidden = bert
+        .forward_hidden(&input_ids, &mask)
+        .expect("F16 forward_hidden with padding mask");
+    assert_eq!(hidden.dims(), &[2, 5, config.hidden_size]);
+    let values = hidden.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+    let values: Vec<f32> = values.to_vec1().unwrap();
+    assert!(
+        values.iter().all(|v| v.is_finite()),
+        "F16 forward_hidden produced non-finite values"
+    );
+}
+
 #[test]
 fn bert_max_seq_length_check() {
     let device = Device::Cpu;

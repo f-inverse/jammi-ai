@@ -111,7 +111,11 @@ impl DistilBertSelfAttention {
         let v = self.transpose_for_scores(&v)?;
 
         let scores = (q.matmul(&k.t()?)? / (self.attention_head_size as f64).sqrt())?;
-        let scores = scores.broadcast_add(extended_mask)?;
+        // The additive mask is always built in F32 (see `extended_attention_mask`);
+        // cast to the scores' dtype so a F16/BF16 backbone can add it (a no-op
+        // when scores are already F32).
+        let extended_mask = extended_mask.to_dtype(scores.dtype())?;
+        let scores = scores.broadcast_add(&extended_mask)?;
         let probs = candle_nn::ops::softmax(&scores, D::Minus1)?;
 
         let context = probs.matmul(&v)?;

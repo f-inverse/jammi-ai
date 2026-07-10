@@ -12,9 +12,10 @@ use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int64Array, LargeBinaryArray,
-    RecordBatch, StringArray,
+    RecordBatch, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::{DataType, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::sink::DataSinkExec;
@@ -235,6 +236,14 @@ fn decode_row(
                 .try_get::<Vec<u8>>(name)?
                 .map(DecodedValue::Bytes)
                 .unwrap_or(DecodedValue::Null)),
+            // The mutable-table DDL stores a timestamp column as its integer
+            // tick (see `sink.rs::extract_value`); the tick is decoded as a
+            // plain i64 here and reassembled into the typed Arrow Timestamp
+            // array in `build_arrays`, which knows the column's `TimeUnit`.
+            DataType::Timestamp(_, _) => Ok(row
+                .try_get::<i64>(name)?
+                .map(DecodedValue::Int)
+                .unwrap_or(DecodedValue::Null)),
             other => Err(crate::catalog::backend::BackendError::Execution(format!(
                 "mutable-table scan: column {name:?} has unsupported Arrow type {other:?}"
             ))),
@@ -337,6 +346,36 @@ fn build_arrays(
                         .collect::<Vec<_>>()
                         .into();
                     Ok(Arc::new(arr) as ArrayRef)
+                }
+                DataType::Timestamp(unit, tz) => {
+                    let ticks: Vec<Option<i64>> = values
+                        .into_iter()
+                        .map(|v| match v {
+                            DecodedValue::Int(i) => Some(i),
+                            _ => None,
+                        })
+                        .collect();
+                    // The tz is carried through unchanged (not reinterpreted)
+                    // so the reconstructed array's DataType exactly equals
+                    // the schema's `Timestamp(unit, tz)`.
+                    Ok(match unit {
+                        TimeUnit::Second => {
+                            let arr: TimestampSecondArray = ticks.into_iter().collect();
+                            Arc::new(arr.with_timezone_opt(tz.clone())) as ArrayRef
+                        }
+                        TimeUnit::Millisecond => {
+                            let arr: TimestampMillisecondArray = ticks.into_iter().collect();
+                            Arc::new(arr.with_timezone_opt(tz.clone())) as ArrayRef
+                        }
+                        TimeUnit::Microsecond => {
+                            let arr: TimestampMicrosecondArray = ticks.into_iter().collect();
+                            Arc::new(arr.with_timezone_opt(tz.clone())) as ArrayRef
+                        }
+                        TimeUnit::Nanosecond => {
+                            let arr: TimestampNanosecondArray = ticks.into_iter().collect();
+                            Arc::new(arr.with_timezone_opt(tz.clone())) as ArrayRef
+                        }
+                    })
                 }
                 other => Err(DataFusionError::NotImplemented(format!(
                     "mutable-table scan cannot materialise Arrow type {other:?}"

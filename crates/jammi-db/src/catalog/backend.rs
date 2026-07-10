@@ -439,13 +439,6 @@ impl HasSqlNull for f64 {
 impl HasSqlNull for bool {
     const NULL_TYPE: SqlNullType = SqlNullType::Bool;
 }
-impl HasSqlNull for Vec<u8> {
-    const NULL_TYPE: SqlNullType = SqlNullType::Bytes;
-}
-impl HasSqlNull for &[u8] {
-    const NULL_TYPE: SqlNullType = SqlNullType::Bytes;
-}
-
 impl<'v, T> From<Option<T>> for SqlValue<'v>
 where
     T: Into<SqlValue<'v>> + HasSqlNull,

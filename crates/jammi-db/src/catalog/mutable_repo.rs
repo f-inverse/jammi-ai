@@ -8,7 +8,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
 use crate::catalog::backend::{BackendError, Row, SqlValue, Transaction, TxOptions};
 use crate::store::mutable::definition::{
@@ -501,22 +501,56 @@ fn encode_schema(schema: &Schema) -> Result<String, MutableTableError> {
     let fields: Vec<serde_json::Value> = schema
         .fields()
         .iter()
-        .map(|f| {
-            let type_name = data_type_name(f.data_type()).ok_or_else(|| {
-                MutableTableError::Schema(format!(
-                    "unsupported mutable-table column type for '{}': {:?}",
-                    f.name(),
-                    f.data_type()
-                ))
-            })?;
-            Ok(serde_json::json!({
-                "name": f.name(),
-                "type": type_name,
-                "nullable": f.is_nullable(),
-            }))
-        })
+        .map(|f| encode_field(f))
         .collect::<Result<_, MutableTableError>>()?;
     Ok(serde_json::json!({ "fields": fields }).to_string())
+}
+
+/// Encode one `Field` to its JSON wire shape. `Timestamp` carries a
+/// `TimeUnit` and an optional timezone that a bare type-name string can't
+/// express, so it gets its own `unit`/`tz` keys; every other supported type
+/// is a plain `{name, type, nullable}` record.
+fn encode_field(f: &Field) -> Result<serde_json::Value, MutableTableError> {
+    if let DataType::Timestamp(unit, tz) = f.data_type() {
+        return Ok(serde_json::json!({
+            "name": f.name(),
+            "type": "Timestamp",
+            "unit": time_unit_name(*unit),
+            "tz": tz.as_ref().map(|t| t.to_string()),
+            "nullable": f.is_nullable(),
+        }));
+    }
+    let type_name = data_type_name(f.data_type()).ok_or_else(|| {
+        MutableTableError::Schema(format!(
+            "unsupported mutable-table column type for '{}': {:?}",
+            f.name(),
+            f.data_type()
+        ))
+    })?;
+    Ok(serde_json::json!({
+        "name": f.name(),
+        "type": type_name,
+        "nullable": f.is_nullable(),
+    }))
+}
+
+fn time_unit_name(unit: TimeUnit) -> &'static str {
+    match unit {
+        TimeUnit::Second => "Second",
+        TimeUnit::Millisecond => "Millisecond",
+        TimeUnit::Microsecond => "Microsecond",
+        TimeUnit::Nanosecond => "Nanosecond",
+    }
+}
+
+fn time_unit_from_name(name: &str) -> Result<TimeUnit, String> {
+    Ok(match name {
+        "Second" => TimeUnit::Second,
+        "Millisecond" => TimeUnit::Millisecond,
+        "Microsecond" => TimeUnit::Microsecond,
+        "Nanosecond" => TimeUnit::Nanosecond,
+        other => return Err(format!("unsupported timestamp unit: {other}")),
+    })
 }
 
 fn decode_schema(json: &str) -> Result<Schema, String> {
@@ -530,12 +564,27 @@ fn decode_schema(json: &str) -> Result<Schema, String> {
         #[serde(rename = "type")]
         ty: String,
         nullable: bool,
+        #[serde(default)]
+        unit: Option<String>,
+        #[serde(default)]
+        tz: Option<String>,
     }
     let wire: Wire = serde_json::from_str(json).map_err(|e| e.to_string())?;
     let fields: Result<Vec<Field>, String> = wire
         .fields
         .into_iter()
-        .map(|w| Ok(Field::new(&w.name, data_type_from_name(&w.ty)?, w.nullable)))
+        .map(|w| {
+            let data_type = if w.ty == "Timestamp" {
+                let unit = w
+                    .unit
+                    .as_deref()
+                    .ok_or_else(|| format!("Timestamp column '{}' missing unit", w.name))?;
+                DataType::Timestamp(time_unit_from_name(unit)?, w.tz.map(Arc::<str>::from))
+            } else {
+                data_type_from_name(&w.ty)?
+            };
+            Ok(Field::new(&w.name, data_type, w.nullable))
+        })
         .collect();
     Ok(Schema::new(fields?))
 }

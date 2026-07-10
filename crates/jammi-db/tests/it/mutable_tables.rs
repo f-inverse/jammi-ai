@@ -17,8 +17,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow::array::{Array, BinaryArray, Float64Array, Int64Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{
+    Array, BinaryArray, Float64Array, Int64Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray,
+};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use futures::StreamExt;
 use jammi_db::catalog::backend::{BackendKind, TxOptions};
 use jammi_db::store::mutable::definition::{
@@ -723,6 +726,98 @@ async fn binary_column_roundtrip_through_provider(backend: BackendKind) {
         });
     assert_eq!(blobs.value(0), payload_a.as_slice());
     assert_eq!(blobs.value(1), payload_b.as_slice());
+
+    session.drop_mutable_table(&id).await.unwrap();
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timestamp_column_roundtrips_as_integer_tick(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = skip_if_no_backend!(backend, dir.path());
+
+    let id = unique_id("events_ts");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "observed_at",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
+    ]));
+    let def = MutableTableDefinitionBuilder::new(id.clone(), Arc::clone(&schema))
+        .primary_key(vec!["id".into()])
+        .build()
+        .unwrap();
+    session.create_mutable_table(def).await.unwrap();
+
+    let ts_micros: i64 = 1_700_000_000_123_456;
+    let ts_array = TimestampMicrosecondArray::from(vec![Some(ts_micros), None]);
+
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2])),
+            Arc::new(ts_array),
+        ],
+    )
+    .unwrap();
+
+    // Force the DataFusion sink path: register the source batch as a memory
+    // table, then `INSERT INTO mutable.public.<id> SELECT *` — equivalent to
+    // a user-written DML statement, which exercises `extract_value`'s
+    // Timestamp arm and the backend's timestamp column DDL.
+    let src = format!("src_{}", id.as_str());
+    session.context().register_batch(&src, batch).unwrap();
+    session
+        .sql(&format!(
+            "INSERT INTO mutable.public.{name} (id, observed_at) SELECT id, observed_at FROM {src}",
+            name = id.as_str(),
+        ))
+        .await
+        .unwrap();
+
+    // Read back through the provider scan path — `decode_row`/`build_arrays`
+    // must reconstruct an exact `Timestamp(Microsecond, None)` array from the
+    // stored integer ticks, not error out or silently widen/narrow the unit.
+    let batches = session
+        .sql(&format!(
+            "SELECT observed_at FROM mutable.public.{name} ORDER BY id",
+            name = id.as_str()
+        ))
+        .await
+        .unwrap();
+    let out = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+    assert_eq!(out.num_rows(), 2);
+
+    let col = out.column_by_name("observed_at").unwrap();
+    assert_eq!(
+        col.data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, None),
+        "reconstructed column's DataType must exactly equal the schema's declared Timestamp(unit, tz)"
+    );
+    let ts = col
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .unwrap_or_else(|| {
+            panic!(
+                "observed_at column is not TimestampMicrosecondArray; got {:?}",
+                col.data_type()
+            )
+        });
+    assert_eq!(
+        ts.value(0),
+        ts_micros,
+        "row 1's non-null timestamp must round-trip to the exact same micros tick"
+    );
+    assert!(
+        ts.is_null(1),
+        "row 2's NULL timestamp must round-trip as null, not error or coerce to a value"
+    );
 
     session.drop_mutable_table(&id).await.unwrap();
 }

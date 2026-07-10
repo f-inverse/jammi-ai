@@ -190,7 +190,7 @@ impl Publisher {
         // the authoritative log and subscribers replay on reconnect.
         match self
             .broker
-            .publish(topic.id, user_batch, produced_at, offset_value)
+            .publish(topic.id, user_batch, produced_at, offset_value, tenant)
             .await
         {
             Ok(off) => Ok(off),

@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
+use crate::tenant::TenantId;
 use crate::trigger::broker::{BrokerKind, TriggerBroker};
 use crate::trigger::consumer::ConsumerOffsetSnapshot;
 use crate::trigger::error::TriggerError;
@@ -128,6 +129,7 @@ impl TriggerBroker for InMemoryBroker {
         batch: RecordBatch,
         produced_at: DateTime<Utc>,
         offset: u64,
+        publish_tenant: Option<TenantId>,
     ) -> Result<Offset, TriggerError> {
         if let Some(message) = self.pending_failure.write().take() {
             return Err(TriggerError::Driver(message));
@@ -145,6 +147,7 @@ impl TriggerBroker for InMemoryBroker {
             offset: off,
             produced_at,
             batch,
+            tenant: publish_tenant,
         });
         Ok(off)
     }
@@ -197,6 +200,7 @@ impl TriggerBroker for InMemoryBroker {
                                 offset: d.offset,
                                 produced_at: d.produced_at,
                                 batch: filtered,
+                                tenant: d.tenant,
                             };
                         }
                     }
@@ -281,7 +285,7 @@ mod tests {
 
         broker.trigger_failure_for_next_publish("simulated broker outage");
         let err = broker
-            .publish(t.id, batch(&t.schema, &[1]), Utc::now(), 0)
+            .publish(t.id, batch(&t.schema, &[1]), Utc::now(), 0, None)
             .await
             .unwrap_err();
         match err {
@@ -291,7 +295,7 @@ mod tests {
 
         // The next publish must succeed — the failure was one-shot.
         broker
-            .publish(t.id, batch(&t.schema, &[2]), Utc::now(), 1)
+            .publish(t.id, batch(&t.schema, &[2]), Utc::now(), 1, None)
             .await
             .expect("subsequent publish succeeds");
     }
@@ -302,7 +306,7 @@ mod tests {
         let t = topic("test.unarmed");
         broker.register_topic(&t).await.unwrap();
         broker
-            .publish(t.id, batch(&t.schema, &[42]), Utc::now(), 0)
+            .publish(t.id, batch(&t.schema, &[42]), Utc::now(), 0, None)
             .await
             .expect("publish without arm succeeds");
     }

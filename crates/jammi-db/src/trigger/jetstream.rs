@@ -11,6 +11,7 @@
 //! sequence is an independent counter and must not be conflated with it).
 
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +30,7 @@ use futures::{StreamExt, TryStreamExt};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 
+use crate::tenant::TenantId;
 use crate::trigger::broker::{BrokerKind, TriggerBroker};
 use crate::trigger::consumer::ConsumerOffsetSnapshot;
 use crate::trigger::error::TriggerError;
@@ -43,6 +45,11 @@ use crate::trigger::topic::TopicDefinition;
 /// schema decoding twice.
 const HDR_OFFSET: &str = "jammi-offset";
 const HDR_PRODUCED_AT: &str = "jammi-produced-at-us";
+/// Carries the opaque publish-scoped tenant tag (see [`TriggerBroker::publish`]).
+/// Absent entirely for a globally-scoped publish — unlike `HDR_OFFSET` /
+/// `HDR_PRODUCED_AT` this header is optional, so its absence on decode means
+/// `tenant: None` rather than a corrupt message.
+const HDR_TENANT: &str = "jammi-publish-tenant";
 
 /// Production broker driver backed by NATS JetStream. Holds the
 /// `async-nats` JetStream context plus a small cache of per-topic Arrow
@@ -150,6 +157,7 @@ impl TriggerBroker for JetStreamBroker {
         batch: RecordBatch,
         produced_at: DateTime<Utc>,
         offset: u64,
+        publish_tenant: Option<TenantId>,
     ) -> Result<Offset, TriggerError> {
         let schema = self
             .schemas
@@ -162,6 +170,9 @@ impl TriggerBroker for JetStreamBroker {
         let mut headers = HeaderMap::new();
         headers.insert(HDR_OFFSET, offset.to_string());
         headers.insert(HDR_PRODUCED_AT, produced_at.timestamp_micros().to_string());
+        if let Some(tenant) = publish_tenant {
+            headers.insert(HDR_TENANT, tenant.to_string());
+        }
 
         let subject = Self::subject_for(topic_id);
         self.context
@@ -223,6 +234,7 @@ impl TriggerBroker for JetStreamBroker {
                         offset: delivered.offset,
                         produced_at: delivered.produced_at,
                         batch: filtered,
+                        tenant: delivered.tenant,
                     };
                 }
             }
@@ -311,6 +323,13 @@ fn decode_message(
             "`{HDR_PRODUCED_AT}` out of range: {produced_at_us}"
         ))
     })?;
+    let tenant = headers
+        .get(HDR_TENANT)
+        .map(|v| {
+            TenantId::from_str(v.as_str())
+                .map_err(|e| TriggerError::Driver(format!("`{HDR_TENANT}` parse: {e}")))
+        })
+        .transpose()?;
     let cursor = std::io::Cursor::new(&message.payload[..]);
     let mut reader = StreamReader::try_new(cursor, None)
         .map_err(|e| TriggerError::Driver(format!("ipc decode: {e}")))?;
@@ -327,6 +346,7 @@ fn decode_message(
         offset: Offset::new(offset_value, produced_at),
         produced_at,
         batch,
+        tenant,
     })
 }
 

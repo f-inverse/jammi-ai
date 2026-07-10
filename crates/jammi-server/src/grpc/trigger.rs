@@ -142,7 +142,7 @@ impl TriggerService for TriggerServer {
 
         let mut inner = self
             .subscriber
-            .subscribe(&topic, predicate, from_offset)
+            .subscribe_scoped(&topic, tenant, predicate, from_offset)
             .await
             .map_err(map_trigger_error)?;
 

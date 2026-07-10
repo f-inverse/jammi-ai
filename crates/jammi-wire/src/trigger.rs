@@ -129,5 +129,10 @@ pub fn decode_subscribed_batch(wire: SubscribedBatch) -> Result<DeliveredBatch, 
         offset: Offset::new(wire.offset, produced_at),
         produced_at,
         batch,
+        // The wire never carries the publish-scoped tenant tag (it is
+        // out-of-band engine metadata — see `DeliveredBatch::tenant`); the
+        // server already enforced tenant scope before this frame was sent,
+        // so the reconstructed value carries no tag of its own.
+        tenant: None,
     })
 }

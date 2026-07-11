@@ -1,0 +1,369 @@
+---
+title: "Storage precision: quantize the index, keep the answer — retrieve→rescore"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** a deployment-default `storage_precision` (`f32` / `f16` / `int8`) on the ANN
+sidecar index, set through `jammi.connect(..., config=...)` · the two-stage
+retrieve→rescore path (`k * oversample` quantized candidates, exact-`f32` re-ranked) ·
+the per-request `oversample` override, set through `search(..., oversample=...)` ·
+**Theory:** approximate nearest-neighbour search and the recall-vs-cost trade
+[@johnson2021billion], HNSW as the navigable proximity graph the quantized index is built
+over [@malkov2020hnsw] · **Rail:** measurement (recall@10 vs an exact-`f32` numpy oracle,
+and the sidecar's own on-disk byte count, both recomputed live at render time — not
+transcribed).
+
+Every embedding table so far in this book keeps its ANN sidecar at full `f32` precision:
+exact, single-stage search. That is the right default, but it is not the only point on the
+recall-vs-memory curve. The engine's ANN sidecar can instead store its HNSW graph's own
+vectors at a **quantized** `storage_precision` — `f16` or `int8` — which shrinks the graph a
+search actually traverses, at the cost of making the graph's own stored vectors lossy. A
+quantized table therefore searches in **two stages**: the quantized graph proposes
+`k * oversample` candidates, and each candidate is re-scored by an exact cosine read off a
+raw-`f32` companion kept alongside the graph — so the *answer* a caller receives is computed
+from exact vectors, never from the lossy quantized ones. `f32` tables skip this entirely
+(single-stage, no companion). This chapter builds an `int8` table over a real corpus, measures
+its recall against an exact `f32` baseline, measures its sidecar's own size against that
+baseline's, and dials `oversample` to show the recall/cost trade the knob buys — reaching
+every one of those knobs through the same public `jammi` front door every other chapter uses.
+
+## The knob is now reachable — through the public front door
+
+`storage_precision` and `oversample` are real, tested engine primitives (a full-precision
+sidecar, a quantized one, and the rescore that reconciles them), and both are now reachable
+from documented Python — `jammi.connect(..., config=...)` carries the deployment-default
+`storage_precision` a session's tables are stamped with, and `search(..., oversample=...)`
+overrides the retrieve→rescore candidate breadth for one call. We probe this directly rather
+than assert it in prose, the same reachability assay a prior render of this chapter used to
+show the opposite:
+
+```{python}
+import inspect
+
+import jammi
+from jammi._assembly import build_search_request
+
+connect_params = set(inspect.signature(jammi.connect).parameters)
+search_params = set(inspect.signature(build_search_request).parameters)
+
+print(f"jammi.connect(...) keyword args:        {sorted(connect_params)}")
+print(f"build_search_request(...) keyword args: {sorted(search_params)}")
+
+assert "config" in connect_params, (
+    "jammi.connect() must carry a config= passthrough — the deployment-default knob a "
+    "caller sets embedding.ann.storage_precision / embedding.ann.oversample through."
+)
+assert "oversample" in search_params, (
+    "build_search_request() — the assembly BOTH the embedded and remote Session.search() "
+    "build their wire request from — must carry an oversample parameter, so a per-request "
+    "override is reachable through db.search(..., oversample=...)."
+)
+print("\nconfirmed: both knobs are reachable through the documented jammi.connect() / "
+      "Session.search() surface.")
+```
+
+Every measurement below therefore stays on that public surface: `jammi.connect(target,
+config=<TOML path>)` to build a table at a chosen `storage_precision` / table-default
+`oversample`, and `Session.search(..., oversample=...)` for the per-request override. No
+`jammi_native.open_local`, no hand-built wire `SearchRequest` — the compiled engine handle
+still does the work underneath `connect()`, but a caller never has to reach for it directly.
+
+## The corpus — a real, held-out slice of the committed cache
+
+We fold a corpus/query slice off the same committed ModernBERT cache the scale-tier chapter
+reads (real, clustered text embeddings — a synthetic random-vector corpus cannot exhibit a
+genuine ANN recall trade, only real geometry can) — never re-embedding, exactly the same "read
+the cache" discipline every other chapter follows. The slice is a deterministic prefix of an
+already sorted-by-`_row_id` cache, so no seed or committed id list is needed to reproduce it.
+The query set is the cache's own **held-out** split (disjoint from the indexed corpus by
+construction), so recall@1 is a real number, not the structural ≈1.0 a self-query would fake.
+
+```{python}
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from jammi_cookbook import contracts
+
+N_CORPUS = 1500
+N_QUERY = 60
+K = 10
+
+corpus_table = contracts.load_artifact("scale.corpus_vectors")
+query_table = contracts.load_artifact("scale.query_vectors")
+
+corpus_ids = [str(x) for x in corpus_table.column("_row_id").to_pylist()[:N_CORPUS]]
+corpus_vecs = np.asarray(corpus_table.column("vector").to_pylist()[:N_CORPUS], dtype=np.float32)
+query_ids = [str(x) for x in query_table.column("_row_id").to_pylist()[:N_QUERY]]
+query_vecs = np.asarray(query_table.column("vector").to_pylist()[:N_QUERY], dtype=np.float32)
+
+assert not (set(corpus_ids) & set(query_ids)), "queries must be held out of the corpus"
+print(f"corpus: {corpus_vecs.shape[0]:,} × {corpus_vecs.shape[1]}  (ModernBERT, real embeddings)")
+print(f"queries: {query_vecs.shape[0]:,} (held out — disjoint from the corpus by construction)")
+```
+
+## The exact oracle — an independent numpy cosine-kNN, computed here
+
+The ground truth every recall number below is scored against: for each held-out query, the
+true top-`k` corpus neighbours by cosine similarity — a single normalized matmul and a per-row
+top-k, independent of anything the engine's own ANN sidecar computes.
+
+```{python}
+def normalize(matrix):
+    return matrix / (np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-12)
+
+
+corpus_unit = normalize(corpus_vecs)
+query_unit = normalize(query_vecs)
+sims = query_unit @ corpus_unit.T
+topk = np.argpartition(-sims, K, axis=1)[:, :K]
+rows = np.arange(query_vecs.shape[0])[:, None]
+order = np.argsort(-sims[rows, topk], axis=1)
+exact_idx = topk[rows, order]
+exact = [[corpus_ids[j] for j in exact_idx[i]] for i in range(query_vecs.shape[0])]
+print(f"exact oracle: top-{K} computed for {len(exact):,} held-out queries")
+```
+
+## Building a table at a chosen `storage_precision` — through `jammi.connect(config=...)`
+
+Each cell below opens a **fresh** session via the public `jammi.connect(target,
+config=...)` — a temp `JammiConfig` TOML sets `embedding.ann.storage_precision` /
+`embedding.ann.oversample`, the deployment default every table this session later creates is
+stamped with — registers the corpus slice as a source, and promotes it to a ready embedding
+table via `import_embeddings`, the precomputed-vector import verb, GPU-free (no encoder runs;
+these vectors are already computed). `storage_precision` is a deployment-config value, not a
+per-call registration argument — the engine offers it only through the session's own
+`config=`, so comparing `int8` against `f32` means opening two sessions at two configs, not
+one session with a per-call override. A fresh `file://` target per build keeps every render
+hermetic.
+
+```{python}
+import glob
+import os
+import tempfile
+
+import jammi
+
+SOURCE_ID = "vectors"
+
+sub_dir = tempfile.mkdtemp(prefix="precision_corpus_")
+corpus_url = f"{sub_dir}/corpus.parquet"
+pq.write_table(
+    pa.table({
+        "_row_id": corpus_ids,
+        "vector": pa.array(corpus_vecs.tolist(), type=pa.list_(pa.float32(), corpus_vecs.shape[1])),
+    }),
+    corpus_url,
+)
+
+
+def build_table(storage_precision: str, oversample: int):
+    """Open a fresh session at (storage_precision, oversample) through the public
+    `jammi.connect(config=...)` front door, import the corpus slice as a ready
+    embedding table, and return the session + table name + its artifact dir."""
+    cfg_dir = tempfile.mkdtemp(prefix="precision_cfg_")
+    cfg_path = f"{cfg_dir}/jammi.toml"
+    with open(cfg_path, "w") as f:
+        f.write(f'[embedding.ann]\nstorage_precision = "{storage_precision}"\noversample = {oversample}\n')
+
+    art_dir = tempfile.mkdtemp(prefix="precision_art_")
+    db = jammi.connect(f"file://{art_dir}", config=cfg_path)
+    db.add_source(SOURCE_ID, url=f"file://{corpus_url}", format="parquet")
+    table_name = db.import_embeddings(
+        source=SOURCE_ID,
+        model="modernbert-base",
+        vectors_url=f"file://{corpus_url}",
+        key="_row_id",
+        dimensions=corpus_vecs.shape[1],
+    )
+    return db, table_name, art_dir
+
+
+def recall_at_k(db, exact_lists, k=K, oversample_override=None):
+    total = 0.0
+    for i, qv in enumerate(query_vecs):
+        kwargs = {} if oversample_override is None else {"oversample": oversample_override}
+        hits = db.search(SOURCE_ID, query=qv.tolist(), k=k, **kwargs)
+        got = [str(row["_row_id"]) for row in hits.to_pylist()]
+        total += len(set(exact_lists[i]) & set(got)) / k
+    return total / len(query_vecs)
+
+
+def sidecar_bytes(art_dir, ext):
+    matches = glob.glob(f"{art_dir}/**/*.{ext}", recursive=True)
+    return os.path.getsize(matches[0]) if matches else None
+
+
+print("helpers ready")
+```
+
+## The `f32` baseline — exact, single-stage
+
+```{python}
+from jammi_cookbook import rails
+
+db_f32, table_f32, art_f32 = build_table("f32", oversample=4)  # oversample is irrelevant at f32
+recall_f32 = recall_at_k(db_f32, exact)
+f32_usearch = sidecar_bytes(art_f32, "usearch")
+f32_rawf32 = sidecar_bytes(art_f32, "rawf32")
+
+print(f"f32 recall@{K}:        {recall_f32:.4f}")
+print(f"f32 sidecar (.usearch): {f32_usearch:,} bytes")
+print(f"f32 rescore companion: {f32_rawf32} (f32 is single-stage — no companion written)")
+
+rails.measure("precision.f32_usearch_bytes", f32_usearch)
+contracts.assert_recall_floor("precision.f32_baseline_at_10", recall_f32)
+assert f32_rawf32 is None, "an f32 table must write no .rawf32 rescore companion"
+```
+
+## `int8` at the default oversample — the recall-vs-memory headline
+
+The default oversample (`4`) retrieves `k * 4` candidates from the quantized graph before the
+exact-`f32` rescore truncates back to `k`. This is the claim worth measuring directly: does
+quantizing the graph's own vectors — and shrinking the structure a search actually
+traverses — cost any recall once the rescore stage runs?
+
+```{python}
+db_int8, table_int8, art_int8 = build_table("int8", oversample=4)
+recall_int8_default = recall_at_k(db_int8, exact)
+int8_usearch = sidecar_bytes(art_int8, "usearch")
+int8_rawf32 = sidecar_bytes(art_int8, "rawf32")
+ratio = int8_usearch / f32_usearch
+
+print(f"int8 recall@{K} (oversample=4):  {recall_int8_default:.4f}   (f32 baseline: {recall_f32:.4f})")
+print(f"int8 sidecar (.usearch):         {int8_usearch:,} bytes  ({ratio:.1%} of the f32 sidecar)")
+print(f"int8 rescore companion (.rawf32): {int8_rawf32:,} bytes")
+
+rails.measure("precision.int8_usearch_bytes", int8_usearch)
+rails.measure("precision.int8_rawf32_bytes", int8_rawf32)
+rails.measure("precision.int8_vs_f32_usearch_ratio", round(ratio, 4))
+contracts.assert_recall_floor("precision.int8_oversample4_at_10", recall_int8_default)
+```
+
+At the default oversample, `int8` recovers the **exact same recall as the `f32` baseline** on
+this corpus, at roughly a quarter of the sidecar's own byte count. That is the two-stage design
+working as intended: the graph a search traverses is small and lossy, but the *answer* is
+re-derived from the exact vectors before it is returned.
+
+### The honest complication: the rescore companion is not free
+
+The `.usearch` graph shrinks — that is the structure held (and, for a hot index, kept
+memory-mapped) for HNSW traversal. But a quantized table also writes a `.rawf32` companion: the
+full, un-quantized vectors, needed so the rescore stage has something exact to re-score
+against. That companion is roughly the corpus's own uncompressed size — larger than the
+shrunk graph itself, and its *total on-disk* footprint is not smaller than the `f32` table's
+single file.
+
+```{python}
+int8_total = int8_usearch + int8_rawf32
+print(f"f32 total sidecar-bundle bytes:  {f32_usearch:,}")
+print(f"int8 total sidecar-bundle bytes: {int8_total:,}  (.usearch + .rawf32)")
+print(f"int8 graph alone vs f32 total:   {int8_usearch / f32_usearch:.1%}")
+print(f"int8 bundle (graph+companion) vs f32 total: {int8_total / f32_usearch:.1%}")
+```
+
+So the precise claim is about the **graph**, not the whole bundle: `storage_precision=int8`
+shrinks the structure a search traverses (and the structure worth keeping memory-resident for a
+hot index), not the total bytes committed to disk — the rescore companion is a flat,
+randomly-addressed array a search touches at only `k * oversample` candidate offsets per
+query, not something HNSW traversal walks. A chapter — or a deploy — that reads "int8 is ~4×
+smaller" as "the table's disk footprint shrinks 4×" would be measuring the wrong file.
+
+## Dialing `oversample` — the recall/cost operating point
+
+`oversample` is the retrieve stage's candidate breadth: `k * oversample` proposals go to the
+rescore, so a narrower oversample risks the true top-`k` never reaching the candidate set at
+all (a candidate the rescore never sees cannot be recovered, however exact the rescore's own
+arithmetic is). We stamp four otherwise-identical `int8` tables at different table-default
+`oversample` values — each through its own `jammi.connect(config=...)` session — and recompute
+recall on each: the same corpus, the same held-out queries, the same exact oracle.
+
+```{python}
+oversample_grid = [1, 2, 4, 8]
+sweep = {}
+for ov in oversample_grid:
+    db_ov, _, _ = build_table("int8", oversample=ov)
+    sweep[ov] = recall_at_k(db_ov, exact)
+
+print(f"{'oversample':>10}{'candidates':>12}{'recall@10':>12}")
+for ov in oversample_grid:
+    print(f"{ov:>10}{K * ov:>12}{sweep[ov]:>12.4f}")
+
+contracts.assert_recall_floor("precision.int8_oversample1_at_10", sweep[1])
+contracts.assert_recall_floor("precision.int8_oversample2_at_10", sweep[2])
+contracts.assert_recall_floor("precision.int8_oversample4_at_10", sweep[4])
+contracts.assert_recall_floor("precision.int8_oversample8_at_10", sweep[8])
+
+assert sweep[1] < sweep[2] < sweep[4], (
+    "recall must strictly rise as oversample widens the candidate set below saturation"
+)
+assert sweep[8] >= sweep[4] - 1e-9, (
+    "once oversample already saturates recall, widening it further must never regress it"
+)
+```
+
+The curve is the trade made visible: at `oversample=1` (candidates == `k`, no widening at all)
+recall drops well below the `f32` baseline — real evidence that the retrieve stage's own
+quantization-distorted ranking can exclude a true neighbour from the candidate set entirely,
+which no amount of exact rescoring downstream can then recover. Widening to `2` recovers most
+of the gap; by `4` (the engine's own default) recall has fully saturated to the exact baseline,
+and `8` buys nothing further on this corpus — the honest reading is that the default was not
+picked arbitrarily.
+
+## The per-request override — `search(..., oversample=...)`, no lower layer needed
+
+`oversample` also has a **per-request** form (`SearchRequest.oversample` on the wire),
+resolved with precedence *request override > table's own stamped default > deployment
+default*. Now that `search(...)` carries the keyword directly, reaching it needs nothing below
+the public front door: no hand-built wire proto, no native `_search_proto` call.
+
+We reuse the narrowest table from the sweep above — stamped at `oversample=1`, the one whose
+*default* search left real recall on the table — and issue the *same* held-out queries with an
+explicit per-request `oversample=8`.
+
+```{python}
+db_narrow, table_narrow, _ = build_table("int8", oversample=1)
+
+recall_no_override = recall_at_k(db_narrow, exact)
+recall_explicit_1 = recall_at_k(db_narrow, exact, oversample_override=1)
+recall_override_8 = recall_at_k(db_narrow, exact, oversample_override=8)
+
+print(f"table stamped at oversample=1, no per-request override:  recall@{K} = {recall_no_override:.4f}")
+print(f"same table, explicit per-request oversample=1:            recall@{K} = {recall_explicit_1:.4f}")
+print(f"same table, per-request override oversample=8:            recall@{K} = {recall_override_8:.4f}")
+
+contracts.assert_recall_floor("precision.per_request_explicit1_on_table_os1_at_10", recall_no_override)
+contracts.assert_recall_floor("precision.per_request_override8_on_table_os1_at_10", recall_override_8)
+assert recall_no_override == recall_explicit_1, (
+    "no override must resolve identically to an explicit override matching the table default"
+)
+assert recall_override_8 > recall_no_override, (
+    "a per-request override must actually widen the candidate set beyond the table's own default"
+)
+```
+
+The mechanism is real and correctly wired — a per-request override recovers exactly the recall
+a wider table-default would have given, on the *same* on-disk graph, with no rebuild. And it is
+reachable exactly where a caller would look for it: `Session.search()`'s own keyword arguments.
+
+## Bridge note
+
+> **Quantization is a real recall trade, and rescore is what makes the trade honest.** HNSW
+> [@malkov2020hnsw] gives approximate search its speed by navigating a proximity graph instead
+> of scanning every vector; scalar quantization shrinks that graph further by storing its own
+> vectors at lower precision, which is exactly the kind of accuracy-for-memory trade billion-scale
+> ANN systems live or die on [@johnson2021billion]. The engine's two-stage retrieve→rescore is
+> what keeps that trade from silently degrading the *answer*: the graph proposes from lossy
+> vectors, but the response is always re-derived from the exact ones — so quantization buys
+> memory on the structure a search traverses without buying error into what a caller receives,
+> *provided* `oversample` is wide enough that the true neighbours are still in the candidate set
+> the rescore gets to see. Measured here at `oversample=4` (the engine's own default), that
+> provision holds exactly: `int8` recall matches `f32` recall while the graph shrinks to
+> roughly a quarter its size — the trade this book keeps insisting on: not assumed, measured.
+> And both knobs — the deployment-default `storage_precision` and the per-request
+> `oversample` override — are reachable from the same public `jammi.connect` / `search` surface
+> every other chapter in this book writes against.

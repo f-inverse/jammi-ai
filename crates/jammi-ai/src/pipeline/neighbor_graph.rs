@@ -469,6 +469,14 @@ impl<'a> NeighborGraphPipeline<'a> {
 /// Its sole input is the source embedding table, pinned by its immutable content
 /// digest (`ResultDigest`) — which is why a neighbor-graph is genuinely
 /// cacheable.
+///
+/// `index_storage_precision` is `Some` only when the build will run the
+/// index-assisted driver (`!params.exact`): that driver's approximate,
+/// non-deterministic neighbour set depends on the source table's ANN sidecar
+/// quantization, so the precision is an output-affecting determinant exactly
+/// when the index is actually consulted. The exact driver reads Parquet
+/// directly and never touches the index, so recording a precision there would
+/// be a false determinant.
 fn neighbor_graph_descriptor(
     source_table: &ResultTableRecord,
     params: &BuildNeighborGraph,
@@ -481,6 +489,8 @@ fn neighbor_graph_descriptor(
         self_exclude: params.self_exclude,
         exact: params.exact,
         exact_max_rows: params.exact_max_rows,
+        index_storage_precision: (!params.exact)
+            .then(|| source_table.storage_precision.unwrap_or_default()),
     }
 }
 

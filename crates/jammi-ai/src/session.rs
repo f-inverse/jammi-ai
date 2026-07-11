@@ -446,14 +446,32 @@ impl InferenceSession {
     /// compose. The bounded typed `search` verb (on [`crate::Session`]) is a
     /// thin wrapper over this — vector-search then optional `filter`/`select`
     /// then `run`.
+    ///
+    /// `oversample` overrides the table's own stamped retrieve→rescore
+    /// default for this one call (`SearchRequest::oversample` on the wire
+    /// path); `None` defers to the table's stamped
+    /// (`ResultTableRecord::oversample`) default, falling back to the
+    /// deployment's current
+    /// [`jammi_db::config::AnnIndexConfig::effective_oversample`] only for a
+    /// pre-migration table with no stamped column. Irrelevant for a `F32`
+    /// table (single-stage, no rescore).
     pub async fn search(
         self: &Arc<Self>,
         source_id: &str,
         query: Vec<f32>,
         k: usize,
         embedding_table: Option<&str>,
+        oversample: Option<usize>,
     ) -> Result<QueryBuilder> {
-        QueryBuilder::new(Arc::clone(self), source_id, query, k, embedding_table).await
+        QueryBuilder::new(
+            Arc::clone(self),
+            source_id,
+            query,
+            k,
+            embedding_table,
+            oversample,
+        )
+        .await
     }
 
     /// Start a search ranked by an existing row (query-by-example).
@@ -473,13 +491,15 @@ impl InferenceSession {
         row_key: &str,
         k: usize,
         embedding_table: Option<&str>,
+        oversample: Option<usize>,
     ) -> Result<QueryBuilder> {
         let table = self
             .catalog()
             .resolve_embedding_table(source_id, embedding_table)
             .await?;
         let query = self.inner.read_vector_by_key(&table, row_key).await?;
-        self.search(source_id, query, k, embedding_table).await
+        self.search(source_id, query, k, embedding_table, oversample)
+            .await
     }
 
     /// Run a model over `columns` of an arbitrary input plan, appending the

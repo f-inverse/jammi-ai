@@ -28,7 +28,7 @@ use tracing::warn;
 use crate::catalog::result_repo::{CreateResultTableParams, ResultTableKind, ResultTableRecord};
 use crate::catalog::status::ResultTableStatus;
 use crate::catalog::Catalog;
-use crate::config::AnnIndexConfig;
+use crate::config::{AnnIndexConfig, StoragePrecision};
 use crate::error::{JammiError, Result};
 use crate::index::sidecar::SidecarIndex;
 use crate::index::VectorIndex;
@@ -220,6 +220,16 @@ impl ResultStore {
         &self.catalog
     }
 
+    /// The deployment's ANN sidecar-index tuning — the HNSW knobs plus the
+    /// `storage_precision` / `oversample` defaults every newly-created
+    /// embedding table's catalog row is stamped with. Read accessor for a
+    /// caller that builds a `SidecarIndex` directly (rather than through
+    /// [`Self::materialize_embedding_table`]) at table-creation time, e.g. the
+    /// embedding-generation pipeline.
+    pub fn ann_config(&self) -> &AnnIndexConfig {
+        &self.ann
+    }
+
     /// Open the [`JammiObjectStore`] handle for a result-table Parquet URL.
     pub fn open_parquet(&self, url: &StorageUrl) -> Result<JammiObjectStore> {
         let driver = self.registry.driver_for(url, None)?;
@@ -289,6 +299,13 @@ impl ResultStore {
                 dimensions,
                 key_column,
                 text_columns,
+                // Stamped once, here, from today's deployment default — every
+                // later build/load of this table's index reads it back off the
+                // catalog row, never off `self.ann` again, so a later config
+                // change cannot silently rebuild an existing table at a
+                // different precision than this row already promises.
+                storage_precision: self.ann.storage_precision,
+                oversample: self.ann.effective_oversample(),
             })
             .await?;
 
@@ -601,6 +618,7 @@ impl ResultStore {
                                 &parquet_handle,
                                 &idx_url,
                                 table.dimensions.unwrap_or(0) as usize,
+                                table.storage_precision.unwrap_or_default(),
                             )
                             .await
                         {
@@ -786,7 +804,11 @@ impl ResultStore {
         };
         let idx_url = StorageUrl::parse(idx_path)?;
         let handle = self.open_index(&idx_url)?;
-        match storage::sidecar_layout::load_sidecar(&handle, &self.ann).await {
+        // The catalog row's own persisted precision — never today's deployment
+        // default — is what a load must verify against; see
+        // `SidecarIndex::load`'s strict scalar_kind check.
+        let expected_precision = table.storage_precision.unwrap_or_default();
+        match storage::sidecar_layout::load_sidecar(&handle, &self.ann, expected_precision).await {
             Ok(index) => Ok(Some(index)),
             Err(e) => {
                 warn!(
@@ -839,18 +861,27 @@ impl ResultStore {
 
     /// Rebuild an ANN sidecar index from a Parquet object backed by an
     /// arbitrary `object_store` scheme. Used by the recovery path.
+    ///
+    /// `precision` must be the table's own persisted
+    /// `ResultTableRecord::storage_precision` — **never** today's
+    /// `self.ann.storage_precision` deployment default. A crash-recovery
+    /// rebuild runs against whatever the *existing* row already promises; a
+    /// rebuild at a different precision than that row's manifest previously
+    /// recorded would silently corrupt recall (a graph a caller believes is
+    /// `Int8` reopened as `F32`, or vice versa).
     async fn rebuild_index_from_parquet(
         &self,
         parquet_handle: &JammiObjectStore,
         index_url: &StorageUrl,
         dimensions: usize,
+        precision: StoragePrecision,
     ) -> Result<()> {
         if dimensions == 0 {
             return Ok(());
         }
 
         let batches = storage::reader::read_all_record_batches(parquet_handle).await?;
-        let mut index = SidecarIndex::new(dimensions, &self.ann)?;
+        let mut index = SidecarIndex::new(dimensions, &self.ann, precision)?;
         for batch in batches {
             let row_ids = batch
                 .column_by_name("_row_id")
@@ -936,7 +967,10 @@ impl ResultStore {
         let batch = embedding_batch(&schema, source_id, model_id, rows, dimensions)?;
 
         let mut writer = self.open_writer(&table_info.parquet_url, schema).await?;
-        let mut index = SidecarIndex::new(dimensions, &self.ann)?;
+        // Fresh creation (the row was just stamped with today's deployment
+        // default in `create_table` above), so the same default applies here —
+        // unlike a rebuild, there is no pre-existing catalog promise to honour.
+        let mut index = SidecarIndex::new(dimensions, &self.ann, self.ann.storage_precision)?;
         if !rows.is_empty() {
             writer.write_batch(&batch).await?;
             for (key, vector) in rows {

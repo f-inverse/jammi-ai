@@ -176,6 +176,8 @@ async fn delete_blocked_by_result_table_name_edge(backend: BackendKind) {
         dimensions: Some(384),
         key_column: Some("id"),
         text_columns: None,
+        storage_precision: jammi_db::config::StoragePrecision::F32,
+        oversample: 4,
     })
     .await
     .unwrap();
@@ -385,6 +387,8 @@ async fn delete_blocked_under_volume(backend: BackendKind) {
             dimensions: Some(384),
             key_column: Some("id"),
             text_columns: None,
+            storage_precision: jammi_db::config::StoragePrecision::F32,
+            oversample: 4,
         })
         .await
         .unwrap();
@@ -407,6 +411,8 @@ async fn delete_blocked_under_volume(backend: BackendKind) {
         dimensions: Some(384),
         key_column: Some("id"),
         text_columns: None,
+        storage_precision: jammi_db::config::StoragePrecision::F32,
+        oversample: 4,
     })
     .await
     .unwrap();

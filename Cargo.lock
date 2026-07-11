@@ -4197,6 +4197,7 @@ dependencies = [
  "jammi-numerics",
  "jammi-test-utils",
  "libc",
+ "memmap2",
  "moka",
  "object_store",
  "parking_lot",

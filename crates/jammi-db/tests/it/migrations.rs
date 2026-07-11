@@ -182,6 +182,7 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "020_channel_tenant_scope",
             "021_materialization_contract",
             "022_definition_hash_index",
+            "023_storage_precision",
         ]
     );
 }
@@ -819,6 +820,43 @@ async fn migration_021_adds_materialization_summary_columns() {
         assert!(
             columns.iter().any(|c| c == expected),
             "result_tables must have '{expected}' after migration 021; got {columns:?}"
+        );
+    }
+}
+
+/// Migration 023 adds the sidecar-index `storage_precision` / `oversample`
+/// columns to `result_tables`. Both are nullable so a pre-migration row
+/// carries NULL and is read back as the honest defaults (`F32`, the config
+/// oversample default) rather than a fabricated precision.
+#[tokio::test]
+async fn migration_023_adds_storage_precision_and_oversample_columns() {
+    let dir = tempdir().unwrap();
+    let _catalog = Catalog::open(dir.path()).await.unwrap();
+    let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
+
+    let columns = backend
+        .transaction(
+            TxOptions {
+                read_only: true,
+                ..Default::default()
+            },
+            |tx| {
+                Box::pin(async move {
+                    tx.query::<_, String>(
+                        "SELECT name FROM pragma_table_info('result_tables')",
+                        &[],
+                        |row| row.get("name"),
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .unwrap();
+    for expected in ["storage_precision", "oversample"] {
+        assert!(
+            columns.iter().any(|c| c == expected),
+            "result_tables must have '{expected}' after migration 023; got {columns:?}"
         );
     }
 }

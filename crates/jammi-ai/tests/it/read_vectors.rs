@@ -80,6 +80,8 @@ async fn inference_session_read_vectors_forwards_to_jammi_session() {
             dimensions: Some(dim),
             key_column: None,
             text_columns: None,
+            storage_precision: jammi_db::config::StoragePrecision::F32,
+            oversample: 4,
         })
         .await
         .unwrap();

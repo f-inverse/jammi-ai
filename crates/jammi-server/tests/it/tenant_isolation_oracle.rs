@@ -277,6 +277,8 @@ fn result_params<'a>(
         dimensions: None,
         key_column: None,
         text_columns: None,
+        storage_precision: jammi_db::config::StoragePrecision::F32,
+        oversample: 4,
     }
 }
 

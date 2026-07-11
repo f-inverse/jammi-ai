@@ -56,6 +56,13 @@ pub struct SearchRequest {
     pub filter: Option<String>,
     /// Columns to project. Empty keeps every hydrated column.
     pub select: Vec<String>,
+    /// Per-request override of the table's own stamped retrieve→rescore
+    /// oversample default (market parity with Qdrant's per-query
+    /// oversampling knob). `None` defers to the table's stamped default,
+    /// falling back to the deployment's current oversample default only for
+    /// a pre-migration table with no stamped column. Irrelevant for a `F32`
+    /// table (single-stage, no rescore).
+    pub oversample: Option<usize>,
 }
 
 /// Identifier of a fine-tune job. Returned in place of an in-process job handle

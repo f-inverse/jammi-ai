@@ -1,5 +1,8 @@
+use std::str::FromStr;
+
 use crate::catalog::backend::{BackendError, Row, SqlValue, TxOptions};
 use crate::catalog::Catalog;
+use crate::config::StoragePrecision;
 use crate::error::{JammiError, Result};
 use crate::model_task::ModelTask;
 use crate::tenant_scope::TenantBinding;
@@ -67,6 +70,17 @@ pub struct CreateResultTableParams<'a> {
     pub dimensions: Option<i32>,
     pub key_column: Option<&'a str>,
     pub text_columns: Option<&'a str>,
+    /// The precision this table's sidecar index is built at — the deployment's
+    /// [`crate::config::AnnIndexConfig::storage_precision`] default at the
+    /// moment of creation, stamped once and read back verbatim by every later
+    /// build/load of this table's index. Recorded even for a non-embedding
+    /// (`index_path = None`) row, so the column stays a total function of
+    /// "when was this row created", not a value that only sometimes exists.
+    pub storage_precision: StoragePrecision,
+    /// The per-table default retrieve→rescore oversample multiplier — the
+    /// deployment's [`crate::config::AnnIndexConfig::effective_oversample`] at
+    /// creation time. A search request may still override it for one call.
+    pub oversample: usize,
 }
 
 /// A row from the `result_tables` catalog table.
@@ -103,6 +117,27 @@ pub struct ResultTableRecord {
     /// indexable summary of the sidecar's `input_anchors`. `None` for a
     /// pre-contract table.
     pub input_anchors_json: Option<String>,
+    /// The precision this table's sidecar index was built at, stamped once at
+    /// creation from the deployment default then carried unchanged across
+    /// every later index build/load of this table (including a
+    /// crash-recovery rebuild) — reading it here rather than the *current*
+    /// deployment config is what keeps a recovery rebuild from silently
+    /// landing at a different precision than the table's existing catalog
+    /// promise. `None` for a row created before migration 023, read as `F32`
+    /// by every consumer (the precision every pre-migration index was built
+    /// at, since quantization did not exist yet).
+    pub storage_precision: Option<StoragePrecision>,
+    /// The per-table default retrieve→rescore oversample multiplier, stamped
+    /// once at creation from the deployment default then carried unchanged
+    /// across every later rescore of this table — reading it here rather
+    /// than the *current* deployment config is what keeps a later
+    /// deployment-config change from silently rescoring an existing table at
+    /// a different candidate breadth than the table's own catalog promise.
+    /// `None` for a row created before migration 023, read as the
+    /// deployment's current oversample default by every consumer (the
+    /// oversample every pre-migration table implicitly used, since no column
+    /// existed yet to stamp it).
+    pub oversample: Option<usize>,
 }
 
 fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendError> {
@@ -117,6 +152,15 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendErr
             column: "kind".into(),
             detail: e.to_string(),
         })?;
+    let storage_precision_raw: Option<String> = row.try_get("storage_precision")?;
+    let storage_precision = storage_precision_raw
+        .map(|s| StoragePrecision::from_str(&s))
+        .transpose()
+        .map_err(|e| BackendError::TypeConversion {
+            column: "storage_precision".into(),
+            detail: e.to_string(),
+        })?;
+    let oversample = row.try_get::<i32>("oversample")?.map(|v| v.max(0) as usize);
     Ok(ResultTableRecord {
         table_name: row.get("table_name")?,
         source_id: row.get("source_id")?,
@@ -137,6 +181,8 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendErr
         tenant_id: row.try_get("tenant_id")?,
         definition_hash: row.try_get("definition_hash")?,
         input_anchors_json: row.try_get("input_anchors_json")?,
+        storage_precision,
+        oversample,
     })
 }
 
@@ -155,6 +201,8 @@ impl Catalog {
         let dimensions = p.dimensions;
         let key_column = p.key_column.map(str::to_string);
         let text_columns = p.text_columns.map(str::to_string);
+        let storage_precision = p.storage_precision.to_string();
+        let oversample = p.oversample;
         let tenant = self.current_tenant();
 
         self.backend()
@@ -165,8 +213,8 @@ impl Catalog {
                     tx.execute(
                         "INSERT INTO result_tables (table_name, source_id, model_id, task, kind, \
                          derived_from, parquet_path, index_path, dimensions, key_column, \
-                         text_columns, tenant_id) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                         text_columns, tenant_id, storage_precision, oversample) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
                         &[
                             SqlValue::TextOwned(table_name),
                             SqlValue::TextOwned(source_id),
@@ -180,6 +228,8 @@ impl Catalog {
                             SqlValue::from(key_column),
                             SqlValue::from(text_columns),
                             SqlValue::from(tenant.map(|t| t.to_string())),
+                            SqlValue::TextOwned(storage_precision),
+                            SqlValue::from(oversample as i64),
                         ],
                     )
                     .await?;

@@ -61,6 +61,7 @@ async fn open_local_yields_a_working_embedded_session() {
             embedding_table: None,
             filter: None,
             select: Vec::new(),
+            oversample: None,
         })
         .await
         .expect("search through the opened session");

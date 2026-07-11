@@ -9,5 +9,6 @@
     "rowmap": "frozen.rowmap"
   },
   "metric": "cosine",
-  "version": 1
+  "scalar_kind": "f32",
+  "version": 2
 }

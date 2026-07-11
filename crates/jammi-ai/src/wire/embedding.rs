@@ -203,7 +203,7 @@ pub fn search_from_bytes(body: &[u8]) -> Result<SearchRequest, Status> {
 /// required `source_id` and the `query` oneof (a precomputed vector or a row key
 /// resolved in-engine) are validated at decode; an absent oneof is a client
 /// error. The `k` cap widens to the engine's `usize`, and `filter` / `select` /
-/// `embedding_table` carry through with their wire presence.
+/// `embedding_table` / `oversample` carry through with their wire presence.
 pub fn search_from_proto(req: pb::SearchRequest) -> Result<SearchRequest, Status> {
     use pb::search_request::Query as ProtoQuery;
     if req.source_id.is_empty() {
@@ -223,5 +223,6 @@ pub fn search_from_proto(req: pb::SearchRequest) -> Result<SearchRequest, Status
         embedding_table: req.embedding_table,
         filter: req.filter,
         select: req.select,
+        oversample: req.oversample.map(|v| v as usize),
     })
 }

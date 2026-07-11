@@ -260,6 +260,7 @@ impl DataClient {
             embedding_table,
             filter,
             select,
+            oversample,
         } = request;
         let query = match query {
             SearchQuery::Vector(values) => ProtoSearchQuery::QueryVector(QueryVector { values }),
@@ -274,6 +275,7 @@ impl DataClient {
                 embedding_table,
                 filter,
                 select: select.clone(),
+                oversample: oversample.map(|v| v as u32),
             })
             .await
             .map_err(|s| error_from_status(&s))?

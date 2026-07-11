@@ -682,3 +682,28 @@ ALTER TABLE result_tables ADD COLUMN input_anchors_json TEXT;
 pub(super) const MIGRATION_022_DEFINITION_HASH_INDEX: &str = r#"
 CREATE INDEX idx_result_tables_definition_hash ON result_tables(definition_hash);
 "#;
+
+/// Migration 023 — the sidecar-index storage-precision + rescore-oversample
+/// columns.
+///
+/// `storage_precision` is the [`StoragePrecision`](crate::config::StoragePrecision)
+/// (`"f32"` / `"f16"` / `"int8"`) an embedding table's ANN sidecar index was
+/// built at — stamped once, at `create_table`, from the deployment's
+/// [`AnnIndexConfig::storage_precision`](crate::config::AnnIndexConfig::storage_precision)
+/// default, and read back verbatim by every later build/load of that table's
+/// index (crash-recovery rebuild included) so a deployment-wide config change
+/// never silently rebuilds an *existing* table's index at a different
+/// precision than its catalog row promises. `oversample` is the matching
+/// per-table default for the quantized-index retrieve→rescore multiplier
+/// (`k * oversample` candidates retrieved before rescoring to `k` exact
+/// results); a search request may still override it for that one call.
+///
+/// Both columns are nullable: a row created before this migration carries
+/// `NULL` and is read back as the honest defaults (`F32`, the config
+/// oversample default) — never a fabricated precision. A row created after
+/// this migration always carries both, written in the same `INSERT` as every
+/// other identity column.
+pub(super) const MIGRATION_023_STORAGE_PRECISION: &str = r#"
+ALTER TABLE result_tables ADD COLUMN storage_precision TEXT;
+ALTER TABLE result_tables ADD COLUMN oversample        INTEGER;
+"#;

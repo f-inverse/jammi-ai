@@ -237,6 +237,12 @@ impl InferenceSession {
                 self_exclude,
                 exact,
                 exact_max_rows,
+                // Not a replay input — it is re-derived fresh from the source
+                // table's *current* sidecar-index precision when the build
+                // re-runs the index-assisted driver; it exists in the
+                // descriptor purely to make that precision an output-affecting
+                // determinant of the *original* run's identity.
+                index_storage_precision: _,
             } => {
                 let params = BuildNeighborGraph {
                     k,

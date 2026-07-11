@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Serialize;
+use serde_json::value::RawValue;
 
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::sidecar::SidecarIndex;
@@ -214,6 +215,11 @@ fn freeze_sidecar(
 /// `frozen` (`F32`) stem — the SAME held-out fixture corpus, quantized.
 const FROZEN_INT8_STEM: &str = "frozen_int8";
 
+/// File stem of the frozen `Binary` sidecar bundle, alongside `frozen` (`F32`)
+/// and `frozen_int8` — the SAME held-out fixture corpus, sign-quantized to one
+/// bit per dimension (USearch `B1`) and searched by Hamming distance.
+const FROZEN_BINARY_STEM: &str = "frozen_binary";
+
 /// The committed precision-recall floor record: the retrieve→rescore recovery
 /// proof, measured on the same fixture slice [`build_held_out_fixture`] froze
 /// the `F32` bundle over.
@@ -241,6 +247,256 @@ pub struct PrecisionFloorRecord {
     pub int8_no_rescore: BTreeMap<usize, FloorEntry>,
 }
 
+/// The committed `Binary`-precision floor record — the same retrieve→rescore
+/// recovery proof as [`PrecisionFloorRecord`], for [`StoragePrecision::Binary`]
+/// rather than `Int8`.
+///
+/// `Binary`'s Hamming coarse stage needs a much wider oversample than `Int8`'s
+/// cosine-ranked stage to recover comparable recall (see
+/// [`jammi_db::config::StoragePrecision::default_oversample`]), so its
+/// rescored oversample is its own field
+/// ([`Self::binary_oversample_rescored`]) rather than sharing
+/// [`PrecisionFloorRecord::oversample_rescored`], which stays Int8's `4`.
+#[derive(Debug, Serialize)]
+pub struct BinaryPrecisionFloorRecord {
+    /// The retrieve→rescore oversample [`Self::binary_rescored`] measured at
+    /// — `Binary`'s own
+    /// [`jammi_db::config::StoragePrecision::default_oversample`] (`32`).
+    pub binary_oversample_rescored: usize,
+    /// The oversample [`Self::binary_no_rescore`] measured at — always `1`.
+    pub binary_oversample_no_rescore: usize,
+    /// Binary + retrieve→rescore at `binary_oversample_rescored`: measured
+    /// recall@k and the margin-subtracted floor, keyed by k.
+    ///
+    /// On this 2000-row fixture, `k=100` at `oversample=32` approaches
+    /// exhaustive (`k * oversample = 3200 > 2000` corpus rows), so its
+    /// recovery is partly a small-fixture artifact rather than a property that
+    /// holds at production scale — the floor is still measured live and
+    /// margin-subtracted, but should not be over-read as "binary rescue
+    /// recovers 100% of top-100 in general".
+    pub binary_rescored: BTreeMap<usize, FloorEntry>,
+    /// Binary at `binary_oversample_no_rescore = 1`: measured recall@k and the
+    /// margin-subtracted floor, keyed by k.
+    pub binary_no_rescore: BTreeMap<usize, FloorEntry>,
+}
+
+/// One quantized precision's measured retrieve→rescore recall@k curve (both
+/// the deployment-default-oversample "rescored" variant and the
+/// `oversample = 1` "no rescore" baseline), each already converted to a
+/// [`FloorEntry`] (`floor = measured − margin`).
+struct QuantizedRecallMeasurement {
+    rescored: BTreeMap<usize, FloorEntry>,
+    no_rescore: BTreeMap<usize, FloorEntry>,
+}
+
+/// Freeze a sidecar at `precision` over the ALREADY-COMMITTED fixture corpus
+/// (`fixture_dir/corpus_vectors.parquet`) to `fixture_dir/{stem}.*` — the ONE
+/// build, committed, never rebuilt by the gate — then measure the held-out
+/// retrieve→rescore recall@k at `oversample_rescored` and at the naive
+/// `oversample = 1` baseline.
+///
+/// Shared by [`build_precision_recall_fixture`] (`Int8`) and
+/// [`build_binary_recall_fixture`] (`Binary`) — the two quantized precisions
+/// differ only in their scalar kind and default oversample, not in how the
+/// fixture is built or measured.
+async fn freeze_and_measure_quantized_precision(
+    fixture_dir: &Path,
+    stem: &str,
+    precision: StoragePrecision,
+    oversample_rescored: usize,
+) -> Result<QuantizedRecallMeasurement, Box<dyn std::error::Error>> {
+    let corpus_table = format!("{stem}_fixture_corpus");
+    let query_table = format!("{stem}_fixture_queries");
+
+    let corpus_path = fixture_dir.join("corpus_vectors.parquet");
+    let query_path = fixture_dir.join("query_vectors.parquet");
+
+    let corpus_url = corpus::storage_url(&corpus_path)?;
+    let ctx = corpus::register(&corpus_url, &corpus_table).await?;
+    let corpus_rows = corpus::load_vectors(&ctx, &corpus_table).await?;
+    let dim = corpus_rows
+        .first()
+        .map(|(_, v)| v.len())
+        .ok_or("fixture corpus is empty — nothing to quantize")?;
+
+    let query_url = corpus::storage_url(&query_path)?;
+    let query_ctx = corpus::register(&query_url, &query_table).await?;
+    let queries: Vec<Vec<f32>> = corpus::load_vectors(&query_ctx, &query_table)
+        .await?
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect();
+    if queries.is_empty() {
+        return Err("fixture query set is empty — nothing to measure recall over".into());
+    }
+
+    // Freeze the quantized sidecar over the SAME corpus the committed F32
+    // bundle indexes — the ONE build, committed, never rebuilt by the gate.
+    let base = fixture_dir.join(stem);
+    let mut index = SidecarIndex::new(dim, &AnnIndexConfig::default(), precision)?;
+    for (id, v) in &corpus_rows {
+        index.add(id, v)?;
+    }
+    index.build()?;
+    VectorIndex::save(&index, &base)?;
+
+    let mut rescored = BTreeMap::new();
+    let mut no_rescore = BTreeMap::new();
+    for &k in &RECALL_KS {
+        let rescored_recall = recall::mean_recall_at_k_rescored(
+            &ctx,
+            &corpus_table,
+            &base,
+            precision,
+            oversample_rescored,
+            &queries,
+            k,
+        )
+        .await?;
+        rescored.insert(
+            k,
+            FloorEntry {
+                measured: rescored_recall,
+                floor: (rescored_recall - FLOOR_MARGIN).max(0.0),
+            },
+        );
+
+        let no_rescore_recall = recall::mean_recall_at_k_rescored(
+            &ctx,
+            &corpus_table,
+            &base,
+            precision,
+            1,
+            &queries,
+            k,
+        )
+        .await?;
+        no_rescore.insert(
+            k,
+            FloorEntry {
+                measured: no_rescore_recall,
+                floor: (no_rescore_recall - FLOOR_MARGIN).max(0.0),
+            },
+        );
+    }
+
+    Ok(QuantizedRecallMeasurement {
+        rescored,
+        no_rescore,
+    })
+}
+
+/// Merge `fields` (a serialized record, top-level keys only) into the
+/// `"precision"` object of the committed `floor.json`, creating that object if
+/// it does not already exist. Additive — existing keys the caller's record
+/// does not touch (e.g. another precision's floors) are left untouched, so
+/// [`build_precision_recall_fixture`] and [`build_binary_recall_fixture`] can
+/// each be run independently without clobbering the other's committed floors.
+///
+/// Every sibling key — both at the top level (`"margin"`/`"provenance"`/
+/// `"recall"`) and inside the existing `"precision"` object (e.g. `Int8`'s
+/// `int8_rescored`/`int8_no_rescore` when this call is writing `Binary`'s
+/// keys) — is carried through as opaque raw JSON text ([`RawValue`]), never
+/// reparsed into an `f64`. `serde_json`'s default number parser is not
+/// exact-round-trip (the `float_roundtrip` cargo feature exists precisely
+/// because reparsing an arbitrary decimal string can land 1 ULP off the
+/// original value), so a naive read-into-`Value`-then-rewrite would silently
+/// perturb an already-committed measured float that this call never touched
+/// or re-measured — a measured number quietly turning into a different,
+/// unmeasured one. Only the keys `fields` supplies are freshly written, from
+/// numbers this run just measured; every other key's bytes are exactly what
+/// was already committed.
+fn merge_precision_floor_fields(
+    fixture_dir: &Path,
+    fields: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let floor_path = fixture_dir.join(FLOOR_FILE);
+    let existing = std::fs::read_to_string(&floor_path)?;
+
+    let mut top: BTreeMap<String, Box<RawValue>> = serde_json::from_str(&existing)?;
+    let mut precision: BTreeMap<String, Box<RawValue>> = match top.get("precision") {
+        Some(raw) => serde_json::from_str(raw.get())?,
+        None => BTreeMap::new(),
+    };
+
+    // `"precision"`'s children sit one level deeper (4 spaces) than a
+    // freshly-`to_string_pretty`'d value assumes (which starts its own
+    // indentation at column 0, as if it were the whole document) — reindent
+    // only the NEW value's lines by the difference. Untouched keys are never
+    // touched here, so they never need reindenting: their raw bytes were
+    // captured at, and are spliced back at, the exact same absolute depth.
+    let fields_map = fields
+        .as_object()
+        .ok_or("precision floor record did not serialize to a JSON object")?;
+    for (k, v) in fields_map {
+        let rendered = indent_continuation_lines(&serde_json::to_string_pretty(v)?, 4);
+        precision.insert(k.clone(), RawValue::from_string(rendered)?);
+    }
+
+    top.insert(
+        "precision".to_string(),
+        RawValue::from_string(render_object(&precision, 2)?)?,
+    );
+
+    std::fs::write(&floor_path, render_object(&top, 0)?)?;
+    Ok(())
+}
+
+/// Prepend `spaces` worth of indentation to every line of `s` EXCEPT the
+/// first — the first line follows immediately after `"key": ` on the same
+/// line, so it needs no leading whitespace of its own; every subsequent line
+/// is a fresh line that must line up at the target nesting depth.
+fn indent_continuation_lines(s: &str, spaces: usize) -> String {
+    let pad = " ".repeat(spaces);
+    s.lines()
+        .enumerate()
+        .map(|(i, line)| {
+            if i == 0 {
+                line.to_string()
+            } else {
+                format!("{pad}{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Render `map` as a pretty-printed JSON object whose entries sit at
+/// `indent + 2` spaces (the entries' own indentation; `indent` is the
+/// indentation of the object's opening/closing braces themselves), splicing
+/// each value's raw JSON bytes in verbatim.
+///
+/// Unlike `serde_json::to_string_pretty` over the map directly (which always
+/// assumes the map is the top of its own document, indenting entries starting
+/// at 2 spaces regardless of where the object actually nests), this renders at
+/// the CALLER-SUPPLIED depth — the mechanism [`merge_precision_floor_fields`]
+/// needs to splice an already-nested object (`"precision"`, or the whole
+/// document) without disturbing the absolute indentation already baked into
+/// untouched [`RawValue`] entries.
+fn render_object(
+    map: &BTreeMap<String, Box<RawValue>>,
+    indent: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let entry_pad = " ".repeat(indent + 2);
+    let mut out = String::from("{\n");
+    for (i, (k, v)) in map.iter().enumerate() {
+        if i > 0 {
+            out.push_str(",\n");
+        }
+        out.push_str(&entry_pad);
+        out.push_str(&serde_json::to_string(k)?);
+        out.push_str(": ");
+        out.push_str(v.get());
+    }
+    out.push('\n');
+    out.push_str(&" ".repeat(indent));
+    out.push('}');
+    if indent == 0 {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 /// Build the frozen `Int8` sidecar over the ALREADY-COMMITTED fixture corpus
 /// (`fixture_dir/corpus_vectors.parquet` — the same real embeddings the
 /// existing frozen `F32` bundle indexes), freeze it to
@@ -260,102 +516,57 @@ pub struct PrecisionFloorRecord {
 pub async fn build_precision_recall_fixture(
     fixture_dir: &Path,
 ) -> Result<PrecisionFloorRecord, Box<dyn std::error::Error>> {
-    const CORPUS_TABLE: &str = "precision_fixture_corpus";
-    const QUERY_TABLE: &str = "precision_fixture_queries";
-
-    let corpus_path = fixture_dir.join("corpus_vectors.parquet");
-    let query_path = fixture_dir.join("query_vectors.parquet");
-
-    let corpus_url = corpus::storage_url(&corpus_path)?;
-    let ctx = corpus::register(&corpus_url, CORPUS_TABLE).await?;
-    let corpus_rows = corpus::load_vectors(&ctx, CORPUS_TABLE).await?;
-    let dim = corpus_rows
-        .first()
-        .map(|(_, v)| v.len())
-        .ok_or("fixture corpus is empty — nothing to quantize")?;
-
-    let query_url = corpus::storage_url(&query_path)?;
-    let query_ctx = corpus::register(&query_url, QUERY_TABLE).await?;
-    let queries: Vec<Vec<f32>> = corpus::load_vectors(&query_ctx, QUERY_TABLE)
-        .await?
-        .into_iter()
-        .map(|(_, v)| v)
-        .collect();
-    if queries.is_empty() {
-        return Err("fixture query set is empty — nothing to measure recall over".into());
-    }
-
-    // Freeze the Int8 sidecar over the SAME corpus the committed F32 bundle
-    // indexes — the ONE build, committed, never rebuilt by the gate.
-    let int8_base = fixture_dir.join(FROZEN_INT8_STEM);
-    let mut index = SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::Int8)?;
-    for (id, v) in &corpus_rows {
-        index.add(id, v)?;
-    }
-    index.build()?;
-    VectorIndex::save(&index, &int8_base)?;
-
-    let oversample_rescored =
-        AnnIndexConfig::default().effective_oversample_for(StoragePrecision::Int8);
-    let mut int8_rescored = BTreeMap::new();
-    let mut int8_no_rescore = BTreeMap::new();
-    for &k in &RECALL_KS {
-        let rescored = recall::mean_recall_at_k_rescored(
-            &ctx,
-            CORPUS_TABLE,
-            &int8_base,
-            StoragePrecision::Int8,
-            oversample_rescored,
-            &queries,
-            k,
-        )
-        .await?;
-        int8_rescored.insert(
-            k,
-            FloorEntry {
-                measured: rescored,
-                floor: (rescored - FLOOR_MARGIN).max(0.0),
-            },
-        );
-
-        let no_rescore = recall::mean_recall_at_k_rescored(
-            &ctx,
-            CORPUS_TABLE,
-            &int8_base,
-            StoragePrecision::Int8,
-            1,
-            &queries,
-            k,
-        )
-        .await?;
-        int8_no_rescore.insert(
-            k,
-            FloorEntry {
-                measured: no_rescore,
-                floor: (no_rescore - FLOOR_MARGIN).max(0.0),
-            },
-        );
-    }
+    let oversample_rescored = StoragePrecision::Int8.default_oversample();
+    let measurement = freeze_and_measure_quantized_precision(
+        fixture_dir,
+        FROZEN_INT8_STEM,
+        StoragePrecision::Int8,
+        oversample_rescored,
+    )
+    .await?;
 
     let record = PrecisionFloorRecord {
         oversample_rescored,
         oversample_no_rescore: 1,
-        int8_rescored,
-        int8_no_rescore,
+        int8_rescored: measurement.rescored,
+        int8_no_rescore: measurement.no_rescore,
     };
+    merge_precision_floor_fields(fixture_dir, serde_json::to_value(&record)?)?;
+    Ok(record)
+}
 
-    // Merge into the existing `floor.json` rather than overwrite it wholesale
-    // — the F32 `"recall"`/`"provenance"` section is written by
-    // `build_held_out_fixture` from the full LFS source, which this function
-    // has no access to.
-    let floor_path = fixture_dir.join(FLOOR_FILE);
-    let existing = std::fs::read_to_string(&floor_path)?;
-    let mut value: serde_json::Value = serde_json::from_str(&existing)?;
-    value
-        .as_object_mut()
-        .ok_or("floor.json is not a JSON object")?
-        .insert("precision".to_string(), serde_json::to_value(&record)?);
-    std::fs::write(&floor_path, serde_json::to_string_pretty(&value)?)?;
+/// Build the frozen `Binary` sidecar over the ALREADY-COMMITTED fixture corpus
+/// (`fixture_dir/corpus_vectors.parquet` — the SAME real embeddings the
+/// existing frozen `F32`/`Int8` bundles index), freeze it to
+/// `fixture_dir/frozen_binary.*`, measure the held-out recall@k for the
+/// two-stage retrieve→rescore at `Binary`'s own default oversample (`32`) and
+/// the naive no-rescore (`oversample = 1`) baseline, and merge the
+/// `binary_*` keys into the existing `"precision"` section of the committed
+/// `floor.json` (`floor = measured − margin`, same discipline as
+/// [`build_precision_recall_fixture`]).
+///
+/// Run off-box once with `RAYON_NUM_THREADS=1` (the one Binary sidecar build
+/// is single-threaded, matching the frozen `F32`/`Int8` builds) after both the
+/// `F32` and `Int8` fixtures are already committed; CI only ever loads what
+/// this writes.
+pub async fn build_binary_recall_fixture(
+    fixture_dir: &Path,
+) -> Result<BinaryPrecisionFloorRecord, Box<dyn std::error::Error>> {
+    let oversample_rescored = StoragePrecision::Binary.default_oversample();
+    let measurement = freeze_and_measure_quantized_precision(
+        fixture_dir,
+        FROZEN_BINARY_STEM,
+        StoragePrecision::Binary,
+        oversample_rescored,
+    )
+    .await?;
 
+    let record = BinaryPrecisionFloorRecord {
+        binary_oversample_rescored: oversample_rescored,
+        binary_oversample_no_rescore: 1,
+        binary_rescored: measurement.rescored,
+        binary_no_rescore: measurement.no_rescore,
+    };
+    merge_precision_floor_fields(fixture_dir, serde_json::to_value(&record)?)?;
     Ok(record)
 }

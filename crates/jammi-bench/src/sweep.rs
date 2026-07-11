@@ -13,12 +13,13 @@
 //!   re-dialed at query time. Recall rises and QPS falls as ef grows. Because it
 //!   re-dials a single (committable) index, this axis is re-derivable — the
 //!   portable recall-floor gate the cookbook re-runs against its own oracle.
-//! * **precision** — sweep `storage_precision` (`F32` exact vs `Int8` quantized)
-//!   and, at `Int8`, the retrieve→rescore `oversample`. Like the build axis,
-//!   quantization is baked in at construction, so each point is a separately
-//!   built graph and this axis is an on-box reference here — the portable,
-//!   COMMITTED recall floor for the shipped `Int8` precision lives in a
-//!   dedicated `cargo test` gate over a frozen `Int8` fixture bundle (mirroring
+//! * **precision** — sweep `storage_precision` (`F32` exact, `Int8` quantized,
+//!   `Binary` sign-quantized) and, at a quantized precision, the
+//!   retrieve→rescore `oversample`. Like the build axis, quantization is baked
+//!   in at construction, so each point is a separately built graph and this
+//!   axis is an on-box reference here — the portable, COMMITTED recall floor
+//!   for each shipped quantized precision (`Int8`, `Binary`) lives in a
+//!   dedicated `cargo test` gate over its own frozen fixture bundle (mirroring
 //!   the search axis's frozen-graph discipline), not in this on-box sweep.
 //!
 //! The exact ground truth does not depend on the ANN knobs, so it is computed
@@ -191,12 +192,20 @@ pub async fn run(
     // loaded production index does — a freshly built, never-saved index has no
     // rescore companion yet, so its `get_exact` would silently fall back to
     // USearch's own lossy reconstruction and the rescore would recover nothing.
-    let default_oversample =
-        AnnIndexConfig::default().effective_oversample_for(StoragePrecision::Int8);
-    let precision_grid: [(StoragePrecision, usize); 3] = [
+    // Each quantized precision's shipped default oversample is its OWN
+    // (`StoragePrecision::default_oversample`), not one shared number: `Binary`'s
+    // single-bit Hamming coarse stage needs a much wider candidate pool than
+    // `Int8`'s to recover comparable recall (32 vs 4) — see
+    // `AnnIndexConfig::effective_oversample_for`.
+    let default_config = AnnIndexConfig::default();
+    let int8_default_oversample = default_config.effective_oversample_for(StoragePrecision::Int8);
+    let binary_default_oversample =
+        default_config.effective_oversample_for(StoragePrecision::Binary);
+    let precision_grid: [(StoragePrecision, usize); 4] = [
         (StoragePrecision::F32, 1),
         (StoragePrecision::Int8, 1),
-        (StoragePrecision::Int8, default_oversample),
+        (StoragePrecision::Int8, int8_default_oversample),
+        (StoragePrecision::Binary, binary_default_oversample),
     ];
     let mut precision_sweep = Vec::with_capacity(precision_grid.len());
     for (i, &(precision, oversample)) in precision_grid.iter().enumerate() {
@@ -347,7 +356,7 @@ mod tests {
                 "search point has a throughput"
             );
         }
-        assert_eq!(tier.precision_sweep.len(), 3, "all precision points");
+        assert_eq!(tier.precision_sweep.len(), 4, "all precision points");
         for p in &tier.precision_sweep {
             assert_recall_shape(&p.recall);
             assert!(
@@ -379,6 +388,14 @@ mod tests {
         assert!(
             tier.precision_sweep[2].oversample > 1,
             "shipped-default point oversamples"
+        );
+        assert_eq!(
+            tier.precision_sweep[3].precision,
+            jammi_db::config::StoragePrecision::Binary
+        );
+        assert!(
+            tier.precision_sweep[3].oversample > tier.precision_sweep[2].oversample,
+            "binary's default oversample is wider than int8's"
         );
     }
 

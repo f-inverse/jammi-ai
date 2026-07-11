@@ -405,10 +405,9 @@ pub struct GpuConfig {
     pub require_gpu: bool,
     /// Global default inference compute precision. A per-model
     /// `compute_precision` declared in the model's `config.json` overrides
-    /// this; both default to `F32`. `BF16` is a valid config value (the
-    /// `jammi_numerics::ComputePrecision` vocabulary also serves fine-tune's
-    /// frozen backbone) but is rejected at model-load time — bf16 inference
-    /// needs a runtime compute-capability gate not yet implemented.
+    /// this; both default to `F32`. `BF16` is a GPU-tier value: the candle
+    /// load boundary admits it on a CUDA device of compute capability >= 8.0
+    /// (Ampere+) and fails loud on a lower-capability or non-CUDA device.
     /// Default: `F32`.
     pub compute_precision: jammi_numerics::ComputePrecision,
 }

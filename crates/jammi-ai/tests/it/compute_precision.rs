@@ -383,10 +383,15 @@ async fn ner_at_f16_produces_valid_entity_spans() {
     );
 }
 
-/// bf16 is deferred: an inference request resolving to `BF16` must fail
-/// loud with the typed "not yet supported" engine error, never silently run
-/// (which would risk the INVALID_PTX class on non-sm_80 hardware) and never
-/// silently fall back to another precision.
+/// bf16 is a GPU-tier precision gated at the candle load boundary: a request
+/// resolving to `BF16` on a device that cannot run it — here a CPU device (the
+/// hermetic suite has no GPU) — must fail loud with the typed
+/// compute-capability refusal naming the >= 8.0 (Ampere+) requirement, never
+/// silently run and never silently fall back to another precision. On the
+/// non-CUDA test build the refusal comes from the `not(feature = "cuda")` arm;
+/// on a CUDA build resolving to CPU it comes from the non-CUDA-device arm —
+/// both carry the same "requires a CUDA device with compute capability >= 8.0"
+/// contract, which is what this asserts.
 #[tokio::test]
 async fn bf16_inference_request_is_rejected_loudly() {
     let catalog_dir = TempDir::new().unwrap();
@@ -408,8 +413,10 @@ async fn bf16_inference_request_is_rejected_loudly() {
     match backend.load(&resolved, &device_config) {
         Err(JammiError::Model { message, .. }) => {
             assert!(
-                message.contains("bf16") && message.to_lowercase().contains("not yet supported"),
-                "expected a typed bf16-not-yet-supported refusal, got: {message}"
+                message.contains("bf16")
+                    && message.contains("compute capability >= 8.0")
+                    && message.contains("Ampere"),
+                "expected a typed bf16 compute-capability refusal, got: {message}"
             );
         }
         Err(other) => panic!("expected a typed JammiError::Model bf16 refusal, got: {other}"),

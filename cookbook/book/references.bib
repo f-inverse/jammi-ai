@@ -471,3 +471,15 @@
   year         = {2002},
   note         = {\url{https://www.joelonsoftware.com/2002/11/11/the-law-of-leaky-abstractions/}}
 }
+
+% BFloat16: the floating-point format the compute-precision chapter's `bf16` value
+% names. It carries fp32's full 8-bit exponent range in half the storage (unlike
+% fp16's narrower 5-bit exponent), which is why a bf16-computed embedding preserves
+% direction against its f32 twin — the cosine-preservation claim the chapter
+% measures on real Ampere hardware. Verified: Kalamkar et al., arXiv:1905.12322, 2019.
+@article{kalamkar2019bfloat16,
+  title   = {A Study of {BFLOAT16} for Deep Learning Training},
+  author  = {Kalamkar, Dhiraj and Mudigere, Dheevatsa and Mellempudi, Naveen and Das, Dipankar and Banerjee, Kunal and Avancha, Sasikanth and Vooturi, Dharma Teja and Jammalamadaka, Nataraj and Huang, Jianyu and Yuen, Hector and Yang, Jiyan and Park, Jongsoo and Heinecke, Alexander and Georganas, Evangelos and Srinivasan, Sudarshan and Kundu, Abhisek and Smelyanskiy, Misha and Kaul, Bharat and Dubey, Pradeep},
+  journal = {arXiv preprint arXiv:1905.12322},
+  year    = {2019}
+}

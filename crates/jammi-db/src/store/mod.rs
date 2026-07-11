@@ -304,8 +304,14 @@ impl ResultStore {
                 // catalog row, never off `self.ann` again, so a later config
                 // change cannot silently rebuild an existing table at a
                 // different precision than this row already promises.
+                // `effective_oversample_for` resolves the precision-specific
+                // default (Binary's wider Hamming-coarse-stage oversample)
+                // when the deployment left `oversample` at its untouched
+                // shared default, while still honoring an explicit override.
                 storage_precision: self.ann.storage_precision,
-                oversample: self.ann.effective_oversample(),
+                oversample: self
+                    .ann
+                    .effective_oversample_for(self.ann.storage_precision),
             })
             .await?;
 

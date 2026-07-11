@@ -21,3 +21,4 @@ approx.workspace = true
 nalgebra.workspace = true
 rand.workspace = true
 rand_distr.workspace = true
+serde_json.workspace = true

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, VarMap};
 use jammi_lora::{
-    effective_rank, load_adapter, save_adapter, should_apply_lora, AdapterConfig, BackboneDtype,
+    effective_rank, load_adapter, save_adapter, should_apply_lora, AdapterConfig, ComputePrecision,
     LoraBuildConfig, LoraInitMode, LoraLinear, MaybeLoraLinear,
 };
 
@@ -281,7 +281,7 @@ fn adapter_config_json_roundtrip() {
         target_modules: vec!["query".into(), "value".into()],
         layers_to_transform: Some(vec![0, 2]),
         rank_pattern,
-        backbone_dtype: BackboneDtype::BF16,
+        backbone_dtype: ComputePrecision::BF16,
     };
 
     let json = serde_json::to_string(&cfg).unwrap();
@@ -308,7 +308,7 @@ fn adapter_config_default_optional_fields() {
     let cfg: AdapterConfig = serde_json::from_str(json).unwrap();
     assert!(cfg.layers_to_transform.is_none());
     assert!(cfg.rank_pattern.is_empty());
-    assert_eq!(cfg.backbone_dtype, BackboneDtype::F32);
+    assert_eq!(cfg.backbone_dtype, ComputePrecision::F32);
 }
 
 #[test]
@@ -331,7 +331,7 @@ fn save_load_adapter_roundtrip() {
         target_modules: vec!["query".into()],
         layers_to_transform: None,
         rank_pattern: HashMap::new(),
-        backbone_dtype: BackboneDtype::F32,
+        backbone_dtype: ComputePrecision::F32,
     };
 
     save_adapter(dir.path(), &tensors, &cfg).unwrap();

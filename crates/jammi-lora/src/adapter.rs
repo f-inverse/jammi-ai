@@ -2,42 +2,10 @@
 
 use std::collections::HashMap;
 
-#[cfg(feature = "candle")]
-use candle_core::DType;
+use jammi_numerics::ComputePrecision;
 use serde::{Deserialize, Serialize};
 
 use crate::config::LoraBuildConfig;
-
-/// Dtype used for the frozen backbone at training time.
-///
-/// `BF16` halves backbone memory with negligible impact on training dynamics
-/// because the backbone weights are frozen. The trainable LoRA A and B
-/// matrices always stay in F32.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BackboneDtype {
-    /// Full precision — maximally compatible.
-    #[default]
-    F32,
-    /// BFloat16 — recommended for CUDA/Metal; cuts backbone VRAM by ~half.
-    BF16,
-    /// Half-precision float — compatible with most CUDA devices.
-    F16,
-}
-
-/// The `BackboneDtype -> candle DType` mapping is the one place this config enum
-/// touches candle, so it rides the `candle` feature; the config-vocabulary build
-/// keeps the enum without the tensor stack.
-#[cfg(feature = "candle")]
-impl From<BackboneDtype> for DType {
-    fn from(d: BackboneDtype) -> Self {
-        match d {
-            BackboneDtype::F32 => DType::F32,
-            BackboneDtype::BF16 => DType::BF16,
-            BackboneDtype::F16 => DType::F16,
-        }
-    }
-}
 
 /// Metadata describing a LoRA adapter injected into an encoder's internal
 /// attention/FFN linears.
@@ -65,8 +33,14 @@ pub struct AdapterConfig {
     #[serde(default)]
     pub rank_pattern: HashMap<String, usize>,
     /// Dtype used for the frozen backbone at training time. Defaults to F32.
+    /// `BF16` halves backbone memory with negligible impact on training
+    /// dynamics because the backbone weights are frozen; the trainable LoRA A
+    /// and B matrices always stay in F32. The `ComputePrecision -> candle
+    /// DType` mapping this field eventually needs lives at the candle
+    /// boundary (`jammi_encoders::compute_precision_to_dtype`), not on this
+    /// candle-free config type.
     #[serde(default)]
-    pub backbone_dtype: BackboneDtype,
+    pub backbone_dtype: ComputePrecision,
 }
 
 impl AdapterConfig {
@@ -78,7 +52,7 @@ impl AdapterConfig {
     pub fn from_build(
         model_type: &str,
         lora: &LoraBuildConfig<'_>,
-        backbone_dtype: BackboneDtype,
+        backbone_dtype: ComputePrecision,
     ) -> Self {
         Self {
             model_type: model_type.into(),

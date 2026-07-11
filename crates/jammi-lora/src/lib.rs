@@ -35,11 +35,16 @@ mod seeded;
 #[cfg(feature = "candle")]
 mod wrapper;
 
-pub use adapter::{AdapterConfig, BackboneDtype};
+pub use adapter::AdapterConfig;
 pub use config::{effective_rank, should_apply_lora, LoraBuildConfig};
 #[cfg(feature = "candle")]
 pub use error::LoraError;
 pub use init::LoraInitMode;
+// `AdapterConfig`'s `backbone_dtype` field is typed on `ComputePrecision`
+// (`jammi-numerics`'s candle-free compute-dtype vocabulary), re-exported here
+// so a consumer that only needs the config vocabulary reaches the type
+// without its own direct `jammi-numerics` import.
+pub use jammi_numerics::ComputePrecision;
 #[cfg(feature = "candle")]
 pub use lora_linear::LoraLinear;
 #[cfg(feature = "candle")]

@@ -4,6 +4,7 @@ mod asof_verb;
 mod backends;
 mod channel_contract;
 mod common;
+mod compute_precision;
 mod conformal;
 mod context_predictor;
 mod context_set;

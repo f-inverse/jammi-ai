@@ -403,6 +403,14 @@ pub struct GpuConfig {
     /// fast if the requested device is unavailable. Default: `false` (degrade
     /// to CPU with a warning).
     pub require_gpu: bool,
+    /// Global default inference compute precision. A per-model
+    /// `compute_precision` declared in the model's `config.json` overrides
+    /// this; both default to `F32`. `BF16` is a valid config value (the
+    /// `jammi_numerics::ComputePrecision` vocabulary also serves fine-tune's
+    /// frozen backbone) but is rejected at model-load time — bf16 inference
+    /// needs a runtime compute-capability gate not yet implemented.
+    /// Default: `F32`.
+    pub compute_precision: jammi_numerics::ComputePrecision,
 }
 
 /// Model inference defaults.
@@ -753,6 +761,7 @@ impl Default for GpuConfig {
             memory_limit: "auto".into(),
             memory_fraction: 0.9,
             require_gpu: false,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
         }
     }
 }

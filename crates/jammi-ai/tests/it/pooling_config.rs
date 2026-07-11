@@ -86,6 +86,7 @@ async fn resolve_and_load(dir: &Path) -> LoadedModel {
         gpu_device: -1,
         memory_fraction: 1.0,
         require_gpu: false,
+        compute_precision: jammi_numerics::ComputePrecision::F32,
     };
     backend.load(&resolved, &device_config).unwrap()
 }
@@ -258,6 +259,7 @@ async fn unsupported_pooling_mode_fails_model_load() {
         gpu_device: -1,
         memory_fraction: 1.0,
         require_gpu: false,
+        compute_precision: jammi_numerics::ComputePrecision::F32,
     };
     let result = backend.load(&resolved, &device_config);
     assert!(

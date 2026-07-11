@@ -10,11 +10,15 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-// The LoRA init/backbone-dtype knobs are part of `FineTuneConfig`'s public
-// shape, so re-export them here: a consumer constructing a config through the
-// SDK boundary reaches every field's type from this module, without depending
-// on `jammi-lora` directly.
-pub use jammi_lora::{BackboneDtype, LoraInitMode};
+// The LoRA init knob and the compute-precision vocabulary are part of
+// `FineTuneConfig`'s public shape, so re-export them here: a consumer
+// constructing a config through the SDK boundary reaches every field's type
+// from this module, without depending on `jammi-lora` / `jammi-numerics`
+// directly. `ComputePrecision` lives in `jammi-numerics` (not `jammi-lora`) —
+// it is the same "what dtype does this backbone run at" concept the
+// inference engine's compute-precision knob uses, so both share one type.
+pub use jammi_lora::LoraInitMode;
+pub use jammi_numerics::ComputePrecision;
 
 /// Supported fine-tuning methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,9 +321,9 @@ pub struct FineTuneConfig {
 
     /// Dtype for the frozen backbone weights. `BF16` cuts backbone VRAM by ~half.
     /// LoRA A/B matrices are always kept in F32 for numerical stability.
-    /// Default: `F32` for backward compatibility.
+    /// Default: `F32`.
     #[serde(default)]
-    pub backbone_dtype: jammi_lora::BackboneDtype,
+    pub backbone_dtype: jammi_numerics::ComputePrecision,
 
     /// AdamW weight decay (L2 regularization coefficient). Default: 0.01.
     /// Matches `train_embedding_model.py` which uses `AdamW(weight_decay=0.01)`.
@@ -413,7 +417,7 @@ impl Default for FineTuneConfig {
             use_rslora: false,
             rank_pattern: HashMap::new(),
             init_lora_weights: jammi_lora::LoraInitMode::ZerosB,
-            backbone_dtype: jammi_lora::BackboneDtype::F32,
+            backbone_dtype: jammi_numerics::ComputePrecision::F32,
             weight_decay: 0.01,
             max_grad_norm: 1.0,
             cached: false,

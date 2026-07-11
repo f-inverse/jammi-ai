@@ -51,6 +51,12 @@ use sha2::{Digest, Sha256};
 
 use crate::model_task::ModelTask;
 
+// Re-exported (not merely imported) so a consumer that constructs or matches a
+// `ModelIdentity` — every model-producing descriptor's environment carries a
+// `Vec<ModelIdentity>` — reaches `ComputePrecision`'s type from this module,
+// without its own direct `jammi-numerics` import.
+pub use jammi_numerics::ComputePrecision;
+
 /// Manifest format version. A change to the [`ProducingDescriptor`] shape — the
 /// determinant set a producer folds into its [`DefinitionHash`] *and* records
 /// verbatim for replay — bumps this so a reader detects an incompatible older
@@ -147,9 +153,10 @@ pub enum ComputeDevice {
 /// The execution environment that affects a producer's output, hashed into the
 /// [`DefinitionHash`] alongside the [`ProducingDescriptor`].
 ///
-/// Carries the engine semantic version, the compute device, and the identities
-/// and backend kinds of every model the producer invokes — the determinants of
-/// the output that are *not* part of the producing description itself.
+/// Carries the engine semantic version, the compute device, and the identities,
+/// backend kinds, and compute precisions of every model the producer invokes —
+/// the determinants of the output that are *not* part of the producing
+/// description itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaterializationEnv {
     /// Engine semantic version that produced the artifact (`CARGO_PKG_VERSION`).
@@ -174,14 +181,28 @@ impl MaterializationEnv {
     }
 }
 
-/// The identity + backend kind of a model an environment invoked. The canonical
-/// model id (HF repo or local path string) plus the backend kind that ran it.
+/// The identity + backend kind + compute precision of a model an environment
+/// invoked. The canonical model id (HF repo or local path string) plus the
+/// backend kind that ran it and the dtype it ran at.
+///
+/// `compute_precision` folds in here — the same place `backend` does — rather
+/// than into a single per-descriptor field, so it enters the definition hash
+/// **uniformly for every model-producing descriptor** (`Inference` and
+/// `Embedding` alike) the moment either records a `ModelIdentity`, instead of
+/// requiring each new model-invoking `ProducingDescriptor` variant to
+/// remember its own precision field. An `F16` run of a model is output-
+/// affecting relative to an `F32` run of the same model over the same input —
+/// two such runs must never collide on one materialization identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelIdentity {
     /// Canonical model id as stored in `result_tables.model_id`.
     pub model_id: String,
     /// The backend kind that ran the model (`candle` / `ort` / `http`).
     pub backend: String,
+    /// The compute precision the model ran at (the resolved per-model
+    /// `config.json` override, or the global `GpuConfig::compute_precision`
+    /// default).
+    pub compute_precision: ComputePrecision,
 }
 
 /// A canonical, deterministically-serialisable description of the verb that
@@ -985,6 +1006,7 @@ mod tests {
             vec![ModelIdentity {
                 model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
                 backend: "candle".into(),
+                compute_precision: ComputePrecision::F32,
             }],
         )
     }
@@ -1070,6 +1092,7 @@ mod tests {
                 vec![ModelIdentity {
                     model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
                     backend: "candle".into(),
+                    compute_precision: ComputePrecision::F32,
                 }],
             ),
         )
@@ -1098,9 +1121,51 @@ mod tests {
             vec![ModelIdentity {
                 model_id: "sentence-transformers/all-MiniLM-L12-v2".into(),
                 backend: "candle".into(),
+                compute_precision: ComputePrecision::F32,
             }],
         );
         assert_ne!(base, definition_hash(&d, &other_model).unwrap());
+    }
+
+    /// K7: `compute_precision` folds into `ModelIdentity` (part of
+    /// `MaterializationEnv`), not into a per-descriptor field — so it enters
+    /// the definition hash uniformly for *every* model-producing descriptor.
+    /// This exercises the `Inference` descriptor specifically (`Embedding` is
+    /// covered by `cpu_env`/`different_model_version_changes_the_hash` above)
+    /// to prove the fold is not blind to the non-embedding model-producing
+    /// path: an `F32` and an `F16` run of the identical model over the
+    /// identical `Inference` descriptor must never collide on one identity.
+    #[test]
+    fn different_compute_precision_changes_the_hash_for_inference_too() {
+        let d = ProducingDescriptor::Inference {
+            model_id: "distilbert-base-uncased-finetuned-sst-2-english".into(),
+            task: ModelTask::Classification,
+            source_id: "reviews".into(),
+            content_columns: vec!["text".into()],
+            key_column: "_row_id".into(),
+        };
+        let f32_env = MaterializationEnv::new(
+            ComputeDevice::Cpu,
+            vec![ModelIdentity {
+                model_id: "distilbert-base-uncased-finetuned-sst-2-english".into(),
+                backend: "candle".into(),
+                compute_precision: ComputePrecision::F32,
+            }],
+        );
+        let f16_env = MaterializationEnv::new(
+            ComputeDevice::Cpu,
+            vec![ModelIdentity {
+                model_id: "distilbert-base-uncased-finetuned-sst-2-english".into(),
+                backend: "candle".into(),
+                compute_precision: ComputePrecision::F16,
+            }],
+        );
+        assert_ne!(
+            definition_hash(&d, &f32_env).unwrap(),
+            definition_hash(&d, &f16_env).unwrap(),
+            "F32 and F16 runs of the same model over the same Inference descriptor \
+             must never collide on one materialization identity"
+        );
     }
 
     #[test]

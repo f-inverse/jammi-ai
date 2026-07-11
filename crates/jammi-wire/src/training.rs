@@ -14,7 +14,7 @@
 use tonic::Status;
 
 use crate::fine_tune::{
-    BackboneDtype, ClassificationLoss, EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig,
+    ClassificationLoss, ComputePrecision, EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig,
     FineTuneMethod, HardNegativeConfig, LoraInitMode, LrSchedule, RegressionLoss,
 };
 
@@ -245,12 +245,15 @@ fn lora_init_mode_from_proto(mode: i32, default: LoraInitMode) -> Result<LoraIni
 }
 
 /// Map the wire [`pb::BackboneDtype`]; `UNSPECIFIED` keeps the default.
-fn backbone_dtype_from_proto(dtype: i32, default: BackboneDtype) -> Result<BackboneDtype, Status> {
+fn backbone_dtype_from_proto(
+    dtype: i32,
+    default: ComputePrecision,
+) -> Result<ComputePrecision, Status> {
     match pb::BackboneDtype::try_from(dtype) {
         Ok(pb::BackboneDtype::Unspecified) => Ok(default),
-        Ok(pb::BackboneDtype::F32) => Ok(BackboneDtype::F32),
-        Ok(pb::BackboneDtype::Bf16) => Ok(BackboneDtype::BF16),
-        Ok(pb::BackboneDtype::F16) => Ok(BackboneDtype::F16),
+        Ok(pb::BackboneDtype::F32) => Ok(ComputePrecision::F32),
+        Ok(pb::BackboneDtype::Bf16) => Ok(ComputePrecision::BF16),
+        Ok(pb::BackboneDtype::F16) => Ok(ComputePrecision::F16),
         Err(_) => Err(Status::invalid_argument("unknown backbone_dtype")),
     }
 }
@@ -398,11 +401,11 @@ fn lora_init_mode_to_proto(mode: LoraInitMode) -> pb::LoraInitMode {
     }
 }
 
-fn backbone_dtype_to_proto(dtype: BackboneDtype) -> pb::BackboneDtype {
+fn backbone_dtype_to_proto(dtype: ComputePrecision) -> pb::BackboneDtype {
     match dtype {
-        BackboneDtype::F32 => pb::BackboneDtype::F32,
-        BackboneDtype::BF16 => pb::BackboneDtype::Bf16,
-        BackboneDtype::F16 => pb::BackboneDtype::F16,
+        ComputePrecision::F32 => pb::BackboneDtype::F32,
+        ComputePrecision::BF16 => pb::BackboneDtype::Bf16,
+        ComputePrecision::F16 => pb::BackboneDtype::F16,
     }
 }
 

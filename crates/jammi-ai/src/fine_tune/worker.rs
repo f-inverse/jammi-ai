@@ -1684,7 +1684,8 @@ fn build_encoder_adapters(
         seed: config.seed,
     };
 
-    let backbone_dtype: candle_core::DType = config.backbone_dtype.into();
+    let backbone_dtype: candle_core::DType =
+        jammi_encoders::compute_precision_to_dtype(config.backbone_dtype);
     let adapter_cfg =
         jammi_lora::AdapterConfig::from_build(model_type, &lora, config.backbone_dtype);
 

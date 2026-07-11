@@ -321,6 +321,20 @@ impl LoadedModel {
         }
     }
 
+    /// The effective inference compute precision this model was loaded at —
+    /// the resolved per-model `config.json` override, or the global
+    /// `GpuConfig::compute_precision` default. Output-affecting (an `F16`
+    /// backbone emits different embedding/logit bytes than `F32`), so the
+    /// materialization contract folds it into `ModelIdentity.compute_precision`
+    /// alongside `backend_kind`. The ORT backend does not yet select a compute
+    /// precision, so it always reports `F32`.
+    pub fn compute_precision(&self) -> jammi_numerics::ComputePrecision {
+        match self {
+            LoadedModel::Candle(m) => m.compute_precision,
+            LoadedModel::Ort(_) => jammi_numerics::ComputePrecision::F32,
+        }
+    }
+
     /// Estimate GPU memory for one inference batch.
     pub fn estimate_batch_memory(&self, batch_size: usize, seq_len: usize) -> usize {
         match self {

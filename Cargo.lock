@@ -4227,6 +4227,7 @@ dependencies = [
  "candle-transformers",
  "hf-hub",
  "jammi-lora",
+ "jammi-numerics",
  "serde",
  "serde_json",
  "tempfile",
@@ -4239,6 +4240,7 @@ version = "0.41.0"
 dependencies = [
  "candle-core",
  "candle-nn",
+ "jammi-numerics",
  "serde",
  "serde_json",
  "tempfile",
@@ -4254,6 +4256,7 @@ dependencies = [
  "rand 0.8.6",
  "rand_distr 0.4.3",
  "serde",
+ "serde_json",
  "statrs",
  "thiserror 2.0.18",
 ]

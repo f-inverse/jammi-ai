@@ -26,6 +26,7 @@ pub mod context;
 pub mod distilbert;
 pub mod htsat_audio;
 pub mod modernbert;
+pub mod precision;
 
 mod any;
 mod error;
@@ -47,3 +48,4 @@ pub use error::EncoderError;
 pub use htsat_audio::{HtsatAudio, HtsatAudioConfig};
 pub use modernbert::{ModernBert, ModernBertConfig};
 pub use pooling::{pool_and_normalize, Pooling};
+pub use precision::compute_precision_to_dtype;

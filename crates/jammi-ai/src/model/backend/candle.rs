@@ -360,6 +360,12 @@ pub struct CandleModel {
     id2label: Option<HashMap<u32, String>>,
     /// Token-level classifier for NER models (applied per token, no pooling).
     ner_classifier: Option<candle_nn::Linear>,
+    /// The effective inference compute precision this model loaded at — the
+    /// resolved per-model override or the global default, unless a saved
+    /// fine-tune adapter's own persisted `backbone_dtype` won instead (see
+    /// `effective_precision` in `CandleBackend::load`). Output-affecting, so
+    /// the materialization contract folds it into `ModelIdentity`.
+    pub(crate) compute_precision: jammi_numerics::ComputePrecision,
 }
 
 /// Mean-pool the `[batch, seq, hidden]` tensor along seq using
@@ -1049,7 +1055,14 @@ impl CandleModel {
                 &self.device,
             )?;
 
-            let probs = logits
+            let logits_f32 = if logits.dtype() == DType::F32 {
+                logits
+            } else {
+                logits
+                    .to_dtype(DType::F32)
+                    .map_err(|e| JammiError::Inference(format!("Logits dtype cast: {e}")))?
+            };
+            let probs = logits_f32
                 .to_vec2::<f32>()
                 .map_err(|e| JammiError::Inference(format!("Logits to vec failed: {e}")))?;
 
@@ -1154,7 +1167,14 @@ impl CandleModel {
                 JammiError::Inference(format!("NER classifier forward failed: {e}"))
             })?;
 
-            let logits_vec = logits
+            let logits_f32 = if logits.dtype() == DType::F32 {
+                logits
+            } else {
+                logits
+                    .to_dtype(DType::F32)
+                    .map_err(|e| JammiError::Inference(format!("NER logits dtype cast: {e}")))?
+            };
+            let logits_vec = logits_f32
                 .to_vec3::<f32>()
                 .map_err(|e| JammiError::Inference(format!("NER logits to vec failed: {e}")))?;
 
@@ -1196,8 +1216,39 @@ impl ModelBackend for CandleBackend {
             .and_then(|v| v.as_str())
             .unwrap_or("bert");
 
+        // Per-model `compute_precision` in `config.json` wins over the global
+        // `DeviceConfig` default; both default to `F32`. Read the same
+        // best-effort way `id2label` is read below: a malformed/unknown value
+        // is honestly "not declared", never a hard error over an optional
+        // field.
+        let per_model_precision: Option<jammi_numerics::ComputePrecision> = resolved
+            .model_config
+            .get("compute_precision")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let compute_precision = per_model_precision.unwrap_or(device_config.compute_precision);
+        let compute_dtype = match compute_precision {
+            jammi_numerics::ComputePrecision::F32 | jammi_numerics::ComputePrecision::F16 => {
+                jammi_encoders::compute_precision_to_dtype(compute_precision)
+            }
+            jammi_numerics::ComputePrecision::BF16 => {
+                return Err(JammiError::Model {
+                    model_id: resolved.model_id.0.clone(),
+                    message: "bf16 inference requires a runtime compute-capability gate — not \
+                              yet supported; use f16 or f32"
+                        .into(),
+                })
+            }
+        };
+
+        // The root `VarBuilder` loads every weight at `compute_dtype` — the
+        // encoder backbone AND every head built from it (classifier,
+        // projection, CLAP/OpenCLIP towers) — because a mismatched backbone ×
+        // head matmul dtype errors in candle. The one exception is the
+        // fine-tune adapter path below, which loads the frozen backbone at its
+        // own *persisted* `backbone_dtype` (a training-time choice, independent
+        // of this inference-time knob) when a saved adapter is present.
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&resolved.weights_paths, DType::F32, &device)
+            VarBuilder::from_mmaped_safetensors(&resolved.weights_paths, compute_dtype, &device)
                 .map_err(|e| JammiError::Model {
                     model_id: resolved.model_id.0.clone(),
                     message: format!("Failed to load safetensors: {e}"),
@@ -1290,10 +1341,20 @@ impl ModelBackend for CandleBackend {
         };
         let encoder_adapter_file: Option<&std::path::Path> =
             encoder_adapter.as_ref().map(|(_, p)| *p);
-        let encoder_backbone_dtype = encoder_adapter
+        // A fine-tune adapter's backbone loads at its own *persisted*
+        // `backbone_dtype` (a training-time choice); with no adapter, the
+        // backbone follows the resolved inference `compute_precision` the root
+        // `vb` above just loaded at — so an unadapted model's backbone and its
+        // heads always agree on dtype. This is also the precision the
+        // materialization contract folds into `ModelIdentity`, so it is
+        // computed once here (as `ComputePrecision`) and carried through to
+        // `CandleModel::compute_precision`, never re-derived.
+        let effective_precision: jammi_numerics::ComputePrecision = encoder_adapter
             .as_ref()
-            .map(|(cfg, _)| candle_core::DType::from(cfg.backbone_dtype))
-            .unwrap_or(DType::F32);
+            .map(|(cfg, _)| cfg.backbone_dtype)
+            .unwrap_or(compute_precision);
+        let encoder_backbone_dtype =
+            jammi_encoders::compute_precision_to_dtype(effective_precision);
         let weights_paths_ref: Vec<&std::path::Path> =
             resolved.weights_paths.iter().map(|p| p.as_path()).collect();
         let dummy_varmap = VarMap::new();
@@ -1575,13 +1636,20 @@ impl ModelBackend for CandleBackend {
         let ner_classifier = if is_ner {
             let num_labels = id2label.as_ref().map_or(3, |m| m.len());
             let hidden_size = dimensions.hidden_size;
-            // NER models use a VarBuilder scoped to the same safetensors
+            // NER models use a VarBuilder scoped to the same safetensors, at
+            // the same dtype as the backbone whose hidden states this
+            // classifier applies to (`encoder_backbone_dtype`) — otherwise a
+            // non-F32 backbone × F32 classifier matmul errors.
             let ner_vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(&resolved.weights_paths, DType::F32, &device)
-                    .map_err(|e| JammiError::Model {
-                        model_id: resolved.model_id.0.clone(),
-                        message: format!("Failed to reload safetensors for NER classifier: {e}"),
-                    })?
+                VarBuilder::from_mmaped_safetensors(
+                    &resolved.weights_paths,
+                    encoder_backbone_dtype,
+                    &device,
+                )
+                .map_err(|e| JammiError::Model {
+                    model_id: resolved.model_id.0.clone(),
+                    message: format!("Failed to reload safetensors for NER classifier: {e}"),
+                })?
             };
             Some(
                 candle_nn::linear(hidden_size, num_labels, ner_vb.pp("classifier")).map_err(
@@ -1631,6 +1699,7 @@ impl ModelBackend for CandleBackend {
             regression_form,
             id2label,
             ner_classifier,
+            compute_precision: effective_precision,
         })))
     }
 
@@ -1995,6 +2064,7 @@ mod device_tests {
             gpu_device: 0,
             memory_fraction: 0.9,
             require_gpu: true,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
         };
         // On a host with no usable GPU (and on the default non-accelerator
         // build), selection must surface a typed GPU error rather than serving
@@ -2017,6 +2087,7 @@ mod device_tests {
                 gpu_device: 0,
                 memory_fraction: 0.9,
                 require_gpu: false,
+                compute_precision: jammi_numerics::ComputePrecision::F32,
             };
             select_device(&config).expect("default fallback must not error")
         });

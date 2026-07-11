@@ -69,8 +69,8 @@ jammi-bench -> jammi-ai, jammi-db, jammi-lora, jammi-numerics
 jammi-cli -> jammi-admin, jammi-db
 jammi-client -> jammi-admin, jammi-db, jammi-wire
 jammi-db -> jammi-numerics, jammi-test-utils
-jammi-encoders -> jammi-lora
-jammi-lora
+jammi-encoders -> jammi-lora, jammi-numerics
+jammi-lora -> jammi-numerics
 jammi-numerics
 jammi-python -> jammi-ai, jammi-db
 jammi-server -> jammi-admin, jammi-ai, jammi-client, jammi-db, jammi-numerics, jammi-test-utils, jammi-wire

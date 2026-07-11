@@ -83,6 +83,7 @@ def connect(
     target: Union[str, Target],
     *,
     credentials: Optional[ChannelCredentials] = None,
+    config: Optional[str] = None,
 ) -> Session:
     """Open a session against `target`, selecting its transport once.
 
@@ -113,6 +114,17 @@ def connect(
     *with* credentials is a caller error, rejected as a
     :class:`NoEmbeddedEngineError` before an engine is opened.
 
+    `config` is a path to a `JammiConfig` TOML file, forwarded to the compiled
+    engine's own `jammi_native.open_local(config=...)` for a `file://` target —
+    the deployment-default knob a caller sets (e.g. `embedding.ann.storage_precision`
+    / `embedding.ann.oversample`, among every other deployment default) through
+    the public front door rather than only the lower-level native handle.
+    ``None`` reproduces the engine's built-in defaults. Meaningless against a
+    REMOTE target — a deployment's own config is the server's concern, never a
+    client-side passthrough — so a remote target opened *with* `config` is a
+    caller error, rejected as an :class:`InvalidArgument` before any channel is
+    opened.
+
     Scaling local→remote is an env flip (``connect(os.environ["JAMMI_TARGET"])``)
     with no code change; the embed build and this lean build are one package,
     differing only by whether the ``[embedded]`` extra is present.
@@ -134,7 +146,16 @@ def connect(
         # Known-importable — the factory does the lazy `import jammi_native`.
         from ._embedded import _open_embedded
 
-        return _open_embedded(parsed.artifact_dir)
+        return _open_embedded(parsed.artifact_dir, config=config)
+    if config is not None:
+        # A remote target has no local deployment config to pass through — the
+        # target/config mismatch is a caller error, caught before a channel is
+        # opened.
+        raise InvalidArgument(
+            f"config= is a deployment-config passthrough for the embedded engine "
+            f"(file:// targets) only; {target!r} is a remote target, whose "
+            f"deployment config is the server's concern, not the client's."
+        )
     # RemoteTarget — the gRPC transport.
     from ._database import open_remote
 

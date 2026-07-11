@@ -1294,6 +1294,7 @@ class RemoteDatabase:
         filter: Optional[str] = None,
         select: Optional[List[str]] = None,
         embedding_table: Optional[str] = None,
+        oversample: Optional[int] = None,
     ) -> pa.Table:
         """Nearest-neighbor search over a source's embedding table.
 
@@ -1301,7 +1302,11 @@ class RemoteDatabase:
         the hydrated results; `select` projects columns (empty keeps the
         keyed+scored shape). `embedding_table` names which of the source's
         embedding tables to search (e.g. a raw, propagated, or fine-tuned
-        table); ``None`` searches the most-recent ready table. Returns a
+        table); ``None`` searches the most-recent ready table. `oversample`
+        overrides, for this one call, a quantized-`storage_precision` table's
+        retrieve→rescore candidate breadth (`k * oversample`); ``None`` defers
+        to the table's own stamped default, and the knob is irrelevant for an
+        `f32`-precision table (single-stage, no rescore). Returns a
         `pyarrow.Table`. Maps to `EmbeddingService.Search`.
         """
         request = build_search_request(
@@ -1311,6 +1316,7 @@ class RemoteDatabase:
             filter=filter,
             select=select,
             embedding_table=embedding_table,
+            oversample=oversample,
         )
         resp = self._call(self._embedding.Search, request)
         return _hits_to_table(list(resp.hits))

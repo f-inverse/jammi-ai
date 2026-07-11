@@ -175,6 +175,22 @@ jobs:
       - name: Assert no crate references the book subtree
         run: bash ci/scripts/check_cookbook_one_way.sh
 
+  sqlite-isms:
+    name: Guard (SQLite-ism syntactic tripwire)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A cheap, hermetic, toolchain-free grep over crates/jammi-db/src for
+      # backend-specific SQL tokens (SQLite-only rowid/AUTOINCREMENT/PRAGMA/
+      # strftime(/glob(, and — bidirectionally — Postgres-only ctid). This is a
+      # syntactic first-pass tripwire, not the parity closure mechanism: the
+      # required Postgres it-matrix (parameterized crates/jammi-db/tests/it) is
+      # what actually enforces backend-behavioral parity. Plain ubuntu: this is
+      # a text guard, not a build.
+      - name: Assert no backend-specific SQL token in jammi-db
+        run: python3 ci/scripts/check_sqlite_isms.py
+
   dep-direction:
     name: Guard (engine dep-direction)
     runs-on: ubuntu-latest

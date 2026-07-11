@@ -279,6 +279,7 @@ fn result_params<'a>(
         text_columns: None,
         storage_precision: jammi_db::config::StoragePrecision::F32,
         oversample: 4,
+        created_at: jammi_db::catalog::backend::now_sortable(),
     }
 }
 

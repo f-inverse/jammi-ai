@@ -341,6 +341,29 @@ pub enum SqlNullType {
     Bytes,
 }
 
+/// A full-resolution, lexicographically-sortable creation-timestamp string,
+/// identical byte-for-byte whichever backend a catalog row lands on.
+///
+/// Exists because a SQL-side `CURRENT_TIMESTAMP` default is not a portable
+/// ordering key: SQLite renders it at second resolution with no offset,
+/// Postgres at microsecond resolution with one, so two backends fed the same
+/// migration DDL populate a `created_at` column with values of different
+/// resolution and shape. Nanosecond precision here means two rows an
+/// application creates in the same call, or even the same second, still
+/// resolve by plain string order — an `ORDER BY created_at DESC` query never
+/// needs a backend-specific tiebreak column (SQLite's `rowid` has no
+/// Postgres analog, and even Postgres's own `ctid` is not creation-ordered
+/// after a `VACUUM`).
+///
+/// Callers stamp this once at row-creation time and bind it as an ordinary
+/// `TEXT` value — the column stays a plain string on both backends, so
+/// nothing downstream needs to parse it as a timestamp to sort on it.
+pub fn now_sortable() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.9fZ")
+        .to_string()
+}
+
 /// Engine-owned parameter value. Backend impls translate to driver-native
 /// types in `bind_sqlite` / `bind_postgres`.
 #[derive(Debug, Clone)]

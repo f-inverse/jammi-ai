@@ -62,10 +62,11 @@ book:
     - part: "The unified client surface"
       chapters:
         - chapters/21-unified-client/unified-client.qmd
-    - part: "Vector storage precision"
+    - part: "Precision — storage and compute"
       chapters:
         - chapters/22-precision/precision.qmd
         - chapters/22-precision/binary-precision.qmd
+        - chapters/22-precision/compute-precision.qmd
   appendices:
     - chapters/api-reference.qmd
 

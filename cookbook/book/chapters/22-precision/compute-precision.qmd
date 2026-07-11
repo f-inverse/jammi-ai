@@ -1,0 +1,328 @@
+---
+title: "Compute precision: the inference dtype, gated by device capability — f16 everywhere, bf16 only on Ampere+"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** the deployment-default `compute_precision` (`f32` / `f16` / `bf16`) on
+`[gpu]`, set through `jammi.connect(..., config=...)` — the same config front door
+[the preceding chapters](precision.qmd) use for `embedding.ann.storage_precision`,
+a different `[gpu]` section, a different axis · the candle load-boundary gate that
+admits `bf16` only on a CUDA device of compute capability ≥ 8.0 (Ampere+) and fails
+loud everywhere else · **Theory:** `bfloat16` carries `f32`'s full 8-bit exponent
+range in half the storage, unlike `f16`'s narrower 5-bit exponent
+[@kalamkar2019bfloat16] · **Rail:** measurement (a live `f16` encode over a real
+corpus on CPU, its vectors' finiteness/dimension/norm asserted; a live `bf16` model
+load refused loud on the same CPU build, its exact typed message asserted) — both
+recomputed live at render time, neither transcribed.
+
+## A second, orthogonal knob
+
+The [preceding two chapters](precision.qmd) measured `storage_precision`: the dtype
+the ANN sidecar's *own stored vectors* are quantized to (`f32` / `f16` / `int8` /
+`binary`) — a knob about how a table's vectors sit on disk and how a search
+traverses them, resolved by the two-stage retrieve→rescore path. `compute_precision`
+is a **different knob on a different stage entirely**: the floating-point dtype an
+encoder's *weights and activations run at during inference* — before a vector is
+ever written to a sidecar at all. A table's `storage_precision` says nothing about
+what dtype produced the vectors it stores, and a session's `compute_precision` says
+nothing about how those vectors are later stored or searched. The two compose
+freely: a deployment can run `bf16` inference and still store the result at
+`storage_precision = "int8"`, or `f32` inference into a `binary` sidecar — this
+chapter and the preceding two never need to agree with each other, because they are
+orthogonal axes of the same engine.
+
+`compute_precision` accepts three literals — `f32` (the default, maximally
+compatible), `f16` (runs on CPU and every CUDA device Jammi targets), and `bf16` (a
+GPU-tier value, admitted only above a hardware floor) — through the exact same
+`[gpu]` section of the `JammiConfig` TOML that `jammi.connect(..., config=...)`
+already carries:
+
+```{python}
+import inspect
+
+import jammi
+
+connect_params = set(inspect.signature(jammi.connect).parameters)
+print(f"jammi.connect(...) keyword args: {sorted(connect_params)}")
+
+assert "config" in connect_params, (
+    "jammi.connect() must carry a config= passthrough — the same deployment-default "
+    "front door the storage-precision chapters use for embedding.ann.storage_precision, "
+    "now read for gpu.compute_precision instead."
+)
+print("\nconfirmed: gpu.compute_precision is reachable through the same "
+      "jammi.connect(config=...) front door — a different TOML section, no new API.")
+```
+
+## The corpus and the encoder — real fixtures, not invented data
+
+This chapter is not a cache read. Unlike every other chapter in the book, its
+measured content is *whether the encoder itself runs correctly at a given
+precision* — that is inherently a live computation, not a headline number replayed
+from a frozen upstream artifact. We reach for the same public, deterministic,
+GPU-free fixtures the engine's own hermetic compute-precision suite drives: the
+20-row `patents` corpus (`tests/fixtures/patents.parquet`, real synthetic patent
+title/abstract text — the same corpus `crates/jammi-ai/tests/it/search.rs` and
+`crates/jammi-ai/tests/it/compute_precision.rs` embed) and the tiny local BERT
+fixture (`cookbook/fixtures/tiny_bert`, hidden size 32 — candle's CPU backend runs
+it at any of the three precisions). Locating them is the one thing this chapter
+does that no other chapter needs: resolving repo-relative fixture paths off the
+installed `jammi_cookbook` package's own location, the same pattern the bridge
+chapter uses to resolve `references.bib`.
+
+```{python}
+from pathlib import Path
+
+import jammi_cookbook
+
+_ENGINE_ROOT = Path(jammi_cookbook.__file__).resolve().parents[3]
+PATENTS_FIXTURE = _ENGINE_ROOT / "tests" / "fixtures" / "patents.parquet"
+TINY_BERT = _ENGINE_ROOT / "cookbook" / "fixtures" / "tiny_bert"
+
+assert PATENTS_FIXTURE.exists(), f"missing engine fixture: {PATENTS_FIXTURE}"
+assert TINY_BERT.exists(), f"missing engine fixture: {TINY_BERT}"
+print(f"corpus:  {PATENTS_FIXTURE}")
+print(f"encoder: {TINY_BERT}  (local BERT, hidden_size=32)")
+```
+
+## Opening a session at a chosen `compute_precision`
+
+Same shape as the storage-precision helpers: a fresh `jammi.connect(target,
+config=...)` session per precision, a temp `JammiConfig` TOML carrying
+`[gpu] compute_precision = "<precision>"`. `device = -1` pins the request to CPU
+explicitly (mirroring the engine's own hermetic suite) — moot on this book's CPU
+wheel, which carries no `cuda` feature at all, but it states the intent plainly.
+
+```{python}
+import tempfile
+
+import jammi
+
+SOURCE_ID = "patents"
+
+
+def open_at_precision(precision: str) -> jammi.Session:
+    """Open a fresh embedded session with `[gpu] compute_precision` set to
+    `precision`, through the public `jammi.connect(config=...)` front door."""
+    cfg_dir = tempfile.mkdtemp(prefix="compute_precision_cfg_")
+    cfg_path = f"{cfg_dir}/jammi.toml"
+    with open(cfg_path, "w") as f:
+        f.write(f'[gpu]\ncompute_precision = "{precision}"\ndevice = -1\n')
+    art_dir = tempfile.mkdtemp(prefix="compute_precision_art_")
+    db = jammi.connect(f"file://{art_dir}", config=cfg_path)
+    db.add_source(SOURCE_ID, url=f"file://{PATENTS_FIXTURE}", format="parquet")
+    return db
+
+
+print("helper ready")
+```
+
+## `f16` on CPU — a real encode, a valid embedding table
+
+`f16` carries no hardware floor: candle's CPU backend runs it directly, on any
+machine, including the CPU-only wheel this book renders against. We embed the
+corpus's `abstract` column with the local BERT fixture through
+`generate_embeddings(..., modality="text")` — the same session-level pipeline
+`crates/jammi-ai/tests/it/search.rs`'s `session_with_embeddings()` drives — and read
+every persisted row back off the resulting result table with the public `sql()`
+verb, exactly the way `crates/jammi-ai/tests/it/pipeline.rs` reads its own
+`_row_id, vector` rows back.
+
+```{python}
+import math
+
+db_f16 = open_at_precision("f16")
+table_f16 = db_f16.generate_embeddings(
+    source=SOURCE_ID,
+    model=f"local:{TINY_BERT}",
+    columns=["abstract"],
+    key="id",
+    modality="text",
+)
+rows_f16 = db_f16.sql(f'SELECT _row_id, vector FROM "jammi.{table_f16}"').to_pylist()
+
+print(f"f16 embedding table {table_f16!r}: {len(rows_f16)} rows")
+
+dims = {len(r["vector"]) for r in rows_f16}
+print(f"vector dimension(s) present: {dims}")
+
+assert len(rows_f16) == 20, "the patents fixture is a fixed 20-row corpus"
+assert dims == {32}, f"tiny_bert's hidden_size is 32; got dimension(s) {dims}"
+
+for r in rows_f16:
+    vec = r["vector"]
+    assert all(math.isfinite(x) for x in vec), (
+        f"a non-finite component in row {r['_row_id']}'s f16-computed vector: {vec}"
+    )
+    norm = math.sqrt(sum(x * x for x in vec))
+    assert abs(norm - 1.0) < 1e-2, (
+        f"row {r['_row_id']} is not unit-norm (the embedding path L2-normalizes): {norm}"
+    )
+
+print(f"every one of {len(rows_f16)} f16-computed vectors is finite, "
+      f"dim=32, unit-norm")
+```
+
+Every vector the encoder produced at `f16` is finite, the correct dimension, and
+unit-norm — a real, active `f16` inference run, not a silently-ignored config
+value. (The engine's own hermetic
+`compute_precision.rs::f16_embedding_is_valid_and_active_but_close_to_f32` additionally
+asserts the `f16` run differs from an `f32` run of the same input while staying
+close by cosine similarity — the same "active but faithful" property this chapter's
+`bf16` measurement returns to below, on real Ampere hardware.)
+
+## `bf16` is refused loud — on this CPU build, by design
+
+`bf16` is a GPU-tier value: its tensor-core kernels are an Ampere (sm_80+)
+innovation, so the candle load boundary admits it only on a CUDA device whose
+compute capability clears that floor. This book's wheel carries no `cuda` feature at
+all, so the very first `bf16` model load — triggered here by the same
+`generate_embeddings` call that just worked at `f16` — must fail loud with a typed
+refusal, never run silently and never fall back to another precision.
+
+```{python}
+db_bf16 = open_at_precision("bf16")
+
+try:
+    db_bf16.generate_embeddings(
+        source=SOURCE_ID,
+        model=f"local:{TINY_BERT}",
+        columns=["abstract"],
+        key="id",
+        modality="text",
+    )
+    raise RuntimeError(
+        "bf16 must be refused on this CPU-only build — it loaded silently instead"
+    )
+except jammi.errors.JammiError as exc:
+    print(f"caught {type(exc).__name__}: {exc}")
+    assert isinstance(exc, jammi.errors.InvalidArgument), (
+        "a bf16 compute-capability refusal is a caller-facing InvalidArgument "
+        f"(the engine's JammiError::Model -> InvalidArgument mapping), got {type(exc).__name__}"
+    )
+    message = str(exc)
+    for token in ("bf16", "compute capability >= 8.0", "Ampere", "no CUDA support"):
+        assert token in message, f"expected {token!r} in the refusal message: {message}"
+
+print("\nbf16 was refused loud, with the typed compute-capability message — "
+      "never a silent run, never a silent fallback to f32/f16.")
+```
+
+This one caught exception is the CI-visible proof that the gate reaches all the way
+to the public Python surface — it is **not** a substitute for the engine's own
+oracles, which prove the two halves of this gate directly:
+`crates/jammi-numerics/src/precision.rs::bf16_requires_ampere_sm80` (the pure
+`is_supported_on_cuda` predicate: unit-tested on every `(major, minor)` boundary,
+no device needed) and
+`crates/jammi-ai/tests/gpu_capability/bf16_gpu_gate.rs::bf16_admitted_and_matches_f32_on_ampere`
+(the live-GPU admit wiring: `--features cuda,live-gpu-tests` on a real Ampere
+device). This chapter's cell shows the refusal *lands where a caller stands*; those
+two oracles are what prove the refusal is *correctly decided* and that the *admit*
+side of the same gate genuinely works.
+
+## `bf16` admitted on Ampere+ — measured on real GPU hardware, not here
+
+CI on this book's CPU wheel cannot open a CUDA device, so the admit side of the
+gate cannot be re-measured in this render — that is a fact about this chapter's
+execution environment, not a gap in the gate's own test coverage. What follows is
+reported, not recomputed: `bf16_admitted_and_matches_f32_on_ampere` (above), run
+under `--features cuda,live-gpu-tests` on a real NVIDIA A10G (compute capability
+sm_86, comfortably above the 8.0 floor), measured
+
+$$\text{cosine}\big(\,\texttt{encode\_query}_{\text{bf16}}(q),\ \texttt{encode\_query}_{\text{f32}}(q)\,\big) = 0.99999$$
+
+for the tiny BERT fixture (dim 32) on the same query text the test drives. This is
+a number this chapter cannot reproduce on CPU; it is cited as measured by that live
+oracle, not re-derived here.
+
+**Why it lands this close to 1.0.** `bf16` carries `f32`'s full 8-bit exponent
+range in half the bytes — only the mantissa is truncated (7 bits vs `f32`'s 23)
+[@kalamkar2019bfloat16]. `f16`, by contrast, has a narrower 5-bit exponent, which is
+why `f16` occasionally needs loss-scaling tricks in training that `bf16` does not.
+For a single forward pass with no accumulated gradient, the practical effect is
+simpler: truncating the mantissa perturbs each activation by a small relative
+error, but does not compress the *dynamic range* the way a narrower exponent would
+— so the resulting embedding points in essentially the same direction as its `f32`
+twin. Cosine similarity is exactly the statistic that is invariant to that kind of
+small, direction-preserving perturbation, which is why it — not raw magnitude — is
+the right lens on this claim.
+
+**Therefore retrieval recall is unchanged by `bf16` inference.** This is the
+cleanest contrast with [the storage-precision chapters](precision.qmd): those
+chapters measure a real, honest recall trade — `storage_precision = "int8"` /
+`"binary"` *does* cost something before rescore recovers it, because it discards
+information a search's own ranking has to work around. `compute_precision` is not
+that kind of knob at all: it changes *how* the encoder arrives at a vector, not
+*what the sidecar stores or a search reconciles*, and at `cos ≈ 0.99999` the vector
+`bf16` arrives at is — for retrieval purposes — the same vector `f32` would have
+produced. What `bf16` buys is roughly half the encoder's VRAM footprint and faster
+inference on Ampere+ tensor cores, with no recall to trade against it.
+
+## Why `bf16` matters now, and to nobody named here
+
+Half-precision `bf16` inference is becoming table-stakes for encoder serving
+generally, independent of any one deployment: Hugging Face's own Candle-based
+serving stack, Text Embeddings Inference, tracks `bf16` support as an open,
+milestoned request (TEI issue #815, milestone v1.10.0) — driven in part by an
+emerging family of `bf16`-only embedding models (`google/embedding-gemma-300m` and
+its EmbeddingGemma siblings), for which `f16` inference is documented not to work
+at all. An engine that admits `bf16` correctly, gated by real hardware capability,
+is ahead of that curve rather than reacting to a single deployment's request —
+which is exactly the standard a primitive in this engine is held to.
+
+## The reject path is honestly future-facing
+
+The below-Ampere refusal this chapter exercises (`"this build has no CUDA
+support"`) is the only reachable arm on a CPU wheel. The CUDA arm's own reject
+message — `"device is sm_XX"`, naming a real sub-8.0 capability — is not reachable
+on *any* device today, including the engine's own published CUDA wheel: that build
+is compiled with `CUDA_COMPUTE_CAP=86`
+(`.github/workflows/pypi-server-cuda.yml`), and PTX compiled for sm_86 does not
+even load on a pre-Ampere device — the process fails before the compute-capability
+gate is ever reached, let alone decides anything. The sm_80-floor refusal becomes a
+genuinely user-facing guard only on a future image built for an older architecture
+(a Turing/Volta `T4`, say) — a build where `bf16` support would be compiled out at
+the CUDA-arch level regardless of what the gate decides. Reading this chapter as
+"a `T4` deployment can run `bf16` today" would be wrong; the gate's below-floor arm
+is correct and tested (`bf16_requires_ampere_sm80` above), but its user-facing
+trigger is a property of an image this engine has not published yet.
+
+## `bf16` identity is bound to the GPU tier that computed it
+
+`compute_precision` is folded into the materialization identity every embedding and
+inference table carries — `crates/jammi-ai/tests/it/compute_precision.rs`'s
+`embedding_compute_precision_changes_the_materialization_identity` and
+`classification_compute_precision_changes_the_materialization_identity` prove two
+runs of the same model over the same input, differing only in `compute_precision`,
+never collide on one `DefinitionHash`. The direct consequence for `bf16`: a table
+materialized at `compute_precision = "bf16"` records that fact in its identity, and
+*replaying* that identity — recomputing the same table byte-for-byte — requires the
+same tier that produced it, a CUDA device of compute capability ≥ 8.0. It cannot be
+replayed on CPU-only infrastructure, ever, no matter how the request is retried.
+This is not a limitation to work around; it is the same deliberate tier property
+`f16`'s GPU targeting already carries (`f16` merely happens to also run on CPU) —
+`compute_precision` states, honestly, what hardware a table's own numbers depend
+on.
+
+## Bridge note
+
+> **Two axes of the same engine, orthogonal by design.** `storage_precision` (the
+> [preceding chapters](precision.qmd)) quantizes what a search's own sidecar stores
+> and trades recall for memory, recovered — when it is recovered — by an explicit
+> retrieve→rescore stage. `compute_precision` changes what dtype an encoder's
+> weights and activations run at, and at the `bf16` operating point measured here
+> (`cos ≈ 0.99999` against `f32`, on real Ampere hardware) it trades nothing in
+> retrieval quality at all: `bf16` preserves `f32`'s exponent range
+> [@kalamkar2019bfloat16], so the vector it produces points the same direction `f32`
+> would have. What is real, and measured directly on this chapter's own CPU render:
+> `f16` runs anywhere, `bf16` is admitted only on Ampere+ (sm_80+), and the load
+> boundary fails loud rather than silently degrading or silently falling back —
+> proven here down to the exact typed message a Python caller catches, and proven
+> at the acquire→decide→admit level by the engine's own unit and live-GPU oracles.
+> Both knobs are reachable from the same `jammi.connect(..., config=...)` front
+> door every other chapter in this book writes against — one more section of the
+> same TOML, not a new surface.

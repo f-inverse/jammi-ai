@@ -924,6 +924,7 @@ class EmbeddedBackend:
         filter: Optional[str] = None,
         select: Optional[List[str]] = None,
         embedding_table: Optional[str] = None,
+        oversample: Optional[int] = None,
     ) -> pa.Table:
         """Nearest-neighbor search over a source's embedding table.
 
@@ -931,11 +932,15 @@ class EmbeddedBackend:
         the hydrated results; `select` projects columns (empty keeps the
         keyed+scored shape). `embedding_table` names which of the source's
         embedding tables to search (e.g. a raw, propagated, or fine-tuned table);
-        ``None`` searches the most-recent ready table. Returns a `pyarrow.Table`.
-        Mirrors the remote `RemoteDatabase.search`; the request is assembled with
-        the shared `SearchRequest` builder and submitted through the engine's
-        wire seam (only the request is shared — the Arrow response wrapping is the
-        embedded transport's).
+        ``None`` searches the most-recent ready table. `oversample` overrides,
+        for this one call, a quantized-`storage_precision` table's retrieve→
+        rescore candidate breadth (`k * oversample`); ``None`` defers to the
+        table's own stamped default, and the knob is irrelevant for an
+        `f32`-precision table (single-stage, no rescore). Returns a
+        `pyarrow.Table`. Mirrors the remote `RemoteDatabase.search`; the request
+        is assembled with the shared `SearchRequest` builder and submitted
+        through the engine's wire seam (only the request is shared — the Arrow
+        response wrapping is the embedded transport's).
         """
         request = build_search_request(
             source,
@@ -944,6 +949,7 @@ class EmbeddedBackend:
             filter=filter,
             select=select,
             embedding_table=embedding_table,
+            oversample=oversample,
         )
         return self._native._search_proto(request.SerializeToString())
 
@@ -1185,9 +1191,17 @@ class EmbeddedBackend:
         return self._native._eval_calibration_proto(request.SerializeToString())
 
 
-def _open_embedded(artifact_dir: str) -> EmbeddedBackend:
+def _open_embedded(artifact_dir: str, *, config: Optional[str] = None) -> EmbeddedBackend:
     """Open the compiled in-process engine at `artifact_dir`, wrapped as a
     :class:`EmbeddedBackend` — the `file://` dispatch factory.
+
+    `config` is an optional path to a `JammiConfig` TOML file, forwarded
+    verbatim to `jammi_native.open_local`; it is the deployment-default knob a
+    caller sets `embedding.ann.storage_precision` / `embedding.ann.oversample`
+    (among every other deployment default) through — every embedding table this
+    session later creates (`generate_embeddings` / `import_embeddings`) is
+    stamped with whatever `storage_precision` was in effect at the moment of
+    its creation. ``None`` reproduces the engine's built-in defaults.
 
     This is the ONE site that imports `jammi_native`, and it does so LAZILY (at
     call time, not module load): `import jammi` and `import
@@ -1199,4 +1213,4 @@ def _open_embedded(artifact_dir: str) -> EmbeddedBackend:
     """
     import jammi_native
 
-    return EmbeddedBackend(jammi_native.open_local(artifact_dir=artifact_dir))
+    return EmbeddedBackend(jammi_native.open_local(artifact_dir=artifact_dir, config=config))

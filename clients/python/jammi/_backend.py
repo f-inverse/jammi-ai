@@ -136,6 +136,7 @@ class Session(Protocol):
         filter: Optional[str] = None,
         select: Optional[List[str]] = None,
         embedding_table: Optional[str] = None,
+        oversample: Optional[int] = None,
     ) -> Any: ...
     def infer(
         self,

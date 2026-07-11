@@ -1201,6 +1201,7 @@ def build_search_request(
     filter: Optional[str] = None,
     select: Optional[List[str]] = None,
     embedding_table: Optional[str] = None,
+    oversample: Optional[int] = None,
 ) -> embedding_pb2.SearchRequest:
     """Assemble the `SearchRequest` for a nearest-neighbour search from the
     binding's flat kwargs.
@@ -1209,8 +1210,12 @@ def build_search_request(
     `filter` is an optional SQL predicate over the hydrated results; `select`
     projects columns (empty keeps the keyed+scored shape); `embedding_table`
     names which of the source's embedding tables to search (unset = the
-    most-recent ready table). The same request the embed binding submits
-    in-process.
+    most-recent ready table). `oversample` overrides, for this one call, the
+    retrieve→rescore candidate-breadth multiplier (`k * oversample`) a
+    quantized-`storage_precision` table's sidecar resolves at search time
+    (`None` defers to the table's own stamped default); irrelevant for an
+    `f32`-precision table (single-stage, no rescore). The same request the
+    embed binding submits in-process.
     """
     request = embedding_pb2.SearchRequest(
         source_id=source,
@@ -1222,6 +1227,8 @@ def build_search_request(
         request.filter = filter
     if embedding_table is not None:
         request.embedding_table = embedding_table
+    if oversample is not None:
+        request.oversample = oversample
     return request
 
 

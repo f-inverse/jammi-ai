@@ -80,3 +80,12 @@ def test_connect_remote_returns_remote_database_without_dialing():
         assert len(db.session_id) == 36  # a v4 UUID
     finally:
         db.close()
+
+
+def test_connect_remote_with_config_raises_invalid_argument():
+    """`config=` is the embedded-engine deployment-config passthrough; a remote
+    target's deployment config is the server's concern, not the client's, so
+    passing both is a caller error rejected before any channel opens."""
+    with pytest.raises(jammi.InvalidArgument) as info:
+        jammi.connect("grpc://127.0.0.1:8081", config="/tmp/jammi.toml")
+    assert "config=" in str(info.value)

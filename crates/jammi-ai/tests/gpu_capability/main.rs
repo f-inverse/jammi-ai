@@ -26,6 +26,12 @@
 //! - **P3 — `fine_tune_graph` learns on GPU.** The end-to-end declared-graph
 //!   fine-tune runs on `gpu.device=0`, completes, and learns (loss decreases /
 //!   adapter changes embeddings).
+//! - **P4 — bf16 inference is admitted on Ampere+.** A `compute_precision=BF16`
+//!   session loads and encodes on `gpu.device=0` (sm_86), proving the runtime
+//!   compute-capability gate's acquire→decide→admit wiring, and its embedding
+//!   matches the f32 direction. This is the only place the gate's *admit* path
+//!   runs — the CPU suite reaches only the non-cuda reject arm and the decision
+//!   predicate in isolation. See `bf16_gpu_gate`.
 //!
 //! Conformal / RRF are pure-CPU numerics and are out of scope — there is no GPU
 //! kernel to validate for them.
@@ -48,6 +54,7 @@
 
 mod harness;
 
+mod bf16_gpu_gate;
 mod embeddings_parity;
 mod fine_tune_learns;
 mod graph_finetune_learns;

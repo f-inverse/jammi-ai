@@ -455,12 +455,12 @@ pub struct HttpConfig {
 /// candidate set, and the exact `f32` rescore companion
 /// ([`crate::index::sidecar::SidecarIndex::get_exact`]) re-ranks it.
 ///
-/// Only two quantized variants ship today; a `Binary` variant (USearch's `B1`
-/// scalar kind, paired with Hamming distance rather than cosine) is a Wave 1.5
-/// unit — it is deliberately not added here as a dead variant. Adding it later
-/// needs no reshape: one new match arm in [`Self::to_scalar_kind`], and the
-/// rescore recompute (today unconditionally cosine, matching every Jammi
-/// index's metric) gains a metric-aware branch at that point.
+/// `Binary` is USearch's `B1` scalar kind, paired with Hamming distance (bit
+/// count) rather than cosine: each dimension is packed down to a single sign
+/// bit (see [`crate::index::sidecar`]'s shared pack function), so its search
+/// stage and rescore-candidate width behave differently enough from the other
+/// three precisions to need their own defaults — see
+/// [`Self::default_oversample`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StoragePrecision {
@@ -472,6 +472,10 @@ pub enum StoragePrecision {
     /// 8-bit signed-integer index vectors — quantized, rescored. USearch's
     /// `I8` scalar kind (linear per-vector affine quantization).
     Int8,
+    /// 1-bit sign-quantized index vectors, searched by Hamming distance —
+    /// quantized, rescored. USearch's `B1` scalar kind (one packed bit per
+    /// dimension, symmetric sign threshold at `0`).
+    Binary,
 }
 
 impl StoragePrecision {
@@ -483,6 +487,7 @@ impl StoragePrecision {
             Self::F32 => usearch::ScalarKind::F32,
             Self::F16 => usearch::ScalarKind::F16,
             Self::Int8 => usearch::ScalarKind::I8,
+            Self::Binary => usearch::ScalarKind::B1,
         }
     }
 
@@ -494,6 +499,23 @@ impl StoragePrecision {
     pub fn needs_rescore(self) -> bool {
         !matches!(self, Self::F32)
     }
+
+    /// The oversample multiplier a NEW table at this precision stamps onto
+    /// its catalog row when the deployment has left
+    /// [`AnnIndexConfig::oversample`] unset (`None`).
+    ///
+    /// `Binary`'s single-bit-per-dimension Hamming coarse stage needs a much
+    /// wider candidate pool than the other three precisions' cosine-ranked
+    /// stage to recover comparable recall — the Wave 1.5 go/no-go spike
+    /// measured recall@1/10 = 0.94/0.992 at oversample `32` (vs. 0.59 recall@1
+    /// at the shared default of `4`), so `Binary` gets its own wider default
+    /// while `F32`/`F16`/`Int8` keep `4`.
+    pub fn default_oversample(self) -> usize {
+        match self {
+            Self::Binary => 32,
+            Self::F32 | Self::F16 | Self::Int8 => DEFAULT_OVERSAMPLE,
+        }
+    }
 }
 
 impl fmt::Display for StoragePrecision {
@@ -502,6 +524,7 @@ impl fmt::Display for StoragePrecision {
             Self::F32 => write!(f, "f32"),
             Self::F16 => write!(f, "f16"),
             Self::Int8 => write!(f, "int8"),
+            Self::Binary => write!(f, "binary"),
         }
     }
 }
@@ -513,8 +536,9 @@ impl FromStr for StoragePrecision {
             "f32" => Ok(Self::F32),
             "f16" => Ok(Self::F16),
             "int8" => Ok(Self::Int8),
+            "binary" => Ok(Self::Binary),
             other => Err(JammiError::Config(format!(
-                "unknown storage precision '{other}'. Expected: f32, f16, int8"
+                "unknown storage precision '{other}'. Expected: f32, f16, int8, binary"
             ))),
         }
     }
@@ -535,7 +559,7 @@ const DEFAULT_OVERSAMPLE: usize = 4;
 /// live here as the deployment-wide defaults every newly-created embedding
 /// table's catalog row is stamped with at creation — see
 /// [`crate::catalog::result_repo::ResultTableRecord::storage_precision`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(default)]
 pub struct AnnIndexConfig {
     /// Maximum connections per graph node (HNSW *M*). Higher trades a larger
@@ -553,32 +577,42 @@ pub struct AnnIndexConfig {
     pub storage_precision: StoragePrecision,
     /// How many candidates a quantized-index search retrieves per requested
     /// result before rescoring down to `k` exact matches (`k * oversample`).
-    /// Irrelevant at `F32` (single-stage, no rescore). Default: `4`. A `0`
-    /// (or any value below `1`) is clamped to `1` at
-    /// [`Self::effective_oversample`] — an oversample below `1` would retrieve
-    /// fewer candidates than the request asks for.
-    pub oversample: usize,
-}
-
-impl Default for AnnIndexConfig {
-    fn default() -> Self {
-        Self {
-            connectivity: 0,
-            build_expansion: 0,
-            search_expansion: 0,
-            storage_precision: StoragePrecision::default(),
-            oversample: DEFAULT_OVERSAMPLE,
-        }
-    }
+    /// Irrelevant at `F32` (single-stage, no rescore).
+    ///
+    /// `None` (the default) means the deployment has not configured this
+    /// knob — [`Self::effective_oversample_for`] falls back to the
+    /// precision's own [`StoragePrecision::default_oversample`]. `Some(v)` is
+    /// an explicit deployment choice and is honored *verbatim* for every
+    /// precision, including `Some(4)` on a `Binary` deployment — an explicit
+    /// override is never silently widened back to the precision default. A
+    /// `Some(0)` (or any value below `1`) is clamped to `1` at
+    /// [`Self::effective_oversample`] / [`Self::effective_oversample_for`] —
+    /// an oversample below `1` would retrieve fewer candidates than the
+    /// request asks for.
+    pub oversample: Option<usize>,
 }
 
 impl AnnIndexConfig {
-    /// [`Self::oversample`] clamped to at least `1` — the domain-valid
-    /// multiplier a quantized-index retrieve stage actually uses. A
+    /// [`Self::oversample`] resolved against the shared `DEFAULT_OVERSAMPLE`
+    /// when unset, then clamped to at least `1` — the domain-valid multiplier
+    /// a quantized-index retrieve stage actually uses when no per-precision
+    /// context is available (the pre-migration-023 fallback path). A
     /// misconfigured `0` must never shrink the candidate set below the
     /// requested `k`.
     pub fn effective_oversample(&self) -> usize {
-        self.oversample.max(1)
+        self.oversample.unwrap_or(DEFAULT_OVERSAMPLE).max(1)
+    }
+
+    /// The oversample a NEW table at `precision` stamps onto its catalog row:
+    /// the deployment's explicit [`Self::oversample`] when set — honored
+    /// verbatim for every precision, including `Some(4)` on `Binary` — clamped
+    /// to at least `1`; otherwise `precision`'s own
+    /// [`StoragePrecision::default_oversample`], so an untouched deployment
+    /// config stamps `32` for a `Binary` table and `4` for the other three.
+    pub fn effective_oversample_for(&self, precision: StoragePrecision) -> usize {
+        self.oversample
+            .unwrap_or_else(|| precision.default_oversample())
+            .max(1)
     }
 }
 
@@ -1711,6 +1745,7 @@ mod tests {
             StoragePrecision::F32,
             StoragePrecision::F16,
             StoragePrecision::Int8,
+            StoragePrecision::Binary,
         ] {
             let s = precision.to_string();
             assert_eq!(s.parse::<StoragePrecision>().unwrap(), precision);
@@ -1736,6 +1771,10 @@ mod tests {
             StoragePrecision::Int8.to_scalar_kind(),
             usearch::ScalarKind::I8
         );
+        assert_eq!(
+            StoragePrecision::Binary.to_scalar_kind(),
+            usearch::ScalarKind::B1
+        );
     }
 
     #[test]
@@ -1743,20 +1782,77 @@ mod tests {
         assert!(!StoragePrecision::F32.needs_rescore());
         assert!(StoragePrecision::F16.needs_rescore());
         assert!(StoragePrecision::Int8.needs_rescore());
+        assert!(StoragePrecision::Binary.needs_rescore());
     }
 
     #[test]
-    fn ann_index_config_default_oversample_is_four() {
-        assert_eq!(AnnIndexConfig::default().oversample, 4);
+    fn ann_index_config_default_oversample_is_unset() {
+        assert_eq!(AnnIndexConfig::default().oversample, None);
         assert_eq!(AnnIndexConfig::default().effective_oversample(), 4);
     }
 
     #[test]
     fn effective_oversample_clamps_a_misconfigured_zero_to_one() {
         let ann = AnnIndexConfig {
-            oversample: 0,
+            oversample: Some(0),
             ..AnnIndexConfig::default()
         };
         assert_eq!(ann.effective_oversample(), 1);
+    }
+
+    #[test]
+    fn storage_precision_default_oversample_is_precision_specific() {
+        assert_eq!(StoragePrecision::F32.default_oversample(), 4);
+        assert_eq!(StoragePrecision::F16.default_oversample(), 4);
+        assert_eq!(StoragePrecision::Int8.default_oversample(), 4);
+        assert_eq!(StoragePrecision::Binary.default_oversample(), 32);
+    }
+
+    #[test]
+    fn effective_oversample_for_uses_precision_default_when_unset() {
+        // An untouched (`None`) deployment config defers to the precision's
+        // own default: Binary widens to 32, the other three stay at 4.
+        let ann = AnnIndexConfig::default();
+        assert_eq!(ann.effective_oversample_for(StoragePrecision::Binary), 32);
+        assert_eq!(ann.effective_oversample_for(StoragePrecision::F32), 4);
+        assert_eq!(ann.effective_oversample_for(StoragePrecision::Int8), 4);
+    }
+
+    #[test]
+    fn effective_oversample_for_honors_an_explicit_deployment_override() {
+        // An explicit `Some` deployment override wins over the
+        // precision-specific default, even for Binary — an operator's
+        // explicit config is never silently widened.
+        let ann = AnnIndexConfig {
+            oversample: Some(8),
+            ..AnnIndexConfig::default()
+        };
+        assert_eq!(ann.effective_oversample_for(StoragePrecision::Binary), 8);
+        assert_eq!(ann.effective_oversample_for(StoragePrecision::F32), 8);
+    }
+
+    #[test]
+    fn effective_oversample_for_honors_an_explicit_four_on_binary_not_widened_to_thirty_two() {
+        // The exact case the adversarial audit flagged: a deployment that has
+        // EXPLICITLY configured `oversample = 4` on a `Binary` table must be
+        // honored verbatim as 4, never silently widened to Binary's own
+        // per-precision default of 32.
+        let ann = AnnIndexConfig {
+            oversample: Some(4),
+            ..AnnIndexConfig::default()
+        };
+        assert_eq!(ann.effective_oversample_for(StoragePrecision::Binary), 4);
+    }
+
+    #[test]
+    fn effective_oversample_for_none_on_binary_resolves_to_thirty_two() {
+        // The unset (`None`) counterpart: with no explicit deployment
+        // override, a Binary table still stamps the wider per-precision
+        // default of 32.
+        let ann = AnnIndexConfig {
+            oversample: None,
+            ..AnnIndexConfig::default()
+        };
+        assert_eq!(ann.effective_oversample_for(StoragePrecision::Binary), 32);
     }
 }

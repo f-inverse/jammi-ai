@@ -295,7 +295,8 @@ pub async fn build_precision_recall_fixture(
     index.build()?;
     VectorIndex::save(&index, &int8_base)?;
 
-    let oversample_rescored = AnnIndexConfig::default().oversample;
+    let oversample_rescored =
+        AnnIndexConfig::default().effective_oversample_for(StoragePrecision::Int8);
     let mut int8_rescored = BTreeMap::new();
     let mut int8_no_rescore = BTreeMap::new();
     for &k in &RECALL_KS {

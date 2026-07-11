@@ -35,7 +35,7 @@ fn config_at(
 ) -> jammi_db::config::JammiConfig {
     let mut config = common::test_config(dir);
     config.embedding.ann.storage_precision = precision;
-    config.embedding.ann.oversample = oversample;
+    config.embedding.ann.oversample = Some(oversample);
     config
 }
 

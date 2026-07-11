@@ -398,6 +398,136 @@ async fn result_store_create_table_generates_correct_paths() {
     );
 }
 
+/// A `Binary`-precision deployment default stamps a NEW table's catalog row
+/// with `oversample = 32` (`StoragePrecision::Binary::default_oversample`),
+/// not the shared `4` every other precision stamps under an untouched
+/// deployment config — Binary's single-bit Hamming coarse stage needs the
+/// much wider oversample the Wave 1.5 go/no-go spike measured, and a
+/// deployment that never explicitly configured `oversample` must not
+/// silently under-provision it.
+#[tokio::test]
+async fn binary_precision_table_stamps_precision_specific_oversample() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let ann = AnnIndexConfig {
+        storage_precision: jammi_db::config::StoragePrecision::Binary,
+        ..AnnIndexConfig::default()
+    };
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), ann).unwrap();
+
+    let info = store
+        .create_table(
+            "patents",
+            ModelTask::TextEmbedding,
+            jammi_db::catalog::result_repo::ResultTableKind::Model,
+            None,
+            "model",
+            Some(64),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let record = catalog
+        .get_result_table(&info.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.storage_precision,
+        Some(jammi_db::config::StoragePrecision::Binary)
+    );
+    assert_eq!(
+        record.oversample,
+        Some(32),
+        "a Binary table must stamp oversample=32, not the shared default of 4"
+    );
+}
+
+/// An explicit deployment override of `oversample` is honored verbatim even
+/// at `Binary` precision — the precision-specific default only kicks in when
+/// the deployment has left `oversample` unset (`None`).
+#[tokio::test]
+async fn binary_precision_table_honors_explicit_oversample_override() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let ann = AnnIndexConfig {
+        storage_precision: jammi_db::config::StoragePrecision::Binary,
+        oversample: Some(8),
+        ..AnnIndexConfig::default()
+    };
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), ann).unwrap();
+
+    let info = store
+        .create_table(
+            "patents",
+            ModelTask::TextEmbedding,
+            jammi_db::catalog::result_repo::ResultTableKind::Model,
+            None,
+            "model",
+            Some(64),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let record = catalog
+        .get_result_table(&info.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.oversample,
+        Some(8),
+        "an explicit deployment oversample override must be honored, not widened to 32"
+    );
+}
+
+/// The exact case the adversarial audit flagged: a deployment that has
+/// EXPLICITLY configured `oversample = Some(4)` on a `Binary` table must stamp
+/// `4` verbatim — never silently widened to Binary's own per-precision
+/// default of `32` just because `4` also happens to equal the shared
+/// `DEFAULT_OVERSAMPLE` every other precision defaults to.
+#[tokio::test]
+async fn binary_precision_table_honors_an_explicit_four_not_widened_to_thirty_two() {
+    let dir = tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let ann = AnnIndexConfig {
+        storage_precision: jammi_db::config::StoragePrecision::Binary,
+        oversample: Some(4),
+        ..AnnIndexConfig::default()
+    };
+    let store = ResultStore::new(dir.path(), Arc::clone(&catalog), ann).unwrap();
+
+    let info = store
+        .create_table(
+            "patents",
+            ModelTask::TextEmbedding,
+            jammi_db::catalog::result_repo::ResultTableKind::Model,
+            None,
+            "model",
+            Some(64),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let record = catalog
+        .get_result_table(&info.table_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.oversample,
+        Some(4),
+        "an explicit oversample=4 on a Binary deployment must be honored verbatim, \
+         not silently widened to Binary's own default of 32"
+    );
+}
+
 /// A `ResultStore` rooted at a `memory://` URL roots every created table
 /// under that URL and round-trips a written batch back through the shared
 /// in-memory object store — the hermetic stand-in for an `r2://`/`s3://`

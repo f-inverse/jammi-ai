@@ -53,28 +53,28 @@ const BUILD_GRID: &[AnnIndexConfig] = &[
         build_expansion: 64,
         search_expansion: 0,
         storage_precision: StoragePrecision::F32,
-        oversample: 4,
+        oversample: Some(4),
     },
     AnnIndexConfig {
         connectivity: 0,
         build_expansion: 128,
         search_expansion: 0,
         storage_precision: StoragePrecision::F32,
-        oversample: 4,
+        oversample: Some(4),
     },
     AnnIndexConfig {
         connectivity: 0,
         build_expansion: 256,
         search_expansion: 0,
         storage_precision: StoragePrecision::F32,
-        oversample: 4,
+        oversample: Some(4),
     },
     AnnIndexConfig {
         connectivity: 32,
         build_expansion: 128,
         search_expansion: 0,
         storage_precision: StoragePrecision::F32,
-        oversample: 4,
+        oversample: Some(4),
     },
 ];
 
@@ -191,7 +191,8 @@ pub async fn run(
     // loaded production index does — a freshly built, never-saved index has no
     // rescore companion yet, so its `get_exact` would silently fall back to
     // USearch's own lossy reconstruction and the rescore would recover nothing.
-    let default_oversample = AnnIndexConfig::default().oversample;
+    let default_oversample =
+        AnnIndexConfig::default().effective_oversample_for(StoragePrecision::Int8);
     let precision_grid: [(StoragePrecision, usize); 3] = [
         (StoragePrecision::F32, 1),
         (StoragePrecision::Int8, 1),

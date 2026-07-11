@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn request_override_wins_over_table_default_and_config_default() {
         let ann = AnnIndexConfig {
-            oversample: 4,
+            oversample: Some(4),
             ..AnnIndexConfig::default()
         };
         assert_eq!(resolve_oversample(Some(9), Some(6), &ann), 9);
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn table_default_wins_over_deployment_config_default() {
         let ann = AnnIndexConfig {
-            oversample: 4,
+            oversample: Some(4),
             ..AnnIndexConfig::default()
         };
         assert_eq!(
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn a_zero_override_is_clamped_to_one_not_zero() {
         let ann = AnnIndexConfig {
-            oversample: 4,
+            oversample: Some(4),
             ..AnnIndexConfig::default()
         };
         assert_eq!(
@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn a_misconfigured_zero_default_is_also_clamped() {
         let ann = AnnIndexConfig {
-            oversample: 0,
+            oversample: Some(0),
             ..AnnIndexConfig::default()
         };
         assert_eq!(resolve_oversample(None, None, &ann), 1);

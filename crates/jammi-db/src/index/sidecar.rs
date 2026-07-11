@@ -30,6 +30,33 @@ const ANN_MANIFEST_VERSION: u32 = 2;
 /// index writes no companion (its own USearch vectors are already exact).
 pub(crate) const RESCORE_COMPANION_EXTENSION: &str = "rawf32";
 
+/// The distance metric a sidecar index at `precision` is built and searched
+/// with: `Binary` (USearch's `B1` scalar kind, one packed sign bit per
+/// dimension) compares by Hamming (bit-differences) distance, since cosine
+/// has no meaning over a bit-packed vector; every other precision keeps the
+/// cosine metric every non-binary Jammi index has always used. The sole place
+/// the storage-precision vocabulary maps onto USearch's `MetricKind`, shared
+/// by [`index_options`] (build/load) and the on-disk manifest's `metric`
+/// field (`SidecarIndex::save`), so the two can never drift apart.
+fn ann_metric(precision: StoragePrecision) -> usearch::MetricKind {
+    match precision {
+        StoragePrecision::Binary => usearch::MetricKind::Hamming,
+        StoragePrecision::F32 | StoragePrecision::F16 | StoragePrecision::Int8 => {
+            usearch::MetricKind::Cos
+        }
+    }
+}
+
+/// The manifest `metric` string for a sidecar index at `precision` —
+/// [`ann_metric`]'s name, in the vocabulary the `.manifest.json` field
+/// already used (`"cosine"`) before `Binary` existed.
+fn ann_metric_name(precision: StoragePrecision) -> &'static str {
+    match ann_metric(precision) {
+        usearch::MetricKind::Hamming => "hamming",
+        _ => "cosine",
+    }
+}
+
 /// Build the USearch index options for a sidecar of the given dimension and
 /// storage precision.
 ///
@@ -43,7 +70,9 @@ pub(crate) const RESCORE_COMPANION_EXTENSION: &str = "rawf32";
 /// callers that reopen an *existing* graph (recovery rebuild, load) must pass
 /// the precision recorded on the catalog row / manifest, never today's
 /// deployment default, or a config change after a table was built would
-/// silently rebuild it at the wrong precision. `..Default::default()`
+/// silently rebuild it at the wrong precision. `metric` is derived from
+/// `precision` via [`ann_metric`] rather than hardcoded, so a `Binary` build
+/// gets Hamming while every other precision keeps cosine. `..Default::default()`
 /// preserves the remaining options (notably `multi`).
 fn index_options(
     dimensions: usize,
@@ -52,13 +81,38 @@ fn index_options(
 ) -> usearch::IndexOptions {
     usearch::IndexOptions {
         dimensions,
-        metric: usearch::MetricKind::Cos,
+        metric: ann_metric(precision),
         quantization: precision.to_scalar_kind(),
         connectivity: ann.connectivity,
         expansion_add: ann.build_expansion,
         expansion_search: ann.search_expansion,
         ..Default::default()
     }
+}
+
+/// Symmetric sign-bit packing for a [`StoragePrecision::Binary`] sidecar:
+/// `v > 0` → bit `1`, else (including `v == 0` and negative) → bit `0`,
+/// packed LSB-first into `ceil(dim / 8)` bytes. Unused high bits in the final
+/// byte are left `0` (`vec![0u8; ...]` is zero-initialized, so this is a
+/// property of the construction, not a separate masking step).
+///
+/// The ONE function both [`SidecarIndex::add`] (corpus rows) and
+/// [`SidecarIndex::search`] (queries) pack through — USearch's Hamming metric
+/// counts every bit position in the buffer, padding included, so packing the
+/// two sides inconsistently would silently bias every Hamming distance by a
+/// fixed, easy-to-miss amount (it would just look like uniformly worse
+/// recall, never a crash). Mirrors the Wave 1.5 go/no-go spike's
+/// `pack_sign_bits` exactly (symmetric sign-at-0, not a per-dimension-median
+/// or otherwise asymmetric threshold).
+fn pack_sign_bits(v: &[f32]) -> Vec<u8> {
+    let n_bytes = v.len().div_ceil(8);
+    let mut packed = vec![0u8; n_bytes];
+    for (i, &x) in v.iter().enumerate() {
+        if x > 0.0 {
+            packed[i / 8] |= 1 << (i % 8);
+        }
+    }
+    packed
 }
 
 /// A positioned-read, id-keyed exact-`f32` companion for a quantized sidecar
@@ -257,15 +311,37 @@ impl SidecarIndex {
 
     /// Fetch the **exact** `f32` vector for `row_id` — the retrieve→rescore
     /// source of truth. For a quantized index this reads the mmap'd rescore
-    /// companion by internal key (O(1), no Parquet scan); for an `F32` index
-    /// (which carries no companion — its own vectors are already exact) this
-    /// falls back to [`Self::get`]. `None` if the id is not indexed.
+    /// companion by internal key (O(1), no Parquet scan) when loaded, or the
+    /// in-memory `exact_vectors` buffer for a freshly built index that
+    /// has not yet been saved/loaded (the companion is only opened at
+    /// [`Self::load`]). For an `F32` index (which carries no companion or
+    /// buffer — its own vectors are already exact) this falls back to
+    /// [`Self::get`]. `None` if the id is not indexed.
+    ///
+    /// A quantized index with neither the companion nor the in-memory buffer
+    /// (a state the constructors never produce, but this guard refuses to
+    /// paper over) is a hard error: silently falling back to [`Self::get`]
+    /// here would hand the caller USearch's own **lossy** reconstruction under
+    /// the name "exact", corrupting every rescore that reads it.
     pub fn get_exact(&self, row_id: &str) -> Result<Option<Vec<f32>>> {
         let Some(&key) = self.row_index.get(row_id) else {
             return Ok(None);
         };
         match &self.rescore {
             Some(companion) => Ok(companion.get(key)),
+            None if self.storage_precision.needs_rescore() => match &self.exact_vectors {
+                Some(vectors) => {
+                    let start = key as usize * self.dimensions;
+                    let end = start + self.dimensions;
+                    Ok(vectors.get(start..end).map(<[f32]>::to_vec))
+                }
+                None => Err(JammiError::Other(format!(
+                    "get_exact: quantized index ({:?}) has no rescore companion and no \
+                     in-memory exact-vector buffer for '{row_id}' — refusing to fall back to \
+                     USearch's lossy reconstruction",
+                    self.storage_precision
+                ))),
+            },
             None => self.get(row_id),
         }
     }
@@ -304,7 +380,7 @@ impl SidecarIndex {
             "version": ANN_MANIFEST_VERSION,
             "dimensions": self.dimensions,
             "count": self.row_map.len(),
-            "metric": "cosine",
+            "metric": ann_metric_name(self.storage_precision),
             "backend": "usearch",
             "backend_version": crate::index::backend_version(),
             "scalar_kind": self.storage_precision,
@@ -491,9 +567,23 @@ impl VectorIndex for SidecarIndex {
                 .reserve(new_cap)
                 .map_err(|e| JammiError::Other(format!("USearch reserve: {e}")))?;
         }
-        self.index
-            .add(key, vector)
-            .map_err(|e| JammiError::Other(format!("USearch add: {e}")))?;
+        match self.storage_precision {
+            // A Binary index's own USearch storage is `b1x8`-typed, not
+            // `f32` — `add_f32` fails against a `B1` graph. Route through the
+            // SAME `pack_sign_bits` a query later packs through, so the
+            // corpus and query sides never diverge.
+            StoragePrecision::Binary => {
+                let packed = pack_sign_bits(vector);
+                self.index
+                    .add(key, usearch::b1x8::from_u8s(&packed))
+                    .map_err(|e| JammiError::Other(format!("USearch add: {e}")))?;
+            }
+            StoragePrecision::F32 | StoragePrecision::F16 | StoragePrecision::Int8 => {
+                self.index
+                    .add(key, vector)
+                    .map_err(|e| JammiError::Other(format!("USearch add: {e}")))?;
+            }
+        }
         if let Some(buf) = self.exact_vectors.as_mut() {
             buf.extend_from_slice(vector);
         }
@@ -514,10 +604,20 @@ impl VectorIndex for SidecarIndex {
             return Ok(Vec::new());
         }
         let actual_k = k.min(self.row_map.len());
-        let matches = self
-            .index
-            .search(query, actual_k)
-            .map_err(|e| JammiError::Other(format!("USearch search: {e}")))?;
+        let matches = match self.storage_precision {
+            // Same routing as `add`: a Binary graph's typed search path is
+            // `search_b1x8`, fed the query packed through the identical
+            // `pack_sign_bits` the corpus rows were added with.
+            StoragePrecision::Binary => {
+                let packed = pack_sign_bits(query);
+                self.index
+                    .search(usearch::b1x8::from_u8s(&packed), actual_k)
+            }
+            StoragePrecision::F32 | StoragePrecision::F16 | StoragePrecision::Int8 => {
+                self.index.search(query, actual_k)
+            }
+        }
+        .map_err(|e| JammiError::Other(format!("USearch search: {e}")))?;
 
         let results: Vec<(String, f32)> = matches
             .keys
@@ -870,5 +970,272 @@ mod tests {
             );
         }
         assert_eq!(loaded.get_exact("row-missing").unwrap(), None);
+    }
+
+    #[test]
+    fn get_exact_reads_the_in_memory_buffer_before_save() {
+        // A freshly built quantized index — never saved or loaded — has no
+        // rescore companion yet (`rescore` is only opened by `load`).
+        // `get_exact` must still return the TRUE exact vector by reading the
+        // in-memory `exact_vectors` buffer `add` accumulated, never falling
+        // back to USearch's own lossy `get` under the "exact" name.
+        let vectors: [[f32; 4]; 2] = [[1.0, 0.0, 0.0, 0.0], [0.25, 0.5, 0.75, 1.0]];
+        let mut idx =
+            SidecarIndex::new(4, &AnnIndexConfig::default(), StoragePrecision::Int8).unwrap();
+        for (i, v) in vectors.iter().enumerate() {
+            idx.add(&format!("row-{i}"), v).unwrap();
+        }
+        idx.build().unwrap();
+        assert!(
+            idx.rescore.is_none(),
+            "a pre-save index has no rescore companion yet"
+        );
+
+        for (i, v) in vectors.iter().enumerate() {
+            let exact = idx.get_exact(&format!("row-{i}")).unwrap().unwrap();
+            assert_eq!(
+                exact,
+                v.to_vec(),
+                "get_exact on a pre-save quantized index must read the in-memory exact \
+                 buffer, not USearch's own lossy quantized reconstruction"
+            );
+        }
+    }
+
+    #[test]
+    fn get_exact_errors_on_a_quantized_index_with_neither_companion_nor_buffer() {
+        // A state the constructors never produce (belt-and-suspenders): if a
+        // quantized index somehow lost both its rescore companion and its
+        // in-memory exact-vector buffer, `get_exact` must hard-error rather
+        // than silently fall back to USearch's own lossy `get`.
+        let mut idx =
+            SidecarIndex::new(4, &AnnIndexConfig::default(), StoragePrecision::Int8).unwrap();
+        idx.add("a", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.build().unwrap();
+        idx.exact_vectors = None;
+
+        assert!(
+            idx.get_exact("a").is_err(),
+            "a quantized index with no rescore source of truth must error, not silently \
+             return USearch's lossy reconstruction"
+        );
+    }
+
+    // ─── Binary (B1) + Hamming ───────────────────────────────────────────────
+
+    /// Deterministic, uncorrelated-looking `f32` values in `[-1, 1]` — a
+    /// small stand-in for a real embedding row, seeded so every test run
+    /// produces the identical corpus with no external `rand` dependency.
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn synthetic_vector(seed: u64, dim: usize) -> Vec<f32> {
+        let mut state = seed;
+        (0..dim)
+            .map(|_| {
+                let bits = splitmix64(&mut state);
+                ((bits >> 11) as f64 / (1u64 << 53) as f64).mul_add(2.0, -1.0) as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pack_sign_bits_is_symmetric_sign_at_zero_lsb_first_zero_padded() {
+        // dim = 9 -> ceil(9/8) = 2 bytes. v > 0 -> bit 1 (including the
+        // padding-adjacent index 8), else (including exactly 0.0) -> bit 0,
+        // LSB-first within each byte, unused high bits left 0.
+        let packed = pack_sign_bits(&[1.0, -1.0, 0.0, 2.0, -0.5, 0.5, -3.0, 4.0, 0.1]);
+        assert_eq!(packed.len(), 2);
+        // Bits 0, 3, 5, 7 set (the positive entries) -> 1 + 8 + 32 + 128.
+        assert_eq!(packed[0], 0b1010_1001);
+        // Only bit 0 of the second byte is set; bits 1..7 are zero padding.
+        assert_eq!(packed[1], 0b0000_0001);
+    }
+
+    #[test]
+    fn binary_query_equal_to_corpus_vector_is_its_own_nearest_at_hamming_zero() {
+        // The corpus rows and the query pack through the SAME `pack_sign_bits`
+        // (both go through `SidecarIndex::add`/`search`), so a query that IS
+        // one of the corpus's own vectors must be its own nearest neighbour at
+        // Hamming distance exactly 0 — any divergence between the add-side and
+        // query-side packing would show up here as a nonzero distance.
+        let dim = 64;
+        let vectors: Vec<Vec<f32>> = (0..12).map(|i| synthetic_vector(i + 1, dim)).collect();
+
+        let mut idx =
+            SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
+        for (i, v) in vectors.iter().enumerate() {
+            idx.add(&format!("row-{i}"), v).unwrap();
+        }
+        idx.build().unwrap();
+
+        let query = vectors[5].clone();
+        let hits = idx.search(&query, 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "row-5");
+        assert_eq!(
+            hits[0].1, 0.0,
+            "a query bit-identical (post sign-threshold) to its own corpus row must be at \
+             Hamming distance 0"
+        );
+    }
+
+    #[test]
+    fn binary_search_with_rescore_matches_exact_f32_baseline() {
+        // Mirrors `int8_search_with_rescore_matches_exact_f32_baseline`
+        // (`crates/jammi-ai/tests/it/storage_precision.rs`) one layer down, at
+        // the `SidecarIndex` this engine unit owns: build a `Binary` sidecar
+        // over a small corpus, run the retrieve->rescore mechanism production
+        // uses (`jammi_ai::operator::ann_search_exec::retrieve_then_rescore`)
+        // by hand over `SidecarIndex::search` + `get_exact`, and compare
+        // against an independently-computed exact brute-force cosine ranking
+        // over the ORIGINAL `f32` vectors.
+        use jammi_numerics::distance::cosine_distance;
+
+        let dim = 64;
+        let corpus_len = 24;
+        let vectors: Vec<(String, Vec<f32>)> = (0..corpus_len)
+            .map(|i| (format!("row-{i}"), synthetic_vector(i as u64 + 100, dim)))
+            .collect();
+
+        let mut idx =
+            SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
+        for (id, v) in &vectors {
+            idx.add(id, v).unwrap();
+        }
+        idx.build().unwrap();
+
+        // Save + reload before searching: `get_exact` serves the exact vector
+        // from the `.rawf32` rescore companion only once it is open (populated
+        // by `load`, mirroring exactly how production always searches a
+        // quantized sidecar — through `resolve_search_mode`'s `load`, never a
+        // still-building handle).
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("binary_rescore_roundtrip");
+        idx.save(&base).unwrap();
+        let idx = SidecarIndex::load(&base, &AnnIndexConfig::default(), StoragePrecision::Binary)
+            .unwrap();
+
+        // A query that is a small perturbation of an existing corpus row, so
+        // it has one clear exact nearest neighbour among otherwise
+        // uncorrelated synthetic vectors.
+        let mut query = vectors[9].1.clone();
+        let noise = synthetic_vector(999, dim);
+        for (q, n) in query.iter_mut().zip(noise.iter()) {
+            *q += 0.05 * n;
+        }
+
+        let k = 5;
+        // The Wave 1.5 spike's confirmed mandatory oversample for Binary.
+        let oversample = StoragePrecision::Binary.default_oversample();
+        let candidate_k = (k * oversample).min(vectors.len());
+
+        let candidates = idx.search(&query, candidate_k).unwrap();
+        assert_eq!(
+            candidates.len(),
+            vectors.len(),
+            "oversample=32 must widen the Hamming coarse stage to cover this whole \
+             24-row fixture"
+        );
+        let mut rescored: Vec<(String, f32)> = candidates
+            .iter()
+            .map(|(id, _)| {
+                let exact = idx
+                    .get_exact(id)
+                    .unwrap()
+                    .expect("every Hamming candidate must have an exact rescore companion entry");
+                (id.clone(), cosine_distance(&query, &exact))
+            })
+            .collect();
+        rescored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        rescored.truncate(k);
+
+        let mut expected: Vec<(String, f32)> = vectors
+            .iter()
+            .map(|(id, v)| (id.clone(), cosine_distance(&query, v)))
+            .collect();
+        expected.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        expected.truncate(k);
+
+        let actual_ids: Vec<&str> = rescored.iter().map(|(id, _)| id.as_str()).collect();
+        let expected_ids: Vec<&str> = expected.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            actual_ids, expected_ids,
+            "Binary retrieve->rescore must recover the exact brute-force top-k row order"
+        );
+        assert_eq!(
+            rescored[0].0, "row-9",
+            "the perturbed corpus row must remain its own exact nearest neighbour"
+        );
+    }
+
+    #[test]
+    fn binary_manifest_records_binary_scalar_kind_and_hamming_metric() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("binary_manifest");
+
+        let mut idx =
+            SidecarIndex::new(8, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
+        let vector = [1.0, -1.0, 0.5, -0.5, 0.0, 2.0, -2.0, 3.0];
+        idx.add("a", &vector).unwrap();
+        idx.build().unwrap();
+        idx.save(&base).unwrap();
+
+        let manifest = read_manifest_json(&base);
+        assert_eq!(manifest["scalar_kind"], "binary");
+        assert_eq!(
+            manifest["metric"], "hamming",
+            "a Binary build's manifest must record the metric it actually searches with, \
+             not a hardcoded 'cosine'"
+        );
+
+        let loaded =
+            SidecarIndex::load(&base, &AnnIndexConfig::default(), StoragePrecision::Binary)
+                .unwrap();
+        assert_eq!(loaded.storage_precision(), StoragePrecision::Binary);
+        assert!(
+            loaded.rescore.is_some(),
+            "a Binary build must write the rescore companion"
+        );
+        assert_eq!(loaded.get_exact("a").unwrap(), Some(vector.to_vec()));
+    }
+
+    #[test]
+    fn binary_scalar_kind_mismatch_is_rejected() {
+        // The strict scalar-kind reject-mismatch path (already exercised for
+        // F32-vs-Int8 by `mismatched_scalar_kind_is_rejected`) also holds for
+        // the new `Binary` variant: a graph built as `Binary` but expected as
+        // `F32` must fail loudly, never silently reopen as if the (very
+        // differently shaped) stored vectors matched.
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("binary_scalar_kind_mismatch");
+
+        let mut idx =
+            SidecarIndex::new(8, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
+        idx.add("a", &[1.0, -1.0, 0.5, -0.5, 0.0, 2.0, -2.0, 3.0])
+            .unwrap();
+        idx.build().unwrap();
+        idx.save(&base).unwrap();
+
+        match SidecarIndex::load(&base, &AnnIndexConfig::default(), StoragePrecision::F32) {
+            Ok(_) => panic!("expected load to fail, but it succeeded"),
+            Err(JammiError::IncompatibleFormat {
+                artifact,
+                found,
+                supported,
+            }) => {
+                assert_eq!(artifact, "ann-index-precision");
+                assert_eq!(found, "binary");
+                assert_eq!(supported, "f32");
+            }
+            Err(other) => {
+                panic!("expected IncompatibleFormat for ann-index-precision, got {other:?}")
+            }
+        }
     }
 }

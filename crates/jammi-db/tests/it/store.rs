@@ -82,6 +82,7 @@ async fn result_table_crud_lifecycle() {
             text_columns: Some("abstract"),
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
+            created_at: jammi_db::catalog::backend::now_sortable(),
         })
         .await
         .unwrap();
@@ -115,6 +116,7 @@ async fn result_table_crud_lifecycle() {
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
+            created_at: jammi_db::catalog::backend::now_sortable(),
         })
         .await
         .unwrap();
@@ -159,6 +161,7 @@ async fn find_result_tables_filters_by_source_and_task() {
                 text_columns: None,
                 storage_precision: jammi_db::config::StoragePrecision::F32,
                 oversample: 4,
+                created_at: jammi_db::catalog::backend::now_sortable(),
             })
             .await
             .unwrap();
@@ -190,7 +193,7 @@ async fn resolve_embedding_table_latest_explicit_and_missing() {
         .await
         .is_err());
 
-    for name in ["old", "new"] {
+    for (seq, name) in ["old", "new"].into_iter().enumerate() {
         catalog
             .create_result_table(CreateResultTableParams {
                 table_name: name,
@@ -206,6 +209,9 @@ async fn resolve_embedding_table_latest_explicit_and_missing() {
                 text_columns: None,
                 storage_precision: jammi_db::config::StoragePrecision::F32,
                 oversample: 4,
+                // Explicit, strictly-increasing `created_at` — "new" must
+                // resolve as newest regardless of wall-clock resolution.
+                created_at: sortable_at(seq as u64 + 1),
             })
             .await
             .unwrap();
@@ -240,11 +246,12 @@ async fn resolve_embedding_table_accepts_every_embedding_variant() {
     let dir = tempdir().unwrap();
     let catalog = Catalog::open(dir.path()).await.unwrap();
 
-    // Seed one Ready table per variant. Created-at ordering puts the
+    // Seed one Ready table per variant. Explicit, strictly-increasing
+    // `created_at` values (independent of wall-clock resolution) put the
     // last-inserted embedding variant on top of the resolver's
     // `ORDER BY created_at DESC` tiebreaker.
     let mut expected_winner: Option<String> = None;
-    for task in ModelTask::ALL {
+    for (seq, task) in ModelTask::ALL.iter().enumerate() {
         let name = format!("row_{}", task.as_db_str());
         catalog
             .create_result_table(CreateResultTableParams {
@@ -261,6 +268,7 @@ async fn resolve_embedding_table_accepts_every_embedding_variant() {
                 text_columns: None,
                 storage_precision: jammi_db::config::StoragePrecision::F32,
                 oversample: 4,
+                created_at: sortable_at(seq as u64 + 1),
             })
             .await
             .unwrap();
@@ -285,6 +293,118 @@ async fn resolve_embedding_table_accepts_every_embedding_variant() {
     assert_eq!(
         resolved.table_name,
         expected_winner.expect("ModelTask::ALL has at least one embedding variant"),
+    );
+}
+
+/// `resolve_embedding_table` must pick the temporally-newest ready `model`
+/// table by `created_at`, not by `table_name` — on both SQLite and Postgres.
+///
+/// The table names are chosen so a `table_name`-only tiebreak would return
+/// the WRONG row: a result table's name is
+/// `{source}__{task}__{model}__{timestamp}_{suffix}`, and the model segment
+/// sorts *before* the timestamp, so `zzz_model` (created first, older) sorts
+/// after `aaa_model` (created second, newer) even though `aaa_model` is the
+/// correct answer. This is the exact naive-fix regression a prior
+/// pressure-test killed (`ORDER BY created_at DESC, table_name DESC` alone
+/// is correct; `ORDER BY table_name DESC` alone is not) — it also
+/// regression-guards the Postgres `rowid`-does-not-exist hard error, since
+/// SQLite is the only backend with a `rowid` to (wrongly) fall back on.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn resolve_embedding_table_picks_newest_by_created_at_not_table_name(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = match make_test_session(backend, dir.path()).await {
+        Some(s) => s,
+        None => {
+            eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+            return;
+        }
+    };
+    let catalog = session.catalog();
+
+    let suffix = unique_suffix();
+    let source_id = format!("multi_model_src_{suffix}");
+    let older_table = format!("{source_id}__text_embedding__zzz_model__{suffix}_1");
+    let newer_table = format!("{source_id}__text_embedding__aaa_model__{suffix}_2");
+
+    catalog
+        .register_source(
+            &source_id,
+            SourceType::File,
+            &SourceConnection {
+                url: Some(format!("file:///tmp/{source_id}.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // First (older) table: model name sorts alphabetically LAST.
+    catalog
+        .create_result_table(CreateResultTableParams {
+            table_name: &older_table,
+            source_id: &source_id,
+            model_id: "zzz_model",
+            task: ModelTask::TextEmbedding,
+            kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
+            derived_from: None,
+            parquet_path: &format!("file:///tmp/{older_table}.parquet"),
+            index_path: None,
+            dimensions: Some(8),
+            key_column: None,
+            text_columns: None,
+            storage_precision: jammi_db::config::StoragePrecision::F32,
+            oversample: 4,
+            created_at: jammi_db::catalog::backend::now_sortable(),
+        })
+        .await
+        .unwrap();
+    catalog
+        .update_result_table_status(&older_table, ResultTableStatus::Ready, 4)
+        .await
+        .unwrap();
+
+    // A real wall-clock gap so `created_at` differs unambiguously even on a
+    // coarse system clock — the oracle must fail on the naive fix
+    // regardless of how fast the two creates happen to run.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    // Second (newer) table: model name sorts alphabetically FIRST — a
+    // `table_name DESC` tiebreak would wrongly return `older_table` above.
+    catalog
+        .create_result_table(CreateResultTableParams {
+            table_name: &newer_table,
+            source_id: &source_id,
+            model_id: "aaa_model",
+            task: ModelTask::TextEmbedding,
+            kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
+            derived_from: None,
+            parquet_path: &format!("file:///tmp/{newer_table}.parquet"),
+            index_path: None,
+            dimensions: Some(8),
+            key_column: None,
+            text_columns: None,
+            storage_precision: jammi_db::config::StoragePrecision::F32,
+            oversample: 4,
+            created_at: jammi_db::catalog::backend::now_sortable(),
+        })
+        .await
+        .unwrap();
+    catalog
+        .update_result_table_status(&newer_table, ResultTableStatus::Ready, 4)
+        .await
+        .unwrap();
+
+    let resolved = catalog
+        .resolve_embedding_table(&source_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved.table_name, newer_table,
+        "resolver must return the temporally-newest ready model table, \
+         not the alphabetically-greatest table_name"
     );
 }
 
@@ -341,6 +461,7 @@ async fn recovery_skips_index_rebuild_for_non_embedding_task() {
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
+            created_at: jammi_db::catalog::backend::now_sortable(),
         })
         .await
         .unwrap();
@@ -614,6 +735,7 @@ async fn recovery_marks_missing_parquet_as_failed() {
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
+            created_at: jammi_db::catalog::backend::now_sortable(),
         })
         .await
         .unwrap();
@@ -659,6 +781,7 @@ async fn recovery_deletes_invalid_parquet_and_marks_failed() {
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
+            created_at: jammi_db::catalog::backend::now_sortable(),
         })
         .await
         .unwrap();
@@ -721,6 +844,7 @@ async fn recovery_promotes_valid_parquet_to_ready() {
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
+            created_at: jammi_db::catalog::backend::now_sortable(),
         })
         .await
         .unwrap();
@@ -749,6 +873,16 @@ fn unique_suffix() -> String {
         .unwrap()
         .as_nanos();
     format!("{epoch_ns:x}_{n:x}")
+}
+
+/// A deterministic, strictly-increasing `now_sortable`-format `created_at`
+/// for tests that assert "newest wins" — `now_sortable` is wall-clock
+/// (`chrono::Utc::now`), which is not monotonic and has no guaranteed
+/// resolution, so back-to-back un-slept inserts must not rely on it to
+/// order themselves. Binding explicit values here makes the ordering the
+/// test asserts on independent of clock behavior entirely.
+fn sortable_at(seq: u64) -> String {
+    format!("2020-01-01T00:00:00.{seq:09}Z")
 }
 
 /// A dimensionless result table (e.g. a classifier, whose output isn't a
@@ -804,6 +938,7 @@ async fn result_table_none_dimensions_round_trips_as_null(backend: BackendKind) 
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
+            created_at: jammi_db::catalog::backend::now_sortable(),
         })
         .await
         .unwrap();

@@ -90,6 +90,7 @@ async fn read_vectors_returns_input_rows_byte_for_byte() {
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
+            created_at: jammi_db::catalog::backend::now_sortable(),
         })
         .await
         .unwrap();
@@ -165,6 +166,7 @@ async fn read_vectors_surfaces_typed_schema_error_on_wrong_column_shape() {
             text_columns: None,
             storage_precision: jammi_db::config::StoragePrecision::F32,
             oversample: 4,
+            created_at: jammi_db::catalog::backend::now_sortable(),
         })
         .await
         .unwrap();

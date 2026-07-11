@@ -312,6 +312,7 @@ impl ResultStore {
                 oversample: self
                     .ann
                     .effective_oversample_for(self.ann.storage_precision),
+                created_at: crate::catalog::backend::now_sortable(),
             })
             .await?;
 

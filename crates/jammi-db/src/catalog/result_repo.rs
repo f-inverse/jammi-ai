@@ -81,6 +81,14 @@ pub struct CreateResultTableParams<'a> {
     /// deployment's [`crate::config::AnnIndexConfig::effective_oversample`] at
     /// creation time. A search request may still override it for one call.
     pub oversample: usize,
+    /// The row's creation timestamp, stamped by the caller via
+    /// [`crate::catalog::backend::now_sortable`] rather than left to a SQL
+    /// `DEFAULT` — a backend-computed default would give SQLite and Postgres
+    /// different resolutions and shapes for the same column, which is exactly
+    /// the ordering-key parity bug [`Catalog::resolve_embedding_table`] used
+    /// to hit. Threading it through here means every INSERT of this table
+    /// binds one app-supplied, backend-identical value.
+    pub created_at: String,
 }
 
 /// A row from the `result_tables` catalog table.
@@ -203,6 +211,7 @@ impl Catalog {
         let text_columns = p.text_columns.map(str::to_string);
         let storage_precision = p.storage_precision.to_string();
         let oversample = p.oversample;
+        let created_at = p.created_at;
         let tenant = self.current_tenant();
 
         self.backend()
@@ -213,8 +222,8 @@ impl Catalog {
                     tx.execute(
                         "INSERT INTO result_tables (table_name, source_id, model_id, task, kind, \
                          derived_from, parquet_path, index_path, dimensions, key_column, \
-                         text_columns, tenant_id, storage_precision, oversample) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                         text_columns, tenant_id, storage_precision, oversample, created_at) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
                         &[
                             SqlValue::TextOwned(table_name),
                             SqlValue::TextOwned(source_id),
@@ -230,6 +239,7 @@ impl Catalog {
                             SqlValue::from(tenant.map(|t| t.to_string())),
                             SqlValue::TextOwned(storage_precision),
                             SqlValue::from(oversample as i64),
+                            SqlValue::TextOwned(created_at),
                         ],
                     )
                     .await?;
@@ -685,13 +695,27 @@ impl Catalog {
         // `kind = 'model'` excludes derived tables (e.g. a neighbor-graph edge
         // relation) whose `task` column still names the source embedding's
         // task — only genuine model outputs resolve as an embedding source.
+        //
+        // `created_at` is app-supplied (`backend::now_sortable`) at
+        // nanosecond resolution and identical in shape on both backends, so
+        // it is the correct primary ordering key — no `rowid` (SQLite has
+        // one, Postgres does not; this query used to hard-error on Postgres
+        // reaching for it). `table_name DESC` is a deterministic final
+        // tiebreak, not a correctness guarantee: `now_sortable` is wall-clock
+        // (`chrono::Utc::now`), which is not monotonic, so a coarse or
+        // backward clock step could in principle collide two genuinely
+        // distinct creation instants. The tiebreak resolves a true
+        // same-nanosecond collision correctly (every table name carries a
+        // uuid suffix, so the pick is at least deterministic); it does not
+        // repair a clock-caused false collision between otherwise-ordered
+        // rows.
         let sql = format!(
             "SELECT * FROM result_tables \
              WHERE source_id = $1 AND task IN ({tasks}) \
                AND kind = 'model' \
                AND status = 'ready' \
                AND (tenant_id = {tenant} OR tenant_id IS NULL) \
-             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+             ORDER BY created_at DESC, table_name DESC LIMIT 1",
             tasks = task_placeholders.join(", "),
             tenant = tenant_placeholder,
         );

@@ -732,11 +732,7 @@ async fn probe_cache_misses_when_the_artifact_was_reaped(backend: BackendKind) {
     let inputs = vec![InputAnchor::mutable_version("docs", unique_version())];
     let (record, def) = materialize(&store, &ctx, inputs.clone()).await;
 
-    // Reap the artifact bytes out from under the still-`ready` catalog row.
-    let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
-    let handle = store.open_parquet(&url).unwrap();
-    let path = handle.data_path().unwrap();
-    handle.delete_if_exists(&path).await.unwrap();
+    reap_artifact(&store, &record).await;
 
     assert_eq!(
         store.lookup_cached(&def, &inputs).await.unwrap().as_deref(),
@@ -747,6 +743,88 @@ async fn probe_cache_misses_when_the_artifact_was_reaped(backend: BackendKind) {
         store.probe_cache(&def, &inputs).await.unwrap(),
         None,
         "probe_cache re-confirms the artifact and misses when the bytes are gone"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn probe_cache_record_reuses_an_intact_newer_row_when_an_older_same_key_row_is_reaped(
+    backend: BackendKind,
+) {
+    // Two `ready` rows can legitimately share the exact same
+    // `(definition_hash, input_anchors)` key — a producer re-materialising an
+    // idempotent recompute, or a race. `descriptor()`/`env()` are fixed
+    // literals across this module, so two `materialize()` calls over the SAME
+    // `inputs` produce two DIFFERENT `ready` tables sharing one definition hash
+    // AND one anchor set — exactly the shared-key scenario.
+    //
+    // When the OLDER of the two has had its Parquet bytes reaped but the NEWER
+    // one's are intact, the cache probe must still resolve the sound reuse: a
+    // reaped candidate must not shadow another candidate at the exact same key
+    // (esc-023 — the false-miss this test pins down).
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = SessionContext::new();
+
+    let inputs = vec![InputAnchor::mutable_version("docs", unique_version())];
+    let (older, def) = materialize(&store, &ctx, inputs.clone()).await;
+    let (newer, def_again) = materialize(&store, &ctx, inputs.clone()).await;
+    assert_eq!(
+        def, def_again,
+        "both materialisations replay the same fixed descriptor/env, so they share one definition hash"
+    );
+
+    reap_artifact(&store, &older).await;
+
+    let hit = store
+        .probe_cache_record(&def, &inputs)
+        .await
+        .unwrap()
+        .expect("the newer same-key row's artifact is intact — a sound reuse exists");
+    assert_eq!(
+        hit.table_name, newer.table_name,
+        "the reaped OLDER candidate must not shadow the intact NEWER match — was a false cache miss"
+    );
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn probe_cache_record_falls_through_a_reaped_newest_row_to_an_intact_older_match(
+    backend: BackendKind,
+) {
+    // The non-tautology guard: reaps the NEWEST same-key row instead, leaving
+    // an OLDER match intact. Preferring the newest candidate (`ORDER BY
+    // created_at DESC`) alone is not sufficient: without the fallthrough
+    // iteration over every exact-match candidate, a reaped newest row would
+    // shadow the still-intact older one and reproduce the same false-miss bug
+    // in the opposite direction. This is the case a DESC-ordering-only change
+    // (no iteration) would still get wrong.
+    let dir = tempdir().unwrap();
+    let catalog = fresh_catalog_or_skip!(backend, dir);
+    let store = store(dir.path(), Arc::clone(&catalog));
+    let ctx = SessionContext::new();
+
+    let inputs = vec![InputAnchor::mutable_version("docs", unique_version())];
+    let (older, def) = materialize(&store, &ctx, inputs.clone()).await;
+    let (newer, def_again) = materialize(&store, &ctx, inputs.clone()).await;
+    assert_eq!(
+        def, def_again,
+        "both materialisations replay the same fixed descriptor/env, so they share one definition hash"
+    );
+
+    reap_artifact(&store, &newer).await;
+
+    let hit = store
+        .probe_cache_record(&def, &inputs)
+        .await
+        .unwrap()
+        .expect("the older same-key row's artifact is intact — a sound reuse exists");
+    assert_eq!(
+        hit.table_name, older.table_name,
+        "the reaped NEWEST candidate must fall through to the intact OLDER match"
     );
 }
 
@@ -842,6 +920,16 @@ async fn probe_cache_never_hits_an_unpinned_request(backend: BackendKind) {
 }
 
 // === helpers ===============================================================
+
+/// Delete a `ready` table's Parquet artifact bytes out from under its
+/// still-`ready` catalog row — models a torn write that committed `ready`
+/// before durability, or a half-deleted table.
+async fn reap_artifact(store: &ResultStore, record: &ResultTableRecord) {
+    let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
+    let handle = store.open_parquet(&url).unwrap();
+    let path = handle.data_path().unwrap();
+    handle.delete_if_exists(&path).await.unwrap();
+}
 
 /// Re-attest a parent table's `.materialization.json` sidecar to a new artifact
 /// digest — models the parent being recomputed to a new output, which

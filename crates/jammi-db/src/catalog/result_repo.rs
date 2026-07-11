@@ -519,9 +519,22 @@ impl Catalog {
     ///
     /// The predicate is `definition_hash = $1 AND status = 'ready'` (migration
     /// 022's index covers the equality arm). Many rows can share a definition
-    /// hash (the same definition over different anchors, or re-emissions), so
-    /// this returns every candidate; the *exact* `(definition_hash,
-    /// input_anchors)` match is the caller's anchor-set comparison.
+    /// hash (the same definition over different anchors, or re-emissions —
+    /// including a producer that legitimately re-materialises the *same*
+    /// `(definition, inputs)` key, e.g. an idempotent recompute or a race), so
+    /// this returns every candidate, **newest first** (`ORDER BY created_at
+    /// DESC, table_name DESC`). Every same-key `ready` row is a semantically
+    /// equivalent reuse; the caller prefers the newest, and iterates the rest as
+    /// a fallback when the newest's artifact turns out to have been reaped (see
+    /// [`crate::store::ResultStore::probe_cache_record`]). The *exact*
+    /// `(definition_hash, input_anchors)` match is the caller's anchor-set
+    /// comparison.
+    ///
+    /// `created_at` is app-supplied (`backend::now_sortable`) at nanosecond
+    /// resolution, identical in shape on both backends; `table_name DESC` is a
+    /// deterministic final tiebreak for a same-nanosecond collision (every
+    /// table name carries a uuid suffix, so the pick is at least
+    /// deterministic), the same idiom [`Self::resolve_embedding_table`] uses.
     pub async fn find_ready_result_tables_by_definition(
         &self,
         definition_hash: &str,
@@ -541,7 +554,7 @@ impl Catalog {
                             "SELECT * FROM result_tables \
                                WHERE definition_hash = $1 AND status = 'ready' \
                                  AND (tenant_id = $2 OR tenant_id IS NULL) \
-                             ORDER BY created_at",
+                             ORDER BY created_at DESC, table_name DESC",
                             &[
                                 SqlValue::TextOwned(hash),
                                 SqlValue::from(tenant.map(|t| t.to_string())),

@@ -6,6 +6,40 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-07-11
+
+The precision/quantization line: two orthogonal precision axes land — vector
+**storage** quantization (how a search's sidecar stores vectors) and encoder
+**compute** precision (the dtype inference runs at) — each demand-pulled,
+measured, and paired with a runnable cookbook chapter.
+
+### Added
+- **Vector-storage quantization + retrieve→rescore (`jammi-db`, `jammi-ai`,
+  `jammi-wire`).** A deployment-default `storage_precision` (`f32` / `f16` /
+  `int8` / `binary`) on the ANN sidecar, with a coarse-propose→exact-rescore
+  stage that recovers recall from an id-keyed raw-f32 companion (durable vectors
+  stay f32 Parquet — quantization is the index's concern, never the source of
+  truth). `binary` routes through sign-bit packing + a Hamming metric space.
+  Recall is dialed by `oversample` — a deployment default (precision-aware:
+  binary defaults higher) and a per-request `search(..., oversample=...)`
+  override — both reachable through the public SDK. `jammi-bench` grows a
+  recall-vs-precision axis with committed floors (int8 rescore-recovery, binary
+  `recall@1`), and Part-I cookbook chapters measure the storage/compute trade
+  end-to-end on real fixtures.
+- **Configurable f16 / bf16 encoder inference — the compute-precision seam
+  (`jammi-numerics`, `jammi-encoders`, `jammi-ai`, `jammi-db`).** A candle-free
+  `ComputePrecision {F32, F16, BF16}` vocabulary, resolved from a global
+  `[gpu] compute_precision` default or a per-model `config.json` override, folds
+  into the materialization identity (a distinct `DefinitionHash` per precision).
+  `f16` runs on CPU and CUDA; **`bf16` is admitted at the load boundary only on a
+  CUDA device of compute capability ≥ 8.0 (Ampere+)**, decided by the pure
+  `ComputePrecision::is_supported_on_cuda` predicate and a runtime capability
+  query, and fails loud (naming the device's `sm_XX`) below the floor, on a
+  non-CUDA device, or in a CPU-only build — never a silent run or silent
+  fallback. The admit-on-Ampere path is proven by a `live-gpu-tests` oracle on
+  real sm_86 hardware (bf16↔f32 direction parity); the reject decision by a CPU
+  unit test.
+
 ## [0.41.0] - 2026-07-10
 
 ### Fixed

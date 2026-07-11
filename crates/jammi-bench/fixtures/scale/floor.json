@@ -1,25 +1,57 @@
 {
+  "margin": 0.04,
+  "precision": {
+    "int8_no_rescore": {
+      "1": {
+        "floor": 0.6699999999999999,
+        "measured": 0.71
+      },
+      "10": {
+        "floor": 0.7869999999999997,
+        "measured": 0.8269999999999997
+      },
+      "100": {
+        "floor": 0.8579000000000002,
+        "measured": 0.8979000000000003
+      }
+    },
+    "int8_rescored": {
+      "1": {
+        "floor": 0.94,
+        "measured": 0.98
+      },
+      "10": {
+        "floor": 0.9590000000000001,
+        "measured": 0.9990000000000001
+      },
+      "100": {
+        "floor": 0.96,
+        "measured": 1.0
+      }
+    },
+    "oversample_no_rescore": 1,
+    "oversample_rescored": 4
+  },
   "provenance": {
-    "source_corpus_rows": 168343,
-    "source_query_rows": 1000,
+    "dim": 768,
+    "note": "deterministic first-N-by-sorted-_row_id subset of the full scale cache; corpus and queries disjoint by construction (held out in the source split)",
     "slice_corpus_rows": 2000,
     "slice_query_rows": 100,
-    "dim": 768,
-    "note": "deterministic first-N-by-sorted-_row_id subset of the full scale cache; corpus and queries disjoint by construction (held out in the source split)"
+    "source_corpus_rows": 168343,
+    "source_query_rows": 1000
   },
-  "margin": 0.04,
   "recall": {
     "1": {
-      "measured": 1.0,
-      "floor": 0.96
+      "floor": 0.96,
+      "measured": 1.0
     },
     "10": {
-      "measured": 1.0,
-      "floor": 0.96
+      "floor": 0.96,
+      "measured": 1.0
     },
     "100": {
-      "measured": 0.9969999999999998,
-      "floor": 0.9569999999999997
+      "floor": 0.9569999999999996,
+      "measured": 0.9969999999999998
     }
   }
 }

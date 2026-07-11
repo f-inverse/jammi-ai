@@ -15,11 +15,13 @@ use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::context::SessionContext;
 use futures::StreamExt;
-use jammi_db::catalog::backend::BackendImpl;
+use jammi_db::catalog::backend::{BackendImpl, BackendKind};
+use jammi_db::catalog::backend_postgres::PostgresBackend;
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::catalog::topic_repo::TopicRepo;
 use jammi_db::catalog::Catalog;
 use jammi_db::source::mutable::MutableTableRegistry;
+use jammi_db::store::mutable::postgres::PostgresMutableBackend;
 use jammi_db::store::mutable::sqlite::SqliteMutableBackend;
 use jammi_db::store::mutable::MutableBackend;
 use jammi_db::tenant::{TenantContext, TenantId};
@@ -28,8 +30,11 @@ use jammi_db::trigger::{
     InMemoryBroker, Offset, Predicate, Publisher, Subscriber, TopicDefinition, TopicId,
     TriggerBroker, TriggerError,
 };
+use jammi_test_utils::unique_suffix;
 use std::str::FromStr;
 use tempfile::TempDir;
+use test_case::test_case;
+use uuid::Uuid;
 
 struct Harness {
     _dir: TempDir,
@@ -41,32 +46,52 @@ struct Harness {
     session: SessionContext,
 }
 
-async fn build_harness() -> Harness {
-    build_harness_with_tenant(None).await
+async fn build_harness(backend: BackendKind) -> Option<Harness> {
+    build_harness_with_tenant(backend, None).await
 }
 
 /// Like [`build_harness`] but also hands back the concrete [`InMemoryBroker`]
 /// so a test can arm `trigger_failure_for_next_publish`. The same broker is
 /// wired into the harness's publisher/subscriber as the `dyn TriggerBroker`,
 /// so arming it affects the live fan-out the harness exercises.
-async fn build_harness_with_in_memory_broker() -> (Harness, Arc<InMemoryBroker>) {
+async fn build_harness_with_in_memory_broker(
+    backend: BackendKind,
+) -> Option<(Harness, Arc<InMemoryBroker>)> {
     let in_mem = Arc::new(InMemoryBroker::new());
-    let h = build_harness_with_broker(None, Arc::clone(&in_mem) as Arc<dyn TriggerBroker>).await;
-    (h, in_mem)
+    let h = build_harness_with_broker(backend, None, Arc::clone(&in_mem) as Arc<dyn TriggerBroker>)
+        .await?;
+    Some((h, in_mem))
 }
 
-async fn build_harness_with_tenant(tenant: Option<TenantId>) -> Harness {
-    build_harness_with_broker(tenant, Arc::new(InMemoryBroker::new())).await
+async fn build_harness_with_tenant(
+    backend: BackendKind,
+    tenant: Option<TenantId>,
+) -> Option<Harness> {
+    build_harness_with_broker(backend, tenant, Arc::new(InMemoryBroker::new())).await
 }
 
+/// Build the harness on `backend`, returning `None` for the Postgres arm when
+/// `JAMMI_TEST_PG_URL` is unset (so callers skip, never `#[ignore]`).
 async fn build_harness_with_broker(
+    backend: BackendKind,
     tenant: Option<TenantId>,
     broker: Arc<dyn TriggerBroker>,
-) -> Harness {
+) -> Option<Harness> {
     let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("catalog.db");
-    let sqlite = SqliteBackend::open(&db_path).await.unwrap();
-    let backend_impl = BackendImpl::Sqlite(sqlite);
+    let backend_impl = match backend {
+        BackendKind::Sqlite => {
+            let db_path = dir.path().join("catalog.db");
+            let sqlite = SqliteBackend::open(&db_path).await.unwrap();
+            BackendImpl::Sqlite(sqlite)
+        }
+        BackendKind::Postgres => {
+            let url = jammi_test_utils::pg_url_for_tests()?;
+            let pg = PostgresBackend::open_with_options(&url, 8, None)
+                .await
+                .unwrap();
+            BackendImpl::Postgres(pg)
+        }
+    };
     backend_impl.migrate().await.unwrap();
 
     // The catalog and the mutable-table registry must share ONE tenant binding
@@ -83,10 +108,12 @@ async fn build_harness_with_broker(
         backend_impl,
         Some(tenant_binding.clone()),
     ));
-    let backend = catalog.backend_arc();
+    let backend_arc = catalog.backend_arc();
 
-    let mutable_backend: Arc<dyn MutableBackend> =
-        Arc::new(SqliteMutableBackend::new(Arc::clone(&backend)));
+    let mutable_backend: Arc<dyn MutableBackend> = match backend {
+        BackendKind::Sqlite => Arc::new(SqliteMutableBackend::new(Arc::clone(&backend_arc))),
+        BackendKind::Postgres => Arc::new(PostgresMutableBackend::new(Arc::clone(&backend_arc))),
+    };
     let registry = Arc::new(MutableTableRegistry::new(
         Arc::clone(&catalog),
         mutable_backend,
@@ -95,13 +122,13 @@ async fn build_harness_with_broker(
 
     let publisher = Publisher::new(
         Arc::clone(&broker),
-        Arc::clone(&backend),
+        Arc::clone(&backend_arc),
         Arc::clone(&registry),
     );
     let subscriber = Subscriber::new(Arc::clone(&broker), Arc::clone(&registry));
     let topic_repo = TopicRepo::new(Arc::clone(&catalog), Arc::clone(&registry));
 
-    Harness {
+    Some(Harness {
         _dir: dir,
         registry,
         topic_repo,
@@ -109,7 +136,29 @@ async fn build_harness_with_broker(
         publisher,
         subscriber,
         session: SessionContext::new(),
-    }
+    })
+}
+
+/// Fetch a backend-parameterized harness, skipping the test (with a warning,
+/// never `#[ignore]`) when the Postgres arm has no `JAMMI_TEST_PG_URL`.
+macro_rules! harness_or_skip {
+    ($build:expr) => {
+        match $build.await {
+            Some(h) => h,
+            None => {
+                eprintln!("skipping: JAMMI_TEST_PG_URL unset");
+                return;
+            }
+        }
+    };
+}
+
+/// A per-test-unique topic name — the Postgres lane shares one catalog
+/// database across the whole run, and `topics` enforces `UNIQUE(name,
+/// tenant_id)`, so a fixed literal reused across sibling tests (or repeated
+/// runs) under the same tenant scope would collide.
+fn unique_topic(base: &str) -> String {
+    format!("{base}.{}", unique_suffix())
 }
 
 fn topic_schema() -> SchemaRef {
@@ -144,12 +193,14 @@ fn batch_of(ids: &[i64], kinds: &[&str], values: &[f64]) -> RecordBatch {
     .unwrap()
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn register_publish_subscribe_filter_end_to_end() {
+async fn register_publish_subscribe_filter_end_to_end(backend: BackendKind) {
     // SPEC-04 §15 #1 — register a topic, publish 100 batches of 10 rows,
     // subscribe with `kind = 'X'`, verify only matching batches arrive.
-    let h = build_harness().await;
-    let topic = topic_def("events.changes", None);
+    let h = harness_or_skip!(build_harness(backend));
+    let topic = topic_def(&unique_topic("events.changes"), None);
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
 
@@ -202,13 +253,15 @@ async fn register_publish_subscribe_filter_end_to_end() {
     assert_eq!(matched_offsets, expected_offsets);
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn replay_correctness_after_broker_restart() {
+async fn replay_correctness_after_broker_restart(backend: BackendKind) {
     // SPEC-04 §15 #2 — publish 100 batches, drop the broker (and the
     // subscriber), construct a fresh broker, subscribe with from_offset=0,
     // expect all 100 batches replayed from the backing table.
-    let h = build_harness().await;
-    let topic = topic_def("events.changes", None);
+    let h = harness_or_skip!(build_harness(backend));
+    let topic = topic_def(&unique_topic("events.changes"), None);
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
     for i in 0..100i64 {
@@ -252,12 +305,14 @@ async fn replay_correctness_after_broker_restart() {
     assert_eq!(replayed, 100);
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn broadcast_fan_out_to_two_subscribers() {
+async fn broadcast_fan_out_to_two_subscribers(backend: BackendKind) {
     // SPEC-04 §15 #3 — one topic, two subscriptions with different
     // predicates, mixed publishes; each subscriber sees its matching subset.
-    let h = build_harness().await;
-    let topic = topic_def("events.changes", None);
+    let h = harness_or_skip!(build_harness(backend));
+    let topic = topic_def(&unique_topic("events.changes"), None);
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
 
@@ -301,30 +356,36 @@ async fn broadcast_fan_out_to_two_subscribers() {
     assert_eq!(count_y, 50);
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn tenant_scope_isolates_topics() {
+async fn tenant_scope_isolates_topics(backend: BackendKind) {
     // SPEC-04 §15 #4 — tenant A registers t1, tenant B registers t2,
     // neither sees the other's topic via lookup_by_name; the global None
     // tenant sees both.
-    let tenant_a = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
-    let tenant_b = TenantId::from_str("01906c84-aaaa-7e10-9c4f-bbbbcccc8e9a").unwrap();
+    let tenant_a = TenantId::from_uuid(Uuid::new_v4()).unwrap();
+    let tenant_b = TenantId::from_uuid(Uuid::new_v4()).unwrap();
+    let topic_a_name = unique_topic("tenant_a.events");
+    let topic_b_name = unique_topic("tenant_b.events");
 
-    let h_a = build_harness_with_tenant(Some(tenant_a)).await;
-    let topic_a = topic_def("tenant_a.events", Some(tenant_a));
+    let h_a = harness_or_skip!(build_harness_with_tenant(backend, Some(tenant_a)));
+    let topic_a = topic_def(&topic_a_name, Some(tenant_a));
     h_a.broker.register_topic(&topic_a).await.unwrap();
     h_a.topic_repo.register_topic(&topic_a).await.unwrap();
 
-    // Different harness (different DB) for tenant B — verifies they don't
-    // accidentally share state via the in-memory broker either.
-    let h_b = build_harness_with_tenant(Some(tenant_b)).await;
-    let topic_b = topic_def("tenant_b.events", Some(tenant_b));
+    // A second harness for tenant B: on SQLite a different on-disk DB, on
+    // Postgres the same shared database — either way `lookup_by_name`'s
+    // tenant-scoped WHERE clause is the isolation boundary under test, not
+    // physical DB separation, so this proves the same property on both.
+    let h_b = harness_or_skip!(build_harness_with_tenant(backend, Some(tenant_b)));
+    let topic_b = topic_def(&topic_b_name, Some(tenant_b));
     h_b.broker.register_topic(&topic_b).await.unwrap();
     h_b.topic_repo.register_topic(&topic_b).await.unwrap();
 
     // Tenant A cannot find tenant B's topic in its own catalog.
     let cross = h_a
         .topic_repo
-        .lookup_by_name("tenant_b.events", Some(tenant_a))
+        .lookup_by_name(&topic_b_name, Some(tenant_a))
         .await
         .unwrap();
     assert!(cross.is_none());
@@ -332,18 +393,20 @@ async fn tenant_scope_isolates_topics() {
     // Tenant A finds its own.
     let own = h_a
         .topic_repo
-        .lookup_by_name("tenant_a.events", Some(tenant_a))
+        .lookup_by_name(&topic_a_name, Some(tenant_a))
         .await
         .unwrap();
     assert!(own.is_some());
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn publish_rejects_schema_mismatch() {
+async fn publish_rejects_schema_mismatch(backend: BackendKind) {
     // SPEC-04 §15 #9 — a batch whose schema does not match the topic's
     // returns BatchSchemaMismatch and writes nothing to the backing table.
-    let h = build_harness().await;
-    let topic = topic_def("events.changes", None);
+    let h = harness_or_skip!(build_harness(backend));
+    let topic = topic_def(&unique_topic("events.changes"), None);
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
 
@@ -369,13 +432,15 @@ async fn publish_rejects_schema_mismatch() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn backpressure_slows_publisher_without_dropping() {
+async fn backpressure_slows_publisher_without_dropping(backend: BackendKind) {
     // SPEC-04 §15 #10 — a slow subscriber slows the broker tail but does
     // not drop events; offsets must be contiguous and complete after
     // catch-up.
-    let h = build_harness().await;
-    let topic = topic_def("events.changes", None);
+    let h = harness_or_skip!(build_harness(backend));
+    let topic = topic_def(&unique_topic("events.changes"), None);
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
 
@@ -416,11 +481,13 @@ async fn backpressure_slows_publisher_without_dropping() {
     }
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn empty_predicate_matches_every_batch() {
+async fn empty_predicate_matches_every_batch(backend: BackendKind) {
     // Predicate-dialect smoke test: empty string ≡ match_all per SPEC-04 §3.5.
-    let h = build_harness().await;
-    let topic = topic_def("events.changes", None);
+    let h = harness_or_skip!(build_harness(backend));
+    let topic = topic_def(&unique_topic("events.changes"), None);
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
 
@@ -451,16 +518,18 @@ async fn empty_predicate_matches_every_batch() {
     }
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn session_topic_register_drop_round_trip() {
-    use jammi_db::config::JammiConfig;
-    use jammi_db::session::JammiSession;
+async fn session_topic_register_drop_round_trip(backend: BackendKind) {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = JammiConfig {
-        artifact_dir: dir.path().to_path_buf(),
-        ..Default::default()
+    let session = match jammi_test_utils::make_test_session(backend, dir.path()).await {
+        Some(s) => s,
+        None => {
+            eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+            return;
+        }
     };
-    let session = JammiSession::new(cfg).await.unwrap();
 
     // Registering a topic dual-registers the broker driver (so a later publish
     // resolves it) and the catalog (the system of record a lookup reads). The
@@ -470,7 +539,7 @@ async fn session_topic_register_drop_round_trip() {
     broker_metadata.insert("retention_seconds".to_string(), "3600".to_string());
     let topic = TopicDefinition {
         id: TopicId::new(),
-        name: "orders.changes".to_string(),
+        name: unique_topic("orders.changes"),
         schema: Arc::new(Schema::new(vec![
             Field::new("op", DataType::Utf8, false),
             Field::new("ts_ms", DataType::Int64, false),
@@ -486,12 +555,17 @@ async fn session_topic_register_drop_round_trip() {
         .unwrap();
     session.topic_repo().register_topic(&topic).await.unwrap();
 
+    // `list_topics(None)` returns every globally-scoped (`tenant_id IS NULL`)
+    // topic — on the shared Postgres lane that accumulates every OTHER
+    // sibling test's unscoped topic too, so filter to this test's own topic
+    // id before asserting.
     let topics = session.topic_repo().list_topics(None).await.unwrap();
-    assert_eq!(topics.len(), 1);
-    assert_eq!(topics[0].name, "orders.changes");
-    assert_eq!(topics[0].schema.fields().len(), 3);
+    let mine: Vec<_> = topics.iter().filter(|t| t.id == topic.id).collect();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].name, topic.name);
+    assert_eq!(mine[0].schema.fields().len(), 3);
     assert_eq!(
-        topics[0].broker_metadata.get("retention_seconds"),
+        mine[0].broker_metadata.get("retention_seconds"),
         Some(&"3600".to_string())
     );
 
@@ -503,19 +577,21 @@ async fn session_topic_register_drop_round_trip() {
         .unwrap();
     session.trigger_broker().drop_topic(topic.id).await.unwrap();
     let topics = session.topic_repo().list_topics(None).await.unwrap();
-    assert!(topics.is_empty());
+    assert!(!topics.iter().any(|t| t.id == topic.id));
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn session_drop_missing_topic_is_not_found() {
-    use jammi_db::config::JammiConfig;
-    use jammi_db::session::JammiSession;
+async fn session_drop_missing_topic_is_not_found(backend: BackendKind) {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = JammiConfig {
-        artifact_dir: dir.path().to_path_buf(),
-        ..Default::default()
+    let session = match jammi_test_utils::make_test_session(backend, dir.path()).await {
+        Some(s) => s,
+        None => {
+            eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+            return;
+        }
     };
-    let session = JammiSession::new(cfg).await.unwrap();
     let err = session
         .topic_repo()
         .drop_topic(TopicId::new(), None)
@@ -550,14 +626,16 @@ async fn predicate_rejects_unsupported_constructs() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn replay_only_drains_backing_table_without_live_tail() {
+async fn replay_only_drains_backing_table_without_live_tail(backend: BackendKind) {
     // `Subscriber::replay_only` is the CLI-shaped variant of `subscribe`
     // that returns the replay prefix as a Vec and exits without attaching
     // to the live broker tail. Publishing two batches and replaying from
     // offset 0 must return exactly those two batches, in order.
-    let h = build_harness().await;
-    let topic = topic_def("events.replay_only", None);
+    let h = harness_or_skip!(build_harness(backend));
+    let topic = topic_def(&unique_topic("events.replay_only"), None);
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
 
@@ -580,13 +658,15 @@ async fn replay_only_drains_backing_table_without_live_tail() {
     assert_eq!(drained[1].offset.value(), 1);
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn replay_only_returns_empty_when_from_offset_none() {
+async fn replay_only_returns_empty_when_from_offset_none(backend: BackendKind) {
     // Without a `from_offset` the live-tail flow has nothing to replay,
     // so the engine returns an empty Vec rather than blocking on the
     // broker tail.
-    let h = build_harness().await;
-    let topic = topic_def("events.replay_only_empty", None);
+    let h = harness_or_skip!(build_harness(backend));
+    let topic = topic_def(&unique_topic("events.replay_only_empty"), None);
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
 
@@ -606,12 +686,14 @@ async fn replay_only_returns_empty_when_from_offset_none() {
     assert!(drained.is_empty());
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn replay_only_applies_predicate_to_replay_window() {
+async fn replay_only_applies_predicate_to_replay_window(backend: BackendKind) {
     // Predicate filter on the replay path: publish two batches with
     // kind='X' / 'Y'; replay with `kind = 'X'` returns only the X batch.
-    let h = build_harness().await;
-    let topic = topic_def("events.replay_only_pred", None);
+    let h = harness_or_skip!(build_harness(backend));
+    let topic = topic_def(&unique_topic("events.replay_only_pred"), None);
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
 
@@ -636,21 +718,26 @@ async fn replay_only_applies_predicate_to_replay_window() {
     assert_eq!(drained[0].offset.value(), 0);
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn publish_tags_rows_with_supplied_tenant() {
+async fn publish_tags_rows_with_supplied_tenant(backend: BackendKind) {
     // `Publisher::publish_scoped` stamps every persisted row's `tenant_id`
     // with the `tenant` argument by binding it on the backing-table
     // transaction. We verify the stamp by replaying through
     // `Subscriber::replay_only_scoped`, whose tenant-scoped backing-table
     // query (`tenant_id = $current OR tenant_id IS NULL`) surfaces a row
-    // iff that row's tenant matches.
+    // iff that row's tenant matches. The tenant literals below are fixed
+    // (not per-test-fresh): every assertion is scoped to THIS test's own
+    // uniquely-named topic's backing table, so reusing the same tenant ids
+    // across sibling tests is safe — the topic name is the isolation axis.
     let tenant_a = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
     let tenant_b = TenantId::from_str("01906c84-aaaa-7e10-9c4f-bbbbcccc8e9a").unwrap();
 
     // The topic is declared unscoped so the publish-time tenant is the
     // only thing that distinguishes the stored rows.
-    let h = build_harness().await;
-    let topic = topic_def("events.tenant_stamp", None);
+    let h = harness_or_skip!(build_harness(backend));
+    let topic = topic_def(&unique_topic("events.tenant_stamp"), None);
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
 
@@ -746,17 +833,20 @@ async fn publish_tags_rows_with_supplied_tenant() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn subscribe_scoped_filters_published_rows_by_tenant() {
+async fn subscribe_scoped_filters_published_rows_by_tenant(backend: BackendKind) {
     // End-to-end check that `Publisher::publish_scoped(..., Some(t), ...)`
     // segregates rows across tenants from the subscriber's vantage point.
     // Three rows under {A, B, A}; tenant A's scope must see two, B's one,
-    // an unscoped scope zero.
+    // an unscoped scope zero. Fixed tenant literals are safe here — every
+    // assertion is scoped to this test's own uniquely-named topic.
     let tenant_a = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
     let tenant_b = TenantId::from_str("01906c84-aaaa-7e10-9c4f-bbbbcccc8e9a").unwrap();
 
-    let h = build_harness().await;
-    let topic = topic_def("events.scoped_filter", None);
+    let h = harness_or_skip!(build_harness(backend));
+    let topic = topic_def(&unique_topic("events.scoped_filter"), None);
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
 
@@ -836,8 +926,12 @@ async fn subscribe_scoped_filters_published_rows_by_tenant() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn publish_returns_error_on_tenant_mismatch_when_topic_is_tenant_pinned() {
+async fn publish_returns_error_on_tenant_mismatch_when_topic_is_tenant_pinned(
+    backend: BackendKind,
+) {
     // When `TopicDefinition::tenant` is `Some(A)`, the topic is pinned and
     // only an `A`-scoped publish is permitted. `Publisher::publish_scoped`
     // rejects anything else with `PublishTenantMismatch` before opening a
@@ -845,8 +939,9 @@ async fn publish_returns_error_on_tenant_mismatch_when_topic_is_tenant_pinned() 
     let tenant_a = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap();
     let tenant_b = TenantId::from_str("01906c84-aaaa-7e10-9c4f-bbbbcccc8e9a").unwrap();
 
-    let h = build_harness_with_tenant(Some(tenant_a)).await;
-    let topic = topic_def("events.pinned", Some(tenant_a));
+    let h = harness_or_skip!(build_harness_with_tenant(backend, Some(tenant_a)));
+    let topic_name = unique_topic("events.pinned");
+    let topic = topic_def(&topic_name, Some(tenant_a));
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
 
@@ -862,7 +957,7 @@ async fn publish_returns_error_on_tenant_mismatch_when_topic_is_tenant_pinned() 
             topic_tenant,
             publish_tenant,
         } => {
-            assert_eq!(name, "events.pinned");
+            assert_eq!(name, &topic_name);
             assert_eq!(topic_tenant, Some(tenant_a));
             assert_eq!(publish_tenant, Some(tenant_b));
         }
@@ -905,8 +1000,10 @@ async fn publish_returns_error_on_tenant_mismatch_when_topic_is_tenant_pinned() 
         .expect("publish under the topic's own tenant must succeed");
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn list_consumers_returns_each_subscribers_last_delivered_offset() {
+async fn list_consumers_returns_each_subscribers_last_delivered_offset(backend: BackendKind) {
     // SPEC-04 backup/restore hook: `TriggerBroker::list_consumers` returns one
     // `ConsumerOffsetSnapshot` per live subscription, carrying the broker's
     // last-delivered stream sequence. The capture is what a downstream
@@ -918,8 +1015,8 @@ async fn list_consumers_returns_each_subscribers_last_delivered_offset() {
     // `list_consumers` and verify both names plus a matching last-delivered
     // offset come back. The in-memory broker has no ack model, so
     // `last_ack_stream_sequence == last_delivered_stream_sequence` by design.
-    let h = build_harness().await;
-    let topic = topic_def("events.list_consumers", None);
+    let h = harness_or_skip!(build_harness(backend));
+    let topic = topic_def(&unique_topic("events.list_consumers"), None);
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
 
@@ -996,35 +1093,53 @@ async fn list_consumers_returns_each_subscribers_last_delivered_offset() {
     assert_eq!(after_drop[0].consumer_name, consumer_b);
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn session_with_broker_swallows_fan_out_failure() {
+async fn session_with_broker_swallows_fan_out_failure(backend: BackendKind) {
     // Verifies the session-level broker injection point + the publisher's
     // transactional-outbox contract: a caller-built `InMemoryBroker` armed
     // with `trigger_failure_for_next_publish` is wired into the session via
-    // `JammiSession::with_broker`. When the publisher fans out, the broker
-    // returns its configured driver error; the publisher logs at WARN and
-    // still returns Ok because the backing table commit is the authoritative
-    // log. Subscribers see the row on replay. The next publish succeeds
-    // because the failure was one-shot.
+    // `JammiSession::with_backend_and_broker`. When the publisher fans out,
+    // the broker returns its configured driver error; the publisher logs at
+    // WARN and still returns Ok because the backing table commit is the
+    // authoritative log. Subscribers see the row on replay. The next publish
+    // succeeds because the failure was one-shot.
     //
     // Underwrites a downstream consumer's "publish failure does not fail the
     // check" invariant by giving downstream tests a deterministic failure
     // injection point.
 
     let dir = tempfile::tempdir().unwrap();
-    let config = jammi_db::config::JammiConfig {
-        artifact_dir: dir.path().to_path_buf(),
-        ..Default::default()
+    let backend_impl = match backend {
+        BackendKind::Sqlite => {
+            let sqlite = SqliteBackend::open(&dir.path().join("catalog.db"))
+                .await
+                .unwrap();
+            BackendImpl::Sqlite(sqlite)
+        }
+        BackendKind::Postgres => {
+            let Some(url) = jammi_test_utils::pg_url_for_tests() else {
+                eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+                return;
+            };
+            let pg = PostgresBackend::open_with_options(&url, 8, None)
+                .await
+                .unwrap();
+            BackendImpl::Postgres(pg)
+        }
     };
+    let config = jammi_test_utils::test_config(dir.path());
     let broker = Arc::new(InMemoryBroker::new());
-    let session = jammi_db::session::JammiSession::with_broker(
+    let session = jammi_db::session::JammiSession::with_backend_and_broker(
         config,
+        backend_impl,
         Arc::clone(&broker) as Arc<dyn TriggerBroker>,
     )
     .await
     .expect("session with broker");
 
-    let topic = topic_def("test.session_inject_failure", None);
+    let topic = topic_def(&unique_topic("test.session_inject_failure"), None);
     session
         .trigger_broker()
         .register_topic(&topic)
@@ -1063,11 +1178,13 @@ async fn session_with_broker_swallows_fan_out_failure() {
         .expect("subsequent publish succeeds after the one-shot failure clears");
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn crash_mid_publish_replays_committed_offsets_with_no_loss() {
+async fn crash_mid_publish_replays_committed_offsets_with_no_loss(backend: BackendKind) {
     // Track T1 — crash-mid-publish replay (hermetic, in-memory).
     //
-    // Publish N batches against a real SQLite backing table, injecting a
+    // Publish N batches against a real backing table, injecting a
     // post-commit broker fan-out failure on one of them via
     // `InMemoryBroker::trigger_failure_for_next_publish`. The publisher's
     // transactional-outbox contract commits the augmented event BEFORE the
@@ -1077,8 +1194,8 @@ async fn crash_mid_publish_replays_committed_offsets_with_no_loss() {
     // fresh empty broker + subscriber, and replay from offset 0. The full
     // multiset `{0..N-1}` must come back, contiguous — no loss, even at the
     // offset whose live fan-out failed.
-    let (h, in_mem) = build_harness_with_in_memory_broker().await;
-    let topic = topic_def("events.crash_mid_publish", None);
+    let (h, in_mem) = harness_or_skip!(build_harness_with_in_memory_broker(backend));
+    let topic = topic_def(&unique_topic("events.crash_mid_publish"), None);
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
 
@@ -1132,8 +1249,10 @@ async fn crash_mid_publish_replays_committed_offsets_with_no_loss() {
     }
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn live_tail_resumes_with_no_loss_after_post_commit_fan_out_failure() {
+async fn live_tail_resumes_with_no_loss_after_post_commit_fan_out_failure(backend: BackendKind) {
     // Track T1 — the in-memory analogue of the JetStream consumer-recreate
     // resume test. A late subscriber attaches at `from_offset` AFTER a
     // post-commit fan-out failure has skewed the broker's view from the
@@ -1141,8 +1260,8 @@ async fn live_tail_resumes_with_no_loss_after_post_commit_fan_out_failure() {
     // Every committed offset in `[from..max]` must be delivered with no skip,
     // proving the replay/live seam is keyed on the engine `_offset` and not on
     // any broker-native sequence.
-    let (h, in_mem) = build_harness_with_in_memory_broker().await;
-    let topic = topic_def("events.resume_after_failure", None);
+    let (h, in_mem) = harness_or_skip!(build_harness_with_in_memory_broker(backend));
+    let topic = topic_def(&unique_topic("events.resume_after_failure"), None);
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
 
@@ -1208,8 +1327,10 @@ async fn live_tail_resumes_with_no_loss_after_post_commit_fan_out_failure() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn at_least_once_no_skip_property_over_randomized_states() {
+async fn at_least_once_no_skip_property_over_randomized_states(backend: BackendKind) {
     // Track T1 — at-least-once / no-skip property test.
     //
     // Over randomized publish counts, subscriber attach points, and an
@@ -1240,6 +1361,10 @@ async fn at_least_once_no_skip_property_over_randomized_states() {
     }
 
     let mut rng = Lcg(0x1234_5678_9abc_def0);
+    // A run-unique prefix: the LCG seed is fixed, so `case` alone repeats the
+    // same 24 topic names every run — on the shared Postgres lane, a repeated
+    // suite run would collide with the prior run's still-registered topics.
+    let run_suffix = unique_suffix();
     // Enough randomized cases to cover the interesting attach/fail orderings
     // without making the hermetic suite slow.
     for case in 0..24u64 {
@@ -1251,8 +1376,14 @@ async fn at_least_once_no_skip_property_over_randomized_states() {
         // covering the skewed offset.
         let from = rng.next_in(fail_at + 1);
 
-        let (h, in_mem) = build_harness_with_in_memory_broker().await;
-        let topic = topic_def(&format!("events.prop_case_{case}"), None);
+        let (h, in_mem) = match build_harness_with_in_memory_broker(backend).await {
+            Some(h) => h,
+            None => {
+                eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+                return;
+            }
+        };
+        let topic = topic_def(&format!("events.prop_case_{case}.{run_suffix}"), None);
         h.broker.register_topic(&topic).await.unwrap();
         h.topic_repo.register_topic(&topic).await.unwrap();
 

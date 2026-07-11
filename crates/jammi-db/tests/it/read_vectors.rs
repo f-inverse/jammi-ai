@@ -8,14 +8,30 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::result_repo::CreateResultTableParams;
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::error::JammiError;
 use jammi_db::model_task::ModelTask;
 use jammi_db::storage::{JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl};
 use jammi_db::store::schema::embedding_table_schema;
-use jammi_test_utils::make_test_session;
+use jammi_test_utils::{make_test_session, unique_suffix};
 use tempfile::tempdir;
+use test_case::test_case;
+
+/// Fetch a backend-parameterized session, skipping the test (with a warning,
+/// never `#[ignore]`) when the Postgres arm has no `JAMMI_TEST_PG_URL`.
+macro_rules! session_or_skip {
+    ($backend:expr, $dir:expr) => {
+        match make_test_session($backend, $dir.path()).await {
+            Some(s) => s,
+            None => {
+                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
+                return;
+            }
+        }
+    };
+}
 
 /// Build the four input rows used by both happy and negative paths.
 fn input_vectors() -> Vec<Vec<f32>> {
@@ -36,12 +52,12 @@ fn fixed_size_list_from(rows: &[Vec<f32>], dim: i32) -> FixedSizeListArray {
     FixedSizeListArray::try_new(field, dim, values, None).unwrap()
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn read_vectors_returns_input_rows_byte_for_byte() {
+async fn read_vectors_returns_input_rows_byte_for_byte(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let session = make_test_session(jammi_db::catalog::backend::BackendKind::Sqlite, dir.path())
-        .await
-        .expect("sqlite session");
+    let session = session_or_skip!(backend, dir);
 
     let dim = 4_i32;
     let schema = embedding_table_schema(dim as usize);
@@ -73,7 +89,8 @@ async fn read_vectors_returns_input_rows_byte_for_byte() {
     writer.write_batch(&batch).await.unwrap();
     writer.close().await.unwrap();
 
-    let table_name = "embeddings_unit";
+    let table_name = format!("embeddings_unit_{}", unique_suffix());
+    let table_name = table_name.as_str();
     session
         .catalog()
         .create_result_table(CreateResultTableParams {
@@ -113,17 +130,17 @@ async fn read_vectors_returns_input_rows_byte_for_byte() {
     }
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn read_vectors_surfaces_typed_schema_error_on_wrong_column_shape() {
+async fn read_vectors_surfaces_typed_schema_error_on_wrong_column_shape(backend: BackendKind) {
     // The parquet at the registered table's URL carries a `vector` column
     // typed Utf8, not FixedSizeList<Float32>. `read_vectors` must surface a
     // `JammiError::Schema` with the actual shape populated — proves callers
     // see a typed signal instead of the panic-on-downcast the OSS path used
     // to emit when consumers reached straight at the parquet.
     let dir = tempdir().unwrap();
-    let session = make_test_session(jammi_db::catalog::backend::BackendKind::Sqlite, dir.path())
-        .await
-        .expect("sqlite session");
+    let session = session_or_skip!(backend, dir);
 
     let wrong_schema = Arc::new(Schema::new(vec![
         Field::new("_row_id", DataType::Utf8, false),
@@ -149,7 +166,8 @@ async fn read_vectors_surfaces_typed_schema_error_on_wrong_column_shape() {
     writer.write_batch(&batch).await.unwrap();
     writer.close().await.unwrap();
 
-    let table_name = "wrong_shape";
+    let table_name = format!("wrong_shape_{}", unique_suffix());
+    let table_name = table_name.as_str();
     session
         .catalog()
         .create_result_table(CreateResultTableParams {

@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use arrow::array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
+use jammi_db::catalog::backend::BackendKind;
+use jammi_db::catalog::backend_postgres::PostgresBackend;
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::catalog::status::ResultTableStatus;
@@ -31,14 +33,43 @@ use jammi_db::store::manifest::{
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{ResultStore, ResultTableInfo};
 use tempfile::tempdir;
+use test_case::test_case;
 
 const DIMS: usize = 4;
 
-async fn fresh_catalog(dir: &std::path::Path) -> Arc<Catalog> {
-    let backend = SqliteBackend::open(&dir.join("catalog.db")).await.unwrap();
-    let backend = jammi_db::catalog::backend::BackendImpl::Sqlite(backend);
-    backend.migrate().await.unwrap();
-    Arc::new(Catalog::from_backend(backend))
+/// Build a catalog on `backend`, running migrations. Returns `None` for the
+/// Postgres arm when `JAMMI_TEST_PG_URL` is unset, so callers skip (never
+/// `#[ignore]`) exactly like [`jammi_test_utils::make_test_session`].
+async fn fresh_catalog(backend: BackendKind, dir: &std::path::Path) -> Option<Arc<Catalog>> {
+    let backend_impl = match backend {
+        BackendKind::Sqlite => {
+            let b = SqliteBackend::open(&dir.join("catalog.db")).await.unwrap();
+            jammi_db::catalog::backend::BackendImpl::Sqlite(b)
+        }
+        BackendKind::Postgres => {
+            let url = jammi_test_utils::pg_url_for_tests()?;
+            let pg = PostgresBackend::open_with_options(&url, 8, None)
+                .await
+                .unwrap();
+            jammi_db::catalog::backend::BackendImpl::Postgres(pg)
+        }
+    };
+    backend_impl.migrate().await.unwrap();
+    Some(Arc::new(Catalog::from_backend(backend_impl)))
+}
+
+/// Fetch a backend-parameterized catalog, skipping the test (with a warning)
+/// when the Postgres arm has no `JAMMI_TEST_PG_URL`.
+macro_rules! fresh_catalog_or_skip {
+    ($backend:expr, $dir:expr) => {
+        match fresh_catalog($backend, $dir.path()).await {
+            Some(c) => c,
+            None => {
+                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
+                return;
+            }
+        }
+    };
 }
 
 fn store(dir: &std::path::Path, catalog: Arc<Catalog>) -> ResultStore {
@@ -143,10 +174,12 @@ async fn materialize(
     (record, manifest.definition_hash)
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn verdict_match_for_an_untouched_table() {
+async fn verdict_match_for_an_untouched_table(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -168,10 +201,12 @@ async fn verdict_match_for_an_untouched_table() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn verdict_mismatch_against_a_wrong_expected_hash() {
+async fn verdict_mismatch_against_a_wrong_expected_hash(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -192,10 +227,12 @@ async fn verdict_mismatch_against_a_wrong_expected_hash() {
     }
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn verdict_mismatch_when_the_data_is_tampered() {
+async fn verdict_mismatch_when_the_data_is_tampered(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -219,10 +256,12 @@ async fn verdict_mismatch_when_the_data_is_tampered() {
     ));
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn verdict_match_with_unpinned_inputs() {
+async fn verdict_match_with_unpinned_inputs(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -244,10 +283,12 @@ async fn verdict_match_with_unpinned_inputs() {
     }
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn verdict_missing_manifest_for_a_pre_contract_table() {
+async fn verdict_missing_manifest_for_a_pre_contract_table(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
 
     // A pre-contract table: bytes + a `ready` catalog row, but NO manifest
@@ -276,10 +317,12 @@ async fn verdict_missing_manifest_for_a_pre_contract_table() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn the_funnel_persists_sidecar_and_summary_columns() {
+async fn the_funnel_persists_sidecar_and_summary_columns(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -307,10 +350,12 @@ async fn the_funnel_persists_sidecar_and_summary_columns() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn recovery_reaps_a_torn_manifestless_building_row() {
+async fn recovery_reaps_a_torn_manifestless_building_row(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
 
     // Construct the torn state the crash window leaves: a `building` row whose
@@ -347,10 +392,12 @@ async fn recovery_reaps_a_torn_manifestless_building_row() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn recovery_promotes_a_building_row_whose_manifest_landed() {
+async fn recovery_promotes_a_building_row_whose_manifest_landed(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
 
     // A `building` row whose Parquet AND manifest sidecar both landed, but whose
@@ -390,10 +437,12 @@ async fn recovery_promotes_a_building_row_whose_manifest_landed() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn recovery_reaps_a_post_contract_ready_table_whose_sidecar_vanished() {
+async fn recovery_reaps_a_post_contract_ready_table_whose_sidecar_vanished(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 

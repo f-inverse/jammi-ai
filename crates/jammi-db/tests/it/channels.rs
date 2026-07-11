@@ -1,21 +1,36 @@
 use arrow::datatypes::DataType;
+use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::channel_repo::{
     ChannelCatalogError, ChannelColumn, ChannelColumnType, ChannelSpec,
 };
-use jammi_db::catalog::Catalog;
 use jammi_db::error::JammiError;
 use jammi_db::ChannelId;
+use jammi_test_utils::{make_test_session, unique_suffix};
 use tempfile::tempdir;
+use test_case::test_case;
 
-async fn open_catalog() -> (tempfile::TempDir, Catalog) {
-    let dir = tempdir().unwrap();
-    let catalog = Catalog::open(dir.path()).await.unwrap();
-    (dir, catalog)
+/// Open a session-backed catalog for `backend`, skipping (with a warning,
+/// never `#[ignore]`) when the Postgres arm is selected but
+/// `JAMMI_TEST_PG_URL` is unset.
+macro_rules! catalog_or_skip {
+    ($backend:expr, $dir:expr) => {
+        match make_test_session($backend, $dir.path()).await {
+            Some(s) => s,
+            None => {
+                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
+                return;
+            }
+        }
+    };
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn migration_006_seeds_vector_and_inference_with_exact_columns() {
-    let (_dir, catalog) = open_catalog().await;
+async fn migration_006_seeds_vector_and_inference_with_exact_columns(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = catalog_or_skip!(backend, dir);
+    let catalog = session.catalog();
     let channels = catalog.channels().list().await.unwrap();
 
     let vector = channels
@@ -40,10 +55,14 @@ async fn migration_006_seeds_vector_and_inference_with_exact_columns() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn declared_columns_appear_in_merged_schema() {
-    let (_dir, catalog) = open_catalog().await;
-    let scored_by = ChannelId::new("scored_by").unwrap();
+async fn declared_columns_appear_in_merged_schema(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = catalog_or_skip!(backend, dir);
+    let catalog = session.catalog();
+    let scored_by = ChannelId::new(format!("scored_by_{}", unique_suffix())).unwrap();
     catalog
         .channels()
         .register(&ChannelSpec {
@@ -82,9 +101,13 @@ async fn declared_columns_appear_in_merged_schema() {
     }
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn channel_column_order_is_stable_across_catalog_reads() {
-    let (_dir, catalog) = open_catalog().await;
+async fn channel_column_order_is_stable_across_catalog_reads(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = catalog_or_skip!(backend, dir);
+    let catalog = session.catalog();
     let first = catalog
         .channels()
         .get(&ChannelId::new("inference").unwrap())
@@ -102,10 +125,14 @@ async fn channel_column_order_is_stable_across_catalog_reads() {
     assert_eq!(first_names, second_names);
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn add_columns_then_merged_schema_includes_new_column() {
-    let (_dir, catalog) = open_catalog().await;
-    let id = ChannelId::new("scored_by").unwrap();
+async fn add_columns_then_merged_schema_includes_new_column(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = catalog_or_skip!(backend, dir);
+    let catalog = session.catalog();
+    let id = ChannelId::new(format!("scored_by_{}", unique_suffix())).unwrap();
     catalog
         .channels()
         .register(&ChannelSpec {
@@ -137,11 +164,16 @@ async fn add_columns_then_merged_schema_includes_new_column() {
 
 /// SPEC-01 §9 — `register` must reject a channel id that's already in the
 /// catalog with `ChannelCatalog(AlreadyExists(...))`.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn register_rejects_duplicate_channel_id() {
-    let (_dir, catalog) = open_catalog().await;
+async fn register_rejects_duplicate_channel_id(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = catalog_or_skip!(backend, dir);
+    let catalog = session.catalog();
+    let channel_id = format!("scored_by_{}", unique_suffix());
     let spec = ChannelSpec {
-        id: ChannelId::new("scored_by").unwrap(),
+        id: ChannelId::new(channel_id.clone()).unwrap(),
         priority: 3,
         columns: vec![ChannelColumn {
             name: "ranker".into(),
@@ -153,8 +185,8 @@ async fn register_rejects_duplicate_channel_id() {
     let err = catalog.channels().register(&spec).await.unwrap_err();
     match err {
         JammiError::ChannelCatalog(ChannelCatalogError::AlreadyExists(channel)) => assert_eq!(
-            channel, "scored_by",
-            "expected 'already exists' for 'scored_by'"
+            channel, channel_id,
+            "expected 'already exists' for '{channel_id}'"
         ),
         other => panic!("expected ChannelCatalog(AlreadyExists), got {other:?}"),
     }
@@ -164,10 +196,14 @@ async fn register_rejects_duplicate_channel_id() {
 /// column with a different `ChannelColumnType`. The production message
 /// names both the column and the would-be new type so a Python caller
 /// learning the API can see exactly what failed.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn add_columns_rejects_int32_retype_of_utf8_column() {
-    let (_dir, catalog) = open_catalog().await;
-    let id = ChannelId::new("scored_by").unwrap();
+async fn add_columns_rejects_int32_retype_of_utf8_column(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = catalog_or_skip!(backend, dir);
+    let catalog = session.catalog();
+    let id = ChannelId::new(format!("scored_by_{}", unique_suffix())).unwrap();
     catalog
         .channels()
         .register(&ChannelSpec {

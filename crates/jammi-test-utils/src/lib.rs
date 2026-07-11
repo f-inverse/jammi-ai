@@ -1,6 +1,7 @@
 //! Shared test helpers for jammi-db and jammi-ai integration tests.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use jammi_db::catalog::backend::{BackendImpl, BackendKind};
 use jammi_db::catalog::backend_postgres::PostgresBackend;
@@ -50,6 +51,28 @@ pub async fn make_test_session(kind: BackendKind, artifact_dir: &Path) -> Option
             )
         }
     }
+}
+
+/// Backend-unique id suffix for any tenant id / source id / table name /
+/// channel name a parameterized integration test creates.
+///
+/// The Postgres lane runs the whole matrix against ONE shared database (see
+/// `make_test_session`), so two tests — or the two `BackendKind` arms of the
+/// same test — must never write under the same catalog identifier: a fixed
+/// literal collides with a sibling test's rows (or a prior run's), producing
+/// cumulative-row-count and "already exists" failures that are a harness bug,
+/// not a product regression. SQLite tests get a fresh on-disk catalog per
+/// `tempdir()` and don't strictly need this, but calling it unconditionally
+/// keeps one code path for both backends instead of a Postgres-only special
+/// case.
+pub fn unique_suffix() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let epoch_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{epoch_ns:x}_{n:x}")
 }
 
 /// Workspace root — two levels up from any crate in `crates/<name>/`.

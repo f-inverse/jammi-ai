@@ -1231,12 +1231,64 @@ impl ModelBackend for CandleBackend {
                 jammi_encoders::compute_precision_to_dtype(compute_precision)
             }
             jammi_numerics::ComputePrecision::BF16 => {
-                return Err(JammiError::Model {
-                    model_id: resolved.model_id.0.clone(),
-                    message: "bf16 inference requires a runtime compute-capability gate — not \
-                              yet supported; use f16 or f32"
-                        .into(),
-                })
+                // bf16 is a GPU-tier precision: its tensor-core kernels are an
+                // Ampere (sm_80) innovation, so it is admitted only on a CUDA
+                // device whose compute capability clears the floor declared by
+                // `ComputePrecision::min_cuda_capability`. The capability query
+                // lives on real candle/cudarc CUDA types, so the whole
+                // acquisition is cuda-gated; the allow/reject *decision* is the
+                // pure `is_supported_on_cuda` predicate, unit-tested on CPU.
+                #[cfg(feature = "cuda")]
+                {
+                    match &device {
+                        Device::Cuda(_) => {
+                            let cuda = device.as_cuda_device().map_err(|e| JammiError::Model {
+                                model_id: resolved.model_id.0.clone(),
+                                message: format!("bf16 gate: expected a CUDA device: {e}"),
+                            })?;
+                            let (major, minor) = cuda
+                                .cuda_stream()
+                                .context()
+                                .compute_capability()
+                                .map_err(|e| JammiError::Model {
+                                    model_id: resolved.model_id.0.clone(),
+                                    message: format!(
+                                        "bf16 gate: could not query CUDA compute capability: {e}"
+                                    ),
+                                })?;
+                            if compute_precision.is_supported_on_cuda(major, minor) {
+                                jammi_encoders::compute_precision_to_dtype(compute_precision)
+                            } else {
+                                return Err(JammiError::Model {
+                                    model_id: resolved.model_id.0.clone(),
+                                    message: format!(
+                                        "bf16 inference requires CUDA compute capability >= 8.0 \
+                                         (Ampere+); device is sm_{major}{minor}. Use f16 or f32."
+                                    ),
+                                });
+                            }
+                        }
+                        _ => {
+                            return Err(JammiError::Model {
+                                model_id: resolved.model_id.0.clone(),
+                                message: "bf16 inference requires a CUDA device with compute \
+                                          capability >= 8.0 (Ampere+); the resolved device is \
+                                          non-CUDA. Use f16 or f32."
+                                    .into(),
+                            });
+                        }
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    return Err(JammiError::Model {
+                        model_id: resolved.model_id.0.clone(),
+                        message: "bf16 inference requires a CUDA device with compute capability \
+                                  >= 8.0 (Ampere+); this build has no CUDA support. Use f16 or \
+                                  f32."
+                            .into(),
+                    });
+                }
             }
         };
 

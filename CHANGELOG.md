@@ -6,6 +6,36 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-07-11
+
+Catalog/store SQLite⇄Postgres parity. The metadata layer targets both backends
+from shared SQL, but the integration suite ran mostly on SQLite, so
+Postgres-strictness violations could ship latent. This release fixes the
+outstanding ones and stands up a Postgres CI matrix so future ones fail in-tree
+instead of at deploy time. No behavioral change to embedded/SQLite deployments;
+no schema migration.
+
+### Fixed
+- **Embedding-table resolution on Postgres (`jammi-db`).** `resolve_embedding_table`
+  tie-broke on SQLite's `rowid` pseudo-column, which Postgres lacks, so the query
+  hard-errored at plan time on a Postgres-backed catalog. It now orders by a
+  portable, app-supplied full-resolution `created_at` (new `now_sortable()`
+  primitive) with a deterministic table-name tiebreak — correct and identical on
+  both backends.
+- **Cache-reuse false miss (`jammi-db`).** When several `ready` result tables
+  shared a `(definition, inputs)` key and the first-selected candidate's artifact
+  had been reaped, `probe_cache_record` returned a false miss and forced a needless
+  recompute. It now iterates same-key candidates newest-first and reuses the first
+  whose artifact is extant.
+
+### Added
+- **Postgres CI matrix.** The catalog/store/mutable integration suite runs on both
+  SQLite and Postgres (18 modules), gated by a required `test-pg` lane — closing the
+  gap that let backend-strictness bugs ship SQLite-green.
+- **SQLite-ism syntactic tripwire (`ci`).** A toolchain-free CI guard fails on
+  hand-written backend-specific SQL tokens (`rowid`, `AUTOINCREMENT`, `PRAGMA`,
+  `strftime(`, `glob(`, `ctid`) — a cheap first-pass complement to the matrix.
+
 ## [0.42.0] - 2026-07-11
 
 The precision/quantization line: two orthogonal precision axes land — vector

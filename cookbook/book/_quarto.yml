@@ -65,6 +65,7 @@ book:
     - part: "Vector storage precision"
       chapters:
         - chapters/22-precision/precision.qmd
+        - chapters/22-precision/binary-precision.qmd
   appendices:
     - chapters/api-reference.qmd
 

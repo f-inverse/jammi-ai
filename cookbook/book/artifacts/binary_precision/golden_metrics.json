@@ -1,0 +1,22 @@
+{
+  "f32_usearch_bytes": {"value": 4834992, "tol": 250000},
+  "binary_usearch_bytes": {"value": 370992, "tol": 25000},
+  "binary_rawf32_bytes": {"value": 4608000, "tol": 16},
+  "binary_vs_f32_usearch_ratio": {"value": 0.0767, "tol": 0.008},
+  "hamming_no_rescore_at_1": {"value": 0.3667, "tol": 0.02},
+  "hamming_no_rescore_at_10": {"value": 0.43, "tol": 0.02},
+  "recall": {
+    "f32_at_1": {"floor": 0.98, "margin": 0.02, "measured": 1.0},
+    "f32_at_10": {"floor": 0.98, "margin": 0.02, "measured": 1.0},
+    "binary_default_at_1": {"floor": 0.9167, "margin": 0.05, "measured": 0.9667},
+    "binary_default_at_10": {"floor": 0.9783, "margin": 0.02, "measured": 0.9983},
+    "oversample1_at_1": {"floor": 0.27, "margin": 0.08, "measured": 0.35},
+    "oversample4_at_1": {"floor": 0.5533, "margin": 0.08, "measured": 0.6333},
+    "oversample8_at_1": {"floor": 0.68, "margin": 0.07, "measured": 0.75},
+    "oversample16_at_1": {"floor": 0.8567, "margin": 0.06, "measured": 0.9167},
+    "oversample32_at_1": {"floor": 0.9167, "margin": 0.05, "measured": 0.9667},
+    "oversample1_at_10": {"floor": 0.3717, "margin": 0.06, "measured": 0.4317},
+    "oversample32_at_10": {"floor": 0.9783, "margin": 0.02, "measured": 0.9983},
+    "per_request_override32_on_table_os1_at_1": {"floor": 0.9167, "margin": 0.05, "measured": 0.9667}
+  }
+}

@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float32Array, StringArray};
@@ -16,7 +15,7 @@ use jammi_db::storage::{
     JammiObjectStore, ObjectParquetWriter, StorageRegistry, StorageUrl,
 };
 use jammi_db::store::ResultStore;
-use jammi_test_utils::make_test_session;
+use jammi_test_utils::{make_test_session, unique_suffix};
 use tempfile::tempdir;
 use test_case::test_case;
 
@@ -862,18 +861,6 @@ async fn recovery_promotes_valid_parquet_to_ready() {
 }
 
 // ─── typed-null catalog bind (dimensions: Option<i32> -> INTEGER) ───────────
-
-/// Backend-unique id suffix, so the Postgres lane (one shared database
-/// across the whole test run) never collides with a sibling test's rows.
-fn unique_suffix() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let epoch_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{epoch_ns:x}_{n:x}")
-}
 
 /// A deterministic, strictly-increasing `now_sortable`-format `created_at`
 /// for tests that assert "newest wins" — `now_sortable` is wall-clock

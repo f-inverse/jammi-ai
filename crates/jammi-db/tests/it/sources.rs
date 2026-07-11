@@ -1,21 +1,69 @@
 use crate::common;
 
+use jammi_db::catalog::backend::{BackendImpl, BackendKind};
+use jammi_db::catalog::backend_postgres::PostgresBackend;
+use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::{
     session::JammiSession,
     source::{FileFormat, SourceConnection, SourceType},
 };
+use jammi_test_utils::{make_test_session, unique_suffix};
 use tempfile::tempdir;
+use test_case::test_case;
 
+/// Fetch a backend-parameterized session, skipping the test (with a warning,
+/// never `#[ignore]`) when the Postgres arm has no `JAMMI_TEST_PG_URL`.
+macro_rules! session_or_skip {
+    ($backend:expr, $dir:expr) => {
+        match make_test_session($backend, $dir.path()).await {
+            Some(s) => s,
+            None => {
+                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
+                return;
+            }
+        }
+    };
+}
+
+/// Build a raw catalog backend on `backend`, without wrapping it in a
+/// session — used only by the one test that needs a caller-customized
+/// [`jammi_db::config::JammiConfig`] (a non-default `engine.batch_size`)
+/// alongside the backend choice.
+async fn build_backend(backend: BackendKind, dir: &std::path::Path) -> Option<BackendImpl> {
+    match backend {
+        BackendKind::Sqlite => {
+            let b = SqliteBackend::open(&dir.join("catalog.db")).await.unwrap();
+            Some(BackendImpl::Sqlite(b))
+        }
+        BackendKind::Postgres => {
+            let url = jammi_test_utils::pg_url_for_tests()?;
+            let pg = PostgresBackend::open_with_options(&url, 8, None)
+                .await
+                .unwrap();
+            Some(BackendImpl::Postgres(pg))
+        }
+    }
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn register_and_query_multiple_formats() {
+async fn register_and_query_multiple_formats(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let config = common::test_config(dir.path());
-    let session = JammiSession::new(config).await.unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    // Backend-unique source ids: the Postgres lane shares one `sources` table
+    // across the whole test run, and `add_source` hard-errors on a duplicate
+    // `source_id` — a fixed literal would collide with a sibling test (or a
+    // prior run) that registered the same name.
+    let suffix = unique_suffix();
+    let patents_id = format!("patents_{suffix}");
+    let scores_id = format!("scores_{suffix}");
 
     // Parquet
     session
         .add_source(
-            "patents",
+            &patents_id,
             SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
@@ -27,7 +75,9 @@ async fn register_and_query_multiple_formats() {
         .unwrap();
 
     let results = session
-        .sql("SELECT id, title FROM patents.public.patents LIMIT 5")
+        .sql(&format!(
+            "SELECT id, title FROM {patents_id}.public.patents LIMIT 5"
+        ))
         .await
         .unwrap();
     assert!(!results.is_empty());
@@ -38,7 +88,7 @@ async fn register_and_query_multiple_formats() {
     // CSV
     session
         .add_source(
-            "scores",
+            &scores_id,
             SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("scores.csv")),
@@ -50,21 +100,25 @@ async fn register_and_query_multiple_formats() {
         .unwrap();
 
     let results = session
-        .sql("SELECT name, score FROM scores.public.scores WHERE score > 0.6")
+        .sql(&format!(
+            "SELECT name, score FROM {scores_id}.public.scores WHERE score > 0.6"
+        ))
         .await
         .unwrap();
     assert_eq!(results[0].num_rows(), 2);
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn query_with_filter_and_order() {
+async fn query_with_filter_and_order(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let config = common::test_config(dir.path());
-    let session = JammiSession::new(config).await.unwrap();
+    let session = session_or_skip!(backend, dir);
+    let patents_id = format!("patents_{}", unique_suffix());
 
     session
         .add_source(
-            "patents",
+            &patents_id,
             SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
@@ -76,7 +130,9 @@ async fn query_with_filter_and_order() {
         .unwrap();
 
     let results = session
-        .sql("SELECT title, year FROM patents.public.patents WHERE year >= 2022 ORDER BY year DESC")
+        .sql(&format!(
+            "SELECT title, year FROM {patents_id}.public.patents WHERE year >= 2022 ORDER BY year DESC"
+        ))
         .await
         .unwrap();
 
@@ -96,16 +152,18 @@ async fn query_with_filter_and_order() {
     }
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn source_persists_across_sessions() {
+async fn source_persists_across_sessions(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let config = common::test_config(dir.path());
+    let persist_id = format!("persist_{}", unique_suffix());
 
     {
-        let session = JammiSession::new(config.clone()).await.unwrap();
+        let session = session_or_skip!(backend, dir);
         session
             .add_source(
-                "persist",
+                &persist_id,
                 SourceType::File,
                 SourceConnection {
                     url: Some(common::fixture_url("patents.parquet")),
@@ -118,21 +176,26 @@ async fn source_persists_across_sessions() {
     }
 
     {
-        let session = JammiSession::new(config).await.unwrap();
+        let session = session_or_skip!(backend, dir);
         let sources = session.catalog().list_sources().await.unwrap();
-        assert!(sources.iter().any(|s| s.source_id == "persist"));
+        assert!(sources.iter().any(|s| s.source_id == persist_id));
     }
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn source_crud_list_and_remove() {
+async fn source_crud_list_and_remove(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let config = common::test_config(dir.path());
-    let session = JammiSession::new(config).await.unwrap();
+    let session = session_or_skip!(backend, dir);
+
+    let suffix = unique_suffix();
+    let src_a = format!("src_a_{suffix}");
+    let src_b = format!("src_b_{suffix}");
 
     session
         .add_source(
-            "src_a",
+            &src_a,
             SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
@@ -145,7 +208,7 @@ async fn source_crud_list_and_remove() {
 
     session
         .add_source(
-            "src_b",
+            &src_b,
             SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("scores.csv")),
@@ -158,36 +221,50 @@ async fn source_crud_list_and_remove() {
 
     let sources = session.catalog().list_sources().await.unwrap();
     let ids: Vec<&str> = sources.iter().map(|s| s.source_id.as_str()).collect();
-    assert!(ids.contains(&"src_a"));
-    assert!(ids.contains(&"src_b"));
+    assert!(ids.contains(&src_a.as_str()));
+    assert!(ids.contains(&src_b.as_str()));
 
-    session.remove_source("src_a").await.unwrap();
+    session.remove_source(&src_a).await.unwrap();
     let sources = session.catalog().list_sources().await.unwrap();
-    assert!(!sources.iter().any(|s| s.source_id == "src_a"));
-    assert!(sources.iter().any(|s| s.source_id == "src_b"));
+    assert!(!sources.iter().any(|s| s.source_id == src_a));
+    assert!(sources.iter().any(|s| s.source_id == src_b));
 
     // Queries against the removed source should fail.
-    let err = session.sql("SELECT * FROM src_a.public.patents").await;
+    let err = session
+        .sql(&format!("SELECT * FROM {src_a}.public.patents"))
+        .await;
     assert!(err.is_err(), "Query against removed source should fail");
 
     // Queries against the other source should still work.
     let rows = session
-        .sql("SELECT COUNT(*) FROM src_b.public.scores")
+        .sql(&format!("SELECT COUNT(*) FROM {src_b}.public.scores"))
         .await
         .unwrap();
     assert!(!rows.is_empty());
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn session_respects_config_batch_size() {
+async fn session_respects_config_batch_size(backend: BackendKind) {
     let dir = tempdir().unwrap();
+    let backend_impl = match build_backend(backend, dir.path()).await {
+        Some(b) => b,
+        None => {
+            eprintln!("skipping {backend:?}: JAMMI_TEST_PG_URL unset");
+            return;
+        }
+    };
     let mut config = common::test_config(dir.path());
     config.engine.batch_size = 2;
 
-    let session = JammiSession::new(config).await.unwrap();
+    let session = JammiSession::with_backend(config, backend_impl)
+        .await
+        .unwrap();
+    let patents_id = format!("patents_{}", unique_suffix());
     session
         .add_source(
-            "patents",
+            &patents_id,
             SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
@@ -199,21 +276,22 @@ async fn session_respects_config_batch_size() {
         .unwrap();
 
     let results = session
-        .sql("SELECT * FROM patents.public.patents")
+        .sql(&format!("SELECT * FROM {patents_id}.public.patents"))
         .await
         .unwrap();
     let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 20);
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn session_tenant_defaults_to_none_and_with_tenant_sets_it() {
+async fn session_tenant_defaults_to_none_and_with_tenant_sets_it(backend: BackendKind) {
     use jammi_db::TenantId;
     use std::str::FromStr;
 
     let dir = tempdir().unwrap();
-    let config = common::test_config(dir.path());
-    let session = JammiSession::new(config).await.unwrap();
+    let session = session_or_skip!(backend, dir);
     assert!(
         session.tenant().is_none(),
         "fresh session has no tenant scope"

@@ -1,10 +1,10 @@
 //! Integration tests for the ephemeral session-storage primitive (spec J6).
 //!
-//! Exercises the success criteria end-to-end against a real SQLite-backed
-//! session: a working session context, session-scoped table visibility,
-//! deletion on close, the `closed` lifecycle event (with deleted-row count),
-//! timeout force-close, tenant isolation, and the audit-record-references-hash
-//! integration pattern.
+//! Exercises the success criteria end-to-end against a real session
+//! (SQLite and Postgres): a working session context, session-scoped table
+//! visibility, deletion on close, the `closed` lifecycle event (with
+//! deleted-row count), timeout force-close, tenant isolation, and the
+//! audit-record-references-hash integration pattern.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,21 +17,41 @@ use jammi_db::ephemeral::{
     self, ActiveSessions, EphemeralSession, SessionLifecycleEvent, SessionLifecycleRecord,
     SESSION_LIFECYCLE_TOPIC,
 };
-use jammi_db::session::JammiSession;
+use jammi_db::tenant::TenantId;
 use jammi_db::trigger::Predicate;
-use jammi_test_utils::make_test_session;
+use jammi_test_utils::{make_test_session, unique_suffix};
+use test_case::test_case;
 use uuid::Uuid;
 
-const TENANT_A: &str = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a";
-const TENANT_B: &str = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8eff";
+/// A fresh, well-formed, per-test tenant id — a random UUID, never a fixed
+/// literal. The Postgres lane runs the whole matrix against one shared
+/// database, and the audit/lifecycle-topic machinery this module exercises
+/// registers under a real tenant scope, so a fixed literal shared across
+/// sibling tests (or repeated runs) would accumulate rows in that tenant's
+/// read-scope and break exact-count assertions below.
+fn fresh_tenant() -> TenantId {
+    TenantId::from_uuid(Uuid::new_v4()).unwrap()
+}
 
-async fn session() -> Arc<JammiSession> {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let s = make_test_session(BackendKind::Sqlite, dir.path())
-        .await
-        .expect("sqlite session");
-    std::mem::forget(dir);
-    Arc::new(s)
+/// Fetch a backend-parameterized session, skipping the test (with a warning,
+/// never `#[ignore]`) when the Postgres arm has no `JAMMI_TEST_PG_URL`. The
+/// `TempDir` is deliberately leaked (`mem::forget`) rather than dropped: the
+/// SQLite arm's catalog file must outlive this helper call, and leaking is
+/// harmless for the Postgres arm (the dir is unused beyond config plumbing).
+macro_rules! session_or_skip {
+    ($backend:expr) => {{
+        let dir = tempfile::tempdir().expect("tempdir");
+        match make_test_session($backend, dir.path()).await {
+            Some(s) => {
+                std::mem::forget(dir);
+                Arc::new(s)
+            }
+            None => {
+                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
+                return;
+            }
+        }
+    }};
 }
 
 /// `(image_id VARCHAR, image_hash VARCHAR)` — the J6 motivating shape.
@@ -56,10 +76,12 @@ fn images_batch(rows: &[(&str, &str)]) -> arrow::array::RecordBatch {
 }
 
 /// Criterion 1 + 2: a working session context whose tables are reachable by it.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn open_create_insert_query() {
-    let s = session().await;
-    s.bind_tenant(TENANT_A.parse().unwrap());
+async fn open_create_insert_query(backend: BackendKind) {
+    let s = session_or_skip!(backend);
+    s.bind_tenant(fresh_tenant());
 
     let mut ephem = EphemeralSession::open(
         Arc::clone(&s),
@@ -113,11 +135,13 @@ async fn open_create_insert_query() {
 
 /// Criterion 3 + 4: close drops the table, and a `closed` event lands on the
 /// lifecycle topic carrying the deleted-row count.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn close_drops_tables_and_emits_closed_event() {
-    let s = session().await;
-    s.bind_tenant(TENANT_A.parse().unwrap());
-    let tenant = TENANT_A.parse().unwrap();
+async fn close_drops_tables_and_emits_closed_event(backend: BackendKind) {
+    let s = session_or_skip!(backend);
+    let tenant = fresh_tenant();
+    s.bind_tenant(tenant);
 
     let mut ephem = EphemeralSession::open(
         Arc::clone(&s),
@@ -170,17 +194,19 @@ async fn close_drops_tables_and_emits_closed_event() {
     // Criterion 4: a `closed` lifecycle event with deleted_row_count == 3.
     let record = next_lifecycle_for(&mut sub, session_id, SessionLifecycleEvent::Closed).await;
     assert_eq!(record.event, SessionLifecycleEvent::Closed);
-    assert_eq!(record.tenant_id, TENANT_A);
+    assert_eq!(record.tenant_id, tenant.to_string());
     assert_eq!(record.deleted_row_count, 3);
 }
 
 /// Criterion 5: a session past its timeout is force-closed by the scanner with
 /// a `timed_out` event, and its tables are deleted.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn timeout_scanner_force_closes() {
-    let s = session().await;
-    s.bind_tenant(TENANT_A.parse().unwrap());
-    let tenant = TENANT_A.parse().unwrap();
+async fn timeout_scanner_force_closes(backend: BackendKind) {
+    let s = session_or_skip!(backend);
+    let tenant = fresh_tenant();
+    s.bind_tenant(tenant);
     let active = ActiveSessions::new();
 
     // Zero timeout: the session is immediately past its deadline.
@@ -235,14 +261,21 @@ async fn timeout_scanner_force_closes() {
 /// Criterion 6: a persistent table can store a hash that an ephemeral table
 /// also held, and survives the ephemeral session's deletion — the persistent
 /// record references the hash, not the deleted data.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn persistent_record_references_hash_after_deletion() {
+async fn persistent_record_references_hash_after_deletion(backend: BackendKind) {
     use jammi_db::store::mutable::{MutableTableDefinitionBuilder, MutableTableId};
-    let s = session().await;
-    s.bind_tenant(TENANT_A.parse().unwrap());
+    let s = session_or_skip!(backend);
+    let tenant = fresh_tenant();
+    s.bind_tenant(tenant);
 
-    // Persistent companion table holding just the hash lineage.
-    let lineage_id = MutableTableId::new("query_lineage").unwrap();
+    // Persistent companion table holding just the hash lineage — a fixed
+    // logical name (unlike the ephemeral tables below, whose physical name
+    // already embeds a fresh session id) so it needs its own per-test suffix
+    // on the shared Postgres lane.
+    let lineage_table = format!("query_lineage_{}", unique_suffix());
+    let lineage_id = MutableTableId::new(lineage_table.clone()).unwrap();
     let lineage_schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
         "image_hash",
         DataType::Utf8,
@@ -250,7 +283,7 @@ async fn persistent_record_references_hash_after_deletion() {
     )]));
     let def = MutableTableDefinitionBuilder::new(lineage_id, Arc::clone(&lineage_schema))
         .primary_key(vec!["image_hash".to_string()])
-        .tenant(Some(TENANT_A.parse().unwrap()))
+        .tenant(Some(tenant))
         .build()
         .unwrap();
     s.create_mutable_table(def).await.unwrap();
@@ -274,7 +307,7 @@ async fn persistent_record_references_hash_after_deletion() {
 
     // Write the hash to the persistent table BEFORE closing the ephemeral one.
     s.sql(&format!(
-        "INSERT INTO mutable.public.query_lineage (image_hash) VALUES ('{hash}')"
+        "INSERT INTO mutable.public.{lineage_table} (image_hash) VALUES ('{hash}')"
     ))
     .await
     .unwrap();
@@ -283,7 +316,9 @@ async fn persistent_record_references_hash_after_deletion() {
 
     // The persistent record survives and still references the hash.
     let batches = s
-        .sql("SELECT image_hash FROM mutable.public.query_lineage")
+        .sql(&format!(
+            "SELECT image_hash FROM mutable.public.{lineage_table}"
+        ))
         .await
         .unwrap();
     let stored: Vec<String> = batches
@@ -304,12 +339,16 @@ async fn persistent_record_references_hash_after_deletion() {
 }
 
 /// Criterion 7: tenant B cannot see tenant A's ephemeral data.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn tenant_isolation() {
-    let s = session().await;
+async fn tenant_isolation(backend: BackendKind) {
+    let s = session_or_skip!(backend);
+    let tenant_a = fresh_tenant();
+    let tenant_b = fresh_tenant();
 
     // Tenant A opens a session and stores a row.
-    s.bind_tenant(TENANT_A.parse().unwrap());
+    s.bind_tenant(tenant_a);
     let mut ephem = EphemeralSession::open(
         Arc::clone(&s),
         Duration::from_secs(3600),
@@ -338,7 +377,7 @@ async fn tenant_isolation() {
     assert_eq!(a.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 
     // Switch to tenant B: the analyzer scopes the row out.
-    s.bind_tenant(TENANT_B.parse().unwrap());
+    s.bind_tenant(tenant_b);
     let b = s
         .sql(&format!(
             "SELECT * FROM mutable.public.\"{}\"",
@@ -353,14 +392,16 @@ async fn tenant_isolation() {
     );
 
     // Restore tenant A so the close runs under the right scope.
-    s.bind_tenant(TENANT_A.parse().unwrap());
+    s.bind_tenant(tenant_a);
     ephem.close().await.unwrap();
 }
 
 /// An ephemeral session cannot be opened without a bound tenant.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn open_requires_tenant_binding() {
-    let s = session().await;
+async fn open_requires_tenant_binding(backend: BackendKind) {
+    let s = session_or_skip!(backend);
     // `EphemeralSession` (the Ok type) is not `Debug`, so `unwrap_err` is
     // unavailable; match the result directly instead.
     let result = EphemeralSession::open(

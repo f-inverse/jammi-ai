@@ -15,6 +15,8 @@ use std::sync::Arc;
 
 use arrow::array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
+use jammi_db::catalog::backend::BackendKind;
+use jammi_db::catalog::backend_postgres::PostgresBackend;
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::catalog::status::ResultTableStatus;
@@ -29,14 +31,69 @@ use jammi_db::store::manifest::{
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{ResultStore, ResultTableInfo, StaleReason, Staleness};
 use tempfile::tempdir;
+use test_case::test_case;
 
 const DIMS: usize = 4;
 
-async fn fresh_catalog(dir: &std::path::Path) -> Arc<Catalog> {
-    let backend = SqliteBackend::open(&dir.join("catalog.db")).await.unwrap();
-    let backend = jammi_db::catalog::backend::BackendImpl::Sqlite(backend);
-    backend.migrate().await.unwrap();
-    Arc::new(Catalog::from_backend(backend))
+/// A fresh, effectively-unique `mutable_version` anchor version number.
+///
+/// Every `descriptor()`/`env()` in this module is a fixed literal, so every
+/// `materialize()` call in the whole file shares one `DefinitionHash` — the
+/// input anchors are the ONLY thing that can distinguish one test's `ready`
+/// row from another's in `find_ready_result_tables_by_definition`'s
+/// `(definition_hash, input_anchors)` search. On the Postgres lane (one
+/// shared database for the whole run, rows never cleaned up), two tests
+/// that pinned the SAME literal `mutable_version("docs", N)` anchor would
+/// produce indistinguishable rows; `lookup_cached`/`probe_cache` would then
+/// nondeterministically resolve to whichever sibling test's row sorts first
+/// by `created_at` — including one whose own tempdir (and therefore Parquet
+/// bytes) has already been dropped. A fresh version number per call sidesteps
+/// the ambiguity entirely: no two tests, and no two runs, ever pin the same
+/// anchor.
+fn unique_version() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    jammi_test_utils::unique_suffix().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Build a catalog on `backend`, running migrations. Returns `None` for the
+/// Postgres arm when `JAMMI_TEST_PG_URL` is unset, so callers skip (never
+/// `#[ignore]`) exactly like [`jammi_test_utils::make_test_session`]. Every
+/// result table this module creates gets a fresh UUID-suffixed name
+/// ([`ResultStore::create_table`]), so the shared Postgres lane never needs a
+/// per-test unique source id: lineage/staleness queries here are always keyed
+/// on that unique `table_name`, never on a fixed literal.
+async fn fresh_catalog(backend: BackendKind, dir: &std::path::Path) -> Option<Arc<Catalog>> {
+    let backend_impl = match backend {
+        BackendKind::Sqlite => {
+            let b = SqliteBackend::open(&dir.join("catalog.db")).await.unwrap();
+            jammi_db::catalog::backend::BackendImpl::Sqlite(b)
+        }
+        BackendKind::Postgres => {
+            let url = jammi_test_utils::pg_url_for_tests()?;
+            let pg = PostgresBackend::open_with_options(&url, 8, None)
+                .await
+                .unwrap();
+            jammi_db::catalog::backend::BackendImpl::Postgres(pg)
+        }
+    };
+    backend_impl.migrate().await.unwrap();
+    Some(Arc::new(Catalog::from_backend(backend_impl)))
+}
+
+/// Fetch a backend-parameterized catalog, skipping the test (with a warning)
+/// when the Postgres arm has no `JAMMI_TEST_PG_URL`.
+macro_rules! fresh_catalog_or_skip {
+    ($backend:expr, $dir:expr) => {
+        match fresh_catalog($backend, $dir.path()).await {
+            Some(c) => c,
+            None => {
+                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
+                return;
+            }
+        }
+    };
 }
 
 fn store(dir: &std::path::Path, catalog: Arc<Catalog>) -> ResultStore {
@@ -143,10 +200,12 @@ async fn materialize(
 
 // === staleness ============================================================
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn fresh_when_definition_and_inputs_are_unchanged() {
+async fn fresh_when_definition_and_inputs_are_unchanged(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -162,10 +221,12 @@ async fn fresh_when_definition_and_inputs_are_unchanged() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn stale_when_the_definition_changes() {
+async fn stale_when_the_definition_changes(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -192,10 +253,12 @@ async fn stale_when_the_definition_changes() {
     }
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn stale_when_a_parent_is_recomputed_to_a_new_digest() {
+async fn stale_when_a_parent_is_recomputed_to_a_new_digest(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -232,10 +295,12 @@ async fn stale_when_a_parent_is_recomputed_to_a_new_digest() {
     }
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn stale_input_vanished_reason() {
+async fn stale_input_vanished_reason(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -262,10 +327,12 @@ async fn stale_input_vanished_reason() {
     }
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn missing_manifest_for_a_pre_contract_table() {
+async fn missing_manifest_for_a_pre_contract_table(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
 
     // A pre-contract row: bytes + a `ready` row, but NO definition_hash summary.
@@ -290,10 +357,12 @@ async fn missing_manifest_for_a_pre_contract_table() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn unpinned_input_is_never_fresh() {
+async fn unpinned_input_is_never_fresh(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -327,10 +396,12 @@ async fn unpinned_input_is_never_fresh() {
     }
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn undecidable_still_reports_a_confidently_decided_definition_change() {
+async fn undecidable_still_reports_a_confidently_decided_definition_change(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -367,14 +438,16 @@ async fn undecidable_still_reports_a_confidently_decided_definition_change() {
 
 // === lookup_cached ========================================================
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn lookup_cached_hits_an_exact_match() {
+async fn lookup_cached_hits_an_exact_match(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
-    let inputs = vec![InputAnchor::mutable_version("docs", 7)];
+    let inputs = vec![InputAnchor::mutable_version("docs", unique_version())];
     let (record, def) = materialize(&store, &ctx, inputs.clone()).await;
 
     let hit = store.lookup_cached(&def, &inputs).await.unwrap();
@@ -385,18 +458,28 @@ async fn lookup_cached_hits_an_exact_match() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn lookup_cached_misses_on_a_one_bit_anchor_change() {
+async fn lookup_cached_misses_on_a_one_bit_anchor_change(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
-    let (_record, def) =
-        materialize(&store, &ctx, vec![InputAnchor::mutable_version("docs", 7)]).await;
+    let base_version = unique_version();
+    let (_record, def) = materialize(
+        &store,
+        &ctx,
+        vec![InputAnchor::mutable_version("docs", base_version)],
+    )
+    .await;
 
-    // Same definition, one anchor value changed (7 -> 8): a miss.
-    let probe = vec![InputAnchor::mutable_version("docs", 8)];
+    // Same definition, one anchor value changed: a miss.
+    let probe = vec![InputAnchor::mutable_version(
+        "docs",
+        base_version.wrapping_add(1),
+    )];
     assert_eq!(
         store.lookup_cached(&def, &probe).await.unwrap(),
         None,
@@ -404,10 +487,12 @@ async fn lookup_cached_misses_on_a_one_bit_anchor_change() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn lookup_cached_never_hits_an_unpinned_request() {
+async fn lookup_cached_never_hits_an_unpinned_request(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -429,10 +514,12 @@ async fn lookup_cached_never_hits_an_unpinned_request() {
 
 // === derives_from + transitive walk ======================================
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn derives_from_reports_the_one_hop_dependents() {
+async fn derives_from_reports_the_one_hop_dependents(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -453,10 +540,12 @@ async fn derives_from_reports_the_one_hop_dependents() {
     assert_eq!(edges[0].derived, child.table_name);
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn derives_from_closure_walks_transitively() {
+async fn derives_from_closure_walks_transitively(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -476,10 +565,12 @@ async fn derives_from_closure_walks_transitively() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn derives_from_closure_is_stack_safe_on_a_deep_chain() {
+async fn derives_from_closure_is_stack_safe_on_a_deep_chain(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -503,10 +594,12 @@ async fn derives_from_closure_is_stack_safe_on_a_deep_chain() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn derives_from_closure_surfaces_a_cycle_as_a_typed_error() {
+async fn derives_from_closure_surfaces_a_cycle_as_a_typed_error(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -515,8 +608,18 @@ async fn derives_from_closure_surfaces_a_cycle_as_a_typed_error() {
     // it is forged here by editing the catalog summary directly, the only way to
     // produce the back-edge the walk must reject as a typed DependencyCycle
     // rather than loop forever.
-    let (x, _) = materialize(&store, &ctx, vec![InputAnchor::mutable_version("docs", 1)]).await;
-    let (y, _) = materialize(&store, &ctx, vec![InputAnchor::mutable_version("docs", 2)]).await;
+    let (x, _) = materialize(
+        &store,
+        &ctx,
+        vec![InputAnchor::mutable_version("docs", unique_version())],
+    )
+    .await;
+    let (y, _) = materialize(
+        &store,
+        &ctx,
+        vec![InputAnchor::mutable_version("docs", unique_version())],
+    )
+    .await;
 
     force_input_anchor(
         &catalog,
@@ -541,15 +644,17 @@ async fn derives_from_closure_surfaces_a_cycle_as_a_typed_error() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn derives_from_closure_collects_a_diamond_descendant_once() {
+async fn derives_from_closure_collects_a_diamond_descendant_once(backend: BackendKind) {
     // A re-converging DAG (a diamond): two parents P1, P2 both feed one shared
     // child C. The stack-safe closure must collect C's subtree exactly once (it is
     // `expanded` after the first descent) and must NOT mistake the second arrival
     // at C for a back-edge cycle. This is the distinction a flat visited-set walk
     // cannot make — the W-61a audit's follow-up.
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -590,14 +695,16 @@ async fn derives_from_closure_collects_a_diamond_descendant_once() {
 
 // === probe_cache (action-layer hit confirmation) ===========================
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn probe_cache_hits_an_exact_match_with_an_extant_artifact() {
+async fn probe_cache_hits_an_exact_match_with_an_extant_artifact(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
-    let inputs = vec![InputAnchor::mutable_version("docs", 7)];
+    let inputs = vec![InputAnchor::mutable_version("docs", unique_version())];
     let (record, def) = materialize(&store, &ctx, inputs.clone()).await;
 
     let hit = store.probe_cache(&def, &inputs).await.unwrap();
@@ -608,19 +715,21 @@ async fn probe_cache_hits_an_exact_match_with_an_extant_artifact() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn probe_cache_misses_when_the_artifact_was_reaped() {
+async fn probe_cache_misses_when_the_artifact_was_reaped(backend: BackendKind) {
     // A `ready` catalog row whose Parquet bytes are gone (a torn write that
     // committed `ready` before durability, or a half-deleted table) must NOT be
     // handed back as a reuse — the producer would short-circuit to a table it
     // cannot read. The bare `lookup_cached` sensor still reports the catalog hit;
     // `probe_cache` re-confirms the bytes and falls through to a miss.
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
-    let inputs = vec![InputAnchor::mutable_version("docs", 11)];
+    let inputs = vec![InputAnchor::mutable_version("docs", unique_version())];
     let (record, def) = materialize(&store, &ctx, inputs.clone()).await;
 
     // Reap the artifact bytes out from under the still-`ready` catalog row.
@@ -641,17 +750,27 @@ async fn probe_cache_misses_when_the_artifact_was_reaped() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn probe_cache_misses_on_a_one_bit_change() {
+async fn probe_cache_misses_on_a_one_bit_change(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
-    let (_record, def) =
-        materialize(&store, &ctx, vec![InputAnchor::mutable_version("docs", 7)]).await;
+    let base_version = unique_version();
+    let (_record, def) = materialize(
+        &store,
+        &ctx,
+        vec![InputAnchor::mutable_version("docs", base_version)],
+    )
+    .await;
 
-    let probe = vec![InputAnchor::mutable_version("docs", 8)];
+    let probe = vec![InputAnchor::mutable_version(
+        "docs",
+        base_version.wrapping_add(1),
+    )];
     assert_eq!(
         store.probe_cache(&def, &probe).await.unwrap(),
         None,
@@ -659,18 +778,21 @@ async fn probe_cache_misses_on_a_one_bit_change() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn probe_cache_record_returns_the_reusable_record_on_a_hit() {
+async fn probe_cache_record_returns_the_reusable_record_on_a_hit(backend: BackendKind) {
     // The producer-facing variant returns the full `ResultTableRecord` (not just
     // the name) so a producer that short-circuits hands the reused record back
     // without a second catalog read. On a hit it is the cached table's record;
     // on a one-bit-changed probe it is `None`.
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
-    let inputs = vec![InputAnchor::mutable_version("docs", 9)];
+    let base_version = unique_version();
+    let inputs = vec![InputAnchor::mutable_version("docs", base_version)];
     let (record, def) = materialize(&store, &ctx, inputs.clone()).await;
 
     let hit = store
@@ -682,7 +804,13 @@ async fn probe_cache_record_returns_the_reusable_record_on_a_hit() {
     assert_eq!(hit.status, "ready");
 
     let miss = store
-        .probe_cache_record(&def, &[InputAnchor::mutable_version("docs", 10)])
+        .probe_cache_record(
+            &def,
+            &[InputAnchor::mutable_version(
+                "docs",
+                base_version.wrapping_add(1),
+            )],
+        )
         .await
         .unwrap();
     assert!(
@@ -691,10 +819,12 @@ async fn probe_cache_record_returns_the_reusable_record_on_a_hit() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn probe_cache_never_hits_an_unpinned_request() {
+async fn probe_cache_never_hits_an_unpinned_request(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 

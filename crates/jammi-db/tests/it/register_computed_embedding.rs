@@ -15,6 +15,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use datafusion::prelude::SessionContext;
+use jammi_db::catalog::backend::BackendKind;
+use jammi_db::catalog::backend_postgres::PostgresBackend;
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
@@ -24,15 +26,45 @@ use jammi_db::store::manifest::{
     AnchorKind, ComputeDevice, InputAnchor, MaterializationEnv, ProducingDescriptor,
 };
 use jammi_db::store::{ComputedEmbeddingProvenance, EmbeddingTableSpec, ResultStore};
+use jammi_test_utils::unique_suffix;
 use tempfile::tempdir;
+use test_case::test_case;
 
 const DIMS: usize = 3;
 
-async fn fresh_catalog(dir: &std::path::Path) -> Arc<Catalog> {
-    let backend = SqliteBackend::open(&dir.join("catalog.db")).await.unwrap();
-    let backend = jammi_db::catalog::backend::BackendImpl::Sqlite(backend);
-    backend.migrate().await.unwrap();
-    Arc::new(Catalog::from_backend(backend))
+/// Build a catalog on `backend`, running migrations. Returns `None` for the
+/// Postgres arm when `JAMMI_TEST_PG_URL` is unset, so callers skip (never
+/// `#[ignore]`) exactly like [`jammi_test_utils::make_test_session`].
+async fn fresh_catalog(backend: BackendKind, dir: &std::path::Path) -> Option<Arc<Catalog>> {
+    let backend_impl = match backend {
+        BackendKind::Sqlite => {
+            let b = SqliteBackend::open(&dir.join("catalog.db")).await.unwrap();
+            jammi_db::catalog::backend::BackendImpl::Sqlite(b)
+        }
+        BackendKind::Postgres => {
+            let url = jammi_test_utils::pg_url_for_tests()?;
+            let pg = PostgresBackend::open_with_options(&url, 8, None)
+                .await
+                .unwrap();
+            jammi_db::catalog::backend::BackendImpl::Postgres(pg)
+        }
+    };
+    backend_impl.migrate().await.unwrap();
+    Some(Arc::new(Catalog::from_backend(backend_impl)))
+}
+
+/// Fetch a backend-parameterized catalog, skipping the test (with a warning)
+/// when the Postgres arm has no `JAMMI_TEST_PG_URL`.
+macro_rules! fresh_catalog_or_skip {
+    ($backend:expr, $dir:expr) => {
+        match fresh_catalog($backend, $dir.path()).await {
+            Some(c) => c,
+            None => {
+                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
+                return;
+            }
+        }
+    };
 }
 
 fn store(dir: &std::path::Path, catalog: Arc<Catalog>) -> ResultStore {
@@ -66,12 +98,24 @@ fn spec<'a>(source_id: &'a str, derived_from: Option<&'a str>) -> EmbeddingTable
     }
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn happy_path_lands_a_ready_searchable_table_with_provenance_and_lineage() {
+async fn happy_path_lands_a_ready_searchable_table_with_provenance_and_lineage(
+    backend: BackendKind,
+) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
+
+    // Backend-unique source ids: the Postgres lane shares one database across
+    // the whole test run, and `find_result_tables` below asserts an EXACT
+    // count for `computed_source_id` — a fixed literal would accumulate rows
+    // across sibling tests and repeated runs, breaking that count.
+    let suffix = unique_suffix();
+    let source_source_id = format!("source_docs_{suffix}");
+    let computed_source_id = format!("computed_{suffix}");
 
     // A source table to derive from — its content digest anchors the
     // `ResultDigest` input, and its table name anchors the catalog FK.
@@ -79,7 +123,7 @@ async fn happy_path_lands_a_ready_searchable_table_with_provenance_and_lineage()
     let source = store
         .materialize_embedding_table(
             &ctx,
-            spec("source_docs", None),
+            spec(&source_source_id, None),
             &source_rows,
             jammi_db::store::manifest::Materialization::new(
                 &ProducingDescriptor::External {
@@ -107,7 +151,7 @@ async fn happy_path_lands_a_ready_searchable_table_with_provenance_and_lineage()
     let record = store
         .materialize_computed_embedding_table(
             &ctx,
-            spec("computed", Some(&source.table_name)),
+            spec(&computed_source_id, Some(&source.table_name)),
             &rows,
             provenance(params, vec![result_digest_anchor.clone()]),
         )
@@ -118,7 +162,7 @@ async fn happy_path_lands_a_ready_searchable_table_with_provenance_and_lineage()
     assert_eq!(record.status, "ready");
     assert_eq!(record.row_count, 2);
     let found = catalog
-        .find_result_tables("computed", Some(ModelTask::TextEmbedding), None)
+        .find_result_tables(&computed_source_id, Some(ModelTask::TextEmbedding), None)
         .await
         .unwrap();
     assert_eq!(found.len(), 1);
@@ -175,10 +219,12 @@ async fn happy_path_lands_a_ready_searchable_table_with_provenance_and_lineage()
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn width_mismatch_is_a_schema_error() {
+async fn width_mismatch_is_a_schema_error(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -198,10 +244,12 @@ async fn width_mismatch_is_a_schema_error() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn zero_norm_is_a_schema_error() {
+async fn zero_norm_is_a_schema_error(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -221,10 +269,12 @@ async fn zero_norm_is_a_schema_error() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn non_finite_norm_is_a_schema_error() {
+async fn non_finite_norm_is_a_schema_error(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -260,10 +310,12 @@ async fn non_finite_norm_is_a_schema_error() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn caller_supplied_reserved_content_digest_key_is_a_hard_error() {
+async fn caller_supplied_reserved_content_digest_key_is_a_hard_error(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 
@@ -286,10 +338,14 @@ async fn caller_supplied_reserved_content_digest_key_is_a_hard_error() {
     );
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn identical_scalar_params_but_different_vectors_never_collide_on_one_hash() {
+async fn identical_scalar_params_but_different_vectors_never_collide_on_one_hash(
+    backend: BackendKind,
+) {
     let dir = tempdir().unwrap();
-    let catalog = fresh_catalog(dir.path()).await;
+    let catalog = fresh_catalog_or_skip!(backend, dir);
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = SessionContext::new();
 

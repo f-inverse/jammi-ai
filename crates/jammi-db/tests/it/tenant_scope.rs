@@ -2,17 +2,34 @@
 //! views of mutable companion tables. Engine-only scope (no wire-surface
 //! tests; those land with the ADR-01 substrate PR).
 
-use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use jammi_db::catalog::backend::BackendKind;
 use jammi_db::session::JammiSession;
 use jammi_db::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
 use jammi_db::TenantId;
+use jammi_test_utils::{make_test_session, unique_suffix};
 use tempfile::tempdir;
+use test_case::test_case;
+use uuid::Uuid;
 
 use crate::common;
+
+/// Fetch a backend-parameterized session, skipping the test (with a warning,
+/// never `#[ignore]`) when the Postgres arm has no `JAMMI_TEST_PG_URL`.
+macro_rules! session_or_skip {
+    ($backend:expr, $dir:expr) => {
+        match make_test_session($backend, $dir.path()).await {
+            Some(s) => s,
+            None => {
+                eprintln!("skipping {:?}: JAMMI_TEST_PG_URL unset", $backend);
+                return;
+            }
+        }
+    };
+}
 
 fn widget_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -21,55 +38,63 @@ fn widget_schema() -> Arc<Schema> {
     ]))
 }
 
-fn tenant_a() -> TenantId {
-    TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap()
+/// A fresh, well-formed, per-test tenant id — a random UUID, never a fixed
+/// literal. The Postgres lane runs the whole matrix against one shared
+/// database, and the `sources` / mutable-table-registry catalog rows are
+/// global (not scoped to a per-test container the way a uniquely-named
+/// mutable table is), so a fixed tenant literal shared across sibling tests
+/// (or repeated runs) would accumulate rows in that tenant's read-scope and
+/// break exact-list assertions below.
+fn fresh_tenant() -> TenantId {
+    TenantId::from_uuid(Uuid::new_v4()).unwrap()
 }
 
-fn tenant_b() -> TenantId {
-    TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b").unwrap()
-}
-
-fn tenant_c() -> TenantId {
-    TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9c").unwrap()
-}
-
-async fn register_widgets(session: &JammiSession) {
-    let def = MutableTableDefinitionBuilder::new(
-        MutableTableId::new("widgets").unwrap(),
-        widget_schema(),
-    )
-    .primary_key(vec!["id".into()])
-    .build()
-    .unwrap();
+/// Register a mutable companion table named `table_id`, keyed on `id`. Every
+/// test picks its own unique `table_id` (via [`unique_suffix`]) so sibling
+/// tests sharing the Postgres lane's one database never collide on the same
+/// backing table.
+async fn register_widgets(session: &JammiSession, table_id: &str) {
+    let def =
+        MutableTableDefinitionBuilder::new(MutableTableId::new(table_id).unwrap(), widget_schema())
+            .primary_key(vec!["id".into()])
+            .build()
+            .unwrap();
     session.create_mutable_table(def).await.unwrap();
 }
 
 /// Two sessions in the same process with different tenant bindings see
 /// disjoint row sets through the same mutable table.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn two_tenants_see_disjoint_rows() {
+async fn two_tenants_see_disjoint_rows(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let cfg = common::test_config(dir.path());
+    let widgets = format!("widgets_{}", unique_suffix());
+    let tenant_a = fresh_tenant();
+    let tenant_b = fresh_tenant();
 
-    let session_a = JammiSession::new(cfg.clone()).await.unwrap();
-    register_widgets(&session_a).await;
-    let session_a = session_a.with_tenant(tenant_a());
+    let session_a = session_or_skip!(backend, dir);
+    register_widgets(&session_a, &widgets).await;
+    let session_a = session_a.with_tenant(tenant_a);
     session_a
-        .sql("INSERT INTO mutable.public.widgets (id, name) VALUES (1, 'alpha')")
+        .sql(&format!(
+            "INSERT INTO mutable.public.{widgets} (id, name) VALUES (1, 'alpha')"
+        ))
         .await
         .unwrap();
 
-    let session_b = JammiSession::new(cfg)
-        .await
-        .unwrap()
-        .with_tenant(tenant_b());
+    let session_b = session_or_skip!(backend, dir).with_tenant(tenant_b);
     session_b
-        .sql("INSERT INTO mutable.public.widgets (id, name) VALUES (2, 'beta')")
+        .sql(&format!(
+            "INSERT INTO mutable.public.{widgets} (id, name) VALUES (2, 'beta')"
+        ))
         .await
         .unwrap();
 
     let rows_a = session_a
-        .sql("SELECT id, name FROM mutable.public.widgets ORDER BY id")
+        .sql(&format!(
+            "SELECT id, name FROM mutable.public.{widgets} ORDER BY id"
+        ))
         .await
         .unwrap();
     let batch_a = arrow::compute::concat_batches(&rows_a[0].schema(), &rows_a).unwrap();
@@ -83,7 +108,9 @@ async fn two_tenants_see_disjoint_rows() {
     assert_eq!(ids_a.value(0), 1);
 
     let rows_b = session_b
-        .sql("SELECT id, name FROM mutable.public.widgets ORDER BY id")
+        .sql(&format!(
+            "SELECT id, name FROM mutable.public.{widgets} ORDER BY id"
+        ))
         .await
         .unwrap();
     let batch_b = arrow::compute::concat_batches(&rows_b[0].schema(), &rows_b).unwrap();
@@ -98,33 +125,39 @@ async fn two_tenants_see_disjoint_rows() {
 }
 
 /// An `Unscoped` session sees only rows whose `tenant_id IS NULL`.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn unscoped_session_sees_only_global_rows() {
+async fn unscoped_session_sees_only_global_rows(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let cfg = common::test_config(dir.path());
+    let widgets = format!("widgets_{}", unique_suffix());
+    let tenant_a = fresh_tenant();
 
     // Unscoped session writes one row → tenant_id NULL.
-    let session = JammiSession::new(cfg.clone()).await.unwrap();
-    register_widgets(&session).await;
+    let session = session_or_skip!(backend, dir);
+    register_widgets(&session, &widgets).await;
     session
-        .sql("INSERT INTO mutable.public.widgets (id, name) VALUES (10, 'global')")
+        .sql(&format!(
+            "INSERT INTO mutable.public.{widgets} (id, name) VALUES (10, 'global')"
+        ))
         .await
         .unwrap();
 
     // Scoped session writes one row → tenant_id = A.
-    let session_a = JammiSession::new(cfg.clone())
-        .await
-        .unwrap()
-        .with_tenant(tenant_a());
+    let session_a = session_or_skip!(backend, dir).with_tenant(tenant_a);
     session_a
-        .sql("INSERT INTO mutable.public.widgets (id, name) VALUES (20, 'a-only')")
+        .sql(&format!(
+            "INSERT INTO mutable.public.{widgets} (id, name) VALUES (20, 'a-only')"
+        ))
         .await
         .unwrap();
 
     // A fresh Unscoped session should see only the global row.
-    let session_unscoped = JammiSession::new(cfg).await.unwrap();
+    let session_unscoped = session_or_skip!(backend, dir);
     let rows = session_unscoped
-        .sql("SELECT id, name FROM mutable.public.widgets ORDER BY id")
+        .sql(&format!(
+            "SELECT id, name FROM mutable.public.{widgets} ORDER BY id"
+        ))
         .await
         .unwrap();
     let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
@@ -140,29 +173,35 @@ async fn unscoped_session_sees_only_global_rows() {
 
 /// A scoped session sees its own rows plus globally-scoped rows
 /// (`tenant_id IS NULL`).
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn scoped_session_sees_own_plus_global() {
+async fn scoped_session_sees_own_plus_global(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let cfg = common::test_config(dir.path());
+    let widgets = format!("widgets_{}", unique_suffix());
+    let tenant_a = fresh_tenant();
 
-    let session = JammiSession::new(cfg.clone()).await.unwrap();
-    register_widgets(&session).await;
+    let session = session_or_skip!(backend, dir);
+    register_widgets(&session, &widgets).await;
     session
-        .sql("INSERT INTO mutable.public.widgets (id, name) VALUES (100, 'global')")
+        .sql(&format!(
+            "INSERT INTO mutable.public.{widgets} (id, name) VALUES (100, 'global')"
+        ))
         .await
         .unwrap();
 
-    let session_a = JammiSession::new(cfg)
-        .await
-        .unwrap()
-        .with_tenant(tenant_a());
+    let session_a = session_or_skip!(backend, dir).with_tenant(tenant_a);
     session_a
-        .sql("INSERT INTO mutable.public.widgets (id, name) VALUES (200, 'a')")
+        .sql(&format!(
+            "INSERT INTO mutable.public.{widgets} (id, name) VALUES (200, 'a')"
+        ))
         .await
         .unwrap();
 
     let rows = session_a
-        .sql("SELECT id FROM mutable.public.widgets ORDER BY id")
+        .sql(&format!(
+            "SELECT id FROM mutable.public.{widgets} ORDER BY id"
+        ))
         .await
         .unwrap();
     let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
@@ -177,21 +216,29 @@ async fn scoped_session_sees_own_plus_global() {
 }
 
 /// Tenant binding persists across multiple queries on the same session.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn tenant_binding_is_sticky_across_queries() {
+async fn tenant_binding_is_sticky_across_queries(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let cfg = common::test_config(dir.path());
-    let session = JammiSession::new(cfg).await.unwrap();
-    register_widgets(&session).await;
-    let session = session.with_tenant(tenant_a());
+    let widgets = format!("widgets_{}", unique_suffix());
+    let tenant_a = fresh_tenant();
+
+    let session = session_or_skip!(backend, dir);
+    register_widgets(&session, &widgets).await;
+    let session = session.with_tenant(tenant_a);
 
     session
-        .sql("INSERT INTO mutable.public.widgets (id, name) VALUES (1, 'a1'), (2, 'a2')")
+        .sql(&format!(
+            "INSERT INTO mutable.public.{widgets} (id, name) VALUES (1, 'a1'), (2, 'a2')"
+        ))
         .await
         .unwrap();
 
     let rows = session
-        .sql("SELECT COUNT(*) AS n FROM mutable.public.widgets")
+        .sql(&format!(
+            "SELECT COUNT(*) AS n FROM mutable.public.{widgets}"
+        ))
         .await
         .unwrap();
     let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
@@ -205,7 +252,9 @@ async fn tenant_binding_is_sticky_across_queries() {
 
     // Same session, second query: also tenant-scoped.
     let rows = session
-        .sql("SELECT name FROM mutable.public.widgets ORDER BY name")
+        .sql(&format!(
+            "SELECT name FROM mutable.public.{widgets} ORDER BY name"
+        ))
         .await
         .unwrap();
     let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
@@ -219,36 +268,44 @@ async fn tenant_binding_is_sticky_across_queries() {
     assert_eq!(names.value(1), "a2");
 }
 
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn with_tenant_returns_same_session_id() {
+async fn with_tenant_returns_same_session_id(backend: BackendKind) {
     // with_tenant is a builder that returns Self — it does not require a
     // SessionContext rebuild.
     let dir = tempdir().unwrap();
-    let cfg = common::test_config(dir.path());
-    let session = JammiSession::new(cfg).await.unwrap();
+    let tenant_a = fresh_tenant();
+    let session = session_or_skip!(backend, dir);
     assert!(session.tenant().is_none());
 
-    let session = session.with_tenant(tenant_a());
-    assert_eq!(session.tenant(), Some(tenant_a()));
+    let session = session.with_tenant(tenant_a);
+    assert_eq!(session.tenant(), Some(tenant_a));
 }
 
 /// Two scoped sessions writing through the same `Catalog::register_source`
 /// path see disjoint `list_sources` results — the tenant filter on read +
 /// the tenant binding on write together enforce isolation.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn catalog_sources_isolated_by_tenant() {
+async fn catalog_sources_isolated_by_tenant(backend: BackendKind) {
     use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
     let dir = tempdir().unwrap();
-    let cfg = common::test_config(dir.path());
+    let suffix = unique_suffix();
+    let src_a = format!("src_a_{suffix}");
+    let src_b = format!("src_b_{suffix}");
+    // Fresh per-test tenants: `sources` is a catalog-wide table, not scoped
+    // to a per-test container, so a fixed tenant literal shared with sibling
+    // tests would accumulate rows in this tenant's read-scope.
+    let tenant_a = fresh_tenant();
+    let tenant_b = fresh_tenant();
 
-    let session_a = JammiSession::new(cfg.clone())
-        .await
-        .unwrap()
-        .with_tenant(tenant_a());
+    let session_a = session_or_skip!(backend, dir).with_tenant(tenant_a);
     session_a
         .add_source(
-            "src_a",
+            &src_a,
             SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
@@ -259,13 +316,10 @@ async fn catalog_sources_isolated_by_tenant() {
         .await
         .unwrap();
 
-    let session_b = JammiSession::new(cfg)
-        .await
-        .unwrap()
-        .with_tenant(tenant_b());
+    let session_b = session_or_skip!(backend, dir).with_tenant(tenant_b);
     session_b
         .add_source(
-            "src_b",
+            &src_b,
             SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
@@ -276,13 +330,27 @@ async fn catalog_sources_isolated_by_tenant() {
         .await
         .unwrap();
 
+    // `list_sources` for a scoped tenant also returns every globally-scoped
+    // (`tenant_id IS NULL`) row — by design (a scoped session sees its own
+    // rows plus global rows). On the shared Postgres lane that global pool
+    // accumulates rows from every OTHER test in the suite that registered an
+    // unscoped source, so filter down to this test's own unique-suffixed
+    // names before asserting the set is exactly `{src_a}` / `{src_b}`.
     let sources_a = session_a.catalog().list_sources().await.unwrap();
-    let ids_a: Vec<&str> = sources_a.iter().map(|s| s.source_id.as_str()).collect();
-    assert_eq!(ids_a, vec!["src_a"]);
+    let ids_a: Vec<&str> = sources_a
+        .iter()
+        .map(|s| s.source_id.as_str())
+        .filter(|id| id.ends_with(&suffix))
+        .collect();
+    assert_eq!(ids_a, vec![src_a.as_str()]);
 
     let sources_b = session_b.catalog().list_sources().await.unwrap();
-    let ids_b: Vec<&str> = sources_b.iter().map(|s| s.source_id.as_str()).collect();
-    assert_eq!(ids_b, vec!["src_b"]);
+    let ids_b: Vec<&str> = sources_b
+        .iter()
+        .map(|s| s.source_id.as_str())
+        .filter(|id| id.ends_with(&suffix))
+        .collect();
+    assert_eq!(ids_b, vec![src_b.as_str()]);
 }
 
 /// `list_all_sources` enumerates sources across every tenant, while the
@@ -290,12 +358,19 @@ async fn catalog_sources_isolated_by_tenant() {
 /// globally-scoped (`tenant_id IS NULL`) rows. Session startup re-hydrates
 /// source providers through the cross-tenant view so a worker that later
 /// binds to any tenant can resolve that tenant's private sources.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn catalog_list_all_sources_sees_across_tenants() {
+async fn catalog_list_all_sources_sees_across_tenants(backend: BackendKind) {
     use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
     let dir = tempdir().unwrap();
-    let cfg = common::test_config(dir.path());
+    let suffix = unique_suffix();
+    let global_src = format!("global_src_{suffix}");
+    let src_a = format!("src_a_{suffix}");
+    let src_b = format!("src_b_{suffix}");
+    let tenant_a = fresh_tenant();
+    let tenant_b = fresh_tenant();
 
     let parquet = || SourceConnection {
         url: Some(common::fixture_url("patents.parquet")),
@@ -304,52 +379,42 @@ async fn catalog_list_all_sources_sees_across_tenants() {
     };
 
     // One global source plus one private source per tenant.
-    let unscoped = JammiSession::new(cfg.clone()).await.unwrap();
+    let unscoped = session_or_skip!(backend, dir);
     unscoped
-        .add_source("global_src", SourceType::File, parquet())
+        .add_source(&global_src, SourceType::File, parquet())
         .await
         .unwrap();
 
-    let session_a = JammiSession::new(cfg.clone())
-        .await
-        .unwrap()
-        .with_tenant(tenant_a());
+    let session_a = session_or_skip!(backend, dir).with_tenant(tenant_a);
     session_a
-        .add_source("src_a", SourceType::File, parquet())
+        .add_source(&src_a, SourceType::File, parquet())
         .await
         .unwrap();
 
-    let session_b = JammiSession::new(cfg.clone())
-        .await
-        .unwrap()
-        .with_tenant(tenant_b());
+    let session_b = session_or_skip!(backend, dir).with_tenant(tenant_b);
     session_b
-        .add_source("src_b", SourceType::File, parquet())
+        .add_source(&src_b, SourceType::File, parquet())
         .await
         .unwrap();
 
-    // Cross-tenant enumeration sees every source regardless of binding.
+    // Cross-tenant enumeration sees every source this test created (and,
+    // on the shared Postgres lane, possibly siblings' — filter down to this
+    // test's own unique-suffixed names before asserting the set).
     // Sort for a registration-order-independent set comparison: the catalog
     // orders by `created_at`, which ties across sub-millisecond inserts.
-    let mut all: Vec<String> = JammiSession::new(cfg.clone())
-        .await
-        .unwrap()
+    let mut all: Vec<String> = session_or_skip!(backend, dir)
         .catalog()
         .list_all_sources()
         .await
         .unwrap()
         .into_iter()
         .map(|s| s.source_id)
+        .filter(|id| id.ends_with(&suffix))
         .collect();
     all.sort();
-    assert_eq!(
-        all,
-        vec![
-            "global_src".to_string(),
-            "src_a".to_string(),
-            "src_b".to_string()
-        ]
-    );
+    let mut expected = vec![global_src.clone(), src_a.clone(), src_b.clone()];
+    expected.sort();
+    assert_eq!(all, expected);
 
     // The tenant-scoped API stays filtered to tenant A's own + global rows.
     let mut scoped_a: Vec<String> = session_a
@@ -359,28 +424,31 @@ async fn catalog_list_all_sources_sees_across_tenants() {
         .unwrap()
         .into_iter()
         .map(|s| s.source_id)
+        .filter(|id| id.ends_with(&suffix))
         .collect();
     scoped_a.sort();
-    assert_eq!(
-        scoped_a,
-        vec!["global_src".to_string(), "src_a".to_string()]
-    );
+    assert_eq!(scoped_a, vec![global_src, src_a]);
 }
 
 /// An unscoped session sees globally-scoped (NULL) rows; a scoped session
 /// sees its own rows plus the NULL rows (consistent with the read-side
 /// predicate-injection rule).
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn catalog_unscoped_session_sees_global_only_after_scoped_writes() {
+async fn catalog_unscoped_session_sees_global_only_after_scoped_writes(backend: BackendKind) {
     use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
     let dir = tempdir().unwrap();
-    let cfg = common::test_config(dir.path());
+    let suffix = unique_suffix();
+    let global_src = format!("global_src_{suffix}");
+    let tenant_a_src = format!("tenant_a_src_{suffix}");
+    let tenant_a = fresh_tenant();
 
-    let unscoped = JammiSession::new(cfg.clone()).await.unwrap();
+    let unscoped = session_or_skip!(backend, dir);
     unscoped
         .add_source(
-            "global_src",
+            &global_src,
             SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
@@ -391,13 +459,10 @@ async fn catalog_unscoped_session_sees_global_only_after_scoped_writes() {
         .await
         .unwrap();
 
-    let scoped = JammiSession::new(cfg.clone())
-        .await
-        .unwrap()
-        .with_tenant(tenant_a());
+    let scoped = session_or_skip!(backend, dir).with_tenant(tenant_a);
     scoped
         .add_source(
-            "tenant_a_src",
+            &tenant_a_src,
             SourceType::File,
             SourceConnection {
                 url: Some(common::fixture_url("patents.parquet")),
@@ -408,8 +473,10 @@ async fn catalog_unscoped_session_sees_global_only_after_scoped_writes() {
         .await
         .unwrap();
 
-    // A fresh unscoped session sees only the global row.
-    let fresh_unscoped = JammiSession::new(cfg).await.unwrap();
+    // A fresh unscoped session sees only the global row (filtered to this
+    // test's own unique-suffixed names — the shared Postgres lane's global
+    // pool may carry other tests' NULL-tenant rows too).
+    let fresh_unscoped = session_or_skip!(backend, dir);
     let ids: Vec<String> = fresh_unscoped
         .catalog()
         .list_sources()
@@ -417,8 +484,9 @@ async fn catalog_unscoped_session_sees_global_only_after_scoped_writes() {
         .unwrap()
         .into_iter()
         .map(|s| s.source_id)
+        .filter(|id| id.ends_with(&suffix))
         .collect();
-    assert_eq!(ids, vec!["global_src".to_string()]);
+    assert_eq!(ids, vec![global_src]);
 }
 
 /// SPEC-03 §12 #2 — one federated source carries a `tenant_id` column;
@@ -427,8 +495,10 @@ async fn catalog_unscoped_session_sees_global_only_after_scoped_writes() {
 /// Verifies the read-side predicate-injection path end-to-end against a
 /// local Parquet source, not just the engine-internal mutable table tested
 /// elsewhere in this file.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn federated_source_tenant_column_filters_split_6_4() {
+async fn federated_source_tenant_column_filters_split_6_4(backend: BackendKind) {
     use arrow::array::{ArrayRef, RecordBatch};
     use jammi_db::source::{FileFormat, SourceConnection, SourceType};
     use parquet::arrow::ArrowWriter;
@@ -436,6 +506,9 @@ async fn federated_source_tenant_column_filters_split_6_4() {
 
     let dir = tempdir().unwrap();
     let pq_path = dir.path().join("notes.parquet");
+    let tenant_a = fresh_tenant();
+    let tenant_b = fresh_tenant();
+    let notes_src = format!("notes_{}", unique_suffix());
 
     // Build a 10-row batch: 6 for tenant A, 4 for tenant B.
     let schema = Arc::new(Schema::new(vec![
@@ -443,8 +516,8 @@ async fn federated_source_tenant_column_filters_split_6_4() {
         Field::new("tenant_id", DataType::Utf8, true),
     ]));
     let note_ids = Int64Array::from((0..10_i64).collect::<Vec<_>>());
-    let a_str = tenant_a().to_string();
-    let b_str = tenant_b().to_string();
+    let a_str = tenant_a.to_string();
+    let b_str = tenant_b.to_string();
     let tenant_col: Vec<&str> = (0..10)
         .map(|i| {
             if i < 6 {
@@ -469,7 +542,6 @@ async fn federated_source_tenant_column_filters_split_6_4() {
     writer.write(&batch).unwrap();
     writer.close().unwrap();
 
-    let cfg = common::test_config(dir.path());
     let url = format!("file://{}", pq_path.display());
 
     // Register the source ONCE — unscoped (tenant_id NULL on the catalog
@@ -477,10 +549,10 @@ async fn federated_source_tenant_column_filters_split_6_4() {
     // reload. SPEC-03 §12 #2 calls for "one source registration, one
     // connection pool, no per-tenant table".
     {
-        let registrar = JammiSession::new(cfg.clone()).await.unwrap();
+        let registrar = session_or_skip!(backend, dir);
         registrar
             .add_source(
-                "notes",
+                &notes_src,
                 SourceType::File,
                 SourceConnection {
                     url: Some(url),
@@ -496,21 +568,17 @@ async fn federated_source_tenant_column_filters_split_6_4() {
     // discriminator column. The source row in the catalog is `tenant_id
     // NULL`, so both per-tenant sessions can see it via the read-side
     // predicate (`tenant_id = $bound OR tenant_id IS NULL`).
-    let session_a = JammiSession::new(cfg.clone())
-        .await
-        .unwrap()
-        .with_tenant(tenant_a());
-    session_a.set_source_tenant_column("notes", Some("tenant_id".into()));
+    let session_a = session_or_skip!(backend, dir).with_tenant(tenant_a);
+    session_a.set_source_tenant_column(&notes_src, Some("tenant_id".into()));
 
-    let session_b = JammiSession::new(cfg.clone())
-        .await
-        .unwrap()
-        .with_tenant(tenant_b());
-    session_b.set_source_tenant_column("notes", Some("tenant_id".into()));
+    let session_b = session_or_skip!(backend, dir).with_tenant(tenant_b);
+    session_b.set_source_tenant_column(&notes_src, Some("tenant_id".into()));
 
-    async fn count_for(session: &JammiSession) -> i64 {
+    async fn count_for(session: &JammiSession, notes_src: &str) -> i64 {
         let rows = session
-            .sql("SELECT COUNT(*) AS n FROM notes.public.notes")
+            .sql(&format!(
+                "SELECT COUNT(*) AS n FROM {notes_src}.public.notes"
+            ))
             .await
             .unwrap();
         let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
@@ -523,14 +591,16 @@ async fn federated_source_tenant_column_filters_split_6_4() {
             .value(0)
     }
 
-    let n_a = count_for(&session_a).await;
-    let n_b = count_for(&session_b).await;
+    let n_a = count_for(&session_a, &notes_src).await;
+    let n_b = count_for(&session_b, &notes_src).await;
     assert_eq!(n_a, 6, "session A must see exactly its 6 rows");
     assert_eq!(n_b, 4, "session B must see exactly its 4 rows");
 
-    async fn collect_ids(session: &JammiSession) -> Vec<i64> {
+    async fn collect_ids(session: &JammiSession, notes_src: &str) -> Vec<i64> {
         let rows = session
-            .sql("SELECT note_id FROM notes.public.notes ORDER BY note_id")
+            .sql(&format!(
+                "SELECT note_id FROM {notes_src}.public.notes ORDER BY note_id"
+            ))
             .await
             .unwrap();
         let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
@@ -542,8 +612,8 @@ async fn federated_source_tenant_column_filters_split_6_4() {
             .unwrap();
         (0..col.len()).map(|i| col.value(i)).collect::<Vec<i64>>()
     }
-    let ids_a = collect_ids(&session_a).await;
-    let ids_b = collect_ids(&session_b).await;
+    let ids_a = collect_ids(&session_a, &notes_src).await;
+    let ids_b = collect_ids(&session_b, &notes_src).await;
     let intersection: Vec<i64> = ids_a
         .iter()
         .copied()
@@ -564,14 +634,21 @@ async fn federated_source_tenant_column_filters_split_6_4() {
 /// catalog DB, and the rebuilt session must replay the discriminator and emit
 /// the scoping filter. A source registered with no discriminator reloads as
 /// `None`, emitting no filter.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn source_tenant_column_persists_and_replays_on_reload() {
+async fn source_tenant_column_persists_and_replays_on_reload(backend: BackendKind) {
     use arrow::array::{ArrayRef, RecordBatch};
     use jammi_db::source::{FileFormat, SourceConnection, SourceType};
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
 
     let dir = tempdir().unwrap();
+    let suffix = unique_suffix();
+    let notes_src = format!("notes_{suffix}");
+    let docs_src = format!("public_docs_{suffix}");
+    let tenant_a = fresh_tenant();
+    let tenant_b = fresh_tenant();
 
     // Two parquet files: `notes` carries tenancy under `customer_id`
     // (6 rows tenant A, 4 rows tenant B); `public_docs` carries no tenant
@@ -583,8 +660,8 @@ async fn source_tenant_column_persists_and_replays_on_reload() {
         Field::new("note_id", DataType::Int64, false),
         Field::new("customer_id", DataType::Utf8, true),
     ]));
-    let a_str = tenant_a().to_string();
-    let b_str = tenant_b().to_string();
+    let a_str = tenant_a.to_string();
+    let b_str = tenant_b.to_string();
     let customer_col: Vec<&str> = (0..10)
         .map(|i| {
             if i < 6 {
@@ -636,16 +713,14 @@ async fn source_tenant_column_persists_and_replays_on_reload() {
         writer.close().unwrap();
     }
 
-    let cfg = common::test_config(dir.path());
-
     // Register both sources against the catalog, then drop the session. The
     // discriminator is carried on the connection — never via
     // `set_source_tenant_column` — so the persist path is what's exercised.
     {
-        let registrar = JammiSession::new(cfg.clone()).await.unwrap();
+        let registrar = session_or_skip!(backend, dir);
         registrar
             .add_source(
-                "notes",
+                &notes_src,
                 SourceType::File,
                 SourceConnection {
                     url: Some(format!("file://{}", notes_path.display())),
@@ -658,7 +733,7 @@ async fn source_tenant_column_persists_and_replays_on_reload() {
             .unwrap();
         registrar
             .add_source(
-                "public_docs",
+                &docs_src,
                 SourceType::File,
                 SourceConnection {
                     url: Some(format!("file://{}", docs_path.display())),
@@ -673,14 +748,8 @@ async fn source_tenant_column_persists_and_replays_on_reload() {
     // Rebuild a fresh session against the SAME catalog DB. `reload_sources`
     // runs at construction and must replay the persisted discriminator — no
     // `set_source_tenant_column` call here.
-    let session_a = JammiSession::new(cfg.clone())
-        .await
-        .unwrap()
-        .with_tenant(tenant_a());
-    let session_b = JammiSession::new(cfg.clone())
-        .await
-        .unwrap()
-        .with_tenant(tenant_b());
+    let session_a = session_or_skip!(backend, dir).with_tenant(tenant_a);
+    let session_b = session_or_skip!(backend, dir).with_tenant(tenant_b);
 
     async fn count(session: &JammiSession, sql: &str) -> i64 {
         let rows = session.sql(sql).await.unwrap();
@@ -695,12 +764,20 @@ async fn source_tenant_column_persists_and_replays_on_reload() {
 
     // The replayed discriminator scopes `notes`: A sees its 6, B its 4.
     assert_eq!(
-        count(&session_a, "SELECT COUNT(*) FROM notes.public.notes").await,
+        count(
+            &session_a,
+            &format!("SELECT COUNT(*) FROM {notes_src}.public.notes")
+        )
+        .await,
         6,
         "tenant A must see its 6 rows via the replayed customer_id filter"
     );
     assert_eq!(
-        count(&session_b, "SELECT COUNT(*) FROM notes.public.notes").await,
+        count(
+            &session_b,
+            &format!("SELECT COUNT(*) FROM {notes_src}.public.notes")
+        )
+        .await,
         4,
         "tenant B must see its 4 rows via the replayed customer_id filter"
     );
@@ -712,7 +789,7 @@ async fn source_tenant_column_persists_and_replays_on_reload() {
     assert_eq!(
         count(
             &session_a,
-            "SELECT COUNT(*) FROM public_docs.public.public_docs"
+            &format!("SELECT COUNT(*) FROM {docs_src}.public.public_docs")
         )
         .await,
         5,
@@ -721,7 +798,7 @@ async fn source_tenant_column_persists_and_replays_on_reload() {
     assert_eq!(
         count(
             &session_b,
-            "SELECT COUNT(*) FROM public_docs.public.public_docs"
+            &format!("SELECT COUNT(*) FROM {docs_src}.public.public_docs")
         )
         .await,
         5,
@@ -738,13 +815,17 @@ async fn source_tenant_column_persists_and_replays_on_reload() {
 /// This is the concurrency property that the helper exists for. Without
 /// it, two gRPC handlers from different tenants sharing one
 /// `Arc<JammiSession>` would race on the shared `Arc<RwLock<TenantContext>>`.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn with_tenant_scoped_isolates_concurrent_tasks() {
+async fn with_tenant_scoped_isolates_concurrent_tasks(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let cfg = common::test_config(dir.path());
+    let widgets = format!("widgets_{}", unique_suffix());
+    let tenant_a = fresh_tenant();
+    let tenant_b = fresh_tenant();
 
-    let session = Arc::new(JammiSession::new(cfg).await.unwrap());
-    register_widgets(&session).await;
+    let session = Arc::new(session_or_skip!(backend, dir));
+    register_widgets(&session, &widgets).await;
 
     // Each task: enter its tenant's scope, insert a row tagged with its
     // tenant name, count rows visible inside the scope, and snapshot
@@ -755,18 +836,19 @@ async fn with_tenant_scoped_isolates_concurrent_tasks() {
         tenant: TenantId,
         row_id: i64,
         row_name: &'static str,
+        widgets: String,
     ) -> (Option<TenantId>, i64) {
         session
             .with_tenant_scoped(tenant, |scope| async move {
                 scope
                     .sql(&format!(
-                        "INSERT INTO mutable.public.widgets (id, name) VALUES ({row_id}, '{row_name}')"
+                        "INSERT INTO mutable.public.{widgets} (id, name) VALUES ({row_id}, '{row_name}')"
                     ))
                     .await
                     .unwrap();
                 let observed = scope.tenant();
                 let rows = scope
-                    .sql("SELECT id FROM mutable.public.widgets")
+                    .sql(&format!("SELECT id FROM mutable.public.{widgets}"))
                     .await
                     .unwrap();
                 let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
@@ -792,18 +874,20 @@ async fn with_tenant_scoped_isolates_concurrent_tasks() {
         let session_b = Arc::clone(&session);
         let id_a = (i * 2) + 1000;
         let id_b = (i * 2) + 1001;
+        let widgets_a = widgets.clone();
+        let widgets_b = widgets.clone();
         handles.push(tokio::spawn(async move {
-            run_one(session_a, tenant_a(), id_a, "alpha").await
+            run_one(session_a, tenant_a, id_a, "alpha", widgets_a).await
         }));
         handles.push(tokio::spawn(async move {
-            run_one(session_b, tenant_b(), id_b, "beta").await
+            run_one(session_b, tenant_b, id_b, "beta", widgets_b).await
         }));
     }
 
     for (i, h) in handles.into_iter().enumerate() {
         let (observed, visible_id) = h.await.unwrap();
         let task_is_a = i % 2 == 0;
-        let expected_tenant = if task_is_a { tenant_a() } else { tenant_b() };
+        let expected_tenant = if task_is_a { tenant_a } else { tenant_b };
         assert_eq!(
             observed,
             Some(expected_tenant),
@@ -825,26 +909,30 @@ async fn with_tenant_scoped_isolates_concurrent_tasks() {
 /// mutate the session's sticky shared binding. After the closure
 /// returns, `session.tenant()` reflects whatever the sticky binding was
 /// before the scoped call — not the scope's tenant.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn with_tenant_scoped_does_not_mutate_sticky_binding() {
+async fn with_tenant_scoped_does_not_mutate_sticky_binding(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let cfg = common::test_config(dir.path());
+    let widgets = format!("widgets_{}", unique_suffix());
+    let tenant_a = fresh_tenant();
+    let tenant_b = fresh_tenant();
 
-    let session = JammiSession::new(cfg).await.unwrap();
-    register_widgets(&session).await;
+    let session = session_or_skip!(backend, dir);
+    register_widgets(&session, &widgets).await;
     // Sticky-bind tenant_b so we can observe that the scoped call to
     // tenant_a does not leak past the closure.
-    let session = session.with_tenant(tenant_b());
+    let session = session.with_tenant(tenant_b);
     let session = Arc::new(session);
 
-    assert_eq!(session.tenant(), Some(tenant_b()));
+    assert_eq!(session.tenant(), Some(tenant_b));
     let observed_inside = session
-        .with_tenant_scoped(tenant_a(), |scope| async move { scope.tenant() })
+        .with_tenant_scoped(tenant_a, |scope| async move { scope.tenant() })
         .await;
-    assert_eq!(observed_inside, Some(tenant_a()));
+    assert_eq!(observed_inside, Some(tenant_a));
     // After the scope exits, the sticky binding (tenant_b) is restored
     // because it was never touched.
-    assert_eq!(session.tenant(), Some(tenant_b()));
+    assert_eq!(session.tenant(), Some(tenant_b));
 }
 
 /// Headline safety property for [`jammi_db::trigger::Subscriber::subscribe_scoped`].
@@ -862,8 +950,12 @@ async fn with_tenant_scoped_does_not_mutate_sticky_binding() {
 /// backing table with rows for two tenants, subscribes for tenant A from a
 /// task with no binding, and verifies the polled output never includes
 /// tenant B's rows.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subscribe_scoped_stream_remains_tenant_filtered_after_closure_returns() {
+async fn subscribe_scoped_stream_remains_tenant_filtered_after_closure_returns(
+    backend: BackendKind,
+) {
     use arrow::array::RecordBatch;
     use futures::StreamExt;
     use jammi_db::catalog::backend::TxOptions;
@@ -875,8 +967,10 @@ async fn subscribe_scoped_stream_remains_tenant_filtered_after_closure_returns()
     use std::collections::BTreeMap;
 
     let dir = tempdir().unwrap();
-    let cfg = common::test_config(dir.path());
-    let session = Arc::new(JammiSession::new(cfg).await.unwrap());
+    let session = Arc::new(session_or_skip!(backend, dir));
+    let tenant_a = fresh_tenant();
+    let tenant_b = fresh_tenant();
+    let topic_name = format!("global.events.{}", unique_suffix());
 
     // Build a global (unscoped) topic so both tenants can write to the
     // same backing table. The leak the PR fixes is on the read side; the
@@ -888,7 +982,7 @@ async fn subscribe_scoped_stream_remains_tenant_filtered_after_closure_returns()
     ]));
     let topic = TopicDefinition {
         id: TopicId::new(),
-        name: "global.events".into(),
+        name: topic_name,
         schema: Arc::clone(&topic_schema),
         tenant: None,
         broker_metadata: BTreeMap::new(),
@@ -926,15 +1020,15 @@ async fn subscribe_scoped_stream_remains_tenant_filtered_after_closure_returns()
         .unwrap()
     };
 
-    let backend = session.catalog().backend_arc();
+    let backend_arc = session.catalog().backend_arc();
     let registry_for_a = Arc::clone(&registry);
     let backing_for_a = backing_id.clone();
     let a_batch_one = row_for(0, 100, "a-one");
     let a_batch_two = row_for(1, 101, "a-two");
-    backend
+    backend_arc
         .transaction(TxOptions::default(), move |tx| {
             Box::pin(async move {
-                tx.set_tenant(Some(tenant_a()));
+                tx.set_tenant(Some(tenant_a));
                 registry_for_a
                     .insert_batch(tx, &backing_for_a, &a_batch_one)
                     .await
@@ -957,10 +1051,10 @@ async fn subscribe_scoped_stream_remains_tenant_filtered_after_closure_returns()
     let backing_for_b = backing_id.clone();
     let b_batch_one = row_for(2, 200, "b-one");
     let b_batch_two = row_for(3, 201, "b-two");
-    backend
+    backend_arc
         .transaction(TxOptions::default(), move |tx| {
             Box::pin(async move {
-                tx.set_tenant(Some(tenant_b()));
+                tx.set_tenant(Some(tenant_b));
                 registry_for_b
                     .insert_batch(tx, &backing_for_b, &b_batch_one)
                     .await
@@ -984,14 +1078,14 @@ async fn subscribe_scoped_stream_remains_tenant_filtered_after_closure_returns()
     // the scope — that is the exact pattern a downstream consumer's gRPC
     // handlers want.
     let subscription = session
-        .with_tenant_scoped(tenant_a(), |_scope| {
+        .with_tenant_scoped(tenant_a, |_scope| {
             let subscriber = Arc::clone(&subscriber);
             let topic = topic.clone();
             async move {
                 subscriber
                     .subscribe_scoped(
                         &topic,
-                        Some(tenant_a()),
+                        Some(tenant_a),
                         Predicate::match_all(),
                         Some(Offset::new(0, chrono::Utc::now())),
                     )
@@ -1047,27 +1141,33 @@ async fn subscribe_scoped_stream_remains_tenant_filtered_after_closure_returns()
 /// sticky tenant, no `with_tenant_scoped` wrapper) when the admin scope
 /// opens; without the bypass it would see only globally-scoped
 /// (`tenant_id IS NULL`) rows.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn with_admin_scope_sees_across_tenants() {
+async fn with_admin_scope_sees_across_tenants(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let cfg = common::test_config(dir.path());
+    let widgets = format!("widgets_{}", unique_suffix());
+    let tenant_a = fresh_tenant();
+    let tenant_b = fresh_tenant();
+    let tenant_c = fresh_tenant();
 
     // Single session, used by every tenant in sequence — exercises the
     // session-shared mutable-table registry that the leak path threads
     // through.
-    let session = Arc::new(JammiSession::new(cfg).await.unwrap());
-    register_widgets(&session).await;
+    let session = Arc::new(session_or_skip!(backend, dir));
+    register_widgets(&session, &widgets).await;
 
     for (tenant, id, name) in [
-        (tenant_a(), 1_i64, "a-row"),
-        (tenant_b(), 2_i64, "b-row"),
-        (tenant_c(), 3_i64, "c-row"),
+        (tenant_a, 1_i64, "a-row"),
+        (tenant_b, 2_i64, "b-row"),
+        (tenant_c, 3_i64, "c-row"),
     ] {
+        let widgets = widgets.clone();
         session
             .with_tenant_scoped(tenant, |scope| async move {
                 scope
                     .sql(&format!(
-                        "INSERT INTO mutable.public.widgets (id, name) VALUES ({id}, '{name}')"
+                        "INSERT INTO mutable.public.{widgets} (id, name) VALUES ({id}, '{name}')"
                     ))
                     .await
                     .unwrap();
@@ -1078,7 +1178,9 @@ async fn with_admin_scope_sees_across_tenants() {
     // Outside an admin scope, an unbound session sees zero tenant-tagged
     // rows (only globally-scoped, `tenant_id IS NULL` rows would surface).
     let rows = session
-        .sql("SELECT COUNT(*) AS n FROM mutable.public.widgets")
+        .sql(&format!(
+            "SELECT COUNT(*) AS n FROM mutable.public.{widgets}"
+        ))
         .await
         .unwrap();
     let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
@@ -1092,10 +1194,13 @@ async fn with_admin_scope_sees_across_tenants() {
     assert_eq!(n, 0, "unbound session must not see any tenant-tagged rows");
 
     // Inside `with_admin_scope`, every row across every tenant is visible.
+    let widgets_admin = widgets.clone();
     let ids: Vec<i64> = session
         .with_admin_scope(|admin| async move {
             let rows = admin
-                .sql("SELECT id FROM mutable.public.widgets ORDER BY id")
+                .sql(&format!(
+                    "SELECT id FROM mutable.public.{widgets_admin} ORDER BY id"
+                ))
                 .await
                 .unwrap();
             let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
@@ -1121,36 +1226,53 @@ async fn with_admin_scope_sees_across_tenants() {
 /// stale bypass leaking past the closure would silently widen the read
 /// surface of every later query and is exactly what the closure-shaped
 /// API exists to prevent.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
-async fn admin_scope_does_not_leak_into_subsequent_calls() {
+async fn admin_scope_does_not_leak_into_subsequent_calls(backend: BackendKind) {
     let dir = tempdir().unwrap();
-    let cfg = common::test_config(dir.path());
+    let widgets = format!("widgets_{}", unique_suffix());
+    let tenant_a = fresh_tenant();
+    let tenant_b = fresh_tenant();
 
-    let session = Arc::new(JammiSession::new(cfg).await.unwrap());
-    register_widgets(&session).await;
+    let session = Arc::new(session_or_skip!(backend, dir));
+    register_widgets(&session, &widgets).await;
 
-    session
-        .with_tenant_scoped(tenant_a(), |scope| async move {
-            scope
-                .sql("INSERT INTO mutable.public.widgets (id, name) VALUES (1, 'a')")
-                .await
-                .unwrap();
-        })
-        .await;
-    session
-        .with_tenant_scoped(tenant_b(), |scope| async move {
-            scope
-                .sql("INSERT INTO mutable.public.widgets (id, name) VALUES (2, 'b')")
-                .await
-                .unwrap();
-        })
-        .await;
+    {
+        let widgets = widgets.clone();
+        session
+            .with_tenant_scoped(tenant_a, |scope| async move {
+                scope
+                    .sql(&format!(
+                        "INSERT INTO mutable.public.{widgets} (id, name) VALUES (1, 'a')"
+                    ))
+                    .await
+                    .unwrap();
+            })
+            .await;
+    }
+    {
+        let widgets = widgets.clone();
+        session
+            .with_tenant_scoped(tenant_b, |scope| async move {
+                scope
+                    .sql(&format!(
+                        "INSERT INTO mutable.public.{widgets} (id, name) VALUES (2, 'b')"
+                    ))
+                    .await
+                    .unwrap();
+            })
+            .await;
+    }
 
     // Admin scope: sees both rows.
+    let widgets_admin = widgets.clone();
     let cross_tenant_count = session
         .with_admin_scope(|admin| async move {
             let rows = admin
-                .sql("SELECT COUNT(*) AS n FROM mutable.public.widgets")
+                .sql(&format!(
+                    "SELECT COUNT(*) AS n FROM mutable.public.{widgets_admin}"
+                ))
                 .await
                 .unwrap();
             let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
@@ -1169,7 +1291,9 @@ async fn admin_scope_does_not_leak_into_subsequent_calls() {
     // session is tenant-filtered again — zero rows because none of the
     // inserted rows have `tenant_id IS NULL`.
     let rows = session
-        .sql("SELECT COUNT(*) AS n FROM mutable.public.widgets")
+        .sql(&format!(
+            "SELECT COUNT(*) AS n FROM mutable.public.{widgets}"
+        ))
         .await
         .unwrap();
     let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
@@ -1187,9 +1311,11 @@ async fn admin_scope_does_not_leak_into_subsequent_calls() {
 
     // And a tenant-scoped query after that still sees only its own row.
     let visible_b = session
-        .with_tenant_scoped(tenant_b(), |scope| async move {
+        .with_tenant_scoped(tenant_b, |scope| async move {
             let rows = scope
-                .sql("SELECT id FROM mutable.public.widgets ORDER BY id")
+                .sql(&format!(
+                    "SELECT id FROM mutable.public.{widgets} ORDER BY id"
+                ))
                 .await
                 .unwrap();
             let batch = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
@@ -1207,6 +1333,13 @@ async fn admin_scope_does_not_leak_into_subsequent_calls() {
 
 /// `Transaction::assert_tenant_matches` is the defence-in-depth write-side
 /// guard. The sink calls it once per write_all; verify it rejects mismatches.
+///
+/// SQLite-only, not parameterized over Postgres: the assertion under test
+/// (`Transaction::assert_tenant_matches`) is a pure in-memory comparison on
+/// the `Transaction` struct — no SQL is sent for it. The surrounding
+/// `backend.transaction()` BEGIN/COMMIT dialect is already exercised on
+/// Postgres by the parameterized tests above, so a Postgres arm here would
+/// duplicate that coverage without adding a new determinant.
 #[tokio::test]
 async fn transaction_tenant_guard_rejects_mismatch() {
     use jammi_db::catalog::backend::{BackendError, TxOptions};
@@ -1220,8 +1353,8 @@ async fn transaction_tenant_guard_rejects_mismatch() {
         .unwrap();
     let _catalog = Catalog::from_backend(jammi_db::BackendImpl::Sqlite(backend.clone()));
 
-    let bound = tenant_a();
-    let other = tenant_b();
+    let bound = fresh_tenant();
+    let other = fresh_tenant();
     let err = backend
         .transaction(TxOptions::default(), |tx| {
             Box::pin(async move {

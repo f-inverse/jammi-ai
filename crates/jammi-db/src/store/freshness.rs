@@ -211,35 +211,45 @@ pub struct DerivesFromEdge {
 }
 
 impl ResultStore {
-    /// Find a `ready` result table already materialised by the **exact** same
-    /// definition over the **exact** same input anchors — a cache hit a producer
-    /// could reuse instead of recomputing. Returns the cached table's name, or
-    /// `None` for a miss. Read-only; tenant-scoped like every catalog read.
+    /// The `ready` result tables already materialised by the **exact** same
+    /// definition over the **exact** same input anchors, **newest first** — the
+    /// shared candidate-resolution [`Self::lookup_cached`] and
+    /// [`Self::probe_cache_record`] both build on, so the anchor-matching logic
+    /// lives in exactly one place.
     ///
     /// The candidate set is narrowed by the indexed predicate
-    /// `definition_hash = $1 AND status = 'ready'` (migration 022); the *exact*
-    /// `input_anchors` match is a Rust set-equality post-filter over each
-    /// candidate's decoded `input_anchors_json`, because an anchor set is a
-    /// structured value, not a SQL-comparable scalar.
+    /// `definition_hash = $1 AND status = 'ready'`, ordered newest-first
+    /// (migration 022's index covers the equality arm; the ordering is
+    /// `find_ready_result_tables_by_definition`'s `ORDER BY created_at DESC`);
+    /// the *exact* `input_anchors` match is a Rust
+    /// set-equality post-filter over each candidate's decoded
+    /// `input_anchors_json`, because an anchor set is a structured value, not a
+    /// SQL-comparable scalar. Many rows can share a `(definition_hash,
+    /// input_anchors)` key — a producer legitimately re-materialising the same
+    /// inputs (an idempotent recompute, or a race) — and every one of them is a
+    /// semantically equivalent reuse; this returns all of them so a caller that
+    /// needs more than the single newest (an extant-artifact retry) can fall
+    /// through to the rest.
     ///
-    /// **An [`AnchorKind::UnpinnedAtInstant`] anchor in the requested set is
-    /// never a hit.** Such an anchor is a wall-clock instant, not a reproducible
-    /// id: two reads of the same unpinned source at different instants carry
+    /// **An [`AnchorKind::UnpinnedAtInstant`] anchor in the requested set never
+    /// matches.** Such an anchor is a wall-clock instant, not a reproducible id:
+    /// two reads of the same unpinned source at different instants carry
     /// different anchors and may have seen different data, so equal instants do
     /// not prove equal inputs — a "hit" on one would be fabricated reuse. A
-    /// requested set containing any unpinned anchor short-circuits to a miss.
-    pub async fn lookup_cached(
+    /// requested set containing any unpinned anchor short-circuits to an empty
+    /// candidate list.
+    async fn exact_match_candidates(
         &self,
         definition: &DefinitionHash,
         inputs: &[InputAnchor],
-    ) -> Result<Option<String>> {
+    ) -> Result<Vec<ResultTableRecord>> {
         // An unpinned input means the request itself is not reproducibly
         // identifiable, so no recorded table can be a sound reuse of it.
         if inputs
             .iter()
             .any(|a| a.kind == AnchorKind::UnpinnedAtInstant)
         {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         let candidates = self
@@ -247,6 +257,7 @@ impl ResultStore {
             .find_ready_result_tables_by_definition(definition.as_str())
             .await?;
 
+        let mut exact = Vec::new();
         for candidate in candidates {
             // A post-contract `ready` row always carries `input_anchors_json`
             // (written in the same transaction as `definition_hash`); a row
@@ -257,28 +268,58 @@ impl ResultStore {
             };
             let recorded: Vec<InputAnchor> = serde_json::from_str(anchors_json)?;
             if anchor_sets_equal(&recorded, inputs) {
-                return Ok(Some(candidate.table_name));
+                exact.push(candidate);
             }
         }
-        Ok(None)
+        Ok(exact)
+    }
+
+    /// Find a `ready` result table already materialised by the **exact** same
+    /// definition over the **exact** same input anchors — a cache hit a producer
+    /// could reuse instead of recomputing. Returns the cached table's name, or
+    /// `None` for a miss. Read-only; tenant-scoped like every catalog read.
+    ///
+    /// When several `ready` rows share the exact `(definition_hash,
+    /// input_anchors)` key, this is a pure sensor over the shared exact-match
+    /// candidate set (newest-first, per-key): it names the newest one,
+    /// deterministically, without touching storage to confirm anything
+    /// survives on disk (that confirmation is [`Self::probe_cache_record`]'s
+    /// job).
+    ///
+    /// **An [`AnchorKind::UnpinnedAtInstant`] anchor in the requested set is
+    /// never a hit**: no candidate is ever considered for such a request.
+    pub async fn lookup_cached(
+        &self,
+        definition: &DefinitionHash,
+        inputs: &[InputAnchor],
+    ) -> Result<Option<String>> {
+        Ok(self
+            .exact_match_candidates(definition, inputs)
+            .await?
+            .into_iter()
+            .next()
+            .map(|record| record.table_name))
     }
 
     /// The **action-layer** cache probe a producer runs at the top of its verb,
-    /// before the expensive compute: resolve [`Self::lookup_cached`] for the
-    /// exact `(definition, inputs)`, then confirm the hit's Parquet artifact is
-    /// still extant on disk. Returns the reusable table's name on a sound hit,
-    /// `None` on a miss.
+    /// before the expensive compute: over every exact `(definition, inputs)`
+    /// match (newest first), return the first whose Parquet artifact is still
+    /// extant on disk. Returns the reusable table's name on a sound hit, `None`
+    /// if no exact match survives.
     ///
     /// The extant-artifact check is the difference between this and the bare
     /// [`Self::lookup_cached`] sensor: a `ready` catalog row whose bytes were
     /// reaped (a torn write that committed `ready` before durability on a power
     /// loss; a half-deleted table) must *not* be handed back as a reuse — the
     /// producer would short-circuit to a table that cannot be read. A cache hit
-    /// is only sound when the catalog row *and* its artifact both survive, so the
-    /// probe re-confirms the bytes the cached row points at. An
-    /// [`AnchorKind::UnpinnedAtInstant`] input never reaches the extant check:
-    /// [`Self::lookup_cached`] already short-circuits it to a miss, so an
-    /// unpinned-anchored producer is honestly never a hit.
+    /// is only sound when the catalog row *and* its artifact both survive.
+    /// Crucially, a reaped artifact is **not** a global miss: when multiple
+    /// `ready` rows share the exact key (an idempotent recompute, a race), this
+    /// falls through to the next-newest exact match rather than giving up after
+    /// the first — a reaped *preferred* candidate must not shadow a sound reuse
+    /// that still exists. An [`AnchorKind::UnpinnedAtInstant`] input never
+    /// reaches the extant check: no candidate is ever considered for such a
+    /// request, so an unpinned-anchored producer is honestly never a hit.
     pub async fn probe_cache(
         &self,
         definition: &DefinitionHash,
@@ -293,31 +334,27 @@ impl ResultStore {
     /// [`Self::probe_cache`] returning the reusable table's full
     /// [`ResultTableRecord`] on a sound hit, not just its name — the shape a
     /// producer needs when it short-circuits, so it can hand the reused record
-    /// straight back without a second catalog read. `None` on a miss (no match,
-    /// an unpinned input, or a hit whose artifact was reaped). Read-only and
-    /// tenant-scoped.
+    /// straight back without a second catalog read. `None` on a miss (no exact
+    /// match, an unpinned input, or every exact match's artifact reaped).
+    /// Read-only and tenant-scoped.
     pub async fn probe_cache_record(
         &self,
         definition: &DefinitionHash,
         inputs: &[InputAnchor],
     ) -> Result<Option<ResultTableRecord>> {
-        let Some(table_name) = self.lookup_cached(definition, inputs).await? else {
-            return Ok(None);
-        };
-        // A hit names a `ready` row; confirm its Parquet bytes are still present.
-        // A row whose artifact was reaped is not a sound reuse — fall through to a
-        // recompute rather than short-circuit to an unreadable table.
-        let Some(record) = self.catalog().get_result_table(&table_name).await? else {
-            return Ok(None);
-        };
-        let parquet_url = StorageUrl::parse(&record.parquet_path)?;
-        let handle = self.open_parquet(&parquet_url)?;
-        let path = handle.data_path()?;
-        if handle.exists(&path).await? {
-            Ok(Some(record))
-        } else {
-            Ok(None)
+        // Iterate every exact-key candidate newest-first; a row whose artifact
+        // was reaped is not a sound reuse — fall through to the next candidate
+        // rather than short-circuit to an unreadable table or give up on the
+        // whole key.
+        for candidate in self.exact_match_candidates(definition, inputs).await? {
+            let parquet_url = StorageUrl::parse(&candidate.parquet_path)?;
+            let handle = self.open_parquet(&parquet_url)?;
+            let path = handle.data_path()?;
+            if handle.exists(&path).await? {
+                return Ok(Some(candidate));
+            }
         }
+        Ok(None)
     }
 
     /// Report whether a `ready` result table is still the output of its recorded

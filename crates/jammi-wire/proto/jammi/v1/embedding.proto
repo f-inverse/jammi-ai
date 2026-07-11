@@ -195,6 +195,11 @@ message SearchRequest {
   // most-recent ready table. Naming a table searches that one (e.g. a raw,
   // propagated, or fine-tuned table when a source carries several).
   optional string embedding_table = 7;
+  // Per-request override of the table's config-default retrieve→rescore
+  // oversample multiplier for a quantized sidecar index (market parity with
+  // Qdrant's per-query oversampling knob). Unset = the table's default.
+  // Irrelevant for an `f32`-precision table (single-stage, no rescore).
+  optional uint32 oversample = 8;
 }
 
 message SearchResponse {

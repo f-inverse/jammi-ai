@@ -171,5 +171,11 @@ pub fn result_table_from_proto(table: pb::ResultTable) -> Result<ResultTableReco
         // `verify_materialization`, not this reconstruction.
         definition_hash: None,
         input_anchors_json: None,
+        // The sidecar-index storage precision / rescore oversample are
+        // server-side bookkeeping, not carried on the `GenerateEmbeddings`
+        // result wire — a remote consumer never builds/loads the index
+        // directly, so it has no use for these here.
+        storage_precision: None,
+        oversample: None,
     })
 }

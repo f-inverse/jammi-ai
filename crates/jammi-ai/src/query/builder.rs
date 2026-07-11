@@ -55,6 +55,7 @@ impl QueryBuilder {
         query_vec: Vec<f32>,
         k: usize,
         embedding_table: Option<&str>,
+        oversample: Option<usize>,
     ) -> Result<Self> {
         let table = session
             .catalog()
@@ -67,6 +68,7 @@ impl QueryBuilder {
             table.clone(),
             query_vec,
             k,
+            oversample,
             result_store,
             session.context().clone(),
         )?;

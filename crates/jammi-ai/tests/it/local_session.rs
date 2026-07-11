@@ -76,13 +76,14 @@ async fn local_session_matches_engine_for_embed_and_search() {
             embedding_table: None,
             filter: None,
             select: Vec::new(),
+            oversample: None,
         })
         .await
         .unwrap();
 
     // Same query straight through the engine builder.
     let via_engine = engine
-        .search("patents", query, 5, None)
+        .search("patents", query, 5, None, None)
         .await
         .unwrap()
         .run()
@@ -160,11 +161,12 @@ async fn local_session_encode_and_search_by_row_key_match_engine() {
             embedding_table: None,
             filter: None,
             select: Vec::new(),
+            oversample: None,
         })
         .await
         .unwrap();
     let via_engine_key = engine
-        .search_by_id("patents", &key, 3, None)
+        .search_by_id("patents", &key, 3, None, None)
         .await
         .unwrap()
         .run()

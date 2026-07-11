@@ -571,8 +571,9 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `finalize`, `recover`, `materialize_embedding_table`, `resolve_search_mode`.
 - **`SidecarKind` / `sidecar_extensions`** —
   `crates/jammi-db/src/storage/sidecar_layout.rs`: the single registry the writer,
-  reader, and cleanup all consult. Ann → `["usearch","rowmap","manifest.json"]`;
-  Lexical → `["tantivy"]`; None → `[]`.
+  reader, and cleanup all consult. Ann →
+  `["usearch","rowmap","manifest.json","rawf32"]` (`rawf32` present only for a
+  quantized-precision graph); Lexical → `["tantivy"]`; None → `[]`.
 - **SQL identifier quoting** — `crates/jammi-db/src/sql/ident.rs`: `quote_ident`,
   `quote_relation`, `source_relation`. **Invariant: every identifier interpolated
   into a generated SQL string goes through here** (an unquoted hyphen parses as
@@ -604,13 +605,43 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
     `impl VectorIndex for SidecarIndex`); the exact path is a free async fn, not a
     trait impl [§5].
 - **`SidecarIndex`** — `crates/jammi-db/src/index/sidecar.rs` (the `SidecarIndex`
-  struct): USearch HNSW + Jammi-owned rowmap (`ROWMAP_VERSION=1`) + JSON manifest.
-  Metric hardcoded `Cos`, quant `F32`. `SidecarIndex::index_options` is the **sole
-  place USearch field names appear**.
+  struct): USearch HNSW + Jammi-owned rowmap (`ROWMAP_VERSION=1`) + JSON manifest
+  (`ANN_MANIFEST_VERSION=2`). Metric hardcoded `Cos`; quantization is
+  `StoragePrecision`-driven (`F32`/`F16`/`Int8`, `crates/jammi-db/src/config.rs`),
+  passed as an explicit `precision` argument to `SidecarIndex::new`/`load` —
+  never read off `self.ann` internally, so a rebuild/load always uses the
+  caller's resolved precision (the catalog row's persisted value), not today's
+  deployment default. `SidecarIndex::index_options` is the **sole place USearch
+  field names appear**. A quantized build also accumulates exact `f32` vectors
+  in `SidecarIndex::add` and flushes them to the `.rawf32` rescore companion on
+  `save` (`RawVectorCompanion`, mmap'd read-only on `load`); `get_exact` reads
+  it (falling back to `get` at `F32`, whose own USearch vectors are already
+  exact). `load` strict-compares the manifest's `scalar_kind` against the
+  caller's expected precision — any mismatch is `IncompatibleFormat`, mirroring
+  the `backend_version` strict-compare (no reject-newer ordering; a config
+  drift since the table was built must never silently reopen the wrong-precision
+  graph).
 - **`AnnIndexConfig`** — `crates/jammi-db/src/config.rs` (the `AnnIndexConfig`
   struct): `connectivity` (HNSW M, build-time), `build_expansion`
   (ef_construction, build-time), `search_expansion` (ef_search, query-time,
-  mutable). **`0` = backend default.**
+  mutable) — **`0` = backend default** for these three. `storage_precision`
+  (default `F32`) and `oversample` (default `4`, clamped to `>= 1` via
+  `effective_oversample`) are the deployment-wide defaults a newly-created
+  embedding table's catalog row is stamped with (migration 023,
+  `result_tables.storage_precision`/`oversample`, both nullable — `NULL` reads
+  back as the honest default for a pre-migration row).
+- **Retrieve→rescore** (`AnnSearchExec::execute`,
+  `crates/jammi-ai/src/operator/ann_search_exec.rs`): when the resolved index's
+  `storage_precision().needs_rescore()`, the plan retrieves `k * oversample`
+  candidates from the quantized graph, reads each candidate's exact vector via
+  `SidecarIndex::get_exact`, recomputes cosine distance, and re-sorts
+  (`total_cmp` + `row_id` tie-break) down to `k`. `oversample` resolves
+  per-request (`SearchRequest::oversample`, wire field 8) over the table's
+  config default. An `F32` table skips this — single-stage, as before.
+  `ProducingDescriptor::NeighborGraph::index_storage_precision`
+  (`crates/jammi-db/src/store/manifest.rs`) folds the source table's precision
+  into the K7 materialization identity when the index-assisted driver ran
+  (`None` when `exact = true`, which never touches the index).
 - **`AnnSearchExec`** (`crates/jammi-ai/src/operator/ann_search_exec.rs`) and
   **`QueryBuilder`** (`crates/jammi-ai/src/query/builder.rs`) are the DataFusion
   overlay: `AnnSearchExec` is the leaf that hits the index; `QueryBuilder` seeds the

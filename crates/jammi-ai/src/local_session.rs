@@ -315,18 +315,19 @@ impl Session {
             embedding_table,
             filter,
             select,
+            oversample,
         } = request;
         let embedding_table = embedding_table.as_deref();
 
         let builder = match query {
             SearchQuery::Vector(vector) => {
                 self.engine
-                    .search(&source_id, vector, k, embedding_table)
+                    .search(&source_id, vector, k, embedding_table, oversample)
                     .await?
             }
             SearchQuery::RowKey(row_key) => {
                 self.engine
-                    .search_by_id(&source_id, &row_key, k, embedding_table)
+                    .search_by_id(&source_id, &row_key, k, embedding_table, oversample)
                     .await?
             }
         };

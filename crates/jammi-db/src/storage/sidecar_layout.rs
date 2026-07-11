@@ -7,11 +7,14 @@
 //! same files and a new kind adds one registry entry rather than editing shared
 //! control flow.
 //!
-//! The shipped ANN kind ([`SidecarKind::Ann`]) carries three siblings:
+//! The shipped ANN kind ([`SidecarKind::Ann`]) carries three siblings, plus a
+//! fourth for a quantized-precision graph:
 //!
 //! - `<root>/<table>.usearch`        — serialised USearch graph
 //! - `<root>/<table>.rowmap`         — row-id mapping (Jammi-owned format)
 //! - `<root>/<table>.manifest.json`  — version, dimensions, count, backend
+//! - `<root>/<table>.rawf32`         — raw-`f32` rescore companion (quantized
+//!   precision only; absent — and simply skipped — for an `F32` graph)
 //!
 //! USearch's `save` / `load` are file-path-based (FFI), so for non-`file://`
 //! backends we materialise the bundle through a tempfile, then push the
@@ -20,7 +23,7 @@
 
 use std::path::Path;
 
-use crate::config::AnnIndexConfig;
+use crate::config::{AnnIndexConfig, StoragePrecision};
 use crate::error::Result;
 use crate::index::sidecar::SidecarIndex;
 
@@ -50,10 +53,19 @@ pub enum SidecarKind {
 ///
 /// This is the single registry the layout consults: writer, reader, and
 /// cleanup all enumerate a kind's siblings through here, so they never drift
-/// and a new kind is one match arm rather than an edit to every loop.
+/// and a new kind is one match arm rather than an edit to every loop. Every
+/// extension here is optional at the file level — the remote save/load
+/// helpers and [`delete_sidecar`] all skip a sibling that doesn't exist,
+/// which is how `rawf32` (quantized-only) coexists with the three that every
+/// `Ann` graph carries.
 pub fn sidecar_extensions(kind: SidecarKind) -> &'static [&'static str] {
     match kind {
-        SidecarKind::Ann => &["usearch", "rowmap", "manifest.json"],
+        SidecarKind::Ann => &[
+            "usearch",
+            "rowmap",
+            "manifest.json",
+            crate::index::sidecar::RESCORE_COMPANION_EXTENSION,
+        ],
         SidecarKind::Lexical => &["tantivy"],
         SidecarKind::None => &[],
     }
@@ -72,14 +84,19 @@ pub async fn save_sidecar(handle: &JammiObjectStore, index: &SidecarIndex) -> Re
 }
 
 /// Load a sidecar bundle into a [`SidecarIndex`], applying the query-time HNSW
-/// knob from `ann` to the loaded graph.
+/// knob from `ann` and strict-checking `expected_precision` (the catalog row's
+/// persisted `storage_precision`) against the graph's own stamped precision.
 ///
 /// For `file://` schemes USearch reads the destination path directly. For
 /// cloud schemes we download into a tempdir, then load from there.
-pub async fn load_sidecar(handle: &JammiObjectStore, ann: &AnnIndexConfig) -> Result<SidecarIndex> {
+pub async fn load_sidecar(
+    handle: &JammiObjectStore,
+    ann: &AnnIndexConfig,
+    expected_precision: StoragePrecision,
+) -> Result<SidecarIndex> {
     match handle.scheme() {
-        Scheme::File => load_sidecar_local(handle, ann),
-        _ => load_sidecar_remote(handle, ann).await,
+        Scheme::File => load_sidecar_local(handle, ann, expected_precision),
+        _ => load_sidecar_remote(handle, ann, expected_precision).await,
     }
 }
 
@@ -98,9 +115,13 @@ fn save_sidecar_local(handle: &JammiObjectStore, index: &SidecarIndex) -> Result
     Ok(())
 }
 
-fn load_sidecar_local(handle: &JammiObjectStore, ann: &AnnIndexConfig) -> Result<SidecarIndex> {
+fn load_sidecar_local(
+    handle: &JammiObjectStore,
+    ann: &AnnIndexConfig,
+    expected_precision: StoragePrecision,
+) -> Result<SidecarIndex> {
     let base = local_base_path(handle)?;
-    SidecarIndex::load(&base, ann)
+    SidecarIndex::load(&base, ann, expected_precision)
 }
 
 async fn save_sidecar_remote(handle: &JammiObjectStore, index: &SidecarIndex) -> Result<()> {
@@ -123,6 +144,7 @@ async fn save_sidecar_remote(handle: &JammiObjectStore, index: &SidecarIndex) ->
 async fn load_sidecar_remote(
     handle: &JammiObjectStore,
     ann: &AnnIndexConfig,
+    expected_precision: StoragePrecision,
 ) -> Result<SidecarIndex> {
     let tmp = tempfile::tempdir()?;
     let stem = tmp.path().join("sidecar");
@@ -136,7 +158,7 @@ async fn load_sidecar_remote(
         std::fs::write(stem.with_extension(ext), &bytes)?;
     }
 
-    SidecarIndex::load(&stem, ann)
+    SidecarIndex::load(&stem, ann, expected_precision)
 }
 
 /// Resolve the on-disk stem for a `file://` handle. Strips the `.parquet`
@@ -155,7 +177,8 @@ mod tests {
     use crate::storage::{JammiObjectStore, StorageRegistry, StorageUrl};
 
     fn build_small_index() -> SidecarIndex {
-        let mut idx = SidecarIndex::new(4, &AnnIndexConfig::default()).unwrap();
+        let mut idx =
+            SidecarIndex::new(4, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
         idx.add("row-a", &[1.0, 0.0, 0.0, 0.0]).unwrap();
         idx.add("row-b", &[0.0, 1.0, 0.0, 0.0]).unwrap();
         idx.add("row-c", &[0.0, 0.0, 1.0, 0.0]).unwrap();
@@ -173,7 +196,7 @@ mod tests {
         let index = build_small_index();
         save_sidecar(&handle, &index).await.unwrap();
 
-        let loaded = load_sidecar(&handle, &AnnIndexConfig::default())
+        let loaded = load_sidecar(&handle, &AnnIndexConfig::default(), StoragePrecision::F32)
             .await
             .unwrap();
         let hits = loaded.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
@@ -185,10 +208,10 @@ mod tests {
     }
 
     #[test]
-    fn ann_kind_carries_todays_three_extensions() {
+    fn ann_kind_carries_todays_four_extensions() {
         assert_eq!(
             sidecar_extensions(SidecarKind::Ann),
-            ["usearch", "rowmap", "manifest.json"],
+            ["usearch", "rowmap", "manifest.json", "rawf32"],
         );
     }
 

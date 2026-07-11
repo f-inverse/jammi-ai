@@ -32,7 +32,7 @@
 
 use std::collections::HashSet;
 
-use jammi_db::config::AnnIndexConfig;
+use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
@@ -114,7 +114,10 @@ impl HardNegativeMiner {
 
         // A transient in-memory index for mining; the deployment's HNSW tuning
         // is irrelevant to a scratch graph that never persists, so use defaults.
-        let mut index = SidecarIndex::new(dim, &AnnIndexConfig::default())?;
+        // Precision is pinned to `F32` (exact, no rescore companion) rather
+        // than the deployment default — mining quality should never silently
+        // degrade because an operator set a quantized default for search.
+        let mut index = SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::F32)?;
         for cand in candidates {
             if cand.embedding.len() != dim {
                 return Err(JammiError::FineTune(format!(

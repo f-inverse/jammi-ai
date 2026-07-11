@@ -2,7 +2,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{JammiError, Result};
 use crate::storage::CloudConfig;
@@ -439,15 +439,103 @@ pub struct HttpConfig {
     pub headers: std::collections::HashMap<String, String>,
 }
 
+/// The precision the ANN sidecar index quantizes its stored vectors to.
+///
+/// This is a **storage** concept, orthogonal to
+/// [`jammi_numerics::ComputePrecision`] (which names the dtype a model's
+/// matmuls run at): `StoragePrecision` names the dtype the HNSW graph's own
+/// vectors are quantized to on disk / in RAM, independent of how those
+/// vectors were computed. The Parquet result table always holds `f32` — this
+/// enum governs only the sidecar accelerator's memory footprint.
+///
+/// `F32` keeps the index's own vectors exact, so a search is single-stage. A
+/// quantized precision (`F16`, `Int8`) shrinks the in-RAM graph but makes the
+/// index's own stored vectors lossy, so a search over one is a two-stage
+/// retrieve-then-rescore: the quantized graph proposes an oversampled
+/// candidate set, and the exact `f32` rescore companion
+/// ([`crate::index::sidecar::SidecarIndex::get_exact`]) re-ranks it.
+///
+/// Only two quantized variants ship today; a `Binary` variant (USearch's `B1`
+/// scalar kind, paired with Hamming distance rather than cosine) is a Wave 1.5
+/// unit — it is deliberately not added here as a dead variant. Adding it later
+/// needs no reshape: one new match arm in [`Self::to_scalar_kind`], and the
+/// rescore recompute (today unconditionally cosine, matching every Jammi
+/// index's metric) gains a metric-aware branch at that point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StoragePrecision {
+    /// Full-precision `f32` vectors in the index — exact, single-stage search.
+    #[default]
+    F32,
+    /// 16-bit half-precision index vectors — quantized, rescored.
+    F16,
+    /// 8-bit signed-integer index vectors — quantized, rescored. USearch's
+    /// `I8` scalar kind (linear per-vector affine quantization).
+    Int8,
+}
+
+impl StoragePrecision {
+    /// The USearch scalar-quantization kind this precision maps onto — the
+    /// sole place the storage-precision vocabulary touches USearch's own
+    /// `ScalarKind` naming.
+    pub fn to_scalar_kind(self) -> usearch::ScalarKind {
+        match self {
+            Self::F32 => usearch::ScalarKind::F32,
+            Self::F16 => usearch::ScalarKind::F16,
+            Self::Int8 => usearch::ScalarKind::I8,
+        }
+    }
+
+    /// Whether a table at this precision needs the raw-`f32` rescore
+    /// companion: `true` for every quantized precision (the index's own
+    /// stored vectors are lossy), `false` for `F32` (the index already holds
+    /// the exact vectors, so a second retrieval stage would only re-derive
+    /// what the first stage already returned).
+    pub fn needs_rescore(self) -> bool {
+        !matches!(self, Self::F32)
+    }
+}
+
+impl fmt::Display for StoragePrecision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::F32 => write!(f, "f32"),
+            Self::F16 => write!(f, "f16"),
+            Self::Int8 => write!(f, "int8"),
+        }
+    }
+}
+
+impl FromStr for StoragePrecision {
+    type Err = JammiError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "f32" => Ok(Self::F32),
+            "f16" => Ok(Self::F16),
+            "int8" => Ok(Self::Int8),
+            other => Err(JammiError::Config(format!(
+                "unknown storage precision '{other}'. Expected: f32, f16, int8"
+            ))),
+        }
+    }
+}
+
+/// Default of [`AnnIndexConfig::oversample`] — retrieve `k * 4` candidates
+/// from the quantized graph before rescoring down to `k` exact results.
+const DEFAULT_OVERSAMPLE: usize = 4;
+
 /// HNSW graph-tuning knobs for the ANN sidecar index — the universal
 /// recall-vs-cost dials of a hierarchical navigable small-world graph, named
 /// for the HNSW primitive and independent of the backing index library.
 ///
-/// `0` on any field means "use the index backend's built-in default" (the
-/// derived [`Default`]), so an unset config reproduces the backend's defaults
-/// exactly. `connectivity` and `build_expansion` are fixed when the graph is
-/// constructed; `search_expansion` is a query-time dial applied to a loaded index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+/// `0` on any of the three HNSW fields means "use the index backend's
+/// built-in default"; `connectivity` and `build_expansion` are fixed when the
+/// graph is constructed, `search_expansion` is a query-time dial applied to a
+/// loaded index. `storage_precision` and `oversample` are not HNSW knobs but
+/// live here as the deployment-wide defaults every newly-created embedding
+/// table's catalog row is stamped with at creation — see
+/// [`crate::catalog::result_repo::ResultTableRecord::storage_precision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct AnnIndexConfig {
     /// Maximum connections per graph node (HNSW *M*). Higher trades a larger
@@ -460,6 +548,38 @@ pub struct AnnIndexConfig {
     /// slower queries for better recall; mutable on a loaded index.
     /// `0` = backend default.
     pub search_expansion: usize,
+    /// The precision new embedding tables' sidecar index is built at.
+    /// Default: `F32`.
+    pub storage_precision: StoragePrecision,
+    /// How many candidates a quantized-index search retrieves per requested
+    /// result before rescoring down to `k` exact matches (`k * oversample`).
+    /// Irrelevant at `F32` (single-stage, no rescore). Default: `4`. A `0`
+    /// (or any value below `1`) is clamped to `1` at
+    /// [`Self::effective_oversample`] — an oversample below `1` would retrieve
+    /// fewer candidates than the request asks for.
+    pub oversample: usize,
+}
+
+impl Default for AnnIndexConfig {
+    fn default() -> Self {
+        Self {
+            connectivity: 0,
+            build_expansion: 0,
+            search_expansion: 0,
+            storage_precision: StoragePrecision::default(),
+            oversample: DEFAULT_OVERSAMPLE,
+        }
+    }
+}
+
+impl AnnIndexConfig {
+    /// [`Self::oversample`] clamped to at least `1` — the domain-valid
+    /// multiplier a quantized-index retrieve stage actually uses. A
+    /// misconfigured `0` must never shrink the candidate set below the
+    /// requested `k`.
+    pub fn effective_oversample(&self) -> usize {
+        self.oversample.max(1)
+    }
 }
 
 /// Embedding index defaults.
@@ -1578,5 +1698,65 @@ mod tests {
             }
         );
         std::env::remove_var("JAMMI_TEST_LOAD_URL");
+    }
+
+    #[test]
+    fn storage_precision_default_is_f32() {
+        assert_eq!(StoragePrecision::default(), StoragePrecision::F32);
+    }
+
+    #[test]
+    fn storage_precision_display_and_from_str_round_trip() {
+        for precision in [
+            StoragePrecision::F32,
+            StoragePrecision::F16,
+            StoragePrecision::Int8,
+        ] {
+            let s = precision.to_string();
+            assert_eq!(s.parse::<StoragePrecision>().unwrap(), precision);
+        }
+    }
+
+    #[test]
+    fn storage_precision_from_str_rejects_unknown_value() {
+        assert!("fp8".parse::<StoragePrecision>().is_err());
+    }
+
+    #[test]
+    fn storage_precision_maps_onto_usearch_scalar_kind() {
+        assert_eq!(
+            StoragePrecision::F32.to_scalar_kind(),
+            usearch::ScalarKind::F32
+        );
+        assert_eq!(
+            StoragePrecision::F16.to_scalar_kind(),
+            usearch::ScalarKind::F16
+        );
+        assert_eq!(
+            StoragePrecision::Int8.to_scalar_kind(),
+            usearch::ScalarKind::I8
+        );
+    }
+
+    #[test]
+    fn only_f32_skips_rescore() {
+        assert!(!StoragePrecision::F32.needs_rescore());
+        assert!(StoragePrecision::F16.needs_rescore());
+        assert!(StoragePrecision::Int8.needs_rescore());
+    }
+
+    #[test]
+    fn ann_index_config_default_oversample_is_four() {
+        assert_eq!(AnnIndexConfig::default().oversample, 4);
+        assert_eq!(AnnIndexConfig::default().effective_oversample(), 4);
+    }
+
+    #[test]
+    fn effective_oversample_clamps_a_misconfigured_zero_to_one() {
+        let ann = AnnIndexConfig {
+            oversample: 0,
+            ..AnnIndexConfig::default()
+        };
+        assert_eq!(ann.effective_oversample(), 1);
     }
 }

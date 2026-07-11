@@ -185,6 +185,7 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
         embedding_table: None,
         filter: None,
         select,
+        oversample: None,
     };
     let remote_hits = keys_and_scores(
         remote
@@ -346,6 +347,7 @@ async fn remote_reconstructs_the_exact_error_variant_local_returns() {
         embedding_table: None,
         filter: None,
         select: Vec::new(),
+        oversample: None,
     };
 
     let local_err = local

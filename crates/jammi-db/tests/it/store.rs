@@ -80,6 +80,8 @@ async fn result_table_crud_lifecycle() {
             dimensions: Some(384),
             key_column: Some("id"),
             text_columns: Some("abstract"),
+            storage_precision: jammi_db::config::StoragePrecision::F32,
+            oversample: 4,
         })
         .await
         .unwrap();
@@ -111,6 +113,8 @@ async fn result_table_crud_lifecycle() {
             dimensions: None,
             key_column: None,
             text_columns: None,
+            storage_precision: jammi_db::config::StoragePrecision::F32,
+            oversample: 4,
         })
         .await
         .unwrap();
@@ -153,6 +157,8 @@ async fn find_result_tables_filters_by_source_and_task() {
                 dimensions: None,
                 key_column: None,
                 text_columns: None,
+                storage_precision: jammi_db::config::StoragePrecision::F32,
+                oversample: 4,
             })
             .await
             .unwrap();
@@ -198,6 +204,8 @@ async fn resolve_embedding_table_latest_explicit_and_missing() {
                 dimensions: Some(384),
                 key_column: None,
                 text_columns: None,
+                storage_precision: jammi_db::config::StoragePrecision::F32,
+                oversample: 4,
             })
             .await
             .unwrap();
@@ -251,6 +259,8 @@ async fn resolve_embedding_table_accepts_every_embedding_variant() {
                 dimensions: Some(8),
                 key_column: None,
                 text_columns: None,
+                storage_precision: jammi_db::config::StoragePrecision::F32,
+                oversample: 4,
             })
             .await
             .unwrap();
@@ -329,6 +339,8 @@ async fn recovery_skips_index_rebuild_for_non_embedding_task() {
             dimensions: None,
             key_column: None,
             text_columns: None,
+            storage_precision: jammi_db::config::StoragePrecision::F32,
+            oversample: 4,
         })
         .await
         .unwrap();
@@ -470,6 +482,8 @@ async fn recovery_marks_missing_parquet_as_failed() {
             dimensions: None,
             key_column: None,
             text_columns: None,
+            storage_precision: jammi_db::config::StoragePrecision::F32,
+            oversample: 4,
         })
         .await
         .unwrap();
@@ -513,6 +527,8 @@ async fn recovery_deletes_invalid_parquet_and_marks_failed() {
             dimensions: None,
             key_column: None,
             text_columns: None,
+            storage_precision: jammi_db::config::StoragePrecision::F32,
+            oversample: 4,
         })
         .await
         .unwrap();
@@ -573,6 +589,8 @@ async fn recovery_promotes_valid_parquet_to_ready() {
             dimensions: None,
             key_column: None,
             text_columns: None,
+            storage_precision: jammi_db::config::StoragePrecision::F32,
+            oversample: 4,
         })
         .await
         .unwrap();
@@ -654,6 +672,8 @@ async fn result_table_none_dimensions_round_trips_as_null(backend: BackendKind) 
             dimensions: None,
             key_column: None,
             text_columns: None,
+            storage_precision: jammi_db::config::StoragePrecision::F32,
+            oversample: 4,
         })
         .await
         .unwrap();

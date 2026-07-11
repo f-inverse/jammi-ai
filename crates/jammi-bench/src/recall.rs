@@ -72,7 +72,7 @@ use std::path::Path;
 
 use datafusion::prelude::SessionContext;
 
-use jammi_db::config::AnnIndexConfig;
+use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::exact::exact_vector_search;
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
@@ -154,7 +154,11 @@ pub async fn mean_recall_at_k(
     }
     // LOAD the frozen sidecar — never rebuild. The committed graph is the one
     // whose recall is being measured.
-    let index = SidecarIndex::load(sidecar_base, &AnnIndexConfig::default())?;
+    let index = SidecarIndex::load(
+        sidecar_base,
+        &AnnIndexConfig::default(),
+        StoragePrecision::F32,
+    )?;
 
     let mut total = 0.0;
     for query in queries {
@@ -261,7 +265,8 @@ mod tests {
     /// `.manifest`). This is the *one* build — it stands in for the on-box emit;
     /// the recall path under test only ever loads what this writes.
     fn freeze_sidecar(base: &std::path::Path, rows: &[(String, Vec<f32>)], dim: usize) {
-        let mut index = SidecarIndex::new(dim, &AnnIndexConfig::default()).unwrap();
+        let mut index =
+            SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
         for (id, v) in rows {
             index.add(id, v).unwrap();
         }

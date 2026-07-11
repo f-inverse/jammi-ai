@@ -76,6 +76,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "022_definition_hash_index",
         schema::MIGRATION_022_DEFINITION_HASH_INDEX,
     ),
+    (
+        "023_storage_precision",
+        schema::MIGRATION_023_STORAGE_PRECISION,
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

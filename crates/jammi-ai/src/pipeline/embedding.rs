@@ -165,7 +165,12 @@ impl<'a> EmbeddingPipeline<'a> {
             .result_store
             .open_writer(&table_info.parquet_url, embedding_schema)
             .await?;
-        let sidecar = SidecarIndex::new(embedding_dim, &self.session.inner_config().embedding.ann)?;
+        // Fresh creation — `create_table` above just stamped this table's
+        // catalog row with today's deployment default, so the same default
+        // applies here (unlike a rebuild, there is no pre-existing catalog
+        // promise to honour).
+        let ann_config = &self.session.inner_config().embedding.ann;
+        let sidecar = SidecarIndex::new(embedding_dim, ann_config, ann_config.storage_precision)?;
         let checkpoint_interval = self.session.inner_config().embedding.checkpoint_interval;
         let mut sink = ResultSink::for_embeddings(
             writer,

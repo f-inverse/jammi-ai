@@ -256,10 +256,18 @@ pub enum ProducingDescriptor {
     /// prunes edges below a floor; `mutual` keeps only reciprocal edges; `self_exclude`
     /// drops (or keeps) the self-edge; `exact` selects the deterministic
     /// brute-force driver over the non-deterministic index-assisted one (so it is
-    /// itself output-affecting); and `exact_max_rows` is the ceiling that gates
-    /// the exact driver. (The `resolve_keys` flag is *not* recorded: today a
-    /// resolved endpoint equals its `_row_id` either way, so it does not affect
-    /// the output — recording it would be a false determinant.)
+    /// itself output-affecting); `exact_max_rows` is the ceiling that gates the
+    /// exact driver; and `index_storage_precision` is the source table's ANN
+    /// sidecar-index precision **at the moment the index-assisted driver ran**
+    /// (`None` when `exact`, which reads Parquet directly and never touches the
+    /// index, so the source table's precision cannot affect it). A quantized
+    /// index (`F16`/`Int8`) yields a different approximate neighbour set than an
+    /// `F32` one over the identical rows — the same non-determinism contract
+    /// that already makes the index-assisted driver's own recall a determinant,
+    /// so the precision it ran at must be recorded too. (The `resolve_keys`
+    /// flag is *not* recorded: today a resolved endpoint equals its `_row_id`
+    /// either way, so it does not affect the output — recording it would be a
+    /// false determinant.)
     NeighborGraph {
         /// The embedding result table the edges were derived from.
         source_table: String,
@@ -278,6 +286,10 @@ pub enum ProducingDescriptor {
         exact: bool,
         /// Row-count ceiling that gates the exact driver.
         exact_max_rows: usize,
+        /// The source table's sidecar-index storage precision at build time,
+        /// when the index-assisted driver ran (`exact = false`); `None` when
+        /// `exact = true`.
+        index_storage_precision: Option<crate::config::StoragePrecision>,
     },
     /// Graph-propagation output: K hops of feature propagation over a
     /// neighbor-graph, materialised as a new embedding table.
@@ -1296,6 +1308,7 @@ mod tests {
             self_exclude: p.self_exclude,
             exact: p.exact,
             exact_max_rows: p.exact_max_rows,
+            index_storage_precision: p.index_storage_precision,
         }
     }
 
@@ -1307,6 +1320,7 @@ mod tests {
         self_exclude: bool,
         exact: bool,
         exact_max_rows: usize,
+        index_storage_precision: Option<crate::config::StoragePrecision>,
     }
 
     #[test]
@@ -1318,6 +1332,7 @@ mod tests {
             self_exclude: true,
             exact: false,
             exact_max_rows: 50_000,
+            index_storage_precision: Some(crate::config::StoragePrecision::F32),
         };
         assert_each_change_moves_hash(
             &base,
@@ -1332,6 +1347,9 @@ mod tests {
                 ("self_exclude", |p| p.self_exclude = false),
                 ("exact", |p| p.exact = true),
                 ("exact_max_rows", |p| p.exact_max_rows = 1_000),
+                ("index_storage_precision", |p| {
+                    p.index_storage_precision = Some(crate::config::StoragePrecision::Int8)
+                }),
             ],
         );
     }

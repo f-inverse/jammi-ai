@@ -16,6 +16,13 @@ candle-nn.workspace = true
 # Needs the candle-backed LoRA primitives (`LoraLinear` / `MaybeLoraLinear` /
 # `LoraError`), so enable jammi-lora's `candle` feature (off at the workspace root).
 jammi-lora = { workspace = true, features = ["candle"] }
+# The candle-free `ComputePrecision` vocabulary. This crate is the candle
+# boundary for it: `compute_precision_to_dtype` is the one place in the
+# workspace that maps `ComputePrecision -> candle_core::DType` (a plain
+# function, not a `From` impl — neither type is local here, so an orphan-rule
+# -legal trait impl cannot exist anywhere but `jammi-numerics` or `candle`
+# itself, and `jammi-numerics` must stay candle-free).
+jammi-numerics.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

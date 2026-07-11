@@ -29,6 +29,10 @@ pub struct DeviceConfig {
     /// fast instead of silently serving on CPU. When `false` (the default),
     /// an unavailable GPU degrades to CPU with a loud warning.
     pub require_gpu: bool,
+    /// Global default inference compute precision (`GpuConfig::compute_precision`).
+    /// A per-model override in the resolved model's `config.json` wins over
+    /// this at load time; both default to `F32`.
+    pub compute_precision: jammi_numerics::ComputePrecision,
 }
 
 impl DeviceConfig {
@@ -38,6 +42,7 @@ impl DeviceConfig {
             gpu_device: config.gpu.device,
             memory_fraction: config.gpu.memory_fraction,
             require_gpu: config.gpu.require_gpu,
+            compute_precision: config.gpu.compute_precision,
         }
     }
 }

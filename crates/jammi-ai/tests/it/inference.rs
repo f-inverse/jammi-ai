@@ -273,6 +273,7 @@ mod live {
             gpu_device: -1,
             memory_fraction: 1.0,
             require_gpu: false,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
         };
         let scheduler = Arc::new(GpuScheduler::new_unlimited());
         let cache = ModelCache::new(resolver, device_config, scheduler);
@@ -381,6 +382,7 @@ mod live {
             gpu_device: -1,
             memory_fraction: 1.0,
             require_gpu: false,
+            compute_precision: jammi_numerics::ComputePrecision::F32,
         };
         let scheduler = Arc::new(jammi_ai::concurrency::GpuScheduler::new_unlimited());
         let cache = ModelCache::new(resolver, device_config, scheduler);

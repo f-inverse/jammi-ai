@@ -1535,8 +1535,8 @@ async fn assert_source_resolver_isolated() {
 /// build on. Returns the constructed engine + session and the private table name.
 async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, String, TempDir) {
     use jammi_db::store::manifest::{
-        ComputeDevice, InputAnchor, Materialization, MaterializationEnv, ModelIdentity,
-        ProducingDescriptor,
+        ComputeDevice, ComputePrecision, InputAnchor, Materialization, MaterializationEnv,
+        ModelIdentity, ProducingDescriptor,
     };
 
     const DIMS: usize = 4;
@@ -1615,6 +1615,7 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
                 vec![ModelIdentity {
                     model_id: model_id.into(),
                     backend: "candle".into(),
+                    compute_precision: ComputePrecision::F32,
                 }],
             );
             let ctx = SessionContext::new();

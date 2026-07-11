@@ -11,13 +11,19 @@ categories = ["science"]
 readme = "README.md"
 
 [dependencies]
+# The candle-free compute-precision vocabulary (`ComputePrecision`) that
+# `AdapterConfig::backbone_dtype` is typed on — the same "what dtype does this
+# backbone run at" concept the inference engine's compute-precision knob uses,
+# so both share one enum rather than duplicating it. Unconditional: it carries
+# no tensor-library dependency of its own.
+jammi-numerics.workspace = true
 # The candle tensor stack backs every LoRA *primitive* (the linear layers, the
-# adapter save/load, the dtype mapping). It is gated behind the default-on
-# `candle` feature so a consumer that only needs the LoRA *config vocabulary* —
-# `LoraInitMode`, `BackboneDtype`, `LoraBuildConfig`, `AdapterConfig` and the
-# module-matching helpers, the fields a `FineTuneConfig` is built from — can
-# depend on this crate without pulling candle. Every existing consumer keeps the
-# default and is byte-unchanged.
+# adapter save/load). It is gated behind the default-on `candle` feature so a
+# consumer that only needs the LoRA *config vocabulary* — `LoraInitMode`,
+# `LoraBuildConfig`, `AdapterConfig` and the module-matching helpers, the
+# fields a `FineTuneConfig` is built from — can depend on this crate without
+# pulling candle. Every existing consumer keeps the default and is
+# byte-unchanged.
 candle-core = { workspace = true, optional = true }
 candle-nn = { workspace = true, optional = true }
 serde.workspace = true
@@ -30,8 +36,10 @@ tempfile = "3"
 [features]
 default = ["candle"]
 # The candle-backed LoRA primitives: the `LoraLinear` / `MaybeLoraLinear` layers,
-# adapter save/load, the `BackboneDtype -> candle DType` mapping, and the candle
-# tensor-error arm of `LoraError`. Default-on; turning it off leaves the
-# candle-free config vocabulary (`LoraInitMode`, `BackboneDtype`, `LoraBuildConfig`,
-# `AdapterConfig`, `should_apply_lora`, `effective_rank`).
+# adapter save/load, and the candle tensor-error arm of `LoraError`. Default-on;
+# turning it off leaves the candle-free config vocabulary (`LoraInitMode`,
+# `LoraBuildConfig`, `AdapterConfig`, `should_apply_lora`, `effective_rank`).
+# The `ComputePrecision -> candle DType` mapping lives at the candle boundary
+# in `jammi-encoders`, not here — `jammi-numerics` (this crate's dependency for
+# `ComputePrecision`) stays candle-free either way.
 candle = ["dep:candle-core", "dep:candle-nn"]

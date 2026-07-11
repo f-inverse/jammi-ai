@@ -109,6 +109,16 @@ impl<'a> ImportPipeline<'a> {
             vec![ModelIdentity {
                 model_id: canonical_model_id.clone(),
                 backend: IMPORT_BACKEND.to_string(),
+                // No inference ran (the vectors were produced outside the
+                // engine), so there is no resolved compute precision to
+                // report; the descriptor is `External` and therefore
+                // recompute-inert (`NotRecomputable`) regardless, and the
+                // content digest the verb auto-folds into `params` is what
+                // actually distinguishes two imports, not this field. The
+                // default is recorded rather than a fabricated non-default
+                // value, matching `IMPORT_BACKEND`'s "honest mechanism
+                // placeholder" stance.
+                compute_precision: jammi_numerics::ComputePrecision::default(),
             }],
         );
         // The sole input is the external vector object, which exposes no version

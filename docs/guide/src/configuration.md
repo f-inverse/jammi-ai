@@ -44,6 +44,11 @@ memory_fraction = 0.9
 # Fail fast if the requested GPU is unavailable instead of falling back to CPU.
 # Default: false (degrade to CPU with a warning).
 require_gpu = false
+# Default inference compute precision: "f32" or "f16". A model may override
+# this with its own "compute_precision" in config.json; the per-model value
+# wins. "bf16" is a valid value for fine-tune's frozen-backbone dtype but is
+# rejected at inference load time (not yet supported). Default: "f32".
+compute_precision = "f32"
 
 [inference]
 # Default backend selection strategy. Default: "auto".

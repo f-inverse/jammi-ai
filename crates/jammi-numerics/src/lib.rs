@@ -31,7 +31,9 @@ pub mod gp;
 pub mod histogram;
 pub mod ner;
 pub mod pareto;
+pub mod precision;
 pub mod retrieval;
 pub mod stats;
 
 pub use error::{NumericsError, Result};
+pub use precision::ComputePrecision;

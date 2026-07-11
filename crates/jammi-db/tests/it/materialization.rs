@@ -25,8 +25,8 @@ use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::model_task::ModelTask;
 use jammi_db::store::manifest::{
-    AnchorKind, ComputeDevice, DefinitionHash, InputAnchor, MatchVerdict, MaterializationEnv,
-    ModelIdentity, ProducingDescriptor,
+    AnchorKind, ComputeDevice, ComputePrecision, DefinitionHash, InputAnchor, MatchVerdict,
+    MaterializationEnv, ModelIdentity, ProducingDescriptor,
 };
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{ResultStore, ResultTableInfo};
@@ -110,6 +110,7 @@ fn env() -> MaterializationEnv {
         vec![ModelIdentity {
             model_id: "test-model".into(),
             backend: "candle".into(),
+            compute_precision: ComputePrecision::F32,
         }],
     )
 }

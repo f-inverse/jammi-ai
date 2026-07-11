@@ -46,6 +46,6 @@ pub mod worker;
 // paths so the engine's training modules and SDK consumers reach it as
 // `jammi_ai::fine_tune::*`.
 pub use jammi_wire::fine_tune::{
-    BackboneDtype, ClassificationLoss, EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig,
+    ClassificationLoss, ComputePrecision, EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig,
     FineTuneMethod, HardNegativeConfig, LoraInitMode, LrSchedule, RegressionLoss,
 };

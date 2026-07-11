@@ -2780,6 +2780,26 @@ graphs don't exhaust runner disk) → `test-clients` (clients + the **two candle
   artifact, not `cargo tree`.)
 - **Conformance:** `crates/jammi-python/tests/test_conformance.py` pins remote == embedded verb sets
   name-for-name.
+- **`ci/scripts/check_sqlite_isms.py`** greps `crates/jammi-db/src/**` for hand-written
+  backend-specific SQL tokens (SQLite-only `rowid`/`AUTOINCREMENT`/`PRAGMA`/`strftime(`/`glob(`;
+  Postgres-only `ctid`). A syntactic first-pass tripwire only — it stops the obvious cheap
+  regression; `test-pg` above is what actually enforces backend-behavioral parity.
+
+**Postgres coverage note (heuristic, not a certified gap list).** A name-based grep of
+`crates/jammi-db/tests/it/` for the following `jammi-db` catalog/store functions found zero direct
+callers by that literal name, so their SQL is exercised only indirectly (if at all) by the
+`test-pg` matrix above: `delete_result_tables_for_source`, `get_mutable_table_for_tenant`,
+`list_source_descriptors`, `describe_source`, `find_ready_result_tables_anchored_on`,
+`delete_artifact_prefix`, `delete_table_files`, `list_all_mutable_tables`, `get_model_version`,
+`list_eval_runs`, `latest_eval_run`, `list_training_jobs`, `mark_training_running`, the
+training-worker checkpoint surface (`put_artifact`/`fetch_artifact`/`put_resume_checkpoint`/
+`fetch_resume_checkpoint`/`get_checkpoint`/`set_checkpoint`/`delete_resume_checkpoint`),
+`register_table`, `promote_result_table_with_manifest`, `save_sidecar`, `read_keyed_vectors_f32`.
+This is a grep over identifier names, not a certified coverage report — a function called through
+a wrapper of a different name, or exercised only via a higher-level integration path, would read as
+covered under a call-graph analysis and still show up here; conversely nothing here proves the SQL
+is actually *un*-exercised end-to-end. Treat it as a to-do list for future direct-coverage work, not
+a gate: no CI job asserts against it.
 
 **Test discipline.** Default `cargo test` is fully hermetic. Live tests gate behind a feature and must
 **skip cleanly** (`tracing::warn`, never `#[ignore]` / `#[cfg(any())]` / `// TODO`). The GPU suite pins

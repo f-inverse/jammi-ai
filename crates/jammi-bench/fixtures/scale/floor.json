@@ -1,6 +1,36 @@
 {
   "margin": 0.04,
   "precision": {
+    "binary_no_rescore": {
+      "1": {
+        "floor": 0.33,
+        "measured": 0.37
+      },
+      "10": {
+        "floor": 0.36599999999999966,
+        "measured": 0.40599999999999964
+      },
+      "100": {
+        "floor": 0.5420000000000001,
+        "measured": 0.5820000000000002
+      }
+    },
+    "binary_oversample_no_rescore": 1,
+    "binary_oversample_rescored": 32,
+    "binary_rescored": {
+      "1": {
+        "floor": 0.8999999999999999,
+        "measured": 0.94
+      },
+      "10": {
+        "floor": 0.9530000000000001,
+        "measured": 0.9930000000000001
+      },
+      "100": {
+        "floor": 0.96,
+        "measured": 1.0
+      }
+    },
     "int8_no_rescore": {
       "1": {
         "floor": 0.6699999999999999,

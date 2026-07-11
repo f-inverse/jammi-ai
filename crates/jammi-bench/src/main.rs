@@ -182,6 +182,19 @@ enum Command {
     /// the provenance-recording builder for the committed precision floor.
     #[command(hide = true)]
     BuildPrecisionRecallFixture,
+    /// Internal: build the committed `Binary`-precision recall fixture —
+    /// freezes a `Binary` (`B1`/Hamming) sidecar over the ALREADY-COMMITTED
+    /// `fixtures/scale/` corpus (the same real embeddings the frozen
+    /// `F32`/`Int8` bundles index) and merges `binary_*` keys (measured
+    /// recall@k for the two-stage retrieve→rescore at `Binary`'s own default
+    /// oversample, and for the naive `oversample = 1` no-rescore baseline;
+    /// floor = measured − margin) into the existing `floor.json`. Run off-box
+    /// once with `RAYON_NUM_THREADS=1` after `build-scale-fixture` and
+    /// `build-precision-recall-fixture` have produced the `F32`/`Int8`
+    /// fixtures; the bundle is committed and CI only loads it. Not a CI step —
+    /// the provenance-recording builder for the committed `Binary` floor.
+    #[command(hide = true)]
+    BuildBinaryRecallFixture,
     /// The CPU-hermetic training tier: measures the engine's in-batch-negative
     /// fine-tune throughput (pairs/s) through one GradCache backward + AdamW step
     /// on `Device::Cpu`, and re-triggers the activation-memory negative control —
@@ -360,6 +373,7 @@ async fn main() -> std::process::ExitCode {
                 .await
         }
         Command::BuildPrecisionRecallFixture => run_build_precision_recall_fixture().await,
+        Command::BuildBinaryRecallFixture => run_build_binary_recall_fixture().await,
         Command::TrainScale => run_train_scale().await,
         Command::TrainMeasureOnce { path, pairs } => run_train_measure_once(&path, pairs),
         Command::TrainThroughputOnce { pairs } => run_train_throughput_once(pairs),
@@ -1433,6 +1447,33 @@ async fn run_build_precision_recall_fixture() -> std::process::ExitCode {
         },
         Err(e) => {
             eprintln!("build-precision-recall-fixture failed: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Build the committed `Binary`-precision recall fixture (the frozen `Binary`
+/// sidecar + its `floor.json` `binary_*` keys) over the already-committed
+/// `fixtures/scale/` corpus, and print the resulting floor record.
+///
+/// Off-box one-shot: freezes the one `Binary` sidecar and merges the measured
+/// recall@k (rescored at `Binary`'s own default oversample, and no-rescore)
+/// into the existing `floor.json`. Prints the measured recall and the derived
+/// floors so the operator sees the numbers being committed.
+async fn run_build_binary_recall_fixture() -> std::process::ExitCode {
+    match fixture::build_binary_recall_fixture(&arxiv_fixture_dir()).await {
+        Ok(record) => match serde_json::to_string_pretty(&record) {
+            Ok(json) => {
+                println!("{json}");
+                std::process::ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("failed to serialize binary precision floor record: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        },
+        Err(e) => {
+            eprintln!("build-binary-recall-fixture failed: {e}");
             std::process::ExitCode::FAILURE
         }
     }

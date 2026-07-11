@@ -61,18 +61,19 @@ fn index_options(
     }
 }
 
-/// A memory-mapped, id-keyed exact-`f32` companion for a quantized sidecar
+/// A positioned-read, id-keyed exact-`f32` companion for a quantized sidecar
 /// index.
 ///
 /// Fixed-size records (`dimensions` × `f32`, little-endian, native byte
 /// order — read back on the same architecture family that wrote it) in the
 /// same order as [`SidecarIndex`]'s internal USearch key (`0..row_map.len()`),
 /// so the vector for internal key `k` sits at byte offset `k * dimensions *
-/// 4` — O(1) random-access, mmap'd rather than loaded resident, and never a
-/// per-query Parquet re-scan. This is the *exact*-vector source a quantized
-/// index's own `search`/`export` cannot serve: once USearch quantizes its
-/// stored vectors (`F16`/`I8`), what it hands back is the lossy reconstructed
-/// value, not the original `f32`.
+/// 4` — O(1) random-access via a positioned read (served from the OS page
+/// cache, never loaded resident up front), and never a per-query Parquet
+/// re-scan. This is the *exact*-vector source a quantized index's own
+/// `search`/`export` cannot serve: once USearch quantizes its stored vectors
+/// (`F16`/`I8`), what it hands back is the lossy reconstructed value, not the
+/// original `f32`.
 ///
 /// A derived artifact: fully rebuildable from the Parquet result table (every
 /// build site that constructs a [`SidecarIndex`] at a quantized precision
@@ -80,7 +81,7 @@ fn index_options(
 /// it carries no independent durability guarantee beyond the sidecar bundle
 /// it rides alongside.
 struct RawVectorCompanion {
-    mmap: memmap2::Mmap,
+    file: std::fs::File,
     dimensions: usize,
 }
 
@@ -98,28 +99,32 @@ impl RawVectorCompanion {
         Ok(())
     }
 
-    /// mmap an existing companion file read-only.
+    /// Open an existing companion file read-only. Kept as an owned `File`
+    /// (no mmap): every read below is a positioned `pread`, so the file
+    /// descriptor is the only resource held for the companion's lifetime.
     fn open(path: &Path, dimensions: usize) -> Result<Self> {
         let file = std::fs::File::open(path)?;
-        // Safety: this file is a Jammi-owned artifact written once by `write`
-        // and never mutated in place afterward (a rebuild replaces it via a
-        // fresh `save`, not an in-place edit) — no writer can race a reader
-        // holding this mapping for the lifetime of the map.
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        Ok(Self { mmap, dimensions })
+        Ok(Self { file, dimensions })
     }
 
-    /// O(1) random read of the exact vector at `internal_key`. `None` when
-    /// the key is out of the mapped range (a stale key past this file's
-    /// record count).
+    /// O(1) random read of the exact vector at `internal_key` via a
+    /// positioned read (`pread`) at `internal_key * dimensions * 4` — no
+    /// seek, no shared file-cursor mutation, safe to call concurrently from
+    /// multiple readers of the same companion. `None` when the record falls
+    /// outside the file (a stale key past this file's record count, or a
+    /// truncated/missing file), mirroring the previous mmap-`get`'s graceful
+    /// out-of-range behaviour rather than surfacing an I/O error.
     fn get(&self, internal_key: u64) -> Option<Vec<f32>> {
+        use std::os::unix::fs::FileExt;
+
         let stride = self.dimensions * std::mem::size_of::<f32>();
         let start = (internal_key as usize).checked_mul(stride)?;
-        let end = start.checked_add(stride)?;
-        let bytes = self.mmap.get(start..end)?;
-        bytemuck::try_cast_slice::<u8, f32>(bytes)
-            .ok()
-            .map(<[f32]>::to_vec)
+        let start = u64::try_from(start).ok()?;
+
+        let mut record = vec![0f32; self.dimensions];
+        let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut record);
+        self.file.read_exact_at(bytes, start).ok()?;
+        Some(record)
     }
 }
 
@@ -153,9 +158,10 @@ pub struct SidecarIndex {
     /// [`Self::load`]: a loaded index reads exact vectors back through
     /// `rescore`'s mmap, never rebuilds this buffer into memory.
     exact_vectors: Option<Vec<f32>>,
-    /// The mmap'd raw-`f32` rescore companion, present iff this index was
-    /// loaded at a quantized precision (its sibling `.rawf32` file is read at
-    /// load time, not lazily). `None` for an `F32` index.
+    /// The raw-`f32` rescore companion, present iff this index was loaded at
+    /// a quantized precision (its sibling `.rawf32` file is opened at load
+    /// time, not lazily; each vector is then served by a positioned read).
+    /// `None` for an `F32` index.
     rescore: Option<RawVectorCompanion>,
 }
 

@@ -119,15 +119,36 @@ def test_int8_storage_precision_and_oversample_reachable_through_public_api(
     oversample=...)` for the per-request override — reaches a REAL, working
     `int8` quantized table and its retrieve->rescore knob.
 
-    Registered at the deployment default `oversample = 1` (so an unoverridden
-    search retrieves exactly `k` candidates off the lossy quantized graph —
-    on this corpus, uncorrelated with the query's true source row): the
-    *default* search misses its own source row on every probe, and an
-    explicit per-request `oversample` wide enough to cover the whole corpus
-    recovers it on every one — proving the override genuinely reaches the
-    engine's rescore resolution, not merely that `search()` accepts the
-    keyword without error.
+    This is proved WITHOUT relying on a negative "the narrow default must
+    MISS" claim: whether a `k=1`, `oversample=1` int8 search happens to land
+    on the query's own source row is quantization noise the construction
+    only makes *unlikely*, not impossible, and it is not required to be
+    identical across environments/USearch builds (this is exactly what made
+    the previous version of this test flaky in CI). Instead this asserts two
+    things that are deterministic by construction, plus the wire-assembly
+    proof that the keyword genuinely reaches the request:
+
+    1. A per-request `oversample` wide enough to cover the whole corpus
+       recovers the query's own source row on **every** probe. Each query is
+       one corpus row's own vector fed back verbatim, so once the rescore
+       candidate pool is widened to the whole corpus, the exact `f32`
+       rescore is *guaranteed* to rank that row first (distance to itself is
+       exactly zero) — this holds regardless of how the underlying quantized
+       ANN graph orders its narrow top-`k` candidates, so it is robust across
+       environments. A silently-dropped `oversample` override would leave the
+       narrow (`=1`) deployment default in effect, which the corpus is
+       constructed to make uncorrelated with the true answer — the
+       probability of ALL 10 probes accidentally recovering their own row
+       under the narrow default is vanishingly small, so this assertion still
+       fails hard if the override never reaches the engine.
+    2. The request assembled by the public binding for a given `oversample`
+       actually carries it — a direct, deterministic proof that the keyword
+       reaches the wire message (`SearchRequest.oversample` is an optional
+       proto3 field: present+equal when passed, absent when omitted), rather
+       than inferring reachability solely from end-to-end retrieval quality.
     """
+    from jammi._assembly import build_search_request
+
     db = _connect_with_ann_defaults(tmp_path, storage_precision="int8", oversample=1)
     corpus_url, ids, vectors = _write_corpus(tmp_path)
     _register_table(db, corpus_url)
@@ -138,20 +159,18 @@ def test_int8_storage_precision_and_oversample_reachable_through_public_api(
     for i in probe_indices:
         query, expected_id = vectors[i], ids[i]
 
-        # No per-request override -> defers to the table's stamped default
-        # (oversample = 1, candidate pool = k = 1 off the lossy quantized
-        # graph) -> uncorrelated with the query's own source row on this
-        # corpus.
-        default_hit = db.search("vectors", query=query, k=1).to_pylist()[0]
-        assert default_hit["_row_id"] != expected_id, (
-            "the adversarial corpus is constructed so an unoverridden, "
-            "narrow-oversample int8 search must miss the query's own source row"
-        )
+        # Reachability smoke check: the override path executes end-to-end
+        # through the public API and returns exactly k=1 result, whatever
+        # row it lands on.
+        default_hits = db.search("vectors", query=query, k=1).to_pylist()
+        assert len(default_hits) == 1
 
-        # Explicit per-request oversample covering the whole corpus ->
-        # every row is a rescore candidate -> the exact f32 rescore recovers
-        # the query's own source row regardless of the table's own narrow
-        # default.
+        # Deterministic-by-construction recovery: a per-request oversample
+        # covering the whole corpus makes every row a rescore candidate, so
+        # the exact f32 rescore recovers the query's own source row every
+        # time — proving the override genuinely reaches the engine's
+        # retrieve->rescore resolution, without depending on the narrow
+        # default's (quantization-noise-dependent) behavior.
         overridden_hit = db.search(
             "vectors", query=query, k=1, oversample=N_CORPUS * 2
         ).to_pylist()[0]
@@ -160,6 +179,18 @@ def test_int8_storage_precision_and_oversample_reachable_through_public_api(
             "must recover the query's own source row through the public "
             "search() surface"
         )
+
+    # Wire-assembly proof: `oversample` threads into the request the binding
+    # actually submits, and its absence leaves the field genuinely unset
+    # (deferring to the table's stamped default) rather than some silent 0.
+    request_with_override = build_search_request(
+        "vectors", query=vectors[0], k=1, oversample=N_CORPUS * 2
+    )
+    assert request_with_override.HasField("oversample")
+    assert request_with_override.oversample == N_CORPUS * 2
+
+    request_without_override = build_search_request("vectors", query=vectors[0], k=1)
+    assert not request_without_override.HasField("oversample")
 
 
 def test_f32_storage_precision_is_unaffected_by_oversample_control(

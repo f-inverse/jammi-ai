@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "quantum computing applications",
     ).await?;
 
-    let results = session.search("patents", query, 5, None).await?
+    let results = session.search("patents", query, 5, None, None).await?
         .sort("similarity", true)?
         .run().await?;
 

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
 use jammi_db::config::{GpuConfig, InferenceConfig, JammiConfig, LoggingConfig};
+use jammi_numerics::ComputePrecision;
 
 // ─── Parity tolerances ───────────────────────────────────────────────────────
 //
@@ -105,17 +106,19 @@ pub fn local_model_id(fixture_name: &str) -> String {
 
 // ─── Session builders ─────────────────────────────────────────────────────────
 
-/// A JammiConfig rooted at `artifact_dir` and pinned to `device`
-/// (`-1` = CPU, `0` = first CUDA device). The GPU variant sets
-/// `require_gpu = true` so a build / host without a usable GPU fails fast at
-/// session construction rather than silently degrading to CPU — a parity test
-/// that runs to completion on `device = 0` therefore *did* run on the GPU.
-fn config_for(artifact_dir: &Path, device: i32) -> JammiConfig {
+/// A JammiConfig rooted at `artifact_dir`, pinned to `device`
+/// (`-1` = CPU, `0` = first CUDA device), running inference at `precision`. The
+/// GPU variant sets `require_gpu = true` so a build / host without a usable GPU
+/// fails fast at session construction rather than silently degrading to CPU — a
+/// parity test that runs to completion on `device = 0` therefore *did* run on
+/// the GPU.
+fn config_for(artifact_dir: &Path, device: i32, precision: ComputePrecision) -> JammiConfig {
     JammiConfig {
         artifact_dir: artifact_dir.to_path_buf(),
         gpu: GpuConfig {
             device,
             require_gpu: device >= 0,
+            compute_precision: precision,
             ..Default::default()
         },
         inference: InferenceConfig {
@@ -130,20 +133,34 @@ fn config_for(artifact_dir: &Path, device: i32) -> JammiConfig {
     }
 }
 
-/// Build a CPU-pinned (`gpu.device = -1`) session over a fresh artifact dir.
+/// Build a CPU-pinned (`gpu.device = -1`) session over a fresh artifact dir, at
+/// the default `F32` precision.
 pub async fn cpu_session(artifact_dir: &Path) -> Arc<InferenceSession> {
     Arc::new(
-        InferenceSession::new(config_for(artifact_dir, -1))
+        InferenceSession::new(config_for(artifact_dir, -1, ComputePrecision::F32))
             .await
             .expect("cpu-pinned session"),
     )
 }
 
 /// Build a GPU-pinned (`gpu.device = 0`, `require_gpu = true`) session over a
-/// fresh artifact dir. Only call after [`gpu_available`] / `skip_without_gpu!`.
+/// fresh artifact dir, at the default `F32` precision. Only call after
+/// [`gpu_available`] / `skip_without_gpu!`.
 pub async fn gpu_session(artifact_dir: &Path) -> Arc<InferenceSession> {
+    gpu_session_with_precision(artifact_dir, ComputePrecision::F32).await
+}
+
+/// Build a GPU-pinned (`gpu.device = 0`, `require_gpu = true`) session over a
+/// fresh artifact dir at an explicit inference `precision` — the entry point
+/// for exercising the compute-precision gate on a real device (e.g. `BF16`,
+/// whose runtime compute-capability gate only resolves on a CUDA device). Only
+/// call after [`gpu_available`] / `skip_without_gpu!`.
+pub async fn gpu_session_with_precision(
+    artifact_dir: &Path,
+    precision: ComputePrecision,
+) -> Arc<InferenceSession> {
     Arc::new(
-        InferenceSession::new(config_for(artifact_dir, 0))
+        InferenceSession::new(config_for(artifact_dir, 0, precision))
             .await
             .expect("gpu-pinned session (require_gpu=true)"),
     )

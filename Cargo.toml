@@ -147,9 +147,6 @@ backon = "1"
 moka = { version = "0.12", features = ["future"] }
 seahash = "4"
 bytemuck = "1"
-# Read-only mmap for the raw-f32 rescore companion (`jammi-db`'s quantized-index
-# sidecar): O(1) random-access exact vectors without an all-resident RAM copy.
-memmap2 = "0.9"
 hf-hub = { version = "0.5", default-features = false, features = ["tokio", "ureq", "rustls-tls"] }
 thiserror = "2"
 directories = "6"

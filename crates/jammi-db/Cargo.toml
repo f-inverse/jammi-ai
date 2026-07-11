@@ -73,7 +73,6 @@ toml.workspace = true
 moka.workspace = true
 seahash.workspace = true
 bytemuck.workspace = true
-memmap2.workspace = true
 
 # Retry
 backon.workspace = true

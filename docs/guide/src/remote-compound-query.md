@@ -66,7 +66,7 @@ Productionising from the embed wheel to the remote client changes only the targe
 
 ## In-process Rust: the fluent builder
 
-In Rust, `session.search(vec, k)` returns a `QueryBuilder` that composes the same
+In Rust, `session.search(source_id, vec, k, embedding_table, oversample)` returns a `QueryBuilder` that composes the same
 operations as a fluent chain (the `annotate` node it builds is the very plan node
 the SQL table function builds):
 
@@ -78,7 +78,7 @@ the SQL table function builds):
 # use jammi_ai::session::InferenceSession;
 use jammi_db::ModelTask;
 # async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
-let results = session.search("patents", query, 10, None).await?
+let results = session.search("patents", query, 10, None, None).await?
     .annotate("local:/models/all-MiniLM-L6-v2", ModelTask::TextEmbedding, &["abstract".into()]).await?
     .run().await?;
 # Ok(()) }

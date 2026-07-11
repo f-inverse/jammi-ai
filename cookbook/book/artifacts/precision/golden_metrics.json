@@ -1,0 +1,15 @@
+{
+  "f32_usearch_bytes": {"value": 4834992, "tol": 250000},
+  "int8_usearch_bytes": {"value": 1378992, "tol": 100000},
+  "int8_rawf32_bytes": {"value": 4608000, "tol": 16},
+  "int8_vs_f32_usearch_ratio": {"value": 0.2852, "tol": 0.03},
+  "recall": {
+    "f32_baseline_at_10": {"floor": 0.99, "margin": 0.01, "measured": 1.0},
+    "int8_oversample1_at_10": {"floor": 0.80, "margin": 0.06, "measured": 0.8617},
+    "int8_oversample2_at_10": {"floor": 0.96, "margin": 0.03, "measured": 0.9967},
+    "int8_oversample4_at_10": {"floor": 0.99, "margin": 0.01, "measured": 1.0},
+    "int8_oversample8_at_10": {"floor": 0.99, "margin": 0.01, "measured": 1.0},
+    "per_request_override8_on_table_os1_at_10": {"floor": 0.99, "margin": 0.01, "measured": 1.0},
+    "per_request_explicit1_on_table_os1_at_10": {"floor": 0.80, "margin": 0.06, "measured": 0.8617}
+  }
+}

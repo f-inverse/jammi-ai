@@ -209,3 +209,152 @@ fn freeze_sidecar(
     VectorIndex::save(&index, base)?;
     Ok(())
 }
+
+/// File stem of the frozen `Int8` sidecar bundle, alongside the existing
+/// `frozen` (`F32`) stem — the SAME held-out fixture corpus, quantized.
+const FROZEN_INT8_STEM: &str = "frozen_int8";
+
+/// The committed precision-recall floor record: the retrieve→rescore recovery
+/// proof, measured on the same fixture slice [`build_held_out_fixture`] froze
+/// the `F32` bundle over.
+///
+/// Two variants, both `Int8` (the shipped quantized precision), differing only
+/// in the query-time `oversample`: [`Self::int8_rescored`] is the deployment
+/// default (a wide candidate pool, exactly rescored), [`Self::int8_no_rescore`]
+/// is `oversample = 1` (the naive quantized-graph-only result — nothing for
+/// the rescore to recover, since it retrieves no more candidates than the
+/// request asks for). The gap between them is the recall the retrieve→rescore
+/// design recovers from quantization.
+#[derive(Debug, Serialize)]
+pub struct PrecisionFloorRecord {
+    /// The retrieve→rescore oversample [`Self::int8_rescored`] measured at —
+    /// the deployment's stamped default
+    /// ([`jammi_db::config::AnnIndexConfig::oversample`]).
+    pub oversample_rescored: usize,
+    /// The oversample [`Self::int8_no_rescore`] measured at — always `1`.
+    pub oversample_no_rescore: usize,
+    /// Int8 + retrieve→rescore at `oversample_rescored`: measured recall@k and
+    /// the margin-subtracted floor, keyed by k.
+    pub int8_rescored: BTreeMap<usize, FloorEntry>,
+    /// Int8 at `oversample_no_rescore = 1`: measured recall@k and the
+    /// margin-subtracted floor, keyed by k.
+    pub int8_no_rescore: BTreeMap<usize, FloorEntry>,
+}
+
+/// Build the frozen `Int8` sidecar over the ALREADY-COMMITTED fixture corpus
+/// (`fixture_dir/corpus_vectors.parquet` — the same real embeddings the
+/// existing frozen `F32` bundle indexes), freeze it to
+/// `fixture_dir/frozen_int8.*`, measure the held-out recall@k for the
+/// two-stage retrieve→rescore (at the deployment's default oversample) and the
+/// naive no-rescore (`oversample = 1`) variants, and merge a `"precision"`
+/// section into the existing committed `floor.json` (`floor = measured −
+/// margin`, same discipline as [`build_held_out_fixture`]).
+///
+/// Unlike [`build_held_out_fixture`], this needs no access to the full
+/// Git-LFS source cache — the `F32` fixture (built from that source) must
+/// already be committed under `fixture_dir`; this function only reads it back
+/// and adds the quantized-precision bundle + floor alongside it. Run off-box
+/// once with `RAYON_NUM_THREADS=1` (the one Int8 sidecar build is
+/// single-threaded, matching the frozen `F32` build); CI only ever loads what
+/// this writes.
+pub async fn build_precision_recall_fixture(
+    fixture_dir: &Path,
+) -> Result<PrecisionFloorRecord, Box<dyn std::error::Error>> {
+    const CORPUS_TABLE: &str = "precision_fixture_corpus";
+    const QUERY_TABLE: &str = "precision_fixture_queries";
+
+    let corpus_path = fixture_dir.join("corpus_vectors.parquet");
+    let query_path = fixture_dir.join("query_vectors.parquet");
+
+    let corpus_url = corpus::storage_url(&corpus_path)?;
+    let ctx = corpus::register(&corpus_url, CORPUS_TABLE).await?;
+    let corpus_rows = corpus::load_vectors(&ctx, CORPUS_TABLE).await?;
+    let dim = corpus_rows
+        .first()
+        .map(|(_, v)| v.len())
+        .ok_or("fixture corpus is empty — nothing to quantize")?;
+
+    let query_url = corpus::storage_url(&query_path)?;
+    let query_ctx = corpus::register(&query_url, QUERY_TABLE).await?;
+    let queries: Vec<Vec<f32>> = corpus::load_vectors(&query_ctx, QUERY_TABLE)
+        .await?
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect();
+    if queries.is_empty() {
+        return Err("fixture query set is empty — nothing to measure recall over".into());
+    }
+
+    // Freeze the Int8 sidecar over the SAME corpus the committed F32 bundle
+    // indexes — the ONE build, committed, never rebuilt by the gate.
+    let int8_base = fixture_dir.join(FROZEN_INT8_STEM);
+    let mut index = SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::Int8)?;
+    for (id, v) in &corpus_rows {
+        index.add(id, v)?;
+    }
+    index.build()?;
+    VectorIndex::save(&index, &int8_base)?;
+
+    let oversample_rescored = AnnIndexConfig::default().oversample;
+    let mut int8_rescored = BTreeMap::new();
+    let mut int8_no_rescore = BTreeMap::new();
+    for &k in &RECALL_KS {
+        let rescored = recall::mean_recall_at_k_rescored(
+            &ctx,
+            CORPUS_TABLE,
+            &int8_base,
+            StoragePrecision::Int8,
+            oversample_rescored,
+            &queries,
+            k,
+        )
+        .await?;
+        int8_rescored.insert(
+            k,
+            FloorEntry {
+                measured: rescored,
+                floor: (rescored - FLOOR_MARGIN).max(0.0),
+            },
+        );
+
+        let no_rescore = recall::mean_recall_at_k_rescored(
+            &ctx,
+            CORPUS_TABLE,
+            &int8_base,
+            StoragePrecision::Int8,
+            1,
+            &queries,
+            k,
+        )
+        .await?;
+        int8_no_rescore.insert(
+            k,
+            FloorEntry {
+                measured: no_rescore,
+                floor: (no_rescore - FLOOR_MARGIN).max(0.0),
+            },
+        );
+    }
+
+    let record = PrecisionFloorRecord {
+        oversample_rescored,
+        oversample_no_rescore: 1,
+        int8_rescored,
+        int8_no_rescore,
+    };
+
+    // Merge into the existing `floor.json` rather than overwrite it wholesale
+    // — the F32 `"recall"`/`"provenance"` section is written by
+    // `build_held_out_fixture` from the full LFS source, which this function
+    // has no access to.
+    let floor_path = fixture_dir.join(FLOOR_FILE);
+    let existing = std::fs::read_to_string(&floor_path)?;
+    let mut value: serde_json::Value = serde_json::from_str(&existing)?;
+    value
+        .as_object_mut()
+        .ok_or("floor.json is not a JSON object")?
+        .insert("precision".to_string(), serde_json::to_value(&record)?);
+    std::fs::write(&floor_path, serde_json::to_string_pretty(&value)?)?;
+
+    Ok(record)
+}

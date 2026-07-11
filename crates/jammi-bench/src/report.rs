@@ -12,6 +12,8 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use jammi_db::config::StoragePrecision;
+
 /// One harness invocation's full output.
 #[derive(Debug, Serialize)]
 pub struct Report {
@@ -214,14 +216,21 @@ impl ArxivTier {
 /// HNSW knobs are swept, each point measured against the exact oracle over a
 /// held-out query set.
 ///
-/// Two axes, because the two cost lifecycles are different. The **build** axis
-/// sweeps the construction knobs (connectivity, build_expansion) — each point is
-/// a *separately built* graph, so the cost is build time and on-disk size, and
+/// Three axes, because the cost lifecycles differ. The **build** axis sweeps
+/// the construction knobs (connectivity, build_expansion) — each point is a
+/// *separately built* graph, so the cost is build time and on-disk size, and
 /// recall here is an on-box reference (the swept graphs are not committed, so a
 /// reader cannot re-derive it — it is not a portable gate). The **search** axis
 /// sweeps `search_expansion` (ef_search) over ONE frozen graph re-dialed at query
 /// time — recall rises and QPS falls as ef grows, and because it re-dials a
 /// single committed index it *is* re-derivable, the portable recall-floor gate.
+/// The **precision** axis sweeps `storage_precision` (and, for a quantized
+/// precision, the retrieve→rescore `oversample`) — like the build axis, each
+/// point is a separately built graph (quantization is baked in at construction,
+/// unlike `search_expansion`), so it is an on-box reference; the portable,
+/// COMMITTED recall floor for the shipped Int8 precision is asserted separately
+/// against a frozen Int8 bundle (mirroring the search axis's frozen-graph
+/// discipline) in `cargo test`.
 #[derive(Debug, Serialize)]
 pub struct RecallSweepTier {
     /// The USearch backend version the swept graphs were built/loaded with —
@@ -240,6 +249,12 @@ pub struct RecallSweepTier {
     /// The search-knob axis (recall-vs-QUERY-cost): one frozen graph re-dialed at
     /// each `search_expansion`; recall rises and QPS falls as ef grows.
     pub search_sweep: Vec<SweepPoint>,
+    /// The precision axis (recall-vs-STORAGE-cost): `F32` (exact, single-stage)
+    /// vs `Int8` at the shipped default oversample (two-stage retrieve→rescore)
+    /// vs `Int8` at `oversample = 1` (the naive quantized-graph-only baseline,
+    /// no candidate widening for the rescore to recover from). The delta between
+    /// the two `Int8` points is the recall the retrieve→rescore design recovers.
+    pub precision_sweep: Vec<PrecisionSweepPoint>,
 }
 
 /// One swept point: the HNSW knobs and every cost/quality metric measured at
@@ -261,6 +276,32 @@ pub struct SweepPoint {
     /// Serialized graph size on disk (build-knob axis only).
     pub index_size_bytes: Measurement,
     /// ANN search throughput at k=10 over the held-out queries.
+    pub search_qps: Measurement,
+}
+
+/// One precision-axis point: the storage precision (and, for a quantized
+/// precision, the retrieve→rescore oversample) a graph was built at, and every
+/// cost/quality metric measured over it.
+#[derive(Debug, Serialize)]
+pub struct PrecisionSweepPoint {
+    /// The precision this point's graph stored its vectors at.
+    pub precision: StoragePrecision,
+    /// The retrieve→rescore oversample this point queried with. Irrelevant at
+    /// `F32` (single-stage, no rescore) — carried anyway so the point is
+    /// self-describing.
+    pub oversample: usize,
+    /// ANN-vs-exact recall@k over the held-out queries, set-intersection keyed
+    /// by k — the same portable fraction the `arxiv` tier reports.
+    pub recall: BTreeMap<usize, Measurement>,
+    /// Wall-clock to build the graph over the corpus.
+    pub build_time_ms: Measurement,
+    /// Serialized graph size on disk (the `.usearch` file; a quantized
+    /// precision's on-disk footprint also includes the `.rawf32` rescore
+    /// companion, not counted here since it is not part of the in-RAM graph
+    /// this axis measures).
+    pub index_size_bytes: Measurement,
+    /// ANN search throughput at k=10 over the held-out queries, through the
+    /// same retrieve→rescore path the recall column measures.
     pub search_qps: Measurement,
 }
 

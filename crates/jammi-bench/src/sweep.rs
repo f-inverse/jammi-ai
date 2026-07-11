@@ -2,8 +2,7 @@
 //! HNSW knobs change, each point measured against the exact oracle over a
 //! held-out query set.
 //!
-//! Two axes, two cost lifecycles ([`crate::report::RecallSweepTier`] states the
-//! split in full):
+//! Three axes ([`crate::report::RecallSweepTier`] states the split in full):
 //!
 //! * **build** — sweep the construction knobs (`connectivity`, `build_expansion`).
 //!   Each point is a *separately built* graph, so the cost is build time and
@@ -14,6 +13,13 @@
 //!   re-dialed at query time. Recall rises and QPS falls as ef grows. Because it
 //!   re-dials a single (committable) index, this axis is re-derivable — the
 //!   portable recall-floor gate the cookbook re-runs against its own oracle.
+//! * **precision** — sweep `storage_precision` (`F32` exact vs `Int8` quantized)
+//!   and, at `Int8`, the retrieve→rescore `oversample`. Like the build axis,
+//!   quantization is baked in at construction, so each point is a separately
+//!   built graph and this axis is an on-box reference here — the portable,
+//!   COMMITTED recall floor for the shipped `Int8` precision lives in a
+//!   dedicated `cargo test` gate over a frozen `Int8` fixture bundle (mirroring
+//!   the search axis's frozen-graph discipline), not in this on-box sweep.
 //!
 //! The exact ground truth does not depend on the ANN knobs, so it is computed
 //! once per query and reused across every swept point.
@@ -28,8 +34,9 @@ use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
 
 use crate::corpus;
+use crate::operator_mirror::retrieve_then_rescore;
 use crate::recall::recall_at_k_for_query;
-use crate::report::{Measurement, RecallSweepTier, SweepPoint, RECALL_KS};
+use crate::report::{Measurement, PrecisionSweepPoint, RecallSweepTier, SweepPoint, RECALL_KS};
 
 /// The k QPS is reported at — a typical retrieval breadth on the recall curve,
 /// so the throughput number reflects a realistic search rather than a corner.
@@ -174,6 +181,52 @@ pub async fn run(
         });
     }
 
+    // PRECISION axis: sweep `storage_precision` (and, for a quantized
+    // precision, the retrieve→rescore `oversample`). Each point is a
+    // SEPARATELY BUILT graph — quantization is baked in at construction,
+    // unlike `search_expansion` — so this axis shares the build axis's
+    // on-box-reference discipline. Every point is save+load round-tripped (not
+    // measured on the fresh in-memory build) so a quantized point's rescore
+    // reads back through the mmap'd `.rawf32` companion exactly the way a
+    // loaded production index does — a freshly built, never-saved index has no
+    // rescore companion yet, so its `get_exact` would silently fall back to
+    // USearch's own lossy reconstruction and the rescore would recover nothing.
+    let default_oversample = AnnIndexConfig::default().oversample;
+    let precision_grid: [(StoragePrecision, usize); 3] = [
+        (StoragePrecision::F32, 1),
+        (StoragePrecision::Int8, 1),
+        (StoragePrecision::Int8, default_oversample),
+    ];
+    let mut precision_sweep = Vec::with_capacity(precision_grid.len());
+    for (i, &(precision, oversample)) in precision_grid.iter().enumerate() {
+        let base = tmp.path().join(format!("precision_{i}"));
+        let t0 = Instant::now();
+        let mut index = SidecarIndex::new(dim, &AnnIndexConfig::default(), precision)?;
+        for (id, v) in &corpus_rows {
+            index.add(id, v)?;
+        }
+        index.build()?;
+        let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        VectorIndex::save(&index, &base)?;
+        let size = std::fs::metadata(base.with_extension("usearch"))?.len();
+        let loaded = SidecarIndex::load(&base, &AnnIndexConfig::default(), precision)?;
+        let (recall, qps) = recall_and_qps_with(&queries, &exact, |q, k| {
+            if precision.needs_rescore() {
+                retrieve_then_rescore(&loaded, q, k, oversample.max(1))
+            } else {
+                loaded.search(q, k)
+            }
+        })?;
+        precision_sweep.push(PrecisionSweepPoint {
+            precision,
+            oversample,
+            recall,
+            build_time_ms: Measurement::measured(build_ms, "ms"),
+            index_size_bytes: Measurement::measured(size as f64, "bytes"),
+            search_qps: Measurement::measured(qps, "queries_per_s"),
+        });
+    }
+
     Ok(RecallSweepTier {
         backend_version: jammi_db::index::backend_version(),
         dim,
@@ -181,27 +234,46 @@ pub async fn run(
         query_rows: queries.len(),
         build_sweep,
         search_sweep,
+        precision_sweep,
     })
 }
 
-/// Recall@k for every k in [`RECALL_KS`] plus QPS at [`QPS_K`] over one index.
+/// Recall@k for every k in [`RECALL_KS`] plus QPS at [`QPS_K`] over one index's
+/// plain `search` — the `F32`/loaded-graph-default retrieval every build/search
+/// axis point uses.
 ///
 /// `exact[i]` is query `i`'s exact top-max-k; recall@k intersects its first `k`
-/// with the index's own top-`k`. QPS is the throughput of the `k == QPS_K`
-/// search pass — measured on the very searches the recall curve already runs, so
-/// it costs no extra work.
+/// with the retrieved top-`k`. QPS is the throughput of the `k == QPS_K` search
+/// pass — measured on the very searches the recall curve already runs, so it
+/// costs no extra work.
 fn recall_and_qps(
     index: &SidecarIndex,
     queries: &[Vec<f32>],
     exact: &[Vec<(String, f32)>],
 ) -> Result<(BTreeMap<usize, Measurement>, f64), Box<dyn std::error::Error>> {
+    recall_and_qps_with(queries, exact, |q, k| index.search(q, k))
+}
+
+/// Recall@k for every k in [`RECALL_KS`] plus QPS at [`QPS_K`], retrieving each
+/// query's top-`k` through the caller-supplied `retrieve` closure rather than a
+/// single fixed index — the shared measurement loop the build/search axes (a
+/// plain `index.search`) and the precision axis (`search` or the two-stage
+/// retrieve→rescore, depending on the point's precision) both drive.
+fn recall_and_qps_with<F>(
+    queries: &[Vec<f32>],
+    exact: &[Vec<(String, f32)>],
+    mut retrieve: F,
+) -> Result<(BTreeMap<usize, Measurement>, f64), Box<dyn std::error::Error>>
+where
+    F: FnMut(&[f32], usize) -> jammi_db::error::Result<Vec<(String, f32)>>,
+{
     let mut curve = BTreeMap::new();
     let mut qps = 0.0;
     for &k in &RECALL_KS {
         let t0 = Instant::now();
         let mut total = 0.0;
         for (i, q) in queries.iter().enumerate() {
-            let ann = index.search(q, k)?;
+            let ann = retrieve(q, k)?;
             total += recall_at_k_for_query(&ann, &exact[i], k);
         }
         let elapsed = t0.elapsed().as_secs_f64();
@@ -274,6 +346,39 @@ mod tests {
                 "search point has a throughput"
             );
         }
+        assert_eq!(tier.precision_sweep.len(), 3, "all precision points");
+        for p in &tier.precision_sweep {
+            assert_recall_shape(&p.recall);
+            assert!(
+                p.build_time_ms.value.is_some_and(|v| v >= 0.0),
+                "precision point has a build time"
+            );
+            assert!(
+                p.index_size_bytes.value.is_some_and(|v| v > 0.0),
+                "precision point has a non-empty index"
+            );
+            assert!(
+                p.search_qps.value.is_some_and(|v| v > 0.0),
+                "precision point has a search throughput"
+            );
+        }
+        assert_eq!(
+            tier.precision_sweep[0].precision,
+            jammi_db::config::StoragePrecision::F32
+        );
+        assert_eq!(
+            tier.precision_sweep[1].precision,
+            jammi_db::config::StoragePrecision::Int8
+        );
+        assert_eq!(tier.precision_sweep[1].oversample, 1, "no-rescore point");
+        assert_eq!(
+            tier.precision_sweep[2].precision,
+            jammi_db::config::StoragePrecision::Int8
+        );
+        assert!(
+            tier.precision_sweep[2].oversample > 1,
+            "shipped-default point oversamples"
+        );
     }
 
     fn assert_recall_shape(recall: &BTreeMap<usize, Measurement>) {

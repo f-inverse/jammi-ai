@@ -68,9 +68,12 @@ pub struct FloorRecord {
 #[derive(Debug, Serialize)]
 pub struct FloorEntry {
     /// The recall@k measured on this committed slice (held-out queries vs. the
-    /// frozen sidecar over the slice corpus).
+    /// frozen sidecar over the slice corpus) — the point estimate.
     pub measured: f64,
-    /// The floor the gate asserts: `measured − margin`, clamped at 0.
+    /// The floor the gate asserts. `measured − margin`, clamped at 0, for
+    /// every point-anchored gate. [`BinaryPrecisionFloorRecord`]'s entries are
+    /// the one exception — bootstrap-CI-anchored (`CI_lower − margin`), see
+    /// [`build_binary_recall_fixture`].
     pub floor: f64,
 }
 
@@ -249,7 +252,9 @@ pub struct PrecisionFloorRecord {
 
 /// The committed `Binary`-precision floor record — the same retrieve→rescore
 /// recovery proof as [`PrecisionFloorRecord`], for [`StoragePrecision::Binary`]
-/// rather than `Int8`.
+/// rather than `Int8`, but bootstrap-CI-anchored rather than point-anchored
+/// (see [`build_binary_recall_fixture`]): each [`FloorEntry::floor`] here is
+/// `CI_lower − margin`, not `measured − margin`.
 ///
 /// `Binary`'s Hamming coarse stage needs a much wider oversample than `Int8`'s
 /// cosine-ranked stage to recover comparable recall (see
@@ -265,8 +270,9 @@ pub struct BinaryPrecisionFloorRecord {
     pub binary_oversample_rescored: usize,
     /// The oversample [`Self::binary_no_rescore`] measured at — always `1`.
     pub binary_oversample_no_rescore: usize,
-    /// Binary + retrieve→rescore at `binary_oversample_rescored`: measured
-    /// recall@k and the margin-subtracted floor, keyed by k.
+    /// Binary + retrieve→rescore at `binary_oversample_rescored`: the measured
+    /// POINT recall@k, and the bootstrap-CI-lower-bound-anchored floor
+    /// (`CI_lower − margin`), keyed by k.
     ///
     /// On this 2000-row fixture, `k=100` at `oversample=32` approaches
     /// exhaustive (`k * oversample = 3200 > 2000` corpus rows), so its
@@ -275,8 +281,8 @@ pub struct BinaryPrecisionFloorRecord {
     /// margin-subtracted, but should not be over-read as "binary rescue
     /// recovers 100% of top-100 in general".
     pub binary_rescored: BTreeMap<usize, FloorEntry>,
-    /// Binary at `binary_oversample_no_rescore = 1`: measured recall@k and the
-    /// margin-subtracted floor, keyed by k.
+    /// Binary at `binary_oversample_no_rescore = 1`: the measured POINT
+    /// recall@k, and the bootstrap-CI-lower-bound-anchored floor, keyed by k.
     pub binary_no_rescore: BTreeMap<usize, FloorEntry>,
 }
 
@@ -295,10 +301,12 @@ struct QuantizedRecallMeasurement {
 /// retrieve→rescore recall@k at `oversample_rescored` and at the naive
 /// `oversample = 1` baseline.
 ///
-/// Shared by [`build_precision_recall_fixture`] (`Int8`) and
-/// [`build_binary_recall_fixture`] (`Binary`) — the two quantized precisions
-/// differ only in their scalar kind and default oversample, not in how the
-/// fixture is built or measured.
+/// Used by [`build_precision_recall_fixture`] (`Int8`), whose gate is
+/// point-based. [`build_binary_recall_fixture`] (`Binary`) does NOT use this —
+/// its gate is bootstrap-CI-based (see [`recall::recall_ci_at_k_rescored`]),
+/// so it derives its `floor.json` entries from the CI's lower bound rather
+/// than this helper's bare point `FloorEntry`; it freezes and measures inline
+/// instead of sharing this point-only path.
 async fn freeze_and_measure_quantized_precision(
     fixture_dir: &Path,
     stem: &str,
@@ -538,12 +546,22 @@ pub async fn build_precision_recall_fixture(
 /// Build the frozen `Binary` sidecar over the ALREADY-COMMITTED fixture corpus
 /// (`fixture_dir/corpus_vectors.parquet` — the SAME real embeddings the
 /// existing frozen `F32`/`Int8` bundles index), freeze it to
-/// `fixture_dir/frozen_binary.*`, measure the held-out recall@k for the
-/// two-stage retrieve→rescore at `Binary`'s own default oversample (`32`) and
-/// the naive no-rescore (`oversample = 1`) baseline, and merge the
-/// `binary_*` keys into the existing `"precision"` section of the committed
-/// `floor.json` (`floor = measured − margin`, same discipline as
-/// [`build_precision_recall_fixture`]).
+/// `fixture_dir/frozen_binary.*`, and merge the `binary_*` keys into the
+/// existing `"precision"` section of the committed `floor.json`.
+///
+/// Unlike every other precision's floor ([`build_precision_recall_fixture`]'s
+/// `measured − margin` on the bare point recall), `Binary`'s floor is derived
+/// from a [`recall::recall_ci_at_k_rescored`] bootstrap CI:
+/// `floor = CI_lower − MARGIN`. `measured` still records the point recall (for
+/// readability — it is what a reader compares the floor against at a glance),
+/// but the floor itself is anchored on the CI's lower bound, not the point —
+/// see `recall.rs`'s module-level "binary gate is a confidence interval"
+/// section for why a point-anchored floor produced a false positive at real
+/// scale and a CI-anchored one does not. Prints the point/CI for both the
+/// retrieve→rescore recovery (at `Binary`'s own default oversample) and the
+/// naive `oversample = 1` baseline at every k, so the operator committing this
+/// fixture sees the interval — not just the point — before the CI-gated
+/// cargo test ever runs.
 ///
 /// Run off-box once with `RAYON_NUM_THREADS=1` (the one Binary sidecar build
 /// is single-threaded, matching the frozen `F32`/`Int8` builds) after both the
@@ -553,19 +571,102 @@ pub async fn build_binary_recall_fixture(
     fixture_dir: &Path,
 ) -> Result<BinaryPrecisionFloorRecord, Box<dyn std::error::Error>> {
     let oversample_rescored = StoragePrecision::Binary.default_oversample();
-    let measurement = freeze_and_measure_quantized_precision(
-        fixture_dir,
-        FROZEN_BINARY_STEM,
-        StoragePrecision::Binary,
-        oversample_rescored,
-    )
-    .await?;
+
+    let corpus_table = format!("{FROZEN_BINARY_STEM}_fixture_corpus");
+    let query_table = format!("{FROZEN_BINARY_STEM}_fixture_queries");
+
+    let corpus_path = fixture_dir.join("corpus_vectors.parquet");
+    let query_path = fixture_dir.join("query_vectors.parquet");
+
+    let corpus_url = corpus::storage_url(&corpus_path)?;
+    let ctx = corpus::register(&corpus_url, &corpus_table).await?;
+    let corpus_rows = corpus::load_vectors(&ctx, &corpus_table).await?;
+    let dim = corpus_rows
+        .first()
+        .map(|(_, v)| v.len())
+        .ok_or("fixture corpus is empty — nothing to quantize")?;
+
+    let query_url = corpus::storage_url(&query_path)?;
+    let query_ctx = corpus::register(&query_url, &query_table).await?;
+    let queries: Vec<Vec<f32>> = corpus::load_vectors(&query_ctx, &query_table)
+        .await?
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect();
+    if queries.is_empty() {
+        return Err("fixture query set is empty — nothing to measure recall over".into());
+    }
+
+    // Freeze the Binary sidecar over the SAME corpus the committed F32/Int8
+    // bundles index — the ONE build, committed, never rebuilt by the gate.
+    let base = fixture_dir.join(FROZEN_BINARY_STEM);
+    let mut index = SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary)?;
+    for (id, v) in &corpus_rows {
+        index.add(id, v)?;
+    }
+    index.build()?;
+    VectorIndex::save(&index, &base)?;
+
+    eprintln!(
+        "binary recall bootstrap CI ({} resamples, {:.0}% interval, seed {:#x}); \
+         floor = CI_lower − {FLOOR_MARGIN}:",
+        recall::RECALL_BOOTSTRAP_ITERATIONS,
+        (1.0 - recall::RECALL_BOOTSTRAP_ALPHA) * 100.0,
+        recall::RECALL_BOOTSTRAP_SEED
+    );
+    let mut binary_rescored = BTreeMap::new();
+    let mut binary_no_rescore = BTreeMap::new();
+    for &k in &RECALL_KS {
+        let rescored = recall::recall_ci_at_k_rescored(
+            &ctx,
+            &corpus_table,
+            &base,
+            StoragePrecision::Binary,
+            oversample_rescored,
+            &queries,
+            k,
+        )
+        .await?;
+        let no_rescore = recall::recall_ci_at_k_rescored(
+            &ctx,
+            &corpus_table,
+            &base,
+            StoragePrecision::Binary,
+            1,
+            &queries,
+            k,
+        )
+        .await?;
+        eprintln!(
+            "  k={k}: rescored point={:.4} ci=[{:.4}, {:.4}]  no_rescore point={:.4} ci=[{:.4}, {:.4}]",
+            rescored.point,
+            rescored.interval.lower,
+            rescored.interval.upper,
+            no_rescore.point,
+            no_rescore.interval.lower,
+            no_rescore.interval.upper,
+        );
+        binary_rescored.insert(
+            k,
+            FloorEntry {
+                measured: rescored.point,
+                floor: (rescored.interval.lower - FLOOR_MARGIN).max(0.0),
+            },
+        );
+        binary_no_rescore.insert(
+            k,
+            FloorEntry {
+                measured: no_rescore.point,
+                floor: (no_rescore.interval.lower - FLOOR_MARGIN).max(0.0),
+            },
+        );
+    }
 
     let record = BinaryPrecisionFloorRecord {
         binary_oversample_rescored: oversample_rescored,
         binary_oversample_no_rescore: 1,
-        binary_rescored: measurement.rescored,
-        binary_no_rescore: measurement.no_rescore,
+        binary_rescored,
+        binary_no_rescore,
     };
     merge_precision_floor_fields(fixture_dir, serde_json::to_value(&record)?)?;
     Ok(record)

@@ -84,6 +84,24 @@
 //! variant clears the no-rescore variant by a real margin — the measured proof
 //! that oversampling-then-rescoring recovers neighbours the lossy graph alone
 //! misses, not just a floor two numbers happen to both clear.
+//!
+//! ## The binary gate is a confidence interval, not a point estimate
+//!
+//! A single-seed point recall on a small held-out query set can invert at
+//! real scale — a lucky or unlucky draw of which queries happen to land in
+//! this committed slice can pass or fail the gate independently of the
+//! underlying index quality. [`recall_ci_at_k_rescored`] instead treats each
+//! query's recall@k ([`recall_at_k_for_query`]) as one bootstrap sample: it
+//! resamples the held-out query set with replacement (the engine's own
+//! [`jammi_numerics::stats::bootstrap_ci`], seeded and deterministic — the
+//! same percentile-bootstrap kernel `eval.rs`'s `eval_compare` significance CI
+//! already uses) and reports the point mean alongside a 95% CI. The `Binary`
+//! precision-recall gate
+//! (`tests::binary_precision_recall_bootstrap_ci_clears_committed_floor`)
+//! asserts the CI's LOWER bound — not the point mean — clears the committed
+//! floor, so a noisy single-sample draw cannot pass (or fail) the gate on
+//! chance alone: the gate only passes when the *worst plausible* mean over
+//! resamples of this query set still clears the floor.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -94,9 +112,51 @@ use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::exact::exact_vector_search;
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
+use jammi_numerics::stats::{bootstrap_ci, Interval};
 
 use crate::corpus;
 use crate::report::{Measurement, RECALL_KS};
+
+/// Bootstrap resamples [`recall_ci_at_k_rescored`] draws to build its
+/// confidence interval.
+///
+/// Matches `eval.rs`'s `BOOTSTRAP_ITERATIONS` — the same percentile-bootstrap
+/// kernel, the same order of iterations. At the committed fixture's 100
+/// held-out queries, a percentile CI's Monte Carlo error falls off as
+/// `1/sqrt(iterations)`: 2000 resamples put the 2.5th/97.5th percentile
+/// estimates within a fraction of a percentage point of their converged
+/// values (the interval bounds stop moving beyond noise well before 2000),
+/// while keeping the hermetic gate fast — the loop is bounded by
+/// `iterations * queries.len()`, a few hundred thousand array reads, not a
+/// re-run of the search path.
+pub(crate) const RECALL_BOOTSTRAP_ITERATIONS: usize = 2000;
+
+/// Two-tailed significance level for [`recall_ci_at_k_rescored`]'s CI — a 95%
+/// interval, the same level `eval.rs`'s bootstrap significance CI uses.
+pub(crate) const RECALL_BOOTSTRAP_ALPHA: f64 = 0.05;
+
+/// Fixed seed for [`recall_ci_at_k_rescored`]'s bootstrap resampling.
+///
+/// The bootstrap is a function of the sample *multiset*
+/// ([`jammi_numerics::stats::bootstrap_ci`] canonicalizes its resample basis
+/// by sorting), so a fixed seed is sufficient for a reproducible interval —
+/// the committed CI is deterministic across boxes and reruns, the same
+/// determinism discipline every other committed number in this harness
+/// carries.
+pub(crate) const RECALL_BOOTSTRAP_SEED: u64 = 0xB17A_5EED;
+
+/// A recall@k point estimate plus its bootstrap confidence interval — the
+/// mean of [`recall_samples_at_k_rescored`]'s per-query samples, and the
+/// `[lower, upper]` interval [`jammi_numerics::stats::bootstrap_ci`] derives
+/// by resampling those same samples with replacement.
+#[derive(Debug, Clone, Copy)]
+pub struct RecallCi {
+    /// The point recall@k — the plain mean over the query set, identical to
+    /// what [`mean_recall_at_k_rescored`] returns for the same inputs.
+    pub point: f64,
+    /// The bootstrap confidence interval over the query-set mean.
+    pub interval: Interval,
+}
 
 /// File names of the committed *held-out* recall fixture, relative to its bundle
 /// directory.
@@ -219,14 +279,49 @@ pub async fn mean_recall_at_k_rescored(
     queries: &[Vec<f32>],
     k: usize,
 ) -> Result<f64, Box<dyn std::error::Error>> {
-    if queries.is_empty() {
+    let samples = recall_samples_at_k_rescored(
+        ctx,
+        table_name,
+        sidecar_base,
+        precision,
+        oversample,
+        queries,
+        k,
+    )
+    .await?;
+    if samples.is_empty() {
         return Ok(0.0);
+    }
+    Ok(samples.iter().sum::<f64>() / samples.len() as f64)
+}
+
+/// Per-query recall@k samples over a query set, for a frozen sidecar bundle
+/// loaded at `precision` — the SAME retrieve→rescore path
+/// [`mean_recall_at_k_rescored`] averages, but returned as the individual
+/// per-query fractions rather than collapsed to their mean. `mean_recall_at_k_rescored`
+/// is exactly `samples.iter().sum() / samples.len()` over what this returns;
+/// [`recall_ci_at_k_rescored`] is what these samples exist for — a bootstrap
+/// CI resamples this exact multiset.
+///
+/// An empty `queries` yields an empty sample set, mirroring
+/// [`mean_recall_at_k_rescored`]'s "no queries, nothing to measure" contract.
+async fn recall_samples_at_k_rescored(
+    ctx: &SessionContext,
+    table_name: &str,
+    sidecar_base: &std::path::Path,
+    precision: StoragePrecision,
+    oversample: usize,
+    queries: &[Vec<f32>],
+    k: usize,
+) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+    if queries.is_empty() {
+        return Ok(Vec::new());
     }
     // LOAD the frozen sidecar — never rebuild. The committed graph is the one
     // whose recall is being measured.
     let index = SidecarIndex::load(sidecar_base, &AnnIndexConfig::default(), precision)?;
 
-    let mut total = 0.0;
+    let mut samples = Vec::with_capacity(queries.len());
     for query in queries {
         let exact = exact_vector_search(ctx, table_name, query, k).await?;
         let ann = if precision.needs_rescore() {
@@ -234,9 +329,66 @@ pub async fn mean_recall_at_k_rescored(
         } else {
             index.search(query, k)?
         };
-        total += recall_at_k_for_query(&ann, &exact, k);
+        samples.push(recall_at_k_for_query(&ann, &exact, k));
     }
-    Ok(total / queries.len() as f64)
+    Ok(samples)
+}
+
+/// Recall@k point estimate AND bootstrap confidence interval over a query set,
+/// for a frozen sidecar bundle loaded at `precision` — the statistically sound
+/// alternative to [`mean_recall_at_k_rescored`]'s bare point estimate (see the
+/// module-level "binary gate is a confidence interval" section).
+///
+/// Draws [`recall_samples_at_k_rescored`] (one sample per query — the SAME
+/// retrieve→rescore path `mean_recall_at_k_rescored` averages) and bootstraps
+/// their mean via the engine's own
+/// [`jammi_numerics::stats::bootstrap_ci`]: [`RECALL_BOOTSTRAP_ITERATIONS`]
+/// resamples of the query set (with replacement), under the fixed
+/// [`RECALL_BOOTSTRAP_SEED`], at the [`RECALL_BOOTSTRAP_ALPHA`] two-tailed
+/// level. `RecallCi::point` is the plain mean (identical to what
+/// `mean_recall_at_k_rescored` returns for the same inputs); `RecallCi::interval`
+/// is the `[2.5th, 97.5th]` percentile interval over that mean, resampled —
+/// the width a caller should treat as "how much this point estimate could move
+/// on a different draw of this same query set".
+///
+/// Errors — rather than reporting a vacuous interval — when `queries` is
+/// empty: a CI over zero samples is not a measurement, it is a hidden 0.0/0.0
+/// masquerading as a confidence interval.
+pub async fn recall_ci_at_k_rescored(
+    ctx: &SessionContext,
+    table_name: &str,
+    sidecar_base: &std::path::Path,
+    precision: StoragePrecision,
+    oversample: usize,
+    queries: &[Vec<f32>],
+    k: usize,
+) -> Result<RecallCi, Box<dyn std::error::Error>> {
+    let samples = recall_samples_at_k_rescored(
+        ctx,
+        table_name,
+        sidecar_base,
+        precision,
+        oversample,
+        queries,
+        k,
+    )
+    .await?;
+    if samples.is_empty() {
+        return Err(
+            "recall_ci_at_k_rescored: empty query set — a bootstrap CI needs at least one sample"
+                .into(),
+        );
+    }
+    let point = samples.iter().sum::<f64>() / samples.len() as f64;
+    let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
+    let interval = bootstrap_ci(
+        &samples,
+        mean,
+        RECALL_BOOTSTRAP_ITERATIONS,
+        RECALL_BOOTSTRAP_ALPHA,
+        RECALL_BOOTSTRAP_SEED,
+    )?;
+    Ok(RecallCi { point, interval })
 }
 
 /// Measure the held-out recall curve over a committed fixture bundle directory.
@@ -629,8 +781,21 @@ mod tests {
         .await;
     }
 
-    /// The `Binary` precision-recall recovery gate — see
-    /// [`assert_precision_recall_rescore_recovers_and_clears_floor`].
+    /// The `Binary` precision-recall recovery gate, gated on a bootstrap
+    /// confidence interval rather than a bare point estimate — see the module
+    /// header's "binary gate is a confidence interval" section for why.
+    ///
+    /// This is the multi-seed/CI upgrade: a prior single-seed toy-scale recall
+    /// gate produced a false positive that inverted at real scale, and the
+    /// fix (per turbopuffer's continuous recall floor and MTEB-BR's
+    /// bootstrap-CI reliability layer, arXiv 2607.04581) is a resampled
+    /// interval, not a lone point. For each variant (the retrieve→rescore
+    /// recovery at `Binary`'s own default oversample, and the naive
+    /// `oversample = 1` baseline) this asserts the [`recall_ci_at_k_rescored`]
+    /// interval's LOWER bound — not the point mean — clears the committed
+    /// floor, plus the rescore-recovery-margin proof
+    /// ([`assert_precision_recall_rescore_recovers_and_clears_floor`]'s same
+    /// discipline) on the point means.
     ///
     /// `Binary`'s Hamming coarse stage is far lossier per-candidate than
     /// `Int8`'s, so it is measured at its own much wider default oversample
@@ -639,15 +804,98 @@ mod tests {
     /// rescore recovery gap this measures is correspondingly larger than
     /// Int8's.
     #[tokio::test]
-    async fn binary_precision_recall_rescore_recovers_and_clears_committed_floor() {
-        assert_precision_recall_rescore_recovers_and_clears_floor(
-            FROZEN_BINARY_STEM,
-            StoragePrecision::Binary,
-            "binary_oversample_rescored",
-            "binary_rescored",
-            "binary_no_rescore",
-        )
-        .await;
+    async fn binary_precision_recall_bootstrap_ci_clears_committed_floor() {
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("scale");
+        let sidecar_base = fixture_dir.join(FROZEN_BINARY_STEM);
+
+        let floor_json = std::fs::read_to_string(fixture_dir.join("floor.json"))
+            .expect("committed floor.json must be present in the fixture bundle");
+        let floor: serde_json::Value = serde_json::from_str(&floor_json).unwrap();
+        let oversample_rescored = floor["precision"]["binary_oversample_rescored"]
+            .as_u64()
+            .expect("floor.json missing precision.binary_oversample_rescored")
+            as usize;
+
+        let corpus_path = fixture_dir.join("corpus_vectors.parquet");
+        let corpus_url = corpus::storage_url(&corpus_path).unwrap();
+        let corpus_table = format!("{FROZEN_BINARY_STEM}_ci_recall_corpus");
+        let ctx = corpus::register(&corpus_url, &corpus_table).await.unwrap();
+
+        let query_path = fixture_dir.join("query_vectors.parquet");
+        let query_url = corpus::storage_url(&query_path).unwrap();
+        let query_table = format!("{FROZEN_BINARY_STEM}_ci_recall_queries");
+        let query_ctx = corpus::register(&query_url, &query_table).await.unwrap();
+        let queries: Vec<Vec<f32>> = corpus::load_vectors(&query_ctx, &query_table)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
+
+        for &k in &RECALL_KS {
+            let rescored = recall_ci_at_k_rescored(
+                &ctx,
+                &corpus_table,
+                &sidecar_base,
+                StoragePrecision::Binary,
+                oversample_rescored,
+                &queries,
+                k,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("rescored binary bootstrap-CI recall path must run: {e}"));
+            let no_rescore = recall_ci_at_k_rescored(
+                &ctx,
+                &corpus_table,
+                &sidecar_base,
+                StoragePrecision::Binary,
+                1,
+                &queries,
+                k,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("no-rescore binary bootstrap-CI recall path must run: {e}"));
+
+            let rescored_floor = floor["precision"]["binary_rescored"][k.to_string()]["floor"]
+                .as_f64()
+                .unwrap_or_else(|| {
+                    panic!("floor.json missing precision.binary_rescored.{k}.floor")
+                });
+            let no_rescore_floor = floor["precision"]["binary_no_rescore"][k.to_string()]["floor"]
+                .as_f64()
+                .unwrap_or_else(|| {
+                    panic!("floor.json missing precision.binary_no_rescore.{k}.floor")
+                });
+
+            assert!(
+                rescored.interval.lower >= rescored_floor,
+                "binary_rescored recall@{k} CI lower bound {} (point {}, 95% CI [{}, {}], \
+                 {RECALL_BOOTSTRAP_ITERATIONS} resamples) fell below committed floor {rescored_floor}",
+                rescored.interval.lower,
+                rescored.point,
+                rescored.interval.lower,
+                rescored.interval.upper
+            );
+            assert!(
+                no_rescore.interval.lower >= no_rescore_floor,
+                "binary_no_rescore recall@{k} CI lower bound {} (point {}, 95% CI [{}, {}], \
+                 {RECALL_BOOTSTRAP_ITERATIONS} resamples) fell below committed floor {no_rescore_floor}",
+                no_rescore.interval.lower,
+                no_rescore.point,
+                no_rescore.interval.lower,
+                no_rescore.interval.upper
+            );
+            assert!(
+                rescored.point - no_rescore.point >= RESCORE_RECOVERY_MARGIN,
+                "rescore recovery at k={k} was only {} (rescored={}, no_rescore={}) — below the \
+                 {RESCORE_RECOVERY_MARGIN} margin the retrieve→rescore design must clear",
+                rescored.point - no_rescore.point,
+                rescored.point,
+                no_rescore.point
+            );
+        }
     }
 
     /// The minimum recall@k gap `{precision}_rescored − {precision}_no_rescore`

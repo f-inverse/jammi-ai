@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jammi-ai"
-version = "0.43.0"
+version = "0.44.0"
 description = "The Python client for a Jammi engine (import `jammi`) — one connect() for local (embedded) and remote targets"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -49,7 +49,7 @@ dependencies = [
 # (K6): the client and the engine ship at one workspace version, and the
 # embedded backend drives the engine's wire seam by direct PyO3 — a version skew
 # between the two would desynchronise that seam, so the pin is EXACT, not a floor.
-embedded = ["jammi-ai-native==0.43.0"]
+embedded = ["jammi-ai-native==0.44.0"]
 # `make generate` regenerates the proto stubs. The wheel ships the
 # already-generated stubs; this extra is the generator toolchain for the
 # developer workflow AND every CI/publish lane — no workflow installs

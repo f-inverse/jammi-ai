@@ -80,11 +80,11 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-r
 object_store = { version = "0.12", default-features = false }
 
 # ML inference
-candle-core = "0.9"
-candle-nn = "0.9"
+candle-core = "0.11"
+candle-nn = "0.11"
 # candle-transformers is consumed only by jammi-encoders dev-dependencies
 # (parity-test feature) — it is no longer in any production dep tree.
-candle-transformers = "0.9"
+candle-transformers = "0.11"
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["download-binaries"] }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 usearch = "2.25"

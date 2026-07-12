@@ -6,6 +6,22 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.44.0] - 2026-07-12
+
+Candle upgrade 0.9.2 → 0.11.0. A dependency-only bump of the ML substrate
+(`candle-core`/`candle-nn`/`candle-transformers`) with no source, API, wire, or
+schema change. Verified numerically transparent: CPU embedding bytes, GPU
+CPU⇄CUDA parity, and the LoRA/AdamW training path are all bit-identical to
+0.9.2. candle-kernels 0.11's always-compiled GGUF/moe quantized kernels build
+under the CUDA 12.6 release toolchain.
+
+### Changed
+- **Candle 0.9.2 → 0.11.0 (`workspace.dependencies`).** Lockfile churn:
+  safetensors 0.7→0.8, fancy-regex 0.17→0.18, zip 7→8, cudarc 0.19.3→0.19.8,
+  float8 consolidated to a single 0.7.0; the candle-kernels CUDA build tool
+  moved from `bindgen_cuda` to `cudaforge`. `candle-core` now depends on
+  `tokenizers 0.22` (with `onig`); jammi's own tokenizer pin stays at 0.21.
+
 ## [0.43.0] - 2026-07-11
 
 Catalog/store SQLite⇄Postgres parity. The metadata layer targets both backends

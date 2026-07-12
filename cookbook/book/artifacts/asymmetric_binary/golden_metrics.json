@@ -1,0 +1,20 @@
+{
+  "anisotropy_ratio": {"value": 0.9669, "tol": 0.01},
+  "collapsed_dims_plain": {"value": 183, "tol": 15},
+  "collapsed_dims_median": {"value": 0, "tol": 3},
+  "collapsed_dims_mean": {"value": 0, "tol": 3},
+  "plain_no_rescore_at_1": {"value": 0.275, "tol": 0.02},
+  "plain_no_rescore_at_10": {"value": 0.3842, "tol": 0.02},
+  "mean_no_rescore_at_1": {"value": 0.3638, "tol": 0.02},
+  "mean_no_rescore_at_10": {"value": 0.4299, "tol": 0.02},
+  "median_no_rescore_at_1": {"value": 0.3675, "tol": 0.02},
+  "median_no_rescore_at_10": {"value": 0.4273, "tol": 0.02},
+  "recall": {
+    "engine_no_rescore_at_1": {"floor": 0.3262, "margin": 0.05, "measured": 0.3762},
+    "engine_no_rescore_at_10": {"floor": 0.3743, "margin": 0.05, "measured": 0.4243},
+    "engine_rescored_at_1": {"floor": 0.8925, "margin": 0.05, "measured": 0.9425},
+    "engine_rescored_at_10": {"floor": 0.9694, "margin": 0.02, "measured": 0.9894},
+    "f32_at_1": {"floor": 0.9488, "margin": 0.05, "measured": 0.9988},
+    "f32_at_10": {"floor": 0.9767, "margin": 0.02, "measured": 0.9967}
+  }
+}

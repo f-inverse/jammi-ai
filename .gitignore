@@ -77,6 +77,7 @@ docs/plans/*
 !docs/plans/52-maintainer-roadmap/
 !docs/plans/53-agentic-swarm/
 !docs/plans/54-python-ecosystem/
+!docs/plans/55-precision-moat/
 docs/superpowers/
 docs/IMPLEMENTATION.md
 docs/specs/

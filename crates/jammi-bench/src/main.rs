@@ -188,11 +188,13 @@ enum Command {
     /// `F32`/`Int8` bundles index) and merges `binary_*` keys (measured
     /// recall@k for the two-stage retrieve→rescore at `Binary`'s own default
     /// oversample, and for the naive `oversample = 1` no-rescore baseline;
-    /// floor = measured − margin) into the existing `floor.json`. Run off-box
-    /// once with `RAYON_NUM_THREADS=1` after `build-scale-fixture` and
-    /// `build-precision-recall-fixture` have produced the `F32`/`Int8`
-    /// fixtures; the bundle is committed and CI only loads it. Not a CI step —
-    /// the provenance-recording builder for the committed `Binary` floor.
+    /// floor = bootstrap-CI-lower-bound − margin, NOT measured − margin — see
+    /// `fixture.rs`'s `build_binary_recall_fixture`) into the existing
+    /// `floor.json`. Run off-box once with `RAYON_NUM_THREADS=1` after
+    /// `build-scale-fixture` and `build-precision-recall-fixture` have
+    /// produced the `F32`/`Int8` fixtures; the bundle is committed and CI only
+    /// loads it. Not a CI step — the provenance-recording builder for the
+    /// committed `Binary` floor.
     #[command(hide = true)]
     BuildBinaryRecallFixture,
     /// The CPU-hermetic training tier: measures the engine's in-batch-negative

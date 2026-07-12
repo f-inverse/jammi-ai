@@ -8,13 +8,15 @@
 //! control flow.
 //!
 //! The shipped ANN kind ([`SidecarKind::Ann`]) carries three siblings, plus a
-//! fourth for a quantized-precision graph:
+//! fourth for a quantized-precision graph and a fifth for a `Binary` one:
 //!
 //! - `<root>/<table>.usearch`        — serialised USearch graph
 //! - `<root>/<table>.rowmap`         — row-id mapping (Jammi-owned format)
 //! - `<root>/<table>.manifest.json`  — version, dimensions, count, backend
 //! - `<root>/<table>.rawf32`         — raw-`f32` rescore companion (quantized
 //!   precision only; absent — and simply skipped — for an `F32` graph)
+//! - `<root>/<table>.threshold`      — per-dimension threshold τ (`Binary`
+//!   precision only; absent — and simply skipped — for every other precision)
 //!
 //! USearch's `save` / `load` are file-path-based (FFI), so for non-`file://`
 //! backends we materialise the bundle through a tempfile, then push the
@@ -65,6 +67,7 @@ pub fn sidecar_extensions(kind: SidecarKind) -> &'static [&'static str] {
             "rowmap",
             "manifest.json",
             crate::index::sidecar::RESCORE_COMPANION_EXTENSION,
+            crate::index::sidecar::THRESHOLD_COMPANION_EXTENSION,
         ],
         SidecarKind::Lexical => &["tantivy"],
         SidecarKind::None => &[],
@@ -208,10 +211,10 @@ mod tests {
     }
 
     #[test]
-    fn ann_kind_carries_todays_four_extensions() {
+    fn ann_kind_carries_todays_five_extensions() {
         assert_eq!(
             sidecar_extensions(SidecarKind::Ann),
-            ["usearch", "rowmap", "manifest.json", "rawf32"],
+            ["usearch", "rowmap", "manifest.json", "rawf32", "threshold"],
         );
     }
 

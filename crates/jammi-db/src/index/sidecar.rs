@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{AnnIndexConfig, StoragePrecision};
 use crate::error::{JammiError, Result};
@@ -23,12 +23,27 @@ const ROWMAP_VERSION: u32 = 1;
 /// handle with the *matching* quantization before calling USearch's own
 /// `load` (USearch's own `Index::restore` does the same: read the header's
 /// quantization, then construct before loading).
-const ANN_MANIFEST_VERSION: u32 = 2;
+///
+/// Bumped to `3`: a [`StoragePrecision::Binary`] manifest now also carries
+/// `binary_threshold_kind` — required (hard error if absent) whenever
+/// `scalar_kind` is `Binary` and the bundle holds at least one row, since
+/// [`SidecarIndex::load`] must know which [`ThresholdKind`] reduction
+/// produced the sibling `.threshold` companion before trusting it. A `Binary`
+/// bundle written before this bump carries neither the field nor the
+/// companion and must be rebuilt — it packed with the old fixed-`0` symmetric
+/// threshold this version replaces.
+const ANN_MANIFEST_VERSION: u32 = 3;
 
 /// The rescore companion's file extension, alongside `.usearch` / `.rowmap` /
 /// `.manifest.json`. Present only for a quantized-precision sidecar; a `F32`
 /// index writes no companion (its own USearch vectors are already exact).
 pub(crate) const RESCORE_COMPANION_EXTENSION: &str = "rawf32";
+
+/// The per-dimension threshold τ companion's file extension, alongside
+/// `.usearch` / `.rowmap` / `.manifest.json` / `.rawf32`. Present only for a
+/// [`StoragePrecision::Binary`] sidecar with at least one row — every other
+/// precision sign-packs nothing, so it carries no τ.
+pub(crate) const THRESHOLD_COMPANION_EXTENSION: &str = "threshold";
 
 /// The distance metric a sidecar index at `precision` is built and searched
 /// with: `Binary` (USearch's `B1` scalar kind, one packed sign bit per
@@ -90,25 +105,135 @@ fn index_options(
     }
 }
 
-/// Symmetric sign-bit packing for a [`StoragePrecision::Binary`] sidecar:
-/// `v > 0` → bit `1`, else (including `v == 0` and negative) → bit `0`,
-/// packed LSB-first into `ceil(dim / 8)` bytes. Unused high bits in the final
-/// byte are left `0` (`vec![0u8; ...]` is zero-initialized, so this is a
-/// property of the construction, not a separate masking step).
+/// Which corpus-wide reduction [`fit_binary_threshold`] fits the
+/// [`StoragePrecision::Binary`] sidecar's per-dimension threshold τ with.
 ///
-/// The ONE function both [`SidecarIndex::add`] (corpus rows) and
-/// [`SidecarIndex::search`] (queries) pack through — USearch's Hamming metric
-/// counts every bit position in the buffer, padding included, so packing the
-/// two sides inconsistently would silently bias every Hamming distance by a
-/// fixed, easy-to-miss amount (it would just look like uniformly worse
-/// recall, never a crash). Mirrors the Wave 1.5 go/no-go spike's
-/// `pack_sign_bits` exactly (symmetric sign-at-0, not a per-dimension-median
-/// or otherwise asymmetric threshold).
-fn pack_sign_bits(v: &[f32]) -> Vec<u8> {
+/// Transformer embeddings are anisotropic (a large common-mean component
+/// shared by nearly every row), so a fixed threshold at `0` collapses every
+/// dimension aligned with that mean to a constant bit — `sign(v − τ)` at a
+/// corpus-fit τ eliminates that collapse instead. `Mean` is the wave-2
+/// validated baseline (per-dimension arithmetic mean directly cancels the
+/// anisotropic offset); `Median` guarantees an exactly balanced 50/50 bit
+/// split per dimension (maximum per-bit entropy) and is kept as the measured
+/// alternative — see the `mean_vs_median_threshold_on_anisotropic_corpus`
+/// test below for which one [`DEFAULT_BINARY_THRESHOLD_KIND`] picks and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ThresholdKind {
+    /// Per-dimension arithmetic mean over the sampled corpus.
+    Mean,
+    /// Per-dimension median over the sampled corpus.
+    Median,
+}
+
+/// The [`ThresholdKind`] a newly built [`StoragePrecision::Binary`] sidecar
+/// fits τ with. Chosen by measurement (see
+/// `mean_vs_median_threshold_measured_on_anisotropic_corpus` below): on a
+/// synthetic anisotropic corpus (a strong shared per-dimension bias added to
+/// uncorrelated noise — the shape that collapses dead bits under the old
+/// fixed-`0` threshold), both reductions eliminate the collapse and beat the
+/// old fixed threshold, but `Median`'s exactly-balanced 50/50 bit split
+/// measured a higher brute-force recall@10 than `Mean` (0.685 vs. 0.675 on
+/// that fixture) — the wave-2 mean baseline is a validated floor, not a
+/// ceiling, and the balanced-bit property does translate into a small
+/// measured win once an exact rescore follows the coarse Hamming stage. Kept
+/// as the default; `Mean` stays available and measured alongside it.
+const DEFAULT_BINARY_THRESHOLD_KIND: ThresholdKind = ThresholdKind::Median;
+
+/// The maximum row count [`fit_binary_threshold`] fits τ over. A representative
+/// per-dimension mean/median needs only a bounded sample, not the whole
+/// corpus — this caps both the time and the (for [`ThresholdKind::Median`],
+/// per-dimension sort) memory the fit costs on a large table.
+const BINARY_THRESHOLD_SAMPLE_CAP: usize = 100_000;
+
+/// Fit the per-dimension threshold τ (length `dimensions`) a
+/// [`StoragePrecision::Binary`] sidecar sign-packs the corpus (at
+/// [`SidecarIndex::build`]) and every query (at [`SidecarIndex::search`])
+/// against — [`pack_threshold_bits`]'s `sign(v − τ)`, replacing the old fixed
+/// `sign(v)`.
+///
+/// `vectors` is `dimensions`-wide `f32` records in internal-key order (the
+/// same buffer [`SidecarIndex::exact_vectors`] accumulates). Only the first
+/// `min(row_count, `[`BINARY_THRESHOLD_SAMPLE_CAP`]`)` rows are read — a
+/// bounded, DETERMINISTIC (insertion-order, never random) sample, so the same
+/// corpus always fits the same τ regardless of corpus size, satisfying the
+/// same-corpus-same-codes determinism contract every other reduction in this
+/// module upholds.
+fn fit_binary_threshold(vectors: &[f32], dimensions: usize, kind: ThresholdKind) -> Vec<f32> {
+    if dimensions == 0 {
+        return Vec::new();
+    }
+    let total_rows = vectors.len() / dimensions;
+    let sample_rows = total_rows.min(BINARY_THRESHOLD_SAMPLE_CAP);
+    match kind {
+        ThresholdKind::Mean => mean_threshold(vectors, dimensions, sample_rows),
+        ThresholdKind::Median => median_threshold(vectors, dimensions, sample_rows),
+    }
+}
+
+/// Per-dimension arithmetic mean over the first `sample_rows` records of
+/// `vectors`. Accumulated in `f64` (a fixed left-to-right reduction order, one
+/// pass) so a wide, deep corpus does not lose precision to `f32` summation
+/// before the final per-dimension cast back down.
+fn mean_threshold(vectors: &[f32], dimensions: usize, sample_rows: usize) -> Vec<f32> {
+    let mut sums = vec![0f64; dimensions];
+    for row in 0..sample_rows {
+        let start = row * dimensions;
+        for (d, &x) in vectors[start..start + dimensions].iter().enumerate() {
+            sums[d] += f64::from(x);
+        }
+    }
+    let n = (sample_rows.max(1)) as f64;
+    sums.into_iter().map(|s| (s / n) as f32).collect()
+}
+
+/// Per-dimension median over the first `sample_rows` records of `vectors`.
+/// One reused column buffer sorted per dimension (`f32::total_cmp` — the
+/// same NaN-safe, deterministic-ordering primitive every other reduction in
+/// this crate sorts floats with); the median of an even sample averages the
+/// two central values.
+fn median_threshold(vectors: &[f32], dimensions: usize, sample_rows: usize) -> Vec<f32> {
+    if sample_rows == 0 {
+        return vec![0.0; dimensions];
+    }
+    let mut column = vec![0f32; sample_rows];
+    (0..dimensions)
+        .map(|d| {
+            for (row, slot) in column.iter_mut().enumerate() {
+                *slot = vectors[row * dimensions + d];
+            }
+            column.sort_unstable_by(f32::total_cmp);
+            let mid = sample_rows / 2;
+            if sample_rows % 2 == 0 {
+                (column[mid - 1] + column[mid]) / 2.0
+            } else {
+                column[mid]
+            }
+        })
+        .collect()
+}
+
+/// Per-dimension threshold sign-bit packing for a [`StoragePrecision::Binary`]
+/// sidecar: `v[i] > threshold[i]` → bit `1`, else (including exact equality
+/// and every value below it) → bit `0`, packed LSB-first into `ceil(dim / 8)`
+/// bytes. Unused high bits in the final byte are left `0` (`vec![0u8; ...]`
+/// is zero-initialized, so this is a property of the construction, not a
+/// separate masking step).
+///
+/// The ONE function both [`SidecarIndex::build`] (corpus rows, once τ is
+/// fit) and [`SidecarIndex::search`] (queries) pack through — USearch's
+/// Hamming metric counts every bit position in the buffer, padding included,
+/// so packing the two sides against a different threshold would silently
+/// bias every Hamming distance by a fixed, easy-to-miss amount (it would just
+/// look like uniformly worse recall, never a crash). `threshold` is the
+/// corpus-fit τ from [`fit_binary_threshold`] — an all-zero `threshold`
+/// reproduces the old symmetric-sign-at-0 packing exactly, since `v[i] >
+/// 0.0` is `sign(v[i] − 0)`.
+fn pack_threshold_bits(v: &[f32], threshold: &[f32]) -> Vec<u8> {
     let n_bytes = v.len().div_ceil(8);
     let mut packed = vec![0u8; n_bytes];
-    for (i, &x) in v.iter().enumerate() {
-        if x > 0.0 {
+    for (i, (&x, &t)) in v.iter().zip(threshold.iter()).enumerate() {
+        if x > t {
             packed[i / 8] |= 1 << (i % 8);
         }
     }
@@ -217,6 +342,18 @@ pub struct SidecarIndex {
     /// time, not lazily; each vector is then served by a positioned read).
     /// `None` for an `F32` index.
     rescore: Option<RawVectorCompanion>,
+    /// The per-dimension threshold τ a [`StoragePrecision::Binary`] index's
+    /// sign-packing (both the corpus at [`Self::build`] and every query at
+    /// [`Self::search`]) is applied against. `Some` (length `dimensions`)
+    /// once a `Binary` index has been built ([`Self::build`] fits it from the
+    /// accumulated corpus) or loaded ([`Self::load`] reads it back from the
+    /// `.threshold` companion). `None` for every other precision, and for a
+    /// `Binary` index that has neither been built nor loaded yet.
+    binary_threshold: Option<Vec<f32>>,
+    /// Which reduction ([`ThresholdKind`]) [`Self::binary_threshold`] was fit
+    /// with. `Some` iff `binary_threshold` is — persisted in the manifest so
+    /// a reload can confirm which threshold a bundle used.
+    threshold_kind: Option<ThresholdKind>,
 }
 
 /// The load-relevant header of the ANN `.manifest.json` sidecar.
@@ -248,6 +385,14 @@ struct AnnManifest {
     /// stale; either way the load must not silently reopen it as if it
     /// matched.
     scalar_kind: StoragePrecision,
+    /// Which [`ThresholdKind`] the `.threshold` companion was fit with.
+    /// Legitimately absent (`None`, via `#[serde(default)]`) for every
+    /// non-`Binary` precision; [`SidecarIndex::load`] hard-errors if it is
+    /// missing while `scalar_kind` is `Binary` and the bundle holds at least
+    /// one row — a `Binary` manifest missing this field is a torn or
+    /// pre-threshold-fix bundle, not a legitimate empty state.
+    #[serde(default)]
+    binary_threshold_kind: Option<ThresholdKind>,
 }
 
 impl SidecarIndex {
@@ -276,6 +421,8 @@ impl SidecarIndex {
             storage_precision: precision,
             exact_vectors: precision.needs_rescore().then(Vec::new),
             rescore: None,
+            binary_threshold: None,
+            threshold_kind: None,
         })
     }
 
@@ -374,6 +521,15 @@ impl SidecarIndex {
             }
         }
 
+        // Save the Binary sidecar's per-dimension threshold τ companion, only
+        // when `build` actually fit one (a `Binary` build with at least one
+        // row added — `build` never sets `binary_threshold` on an empty
+        // index).
+        if let Some(threshold) = self.binary_threshold.as_ref() {
+            let threshold_path = base_path.with_extension(THRESHOLD_COMPANION_EXTENSION);
+            std::fs::write(&threshold_path, bytemuck::cast_slice(threshold))?;
+        }
+
         // Save manifest
         let manifest_path = base_path.with_extension("manifest.json");
         let manifest = serde_json::json!({
@@ -384,6 +540,7 @@ impl SidecarIndex {
             "backend": "usearch",
             "backend_version": crate::index::backend_version(),
             "scalar_kind": self.storage_precision,
+            "binary_threshold_kind": self.threshold_kind,
             "files": {
                 "index": usearch_path.file_name().and_then(|n| n.to_str()),
                 "rowmap": rowmap_path.file_name().and_then(|n| n.to_str()),
@@ -537,6 +694,35 @@ impl SidecarIndex {
             None
         };
 
+        // A `Binary` bundle with at least one row expects the `.threshold`
+        // companion beside it, and `binary_threshold_kind` on the manifest —
+        // both written together by every `Binary` `save`, so either's
+        // absence is a torn/incomplete (or pre-threshold-fix) bundle, not a
+        // legitimate empty state. Fail loudly rather than silently reopening
+        // it under the old fixed-`0` symmetric packing.
+        let (binary_threshold, threshold_kind) =
+            if manifest.scalar_kind == StoragePrecision::Binary && !row_map.is_empty() {
+                let kind = manifest.binary_threshold_kind.ok_or_else(|| {
+                    JammiError::Other(
+                        "ann-manifest: a Binary sidecar's manifest is missing \
+                         binary_threshold_kind — torn or pre-threshold-fix bundle"
+                            .into(),
+                    )
+                })?;
+                let threshold_path = base_path.with_extension(THRESHOLD_COMPANION_EXTENSION);
+                let bytes = std::fs::read(&threshold_path)?;
+                let threshold: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
+                if threshold.len() != dimensions {
+                    return Err(JammiError::Other(format!(
+                        "ann-threshold: expected {dimensions} τ values, found {}",
+                        threshold.len()
+                    )));
+                }
+                (Some(threshold), Some(kind))
+            } else {
+                (None, None)
+            };
+
         Ok(Self {
             dimensions,
             index,
@@ -546,6 +732,8 @@ impl SidecarIndex {
             storage_precision: manifest.scalar_kind,
             exact_vectors: None,
             rescore,
+            binary_threshold,
+            threshold_kind,
         })
     }
 }
@@ -560,25 +748,22 @@ impl VectorIndex for SidecarIndex {
             )));
         }
         let key = self.row_map.len() as u64;
-        // Reserve space if needed
-        if self.index.capacity() <= self.index.size() {
-            let new_cap = (self.index.capacity() + 1).max(64);
-            self.index
-                .reserve(new_cap)
-                .map_err(|e| JammiError::Other(format!("USearch reserve: {e}")))?;
-        }
         match self.storage_precision {
-            // A Binary index's own USearch storage is `b1x8`-typed, not
-            // `f32` — `add_f32` fails against a `B1` graph. Route through the
-            // SAME `pack_sign_bits` a query later packs through, so the
-            // corpus and query sides never diverge.
-            StoragePrecision::Binary => {
-                let packed = pack_sign_bits(vector);
-                self.index
-                    .add(key, usearch::b1x8::from_u8s(&packed))
-                    .map_err(|e| JammiError::Other(format!("USearch add: {e}")))?;
-            }
+            // A Binary index's own USearch storage is `b1x8`-typed
+            // sign-packed against a corpus-wide per-dimension threshold τ —
+            // unknown until every row has been seen. So a Binary row is only
+            // accumulated here (into `exact_vectors` below); [`Self::build`]
+            // fits τ from the whole corpus and inserts every row into the
+            // USearch graph in one bulk pass.
+            StoragePrecision::Binary => {}
             StoragePrecision::F32 | StoragePrecision::F16 | StoragePrecision::Int8 => {
+                // Reserve space if needed.
+                if self.index.capacity() <= self.index.size() {
+                    let new_cap = (self.index.capacity() + 1).max(64);
+                    self.index
+                        .reserve(new_cap)
+                        .map_err(|e| JammiError::Other(format!("USearch reserve: {e}")))?;
+                }
                 self.index
                     .add(key, vector)
                     .map_err(|e| JammiError::Other(format!("USearch add: {e}")))?;
@@ -593,7 +778,34 @@ impl VectorIndex for SidecarIndex {
     }
 
     fn build(&mut self) -> Result<()> {
-        // USearch builds incrementally during add(), so build is a no-op.
+        // USearch builds incrementally during add() for every precision
+        // EXCEPT Binary, whose corpus rows `add` only accumulated into
+        // `exact_vectors` (see above) — this is where a Binary index's
+        // per-dimension threshold τ is fit from the whole corpus and every
+        // row is bulk-inserted into the USearch graph, sign-packed against
+        // it. Every other precision was already inserted incrementally, so
+        // this stays a no-op for them.
+        if self.storage_precision == StoragePrecision::Binary && !self.row_map.is_empty() {
+            let vectors = self.exact_vectors.as_ref().expect(
+                "a Binary sidecar always tracks exact_vectors (StoragePrecision::Binary::needs_rescore() is true)",
+            );
+            let kind = DEFAULT_BINARY_THRESHOLD_KIND;
+            let threshold = fit_binary_threshold(vectors, self.dimensions, kind);
+
+            self.index
+                .reserve(self.row_map.len())
+                .map_err(|e| JammiError::Other(format!("USearch reserve: {e}")))?;
+            for key in 0..self.row_map.len() as u64 {
+                let start = key as usize * self.dimensions;
+                let vector = &vectors[start..start + self.dimensions];
+                let packed = pack_threshold_bits(vector, &threshold);
+                self.index
+                    .add(key, usearch::b1x8::from_u8s(&packed))
+                    .map_err(|e| JammiError::Other(format!("USearch add: {e}")))?;
+            }
+            self.binary_threshold = Some(threshold);
+            self.threshold_kind = Some(kind);
+        }
         // We just mark it as built for correctness tracking.
         self.built = true;
         Ok(())
@@ -605,11 +817,19 @@ impl VectorIndex for SidecarIndex {
         }
         let actual_k = k.min(self.row_map.len());
         let matches = match self.storage_precision {
-            // Same routing as `add`: a Binary graph's typed search path is
+            // Same routing as `build`: a Binary graph's typed search path is
             // `search_b1x8`, fed the query packed through the identical
-            // `pack_sign_bits` the corpus rows were added with.
+            // `pack_threshold_bits` (against the SAME corpus-fit τ) the
+            // corpus rows were bulk-inserted with.
             StoragePrecision::Binary => {
-                let packed = pack_sign_bits(query);
+                let threshold = self.binary_threshold.as_deref().ok_or_else(|| {
+                    JammiError::Other(
+                        "Binary search: no threshold τ available — index has not been built or \
+                         loaded"
+                            .into(),
+                    )
+                })?;
+                let packed = pack_threshold_bits(query, threshold);
                 self.index
                     .search(usearch::b1x8::from_u8s(&packed), actual_k)
             }
@@ -1045,11 +1265,14 @@ mod tests {
     }
 
     #[test]
-    fn pack_sign_bits_is_symmetric_sign_at_zero_lsb_first_zero_padded() {
-        // dim = 9 -> ceil(9/8) = 2 bytes. v > 0 -> bit 1 (including the
-        // padding-adjacent index 8), else (including exactly 0.0) -> bit 0,
-        // LSB-first within each byte, unused high bits left 0.
-        let packed = pack_sign_bits(&[1.0, -1.0, 0.0, 2.0, -0.5, 0.5, -3.0, 4.0, 0.1]);
+    fn pack_threshold_bits_with_zero_threshold_matches_old_symmetric_sign_at_zero() {
+        // dim = 9 -> ceil(9/8) = 2 bytes. An all-zero threshold reproduces
+        // the pre-fix symmetric packing exactly: v > 0 -> bit 1 (including
+        // the padding-adjacent index 8), else (including exactly 0.0) -> bit
+        // 0, LSB-first within each byte, unused high bits left 0.
+        let v = [1.0, -1.0, 0.0, 2.0, -0.5, 0.5, -3.0, 4.0, 0.1];
+        let zero_threshold = [0.0f32; 9];
+        let packed = pack_threshold_bits(&v, &zero_threshold);
         assert_eq!(packed.len(), 2);
         // Bits 0, 3, 5, 7 set (the positive entries) -> 1 + 8 + 32 + 128.
         assert_eq!(packed[0], 0b1010_1001);
@@ -1058,9 +1281,22 @@ mod tests {
     }
 
     #[test]
+    fn pack_threshold_bits_shifts_the_boundary_per_dimension() {
+        // A non-zero, per-dimension threshold moves the bit boundary away
+        // from 0 independently per dimension — the asymmetric generalisation
+        // `pack_sign_bits` (the old fixed-0 packer) could not express.
+        let v = [0.4, 0.6, -0.1, -0.1];
+        let threshold = [0.5, 0.5, -0.2, 0.0];
+        let packed = pack_threshold_bits(&v, &threshold);
+        // 0.4 <= 0.5 -> 0; 0.6 > 0.5 -> 1; -0.1 > -0.2 -> 1; -0.1 <= 0.0 -> 0.
+        assert_eq!(packed, vec![0b0000_0110]);
+    }
+
+    #[test]
     fn binary_query_equal_to_corpus_vector_is_its_own_nearest_at_hamming_zero() {
-        // The corpus rows and the query pack through the SAME `pack_sign_bits`
-        // (both go through `SidecarIndex::add`/`search`), so a query that IS
+        // The corpus rows and the query pack through the SAME
+        // `pack_threshold_bits` against the SAME corpus-fit τ (both go
+        // through `SidecarIndex::build`/`search`), so a query that IS
         // one of the corpus's own vectors must be its own nearest neighbour at
         // Hamming distance exactly 0 — any divergence between the add-side and
         // query-side packing would show up here as a nonzero distance.
@@ -1193,6 +1429,14 @@ mod tests {
             "a Binary build's manifest must record the metric it actually searches with, \
              not a hardcoded 'cosine'"
         );
+        assert_eq!(
+            manifest["binary_threshold_kind"], "median",
+            "a Binary build's manifest must record which ThresholdKind fit τ"
+        );
+        assert!(
+            base.with_extension(THRESHOLD_COMPANION_EXTENSION).exists(),
+            "a Binary build must write the .threshold companion"
+        );
 
         let loaded =
             SidecarIndex::load(&base, &AnnIndexConfig::default(), StoragePrecision::Binary)
@@ -1203,6 +1447,17 @@ mod tests {
             "a Binary build must write the rescore companion"
         );
         assert_eq!(loaded.get_exact("a").unwrap(), Some(vector.to_vec()));
+        assert_eq!(
+            loaded.threshold_kind,
+            Some(ThresholdKind::Median),
+            "a loaded Binary index must recover the ThresholdKind its manifest recorded"
+        );
+        assert_eq!(
+            loaded.binary_threshold.as_deref(),
+            Some(vector.as_slice()),
+            "a single-row corpus's per-dimension mean/median IS that row, so its own τ \
+             round-trips to the vector itself"
+        );
     }
 
     #[test]
@@ -1237,5 +1492,427 @@ mod tests {
                 panic!("expected IncompatibleFormat for ann-index-precision, got {other:?}")
             }
         }
+    }
+
+    // ─── Asymmetric (mean-centered) threshold: wave-2 anisotropy fix ────────
+
+    /// A shared, large positive per-dimension bias — the synthetic stand-in
+    /// for a real embedding corpus's dominant common-mean component
+    /// (`‖μ‖/E‖v‖ ≈ 0.97` measured on ModernBERT): every row's value at
+    /// dimension `d` sits close to `bias[d]` (`[3.0, 3.5)`), with only a
+    /// small (`[-1, 1]`) per-row noise residual distinguishing rows. A fixed
+    /// threshold at `0` sees only the bias and collapses every dimension to
+    /// a constant bit; a corpus-fit τ ≈ `bias` cancels it and exposes the
+    /// noise residual.
+    fn anisotropic_bias(dim: usize) -> Vec<f32> {
+        let mut state = 1_000_000u64;
+        (0..dim)
+            .map(|_| {
+                let bits = splitmix64(&mut state);
+                let u = (bits >> 11) as f64 / (1u64 << 53) as f64; // [0, 1)
+                (3.0 + 0.5 * u) as f32
+            })
+            .collect()
+    }
+
+    /// One anisotropic row: `bias[d] + noise[d]`, `noise` uniform in `[-1,
+    /// 1]` via [`synthetic_vector`]. `bias` dominates (`>= 3.0` vs. noise's
+    /// `<= 1.0` magnitude), so `v[d] > 0` for every row at every dimension —
+    /// the fully-collapsed extreme of the real anisotropy this fix targets.
+    fn anisotropic_vector(seed: u64, dim: usize, bias: &[f32]) -> Vec<f32> {
+        let noise = synthetic_vector(seed, dim);
+        bias.iter()
+            .zip(noise.iter())
+            .map(|(&b, &n)| b + n)
+            .collect()
+    }
+
+    /// Popcount of `a XOR b` over equal-length packed-bit buffers — an exact
+    /// (non-approximate) Hamming distance, used by the hand-rolled coarse
+    /// stage below so the RED-side measurement is never contaminated by
+    /// USearch's own HNSW approximation.
+    fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| (x ^ y).count_ones())
+            .sum()
+    }
+
+    /// How many of `dim` dimensions have an IDENTICAL sign bit
+    /// (`v[d] > threshold[d]`) across every row of `vectors` — USearch's
+    /// Hamming metric can never discriminate on a collapsed dimension, since
+    /// it contributes the same bit to every corpus row's code.
+    fn count_collapsed_dims(vectors: &[Vec<f32>], dim: usize, threshold: &[f32]) -> usize {
+        (0..dim)
+            .filter(|&d| {
+                let first = vectors[0][d] > threshold[d];
+                vectors.iter().all(|v| (v[d] > threshold[d]) == first)
+            })
+            .count()
+    }
+
+    /// Exact brute-force cosine top-`k` over `corpus` — the ground-truth
+    /// oracle every retrieve→rescore recall measurement below is checked
+    /// against.
+    fn brute_force_top_k(query: &[f32], corpus: &[(String, Vec<f32>)], k: usize) -> Vec<String> {
+        use jammi_numerics::distance::cosine_distance;
+        let mut ranked: Vec<(String, f32)> = corpus
+            .iter()
+            .map(|(id, v)| (id.clone(), cosine_distance(query, v)))
+            .collect();
+        ranked.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(k);
+        ranked.into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// A hand-rolled retrieve→rescore over `corpus`'s codes at an arbitrary
+    /// `threshold` — an exact brute-force Hamming coarse stage (never
+    /// USearch's approximate HNSW), so this is reusable to measure ANY
+    /// [`ThresholdKind`] fit (or the pre-fix all-zero threshold) on a level,
+    /// backend-independent footing.
+    fn manual_threshold_retrieve_then_rescore(
+        query: &[f32],
+        corpus: &[(String, Vec<f32>)],
+        threshold: &[f32],
+        k: usize,
+        candidate_k: usize,
+    ) -> Vec<String> {
+        use jammi_numerics::distance::cosine_distance;
+        let query_code = pack_threshold_bits(query, threshold);
+        let mut candidates: Vec<(String, u32)> = corpus
+            .iter()
+            .map(|(id, v)| {
+                (
+                    id.clone(),
+                    hamming_distance(&query_code, &pack_threshold_bits(v, threshold)),
+                )
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        candidates.truncate(candidate_k);
+
+        let mut rescored: Vec<(String, f32)> = candidates
+            .into_iter()
+            .map(|(id, _)| {
+                let v = &corpus.iter().find(|(cid, _)| cid == &id).unwrap().1;
+                (id, cosine_distance(query, v))
+            })
+            .collect();
+        rescored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        rescored.truncate(k);
+        rescored.into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// A retrieve→rescore over a real, built [`SidecarIndex`] — the SAME
+    /// production mechanism [`binary_search_with_rescore_matches_exact_f32_baseline`]
+    /// exercises, factored out for the RED→GREEN oracle below.
+    fn index_retrieve_then_rescore(
+        index: &SidecarIndex,
+        query: &[f32],
+        k: usize,
+        candidate_k: usize,
+    ) -> Vec<String> {
+        use jammi_numerics::distance::cosine_distance;
+        let candidates = index.search(query, candidate_k).unwrap();
+        let mut rescored: Vec<(String, f32)> = candidates
+            .into_iter()
+            .map(|(id, _)| {
+                let exact = index.get_exact(&id).unwrap().unwrap();
+                (id, cosine_distance(query, &exact))
+            })
+            .collect();
+        rescored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        rescored.truncate(k);
+        rescored.into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// Mean recall@k of `predicted` against `truth` (both already truncated
+    /// to `k`), one query per pair.
+    fn mean_recall_at_k(predicted: &[Vec<String>], truth: &[Vec<String>], k: usize) -> f64 {
+        let total: usize = predicted
+            .iter()
+            .zip(truth.iter())
+            .map(|(p, t)| p.iter().filter(|id| t.contains(*id)).count())
+            .sum();
+        total as f64 / (predicted.len() * k) as f64
+    }
+
+    #[test]
+    fn asymmetric_threshold_eliminates_collapsed_dims_and_improves_recall_on_anisotropic_corpus() {
+        // RED under the old fixed-0 symmetric threshold: a shared
+        // per-dimension bias (>= 3.0) dominates a small (<= 1.0) per-row
+        // noise residual, so `v[d] > 0` holds for EVERY row at EVERY
+        // dimension — full collapse, the extreme of the real
+        // ‖μ‖/E‖v‖ ≈ 0.97 anisotropy this fix targets. GREEN once τ is fit
+        // at the corpus mean: it cancels the bias and exposes the noise
+        // residual as genuine per-row bit variation. This test fails (both
+        // assertions) if [`SidecarIndex::build`]'s Binary path is ever
+        // reverted to the old fixed-0 packing.
+        let dim = 64;
+        let corpus_n = 300;
+        let k = 10;
+        let candidate_k = k * 4; // << corpus_n, so the coarse stage's
+                                 // discriminative power actually matters —
+                                 // a wider oversample would rescore the
+                                 // whole corpus and hide any coarse-stage
+                                 // difference.
+        let bias = anisotropic_bias(dim);
+
+        let corpus: Vec<(String, Vec<f32>)> = (0..corpus_n)
+            .map(|i| {
+                (
+                    format!("row-{i}"),
+                    anisotropic_vector(i as u64 + 1, dim, &bias),
+                )
+            })
+            .collect();
+        let corpus_vectors: Vec<Vec<f32>> = corpus.iter().map(|(_, v)| v.clone()).collect();
+
+        // Held-out queries: fresh seeds, disjoint from the corpus's.
+        let queries: Vec<Vec<f32>> = (0..20)
+            .map(|i| anisotropic_vector(500_000 + i, dim, &bias))
+            .collect();
+
+        // ── Collapsed-dim count ──
+        let zero_threshold = vec![0f32; dim];
+        let collapsed_at_zero = count_collapsed_dims(&corpus_vectors, dim, &zero_threshold);
+        assert_eq!(
+            collapsed_at_zero, dim,
+            "the synthetic anisotropic corpus must fully collapse under the old fixed-0 \
+             threshold (every dimension's bias dominates its noise residual)"
+        );
+
+        let mut idx =
+            SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
+        for (id, v) in &corpus {
+            idx.add(id, v).unwrap();
+        }
+        idx.build().unwrap();
+        let fitted_threshold = idx.binary_threshold.clone().unwrap();
+        let collapsed_at_mean = count_collapsed_dims(&corpus_vectors, dim, &fitted_threshold);
+        assert!(
+            collapsed_at_mean < collapsed_at_zero,
+            "a corpus-fit τ must eliminate collapsed dims the old fixed-0 threshold produced: \
+             zero={collapsed_at_zero} mean={collapsed_at_mean}"
+        );
+        assert_eq!(
+            collapsed_at_mean, 0,
+            "with 300 rows of genuine per-row noise, no dimension should remain collapsed once \
+             τ cancels the shared bias, got {collapsed_at_mean}"
+        );
+
+        // ── Recall@10 ──
+        let truth: Vec<Vec<String>> = queries
+            .iter()
+            .map(|q| brute_force_top_k(q, &corpus, k))
+            .collect();
+        let plain_sign_predicted: Vec<Vec<String>> = queries
+            .iter()
+            .map(|q| {
+                manual_threshold_retrieve_then_rescore(q, &corpus, &zero_threshold, k, candidate_k)
+            })
+            .collect();
+        let asymmetric_predicted: Vec<Vec<String>> = queries
+            .iter()
+            .map(|q| index_retrieve_then_rescore(&idx, q, k, candidate_k))
+            .collect();
+
+        let plain_sign_recall = mean_recall_at_k(&plain_sign_predicted, &truth, k);
+        let asymmetric_recall = mean_recall_at_k(&asymmetric_predicted, &truth, k);
+        assert!(
+            asymmetric_recall > plain_sign_recall,
+            "asymmetric (mean-centered) threshold must beat the old fixed-0 symmetric \
+             threshold on this anisotropic corpus: plain_sign={plain_sign_recall:.3} \
+             asymmetric={asymmetric_recall:.3}"
+        );
+    }
+
+    #[test]
+    fn mean_vs_median_threshold_measured_on_anisotropic_corpus() {
+        // "Decide by measurement, not guess": fits BOTH ThresholdKind
+        // reductions on the identical anisotropic fixture the RED→GREEN
+        // oracle above uses, ranks each through the SAME hand-rolled exact
+        // (non-approximate) coarse+rescore mechanism — so the comparison
+        // measures only the two reductions' discriminative quality, never
+        // USearch's HNSW approximation — and asserts
+        // [`DEFAULT_BINARY_THRESHOLD_KIND`] is the one that measured at
+        // least as well.
+        let dim = 64;
+        let corpus_n = 300;
+        let k = 10;
+        let candidate_k = k * 4;
+        let bias = anisotropic_bias(dim);
+
+        let corpus: Vec<(String, Vec<f32>)> = (0..corpus_n)
+            .map(|i| {
+                (
+                    format!("row-{i}"),
+                    anisotropic_vector(i as u64 + 1, dim, &bias),
+                )
+            })
+            .collect();
+        let flat: Vec<f32> = corpus.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        let queries: Vec<Vec<f32>> = (0..20)
+            .map(|i| anisotropic_vector(500_000 + i, dim, &bias))
+            .collect();
+        let truth: Vec<Vec<String>> = queries
+            .iter()
+            .map(|q| brute_force_top_k(q, &corpus, k))
+            .collect();
+
+        let recall_for = |kind: ThresholdKind| -> f64 {
+            let threshold = fit_binary_threshold(&flat, dim, kind);
+            let predicted: Vec<Vec<String>> = queries
+                .iter()
+                .map(|q| {
+                    manual_threshold_retrieve_then_rescore(q, &corpus, &threshold, k, candidate_k)
+                })
+                .collect();
+            mean_recall_at_k(&predicted, &truth, k)
+        };
+
+        let mean_recall = recall_for(ThresholdKind::Mean);
+        let median_recall = recall_for(ThresholdKind::Median);
+        let default_recall = recall_for(DEFAULT_BINARY_THRESHOLD_KIND);
+
+        assert!(
+            default_recall >= mean_recall.max(median_recall) - f64::EPSILON,
+            "DEFAULT_BINARY_THRESHOLD_KIND ({DEFAULT_BINARY_THRESHOLD_KIND:?}) must match the \
+             measured best of the two kinds: mean={mean_recall:.3} median={median_recall:.3} \
+             default={default_recall:.3}"
+        );
+    }
+
+    #[test]
+    fn binary_threshold_round_trips_through_save_and_load_and_query_uses_it() {
+        let dim = 32;
+        let mut idx =
+            SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
+        let vectors: Vec<Vec<f32>> = (0..40).map(|i| synthetic_vector(i + 1, dim)).collect();
+        for (i, v) in vectors.iter().enumerate() {
+            idx.add(&format!("row-{i}"), v).unwrap();
+        }
+        idx.build().unwrap();
+        let built_threshold = idx.binary_threshold.clone().unwrap();
+        assert_eq!(idx.threshold_kind, Some(DEFAULT_BINARY_THRESHOLD_KIND));
+
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("binary_threshold_roundtrip");
+        idx.save(&base).unwrap();
+        let loaded =
+            SidecarIndex::load(&base, &AnnIndexConfig::default(), StoragePrecision::Binary)
+                .unwrap();
+
+        assert_eq!(
+            loaded.binary_threshold,
+            Some(built_threshold),
+            "τ must round-trip bit-for-bit through the .threshold companion"
+        );
+        assert_eq!(loaded.threshold_kind, idx.threshold_kind);
+
+        // The query must be thresholded with the SAME τ: a query
+        // bit-identical to a corpus row (post-threshold) is its own nearest
+        // neighbour at Hamming 0 whether we search the freshly-built or the
+        // reloaded index.
+        let query = vectors[7].clone();
+        let hits_built = idx.search(&query, 1).unwrap();
+        let hits_loaded = loaded.search(&query, 1).unwrap();
+        assert_eq!(hits_built, hits_loaded);
+        assert_eq!(hits_loaded[0].0, "row-7");
+        assert_eq!(hits_loaded[0].1, 0.0);
+    }
+
+    #[test]
+    fn binary_threshold_is_deterministic_across_builds_of_the_same_corpus() {
+        let dim = 40;
+        let vectors: Vec<(String, Vec<f32>)> = (0..50)
+            .map(|i| (format!("row-{i}"), synthetic_vector(i + 1, dim)))
+            .collect();
+
+        let build = || {
+            let mut idx =
+                SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary)
+                    .unwrap();
+            for (id, v) in &vectors {
+                idx.add(id, v).unwrap();
+            }
+            idx.build().unwrap();
+            idx
+        };
+
+        let idx_a = build();
+        let idx_b = build();
+
+        assert_eq!(
+            idx_a.binary_threshold, idx_b.binary_threshold,
+            "the same corpus must fit an identical τ every build"
+        );
+        assert_eq!(idx_a.threshold_kind, idx_b.threshold_kind);
+
+        // Same τ implies identical packed codes, so an identical query
+        // returns identical results both times.
+        let query = vectors[10].1.clone();
+        assert_eq!(
+            idx_a.search(&query, 5).unwrap(),
+            idx_b.search(&query, 5).unwrap()
+        );
+    }
+
+    #[test]
+    fn rescore_is_byte_identical_regardless_of_binary_threshold() {
+        // The exact-f32 rescore companion is populated from `exact_vectors`
+        // (`add`'s ORIGINAL, un-thresholded vectors) and never touched by τ,
+        // so `get_exact` must return byte-identical results no matter which
+        // threshold the coarse Hamming stage used — τ can only ever change
+        // the coarse CANDIDATE SET, never the exact rescore values.
+        let dim = 64;
+        let bias = anisotropic_bias(dim);
+        let vectors: Vec<(String, Vec<f32>)> = (0..30)
+            .map(|i| {
+                (
+                    format!("row-{i}"),
+                    anisotropic_vector(i as u64 + 1, dim, &bias),
+                )
+            })
+            .collect();
+
+        let mut idx =
+            SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
+        for (id, v) in &vectors {
+            idx.add(id, v).unwrap();
+        }
+        idx.build().unwrap();
+
+        let exact_with_fitted_threshold: Vec<Vec<f32>> = vectors
+            .iter()
+            .map(|(id, _)| idx.get_exact(id).unwrap().unwrap())
+            .collect();
+        let query = vectors[3].1.clone();
+        let candidates_with_fitted = idx.search(&query, vectors.len()).unwrap();
+
+        // Swap in a DIFFERENT threshold (the pre-fix all-zero one) directly
+        // on the already-built index — a private-field test-only override,
+        // never a public API — to isolate τ's effect to the coarse stage
+        // alone; `exact_vectors`/the `.rawf32` rescore path never reads this
+        // field.
+        idx.binary_threshold = Some(vec![0.0; dim]);
+
+        let exact_with_zero_threshold: Vec<Vec<f32>> = vectors
+            .iter()
+            .map(|(id, _)| idx.get_exact(id).unwrap().unwrap())
+            .collect();
+        let candidates_with_zero = idx.search(&query, vectors.len()).unwrap();
+
+        assert_eq!(
+            exact_with_fitted_threshold, exact_with_zero_threshold,
+            "get_exact/rescore must be byte-identical regardless of the binary threshold — it \
+             reads exact_vectors, which τ never touches"
+        );
+        assert_ne!(
+            candidates_with_fitted, candidates_with_zero,
+            "the coarse Hamming ranking DOES depend on τ — on this anisotropic corpus a \
+             mismatched query-side threshold must change the candidate ranking, otherwise this \
+             test is not distinguishing anything"
+        );
     }
 }

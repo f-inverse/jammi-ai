@@ -12,7 +12,7 @@ claim here traces to a cited source in those notes or the per-wave specs.
 
 ## The base (already built, unshipped)
 
-Branch `feat/qat-wave2` carries the **base of this train**:
+Branch `feat/asymmetric-binary-quant` carries the **base of this train**:
 - **Asymmetric (median-centered) binary quantization** — fixes a real latent defect:
   transformer embeddings are anisotropic (‖μ‖/E‖v‖≈0.97 on ModernBERT), so a fixed-0
   `sign(v)` collapsed ~183/768 bits. `sign(v−τ)` with a per-dim learned threshold (τ

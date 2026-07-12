@@ -473,7 +473,8 @@ pub enum StoragePrecision {
     Int8,
     /// 1-bit sign-quantized index vectors, searched by Hamming distance —
     /// quantized, rescored. USearch's `B1` scalar kind (one packed bit per
-    /// dimension, symmetric sign threshold at `0`).
+    /// dimension, `sign(v - τ)` against a per-dimension threshold τ fit from
+    /// the corpus — see [`crate::index::sidecar`]'s `ThresholdKind`).
     Binary,
 }
 

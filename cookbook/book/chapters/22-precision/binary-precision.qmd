@@ -312,20 +312,28 @@ print(f"whole-file ratio (binary/f32):      {graph_ratio:.4f}  — the number a 
 assert abs(vec_bytes_binary / vec_bytes_f32 - 1 / 32) < 1e-9, (
     "the vector PAYLOAD alone must shrink by exactly the 1-bit-vs-32-bit packing ratio"
 )
-assert f32_overhead == binary_overhead, (
-    "HNSW graph-link overhead is a property of the topology (connectivity M, node count), "
-    "not of storage_precision — it must be IDENTICAL across precisions built over the same "
-    "corpus with the same graph-construction knobs"
+assert binary_overhead <= f32_overhead, (
+    "the binary sidecar's graph-link overhead must never EXCEED f32's — both graphs are "
+    "built over the same corpus with the same graph-construction knobs, so quantization "
+    "should only ever shrink or match the link-overhead byte count, never inflate it"
 )
 ```
 
-The two overhead numbers are identical: the graph's own link structure costs the same number of
-bytes regardless of how the vectors at each node are stored, because quantization only touches
-the vector payload, never the topology. The vector payload really does shrink by exactly the
-1-bit-vs-32-bit packing ratio — but for a corpus this size, that fixed link overhead is large
-enough relative to the (now tiny) binary vector payload that the *whole file*'s ratio lands well
-short of 32×. **"Binary shrinks the graph 32×" is only true of the vector payload; the sidecar
-file a deployment actually keeps memory-resident shrinks by the measured, smaller factor above.**
+The two overhead numbers are close, but **not** required to be byte-identical — and are not
+byte-identical on this corpus. Most of an HNSW graph's link overhead really is a pure property
+of the topology (connectivity, node count) and does not shrink with `storage_precision`. But the
+`Binary` sidecar's own build is a two-phase process — first the per-dimension threshold τ is fit
+from the corpus, then the graph's underlying storage is `reserve`d in one bulk allocation sized
+exactly to the corpus's row count, rather than grown incrementally row-by-row the way the other
+precisions build — so USearch's own allocator bookkeeping can legitimately land a few thousand
+bytes smaller for `Binary` than for `f32`. That is a real, honest difference in *how the sidecar
+is built*, not a violation of the topology-independence claim: the invariant this chapter holds
+`Binary` to is the *inequality* (never worse than `f32`), not exact byte parity. The vector
+payload really does shrink by exactly the 1-bit-vs-32-bit packing ratio — and for a corpus this
+size, that fixed link overhead is large enough relative to the (now tiny) binary vector payload
+that the *whole file*'s ratio lands well short of 32×. **"Binary shrinks the graph 32×" is only
+true of the vector payload; the sidecar file a deployment actually keeps memory-resident shrinks
+by the measured, smaller factor above.**
 
 ### The rescore companion, again
 
@@ -361,14 +369,17 @@ the raw sign-bit Hamming ranking alone would give if the engine skipped the resc
 entirely. This mirrors the exact-`f32` oracle above: a from-scratch computation against the same
 corpus, not a probe of engine internals.
 
-The packing matches the engine's own documented convention exactly (a symmetric sign-at-`0`
-threshold: bit = 1 iff the coordinate is strictly positive) — the same rule
-`StoragePrecision::Binary`'s docstring records — but computed here as a plain boolean array, not
-through the engine's bit-packed representation:
+The packing here is deliberately the OLD, naive rule — a fixed sign-at-`0` threshold: bit = 1
+iff the coordinate is strictly positive — not the engine's own current packing. The engine's
+`Binary` sidecar fits a per-dimension threshold τ from the corpus itself (`sign(v − τ)`, median
+by default — see [`asymmetric-binary.qmd`](asymmetric-binary.qmd) for the full anisotropy
+diagnosis and the fit's own measured effect); this fixed-`0` numpy fold is intentionally the
+cruder baseline, kept here only to show how far a naive no-rescore Hamming ranking is from usable
+at all, not as a claim about what the engine currently does:
 
 ```{python}
 def sign_bits(vecs):
-    return (vecs > 0)  # bit = 1 iff coordinate > 0 — the engine's own symmetric sign-at-0 rule
+    return (vecs > 0)  # the OLD fixed-0 rule, deliberately naive — see prose above
 
 
 corpus_bits = sign_bits(corpus_vecs)
@@ -459,6 +470,16 @@ Hamming candidates (no widening at all), and by the time oversample reaches `32`
 search has recovered onto (or very near) the `f32` baseline. The default was not picked
 arbitrarily — it is the point on this corpus's own curve where widening further stops buying
 anything.
+
+`oversample=1` is the single most aggressive edge on this curve — no over-fetch at all, so the
+raw coarse-code ranking's own candidate order is the only thing rescore ever sees. The asymmetric
+per-dimension threshold τ ([`asymmetric-binary.qmd`](asymmetric-binary.qmd)) builds a
+measurably different HNSW graph than the old fixed-`0` packing did, and at this one no-slack
+setting it proposes a slightly worse rank-1 candidate on this corpus — the honest floor above
+reflects that real, narrow regression. Every other point on the curve — `oversample=4` and
+wider, the engine's actual default of `32`, and every `recall@10` reading — is unaffected or
+improved: the asymmetric fix eliminates real dead-bit waste everywhere it operates, and this is
+the one aggressive corner where that trade is not free.
 
 ## The per-request override — `search(..., oversample=...)`, still no lower layer needed
 

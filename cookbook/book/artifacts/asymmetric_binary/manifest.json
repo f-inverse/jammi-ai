@@ -1,0 +1,17 @@
+{
+  "base_model": "answerdotai/ModernBERT-base",
+  "corpus_rows": 3200,
+  "query_rows": 800,
+  "dim": 768,
+  "source": {
+    "ref": "feat/qat-wave2-joint-abandoned",
+    "commit": "8c66455f722f64d5648d5dabd5958cbe7e33f237",
+    "path": "cookbook/book/artifacts/qat/baseline",
+    "lfs_oids": {
+      "corpus_vectors.parquet": "181c0732d3e523075f5e018135b06a4d2ef5568283a9cb41b74160cc5881554d",
+      "query_vectors.parquet": "a1e247a0a2e4a2382c95fac7b3e2ae84a54b9d3d828133b5dba2ac25d09d03d6"
+    },
+    "note": "The `baseline` head (quantization_aware=None) of the abandoned QAT joint keystone (scripts/build_qat_cache.py) \u2014 a real ModernBERT-base embedding of the committed ogbn-arxiv subset, with a disjoint held-out query split. Copied byte-for-byte (never re-embedded) to avoid a duplicate GPU pass over the SAME few-thousand-document corpus the QAT vertical already emitted."
+  },
+  "note": "The anisotropy diagnosis, the plain-vs-asymmetric no-rescore recall fold, and the engine-measured binary-precision recall are computed LIVE by chapters/22-precision/asymmetric-binary.qmd from the two committed parquet files \u2014 never frozen here."
+}

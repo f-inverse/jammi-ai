@@ -847,6 +847,50 @@ ARTIFACTS: dict[str, Artifact] = {
         "embedded engine returns the same-scale payload in-process unbounded). Names no "
         "consumer — every capability and error class is a generic engine feature.",
     ),
+    # --- asymmetric (per-dimension threshold) binary quantization (Wave-2) ---
+    "asymmetric_binary.corpus_vectors": Artifact(
+        name="asymmetric_binary.corpus_vectors",
+        kind="parquet",
+        filename="corpus_vectors.parquet",
+        columns={"_row_id": "Utf8", "vector": _vec(_EMB_DIM)},
+        produced_by="asymmetric_binary",
+        note="The INDEXED corpus: 3 200 real ModernBERT-base embeddings — copied "
+        "byte-for-byte from the abandoned QAT keystone's `baseline` head (never "
+        "re-embedded; see manifest.json's source block for the exact commit + LFS "
+        "object ids). The anisotropy diagnosis (‖μ‖/E‖v‖, collapsed-dim counts) and "
+        "the plain-vs-asymmetric no-rescore recall fold are computed LIVE from this "
+        "matrix by asymmetric-binary.qmd.",
+    ),
+    "asymmetric_binary.query_vectors": Artifact(
+        name="asymmetric_binary.query_vectors",
+        kind="parquet",
+        filename="query_vectors.parquet",
+        columns={"_row_id": "Utf8", "vector": _vec(_EMB_DIM)},
+        produced_by="asymmetric_binary",
+        note="The HELD-OUT query vectors: 800 real ModernBERT-base embeddings, "
+        "disjoint from asymmetric_binary.corpus_vectors by construction (the same "
+        "held-out paper_ids the QAT keystone's own split used).",
+    ),
+    "asymmetric_binary.manifest": Artifact(
+        name="asymmetric_binary.manifest",
+        kind="model_id",
+        filename="manifest.json",
+        produced_by="asymmetric_binary",
+        note="The provenance record: base model, corpus/query row counts + dim, and "
+        "the exact source (git ref + commit + LFS object ids) the vectors were "
+        "copied from — no recall number, no engine version fold; the recall fold is "
+        "computed live by the chapter, every render, against whichever engine build "
+        "is under test.",
+    ),
+    "asymmetric_binary.checksums": Artifact(
+        name="asymmetric_binary.checksums",
+        kind="model_id",
+        filename="checksums.json",
+        produced_by="asymmetric_binary",
+        note="sha256[:16] of every committed asymmetric_binary vector/manifest file "
+        "— a corrupted or drifted commit fails loudly rather than producing a "
+        "quietly-wrong anisotropy or recall number.",
+    ),
 }
 
 

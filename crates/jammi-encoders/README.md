@@ -61,7 +61,7 @@ let embedding = bert.forward(&input_ids, &mask)?;
 ## Why this exists
 
 The candle ecosystem has `candle-transformers` for raw transformer
-architectures but no candle-0.9.x-native sentence-embedding stack with PEFT
+architectures but no candle-native sentence-embedding stack with PEFT
 support. `jammi-encoders` fills that gap.
 
 ## When to use this vs. `candle-transformers`

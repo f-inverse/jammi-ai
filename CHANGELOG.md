@@ -6,6 +6,54 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-07-13
+
+The precision-moat base wave: asymmetric binary quantization. Transformer
+embeddings are anisotropic (measured `||mu||/E||v|| = 0.967` on real
+ModernBERT-base embeddings), so the `Binary` storage-precision sidecar's fixed
+sign-at-`0` threshold collapsed 183/768 dimensions to a constant bit, tanking
+Hamming recall (measured recall@10 0.155 on an anisotropic fixture). The
+sidecar now fits a per-dimension threshold from the corpus and packs
+`sign(v - tau)` instead, recovering recall@10 to 0.705 on the same fixture.
+Also unifies the global Rust toolchain on 1.94.0 to clear candle-0.11's
+aarch64 MSRV floor.
+
+### Added
+- **Asymmetric (mean/median-centered) binary quantization (`jammi-db`).** The
+  `Binary` sidecar's two-phase build fits a per-dimension threshold tau over
+  the corpus (median by default, bounded 100k-row sample) during `build()`,
+  then packs `sign(v - tau)`; `search()` thresholds the query by the same
+  stored tau. Applies only to the coarse Hamming code — the `f32` rescore
+  companion stays untouched, so retrieve-then-rescore is byte-identical to
+  before. Cosine-invariant, storage-side only; no trainer/wire/API change.
+  Persists as a `.threshold` sidecar companion (manifest v2 → v3, new
+  `binary_threshold_kind` field, required for `Binary`).
+- **Bootstrap-CI recall gate for the binary fixture (`jammi-bench`).** The
+  binary recall-floor gate now gates on the lower bound of a
+  percentile-bootstrap 95% CI (2000 resamples, fixed seed) rather than a flat
+  point-anchored margin, closing a single-seed false-positive class that a
+  fixed margin missed under real Bernoulli variance at `n=100`.
+- **Asymmetric-binary cookbook chapter.** `binary-precision.qmd`'s companion
+  `asymmetric-binary.qmd` measures the anisotropy, the dead-bit collapse under
+  the old fixed threshold, and the `sign(v - tau)` recall recovery against a
+  live engine, cross-referenced from the sibling chapter.
+
+### Changed
+- **Global Rust toolchain 1.88.0 → 1.94.0.** candle-core 0.11's aarch64 NEON
+  path needs `stdarch_neon_f16`, stabilized only in 1.94.0. Removes the
+  lane-local macOS-wheel toolchain override in favor of one workspace-wide
+  pin; pins the mdbook guide-doctest toolchain to match; drops the unused
+  sqlx `macros` feature (a duplicate host/target tokio build, −51 build
+  units).
+- **Recall-floor bench gates consolidated (`jammi-bench`).** The three
+  copy-pasted per-precision recall-floor gates (F32 point held-out, Int8
+  point retrieve→rescore, Binary bootstrap-CI) are now one data-driven
+  `RECALL_GATE_TABLE` descriptor driving a single assertion helper.
+  Behavior-preserving — every committed floor is byte-identical to before.
+- **macOS aarch64 wheels build on Rust 1.94.** Folded into the global
+  toolchain bump above; the native wheel's aarch64 build no longer needs its
+  own override.
+
 ## [0.44.0] - 2026-07-12
 
 Candle upgrade 0.9.2 → 0.11.0. A dependency-only bump of the ML substrate

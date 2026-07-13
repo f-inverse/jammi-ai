@@ -52,7 +52,7 @@ impl AttnCnp {
     /// Build the AttnCnp. The query/key/value projections share `hidden_dim`;
     /// the prior key/value are registered as trainable tensors.
     pub fn new(cfg: &ContextPredictorConfig, vb: VarBuilder) -> Result<Self, EncoderError> {
-        if cfg.hidden_dim % cfg.num_heads != 0 {
+        if !cfg.hidden_dim.is_multiple_of(cfg.num_heads) {
             return Err(EncoderError::Config(format!(
                 "AttnCnp: hidden_dim {} not divisible by num_heads {}",
                 cfg.hidden_dim, cfg.num_heads

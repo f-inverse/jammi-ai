@@ -49,10 +49,11 @@ impl std::str::FromStr for FineTuneMethod {
 }
 
 /// Loss function for embedding fine-tuning.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum EmbeddingLoss {
     /// CoSENT: sorts pairs by score, applies cross-entropy on cosine similarity ordering.
+    #[default]
     CoSent,
     /// Triplet loss: `max(0, cos(a,neg) - cos(a,pos) + margin)`.
     Triplet { margin: f64 },
@@ -75,12 +76,6 @@ pub enum EmbeddingLoss {
     /// similarity labels; prefer it over CoSENT/MNRL when labels are graded
     /// scores rather than pairs or rankings.
     CosineMse,
-}
-
-impl Default for EmbeddingLoss {
-    fn default() -> Self {
-        Self::CoSent
-    }
 }
 
 /// Proper-scoring objective for a distributional regression head (S18).
@@ -147,17 +142,12 @@ impl Default for RegressionLoss {
 }
 
 /// Loss function for classification fine-tuning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ClassificationLoss {
     /// Standard cross-entropy loss.
+    #[default]
     CrossEntropy,
-}
-
-impl Default for ClassificationLoss {
-    fn default() -> Self {
-        Self::CrossEntropy
-    }
 }
 
 /// Which loss signal to monitor for early stopping.
@@ -168,37 +158,27 @@ impl Default for ClassificationLoss {
 /// `TrainLoss` — monitors average training loss each epoch; the full
 /// dataset is used for training (set `validation_fraction = 0.0`).  Matches
 /// `train_embedding_model.py` without `--val-file`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum EarlyStoppingMetric {
     /// Monitor held-out validation loss (default).
+    #[default]
     ValLoss,
     /// Monitor epoch-average training loss — no validation split needed.
     TrainLoss,
 }
 
-impl Default for EarlyStoppingMetric {
-    fn default() -> Self {
-        Self::ValLoss
-    }
-}
-
 /// Learning rate schedule applied after warmup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LrSchedule {
     /// Fixed learning rate throughout.
     Constant,
     /// Cosine annealing from base LR to 0 (default).
+    #[default]
     CosineDecay,
     /// Linear ramp from base LR to 0.
     LinearDecay,
-}
-
-impl Default for LrSchedule {
-    fn default() -> Self {
-        Self::CosineDecay
-    }
 }
 
 /// Hard-negative mining via jammi's own ANN index.

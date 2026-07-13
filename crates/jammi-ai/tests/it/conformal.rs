@@ -168,9 +168,9 @@ async fn conformal_channel_registers_and_merges_through_the_catalog() {
     let merged = merge_channels(
         &catalog,
         &[batch],
-        &[conformal.clone()],
+        std::slice::from_ref(&conformal),
         &[],
-        &[conformal.clone()],
+        std::slice::from_ref(&conformal),
         &[vec![contrib]],
     )
     .await

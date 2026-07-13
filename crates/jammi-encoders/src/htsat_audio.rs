@@ -682,7 +682,7 @@ impl SwinBlock {
         // set_shift_and_window_size: window/2 for odd blocks, forced 0 (with the
         // window clamped to the grid) when the grid is no larger than the window.
         let mut window_size = config.window_size;
-        let mut shift_size = if block_index % 2 == 0 {
+        let mut shift_size = if block_index.is_multiple_of(2) {
             0
         } else {
             config.window_size / 2

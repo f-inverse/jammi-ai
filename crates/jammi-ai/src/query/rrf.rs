@@ -169,7 +169,7 @@ mod tests {
         //      of a rank-0 score to a rank-1 score shrinks toward 1 as k grows.
         let list = vec!["r0", "r1"];
 
-        let small = rrf_fuse(&[list.clone()], 1);
+        let small = rrf_fuse(std::slice::from_ref(&list), 1);
         let large = rrf_fuse(&[list], 1000);
 
         let score =

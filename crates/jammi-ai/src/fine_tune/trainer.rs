@@ -1365,7 +1365,7 @@ impl TrainingLoop {
         }
 
         // Optimizer step every N micro-batches.
-        if *epoch.batch_count % self.config.gradient_accumulation_steps == 0 {
+        if (*epoch.batch_count).is_multiple_of(self.config.gradient_accumulation_steps) {
             let lr = compute_lr(&self.config, *epoch.global_step, ctx.total_steps);
             ctx.optimizer.set_learning_rate(lr);
 
@@ -1381,7 +1381,9 @@ impl TrainingLoop {
             *epoch.global_step += 1;
 
             // Checkpoint
-            if ctx.checkpoint_interval > 0 && *epoch.global_step % ctx.checkpoint_interval == 0 {
+            if ctx.checkpoint_interval > 0
+                && (*epoch.global_step).is_multiple_of(ctx.checkpoint_interval)
+            {
                 self.save_checkpoint(ctx.checkpoint_dir, *epoch.global_step)?;
             }
         }

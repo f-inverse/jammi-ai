@@ -18,7 +18,7 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH="/usr/local/cargo/bin:${PATH}"
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain 1.88.0 --profile minimal \
+    | sh -s -- -y --default-toolchain 1.94.0 --profile minimal \
     && rustup component add rustfmt clippy
 
 # sccache — pre-built static binary (avoids openssl-devel in the image,
@@ -32,11 +32,10 @@ RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_
 RUN cargo install mdbook --locked --version 0.5.2 \
     && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
 
-# maturin — PyO3 wheel builds. Pinned: maturin >=1.13.2 raised its MSRV to
-# rustc 1.89, but this image (and the workspace) pins 1.88.0 — an unpinned
-# `cargo install` pulls a maturin that refuses to build. 1.13.1 is the last
-# release whose MSRV is 1.88.
-RUN cargo install maturin --locked --version 1.13.1 \
+# maturin — PyO3 wheel builds. Pinned to a specific release (not an unpinned
+# `cargo install`) so every image build resolves the same maturin, keeping
+# wheel builds reproducible across CI runs and local dev.
+RUN cargo install maturin --locked --version 1.14.1 \
     && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
 
 # Quarto — renders + executes the in-repo cookbook (cookbook/book/). The binary

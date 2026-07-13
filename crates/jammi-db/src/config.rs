@@ -317,10 +317,11 @@ fn default_pool_size() -> u32 {
 /// retention_seconds = 604800
 /// credentials_path = "/var/run/secrets/nats.creds"
 /// ```
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrokerConfig {
     /// In-process broker. Default; matches the laptop / dev workflow.
+    #[default]
     InMemory,
     /// JetStream (NATS). Requires the `jetstream-broker` cargo feature on
     /// `jammi-db`; building a session whose config selects `JetStream`
@@ -340,12 +341,6 @@ pub enum BrokerConfig {
     },
 }
 
-impl Default for BrokerConfig {
-    fn default() -> Self {
-        Self::InMemory
-    }
-}
-
 fn default_retention_secs() -> u64 {
     7 * 24 * 60 * 60
 }
@@ -363,18 +358,13 @@ fn default_retention_secs() -> u64 {
 /// [signing_key]
 /// kind = "env"
 /// ```
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SigningKeyConfig {
     /// Read the master key from `JAMMI_AUDIT_MASTER_KEY` via
     /// [`crate::audit::EnvSigningKeyStore`]. The default.
+    #[default]
     Env,
-}
-
-impl Default for SigningKeyConfig {
-    fn default() -> Self {
-        Self::Env
-    }
 }
 
 /// DataFusion query-engine settings.

@@ -134,8 +134,8 @@ async fn length_mismatched_contribution_returns_typed_error() {
     let err = merge_channels(
         &catalog,
         &[batch],
-        &[vector.clone()],
-        &[vector],
+        std::slice::from_ref(&vector),
+        std::slice::from_ref(&vector),
         &[],
         &[vec![bad]],
     )
@@ -170,8 +170,8 @@ async fn wrong_dtype_contribution_returns_typed_error() {
     let err = merge_channels(
         &catalog,
         &[batch],
-        &[vector.clone()],
-        &[vector],
+        std::slice::from_ref(&vector),
+        std::slice::from_ref(&vector),
         &[],
         &[vec![bad]],
     )

@@ -15,7 +15,7 @@
 ARG RUNTIME_VARIANT=runtime-generic
 
 # ---- builder ----
-# The CI base image carries the full Rust toolchain (rustc 1.88.0,
+# The CI base image carries the full Rust toolchain (rustc 1.94.0,
 # protoc, mold, sccache). Pinning to `:latest` is intentional —
 # the CI image is rebuilt on toolchain bumps and the OSS server
 # inherits that update lockstep with the workspace.

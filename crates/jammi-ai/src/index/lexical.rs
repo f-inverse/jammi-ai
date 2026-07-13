@@ -46,20 +46,15 @@ const WRITER_HEAP_BYTES: usize = 15_000_000;
 /// for domains the English stemmer mangles (codes, identifiers, languages the
 /// Porter stemmer was never built for). The analyzer is *config*, never a
 /// hardcoded English-only path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Analyzer {
     /// Lowercase + Porter (English) stemming + over-long-token removal. The
     /// default for English prose.
+    #[default]
     English,
     /// Lowercase + over-long-token removal, **no** stemming. For text the
     /// English stemmer would corrupt.
     Raw,
-}
-
-impl Default for Analyzer {
-    fn default() -> Self {
-        Self::English
-    }
 }
 
 impl Analyzer {

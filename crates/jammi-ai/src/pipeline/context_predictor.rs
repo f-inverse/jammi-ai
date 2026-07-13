@@ -290,7 +290,7 @@ impl ContextPredictorTrainConfig {
         if matches!(
             self.architecture,
             ContextArchitecture::AttnCnp | ContextArchitecture::Tnp
-        ) && (self.num_heads == 0 || self.hidden_dim % self.num_heads != 0)
+        ) && (self.num_heads == 0 || !self.hidden_dim.is_multiple_of(self.num_heads))
         {
             return Err(JammiError::FineTune(format!(
                 "num_heads ({}) must be non-zero and divide hidden_dim ({})",

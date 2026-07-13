@@ -78,12 +78,6 @@ jobs:
           # `--manifest-path` in args.
           working-directory: packaging/native
           args: --release --out dist
-          # candle-core's aarch64 NEON path uses `stdarch_neon_f16`, stabilized
-          # only in Rust 1.94.0. The workspace `rust-toolchain.toml` pins 1.88.0,
-          # below candle's aarch64 MSRV, so this leg needs a newer toolchain than
-          # the rest of the workspace; pinned here (not in `rust-toolchain.toml`)
-          # to keep the override scoped to the macOS wheel build.
-          rust-toolchain: "1.94.0"
         env:
           RUSTC_WRAPPER: ""
 

@@ -459,8 +459,7 @@ impl InferenceSession {
             .find_result_tables(source_id, Some(task), Some(model_id))
             .await?
             .into_iter()
-            .filter(|record| record.status == "ready")
-            .next_back()
+            .rfind(|record| record.status == "ready")
             .map(|record| record.table_name)
             .ok_or_else(|| {
                 JammiError::Other(format!(

@@ -96,7 +96,7 @@ pub struct Tnp {
 impl Tnp {
     /// Build the TNP with `cfg.num_layers` self-attention layers.
     pub fn new(cfg: &ContextPredictorConfig, vb: VarBuilder) -> Result<Self, EncoderError> {
-        if cfg.hidden_dim % cfg.num_heads != 0 {
+        if !cfg.hidden_dim.is_multiple_of(cfg.num_heads) {
             return Err(EncoderError::Config(format!(
                 "Tnp: hidden_dim {} not divisible by num_heads {}",
                 cfg.hidden_dim, cfg.num_heads

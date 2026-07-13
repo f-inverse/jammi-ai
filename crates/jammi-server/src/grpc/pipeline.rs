@@ -7,7 +7,7 @@
 //! aggregation logic.
 //!
 //! The two graph-build verbs return the engine's result-table record as the
-//! shared [`jammi.v1.embedding.ResultTable`] (the same handle `GenerateEmbeddings`
+//! shared `jammi.v1.embedding.ResultTable` (the same handle `GenerateEmbeddings`
 //! returns) — the compute stays server-side and the client reads the table via
 //! SQL. `AssembleContext` returns its pooled context vector and carried metadata
 //! inline: the vector as IEEE-754 `float` (bit-exact for the engine's

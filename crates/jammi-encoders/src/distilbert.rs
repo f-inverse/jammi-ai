@@ -415,7 +415,11 @@ impl<'a> DistilBertBuilder<'a> {
         device: &Device,
         varmap: &VarMap,
     ) -> Result<DistilBert, EncoderError> {
-        if config.num_attention_heads == 0 || config.hidden_size % config.num_attention_heads != 0 {
+        if config.num_attention_heads == 0
+            || !config
+                .hidden_size
+                .is_multiple_of(config.num_attention_heads)
+        {
             return Err(EncoderError::Config(format!(
                 "hidden_size {} not divisible by num_attention_heads {}",
                 config.hidden_size, config.num_attention_heads

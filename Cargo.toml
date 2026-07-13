@@ -33,7 +33,7 @@ default-members = [
 [workspace.package]
 version = "0.44.0"
 edition = "2021"
-rust-version = "1.88.0"
+rust-version = "1.94.0"
 license = "Apache-2.0"
 repository = "https://github.com/f-inverse/jammi-ai"
 
@@ -73,7 +73,23 @@ arrow-ipc = "57"
 # Jammi uses for every result-table write. Without it the writer falls back
 # to a sync `File` path that can't target S3 / GCS / Azure.
 parquet = { version = "57", features = ["object_store"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres", "uuid", "chrono", "json", "macros"] }
+# No `macros` feature: `sqlx::query!`/`query_as!` and the `FromRow`/`Type`
+# derives are unused workspace-wide (every row-mapping call site is the
+# runtime `sqlx::query`/`query_as::<_, T>` form) and `macros` is the ONLY
+# path that pulls the `sqlx-macros` proc-macro crate into the graph. A
+# proc-macro forces its own transitive deps (here: `sqlx-core`, hence
+# `tokio`) to build twice — once for the host (running the macro at compile
+# time) and once for the target — under a DIFFERENT feature/profile than the
+# normal target-side build. Two `tokio` rmetas of the same crate land in
+# `target/debug/deps`, which is unambiguous to a normal `cargo build`/`test`
+# (each unit links its own exact dependency by hash) but ambiguous to a
+# `-L`-directory-only linker search — e.g. `mdbook test`'s guide doctests,
+# which resolve `extern crate tokio;` purely by scanning that directory for a
+# uniquely-named candidate. Re-adding `macros` reintroduces that duplicate
+# build and reopens the ambiguity; keep it off unless a call site starts
+# using the compile-time macros, and if it does, that call site is a
+# workspace-crate concern to coordinate before flipping this back on.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres", "uuid", "chrono", "json"] }
 # Object-store pin matches the transitive version DataFusion 52.3 carries
 # (see Cargo.lock: object_store 0.12.5). Mismatching this would force
 # duplicate crates in the dep graph and break ListingTableUrl interop.

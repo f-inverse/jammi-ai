@@ -2749,7 +2749,7 @@ auto-available to every encoder.)
 
 ## 6. Build, test & release mechanics
 
-**Toolchain.** Pinned `1.88.0` + rustfmt/clippy (`rust-toolchain.toml`). `.cargo/config.toml` sets
+**Toolchain.** Pinned `1.94.0` + rustfmt/clippy (`rust-toolchain.toml`). `.cargo/config.toml` sets
 `rustc-wrapper = "sccache"` globally (sccache disables incremental by design — if sccache is missing,
 cargo fails) and `-fuse-ld=mold` for the two linux-gnu targets *only in local dev* (in CI the
 `RUSTFLAGS` env var wins). One CI/dev/release base image: `quay.io/pypa/manylinux_2_28_x86_64` →
@@ -2834,7 +2834,7 @@ This is distinct from the §1.1 `dep-dag` block (crate-level dependency DAG, gen
 The rich graph is **per-symbol**, lives only under `target/`, and is for interactive navigation.
 
 **One-time setup.** The rich (Layer 2) layer needs a nightly toolchain (for nightly rustdoc) plus
-`rust-analyzer` (for the `--references` reference edges); neither is the pinned `1.88.0` toolchain
+`rust-analyzer` (for the `--references` reference edges); neither is the pinned `1.94.0` toolchain
 (`rust-toolchain.toml`), so install them alongside it:
 
 ```

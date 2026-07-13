@@ -91,6 +91,7 @@ jobs:
         if: runner.os == 'macOS'
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.94.0"
           targets: ${{ matrix.target }}
 
       - name: Build jammi (CPU, release)

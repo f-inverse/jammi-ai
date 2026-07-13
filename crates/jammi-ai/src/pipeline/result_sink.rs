@@ -73,7 +73,7 @@ impl<'a> ResultSink<'a> {
         } else {
             self.writer.write_batch(batch).await?;
         }
-        if self.checkpoint_interval > 0 && self.batch_num % self.checkpoint_interval == 0 {
+        if self.checkpoint_interval > 0 && self.batch_num.is_multiple_of(self.checkpoint_interval) {
             self.catalog
                 .set_checkpoint(&self.table_name, self.batch_num)
                 .await?;

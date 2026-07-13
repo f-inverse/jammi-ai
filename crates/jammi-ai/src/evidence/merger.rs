@@ -324,8 +324,8 @@ mod tests {
             &catalog,
             &[batch],
             &[vector.clone(), inference.clone()],
-            &[vector.clone()],
-            &[inference.clone()],
+            std::slice::from_ref(&vector),
+            std::slice::from_ref(&inference),
             &[vec![vector_contrib]],
         )
         .await
@@ -359,8 +359,8 @@ mod tests {
         let err = merge_channels(
             &catalog,
             &[batch],
-            &[vector.clone()],
-            &[vector.clone()],
+            std::slice::from_ref(&vector),
+            std::slice::from_ref(&vector),
             &[],
             &[vec![bad]],
         )
@@ -388,8 +388,8 @@ mod tests {
         let err = merge_channels(
             &catalog,
             &[batch],
-            &[vector.clone()],
-            &[vector.clone()],
+            std::slice::from_ref(&vector),
+            std::slice::from_ref(&vector),
             &[],
             &[vec![bad]],
         )
@@ -414,8 +414,8 @@ mod tests {
         let err = merge_channels(
             &catalog,
             &[batch],
-            &[vector.clone()], // inference is NOT participating
-            &[vector.clone()],
+            std::slice::from_ref(&vector), // inference is NOT participating
+            std::slice::from_ref(&vector),
             &[],
             &[vec![stranger]],
         )
@@ -456,8 +456,8 @@ mod tests {
         let err = merge_channels(
             &catalog,
             &batches,
-            &[vector.clone()],
-            &[vector.clone()],
+            std::slice::from_ref(&vector),
+            std::slice::from_ref(&vector),
             &[],
             &contribs,
         )
@@ -483,9 +483,9 @@ mod tests {
         );
         let merged = merge_channels(
             &catalog,
-            &[batch.clone()],
-            &[vector.clone()],
-            &[vector.clone()],
+            std::slice::from_ref(&batch),
+            std::slice::from_ref(&vector),
+            std::slice::from_ref(&vector),
             &[],
             &[vec![contrib]],
         )
@@ -514,8 +514,8 @@ mod tests {
         let err = merge_channels(
             &catalog,
             &[batch],
-            &[vector.clone()],
-            &[vector.clone()],
+            std::slice::from_ref(&vector),
+            std::slice::from_ref(&vector),
             &[],
             &[vec![dup_a, dup_b]],
         )
@@ -542,8 +542,8 @@ mod tests {
         let merged = merge_channels(
             &catalog,
             &[batch],
-            &[vector.clone()],
-            &[vector.clone()],
+            std::slice::from_ref(&vector),
+            std::slice::from_ref(&vector),
             &[],
             &[vec![contrib]],
         )

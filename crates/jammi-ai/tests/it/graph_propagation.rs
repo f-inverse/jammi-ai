@@ -461,11 +461,15 @@ fn jacobi_eigenvalues(mut a: Vec<Vec<f64>>) -> Vec<f64> {
             row[p] = c * akp - s * akq;
             row[q] = s * akp + c * akq;
         }
-        // Rotate rows p, q (the two pivot rows' entries).
-        for k in 0..n {
-            let (apk, aqk) = (a[p][k], a[q][k]);
-            a[p][k] = c * apk - s * aqk;
-            a[q][k] = s * apk + c * aqk;
+        // Rotate rows p, q (the two pivot rows' entries). `p < q` always (the
+        // pivot search above only considers `j > i`), so a single split at `q`
+        // yields both rows as disjoint mutable slices.
+        let (left, right) = a.split_at_mut(q);
+        let (row_p, row_q) = (&mut left[p], &mut right[0]);
+        for (apk, aqk) in row_p.iter_mut().zip(row_q.iter_mut()) {
+            let (old_p, old_q) = (*apk, *aqk);
+            *apk = c * old_p - s * old_q;
+            *aqk = s * old_p + c * old_q;
         }
     }
     (0..n).map(|i| a[i][i]).collect()

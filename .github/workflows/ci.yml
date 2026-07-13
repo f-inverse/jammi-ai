@@ -238,7 +238,7 @@ jobs:
     runs-on: ubuntu-latest
     # Runs in the same gnu CI image as every other job: `cargo deny` resolves
     # `cargo metadata`, which needs the repo's pinned toolchain (rust-toolchain.toml
-    # = 1.88.0) and respects `.cargo/config.toml`. The upstream cargo-deny *action*
+    # = 1.94.0) and respects `.cargo/config.toml`. The upstream cargo-deny *action*
     # runs in its own Alpine/musl container, where that toolchain is absent and the
     # sccache wrapper has no server — so we install + run the binary here instead.
     container:

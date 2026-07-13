@@ -204,7 +204,7 @@ fn median_threshold(vectors: &[f32], dimensions: usize, sample_rows: usize) -> V
             }
             column.sort_unstable_by(f32::total_cmp);
             let mid = sample_rows / 2;
-            if sample_rows % 2 == 0 {
+            if sample_rows.is_multiple_of(2) {
                 (column[mid - 1] + column[mid]) / 2.0
             } else {
                 column[mid]

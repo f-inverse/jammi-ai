@@ -1390,8 +1390,8 @@ async fn cookbook_declare_provenance_channel_recipe_runs_end_to_end() {
     let merged = merge_channels(
         session.catalog(),
         &[batch],
-        &[scored_by.clone()],
-        &[scored_by],
+        std::slice::from_ref(&scored_by),
+        std::slice::from_ref(&scored_by),
         &[],
         &[vec![contrib]],
     )

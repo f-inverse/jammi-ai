@@ -187,9 +187,9 @@ async fn uncertainty_channel_registers_and_merges_through_the_catalog() {
     let merged = merge_channels(
         &catalog,
         &[batch],
-        &[uncertainty.clone()],
+        std::slice::from_ref(&uncertainty),
         &[],
-        &[uncertainty.clone()],
+        std::slice::from_ref(&uncertainty),
         &[vec![contrib]],
     )
     .await

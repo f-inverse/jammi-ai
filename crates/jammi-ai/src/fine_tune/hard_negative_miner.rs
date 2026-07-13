@@ -88,7 +88,7 @@ pub struct AnchorQuery {
 /// Epoch 0 always mines (no negatives yet); thereafter mining happens every
 /// `refresh_every` epochs. `refresh_every == 1` mines every epoch.
 pub fn should_refresh(epoch: usize, refresh_every: usize) -> bool {
-    refresh_every > 0 && epoch % refresh_every == 0
+    refresh_every > 0 && epoch.is_multiple_of(refresh_every)
 }
 
 /// Mines hard negatives from a cosine ANN index built over the candidate

@@ -21,6 +21,7 @@ input anchors — see [The Materialization Contract](./materialization-contract.
 | Materialization manifest | `.materialization.json` | `manifest_version` (`u32`) | **Reject-newer** — `found > MANIFEST_VERSION` → `ManifestError::UnsupportedManifestVersion` |
 | ANN row map | `.rowmap` | leading `u32` version header | **Reject-newer** — `found > ROWMAP_VERSION` → `JammiError::IncompatibleFormat { artifact: "rowmap", .. }` |
 | ANN sidecar manifest | `.manifest.json` | `version` (`u32`) | **Reject-newer** — `found > ANN_MANIFEST_VERSION` → `JammiError::IncompatibleFormat { artifact: "ann-manifest", .. }` |
+| ANN binary threshold companion | `.threshold` | *none embedded* — required whenever the sidecar manifest's `scalar_kind` is `Binary`, confirmed by the manifest's `binary_threshold_kind` field | **Fail-loud, not versioned** — a missing `binary_threshold_kind`, a missing file, or a byte length not matching `dimensions` `f32`s → `JammiError::Other` |
 | USearch ANN graph | `.usearch` | `backend_version` stamped in the sidecar `.manifest.json` | **Strict** — any mismatch with the linked USearch → `JammiError::IncompatibleFormat { artifact: "usearch-index", .. }` |
 | Lexical (BM25) index | tantivy index dir | tantivy's own format tag | **Library-loud** — tantivy's `Index::open` fails with `IncompatibleIndex`, surfaced as `JammiError::Lexical` |
 | Result-table data | `.parquet` | *none embedded* — its format-of-record version **is** the `.materialization.json` `manifest_version` | Schema-shape checked at read via `JammiError::Schema`; byte integrity caught by `verify_materialization` |
@@ -60,12 +61,17 @@ header and rejects a version greater than `ROWMAP_VERSION` as
 ## ANN sidecar manifest (`.manifest.json`) — reject-newer + strict backend
 
 The ANN sidecar's `.manifest.json` records the index metadata: `version`,
-`dimensions`, `backend`, `backend_version`, `count`, the file names, and the
-creation instant. On load it is deserialised as a **typed struct** (mirroring
-`MaterializationManifest::from_json_bytes`), never by field-by-key
-`serde_json::Value` lookups. The determinants of a safe load — `version`,
-`dimensions`, and `backend_version` — are all **required**: a manifest missing
-any of them is a hard decode error, never silently defaulted to a guess.
+`dimensions`, `backend`, `backend_version`, `scalar_kind`, `count`, the file
+names, and the creation instant. On load it is deserialised as a **typed
+struct** (mirroring `MaterializationManifest::from_json_bytes`), never by
+field-by-key `serde_json::Value` lookups. The determinants of a safe load —
+`version`, `dimensions`, `backend_version`, and `scalar_kind` — are all
+**required**: a manifest missing any of them is a hard decode error, never
+silently defaulted to a guess. A fifth field, `binary_threshold_kind`, is
+conditionally required: legitimately absent for every non-`Binary`
+`scalar_kind`, but its absence on a `Binary` manifest with at least one row is
+itself a hard error — a torn or pre-threshold-fix bundle, not a legitimate
+empty state.
 
 Two checks run on the deserialised manifest:
 
@@ -74,6 +80,12 @@ Two checks run on the deserialised manifest:
 2. **`backend_version`, strict.** The stamped USearch version is compared for
    exact equality against the linked `jammi_db::index::backend_version()`. Any
    mismatch is `JammiError::IncompatibleFormat { artifact: "usearch-index", .. }`.
+
+A `Binary` `scalar_kind` additionally loads the `.threshold` companion beside
+the bundle — the per-dimension threshold τ the sidecar's sign-packing was
+fit against — validated against `dimensions` and the manifest's
+`binary_threshold_kind` rather than a stamp of its own (see the per-format
+table above).
 
 ## USearch ANN graph (`.usearch`) — strict backend version
 

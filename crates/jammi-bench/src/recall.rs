@@ -52,13 +52,15 @@
 //!
 //! ## What the engine gate proves vs. what the cookbook proves
 //!
-//! The hermetic cargo-test gate (`held_out_recall_clears_committed_floor`)
-//! loads a *small committed fixture* — a deterministic sorted-`_row_id` subset of
-//! the real 170k cache (real embeddings: corpus rows + held-out query rows, with
-//! a sidecar frozen over the subset once) — and asserts the held-out recall@k
-//! clears a committed floor measured on that same slice. This proves the
-//! held-out gate works hermetically on real embeddings, inside `cargo test`,
-//! with no LFS dependency.
+//! The hermetic cargo-test gate
+//! (`tests::recall_floor_gates_clear_their_committed_floors`) loads a *small
+//! committed fixture* — a deterministic sorted-`_row_id` subset of the real
+//! 170k cache (real embeddings: corpus rows + held-out query rows, with a
+//! sidecar frozen over the subset once) — and asserts the held-out recall@k
+//! clears a committed floor measured on that same slice, for every precision
+//! the fixture carries a frozen bundle for. This proves the held-out gate
+//! works hermetically on real embeddings, inside `cargo test`, with no LFS
+//! dependency.
 //!
 //! The *full* 168k held-out recall gate runs in the cookbook chapter (a later
 //! step), which reads the Git-LFS cache the fixture is subset from. The split is
@@ -70,19 +72,21 @@
 //! ## The precision axis: retrieve→rescore recovery
 //!
 //! [`mean_recall_at_k_rescored`] generalizes the held-out measurement to a
-//! quantized [`StoragePrecision`]: at `Int8` the loaded graph's own vectors are
-//! lossy, so a search is the engine's two-stage retrieve→rescore — an
-//! oversampled candidate pool off the quantized graph, exactly re-ranked
+//! quantized [`StoragePrecision`]: at `Int8`/`Binary` the loaded graph's own
+//! vectors are lossy, so a search is the engine's two-stage retrieve→rescore —
+//! an oversampled candidate pool off the quantized graph, exactly re-ranked
 //! against the `.rawf32` rescore companion. Because recall@k is order-blind
 //! (see above), `oversample == 1` measures the quantized graph's own naive
 //! top-k (nothing for the rescore to recover), while the deployment's default
 //! oversample measures how much of the quantization loss the rescore recovers.
-//! `precision_recall_rescore_recovers_and_clears_committed_floor` loads a
-//! second frozen bundle (`frozen_int8`, built once over the SAME fixture
-//! corpus by `fixture.rs`'s `build_precision_recall_fixture`) and asserts both
-//! that each variant clears its own committed floor AND that the rescored
-//! variant clears the no-rescore variant by a real margin — the measured proof
-//! that oversampling-then-rescoring recovers neighbours the lossy graph alone
+//! Every quantized row in `tests::RECALL_GATE_TABLE` pairs a `primary`
+//! (retrieve→rescore) variant against a `baseline` (`oversample = 1`) variant,
+//! both loaded from a second frozen bundle (e.g. `frozen_int8`, built once
+//! over the SAME fixture corpus by `fixture.rs`'s
+//! `build_precision_recall_fixture`) — the gate asserts both that each variant
+//! clears its own committed floor AND that the `primary` variant clears the
+//! `baseline` by a real margin — the measured proof that
+//! oversampling-then-rescoring recovers neighbours the lossy graph alone
 //! misses, not just a floor two numbers happen to both clear.
 //!
 //! ## The binary gate is a confidence interval, not a point estimate
@@ -96,12 +100,14 @@
 //! [`jammi_numerics::stats::bootstrap_ci`], seeded and deterministic — the
 //! same percentile-bootstrap kernel `eval.rs`'s `eval_compare` significance CI
 //! already uses) and reports the point mean alongside a 95% CI. The `Binary`
-//! precision-recall gate
-//! (`tests::binary_precision_recall_bootstrap_ci_clears_committed_floor`)
-//! asserts the CI's LOWER bound — not the point mean — clears the committed
-//! floor, so a noisy single-sample draw cannot pass (or fail) the gate on
-//! chance alone: the gate only passes when the *worst plausible* mean over
-//! resamples of this query set still clears the floor.
+//! row in `tests::RECALL_GATE_TABLE` sets its `anchor` to
+//! `tests::Anchor::CiLower` rather than `tests::Anchor::Point` — the ONLY
+//! difference from `Int8`'s row — which is what makes
+//! `tests::recall_floor_gates_clear_their_committed_floors` assert the CI's
+//! LOWER bound rather than the point mean for that row, so a noisy
+//! single-sample draw cannot pass (or fail) the gate on chance alone: the
+//! gate only passes when the *worst plausible* mean over resamples of this
+//! query set still clears the floor.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -593,321 +599,334 @@ mod tests {
         assert_eq!(recall_at_k_for_query(&[], &exact, 10), 0.0);
     }
 
-    /// The held-out recall gate: load the committed fixture (a real-embedding
-    /// subset of the 170k scale cache — corpus + sidecar frozen over it + a
-    /// SEPARATE disjoint query set) and assert each recall@k clears the floor
-    /// committed in `floor.json`.
+    /// Where a [`RecallGateRow`]'s floor is checked against a measurement:
+    /// the bare point mean, or the bootstrap-CI lower bound.
     ///
-    /// This is the hermetic engine proof that the *held-out* recall path works on
-    /// real embeddings: the queries are not corpus rows, so no query finds itself
-    /// and the recall is a genuine generalization measurement. The floor is the
-    /// recall measured on this same slice minus a safety margin, so the gate has
-    /// headroom against USearch-version or load-path drift without going vacuous.
-    /// The FULL 168k held-out gate runs in the cookbook chapter over the Git-LFS
-    /// cache this fixture is subset from; the engine repo carries no LFS, so this
-    /// gate proves the floor on the small committed projection.
-    #[tokio::test]
-    async fn held_out_recall_clears_committed_floor() {
-        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures")
-            .join("scale");
-
-        let floor_json = std::fs::read_to_string(fixture_dir.join("floor.json"))
-            .expect("committed floor.json must be present in the fixture bundle");
-        let floor: serde_json::Value = serde_json::from_str(&floor_json).unwrap();
-
-        let curve = recall_curve_held_out(&fixture_dir)
-            .await
-            .expect("held-out recall path over the committed fixture must run");
-
-        for &k in &RECALL_KS {
-            let measured = curve
-                .get(&k)
-                .and_then(|m| m.value)
-                .unwrap_or_else(|| panic!("recall@{k} missing from measured curve"));
-            let floor_k = floor["recall"][k.to_string()]["floor"]
-                .as_f64()
-                .unwrap_or_else(|| panic!("floor.json missing recall.{k}.floor"));
-            assert!(
-                measured >= floor_k,
-                "held-out recall@{k} = {measured} fell below committed floor {floor_k}"
-            );
-        }
+    /// This is the ONE bit of data that carries the CI-anchored discipline
+    /// (see the module header's "binary gate is a confidence interval"
+    /// section) on the `Binary` row: [`measure_variant`]'s `match anchor`
+    /// is the only place this field changes behavior, and it changes ONLY
+    /// which value is handed back for the floor check — a row's `precision`
+    /// never enters that decision.
+    #[derive(Debug, Clone, Copy)]
+    enum Anchor {
+        /// [`mean_recall_at_k_rescored`]'s bare mean.
+        Point,
+        /// [`recall_ci_at_k_rescored`]'s `interval.lower` — a noisy
+        /// single-sample draw of the query set cannot pass on chance alone.
+        CiLower,
     }
 
-    /// The file stem of the committed frozen `Int8` sidecar bundle — the SAME
-    /// held-out fixture corpus [`held_out_recall_clears_committed_floor`]
-    /// measures the `F32` bundle over, quantized. See `fixture.rs`'s
-    /// `build_precision_recall_fixture`, the off-box builder that froze it and
-    /// wrote the `floor.json` `"precision"` section this gate reads.
+    /// Where a [`Variant`]'s query-time `oversample` comes from.
+    #[derive(Debug, Clone, Copy)]
+    enum Oversample {
+        /// A literal — always `1` for a no-rescore baseline, and for `F32`
+        /// (where the value is irrelevant: `StoragePrecision::needs_rescore`
+        /// is `false`, so the rescore stage this parameter widens never
+        /// runs).
+        Fixed(usize),
+        /// Read live from `floor.json`'s `precision.<key>` — the
+        /// deployment's stamped default oversample for a quantized
+        /// precision's retrieve→rescore stage.
+        FromFloorKey(&'static str),
+    }
+
+    /// One measured variant of a [`RecallGateRow`]: the `oversample` its
+    /// search runs at, and the `floor.json` path (object-key segments,
+    /// before the per-k key) its floor lives under.
+    struct Variant {
+        oversample: Oversample,
+        floor_path: &'static [&'static str],
+    }
+
+    /// One precision's recall-floor gate, expressed entirely as data: which
+    /// frozen sidecar to load, which [`Anchor`] its floors are checked
+    /// against, its always-measured `primary` variant, and an optional
+    /// `baseline` variant.
+    ///
+    /// When `baseline` is `Some`, [`assert_recall_gate_row_clears_floor`]
+    /// also asserts `primary` clears `baseline` by
+    /// [`RESCORE_RECOVERY_MARGIN`] — the retrieve→rescore recovery proof.
+    /// `F32` has no `baseline` (its single-stage `primary` measurement
+    /// leaves nothing to recover from), so "recovery margin applicable" is
+    /// never its own field — it is exactly `baseline.is_some()`.
+    struct RecallGateRow {
+        precision: StoragePrecision,
+        sidecar_stem: &'static str,
+        anchor: Anchor,
+        primary: Variant,
+        baseline: Option<Variant>,
+    }
+
+    /// The three precision-recall floor gates, as data: `F32` (single-stage,
+    /// point-anchored, no recovery margin), `Int8` (retrieve→rescore,
+    /// point-anchored), `Binary` (retrieve→rescore, CI-lower-anchored — the
+    /// ONLY difference from `Int8`'s row is its `anchor`).
+    const RECALL_GATE_TABLE: &[RecallGateRow] = &[
+        RecallGateRow {
+            precision: StoragePrecision::F32,
+            sidecar_stem: HELD_OUT_SIDECAR_STEM,
+            anchor: Anchor::Point,
+            primary: Variant {
+                oversample: Oversample::Fixed(1),
+                floor_path: &["recall"],
+            },
+            baseline: None,
+        },
+        RecallGateRow {
+            precision: StoragePrecision::Int8,
+            sidecar_stem: FROZEN_INT8_STEM,
+            anchor: Anchor::Point,
+            primary: Variant {
+                oversample: Oversample::FromFloorKey("oversample_rescored"),
+                floor_path: &["precision", "int8_rescored"],
+            },
+            baseline: Some(Variant {
+                oversample: Oversample::Fixed(1),
+                floor_path: &["precision", "int8_no_rescore"],
+            }),
+        },
+        RecallGateRow {
+            precision: StoragePrecision::Binary,
+            sidecar_stem: FROZEN_BINARY_STEM,
+            anchor: Anchor::CiLower,
+            primary: Variant {
+                oversample: Oversample::FromFloorKey("binary_oversample_rescored"),
+                floor_path: &["precision", "binary_rescored"],
+            },
+            baseline: Some(Variant {
+                oversample: Oversample::Fixed(1),
+                floor_path: &["precision", "binary_no_rescore"],
+            }),
+        },
+    ];
+
+    /// The file stem of the committed frozen `Int8` sidecar bundle — the
+    /// SAME held-out fixture corpus [`HELD_OUT_SIDECAR_STEM`]'s `F32` bundle
+    /// indexes, quantized. See `fixture.rs`'s `build_precision_recall_fixture`.
     const FROZEN_INT8_STEM: &str = "frozen_int8";
 
     /// The file stem of the committed frozen `Binary` sidecar bundle — the
     /// SAME held-out fixture corpus, sign-quantized. See `fixture.rs`'s
-    /// `build_binary_recall_fixture`, the off-box builder that froze it and
-    /// wrote the `binary_*` keys in `floor.json`'s `"precision"` section this
-    /// gate reads.
+    /// `build_binary_recall_fixture`.
     const FROZEN_BINARY_STEM: &str = "frozen_binary";
 
-    /// The margin-clearing precision-recall recovery assertion shared by every
-    /// quantized precision's gate: load the committed frozen bundle at
-    /// `precision` (frozen once over the SAME fixture corpus the `F32` gate
-    /// measures) and assert two things against `floor.json`'s `"precision"`
-    /// section, keyed by `rescored_key`/`no_rescore_key`.
-    ///
-    /// 1. **Each variant clears its own committed floor** — the two-stage
-    ///    retrieve→rescore at `oversample_rescored` and the naive
-    ///    no-widening `oversample = 1` baseline both hold at or above
-    ///    `measured − margin` on this same frozen bundle, the same
-    ///    discipline [`held_out_recall_clears_committed_floor`] applies to
-    ///    `F32`.
-    /// 2. **The rescore recovery is real, not vacuous** — at every k the
-    ///    rescored recall clears the no-rescore recall by at least
-    ///    [`RESCORE_RECOVERY_MARGIN`], the measured proof that oversampling
-    ///    the quantized graph's candidate pool and rescoring against the
-    ///    exact `.rawf32` companion recovers neighbours the lossy quantized
-    ///    graph alone would have missed (recall@k is order-blind — see
-    ///    [`recall_at_k_for_query`] — so this margin cannot be satisfied by
-    ///    re-ranking the SAME candidate set; the widened set must actually
-    ///    contain the recovered ids).
-    async fn assert_precision_recall_rescore_recovers_and_clears_floor(
-        sidecar_stem: &str,
-        precision: StoragePrecision,
-        oversample_key: &str,
-        rescored_key: &str,
-        no_rescore_key: &str,
-    ) {
-        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures")
-            .join("scale");
-        let sidecar_base = fixture_dir.join(sidecar_stem);
-
-        let floor_json = std::fs::read_to_string(fixture_dir.join("floor.json"))
-            .expect("committed floor.json must be present in the fixture bundle");
-        let floor: serde_json::Value = serde_json::from_str(&floor_json).unwrap();
-        let oversample_rescored = floor["precision"][oversample_key]
-            .as_u64()
-            .unwrap_or_else(|| panic!("floor.json missing precision.{oversample_key}"))
-            as usize;
-
-        let corpus_path = fixture_dir.join("corpus_vectors.parquet");
-        let corpus_url = corpus::storage_url(&corpus_path).unwrap();
-        let corpus_table = format!("{sidecar_stem}_recall_corpus");
-        let ctx = corpus::register(&corpus_url, &corpus_table).await.unwrap();
-
-        let query_path = fixture_dir.join("query_vectors.parquet");
-        let query_url = corpus::storage_url(&query_path).unwrap();
-        let query_table = format!("{sidecar_stem}_recall_queries");
-        let query_ctx = corpus::register(&query_url, &query_table).await.unwrap();
-        let queries: Vec<Vec<f32>> = corpus::load_vectors(&query_ctx, &query_table)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect();
-
-        for &k in &RECALL_KS {
-            let rescored = mean_recall_at_k_rescored(
-                &ctx,
-                &corpus_table,
-                &sidecar_base,
-                precision,
-                oversample_rescored,
-                &queries,
-                k,
-            )
-            .await
-            .unwrap_or_else(|e| {
-                panic!("rescored precision-recall path over the frozen {sidecar_stem} bundle must run: {e}")
-            });
-            let no_rescore = mean_recall_at_k_rescored(
-                &ctx,
-                &corpus_table,
-                &sidecar_base,
-                precision,
-                1,
-                &queries,
-                k,
-            )
-            .await
-            .unwrap_or_else(|e| {
-                panic!("no-rescore precision-recall path over the frozen {sidecar_stem} bundle must run: {e}")
-            });
-
-            let rescored_floor = floor["precision"][rescored_key][k.to_string()]["floor"]
-                .as_f64()
-                .unwrap_or_else(|| panic!("floor.json missing precision.{rescored_key}.{k}.floor"));
-            let no_rescore_floor = floor["precision"][no_rescore_key][k.to_string()]["floor"]
-                .as_f64()
-                .unwrap_or_else(|| {
-                    panic!("floor.json missing precision.{no_rescore_key}.{k}.floor")
-                });
-
-            assert!(
-                rescored >= rescored_floor,
-                "{rescored_key} recall@{k} = {rescored} fell below committed floor {rescored_floor}"
-            );
-            assert!(
-                no_rescore >= no_rescore_floor,
-                "{no_rescore_key} recall@{k} = {no_rescore} fell below committed floor {no_rescore_floor}"
-            );
-            assert!(
-                rescored - no_rescore >= RESCORE_RECOVERY_MARGIN,
-                "rescore recovery at k={k} was only {} (rescored={rescored}, no_rescore={no_rescore}) \
-                 — below the {RESCORE_RECOVERY_MARGIN} margin the retrieve→rescore design must clear",
-                rescored - no_rescore
-            );
-        }
-    }
-
-    /// The `Int8` precision-recall recovery gate — see
-    /// [`assert_precision_recall_rescore_recovers_and_clears_floor`].
-    ///
-    /// On this fixture the measured gap is large (recall@1: 0.98 rescored vs
-    /// 0.71 without — an 0.27 recovery), so [`RESCORE_RECOVERY_MARGIN`] is set
-    /// well below that to leave headroom for load-path/USearch-version drift
-    /// while still having real teeth: a rescore path that silently degenerated
-    /// into "return the quantized graph's own top-k" (the bug this gate exists
-    /// to catch) would collapse the gap to ~0 and trip it.
-    #[tokio::test]
-    async fn precision_recall_rescore_recovers_and_clears_committed_floor() {
-        assert_precision_recall_rescore_recovers_and_clears_floor(
-            FROZEN_INT8_STEM,
-            StoragePrecision::Int8,
-            "oversample_rescored",
-            "int8_rescored",
-            "int8_no_rescore",
-        )
-        .await;
-    }
-
-    /// The `Binary` precision-recall recovery gate, gated on a bootstrap
-    /// confidence interval rather than a bare point estimate — see the module
-    /// header's "binary gate is a confidence interval" section for why.
-    ///
-    /// This is the multi-seed/CI upgrade: a prior single-seed toy-scale recall
-    /// gate produced a false positive that inverted at real scale, and the
-    /// fix (per turbopuffer's continuous recall floor and MTEB-BR's
-    /// bootstrap-CI reliability layer, arXiv 2607.04581) is a resampled
-    /// interval, not a lone point. For each variant (the retrieve→rescore
-    /// recovery at `Binary`'s own default oversample, and the naive
-    /// `oversample = 1` baseline) this asserts the [`recall_ci_at_k_rescored`]
-    /// interval's LOWER bound — not the point mean — clears the committed
-    /// floor, plus the rescore-recovery-margin proof
-    /// ([`assert_precision_recall_rescore_recovers_and_clears_floor`]'s same
-    /// discipline) on the point means.
-    ///
-    /// `Binary`'s Hamming coarse stage is far lossier per-candidate than
-    /// `Int8`'s, so it is measured at its own much wider default oversample
-    /// (`32` vs Int8's `4`, see
-    /// [`jammi_db::config::StoragePrecision::default_oversample`]); the
-    /// rescore recovery gap this measures is correspondingly larger than
-    /// Int8's.
-    #[tokio::test]
-    async fn binary_precision_recall_bootstrap_ci_clears_committed_floor() {
-        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures")
-            .join("scale");
-        let sidecar_base = fixture_dir.join(FROZEN_BINARY_STEM);
-
-        let floor_json = std::fs::read_to_string(fixture_dir.join("floor.json"))
-            .expect("committed floor.json must be present in the fixture bundle");
-        let floor: serde_json::Value = serde_json::from_str(&floor_json).unwrap();
-        let oversample_rescored = floor["precision"]["binary_oversample_rescored"]
-            .as_u64()
-            .expect("floor.json missing precision.binary_oversample_rescored")
-            as usize;
-
-        let corpus_path = fixture_dir.join("corpus_vectors.parquet");
-        let corpus_url = corpus::storage_url(&corpus_path).unwrap();
-        let corpus_table = format!("{FROZEN_BINARY_STEM}_ci_recall_corpus");
-        let ctx = corpus::register(&corpus_url, &corpus_table).await.unwrap();
-
-        let query_path = fixture_dir.join("query_vectors.parquet");
-        let query_url = corpus::storage_url(&query_path).unwrap();
-        let query_table = format!("{FROZEN_BINARY_STEM}_ci_recall_queries");
-        let query_ctx = corpus::register(&query_url, &query_table).await.unwrap();
-        let queries: Vec<Vec<f32>> = corpus::load_vectors(&query_ctx, &query_table)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect();
-
-        for &k in &RECALL_KS {
-            let rescored = recall_ci_at_k_rescored(
-                &ctx,
-                &corpus_table,
-                &sidecar_base,
-                StoragePrecision::Binary,
-                oversample_rescored,
-                &queries,
-                k,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("rescored binary bootstrap-CI recall path must run: {e}"));
-            let no_rescore = recall_ci_at_k_rescored(
-                &ctx,
-                &corpus_table,
-                &sidecar_base,
-                StoragePrecision::Binary,
-                1,
-                &queries,
-                k,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("no-rescore binary bootstrap-CI recall path must run: {e}"));
-
-            let rescored_floor = floor["precision"]["binary_rescored"][k.to_string()]["floor"]
-                .as_f64()
-                .unwrap_or_else(|| {
-                    panic!("floor.json missing precision.binary_rescored.{k}.floor")
-                });
-            let no_rescore_floor = floor["precision"]["binary_no_rescore"][k.to_string()]["floor"]
-                .as_f64()
-                .unwrap_or_else(|| {
-                    panic!("floor.json missing precision.binary_no_rescore.{k}.floor")
-                });
-
-            assert!(
-                rescored.interval.lower >= rescored_floor,
-                "binary_rescored recall@{k} CI lower bound {} (point {}, 95% CI [{}, {}], \
-                 {RECALL_BOOTSTRAP_ITERATIONS} resamples) fell below committed floor {rescored_floor}",
-                rescored.interval.lower,
-                rescored.point,
-                rescored.interval.lower,
-                rescored.interval.upper
-            );
-            assert!(
-                no_rescore.interval.lower >= no_rescore_floor,
-                "binary_no_rescore recall@{k} CI lower bound {} (point {}, 95% CI [{}, {}], \
-                 {RECALL_BOOTSTRAP_ITERATIONS} resamples) fell below committed floor {no_rescore_floor}",
-                no_rescore.interval.lower,
-                no_rescore.point,
-                no_rescore.interval.lower,
-                no_rescore.interval.upper
-            );
-            assert!(
-                rescored.point - no_rescore.point >= RESCORE_RECOVERY_MARGIN,
-                "rescore recovery at k={k} was only {} (rescored={}, no_rescore={}) — below the \
-                 {RESCORE_RECOVERY_MARGIN} margin the retrieve→rescore design must clear",
-                rescored.point - no_rescore.point,
-                rescored.point,
-                no_rescore.point
-            );
-        }
-    }
-
-    /// The minimum recall@k gap `{precision}_rescored − {precision}_no_rescore`
-    /// must clear for the retrieve→rescore recovery to count as real, shared
-    /// by every quantized precision's gate. Measured on the committed fixture
-    /// the Int8 gap is 0.27/0.17/0.10 at k=1/10/100 (Binary's is wider still,
-    /// its Hamming coarse stage being lossier) — this margin is set an order
-    /// of magnitude below the smallest Int8 gap, so it has real teeth (a
+    /// The minimum recall@k gap `primary − baseline` a [`RecallGateRow`]
+    /// with a `baseline` must clear for the retrieve→rescore recovery to
+    /// count as real. Measured on the committed fixture the Int8 gap is
+    /// 0.27/0.17/0.10 at k=1/10/100 (Binary's is wider still, its Hamming
+    /// coarse stage being lossier) — this margin is set an order of
+    /// magnitude below the smallest Int8 gap, so it has real teeth (a
     /// rescore that silently returned the quantized graph's own top-k,
     /// recovering nothing, collapses the gap to ~0 and trips it) while
     /// leaving generous headroom against load-path or USearch-version drift.
     const RESCORE_RECOVERY_MARGIN: f64 = 0.03;
+
+    /// Absolute path to the committed held-out recall fixture bundle
+    /// (`fixtures/scale/` — corpus, held-out queries, and the frozen
+    /// `F32`/`Int8`/`Binary` sidecar bundles), shared by every gate that
+    /// reads it.
+    fn scale_fixture_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("scale")
+    }
+
+    /// Parse the committed `floor.json` out of a fixture bundle directory.
+    fn load_floor_json(fixture_dir: &Path) -> serde_json::Value {
+        let floor_json = std::fs::read_to_string(fixture_dir.join("floor.json"))
+            .expect("committed floor.json must be present in the fixture bundle");
+        serde_json::from_str(&floor_json).expect("floor.json must be valid JSON")
+    }
+
+    /// Register the fixture's corpus and held-out query tables under names
+    /// prefixed by `table_prefix` (so concurrently-loaded rows never
+    /// collide), and load the query vectors — the ONE fixture-loading path
+    /// every [`RecallGateRow`] shares.
+    async fn register_gate_fixture(
+        fixture_dir: &Path,
+        table_prefix: &str,
+    ) -> (SessionContext, String, Vec<Vec<f32>>) {
+        let corpus_path = fixture_dir.join(HELD_OUT_CORPUS_FILE);
+        let corpus_url = corpus::storage_url(&corpus_path).unwrap();
+        let corpus_table = format!("{table_prefix}_recall_corpus");
+        let ctx = corpus::register(&corpus_url, &corpus_table).await.unwrap();
+
+        let query_path = fixture_dir.join(HELD_OUT_QUERY_FILE);
+        let query_url = corpus::storage_url(&query_path).unwrap();
+        let query_table = format!("{table_prefix}_recall_queries");
+        let query_ctx = corpus::register(&query_url, &query_table).await.unwrap();
+        let queries: Vec<Vec<f32>> = corpus::load_vectors(&query_ctx, &query_table)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
+        (ctx, corpus_table, queries)
+    }
+
+    /// Read the floor at `path` (object-key segments) then `k` then
+    /// `"floor"` out of a parsed `floor.json`.
+    fn floor_at(floor: &serde_json::Value, path: &[&str], k: usize) -> f64 {
+        let mut v = floor;
+        for segment in path {
+            v = &v[*segment];
+        }
+        v[k.to_string()]["floor"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("floor.json missing {}.{k}.floor", path.join(".")))
+    }
+
+    /// Resolve a [`Variant`]'s `oversample` — either the literal, or a live
+    /// read of `floor.json`'s stamped default.
+    fn resolve_oversample(oversample: Oversample, floor: &serde_json::Value) -> usize {
+        match oversample {
+            Oversample::Fixed(n) => n,
+            Oversample::FromFloorKey(key) => floor["precision"][key]
+                .as_u64()
+                .unwrap_or_else(|| panic!("floor.json missing precision.{key}"))
+                as usize,
+        }
+    }
+
+    /// The frozen bundle a [`Variant`] is measured over. Fixed for a whole
+    /// [`RecallGateRow`] (`primary` and `baseline` search the SAME bundle) —
+    /// bundled so [`measure_variant`] takes one "where to search" argument
+    /// instead of four.
+    struct SearchTarget<'a> {
+        ctx: &'a SessionContext,
+        table: &'a str,
+        sidecar_base: &'a Path,
+        precision: StoragePrecision,
+    }
+
+    /// Measure one [`Variant`] at `k`: the plain point mean (identical
+    /// whichever `anchor` is used — only the returned "value a floor is
+    /// checked against" differs), and that checked value — the SAME point
+    /// mean at [`Anchor::Point`], or the bootstrap-CI lower bound at
+    /// [`Anchor::CiLower`].
+    async fn measure_variant(
+        target: &SearchTarget<'_>,
+        anchor: Anchor,
+        oversample: usize,
+        queries: &[Vec<f32>],
+        k: usize,
+    ) -> (f64, f64) {
+        match anchor {
+            Anchor::Point => {
+                let point = mean_recall_at_k_rescored(
+                    target.ctx,
+                    target.table,
+                    target.sidecar_base,
+                    target.precision,
+                    oversample,
+                    queries,
+                    k,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "point recall path over {} at k={k} must run: {e}",
+                        target.sidecar_base.display()
+                    )
+                });
+                (point, point)
+            }
+            Anchor::CiLower => {
+                let ci = recall_ci_at_k_rescored(
+                    target.ctx,
+                    target.table,
+                    target.sidecar_base,
+                    target.precision,
+                    oversample,
+                    queries,
+                    k,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "bootstrap-CI recall path over {} at k={k} must run: {e}",
+                        target.sidecar_base.display()
+                    )
+                });
+                (ci.point, ci.interval.lower)
+            }
+        }
+    }
+
+    /// Measure and assert one [`RecallGateRow`] over the committed fixture:
+    /// `primary` clears its own floor at every k, and — when `baseline` is
+    /// present — `baseline` clears its own floor AND `primary` clears
+    /// `baseline` by [`RESCORE_RECOVERY_MARGIN`].
+    ///
+    /// This is the ONE parameterized assertion every precision's gate runs
+    /// through: which value is compared against a floor (point vs CI lower)
+    /// is driven purely by `row.anchor`, and whether the recovery-margin
+    /// check runs at all is driven purely by whether `row.baseline` is
+    /// `Some` — no branch here inspects `row.precision`.
+    async fn assert_recall_gate_row_clears_floor(
+        row: &RecallGateRow,
+        fixture_dir: &Path,
+        floor: &serde_json::Value,
+    ) {
+        let sidecar_base = fixture_dir.join(row.sidecar_stem);
+        let (ctx, corpus_table, queries) =
+            register_gate_fixture(fixture_dir, row.sidecar_stem).await;
+        let target = SearchTarget {
+            ctx: &ctx,
+            table: &corpus_table,
+            sidecar_base: &sidecar_base,
+            precision: row.precision,
+        };
+
+        for &k in &RECALL_KS {
+            let primary_oversample = resolve_oversample(row.primary.oversample, floor);
+            let (primary_point, primary_anchor_value) =
+                measure_variant(&target, row.anchor, primary_oversample, &queries, k).await;
+            let primary_floor = floor_at(floor, row.primary.floor_path, k);
+            assert!(
+                primary_anchor_value >= primary_floor,
+                "{:?} {} recall@{k} = {primary_anchor_value} fell below committed floor {primary_floor}",
+                row.precision,
+                row.primary.floor_path.join("."),
+            );
+
+            let Some(baseline) = &row.baseline else {
+                continue;
+            };
+            let baseline_oversample = resolve_oversample(baseline.oversample, floor);
+            let (baseline_point, baseline_anchor_value) =
+                measure_variant(&target, row.anchor, baseline_oversample, &queries, k).await;
+            let baseline_floor = floor_at(floor, baseline.floor_path, k);
+            assert!(
+                baseline_anchor_value >= baseline_floor,
+                "{:?} {} recall@{k} = {baseline_anchor_value} fell below committed floor {baseline_floor}",
+                row.precision,
+                baseline.floor_path.join("."),
+            );
+            assert!(
+                primary_point - baseline_point >= RESCORE_RECOVERY_MARGIN,
+                "{:?} rescore recovery at k={k} was only {} (primary={primary_point}, baseline={baseline_point}) \
+                 — below the {RESCORE_RECOVERY_MARGIN} margin the retrieve→rescore design must clear",
+                row.precision,
+                primary_point - baseline_point,
+            );
+        }
+    }
+
+    /// The unified held-out recall-floor gate: for every row in
+    /// [`RECALL_GATE_TABLE`] (`F32` single-stage, `Int8` and `Binary`
+    /// retrieve→rescore), measure over the committed fixture and assert it
+    /// clears its committed floor, driven by one loop over explicit data
+    /// rather than a hand-written function per precision.
+    #[tokio::test]
+    async fn recall_floor_gates_clear_their_committed_floors() {
+        let fixture_dir = scale_fixture_dir();
+        let floor = load_floor_json(&fixture_dir);
+        for row in RECALL_GATE_TABLE {
+            assert_recall_gate_row_clears_floor(row, &fixture_dir, &floor).await;
+        }
+    }
 
     /// The sorted-`_row_id` subset helper returns the deterministic
     /// first-`n`-by-sorted-id projection, independent of input order.

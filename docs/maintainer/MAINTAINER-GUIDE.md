@@ -572,8 +572,10 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
 - **`SidecarKind` / `sidecar_extensions`** —
   `crates/jammi-db/src/storage/sidecar_layout.rs`: the single registry the writer,
   reader, and cleanup all consult. Ann →
-  `["usearch","rowmap","manifest.json","rawf32"]` (`rawf32` present only for a
-  quantized-precision graph); Lexical → `["tantivy"]`; None → `[]`.
+  `["usearch","rowmap","manifest.json","rawf32","threshold"]` (`rawf32` present
+  only for a quantized-precision graph; `threshold` present only for a `Binary`
+  graph — its per-dimension threshold τ companion); Lexical → `["tantivy"]`;
+  None → `[]`.
 - **SQL identifier quoting** — `crates/jammi-db/src/sql/ident.rs`: `quote_ident`,
   `quote_relation`, `source_relation`. **Invariant: every identifier interpolated
   into a generated SQL string goes through here** (an unquoted hyphen parses as
@@ -606,21 +608,29 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
     trait impl [§5].
 - **`SidecarIndex`** — `crates/jammi-db/src/index/sidecar.rs` (the `SidecarIndex`
   struct): USearch HNSW + Jammi-owned rowmap (`ROWMAP_VERSION=1`) + JSON manifest
-  (`ANN_MANIFEST_VERSION=2`). Metric hardcoded `Cos`; quantization is
-  `StoragePrecision`-driven (`F32`/`F16`/`Int8`, `crates/jammi-db/src/config.rs`),
-  passed as an explicit `precision` argument to `SidecarIndex::new`/`load` —
-  never read off `self.ann` internally, so a rebuild/load always uses the
-  caller's resolved precision (the catalog row's persisted value), not today's
-  deployment default. `SidecarIndex::index_options` is the **sole place USearch
-  field names appear**. A quantized build also accumulates exact `f32` vectors
-  in `SidecarIndex::add` and flushes them to the `.rawf32` rescore companion on
-  `save` (`RawVectorCompanion`, mmap'd read-only on `load`); `get_exact` reads
-  it (falling back to `get` at `F32`, whose own USearch vectors are already
-  exact). `load` strict-compares the manifest's `scalar_kind` against the
-  caller's expected precision — any mismatch is `IncompatibleFormat`, mirroring
-  the `backend_version` strict-compare (no reject-newer ordering; a config
-  drift since the table was built must never silently reopen the wrong-precision
-  graph).
+  (`ANN_MANIFEST_VERSION=3`). Metric hardcoded `Cos`; quantization is
+  `StoragePrecision`-driven (`F32`/`F16`/`Int8`/`Binary`,
+  `crates/jammi-db/src/config.rs`), passed as an explicit `precision` argument to
+  `SidecarIndex::new`/`load` — never read off `self.ann` internally, so a
+  rebuild/load always uses the caller's resolved precision (the catalog row's
+  persisted value), not today's deployment default. `SidecarIndex::index_options`
+  is the **sole place USearch field names appear**. A quantized (`F16`/`Int8`)
+  build also accumulates exact `f32` vectors in `SidecarIndex::add` and flushes
+  them to the `.rawf32` rescore companion on `save` (`RawVectorCompanion`,
+  mmap'd read-only on `load`); `get_exact` reads it (falling back to `get` at
+  `F32`, whose own USearch vectors are already exact). `Binary` is USearch's
+  `B1` scalar kind: each dimension is packed to a single sign bit,
+  `sign(v − τ)` against a per-dimension threshold τ fit from the corpus (a
+  bounded, deterministic sample) by `ThresholdKind::Mean` or `::Median`
+  (default `Median` — an exactly-balanced 50/50 bit split measured a higher
+  recall@10 than `Mean` on an anisotropic corpus); τ is persisted as the
+  `.threshold` companion (one `f32` per dimension) and the fitting
+  `ThresholdKind` as the manifest's `binary_threshold_kind` field, required
+  whenever `scalar_kind` is `Binary`. `load` strict-compares the manifest's
+  `scalar_kind` against the caller's expected precision — any mismatch is
+  `IncompatibleFormat`, mirroring the `backend_version` strict-compare (no
+  reject-newer ordering; a config drift since the table was built must never
+  silently reopen the wrong-precision graph).
 - **`AnnIndexConfig`** — `crates/jammi-db/src/config.rs` (the `AnnIndexConfig`
   struct): `connectivity` (HNSW M, build-time), `build_expansion`
   (ef_construction, build-time), `search_expansion` (ef_search, query-time,

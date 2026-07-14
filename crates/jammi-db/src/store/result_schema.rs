@@ -74,7 +74,7 @@ impl ResultTableSchemaProvider {
     /// owner — the single owner-aware registration path the [`crate::store::ResultStore`]
     /// routes through, distinct from the ownerless [`SchemaProvider::register_table`]
     /// trait entry point.
-    pub fn register_result_table(
+    pub fn add_result_table(
         &self,
         name: String,
         provider: Arc<dyn TableProvider>,
@@ -166,7 +166,7 @@ impl SchemaProvider for ResultTableSchemaProvider {
         name: String,
         table: Arc<dyn TableProvider>,
     ) -> DfResult<Option<Arc<dyn TableProvider>>> {
-        // The engine's owner-aware path is `register_result_table`; this bare
+        // The engine's owner-aware path is `add_result_table`; this bare
         // trait entry point carries no owner, so a table registered through it
         // (a `CREATE TABLE` over the SQL surface) is owned by the tenant
         // currently in scope.

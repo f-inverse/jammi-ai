@@ -412,7 +412,7 @@ impl ResultStore {
         let provider = build_result_table_provider(ctx, &self.registry, url).await?;
         self.install_result_schema(ctx)?;
         self.result_schema
-            .register_result_table(format!("jammi.{name}"), provider, owner);
+            .add_result_table(format!("jammi.{name}"), provider, owner);
         Ok(())
     }
 

@@ -367,8 +367,8 @@ mod tests {
     }
 
     // Test 1 — N=1 byte-identity, quantized: search_final over one Int8 segment
-    // equals a manual retrieve-then-rescore over that same sidecar (the pre-S10
-    // path search_final folds in).
+    // equals a manual retrieve-then-rescore over that same sidecar (the
+    // single-sidecar retrieve-then-rescore path search_final folds in).
     #[test]
     fn n1_int8_search_final_equals_manual_retrieve_then_rescore() {
         let rows = corpus();

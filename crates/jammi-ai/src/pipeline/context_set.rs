@@ -439,7 +439,7 @@ impl InferenceSession {
             })?;
 
         // Result tables register under the single bare literal `jammi.{name}`
-        // (`register_parquet_table`), so reach this one through
+        // (`ResultStore::register_table`), so reach this one through
         // `TableReference::bare` — a `&str` would be re-parsed and split on the
         // dot, missing the registered table whenever the name carries a hyphen
         // from a sanitized local model path.

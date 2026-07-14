@@ -137,6 +137,15 @@ impl Catalog {
         self.tenant.as_ref().and_then(|b| b.current_tenant())
     }
 
+    /// The shared [`TenantBinding`] backing this catalog, or `None` when the
+    /// catalog was built without one. The result-table schema provider clones
+    /// this so its read gate resolves the same effective tenant every other
+    /// tenant-aware surface (the analyzer, the catalog repos, the mutable lane)
+    /// does — sticky binding or task-local scope alike.
+    pub fn tenant_binding(&self) -> Option<TenantBinding> {
+        self.tenant.clone()
+    }
+
     /// Cheap reachability test. Delegates to
     /// [`backend::CatalogBackend::ping`]. Returns
     /// [`backend::BackendError::Unavailable`] when the connection pool is

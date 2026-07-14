@@ -116,6 +116,11 @@ impl InferenceSession {
         let scheduler = Arc::new(GpuScheduler::new_unlimited());
         let model_cache = Arc::new(ModelCache::new(resolver, device_config.clone(), scheduler));
         let result_store = Arc::new(build_result_store(&inner, Arc::clone(&catalog))?);
+        // Install the tenant-gating result-table schema as the context's
+        // default schema before any table is loaded, so bare `jammi.{name}`
+        // resolutions honour the catalog owner on every read lane and source
+        // removal can find the provider to clear.
+        result_store.install_result_schema(inner.context())?;
         result_store.recover().await?;
         result_store.load_existing_tables(inner.context()).await?;
 

@@ -631,7 +631,16 @@ impl JammiSession {
         // 3. Delete the source row from the catalog.
         self.catalog.remove_source(source_id).await?;
 
-        // 4. Clear the DataFusion schema provider so queries return "not found".
+        // 4. Deregister the source's result tables from the tenant-gating
+        //    result-table schema so post-removal queries resolve not-found,
+        //    the same way clearing the source schema below does for the
+        //    source's own tables.
+        crate::store::result_schema::deregister_result_tables(
+            &self.ctx,
+            result_tables.iter().map(|rt| rt.table_name.as_str()),
+        );
+
+        // 5. Clear the DataFusion schema provider so queries return "not found".
         if let Some(catalog) = self.ctx.catalog(source_id) {
             if let Some(schema) = catalog.schema("public") {
                 if let Some(provider) = schema.as_any().downcast_ref::<JammiSchemaProvider>() {
@@ -858,7 +867,7 @@ impl JammiSession {
         // Result tables register under the single bare identifier
         // `jammi.{name}`; reach this one the same way rather than as a string
         // DataFusion would re-parse into a `jammi` schema reference (see
-        // `register_parquet_table`).
+        // `ResultStore::register_table`).
         let table_ref = TableReference::bare(format!("jammi.{}", table.table_name));
         let batches = self
             .ctx

@@ -1098,6 +1098,21 @@ fn cases() -> Vec<IsolationCase> {
                 assert_flight_sql_isolated().await;
             }
         ),
+        // --- Flight SQL result-table SCAN (off-descriptor; explicit case) ----
+        // Result Parquets carry no `tenant_id` column, so the predicate-
+        // injection analyzer never scoped them; the tenant-gating result-table
+        // schema provider closes that lane. This case proves a correctly-bound
+        // peer resolves not-found for another tenant's result table over the
+        // real `db.sql` lane, across two verb kinds.
+        case!(
+            "arrow.flight.FlightService",
+            "DoGet_result_table_scan",
+            CaseKind::FlightSql,
+            None,
+            {
+                assert_result_table_scan_isolated().await;
+            }
+        ),
     ]
 }
 
@@ -1906,6 +1921,321 @@ async fn select_ids(session: &JammiSession, tenant: TenantId) -> Vec<i64> {
                 .downcast_ref::<Int64Array>()
                 .unwrap();
             (0..col.len()).map(|i| col.value(i)).collect()
+        })
+        .await
+}
+
+/// Result-table SCAN isolation over the real `db.sql` lane (esc-024).
+///
+/// A result Parquet carries no `tenant_id` column, so the predicate-injection
+/// analyzer never scoped it; it resolved by bare `jammi.{name}` into the one
+/// shared context with no tenant gate, and any correctly-bound tenant naming
+/// another tenant's table scanned its full Parquet. This drives the fix end to
+/// end: two result tables of different verb kinds — an as-of-join spine+facts
+/// table and an embedding `_row_id`+vector table — are materialised under
+/// tenant A through the single `finalize_with_manifest` funnel, plus one GLOBAL
+/// (unscoped) embedding table, then read back over `with_tenant_scoped(T, |s|
+/// s.sql("SELECT count(*) FROM \"jammi.<name>\""))` — the actual Flight `db.sql`
+/// path. The 3-arm control: A reads its own tables (N > 0); the GLOBAL table is
+/// visible to BOTH A and B; B reading A's private tables resolves not-found
+/// (the fix), while an admin read of the same tables returns N (non-vacuity —
+/// the bytes exist and are readable, so B's not-found is a scoping result). The
+/// table-name enumeration under B lists the GLOBAL table but not A's.
+async fn assert_result_table_scan_isolated() {
+    let dir = tempdir().unwrap();
+    let engine = Arc::new(
+        InferenceSession::new(test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+
+    // Materialise under tenant A: an as-of-join table and an embedding table,
+    // both through the single funnel, both stamped private to A.
+    let (asof_a, emb_a) = engine
+        .with_tenant_scoped(tenant_a(), |_scope| async {
+            let asof = materialize_asof_result_table(&engine, "spine-src-a", "facts-src-a").await;
+            let emb = materialize_embedding_result_table(&engine, "emb-src-a").await;
+            (asof, emb)
+        })
+        .await;
+
+    // Materialise a GLOBAL result table with no tenant scope in effect — its
+    // catalog row carries `tenant_id IS NULL`, so it is visible to every tenant.
+    let global = materialize_embedding_result_table(&engine, "emb-src-global").await;
+
+    // Arm 1 — OWN-TENANT: tenant A reads each of its own tables → N (> 0).
+    let asof_a_own = scan_count(&engine, tenant_a(), &asof_a).await.unwrap();
+    let emb_a_own = scan_count(&engine, tenant_a(), &emb_a).await.unwrap();
+    assert!(
+        asof_a_own > 0 && emb_a_own > 0,
+        "tenant A must read its own result tables: asof={asof_a_own}, emb={emb_a_own}"
+    );
+
+    // Arm 2 — GLOBAL: the NULL-tenant table is visible to BOTH A and B.
+    let global_a = scan_count(&engine, tenant_a(), &global).await.unwrap();
+    let global_b = scan_count(&engine, tenant_b(), &global).await.unwrap();
+    assert!(
+        global_a > 0 && global_a == global_b,
+        "a GLOBAL result table must be visible to every tenant: A={global_a}, B={global_b}"
+    );
+
+    // Arm 3 — CROSS-TENANT: tenant B reading A's private tables resolves
+    // not-found (the fix); pre-fix these returned A's N rows (the RED).
+    let asof_b = scan_count(&engine, tenant_b(), &asof_a).await;
+    let emb_b = scan_count(&engine, tenant_b(), &emb_a).await;
+    assert!(
+        asof_b.is_err(),
+        "CROSS-TENANT SCAN LEAK: tenant B scanned tenant A's as-of-join result table: {asof_b:?}"
+    );
+    assert!(
+        emb_b.is_err(),
+        "CROSS-TENANT SCAN LEAK: tenant B scanned tenant A's embedding result table: {emb_b:?}"
+    );
+
+    // Non-vacuity: the very tables B was refused are readable — an admin scan
+    // returns N, so B's not-found is a scoping result, not empty/absent bytes.
+    let asof_admin = admin_scan_count(&engine, &asof_a).await;
+    let emb_admin = admin_scan_count(&engine, &emb_a).await;
+    assert_eq!(
+        (asof_admin, emb_admin),
+        (asof_a_own, emb_a_own),
+        "admin read of A's tables must return the same N A reads (non-vacuity)"
+    );
+
+    // Metadata: tenant B's schema enumeration lists the GLOBAL table but never
+    // A's private tables — the not-found closes the name leak too.
+    let names_b = engine
+        .with_tenant_scoped(tenant_b(), |scope| async move {
+            scope
+                .context()
+                .catalog("datafusion")
+                .unwrap()
+                .schema("public")
+                .unwrap()
+                .table_names()
+        })
+        .await;
+    assert!(
+        names_b.contains(&format!("jammi.{global}")),
+        "tenant B must see the GLOBAL result table in its schema enumeration: {names_b:?}"
+    );
+    assert!(
+        !names_b.contains(&format!("jammi.{asof_a}"))
+            && !names_b.contains(&format!("jammi.{emb_a}")),
+        "CROSS-TENANT METADATA LEAK: tenant B enumerates tenant A's result tables: {names_b:?}"
+    );
+}
+
+/// Materialise an embedding (`_row_id` + `vector`) result table through the
+/// single `finalize_with_manifest` funnel into the engine's real (gated)
+/// context, under whatever tenant scope is in effect at the call site. Returns
+/// its table name.
+async fn materialize_embedding_result_table(engine: &InferenceSession, source: &str) -> String {
+    use jammi_db::store::manifest::{
+        ComputeDevice, ComputePrecision, InputAnchor, Materialization, MaterializationEnv,
+        ModelIdentity, ProducingDescriptor,
+    };
+
+    const DIMS: usize = 4;
+    let model_id = "embed-model";
+    let store = engine.result_store();
+    let info = store
+        .create_table(
+            source,
+            ModelTask::TextEmbedding,
+            ResultTableKind::Model,
+            None,
+            model_id,
+            Some(DIMS as i32),
+            Some("_row_id"),
+            Some("body"),
+        )
+        .await
+        .unwrap();
+
+    let schema = jammi_db::store::schema::embedding_table_schema(DIMS);
+    let n = 3usize;
+    let row_id = StringArray::from_iter_values((0..n).map(|i| format!("row-{i}")));
+    let src = StringArray::from_iter_values((0..n).map(|_| source));
+    let model = StringArray::from_iter_values((0..n).map(|_| model_id));
+    let flat: Vec<f32> = (0..n)
+        .flat_map(|i| (0..DIMS).map(move |d| (i * DIMS + d) as f32))
+        .collect();
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    let vectors =
+        FixedSizeListArray::try_new(item, DIMS as i32, Arc::new(Float32Array::from(flat)), None)
+            .unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(row_id),
+            Arc::new(src),
+            Arc::new(model),
+            Arc::new(vectors),
+        ],
+    )
+    .unwrap();
+    let mut writer = store.open_writer(&info.parquet_url, schema).await.unwrap();
+    writer.write_batch(&batch).await.unwrap();
+    let rows = writer.close().await.unwrap();
+
+    let descriptor = ProducingDescriptor::Embedding {
+        model_id: model_id.into(),
+        task: ModelTask::TextEmbedding,
+        source_id: source.into(),
+        columns: vec!["body".into()],
+        key_column: "_row_id".into(),
+        dimensions: DIMS,
+    };
+    let env = MaterializationEnv::new(
+        ComputeDevice::Cpu,
+        vec![ModelIdentity {
+            model_id: model_id.into(),
+            backend: "candle".into(),
+            compute_precision: ComputePrecision::F32,
+        }],
+    );
+    store
+        .finalize_with_manifest(
+            engine.context(),
+            &info.table_name,
+            &info.parquet_url,
+            rows,
+            Materialization::new(
+                &descriptor,
+                &env,
+                vec![InputAnchor::mutable_version(source, 1)],
+            ),
+        )
+        .await
+        .unwrap();
+    info.table_name
+}
+
+/// Materialise an as-of-join-shaped (spine + facts, no `tenant_id` column)
+/// result table through the single funnel into the engine's real (gated)
+/// context, under whatever tenant scope is in effect at the call site. Returns
+/// its table name.
+async fn materialize_asof_result_table(
+    engine: &InferenceSession,
+    spine: &str,
+    facts: &str,
+) -> String {
+    use jammi_db::store::manifest::{
+        AsofBoundary, AsofDirection, ComputeDevice, InputAnchor, Materialization,
+        MaterializationEnv, ProducingDescriptor,
+    };
+
+    let store = engine.result_store();
+    let info = store
+        .create_table(
+            spine,
+            ModelTask::TextEmbedding,
+            ResultTableKind::AsofJoin,
+            None,
+            "asof-model",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // A spine+facts output row set: the join key, its temporal column, and a
+    // projected facts value — none of them a `tenant_id`.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new("ts", DataType::Int64, false),
+        Field::new("price", DataType::Float32, true),
+    ]));
+    let n = 3usize;
+    let symbol = StringArray::from_iter_values((0..n).map(|_| "AAA"));
+    let ts = Int64Array::from_iter_values(0..n as i64);
+    let price = Float32Array::from((0..n).map(|i| i as f32).collect::<Vec<f32>>());
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(symbol), Arc::new(ts), Arc::new(price)],
+    )
+    .unwrap();
+    let mut writer = store.open_writer(&info.parquet_url, schema).await.unwrap();
+    writer.write_batch(&batch).await.unwrap();
+    let rows = writer.close().await.unwrap();
+
+    let descriptor = ProducingDescriptor::AsofJoin {
+        spine: spine.into(),
+        facts: facts.into(),
+        spine_by: vec!["symbol".into()],
+        facts_by: vec!["symbol".into()],
+        spine_time: "ts".into(),
+        facts_time: "ts".into(),
+        direction: AsofDirection::Backward,
+        boundary: AsofBoundary::Inclusive,
+        tolerance: None,
+        tie_break_column: None,
+        project: vec!["price".into()],
+    };
+    let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());
+    let now = chrono::Utc::now().to_rfc3339();
+    store
+        .finalize_with_manifest(
+            engine.context(),
+            &info.table_name,
+            &info.parquet_url,
+            rows,
+            Materialization::new(
+                &descriptor,
+                &env,
+                vec![
+                    InputAnchor::unpinned_at_instant(spine, now.clone()),
+                    InputAnchor::unpinned_at_instant(facts, now),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+    info.table_name
+}
+
+/// Scan `SELECT count(*) FROM "jammi.<table>"` under `tenant` through the real
+/// `db.sql` lane, returning the row count or the error string. A not-found
+/// (a peer's private table) surfaces as `Err`.
+async fn scan_count(
+    engine: &InferenceSession,
+    tenant: TenantId,
+    table: &str,
+) -> Result<i64, String> {
+    let query = format!("SELECT count(*) AS c FROM \"jammi.{table}\"");
+    engine
+        .with_tenant_scoped(tenant, |scope| async move {
+            let rows = scope.sql(&query).await.map_err(|e| e.to_string())?;
+            let batch = rows
+                .into_iter()
+                .next()
+                .ok_or_else(|| "no batch".to_string())?;
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "count column not Int64".to_string())?;
+            Ok(col.value(0))
+        })
+        .await
+}
+
+/// Scan `SELECT count(*)` for a table under an admin scope (the analyzer bypass
+/// plus provider admin visibility) — the cross-tenant read that proves the
+/// bytes a bound peer was refused actually exist and are readable.
+async fn admin_scan_count(engine: &InferenceSession, table: &str) -> i64 {
+    let query = format!("SELECT count(*) AS c FROM \"jammi.{table}\"");
+    engine
+        .with_admin_scope(|scope| async move {
+            let rows = scope.sql(&query).await.unwrap();
+            let col = rows[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            col.value(0)
         })
         .await
 }

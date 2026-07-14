@@ -235,12 +235,21 @@ Two sessions on the same process, bound to different tenants, will:
    registration — typically a public reference dataset — is visible to
    every tenant.
 
-The engine enforces the binding at three layers (the SPEC-03 defence-in-depth
+The engine enforces the binding at four layers (the SPEC-03 defence-in-depth
 discipline):
 
 - **Read-side predicate injection** — `TenantScopeAnalyzerRule` injects
   `tenant_id = $current OR tenant_id IS NULL` on every `TableScan` whose
   schema declares the column.
+- **Result-table resolution gate** — a Jammi-owned result table is wholly
+  owned by one tenant (or GLOBAL), so its Parquet carries no `tenant_id`
+  column for the analyzer to filter on. The tenant-gating result-table schema
+  provider instead gates *resolution* on the catalog owner: over every lane
+  that names `jammi.{table}` (Flight `db.sql`, gRPC `sql`, search), a
+  correctly-bound tenant resolves only its own and GLOBAL result tables, and a
+  peer's private table resolves not-found (and is absent from the schema's
+  table enumeration) — the same `(tenant_id = $current OR tenant_id IS NULL)`
+  visibility the catalog read API applies.
 - **Write-side guard** — every catalog `register_*` and the mutable-table
   sink calls `Transaction::assert_tenant_matches` before INSERT.
 - **Storage-side filter** — catalog repo reads also pass the predicate to

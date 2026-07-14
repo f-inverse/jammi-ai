@@ -711,3 +711,35 @@ pub(super) const MIGRATION_023_STORAGE_PRECISION: &str = r#"
 ALTER TABLE result_tables ADD COLUMN storage_precision TEXT;
 ALTER TABLE result_tables ADD COLUMN oversample        INTEGER;
 "#;
+
+/// Migration 024 — the claim-policy columns on `training_jobs`.
+///
+/// `priority` and `claimable` turn the job claim's scheduling policy into
+/// catalog data instead of a fixed rule: `priority` breaks ties before
+/// `created_at` (higher claims first), and `claimable` is a hold flag that
+/// data-excludes a row from the claim without deleting it or introducing a
+/// new status. Both default such that an existing or freshly enqueued row —
+/// nothing writes a non-default value today — sits at `priority = 0,
+/// claimable = TRUE`, where the claim ordering degenerates to plain
+/// oldest-first FIFO: the defaults are chosen to preserve today's behavior
+/// exactly, not merely approximately.
+///
+/// `claimable` is declared `BOOLEAN`, a conscious departure from this
+/// table's earlier integer-flag columns: SQLite accepts the `BOOLEAN` type
+/// name (numeric affinity) and the `TRUE` literal, and Postgres has a native
+/// boolean, so the same DDL is portable and the column reads back as an
+/// actual boolean on both backends — `DEFAULT 1` would not be, since Postgres
+/// rejects an implicit integer-to-boolean default.
+///
+/// Two indexes now serve two distinct predicates over `training_jobs`:
+/// `idx_training_jobs_claim (status, lease_expires_at)` (added in migration
+/// 016) serves the expired-lease reclaim scan, and the new
+/// `idx_training_jobs_claim_policy (status, claimable, priority DESC,
+/// created_at)` serves the claim's own predicate and ordering. Neither
+/// replaces the other.
+pub(super) const MIGRATION_024_CLAIM_POLICY: &str = r#"
+ALTER TABLE training_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE training_jobs ADD COLUMN claimable BOOLEAN NOT NULL DEFAULT TRUE;
+CREATE INDEX idx_training_jobs_claim_policy
+    ON training_jobs(status, claimable, priority DESC, created_at);
+"#;

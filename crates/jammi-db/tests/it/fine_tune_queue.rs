@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use jammi_db::catalog::backend::{BackendKind, TxOptions};
+use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::status::TrainingJobStatus;
 use jammi_db::catalog::training_repo::CreateTrainingJobParams;
@@ -84,6 +84,31 @@ async fn reset_queue(catalog: &Catalog) {
         .backend_arc()
         .transaction(TxOptions::default(), |tx| {
             Box::pin(async move { tx.execute("DELETE FROM training_jobs", &[]).await })
+        })
+        .await
+        .unwrap();
+}
+
+/// Set `priority`/`claimable` on one row via raw SQL, mirroring [`reset_queue`]
+/// — the claim-policy columns are catalog data, so the fixture writes them as
+/// data rather than through any typed setter (there is none; the engine only
+/// honors the columns).
+async fn set_claim_policy(catalog: &Catalog, job_id: &str, priority: i64, claimable: bool) {
+    let job_id = job_id.to_string();
+    catalog
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE training_jobs SET priority = $1, claimable = $2 WHERE job_id = $3",
+                    &[
+                        SqlValue::Int(priority),
+                        SqlValue::Bool(claimable),
+                        SqlValue::TextOwned(job_id),
+                    ],
+                )
+                .await
+            })
         })
         .await
         .unwrap();
@@ -186,6 +211,198 @@ async fn claim_returns_oldest_queued_job_first(backend: BackendKind) {
         .unwrap()
         .expect("a job is queued");
     assert_eq!(first.job_id, "old", "oldest queued job is claimed first");
+}
+
+/// `priority` breaks the tie ahead of `created_at`: a younger high-priority job
+/// claims before an older default-priority job, and the default-priority job
+/// still claims after it.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claim_honors_priority_over_created_at(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("low"))
+        .await
+        .unwrap();
+    // A distinct, strictly-later created_at so the FIFO tiebreak would (if
+    // priority did not win) pick "low" first.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    catalog
+        .create_training_job(job_params("high"))
+        .await
+        .unwrap();
+    set_claim_policy(&catalog, "high", 10, true).await;
+
+    let first = catalog
+        .claim_next_training_job("w", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("a job is queued");
+    assert_eq!(
+        first.job_id, "high",
+        "the higher-priority job claims first despite being strictly younger"
+    );
+
+    let second = catalog
+        .claim_next_training_job("w", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("a job is queued");
+    assert_eq!(
+        second.job_id, "low",
+        "the default-priority job claims once the higher-priority job is gone"
+    );
+}
+
+/// A `claimable = FALSE` job is skipped by the claim, not errored, and stays
+/// invisible until flipped back — with no status change either way.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claim_skips_a_held_job_without_erroring(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("held"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    catalog
+        .create_training_job(job_params("ready"))
+        .await
+        .unwrap();
+    set_claim_policy(&catalog, "held", 0, false).await;
+
+    let first = catalog
+        .claim_next_training_job("w", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("the claimable job is queued");
+    assert_eq!(
+        first.job_id, "ready",
+        "the older held job is skipped, not claimed and not errored"
+    );
+
+    let none = catalog
+        .claim_next_training_job("w", Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert!(
+        none.is_none(),
+        "the held job stays invisible to the claim while claimable = FALSE"
+    );
+
+    set_claim_policy(&catalog, "held", 0, true).await;
+    let released = catalog
+        .claim_next_training_job("w", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("the released job is claimable again");
+    assert_eq!(released.job_id, "held");
+    assert_eq!(
+        released.status,
+        TrainingJobStatus::Running.to_string(),
+        "the hold is released with no other status change along the way"
+    );
+}
+
+/// A job re-queued by [`Catalog::reclaim_expired_training_jobs`] retains its
+/// `priority`/`claimable` values (the row is untouched by reclaim, only its
+/// lease fields are cleared) and re-enters the claim ordering accordingly.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reclaimed_job_retains_priority_and_reenters_ordering(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog.create_training_job(job_params("hi")).await.unwrap();
+    set_claim_policy(&catalog, "hi", 10, true).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    catalog
+        .create_training_job(job_params("sibling"))
+        .await
+        .unwrap();
+
+    // Claim "hi" with a zero lease so it is already expired by the time
+    // reclaim runs, then reclaim re-queues it.
+    let claimed = catalog
+        .claim_next_training_job("worker", Duration::from_secs(0))
+        .await
+        .unwrap()
+        .expect("the high-priority job claims first");
+    assert_eq!(claimed.job_id, "hi");
+    let actioned = catalog.reclaim_expired_training_jobs(5).await.unwrap();
+    assert_eq!(actioned, 1, "the expired lease is re-queued");
+
+    // Under contention with the default-priority sibling, the re-queued job's
+    // priority still wins — reclaim did not reset it.
+    let next = catalog
+        .claim_next_training_job("worker", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("the re-queued job re-enters the ordering");
+    assert_eq!(
+        next.job_id, "hi",
+        "reclaim preserves priority: the high-priority job claims again ahead of its sibling"
+    );
+}
+
+/// Two concurrent claims against two jobs of differing priority each win a
+/// distinct job: `FOR UPDATE SKIP LOCKED` composes with the new
+/// `ORDER BY priority DESC, created_at` — one worker gets the high-priority
+/// job, the other gets the remaining job, never the same one and never none
+/// while a claimable job is still queued.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_claim_composes_with_priority_ordering(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_catalog!(backend, dir.path());
+
+    catalog
+        .create_training_job(job_params("low"))
+        .await
+        .unwrap();
+    catalog
+        .create_training_job(job_params("high"))
+        .await
+        .unwrap();
+    set_claim_policy(&catalog, "high", 10, true).await;
+
+    let c1 = Arc::clone(&catalog);
+    let c2 = Arc::clone(&catalog);
+    let lease = Duration::from_secs(30);
+    let h1 =
+        tokio::spawn(async move { c1.claim_next_training_job("worker-a", lease).await.unwrap() });
+    let h2 =
+        tokio::spawn(async move { c2.claim_next_training_job("worker-b", lease).await.unwrap() });
+    let a = h1.await.unwrap();
+    let b = h2.await.unwrap();
+
+    let mut winners: Vec<String> = [a, b].into_iter().flatten().map(|r| r.job_id).collect();
+    winners.sort();
+    assert_eq!(
+        winners,
+        vec!["high".to_string(), "low".to_string()],
+        "each concurrent claim wins a distinct job, spanning the priority ordering"
+    );
 }
 
 /// Heartbeat renews the lease for the owning worker and refuses everyone else.

@@ -26,7 +26,7 @@
 //! consumer routes through. On a table that
 //! [`needs_rescore`](StoragePrecision::needs_rescore) it retrieves an
 //! oversampled candidate set through `search`, reads each candidate's exact
-//! `f32` vector via [`SegmentedIndex::get_exact`], recomputes cosine against the
+//! `f32` vector via its owning segment, recomputes cosine against the
 //! query, and re-ranks by that exact distance — a corpus-independent order that
 //! *is* comparable across segments. On an `F32` table it is `search` directly.
 //! Routing every final read through `search_final` is what keeps a
@@ -74,6 +74,14 @@ pub struct SegmentId(pub i64);
 /// be no over-fetch (correct only for `N = 1`); `2.0` is the measured default —
 /// generous enough that the merge's recall tracks a single graph's, cheap
 /// enough that it does not dominate query cost.
+///
+/// SEAM: this factor's recall benefit is *recovering per-segment HNSW recall
+/// loss* — it only bites when a segment's own graph returns less than its exact
+/// top, a scale/seed-dependent property that is not robustly isolable at
+/// deterministic unit scale (the merge-correctness unit tests below hold at
+/// `1.0` too). Its floor is therefore guarded by a committed multi-seed recall
+/// bench in `jammi-bench` (a follow-up), not by a single-seed unit assertion —
+/// naming the gap rather than pretending a flaky unit test closes it.
 pub const DEFAULT_SEGMENT_OVERFETCH_FACTOR: f32 = 2.0;
 
 /// Per-segment fetch width for a merge that wants a global top-`m` over
@@ -174,7 +182,7 @@ impl SegmentedIndex {
     /// for a stable candidate set, but **not** a final answer; only
     /// [`Self::search_final`] consumes them, feeding the exact rescore that
     /// makes the final order comparable. The dedup keeps the merge correct over
-    /// the row-id space even though the S10 append-disjoint-rows invariant means
+    /// the row-id space even though the append-disjoint-rows invariant means
     /// no row id spans two segments today; which segment's vector wins for a
     /// re-embedded row is a compaction/retire concern, seamed, not built.
     pub fn search(&self, query: &[f32], m: usize) -> Result<Vec<(String, f32)>> {
@@ -216,7 +224,7 @@ impl SegmentedIndex {
     /// (quantized or `Binary`) this is a two-stage retrieve→rescore: retrieve
     /// `k * oversample` candidates through [`Self::search`] (the merge
     /// over-fetch nests *under* this candidate width by construction), read each
-    /// candidate's exact `f32` vector via [`Self::get_exact`], recompute cosine
+    /// candidate's exact `f32` vector via `get_exact`, recompute cosine
     /// distance against the query, then re-rank by `(distance, row_id)` and
     /// truncate to `k`. The exact re-rank is corpus-independent, so a candidate
     /// drawn from any segment lands in one global order — the property a raw
@@ -257,8 +265,10 @@ impl SegmentedIndex {
 
     /// The exact `f32` vector for `row_id`, dispatched to the segment that owns
     /// it. Segments are row-disjoint, so at most one returns `Some`; the first
-    /// hit wins. `None` when no segment indexes the id.
-    pub fn get_exact(&self, row_id: &str) -> Result<Option<Vec<f32>>> {
+    /// hit wins. `None` when no segment indexes the id. Internal to the crate:
+    /// the only consumer is [`Self::search_final`]'s rescore stage — callers ask
+    /// for final results, not raw exact vectors.
+    pub(crate) fn get_exact(&self, row_id: &str) -> Result<Option<Vec<f32>>> {
         for seg in &self.segments {
             if let Some(vector) = seg.index.get_exact(row_id)? {
                 return Ok(Some(vector));
@@ -432,32 +442,104 @@ mod tests {
         }
     }
 
-    // Test 9 (recall floor) — a merged multi-segment quantized index's recall@k
-    // is no worse than the same rows in a single segment, over a fixed query
-    // set. The relative floor that forbids a factor that silently degrades
-    // recall.
+    // Test 9 (correctness under truncation) — a two-segment quantized
+    // `search_final` returns the exact brute-force top-k over the union even when
+    // the candidate stage truncates *below* the corpus size, so the rescore does
+    // not simply re-rank every row. This is the assertion that BITES: it fails if
+    // the merge drops a true neighbour (a mis-ordered or mis-truncated candidate
+    // set, a lost segment).
+    //
+    // It does NOT isolate `DEFAULT_SEGMENT_OVERFETCH_FACTOR` — the factor only
+    // pays off when a segment's own HNSW recall is below 100%, which is not
+    // robustly reproducible at deterministic unit scale (this test holds at
+    // factor `1.0` too). That floor is seamed to a multi-seed recall bench; see
+    // the const's SEAM note.
     #[test]
-    fn merged_quantized_recall_is_not_below_single_segment() {
-        let rows = corpus();
-        let (left, right) = rows.split_at(6);
-        let single = segmented(vec![(&rows[..], StoragePrecision::Int8)]);
-        let merged = segmented(vec![
-            (left, StoragePrecision::Int8),
-            (right, StoragePrecision::Int8),
-        ]);
-        let k = 3;
-        let (mut single_hits, mut merged_hits) = (0usize, 0usize);
-        for (_, q) in &rows {
-            let truth: std::collections::HashSet<String> =
-                brute_force(&rows, q, k).into_iter().collect();
-            let s = single.search_final(q, k, 8).unwrap();
-            let m = merged.search_final(q, k, 8).unwrap();
-            single_hits += ids(&s).iter().filter(|id| truth.contains(*id)).count();
-            merged_hits += ids(&m).iter().filter(|id| truth.contains(*id)).count();
+    fn two_segment_quantized_search_final_equals_brute_force_under_truncation() {
+        fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in &mut v {
+                *x /= norm;
+            }
+            v
         }
+        let dim = 32;
+        let mut query = vec![0.0f32; dim];
+        query[0] = 1.0;
+
+        // 5 "near" rows at strictly increasing (distinct) distance to the query,
+        // and 123 "far" rows orthogonal to it (distance ~1.0). The gap between
+        // the two families is far larger than Int8 quantization error, so the
+        // true top-5 are unambiguous in both exact and quantized space — the test
+        // is deterministic, not seed-fragile.
+        let mut all: Vec<(String, Vec<f32>)> = Vec::new();
+        for i in 0..5 {
+            let mut v = vec![0.0f32; dim];
+            v[0] = 1.0;
+            v[1] = 0.08 * i as f32;
+            all.push((format!("near{i}"), normalize(v)));
+        }
+        for r in 0..123 {
+            let mut v = vec![0.0f32; dim];
+            v[2 + (r % 28)] = 1.0;
+            v[3 + (r % 28)] += 0.01 * ((r % 5) as f32);
+            all.push((format!("far{r:03}"), normalize(v)));
+        }
+
+        // Even/odd split → two 64-row segments with the near rows spread across
+        // BOTH, so recovering the top-k exercises the cross-segment merge.
+        let mut seg_a: Vec<(String, Vec<f32>)> = Vec::new();
+        let mut seg_b: Vec<(String, Vec<f32>)> = Vec::new();
+        for (idx, row) in all.iter().enumerate() {
+            if idx % 2 == 0 {
+                seg_a.push(row.clone());
+            } else {
+                seg_b.push(row.clone());
+            }
+        }
+
+        let build = |rows: &[(String, Vec<f32>)]| {
+            let mut idx =
+                SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::Int8).unwrap();
+            for (id, v) in rows {
+                idx.add(id, v).unwrap();
+            }
+            idx.build().unwrap();
+            idx
+        };
+        let seg = SegmentedIndex::new(vec![
+            (SegmentId(0), build(&seg_a)),
+            (SegmentId(1), build(&seg_b)),
+        ])
+        .unwrap();
+
+        // candidate_k = k * oversample = 5 * 4 = 20 < 128, and per-segment fetch
+        // ceil(20 * 2.0) = 40 < 64: BOTH the per-segment fetch and the merge
+        // truncate before the exact rescore — the truncation regime, not
+        // rescore-everything.
+        let k = 5;
+        let got: Vec<String> = seg
+            .search_final(&query, k, 4)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        let mut scored: Vec<(String, f32)> = all
+            .iter()
+            .map(|(id, v)| (id.clone(), cosine_distance(&query, v)))
+            .collect();
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let expected: Vec<String> = scored.into_iter().take(k).map(|(id, _)| id).collect();
+
+        assert_eq!(
+            got, expected,
+            "merged Int8 search_final must equal the exact brute-force top-k even when the \
+             candidate stage truncates below the corpus size"
+        );
         assert!(
-            merged_hits >= single_hits,
-            "merged recall ({merged_hits}) must be >= single-segment recall ({single_hits})"
+            expected.iter().all(|id| id.starts_with("near")),
+            "the true top-k are the five near rows"
         );
     }
 

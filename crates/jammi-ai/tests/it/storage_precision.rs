@@ -25,27 +25,6 @@ fn tiny_bert_model() -> String {
     "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
 }
 
-/// The single ANN segment's bundle base URL for a freshly-embedded table: one
-/// embed pass writes exactly one segment (`segment 0`), so these single-segment
-/// fixtures resolve their on-disk sidecar through it. Panics if the table does
-/// not have exactly one segment, keeping the fixtures honest.
-async fn segment0_index_url(
-    session: &jammi_ai::session::InferenceSession,
-    table_name: &str,
-) -> String {
-    let segs = session
-        .catalog()
-        .list_index_segments(table_name)
-        .await
-        .unwrap();
-    assert_eq!(
-        segs.len(),
-        1,
-        "a single embed pass writes exactly one segment"
-    );
-    segs[0].index_path.clone()
-}
-
 /// A session config rooted at `dir` with the embedding ANN sidecar built at
 /// `precision` and the table-default oversample set explicitly (rather than
 /// left at its own default), so every test controls both knobs.
@@ -213,7 +192,7 @@ async fn f32_table_writes_no_rescore_companion() {
         .unwrap();
     assert_eq!(table.storage_precision, Some(StoragePrecision::F32));
 
-    let seg_url = segment0_index_url(&session, &table.table_name).await;
+    let seg_url = common::segment0_index_url(&session, &table.table_name).await;
     let base = jammi_test_utils::url_to_path(&seg_url);
     assert!(
         !base.with_extension("rawf32").exists(),
@@ -239,7 +218,7 @@ async fn stale_manifest_precision_falls_back_to_exact_search_not_a_crash() {
         .await
         .unwrap();
     let ground_truth = read_ground_truth(&session, &table.table_name).await;
-    let seg_url = segment0_index_url(&session, &table.table_name).await;
+    let seg_url = common::segment0_index_url(&session, &table.table_name).await;
     let base = jammi_test_utils::url_to_path(&seg_url);
     let manifest_path = base.with_extension("manifest.json");
 
@@ -287,7 +266,7 @@ async fn int8_index_writes_companion_and_get_exact_recovers_ground_truth() {
         .resolve_embedding_table("patents", None)
         .await
         .unwrap();
-    let seg_url = segment0_index_url(&session, &table.table_name).await;
+    let seg_url = common::segment0_index_url(&session, &table.table_name).await;
     let base = jammi_test_utils::url_to_path(&seg_url);
     assert!(
         base.with_extension("rawf32").exists(),

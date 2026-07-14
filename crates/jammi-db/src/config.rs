@@ -610,9 +610,9 @@ impl AnnIndexConfig {
     /// own stamped default (`ResultTableRecord::oversample`, passed as
     /// `table_default`) — never today's deployment config, mirroring how
     /// `storage_precision` is resolved — falling back to this deployment's
-    /// [`Self::effective_oversample`] only for a pre-migration-023 table with no
-    /// stamped column. Clamped to at least `1`, so a `0` override or a
-    /// misconfigured `0` default never shrinks the candidate set below `k`.
+    /// [`Self::effective_oversample`] only for a table with no stamped oversample
+    /// column. Clamped to at least `1`, so a `0` override or a misconfigured `0`
+    /// default never shrinks the candidate set below `k`.
     pub fn resolve_oversample(
         &self,
         request_override: Option<usize>,

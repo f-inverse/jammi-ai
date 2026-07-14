@@ -2,6 +2,7 @@ pub mod artifact;
 pub mod freshness;
 pub mod manifest;
 pub mod mutable;
+pub mod result_schema;
 pub mod schema;
 pub mod vectors;
 
@@ -14,15 +15,19 @@ pub use manifest::{
     ManifestError, MatchVerdict, Materialization, MaterializationEnv, MaterializationManifest,
     ModelIdentity, ProducingDescriptor,
 };
+pub use result_schema::ResultTableSchemaProvider;
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow::array::Array;
-use datafusion::datasource::listing::ListingTableUrl;
+use datafusion::catalog::SchemaProvider;
+use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
+use datafusion::datasource::TableProvider;
+use datafusion::execution::options::ReadOptions;
 use datafusion::prelude::SessionContext;
-use datafusion::sql::TableReference;
 use tracing::warn;
 
 use crate::catalog::result_repo::{CreateResultTableParams, ResultTableKind, ResultTableRecord};
@@ -37,6 +42,7 @@ use crate::storage::sidecar_layout::SidecarKind;
 use crate::storage::{
     self, JammiObjectStore, ObjectParquetWriter, Scheme, StorageRegistry, StorageUrl,
 };
+use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
 
 /// The catalog-row provenance of an embedding result table
@@ -144,6 +150,12 @@ pub struct ResultStore {
     /// deployment's [`AnnIndexConfig`], applied at build time (recovery and
     /// materialization) and re-applied to the query-time dial on load.
     ann: AnnIndexConfig,
+    /// The tenant-gating schema provider every result table registers into —
+    /// installed as the session context's default schema so bare `jammi.{name}`
+    /// resolutions honour the catalog owner. Shares the catalog's
+    /// [`TenantBinding`], so the read gate matches the catalog API's own
+    /// `(tenant_id = $current OR tenant_id IS NULL)` + admin-scope bypass.
+    result_schema: Arc<ResultTableSchemaProvider>,
 }
 
 /// Sanitize a model ID for use in file names.
@@ -180,11 +192,17 @@ impl ResultStore {
                 .to_str()
                 .ok_or_else(|| JammiError::Config("Non-UTF8 artifact_dir".into()))?,
         )?;
+        let result_schema = Arc::new(ResultTableSchemaProvider::new(
+            catalog
+                .tenant_binding()
+                .unwrap_or_else(TenantBinding::unscoped),
+        ));
         Ok(Self {
             root: url,
             registry: StorageRegistry::new(),
             catalog,
             ann,
+            result_schema,
         })
     }
 
@@ -205,11 +223,17 @@ impl ResultStore {
             let path = root.path();
             std::fs::create_dir_all(path)?;
         }
+        let result_schema = Arc::new(ResultTableSchemaProvider::new(
+            catalog
+                .tenant_binding()
+                .unwrap_or_else(TenantBinding::unscoped),
+        ));
         Ok(Self {
             root,
             registry,
             catalog,
             ann,
+            result_schema,
         })
     }
 
@@ -218,6 +242,39 @@ impl ResultStore {
     /// (e.g. to resolve a `ResultTableRecord` by name before verifying it).
     pub fn catalog(&self) -> &Arc<Catalog> {
         &self.catalog
+    }
+
+    /// The tenant-gating schema provider this store registers result tables
+    /// into. A caller composing the session installs it as the query context's
+    /// default schema (see [`Self::install_result_schema`]) so bare
+    /// `jammi.{name}` resolutions honour the catalog owner.
+    pub fn result_schema(&self) -> Arc<ResultTableSchemaProvider> {
+        Arc::clone(&self.result_schema)
+    }
+
+    /// Install this store's [`ResultTableSchemaProvider`] as `ctx`'s default
+    /// schema (`datafusion.public`) — the schema bare `jammi.{name}` result
+    /// tables resolve through. Idempotent: re-installing the same provider
+    /// preserves the tables it already holds. Registration
+    /// ([`Self::register_table`]) calls this itself, so a context that only
+    /// ever registers through the store need not call it; a session installs it
+    /// eagerly so the provider is present even before the first table lands.
+    pub fn install_result_schema(&self, ctx: &SessionContext) -> Result<()> {
+        let config = ctx.copied_config();
+        let catalog_opts = &config.options().catalog;
+        let catalog = ctx.catalog(&catalog_opts.default_catalog).ok_or_else(|| {
+            JammiError::Other(format!(
+                "default catalog '{}' is not registered on the session context",
+                catalog_opts.default_catalog
+            ))
+        })?;
+        catalog
+            .register_schema(
+                &catalog_opts.default_schema,
+                Arc::clone(&self.result_schema) as Arc<dyn SchemaProvider>,
+            )
+            .map_err(|e| JammiError::Other(format!("install result-table schema provider: {e}")))?;
+        Ok(())
     }
 
     /// The deployment's ANN sidecar-index tuning — the HNSW knobs plus the
@@ -333,14 +390,30 @@ impl ResultStore {
         Ok(ObjectParquetWriter::open(&handle, schema).await?)
     }
 
-    /// Register an existing Parquet object as a DataFusion table.
+    /// Register an existing result-table Parquet object under the bare
+    /// `jammi.{name}` identifier, gated on its catalog `owner` (the row's
+    /// `tenant_id`, or `None` for a GLOBAL table).
+    ///
+    /// Builds the `ListingTable` provider — replicating the schema inference
+    /// [`SessionContext::register_parquet`] performs so the resolved Arrow
+    /// schema (Utf8View under the Arrow parquet-reader default) matches — then
+    /// inserts it into this store's [`ResultTableSchemaProvider`], ensuring the
+    /// provider is installed as `ctx`'s default schema first. The table
+    /// resolves through the provider's tenant gate on every read lane, so a
+    /// correctly-bound peer that names another tenant's table resolves
+    /// not-found.
     pub async fn register_table(
         &self,
         ctx: &SessionContext,
         name: &str,
         url: &StorageUrl,
+        owner: Option<TenantId>,
     ) -> Result<()> {
-        register_parquet_table(ctx, &self.registry, name, url).await
+        let provider = build_result_table_provider(ctx, &self.registry, url).await?;
+        self.install_result_schema(ctx)?;
+        self.result_schema
+            .add_result_table(format!("jammi.{name}"), provider, owner);
+        Ok(())
     }
 
     /// Finalize a result table behind its materialization contract: the single
@@ -354,13 +427,19 @@ impl ResultStore {
     /// 1. compute the artifact digest over the durable Parquet bytes;
     /// 2. write the `.materialization.json` sidecar (a sibling of the Parquet,
     ///    distinct from the ANN `.manifest.json` index sidecar);
-    /// 3. register the table in DataFusion; and
-    /// 4. flip `building -> ready` **and** persist the catalog summary columns
-    ///    (`definition_hash`, `input_anchors_json`) in one transaction.
+    /// 3. flip `building -> ready` **and** persist the catalog summary columns
+    ///    (`definition_hash`, `input_anchors_json`) in one transaction,
+    ///    returning the row's `tenant_id`; and
+    /// 4. register the table in DataFusion under that catalog owner, so its
+    ///    resolution is tenant-gated by the row's own owner.
     ///
     /// The sidecar is written *before* the status flip — the same boundary the
     /// ANN sidecar uses — so a crash never leaves a `ready` table without a
-    /// manifest. A crash between (1) and (2) leaves a `building` row whose
+    /// manifest. Registration is in-memory session state (not a durability
+    /// boundary), so it follows the flip: a crash between the flip and
+    /// registration leaves a valid `ready` row that the restart's
+    /// [`Self::load_existing_tables`] re-registers. A crash between (1) and (2)
+    /// leaves a `building` row whose
     /// Parquet is valid but whose manifest never landed; recovery reconciles
     /// that to `failed` (the producing descriptor cannot be reconstructed),
     /// never a manifest-less promotion.
@@ -401,11 +480,13 @@ impl ResultStore {
 
         self.write_materialization_sidecar(url, &manifest).await?;
 
-        self.register_table(ctx, name, url).await?;
-
         let anchors_json = serde_json::to_string(&manifest.input_anchors)
             .map_err(|e| JammiError::Other(format!("serialise input anchors: {e}")))?;
-        self.catalog
+        // The flip returns the row's own `tenant_id` (the owner stamped at
+        // `create_table`) so registration gates the table on the catalog owner
+        // by construction, never on whatever scope happens to run finalize.
+        let owner = self
+            .catalog
             .promote_result_table_with_manifest(
                 name,
                 rows,
@@ -413,6 +494,8 @@ impl ResultStore {
                 &anchors_json,
             )
             .await?;
+
+        self.register_table(ctx, name, url, owner).await?;
         Ok(manifest)
     }
 
@@ -731,17 +814,24 @@ impl ResultStore {
     ///
     /// Runs under an admin scope so a restart re-registers `ready` tables for
     /// **every** tenant (a single startup session is unscoped/GLOBAL and would
-    /// otherwise miss tenant-owned tables).
+    /// otherwise miss tenant-owned tables). Each table keeps its own catalog
+    /// owner (`tenant_id`), so admin-scoped bulk loading does not flatten
+    /// ownership: query-time resolution still gates each table on the tenant
+    /// that owns it.
     ///
-    /// All tenants' `ready` tables share one DataFusion context, so raw `sql()`
-    /// over a result table is **not** tenant-isolated — a session can resolve any
-    /// `jammi.{name}` it can name. This is by design: the open-core engine targets
-    /// a **trusted network** and ships no security boundary of its own.
-    /// `tenant_scope` is an *organizational* mechanism (catalog-API access such as
-    /// `get_result_table` is tenant-scoped); access
-    /// control against a hostile principal is the consumer's responsibility — the
-    /// BYO-auth seam / a governing platform — never the engine's. See the guide's
-    /// security posture / threat model for the boundary.
+    /// All tenants' `ready` tables share one DataFusion context, but each
+    /// registers through the [`ResultTableSchemaProvider`] carrying its catalog
+    /// owner, so raw `sql()` over a result table applies the **same
+    /// organizational tenant-scope** as the catalog API (`get_result_table`)
+    /// and the mutable-table lane: a correctly-bound tenant resolves only its
+    /// own and GLOBAL (`tenant_id IS NULL`) result tables over every lane
+    /// (Flight `db.sql` included), and a peer's private table resolves
+    /// not-found. This scopes a correctly-bound tenant's reads; it is an
+    /// organizational mechanism, not a hostile-principal boundary — the
+    /// trusted-network + BYO-auth posture is unchanged. Access control against a
+    /// forged principal remains the consumer's BYO-auth seam / governing
+    /// platform, never the engine's. See the guide's security posture for the
+    /// boundary.
     ///
     /// A `ready` row whose bytes are absent (a torn write that committed `ready`
     /// before the bytes were durable on a power loss) is skipped, not
@@ -751,6 +841,11 @@ impl ResultStore {
     }
 
     async fn load_existing_tables_inner(&self, ctx: &SessionContext) -> Result<()> {
+        // Install the gating provider up-front so it is `ctx`'s default schema
+        // even when there are zero ready tables to register (so a query on a
+        // fresh session resolves not-found through the gate, and source removal
+        // finds the provider to clear).
+        self.install_result_schema(ctx)?;
         let ready = self
             .catalog
             .list_result_tables_by_status(ResultTableStatus::Ready)
@@ -767,10 +862,30 @@ impl ResultStore {
                     continue;
                 }
             };
+            // The row's own `tenant_id` is the table's owner — captured here so
+            // an admin-scoped bulk load registers each table under the tenant
+            // that owns it, never flattened to the loading scope.
+            let owner = match table.tenant_id.as_deref() {
+                Some(s) => match TenantId::from_str(s) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        warn!(
+                            table = table.table_name,
+                            error = %e,
+                            "Result-table tenant_id is not a valid tenant id; skipping"
+                        );
+                        continue;
+                    }
+                },
+                None => None,
+            };
             let handle = self.open_parquet(&url)?;
             let path = handle.data_path()?;
             if handle.exists(&path).await? {
-                if let Err(e) = self.register_table(ctx, &table.table_name, &url).await {
+                if let Err(e) = self
+                    .register_table(ctx, &table.table_name, &url, owner)
+                    .await
+                {
                     warn!(
                         table = table.table_name,
                         error = %e,
@@ -1205,16 +1320,26 @@ pub fn manifest_to_jammi(e: ManifestError) -> JammiError {
     }
 }
 
-/// Register a Parquet URL as a DataFusion table under `jammi.{name}`.
+/// Build the `ListingTable` provider for a result-table Parquet URL, ready to
+/// register under the bare `jammi.{name}` identifier in the
+/// [`ResultTableSchemaProvider`].
 ///
-/// Ensures the underlying object_store driver is registered on the
-/// `RuntimeEnv` so the URL resolves on read.
-pub(crate) async fn register_parquet_table(
+/// Replicates exactly what [`SessionContext::register_parquet`] does — the same
+/// driver registration, `ParquetReadOptions::default()` → listing options
+/// (resolved against the session's config + table options) → schema inference →
+/// `ListingTable` — so the resolved Arrow schema (Utf8View under the parquet
+/// reader default) matches the one the old direct-registration path produced.
+/// Only the final step differs: rather than registering into the context's
+/// default `MemorySchemaProvider` under a re-parsed `TableReference`, the
+/// caller inserts this provider into the tenant-gating schema keyed by the
+/// single bare `jammi.{name}` literal — the same literal the query side reaches
+/// these tables through, which the SQL tokenizer never splits on the embedded
+/// timestamp dot or a sanitized model path's hyphen.
+async fn build_result_table_provider(
     ctx: &SessionContext,
     registry: &StorageRegistry,
-    name: &str,
     url: &StorageUrl,
-) -> Result<()> {
+) -> Result<Arc<dyn TableProvider>> {
     use datafusion::datasource::file_format::options::ParquetReadOptions;
 
     // Make sure the engine's driver for this URL is the same one DataFusion
@@ -1228,20 +1353,15 @@ pub(crate) async fn register_parquet_table(
         ctx.runtime_env().register_object_store(&parsed, driver);
     }
 
-    // Register under a single bare identifier `jammi.{name}` rather than a
-    // string DataFusion would re-parse as a multipart reference. A result
-    // table name embeds a UTC timestamp (`…T…`) and may carry characters
-    // (hyphens from a sanitized local model path) that the SQL tokenizer
-    // either rejects — falling back to a case-preserved bare literal — or
-    // splits on the dot into a lowercased `jammi` schema. That parser-routing
-    // is name-dependent and inconsistent. The query side reaches these tables
-    // through the quoted single identifier `"jammi.{name}"`, which is always a
-    // bare, case-preserved literal; matching that here makes every result
-    // table — embedding and edge alike — register and resolve identically.
-    let table_ref = TableReference::bare(format!("jammi.{name}"));
-    // Validate the URL parses as a ListingTableUrl before handing to DF.
-    let _ = ListingTableUrl::parse(url.as_str())?;
-    ctx.register_parquet(table_ref, url.as_str(), ParquetReadOptions::default())
+    let config = ctx.copied_config();
+    let listing_options =
+        ParquetReadOptions::default().to_listing_options(&config, ctx.copied_table_options());
+    let table_path = ListingTableUrl::parse(url.as_str())?;
+    let resolved_schema = listing_options
+        .infer_schema(&ctx.state(), &table_path)
         .await?;
-    Ok(())
+    let table_config = ListingTableConfig::new(table_path)
+        .with_listing_options(listing_options)
+        .with_schema(resolved_schema);
+    Ok(Arc::new(ListingTable::try_new(table_config)?))
 }

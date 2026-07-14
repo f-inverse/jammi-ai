@@ -5,6 +5,7 @@ use crate::catalog::Catalog;
 use crate::config::StoragePrecision;
 use crate::error::{JammiError, Result};
 use crate::model_task::ModelTask;
+use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
 
 /// Whether a result table is a direct model output or a derivation of another
@@ -335,13 +336,18 @@ impl Catalog {
     /// Like [`Self::update_result_table_status`] this is tenant-scoped outside
     /// an admin scope and PK-only inside one (recovery promotes an orphan it
     /// found cross-tenant). `completed_at` is set because `ready` is terminal.
+    ///
+    /// Returns the promoted row's `tenant_id` (the owner stamped at
+    /// `create_table`, or `None` for a GLOBAL row) so the caller can register
+    /// the table's DataFusion provider under its catalog owner by construction,
+    /// rather than inferring the owner from whatever scope runs finalize.
     pub async fn promote_result_table_with_manifest(
         &self,
         name: &str,
         rows: usize,
         definition_hash: &str,
         input_anchors_json: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<TenantId>> {
         let completed_at = chrono::Utc::now()
             .format("%Y-%m-%dT%H:%M:%S%.3fZ")
             .to_string();
@@ -352,7 +358,8 @@ impl Catalog {
         let admin = TenantBinding::is_admin_scope();
         let tenant = self.current_tenant();
 
-        self.backend()
+        let owner_raw: Option<String> = self
+            .backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.set_tenant(tenant);
@@ -366,7 +373,7 @@ impl Catalog {
                                 SqlValue::TextOwned(completed_at),
                                 SqlValue::TextOwned(definition_hash),
                                 SqlValue::TextOwned(input_anchors_json),
-                                SqlValue::TextOwned(name),
+                                SqlValue::TextOwned(name.clone()),
                             ],
                         )
                         .await?;
@@ -380,17 +387,27 @@ impl Catalog {
                                 SqlValue::TextOwned(completed_at),
                                 SqlValue::TextOwned(definition_hash),
                                 SqlValue::TextOwned(input_anchors_json),
-                                SqlValue::TextOwned(name),
+                                SqlValue::TextOwned(name.clone()),
                                 SqlValue::from(tenant.map(|t| t.to_string())),
                             ],
                         )
                         .await?;
                     }
-                    Ok(())
+                    // Read the row's own owner back inside the same transaction —
+                    // by primary key, so it is exact and scope-independent (the
+                    // row was just promoted, so it exists).
+                    let owner = tx
+                        .query_opt(
+                            "SELECT tenant_id FROM result_tables WHERE table_name = $1",
+                            &[SqlValue::TextOwned(name)],
+                            |row| row.try_get::<String>("tenant_id"),
+                        )
+                        .await?;
+                    Ok(owner.flatten())
                 })
             })
             .await?;
-        Ok(())
+        owner_raw.map(|s| TenantId::from_str(&s)).transpose()
     }
 
     /// Fetch a single result table by name. Tenant-filtered.

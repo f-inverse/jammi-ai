@@ -54,6 +54,22 @@ aarch64 MSRV floor.
   toolchain bump above; the native wheel's aarch64 build no longer needs its
   own override.
 
+### Fixed
+- **Cross-tenant result-table read isolation (`jammi-db`).** Result tables now
+  resolve through a tenant-scoped schema provider
+  (`store::result_schema::ResultTableSchemaProvider`), so a correctly-bound
+  tenant reads only its own and GLOBAL (`tenant_id IS NULL`) result tables over
+  every lane (Flight `db.sql` included), matching the catalog API
+  (`get_result_table`) and the mutable-table lane; a peer's private table
+  resolves not-found and is absent from the schema's table enumeration.
+  Previously a result table registered by bare `jammi.{name}` into the shared
+  context's default schema with no tenant scope — a result Parquet carries no
+  `tenant_id` column for the predicate-injection analyzer to filter on — so a
+  bound tenant naming another tenant's table scanned its full Parquet
+  unfiltered. This completes an organizational tenant-scope mechanism across
+  the last data lane; it is not a hostile-principal boundary (the
+  trusted-network + BYO-auth posture is unchanged).
+
 ## [0.44.0] - 2026-07-12
 
 Candle upgrade 0.9.2 → 0.11.0. A dependency-only bump of the ML substrate

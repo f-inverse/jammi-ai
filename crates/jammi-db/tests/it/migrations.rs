@@ -183,6 +183,7 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "021_materialization_contract",
             "022_definition_hash_index",
             "023_storage_precision",
+            "024_claim_policy",
         ]
     );
 }
@@ -859,4 +860,220 @@ async fn migration_023_adds_storage_precision_and_oversample_columns() {
             "result_tables must have '{expected}' after migration 023; got {columns:?}"
         );
     }
+}
+
+/// Migration 024 adds the claim-policy columns (`priority`, `claimable`) and
+/// the `idx_training_jobs_claim_policy` index to `training_jobs`, on both a
+/// fresh catalog and a catalog migrated up from a pre-024 file — the older
+/// reclaim index (`idx_training_jobs_claim`, migration 016) survives either
+/// way, and a row born under either schema backfills to the same defaults
+/// (`priority = 0`, `claimable = TRUE`).
+#[tokio::test]
+async fn migration_024_adds_claim_policy_columns_and_index() {
+    use jammi_db::catalog::backend::SqlValue;
+    use jammi_db::catalog::model_repo::RegisterModelParams;
+    use jammi_db::catalog::training_repo::CreateTrainingJobParams;
+    use jammi_db::model_task::ModelTask;
+
+    let dir = tempdir().unwrap();
+    let catalog = Catalog::open(dir.path()).await.unwrap();
+    let backend = BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await);
+
+    let table_columns = || {
+        let backend = &backend;
+        async move {
+            backend
+                .transaction(
+                    TxOptions {
+                        read_only: true,
+                        ..Default::default()
+                    },
+                    |tx| {
+                        Box::pin(async move {
+                            tx.query::<_, String>(
+                                "SELECT name FROM pragma_table_info('training_jobs')",
+                                &[],
+                                |row| row.get("name"),
+                            )
+                            .await
+                        })
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let index_exists = |name: &'static str| {
+        let backend = &backend;
+        async move {
+            backend
+                .transaction(
+                    TxOptions {
+                        read_only: true,
+                        ..Default::default()
+                    },
+                    |tx| {
+                        Box::pin(async move {
+                            let rows: Vec<i64> = tx
+                                .query(
+                                    "SELECT 1 AS one FROM sqlite_master \
+                                     WHERE type='index' AND name=$1 AND tbl_name='training_jobs'",
+                                    &[SqlValue::TextOwned(name.into())],
+                                    |row| row.get::<i64>("one"),
+                                )
+                                .await?;
+                            Ok(!rows.is_empty())
+                        })
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let job_claim_policy = |job_id: &'static str| {
+        let backend = &backend;
+        async move {
+            backend
+                .transaction(
+                    TxOptions {
+                        read_only: true,
+                        ..Default::default()
+                    },
+                    |tx| {
+                        Box::pin(async move {
+                            tx.query::<_, (i64, bool)>(
+                                "SELECT priority, claimable FROM training_jobs WHERE job_id = $1",
+                                &[SqlValue::TextOwned(job_id.into())],
+                                |row| Ok((row.get("priority")?, row.get("claimable")?)),
+                            )
+                            .await
+                        })
+                    },
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("job '{job_id}' must exist"))
+        }
+    };
+
+    // --- Fresh catalog: the columns and the new index exist; the older
+    // reclaim index survives alongside the new one. ---
+    let columns = table_columns().await;
+    for expected in ["priority", "claimable"] {
+        assert!(
+            columns.iter().any(|c| c == expected),
+            "training_jobs must have '{expected}' after migration 024; got {columns:?}"
+        );
+    }
+    assert!(
+        index_exists("idx_training_jobs_claim_policy").await,
+        "idx_training_jobs_claim_policy must exist after migration 024"
+    );
+    assert!(
+        index_exists("idx_training_jobs_claim").await,
+        "idx_training_jobs_claim (the reclaim index, migration 016) must survive migration 024"
+    );
+
+    // A freshly enqueued row is born at the defaults.
+    catalog
+        .register_model(RegisterModelParams {
+            model_id: "shape-base",
+            version: 1,
+            model_type: "embedding",
+            backend: "candle",
+            task: ModelTask::TextEmbedding,
+            base_model_id: None,
+            artifact_path: None,
+            config_json: None,
+        })
+        .await
+        .unwrap();
+    catalog
+        .create_training_job(CreateTrainingJobParams {
+            job_id: "fresh",
+            base_model_id: "shape-base::1",
+            training_source: "src.csv",
+            loss_type: "contrastive",
+            hyperparams: "{}",
+            kind: "fine_tune",
+            training_spec: "{}",
+        })
+        .await
+        .unwrap();
+    let (priority, claimable) = job_claim_policy("fresh").await;
+    assert_eq!(priority, 0, "a freshly enqueued job defaults to priority 0");
+    assert!(
+        claimable,
+        "a freshly enqueued job defaults to claimable = TRUE"
+    );
+
+    // --- Pre-024-migrated catalog: roll migration 024 back by hand (drop its
+    // index and columns, remove its ledger entry) to reproduce the schema a
+    // pre-024 catalog file would carry, insert a row under that schema, then
+    // reopen — the runner re-applies 024 on top of the existing row and
+    // backfills it to the same defaults, exactly as a real upgrade would. ---
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute("DROP INDEX idx_training_jobs_claim_policy", &[])
+                    .await?;
+                tx.execute("ALTER TABLE training_jobs DROP COLUMN claimable", &[])
+                    .await?;
+                tx.execute("ALTER TABLE training_jobs DROP COLUMN priority", &[])
+                    .await?;
+                tx.execute(
+                    "DELETE FROM applied_migrations WHERE name = '024_claim_policy'",
+                    &[],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+    catalog
+        .create_training_job(CreateTrainingJobParams {
+            job_id: "pre-024",
+            base_model_id: "shape-base::1",
+            training_source: "src.csv",
+            loss_type: "contrastive",
+            hyperparams: "{}",
+            kind: "fine_tune",
+            training_spec: "{}",
+        })
+        .await
+        .unwrap();
+
+    drop(catalog);
+    let _reopened = Catalog::open(dir.path()).await.unwrap();
+
+    let columns_after = table_columns().await;
+    for expected in ["priority", "claimable"] {
+        assert!(
+            columns_after.iter().any(|c| c == expected),
+            "training_jobs must regain '{expected}' after re-applying migration 024; \
+             got {columns_after:?}"
+        );
+    }
+    assert!(
+        index_exists("idx_training_jobs_claim_policy").await,
+        "idx_training_jobs_claim_policy must exist again after re-applying migration 024"
+    );
+    assert!(
+        index_exists("idx_training_jobs_claim").await,
+        "idx_training_jobs_claim must still exist after re-applying migration 024"
+    );
+
+    let (priority, claimable) = job_claim_policy("pre-024").await;
+    assert_eq!(
+        priority, 0,
+        "a row born before migration 024 backfills to priority 0"
+    );
+    assert!(
+        claimable,
+        "a row born before migration 024 backfills to claimable = TRUE"
+    );
 }

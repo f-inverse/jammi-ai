@@ -438,11 +438,16 @@ impl Catalog {
             .await?)
     }
 
-    /// Atomically claim the oldest queued training job for `worker_id`, leasing
-    /// it for `lease`. On success the row transitions `queued → running`,
-    /// stamps `claimed_by = worker_id`, sets `lease_expires_at = now + lease`,
-    /// and increments `attempts`; the claimed record is returned. `Ok(None)`
-    /// when no job is queued.
+    /// Atomically claim the highest-priority queued training job for
+    /// `worker_id`, leasing it for `lease`. The candidate is the queued,
+    /// claimable row with the greatest `priority`, ties broken by the oldest
+    /// `created_at` — a `claimable = FALSE` row is skipped, not errored, and
+    /// stays invisible to the claim until it is flipped back. With every row
+    /// at the column defaults (`priority = 0`, `claimable = TRUE`) this
+    /// ordering is oldest-first FIFO. On success the row transitions
+    /// `queued → running`, stamps `claimed_by = worker_id`, sets
+    /// `lease_expires_at = now + lease`, and increments `attempts`; the
+    /// claimed record is returned. `Ok(None)` when no job is claimable.
     ///
     /// Deliberately **not** tenant-scoped: a worker serves every tenant's
     /// queue, so this bypasses the `tenant_id` filter the other reads apply.
@@ -470,12 +475,12 @@ impl Catalog {
 
         let candidate = match self.backend().backend_kind() {
             super::backend::BackendKind::Postgres => {
-                "(SELECT job_id FROM training_jobs WHERE status = $3 \
-                  ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED)"
+                "(SELECT job_id FROM training_jobs WHERE status = $3 AND claimable \
+                  ORDER BY priority DESC, created_at LIMIT 1 FOR UPDATE SKIP LOCKED)"
             }
             super::backend::BackendKind::Sqlite => {
-                "(SELECT job_id FROM training_jobs WHERE status = $3 \
-                  ORDER BY created_at LIMIT 1)"
+                "(SELECT job_id FROM training_jobs WHERE status = $3 AND claimable \
+                  ORDER BY priority DESC, created_at LIMIT 1)"
             }
         };
         let sql = format!(

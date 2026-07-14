@@ -743,3 +743,47 @@ ALTER TABLE training_jobs ADD COLUMN claimable BOOLEAN NOT NULL DEFAULT TRUE;
 CREATE INDEX idx_training_jobs_claim_policy
     ON training_jobs(status, claimable, priority DESC, created_at);
 "#;
+
+/// Migration 025 — the ANN index-segment set.
+///
+/// A table's ANN index is a *set* of immutable segments, one row per segment,
+/// rather than the single sidecar bundle the dropped `result_tables.index_path`
+/// column named. Each segment is a self-contained
+/// [`SidecarIndex`](crate::index::sidecar::SidecarIndex) bundle over a disjoint
+/// row subset; the reader merges them. Appending a batch of new rows writes a
+/// new segment and inserts one row here, leaving every existing segment
+/// untouched — the row-set grows without rebuilding the graph.
+///
+/// `segment_id` is a per-table sequence starting at `0` (the first segment a
+/// fresh embedding table writes). The composite primary key
+/// `(table_name, segment_id)` both enforces that a table never has two segments
+/// at the same id — the collision an allocator's read-then-insert must retry
+/// against under concurrent appends — and serves the table-scoped ordered
+/// lookup its leading column covers, so no secondary index is added. The FK to
+/// `result_tables` with `ON DELETE CASCADE` makes a table's segment rows a
+/// dependent part of the table row: deleting the table reaps its segment set in
+/// the same statement, and the file-level sidecar cleanup a caller runs
+/// alongside enumerates this set before the cascade removes it.
+///
+/// `index_path` is the per-segment sidecar-bundle base URL (no extension; the
+/// layout helpers append `.usearch` / `.rowmap` / `.manifest.json` / …).
+/// `row_count` records the segment's own contribution, and `tenant_id` carries
+/// the owning tenant stamped from the appending session (inherited from the
+/// parent table), `NULL` for a GLOBAL table.
+///
+/// The prior single-index era is dropped, not migrated: `result_tables` loses
+/// its `index_path` column in the same migration, so a pre-existing embedding
+/// table's index is rebuilt from its Parquet on next recovery into a segment
+/// set rather than read from the old column.
+pub(super) const MIGRATION_025_INDEX_SEGMENTS: &str = r#"
+CREATE TABLE index_segments (
+    table_name TEXT NOT NULL REFERENCES result_tables(table_name) ON DELETE CASCADE,
+    segment_id INTEGER NOT NULL,
+    index_path TEXT NOT NULL,
+    row_count  INTEGER NOT NULL DEFAULT 0,
+    tenant_id  TEXT,
+    created_at TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT)),
+    PRIMARY KEY (table_name, segment_id)
+);
+ALTER TABLE result_tables DROP COLUMN index_path;
+"#;

@@ -180,7 +180,7 @@ async fn recipe_generate_embeddings() {
     assert!(common::url_to_path(&record.parquet_path).exists());
 
     // Sidecar index files exist
-    let base = common::url_to_path(record.index_path.as_ref().unwrap());
+    let base = common::url_to_path(&common::segment0_index_url(&session, &record.table_name).await);
     assert!(base.with_extension("usearch").exists());
     assert!(base.with_extension("rowmap").exists());
     assert!(base.with_extension("manifest.json").exists());
@@ -1142,7 +1142,7 @@ async fn recipe_generate_image_embeddings() {
     assert!(common::url_to_path(&record.parquet_path).exists());
 
     // Sidecar index files exist
-    let base = common::url_to_path(record.index_path.as_ref().unwrap());
+    let base = common::url_to_path(&common::segment0_index_url(&session, &record.table_name).await);
     assert!(base.with_extension("usearch").exists());
     assert!(base.with_extension("rowmap").exists());
     assert!(base.with_extension("manifest.json").exists());
@@ -1293,7 +1293,7 @@ async fn recipe_generate_audio_embeddings() {
 
     // Sidecar index files exist (the audio path participates in ANN like the
     // text and image paths — it is an embedding task).
-    let base = common::url_to_path(record.index_path.as_ref().unwrap());
+    let base = common::url_to_path(&common::segment0_index_url(&session, &record.table_name).await);
     assert!(base.with_extension("usearch").exists());
     assert!(base.with_extension("rowmap").exists());
     assert!(base.with_extension("manifest.json").exists());

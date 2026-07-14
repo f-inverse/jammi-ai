@@ -567,6 +567,28 @@ impl JammiSession {
     ///
     /// Eval runs are preserved as immutable historical records.
     pub async fn remove_source(&self, source_id: &str) -> Result<()> {
+        // 0. Capture each result table's ANN segment bundle URLs BEFORE the
+        //    catalog delete: `delete_result_tables_for_source` cascades to
+        //    `index_segments`, so the per-segment bundle paths must be read
+        //    while those rows still exist. The enumeration is a superset of the
+        //    delete set (its tenant predicate is wider), so every deleted
+        //    table's segments are covered; extra entries are simply unused.
+        let doomed = self
+            .catalog
+            .find_result_tables(source_id, None, None)
+            .await?;
+        let mut segment_paths: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for t in &doomed {
+            let segs = self.catalog.list_index_segments(&t.table_name).await?;
+            if !segs.is_empty() {
+                segment_paths.insert(
+                    t.table_name.clone(),
+                    segs.into_iter().map(|s| s.index_path).collect(),
+                );
+            }
+        }
+
         // 1. Fetch result tables so we know which files to delete.
         let result_tables = self
             .catalog
@@ -601,11 +623,11 @@ impl JammiSession {
                     tracing::warn!(path = %parquet_url, error = %e, "Failed to delete parquet object");
                 }
             }
-            if let Some(idx) = &rt.index_path {
+            for idx in segment_paths.get(&rt.table_name).into_iter().flatten() {
                 let idx_url = match StorageUrl::parse(idx) {
                     Ok(u) => u,
                     Err(e) => {
-                        tracing::warn!(path = %idx, error = %e, "Invalid index path on result-table row, skipping delete");
+                        tracing::warn!(path = %idx, error = %e, "Invalid segment index path on result-table row, skipping delete");
                         continue;
                     }
                 };

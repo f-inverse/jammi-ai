@@ -631,6 +631,29 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `IncompatibleFormat`, mirroring the `backend_version` strict-compare (no
   reject-newer ordering; a config drift since the table was built must never
   silently reopen the wrong-precision graph).
+- **`SegmentedIndex`** — `crates/jammi-db/src/index/segment.rs` (the
+  `SegmentedIndex` struct): a table's ANN index as a **set of segments**, one
+  immutable `SidecarIndex` per disjoint row subset (catalog table
+  `index_segments`, migration 025 — `result_tables.index_path` is dropped). It
+  does **not** implement `VectorIndex`; it owns the merge across segments and
+  exposes two entry points. `search(query, m)` is the raw candidate primitive:
+  each segment is searched at `over_fetch(m, n)` (`m` for a lone segment,
+  `ceil(m * DEFAULT_SEGMENT_OVERFETCH_FACTOR)` = `2.0×` otherwise), concatenated,
+  ordered `(distance, row_id, segment_id)`, deduped by row id keeping the
+  nearest, truncated to `m`. `search_final(query, k, oversample)` is the **single
+  final-results entry** every consumer routes through — `AnnSearchExec::execute`,
+  `ResultStore::search_vectors`, and the neighbor-graph `IndexAssisted` driver:
+  for an `F32` set it is `search(query, k)` (already exact-comparable), for a
+  quantized/`Binary` set it retrieves `k * oversample` candidates and
+  exact-rescores them via `get_exact` (dispatched to the owning segment) into one
+  cross-segment comparable order. `N = 1` is the same operator at scale 1
+  (byte-identical to a lone `SidecarIndex` on a tie-free corpus). Uniform
+  precision is enforced (a drifted-precision segment fails `SidecarIndex::load`'s
+  strict `scalar_kind` check and never reaches the constructor). `resolve_search_mode`
+  builds it by loading every segment through the content-addressed
+  `SegmentIndexCache` (`crates/jammi-db/src/storage/index_cache.rs`, keyed on the
+  segment manifest bytes); **any** segment load failure falls the whole table
+  back to exact search, never a `SegmentedIndex` over the surviving subset.
 - **`AnnIndexConfig`** — `crates/jammi-db/src/config.rs` (the `AnnIndexConfig`
   struct): `connectivity` (HNSW M, build-time), `build_expansion`
   (ef_construction, build-time), `search_expansion` (ef_search, query-time,
@@ -640,14 +663,18 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   embedding table's catalog row is stamped with (migration 023,
   `result_tables.storage_precision`/`oversample`, both nullable — `NULL` reads
   back as the honest default for a pre-migration row).
-- **Retrieve→rescore** (`AnnSearchExec::execute`,
-  `crates/jammi-ai/src/operator/ann_search_exec.rs`): when the resolved index's
-  `storage_precision().needs_rescore()`, the plan retrieves `k * oversample`
-  candidates from the quantized graph, reads each candidate's exact vector via
-  `SidecarIndex::get_exact`, recomputes cosine distance, and re-sorts
-  (`total_cmp` + `row_id` tie-break) down to `k`. `oversample` resolves
-  per-request (`SearchRequest::oversample`, wire field 8) over the table's
-  config default. An `F32` table skips this — single-stage, as before.
+- **Retrieve→rescore** (`SegmentedIndex::search_final`,
+  `crates/jammi-db/src/index/segment.rs`): the single rescore implementation,
+  folded into the segment merge (there is no free `retrieve_then_rescore` fn).
+  When the resolved index's `storage_precision().needs_rescore()`, it retrieves
+  `k * oversample` merged candidates, reads each candidate's exact vector via
+  `SegmentedIndex::get_exact` (dispatched to the owning segment's `.rawf32`
+  companion), recomputes cosine distance, and re-sorts (`total_cmp` + `row_id`
+  tie-break) down to `k` — a corpus-independent order comparable across every
+  segment. `oversample` resolves via `AnnIndexConfig::resolve_oversample`
+  (per-request `SearchRequest::oversample`, wire field 8, over the table's
+  stamped default, over the deployment default). An `F32` table skips the rescore
+  — the merge is already exact.
   `ProducingDescriptor::NeighborGraph::index_storage_precision`
   (`crates/jammi-db/src/store/manifest.rs`) folds the source table's precision
   into the K7 materialization identity when the index-assisted driver ran

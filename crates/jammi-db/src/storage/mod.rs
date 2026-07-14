@@ -9,12 +9,21 @@
 pub mod builder;
 pub mod config;
 pub mod error;
+pub mod index_cache;
 pub mod object_store_handle;
 pub mod reader;
 pub mod registry;
 pub mod sidecar_layout;
 pub mod url;
 pub mod writer;
+
+/// Lowercase-hex sha256 of a byte slice — the shared content-address primitive
+/// for the model-artifact bundle cache ([`crate::store::artifact`]) and the ANN
+/// segment cache ([`index_cache`]).
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
 
 pub use builder::{build_object_store, DynObjectStore};
 pub use config::{AzureConfig, CloudConfig, GcsConfig, R2Config, S3Config};

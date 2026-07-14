@@ -6,6 +6,23 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+### Added
+- **Segmented ANN index — incremental append without rebuild (`jammi-db` +
+  `jammi-ai`).** A table's ANN index is now a *set* of immutable segments
+  (`SegmentedIndex`), one `SidecarIndex` bundle per disjoint row subset, rather
+  than a single sidecar. Appending a batch of new rows writes a new segment
+  (`{table}__seg{N}.idx`) beside the existing ones and leaves them byte-for-byte
+  untouched, so an index's row-set grows without rebuilding any graph; a search
+  fans across every segment and merges under one total order. All final-results
+  reads route through `SegmentedIndex::search_final`, which owns comparability:
+  an `F32` set's merged cosine order is final, while a quantized/`Binary` set's
+  per-segment approximate candidates are exact-rescored into one cross-segment
+  comparable top-`k`. Catalog table `index_segments` (migration 025) records the
+  set; `result_tables.index_path` is dropped. Remote segments load through a
+  content-addressed local cache (`SegmentIndexCache`) keyed on the segment
+  manifest bytes. Any single segment's load failure falls the whole table back
+  to exact search — never a silently incomplete index.
+
 ## [0.45.0] - 2026-07-13
 
 The precision-moat base wave: asymmetric binary quantization. Transformer

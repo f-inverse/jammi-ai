@@ -49,7 +49,6 @@ use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
-use jammi_db::index::VectorIndex;
 use jammi_db::model_task::ModelTask;
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{ResultStore, ResultTableInfo};
@@ -349,12 +348,17 @@ async fn building_with_valid_parquet_promotes_with_true_count(kind: BackendKind)
     // landed, recovery promotes it with the footer's true count.
     write_closed_embedding_parquet(&store, &info, 7).await;
     jammi_test_utils::write_manifest_sidecar_for(&store, &info.parquet_url, "src1", DIMS).await;
-    if let Some(ref idx_url) = info.index_url {
-        let idx_handle = store.open_index(idx_url).unwrap();
-        // Prove the sidecar is genuinely absent before recovery.
-        let sidecar = idx_handle.sibling_path("usearch").unwrap();
-        assert!(!idx_handle.exists(&sidecar).await.unwrap());
-    }
+    // Prove the ANN index is genuinely absent before recovery: the building
+    // table has no segments yet (none were ever appended).
+    assert!(
+        store
+            .catalog()
+            .list_index_segments(&info.table_name)
+            .await
+            .unwrap()
+            .is_empty(),
+        "no index segments exist before recovery"
+    );
 
     store.recover().await.unwrap();
 
@@ -366,6 +370,18 @@ async fn building_with_valid_parquet_promotes_with_true_count(kind: BackendKind)
 
     // I6: the sidecar self-heals — resolve_search_mode returns a working index
     // rebuilt from the Parquet even though no sidecar was on disk pre-recovery.
+    // Recovery rebuilds the whole table as a single fresh segment (segment 0).
+    let segs = store
+        .catalog()
+        .list_index_segments(&info.table_name)
+        .await
+        .unwrap();
+    assert_eq!(
+        segs.len(),
+        1,
+        "I6: recovery rebuilds the index as one segment"
+    );
+    assert_eq!(segs[0].segment_id, 0);
     let index = store
         .resolve_search_mode(&rec)
         .await

@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use arrow::array::{Array, FixedSizeListArray, Float32Array, StringArray};
 use arrow::datatypes::DataType;
-use jammi_db::config::StoragePrecision;
-use jammi_db::index::VectorIndex;
+use jammi_db::config::{AnnIndexConfig, StoragePrecision};
+use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_numerics::distance::cosine_distance;
 use tempfile::TempDir;
@@ -23,6 +23,27 @@ use crate::common;
 
 fn tiny_bert_model() -> String {
     "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
+}
+
+/// The single ANN segment's bundle base URL for a freshly-embedded table: one
+/// embed pass writes exactly one segment (`segment 0`), so these single-segment
+/// fixtures resolve their on-disk sidecar through it. Panics if the table does
+/// not have exactly one segment, keeping the fixtures honest.
+async fn segment0_index_url(
+    session: &jammi_ai::session::InferenceSession,
+    table_name: &str,
+) -> String {
+    let segs = session
+        .catalog()
+        .list_index_segments(table_name)
+        .await
+        .unwrap();
+    assert_eq!(
+        segs.len(),
+        1,
+        "a single embed pass writes exactly one segment"
+    );
+    segs[0].index_path.clone()
 }
 
 /// A session config rooted at `dir` with the embedding ANN sidecar built at
@@ -192,11 +213,8 @@ async fn f32_table_writes_no_rescore_companion() {
         .unwrap();
     assert_eq!(table.storage_precision, Some(StoragePrecision::F32));
 
-    let index_path = table
-        .index_path
-        .as_ref()
-        .expect("an embedding table always carries an index_path");
-    let base = jammi_test_utils::url_to_path(index_path);
+    let seg_url = segment0_index_url(&session, &table.table_name).await;
+    let base = jammi_test_utils::url_to_path(&seg_url);
     assert!(
         !base.with_extension("rawf32").exists(),
         "an F32-precision index must never write a rescore companion"
@@ -221,8 +239,8 @@ async fn stale_manifest_precision_falls_back_to_exact_search_not_a_crash() {
         .await
         .unwrap();
     let ground_truth = read_ground_truth(&session, &table.table_name).await;
-    let index_path = table.index_path.as_ref().unwrap();
-    let base = jammi_test_utils::url_to_path(index_path);
+    let seg_url = segment0_index_url(&session, &table.table_name).await;
+    let base = jammi_test_utils::url_to_path(&seg_url);
     let manifest_path = base.with_extension("manifest.json");
 
     let mut manifest: serde_json::Value =
@@ -269,20 +287,19 @@ async fn int8_index_writes_companion_and_get_exact_recovers_ground_truth() {
         .resolve_embedding_table("patents", None)
         .await
         .unwrap();
-    let index_path = table.index_path.as_ref().unwrap();
-    let base = jammi_test_utils::url_to_path(index_path);
+    let seg_url = segment0_index_url(&session, &table.table_name).await;
+    let base = jammi_test_utils::url_to_path(&seg_url);
     assert!(
         base.with_extension("rawf32").exists(),
         "an Int8-precision index must write the rescore companion"
     );
 
     let ground_truth = read_ground_truth(&session, &table.table_name).await;
-    let index = session
-        .result_store()
-        .resolve_search_mode(&table)
-        .await
-        .unwrap()
-        .expect("the Int8 sidecar index must load");
+    // Load the segment's own `SidecarIndex` directly: `get` (USearch's lossy
+    // reconstruction) vs `get_exact` (the companion) is a per-segment property,
+    // not part of the merged `SegmentedIndex` surface.
+    let index = SidecarIndex::load(&base, &AnnIndexConfig::default(), StoragePrecision::Int8)
+        .expect("the Int8 sidecar segment must load");
     assert_eq!(index.storage_precision(), StoragePrecision::Int8);
 
     let mut saw_quantization_loss = false;

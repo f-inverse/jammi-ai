@@ -153,7 +153,6 @@ pub fn result_table_from_proto(table: pb::ResultTable) -> Result<ResultTableReco
         kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
         derived_from: None,
         parquet_path: String::new(),
-        index_path: None,
         dimensions: (table.dimensions != 0).then_some(table.dimensions),
         distance_metric: String::new(),
         row_count: table.row_count as usize,

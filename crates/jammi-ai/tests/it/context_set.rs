@@ -262,7 +262,9 @@ async fn materialize_context_writes_a_searchable_embedding_table() {
     assert_eq!(table.row_count, 3);
     assert_eq!(table.dimensions, Some(32));
     assert!(
-        table.index_path.is_some(),
+        !common::segment_index_urls(&session, &table.table_name)
+            .await
+            .is_empty(),
         "a materialised context table gets the embedding-table sidecar index"
     );
 

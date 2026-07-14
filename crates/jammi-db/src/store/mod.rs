@@ -33,11 +33,13 @@ use tracing::warn;
 use crate::catalog::result_repo::{CreateResultTableParams, ResultTableKind, ResultTableRecord};
 use crate::catalog::status::ResultTableStatus;
 use crate::catalog::Catalog;
-use crate::config::{AnnIndexConfig, StoragePrecision};
+use crate::config::AnnIndexConfig;
 use crate::error::{JammiError, Result};
+use crate::index::segment::{SegmentId, SegmentedIndex};
 use crate::index::sidecar::SidecarIndex;
 use crate::index::VectorIndex;
 use crate::model_task::ModelTask;
+use crate::storage::index_cache::SegmentIndexCache;
 use crate::storage::sidecar_layout::SidecarKind;
 use crate::storage::{
     self, JammiObjectStore, ObjectParquetWriter, Scheme, StorageRegistry, StorageUrl,
@@ -122,6 +124,11 @@ pub struct ComputedEmbeddingProvenance {
 
 /// Returned by [`ResultStore::create_table`] — the generated paths and name
 /// for a new result table, before any data has been written.
+///
+/// No index URL is generated here: a table's ANN index is a *set* of segments
+/// (migration 025), each with its own bundle URL derived when the segment is
+/// written through [`ResultStore::append_segment`], not a single sidecar named
+/// at table creation.
 #[derive(Debug)]
 pub struct ResultTableInfo {
     /// Unique table identifier (schema-qualified by the engine when registering
@@ -129,10 +136,6 @@ pub struct ResultTableInfo {
     pub table_name: String,
     /// Storage URL for the Parquet object — open via [`ResultStore::open_parquet`].
     pub parquet_url: StorageUrl,
-    /// Storage URL for the sidecar-index *base* (no extension; the layout
-    /// helpers append `.usearch`/`.rowmap`/`.manifest.json`). `None` for
-    /// non-embedding tables.
-    pub index_url: Option<StorageUrl>,
 }
 
 /// Coordinates Parquet storage, ANN indexes, DataFusion registration,
@@ -156,6 +159,11 @@ pub struct ResultStore {
     /// [`TenantBinding`], so the read gate matches the catalog API's own
     /// `(tenant_id = $current OR tenant_id IS NULL)` + admin-scope bypass.
     result_schema: Arc<ResultTableSchemaProvider>,
+    /// The content-addressed local cache every ANN index segment is loaded
+    /// through. Materialises a remote segment bundle into a local directory
+    /// USearch can open, once per immutable segment; a `file://` bundle loads
+    /// in place. Shares the store's [`StorageRegistry`].
+    segment_cache: SegmentIndexCache,
 }
 
 /// Sanitize a model ID for use in file names.
@@ -197,12 +205,16 @@ impl ResultStore {
                 .tenant_binding()
                 .unwrap_or_else(TenantBinding::unscoped),
         ));
+        let registry = StorageRegistry::new();
+        let segment_cache =
+            SegmentIndexCache::new(registry.clone(), jammi_db_dir.join("index_cache"))?;
         Ok(Self {
             root: url,
-            registry: StorageRegistry::new(),
+            registry,
             catalog,
             ann,
             result_schema,
+            segment_cache,
         })
     }
 
@@ -210,11 +222,17 @@ impl ResultStore {
     /// the path on `cloud://` schemes a deployment uses for shared
     /// result-table storage. The registry is shared with the engine
     /// session so callers register cloud credentials once.
+    ///
+    /// `cache_root` is the **local** directory the ANN segment cache
+    /// materialises remote segment bundles under (a `file://` root loads its
+    /// segments in place, so it is unused there) — a local path even when
+    /// `root` is a cloud scheme, since USearch reads from the local filesystem.
     pub fn with_root(
         root: StorageUrl,
         registry: StorageRegistry,
         catalog: Arc<Catalog>,
         ann: AnnIndexConfig,
+        cache_root: std::path::PathBuf,
     ) -> Result<Self> {
         if root.scheme() == Scheme::File {
             // Ensure the directory exists so create_table doesn't fail on
@@ -228,12 +246,14 @@ impl ResultStore {
                 .tenant_binding()
                 .unwrap_or_else(TenantBinding::unscoped),
         ));
+        let segment_cache = SegmentIndexCache::new(registry.clone(), cache_root)?;
         Ok(Self {
             root,
             registry,
             catalog,
             ann,
             result_schema,
+            segment_cache,
         })
     }
 
@@ -307,8 +327,9 @@ impl ResultStore {
     /// `kind` discriminates a direct model output from a derivation of another
     /// result table (e.g. a neighbor-graph edge relation); `derived_from` names
     /// the source result table a derivation was computed from (`None` for a
-    /// `Model` table). A non-`Model` table gets `index_url = None` — no sidecar
-    /// index is built for it — regardless of its `task`.
+    /// `Model` table). No ANN index is created here for any `kind`: an embedding
+    /// table's index materialises lazily as segments through
+    /// [`Self::append_segment`], and a derived table carries none at all.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_table(
         &self,
@@ -331,17 +352,6 @@ impl ResultStore {
         let table_name = format!("{source_id}__{task_str}__{sanitized}__{timestamp}_{suffix}");
 
         let parquet_url = self.derive_url(&format!("{table_name}.parquet"))?;
-        // A sidecar index exists only for a model embedding table. A derived
-        // table (a neighbor-graph edge relation) is searched as a plain
-        // relation, never through an ANN sidecar — it maps to
-        // `SidecarKind::None` at the storage layer.
-        let index_url = if matches!(kind, ResultTableKind::Model) && task.is_embedding() {
-            // Index base path has no extension — the sidecar layout helpers
-            // append .usearch / .rowmap / .manifest.json.
-            Some(self.derive_url(&format!("{table_name}.idx"))?)
-        } else {
-            None
-        };
 
         self.catalog
             .create_result_table(CreateResultTableParams {
@@ -352,7 +362,6 @@ impl ResultStore {
                 kind,
                 derived_from,
                 parquet_path: parquet_url.as_str(),
-                index_path: index_url.as_ref().map(|u| u.as_str()),
                 dimensions,
                 key_column,
                 text_columns,
@@ -376,7 +385,6 @@ impl ResultStore {
         Ok(ResultTableInfo {
             table_name,
             parquet_url,
-            index_url,
         })
     }
 
@@ -684,13 +692,7 @@ impl ResultStore {
                     "Recovery: invalid Parquet, deleting and marking failed"
                 );
                 parquet_handle.delete_if_exists(&parquet_path).await.ok();
-                if let Some(ref idx) = table.index_path {
-                    let idx_url = StorageUrl::parse(idx)?;
-                    let idx_handle = self.open_index(&idx_url)?;
-                    storage::sidecar_layout::delete_sidecar(&idx_handle, SidecarKind::Ann)
-                        .await
-                        .ok();
-                }
+                self.purge_segments(&table.table_name).await.ok();
                 self.catalog
                     .update_result_table_status(&table.table_name, ResultTableStatus::Failed, 0)
                     .await?;
@@ -699,25 +701,19 @@ impl ResultStore {
                 // its summary columns can be backfilled as part of the same
                 // promotion the live path performs.
                 let row_count = storage::reader::count_parquet_rows(&parquet_handle).await?;
-                // Rebuild ANN index if this is an embedding table
+                // Rebuild the ANN index as a fresh single segment if this is an
+                // embedding table (self-healing even if its segment set never
+                // landed, or landed torn).
                 if table.task.is_embedding() {
-                    if let Some(ref idx_path) = table.index_path {
-                        let idx_url = StorageUrl::parse(idx_path)?;
-                        if let Err(e) = self
-                            .rebuild_index_from_parquet(
-                                &parquet_handle,
-                                &idx_url,
-                                table.dimensions.unwrap_or(0) as usize,
-                                table.storage_precision.unwrap_or_default(),
-                            )
-                            .await
-                        {
-                            warn!(
-                                table = table.table_name,
-                                error = %e,
-                                "Recovery: failed to rebuild index, proceeding without"
-                            );
-                        }
+                    if let Err(e) = self
+                        .rebuild_index_from_parquet(&parquet_handle, &table)
+                        .await
+                    {
+                        warn!(
+                            table = table.table_name,
+                            error = %e,
+                            "Recovery: failed to rebuild index, proceeding without"
+                        );
                     }
                 }
                 let anchors_json = serde_json::to_string(&manifest.input_anchors)
@@ -743,13 +739,7 @@ impl ResultStore {
                      (torn write before manifest); deleting and marking failed"
                 );
                 parquet_handle.delete_if_exists(&parquet_path).await.ok();
-                if let Some(ref idx) = table.index_path {
-                    let idx_url = StorageUrl::parse(idx)?;
-                    let idx_handle = self.open_index(&idx_url)?;
-                    storage::sidecar_layout::delete_sidecar(&idx_handle, SidecarKind::Ann)
-                        .await
-                        .ok();
-                }
+                self.purge_segments(&table.table_name).await.ok();
                 self.catalog
                     .update_result_table_status(&table.table_name, ResultTableStatus::Failed, 0)
                     .await?;
@@ -796,13 +786,7 @@ impl ResultStore {
             );
             let data_path = handle.data_path()?;
             handle.delete_if_exists(&data_path).await.ok();
-            if let Some(ref idx) = table.index_path {
-                let idx_url = StorageUrl::parse(idx)?;
-                let idx_handle = self.open_index(&idx_url)?;
-                storage::sidecar_layout::delete_sidecar(&idx_handle, SidecarKind::Ann)
-                    .await
-                    .ok();
-            }
+            self.purge_segments(&table.table_name).await.ok();
             self.catalog
                 .update_result_table_status(&table.table_name, ResultTableStatus::Failed, 0)
                 .await?;
@@ -898,7 +882,14 @@ impl ResultStore {
     }
 
     /// Search an embedding table for the nearest neighbors of a query vector.
-    /// Uses SidecarIndex (ANN) when available, falls back to exact brute-force search.
+    /// Uses the segmented ANN index when available, falls back to exact
+    /// brute-force search over the whole Parquet otherwise.
+    ///
+    /// Routes through [`SegmentedIndex::search_final`], so a multi-segment
+    /// quantized / `Binary` table returns the exact-rescored, cross-segment
+    /// comparable top-`k` — never raw per-segment candidate distances. The
+    /// oversample is the table's own stamped default (no per-request override
+    /// on this lane).
     pub async fn search_vectors(
         &self,
         ctx: &SessionContext,
@@ -906,67 +897,160 @@ impl ResultStore {
         query: &[f32],
         k: usize,
     ) -> Result<Vec<(String, f32)>> {
-        let index = self.resolve_search_mode(table).await?;
-        match index {
-            Some(idx) => idx.search(query, k),
+        match self.resolve_search_mode(table).await? {
+            Some(index) => {
+                let oversample = self.ann.resolve_oversample(None, table.oversample);
+                index.search_final(query, k, oversample)
+            }
             None => {
                 crate::index::exact::exact_vector_search(ctx, &table.table_name, query, k).await
             }
         }
     }
 
-    /// Resolve whether to use ANN (sidecar index) or exact search for a table.
-    /// Returns `Some(SidecarIndex)` for ANN, `None` for exact fallback.
+    /// Resolve whether a table's ANN index (its whole segment set) can serve a
+    /// search, or whether the caller must fall back to exact brute-force.
+    /// Returns `Some(SegmentedIndex)` merging every segment, `None` for exact
+    /// fallback.
+    ///
+    /// A table with no segments resolves to `None`. If *any* segment fails to
+    /// load — a torn bundle, or a drifted-precision segment failing
+    /// [`SidecarIndex::load`]'s strict `scalar_kind` check — the whole table
+    /// falls back to exact (`None`), never a `SegmentedIndex` over the surviving
+    /// subset: dropping a failed segment would silently make its rows
+    /// unsearchable, surfacing "no matches" for rows that exist. Each segment is
+    /// loaded through the content-addressed segment cache; the catalog row's own
+    /// persisted precision — never the deployment default — is what each load
+    /// verifies against.
     pub async fn resolve_search_mode(
         &self,
         table: &ResultTableRecord,
-    ) -> Result<Option<SidecarIndex>> {
-        let Some(ref idx_path) = table.index_path else {
+    ) -> Result<Option<SegmentedIndex>> {
+        let segments = self.catalog.list_index_segments(&table.table_name).await?;
+        if segments.is_empty() {
             return Ok(None);
-        };
-        let idx_url = StorageUrl::parse(idx_path)?;
-        let handle = self.open_index(&idx_url)?;
-        // The catalog row's own persisted precision — never today's deployment
-        // default — is what a load must verify against; see
-        // `SidecarIndex::load`'s strict scalar_kind check.
+        }
         let expected_precision = table.storage_precision.unwrap_or_default();
-        match storage::sidecar_layout::load_sidecar(&handle, &self.ann, expected_precision).await {
-            Ok(index) => Ok(Some(index)),
-            Err(e) => {
-                warn!(
-                    table = table.table_name,
-                    error = %e,
-                    "Sidecar index unavailable, falling back to exact search"
-                );
-                Ok(None)
+        let mut loaded = Vec::with_capacity(segments.len());
+        for seg in segments {
+            let url = StorageUrl::parse(&seg.index_path)?;
+            match self
+                .segment_cache
+                .load_segment(&url, &self.ann, expected_precision)
+                .await
+            {
+                Ok(index) => loaded.push((SegmentId(seg.segment_id), index)),
+                Err(e) => {
+                    warn!(
+                        table = table.table_name,
+                        segment = seg.segment_id,
+                        error = %e,
+                        "Segment index unavailable, falling back to whole-table exact search"
+                    );
+                    return Ok(None);
+                }
             }
+        }
+        Ok(Some(SegmentedIndex::new(loaded)?))
+    }
+
+    /// Persist a fully-built [`SidecarIndex`] as a NEW immutable segment of
+    /// `table`'s ANN index and register it, returning the allocated
+    /// [`SegmentId`]. Existing segments are untouched — the index's row-set
+    /// grows without any graph rebuild.
+    ///
+    /// The id is allocated by reading the current maximum and inserting at
+    /// `max + 1` (or `0` for the first segment), retrying on the
+    /// `(table_name, segment_id)` primary-key collision a concurrent appender
+    /// racing to the same next id would cause — the segment bundle's URL
+    /// (`{table}__seg{N}.idx`) embeds the id, so allocation and URL derivation
+    /// share this loop rather than a single non-atomic `INSERT … SELECT MAX+1`.
+    /// The catalog row is inserted first (reserving the id) and the bundle saved
+    /// second, so a save failure leaves a segment row whose bundle is absent —
+    /// [`Self::resolve_search_mode`] then falls the whole table back to exact,
+    /// and recovery rebuilds the set — never a silently missing row.
+    ///
+    /// The index's own precision **must** equal `table`'s persisted
+    /// `storage_precision`: a segment built at the deployment default after that
+    /// default drifted from the table's promise would be caught only at load
+    /// time as a hard failure, so it is rejected here instead. The segment
+    /// inherits the table's owning tenant.
+    pub async fn append_segment(
+        &self,
+        table: &ResultTableRecord,
+        index: &SidecarIndex,
+    ) -> Result<SegmentId> {
+        let precision = table.storage_precision.unwrap_or_default();
+        if index.storage_precision() != precision {
+            return Err(JammiError::Other(format!(
+                "append_segment: index built at {:?} but table '{}' is persisted at {:?} — \
+                 a segment must match its table's precision",
+                index.storage_precision(),
+                table.table_name,
+                precision
+            )));
+        }
+        let tenant = table
+            .tenant_id
+            .as_deref()
+            .map(TenantId::from_str)
+            .transpose()
+            .map_err(|e| JammiError::Other(format!("append_segment: invalid tenant_id: {e}")))?;
+        let row_count = index.len();
+
+        loop {
+            let next = self
+                .catalog
+                .max_index_segment_id(&table.table_name)
+                .await?
+                .map_or(0, |m| m + 1);
+            let seg_url = self.derive_url(&format!("{}__seg{next}.idx", table.table_name))?;
+            if self
+                .catalog
+                .insert_index_segment(&table.table_name, tenant, next, seg_url.as_str(), row_count)
+                .await?
+            {
+                self.save_sidecar(&seg_url, index).await?;
+                return Ok(SegmentId(next));
+            }
+            // Lost the race for `next` (another appender inserted it first);
+            // re-read the max and retry at the new next id.
         }
     }
 
-    /// Persist a fully-built sidecar index next to the table's parquet object.
+    /// Persist a fully-built sidecar index bundle at `url` (its base, no
+    /// extension). The write half every segment save routes through.
     pub async fn save_sidecar(&self, url: &StorageUrl, index: &SidecarIndex) -> Result<()> {
         let handle = self.open_index(url)?;
         storage::sidecar_layout::save_sidecar(&handle, index).await
     }
 
-    /// Best-effort delete of a result-table's parquet object + sidecar bundle.
-    /// 404 is not an error — callers (e.g. `remove_source`) are paving over
-    /// already-cleaned state.
-    pub async fn delete_table_files(
-        &self,
-        parquet_path: &str,
-        index_path: Option<&str>,
-    ) -> Result<()> {
-        let parquet_url = StorageUrl::parse(parquet_path)?;
+    /// Best-effort delete of every segment bundle in a table's ANN index set
+    /// **and** the segment catalog rows. 404 is not an error — the caller may be
+    /// paving over already-cleaned state. Enumerates the set from the catalog,
+    /// so it must run *before* the `result_tables` row is deleted (the
+    /// `ON DELETE CASCADE` on `index_segments` would otherwise reap the rows
+    /// first and hide the bundle URLs).
+    async fn purge_segments(&self, table_name: &str) -> Result<()> {
+        for seg in self.catalog.list_index_segments(table_name).await? {
+            let url = StorageUrl::parse(&seg.index_path)?;
+            let handle = self.open_index(&url)?;
+            storage::sidecar_layout::delete_sidecar(&handle, SidecarKind::Ann).await?;
+        }
+        self.catalog.delete_index_segments(table_name).await?;
+        Ok(())
+    }
+
+    /// Best-effort delete of a result-table's parquet object + its whole ANN
+    /// segment set (bundles and catalog rows). 404 is not an error. Enumerates
+    /// the segment set from the catalog, so it must run *before* the table's
+    /// `result_tables` row is removed.
+    pub async fn delete_table_files(&self, table: &ResultTableRecord) -> Result<()> {
+        let parquet_url = StorageUrl::parse(&table.parquet_path)?;
         let parquet_handle = self.open_parquet(&parquet_url)?;
         let path = parquet_handle.data_path()?;
         parquet_handle.delete_if_exists(&path).await?;
-
-        if let Some(idx) = index_path {
-            let idx_url = StorageUrl::parse(idx)?;
-            let idx_handle = self.open_index(&idx_url)?;
-            storage::sidecar_layout::delete_sidecar(&idx_handle, SidecarKind::Ann).await?;
-        }
+        self.purge_segments(&table.table_name).await?;
         Ok(())
     }
 
@@ -981,27 +1065,32 @@ impl ResultStore {
         Ok(StorageUrl::parse(&joined)?)
     }
 
-    /// Rebuild an ANN sidecar index from a Parquet object backed by an
-    /// arbitrary `object_store` scheme. Used by the recovery path.
+    /// Rebuild a table's whole ANN index from its Parquet as a single fresh
+    /// segment. Used by the recovery path: it discards any stale segment set the
+    /// crashed attempt left (bundles and catalog rows) and writes one
+    /// authoritative segment `0` over every Parquet row, so a recovered table's
+    /// index exactly covers its data regardless of how many segments the
+    /// interrupted write had produced.
     ///
-    /// `precision` must be the table's own persisted
-    /// `ResultTableRecord::storage_precision` — **never** today's
-    /// `self.ann.storage_precision` deployment default. A crash-recovery
-    /// rebuild runs against whatever the *existing* row already promises; a
-    /// rebuild at a different precision than that row's manifest previously
-    /// recorded would silently corrupt recall (a graph a caller believes is
-    /// `Int8` reopened as `F32`, or vice versa).
+    /// The precision is the table's own persisted
+    /// `ResultTableRecord::storage_precision` — **never** today's deployment
+    /// default (threaded through [`Self::append_segment`]'s B4 guard). A rebuild
+    /// at a different precision than the row promises would silently corrupt
+    /// recall (a graph a caller believes is `Int8` reopened as `F32`).
     async fn rebuild_index_from_parquet(
         &self,
         parquet_handle: &JammiObjectStore,
-        index_url: &StorageUrl,
-        dimensions: usize,
-        precision: StoragePrecision,
+        table: &ResultTableRecord,
     ) -> Result<()> {
+        let dimensions = table.dimensions.unwrap_or(0) as usize;
         if dimensions == 0 {
             return Ok(());
         }
 
+        // Replace any stale segment set from the interrupted attempt.
+        self.purge_segments(&table.table_name).await?;
+
+        let precision = table.storage_precision.unwrap_or_default();
         let batches = storage::reader::read_all_record_batches(parquet_handle).await?;
         let mut index = SidecarIndex::new(dimensions, &self.ann, precision)?;
         for batch in batches {
@@ -1029,7 +1118,7 @@ impl ResultStore {
 
         if index.len() > 0 {
             index.build()?;
-            self.save_sidecar(index_url, &index).await?;
+            self.append_segment(table, &index).await?;
         }
         Ok(())
     }
@@ -1085,14 +1174,28 @@ impl ResultStore {
             )
             .await?;
 
+        // The building row now carries this table's persisted precision; the
+        // segment is built at THAT precision (B4), read back off the row rather
+        // than re-derived from `self.ann` — for a fresh table the two agree, but
+        // reading the row is the uniform, drift-proof source `append_segment`'s
+        // own guard checks against.
+        let record = self
+            .catalog
+            .get_result_table(&table_info.table_name)
+            .await?
+            .ok_or_else(|| {
+                JammiError::Catalog(format!(
+                    "Result table '{}' not found after creation",
+                    table_info.table_name
+                ))
+            })?;
+        let precision = record.storage_precision.unwrap_or_default();
+
         let schema = crate::store::schema::embedding_table_schema(dimensions);
         let batch = embedding_batch(&schema, source_id, model_id, rows, dimensions)?;
 
         let mut writer = self.open_writer(&table_info.parquet_url, schema).await?;
-        // Fresh creation (the row was just stamped with today's deployment
-        // default in `create_table` above), so the same default applies here —
-        // unlike a rebuild, there is no pre-existing catalog promise to honour.
-        let mut index = SidecarIndex::new(dimensions, &self.ann, self.ann.storage_precision)?;
+        let mut index = SidecarIndex::new(dimensions, &self.ann, precision)?;
         if !rows.is_empty() {
             writer.write_batch(&batch).await?;
             for (key, vector) in rows {
@@ -1103,9 +1206,7 @@ impl ResultStore {
 
         if index.len() > 0 {
             index.build()?;
-            if let Some(ref index_url) = table_info.index_url {
-                self.save_sidecar(index_url, &index).await?;
-            }
+            self.append_segment(&record, &index).await?;
         }
 
         self.finalize_with_manifest(

@@ -160,12 +160,17 @@ use std::sync::Arc;
 let root = StorageUrl::parse("s3://benchmarks/jammi_db")?;
 let registry = StorageRegistry::new();
 // `AnnIndexConfig` tunes the HNSW sidecar index every embedding table carries;
-// the default reproduces the index backend's built-in defaults.
+// the default reproduces the index backend's built-in defaults. The last
+// argument is the LOCAL cache directory each remote ANN segment is materialised
+// into before USearch opens it (a `file://` root loads its segments in place,
+// so it is unused there).
+let cache_root = std::path::PathBuf::from("/var/lib/jammi/index_cache");
 let result_store = Arc::new(ResultStore::with_root(
     root,
     registry,
     catalog,
     AnnIndexConfig::default(),
+    cache_root,
 )?);
 # Ok(()) }
 ```
@@ -227,13 +232,15 @@ GCS reads `GOOGLE_APPLICATION_CREDENTIALS` (or Workload Identity); Azure reads t
 
 ## How the layout maps onto buckets
 
-For a result table named `papers__text_embedding__bge-m3__20260520T120000Z_abc12345`, the engine writes three siblings:
+For a result table named `papers__text_embedding__bge-m3__20260520T120000Z_abc12345`, the engine writes the Parquet plus one ANN **segment** bundle per index segment. A table built in a single embedding pass has one segment, `seg0`:
 
 ```text
 s3://benchmarks/jammi_db/papers__text_embedding__bge-m3__….parquet
-s3://benchmarks/jammi_db/papers__text_embedding__bge-m3__….idx.usearch
-s3://benchmarks/jammi_db/papers__text_embedding__bge-m3__….idx.rowmap
-s3://benchmarks/jammi_db/papers__text_embedding__bge-m3__….idx.manifest.json
+s3://benchmarks/jammi_db/papers__text_embedding__bge-m3__…__seg0.usearch
+s3://benchmarks/jammi_db/papers__text_embedding__bge-m3__…__seg0.rowmap
+s3://benchmarks/jammi_db/papers__text_embedding__bge-m3__…__seg0.manifest.json
 ```
 
-The sidecar layout is the same on every backend; the only difference is the driver under the hood. USearch's path-based FFI is bridged through a tempfile for cloud schemes so its `save` / `load` calls work unchanged.
+A table's ANN index is a *set* of segments: appending a batch of new rows writes a new bundle (`…__seg1.*`, `…__seg2.*`, …) beside the existing ones and leaves them untouched, and a search merges every segment. A quantized-precision segment adds a `…__seg{N}.rawf32` rescore companion; a `Binary` one adds a `…__seg{N}.threshold` companion too.
+
+The segment layout is the same on every backend; the only difference is the driver under the hood. USearch's path-based FFI is bridged through a tempfile for cloud schemes so its `save` / `load` calls work unchanged, and each remote segment is materialised once into a content-addressed local cache before it is opened.

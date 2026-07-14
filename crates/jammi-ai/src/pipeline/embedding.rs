@@ -196,11 +196,22 @@ impl<'a> EmbeddingPipeline<'a> {
 
         let (row_count, index) = sink.finalize().await?;
 
-        // Save sidecar index
+        // Persist the built index as this table's first ANN segment (segment 0).
+        // The `building` catalog row carries the table's persisted precision,
+        // which `append_segment` checks the built index against (B4).
         if let Some(ref idx) = index {
-            if let Some(ref idx_url) = table_info.index_url {
-                self.result_store.save_sidecar(idx_url, idx).await?;
-            }
+            let building = self
+                .session
+                .catalog()
+                .get_result_table(&table_info.table_name)
+                .await?
+                .ok_or_else(|| {
+                    JammiError::Catalog(format!(
+                        "Result table '{}' not found while persisting its index segment",
+                        table_info.table_name
+                    ))
+                })?;
+            self.result_store.append_segment(&building, idx).await?;
         }
 
         // Finalize with the contract built at the top (the same definition +

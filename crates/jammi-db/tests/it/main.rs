@@ -23,6 +23,7 @@ mod mutable_tables;
 mod read_vectors;
 mod recovery;
 mod register_computed_embedding;
+mod segment;
 mod sources;
 mod storage_cloud;
 mod store;

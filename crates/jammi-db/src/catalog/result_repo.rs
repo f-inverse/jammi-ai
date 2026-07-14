@@ -67,16 +67,16 @@ pub struct CreateResultTableParams<'a> {
     pub kind: ResultTableKind,
     pub derived_from: Option<&'a str>,
     pub parquet_path: &'a str,
-    pub index_path: Option<&'a str>,
     pub dimensions: Option<i32>,
     pub key_column: Option<&'a str>,
     pub text_columns: Option<&'a str>,
     /// The precision this table's sidecar index is built at — the deployment's
     /// [`crate::config::AnnIndexConfig::storage_precision`] default at the
     /// moment of creation, stamped once and read back verbatim by every later
-    /// build/load of this table's index. Recorded even for a non-embedding
-    /// (`index_path = None`) row, so the column stays a total function of
-    /// "when was this row created", not a value that only sometimes exists.
+    /// build/load of this table's index. Recorded even for a non-embedding row
+    /// (one that never grows an index segment), so the column stays a total
+    /// function of "when was this row created", not a value that only sometimes
+    /// exists.
     pub storage_precision: StoragePrecision,
     /// The per-table default retrieve→rescore oversample multiplier — the
     /// deployment's [`crate::config::AnnIndexConfig::effective_oversample`] at
@@ -102,7 +102,6 @@ pub struct ResultTableRecord {
     pub kind: ResultTableKind,
     pub derived_from: Option<String>,
     pub parquet_path: String,
-    pub index_path: Option<String>,
     pub dimensions: Option<i32>,
     pub distance_metric: String,
     pub row_count: usize,
@@ -178,7 +177,6 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendErr
         kind,
         derived_from: row.try_get("derived_from")?,
         parquet_path: row.get("parquet_path")?,
-        index_path: row.try_get("index_path")?,
         dimensions: row.try_get("dimensions")?,
         distance_metric: row.get("distance_metric")?,
         row_count: row.get::<i32>("row_count")? as usize,
@@ -206,7 +204,6 @@ impl Catalog {
         let kind = p.kind.as_db_str();
         let derived_from = p.derived_from.map(str::to_string);
         let parquet_path = p.parquet_path.to_string();
-        let index_path = p.index_path.map(str::to_string);
         let dimensions = p.dimensions;
         let key_column = p.key_column.map(str::to_string);
         let text_columns = p.text_columns.map(str::to_string);
@@ -222,9 +219,9 @@ impl Catalog {
                     tx.assert_tenant_matches(tenant, "result_tables")?;
                     tx.execute(
                         "INSERT INTO result_tables (table_name, source_id, model_id, task, kind, \
-                         derived_from, parquet_path, index_path, dimensions, key_column, \
+                         derived_from, parquet_path, dimensions, key_column, \
                          text_columns, tenant_id, storage_precision, oversample, created_at) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
                         &[
                             SqlValue::TextOwned(table_name),
                             SqlValue::TextOwned(source_id),
@@ -233,7 +230,6 @@ impl Catalog {
                             SqlValue::Text(kind),
                             SqlValue::from(derived_from),
                             SqlValue::TextOwned(parquet_path),
-                            SqlValue::from(index_path),
                             SqlValue::from(dimensions.map(|d| d as i64)),
                             SqlValue::from(key_column),
                             SqlValue::from(text_columns),

@@ -604,6 +604,25 @@ impl AnnIndexConfig {
             .unwrap_or_else(|| precision.default_oversample())
             .max(1)
     }
+
+    /// Resolve the retrieve→rescore oversample multiplier a single search
+    /// actually uses: a per-request `request_override` wins, then the table's
+    /// own stamped default (`ResultTableRecord::oversample`, passed as
+    /// `table_default`) — never today's deployment config, mirroring how
+    /// `storage_precision` is resolved — falling back to this deployment's
+    /// [`Self::effective_oversample`] only for a pre-migration-023 table with no
+    /// stamped column. Clamped to at least `1`, so a `0` override or a
+    /// misconfigured `0` default never shrinks the candidate set below `k`.
+    pub fn resolve_oversample(
+        &self,
+        request_override: Option<usize>,
+        table_default: Option<usize>,
+    ) -> usize {
+        request_override
+            .or(table_default)
+            .unwrap_or_else(|| self.effective_oversample())
+            .max(1)
+    }
 }
 
 /// Embedding index defaults.
@@ -1788,6 +1807,37 @@ mod tests {
             ..AnnIndexConfig::default()
         };
         assert_eq!(ann.effective_oversample(), 1);
+    }
+
+    #[test]
+    fn resolve_oversample_prefers_request_then_table_then_config() {
+        let ann = AnnIndexConfig {
+            oversample: Some(4),
+            ..AnnIndexConfig::default()
+        };
+        // A per-request override wins over both.
+        assert_eq!(ann.resolve_oversample(Some(9), Some(6)), 9);
+        // No request → the table's own stamped default drives it, not the
+        // deployment config default.
+        assert_eq!(ann.resolve_oversample(None, Some(6)), 6);
+        // Neither → the deployment's effective oversample (pre-migration-023
+        // fallback).
+        assert_eq!(ann.resolve_oversample(None, None), 4);
+    }
+
+    #[test]
+    fn resolve_oversample_clamps_a_zero_override_or_default_to_one() {
+        let ann = AnnIndexConfig {
+            oversample: Some(4),
+            ..AnnIndexConfig::default()
+        };
+        // A 0 override must never shrink the candidate set below k.
+        assert_eq!(ann.resolve_oversample(Some(0), Some(6)), 1);
+        let misconfigured = AnnIndexConfig {
+            oversample: Some(0),
+            ..AnnIndexConfig::default()
+        };
+        assert_eq!(misconfigured.resolve_oversample(None, None), 1);
     }
 
     #[test]

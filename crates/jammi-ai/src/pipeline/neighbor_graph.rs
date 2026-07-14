@@ -45,7 +45,6 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::error::{JammiError, Result};
-use jammi_db::index::VectorIndex;
 use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore};
 
 use crate::session::InferenceSession;
@@ -129,17 +128,26 @@ pub trait NeighborGraphStrategy {
     fn is_exact(&self) -> bool;
 }
 
-/// Index-assisted driver: each query goes to the HNSW sidecar index loaded
-/// once. Queries `k + 1` and drops the self-hit so a full `k` survive.
+/// Index-assisted driver: each query goes to the table's whole segment set,
+/// loaded once. Queries `k + 1` and drops the self-hit so a full `k` survive.
 struct IndexAssisted {
-    index: jammi_db::index::sidecar::SidecarIndex,
+    index: jammi_db::index::SegmentedIndex,
+    /// The retrieve→rescore oversample, resolved once from the table's stamped
+    /// default. Unused for an `F32` table (its merged order is already exact);
+    /// governs candidate breadth for a quantized / `Binary` one.
+    oversample: usize,
 }
 
 impl NeighborGraphStrategy for IndexAssisted {
     fn neighbours(&self, node: &Node, k: usize) -> Result<Vec<(String, f32)>> {
         // Query k+1 because the node itself is (almost always) its own nearest
-        // hit; drop it so a full k non-self neighbours remain.
-        let raw = self.index.search(&node.vector, k + 1)?;
+        // hit; drop it so a full k non-self neighbours remain. `search_final`
+        // owns the merge across segments and the exact rescore for a quantized
+        // table, so the driver sees one comparable neighbour list regardless of
+        // segment count or precision.
+        let raw = self
+            .index
+            .search_final(&node.vector, k + 1, self.oversample)?;
         Ok(drop_self_hit(raw, &node.row_id, k))
     }
 
@@ -393,8 +401,13 @@ impl<'a> NeighborGraphPipeline<'a> {
             }));
         }
 
+        let oversample = self
+            .result_store
+            .ann_config()
+            .resolve_oversample(None, table.oversample);
         Ok(Box::new(IndexAssisted {
             index: index.expect("index presence checked above"),
+            oversample,
         }))
     }
 

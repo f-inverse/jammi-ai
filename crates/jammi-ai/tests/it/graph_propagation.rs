@@ -1084,7 +1084,9 @@ async fn output_is_model_kind_with_lineage_and_is_regraphable() {
         "derived_from records the source embedding table (FK lineage)"
     );
     assert!(
-        table.index_path.is_some(),
+        !common::segment_index_urls(&session, &table.table_name)
+            .await
+            .is_empty(),
         "a Model embedding table gets a sidecar index"
     );
 

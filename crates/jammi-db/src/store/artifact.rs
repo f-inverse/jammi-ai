@@ -46,7 +46,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{JammiError, Result};
-use crate::storage::{JammiObjectStore, Scheme, StorageError, StorageRegistry, StorageUrl};
+use crate::storage::{
+    sha256_hex, JammiObjectStore, Scheme, StorageError, StorageRegistry, StorageUrl,
+};
 
 /// The file every artifact prefix carries last, naming the bundle's exact keys
 /// and per-file digests. Written after every data file so its presence proves
@@ -92,11 +94,6 @@ impl Manifest {
         }
         hex::encode(hasher.finalize())
     }
-}
-
-/// Lowercase-hex sha256 of a byte slice.
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
 }
 
 /// A fetched artifact materialised onto the local filesystem: a directory whose

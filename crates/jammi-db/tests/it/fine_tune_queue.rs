@@ -329,13 +329,17 @@ async fn reclaimed_job_retains_priority_and_reenters_ordering(backend: BackendKi
     let dir = tempdir().unwrap();
     let (_session, catalog) = queue_catalog!(backend, dir.path());
 
-    catalog.create_training_job(job_params("hi")).await.unwrap();
-    set_claim_policy(&catalog, "hi", 10, true).await;
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // "sibling" is the older, default-priority row; "hi" is strictly younger.
+    // Only `priority` — never plain `created_at` FIFO — can put "hi" ahead:
+    // this is what makes the final assertion discriminate a reclaim that
+    // preserves priority from one that silently resets it.
     catalog
         .create_training_job(job_params("sibling"))
         .await
         .unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    catalog.create_training_job(job_params("hi")).await.unwrap();
+    set_claim_policy(&catalog, "hi", 10, true).await;
 
     // Claim "hi" with a zero lease so it is already expired by the time
     // reclaim runs, then reclaim re-queues it.
@@ -343,13 +347,15 @@ async fn reclaimed_job_retains_priority_and_reenters_ordering(backend: BackendKi
         .claim_next_training_job("worker", Duration::from_secs(0))
         .await
         .unwrap()
-        .expect("the high-priority job claims first");
+        .expect("the high-priority job claims first despite being younger");
     assert_eq!(claimed.job_id, "hi");
     let actioned = catalog.reclaim_expired_training_jobs(5).await.unwrap();
     assert_eq!(actioned, 1, "the expired lease is re-queued");
 
-    // Under contention with the default-priority sibling, the re-queued job's
-    // priority still wins — reclaim did not reset it.
+    // Under contention with the older, default-priority sibling, the
+    // re-queued job's priority still wins. If reclaim had reset priority to
+    // the default, plain `created_at` FIFO would pick the older "sibling"
+    // instead — that is the failure this assertion catches.
     let next = catalog
         .claim_next_training_job("worker", Duration::from_secs(30))
         .await
@@ -357,7 +363,8 @@ async fn reclaimed_job_retains_priority_and_reenters_ordering(backend: BackendKi
         .expect("the re-queued job re-enters the ordering");
     assert_eq!(
         next.job_id, "hi",
-        "reclaim preserves priority: the high-priority job claims again ahead of its sibling"
+        "reclaim preserves priority: the high-priority job claims again ahead of its \
+         strictly-older sibling"
     );
 }
 

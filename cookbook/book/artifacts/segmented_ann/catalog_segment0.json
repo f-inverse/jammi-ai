@@ -1,0 +1,11 @@
+{
+  "naming_matches_seg0_convention": true,
+  "row_count": 20,
+  "segment_count": 1,
+  "segment_id": 0,
+  "sidecar_files_present": {
+    "manifest_json": true,
+    "rowmap": true,
+    "usearch": true
+  }
+}

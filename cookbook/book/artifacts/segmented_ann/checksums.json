@@ -1,0 +1,8 @@
+{
+  "append_suite.json": "df969f2d1898c3e1",
+  "catalog_segment0.json": "da82cf2c0a648fff",
+  "corpus_vectors.parquet": "f48a78b8dd7c866b",
+  "golden_metrics.json": "c771fe559c1097c5",
+  "live_hits.json": "b14828bffa8a9718",
+  "record.json": "71a0d9b7630895da"
+}

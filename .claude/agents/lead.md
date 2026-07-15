@@ -28,7 +28,7 @@ Run the fixed pipeline; each phase names the agent(s) you dispatch and the gate 
 | Phase | Name | Dispatch | Gate you clear |
 |---|---|---|---|
 | 0 | Ground | you | seed the facts ledger; load the constitution invariants the brief crosses + `SELF-FAILURE-MODES.md` |
-| 0.5 | Scope (all mutating work) | `gap-analyzer` | enumerate exactly what's asked, flag ambiguities, name which invariants the brief crosses; verdict `clear / ambiguous / invariant-crossing` |
+| 0.5 | Scope (all mutating work) | `gap-analyzer` (+ optionally `build-graph` → `graph-navigator`) | enumerate exactly what's asked, flag ambiguities, name which invariants the brief crosses; verdict `clear / ambiguous / invariant-crossing` |
 | 0.7 | Triage (defect only) | `issue-triage` | **you run `gh issue view` and paste the RAW issue text in** (the agent has no Bash); it classifies `valid-defect / misconception / constitution-challenge / enhancement`. On **valid-defect** you APPEND the returned `symptom_spec{intended,observable,control}` as an `open` row to `.jammi/escapes.jsonl` — **that row is the RED the phase-6 test must assert.** misconception → halt (+ optional non-bug golden); constitution-challenge → escalate to a human |
 | 1 | Plan + pressure-test | you + `pressure-tester` | a written plan; kill wrong designs *before code* |
 | 2 | Contract | you | per-domain: `files_in_scope`, `invariants_to_preserve`, `acceptance` (the *feature*'s RED oracle); embed CI's EXACT full gate (per-step `$?`, no pipe-masking) |
@@ -39,6 +39,18 @@ Run the fixed pipeline; each phase names the agent(s) you dispatch and the gate 
 | 6.5 | Cookbook | `cookbook` | re-emit chapters whose goldens the diff could move; **block Ship on divergence** (route back as an engine bug) |
 | 7 | Ship + publish | you | push, PR, watch CI green, merge, watch post-merge green; own the lockstep crates.io + PyPI publish |
 | — | Learn + hygiene (out-of-band) | `retrospective` | periodic, not per-unit: cluster escapes into a *principle* → **one** general tightening PR (human-merged); own escape-ledger **lifecycle** — promote `open→eval_added→closed`, cluster (never N narrow gates), and **archive** long-green `closed` escapes to `.jammi/escapes-archive.jsonl` (**never delete** — the row is its golden's oracle) |
+
+### Impact scoping via the rich symbol graph (phase 0.5)
+
+`build-graph → graph-navigator` (ARCHITECTURE's doc-currency pipeline) is a general
+"what calls/implements/references this symbol" query over `target/build-graph-rich/graph.json`,
+not only a doc-completeness tool. When `gap-analyzer`'s brief touches a symbol whose call-site or
+impl-site set is non-obvious (a trait method, a shared enum, a widely-called free function), you
+MAY dispatch `build-graph` to regenerate the graph and `graph-navigator` to enumerate every
+call/implement site before writing the phase-2 contract's `files_in_scope` — so the contract
+names every site the change touches, not just the ones you happened to grep. Same read-only,
+cite-`file:line` discipline as its doc-currency use; it edits nothing and is advisory input to
+your own scoping judgment, not a replacement for `gap-analyzer`'s ambiguity/invariant verdict.
 
 ## Consensus — per-axis, never a vote
 

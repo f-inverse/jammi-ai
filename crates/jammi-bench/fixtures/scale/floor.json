@@ -83,5 +83,90 @@
       "floor": 0.9569999999999996,
       "measured": 0.9969999999999998
     }
+  },
+  "segment_merge": {
+    "precisions": {
+      "binary": {
+        "anchor": "ci_lower",
+        "oversample": 32,
+        "partitionings": {
+          "seg_block": {
+            "1": {
+              "floor": 0.82,
+              "measured": 0.92
+            },
+            "10": {
+              "floor": 0.955,
+              "measured": 0.9980000000000001
+            },
+            "100": {
+              "floor": 0.96,
+              "measured": 1.0
+            }
+          },
+          "seg_interleaved": {
+            "1": {
+              "floor": 0.85,
+              "measured": 0.94
+            },
+            "10": {
+              "floor": 0.9519999999999998,
+              "measured": 0.997
+            },
+            "100": {
+              "floor": 0.96,
+              "measured": 1.0
+            }
+          }
+        },
+        "single_graph": {
+          "1": 0.9,
+          "10": 0.9990000000000001,
+          "100": 1.0
+        },
+        "single_graph_tracking_margin": 0.022000000000000113
+      },
+      "int8": {
+        "anchor": "point",
+        "oversample": 4,
+        "partitionings": {
+          "seg_block": {
+            "1": {
+              "floor": 0.94,
+              "measured": 0.98
+            },
+            "10": {
+              "floor": 0.96,
+              "measured": 1.0
+            },
+            "100": {
+              "floor": 0.96,
+              "measured": 1.0
+            }
+          },
+          "seg_interleaved": {
+            "1": {
+              "floor": 0.94,
+              "measured": 0.98
+            },
+            "10": {
+              "floor": 0.96,
+              "measured": 1.0
+            },
+            "100": {
+              "floor": 0.96,
+              "measured": 1.0
+            }
+          }
+        },
+        "single_graph": {
+          "1": 0.98,
+          "10": 0.9990000000000001,
+          "100": 1.0
+        },
+        "single_graph_tracking_margin": 0.02
+      }
+    },
+    "segment_count": 2
   }
 }

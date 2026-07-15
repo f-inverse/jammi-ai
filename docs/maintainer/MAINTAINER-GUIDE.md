@@ -630,7 +630,16 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `scalar_kind` against the caller's expected precision — any mismatch is
   `IncompatibleFormat`, mirroring the `backend_version` strict-compare (no
   reject-newer ordering; a config drift since the table was built must never
-  silently reopen the wrong-precision graph).
+  silently reopen the wrong-precision graph). The precisions, kept in parity
+  with `StoragePrecision` (`crates/jammi-db/src/config.rs`) by
+  `ci/scripts/check_doc_parity.py`:
+
+  <!-- BEGIN STORAGE-PRECISION-VARIANTS -->
+  - `F32` — full-precision index vectors; exact, single-stage search (the default).
+  - `F16` — 16-bit half-precision index vectors; quantized, rescored via the `.rawf32` companion.
+  - `Int8` — 8-bit signed-integer index vectors (USearch `I8`, linear per-vector affine quantization); quantized, rescored.
+  - `Binary` — 1-bit sign-quantized index vectors (USearch `B1`), searched by Hamming distance; quantized, rescored.
+  <!-- END STORAGE-PRECISION-VARIANTS -->
 - **`SegmentedIndex`** — `crates/jammi-db/src/index/segment.rs` (the
   `SegmentedIndex` struct): a table's ANN index as a **set of segments**, one
   immutable `SidecarIndex` per disjoint row subset (catalog table

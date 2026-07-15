@@ -53,6 +53,21 @@ listing/read/reach is measured:
   (topic), and A's resource SURVIVES. Measured directly: A's resource is still
   present after B's destructive call. (This is the property the standing oracle
   guards — a regression here would be a cross-tenant data-destruction leak.)
+* **the result-table SCAN, over the `db.sql` lane (esc-024, embedded-only)** —
+  a result table (`asof_join`, `generate_embeddings`, …) carries no `tenant_id`
+  column, so the predicate-injection analyzer above has nothing to rewrite;
+  resolution is gated on the catalog row's owner instead
+  (`ResultTableSchemaProvider::visible`, `crates/jammi-db/src/store/result_schema.rs`).
+  Mirrors the engine's own oracle
+  (`tenant_isolation_oracle.rs::assert_result_table_scan_isolated`): A
+  materializes a private `asof_join` output and a GLOBAL one; A reads its own
+  (`N > 0`), the GLOBAL table is visible to both A and B, and B naming A's
+  private table is refused (`jammi.BackendError`). Non-vacuity is witnessed by
+  A's own re-read of the same table after B's refusal (the engine's internal
+  `admin_scope()` bypass has no public Python surface — `tenant_scope.rs`
+  @46/180–197). This arm measures the `db.sql` lane only; the provider also
+  gates the Flight SQL, exact-search-fallback, and vector-by-key lanes, cited
+  but not independently re-measured here.
 
 Every cell ends in a measured number: a leak count that must be `0`, or a
 stated-positive count (the built-ins B sees, the caveat rows A sees) that is a
@@ -359,6 +374,84 @@ def run_matrix(db, work: Path, base_model: str, *, tag: str, cross_transport: bo
         "tp_survives_foreign_drop": bool(tp_survives),
         "b_drop_mt_raised": b_drop_mt["raised"],
         "b_drop_tp_raised": b_drop_tp["raised"],
+    }
+
+
+def run_result_table_scan(db, work: Path, *, tag: str) -> dict:
+    """Drive the esc-024 result-table SCAN isolation live over the `db.sql` lane —
+    the cache-side mirror of the chapter's live-driven cell and of the Rust oracle
+    (``tenant_isolation_oracle.rs::assert_result_table_scan_isolated``).
+
+    A result Parquet carries no ``tenant_id`` column; resolution of its bare
+    ``jammi.{name}`` identifier is gated on the catalog row's OWNER instead
+    (``ResultTableSchemaProvider::visible``, ``result_schema.rs``). Two
+    ``asof_join`` outputs are materialized through the real verb: one privately
+    under tenant A, one with no tenant bound (GLOBAL). The 3-arm control: A
+    reads its own table (N > 0); the GLOBAL table is visible to both A and B; B
+    reading A's private table is refused. Non-vacuity substitutes A's own
+    re-read of the SAME table after B's refusal for the oracle's internal
+    ``admin_scope()`` bypass, which carries no public Python surface
+    (``tenant_scope.rs``, "not exposed otherwise").
+
+    Embedded-only, by design: this measures the ``db.sql`` lane the oracle
+    drives with ``with_tenant_scoped(T, sql(...))``. It does not re-drive the
+    other three lanes the same provider gates (Flight SQL, the exact-search
+    fallback, vector-by-key), nor cross-transport parity for this cell."""
+
+    def _materialize(spine_name: str, facts_name: str) -> str:
+        spine_path = str(work / f"{spine_name}.parquet")
+        facts_path = str(work / f"{facts_name}.parquet")
+        pq.write_table(pa.table({"entity": ["p", "q", "r"], "as_of": [10, 10, 10]}), spine_path)
+        pq.write_table(pa.table({
+            "entity": ["p", "q", "r"], "t": [10, 10, 10], "val": [1.0, 2.0, 3.0],
+        }), facts_path)
+        db.add_source(spine_name, url=spine_path, format="parquet")
+        db.add_source(facts_name, url=facts_path, format="parquet")
+        return db.asof_join(
+            spine_name, facts_name,
+            spine_by=["entity"], spine_time="as_of",
+            facts_by=["entity"], facts_time="t",
+            direction="backward", boundary="inclusive", project=["val"],
+        )
+
+    def _scan_count(table_name: str) -> int:
+        return db.sql(f'SELECT COUNT(*) AS n FROM "jammi.{table_name}"').to_pylist()[0]["n"]
+
+    with tenant(db, TENANT_A):
+        table_a = _materialize(f"rts_spine_a_{tag}", f"rts_facts_a_{tag}")
+
+    db.set_tenant("")  # unscoped — the GLOBAL (tenant_id IS NULL) case
+    table_global = _materialize(f"rts_spine_global_{tag}", f"rts_facts_global_{tag}")
+
+    # Arm 1 — OWN-TENANT: A reads its own private table.
+    with tenant(db, TENANT_A):
+        a_own = _scan_count(table_a)
+
+    # Arm 2 — GLOBAL: visible to both A and B.
+    with tenant(db, TENANT_A):
+        global_a = _scan_count(table_global)
+    with tenant(db, TENANT_B):
+        global_b = _scan_count(table_global)
+
+    # Arm 3 — CROSS-TENANT: B naming A's private table is refused.
+    b_refused = False
+    with tenant(db, TENANT_B):
+        try:
+            _scan_count(table_a)
+        except jammi.BackendError:
+            b_refused = True
+
+    # Non-vacuity: A's own re-read of the SAME table, after B's refused attempt.
+    with tenant(db, TENANT_A):
+        a_own_after = _scan_count(table_a)
+
+    return {
+        "a_own_read": a_own,
+        "global_visible_to_a": global_a,
+        "global_visible_to_b": global_b,
+        "b_refused": b_refused,
+        "a_own_read_after_b_refused": a_own_after,
+        "leak": 0.0 if b_refused else 1.0,
     }
 
 
@@ -713,6 +806,8 @@ def emit(fixtures_root: Path, server_bin: str) -> None:
             embedded_matrix = run_matrix(
                 embedded, work, base_model, tag="emb", cross_transport=False
             )
+            print("== embedded engine: esc-024 result-table scan (db.sql lane) ==", flush=True)
+            result_table_scan = run_result_table_scan(embedded, work, tag="emb")
 
         # --- remote transport (live grpc:// parity for the wire verbs) ------ #
         with LiveServer(server_bin) as endpoint:
@@ -804,6 +899,26 @@ def emit(fixtures_root: Path, server_bin: str) -> None:
         "byo_auth.over_flight_eq_embedded": {
             "value": 1.0 if byo["over_flight_eq_embedded"] else 0.0, "tol": 0.0
         },
+        # --- esc-024 result-table SCAN isolation, over the db.sql lane ------ #
+        "result_table_scan": {"value": result_table_scan["leak"], "tol": 0.0},
+        "result_table_scan.a_own_read_positive": {
+            "value": 1.0 if result_table_scan["a_own_read"] > 0 else 0.0, "tol": 0.0
+        },
+        "result_table_scan.global_visible_both": {
+            "value": 1.0 if (
+                result_table_scan["global_visible_to_a"] > 0
+                and result_table_scan["global_visible_to_a"]
+                == result_table_scan["global_visible_to_b"]
+            ) else 0.0,
+            "tol": 0.0,
+        },
+        "result_table_scan.nonvacuity": {
+            "value": 1.0 if (
+                result_table_scan["a_own_read_after_b_refused"]
+                == result_table_scan["a_own_read"]
+            ) else 0.0,
+            "tol": 0.0,
+        },
     }
 
     (ARTIFACTS / "matrix.json").write_text(json.dumps(embedded_matrix, indent=2, sort_keys=True))
@@ -830,6 +945,21 @@ def emit(fixtures_root: Path, server_bin: str) -> None:
         "parity_verdict": "remote == embedded for every cross-transport observable",
         "parity": parity,
         "matrix": embedded_matrix,
+        "result_table_scan": result_table_scan,
+        "result_table_scan_note": (
+            "esc-024: a result table (asof_join, generate_embeddings, ...) carries no "
+            "tenant_id column, so resolution of its bare jammi.{name} identifier is gated "
+            "on the catalog row's OWNER instead (ResultTableSchemaProvider::visible, "
+            "result_schema.rs), mirroring the engine's own oracle "
+            "(tenant_isolation_oracle.rs::assert_result_table_scan_isolated). Measured over "
+            "the db.sql lane only, embedded-only: A's own asof_join output reads N > 0, a "
+            "GLOBAL asof_join output is visible to both A and B, and B naming A's private "
+            "table is refused (jammi.BackendError). Non-vacuity is witnessed by A's own "
+            "re-read of the SAME table after B's refusal, since the oracle's internal "
+            "admin_scope() bypass has no public Python surface (tenant_scope.rs). "
+            "Organizational resolution-visibility, not a hostile-principal boundary — the "
+            "trusted-network + BYO-auth posture is unchanged."
+        ),
         "byo_auth": byo,
         "byo_auth_note": (
             "The engine authenticates nothing on any transport; the jammi-session-id header "

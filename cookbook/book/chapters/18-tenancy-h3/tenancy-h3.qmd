@@ -94,6 +94,161 @@ for cell in HARD_ZEROS:
     assert contracts.golden(f"tenancy_h3.hard_zero.{cell}").tol == 0.0
 ```
 
+### The result-table scan — esc-024, driven live over the `db.sql` lane
+
+Every cell above filters the **catalog registry** — a listing, a describe, a
+topic name. A **result table** (the output of `asof_join`, `generate_embeddings`,
+…) is a different case: its Parquet carries no `tenant_id` column, so the
+predicate-injection analyzer above has nothing to rewrite. Resolution
+visibility is gated a different way — on the **catalog row's owner** — by a
+dedicated schema provider
+(`crates/jammi-db/src/store/result_schema.rs`, `visible(owner)` @112–114): a
+correctly-bound tenant resolves only its own and GLOBAL (`tenant_id IS NULL`)
+result tables over the bare `jammi.{name}` identifier every read lane names it
+by; a peer's private table resolves **not-found**. We drive that live here,
+over the `db.sql` lane, mirroring the engine's own standing oracle
+(`crates/jammi-server/tests/it/tenant_isolation_oracle.rs::assert_result_table_scan_isolated`
+@1943–2026) — the same 3-arm control, driven from the consumer side rather than
+the Rust internals.
+
+> **Honest scope (esc-024).** This measures the `db.sql` lane only — the lane
+> the oracle drives with `with_tenant_scoped(T, sql(...))`. The provider's
+> `visible()` gate applies to three other lanes too (Flight SQL, the
+> exact-search fallback, vector-by-key — `result_schema.rs` @14), cited here
+> but not independently re-measured in this cell; the SQL lane is the one every
+> other cell in this chapter already exercises, so it is the one this chapter
+> extends.
+>
+> **Organizational, not adversarial (esc-020).** Like every other property in
+> this chapter, this is *resolution-visibility* isolation: a peer's private
+> table resolves not-found because it is out of scope for the current binding —
+> not because a hostile principal was defeated. The trusted-network + BYO-auth
+> posture Part B demonstrates is unchanged; this is not a claim that the engine
+> defends against an attacker on the wire.
+
+Tenant A materializes a real result table the only way one exists — through
+`asof_join`, the same verb Chapter 19 drives — under its own scope; a second
+`asof_join` output is materialized with **no** tenant bound, the GLOBAL case.
+The 3-arm control mirrors the oracle: A reads its own table (`N > 0`); the
+GLOBAL table is visible to *both* A and B; B naming A's private table is
+**refused**.
+
+```{python}
+import tempfile
+
+import jammi
+import pyarrow as pa
+import pyarrow.parquet as pq
+from jammi_cookbook.rails import tenant
+
+TENANT_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+TENANT_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+rts_work = tempfile.mkdtemp(prefix="jammi_esc024_")
+rts_db = jammi.connect(f"file://{tempfile.mkdtemp(prefix='jammi_esc024_catalog_')}")
+
+
+def rts_materialize(spine_name, facts_name):
+    """A real asof_join output — the actual `create_result_table` /
+    `finalize_with_manifest` funnel, driven through the public verb, exactly
+    the recipe Chapter 19 drives. Returns the result table's bare name."""
+    spine_path = f"{rts_work}/{spine_name}.parquet"
+    facts_path = f"{rts_work}/{facts_name}.parquet"
+    pq.write_table(pa.table({"entity": ["p", "q", "r"], "as_of": [10, 10, 10]}), spine_path)
+    pq.write_table(pa.table({
+        "entity": ["p", "q", "r"], "t": [10, 10, 10], "val": [1.0, 2.0, 3.0],
+    }), facts_path)
+    rts_db.add_source(spine_name, url=spine_path, format="parquet")
+    rts_db.add_source(facts_name, url=facts_path, format="parquet")
+    return rts_db.asof_join(
+        spine_name, facts_name,
+        spine_by=["entity"], spine_time="as_of",
+        facts_by=["entity"], facts_time="t",
+        direction="backward", boundary="inclusive", project=["val"],
+    )
+
+
+def rts_scan_count(table_name):
+    """The db.sql lane the oracle mirrors: a bare `jammi.{table}` identifier,
+    scoped by whatever tenant binding is currently in effect."""
+    return rts_db.sql(f'SELECT COUNT(*) AS n FROM "jammi.{table_name}"').to_pylist()[0]["n"]
+
+
+with tenant(rts_db, TENANT_A):
+    rts_table_a = rts_materialize("rts_spine_a", "rts_facts_a")
+
+rts_db.set_tenant("")  # unscoped — the GLOBAL (tenant_id IS NULL) case
+rts_table_global = rts_materialize("rts_spine_global", "rts_facts_global")
+```
+
+Arm 1 (own tenant) and arm 2 (GLOBAL), both live reads over `db.sql`:
+
+```{python}
+with tenant(rts_db, TENANT_A):
+    rts_a_own = rts_scan_count(rts_table_a)
+with tenant(rts_db, TENANT_A):
+    rts_global_a = rts_scan_count(rts_table_global)
+with tenant(rts_db, TENANT_B):
+    rts_global_b = rts_scan_count(rts_table_global)
+
+print(f"A reads its own private result table: N = {rts_a_own}")
+print(f"GLOBAL result table — A sees N = {rts_global_a}, B sees N = {rts_global_b}")
+assert rts_a_own > 0
+assert rts_global_a > 0 and rts_global_a == rts_global_b
+```
+
+Arm 3 (cross-tenant) — B names A's private result table over `db.sql`:
+
+```{python}
+rts_b_refused = False
+with tenant(rts_db, TENANT_B):
+    try:
+        rts_scan_count(rts_table_a)
+    except jammi.BackendError:
+        rts_b_refused = True
+
+print(f"B scanning A's private result table refused: {rts_b_refused}")
+assert rts_b_refused, "CROSS-TENANT SCAN LEAK: B scanned tenant A's private result table"
+```
+
+Non-vacuity — proving B's refusal is a **scoping** decision, not an absent or
+empty table. The Rust oracle demonstrates this with an internal
+`admin_scope()` bypass (`crates/jammi-db/src/tenant_scope.rs` @180–197 — "not
+exposed otherwise", @46); that bypass has no public Python surface, so this
+chapter substitutes the witness this SDK *can* reach: A's own re-read of the
+**same** table, taken *after* B's refused attempt, still returns the same `N` —
+the table B was refused was never touched, let alone empty.
+
+```{python}
+with tenant(rts_db, TENANT_A):
+    rts_a_own_after = rts_scan_count(rts_table_a)
+
+print(f"A's own re-read of the same table, after B's refusal: N = {rts_a_own_after}")
+assert rts_a_own_after == rts_a_own, "non-vacuity: A's own table must be unchanged"
+```
+
+```{python}
+# | echo: false
+# Cross-check the freshly-driven live verdict against the frozen committed
+# record (the same recipe run live at the last cache-build) — the same
+# double-check Part B's BYO-auth seam applies before recording.
+rts_record = record["result_table_scan"]
+assert rts_record["b_refused"] is True
+assert (rts_record["a_own_read"] > 0) == (rts_a_own > 0)
+assert rts_record["global_visible_to_a"] == rts_record["global_visible_to_b"]
+
+rts_leak = 0.0 if rts_b_refused else 1.0
+rails.measure("tenancy_h3.result_table_scan", rts_leak)
+assert contracts.golden("tenancy_h3.result_table_scan").tol == 0.0
+
+rails.measure("tenancy_h3.result_table_scan.a_own_read_positive",
+              1.0 if rts_a_own > 0 else 0.0)
+rails.measure("tenancy_h3.result_table_scan.global_visible_both",
+              1.0 if (rts_global_a > 0 and rts_global_a == rts_global_b) else 0.0)
+rails.measure("tenancy_h3.result_table_scan.nonvacuity",
+              1.0 if rts_a_own_after == rts_a_own else 0.0)
+```
+
 ### The stated-positives — the honest visibility, as real counts
 
 Two cells are *not* zero, and the chapter asserts them as the positive counts they
@@ -487,6 +642,14 @@ destructive verb is tenant-scoped so a foreign tenant cannot reach across to
 destroy A's resource. The two honest limits — a globally-scoped resource (a
 built-in channel, a discriminator-less source) is visible to every tenant — are
 measured as positive counts, not glossed. No verb leaks.
+
+A **result table** (`asof_join`, `generate_embeddings`, …) isolates the same way
+despite carrying no `tenant_id` column of its own: the catalog row's owner gates
+resolution of the bare `jammi.{name}` identifier (esc-024,
+`result_schema.rs`), driven live here over the `db.sql` lane, mirroring the
+engine's own standing oracle. It is the same organizational
+resolution-visibility property as the rest of the chapter, not a hostile-principal
+boundary — the trusted-network + BYO-auth posture is unchanged.
 
 And the engine's BYO-auth seam, demonstrated from the consumer side **over the
 real Flight SQL wire**: the credential now rides the actual `db.sql()` Flight lane

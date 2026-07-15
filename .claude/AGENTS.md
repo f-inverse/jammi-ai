@@ -64,6 +64,10 @@ criteria drive `acceptance-verifier`. A **question** mutates nothing → no phas
 - **Domain agents** (per crate, ARCHITECTURE §6) — the write-owners, worktree-isolated, each
   carrying its crate's invariants. **Doc-currency** (`build-graph`, `graph-navigator`,
   `doc-updater`, `doc-parity`) and **cookbook** complete the roster.
+- **The rich symbol graph** (`build-graph` → `graph-navigator`, `target/build-graph-rich/graph.json`)
+  is a general call/implement/reference-site query surface, not solely a doc-currency stage: the
+  lead may dispatch it at phase 0.5 for impact scoping (enumerate every call/impl site of a symbol
+  a contract is about to touch) as well as at phase 6.5 for doc-completeness. Read-only in both uses.
 
 ## Consensus is per-axis, never a vote
 

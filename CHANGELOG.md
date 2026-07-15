@@ -50,6 +50,37 @@ catalog-tracked set of segments.
   `AuditHandle::verify` primitive backs both the wire and embedded transports
   (byte-parity), and the new rpc carries its own cross-tenant isolation case.
 
+### Testing
+- **Committed segment-merge recall floor (`jammi-bench`).** A per-PR recall gate
+  for the segmented-ANN over-fetch path: an N-segment `SegmentedIndex::search_final`
+  recall@k over the committed real 2000-row corpus, at `Int8` and `Binary`
+  precision (the precisions whose retrieve→rescore-in-merge stage runs), across
+  two committed segment partitionings (a deterministic multi-seed). Each floor is
+  `measured − margin` with a single-graph tracking margin, so a broken merge
+  order, a reduced over-fetch factor, or a dropped segment reds the gate.
+
+### CI / tooling
+- **Crates-publish retry on transient failures.** The release publish now wraps
+  the crates.io auth exchange and each `cargo publish` in a bounded
+  exponential-backoff retry that fires only on transient signals (5xx, network),
+  never on a version conflict; the publish retry re-checks the crate's presence
+  on the index after a transient failure, so a publish that succeeded but
+  returned a 5xx is treated as done rather than retried into an "already
+  uploaded" false failure.
+- **`StoragePrecision` doc↔enum parity binding.** The doc-parity gate now covers
+  the `StoragePrecision` enumeration in addition to `ProducingDescriptor`; the
+  `Binding` shape is generalized so a set-equality-only enumeration (no replay
+  axis) is a first-class binding. A drifted precision block (a missing or extra
+  variant) reds the gate.
+
+### Docs
+- **Cookbook ch.18 — measured result-table-scan tenant isolation.** The per-verb
+  tenancy matrix gains a cell that drives the result-table read over the `db.sql`
+  lane: a peer tenant's read of another tenant's private result table resolves
+  not-found while the owner's and a GLOBAL table resolve normally — measured live
+  against the catalog-owner resolution gate, framed honestly as organizational
+  resolution-visibility (not a hostile-principal boundary).
+
 ## [0.45.0] - 2026-07-13
 
 The precision-moat base wave: asymmetric binary quantization. Transformer

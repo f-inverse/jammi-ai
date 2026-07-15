@@ -30,6 +30,7 @@ PACKAGE jammi.v1.trigger
 RPC AuditService/AuditFetchByQueryId
 RPC AuditService/AuditFetchRecent
 RPC AuditService/AuditLog
+RPC AuditService/Verify
 RPC CatalogService/AddChannelColumns
 RPC CatalogService/AddSource
 RPC CatalogService/ClearTenant

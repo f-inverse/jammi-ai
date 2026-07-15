@@ -21,7 +21,7 @@
 //! * **Fine-tune** returns a job **id**; status is polled by id through
 //!   [`Session::fine_tune_status`]. The in-process `TrainingJob` handle never
 //!   escapes.
-//! * **Audit** is three flat methods rather than a borrow-scoped handle.
+//! * **Audit** is four flat methods rather than a borrow-scoped handle.
 //! * **Subscribe** returns a `Pin<Box<dyn Stream>>`, the transport-neutral
 //!   streaming shape.
 //!
@@ -757,6 +757,22 @@ impl Session {
         limit: usize,
     ) -> std::result::Result<Vec<PerQueryAudit>, jammi_db::AuditError> {
         self.engine.audit().fetch_recent(limit).await
+    }
+
+    /// Verify a presented record's signature under this session's tenant.
+    ///
+    /// Re-derives the per-tenant secret from the session tenant (never the
+    /// record's own `tenant_id`) and checks the record's signature as presented:
+    /// `true` only when this tenant signed it, `false` for any mismatch —
+    /// including a record signed by a different tenant. A genuine fault (no
+    /// bound tenant, or an unavailable master key) is an `Err`. The same
+    /// `AuditHandle::verify` primitive the embedded path reaches, so the wire
+    /// and in-process verdicts are byte-identical.
+    pub async fn audit_verify(
+        &self,
+        record: PerQueryAudit,
+    ) -> std::result::Result<bool, jammi_db::AuditError> {
+        self.engine.audit().verify(&record).await
     }
 }
 

@@ -26,6 +26,7 @@ use jammi_db::TenantId;
 use jammi_server::grpc::proto::audit::audit_service_client::AuditServiceClient;
 use jammi_server::grpc::proto::audit::{
     AuditFetchByQueryIdRequest, AuditFetchRecentRequest, AuditLogRequest, PerQueryAudit,
+    VerifyRequest,
 };
 use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
 use jammi_server::grpc::proto::catalog::{
@@ -644,6 +645,108 @@ async fn audit_log_then_fetch_and_signature_verifies() {
             .iter()
             .any(|r| r.query_id == query_id.to_string()),
         "fetch_recent must include the logged record"
+    );
+}
+
+/// `AuditService.Verify` is SESSION-scoped: the engine re-derives the signing
+/// secret from the verifying session's tenant, never the record's own
+/// `tenant_id`, and holds the master key server-side (the wire carries only a
+/// `verified` bool). A record signed by tenant A over the wire verifies `true`
+/// under A's session and `false` under a peer B's session — the cross-tenant
+/// integrity leak that deriving from `record.tenant_id` would open. A tampered
+/// record verifies `false` under its own tenant too. All three run through the
+/// real gRPC path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_verify_is_session_scoped_over_the_wire() {
+    let _g = env_lock().lock().await;
+    std::env::set_var(MASTER_KEY_ENV, TEST_KEY);
+
+    let fixture = start_fixture().await;
+
+    // Two sessions, each bound to a distinct tenant through the shared store.
+    set_tenant(fixture.addr, "session-verify-a", TENANT_A).await;
+    set_tenant(fixture.addr, "session-verify-b", TENANT_B).await;
+
+    let mut client_a = AuditServiceClient::with_interceptor(
+        channel(fixture.addr).await,
+        with_session("session-verify-a"),
+    );
+    let mut client_b = AuditServiceClient::with_interceptor(
+        channel(fixture.addr).await,
+        with_session("session-verify-b"),
+    );
+
+    // Tenant A logs a record and reads it back — signed and tenant-stamped.
+    let query_id = Uuid::now_v7();
+    client_a
+        .audit_log(AuditLogRequest {
+            records: vec![PerQueryAudit {
+                query_id: query_id.to_string(),
+                tenant_id: String::new(),
+                model_id: "openai/clip-vit-base".into(),
+                model_version: "rev-3".into(),
+                query_lineage: serde_json::json!({ "examiner_id": "42" }).to_string(),
+                top_k_result_ids: vec!["doc-1".into(), "doc-2".into()],
+                retrieval_scores: vec![0.91, 0.84],
+                executed_at_micros: 0,
+                signature: String::new(),
+            }],
+        })
+        .await
+        .expect("audit log");
+    let signed = client_a
+        .audit_fetch_by_query_id(AuditFetchByQueryIdRequest {
+            query_id: query_id.to_string(),
+        })
+        .await
+        .expect("audit fetch by id")
+        .into_inner()
+        .record
+        .expect("record present after log");
+    assert_eq!(signed.tenant_id, TENANT_A, "tenant stamped on write");
+
+    // Positive control: tenant A verifies its own record as authentic.
+    let a_verdict = client_a
+        .verify(VerifyRequest {
+            record: Some(signed.clone()),
+        })
+        .await
+        .expect("verify under tenant A")
+        .into_inner();
+    assert!(
+        a_verdict.verified,
+        "tenant A must verify its own audit record as authentic"
+    );
+
+    // The leak this guards: tenant B verifies the SAME record and must get
+    // false — its session-derived secret differs, so the signature does not
+    // match. `verified=true` here would be a cross-tenant integrity leak.
+    let b_verdict = client_b
+        .verify(VerifyRequest {
+            record: Some(signed.clone()),
+        })
+        .await
+        .expect("verify under tenant B")
+        .into_inner();
+    assert!(
+        !b_verdict.verified,
+        "CROSS-TENANT VERIFY LEAK: tenant B verified tenant A's record as authentic"
+    );
+
+    // A tampered record fails under its own tenant: a mismatch is a `false`
+    // verdict, not an error.
+    let mut tampered = signed.clone();
+    tampered.model_id = "tampered".into();
+    let tampered_verdict = client_a
+        .verify(VerifyRequest {
+            record: Some(tampered),
+        })
+        .await
+        .expect("verify tampered under tenant A")
+        .into_inner();
+    assert!(
+        !tampered_verdict.verified,
+        "a tampered record must not verify, even under its signing tenant"
     );
 }
 

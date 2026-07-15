@@ -951,6 +951,12 @@ fn cases() -> Vec<IsolationCase> {
                 assert_audit_isolated().await;
             }
         ),
+        // Verify is session-scoped: the signing secret is re-derived from the
+        // VERIFYING session's tenant, never the record's own `tenant_id`, so a
+        // peer cannot confirm another tenant's record as authentic.
+        case!("AuditService", "Verify", CaseKind::Hermetic, None, {
+            assert_audit_verify_isolated().await;
+        }),
         // --- compute verbs (resolver-isolated; covered_by names the e2e) -----
         case!(
             "EmbeddingService",
@@ -1375,6 +1381,76 @@ async fn assert_audit_isolated() {
     assert_eq!(
         b_recent[0].model_id, "m_b",
         "tenant B's recent fetch is its own row, not tenant A's"
+    );
+}
+
+/// The audit `Verify` verb re-derives the signing secret from the VERIFYING
+/// session's tenant, never the record's own `tenant_id`. A record signed under
+/// tenant A verifies `true` under A's session (positive control) and `false`
+/// under a peer B's session, whose derived secret differs over the identical
+/// canonical bytes. Deriving from `record.tenant_id` instead would make B's
+/// verify return `true` — the cross-tenant integrity leak this case closes — so
+/// the session-scoped boundary is asserted directly, on one shared session
+/// scoped per-tenant via `with_tenant_scoped` (the realistic server topology).
+async fn assert_audit_verify_isolated() {
+    use jammi_db::audit::{PerQueryAudit, MASTER_KEY_ENV};
+
+    std::env::set_var(
+        MASTER_KEY_ENV,
+        "0000000000000000000000000000000000000000000000000000000000000001",
+    );
+
+    let dir = tempdir().unwrap();
+    let session = Arc::new(JammiSession::new(test_config(dir.path())).await.unwrap());
+
+    // Tenant A logs a record, then reads it back — signed and stamped — under
+    // its own scope. The read-back record is the one both sessions verify.
+    let a_record = session
+        .with_tenant_scoped(tenant_a(), |scope| async move {
+            let query_id = uuid::Uuid::new_v4();
+            let record = PerQueryAudit::new(
+                query_id,
+                "m_a",
+                "v1",
+                serde_json::json!({ "q": "a" }),
+                vec!["doc1".into()],
+                vec![0.9_f32],
+            )
+            .unwrap();
+            scope.audit().log(vec![record]).await.unwrap();
+            scope
+                .audit()
+                .fetch_by_query_id(query_id)
+                .await
+                .unwrap()
+                .expect("tenant A reads back its own signed record")
+        })
+        .await;
+
+    // Positive control: under tenant A's session the record verifies true.
+    let a_verdict = session
+        .with_tenant_scoped(tenant_a(), |scope| {
+            let record = a_record.clone();
+            async move { scope.audit().verify(&record).await.unwrap() }
+        })
+        .await;
+    assert!(
+        a_verdict,
+        "tenant A must verify its own audit record as authentic"
+    );
+
+    // The leak this case guards: under peer tenant B's session the SAME record
+    // must verify false — B's derived secret differs, so the signature does not
+    // match. A `true` here would be a cross-tenant integrity confirmation.
+    let b_verdict = session
+        .with_tenant_scoped(tenant_b(), |scope| {
+            let record = a_record.clone();
+            async move { scope.audit().verify(&record).await.unwrap() }
+        })
+        .await;
+    assert!(
+        !b_verdict,
+        "CROSS-TENANT VERIFY LEAK: tenant B verified tenant A's audit record as authentic"
     );
 }
 

@@ -6,18 +6,18 @@ import "google/protobuf/empty.proto";
 
 // AuditService — the wire surface for the engine's per-query audit verbs.
 //
-// `AuditLog`, `AuditFetchByQueryId`, and `AuditFetchRecent` are imperative
-// session methods — signing, tenant-injection, and signature-verified decode
-// are non-SQL logic — so they live as typed gRPC RPCs alongside the other
-// engine-backed services rather than on the Flight SQL surface (query/result
-// only, per ADR-01 §3.2). The verbs name a substrate primitive — a signed
-// per-query audit log — and carry no tenant-domain concept.
+// `AuditLog`, `AuditFetchByQueryId`, `AuditFetchRecent`, and `Verify` are
+// imperative session methods — signing, tenant-injection, and signature
+// verification are non-SQL logic — so they live as typed gRPC RPCs alongside
+// the other engine-backed services rather than on the Flight SQL surface
+// (query/result only, per ADR-01 §3.2). The verbs name a substrate primitive —
+// a signed per-query audit log — and carry no tenant-domain concept.
 //
-// Each verb delegates 1:1 to the consumer-facing `Session`
-// abstraction (`audit_log` / `audit_fetch_by_query_id` / `audit_fetch_recent`);
-// the service reimplements no signing, storage, or query logic. The
-// `PerQueryAudit` message mirrors the Rust record field for field, including
-// its server-computed `signature`.
+// Each verb delegates 1:1 to the consumer-facing `Session` abstraction
+// (`audit_log` / `audit_fetch_by_query_id` / `audit_fetch_recent` /
+// `audit_verify`); the service reimplements no signing, storage, query, or
+// verification logic. The `PerQueryAudit` message mirrors the Rust record field
+// for field, including its server-computed `signature`.
 //
 // Tenant scope is read from the request's `SessionTenant` extension, set by
 // the single async tenant-binding layer driven by the engine's
@@ -35,6 +35,13 @@ service AuditService {
   // Fetch the most recent audit records (tenant-scoped), newest first. Peer of
   // the abstraction's `audit_fetch_recent`.
   rpc AuditFetchRecent(AuditFetchRecentRequest) returns (AuditFetchRecentResponse);
+
+  // Verify a presented record's HMAC signature under the session's tenant. The
+  // engine re-derives the per-tenant signing secret from the SESSION tenant —
+  // never the record's own `tenant_id` — and holds the master key server-side,
+  // never returning it: `verified` is true only when the record was signed by
+  // this tenant. Peer of the abstraction's `audit_verify`.
+  rpc Verify(VerifyRequest) returns (VerifyResponse);
 }
 
 // One per-query audit record. Mirrors the Rust `jammi_db::PerQueryAudit`.
@@ -87,4 +94,21 @@ message AuditFetchRecentRequest {
 
 message AuditFetchRecentResponse {
   repeated PerQueryAudit records = 1;
+}
+
+message VerifyRequest {
+  // The record to check, exactly as a fetch verb returned it — every field the
+  // canonical signature covers (including `tenant_id`, `signature`, and
+  // `executed_at`) carried verbatim, so the check runs over the identical
+  // canonical bytes the engine signed.
+  PerQueryAudit record = 1;
+}
+
+message VerifyResponse {
+  // True when the record's signature matches the one the session's tenant would
+  // compute over the same canonical bytes. A signature that does not match —
+  // including a record signed by a different tenant, whose derived secret
+  // differs — is `false`, not an error. A genuine fault (no bound tenant, or an
+  // unavailable master key) surfaces as a gRPC error status instead.
+  bool verified = 1;
 }

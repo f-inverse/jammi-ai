@@ -36,7 +36,7 @@ pub use query::{fetch_by_query_id, fetch_recent};
 pub use record::{canonical_serialize, PerQueryAudit};
 pub use signature::{
     derive_tenant_secret, ensure_master_key_present, hmac_sign, sign_record, verify,
-    verify_with_store,
+    verify_with_store, verify_with_tenant,
 };
 pub use table::{
     audit_schema, ensure_table_exists, is_reserved_table_name, AUDIT_TABLE_NAME, AUDIT_TOPIC,
@@ -75,5 +75,24 @@ impl<'a> AuditHandle<'a> {
     /// Fetch the most recent records (tenant-scoped), newest first.
     pub async fn fetch_recent(&self, limit: usize) -> Result<Vec<PerQueryAudit>, AuditError> {
         fetch_recent(self.session, limit).await
+    }
+
+    /// Verify a presented record's signature under this session's tenant.
+    ///
+    /// The signing secret is re-derived from the session's bound tenant — NOT
+    /// the record's own `tenant_id` — so a caller only ever verifies a record as
+    /// its own tenant would have signed it. The audit surface treats the
+    /// record's `tenant_id` as untrusted (the log path stamps it from the
+    /// session, ignoring caller input), so the session tenant, not a field on
+    /// the record, is the authority here too: a record signed under tenant A
+    /// verifies `true` under A's session and `false` under a peer B's session,
+    /// whose derived secret differs.
+    ///
+    /// A signature that does not match is `Ok(false)`; only a genuine fault — no
+    /// bound tenant, or an unavailable master key — is an `Err`.
+    pub async fn verify(&self, record: &PerQueryAudit) -> Result<bool, AuditError> {
+        let tenant = self.session.tenant().ok_or(AuditError::NoTenantBinding)?;
+        let store = self.session.signing_key_store();
+        verify_with_tenant(record, &tenant.to_string(), store.as_ref())
     }
 }

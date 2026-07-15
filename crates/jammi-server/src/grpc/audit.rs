@@ -1,10 +1,10 @@
 //! `AuditService` gRPC implementation.
 //!
-//! Three verbs land on the wire: `AuditLog`, `AuditFetchByQueryId`, and
-//! `AuditFetchRecent`. Each is a thin adapter over the transport-agnostic
-//! [`Session`] abstraction (never raw [`InferenceSession`]
+//! Four verbs land on the wire: `AuditLog`, `AuditFetchByQueryId`,
+//! `AuditFetchRecent`, and `Verify`. Each is a thin adapter over the
+//! transport-agnostic [`Session`] abstraction (never raw [`InferenceSession`]
 //! calls): proto in, one flat `Session::audit_*` call, proto out. The service
-//! reimplements no signing, storage, or query logic.
+//! reimplements no signing, storage, query, or verification logic.
 //!
 //! The [`pb::PerQueryAudit`] message mirrors the Rust [`jammi_db::PerQueryAudit`]
 //! field for field, including its server-computed `signature`. On `AuditLog` the
@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
 use jammi_ai::{AuditError, PerQueryAudit, Session};
-use jammi_wire::{attach_audit_detail, parse_query_id};
+use jammi_wire::{attach_audit_detail, parse_query_id, record_from_wire};
 use tonic::{Code, Request, Response, Status};
 
 use crate::grpc::proto::audit as pb;
@@ -111,6 +111,35 @@ impl AuditService for AuditServer {
         Ok(Response::new(pb::AuditFetchRecentResponse {
             records: records.into_iter().map(Into::into).collect(),
         }))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
+    async fn verify(
+        &self,
+        request: Request<pb::VerifyRequest>,
+    ) -> Result<Response<pb::VerifyResponse>, Status> {
+        let tenant = session_tenant_traced(&request);
+        let req = request.into_inner();
+        // Decode the record AS PRESENTED — every field the canonical signature
+        // covers (`tenant_id`, `signature`, `executed_at`) carried verbatim, so
+        // the check runs over the identical bytes the engine signed. This is the
+        // fetch-side decode, not `record_from_proto` (which drops those fields to
+        // let the engine stamp them on write).
+        let record = record_from_wire(
+            req.record
+                .ok_or_else(|| Status::invalid_argument("verify requires a record"))?,
+        )
+        .map_err(map_audit_error)?;
+        let session = self.local();
+
+        // The secret is re-derived from the SESSION tenant, never the record's
+        // own `tenant_id`; a mismatch (including a peer's record) is a `false`
+        // verdict, while a genuine fault maps to a `Status` below.
+        let verified = scoped(&self.session, tenant, || session.audit_verify(record))
+            .await
+            .map_err(map_audit_error)?;
+
+        Ok(Response::new(pb::VerifyResponse { verified }))
     }
 }
 

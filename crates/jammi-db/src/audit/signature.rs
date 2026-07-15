@@ -103,6 +103,33 @@ pub fn verify_with_store(
     verify(record, &secret)
 }
 
+/// Verify a presented record's signature under an explicit tenant scope.
+///
+/// The signing secret is derived from `tenant` — the scope that PRESENTS the
+/// record — never from the record's own `tenant_id`. A record therefore
+/// verifies only under the tenant whose secret produced its signature: a record
+/// signed by tenant A returns `true` under A and `false` under any peer B,
+/// whose derived secret differs even over the identical canonical bytes. This
+/// is the session-scoped integrity check for the untrusted-`tenant_id` audit
+/// surface, where the caller's session tenant — not a field on the record — is
+/// the authority.
+///
+/// A signature that does not match is `Ok(false)`, distinguishing a legitimate
+/// negative from a genuine fault (an unavailable master key), which is `Err`.
+pub fn verify_with_tenant(
+    record: &PerQueryAudit,
+    tenant: &str,
+    store: &dyn SigningKeyStore,
+) -> Result<bool, AuditError> {
+    let master = store.master_key()?;
+    let secret = derive_tenant_secret(&master, tenant)?;
+    match verify(record, &secret) {
+        Ok(()) => Ok(true),
+        Err(AuditError::SignatureMismatch(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Constant-time byte comparison to avoid signature-timing side channels.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -189,6 +216,84 @@ mod tests {
             derive_tenant_secret(&master, "tenant-a").unwrap(),
             derive_tenant_secret(&master, "tenant-b").unwrap()
         );
+    }
+
+    #[test]
+    fn verify_with_tenant_is_true_under_the_signing_tenant() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var(MASTER_KEY_ENV, TEST_KEY);
+        let store = EnvSigningKeyStore;
+        let mut r = scoped(); // signed under "tenant-a"
+        sign_record(&mut r, &store).unwrap();
+        assert!(verify_with_tenant(&r, "tenant-a", &store).unwrap());
+    }
+
+    #[test]
+    fn verify_with_tenant_is_false_under_a_peer_tenant() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var(MASTER_KEY_ENV, TEST_KEY);
+        let store = EnvSigningKeyStore;
+        let mut r = scoped(); // signed under "tenant-a"
+        sign_record(&mut r, &store).unwrap();
+        // A peer's session derives a different secret over the identical
+        // canonical bytes, so the record does not verify — a false, not an
+        // error, and not a cross-tenant true (which deriving from
+        // `record.tenant_id` would produce — the leak this scope closes).
+        assert!(!verify_with_tenant(&r, "tenant-b", &store).unwrap());
+    }
+
+    #[test]
+    fn session_scope_closes_the_record_tenant_verify_leak() {
+        // The RED→GREEN contrast, pinned as a regression test. A record signed
+        // by tenant A is presented to tenant B's session.
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var(MASTER_KEY_ENV, TEST_KEY);
+        let store = EnvSigningKeyStore;
+        let mut a_record = scoped(); // tenant_id = "tenant-a"
+        sign_record(&mut a_record, &store).unwrap();
+
+        // RED — the record-scoped primitive derives the secret from the
+        // record's OWN `tenant_id` ("tenant-a"), so it confirms the signature as
+        // valid to WHOEVER holds the record, including a peer: a cross-tenant
+        // integrity leak.
+        assert!(
+            verify_with_store(&a_record, &store).is_ok(),
+            "record-scoped verify confirms A's record regardless of the caller — the leak",
+        );
+
+        // GREEN — the session-scoped primitive derives the secret from the
+        // presenting tenant ("tenant-b"), whose secret differs, so the same
+        // record does not verify. The session, not a field on the record, is the
+        // authority.
+        assert!(
+            !verify_with_tenant(&a_record, "tenant-b", &store).unwrap(),
+            "session-scoped verify refuses A's record under B's scope — leak closed",
+        );
+    }
+
+    #[test]
+    fn verify_with_tenant_reports_tamper_as_false() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var(MASTER_KEY_ENV, TEST_KEY);
+        let store = EnvSigningKeyStore;
+        let mut r = scoped();
+        sign_record(&mut r, &store).unwrap();
+        r.model_id = "tampered".into();
+        assert!(!verify_with_tenant(&r, "tenant-a", &store).unwrap());
+    }
+
+    #[test]
+    fn verify_with_tenant_surfaces_a_missing_master_key_as_error() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var(MASTER_KEY_ENV, TEST_KEY);
+        let mut r = scoped();
+        sign_record(&mut r, &EnvSigningKeyStore).unwrap();
+        // A genuine fault (no usable key) is an Err, not a silent `false`.
+        std::env::remove_var(MASTER_KEY_ENV);
+        assert!(matches!(
+            verify_with_tenant(&r, "tenant-a", &EnvSigningKeyStore),
+            Err(AuditError::MasterKey(_))
+        ));
     }
 
     #[test]

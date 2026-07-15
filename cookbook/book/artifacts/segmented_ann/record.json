@@ -1,7 +1,7 @@
 {
   "append_no_rebuild": {
     "exit_code": 0,
-    "finding": "No public verb appends a second segment onto an already-ready table: generate_embeddings, import_embeddings, graph propagation, and context-set materialization all call ResultStore::create_table fresh (grep-verified). ResultStore::append_segment is a jammi-db crate-level Rust primitive with no SDK/wire binding in this diff, measured here at the layer it is live and public: the already-shipped jammi-db it-suite, re-run live, never modified.",
+    "finding": "No public verb appends a second segment onto an already-ready table: generate_embeddings, import_embeddings, graph propagation, and context-set materialization all call ResultStore::create_table fresh (grep-verified). ResultStore::append_segment is a jammi-db crate-level Rust primitive with no SDK/wire binding today, measured here at the layer it is live and public: the already-shipped jammi-db it-suite, re-run live, never modified.",
     "headline_test": "segment::append_does_not_rebuild_prior_segments",
     "headline_test_asserts": [
       "segment 0's raw .usearch bytes are byte-identical before and after appending segment 1 (read off disk both times)",
@@ -32,5 +32,5 @@
       "usearch": true
     }
   },
-  "purpose": "The engine\u2194cookbook validator for S10 (crates/jammi-db/src/index/segment.rs + ResultStore::append_segment): a table's ANN index as a set of immutable segments, searched through a merge that is byte-identical to the single-index path at N=1. Measures the SDK-reachable N=1 exact-search property live against the wheel, and the write-side append/no-rebuild property live against the already-shipped jammi-db it-suite (the layer it is public at today \u2014 no SDK/wire verb appends a second segment onto an already-ready table in this diff)."
+  "purpose": "The engine\u2194cookbook validator for the segmented-ANN capability (crates/jammi-db/src/index/segment.rs + ResultStore::append_segment): a table's ANN index as a set of immutable segments, searched through a merge that is byte-identical to the single-index path at N=1. Measures the SDK-reachable N=1 exact-search property live against the wheel, and the write-side append/no-rebuild property live against the already-shipped jammi-db it-suite (the layer it is public at today \u2014 no SDK/wire verb appends a second segment onto an already-ready table today)."
 }

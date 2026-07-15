@@ -38,13 +38,13 @@ surface is narrower than its engine surface:
   ranking over the SAME vectors the table holds, live, right here, asserting it against the
   engine's own recorded `search` hits. "A freshly-built single-segment table's search is
   the exact top-k" is what "byte-identical to the pre-existing single-index behavior"
-  cashes out to: the pre-S10 path was also single-stage exact cosine for an `F32` table.
+  cashes out to: the single-index path is also single-stage exact cosine for an `F32` table.
 - **There is no public verb yet that appends a second segment onto an already-ready
   table.** Every embedding-producing pipeline — `generate_embeddings`, `import_embeddings`,
   graph propagation, context-set materialization — calls the engine's table-creation path
   fresh, so calling `generate_embeddings` again always lands a brand-new table, never a
   second segment on this one. `ResultStore::append_segment` (the primitive this release
-  ships) is a `jammi-db` crate-level Rust API with no SDK or wire binding in this diff — a
+  ships) is a `jammi-db` crate-level Rust API with no SDK or wire binding today — a
   real engine-surface finding, not a script that dodges the question.
 - **So the incremental-append property is measured at the layer where it is genuinely live
   and public today**: this chapter's cache shells out to the ALREADY-SHIPPED, unmodified
@@ -206,7 +206,7 @@ measured — not a Python restatement of it.
 ## Why this cache is honest about what it did *not* measure
 
 This is worth stating as plainly as `retrieval.qmd`'s `search` multi-table gotcha states its
-own finding: **the write side of S10 — `ResultStore::append_segment` — has no SDK or wire
+own finding: **the write side — `ResultStore::append_segment` — has no SDK or wire
 binding yet.** Every path this book's other chapters exercise (`generate_embeddings`,
 `import_embeddings`) always creates a fresh, uniquely-named result table; none of them lands
 a second segment on an existing one. That is not a limitation of this cache's emit script —

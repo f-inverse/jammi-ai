@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Emit the segmented-ANN-index cache — CPU, embedded-only, hermetic.
 
-The engine↔cookbook validator for S10 (`crates/jammi-db/src/index/segment.rs` +
-`ResultStore::append_segment`, `crates/jammi-db/src/store/mod.rs`): a table's
+The engine↔cookbook validator for the segmented-ANN capability
+(`crates/jammi-db/src/index/segment.rs` + `ResultStore::append_segment`,
+`crates/jammi-db/src/store/mod.rs`): a table's
 ANN index is a *set* of immutable segments rather than one sidecar. Appending a
 batch of new rows writes a new segment beside the existing ones and leaves them
 byte-for-byte untouched; a search fans across every segment and merges under one
@@ -23,7 +24,7 @@ never a Python reimplementation of the merge:
   vectors (read back from the table's own Parquet) and asserts it against the
   recorded hits — "a freshly-built single-segment table's search is the exact
   top-k" is what "byte-identical to the pre-existing single-index behavior"
-  cashes out to (the pre-S10 path was also single-stage exact cosine for an
+  cashes out to (the single-index path is also single-stage exact cosine for an
   `F32` table).
 
 * **Incremental append leaves segment 0 untouched (the write-side primitive this
@@ -35,7 +36,7 @@ never a Python reimplementation of the merge:
   segment on this one (grep-verified against
   `crates/jammi-ai/src/pipeline/embedding.rs`, `pipeline/import.rs`, and
   `crates/jammi-db/src/store/mod.rs`). `ResultStore::append_segment` is a
-  `jammi-db` crate-level Rust primitive with no SDK/wire binding in this diff — a
+  `jammi-db` crate-level Rust primitive with no SDK/wire binding today — a
   genuine, honest engine-surface finding (the "teach the honest negative"
   discipline this book applies everywhere), not a gap in this script.
 
@@ -336,14 +337,15 @@ def emit(fixtures_root: Path) -> None:
 
     record = {
         "purpose": (
-            "The engine↔cookbook validator for S10 (crates/jammi-db/src/index/"
-            "segment.rs + ResultStore::append_segment): a table's ANN index as a set "
+            "The engine↔cookbook validator for the segmented-ANN capability "
+            "(crates/jammi-db/src/index/segment.rs + ResultStore::append_segment): "
+            "a table's ANN index as a set "
             "of immutable segments, searched through a merge that is byte-identical "
             "to the single-index path at N=1. Measures the SDK-reachable N=1 exact-"
             "search property live against the wheel, and the write-side append/"
             "no-rebuild property live against the already-shipped jammi-db it-suite "
             "(the layer it is public at today — no SDK/wire verb appends a second "
-            "segment onto an already-ready table in this diff)."
+            "segment onto an already-ready table today)."
         ),
         "n1": {
             # `table_name` itself is not recorded: it embeds the sanitized
@@ -366,7 +368,7 @@ def emit(fixtures_root: Path) -> None:
                 "table: generate_embeddings, import_embeddings, graph propagation, "
                 "and context-set materialization all call ResultStore::create_table "
                 "fresh (grep-verified). ResultStore::append_segment is a jammi-db "
-                "crate-level Rust primitive with no SDK/wire binding in this diff, "
+                "crate-level Rust primitive with no SDK/wire binding today, "
                 "measured here at the layer it is live and public: the already-"
                 "shipped jammi-db it-suite, re-run live, never modified."
             ),

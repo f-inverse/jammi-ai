@@ -931,7 +931,7 @@ ARTIFACTS: dict[str, Artifact] = {
         note="The live verdict of the already-shipped, unmodified `jammi-db` it-suite's "
         "`segment::` tests (`cargo test -p jammi-db --test it -- segment::`) — the "
         "correctness oracle for the incremental-append/no-rebuild property, since no "
-        "SDK/wire verb appends a second segment onto an already-ready table in this diff. "
+        "SDK/wire verb appends a second segment onto an already-ready table today. "
         "Exit code + per-test pass/fail, never a fabricated number.",
     ),
     "segmented_ann.record": Artifact(

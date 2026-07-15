@@ -6,7 +6,22 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.46.0] - 2026-07-15
+
+Two additive feature seams land together: a durable claim policy for the
+training-job queue, and the ANN index generalized from a single sidecar to a
+catalog-tracked set of segments.
+
 ### Added
+- **Durable job-queue claim policy (`jammi-db`).** The training-job claim now
+  honors a `priority` column (`DESC`, then `created_at`) and skips jobs held by
+  a `claimable = FALSE` flag (migration 024, new
+  `idx_training_jobs_claim_policy` index matching the claim's predicate). Both
+  backend branches of `claim_next_training_job` share the ordering and the
+  skip predicate; the reclaim index and lease lifecycle are untouched. With
+  every row at the column defaults (`priority = 0`, `claimable = TRUE`) the
+  claim order is unchanged from today's oldest-first FIFO — no new typed
+  surface, the policy is catalog data the engine honors.
 - **Segmented ANN index — incremental append without rebuild (`jammi-db` +
   `jammi-ai`).** A table's ANN index is now a *set* of immutable segments
   (`SegmentedIndex`), one `SidecarIndex` bundle per disjoint row subset, rather
@@ -21,7 +36,8 @@ workspace ships every publishable crate at the same
   set; `result_tables.index_path` is dropped. Remote segments load through a
   content-addressed local cache (`SegmentIndexCache`) keyed on the segment
   manifest bytes. Any single segment's load failure falls the whole table back
-  to exact search — never a silently incomplete index.
+  to exact search — never a silently incomplete index. Search is byte-identical
+  to the single-index path at a segment count of one.
 
 ## [0.45.0] - 2026-07-13
 

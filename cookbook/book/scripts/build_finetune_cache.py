@@ -66,6 +66,7 @@ import pyarrow.parquet as pq
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
 from jammi_cookbook import datasets, determinism
 
+ENGINE_VERSION = "0.46.0"
 EMBED_MODEL = "answerdotai/ModernBERT-base"
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "finetune"
 SUBSET = 4000
@@ -353,8 +354,9 @@ def emit(db) -> None:
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
     info = db.get_server_info()
     print("server:", json.dumps(info), flush=True)
-    if info.get("version") != "0.26.4":
-        raise RuntimeError(f"server version {info.get('version')} != pinned 0.26.4 — STOP")
+    if info.get("version") != ENGINE_VERSION:
+        raise RuntimeError(
+            f"server version {info.get('version')} != pinned {ENGINE_VERSION} — STOP")
 
     arxiv = datasets.load_ogbn_arxiv(db, subset=SUBSET)
     papers = arxiv.papers_source

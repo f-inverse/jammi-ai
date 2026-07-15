@@ -60,7 +60,7 @@ import pyarrow.parquet as pq
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
 from jammi_cookbook import datasets, determinism
 
-ENGINE_VERSION = "0.29.0"
+ENGINE_VERSION = "0.46.0"
 EMBED_MODEL = "answerdotai/ModernBERT-base"
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "finetune_regression"
 SUBSET = 4000

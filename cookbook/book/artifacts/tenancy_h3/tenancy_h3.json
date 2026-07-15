@@ -95,6 +95,15 @@
   ],
   "parity_verdict": "remote == embedded for every cross-transport observable",
   "purpose": "The engine\u2194cookbook validator for the \u00a73.5 standing isolation oracle: for every tenant-scoped verb, tenant B cannot see or reach tenant A's resource, measured from the consumer side as a per-verb matrix of hard zeros and documented stated-positives, on the embedded engine and a live grpc:// jammi-server. Plus the BYO-auth seam, demonstrated from the consumer side over the REAL Flight SQL wire: a generic HMAC-bearer-token gateway that reads the bearer off a genuine db.sql() Flight call and binds the verified tenant for a real-engine read, in front of the engine's tenant binding.",
+  "result_table_scan": {
+    "a_own_read": 3,
+    "a_own_read_after_b_refused": 3,
+    "b_refused": true,
+    "global_visible_to_a": 3,
+    "global_visible_to_b": 3,
+    "leak": 0.0
+  },
+  "result_table_scan_note": "esc-024: a result table (asof_join, generate_embeddings, ...) carries no tenant_id column, so resolution of its bare jammi.{name} identifier is gated on the catalog row's OWNER instead (ResultTableSchemaProvider::visible, result_schema.rs), mirroring the engine's own oracle (tenant_isolation_oracle.rs::assert_result_table_scan_isolated). Measured over the db.sql lane only, embedded-only: A's own asof_join output reads N > 0, a GLOBAL asof_join output is visible to both A and B, and B naming A's private table is refused (jammi.BackendError). Non-vacuity is witnessed by A's own re-read of the SAME table after B's refusal, since the oracle's internal admin_scope() bypass has no public Python surface (tenant_scope.rs). Organizational resolution-visibility, not a hostile-principal boundary \u2014 the trusted-network + BYO-auth posture is unchanged.",
   "transports": [
     "embedded (file://, in-process)",
     "remote (grpc://, live jammi-server) \u2014 the catalog reads + the discriminator sql row read",

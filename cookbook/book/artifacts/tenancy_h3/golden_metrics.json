@@ -83,6 +83,22 @@
     "tol": 0.0,
     "value": 1.0
   },
+  "result_table_scan": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "result_table_scan.a_own_read_positive": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "result_table_scan.global_visible_both": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "result_table_scan.nonvacuity": {
+    "tol": 0.0,
+    "value": 1.0
+  },
   "stated_positive.builtin_channels_visible": {
     "tol": 0.0,
     "value": 3.0

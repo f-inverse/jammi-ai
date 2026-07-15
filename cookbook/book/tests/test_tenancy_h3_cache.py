@@ -14,6 +14,12 @@ no GPU, no recompute) and assert the chapter's load-bearing facts:
 * **the destructive-verb survival** — A's mutable table / topic SURVIVES a
   foreign-tenant drop: no cross-tenant data destruction (the property the standing
   oracle guards; the headline no-leak finding);
+* **the esc-024 result-table SCAN isolation, over the db.sql lane** — a result
+  table (``asof_join``, ``generate_embeddings``, ...) carries no ``tenant_id``
+  column, so resolution of its bare ``jammi.{name}`` identifier is gated on the
+  catalog row's owner instead; B naming A's private result table is refused,
+  the GLOBAL case is visible to both, and non-vacuity is witnessed by A's own
+  re-read of the same table after B's refusal;
 * **the BYO-auth seam over the real Flight SQL wire** — the bearer is observed on
   the Flight lane (anonymous carries none); two authenticated tenants get isolated
   reads; a missing/forged credential is rejected, not run unscoped; the over-Flight
@@ -86,6 +92,7 @@ def test_every_verdict_matches_golden():
     ):
         # every hard zero is exactly 0
         contracts.assert_close(f"tenancy_h3.{metric}", 0.0)
+    contracts.assert_close("tenancy_h3.result_table_scan", 0.0)
     for metric in (
         "collision.mutable_dup_errored",
         "collision.topic_dup_isolated",
@@ -101,6 +108,9 @@ def test_every_verdict_matches_golden():
         "byo_auth.forged_rejected_over_flight",
         "byo_auth.legit_after_forgery_over_flight",
         "byo_auth.over_flight_eq_embedded",
+        "result_table_scan.a_own_read_positive",
+        "result_table_scan.global_visible_both",
+        "result_table_scan.nonvacuity",
     ):
         contracts.assert_close(f"tenancy_h3.{metric}", 1.0)
 
@@ -201,6 +211,34 @@ def test_remote_equals_embedded_for_cross_transport_verbs():
     assert all(p["equal"] for p in parity), "every cross-transport observable must agree"
     assert rec["parity_verdict"].startswith("remote == embedded")
     contracts.assert_close("tenancy_h3.parity.cross_transport_equal", 1.0)
+
+
+# --------------------------------------------------------------------------- #
+# the esc-024 result-table SCAN isolation (db.sql lane, embedded-only)
+# --------------------------------------------------------------------------- #
+
+
+@_needs_cache
+def test_result_table_scan_isolated():
+    """The esc-024 mirror of the Rust oracle
+    (``tenant_isolation_oracle.rs::assert_result_table_scan_isolated``), over the
+    ``db.sql`` lane: A's own ``asof_join`` output reads a real positive count; a
+    GLOBAL ``asof_join`` output is visible to both A and B; B naming A's private
+    table is REFUSED. Non-vacuity substitutes A's own re-read of the SAME table
+    after B's refusal for the oracle's internal ``admin_scope()`` bypass, which
+    carries no public Python surface. Organizational resolution-visibility, not
+    a hostile-principal boundary — the trusted-network + BYO-auth posture is
+    unchanged (esc-020)."""
+    rec = _record()
+    rts = rec["result_table_scan"]
+    assert rts["a_own_read"] > 0
+    assert rts["global_visible_to_a"] > 0
+    assert rts["global_visible_to_a"] == rts["global_visible_to_b"]
+    assert rts["b_refused"] is True, "CROSS-TENANT SCAN LEAK: B scanned A's private result table"
+    assert rts["a_own_read_after_b_refused"] == rts["a_own_read"], (
+        "non-vacuity: A's own table must be unchanged after B's refused attempt"
+    )
+    contracts.assert_close("tenancy_h3.result_table_scan", 0.0)
 
 
 # --------------------------------------------------------------------------- #

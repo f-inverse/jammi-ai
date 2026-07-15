@@ -108,16 +108,55 @@
 //! single-sample draw cannot pass (or fail) the gate on chance alone: the
 //! gate only passes when the *worst plausible* mean over resamples of this
 //! query set still clears the floor.
+//!
+//! ## The segment axis: does the merge recover what a lone graph would find
+//!
+//! [`mean_recall_at_k_segmented`] generalizes the held-out measurement again,
+//! this time along the ANN index's *topology* rather than its storage
+//! precision: instead of one frozen [`SidecarIndex`] over the whole corpus, `N`
+//! frozen sidecars — each over a disjoint subset of the SAME corpus — are
+//! loaded and assembled into one [`SegmentedIndex`], whose
+//! [`SegmentedIndex::search_final`] fans the query across every segment and
+//! merges the results (`jammi_db::index::segment`'s `DEFAULT_SEGMENT_OVERFETCH_FACTOR`
+//! over-fetches from each segment before the merge). USearch's HNSW build is
+//! nondeterministic, so — mirroring the frozen-single-graph discipline above —
+//! a real recall floor over this axis needs the seed varied and averaged, and
+//! the one lever this harness can pull deterministically is not the
+//! (uncontrollable) HNSW build seed but the *partitioning*: which corpus rows
+//! land in which segment. `tests::segment_merge_recall_clears_its_committed_floor_and_tracks_the_single_graph`
+//! asserts the committed floor holds across every committed partitioning
+//! (`fixture.rs`'s `build_segment_recall_fixture` freezes more than one), each
+//! standing in for an independent draw of the graph. Alongside the floor, that
+//! gate also measures the SAME corpus as a single (`N = 1`) frozen
+//! [`SidecarIndex`] at the SAME precision and asserts the merge's recall does
+//! not fall more than a committed margin below it — the merge-vs-single-graph
+//! tracking check that gives `DEFAULT_SEGMENT_OVERFETCH_FACTOR` real teeth: an
+//! under-provisioned over-fetch would surface here as the merge losing recall
+//! the single graph recovers, exactly the failure mode the constant's SEAM
+//! note names.
+//!
+//! The committed floor is measured at `Int8` and `Binary`, never `F32`: at
+//! `F32`, [`StoragePrecision::needs_rescore`] is `false`, so
+//! [`SegmentedIndex::search_final`] never enters its retrieve→rescore stage —
+//! there is no rescore-in-merge for the merge's over-fetch to feed, and this
+//! fixture's real-embedding corpus is small enough per segment that an `F32`
+//! HNSW segment's own recall already sits at (or above) `1.0`, so an `F32`
+//! floor would guard nothing precision-specific (a near-tautological "recall
+//! is always `1.0`" floor). `Int8`/`Binary` segments are lossy enough on
+//! their own — see [`mean_recall_at_k_rescored`]'s doc and the committed
+//! single-graph `int8_no_rescore`/`binary_no_rescore` numbers — that
+//! `search_final`'s retrieve→rescore-in-merge design has real recall to
+//! recover, which is exactly what this floor and the tracking margin measure.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use datafusion::prelude::SessionContext;
 
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::exact::exact_vector_search;
 use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::VectorIndex;
+use jammi_db::index::{SegmentId, SegmentedIndex, VectorIndex};
 use jammi_numerics::stats::{bootstrap_ci, Interval};
 
 use crate::corpus;
@@ -338,6 +377,132 @@ async fn recall_samples_at_k_rescored(
         samples.push(recall_at_k_for_query(&ann, &exact, k));
     }
     Ok(samples)
+}
+
+/// Per-query segment-merge recall@k samples over a query set — the
+/// multi-segment analogue of [`recall_samples_at_k_rescored`]. LOADS (never
+/// rebuilds) each of `segment_bases` as its own frozen [`SidecarIndex`] at
+/// `precision`, assembles them in order into one [`SegmentedIndex`] via
+/// [`SegmentedIndex::new`], then measures the ASSEMBLED merge's
+/// [`SegmentedIndex::search_final`] top-`k` against the exact oracle's
+/// top-`k`, one sample per query.
+///
+/// `segment_bases` is ordered — position `i` becomes [`SegmentId`]`(i)` — but
+/// the merge's own correctness does not depend on that order (see
+/// `jammi_db::index::segment`'s merge tests); ordering here only pins the
+/// tie-break identity, not the recall this measures. An empty `queries`
+/// yields an empty sample set, mirroring [`recall_samples_at_k_rescored`]'s
+/// contract.
+async fn recall_samples_at_k_segmented(
+    ctx: &SessionContext,
+    table_name: &str,
+    segment_bases: &[PathBuf],
+    precision: StoragePrecision,
+    oversample: usize,
+    queries: &[Vec<f32>],
+    k: usize,
+) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+    if queries.is_empty() {
+        return Ok(Vec::new());
+    }
+    // LOAD every segment — never rebuild. The committed graphs are the ones
+    // whose merged recall is being measured.
+    let segments = segment_bases
+        .iter()
+        .enumerate()
+        .map(|(i, base)| {
+            let index = SidecarIndex::load(base, &AnnIndexConfig::default(), precision)?;
+            Ok::<_, Box<dyn std::error::Error>>((SegmentId(i as i64), index))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let merged = SegmentedIndex::new(segments)?;
+
+    let mut samples = Vec::with_capacity(queries.len());
+    for query in queries {
+        let exact = exact_vector_search(ctx, table_name, query, k).await?;
+        let ann = merged.search_final(query, k, oversample.max(1))?;
+        samples.push(recall_at_k_for_query(&ann, &exact, k));
+    }
+    Ok(samples)
+}
+
+/// Mean segment-merge recall@k over a query set — the multi-segment analogue
+/// of [`mean_recall_at_k_rescored`]. Exactly the mean of
+/// [`recall_samples_at_k_segmented`]'s per-query samples.
+pub async fn mean_recall_at_k_segmented(
+    ctx: &SessionContext,
+    table_name: &str,
+    segment_bases: &[PathBuf],
+    precision: StoragePrecision,
+    oversample: usize,
+    queries: &[Vec<f32>],
+    k: usize,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    let samples = recall_samples_at_k_segmented(
+        ctx,
+        table_name,
+        segment_bases,
+        precision,
+        oversample,
+        queries,
+        k,
+    )
+    .await?;
+    if samples.is_empty() {
+        return Ok(0.0);
+    }
+    Ok(samples.iter().sum::<f64>() / samples.len() as f64)
+}
+
+/// Segment-merge recall@k point estimate AND bootstrap confidence interval —
+/// the multi-segment analogue of [`recall_ci_at_k_rescored`], built on
+/// [`recall_samples_at_k_segmented`]'s per-query samples exactly as
+/// `recall_ci_at_k_rescored` is built on [`recall_samples_at_k_rescored`]'s
+/// (same [`RECALL_BOOTSTRAP_ITERATIONS`]/[`RECALL_BOOTSTRAP_ALPHA`]/
+/// [`RECALL_BOOTSTRAP_SEED`]). This is what a `Binary` segment set is
+/// measured through: `Binary`'s Hamming coarse stage is noisy enough at a
+/// per-segment row count this small that a single-sample point estimate could
+/// invert, the same reasoning [`recall_ci_at_k_rescored`]'s module-level
+/// "binary gate is a confidence interval" section gives for the single-graph
+/// `Binary` row.
+///
+/// Errors when `queries` is empty, mirroring `recall_ci_at_k_rescored`'s
+/// contract: a CI over zero samples is not a measurement.
+pub async fn recall_ci_at_k_segmented(
+    ctx: &SessionContext,
+    table_name: &str,
+    segment_bases: &[PathBuf],
+    precision: StoragePrecision,
+    oversample: usize,
+    queries: &[Vec<f32>],
+    k: usize,
+) -> Result<RecallCi, Box<dyn std::error::Error>> {
+    let samples = recall_samples_at_k_segmented(
+        ctx,
+        table_name,
+        segment_bases,
+        precision,
+        oversample,
+        queries,
+        k,
+    )
+    .await?;
+    if samples.is_empty() {
+        return Err(
+            "recall_ci_at_k_segmented: empty query set — a bootstrap CI needs at least one sample"
+                .into(),
+        );
+    }
+    let point = samples.iter().sum::<f64>() / samples.len() as f64;
+    let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
+    let interval = bootstrap_ci(
+        &samples,
+        mean,
+        RECALL_BOOTSTRAP_ITERATIONS,
+        RECALL_BOOTSTRAP_ALPHA,
+        RECALL_BOOTSTRAP_SEED,
+    )?;
+    Ok(RecallCi { point, interval })
 }
 
 /// Recall@k point estimate AND bootstrap confidence interval over a query set,
@@ -925,6 +1090,152 @@ mod tests {
         let floor = load_floor_json(&fixture_dir);
         for row in RECALL_GATE_TABLE {
             assert_recall_gate_row_clears_floor(row, &fixture_dir, &floor).await;
+        }
+    }
+
+    /// The committed segment-merge recall floor gate — its OWN gate, not a
+    /// [`RecallGateRow`]: the axis under test is the ANN index's segment
+    /// TOPOLOGY (how many segments, which corpus rows land in which), which
+    /// means something different from `RecallGateRow::precision`, so folding
+    /// it into that table would special-case a field for an unrelated axis
+    /// rather than model the two axes separately.
+    ///
+    /// Reads `floor.json`'s `"segment_merge"` section (written by
+    /// `fixture.rs`'s `build_segment_recall_fixture`): for EVERY committed
+    /// precision (`Int8`, `Binary` — the ones where
+    /// [`StoragePrecision::needs_rescore`] is `true`, so `search_final`'s
+    /// retrieve→rescore-in-merge stage actually runs; see the module-level
+    /// "segment axis" section for why `F32` is not a committed precision
+    /// here) and every committed partitioning under it (each a deterministic
+    /// stand-in for an independent HNSW build seed USearch does not let this
+    /// harness pin), assembles the `N` committed segment bundles into one
+    /// [`SegmentedIndex`] and asserts its measured recall clears the
+    /// committed floor at every k in [`RECALL_KS`] — the point mean
+    /// ([`mean_recall_at_k_segmented`]) at `Int8`, the bootstrap-CI lower
+    /// bound ([`recall_ci_at_k_segmented`]) at `Binary`, driven purely by the
+    /// row's own committed `anchor`. It ALSO measures the SAME corpus +
+    /// queries as a single (`N = 1`) frozen [`SidecarIndex`] at that SAME
+    /// precision and asserts the merge never falls more than the committed
+    /// `single_graph_tracking_margin` below that single-graph baseline — the
+    /// check that gives `jammi_db::index::segment::DEFAULT_SEGMENT_OVERFETCH_FACTOR`
+    /// real teeth over a precision where per-segment recall is genuinely
+    /// below `1.0`.
+    #[tokio::test]
+    async fn segment_merge_recall_clears_its_committed_floor_and_tracks_the_single_graph() {
+        let fixture_dir = scale_fixture_dir();
+        let floor = load_floor_json(&fixture_dir);
+        let segment_merge = &floor["segment_merge"];
+        let segment_count = segment_merge["segment_count"]
+            .as_u64()
+            .expect("floor.json missing segment_merge.segment_count")
+            as usize;
+        let precisions = segment_merge["precisions"]
+            .as_object()
+            .expect("floor.json segment_merge.precisions must be an object");
+        assert!(
+            !precisions.is_empty(),
+            "the segment_merge fixture must carry at least one committed precision"
+        );
+
+        let (ctx, corpus_table, queries) =
+            register_gate_fixture(&fixture_dir, "segment_merge").await;
+
+        for (precision_key, spec) in precisions {
+            let precision = match precision_key.as_str() {
+                "int8" => StoragePrecision::Int8,
+                "binary" => StoragePrecision::Binary,
+                other => panic!("floor.json segment_merge.precisions has unknown key {other}"),
+            };
+            let oversample = spec["oversample"].as_u64().unwrap_or_else(|| {
+                panic!("floor.json missing segment_merge.{precision_key}.oversample")
+            }) as usize;
+            let anchor = spec["anchor"].as_str().unwrap_or_else(|| {
+                panic!("floor.json missing segment_merge.{precision_key}.anchor")
+            });
+            let tracking_margin = spec["single_graph_tracking_margin"]
+                .as_f64()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "floor.json missing segment_merge.{precision_key}.single_graph_tracking_margin"
+                    )
+                });
+            let single_graph = &spec["single_graph"];
+            let partitionings = spec["partitionings"].as_object().unwrap_or_else(|| {
+                panic!("floor.json segment_merge.{precision_key}.partitionings must be an object")
+            });
+            assert!(
+                !partitionings.is_empty(),
+                "segment_merge.{precision_key} must carry at least one committed partitioning"
+            );
+
+            for (name, per_k) in partitionings {
+                let segment_bases: Vec<std::path::PathBuf> = (0..segment_count)
+                    .map(|i| fixture_dir.join(format!("{name}_{precision_key}_seg{i}")))
+                    .collect();
+                for &k in &RECALL_KS {
+                    let (point, anchor_value) = match anchor {
+                        "point" => {
+                            let point = mean_recall_at_k_segmented(
+                                &ctx,
+                                &corpus_table,
+                                &segment_bases,
+                                precision,
+                                oversample,
+                                &queries,
+                                k,
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "segment-merge recall@{k} over {precision_key}/{name} must run: {e}"
+                                )
+                            });
+                            (point, point)
+                        }
+                        "ci_lower" => {
+                            let ci = recall_ci_at_k_segmented(
+                                &ctx,
+                                &corpus_table,
+                                &segment_bases,
+                                precision,
+                                oversample,
+                                &queries,
+                                k,
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "segment-merge recall CI@{k} over {precision_key}/{name} must run: {e}"
+                                )
+                            });
+                            (ci.point, ci.interval.lower)
+                        }
+                        other => panic!(
+                            "floor.json segment_merge.{precision_key}.anchor has unknown value {other}"
+                        ),
+                    };
+                    let floor_k = per_k[k.to_string()]["floor"].as_f64().unwrap_or_else(|| {
+                        panic!(
+                            "floor.json missing segment_merge.{precision_key}.partitionings.{name}.{k}.floor"
+                        )
+                    });
+                    assert!(
+                        anchor_value >= floor_k,
+                        "segment_merge[{precision_key}][{name}] recall@{k} = {anchor_value} fell \
+                         below committed floor {floor_k}"
+                    );
+
+                    let single = single_graph[k.to_string()].as_f64().unwrap_or_else(|| {
+                        panic!("floor.json missing segment_merge.{precision_key}.single_graph.{k}")
+                    });
+                    assert!(
+                        single - point <= tracking_margin,
+                        "segment_merge[{precision_key}][{name}] recall@{k} = {point} fell more \
+                         than {tracking_margin} below the single-graph baseline {single} — the \
+                         retrieve→rescore-in-merge design did not recover the per-segment loss"
+                    );
+                }
+            }
         }
     }
 

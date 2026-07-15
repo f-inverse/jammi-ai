@@ -197,6 +197,25 @@ enum Command {
     /// committed `Binary` floor.
     #[command(hide = true)]
     BuildBinaryRecallFixture,
+    /// Internal: build the committed segment-merge recall fixture — for each
+    /// of the `Int8`/`Binary` precisions (the ones whose `search_final` runs a
+    /// real retrieve→rescore stage), splits the ALREADY-COMMITTED
+    /// `fixtures/scale/` corpus into two or more segments under each of
+    /// several committed row→segment partitionings, freezes one sidecar per
+    /// segment AT THAT PRECISION, assembles a `SegmentedIndex` per
+    /// partitioning, measures its held-out `search_final` recall@k against the
+    /// exact oracle, and merges a `"segment_merge"` section (per-precision,
+    /// per-partitioning measured recall@k + floor, the live single-graph
+    /// baseline at that precision, and the merge-vs-single-graph tracking
+    /// margin — see `fixture.rs`'s `build_segment_recall_fixture`) into the
+    /// existing `floor.json`. Run off-box once with `RAYON_NUM_THREADS=1`
+    /// after `build-precision-recall-fixture` and
+    /// `build-binary-recall-fixture` have produced the single-graph
+    /// `Int8`/`Binary` fixtures; the segment bundles are committed and CI only
+    /// ever loads them. Not a CI step — the provenance-recording builder for
+    /// the committed segment-merge floor.
+    #[command(hide = true)]
+    BuildSegmentRecallFixture,
     /// The CPU-hermetic training tier: measures the engine's in-batch-negative
     /// fine-tune throughput (pairs/s) through one GradCache backward + AdamW step
     /// on `Device::Cpu`, and re-triggers the activation-memory negative control —
@@ -376,6 +395,7 @@ async fn main() -> std::process::ExitCode {
         }
         Command::BuildPrecisionRecallFixture => run_build_precision_recall_fixture().await,
         Command::BuildBinaryRecallFixture => run_build_binary_recall_fixture().await,
+        Command::BuildSegmentRecallFixture => run_build_segment_recall_fixture().await,
         Command::TrainScale => run_train_scale().await,
         Command::TrainMeasureOnce { path, pairs } => run_train_measure_once(&path, pairs),
         Command::TrainThroughputOnce { pairs } => run_train_throughput_once(pairs),
@@ -1476,6 +1496,34 @@ async fn run_build_binary_recall_fixture() -> std::process::ExitCode {
         },
         Err(e) => {
             eprintln!("build-binary-recall-fixture failed: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Build the committed segment-merge recall fixture (the frozen per-segment
+/// `Int8`/`Binary` sidecars + its `floor.json` `"segment_merge"` section) over
+/// the already-committed `fixtures/scale/` corpus, and print the resulting
+/// floor record.
+///
+/// Off-box one-shot: freezes the per-precision, per-partitioning segment
+/// sidecars and merges the measured recall@k, the single-graph baseline at
+/// each precision, and the tracking margin into the existing `floor.json`.
+/// Prints the record so the operator sees the numbers being committed.
+async fn run_build_segment_recall_fixture() -> std::process::ExitCode {
+    match fixture::build_segment_recall_fixture(&arxiv_fixture_dir()).await {
+        Ok(record) => match serde_json::to_string_pretty(&record) {
+            Ok(json) => {
+                println!("{json}");
+                std::process::ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("failed to serialize segment recall floor record: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        },
+        Err(e) => {
+            eprintln!("build-segment-recall-fixture failed: {e}");
             std::process::ExitCode::FAILURE
         }
     }

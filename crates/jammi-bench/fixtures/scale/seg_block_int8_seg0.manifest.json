@@ -1,0 +1,15 @@
+{
+  "backend": "usearch",
+  "backend_version": "2.25.1",
+  "binary_threshold_kind": null,
+  "count": 1000,
+  "created_at": "2026-07-15T05:17:42.755072033+00:00",
+  "dimensions": 768,
+  "files": {
+    "index": "seg_block_int8_seg0.usearch",
+    "rowmap": "seg_block_int8_seg0.rowmap"
+  },
+  "metric": "cosine",
+  "scalar_kind": "int8",
+  "version": 3
+}

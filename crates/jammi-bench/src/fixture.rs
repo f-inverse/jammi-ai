@@ -25,7 +25,7 @@
 //! vacuous — it is `measured − margin`, never an invented round number.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::value::RawValue;
@@ -162,7 +162,7 @@ pub async fn build_held_out_fixture(
     // Freeze the sidecar over the corpus slice — the ONE build, committed, never
     // rebuilt by the gate.
     let sidecar_base = out_dir.join("frozen");
-    freeze_sidecar(&sidecar_base, &corpus_slice, dim)?;
+    freeze_sidecar(&sidecar_base, &corpus_slice, dim, StoragePrecision::F32)?;
 
     // Measure the held-out recall over the freshly built fixture, then derive the
     // floor as measured − margin.
@@ -197,15 +197,17 @@ pub async fn build_held_out_fixture(
     Ok(record)
 }
 
-/// Build a sidecar over `rows` and freeze it to `base`
-/// (`.usearch`/`.rowmap`/`.manifest.json`). This is the one build the committed
+/// Build a sidecar over `rows` at `precision` and freeze it to `base`
+/// (`.usearch`/`.rowmap`/`.manifest.json`, plus a `.rawf32` rescore companion
+/// when `precision` is quantized). This is the one build the committed
 /// fixture carries; the recall gate only ever loads what this writes.
 fn freeze_sidecar(
     base: &Path,
     rows: &[(String, Vec<f32>)],
     dim: usize,
+    precision: StoragePrecision,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut index = SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::F32)?;
+    let mut index = SidecarIndex::new(dim, &AnnIndexConfig::default(), precision)?;
     for (id, v) in rows {
         index.add(id, v)?;
     }
@@ -427,19 +429,12 @@ fn merge_precision_floor_fields(
         None => BTreeMap::new(),
     };
 
-    // `"precision"`'s children sit one level deeper (4 spaces) than a
-    // freshly-`to_string_pretty`'d value assumes (which starts its own
-    // indentation at column 0, as if it were the whole document) — reindent
-    // only the NEW value's lines by the difference. Untouched keys are never
-    // touched here, so they never need reindenting: their raw bytes were
-    // captured at, and are spliced back at, the exact same absolute depth.
     let fields_map = fields
         .as_object()
         .ok_or("precision floor record did not serialize to a JSON object")?;
-    for (k, v) in fields_map {
-        let rendered = indent_continuation_lines(&serde_json::to_string_pretty(v)?, 4);
-        precision.insert(k.clone(), RawValue::from_string(rendered)?);
-    }
+    // `"precision"`'s children sit one level deeper (4 spaces) than a
+    // freshly-`to_string_pretty`'d value assumes — see [`splice_raw_fields`].
+    splice_raw_fields(&mut precision, fields_map, 4)?;
 
     top.insert(
         "precision".to_string(),
@@ -447,6 +442,63 @@ fn merge_precision_floor_fields(
     );
 
     std::fs::write(&floor_path, render_object(&top, 0)?)?;
+    Ok(())
+}
+
+/// Merge `fields` (a serialized record, top-level keys only) as a NEW
+/// top-level key `key` of the committed `floor.json`, alongside `"margin"` /
+/// `"provenance"` / `"recall"` / `"precision"`. Same additive,
+/// raw-byte-preserving discipline as [`merge_precision_floor_fields`] — every
+/// sibling top-level key this call does not touch is carried through
+/// unreparsed — one level shallower (there is no nested container to descend
+/// into first).
+///
+/// Used by [`build_segment_recall_fixture`] to add the `"segment_merge"`
+/// section without disturbing any existing key `build_held_out_fixture` /
+/// `build_precision_recall_fixture` / `build_binary_recall_fixture` already
+/// wrote.
+fn merge_top_level_floor_field(
+    fixture_dir: &Path,
+    key: &str,
+    value: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let floor_path = fixture_dir.join(FLOOR_FILE);
+    let existing = std::fs::read_to_string(&floor_path)?;
+
+    let mut top: BTreeMap<String, Box<RawValue>> = serde_json::from_str(&existing)?;
+    let mut wrapper = serde_json::Map::new();
+    wrapper.insert(key.to_string(), value);
+    // A fresh top-level key's entry sits at 2 spaces (the document root's own
+    // entry depth) — see [`splice_raw_fields`].
+    splice_raw_fields(&mut top, &wrapper, 2)?;
+
+    std::fs::write(&floor_path, render_object(&top, 0)?)?;
+    Ok(())
+}
+
+/// Insert each of `fields`' entries into `map` as raw JSON bytes, reindented
+/// so its continuation lines land at `spaces` — the ONE reindent-and-splice
+/// primitive [`merge_precision_floor_fields`] (splicing into the nested
+/// `"precision"` object, `spaces = 4`) and [`merge_top_level_floor_field`]
+/// (splicing a new top-level key, `spaces = 2`) share.
+///
+/// `serde_json`'s default number parser is not exact-round-trip (the
+/// `float_roundtrip` cargo feature exists precisely because reparsing an
+/// arbitrary decimal string can land 1 ULP off the original value), so a naive
+/// read-into-`Value`-then-rewrite would silently perturb an already-committed
+/// measured float this call never touched or re-measured — a measured number
+/// quietly turning into a different, unmeasured one. Splicing raw bytes in
+/// verbatim (only reindenting, never reparsing into `f64`) is what keeps every
+/// untouched key byte-identical.
+fn splice_raw_fields(
+    map: &mut BTreeMap<String, Box<RawValue>>,
+    fields: &serde_json::Map<String, serde_json::Value>,
+    spaces: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (k, v) in fields {
+        let rendered = indent_continuation_lines(&serde_json::to_string_pretty(v)?, spaces);
+        map.insert(k.clone(), RawValue::from_string(rendered)?);
+    }
     Ok(())
 }
 
@@ -669,5 +721,332 @@ pub async fn build_binary_recall_fixture(
         binary_no_rescore,
     };
     merge_precision_floor_fields(fixture_dir, serde_json::to_value(&record)?)?;
+    Ok(record)
+}
+
+/// How many segments each committed partitioning splits the fixture corpus
+/// into. `2` is the smallest split that exercises the cross-segment merge at
+/// all (a single segment is the `N = 1` byte-identity case
+/// `jammi_db::index::segment`'s own unit tests already cover).
+const SEGMENT_COUNT: usize = 2;
+
+/// A committed row→segment assignment — the deterministic axis this fixture
+/// varies in place of the HNSW build seed USearch does not let it pin (see
+/// `recall.rs`'s module-level "segment axis" section). `assign(i, total)`
+/// maps corpus row `i` of `total` (0-based, in the corpus parquet's
+/// sorted-`_row_id` order) to a segment index in `0..SEGMENT_COUNT`.
+struct SegmentPartitioning {
+    /// Fixture file stem prefix: each segment freezes to
+    /// `fixture_dir/{name}_{precision_key}_seg{i}.*`.
+    name: &'static str,
+    /// Row index, total row count → segment index.
+    assign: fn(usize, usize) -> usize,
+}
+
+/// Contiguous halves: rows `[0, total/2)` land in segment 0, the rest in
+/// segment 1 (generalizes to `SEGMENT_COUNT > 2` as even-width contiguous
+/// blocks). Mirrors how an append-only table's segments actually accumulate —
+/// each batch of newly-added rows is contiguous in insertion order.
+fn contiguous_block_partition(i: usize, total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    ((i * SEGMENT_COUNT) / total).min(SEGMENT_COUNT - 1)
+}
+
+/// Round-robin: row `i` lands in segment `i % SEGMENT_COUNT`. A structurally
+/// different row→segment assignment from [`contiguous_block_partition`] over
+/// the SAME rows — each corpus row's true nearest neighbours are scattered
+/// across segments differently than under the contiguous split, so the two
+/// partitionings are genuinely independent draws of "which segment a row's
+/// neighbours end up in", not a relabeling of the same split.
+fn interleaved_partition(i: usize, _total: usize) -> usize {
+    i % SEGMENT_COUNT
+}
+
+/// The committed partitionings [`build_segment_recall_fixture`] freezes — at
+/// least two, so the segment-merge floor holds across more than one
+/// deterministic stand-in for an HNSW build seed.
+const SEGMENT_PARTITIONINGS: &[SegmentPartitioning] = &[
+    SegmentPartitioning {
+        name: "seg_block",
+        assign: contiguous_block_partition,
+    },
+    SegmentPartitioning {
+        name: "seg_interleaved",
+        assign: interleaved_partition,
+    },
+];
+
+/// Fixed headroom added atop the measured worst-case (single-graph − merged)
+/// recall gap across every committed partitioning and k, to set the committed
+/// `single_graph_tracking_margin` — the same "measured, then pad a fixed
+/// safety amount" discipline `recall.rs`'s `RESCORE_RECOVERY_MARGIN` and this
+/// module's [`FLOOR_MARGIN`] both use, applied to an upper-bound gap rather
+/// than a lower-bound floor.
+const TRACKING_MARGIN_HEADROOM: f64 = 0.02;
+
+/// One quantized precision [`build_segment_recall_fixture`] freezes segments
+/// at and measures the merge over.
+///
+/// The segment-merge floor is only load-bearing at a precision where
+/// [`StoragePrecision::needs_rescore`] is `true`: at `F32` `search_final` never
+/// enters its rescore stage, so `oversample` is unused and the merge's own
+/// per-segment over-fetch (`jammi_db::index::segment::DEFAULT_SEGMENT_OVERFETCH_FACTOR`)
+/// is the only thing between a segment's own HNSW recall and the merged
+/// answer — at this fixture's 1000-row-per-segment real-embedding scale that
+/// floor turned out to sit at (or above) `1.0`, guarding nothing. `Int8`/
+/// `Binary` segments are lossy enough on their own (see
+/// [`build_precision_recall_fixture`] / [`build_binary_recall_fixture`]'s
+/// single-graph numbers) that the retrieve→rescore-in-merge design has real
+/// work to do, so these are the precisions this fixture's floor is measured
+/// at.
+struct SegmentPrecisionSpec {
+    /// `floor.json` key under `"segment_merge"."precisions"`, and the segment
+    /// file-stem infix (`fixture_dir/{partitioning}_{key}_seg{i}.*`).
+    key: &'static str,
+    precision: StoragePrecision,
+    /// Stem of the ALREADY-COMMITTED single-graph bundle at this precision
+    /// (`build_precision_recall_fixture`'s `frozen_int8` /
+    /// `build_binary_recall_fixture`'s `frozen_binary`) the merge is tracked
+    /// against.
+    single_graph_stem: &'static str,
+    /// Whether the floor (and the tracking-margin comparison) is anchored to
+    /// the bare point mean (`Int8`) or the bootstrap-CI lower bound
+    /// (`Binary`) — mirrors `recall.rs::tests::Anchor` and
+    /// [`build_binary_recall_fixture`]'s "CI, not a point estimate"
+    /// discipline, since `Binary`'s Hamming coarse stage is noisy enough at
+    /// this small a per-segment row count that a single-sample point could
+    /// invert.
+    ci_anchored: bool,
+}
+
+/// The precisions [`build_segment_recall_fixture`] measures the segment merge
+/// at — both quantized, both already load-bearing at the single-graph level
+/// (see [`SegmentPrecisionSpec`]'s doc for why `F32` is excluded).
+const SEGMENT_PRECISIONS: &[SegmentPrecisionSpec] = &[
+    SegmentPrecisionSpec {
+        key: "int8",
+        precision: StoragePrecision::Int8,
+        single_graph_stem: FROZEN_INT8_STEM,
+        ci_anchored: false,
+    },
+    SegmentPrecisionSpec {
+        key: "binary",
+        precision: StoragePrecision::Binary,
+        single_graph_stem: FROZEN_BINARY_STEM,
+        ci_anchored: true,
+    },
+];
+
+/// One precision's committed segment-merge floor record: the deployment
+/// oversample it was measured at, which anchor (`"point"` / `"ci_lower"`)
+/// its floors and tracking margin are checked against, the live single-graph
+/// (`N = 1`) baseline recall@k the merge is checked to track, the derived
+/// tracking margin, and the per-partitioning measured recall@k + floor.
+#[derive(Debug, Serialize)]
+pub struct SegmentPrecisionFloorRecord {
+    /// The `search_final` retrieve→rescore oversample the merge is measured
+    /// at — this precision's [`StoragePrecision::default_oversample`].
+    pub oversample: usize,
+    /// `"point"` or `"ci_lower"` — which value [`FloorEntry::measured`] and
+    /// the tracking-margin comparison are anchored to; mirrors
+    /// [`SegmentPrecisionSpec::ci_anchored`].
+    pub anchor: &'static str,
+    /// The single-graph (`N = 1`) baseline recall@k, measured live over the
+    /// SAME corpus and queries via the already-committed frozen bundle at
+    /// this precision — what the merge is checked to TRACK, not a floor
+    /// asserted on its own.
+    pub single_graph: BTreeMap<usize, f64>,
+    /// The merge-vs-single-graph tracking margin: the worst observed
+    /// (single_graph − merged) gap across every partitioning and k at this
+    /// precision, plus [`TRACKING_MARGIN_HEADROOM`].
+    pub single_graph_tracking_margin: f64,
+    /// Per-partitioning measured recall@k and its margin-subtracted floor,
+    /// keyed by partitioning name then k.
+    pub partitionings: BTreeMap<String, BTreeMap<usize, FloorEntry>>,
+}
+
+/// The committed segment-merge floor record: how many segments each
+/// partitioning splits the corpus into, and one [`SegmentPrecisionFloorRecord`]
+/// per precision in [`SEGMENT_PRECISIONS`] — the `"segment_merge"` `floor.json`
+/// section this whole record serializes to.
+#[derive(Debug, Serialize)]
+pub struct SegmentRecallFloorRecord {
+    /// Segments each partitioning splits the corpus into.
+    pub segment_count: usize,
+    /// Per-precision floor record, keyed by [`SegmentPrecisionSpec::key`].
+    pub precisions: BTreeMap<String, SegmentPrecisionFloorRecord>,
+}
+
+/// Build the committed segment-merge recall fixture: for each precision in
+/// [`SEGMENT_PRECISIONS`] (`Int8`, `Binary`), split the ALREADY-COMMITTED
+/// fixture corpus (`fixture_dir/corpus_vectors.parquet` — the SAME real
+/// embeddings the frozen `F32`/`Int8`/`Binary` bundles index) into
+/// [`SEGMENT_COUNT`] segments under each of [`SEGMENT_PARTITIONINGS`], freeze
+/// one [`SidecarIndex`] per segment AT THAT PRECISION
+/// (`fixture_dir/{partitioning}_{precision}_seg{i}.*` — ONE build per segment,
+/// committed, never rebuilt by the gate), assemble them into a
+/// [`jammi_db::index::SegmentedIndex`], and measure its held-out
+/// `search_final` recall@k against the exact oracle — the SAME
+/// retrieve→rescore-in-merge path `search_final` runs at deployment, since
+/// [`StoragePrecision::needs_rescore`] is `true` for both.
+///
+/// Also measures the SAME corpus + queries through the already-committed
+/// single-graph bundle at that precision, and records the worst observed
+/// (single_graph − merged) gap plus [`TRACKING_MARGIN_HEADROOM`] as the
+/// committed tracking margin. Merges a `"segment_merge"` top-level section
+/// into the existing `floor.json` (`floor = measured − `[`FLOOR_MARGIN`]` at
+/// `Int8`, `floor = CI_lower − `[`FLOOR_MARGIN`]` at `Binary` — same
+/// discipline [`build_precision_recall_fixture`] /
+/// [`build_binary_recall_fixture`] already use for the single-graph rows).
+///
+/// Run off-box once with `RAYON_NUM_THREADS=1` (every sidecar build here is
+/// single-threaded, matching the other frozen bundles) after
+/// `build-precision-recall-fixture` and `build-binary-recall-fixture` have
+/// produced the single-graph `Int8`/`Binary` fixtures; the segment bundles
+/// are committed and CI only ever loads them.
+pub async fn build_segment_recall_fixture(
+    fixture_dir: &Path,
+) -> Result<SegmentRecallFloorRecord, Box<dyn std::error::Error>> {
+    let corpus_path = fixture_dir.join("corpus_vectors.parquet");
+    let query_path = fixture_dir.join("query_vectors.parquet");
+
+    let corpus_url = corpus::storage_url(&corpus_path)?;
+    let corpus_table = "segment_merge_fixture_corpus";
+    let ctx = corpus::register(&corpus_url, corpus_table).await?;
+    let corpus_rows = corpus::load_vectors(&ctx, corpus_table).await?;
+    let dim = corpus_rows
+        .first()
+        .map(|(_, v)| v.len())
+        .ok_or("fixture corpus is empty — nothing to segment")?;
+
+    let query_url = corpus::storage_url(&query_path)?;
+    let query_table = "segment_merge_fixture_queries";
+    let query_ctx = corpus::register(&query_url, query_table).await?;
+    let queries: Vec<Vec<f32>> = corpus::load_vectors(&query_ctx, query_table)
+        .await?
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect();
+    if queries.is_empty() {
+        return Err(
+            "fixture query set is empty — nothing to measure segment-merge recall over".into(),
+        );
+    }
+
+    let mut precisions: BTreeMap<String, SegmentPrecisionFloorRecord> = BTreeMap::new();
+    for spec in SEGMENT_PRECISIONS {
+        let oversample = spec.precision.default_oversample();
+
+        // The SAME corpus + queries through the already-committed single-graph
+        // (`N = 1`) bundle at THIS precision — measured live, never
+        // transcribed from the `"precision"` section this same floor.json
+        // already carries.
+        let single_graph_base = fixture_dir.join(spec.single_graph_stem);
+        let mut single_graph: BTreeMap<usize, f64> = BTreeMap::new();
+        for &k in &RECALL_KS {
+            let recall = recall::mean_recall_at_k_rescored(
+                &ctx,
+                corpus_table,
+                &single_graph_base,
+                spec.precision,
+                oversample,
+                &queries,
+                k,
+            )
+            .await?;
+            single_graph.insert(k, recall);
+        }
+
+        let mut partitionings: BTreeMap<String, BTreeMap<usize, FloorEntry>> = BTreeMap::new();
+        let mut worst_gap = 0.0f64;
+        for part in SEGMENT_PARTITIONINGS {
+            let mut buckets: Vec<Vec<(String, Vec<f32>)>> = vec![Vec::new(); SEGMENT_COUNT];
+            for (i, row) in corpus_rows.iter().enumerate() {
+                let seg = (part.assign)(i, corpus_rows.len());
+                buckets[seg].push(row.clone());
+            }
+            if let Some(empty_idx) = buckets.iter().position(Vec::is_empty) {
+                return Err(format!(
+                    "partitioning {} produced an empty segment {empty_idx} — cannot build a \
+                     SidecarIndex over zero rows",
+                    part.name
+                )
+                .into());
+            }
+
+            let mut segment_bases: Vec<PathBuf> = Vec::with_capacity(SEGMENT_COUNT);
+            for (idx, bucket) in buckets.iter().enumerate() {
+                let base = fixture_dir.join(format!("{}_{}_seg{idx}", part.name, spec.key));
+                freeze_sidecar(&base, bucket, dim, spec.precision)?;
+                segment_bases.push(base);
+            }
+
+            let mut per_k: BTreeMap<usize, FloorEntry> = BTreeMap::new();
+            for &k in &RECALL_KS {
+                let (point, anchor_value) = if spec.ci_anchored {
+                    let ci = recall::recall_ci_at_k_segmented(
+                        &ctx,
+                        corpus_table,
+                        &segment_bases,
+                        spec.precision,
+                        oversample,
+                        &queries,
+                        k,
+                    )
+                    .await?;
+                    (ci.point, ci.interval.lower)
+                } else {
+                    let point = recall::mean_recall_at_k_segmented(
+                        &ctx,
+                        corpus_table,
+                        &segment_bases,
+                        spec.precision,
+                        oversample,
+                        &queries,
+                        k,
+                    )
+                    .await?;
+                    (point, point)
+                };
+                let gap = single_graph
+                    .get(&k)
+                    .copied()
+                    .ok_or("single-graph recall missing for k")?
+                    - point;
+                worst_gap = worst_gap.max(gap);
+                per_k.insert(
+                    k,
+                    FloorEntry {
+                        measured: point,
+                        floor: (anchor_value - FLOOR_MARGIN).max(0.0),
+                    },
+                );
+            }
+            partitionings.insert(part.name.to_string(), per_k);
+        }
+
+        precisions.insert(
+            spec.key.to_string(),
+            SegmentPrecisionFloorRecord {
+                oversample,
+                anchor: if spec.ci_anchored {
+                    "ci_lower"
+                } else {
+                    "point"
+                },
+                single_graph,
+                single_graph_tracking_margin: worst_gap + TRACKING_MARGIN_HEADROOM,
+                partitionings,
+            },
+        );
+    }
+
+    let record = SegmentRecallFloorRecord {
+        segment_count: SEGMENT_COUNT,
+        precisions,
+    };
+    merge_top_level_floor_field(fixture_dir, "segment_merge", serde_json::to_value(&record)?)?;
     Ok(record)
 }

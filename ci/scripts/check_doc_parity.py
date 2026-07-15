@@ -6,16 +6,27 @@ guide keeps listing the old variants while the code has moved on. This gate make
 that drift a red CI check instead of a human catch. It is the mechanized
 anti-staleness tripwire for the guide↔enum bindings registered below.
 
-Seeded binding: `ProducingDescriptor` (the materialization replay key). The guide
-carries the canonical variant list between explicit parity markers; this script
-asserts, fail-closed:
+A binding is either:
 
-  1. the set of variant names the guide enumerates == the set of top-level
-     variant names in the `ProducingDescriptor` enum (order-insensitive), and
-  2. every variant the guide annotates "no replay arm" is one whose
-     `replay_descriptor` arm in `recompute.rs` returns `NotRecomputable`, and
-     every non-annotated variant is one whose arm does *not* — i.e. the guide's
-     recorded replay-exceptions match the code's actual no-replay arms exactly.
+  - **set-equality-only**: the guide's marked variant list == the enum's variant
+    set, order-insensitive (`recompute_file` is `None`), or
+  - **set-equality + replay-parity**: set-equality above, *and* every variant the
+    guide annotates with its exception phrase (e.g. "no replay arm") is one whose
+    arm in `recompute_file`'s dispatch match returns the binding's no-replay
+    marker, and every non-annotated variant is one whose arm does *not* — i.e.
+    the guide's recorded replay-exceptions match the code's actual no-replay arms
+    exactly.
+
+The replay-parity leg is optional per binding, not a special case bolted onto
+`check_binding`: a binding either carries the three replay-exception fields
+(`recompute_file`, `exception_phrase`, `no_replay_marker`) together, or carries
+none of them, and `check_binding` runs the matching leg(s) accordingly.
+
+Registered bindings:
+  - `ProducingDescriptor` (the materialization replay key) — set-equality +
+    replay-parity.
+  - `StoragePrecision` (the ANN index's storage/compute precision) —
+    set-equality-only; this enum has no replay-parity dimension.
 
 Any parse failure — a missing marker, an unparseable enum, an absent match block
 — is a non-zero exit with a message naming what could not be resolved. A silent
@@ -36,6 +47,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 GUIDE = REPO_ROOT / "docs" / "maintainer" / "MAINTAINER-GUIDE.md"
 MANIFEST = REPO_ROOT / "crates" / "jammi-db" / "src" / "store" / "manifest.rs"
 RECOMPUTE = REPO_ROOT / "crates" / "jammi-ai" / "src" / "pipeline" / "recompute.rs"
+CONFIG = REPO_ROOT / "crates" / "jammi-db" / "src" / "config.rs"
 
 
 class ParityError(Exception):
@@ -44,32 +56,58 @@ class ParityError(Exception):
 
 @dataclass(frozen=True)
 class Binding:
-    """One registered guide↔enum parity binding."""
+    """One registered guide↔enum parity binding.
+
+    `recompute_file`/`exception_phrase`/`no_replay_marker` are the
+    replay-parity leg's inputs; they are `None` together for a
+    set-equality-only binding (no enum-specific fields ever hang off one
+    without the others — see `check_binding`).
+    """
 
     name: str
     enum_name: str
     enum_file: Path
-    recompute_file: Path
     guide_begin: str
     guide_end: str
+    recompute_file: Path | None = None
     # The prose phrase that marks a guide variant as a replay exception, and the
-    # error the exception's `recompute.rs` arm must return.
-    exception_phrase: str
-    no_replay_marker: str
+    # error the exception's `recompute_file` arm must return.
+    exception_phrase: str | None = None
+    no_replay_marker: str | None = None
+
+    @property
+    def has_replay_parity(self) -> bool:
+        fields = (self.recompute_file, self.exception_phrase, self.no_replay_marker)
+        if all(f is not None for f in fields):
+            return True
+        if all(f is None for f in fields):
+            return False
+        raise ParityError(
+            f"binding `{self.name}`: replay-parity fields must be set together "
+            "(recompute_file, exception_phrase, no_replay_marker) or not at all"
+        )
 
 
 PRODUCING_DESCRIPTOR = Binding(
     name="ProducingDescriptor",
     enum_name="ProducingDescriptor",
     enum_file=MANIFEST,
-    recompute_file=RECOMPUTE,
     guide_begin="<!-- BEGIN PRODUCING-DESCRIPTOR-VARIANTS -->",
     guide_end="<!-- END PRODUCING-DESCRIPTOR-VARIANTS -->",
+    recompute_file=RECOMPUTE,
     exception_phrase="no replay arm",
     no_replay_marker="NotRecomputable",
 )
 
-BINDINGS = [PRODUCING_DESCRIPTOR]
+STORAGE_PRECISION = Binding(
+    name="StoragePrecision",
+    enum_name="StoragePrecision",
+    enum_file=CONFIG,
+    guide_begin="<!-- BEGIN STORAGE-PRECISION-VARIANTS -->",
+    guide_end="<!-- END STORAGE-PRECISION-VARIANTS -->",
+)
+
+BINDINGS = [PRODUCING_DESCRIPTOR, STORAGE_PRECISION]
 
 
 def _strip_rust_comments(text: str) -> str:
@@ -172,7 +210,7 @@ def parse_guide_variants(
             continue
         name = ident.group(1)
         names.append(name)
-        if binding.exception_phrase.lower() in line.lower():
+        if binding.exception_phrase is not None and binding.exception_phrase.lower() in line.lower():
             exceptions.add(name)
     if not names:
         raise ParityError(
@@ -239,15 +277,19 @@ def parse_no_replay_variants(recompute: str, binding: Binding) -> set[str]:
 
 
 def check_binding(binding: Binding) -> list[str]:
-    """Check one binding; return a list of human-readable parity failures (empty = OK)."""
+    """Check one binding; return a list of human-readable parity failures (empty = OK).
+
+    Every binding gets the set-equality leg. The replay-parity leg only runs
+    when `binding.has_replay_parity` — a `StoragePrecision`-shaped binding
+    (no replay dimension) skips it entirely rather than being special-cased
+    around a `recompute_file` it doesn't have.
+    """
     enum_src = binding.enum_file.read_text()
     guide_src = GUIDE.read_text()
-    recompute_src = binding.recompute_file.read_text()
 
     code_variants = set(parse_enum_variants(enum_src, binding.enum_name))
     guide_names, guide_exceptions = parse_guide_variants(guide_src, binding)
     guide_variants = set(guide_names)
-    code_no_replay = parse_no_replay_variants(recompute_src, binding)
 
     failures: list[str] = []
 
@@ -271,28 +313,39 @@ def check_binding(binding: Binding) -> list[str]:
             f"guide parity block lists duplicate variant(s): {', '.join(dupes)}."
         )
 
-    # (2) The guide's replay-exceptions must match the code's no-replay arms — but
-    # only over variants both sides agree exist (set-equality failures above name
-    # the rest).
-    shared = code_variants & guide_variants
-    doc_says_exception_but_code_replays = sorted(
-        v for v in shared if v in guide_exceptions and v not in code_no_replay
-    )
-    code_no_replay_but_doc_unmarked = sorted(
-        v for v in shared if v in code_no_replay and v not in guide_exceptions
-    )
-    for v in doc_says_exception_but_code_replays:
-        failures.append(
-            f"guide annotates `{v}` as '{binding.exception_phrase}', but its "
-            f"`replay_descriptor` arm does NOT return `{binding.no_replay_marker}` "
-            "(it has a real replay arm) — fix the annotation or the code."
+    # (2) The guide's replay-exceptions must match the code's no-replay arms —
+    # only for a binding that carries a replay dimension at all. A
+    # set-equality-only binding (e.g. `StoragePrecision`) has no
+    # `recompute_file` to read an arm from, so it skips this leg entirely
+    # rather than being special-cased in.
+    if binding.has_replay_parity:
+        recompute_src = binding.recompute_file.read_text()
+        code_no_replay = parse_no_replay_variants(recompute_src, binding)
+
+        # Only over variants both sides agree exist (set-equality failures
+        # above name the rest).
+        shared = code_variants & guide_variants
+        doc_says_exception_but_code_replays = sorted(
+            v for v in shared if v in guide_exceptions and v not in code_no_replay
         )
-    for v in code_no_replay_but_doc_unmarked:
-        failures.append(
-            f"`{v}`'s `replay_descriptor` arm returns `{binding.no_replay_marker}` "
-            f"(no replay arm), but the guide does not annotate it "
-            f"'{binding.exception_phrase}' — annotate it in the parity block."
+        code_no_replay_but_doc_unmarked = sorted(
+            v for v in shared if v in code_no_replay and v not in guide_exceptions
         )
+        for v in doc_says_exception_but_code_replays:
+            failures.append(
+                f"guide annotates `{v}` as '{binding.exception_phrase}', but its "
+                f"`replay_descriptor` arm does NOT return `{binding.no_replay_marker}` "
+                "(it has a real replay arm) — fix the annotation or the code."
+            )
+        for v in code_no_replay_but_doc_unmarked:
+            failures.append(
+                f"`{v}`'s `replay_descriptor` arm returns `{binding.no_replay_marker}` "
+                f"(no replay arm), but the guide does not annotate it "
+                f"'{binding.exception_phrase}' — annotate it in the parity block."
+            )
+    # A set-equality-only binding has no `exception_phrase` registered, so
+    # `parse_guide_variants` above can never populate `guide_exceptions` for
+    # it — there is no dead "unmarked exception" state to check here.
 
     return failures
 

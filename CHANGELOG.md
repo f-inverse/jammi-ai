@@ -38,6 +38,17 @@ catalog-tracked set of segments.
   manifest bytes. Any single segment's load failure falls the whole table back
   to exact search — never a silently incomplete index. Search is byte-identical
   to the single-index path at a segment count of one.
+- **Generic `AuditService.Verify` RPC (`jammi-wire` + `jammi-server` +
+  `jammi-db` + `jammi-ai`).** The frozen `jammi.v1.audit.AuditService` gains an
+  additive `Verify(PerQueryAudit) -> {verified}` rpc (the api-freeze baseline is
+  advanced by exactly one rpc line — the sanctioned additive, minor-compatible
+  case). It exposes the engine's existing single-record signature check on the
+  wire: the server re-derives the per-tenant signing secret from the **session**
+  tenant — never the record's own `tenant_id` — and holds the master key
+  server-side, returning only a boolean, so a record signed by one tenant
+  verifies `true` only under that tenant and `false` under any peer. The same
+  `AuditHandle::verify` primitive backs both the wire and embedded transports
+  (byte-parity), and the new rpc carries its own cross-tenant isolation case.
 
 ## [0.45.0] - 2026-07-13
 

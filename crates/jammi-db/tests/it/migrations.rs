@@ -184,6 +184,7 @@ async fn applied_migrations_ledger_records_all_migrations() {
             "022_definition_hash_index",
             "023_storage_precision",
             "024_claim_policy",
+            "025_index_segments",
         ]
     );
 }

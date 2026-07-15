@@ -81,6 +81,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
         schema::MIGRATION_023_STORAGE_PRECISION,
     ),
     ("024_claim_policy", schema::MIGRATION_024_CLAIM_POLICY),
+    ("025_index_segments", schema::MIGRATION_025_INDEX_SEGMENTS),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

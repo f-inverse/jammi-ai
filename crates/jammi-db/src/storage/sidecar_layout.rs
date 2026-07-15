@@ -25,7 +25,6 @@
 
 use std::path::Path;
 
-use crate::config::{AnnIndexConfig, StoragePrecision};
 use crate::error::Result;
 use crate::index::sidecar::SidecarIndex;
 
@@ -86,23 +85,6 @@ pub async fn save_sidecar(handle: &JammiObjectStore, index: &SidecarIndex) -> Re
     }
 }
 
-/// Load a sidecar bundle into a [`SidecarIndex`], applying the query-time HNSW
-/// knob from `ann` and strict-checking `expected_precision` (the catalog row's
-/// persisted `storage_precision`) against the graph's own stamped precision.
-///
-/// For `file://` schemes USearch reads the destination path directly. For
-/// cloud schemes we download into a tempdir, then load from there.
-pub async fn load_sidecar(
-    handle: &JammiObjectStore,
-    ann: &AnnIndexConfig,
-    expected_precision: StoragePrecision,
-) -> Result<SidecarIndex> {
-    match handle.scheme() {
-        Scheme::File => load_sidecar_local(handle, ann, expected_precision),
-        _ => load_sidecar_remote(handle, ann, expected_precision).await,
-    }
-}
-
 /// Best-effort cleanup: delete every sidecar sibling a `kind` carries.
 pub async fn delete_sidecar(handle: &JammiObjectStore, kind: SidecarKind) -> Result<()> {
     for ext in sidecar_extensions(kind) {
@@ -116,15 +98,6 @@ fn save_sidecar_local(handle: &JammiObjectStore, index: &SidecarIndex) -> Result
     let base = local_base_path(handle)?;
     index.save(&base)?;
     Ok(())
-}
-
-fn load_sidecar_local(
-    handle: &JammiObjectStore,
-    ann: &AnnIndexConfig,
-    expected_precision: StoragePrecision,
-) -> Result<SidecarIndex> {
-    let base = local_base_path(handle)?;
-    SidecarIndex::load(&base, ann, expected_precision)
 }
 
 async fn save_sidecar_remote(handle: &JammiObjectStore, index: &SidecarIndex) -> Result<()> {
@@ -144,30 +117,11 @@ async fn save_sidecar_remote(handle: &JammiObjectStore, index: &SidecarIndex) ->
     Ok(())
 }
 
-async fn load_sidecar_remote(
-    handle: &JammiObjectStore,
-    ann: &AnnIndexConfig,
-    expected_precision: StoragePrecision,
-) -> Result<SidecarIndex> {
-    let tmp = tempfile::tempdir()?;
-    let stem = tmp.path().join("sidecar");
-
-    for ext in sidecar_extensions(SidecarKind::Ann) {
-        let remote = handle.sibling_path(ext)?;
-        if !handle.exists(&remote).await? {
-            continue;
-        }
-        let bytes = handle.get_bytes(&remote).await?;
-        std::fs::write(stem.with_extension(ext), &bytes)?;
-    }
-
-    SidecarIndex::load(&stem, ann, expected_precision)
-}
-
-/// Resolve the on-disk stem for a `file://` handle. Strips the `.parquet`
+/// Resolve the on-disk stem for a `file://` handle. Strips the trailing
 /// extension off the data path — `SidecarIndex` does `with_extension()`
-/// internally to derive the three sibling paths.
-fn local_base_path(handle: &JammiObjectStore) -> Result<std::path::PathBuf> {
+/// internally to derive the sibling paths. Shared with
+/// [`crate::storage::index_cache`], the load-side counterpart to `save_sidecar`.
+pub(crate) fn local_base_path(handle: &JammiObjectStore) -> Result<std::path::PathBuf> {
     let raw = handle.url().path();
     let path = Path::new(raw);
     Ok(path.with_extension(""))
@@ -176,6 +130,7 @@ fn local_base_path(handle: &JammiObjectStore) -> Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AnnIndexConfig, StoragePrecision};
     use crate::index::VectorIndex;
     use crate::storage::{JammiObjectStore, StorageRegistry, StorageUrl};
 
@@ -190,24 +145,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sidecar_round_trip_memory() {
+    async fn save_then_delete_round_trips_the_bundle() {
+        // The write + cleanup halves of the layout. The load half is the
+        // content-addressed segment cache's, covered in `storage::index_cache`.
         let registry = StorageRegistry::new();
         let url = StorageUrl::memory("snapshots/2026/data.parquet");
         let driver = registry.driver_for(&url, None).unwrap();
         let handle = JammiObjectStore::new(driver, url);
 
-        let index = build_small_index();
-        save_sidecar(&handle, &index).await.unwrap();
-
-        let loaded = load_sidecar(&handle, &AnnIndexConfig::default(), StoragePrecision::F32)
-            .await
-            .unwrap();
-        let hits = loaded.search(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
-        assert_eq!(hits.first().map(|(id, _)| id.as_str()), Some("row-a"));
+        save_sidecar(&handle, &build_small_index()).await.unwrap();
+        let usearch = handle.sibling_path("usearch").unwrap();
+        assert!(handle.exists(&usearch).await.unwrap());
 
         delete_sidecar(&handle, SidecarKind::Ann).await.unwrap();
-        let path = handle.sibling_path("usearch").unwrap();
-        assert!(!handle.exists(&path).await.unwrap());
+        assert!(!handle.exists(&usearch).await.unwrap());
     }
 
     #[test]

@@ -68,6 +68,9 @@ book:
         - chapters/22-precision/binary-precision.qmd
         - chapters/22-precision/compute-precision.qmd
         - chapters/22-precision/asymmetric-binary.qmd
+    - part: "The ANN index as a set of segments"
+      chapters:
+        - chapters/23-segmented-ann/segmented-ann.qmd
   appendices:
     - chapters/api-reference.qmd
 

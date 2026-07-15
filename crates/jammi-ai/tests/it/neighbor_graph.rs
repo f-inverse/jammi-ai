@@ -130,7 +130,9 @@ async fn neighbor_graph_has_correct_shape_and_ranking() {
         "an edge table records the embedding table it was derived from"
     );
     assert!(
-        edges_table.index_path.is_none(),
+        common::segment_index_urls(&session, &edges_table.table_name)
+            .await
+            .is_empty(),
         "an edge table carries no sidecar index"
     );
 

@@ -5,6 +5,38 @@ use std::sync::Arc;
 use jammi_db::store::ArtifactStore;
 use jammi_numerics::retrieval::AggregateMetrics;
 
+/// The ANN index-segment bundle base URLs of `table_name`, in segment order —
+/// the load-side handle for tests that inspect a table's on-disk sidecar bundle
+/// now that a table's index is a set of segments rather than one `index_path`.
+pub async fn segment_index_urls(
+    session: &jammi_ai::session::InferenceSession,
+    table_name: &str,
+) -> Vec<String> {
+    session
+        .catalog()
+        .list_index_segments(table_name)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.index_path)
+        .collect()
+}
+
+/// The single segment's bundle base URL for a freshly-embedded table (one embed
+/// pass writes exactly one segment). Panics unless there is exactly one.
+pub async fn segment0_index_url(
+    session: &jammi_ai::session::InferenceSession,
+    table_name: &str,
+) -> String {
+    let mut urls = segment_index_urls(session, table_name).await;
+    assert_eq!(
+        urls.len(),
+        1,
+        "expected exactly one index segment for '{table_name}'"
+    );
+    urls.pop().unwrap()
+}
+
 /// Build an [`ArtifactStore`] rooted at a hermetic `memory://` URL with a fresh
 /// local fetch cache, for resolver-level unit tests that construct a
 /// `ModelResolver` directly (rather than through a full `InferenceSession`). The

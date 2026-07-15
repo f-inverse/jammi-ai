@@ -8,6 +8,7 @@ pub mod model_repo;
 pub mod mutable_repo;
 pub mod result_repo;
 pub mod schema;
+pub mod segment_repo;
 pub mod source_repo;
 pub mod status;
 pub mod topic_repo;

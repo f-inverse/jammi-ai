@@ -273,7 +273,6 @@ fn result_params<'a>(
         kind: ResultTableKind::Model,
         derived_from: None,
         parquet_path: "file:///tmp/rt.parquet",
-        index_path: None,
         dimensions: None,
         key_column: None,
         text_columns: None,

@@ -82,12 +82,9 @@ async fn generate_embeddings_produces_complete_result() {
     assert!(record.key_column.as_deref() == Some("id"));
     assert!(record.text_columns.as_deref() == Some("abstract"));
 
-    // Sidecar index files exist
-    let base_url = record
-        .index_path
-        .as_ref()
-        .expect("Embedding table should have index_path");
-    let base = common::url_to_path(base_url);
+    // Sidecar index files exist (the table's single segment 0 bundle)
+    let base_url = common::segment0_index_url(&session, &record.table_name).await;
+    let base = common::url_to_path(&base_url);
     assert!(
         base.with_extension("usearch").exists(),
         "USearch index missing"
@@ -165,9 +162,9 @@ async fn multiple_tables_and_sidecar_fallback() {
         .unwrap();
     assert!(tables.len() >= 2);
 
-    // Delete sidecar for r1 — Parquet still queryable
-    if let Some(ref base_url) = r1.index_path {
-        let base = common::url_to_path(base_url);
+    // Delete every segment sidecar for r1 — Parquet still queryable
+    for base_url in common::segment_index_urls(&session, &r1.table_name).await {
+        let base = common::url_to_path(&base_url);
         std::fs::remove_file(base.with_extension("usearch")).ok();
         std::fs::remove_file(base.with_extension("rowmap")).ok();
         std::fs::remove_file(base.with_extension("manifest.json")).ok();

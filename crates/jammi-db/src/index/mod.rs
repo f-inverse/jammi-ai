@@ -1,5 +1,8 @@
 pub mod exact;
+pub mod segment;
 pub mod sidecar;
+
+pub use segment::{SegmentId, SegmentedIndex, DEFAULT_SEGMENT_OVERFETCH_FACTOR};
 
 use crate::error::Result;
 

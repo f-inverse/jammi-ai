@@ -1,0 +1,238 @@
+---
+title: "The ANN index as a set of segments: incremental append, never a rebuild"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `generate_embeddings` · `search` · the catalog's `index_segments` table ·
+**Theory:** append-only immutable segments merged at read time — the same shape as an
+LSM-tree's SSTables, never rewritten in place, only ever added to and later compacted
+[@kleppmann2017ddia] — built over a per-segment HNSW proximity graph [@malkov2020hnsw] ·
+**Rail:** measurement (`N=1` exact-search re-derived live from committed vectors; the
+incremental-append/no-rebuild property measured at the layer it is live and public today)
++ the honest-negative rail (no SDK verb appends a second segment onto an already-ready
+table yet — a documented finding, not a gap this chapter papers over).
+
+A table's ANN index is a **set** of immutable segments rather than one sidecar. Appending a
+batch of new rows writes a new segment beside the existing ones and leaves them
+byte-for-byte untouched — the index's row-set grows without rebuilding any graph — and a
+search fans across every segment, merging the results under one total order that is
+byte-identical to the single-index path at `N = 1`. This chapter measures both halves of
+that claim: `N = 1` is the same operator at scale one, and appending a segment never
+rewrites its neighbours.
+
+## What this chapter validates — and the honesty contract
+
+Read the framing plainly, the same way this book always does when a capability's SDK
+surface is narrower than its engine surface:
+
+- **`N = 1` byte-identity is measured LIVE against the wheel.** A single
+  `generate_embeddings` pass over the engine's public 20-row `patents` fixture (embedded
+  with the deterministic `tiny_modernbert` encoder — the same pairing the engine's own
+  `storage_precision` integration tests use) writes exactly one segment. This chapter reads
+  that fact back off the embedded engine's own SQLite catalog file — a real artifact the
+  running wheel wrote, never reimplemented — and recomputes the exact brute-force cosine
+  ranking over the SAME vectors the table holds, live, right here, asserting it against the
+  engine's own recorded `search` hits. "A freshly-built single-segment table's search is
+  the exact top-k" is what "byte-identical to the pre-existing single-index behavior"
+  cashes out to: the single-index path is also single-stage exact cosine for an `F32` table.
+- **There is no public verb yet that appends a second segment onto an already-ready
+  table.** Every embedding-producing pipeline — `generate_embeddings`, `import_embeddings`,
+  graph propagation, context-set materialization — calls the engine's table-creation path
+  fresh, so calling `generate_embeddings` again always lands a brand-new table, never a
+  second segment on this one. `ResultStore::append_segment` (the primitive this release
+  ships) is a `jammi-db` crate-level Rust API with no SDK or wire binding today — a
+  real engine-surface finding, not a script that dodges the question.
+- **So the incremental-append property is measured at the layer where it is genuinely live
+  and public today**: this chapter's cache shells out to the ALREADY-SHIPPED, unmodified
+  `jammi-db` integration-test binary (`cargo test -p jammi-db --test it -- segment::`) —
+  the exact compiled artifact CI runs — and records its live verdict. This is the same
+  boolean-verdict-from-a-live-run technique `lifecycle.qmd`'s
+  `every_catalog_model_is_referenced` uses; it is never a fabricated number, and never a
+  Python reimplementation of `SegmentedIndex`'s merge.
+
+## The freshly-built table's segment set — read off the real catalog
+
+```{python}
+from jammi_cookbook import contracts
+
+catalog = contracts.load_artifact("segmented_ann.catalog_segment0")
+print("segment count:  ", catalog["segment_count"])
+print("segment id:     ", catalog["segment_id"])
+print("row count:      ", catalog["row_count"])
+print("seg0 naming ok: ", catalog["naming_matches_seg0_convention"])
+print("sidecar files:  ", catalog["sidecar_files_present"])
+```
+
+A single `generate_embeddings` pass over the 20-row `patents` fixture writes **exactly one**
+`index_segments` row — read directly off the embedded engine's own SQLite catalog file, not
+asserted by fiat. Its bundle carries the documented `{table}__seg0.*` naming (the dot-free
+discriminator the engine's own `segment::append_does_not_rebuild_prior_segments` test
+checks) and all three sidecar files an `F32` (no-rescore) segment writes.
+
+```{python}
+assert catalog["segment_count"] == 1, "a freshly-built table has exactly one segment"
+assert catalog["row_count"] == 20, "every patents row lands in that one segment"
+assert catalog["naming_matches_seg0_convention"] is True
+assert all(catalog["sidecar_files_present"].values())
+
+contracts.assert_close("segmented_ann.n1.segment_count", float(catalog["segment_count"]))
+contracts.assert_close(
+    "segmented_ann.n1.naming_matches_seg0_convention",
+    1.0 if catalog["naming_matches_seg0_convention"] else 0.0,
+)
+contracts.assert_close(
+    "segmented_ann.n1.sidecar_files_present",
+    1.0 if all(catalog["sidecar_files_present"].values()) else 0.0,
+)
+```
+
+## `N = 1`: live search is the exact brute-force top-*k*
+
+The corpus is the table's own vectors, read back off its Parquet — independent of the ANN
+sidecar entirely — and the recorded hits are the engine's own live `db.search(...)` calls,
+captured once during the emit, never transcribed. This chapter recomputes the exact
+brute-force cosine ranking **live, right now**, over the same committed vectors, and asserts
+it against those recorded hits — the same "re-fold live to prove it's real" technique
+`retrieval.qmd`'s RRF fusion numbers use.
+
+```{python}
+import numpy as np
+
+corpus = contracts.load_artifact("segmented_ann.corpus_vectors")
+live_hits = contracts.load_artifact("segmented_ann.live_hits")
+
+row_ids = [str(x) for x in corpus.column("_row_id").to_pylist()]
+vectors = {
+    rid: np.asarray(v, dtype=np.float32)
+    for rid, v in zip(row_ids, corpus.column("vector").to_pylist())
+}
+print(f"corpus: {len(vectors)} rows x {len(next(iter(vectors.values())))} dims "
+      f"(tiny_modernbert, real embeddings of the patents fixture)")
+
+
+def brute_force_top_k(query_id: str, k: int) -> list[str]:
+    """The independent oracle: exact brute-force cosine top-k, ordered
+    (distance ASC, row_id ASC) — the same tie-break SegmentedIndex uses."""
+    q = vectors[query_id]
+    q = q / np.linalg.norm(q)
+    scored = []
+    for rid, v in vectors.items():
+        vn = v / np.linalg.norm(v)
+        distance = 1.0 - float(np.dot(q, vn))
+        scored.append((distance, rid))
+    scored.sort(key=lambda t: (t[0], t[1]))
+    return [rid for _, rid in scored[:k]]
+```
+
+```{python}
+n_trials = 0
+n_matches = 0
+mismatches = []
+for query_id, per_k in live_hits.items():
+    for k_str, recorded in per_k.items():
+        expected = brute_force_top_k(query_id, int(k_str))
+        n_trials += 1
+        if expected == recorded:
+            n_matches += 1
+        else:
+            mismatches.append((query_id, k_str, expected, recorded))
+
+print(f"live search == live brute-force recompute: {n_matches}/{n_trials} trials "
+      f"({len(live_hits)} query rows x {len(next(iter(live_hits.values())))} k values)")
+assert not mismatches, f"a single-segment table's search must be the exact top-k: {mismatches}"
+
+contracts.assert_close(
+    "segmented_ann.n1.search_matches_bruteforce_fraction", n_matches / n_trials
+)
+```
+
+Every one of these trials draws on a single segment (`N = 1`, `over_fetch(m, 1) = m` — no
+over-fetch, no reordering), so the merge is already exact and the search is final without
+any rescore. That is exactly what "byte-identical to the pre-existing single-index
+behavior" means in practice: nothing about introducing the segment *set* changes what a
+table with one segment in it returns.
+
+## Incremental append leaves segment 0 untouched
+
+There is no SDK verb this chapter can call to append a second segment onto the table above
+— `generate_embeddings` always creates a fresh table (see the honesty note). The property
+this release ships — appending a segment never rewrites an existing one, and every
+segment's rows become searchable through the merge — is measured at the layer it is
+genuinely live at today: the already-shipped `jammi-db` integration-test binary, re-run
+live for this cache, never modified for it.
+
+```{python}
+append_suite = contracts.load_artifact("segmented_ann.append_suite")
+record = contracts.load_artifact("segmented_ann.record")
+
+print("measured via:", append_suite["command"])
+print(f"exit code: {append_suite['exit_code']}   "
+      f"passed: {append_suite['passed']}   failed: {append_suite['failed']}")
+for line in append_suite["tests"]:
+    print(" ", line)
+```
+
+The headline test, `segment::append_does_not_rebuild_prior_segments`, asserts exactly the
+three properties this chapter claims:
+
+```{python}
+for claim in record["append_no_rebuild"]["headline_test_asserts"]:
+    print("-", claim)
+```
+
+```{python}
+assert append_suite["exit_code"] == 0
+assert append_suite["failed"] == 0
+assert append_suite["passed"] == 4
+assert "segment::append_does_not_rebuild_prior_segments ... ok" in "\n".join(append_suite["tests"])
+
+contracts.assert_close("segmented_ann.append.exit_code", float(append_suite["exit_code"]))
+contracts.assert_close("segmented_ann.append.tests_passed", float(append_suite["passed"]))
+contracts.assert_close("segmented_ann.append.tests_failed", float(append_suite["failed"]))
+```
+
+Concretely, that test builds a two-row segment 0, snapshots its raw `.usearch` bytes,
+appends a disjoint two-row segment 1 over new keys, and re-reads segment 0's bytes off disk
+— asserting them **byte-for-byte identical** to the snapshot. It then resolves the merged
+index and searches for each segment's own row: the new segment's row is found (no rebuild
+was needed to make it reachable), and the original segment's row is still found too (the
+append changed nothing about it). That is the incremental-append property this book claims,
+measured — not a Python restatement of it.
+
+## Why this cache is honest about what it did *not* measure
+
+This is worth stating as plainly as `retrieval.qmd`'s `search` multi-table gotcha states its
+own finding: **the write side — `ResultStore::append_segment` — has no SDK or wire
+binding yet.** Every path this book's other chapters exercise (`generate_embeddings`,
+`import_embeddings`) always creates a fresh, uniquely-named result table; none of them lands
+a second segment on an existing one. That is not a limitation of this cache's emit script —
+it is grep-verified against `crates/jammi-ai/src/pipeline/embedding.rs`,
+`crates/jammi-ai/src/pipeline/import.rs`, and `crates/jammi-db/src/store/mod.rs`'s
+`create_table`. A future incremental-embed verb (or a Rust embedder calling `jammi-db`
+directly) is what would make the append half of this chapter reachable from `db.search(...)`
+the same way the `N=1` half already is; until then, measuring it against the engine's own
+already-shipped test suite is the honest choice — the alternative would be fabricating a
+verb that does not exist, or reimplementing the merge in Python and testing that instead of
+the shipped code.
+
+## The measured segmented-ANN index, at a glance
+
+```{python}
+print("N=1 segment count:              ", catalog["segment_count"])
+print("N=1 seg0 naming + sidecar files: ", catalog["naming_matches_seg0_convention"],
+      "/", all(catalog["sidecar_files_present"].values()))
+print(f"N=1 search == brute force:       {n_matches}/{n_trials} trials")
+print("append it-suite (live, unmodified):", append_suite["passed"], "passed,",
+      append_suite["failed"], "failed, exit", append_suite["exit_code"])
+```
+
+A table's ANN index is a real, asserted property at both ends of its lifecycle: a
+freshly-built table is exactly one segment whose search is the exact top-*k* (measured live
+against the wheel), and appending a segment never rewrites its neighbours while making the
+new rows searchable through the merge (measured live against the engine's own shipped
+proof). `N = 1` is the same operator the single-sidecar path always was — not a special
+case bolted onto a new one.

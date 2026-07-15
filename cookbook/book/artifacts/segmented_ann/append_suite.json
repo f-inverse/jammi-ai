@@ -1,0 +1,12 @@
+{
+  "command": "cargo test -p jammi-db --test it -- segment:: --test-threads=1",
+  "exit_code": 0,
+  "failed": 0,
+  "passed": 4,
+  "tests": [
+    "test segment::append_does_not_rebuild_prior_segments ... ok",
+    "test segment::concurrent_append_never_collides_and_cascades::sqlite ... ok",
+    "test segment::migration_025_creates_an_empty_index_segments_table ... ok",
+    "test segment::search_vectors_over_two_int8_segments_equals_brute_force ... ok"
+  ]
+}

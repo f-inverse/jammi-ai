@@ -891,6 +891,71 @@ ARTIFACTS: dict[str, Artifact] = {
         "— a corrupted or drifted commit fails loudly rather than producing a "
         "quietly-wrong anisotropy or recall number.",
     ),
+    # --- the ANN index as a set of segments (incremental append, no rebuild) --
+    "segmented_ann.corpus_vectors": Artifact(
+        name="segmented_ann.corpus_vectors",
+        kind="parquet",
+        filename="corpus_vectors.parquet",
+        columns={"_row_id": "Utf8", "vector": _vec(32)},
+        produced_by="segmented_ann",
+        note="The 20-row `patents` fixture, embedded once with the public `tiny_modernbert` "
+        "encoder, read back off the freshly-built table's own Parquet — the ground truth "
+        "`segmented-ann.qmd` recomputes the brute-force cosine ranking from, live.",
+    ),
+    "segmented_ann.live_hits": Artifact(
+        name="segmented_ann.live_hits",
+        kind="model_id",
+        filename="live_hits.json",
+        produced_by="segmented_ann",
+        note="The engine's own live `db.search(...)` results, one call per (query row, k) "
+        "pair, captured once during the emit — never transcribed or fabricated. The "
+        "chapter recomputes the exact brute-force ranking from `segmented_ann.corpus_vectors` "
+        "live and asserts it against these recorded hits.",
+    ),
+    "segmented_ann.catalog_segment0": Artifact(
+        name="segmented_ann.catalog_segment0",
+        kind="model_id",
+        filename="catalog_segment0.json",
+        produced_by="segmented_ann",
+        note="The freshly-built table's `index_segments` catalog row, read directly off "
+        "the embedded engine's own SQLite catalog file (never reimplemented): segment "
+        "count, segment id, row count, whether the `{table}__seg0.idx` naming convention "
+        "held, and whether the three sidecar files (`.usearch` / `.rowmap` / "
+        "`.manifest.json`) exist on disk.",
+    ),
+    "segmented_ann.append_suite": Artifact(
+        name="segmented_ann.append_suite",
+        kind="model_id",
+        filename="append_suite.json",
+        produced_by="segmented_ann",
+        note="The live verdict of the already-shipped, unmodified `jammi-db` it-suite's "
+        "`segment::` tests (`cargo test -p jammi-db --test it -- segment::`) — the "
+        "correctness oracle for the incremental-append/no-rebuild property, since no "
+        "SDK/wire verb appends a second segment onto an already-ready table today. "
+        "Exit code + per-test pass/fail, never a fabricated number.",
+    ),
+    "segmented_ann.record": Artifact(
+        name="segmented_ann.record",
+        kind="model_id",
+        filename="record.json",
+        produced_by="segmented_ann",
+        note="The narrated verdict: N=1 byte-identity (a freshly-embedded table writes "
+        "exactly one segment, segment_id=0, whose live `search` matches an independent "
+        "brute-force cosine ranking over the same vectors) plus the incremental-append "
+        "finding — `ResultStore::append_segment` is measured at the layer it is live and "
+        "public today (the already-shipped `jammi-db` it-suite), since no SDK/wire verb "
+        "yet appends a second segment onto an already-ready table (grep-verified: every "
+        "embedding-producing pipeline path calls `create_table` fresh). Names no "
+        "consumer — a generic `patents` fixture corpus, the engine's own public "
+        "`tiny_modernbert` encoder.",
+    ),
+    "segmented_ann.checksums": Artifact(
+        name="segmented_ann.checksums",
+        kind="model_id",
+        filename="checksums.json",
+        produced_by="segmented_ann",
+        note="sha256[:16] of every committed segmented_ann cache file.",
+    ),
 }
 
 

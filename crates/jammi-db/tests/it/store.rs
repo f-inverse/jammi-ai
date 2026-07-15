@@ -75,7 +75,6 @@ async fn result_table_crud_lifecycle() {
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: "file:///tmp/test.parquet",
-            index_path: Some("file:///tmp/test.idx"),
             dimensions: Some(384),
             key_column: Some("id"),
             text_columns: Some("abstract"),
@@ -109,7 +108,6 @@ async fn result_table_crud_lifecycle() {
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: "file:///tmp/t2.parquet",
-            index_path: None,
             dimensions: None,
             key_column: None,
             text_columns: None,
@@ -154,7 +152,6 @@ async fn find_result_tables_filters_by_source_and_task() {
                 kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
                 derived_from: None,
                 parquet_path: &format!("file:///tmp/{name}.parquet"),
-                index_path: None,
                 dimensions: None,
                 key_column: None,
                 text_columns: None,
@@ -202,7 +199,6 @@ async fn resolve_embedding_table_latest_explicit_and_missing() {
                 kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
                 derived_from: None,
                 parquet_path: &format!("file:///tmp/{name}.parquet"),
-                index_path: None,
                 dimensions: Some(384),
                 key_column: None,
                 text_columns: None,
@@ -261,7 +257,6 @@ async fn resolve_embedding_table_accepts_every_embedding_variant() {
                 kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
                 derived_from: None,
                 parquet_path: &format!("file:///tmp/{name}.parquet"),
-                index_path: None,
                 dimensions: Some(8),
                 key_column: None,
                 text_columns: None,
@@ -350,7 +345,6 @@ async fn resolve_embedding_table_picks_newest_by_created_at_not_table_name(backe
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: &format!("file:///tmp/{older_table}.parquet"),
-            index_path: None,
             dimensions: Some(8),
             key_column: None,
             text_columns: None,
@@ -381,7 +375,6 @@ async fn resolve_embedding_table_picks_newest_by_created_at_not_table_name(backe
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: &format!("file:///tmp/{newer_table}.parquet"),
-            index_path: None,
             dimensions: Some(8),
             key_column: None,
             text_columns: None,
@@ -454,7 +447,6 @@ async fn recovery_skips_index_rebuild_for_non_embedding_task() {
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: url.as_str(),
-            index_path: None,
             dimensions: None,
             key_column: None,
             text_columns: None,
@@ -512,9 +504,16 @@ async fn result_store_create_table_generates_correct_paths() {
     // parquet_url is a StorageUrl pointing at a file://… path under the
     // jammi_db root we just created.
     assert!(info.parquet_url.as_str().contains("jammi_db"));
+    // No ANN index is generated at table creation — the index materialises
+    // lazily as segments, so a freshly created table has an empty segment set.
     assert!(
-        info.index_url.is_some(),
-        "Embedding tables should have an index URL"
+        store
+            .catalog()
+            .list_index_segments(&info.table_name)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a freshly created embedding table has no index segments yet"
     );
 }
 
@@ -665,6 +664,7 @@ async fn result_store_with_memory_root_roots_and_roundtrips() {
         registry,
         Arc::clone(&catalog),
         AnnIndexConfig::default(),
+        dir.path().join("index_cache"),
     )
     .unwrap();
 
@@ -728,7 +728,6 @@ async fn recovery_marks_missing_parquet_as_failed() {
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: missing_url.as_str(),
-            index_path: None,
             dimensions: None,
             key_column: None,
             text_columns: None,
@@ -774,7 +773,6 @@ async fn recovery_deletes_invalid_parquet_and_marks_failed() {
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: bad_url.as_str(),
-            index_path: None,
             dimensions: None,
             key_column: None,
             text_columns: None,
@@ -837,7 +835,6 @@ async fn recovery_promotes_valid_parquet_to_ready() {
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: url.as_str(),
-            index_path: None,
             dimensions: None,
             key_column: None,
             text_columns: None,
@@ -919,7 +916,6 @@ async fn result_table_none_dimensions_round_trips_as_null(backend: BackendKind) 
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: &format!("file:///tmp/{table_name}.parquet"),
-            index_path: None,
             dimensions: None,
             key_column: None,
             text_columns: None,

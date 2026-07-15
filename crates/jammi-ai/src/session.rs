@@ -1399,7 +1399,15 @@ fn build_result_store(
     match inner.config().storage.result_root.as_deref() {
         Some(root) => {
             let root = jammi_db::storage::StorageUrl::parse(root)?;
-            ResultStore::with_root(root, inner.storage_registry(), catalog, ann)
+            // The ANN segment cache is always local (USearch reads the local
+            // filesystem) even when the result root is a cloud scheme — rooted
+            // beside the model-artifact cache under the local artifact dir.
+            let cache_root = inner
+                .config()
+                .artifact_dir
+                .join("jammi_db")
+                .join("index_cache");
+            ResultStore::with_root(root, inner.storage_registry(), catalog, ann, cache_root)
         }
         None => ResultStore::new(inner.config().artifact_dir.as_path(), catalog, ann),
     }

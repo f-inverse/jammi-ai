@@ -25,6 +25,20 @@ Run the fixed pipeline; each phase names the agent(s) you dispatch and the gate 
 
 **Route by work type first.** A **question** mutates nothing → **no phase machine** (answer it; nothing to verify). A **defect** takes the triage path (0.7 → the `symptom_spec` RED drives `fix-verifier` at phase 6). A **feature** takes the scope path (0.5 → the phase-2 `acceptance` criteria drive `acceptance-verifier` at phase 6). Both mutating doors are symmetric on their RED oracle.
 
+### Answering a code/architecture question (graph-routed)
+
+Not every question is trivial. A non-trivial question about a specific symbol, subsystem, or behavior gets a bounded, read-only sub-flow — clearly separate from the mutating phase machine above (no `gap-analyzer`/`pressure-tester`/contract/oracle; a question changes nothing, so there is nothing for red→green to verify):
+
+- **Q0 — triage.** Trivial or general question → answer it directly, as today. A question that names or implies a specific symbol/subsystem/behavior enters Q1.
+- **Q1 — localize (graph).** Dispatch `graph-navigator` to resolve the question over the **fresh** `target/build-graph-rich/graph.json` (regenerate via `build-graph` first if stale) and return a routing verdict: `{ key_symbols: [name @ file:line], owning_crate(s), suggested_domain_agent(s) }`. The owning crate falls out of each symbol's file path → the domain-mutex table.
+- **Q2 — route to the expert.**
+  - *Structural* (what calls/implements/references X, where is X enumerated) → `graph-navigator` answers directly; it already reads source via Grep/Glob and cites `file:line`.
+  - *Deep-domain* (why X is designed this way, a subtle invariant, correctness reasoning) → dispatch the **owning domain agent** named in the verdict with a **read-only answering brief**: answer this question about your crate, cite `file:line`, **edit nothing, open no worktree, run no gate.** The domain agent carries its crate's invariants — it is the right expert for *why*, not just *where*.
+  - *Cross-crate* → fan the same read-only brief to each owning domain agent; you synthesize.
+- **Q3 — synthesize + verify.** Compose the answer from what came back, but **re-verify every cited `file:line` yourself** before handing it back — a delegated answer is a claim to audit, same load-bearing stance as a delegated "done" (above).
+
+This path is read-only and non-authoritative for mutation: if the answer reveals a change is actually needed, that need converts to a normal mutating unit (`gap-analyzer` for a feature, `issue-triage` for a defect) and re-enters the phase machine from the top — the router answers, it does not fix. It shares the same graph as the phase-0.5 impact-scoping use below, and does not depend on `graphify.serve`; read the JSON directly when the nav server isn't running.
+
 | Phase | Name | Dispatch | Gate you clear |
 |---|---|---|---|
 | 0 | Ground | you | seed the facts ledger; load the constitution invariants the brief crosses + `SELF-FAILURE-MODES.md` |
@@ -51,6 +65,8 @@ call/implement site before writing the phase-2 contract's `files_in_scope` — s
 names every site the change touches, not just the ones you happened to grep. Same read-only,
 cite-`file:line` discipline as its doc-currency use; it edits nothing and is advisory input to
 your own scoping judgment, not a replacement for `gap-analyzer`'s ambiguity/invariant verdict.
+The same graph and the same agent also power the read-only Q&A routing path above — one
+localization surface, two callers (mutating-contract scoping here, question routing there).
 
 ## Consensus — per-axis, never a vote
 

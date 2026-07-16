@@ -93,7 +93,7 @@ fn spec<'a>(source_id: &'a str, derived_from: Option<&'a str>) -> EmbeddingTable
         model_id: "custom-model",
         derived_from,
         dimensions: DIMS,
-        key_column: "_row_id",
+        key_column: Some("_row_id"),
         text_columns: None,
     }
 }

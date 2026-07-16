@@ -400,7 +400,11 @@ impl InferenceSession {
                     model_id: PROPAGATE_MODEL_ID,
                     derived_from: Some(table.table_name.as_str()),
                     dimensions: out_dim,
-                    key_column: "_row_id",
+                    // Every output row is keyed by a `_row_id` read verbatim off
+                    // the source table, so the output's keys came from exactly
+                    // the origin column the source records — the provenance is
+                    // inherited, never re-asserted.
+                    key_column: table.key_column.as_deref(),
                     text_columns: None,
                 },
                 &rows,

@@ -61,6 +61,12 @@ async fn session_with_synthetic_embeddings() -> (Arc<InferenceSession>, TempDir,
         })
         .collect();
 
+    // The `points` source the embedding table below records its lineage to,
+    // keyed by `_row_id` — the column that table attributes its keys to. The
+    // rows carry no payload beyond the key: the derived producers here pool
+    // vectors and never read a value column, so the key is the whole source.
+    register_points_source(&session, dir.path(), &pairs).await;
+
     let (descriptor, env, inputs) =
         jammi_test_utils::synthetic_seed_contract("synthetic-embed", "points", DIM);
     let record = session
@@ -72,7 +78,7 @@ async fn session_with_synthetic_embeddings() -> (Arc<InferenceSession>, TempDir,
                 model_id: "synthetic-embed",
                 derived_from: None,
                 dimensions: DIM,
-                key_column: "_row_id",
+                key_column: Some("_row_id"),
                 text_columns: None,
             },
             &pairs,
@@ -326,6 +332,7 @@ async fn recompute_context_set_pair_with_non_default_params_is_byte_identical() 
                 rows: &rows,
                 dimensions: DIM,
                 recipe: &recipe_proto,
+                key_column: emb.key_column.as_deref(),
             },
             CachePolicy::Bypass,
         )
@@ -405,6 +412,7 @@ async fn recompute_context_set_over_default_embedding_table_is_byte_identical() 
                 rows: &rows,
                 dimensions: DIM,
                 recipe: &recipe_proto,
+                key_column: emb.key_column.as_deref(),
             },
             CachePolicy::Bypass,
         )
@@ -716,6 +724,52 @@ async fn a_pre_contract_table_is_not_recomputable() {
 }
 
 // ── helpers ──
+
+/// Register the `points` source the synthetic embedding table records its
+/// lineage to, keyed by `_row_id` over the same eight point keys.
+///
+/// A derived table's catalog `key_column` names a column of this source, so the
+/// source has to exist and carry that column for the provenance to be
+/// followable — the embedding table's keys are `_row_id` values here.
+async fn register_points_source(
+    session: &InferenceSession,
+    dir: &std::path::Path,
+    pairs: &[(String, Vec<f32>)],
+) {
+    use arrow::array::RecordBatch;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "_row_id",
+        DataType::Utf8,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(StringArray::from(
+            pairs.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        )) as arrow::array::ArrayRef],
+    )
+    .unwrap();
+    let path = dir.join("points.parquet");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    session
+        .add_source(
+            "points",
+            jammi_db::source::SourceType::File,
+            jammi_db::source::SourceConnection {
+                url: Some(format!("file://{}", path.to_str().unwrap())),
+                format: Some(jammi_db::source::FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+}
 
 /// Register a small declared-edge `edges` source (`from`/`to` Utf8 endpoints) so
 /// an edge-gathered context set is reproducible. A path graph over the eight

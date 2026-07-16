@@ -688,9 +688,70 @@ pub struct MaterializedContext<'a> {
     /// The assembly recipe every row in the batch was pooled under — the
     /// `ContextSet` descriptor's determinant set.
     pub recipe: &'a ContextRequest,
+    /// Which column of the source the batch's target keys came from, recorded
+    /// as the output table's catalog `key_column` provenance. The **caller**
+    /// declares this: the targets are its own, so only it knows which column
+    /// they were keyed by.
+    ///
+    /// `Some(name)` is checked against the source's schema — a name the source
+    /// does not have is rejected, since a reader resolves this provenance by
+    /// scanning `name` on the raw source. That the keys genuinely *came from*
+    /// that column remains the caller's claim: the sink sees only
+    /// `(key, vector)` pairs and cannot confirm their origin.
+    ///
+    /// `None` is the honest answer for free-vector targets that correspond to
+    /// no stored source row (the same case [`ContextRequest::exclude_key`]
+    /// leaves unset), and skips the check.
+    pub key_column: Option<&'a str>,
 }
 
 impl InferenceSession {
+    /// Confirm `column` is a real column of `source_id`'s source table.
+    ///
+    /// The necessary half of a `key_column` provenance claim: a reader resolves
+    /// the claim by scanning `column` on the raw source, so a name the source
+    /// does not have is provenance no reader can follow.
+    ///
+    /// Fails closed on a source this session cannot reach at all: a source can
+    /// be catalog-present but absent from the query context (registration is
+    /// warn-and-continue at session load), and an unreachable source is one
+    /// whose columns cannot be confirmed — not one whose claim is proven.
+    async fn ensure_source_has_column(&self, source_id: &str, column: &str) -> Result<()> {
+        let source_table = self.find_table_name(source_id).map_err(|e| {
+            JammiError::Other(format!(
+                "Key column check: resolving source '{source_id}' to confirm \
+                 key_column '{column}': {e}"
+            ))
+        })?;
+        let df = self
+            .context()
+            .sql(&format!(
+                "SELECT * FROM \"{source_id}\".public.\"{source_table}\" LIMIT 0"
+            ))
+            .await
+            .map_err(|e| {
+                JammiError::Other(format!("Key column check: schema introspection: {e}"))
+            })?;
+        let fields = df.schema();
+        if fields.fields().iter().any(|f| f.name() == column) {
+            return Ok(());
+        }
+        Err(JammiError::Schema {
+            table: format!("{source_id}.{source_table}"),
+            column: column.to_string(),
+            expected: format!(
+                "a key column the source has: {}",
+                fields
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            actual: format!("source '{source_id}' has no column '{column}'"),
+        })
+    }
+
     /// Materialise per-target pooled context vectors into a normal
     /// embedding-shaped result table — searchable and joinable like any other
     /// embedding table, with its own sidecar ANN index — for batch NP
@@ -700,6 +761,20 @@ impl InferenceSession {
     /// which builds the same `(_row_id, _source_id, _model_id, vector)` Parquet
     /// and sidecar index every embedding table gets, so a materialised context
     /// set is a first-class member of the same table family.
+    ///
+    /// The output's catalog `key_column` provenance is the caller's
+    /// [`MaterializedContext::key_column`] declaration, not a descriptor
+    /// determinant — so a replay reconstructs it as the pinned source table's
+    /// `key_column` rather than whatever the original caller declared. This is
+    /// consistent with replay already substituting the source's current rows
+    /// for the caller's targets; the consequence is that a context set over
+    /// free-vector targets does not round-trip its `key_column`.
+    ///
+    /// A declared `key_column` is checked against the source before anything is
+    /// written: a name the source does not have is [`JammiError::Schema`], and a
+    /// source this session cannot reach — so the name can be neither confirmed
+    /// nor refuted — is [`JammiError::Other`]. Both fail closed; `None` declares
+    /// no origin key and is checked against nothing.
     pub async fn materialize_context(
         &self,
         context: MaterializedContext<'_>,
@@ -716,6 +791,14 @@ impl InferenceSession {
 
         let recipe = context.recipe;
         let source_id = recipe.source_id.as_str();
+
+        // A declared origin column is only useful if a reader can scan it: the
+        // split/hydrate readers resolve this provenance straight into a scan of
+        // the raw source. This batch's rows are the caller's, so the name it
+        // declares is checked here rather than inferred from anything written.
+        if let Some(key_column) = context.key_column {
+            self.ensure_source_has_column(source_id, key_column).await?;
+        }
 
         // Pin the **resolved** source embedding table into the descriptor, not the
         // recipe's `Option`. The recipe may carry `None` (resolve the source's
@@ -795,7 +878,7 @@ impl InferenceSession {
                     // derives from, so there is no FK-lineage anchor to record.
                     derived_from: None,
                     dimensions: context.dimensions,
-                    key_column: "_row_id",
+                    key_column: context.key_column,
                     text_columns: None,
                 },
                 context.rows,

@@ -178,7 +178,7 @@ async fn graph_session_with_partitions(
                 model_id: "synthetic-embed",
                 derived_from: None,
                 dimensions: DIM,
-                key_column: "_row_id",
+                key_column: Some("_row_id"),
                 text_columns: None,
             },
             &pairs,
@@ -1145,6 +1145,217 @@ async fn evaluable_through_r1_eval_embeddings() {
     assert!(
         !hits.is_empty(),
         "the propagated table serves the R1 eval search path"
+    );
+}
+
+/// Stand up a `papers`/`cites` graph whose source key column is named
+/// `key_col` — the knob the origin-key provenance tests turn.
+///
+/// The source parquet declares exactly `key_col` and `class`, so when `key_col`
+/// is not `_row_id` the source genuinely HAS no `_row_id` column: a reader that
+/// resolves the derived table's provenance to `_row_id` cannot scan the origin
+/// at all. The embedding table's `_row_id` carries the source key's values
+/// verbatim (the physical key is invariant), and its catalog `key_column`
+/// records `key_col` as the origin those values came from.
+///
+/// Returns the session, its tempdir, and the seeded source embedding table.
+async fn origin_keyed_session(
+    key_col: &str,
+    nodes: &[Node],
+    edges: &[Edge],
+) -> (Arc<InferenceSession>, TempDir, ResultTableRecord) {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    session.register_query_functions();
+
+    let paper_schema = Arc::new(Schema::new(vec![
+        Field::new(key_col, DataType::Utf8, false),
+        Field::new("class", DataType::Int64, false),
+    ]));
+    let paper_batch = RecordBatch::try_new(
+        Arc::clone(&paper_schema),
+        vec![
+            Arc::new(StringArray::from(
+                nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(arrow::array::Int64Array::from(
+                nodes.iter().map(|n| n.class as i64).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    let paper_url = write_parquet(&dir, "papers.parquet", paper_schema, paper_batch);
+    session
+        .add_source(
+            "papers",
+            SourceType::File,
+            SourceConnection {
+                url: Some(paper_url),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let pairs: Vec<(String, Vec<f32>)> = nodes
+        .iter()
+        .map(|n| (n.id.clone(), node_vector(&n.id, n.class)))
+        .collect();
+    let (__d, __e, __i) =
+        jammi_test_utils::synthetic_seed_contract("synthetic-embed", "papers", DIM);
+    let embedded = session
+        .result_store()
+        .materialize_embedding_table(
+            session.context(),
+            jammi_db::store::EmbeddingTableSpec {
+                source_id: "papers",
+                model_id: "synthetic-embed",
+                derived_from: None,
+                dimensions: DIM,
+                key_column: Some(key_col),
+                text_columns: None,
+            },
+            &pairs,
+            jammi_db::store::manifest::Materialization::new(&__d, &__e, __i),
+        )
+        .await
+        .unwrap();
+
+    let edge_schema = Arc::new(Schema::new(vec![
+        Field::new("src", DataType::Utf8, false),
+        Field::new("dst", DataType::Utf8, false),
+    ]));
+    let edge_batch = RecordBatch::try_new(
+        Arc::clone(&edge_schema),
+        vec![
+            Arc::new(StringArray::from(
+                edges.iter().map(|e| e.src.as_str()).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                edges.iter().map(|e| e.dst.as_str()).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    let edge_url = write_parquet(&dir, "cites.parquet", edge_schema, edge_batch);
+    session
+        .add_source(
+            "cites",
+            SourceType::File,
+            SourceConnection {
+                url: Some(edge_url),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    (session, dir, embedded)
+}
+
+/// A propagation over the `papers` embedding table, pinned to the concrete
+/// input table so the request never resolves to its own output.
+fn origin_keyed_request(input_table: &ResultTableRecord) -> PropagateRequest {
+    PropagateRequest::new(
+        "papers",
+        jammi_ai::pipeline::graph_neighbourhood::EdgeSourceRef::Registered {
+            source_id: "cites".into(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+            type_column: None,
+            weight_column: None,
+            as_of_column: None,
+        },
+    )
+    .with_embedding_table(input_table.table_name.clone())
+    .with_direction(EdgeDirection::Undirected)
+}
+
+#[tokio::test]
+async fn propagated_table_inherits_the_source_origin_key_column() {
+    // The derived table's `_row_id` values are read verbatim off the source's
+    // `_row_id`, which in turn carries the values of the source's ORIGIN key
+    // column. So the propagated table's catalog provenance must name that same
+    // origin column — a reader joins `papers.paper_id = propagated._row_id`.
+    let (nodes, edges) = two_class_homophilous(5);
+    let (session, _dir, embedded) = origin_keyed_session("paper_id", &nodes, &edges).await;
+
+    // The source embedding table records the origin key it was built from.
+    assert_eq!(embedded.key_column.as_deref(), Some("paper_id"));
+
+    // Assert against the record the producer RETURNS: `resolve_embedding_table`
+    // orders on an app-supplied wall-clock `created_at`, so a fast embed-then-
+    // propagate can tie and resolve the wrong row.
+    let (propagated, _) = session
+        .propagate_embeddings(
+            &origin_keyed_request(&embedded),
+            jammi_db::store::CachePolicy::Bypass,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        propagated.key_column.as_deref(),
+        Some("paper_id"),
+        "the propagated table must name the origin column its keys came from"
+    );
+}
+
+#[tokio::test]
+async fn propagated_table_over_a_row_id_keyed_source_still_records_row_id() {
+    // The non-vacuous control: a source whose origin key genuinely IS `_row_id`
+    // must still record `_row_id`. Inheritance is not "never `_row_id`" — a fix
+    // that blanket-drops or blanket-substitutes the name fails here.
+    let (nodes, edges) = two_class_homophilous(5);
+    let (session, _dir, embedded) = origin_keyed_session("_row_id", &nodes, &edges).await;
+
+    let (propagated, _) = session
+        .propagate_embeddings(
+            &origin_keyed_request(&embedded),
+            jammi_db::store::CachePolicy::Bypass,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        propagated.key_column.as_deref(),
+        Some("_row_id"),
+        "a genuinely `_row_id`-keyed origin still records `_row_id`"
+    );
+}
+
+#[tokio::test]
+async fn origin_keyed_fixture_has_no_row_id_column() {
+    // The positive control that makes the provenance failure the ONLY
+    // explanation: the `paper_id`-keyed source really has no `_row_id` column,
+    // so a reader that trusts `_row_id` provenance cannot scan this origin.
+    let (nodes, edges) = two_class_homophilous(5);
+    let (session, _dir, _embedded) = origin_keyed_session("paper_id", &nodes, &edges).await;
+
+    let columns: Vec<String> = session
+        .context()
+        .sql("SELECT * FROM \"papers\".public.\"papers\" LIMIT 0")
+        .await
+        .unwrap()
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+
+    assert!(
+        columns.iter().any(|c| c == "paper_id"),
+        "the origin is keyed by `paper_id`: {columns:?}"
+    );
+    assert!(
+        !columns.iter().any(|c| c == "_row_id"),
+        "the origin has no `_row_id` column, so `_row_id` provenance is unscannable: {columns:?}"
     );
 }
 

@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 
 use jammi_db::catalog::result_repo::ResultTableRecord;
-use jammi_db::error::Result;
+use jammi_db::error::{JammiError, Result};
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::manifest::{InputAnchor, MaterializationEnv, ModelIdentity};
 use jammi_db::store::{ComputedEmbeddingProvenance, EmbeddingTableSpec, ResultStore};
@@ -69,6 +69,15 @@ impl<'a> ImportPipeline<'a> {
     /// its canonical form and recorded as derivation provenance — it is never
     /// loaded, so the import runs GPU-free.
     ///
+    /// `key_column` is required and must be non-empty ([`JammiError::Schema`]).
+    /// It is recorded verbatim as the source-side provenance a reader later
+    /// scans; the engine does not check that the source has that column, because
+    /// an import resolves nothing at write time beyond the storage object it is
+    /// handed. A `key_column` the source lacks therefore writes a ready table
+    /// whose vectors search normally, and whose readers that follow the
+    /// provenance back to the source — the context split and value-column
+    /// hydration — fail when they scan for that column.
+    ///
     /// Reads the whole input object into memory (a thin promotion of
     /// [`ResultStore::materialize_computed_embedding_table`], which takes the
     /// rows eagerly); a streaming variant is future work.
@@ -81,6 +90,20 @@ impl<'a> ImportPipeline<'a> {
         text_columns: &[String],
         dimensions: usize,
     ) -> Result<ResultTableRecord> {
+        // An import always attributes its keys to a source column — that name is
+        // both a hash determinant and the catalog provenance a reader joins on,
+        // so an empty one would record two disagreeing stories about the same
+        // table. Rejected here so every entry to the pipeline, not just the wire
+        // decode, upholds it.
+        if key_column.is_empty() {
+            return Err(JammiError::Schema {
+                table: source_id.to_string(),
+                column: "key_column".to_string(),
+                expected: "a source key-column name to attribute the imported keys to".to_string(),
+                actual: "an empty key_column".to_string(),
+            });
+        }
+
         // GPU-free model validation: parse to the canonical encoder reference
         // (never load it — real loadability surfaces at query time), exactly as
         // the generate path canonicalizes at `pipeline/embedding.rs`.
@@ -139,7 +162,7 @@ impl<'a> ImportPipeline<'a> {
                     model_id: &canonical_model_id,
                     derived_from: None,
                     dimensions,
-                    key_column,
+                    key_column: Some(key_column),
                     text_columns,
                 },
                 &rows,

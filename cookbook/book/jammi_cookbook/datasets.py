@@ -107,6 +107,21 @@ def _write_parquet(table: pa.Table, name: str) -> str:
     return str(path)
 
 
+def add_source_idempotent(db, name: str, *, url: str, format: str) -> None:
+    """Register a source, tolerating a prior registration under the same name.
+
+    A keystone emit script re-run against the same still-live server after a
+    later stage failed (this loader's own registration already succeeded) must
+    not treat the earlier, already-registered source as an error — the parquet
+    this call would write is byte-identical (the same committed subset each
+    time), so re-registering is a no-op, not a conflict.
+    """
+    existing = {s["source_id"] for s in db.list_sources()}
+    if name in existing:
+        return
+    db.add_source(name, url=url, format=format)
+
+
 # --------------------------------------------------------------------------- #
 # Air Routes
 # --------------------------------------------------------------------------- #
@@ -431,11 +446,12 @@ def load_ogbn_arxiv(db, *, subset: int = 4000) -> OgbnArxiv:
         }
     )
 
-    db.add_source(
-        "arxiv_papers", url=_write_parquet(papers_table, "arxiv_papers"), format="parquet"
+    add_source_idempotent(
+        db, "arxiv_papers", url=_write_parquet(papers_table, "arxiv_papers"), format="parquet"
     )
-    db.add_source(
-        "arxiv_cite_edges", url=_write_parquet(cite_table, "arxiv_cite_edges"), format="parquet"
+    add_source_idempotent(
+        db, "arxiv_cite_edges",
+        url=_write_parquet(cite_table, "arxiv_cite_edges"), format="parquet",
     )
 
     keep_set = set(keep_pids)

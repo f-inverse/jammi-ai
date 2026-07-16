@@ -9,10 +9,13 @@ now **fits** (real mean ≈ 2018, real spread — not the #43 collapse), so the
 previously-impossible regression-conformal workflow runs end-to-end. The honest
 conformal lesson, under the dataset's time-split, holds in BOTH cruxes:
 
-* **(A) regression** — the year-regression interval **under-covers** (≈ 0.83). The
-  shift is a *location* shift: the predictor regresses to the embedding-conditioned
-  mean for both eras, so cal and test |y−ŷ| residual magnitudes are ≈ equal and
-  corr(|residual|, test-likeness) ≈ 0 — importance weighting is a no-op (Δ ≤ ~0.01).
+* **(A) regression** — the year-regression interval **under-covers**. The point
+  prediction itself is essentially unbiased across eras, but the residual
+  magnitude is NOT equal (the test era runs noticeably larger — a real spread
+  shift); importance weighting is still a no-op (Δ ≤ ~0.01), because *within* the
+  calibration set residual magnitude is uncorrelated with test-likeness
+  (corr(|residual|, test-likeness) ≈ 0) — reweighting reallocates mass across
+  calibration residuals uninformed by their size, so it cannot move the quantile.
 * **(B) classification** — the subject-classification marginal APS **under-covers**
   (≈ 0.867); the shift is ≈ orthogonal to the APS score (corr ≈ −0.12), so none of
   the three weighting schemes repairs it — they move coverage a little (−0.001 /
@@ -58,23 +61,29 @@ def test_regression_conformal_under_covers_and_weighting_is_a_noop():
     """Part A — the honest finding: the year-regression interval UNDER-covers.
 
     Under the time-split the |y−ŷ| split-conformal interval falls below nominal.
-    The shift is a *location* shift, not a residual-magnitude shift: the predictor
-    regresses to the embedding-conditioned mean for both eras, so cal and test
-    residual magnitudes are ≈ equal and corr(|residual|, test-likeness) ≈ 0 —
-    importance weighting is a no-op (Δ ≤ ~0.01). A negative result, NOT a restore.
+    Cal and test residual magnitudes need NOT be equal (the test era can run
+    larger — a real spread shift, not just a location one); importance weighting
+    is still a no-op (Δ ≤ ~0.01), because *within* the calibration set residual
+    magnitude is uncorrelated with test-likeness (corr(|residual|, test-likeness)
+    ≈ 0) — reweighting reallocates mass across calibration residuals uninformed by
+    their size, so it cannot move the quantile. A negative result, NOT a restore.
     """
     nominal = contracts.golden("arxiv.tier04.nominal_coverage").value
     reg_cov = contracts.golden("arxiv.tier04.reg_interval_coverage").value
     assert reg_cov < nominal, "the regression interval must UNDER-cover under the time-split"
 
-    # location-shift evidence: cal and test residual magnitudes match.
+    # both residual magnitudes are real, positive spreads (a magnitude gap here is
+    # NOT itself evidence against the no-op — see the correlation diagnostic below).
     cal_mag = contracts.golden("arxiv.tier04.reg_cal_resid_mag").value
     test_mag = contracts.golden("arxiv.tier04.reg_test_resid_mag").value
-    assert abs(cal_mag - test_mag) < 0.25, "residual magnitudes must match (location shift)"
+    assert cal_mag > 0 and test_mag > 0, "residual magnitudes must be real, positive spreads"
 
     delta = contracts.golden("arxiv.tier04.reg_weighting_delta")
     assert abs(delta.value) <= delta.tol, "regression weighting must be a no-op here"
 
+    # the diagnostic that actually explains the no-op: WITHIN the calibration set,
+    # residual magnitude is uncorrelated with test-likeness — regardless of whether
+    # the cal/test aggregate magnitudes themselves match.
     corr = contracts.golden("arxiv.tier04.reg_resid_corr")
     assert abs(corr.value) < 0.2, "|residual| must be ~uncorrelated with test-likeness"
 

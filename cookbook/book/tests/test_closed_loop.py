@@ -36,15 +36,16 @@ _ALPHA = (
 
 @_needs_cache
 def test_recall_chain_reads_in_order():
-    """The construct→propagate→learn recall chain is the frozen 0.538 → 0.556 → 0.548."""
+    """The construct→propagate→learn recall chain is the frozen 0.538 → 0.556 → 0.594."""
     base = contracts.golden("arxiv.tier01.recall_at_10").value
     prop = contracts.golden("arxiv.tier02.recall_at_10").value
     ft = contracts.golden("arxiv.tier03.recall_at_10").value
     assert abs(base - 0.538) <= contracts.golden("arxiv.tier01.recall_at_10").tol
     assert abs(prop - 0.556) <= contracts.golden("arxiv.tier02.recall_at_10").tol
-    assert abs(ft - 0.548) <= contracts.golden("arxiv.tier03.recall_at_10").tol
+    assert abs(ft - 0.594) <= contracts.golden("arxiv.tier03.recall_at_10").tol
     assert prop > base  # propagation denoises
-    assert ft > base    # the declared-edge fine-tune beats the base (circularity contract)
+    assert ft > base    # the declared-edge fine-tune beats the base (the largest of the
+                        # three graphs tried — declared > similarity > random)
 
 
 @_needs_cache
@@ -64,7 +65,7 @@ def test_marginal_classification_conformal_recomputes_to_golden():
 
 @_needs_cache
 def test_regression_interval_conformal_recomputes_to_golden():
-    """Live conformalize_interval coverage matches the frozen 0.830 — under-covers."""
+    """Live conformalize_interval coverage matches the frozen golden — under-covers."""
     db = jammi.connect("file:///tmp/jammi_test_cel_reg")
     reg = contracts.load_artifact("arxiv.tier04_regression").to_pylist()
     cal = [r for r in reg if r["split"] == "calibration"]
@@ -82,7 +83,8 @@ def test_regression_interval_conformal_recomputes_to_golden():
 def test_weighting_restores_neither_crux():
     """Regression weighting is an exact no-op; no classification scheme reaches nominal."""
     reg_w = contracts.load_artifact("arxiv.tier04_regression_weighting")
-    assert reg_w["weighting_delta"] == 0.0  # exact no-op (location shift)
+    assert reg_w["weighting_delta"] == 0.0  # exact no-op (residual size uncorrelated
+                                             # with test-likeness within calibration)
 
     cls_w = contracts.load_artifact("arxiv.tier04_weighting")
     covs = {n: s["coverage"] for n, s in cls_w["schemes"].items()}

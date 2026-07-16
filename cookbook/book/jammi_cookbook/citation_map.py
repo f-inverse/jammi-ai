@@ -53,11 +53,16 @@ CITATION_MAP: tuple[CitationRow, ...] = (
         bib_keys=("stankovic2019gsp2", "wu2019sgc", "gasteiger2019appnp"),
     ),
     CitationRow(
-        recipe="03 learn — graph-supervised metric learning",
+        recipe="03 learn — graph-supervised metric learning (declared edges vs. "
+        "self-similarity vs. a random null)",
         monograph="Part III — graph embeddings, machine learning on graphs",
-        canon="node2vec (Grover & Leskovec 2016); GraphSAGE (Hamilton et al. 2017)",
+        canon="node2vec (Grover & Leskovec 2016); GraphSAGE (Hamilton et al. 2017); "
+        "SPECTER (Cohan et al. 2020, declared-citation supervision); NNCLR (Dwibedi et "
+        "al. 2021, nearest-neighbor-of-own-representations via homophily); SciNCL "
+        "(Ostendorff et al. 2022, citation-embedding kNN)",
         jammi_call="fine_tune_graph",
-        bib_keys=("stankovic2020gsp3", "grover2016node2vec", "hamilton2017graphsage"),
+        bib_keys=("stankovic2020gsp3", "grover2016node2vec", "hamilton2017graphsage",
+                  "cohan2020specter", "dwibedi2021nnclr", "ostendorff2022scincl"),
     ),
     CitationRow(
         recipe="02/03 retrieval — an edge is a self-search; a context set is a search/walk",

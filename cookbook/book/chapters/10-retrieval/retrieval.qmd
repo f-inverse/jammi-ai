@@ -68,10 +68,10 @@ committed dense matrices the keystone emits in full — raw ModernBERT embedding
 graph-propagated variant — with both recall@10 and nDCG@10 (which credits rank position,
 not just presence in the top 10).
 
-The keystone's tier-03 fine-tune commits a model-id record (`arxiv.ft_model`, recall
-0.548), not a fine-tuned *matrix*; the standalone fine-tuned matrix lives in the
-fine-tuning-methods vertical. We measure the two matrices this cache carries in full and
-do not fabricate a fine-tuned-matrix arm we cannot read here.
+The keystone's tier-03 fine-tune commits a model-id record (`arxiv.ft_model`), not a
+fine-tuned *matrix*; the standalone fine-tuned matrix lives in the fine-tuning-methods
+vertical. We measure the two matrices this cache carries in full and do not fabricate a
+fine-tuned-matrix arm we cannot read here.
 
 ```{python}
 metrics = contracts.load_artifact("retrieval.method_metrics").to_pylist()

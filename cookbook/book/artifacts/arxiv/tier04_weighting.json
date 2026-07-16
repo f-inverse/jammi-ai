@@ -18,5 +18,5 @@
     }
   },
   "score_shift_corr": -0.121,
-  "note": "Importance-weighted conformal (Tibshirani 2019) with an APS nonconformity identical to the marginal pass. Weighting moves coverage but no scheme reaches the nominal 0.90: kNN is the largest mover (+0.022, ~2/3 of the gap, still under-covering), centroid moves down, domain_lr barely moves. The time-split shift is ~orthogonal to the conformal score (see score_shift_corr), so reweighting the calibration scores cannot restore coverage."
+  "note": "Importance-weighted conformal (Tibshirani 2019) with an APS nonconformity identical to the marginal pass: no scheme repairs the under-coverage (all stay below nominal; movements are small and not even consistently toward nominal) because the time-split shift is ~orthogonal to the conformal score (see score_shift_corr)."
 }

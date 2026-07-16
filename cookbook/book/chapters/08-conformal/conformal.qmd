@@ -194,10 +194,11 @@ Both intervals **under-cover** under the time-split — the same non-exchangeabi
 lesson as the classification sets. CQR's interval is **wider** (it inherits the
 predictor's $\hat\sigma$ rather than imposing one constant half-width) and recovers a
 little more coverage, but not to nominal. The keystone (tier 04) carries the *why*:
-this is a **location** shift — the predictor regresses to the embedding-conditioned
-mean for both eras, so the residual *magnitudes* match across cal and test and no
-amount of width-recalibration on the calibration era can see the bias. Weighting that
-interval is a no-op there.
+the predictor's point prediction is essentially unbiased across eras, but the test
+era's residuals genuinely run larger — yet residual size is uncorrelated with
+test-likeness *within* the calibration set, so no amount of importance-reweighting
+on the calibration era can see (or repair) that bias. Weighting that interval is a
+no-op there.
 
 ## Part C — the score-aligned weighted restore (the keystone's complement)
 
@@ -353,10 +354,12 @@ choice.
 > **Weighted conformal repairs a covariate shift if and only if the shift moves the
 > nonconformity-score distribution.** The keystone (tier 04) is one half: on the real
 > ogbn-arxiv time-split the shift is *orthogonal* to the score (corr ≈ −0.12 for
-> classification; a *location* shift with matched residual magnitudes for regression),
-> so reweighting the calibration CDF along a direction the score barely depends on
-> cannot move the quantile — a no-op, and the honest remedy is a governed, time-aware
-> cohort. This chapter is the other half: a transparently-constructed, score-aligned
+> classification; for regression, residual magnitude is uncorrelated with
+> test-likeness *within* the calibration set, even though the residuals themselves do
+> shift across eras), so reweighting the calibration CDF along a direction the score
+> barely depends on cannot move the quantile — a no-op, and the honest remedy is a
+> governed, time-aware cohort. This chapter is the other half: a
+> transparently-constructed, score-aligned
 > shift (corr ≈ +0.73) on which marginal under-covers (≈ 0.83) and the weighted restore
 > [@tibshirani2019covariateshift] is real (≈ 0.94). Together they are the complete statement —
 > neither half alone is the theorem. A graph-aware, productionized version of the governed

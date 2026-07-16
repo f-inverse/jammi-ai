@@ -26,8 +26,9 @@ measured against the committed cache:
 2. **The conformal-under-shift lesson** — under the dataset's time-split, **both**
    the year-regression interval *and* the subject-classification set *under-cover*,
    and the textbook weighted-conformal remedy is a **no-op in both cases**, for two
-   complementary reasons (a location shift; an orthogonal shift) — each with a
-   diagnostic that explains exactly why.
+   complementary reasons (residual magnitude uncorrelated with test-likeness within
+   the calibration set; an orthogonal shift) — each with a diagnostic that explains
+   exactly why.
 
 The keystone ran the heavy work on the GPU server and committed the per-row
 predictor outputs and class scores. The conformal math below is cheap numpy — it
@@ -42,14 +43,15 @@ returned a near-zero spread (std ≈ 0.001) and a badly biased mean (~2163 for a
 landed in two parts: 0.26.1 standardized the fine-tune projection head's target, but
 the *amortized context predictor* still collapsed; 0.26.2 completed it with z-space
 standardization of the predictor's target. **The bidirectional win is that this
-workflow now runs end-to-end at all**: the predictor fits a real mean (≈ 2018.6)
-with real spread (≈ 0.9), and the previously-impossible regression-conformal recipe
-executes. That is the cookbook → engine → cookbook loop: writing the recipe found
-the bug, the engine fix made the recipe work.
+workflow now runs end-to-end at all**: the predictor fits a real mean (essentially
+unbiased across eras) with real spread, and the previously-impossible
+regression-conformal recipe executes. That is the cookbook → engine → cookbook
+loop: writing the recipe found the bug, the engine fix made the recipe work.
 
 What the recipe then *measures* is the honest part, and it is the same lesson as
 Part B: the interval **under-covers** under the time-split, and weighting it is a
-**no-op** — here for an especially clean reason (a location shift).
+**no-op** — not because the residual magnitudes match (they do not), but because
+residual magnitude is uncorrelated with test-likeness *within* the calibration set.
 
 ```{python}
 import numpy as np
@@ -66,8 +68,8 @@ pred_std = float(np.mean([r["pred_std"] for r in reg]))
 print(f"predictor cal-era mean:  {cal_mean:.2f}")
 print(f"predictor test-era mean: {test_mean:.2f}")
 print(f"mean predictive std:     {pred_std:.3f}   (real spread — no collapse)")
-# The predictor regresses to the embedding-conditioned mean (~2018.6) for BOTH eras:
-# the cal/test mean gap is tiny. That is the location-shift signature used below.
+# The predictor's point prediction is essentially unbiased across eras: the
+# cal/test MEAN gap is tiny, even though (see below) the residual SPREAD is not.
 ```
 
 ```{python}
@@ -114,21 +116,22 @@ assert reg_cov < 1 - alpha  # under-coverage — the honest finding under the ti
 The interval **under-covers**: realised coverage falls below the nominal 0.90. The
 win is that this workflow *runs at all*; what it then measures is the honest lesson.
 
-### Weighting the regression interval is a no-op — it's a location shift
+### Weighting the regression interval is a no-op — residual size is uninformative
 
 The textbook covariate-shift fix is importance-weighted conformal: reweight the
 calibration residuals toward the test era before taking the quantile. Here it cannot
-help, for a clean reason. The predictor regresses to the embedding-conditioned mean
-(~2018.6) for *both* eras, so the absolute residuals $|y-\hat y|$ have essentially
-the **same magnitude** on the calibration and test sets — the under-coverage is
-point-prediction *bias*, not a residual-magnitude shift. Reweighting *which*
-residuals count cannot move a quantile when the magnitudes don't differ.
+help, for a precise reason. The test era's absolute residuals $|y-\hat y|$ actually
+run noticeably *larger* than the calibration era's — a real spread shift, not just
+a location one — but reweighting only reallocates probability mass *within* the
+calibration set by how test-era-like each calibration row is, and there residual
+size is uncorrelated with test-likeness. So no reallocation of the calibration
+residuals can systematically favor the larger ones, and the quantile does not move.
 
 ```{python}
 cal_resid = np.abs(np.asarray(cal_mean_v) - np.asarray(cal_year))
 test_resid = np.abs(np.asarray(test_mean_v) - np.asarray(test_year, dtype=float))
 print(f"cal  mean |y−ŷ|: {cal_resid.mean():.3f}")
-print(f"test mean |y−ŷ|: {test_resid.mean():.3f}   (≈ equal → location shift)")
+print(f"test mean |y−ŷ|: {test_resid.mean():.3f}   (test runs larger — a real spread shift)")
 
 # test-era-likeness weights over the committed per-row graph-conditioned embeddings.
 emb_rows = contracts.load_artifact("arxiv.tier04_predictions").to_pylist()
@@ -152,9 +155,10 @@ print(f"corr(|residual|, test-likeness): {reg_corr:+.3f}   (≈ 0)")
 
 ```{python}
 # | echo: false
-# The location-shift diagnostics: cal/test residual magnitudes ≈ equal, the weighting
-# moves coverage by ≈ 0, and corr(|residual|, test-likeness) ≈ 0 — reweighting cannot
-# move the |residual| quantile. (The keystone froze the same numbers.)
+# The diagnostics: the weighting moves coverage by ≈ 0, and corr(|residual|,
+# test-likeness) ≈ 0 within the calibration set — reweighting cannot move the
+# |residual| quantile regardless of the cal/test aggregate magnitude gap. (The
+# keystone froze the same numbers.)
 rails.measure("arxiv.tier04.reg_cal_resid_mag", float(cal_resid.mean()))
 rails.measure("arxiv.tier04.reg_test_resid_mag", float(test_resid.mean()))
 rails.measure("arxiv.tier04.reg_weighted_coverage", wt_reg_cov)
@@ -163,9 +167,10 @@ assert abs(wt_reg_cov - reg_cov) <= contracts.golden("arxiv.tier04.reg_weighting
 ```
 
 Coverage barely moves, and the correlation between a calibration row's residual
-magnitude and its test-era likeness is near zero — the diagnostic that proves the
-shift is a *location* shift the residual quantile cannot see. The honest remedy is
-the same one Part B reaches: a governed, time-aware cohort, not a client-side
+magnitude and its test-era likeness is near zero — the diagnostic that shows
+*why* the residual quantile cannot see the shift, even though the shift itself is
+real (the test era's residuals genuinely run larger). The honest remedy is the
+same one Part B reaches: a governed, time-aware cohort, not a client-side
 reweight. This is *not* conformal magically working; it is conformal honestly
 reporting a shift the OSS marginal surface cannot repair alone.
 
@@ -369,8 +374,8 @@ patch; it repairs under-coverage only when the shift is score-aligned.
 ## The honest remedy: a governed calibration cohort
 
 If a client-side reweight cannot restore coverage in *either* crux — the regression
-interval (a location shift) or the classification set (an orthogonal shift) — what
-does? A **governed, time-aware (or simply larger) calibration cohort**: choose the
+interval (residual size uncorrelated with test-likeness within calibration) or the
+classification set (an orthogonal shift) — what does? A **governed, time-aware (or simply larger) calibration cohort**: choose the
 calibration set so it
 is exchangeable with the deployment era — a Mondrian / time-stratified cohort the
 consumer owns and registers. The OSS Python surface exposes the **marginal**
@@ -389,9 +394,10 @@ doctrine puts it. The point stands: honest coverage on a shifting graph requires
 > time-split both the regression interval and the classification set under-cover
 > (Barber et al. 2023). The textbook remedy is weighted / stratified conformal
 > (Tibshirani et al. 2019; NAPS, Clarkson et al. 2023; CF-GNN, Huang et al. 2023) —
-> but it repairs only a shift the nonconformity score can *see*: it is a no-op for a
-> location shift (the regression case, where cal and test residual magnitudes match)
-> and for a shift orthogonal to the score (the classification case). The unifying
+> but it repairs only a shift the nonconformity score can *see*: it is a no-op for
+> the regression case (residual size is uncorrelated with test-likeness within the
+> calibration set, even though the residuals themselves do shift) and for a shift
+> orthogonal to the score (the classification case). The unifying
 > lesson: weighted conformal repairs a covariate shift only when the shift moves the
 > nonconformity-score distribution; a location/orthogonal shift needs a governed
 > time-aware cohort, not a client-side reweight. This is the tier with **no

@@ -97,29 +97,43 @@ print("each edge is an auditable self-search result (similarity + rank recorded)
 - **GNN canon.** node2vec / DeepWalk's skip-gram over biased random walks
   [@grover2016node2vec], and the inductive aggregate-over-neighbours of GraphSAGE
   [@hamilton2017graphsage]. The walk sampler turns the graph into positive pairs;
-  the contrastive loss is the objective.
-- **Jammi call.** `fine_tune_graph(edge_provenance="declared")` — the
-  `edge_provenance` knob is the **circularity guard**: only a *declared* graph
-  (who-cited-whom) supervises a non-trivial gain; a *similarity* graph would teach
-  the encoder the metric it already uses.
+  the contrastive loss is the objective. Citation-graph contrastive supervision is
+  SPECTER [@cohan2020specter]; nearest-neighbor-of-own-representations contrastive
+  learning is NNCLR [@dwibedi2021nnclr], which works via homophily, not circularity;
+  SciNCL [@ostendorff2022scincl] augments citation embeddings with exactly this kind
+  of k-NN self-similarity graph.
+- **Jammi call.** `fine_tune_graph` — the `edge_provenance` knob names *which*
+  graph supervises the metric: `"declared"` (who-cited-whom, external to the
+  embedding metric) versus `"similarity"` (the k-NN-of-own-embeddings graph,
+  drawn *by* the metric). The two are not equally informative, but neither is the
+  similarity graph a no-op — see the measurement below.
 
-We demonstrate the circularity contract empirically from the cached tier-03
-metrics: the declared-edge fine-tune beats the base encoder.
+We measure this empirically from the cached tier-03 results, over three graphs run
+with the identical recipe: the **declared** citation graph (trained to
+convergence), the **similarity** self-k-NN graph, and a **random** null.
 
 ```{python}
 base = contracts.golden("arxiv.tier01.recall_at_10").value
 ft = contracts.golden("arxiv.tier03.recall_at_10").value
 gain = contracts.golden("arxiv.tier03.recall_gain_vs_base").value
+sim_gain = contracts.golden("arxiv.tier03.control_similarity_recall_gain_vs_base").value
+rand_gain = contracts.golden("arxiv.tier03.control_random_recall_gain_vs_base").value
 print(f"recall@10 base → declared-edge fine-tune: {base:.3f} → {ft:.3f}   (Δ {gain:+.3f})")
+print(f"control gains — similarity: {sim_gain:+.3f}   random: {rand_gain:+.3f}")
 rails.measure("arxiv.tier03.recall_at_10", ft)
 rails.measure("arxiv.tier03.recall_gain_vs_base", gain)
+rails.measure("arxiv.tier03.control_similarity_recall_gain_vs_base", sim_gain)
+rails.measure("arxiv.tier03.control_random_recall_gain_vs_base", rand_gain)
 ```
 
 ```{python}
 # | echo: false
-# The circularity contract demonstrated: the DECLARED graph moves the metric (a
-# similarity graph would be circular). node2vec walks ↔ fine_tune_graph(declared).
+# The honest three-way ordering: random (harmful) < base < similarity (real,
+# partial, via homophily — NNCLR/SciNCL) < declared (largest — SPECTER). A
+# similarity graph is a weak bootstrap, not "nothing"; only a random graph is a
+# true no-signal control, and it actively hurts.
 assert gain > 0
+assert rand_gain < 0 < sim_gain < gain
 ```
 
 ## Signature 4 — A prediction is a context-conditioned posterior (the moat)

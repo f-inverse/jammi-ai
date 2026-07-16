@@ -1,6 +1,7 @@
 {
-  "model_id": "jammi:fine-tuned:9e8e3908-a1e7-434e-be63-bdcd2c6926da",
+  "model_id": "jammi:fine-tuned:f41e7b50-b737-4b82-b4a5-a3455f3079cd",
   "edge_provenance": "declared",
   "base_model": "answerdotai/ModernBERT-base",
-  "recall_at_10": 0.548
+  "epochs": 15,
+  "recall_at_10": 0.594
 }

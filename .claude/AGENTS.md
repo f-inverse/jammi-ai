@@ -67,7 +67,9 @@ criteria drive `acceptance-verifier`. A **question** mutates nothing → no phas
 - **The rich symbol graph** (`build-graph` → `graph-navigator`, `target/build-graph-rich/graph.json`)
   is a general call/implement/reference-site query surface, not solely a doc-currency stage: the
   lead may dispatch it at phase 0.5 for impact scoping (enumerate every call/impl site of a symbol
-  a contract is about to touch) as well as at phase 6.5 for doc-completeness. Read-only in both uses.
+  a contract is about to touch), in the doc-currency pipeline for enumeration completeness, and to
+  localize and route an arbitrary code/architecture question to its owning domain expert (the
+  lead's read-only Q&A path, `agents/lead.md`). Read-only in every use.
 
 ## Consensus is per-axis, never a vote
 

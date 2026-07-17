@@ -296,7 +296,9 @@ message AuditErrorDetail {
     // `AuditError::NoTenantBinding` carries no payload.
     bool no_tenant_binding = 3;
     // `AuditError::SignatureMismatch(Uuid)` — the offending query id (UUID
-    // string).
+    // string). The faithful server-emitted path always carries a valid UUID;
+    // a decode that finds an un-parseable string here (a forged or corrupted
+    // message) folds to `storage` rather than fabricating the nil UUID.
     string signature_mismatch = 4;
     string master_key = 5;
     // `AuditError::Serde` — the lone genuinely-foreign arm; its `Display`

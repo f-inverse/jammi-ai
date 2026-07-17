@@ -405,6 +405,11 @@ impl InferenceSession {
                     rows: &rows,
                     dimensions,
                     recipe,
+                    // A replay's targets are `read_target_rows` of the resolved
+                    // table, so every key here IS one of that table's `_row_id`
+                    // values — the one caller position that can honestly claim
+                    // the table's own origin column for its targets.
+                    key_column: table.key_column.as_deref(),
                 },
                 CachePolicy::Bypass,
             )

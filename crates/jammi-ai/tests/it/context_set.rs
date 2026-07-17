@@ -252,6 +252,7 @@ async fn materialize_context_writes_a_searchable_embedding_table() {
                 rows: &rows,
                 dimensions: 32,
                 recipe: &recipe,
+                key_column: None,
             },
             jammi_db::store::CachePolicy::Bypass,
         )
@@ -287,10 +288,103 @@ async fn materialize_context_rejects_duplicate_target_keys() {
                 rows: &rows,
                 dimensions: 32,
                 recipe: &recipe,
+                key_column: None,
             },
             jammi_db::store::CachePolicy::Bypass,
         )
         .await
         .expect_err("a target key must be unique in a context table");
     assert!(err.to_string().contains("duplicate target key"));
+}
+
+#[tokio::test]
+async fn materialize_context_rejects_a_key_column_the_source_lacks() {
+    // A declared origin column is resolved by scanning it on the raw source, so
+    // a name the source does not have is provenance no reader can follow. The
+    // `patents` fixture is keyed by `id` and has no `nope` column.
+    let (session, _dir) = session_with_embeddings().await;
+    let rows: Vec<(String, Vec<f32>)> = (0..3)
+        .map(|i| (format!("target-{i}"), vec![i as f32; 32]))
+        .collect();
+    let recipe = ContextRequest::new("patents", vec![0.0_f32; 32], 5);
+
+    let err = session
+        .materialize_context(
+            MaterializedContext {
+                rows: &rows,
+                dimensions: 32,
+                recipe: &recipe,
+                key_column: Some("nope"),
+            },
+            jammi_db::store::CachePolicy::Bypass,
+        )
+        .await
+        .expect_err("a key column the source lacks must be rejected");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("nope") && msg.contains("patents"),
+        "the error must name the column and the source, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn materialize_context_accepts_a_real_key_column_and_records_it() {
+    // The non-vacuous control for the guard: a truthful declaration still
+    // succeeds and lands in the catalog, so the check rejects false names
+    // rather than the field itself.
+    let (session, _dir) = session_with_embeddings().await;
+    let rows: Vec<(String, Vec<f32>)> = (0..3)
+        .map(|i| (format!("target-{i}"), vec![i as f32; 32]))
+        .collect();
+    let recipe = ContextRequest::new("patents", vec![0.0_f32; 32], 5);
+
+    let (table, _) = session
+        .materialize_context(
+            MaterializedContext {
+                rows: &rows,
+                dimensions: 32,
+                recipe: &recipe,
+                key_column: Some("id"),
+            },
+            jammi_db::store::CachePolicy::Bypass,
+        )
+        .await
+        .expect("`id` is a real column of the patents source");
+
+    assert_eq!(table.key_column.as_deref(), Some("id"));
+}
+
+#[tokio::test]
+async fn materialize_context_rejects_a_key_column_on_an_unreachable_source() {
+    // The guard's fail-closed arm: a source this session cannot reach is one
+    // whose columns cannot be confirmed, not one whose claim is proven. A
+    // source can reach this state in the wild by being catalog-present but
+    // failing registration (session load warns and continues); an
+    // never-registered source is the same reachability condition.
+    let (session, _dir) = session_with_embeddings().await;
+    let rows: Vec<(String, Vec<f32>)> = (0..2)
+        .map(|i| (format!("target-{i}"), vec![i as f32; 32]))
+        .collect();
+    let recipe = ContextRequest::new("ghost", vec![0.0_f32; 32], 5);
+
+    let err = session
+        .materialize_context(
+            MaterializedContext {
+                rows: &rows,
+                dimensions: 32,
+                recipe: &recipe,
+                key_column: Some("id"),
+            },
+            jammi_db::store::CachePolicy::Bypass,
+        )
+        .await
+        .expect_err("an unreachable source cannot confirm a declared key column");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Key column check") && msg.contains("ghost") && msg.contains("id"),
+        "the error must say the check could not resolve the source, and name \
+         both the source and the key column, got: {msg}"
+    );
 }

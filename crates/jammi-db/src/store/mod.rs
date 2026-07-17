@@ -75,9 +75,13 @@ pub struct EmbeddingTableSpec<'a> {
     /// The source key-column name recorded as catalog provenance (the catalog
     /// `key_column`). The *physical* key of every embedding table is always
     /// `_row_id`; this names which column of the origin those keys came from,
-    /// so lineage survives without changing the output schema. Producers that
-    /// key straight off `_row_id` pass `"_row_id"`.
-    pub key_column: &'a str,
+    /// so lineage survives without changing the output schema. A reader joins
+    /// `source.<key_column> = derived._row_id`, so the name must be a column
+    /// the origin really has — a producer keying straight off a source's own
+    /// `_row_id` passes `Some("_row_id")`. `None` when the origin key is
+    /// unknown or does not apply (keys that correspond to no stored source
+    /// row), which is the honest answer rather than a name the origin lacks.
+    pub key_column: Option<&'a str>,
     /// The source content columns these vectors were computed from, recorded as
     /// the catalog `text_columns` provenance (joined). `None` when no source
     /// columns are attributed (a pooled or externally-produced batch).
@@ -1169,7 +1173,7 @@ impl ResultStore {
                 derived_from,
                 model_id,
                 Some(dimensions as i32),
-                Some(key_column),
+                key_column,
                 text_columns,
             )
             .await?;

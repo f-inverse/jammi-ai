@@ -163,7 +163,7 @@ async fn session_with_meta_dataset_named(
                 model_id: "synthetic-embed",
                 derived_from: None,
                 dimensions: FEATURE_DIM,
-                key_column: "_row_id",
+                key_column: Some("_row_id"),
                 text_columns: None,
             },
             &pairs,
@@ -455,6 +455,282 @@ async fn too_few_tasks_is_rejected() {
     assert!(
         msg.contains("min_task_count") && msg.contains("distinct task"),
         "error should name the meta-overfitting guard, got: {msg}"
+    );
+}
+
+/// Stand up a meta-dataset whose source key column is `paper_id` — an origin
+/// with NO `_row_id` column — then propagate its embedding table so the
+/// derived, auto-resolved table is what the predictor reads.
+///
+/// This is the shape that exercises catalog auto-resolution: the predictor
+/// builds its `ContextRequest` with `embedding_table: None`, so it resolves the
+/// source's NEWEST embedding table (the propagated one) and interpolates that
+/// table's `key_column` into a scan of the RAW source. Naming a column the raw
+/// source does not have makes that scan unresolvable.
+///
+/// Returns the session, its tempdir, and the propagated table.
+async fn session_with_origin_keyed_propagated_table(
+    rows: &[Row],
+) -> (
+    Arc<InferenceSession>,
+    TempDir,
+    jammi_db::catalog::result_repo::ResultTableRecord,
+) {
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    session.register_query_functions();
+
+    // Source parquet: `paper_id` (the origin key), `task`, `y`. There is no
+    // `_row_id` column — the positive control below asserts exactly that.
+    let source_schema = Arc::new(Schema::new(vec![
+        Field::new("paper_id", DataType::Utf8, false),
+        Field::new("task", DataType::Utf8, false),
+        Field::new("y", DataType::Float64, false),
+    ]));
+    let source_batch = RecordBatch::try_new(
+        Arc::clone(&source_schema),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.task.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.y).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    let source_path = dir.path().join("papers.parquet");
+    {
+        let file = std::fs::File::create(&source_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&source_schema), None).unwrap();
+        writer.write(&source_batch).unwrap();
+        writer.close().unwrap();
+    }
+    session
+        .add_source(
+            "papers",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", source_path.to_str().unwrap())),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // The embedding table's `_row_id` carries the `paper_id` values; its
+    // catalog `key_column` names the origin those values came from.
+    let pairs: Vec<(String, Vec<f32>)> = rows.iter().map(|r| (r.id.clone(), r.x.clone())).collect();
+    let (__d, __e, __i) =
+        jammi_test_utils::synthetic_seed_contract("synthetic-embed", "papers", FEATURE_DIM);
+    let embedded = session
+        .result_store()
+        .materialize_embedding_table(
+            session.context(),
+            jammi_db::store::EmbeddingTableSpec {
+                source_id: "papers",
+                model_id: "synthetic-embed",
+                derived_from: None,
+                dimensions: FEATURE_DIM,
+                key_column: Some("paper_id"),
+                text_columns: None,
+            },
+            &pairs,
+            jammi_db::store::manifest::Materialization::new(&__d, &__e, __i),
+        )
+        .await
+        .unwrap();
+
+    // A citation edge source over the same keys, so a propagation has a graph.
+    let edge_schema = Arc::new(Schema::new(vec![
+        Field::new("src", DataType::Utf8, false),
+        Field::new("dst", DataType::Utf8, false),
+    ]));
+    let (src, dst): (Vec<&str>, Vec<&str>) = rows
+        .windows(2)
+        .filter(|w| w[0].task == w[1].task)
+        .map(|w| (w[0].id.as_str(), w[1].id.as_str()))
+        .unzip();
+    let edge_batch = RecordBatch::try_new(
+        Arc::clone(&edge_schema),
+        vec![
+            Arc::new(StringArray::from(src)) as ArrayRef,
+            Arc::new(StringArray::from(dst)),
+        ],
+    )
+    .unwrap();
+    let edge_path = dir.path().join("cites.parquet");
+    {
+        let file = std::fs::File::create(&edge_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&edge_schema), None).unwrap();
+        writer.write(&edge_batch).unwrap();
+        writer.close().unwrap();
+    }
+    session
+        .add_source(
+            "cites",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", edge_path.to_str().unwrap())),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let request = jammi_ai::pipeline::graph_propagation::PropagateRequest::new(
+        "papers",
+        jammi_ai::pipeline::graph_neighbourhood::EdgeSourceRef::Registered {
+            source_id: "cites".into(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+            type_column: None,
+            weight_column: None,
+            as_of_column: None,
+        },
+    )
+    .with_embedding_table(embedded.table_name.clone())
+    .with_direction(jammi_ai::pipeline::graph_neighbourhood::EdgeDirection::Undirected);
+
+    let (propagated, _) = session
+        .propagate_embeddings(&request, jammi_db::store::CachePolicy::Bypass)
+        .await
+        .unwrap();
+
+    (session, dir, propagated)
+}
+
+#[tokio::test]
+async fn origin_keyed_predictor_source_has_no_row_id_column() {
+    // The positive control: the raw source really has no `_row_id`, so a
+    // reader that trusts `_row_id` provenance cannot scan it. This is what
+    // makes the failure below attributable to the provenance, not to an
+    // unrelated missing column.
+    let rows = synthetic_meta_dataset(6, 10, 99);
+    let (session, _dir, _propagated) = session_with_origin_keyed_propagated_table(&rows).await;
+
+    let columns: Vec<String> = session
+        .context()
+        .sql("SELECT * FROM \"papers\".public.\"papers\" LIMIT 0")
+        .await
+        .unwrap()
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+
+    assert!(columns.iter().any(|c| c == "paper_id"));
+    assert!(
+        !columns.iter().any(|c| c == "_row_id"),
+        "the origin must have no `_row_id` column: {columns:?}"
+    );
+}
+
+#[tokio::test]
+async fn assemble_context_over_a_propagated_table_resolves_the_origin_key() {
+    // The direct reader RED. `assemble_context` with a split + value_columns
+    // drives `filter_keys_by_split` and `hydrate_value_columns`, both of which
+    // interpolate the resolved table's `key_column` into a scan of the RAW
+    // source. Pin the propagated table so this asserts the reader, not the
+    // wall-clock-ordered resolution.
+    let rows = synthetic_meta_dataset(6, 10, 99);
+    let (session, _dir, propagated) = session_with_origin_keyed_propagated_table(&rows).await;
+
+    let target = &rows[0];
+    let mut request =
+        jammi_ai::pipeline::context_set::ContextRequest::new("papers", target.x.clone(), 5);
+    request.embedding_table = Some(propagated.table_name.clone());
+    request.exclude_key = Some(target.id.clone());
+    request.split = Some(format!("task = '{}'", target.task));
+    request.value_columns = vec!["y".to_string()];
+
+    let rep = session.assemble_context(&request).await.unwrap();
+
+    // Success AND correct: the split-scoped context is non-empty and every
+    // surfaced key is a real `paper_id` of the target's own task, never the
+    // target itself.
+    assert!(
+        !rep.context_keys.is_empty(),
+        "the split-scoped context must retain members"
+    );
+    let same_task: std::collections::BTreeSet<&str> = rows
+        .iter()
+        .filter(|r| r.task == target.task && r.id != target.id)
+        .map(|r| r.id.as_str())
+        .collect();
+    let surfaced: std::collections::BTreeSet<&str> =
+        rep.context_keys.iter().map(|k| k.as_str()).collect();
+    assert!(
+        surfaced.is_subset(&same_task),
+        "context keys must be same-task paper_ids: got {surfaced:?}, expected within {same_task:?}"
+    );
+    assert_eq!(
+        rep.value_rows.iter().map(|b| b.num_rows()).sum::<usize>(),
+        rep.context_keys.len(),
+        "every context member hydrates its outcome from the origin"
+    );
+}
+
+/// End-to-end: `train_context_predictor` over a source whose origin key is not
+/// `_row_id`, with a propagated table shadowing the source's own. The predictor
+/// builds `ContextRequest::new(..)` with `embedding_table: None`, so it reaches
+/// the catalog auto-resolvers and reads whichever table they land on — its
+/// context assembly therefore depends on that table's recorded origin key.
+#[tokio::test(flavor = "multi_thread")]
+async fn train_context_predictor_over_an_origin_keyed_source() {
+    let rows = synthetic_meta_dataset(8, 18, 321);
+    let (session, _dir, propagated) = session_with_origin_keyed_propagated_table(&rows).await;
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+
+    // The predictor auto-resolves `None` to the source's newest embedding
+    // table. Assert that IS the propagated one, so a wall-clock tie surfaces
+    // here as a loud failure rather than silently weakening the oracle.
+    let resolved = session
+        .catalog()
+        .resolve_embedding_table("papers", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved.table_name, propagated.table_name,
+        "the predictor must auto-resolve the propagated table for this oracle to bite"
+    );
+
+    let mut spec = spec(
+        ContextArchitecture::Cnp,
+        PredictiveHead::Gaussian {
+            objective: GaussianObjective::Crps,
+        },
+    );
+    spec.key_column = "paper_id".to_string();
+
+    let job = session
+        .train_context_predictor("papers", &spec)
+        .await
+        .unwrap();
+    // A swallowed error would surface here as a failed job, not a panic.
+    job.wait().await.unwrap();
+
+    let record = session
+        .catalog()
+        .get_model("ctx-predictor")
+        .await
+        .unwrap()
+        .expect("predictor registered in catalog");
+    assert_eq!(record.task, ModelTask::Regression);
+    assert!(
+        record.artifact_path.is_some(),
+        "training over an origin-keyed source must persist a real artifact"
     );
 }
 

@@ -282,11 +282,12 @@ def emit(db) -> None:
         ft.wait()
         model_id = ft.model_id
         print(f"  ft model_id: {model_id}", flush=True)
-        # A fresh embed pass over the just-trained checkpoint — also the table
-        # that gives tier04's `train_context_predictor` a correctly `key_column=
-        # "paper_id"`-tagged, most-recent embedding table to auto-resolve, since
-        # `propagate_embeddings`'s own registered table hardcodes `key_column=
-        # "_row_id"` (an engine finding, not a cookbook one — see K0 follow-ups).
+        # `fine_tune_graph` trains a model, not an embedding table — this fresh
+        # embed pass over the just-trained checkpoint is what turns it into one.
+        # Registered after `prop` (tier02), it also becomes the source's
+        # most-recently-registered ready embedding table, which is what tier04's
+        # `train_context_predictor` / `predict_with_context_predictor` resolve
+        # against whenever no table is named explicitly.
         ft_emb = db.generate_embeddings(source=papers, model=model_id,
                                         columns=["title", "abstract"], key="paper_id")
 

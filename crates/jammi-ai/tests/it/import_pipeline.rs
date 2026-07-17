@@ -201,3 +201,35 @@ async fn import_pipeline_is_byte_identical_across_the_refactor() {
          content-digest input changed"
     );
 }
+
+/// An import attributes its keys to a source column, so the pipeline requires
+/// one — the same condition the wire decode enforces, held at the engine edge
+/// so a direct Rust caller cannot slip past it. Every other argument here is
+/// the one the byte-parity import above uses successfully, so the empty
+/// `key_column` is the only thing under test.
+#[tokio::test]
+async fn import_rejects_an_empty_key_column() {
+    let dir = TempDir::new().unwrap();
+    let session = InferenceSession::new(common::test_config(dir.path()))
+        .await
+        .unwrap();
+    let vectors_url = write_precomputed_vectors_fixture(dir.path());
+
+    let err = session
+        .import_embeddings(
+            "byte_parity_source",
+            "byte-parity-model",
+            &vectors_url,
+            "",
+            &["body".to_string()],
+            DIMS,
+        )
+        .await
+        .expect_err("an empty key_column must be rejected");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("key_column"),
+        "the error must name the offending field, got: {msg}"
+    );
+}

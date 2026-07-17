@@ -647,6 +647,66 @@ async fn binary_precision_table_honors_an_explicit_four_not_widened_to_thirty_tw
     );
 }
 
+/// TRIPWIRE for the identity-completeness argument that lets
+/// `ProducingDescriptor::NeighborGraph` fold `index_storage_precision` but
+/// omit `oversample`: every row `create_table` persists must couple the two
+/// columns so a rescoring precision never carries a `None` oversample — a
+/// live-mutable `oversample` can only go live under a precision that already
+/// makes the merge inexact-and-rescored, never under a precision where the
+/// merge is exact regardless of `oversample`. If this invariant ever broke,
+/// the omission would let a definition-hash cache-hit silently replay a
+/// stale oversample under a folded, rescoring precision.
+#[tokio::test]
+async fn create_table_couples_rescoring_precision_to_a_present_oversample() {
+    for precision in [
+        jammi_db::config::StoragePrecision::F32,
+        jammi_db::config::StoragePrecision::F16,
+        jammi_db::config::StoragePrecision::Int8,
+        jammi_db::config::StoragePrecision::Binary,
+    ] {
+        let dir = tempdir().unwrap();
+        let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+        let ann = AnnIndexConfig {
+            storage_precision: precision,
+            ..AnnIndexConfig::default()
+        };
+        let store = ResultStore::new(dir.path(), Arc::clone(&catalog), ann).unwrap();
+
+        let info = store
+            .create_table(
+                "patents",
+                ModelTask::TextEmbedding,
+                jammi_db::catalog::result_repo::ResultTableKind::Model,
+                None,
+                "model",
+                Some(64),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let record = catalog
+            .get_result_table(&info.table_name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.storage_precision,
+            Some(precision),
+            "create_table must stamp the precision it was configured at"
+        );
+        if precision.needs_rescore() {
+            assert!(
+                record.oversample.is_some(),
+                "{precision:?} needs a rescore companion, so its persisted row must carry a \
+                 present oversample — a None here would let a live-mutable oversample go live \
+                 under a folded, rescoring precision"
+            );
+        }
+    }
+}
+
 /// A `ResultStore` rooted at a `memory://` URL roots every created table
 /// under that URL and round-trips a written batch back through the shared
 /// in-memory object store — the hermetic stand-in for an `r2://`/`s3://`

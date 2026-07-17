@@ -268,6 +268,27 @@ pub enum ProducingDescriptor {
     /// flag is *not* recorded: today a resolved endpoint equals its `_row_id`
     /// either way, so it does not affect the output — recording it would be a
     /// false determinant.)
+    ///
+    /// The retrieve→rescore `oversample` multiplier is deliberately **not**
+    /// recorded here even though the index-assisted driver reads it — folding
+    /// a live-mutable deployment/table config knob into a deterministic
+    /// identity would itself be wrong (a later config change would silently
+    /// stop matching a still-valid cached artifact). The omission is sound
+    /// only because of a persisted-record invariant enforced at
+    /// [`crate::store::ResultStore::create_table`]/
+    /// [`crate::catalog::Catalog::create_result_table`]: `oversample` and
+    /// `storage_precision` are always written together (migration 023), so
+    /// no persisted row has `oversample = None` under a `storage_precision`
+    /// for which [`crate::config::StoragePrecision::needs_rescore`] is true —
+    /// an `F32` (or pre-023-`None`, which reads back as `F32`) row makes
+    /// `oversample` inert (`needs_rescore() == false`, so the index-assisted
+    /// merge is already exact and `oversample` cannot change it), and a
+    /// rescoring row always carries a concrete `oversample`. If either write
+    /// site ever persisted `storage_precision` and `oversample` independently,
+    /// or `oversample` started mattering at `F32`, this omission would become
+    /// a silent stale cache-hit. See the coupling tripwire test in
+    /// `crates/jammi-db/tests/it/store.rs`
+    /// (`create_table_couples_rescoring_precision_to_a_present_oversample`).
     NeighborGraph {
         /// The embedding result table the edges were derived from.
         source_table: String,

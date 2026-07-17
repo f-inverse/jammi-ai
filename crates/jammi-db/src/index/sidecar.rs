@@ -498,8 +498,14 @@ impl SidecarIndex {
     pub fn save(&self, base_path: &Path) -> Result<()> {
         // Save USearch index
         let usearch_path = base_path.with_extension("usearch");
+        let usearch_path_str = usearch_path.to_str().ok_or_else(|| {
+            JammiError::Other(format!(
+                "USearch save: index path is not valid UTF-8: {}",
+                usearch_path.display()
+            ))
+        })?;
         self.index
-            .save(usearch_path.to_str().unwrap_or_default())
+            .save(usearch_path_str)
             .map_err(|e| JammiError::Other(format!("USearch save: {e}")))?;
 
         // Save rowmap: version (u32 LE) + entries (len_u32 LE + UTF-8 bytes)
@@ -668,8 +674,14 @@ impl SidecarIndex {
         .map_err(|e| JammiError::Other(format!("USearch index creation for load: {e}")))?;
 
         let usearch_path = base_path.with_extension("usearch");
+        let usearch_path_str = usearch_path.to_str().ok_or_else(|| {
+            JammiError::Other(format!(
+                "USearch load: index path is not valid UTF-8: {}",
+                usearch_path.display()
+            ))
+        })?;
         index
-            .load(usearch_path.to_str().unwrap_or_default())
+            .load(usearch_path_str)
             .map_err(|e| JammiError::Other(format!("USearch load: {e}")))?;
 
         if ann.search_expansion != 0 {

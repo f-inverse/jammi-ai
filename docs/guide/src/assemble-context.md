@@ -125,7 +125,13 @@ table, with its own sidecar ANN index:
 let recipe = ContextRequest::new("patents", vec![0.0_f32; 32], 5);
 let (table, _outcome) = session
     .materialize_context(
-        MaterializedContext { rows: &rows, dimensions: 32, recipe: &recipe },
+        MaterializedContext {
+            rows: &rows,
+            dimensions: 32,
+            recipe: &recipe,
+            // These targets are `patents` rows, so their keys are `patents.id`.
+            key_column: Some("id"),
+        },
         CachePolicy::Bypass,
     )
     .await?;
@@ -140,3 +146,12 @@ same table family every embedding table belongs to. The recipe `materialize_cont
 takes is the batch's shared assembly definition (the source comes from it); the
 per-target query vectors are the inputs the recipe ran over, which is why they are
 the `rows`, not part of the recipe.
+
+`key_column` names which column of the source those target keys came from, and is
+recorded as the table's provenance: it is what lets a reader join
+`patents.id = <context table>._row_id` to get back to the rows the targets are.
+You declare it because the targets are yours — `materialize_context` receives only
+`(key, vector)` pairs and cannot see where the keys came from — but it does check
+the half it can: a column the source does not have is rejected rather than
+recorded. Pass `None` when the targets are free vectors that correspond to no
+stored row; the table is still searchable, but nothing joins it back to a source.

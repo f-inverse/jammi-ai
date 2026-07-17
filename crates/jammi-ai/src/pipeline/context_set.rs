@@ -494,6 +494,14 @@ impl InferenceSession {
         })?;
         let source_table = self.find_table_name(source_id)?;
 
+        // The recorded `key_column` is provenance, not a proven fact — a
+        // caller-declared import can record a name the source never had (see
+        // `ensure_source_has_column`'s doc). Confirm it here, before it is
+        // interpolated into the scan below, so a stale/wrong recording surfaces
+        // as the typed provenance-mismatch error rather than a raw planner
+        // "No field named" from an unrelated verb.
+        self.ensure_source_has_column(source_id, key_col).await?;
+
         let keys: Vec<datafusion::prelude::Expr> =
             context_keys.iter().map(|k| lit(k.as_str())).collect();
 
@@ -548,6 +556,10 @@ impl InferenceSession {
             ))
         })?;
         let source_table = self.find_table_name(source_id)?;
+
+        // See the matching guard in `filter_keys_by_split`: confirm the
+        // recorded `key_column` before it is interpolated into the scan below.
+        self.ensure_source_has_column(source_id, key_col).await?;
 
         let select_list = value_columns
             .iter()

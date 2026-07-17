@@ -388,3 +388,176 @@ async fn materialize_context_rejects_a_key_column_on_an_unreachable_source() {
          both the source and the key column, got: {msg}"
     );
 }
+
+/// `import_embeddings` resolves nothing at write time beyond the storage
+/// object it is handed, so it cannot confirm the `key_column` it records —
+/// unlike a declared context-set `key_column`, which *is* checked against the
+/// source before anything is written (the guard above). A caller can therefore
+/// import a table whose recorded provenance the source never had; the read
+/// resolvers that later interpolate that name into a raw scan of the source
+/// must reject it with the same typed provenance-mismatch error, not let
+/// DataFusion's raw "No field named" surface from an unrelated verb.
+#[tokio::test]
+async fn read_resolvers_reject_a_recorded_key_column_the_source_lacks() {
+    use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use jammi_db::storage::StorageUrl;
+    use parquet::arrow::ArrowWriter;
+
+    const DIMS: usize = 4;
+
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    session.register_query_functions();
+
+    // The source: keyed by `doc_id`, scoped by `split` — and genuinely no
+    // `nope` column, so a recorded key_column of "nope" is unresolvable.
+    let doc_ids = ["doc-0", "doc-1", "doc-2"];
+    let splits = ["train", "train", "test"];
+    let source_schema = Arc::new(Schema::new(vec![
+        Field::new("doc_id", DataType::Utf8, false),
+        Field::new("split", DataType::Utf8, false),
+    ]));
+    let source_batch = arrow::array::RecordBatch::try_new(
+        Arc::clone(&source_schema),
+        vec![
+            Arc::new(StringArray::from(doc_ids.to_vec())) as ArrayRef,
+            Arc::new(StringArray::from(splits.to_vec())) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let source_path = dir.path().join("docs.parquet");
+    {
+        let file = std::fs::File::create(&source_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&source_schema), None).unwrap();
+        writer.write(&source_batch).unwrap();
+        writer.close().unwrap();
+    }
+    session
+        .add_source(
+            "docs",
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", source_path.to_str().unwrap())),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Positive control: the fixture genuinely has no `nope` column, so the
+    // failure below is attributable to the false provenance, not an unrelated
+    // missing column.
+    let columns: Vec<String> = session
+        .context()
+        .sql("SELECT * FROM \"docs\".public.\"docs\" LIMIT 0")
+        .await
+        .unwrap()
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert!(
+        !columns.iter().any(|c| c == "nope"),
+        "positive control: fixture must not have a 'nope' column: {columns:?}"
+    );
+
+    // A precomputed-vector fixture keyed by the same `doc_id` values.
+    let vector_schema = Arc::new(Schema::new(vec![
+        Field::new("_row_id", DataType::Utf8, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, false)),
+                DIMS as i32,
+            ),
+            false,
+        ),
+    ]));
+    let flat: Vec<f32> = (0..doc_ids.len() * DIMS).map(|i| i as f32 + 1.0).collect();
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    let vector_array =
+        FixedSizeListArray::try_new(item, DIMS as i32, Arc::new(Float32Array::from(flat)), None)
+            .unwrap();
+    let vector_batch = arrow::array::RecordBatch::try_new(
+        Arc::clone(&vector_schema),
+        vec![
+            Arc::new(StringArray::from(doc_ids.to_vec())) as ArrayRef,
+            Arc::new(vector_array),
+        ],
+    )
+    .unwrap();
+    let vector_path = dir.path().join("vectors.parquet");
+    {
+        let file = std::fs::File::create(&vector_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&vector_schema), None).unwrap();
+        writer.write(&vector_batch).unwrap();
+        writer.close().unwrap();
+    }
+    let vectors_url = StorageUrl::parse(&format!("file://{}", vector_path.display())).unwrap();
+
+    // The write SUCCEEDS today: import resolves nothing at write time beyond
+    // the storage object it is handed, so a false `key_column` lands.
+    let imported = session
+        .import_embeddings("docs", "test-model", &vectors_url, "nope", &[], DIMS)
+        .await
+        .unwrap();
+    assert_eq!(imported.key_column.as_deref(), Some("nope"));
+
+    // The reader: a split-scoped `assemble_context` drives
+    // `filter_keys_by_split`, which resolves `key_column = "nope"` from the
+    // catalog and must reject it before interpolating it into the raw scan.
+    let mut request = ContextRequest::new("docs", vec![1.0_f32; DIMS], 3);
+    request.split = Some("split = 'train'".to_string());
+    let err = session
+        .assemble_context(&request)
+        .await
+        .expect_err("a recorded key_column the source lacks must be rejected, not raw-surfaced");
+    match err {
+        jammi_db::error::JammiError::Schema { table, column, .. } => {
+            assert_eq!(column, "nope");
+            assert!(
+                table.contains("docs"),
+                "table must name the source, got: {table}"
+            );
+        }
+        other => panic!("expected a typed Schema error naming 'nope', got: {other}"),
+    }
+
+    // Negative control: the already-typed `None`-key path is unaffected —
+    // a table declaring no key column at all still short-circuits to its own
+    // distinct error before the new guard ever runs.
+    let rows: Vec<(String, Vec<f32>)> = vec![("target-0".to_string(), vec![1.0_f32; DIMS])];
+    let recipe = ContextRequest::new("docs", vec![1.0_f32; DIMS], 3);
+    let (none_key_table, _) = session
+        .materialize_context(
+            MaterializedContext {
+                rows: &rows,
+                dimensions: DIMS,
+                recipe: &recipe,
+                key_column: None,
+            },
+            jammi_db::store::CachePolicy::Bypass,
+        )
+        .await
+        .unwrap();
+    assert_eq!(none_key_table.key_column, None);
+
+    let mut none_key_request = ContextRequest::new("docs", vec![1.0_f32; DIMS], 3);
+    none_key_request.embedding_table = Some(none_key_table.table_name.clone());
+    none_key_request.split = Some("split = 'train'".to_string());
+    let none_key_err = session
+        .assemble_context(&none_key_request)
+        .await
+        .expect_err("a table with no key column must still surface its own distinct error");
+    assert!(
+        none_key_err.to_string().contains("has no key column"),
+        "the None-key path must stay unaffected by the new provenance guard, got: {none_key_err}"
+    );
+}

@@ -19,7 +19,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arrow::array::{ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -39,7 +38,6 @@ use jammi_server::grpc::session::SessionStore;
 use jammi_test_utils::{cookbook_fixture, fixture, test_config};
 use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use super::common::grpc::{catalog_client, channel};
@@ -127,36 +125,19 @@ async fn start_embedding_server() -> (
 
     let store = SessionStore::new();
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let flight_ctx = session.context().clone();
-    let binding = session.tenant_binding_arc();
-    let handle = tokio::spawn(async move {
-        jammi_server::runtime::serve_grpc_chain(
-            jammi_server::runtime::GrpcChain {
-                addr,
-                flight_ctx,
-                flight_binding: binding,
-                store: store.clone(),
-                trigger: None,
-                engine: Some(session),
-                tiers: jammi_server::tiers::TierSet::all_compiled(),
-                metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
-                tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
-            },
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        )
-        .await
-        .expect("grpc server");
-    });
-
-    // Give the server a moment to bind.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let chain = jammi_server::runtime::GrpcChain {
+        addr: super::common::grpc::ephemeral_addr(),
+        flight_ctx: session.context().clone(),
+        flight_binding: session.tenant_binding_arc(),
+        store: store.clone(),
+        trigger: None,
+        engine: Some(session),
+        tiers: jammi_server::tiers::TierSet::all_compiled(),
+        metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
+        tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
+    };
+    let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
 
     (addr, shutdown_tx, dir, handle)
 }

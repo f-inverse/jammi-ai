@@ -554,12 +554,16 @@ impl From<&AuditError> for pb::AuditErrorDetail {
 
 /// Reconstruct the [`AuditError`] from its wire detail — the inverse of the
 /// encode above. The `signature_mismatch` arm re-parses the query-id UUID; a
-/// forged string that fails to parse reconstructs as the nil UUID (total, since
-/// the faithful path always carries a valid UUID). The `serde` arm reconstructs
-/// as `AuditError::Storage` carrying the original `Display` string — the raw
-/// `serde_json::Error` cannot be rebuilt, so the faithful message lands in the
-/// nearest audit-owned string arm rather than escaping the taxonomy. A detail
-/// with no variant reconstructs as an empty `Storage`.
+/// forged string that fails to parse cannot be rebuilt as the typed variant
+/// (there is no id to carry), so — mirroring how the `serde` arm folds a
+/// foreign error it cannot rebuild — it reconstructs as `AuditError::Storage`
+/// carrying the malformed value verbatim rather than fabricating the nil UUID,
+/// which would silently claim a specific (and wrong) offending query. The
+/// `serde` arm itself reconstructs as `AuditError::Storage` carrying the
+/// original `Display` string — the raw `serde_json::Error` cannot be rebuilt,
+/// so the faithful message lands in the nearest audit-owned string arm rather
+/// than escaping the taxonomy. A detail with no variant reconstructs as an
+/// empty `Storage`.
 impl From<pb::AuditErrorDetail> for AuditError {
     fn from(detail: pb::AuditErrorDetail) -> Self {
         use pb::audit_error_detail::Variant;
@@ -573,9 +577,12 @@ impl From<pb::AuditErrorDetail> for AuditError {
                 max: l.max as usize,
             },
             Some(Variant::NoTenantBinding(_)) => AuditError::NoTenantBinding,
-            Some(Variant::SignatureMismatch(id)) => {
-                AuditError::SignatureMismatch(Uuid::parse_str(&id).unwrap_or_default())
-            }
+            Some(Variant::SignatureMismatch(id)) => match Uuid::parse_str(&id) {
+                Ok(uuid) => AuditError::SignatureMismatch(uuid),
+                Err(e) => AuditError::Storage(format!(
+                    "signature_mismatch: malformed query id {id:?}: {e}"
+                )),
+            },
             Some(Variant::MasterKey(m)) => AuditError::MasterKey(m),
             Some(Variant::Serde(m)) => AuditError::Storage(m),
             Some(Variant::Storage(m)) => AuditError::Storage(m),
@@ -1022,6 +1029,34 @@ mod tests {
                 "the foreign serde leaf carries the inner error's faithful Display string"
             ),
             other => panic!("a foreign serde leaf must fold to Storage, got {other:?}"),
+        }
+    }
+
+    /// A `signature_mismatch` detail carrying an un-parseable id (a forged or
+    /// corrupted wire message — the faithful encode path never emits one) must
+    /// not silently coerce to the nil UUID: that would fabricate a valid-looking
+    /// id and point blame at a specific (wrong) query. It folds to `Storage`
+    /// carrying the malformed value verbatim, the same "cannot rebuild the typed
+    /// variant" fold the foreign `serde` leaf takes.
+    #[test]
+    fn signature_mismatch_malformed_id_folds_to_storage_not_nil_uuid() {
+        use pb::audit_error_detail::Variant;
+        let malformed = "not-a-uuid";
+        let detail = pb::AuditErrorDetail {
+            variant: Some(Variant::SignatureMismatch(malformed.to_string())),
+        };
+        match AuditError::from(detail) {
+            AuditError::Storage(message) => {
+                assert!(
+                    message.contains(malformed),
+                    "the malformed id is preserved verbatim in the fold: {message:?}"
+                );
+            }
+            AuditError::SignatureMismatch(uuid) => panic!(
+                "a malformed id must not coerce to a fabricated UUID (got {uuid}), \
+                 it must fold to Storage instead"
+            ),
+            other => panic!("expected a Storage fold, got {other:?}"),
         }
     }
 }

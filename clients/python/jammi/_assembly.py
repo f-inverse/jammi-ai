@@ -51,6 +51,19 @@ _SOURCE_KIND_NAME = {
     catalog_pb2.SourceKind.SOURCE_KIND_MYSQL: "MySql",
 }
 
+# Wire `ResultTableKind` enum value → the string the embed wheel's
+# `ResultTableKind` (a plain `#[derive(Serialize)]` unit enum, no
+# `rename_all`) serialises to, so a result-table dict's `kind` reads
+# identically whether it crossed the gRPC wire or came back from the
+# in-process engine. `RESULT_TABLE_KIND_UNSPECIFIED` is deliberately absent —
+# a live `ResultTable` always carries a concrete kind, so seeing it on the
+# wire is a proto-version skew, not a value to default.
+_RESULT_TABLE_KIND_NAME = {
+    embedding_pb2.ResultTableKind.MODEL: "Model",
+    embedding_pb2.ResultTableKind.NEIGHBOR_GRAPH: "NeighborGraph",
+    embedding_pb2.ResultTableKind.ASOF_JOIN: "AsofJoin",
+}
+
 # File-format string → wire `FileFormat` enum. Mirrors the engine's `FileFormat`
 # parse so `add_source(format=...)` accepts the same vocabulary as the embed
 # wheel's local path.

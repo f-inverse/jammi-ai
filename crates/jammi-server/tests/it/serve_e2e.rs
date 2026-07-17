@@ -27,24 +27,8 @@ use jammi_server::runtime::OssServer;
 use jammi_test_utils::{cookbook_fixture, fixture, test_config};
 use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tonic::transport::Channel;
-
-/// Acquire two distinct loopback ports for health + flight by binding
-/// `127.0.0.1:0` twice and immediately dropping the listeners. The
-/// kernel issues unique ephemeral ports, so the bound addresses are
-/// safe to hand to the OSS server seconds later — the race window is
-/// the same one every other multi-listener integration test relies on.
-async fn pick_two_ports() -> (String, String) {
-    let l1 = TcpListener::bind("127.0.0.1:0").await.expect("bind 1");
-    let l2 = TcpListener::bind("127.0.0.1:0").await.expect("bind 2");
-    let a1 = l1.local_addr().expect("addr 1");
-    let a2 = l2.local_addr().expect("addr 2");
-    drop(l1);
-    drop(l2);
-    (a1.to_string(), a2.to_string())
-}
 
 fn test_oss_config(artifact_dir: &std::path::Path, health: &str, flight: &str) -> JammiConfig {
     let mut cfg = test_config(artifact_dir);
@@ -151,26 +135,25 @@ fn sample_value(metrics: &str, name: &str) -> f64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oss_server_serves_healthz_and_drives_live_metrics() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (health_addr, flight_addr) = pick_two_ports().await;
-    let cfg = test_oss_config(dir.path(), &health_addr, &flight_addr);
+    let cfg = test_oss_config(dir.path(), "127.0.0.1:0", "127.0.0.1:0");
 
+    // Bind both listeners eagerly, then read the ACTUAL ephemeral ports off the
+    // bound handle. The listeners are held live from bind through serve, so
+    // neither port is released for a concurrent test process to steal — and the
+    // reported ports are the real ones the kernel assigned, not a config `:0`.
     let server = OssServer::new(cfg).await.expect("OssServer::new");
-    let server_health_addr = server.health_addr();
-    let server_flight_addr = server.flight_addr();
+    let bound = server.bind().await.expect("OssServer::bind");
+    let server_health_addr = bound.health_addr();
+    let server_flight_addr = bound.flight_addr();
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server_task = tokio::spawn(async move {
-        server
-            .run_with_shutdown(async move {
+        bound
+            .serve_with_shutdown(async move {
                 let _ = shutdown_rx.await;
             })
             .await
     });
-
-    // Wait for both listeners to bind. The HTTP side-channel and the
-    // Tonic chain bind in parallel; 200ms is comfortably above the
-    // measured worst-case bind latency on CI hardware.
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // /healthz round-trip.
     let healthz = reqwest::get(format!("http://{server_health_addr}/healthz"))

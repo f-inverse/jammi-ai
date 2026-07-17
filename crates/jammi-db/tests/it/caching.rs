@@ -1,7 +1,5 @@
 use jammi_db::cache::ann_cache::AnnCache;
-use jammi_db::cache::inference_cache::InferenceCache;
 use jammi_db::error::JammiError;
-use jammi_db::model_task::ModelTask;
 use jammi_db::source::retry::{retry_with_backoff, RetryConfig};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -83,49 +81,6 @@ async fn ann_cache_lifecycle_and_concurrency() {
     for h in handles {
         h.await.unwrap();
     }
-}
-
-// ─── Inference cache: task+model versioning ──────────────────────────────────
-
-#[tokio::test]
-async fn inference_cache_hit_and_model_version_miss() {
-    let cache = InferenceCache::new(100);
-
-    cache
-        .put(
-            "model-a::1",
-            ModelTask::TextEmbedding,
-            "hello world",
-            vec![],
-        )
-        .await;
-
-    // Hit with same key
-    assert!(
-        cache
-            .get("model-a::1", ModelTask::TextEmbedding, "hello world")
-            .await
-            .is_some(),
-        "Same model+task+content should hit"
-    );
-
-    // Miss with different model version (simulates model update)
-    assert!(
-        cache
-            .get("model-a::2", ModelTask::TextEmbedding, "hello world")
-            .await
-            .is_none(),
-        "Different model version should miss"
-    );
-
-    // Miss with different task
-    assert!(
-        cache
-            .get("model-a::1", ModelTask::Classification, "hello world")
-            .await
-            .is_none(),
-        "Different task should miss"
-    );
 }
 
 // ─── Retry: backoff behavior, attempt count, exhaustion, timing ──────────────

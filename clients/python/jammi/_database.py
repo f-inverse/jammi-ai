@@ -31,6 +31,7 @@ from ._assembly import (
     _EDGE_DIRECTION,
     _FILE_FORMAT,
     _MODEL_TASK_NAME,
+    _RESULT_TABLE_KIND_NAME,
     _SOURCE_KIND_NAME,
     _local_source_url,
     build_add_channel_columns_request,
@@ -129,7 +130,17 @@ def _rpc_to_jammi(exc: grpc.RpcError) -> JammiError:
 
 
 def _result_table_to_dict(rt: embedding_pb2.ResultTable) -> Dict[str, Any]:
-    """Project a wire `ResultTable` into the embed wheel's result-table dict."""
+    """Project a wire `ResultTable` into the embed wheel's result-table dict.
+
+    `key_column` and `derived_from` round-trip as `None` when the engine did
+    not record one — the same shape the embedded `Option<String>` serialises
+    to — and `kind` is spelled the same string the embedded `ResultTableKind`
+    serialises to, so a derived (neighbor-graph / as-of-join) table's
+    provenance reads identically regardless of transport. `RESULT_TABLE_KIND_
+    UNSPECIFIED` (never emitted for a genuine result table — every persisted
+    row has a concrete kind) falls back to `"Unspecified"`, the same
+    unrecognised-enum fallback `_source_descriptor_to_dict` uses for `kind`.
+    """
     return {
         "table_name": rt.table_name,
         "source_id": rt.source_id,
@@ -137,6 +148,9 @@ def _result_table_to_dict(rt: embedding_pb2.ResultTable) -> Dict[str, Any]:
         "dimensions": rt.dimensions,
         "row_count": rt.row_count,
         "status": rt.status,
+        "key_column": rt.key_column or None,
+        "kind": _RESULT_TABLE_KIND_NAME.get(rt.kind, "Unspecified"),
+        "derived_from": rt.derived_from if rt.HasField("derived_from") else None,
     }
 
 

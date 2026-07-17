@@ -21,7 +21,6 @@
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use jammi_db::session::JammiSession;
 use jammi_db::TenantId;
@@ -39,7 +38,6 @@ use jammi_wire::proto::lifecycle::{
     LoginResponse, PlatformStatus,
 };
 use tempfile::TempDir;
-use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
 
@@ -132,13 +130,6 @@ impl LifecycleService for TenantEchoLifecycle {
     }
 }
 
-async fn bind_addr() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-    addr
-}
-
 /// Build a transport-only [`GrpcChain`] (no engine — this seam needs only the
 /// always-present `CatalogService` core to prove the tenant-binding layer)
 /// driven by `resolver`. Returns the chain plus the guards that keep the
@@ -195,8 +186,11 @@ async fn probe_status(
 /// the wrapped service under its `NAME` (the wrap does not drop the route).
 #[tokio::test]
 async fn mount_tenant_scoped_binds_session_tenant_from_the_resolver() {
-    let addr = bind_addr().await;
-    let (chain, _dir) = probe_chain(addr, Arc::new(ProbeResolver)).await;
+    let (chain, _dir) = probe_chain(
+        super::common::grpc::ephemeral_addr(),
+        Arc::new(ProbeResolver),
+    )
+    .await;
 
     let assembled = assemble_grpc_chain(chain)
         .expect("assemble")
@@ -211,16 +205,17 @@ async fn mount_tenant_scoped_binds_session_tenant_from_the_resolver() {
         assembled.mounted()
     );
 
+    let bound = assembled.bind().await.expect("bind");
+    let addr = bound.addr();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
-        assembled
-            .serve(async move {
+        bound
+            .serve_with_shutdown(async move {
                 let _ = shutdown_rx.await;
             })
             .await
             .expect("serve");
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // No credential: the resolver's EXPLICIT Global scope — the wrapper still
     // binds `SessionTenant(None)`, distinct from never having bound at all.
@@ -254,21 +249,25 @@ async fn mount_tenant_scoped_binds_session_tenant_from_the_resolver() {
 async fn mount_tenant_scoped_rejects_before_inner_while_plain_mount_stays_ungated() {
     // The `mount_tenant_scoped` listener: a credential the resolver does not
     // recognize must reject before the handler runs.
-    let addr_scoped = bind_addr().await;
-    let (chain_scoped, _dir_scoped) = probe_chain(addr_scoped, Arc::new(ProbeResolver)).await;
+    let (chain_scoped, _dir_scoped) = probe_chain(
+        super::common::grpc::ephemeral_addr(),
+        Arc::new(ProbeResolver),
+    )
+    .await;
     let scoped = assemble_grpc_chain(chain_scoped)
         .expect("assemble")
         .mount_tenant_scoped(LifecycleServiceServer::new(TenantEchoLifecycle));
+    let bound_scoped = scoped.bind().await.expect("bind");
+    let addr_scoped = bound_scoped.addr();
     let (tx_scoped, rx_scoped) = oneshot::channel::<()>();
     let h_scoped = tokio::spawn(async move {
-        scoped
-            .serve(async move {
+        bound_scoped
+            .serve_with_shutdown(async move {
                 let _ = rx_scoped.await;
             })
             .await
             .expect("serve");
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let err = probe_status(addr_scoped, Some("bogus-credential"))
         .await
@@ -284,21 +283,25 @@ async fn mount_tenant_scoped_rejects_before_inner_while_plain_mount_stays_ungate
 
     // The plain-`mount` listener: the IDENTICAL rejecting credential must NOT
     // stop the handler — `mount` is un-gated by the resolver entirely.
-    let addr_plain = bind_addr().await;
-    let (chain_plain, _dir_plain) = probe_chain(addr_plain, Arc::new(ProbeResolver)).await;
+    let (chain_plain, _dir_plain) = probe_chain(
+        super::common::grpc::ephemeral_addr(),
+        Arc::new(ProbeResolver),
+    )
+    .await;
     let plain = assemble_grpc_chain(chain_plain)
         .expect("assemble")
         .mount(LifecycleServiceServer::new(TenantEchoLifecycle));
+    let bound_plain = plain.bind().await.expect("bind");
+    let addr_plain = bound_plain.addr();
     let (tx_plain, rx_plain) = oneshot::channel::<()>();
     let h_plain = tokio::spawn(async move {
-        plain
-            .serve(async move {
+        bound_plain
+            .serve_with_shutdown(async move {
                 let _ = rx_plain.await;
             })
             .await
             .expect("serve");
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let ok = probe_status(addr_plain, Some("bogus-credential"))
         .await

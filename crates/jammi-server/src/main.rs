@@ -2,7 +2,8 @@
 //!
 //! Parses a single optional `--config` flag, loads the workspace
 //! [`JammiConfig`], initialises tracing per the resolved logging
-//! settings, and hands control to [`OssServer::run`].
+//! settings, binds the server's listeners, announces the resolved bind
+//! addresses on stdout, and serves until a shutdown signal arrives.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -55,7 +56,28 @@ async fn main() -> ExitCode {
         }
     };
 
-    if let Err(e) = server.run().await {
+    // Bind both listeners eagerly, then announce the ACTUAL bound addresses on
+    // stdout before serving. When the config requests an ephemeral `:0` port,
+    // this line is the only channel a supervisor — or a subprocess-driving test
+    // harness — has to learn the port the kernel actually assigned. The format
+    // is deliberately fixed and machine-parseable:
+    // `jammi-server listening flight=<addr> health=<addr>`. `println!` flushes at
+    // the newline (stdout is a `LineWriter`), so the line is visible immediately
+    // even when stdout is a pipe rather than a terminal.
+    let bound = match server.bind().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to bind OSS server listeners");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "jammi-server listening flight={} health={}",
+        bound.flight_addr(),
+        bound.health_addr()
+    );
+
+    if let Err(e) = bound.serve().await {
         tracing::error!(error = %e, "OSS server exited with error");
         return ExitCode::FAILURE;
     }

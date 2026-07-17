@@ -10,7 +10,7 @@
 //! `Model`) live with the control-plane catalog wire surface
 //! ([`super::catalog`]); only the compute verbs' shapes are here.
 
-use jammi_db::catalog::result_repo::ResultTableRecord;
+use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use tonic::Status;
 
 use crate::proto::embedding as pb;
@@ -88,10 +88,40 @@ impl TryFrom<ProtoQueryInput> for QueryInput {
     }
 }
 
+/// Map the engine's [`ResultTableKind`] onto the wire enum — the inverse of
+/// [`result_table_kind_from_proto`]. Total: every engine kind maps to a
+/// concrete wire variant (the engine type has no unspecified state). Mirrors
+/// [`super::model_task_to_proto`].
+fn result_table_kind_to_proto(kind: ResultTableKind) -> pb::ResultTableKind {
+    match kind {
+        ResultTableKind::Model => pb::ResultTableKind::Model,
+        ResultTableKind::NeighborGraph => pb::ResultTableKind::NeighborGraph,
+        ResultTableKind::AsofJoin => pb::ResultTableKind::AsofJoin,
+    }
+}
+
+/// Map the wire [`pb::ResultTableKind`] discriminant onto the engine's
+/// [`ResultTableKind`]. An unspecified/unknown kind is rejected — a
+/// `ResultTable` that names no kind is a malformed message, not a silent
+/// `Model` guess. Mirrors [`super::model_task_from_proto`].
+fn result_table_kind_from_proto(kind: i32) -> Result<ResultTableKind, Status> {
+    match pb::ResultTableKind::try_from(kind) {
+        Ok(pb::ResultTableKind::Model) => Ok(ResultTableKind::Model),
+        Ok(pb::ResultTableKind::NeighborGraph) => Ok(ResultTableKind::NeighborGraph),
+        Ok(pb::ResultTableKind::AsofJoin) => Ok(ResultTableKind::AsofJoin),
+        Ok(pb::ResultTableKind::Unspecified) | Err(_) => Err(Status::invalid_argument(
+            "result table kind must be specified",
+        )),
+    }
+}
+
 /// Encode the engine's result-table record into the wire `ResultTable`. The
 /// engine's optional `dimensions` is flattened to `0` for a non-embedding /
 /// unset result, `row_count` widens to the wire's `u64`, and `task` rides the
-/// shared [`super::model_task_to_proto`] task vocabulary.
+/// shared [`super::model_task_to_proto`] task vocabulary. `kind` and
+/// `derived_from` ride the same faithful mapping so a `DescribeSource`
+/// projection tells a neighbor-graph or as-of-join row apart from a model
+/// output rather than fabricating `MODEL` for every row.
 ///
 /// The wire `ResultTable` carries its own `task` (the embedding tower), so the
 /// reconstruction recovers it faithfully from the message itself — never from a
@@ -111,6 +141,9 @@ impl From<ResultTableRecord> for pb::ResultTable {
             // "no producer ran" value. A producer handler uses
             // [`result_table_with_outcome`] to carry the real outcome.
             cache_outcome: crate::proto::inference::CacheOutcome::Unspecified as i32,
+            key_column: record.key_column.unwrap_or_default(),
+            kind: result_table_kind_to_proto(record.kind) as i32,
+            derived_from: record.derived_from,
         }
     }
 }
@@ -133,31 +166,30 @@ pub fn result_table_with_outcome(record: ResultTableRecord, outcome: i32) -> pb:
 /// The wire message is the client-observable projection: it carries the fields
 /// a client needs to locate and query the persisted embedding table
 /// (`table_name`, `source_id`, `model_id`, `dimensions`, `row_count`, `status`,
-/// `task`). The engine's server-internal bookkeeping — storage/index paths,
-/// timestamps, the originating columns — is intentionally not on the wire, so
-/// the reconstruction leaves those at their "not carried" values (`String::new`
-/// / `None`). A remote consumer keys off the same fields a local one reads back;
-/// the dropped fields are server-side state, not result data. The message is
-/// self-describing in `task`, so an out-of-range/unspecified task is the
-/// faithful `invalid_argument` the shared decoder builds.
+/// `task`, `key_column`, `kind`, `derived_from`). The engine's server-internal
+/// bookkeeping — storage/index paths, timestamps, text columns — is
+/// intentionally not on the wire, so the reconstruction leaves those at their
+/// "not carried" values (`String::new` / `None`). A remote consumer keys off
+/// the same fields a local one reads back; the dropped fields are server-side
+/// state, not result data. The message is self-describing in `task` and
+/// `kind`, so an out-of-range/unspecified value in either is the faithful
+/// `invalid_argument` the shared decoders build.
 pub fn result_table_from_proto(table: pb::ResultTable) -> Result<ResultTableRecord, Status> {
     let task = super::model_task_from_proto(table.task)?;
+    let kind = result_table_kind_from_proto(table.kind)?;
     Ok(ResultTableRecord {
         table_name: table.table_name,
         source_id: table.source_id,
         model_id: table.model_id,
         task,
-        // `kind`/`derived_from` are server-internal bookkeeping, not carried on
-        // the wire — `GenerateEmbeddings` only ever returns a model output, so
-        // the reconstruction defaults to that kind.
-        kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
-        derived_from: None,
+        kind,
+        derived_from: table.derived_from,
         parquet_path: String::new(),
         dimensions: (table.dimensions != 0).then_some(table.dimensions),
         distance_metric: String::new(),
         row_count: table.row_count as usize,
         status: table.status,
-        key_column: None,
+        key_column: (!table.key_column.is_empty()).then_some(table.key_column),
         text_columns: None,
         created_at: String::new(),
         completed_at: None,

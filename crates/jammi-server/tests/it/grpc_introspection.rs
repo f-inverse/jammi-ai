@@ -26,8 +26,11 @@
 use std::sync::Arc;
 
 use jammi_admin::CatalogClient;
+use jammi_ai::pipeline::neighbor_graph::BuildNeighborGraph;
 use jammi_ai::{Modality, ServerInfo, Session, SourceDescriptor};
+use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::store::CachePolicy;
 use jammi_test_utils::{cookbook_fixture, fixture};
 use tonic::transport::Endpoint;
 
@@ -58,11 +61,24 @@ fn local(server: &EngineServer) -> Session {
 
 /// A comparable projection of a descriptor: the registry identity plus, per
 /// result table, the client-observable embedding fields (`table_name`,
-/// `status`, `row_count`, `dimensions`, `task`). Comparing on this rather than
-/// the whole record keeps the assertion on the fields the verb surfaces while
-/// ignoring server-internal bookkeeping the wire intentionally drops
-/// (parquet/index paths, timestamps).
-type TableShape = (String, String, usize, Option<i32>, jammi_db::ModelTask);
+/// `status`, `row_count`, `dimensions`, `task`, `kind`, `derived_from`,
+/// `key_column`). Comparing on this rather than the whole record keeps the
+/// assertion on the fields the verb surfaces while ignoring server-internal
+/// bookkeeping the wire intentionally drops (parquet/index paths, timestamps).
+/// `kind`/`derived_from` matter here specifically: a `DescribeSource`
+/// projection returns BOTH a source's model-output tables and any derived
+/// tables (neighbor graphs, as-of joins) built on top of them, so the shape
+/// must tell those apart rather than collapsing every row to `Model`.
+type TableShape = (
+    String,
+    String,
+    usize,
+    Option<i32>,
+    jammi_db::ModelTask,
+    ResultTableKind,
+    Option<String>,
+    Option<String>,
+);
 type DescriptorShape = (String, SourceType, String, Vec<TableShape>);
 
 fn descriptor_shape(d: &SourceDescriptor) -> DescriptorShape {
@@ -76,6 +92,9 @@ fn descriptor_shape(d: &SourceDescriptor) -> DescriptorShape {
                 t.row_count,
                 t.dimensions,
                 t.task,
+                t.kind,
+                t.derived_from.clone(),
+                t.key_column.clone(),
             )
         })
         .collect();
@@ -116,6 +135,36 @@ async fn remote_list_and_describe_sources_like_local() {
     assert!(table.row_count > 0, "patents corpus embeds rows");
     assert!(table.dimensions.is_some(), "dimensions recorded");
 
+    // A neighbor graph derived from that embedding table — a second result
+    // table under the same source, of a DIFFERENT kind, with real provenance
+    // back to the table it came from. Exercises the divergence-prone case: a
+    // `DescribeSource` projection carries both a model output and a
+    // derivation, so parity must hold on `kind`/`derived_from`, not just on
+    // the fields every row shares.
+    // `Session` (the curated data-plane wrapper) exposes no pipeline verbs, so
+    // the graph is built directly on the shared `InferenceSession` — the same
+    // engine `Arc` both `local` and `remote` introspect.
+    let graph = server
+        .engine
+        .build_neighbor_graph(
+            "patents",
+            Some(&table.table_name),
+            &BuildNeighborGraph {
+                k: 5,
+                exact: true,
+                ..Default::default()
+            },
+            CachePolicy::Bypass,
+        )
+        .await
+        .expect("build_neighbor_graph")
+        .0;
+    assert_eq!(graph.kind, ResultTableKind::NeighborGraph);
+    assert_eq!(
+        graph.derived_from.as_deref(),
+        Some(table.table_name.as_str())
+    );
+
     // list_sources parity: same descriptors through either transport.
     let remote_list = remote.list_sources().await.expect("remote list_sources");
     let local_list = local.list_sources().await.expect("local list_sources");
@@ -128,16 +177,42 @@ async fn remote_list_and_describe_sources_like_local() {
     );
 
     // The descriptor carries the embedding numbers from their source-of-truth:
-    // the result table generate_embeddings just produced.
+    // the result table generate_embeddings just produced — plus the derived
+    // neighbor-graph table alongside it, correctly attributed.
     let described = remote_list.into_iter().next().expect("one source");
     assert_eq!(described.source_id, "patents");
     assert_eq!(described.source_type, SourceType::File);
-    assert_eq!(described.result_tables.len(), 1, "one embedding table");
-    let rt = &described.result_tables[0];
+    assert_eq!(
+        described.result_tables.len(),
+        2,
+        "the embedding table plus its derived neighbor graph"
+    );
+    let rt = described
+        .result_tables
+        .iter()
+        .find(|t| t.table_name == table.table_name)
+        .expect("the model-output embedding table");
     assert_eq!(rt.status, "ready");
     assert_eq!(rt.row_count, table.row_count);
     assert_eq!(rt.dimensions, table.dimensions);
     assert_eq!(rt.task, jammi_db::ModelTask::TextEmbedding);
+    assert_eq!(rt.kind, ResultTableKind::Model);
+    assert_eq!(rt.derived_from, None);
+
+    let graph_rt = described
+        .result_tables
+        .iter()
+        .find(|t| t.table_name == graph.table_name)
+        .expect("the derived neighbor-graph table");
+    assert_eq!(
+        graph_rt.kind,
+        ResultTableKind::NeighborGraph,
+        "the remote descriptor must not fabricate MODEL for a derived table"
+    );
+    assert_eq!(
+        graph_rt.derived_from.as_deref(),
+        Some(table.table_name.as_str())
+    );
 
     // describe_source parity for a present source.
     let remote_one = remote

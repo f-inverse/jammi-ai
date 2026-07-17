@@ -96,6 +96,19 @@ message GenerateEmbeddingsRequest {
   jammi.v1.inference.CachePolicy cache = 6;
 }
 
+// Which kind of derivation a `ResultTable` is — the wire mirror of the
+// engine's `jammi_db::catalog::result_repo::ResultTableKind`. A `DescribeSource`
+// projection carries a source's embedding tables AND its derived tables
+// (neighbor graphs, as-of joins) under the same shape, so the kind is what
+// tells a remote consumer which one it is looking at rather than fabricating
+// `MODEL` for every row.
+enum ResultTableKind {
+  RESULT_TABLE_KIND_UNSPECIFIED = 0;
+  MODEL = 1;
+  NEIGHBOR_GRAPH = 2;
+  ASOF_JOIN = 3;
+}
+
 // Subset of the engine's `ResultTableRecord` a client needs to locate and
 // query the persisted embedding table. Internal bookkeeping columns
 // (parquet/index paths, timestamps) stay server-side. The record is
@@ -122,6 +135,14 @@ message ResultTable {
   // catalog `DescribeSource` projection), so reuse is observable without
   // claiming a producer ran. Mirrors the engine's `CacheOutcome`.
   jammi.v1.inference.CacheOutcome cache_outcome = 8;
+  // The column whose value became each row's key; empty when the engine did
+  // not record one.
+  string key_column = 9;
+  // Direct model output vs. a derivation of another result table.
+  ResultTableKind kind = 10;
+  // The table this one was derived from (a `NEIGHBOR_GRAPH` or `ASOF_JOIN`
+  // row's origin embedding table); unset for a `MODEL` row.
+  optional string derived_from = 11;
 }
 
 message ImportEmbeddingsRequest {

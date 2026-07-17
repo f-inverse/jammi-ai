@@ -9,7 +9,21 @@ workspace ships every publishable crate at the same
 ## [0.47.0] - 2026-07-17
 
 A derived embedding table now records the origin column its keys actually came
-from, instead of the literal `"_row_id"`.
+from, instead of the literal `"_row_id"`. This release also closes a batch of
+provenance, wire-projection, and robustness gaps around that work.
+
+### Added
+- **The wire `ResultTable` carries `key_column`, `kind`, and `derived_from`.** A
+  remote `GenerateEmbeddings` or `DescribeSource` response now projects a derived
+  table's origin key column, its derivation kind (`MODEL` / `NEIGHBOR_GRAPH` /
+  `ASOF_JOIN`), and its lineage pointer, matching the record the embedded path
+  returns. A neighbor-graph or as-of-join table under a source no longer
+  reconstructs over the wire as a plain model output. Additive and
+  wire-compatible.
+- **The server binds its listeners eagerly and reports the bound addresses on
+  startup.** `jammi-server` binds the Flight/gRPC and health listeners before
+  serving and logs the resolved addresses, so a `:0` ephemeral bind reports the
+  concrete port it received.
 
 ### Fixed
 - **Origin key-column provenance on derived tables (`jammi-db` + `jammi-ai`).**
@@ -26,6 +40,22 @@ from, instead of the literal `"_row_id"`.
   `_row_id` inherits `"_row_id"`. The physical key of every embedding table is
   still invariantly `_row_id` and the output schema is unchanged, so no
   materialization identity moves and no migration is required.
+- **A recorded key column the source lacks now surfaces a typed provenance
+  error.** The context split and value-column hydration confirm a derived
+  table's recorded `key_column` against the source before scanning it, so a
+  mismatch is a typed schema error naming the table, column, and source rather
+  than a raw planner "No field named …" from an unrelated verb.
+  `materialize_context` also validates a recipe's `value_columns` at the write
+  site, and an unevaluable split predicate is reported the same way.
+- **Catalog reads and the ANN sidecar no longer mask a fault with a default.** A
+  `NULL` model `status` or `created_at` is a typed conversion error instead of an
+  empty string, a non-UTF-8 index path is a typed error instead of an empty path,
+  and a malformed audit `signature_mismatch` id preserves the raw value instead
+  of folding to the nil UUID.
+- **The server integration harnesses no longer race on ephemeral ports.** The
+  serve seam binds a listener and serves on that same held listener, with no
+  release-then-rebind window, closing a load-dependent flake in the parallel
+  test suite.
 
 ### Changed
 - **`EmbeddingTableSpec::key_column` is now `Option<&str>` (breaking).** It
@@ -39,6 +69,9 @@ from, instead of the literal `"_row_id"`.
   does not have, and `None` is the honest answer for free-vector targets.
 - **`import_embeddings` rejects an empty `key_column`**, matching the wire
   surface, which already required one.
+- **Server bind-address validation accepts two identical ephemeral (`:0`)
+  addresses** — each binds a distinct kernel-assigned port — while still
+  rejecting two identical fixed addresses.
 
 ## [0.46.0] - 2026-07-15
 

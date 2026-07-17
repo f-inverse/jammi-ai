@@ -13,10 +13,12 @@
 //! depending on `CARGO_BIN_EXE_*` (which Cargo only sets for binaries in the
 //! test's own package).
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command as AssertCommand;
@@ -27,39 +29,70 @@ pub struct TestServer {
     child: Child,
     flight_port: u16,
     _scratch: TempDir,
+    // The background thread draining the child's stdout. Held so it lives as long
+    // as the server; it exits on its own when the child is killed (EOF) on drop.
+    _stdout_drain: thread::JoinHandle<()>,
 }
 
 impl TestServer {
-    /// Spawn a server with default backends on ephemeral ports and block until
-    /// `/readyz` returns 200 (or panic after a generous timeout). The catalog
-    /// and artifact state live under a per-test `TempDir`.
+    /// Spawn a server with default backends on ephemeral (`:0`) ports and block
+    /// until `/readyz` returns 200 (or panic after a generous timeout). The child
+    /// binds the ports itself and announces the ACTUAL ports it got on stdout —
+    /// the harness reads that banner rather than pre-picking a port and dropping
+    /// it (which would open a release-then-rebind race). The catalog and artifact
+    /// state live under a per-test `TempDir`.
     pub fn spawn() -> Self {
         let scratch = TempDir::new().expect("tempdir for server scratch");
-        let flight_port = free_port();
-        let health_port = free_port();
         let exe = server_binary();
 
-        let child = Command::new(&exe)
+        let mut child = Command::new(&exe)
             .env("JAMMI_ARTIFACT_DIR", scratch.path())
-            .env(
-                "JAMMI_SERVER__FLIGHT_LISTEN",
-                format!("127.0.0.1:{flight_port}"),
-            )
-            .env(
-                "JAMMI_SERVER__HEALTH_LISTEN",
-                format!("127.0.0.1:{health_port}"),
-            )
+            .env("JAMMI_SERVER__FLIGHT_LISTEN", "127.0.0.1:0")
+            .env("JAMMI_SERVER__HEALTH_LISTEN", "127.0.0.1:0")
             // A fixed audit master key keeps the server's audit signer happy
             // without a per-test secret.
             .env("JAMMI_AUDIT_MASTER_KEY", "cli-it-test-key")
             .env_remove("JAMMI_CONFIG")
+            .stdout(Stdio::piped())
             .spawn()
             .unwrap_or_else(|e| panic!("spawn jammi-server at {}: {e}", exe.display()));
+
+        // Read the child's stdout for its startup banner (the ACTUAL bound
+        // ports), then keep draining so a full pipe never blocks the child's own
+        // logging. The banner is a fixed line the server prints before serving:
+        // `jammi-server listening flight=<addr> health=<addr>`.
+        let stdout = child.stdout.take().expect("child stdout is piped");
+        let (tx, rx) = mpsc::channel::<(u16, u16)>();
+        let drain = thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut tx = Some(tx);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break, // EOF (child exited) or read error
+                    Ok(_) => {
+                        if let Some(sender) = tx.as_ref() {
+                            if let Some(ports) = parse_listening_banner(&line) {
+                                let _ = sender.send(ports);
+                                tx = None; // reported once; keep draining stdout
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let (flight_port, health_port) = rx.recv_timeout(Duration::from_secs(30)).expect(
+            "jammi-server did not announce its listening ports on stdout within 30s \
+             (did it fail to bind?)",
+        );
 
         let server = Self {
             child,
             flight_port,
             _scratch: scratch,
+            _stdout_drain: drain,
         };
         server.wait_ready(health_port);
         server
@@ -97,13 +130,22 @@ impl Drop for TestServer {
     }
 }
 
-/// Bind a free ephemeral port and release it, returning the number. There is a
-/// small race between release and the server's bind, but on a CI host the
-/// kernel does not immediately re-hand the same port, so this is reliable for a
-/// test harness.
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local addr").port()
+/// Parse the server's fixed startup banner — `jammi-server listening
+/// flight=<addr> health=<addr>` — into `(flight_port, health_port)`. Returns
+/// `None` for any other line (ordinary log output), so the caller can scan the
+/// child's stdout stream and pick out the one banner line.
+fn parse_listening_banner(line: &str) -> Option<(u16, u16)> {
+    let rest = line.trim().strip_prefix("jammi-server listening ")?;
+    let mut flight = None;
+    let mut health = None;
+    for token in rest.split_whitespace() {
+        if let Some(addr) = token.strip_prefix("flight=") {
+            flight = addr.rsplit(':').next().and_then(|p| p.parse().ok());
+        } else if let Some(addr) = token.strip_prefix("health=") {
+            health = addr.rsplit(':').next().and_then(|p| p.parse().ok());
+        }
+    }
+    Some((flight?, health?))
 }
 
 /// Issue a minimal HTTP/1.1 GET and report whether the response status line is

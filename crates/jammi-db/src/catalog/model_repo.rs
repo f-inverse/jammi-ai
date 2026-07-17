@@ -496,9 +496,9 @@ fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendErr
     })?;
     let backend: String = row.try_get("backend")?.unwrap_or_default();
     let version: i32 = row.try_get("version")?.unwrap_or(1);
-    let status: String = row.try_get("status")?.unwrap_or_default();
+    let status: String = row.get("status")?;
     let metadata: Option<String> = row.try_get("metadata")?;
-    let created_at: String = row.try_get("created_at")?.unwrap_or_default();
+    let created_at: String = row.get("created_at")?;
 
     // The served path is its own column (the single-writer commit pointer); the
     // `metadata` blob carries only the descriptive `base_model_id`/`config_json`.

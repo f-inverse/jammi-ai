@@ -143,11 +143,25 @@ async fn transport_only_chain(addr: SocketAddr) -> (GrpcChain, TempDir, Arc<Jamm
     (chain, dir, session)
 }
 
-async fn bind_addr() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-    addr
+/// Bind an already-assembled chain eagerly and spawn its serve loop, returning
+/// the ACTUAL bound address, a shutdown sender, and the serve task's handle. The
+/// listener is held from bind through serve — no release-then-rebind window a
+/// concurrent test process could exploit.
+async fn serve_assembled(
+    assembled: jammi_server::runtime::AssembledChain,
+) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let bound = assembled.bind().await.expect("bind");
+    let addr = bound.addr();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        bound
+            .serve_with_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("serve");
+    });
+    (addr, shutdown_tx, handle)
 }
 
 /// TEST #1 + #8 (positive) — a downstream mounts its own `LifecycleService`
@@ -156,8 +170,7 @@ async fn bind_addr() -> SocketAddr {
 /// `with_bearer` client's session id + bearer both reach the mounted service.
 #[tokio::test]
 async fn downstream_mounts_a_service_beside_the_engine_and_both_answer() {
-    let addr = bind_addr().await;
-    let (chain, _dir, _session) = transport_only_chain(addr).await;
+    let (chain, _dir, _session) = transport_only_chain(super::common::grpc::ephemeral_addr()).await;
 
     let assembled = assemble_grpc_chain(chain)
         .expect("assemble")
@@ -173,16 +186,7 @@ async fn downstream_mounts_a_service_beside_the_engine_and_both_answer() {
         assembled.mounted()
     );
 
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let handle = tokio::spawn(async move {
-        assembled
-            .serve(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .expect("serve");
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let (addr, shutdown_tx, handle) = serve_assembled(assembled).await;
 
     // (a) The engine core still answers through the seam's layer stack.
     let catalog = CatalogClient::connect(endpoint(addr))
@@ -223,22 +227,12 @@ async fn downstream_mounts_a_service_beside_the_engine_and_both_answer() {
 /// the wire descriptor; the room is empty in OSS.
 #[tokio::test]
 async fn oss_server_answers_unimplemented_for_lifecycle() {
-    let addr = bind_addr().await;
-    let (chain, _dir, _session) = transport_only_chain(addr).await;
+    let (chain, _dir, _session) = transport_only_chain(super::common::grpc::ephemeral_addr()).await;
 
     // Note: no `.mount(...)` of a LifecycleService — exactly what the OSS engine
     // does.
     let assembled = assemble_grpc_chain(chain).expect("assemble");
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let handle = tokio::spawn(async move {
-        assembled
-            .serve(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .expect("serve");
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let (addr, shutdown_tx, handle) = serve_assembled(assembled).await;
 
     let lifecycle = LifecycleClient::connect(endpoint(addr))
         .await
@@ -264,21 +258,11 @@ async fn oss_server_answers_unimplemented_for_lifecycle() {
 /// bearer (`expires_at_micros == 0`).
 #[tokio::test]
 async fn lifecycle_client_round_trips_the_four_verbs() {
-    let addr = bind_addr().await;
-    let (chain, _dir, _session) = transport_only_chain(addr).await;
+    let (chain, _dir, _session) = transport_only_chain(super::common::grpc::ephemeral_addr()).await;
     let assembled = assemble_grpc_chain(chain)
         .expect("assemble")
         .mount(LifecycleServiceServer::new(EchoLifecycle));
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let handle = tokio::spawn(async move {
-        assembled
-            .serve(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .expect("serve");
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let (addr, shutdown_tx, handle) = serve_assembled(assembled).await;
 
     let client = LifecycleClient::connect(endpoint(addr))
         .await
@@ -324,19 +308,9 @@ async fn lifecycle_client_round_trips_the_four_verbs() {
 /// panic or a silently dropped header.
 #[tokio::test]
 async fn with_bearer_rejects_a_non_ascii_token() {
-    let addr = bind_addr().await;
-    let (chain, _dir, _session) = transport_only_chain(addr).await;
+    let (chain, _dir, _session) = transport_only_chain(super::common::grpc::ephemeral_addr()).await;
     let assembled = assemble_grpc_chain(chain).expect("assemble");
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let handle = tokio::spawn(async move {
-        assembled
-            .serve(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .expect("serve");
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let (addr, shutdown_tx, handle) = serve_assembled(assembled).await;
 
     let transport = SessionTransport::connect(endpoint(addr))
         .await
@@ -366,7 +340,12 @@ async fn into_axum_router_composes_one_listener_with_a_plain_http_route() {
     use axum::routing::get;
     use tonic_web::GrpcWebLayer;
 
-    let addr = bind_addr().await;
+    // Bind the listener FIRST and hold it: its address feeds the chain (so the
+    // `ChainParts` split reports the same addr) and the axum server serves on the
+    // very same held listener — the port is never released between resolving it
+    // and serving on it.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
     let (chain, _dir, _session) = transport_only_chain(addr).await;
     let assembled = assemble_grpc_chain(chain)
         .expect("assemble")
@@ -393,7 +372,8 @@ async fn into_axum_router_composes_one_listener_with_a_plain_http_route() {
         .route("/plain", get(|| async { "plain-http-ok" }))
         .merge(grpc_router);
 
-    let listener = TcpListener::bind(addr).await.expect("rebind");
+    // Serve on the listener bound above — held continuously since the bind, so
+    // no concurrent process could have taken the port.
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -403,7 +383,6 @@ async fn into_axum_router_composes_one_listener_with_a_plain_http_route() {
             .await
             .expect("axum serve");
     });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // (a) The plain HTTP route answers.
     let body = reqwest::get(format!("http://{addr}/plain"))
@@ -503,7 +482,11 @@ async fn into_layered_axum_router_serves_directly_with_grpc_web_trailer_repair()
     };
     use prost::Message as _;
 
-    let addr = bind_addr().await;
+    // Bind the listener FIRST and hold it — its address feeds the chain (so the
+    // `ChainParts` split reports the same addr) and axum serves on the same held
+    // listener, never releasing the port.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
 
     // An engine-backed chain so a real unary handler (`EncodeQuery`) can return
     // a structured error — the transport-only chain has no such data-plane verb.
@@ -540,7 +523,7 @@ async fn into_layered_axum_router_serves_directly_with_grpc_web_trailer_repair()
         .iter()
         .any(|m| m == "jammi.v1.lifecycle.LifecycleService"));
 
-    let listener = TcpListener::bind(addr).await.expect("rebind");
+    // Serve on the listener bound above — held continuously since the bind.
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         axum::serve(listener, router)
@@ -550,7 +533,6 @@ async fn into_layered_axum_router_serves_directly_with_grpc_web_trailer_repair()
             .await
             .expect("axum serve");
     });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // (i) A gRPC verb answers through the pre-applied layer stack (native HTTP/2).
     let catalog = CatalogClient::connect(endpoint(addr))
@@ -778,8 +760,6 @@ async fn resolver_seam_scopes_both_transports_and_rejects_missing_credential() {
     use jammi_db::source::{FileFormat, SourceConnection, SourceType};
     use jammi_db::store::mutable::definition::{MutableTableDefinitionBuilder, MutableTableId};
 
-    let addr = bind_addr().await;
-
     let dir = tempfile::tempdir().expect("tempdir");
     let session = InferenceSession::open(test_config(dir.path()))
         .await
@@ -842,7 +822,7 @@ async fn resolver_seam_scopes_both_transports_and_rejects_missing_credential() {
     let flight_ctx = session.context().clone();
     let flight_binding = session.tenant_binding_arc();
     let chain = GrpcChain {
-        addr,
+        addr: super::common::grpc::ephemeral_addr(),
         flight_ctx,
         flight_binding,
         store: jammi_server::grpc::session::SessionStore::new(),
@@ -857,16 +837,7 @@ async fn resolver_seam_scopes_both_transports_and_rejects_missing_credential() {
     };
 
     let assembled = assemble_grpc_chain(chain).expect("assemble");
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let handle = tokio::spawn(async move {
-        assembled
-            .serve(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .expect("serve");
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let (addr, shutdown_tx, handle) = serve_assembled(assembled).await;
 
     // (i) + (ii) gRPC data-plane, scoped to the resolved tenant, cross-tenant
     // denial. A's credential lists A's source and NOT B's; B's the inverse.

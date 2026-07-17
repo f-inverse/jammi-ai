@@ -31,6 +31,7 @@ use jammi_db::config::JammiConfig;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::broadcast;
+use tonic::transport::server::TcpIncoming;
 use tonic::transport::Server;
 use tonic_web::GrpcWebLayer;
 use tower::Layer;
@@ -149,8 +150,10 @@ pub struct OssServer {
 
 impl OssServer {
     /// Build an OSS server from `JammiConfig`. Validates the server
-    /// configuration up front (parses both bind addresses, rejects
-    /// matching health/flight ports), constructs the engine session
+    /// configuration up front (parses both bind addresses, rejects two
+    /// identical FIXED bind addresses — identical `:0` ephemeral addresses
+    /// are allowed, since each resolves to a distinct port at bind),
+    /// constructs the engine session
     /// (catalog, mutable tables, broker), and prepares the shared
     /// metrics registry and readiness probe.
     pub async fn new(config: JammiConfig) -> Result<Self, ServerError> {
@@ -195,16 +198,6 @@ impl OssServer {
         })
     }
 
-    /// Bind address the gRPC + Flight SQL surface listens on.
-    pub fn flight_addr(&self) -> SocketAddr {
-        self.flight_addr
-    }
-
-    /// Bind address the HTTP side-channel listens on.
-    pub fn health_addr(&self) -> SocketAddr {
-        self.health_addr
-    }
-
     /// Shared handle to the metrics registry. Test fixtures and the
     /// gRPC services use this to increment counters.
     pub fn metrics(&self) -> Arc<MetricsRegistry> {
@@ -225,12 +218,37 @@ impl OssServer {
         self
     }
 
+    /// Bind both listeners eagerly and return a [`BoundServer`] holding them
+    /// live. The gRPC + Flight SQL surface and the HTTP side-channel are each
+    /// bound here — so their ACTUAL addresses are known (the real ports even
+    /// when the config requested an ephemeral `:0`) before a single connection
+    /// is served, and neither port is released before
+    /// [`BoundServer::serve_with_shutdown`] serves on the same listeners. A
+    /// caller reads the resolved ports off the returned handle
+    /// ([`BoundServer::flight_addr`] / [`BoundServer::health_addr`]) while the
+    /// listeners stay bound, with no observable release-then-rebind window.
+    pub async fn bind(self) -> Result<BoundServer, ServerError> {
+        let health_router = self.build_health_router();
+        let health_listener = TcpListener::bind(self.health_addr).await?;
+        let health_addr = health_listener.local_addr()?;
+        let grpc = assemble_grpc_chain(self.build_grpc_chain())?.bind().await?;
+        Ok(BoundServer {
+            grpc,
+            health_listener,
+            health_addr,
+            health_router,
+        })
+    }
+
     /// Drive the server until SIGINT / SIGTERM arrives. Both the HTTP
     /// side-channel and the gRPC surface drain in parallel; the call
     /// returns when both have stopped accepting new connections and
     /// finished serving in-flight requests.
     pub async fn run(self) -> Result<(), ServerError> {
-        self.run_with_shutdown(shutdown_signal()).await
+        self.bind()
+            .await?
+            .serve_with_shutdown(shutdown_signal())
+            .await
     }
 
     /// Variant of [`Self::run`] that accepts a caller-provided
@@ -240,53 +258,7 @@ impl OssServer {
         self,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), ServerError> {
-        // Fan out one shutdown signal to both servers. A `broadcast`
-        // channel gives every subscriber an independent receiver and
-        // does not require the futures to share lifetimes.
-        let (shutdown_tx, _) = broadcast::channel::<()>(1);
-        let mut shutdown_health_rx = shutdown_tx.subscribe();
-        let mut shutdown_grpc_rx = shutdown_tx.subscribe();
-        let shutdown_tx_for_signal = shutdown_tx.clone();
-        tokio::spawn(async move {
-            shutdown.await;
-            // Receivers may already be gone if the servers errored
-            // first; either way the broadcast send is best-effort.
-            let _ = shutdown_tx_for_signal.send(());
-        });
-
-        let health_router = self.build_health_router();
-        let health_listener = TcpListener::bind(self.health_addr).await?;
-        tracing::info!(
-            address = %self.health_addr,
-            "HTTP side-channel listening (/healthz, /readyz, /metrics)"
-        );
-
-        let health_task = tokio::spawn(async move {
-            axum::serve(health_listener, health_router)
-                .with_graceful_shutdown(async move {
-                    let _ = shutdown_health_rx.recv().await;
-                })
-                .await
-                .map_err(ServerError::from)
-        });
-
-        let grpc_future = self.build_and_serve_grpc(async move {
-            let _ = shutdown_grpc_rx.recv().await;
-        });
-
-        // Run both halves to completion. If either errors out we still
-        // wait for the other to drain — abandoning a running server
-        // mid-shutdown corrupts in-flight connections.
-        let grpc_result = grpc_future.await;
-        if grpc_result.is_err() {
-            let _ = shutdown_tx.send(());
-        }
-        let health_result = match health_task.await {
-            Ok(r) => r,
-            Err(join_err) => Err(ServerError::Io(std::io::Error::other(join_err.to_string()))),
-        };
-
-        grpc_result.and(health_result)
+        self.bind().await?.serve_with_shutdown(shutdown).await
     }
 
     fn build_health_router(&self) -> Router {
@@ -307,10 +279,11 @@ impl OssServer {
             .fallback(fallback_handler)
     }
 
-    async fn build_and_serve_grpc(
-        &self,
-        shutdown: impl Future<Output = ()> + Send + 'static,
-    ) -> Result<(), ServerError> {
+    /// Assemble the engine's [`GrpcChain`] from this server's config and engine
+    /// session. Derives the event-tier trigger handles (only when the event
+    /// tier is mounted) and the engine-default `jammi-session-id` tenant
+    /// resolver — the OSS-cooperative multitenancy binder.
+    fn build_grpc_chain(&self) -> GrpcChain {
         // The event tier (`TriggerService`) is mounted only when the deployment
         // selected it; the handles are derived from the same engine session.
         let trigger = self
@@ -321,25 +294,120 @@ impl OssServer {
                 publisher: self.session.publisher(),
                 subscriber: self.session.subscriber(),
             });
-        serve_grpc_chain(
-            GrpcChain {
-                addr: self.flight_addr,
-                flight_ctx: self.session.context().clone(),
-                flight_binding: self.session.tenant_binding_arc(),
-                store: self.session_store.clone(),
-                trigger,
-                engine: Some(Arc::clone(&self.session)),
-                tiers: self.tiers.clone(),
-                metrics: Arc::clone(&self.metrics),
-                // The OSS binary binds tenants with the engine-default
-                // `jammi-session-id` resolver — the OSS-cooperative multitenancy
-                // behavior, now a first-class resolver rather than an implicit
-                // interceptor.
-                tenant_resolver: SessionIdTenantResolver::arc(self.session_store.clone()),
-            },
-            shutdown,
-        )
-        .await
+        GrpcChain {
+            addr: self.flight_addr,
+            flight_ctx: self.session.context().clone(),
+            flight_binding: self.session.tenant_binding_arc(),
+            store: self.session_store.clone(),
+            trigger,
+            engine: Some(Arc::clone(&self.session)),
+            tiers: self.tiers.clone(),
+            metrics: Arc::clone(&self.metrics),
+            // The OSS binary binds tenants with the engine-default
+            // `jammi-session-id` resolver — the OSS-cooperative multitenancy
+            // behavior, now a first-class resolver rather than an implicit
+            // interceptor.
+            tenant_resolver: SessionIdTenantResolver::arc(self.session_store.clone()),
+        }
+    }
+}
+
+/// An [`OssServer`] with both listeners bound and held live — the eager-bind
+/// half of the serve seam. Returned by [`OssServer::bind`]. The gRPC + Flight
+/// SQL surface and the HTTP side-channel are already listening:
+/// [`Self::flight_addr`] / [`Self::health_addr`] report the ACTUAL bound
+/// addresses (the real ports even when the config requested `:0`), and neither
+/// port is released before [`Self::serve_with_shutdown`] serves on the very same
+/// listeners — there is no release-then-rebind window a concurrent binder could
+/// slip into.
+pub struct BoundServer {
+    grpc: BoundChain,
+    health_listener: TcpListener,
+    health_addr: SocketAddr,
+    health_router: Router,
+}
+
+impl BoundServer {
+    /// The ACTUAL address the gRPC + Flight SQL surface is bound to. When the
+    /// config requested `:0`, this is the ephemeral port the kernel assigned —
+    /// resolved at [`OssServer::bind`] and held.
+    pub fn flight_addr(&self) -> SocketAddr {
+        self.grpc.addr()
+    }
+
+    /// The ACTUAL address the HTTP side-channel (`/healthz`, `/readyz`,
+    /// `/metrics`) is bound to. When the config requested `:0`, this is the
+    /// ephemeral port the kernel assigned.
+    pub fn health_addr(&self) -> SocketAddr {
+        self.health_addr
+    }
+
+    /// Serve both halves on the already-bound listeners until `shutdown`
+    /// resolves. The HTTP side-channel and the gRPC surface drain in parallel;
+    /// the call returns when both have stopped accepting new connections and
+    /// finished serving in-flight requests.
+    pub async fn serve_with_shutdown(
+        self,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), ServerError> {
+        // Fan out one shutdown signal to both servers. A `broadcast`
+        // channel gives every subscriber an independent receiver and
+        // does not require the futures to share lifetimes.
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let mut shutdown_health_rx = shutdown_tx.subscribe();
+        let mut shutdown_grpc_rx = shutdown_tx.subscribe();
+        let shutdown_tx_for_signal = shutdown_tx.clone();
+        tokio::spawn(async move {
+            shutdown.await;
+            // Receivers may already be gone if the servers errored
+            // first; either way the broadcast send is best-effort.
+            let _ = shutdown_tx_for_signal.send(());
+        });
+
+        let BoundServer {
+            grpc,
+            health_listener,
+            health_addr,
+            health_router,
+        } = self;
+        tracing::info!(
+            address = %health_addr,
+            "HTTP side-channel listening (/healthz, /readyz, /metrics)"
+        );
+
+        let health_task = tokio::spawn(async move {
+            axum::serve(health_listener, health_router)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_health_rx.recv().await;
+                })
+                .await
+                .map_err(ServerError::from)
+        });
+
+        // Run both halves to completion. If either errors out we still
+        // wait for the other to drain — abandoning a running server
+        // mid-shutdown corrupts in-flight connections.
+        let grpc_result = grpc
+            .serve_with_shutdown(async move {
+                let _ = shutdown_grpc_rx.recv().await;
+            })
+            .await;
+        if grpc_result.is_err() {
+            let _ = shutdown_tx.send(());
+        }
+        let health_result = match health_task.await {
+            Ok(r) => r,
+            Err(join_err) => Err(ServerError::Io(std::io::Error::other(join_err.to_string()))),
+        };
+
+        grpc_result.and(health_result)
+    }
+
+    /// Serve both halves until SIGINT / SIGTERM arrives. The binary entry
+    /// point ([`OssServer::run`] and `main`) reaches graceful shutdown through
+    /// this.
+    pub async fn serve(self) -> Result<(), ServerError> {
+        self.serve_with_shutdown(shutdown_signal()).await
     }
 }
 
@@ -543,43 +611,44 @@ impl AssembledChain {
         &self.mounted
     }
 
-    /// Serve the assembled chain (engine core + any downstream-mounted services)
-    /// until `shutdown` resolves. Consumes `self`, keeping the training-worker
-    /// guard alive for the whole serve loop.
+    /// Bind the gRPC + Flight SQL listener eagerly and return a [`BoundChain`]
+    /// holding it live. The listener is opened HERE, so [`BoundChain::addr`]
+    /// reports the ACTUAL bound address — the real port even when the chain was
+    /// assembled at an ephemeral `:0` — and the port stays held with no release
+    /// window until [`BoundChain::serve_with_shutdown`] serves on the very same
+    /// listener. A caller that needs the resolved port before serving (a test
+    /// harness building a client, a downstream logging its startup address)
+    /// reads it off the bound handle rather than pre-binding-and-dropping a
+    /// throwaway listener.
     ///
-    /// The transport layers apply HERE, in this order: `accept_http1(true)` then
-    /// `MetricsLayer` (outermost — observes every request by method path before
-    /// routing) then `GrpcWebTrailersLayer` (wraps `GrpcWebLayer`, repairing the
-    /// trailers-only error response into the in-body trailer frame a gRPC-web
-    /// client requires) then `GrpcWebLayer`. Every service mounted via
-    /// [`Self::mount`], engine or downstream, inherits gRPC-web framing + trailer
-    /// repair with no per-service opt-in.
+    /// `nodelay` is set to match the [`tonic::transport::Server`] default the
+    /// addr-based serve path applies, so the served connections behave
+    /// identically to a chain served straight from a configured address.
+    pub async fn bind(self) -> Result<BoundChain, ServerError> {
+        let listener = TcpListener::bind(self.addr).await?;
+        let incoming = TcpIncoming::from(listener).with_nodelay(Some(true));
+        let addr = incoming.local_addr()?;
+        Ok(BoundChain {
+            incoming,
+            addr,
+            routes: self.routes,
+            mounted: self.mounted,
+            metrics: self.metrics,
+            #[cfg(feature = "train")]
+            _train_worker: self._train_worker,
+        })
+    }
+
+    /// Serve the assembled chain (engine core + any downstream-mounted services)
+    /// until `shutdown` resolves. A thin composition of [`Self::bind`] +
+    /// [`BoundChain::serve_with_shutdown`] — binds the listener, then serves on
+    /// it; the training-worker guard stays alive for the whole serve loop. The
+    /// transport layer stack is applied by [`BoundChain::serve_with_shutdown`].
     pub async fn serve(
         self,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), ServerError> {
-        tracing::info!(
-            "gRPC chain ({}) listening on {}",
-            self.mounted.join(" + "),
-            self.addr
-        );
-        // The layer stack is deferred to here (G1): `accept_http1` is a listener
-        // property, and holding the post-layer `Router<L>` would leak the
-        // concrete `Stack<…>` layer types into `AssembledChain`. `Routes` is the
-        // layer-free accumulation point; `add_routes` attaches it behind the
-        // stack at serve time.
-        let mut server = Server::builder()
-            .accept_http1(true)
-            .layer(MetricsLayer::new(self.metrics))
-            .layer(GrpcWebTrailersLayer::new())
-            .layer(GrpcWebLayer::new());
-        server
-            .add_routes(self.routes)
-            .serve_with_shutdown(self.addr, shutdown)
-            .await
-            .map_err(ServerError::from)
-        // `self._train_worker` (train build) is dropped here, after the serve
-        // future resolves — its RAII lifetime spans the whole serve loop.
+        self.bind().await?.serve_with_shutdown(shutdown).await
     }
 
     /// Split into a plain, **LAYER-FREE** [`axum::Router`] (via
@@ -686,6 +755,82 @@ impl AssembledChain {
             train_worker: self._train_worker,
         };
         (router, parts)
+    }
+}
+
+/// An [`AssembledChain`] whose gRPC + Flight SQL listener is bound and held
+/// live, ready to serve. Returned by [`AssembledChain::bind`]. The listener is
+/// open from bind through serve, so [`Self::addr`] reports the ACTUAL bound
+/// address (the real port even for a `:0` assembly) and the port is never
+/// observably free between resolving it and serving on it.
+pub struct BoundChain {
+    // The bound listener, wrapped as tonic's incoming stream with the same
+    // `nodelay` the addr-based serve path applies. Held from bind through serve
+    // — this is the whole point: zero release-then-rebind window.
+    incoming: TcpIncoming,
+    addr: SocketAddr,
+    // The layer-free routes, carried forward so the transport layer stack is
+    // still applied at serve time (G1) rather than baked in at bind.
+    routes: tonic::service::Routes,
+    mounted: Vec<String>,
+    metrics: Arc<MetricsRegistry>,
+    // The embedded training worker guard, held RAII across the serve loop — its
+    // lifetime spans bind → serve, exactly as it did on `AssembledChain`.
+    #[cfg(feature = "train")]
+    _train_worker: Option<jammi_ai::fine_tune::worker::EmbeddedWorker>,
+}
+
+impl BoundChain {
+    /// The ACTUAL address the listener is bound to. For a chain assembled at
+    /// `:0`, this is the ephemeral port the kernel assigned — resolved at
+    /// [`AssembledChain::bind`] and held live until serve.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// The ledger of mounted service names, in mount order. Read for a startup
+    /// log; carried through the bind unchanged.
+    pub fn mounted(&self) -> &[String] {
+        &self.mounted
+    }
+
+    /// Serve the bound chain on its already-open listener until `shutdown`
+    /// resolves. Consumes `self`, keeping the training-worker guard alive for
+    /// the whole serve loop.
+    ///
+    /// The transport layers apply HERE, in this order: `accept_http1(true)` then
+    /// `MetricsLayer` (outermost — observes every request by method path before
+    /// routing) then `GrpcWebTrailersLayer` (wraps `GrpcWebLayer`, repairing the
+    /// trailers-only error response into the in-body trailer frame a gRPC-web
+    /// client requires) then `GrpcWebLayer`. Every service mounted via
+    /// [`AssembledChain::mount`], engine or downstream, inherits gRPC-web framing
+    /// + trailer repair with no per-service opt-in.
+    pub async fn serve_with_shutdown(
+        self,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), ServerError> {
+        tracing::info!(
+            "gRPC chain ({}) listening on {}",
+            self.mounted.join(" + "),
+            self.addr
+        );
+        // The layer stack is deferred to here (G1): holding the post-layer
+        // `Router<L>` would leak the concrete `Stack<…>` layer types into
+        // `BoundChain`. `Routes` is the layer-free accumulation point;
+        // `add_routes` attaches it behind the stack at serve time, then serves
+        // on the pre-bound listener via `serve_with_incoming_shutdown`.
+        let mut server = Server::builder()
+            .accept_http1(true)
+            .layer(MetricsLayer::new(self.metrics))
+            .layer(GrpcWebTrailersLayer::new())
+            .layer(GrpcWebLayer::new());
+        server
+            .add_routes(self.routes)
+            .serve_with_incoming_shutdown(self.incoming, shutdown)
+            .await
+            .map_err(ServerError::from)
+        // `self._train_worker` (train build) is dropped here, after the serve
+        // future resolves — its RAII lifetime spans the whole serve loop.
     }
 }
 
@@ -883,13 +1028,16 @@ pub fn assemble_grpc_chain(chain: GrpcChain) -> Result<AssembledChain, ServerErr
     })
 }
 
-/// Build and serve the engine's gRPC chain on `chain.addr` (the OSS-only path).
+/// Build and serve the engine's gRPC chain on `chain.addr` in one call — the
+/// OSS-only convenience for a caller serving straight from a configured address.
 ///
-/// A thin composition of the D1 seam: `assemble_grpc_chain(chain)?.serve(...)`.
-/// There is no parallel assembly logic to drift — every existing caller
-/// ([`OssServer`]'s internal serve path, the test fixtures) keeps this exact
-/// signature and behaviour. Downstreams that need to mount their own services go
-/// through [`assemble_grpc_chain`] + [`AssembledChain::mount`] instead.
+/// A thin composition of the seam: `assemble_grpc_chain(chain)?.serve(...)`,
+/// which binds the listener eagerly ([`AssembledChain::bind`]) and serves on it.
+/// A caller that needs the RESOLVED port before serving (an ephemeral `:0` bind)
+/// drives [`assemble_grpc_chain`] → [`AssembledChain::bind`] →
+/// [`BoundChain::serve_with_shutdown`] directly and reads the port off the bound
+/// handle. Downstreams that mount their own services go through
+/// [`assemble_grpc_chain`] + [`AssembledChain::mount`] instead.
 pub async fn serve_grpc_chain(
     chain: GrpcChain,
     shutdown: impl Future<Output = ()> + Send + 'static,

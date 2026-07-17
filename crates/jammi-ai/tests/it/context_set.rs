@@ -314,6 +314,83 @@ async fn materialize_context_writes_a_searchable_embedding_table() {
     assert_eq!(read.len(), 3);
 }
 
+// ─── Opt-in memoization: a context set is honestly NEVER cacheable ──────────
+//
+// `materialize_context` anchors its source `UnpinnedAtInstant` — the same
+// honest-miss contract `generate_text_embeddings` upholds (see
+// `pipeline::cache_use_on_embeddings_always_recomputes_unpinned_source`), so a
+// `Use` request always recomputes. `key_column` is deliberately *not* folded
+// into `ProducingDescriptor::ContextSet` (it is caller-declared provenance,
+// not a determinant of the pooled rows); that omission is only sound because
+// the anchor stays `UnpinnedAtInstant` and a probe can never hit. If a future
+// change gives the source a version surface that makes `Use` able to hit,
+// `key_column` MUST be folded into the descriptor at that point, or a stale
+// hit would return a table recorded under the wrong caller's provenance.
+
+#[tokio::test]
+async fn cache_use_on_context_sets_always_recomputes_unpinned_source() {
+    use jammi_db::store::{CacheOutcome, CachePolicy};
+
+    let (session, _dir) = session_with_embeddings().await;
+    let rows: Vec<(String, Vec<f32>)> = (0..3)
+        .map(|i| (format!("target-{i}"), vec![i as f32; 32]))
+        .collect();
+
+    // Pin the recipe's embedding table so both runs pool over the *same*
+    // source table: a materialised context set is itself a `kind=model` table
+    // for "patents", so leaving this `None` would have the second run's
+    // default resolution shadow onto the first run's own output — a confound
+    // this test must not carry, since it would recompute for that unrelated
+    // reason regardless of the unpinned-source cache contract under test.
+    let source_table = session
+        .catalog()
+        .resolve_embedding_table("patents", None)
+        .await
+        .unwrap()
+        .table_name;
+    let mut recipe = ContextRequest::new("patents", vec![0.0_f32; 32], 5);
+    recipe.embedding_table = Some(source_table);
+
+    let (first, first_outcome) = session
+        .materialize_context(
+            MaterializedContext {
+                rows: &rows,
+                dimensions: 32,
+                recipe: &recipe,
+                key_column: None,
+            },
+            CachePolicy::Use,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_outcome, CacheOutcome::Computed);
+
+    // A byte-identical second Use request still computes — the source is
+    // unpinned, so the probe is honestly always a miss and a fresh table is
+    // materialised.
+    let (second, second_outcome) = session
+        .materialize_context(
+            MaterializedContext {
+                rows: &rows,
+                dimensions: 32,
+                recipe: &recipe,
+                key_column: None,
+            },
+            CachePolicy::Use,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second_outcome,
+        CacheOutcome::Computed,
+        "an unpinned-anchored producer never reuses — caching is honestly off"
+    );
+    assert_ne!(
+        first.table_name, second.table_name,
+        "each Use context-set run materialises a fresh table (no reuse)"
+    );
+}
+
 #[tokio::test]
 async fn materialize_context_rejects_duplicate_target_keys() {
     let (session, _dir) = session_with_embeddings().await;

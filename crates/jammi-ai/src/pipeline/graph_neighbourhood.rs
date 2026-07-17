@@ -469,6 +469,14 @@ impl InferenceSession {
         label_column: &str,
     ) -> Result<HashMap<String, String>> {
         let table = self.find_table_name(source_id)?;
+
+        // Both column names are caller-supplied and decidable right here (the
+        // source is already resolved above), so a bad one is rejected with the
+        // typed provenance-mismatch error instead of a raw planner failure.
+        self.ensure_source_has_column(source_id, key_column).await?;
+        self.ensure_source_has_column(source_id, label_column)
+            .await?;
+
         let sql = format!(
             "SELECT arrow_cast(\"{key_column}\", 'Utf8') AS _k, \
              arrow_cast(\"{label_column}\", 'Utf8') AS _v \

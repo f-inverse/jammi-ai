@@ -583,6 +583,44 @@ async fn homophily_diagnostic_flags_heterophily() {
     );
 }
 
+/// `homophily_by_edge_type`'s `label_key_column`/`label_column` are
+/// caller-supplied, and the labelled source is already resolved by the time
+/// the label scan runs — the same decidable class as a context-set
+/// `value_column`, so a bad one must surface as the typed provenance-mismatch
+/// error, not DataFusion's raw planner message.
+#[tokio::test]
+async fn homophily_rejects_a_label_column_the_source_lacks() {
+    let nodes = vec![
+        Node {
+            id: "a",
+            label: "red",
+            component: "one",
+        },
+        Node {
+            id: "b",
+            label: "red",
+            component: "one",
+        },
+    ];
+    let edges = [Edge::typed("a", "b", "same")];
+    let (session, _dir) = graph_session(&nodes, &edges, None).await;
+
+    let err = session
+        .homophily_by_edge_type(&edge_gather(), "nodes", "_row_id", "nope")
+        .await
+        .expect_err("a label column the source lacks must be rejected");
+    match err {
+        jammi_db::error::JammiError::Schema { table, column, .. } => {
+            assert_eq!(column, "nope");
+            assert!(
+                table.contains("nodes"),
+                "table must name the source, got: {table}"
+            );
+        }
+        other => panic!("expected a typed Schema error naming 'nope', got: {other}"),
+    }
+}
+
 #[tokio::test]
 async fn cross_tenant_edge_endpoint_is_never_gathered() {
     // THE load-bearing tenancy contract. Alice binds her tenant; the edge source

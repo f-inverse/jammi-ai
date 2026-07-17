@@ -508,6 +508,11 @@ impl InferenceSession {
         // The split predicate is the user's own SQL over the source columns, so
         // it is applied as a `WHERE` clause inside the scan; the candidate keys
         // stay bound values in a typed IN-list, never interpolated into text.
+        // A recorded `ContextRequest::split` is validated only here, on read —
+        // it is a predicate, not a bare column, so a write-time check would
+        // need a plan dry-run of the whole recipe; a planner failure here is
+        // therefore surfaced as the typed provenance-mismatch error naming the
+        // table and the offending predicate, not a raw planner message.
         let batches = self
             .context()
             .sql(&format!(
@@ -515,7 +520,12 @@ impl InferenceSession {
                  FROM \"{source_id}\".public.\"{source_table}\" WHERE {split}"
             ))
             .await
-            .map_err(|e| JammiError::Other(format!("Context split: scan: {e}")))?
+            .map_err(|e| JammiError::Schema {
+                table: format!("{source_id}.{source_table}"),
+                column: split.to_string(),
+                expected: "a split predicate over columns the source has".to_string(),
+                actual: e.to_string(),
+            })?
             .filter(col("_context_key").in_list(keys, false))
             .map_err(|e| JammiError::Other(format!("Context split: filter: {e}")))?
             .collect()
@@ -728,7 +738,11 @@ impl InferenceSession {
     /// be catalog-present but absent from the query context (registration is
     /// warn-and-continue at session load), and an unreachable source is one
     /// whose columns cannot be confirmed — not one whose claim is proven.
-    async fn ensure_source_has_column(&self, source_id: &str, column: &str) -> Result<()> {
+    pub(crate) async fn ensure_source_has_column(
+        &self,
+        source_id: &str,
+        column: &str,
+    ) -> Result<()> {
         let source_table = self.find_table_name(source_id).map_err(|e| {
             JammiError::Other(format!(
                 "Key column check: resolving source '{source_id}' to confirm \
@@ -810,6 +824,17 @@ impl InferenceSession {
         // declares is checked here rather than inferred from anything written.
         if let Some(key_column) = context.key_column {
             self.ensure_source_has_column(source_id, key_column).await?;
+        }
+
+        // The recipe's `value_columns` are the same kind of claim: they are
+        // recorded into the descriptor here but resolved by
+        // `hydrate_value_columns` straight against the raw source on every
+        // read. The source is already resolved at this write site, so a bad
+        // value column is decidable now — checked before it can be recorded
+        // as a determinant a reader later discovers is unscannable.
+        for value_column in &recipe.value_columns {
+            self.ensure_source_has_column(source_id, value_column)
+                .await?;
         }
 
         // Pin the **resolved** source embedding table into the descriptor, not the

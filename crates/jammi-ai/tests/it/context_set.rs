@@ -237,6 +237,46 @@ async fn empty_context_is_defined_not_a_crash() {
     assert!(context.value_rows.is_empty());
 }
 
+/// `ContextRequest::split` is a predicate, not a bare column, so a full
+/// write-time check would need a plan dry-run of the recipe — out of scope.
+/// It is validated on read instead, where `filter_keys_by_split` already
+/// resolves the source: a predicate referencing a column the source lacks
+/// must surface as the typed provenance-mismatch error naming the table and
+/// the offending predicate, not DataFusion's raw planner message.
+#[tokio::test]
+async fn assemble_context_rejects_a_split_the_source_cannot_evaluate() {
+    let (session, _dir) = session_with_embeddings().await;
+
+    let mut bad = ContextRequest::new("patents", vec![0.3_f32; 32], 5);
+    bad.split = Some("bogus = 'train'".to_string());
+    let err = session
+        .assemble_context(&bad)
+        .await
+        .expect_err("a split predicate over a column the source lacks must be rejected");
+    match err {
+        jammi_db::error::JammiError::Schema { table, column, .. } => {
+            assert_eq!(column, "bogus = 'train'");
+            assert!(
+                table.contains("patents"),
+                "table must name the source, got: {table}"
+            );
+        }
+        other => panic!(
+            "expected a typed Schema error naming the offending predicate, not a raw \
+             planner message, got: {other}"
+        ),
+    }
+
+    // Negative control: a real predicate over a real column still filters
+    // cleanly — the guard rejects a false predicate, not split scoping itself.
+    let mut good = ContextRequest::new("patents", vec![0.3_f32; 32], 5);
+    good.split = Some("category IS NOT NULL".to_string());
+    session
+        .assemble_context(&good)
+        .await
+        .expect("a real predicate over a real column must still filter cleanly");
+}
+
 #[tokio::test]
 async fn materialize_context_writes_a_searchable_embedding_table() {
     let (session, _dir) = session_with_embeddings().await;
@@ -353,6 +393,87 @@ async fn materialize_context_accepts_a_real_key_column_and_records_it() {
         .expect("`id` is a real column of the patents source");
 
     assert_eq!(table.key_column.as_deref(), Some("id"));
+}
+
+/// `recipe.value_columns` is recorded into the descriptor at this same write
+/// site, but was previously never checked against the source although the
+/// source is already resolved here — a decidable gap, the same class as the
+/// `key_column` guard above. A bad value column must be rejected at write
+/// time, before it is recorded as a determinant `hydrate_value_columns` later
+/// discovers is unscannable.
+#[tokio::test]
+async fn materialize_context_rejects_a_value_column_the_source_lacks() {
+    let (session, _dir) = session_with_embeddings().await;
+
+    // Positive control: the `patents` fixture genuinely has no `nope` column,
+    // so the rejection below is attributable to the false determinant, not an
+    // unrelated missing column.
+    let columns: Vec<String> = session
+        .context()
+        .sql("SELECT * FROM \"patents\".public.\"patents\" LIMIT 0")
+        .await
+        .unwrap()
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert!(
+        !columns.iter().any(|c| c == "nope"),
+        "positive control: fixture must not have a 'nope' column: {columns:?}"
+    );
+
+    let rows: Vec<(String, Vec<f32>)> = (0..3)
+        .map(|i| (format!("target-{i}"), vec![i as f32; 32]))
+        .collect();
+    let mut recipe = ContextRequest::new("patents", vec![0.0_f32; 32], 5);
+    recipe.value_columns = vec!["nope".to_string()];
+
+    let err = session
+        .materialize_context(
+            MaterializedContext {
+                rows: &rows,
+                dimensions: 32,
+                recipe: &recipe,
+                key_column: None,
+            },
+            jammi_db::store::CachePolicy::Bypass,
+        )
+        .await
+        .expect_err("a value column the source lacks must be rejected at write time");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("nope") && msg.contains("patents"),
+        "the error must name the column and the source, got: {msg}"
+    );
+}
+
+/// The non-vacuous control for the guard above: real value columns still
+/// succeed, so the check rejects false names rather than the field itself.
+#[tokio::test]
+async fn materialize_context_accepts_real_value_columns() {
+    let (session, _dir) = session_with_embeddings().await;
+    let rows: Vec<(String, Vec<f32>)> = (0..3)
+        .map(|i| (format!("target-{i}"), vec![i as f32; 32]))
+        .collect();
+    let mut recipe = ContextRequest::new("patents", vec![0.0_f32; 32], 5);
+    recipe.value_columns = vec!["category".to_string()];
+
+    let (table, _) = session
+        .materialize_context(
+            MaterializedContext {
+                rows: &rows,
+                dimensions: 32,
+                recipe: &recipe,
+                key_column: None,
+            },
+            jammi_db::store::CachePolicy::Bypass,
+        )
+        .await
+        .expect("`category` is a real column of the patents source");
+
+    assert_eq!(table.row_count, 3);
 }
 
 #[tokio::test]

@@ -847,19 +847,23 @@ impl ServerConfig {
     pub fn validate(&self) -> Result<()> {
         use std::net::SocketAddr;
 
-        let _: SocketAddr = self.health_listen.parse().map_err(|e| {
+        let health: SocketAddr = self.health_listen.parse().map_err(|e| {
             crate::error::JammiError::Config(format!(
                 "Invalid health_listen address '{}': {e}",
                 self.health_listen
             ))
         })?;
-        let _: SocketAddr = self.flight_listen.parse().map_err(|e| {
+        let flight: SocketAddr = self.flight_listen.parse().map_err(|e| {
             crate::error::JammiError::Config(format!(
                 "Invalid flight_listen address '{}': {e}",
                 self.flight_listen
             ))
         })?;
-        if self.health_listen == self.flight_listen {
+        // Two surfaces must not bind the same concrete address. An ephemeral
+        // (`:0`) request never collides — the kernel assigns each bind a distinct
+        // free port — so identical `:0` addresses are allowed; only identical
+        // FIXED addresses would land both surfaces on one port.
+        if health == flight && health.port() != 0 {
             return Err(crate::error::JammiError::Config(
                 "health_listen and flight_listen must be different addresses".into(),
             ));

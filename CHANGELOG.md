@@ -6,6 +6,40 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.47.0] - 2026-07-17
+
+A derived embedding table now records the origin column its keys actually came
+from, instead of the literal `"_row_id"`.
+
+### Fixed
+- **Origin key-column provenance on derived tables (`jammi-db` + `jammi-ai`).**
+  A result table's catalog `key_column` names which column of the origin its
+  `_row_id` values came from, so a reader can follow the provenance back with
+  `source.<key_column> = derived._row_id`. `propagate_embeddings` and
+  `materialize_context` recorded the literal `"_row_id"` regardless of the
+  origin, so a table derived from a `paper_id`-keyed source advertised a column
+  the source does not have, and any consumer that resolved that provenance —
+  the context split and value-column hydration, and `train_context_predictor`
+  through them — scanned for a missing column instead of the real keys.
+  `propagate_embeddings` now inherits the source table's `key_column` (its
+  `_row_id` values flow verbatim off that table); a source genuinely keyed on
+  `_row_id` inherits `"_row_id"`. The physical key of every embedding table is
+  still invariantly `_row_id` and the output schema is unchanged, so no
+  materialization identity moves and no migration is required.
+
+### Changed
+- **`EmbeddingTableSpec::key_column` is now `Option<&str>` (breaking).** It
+  mirrors the catalog column, which was always nullable: `None` records no
+  origin-key provenance, the honest answer when the keys correspond to no
+  stored source row. A producer keying straight off a source's own `_row_id`
+  passes `Some("_row_id")`.
+- **`MaterializedContext` declares its `key_column` (breaking).** A sink handed
+  `(key, vector)` pairs cannot attribute them, so the caller names the column
+  its target keys came from; `materialize_context` rejects a column the source
+  does not have, and `None` is the honest answer for free-vector targets.
+- **`import_embeddings` rejects an empty `key_column`**, matching the wire
+  surface, which already required one.
+
 ## [0.46.0] - 2026-07-15
 
 Two additive feature seams land together: a durable claim policy for the

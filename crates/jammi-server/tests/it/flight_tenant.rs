@@ -15,7 +15,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arrow::array::Int64Array;
 use arrow_flight::sql::client::FlightSqlServiceClient;
@@ -27,7 +26,6 @@ use jammi_server::grpc::proto::catalog::{SetTenantRequest, Tenant};
 use jammi_server::grpc::session::{SessionStore, SESSION_HEADER};
 use jammi_test_utils::test_config;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
 
 use super::common::grpc::{channel, tenant_a, tenant_b, with_session, TENANT_A, TENANT_B};
 
@@ -92,22 +90,41 @@ async fn start_flight_test_server() -> (SocketAddr, TempDir, tokio::task::JoinHa
         .expect("add notes source");
     session.set_source_tenant_column("notes", Some("tenant_id".into()));
 
+    // Flight SQL + the control-plane `CatalogService` on one listener — the same
+    // surface the multi-tenant Flight shape serves (Flight bound through the
+    // `TenantBoundProvider`, `CatalogService.SetTenant` binding the tenant via
+    // the engine-default `jammi-session-id` resolver), assembled from the
+    // canonical gRPC chain with no engine mounted. Binding eagerly through the
+    // chain seam holds the port from bind through serve, so no concurrent test
+    // process can steal it in a release-then-rebind window.
     let store = SessionStore::new();
-    let binding = session.tenant_binding_arc();
-    let ctx_clone = session.context().clone();
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-
+    let chain = jammi_server::runtime::GrpcChain {
+        addr: super::common::grpc::ephemeral_addr(),
+        flight_ctx: session.context().clone(),
+        flight_binding: session.tenant_binding_arc(),
+        store: store.clone(),
+        trigger: None,
+        engine: None,
+        tiers: jammi_server::tiers::TierSet::resolve(std::iter::empty())
+            .expect("core-only tier set resolves"),
+        metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
+        tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
+    };
+    let bound = jammi_server::runtime::assemble_grpc_chain(chain)
+        .expect("assemble")
+        .bind()
+        .await
+        .expect("bind grpc listener");
+    let addr = bound.addr();
+    // No shutdown channel: the server runs until the test aborts `handle`,
+    // exactly as before. `pending()` never resolves, so shutdown is driven
+    // solely by the abort — and the listener is held live throughout.
     let handle = tokio::spawn(async move {
-        jammi_server::flight::serve_flight_with_catalog_service(&ctx_clone, binding, addr, store)
+        bound
+            .serve_with_shutdown(std::future::pending::<()>())
             .await
-            .expect("flight + session server");
+            .expect("flight + catalog server");
     });
-
-    // Briefly wait for the listener to come up.
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     (addr, dir, handle)
 }

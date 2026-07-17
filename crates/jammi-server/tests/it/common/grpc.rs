@@ -9,14 +9,12 @@
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use jammi_ai::session::InferenceSession;
 use jammi_db::TenantId;
 use jammi_server::grpc::session::{SessionStore, SESSION_HEADER};
 use jammi_test_utils::test_config;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
@@ -49,6 +47,48 @@ pub async fn channel(addr: SocketAddr) -> Channel {
         .connect()
         .await
         .expect("channel connect")
+}
+
+/// The loopback ephemeral-port config address (`127.0.0.1:0`) every in-process
+/// fixture assembles its [`jammi_server::runtime::GrpcChain`] at. The real,
+/// bindable port is resolved by [`spawn_bound_chain`] at bind time — the
+/// fixture never picks a port itself.
+pub fn ephemeral_addr() -> SocketAddr {
+    "127.0.0.1:0".parse().expect("loopback :0 parses")
+}
+
+/// Assemble `chain`, bind its gRPC + Flight SQL listener EAGERLY, and spawn the
+/// serve loop on the already-bound listener — returning the ACTUAL bound
+/// address (the real ephemeral port) and the serve task's join handle.
+///
+/// The listener is held continuously from bind through serve: there is no
+/// release-then-rebind window in which a concurrent `cargo test` process could
+/// steal the port, which is exactly the flake this handoff exists to close. A
+/// caller builds its client against the returned address; firing `shutdown_rx`
+/// (or dropping its sender) tears the server down.
+///
+/// Every in-process gRPC fixture builds its own `GrpcChain` (its own tiers /
+/// engine / trigger wiring) at [`ephemeral_addr`] and hands it here, so the
+/// eager-bind handoff lives in exactly one place.
+pub async fn spawn_bound_chain(
+    chain: jammi_server::runtime::GrpcChain,
+    shutdown_rx: oneshot::Receiver<()>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let bound = jammi_server::runtime::assemble_grpc_chain(chain)
+        .expect("assemble grpc chain")
+        .bind()
+        .await
+        .expect("bind grpc listener");
+    let addr = bound.addr();
+    let handle = tokio::spawn(async move {
+        bound
+            .serve_with_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("grpc server");
+    });
+    (addr, handle)
 }
 
 /// Guards that keep an in-process engine-backed gRPC server (and its catalog)
@@ -115,37 +155,24 @@ pub async fn start_engine_server_with_tiers(tiers: jammi_server::tiers::TierSet)
             subscriber: session.subscriber(),
         });
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let flight_ctx = session.context().clone();
-    let binding = session.tenant_binding_arc();
     let engine = Arc::clone(&session);
-    let handle = tokio::spawn(async move {
-        jammi_server::runtime::serve_grpc_chain(
-            jammi_server::runtime::GrpcChain {
-                addr,
-                flight_ctx,
-                flight_binding: binding,
-                store: store.clone(),
-                trigger,
-                engine: Some(session),
-                tiers,
-                metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
-                tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
-            },
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        )
-        .await
-        .expect("grpc server");
-    });
-
-    // Give the server a moment to bind.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Assemble the chain at the loopback ephemeral address and hand it to
+    // `spawn_bound_chain`, which binds the listener EAGERLY and serves on it —
+    // the port is held from bind through serve, so `addr` names a port no
+    // concurrent test process can have stolen.
+    let chain = jammi_server::runtime::GrpcChain {
+        addr: ephemeral_addr(),
+        flight_ctx: session.context().clone(),
+        flight_binding: session.tenant_binding_arc(),
+        store: store.clone(),
+        trigger,
+        engine: Some(session),
+        tiers,
+        metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
+        tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
+    };
+    let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
 
     EngineServer {
         addr,

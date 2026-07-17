@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use arrow_ipc::writer::StreamWriter;
@@ -38,7 +37,6 @@ use jammi_server::grpc::session::SessionStore;
 use jammi_server::TriggerHandles;
 use jammi_test_utils::test_config;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -89,36 +87,20 @@ async fn start_fixture() -> Fixture {
         subscriber: session.subscriber(),
     };
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let flight_ctx = session.context().clone();
-    let binding = session.tenant_binding_arc();
     let engine = Arc::clone(&session);
-    let handle = tokio::spawn(async move {
-        jammi_server::runtime::serve_grpc_chain(
-            jammi_server::runtime::GrpcChain {
-                addr,
-                flight_ctx,
-                flight_binding: binding,
-                store: store.clone(),
-                trigger: Some(trigger),
-                engine: Some(session),
-                tiers: jammi_server::tiers::TierSet::all_compiled(),
-                metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
-                tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
-            },
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        )
-        .await
-        .expect("grpc server");
-    });
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let chain = jammi_server::runtime::GrpcChain {
+        addr: super::common::grpc::ephemeral_addr(),
+        flight_ctx: session.context().clone(),
+        flight_binding: session.tenant_binding_arc(),
+        store: store.clone(),
+        trigger: Some(trigger),
+        engine: Some(session),
+        tiers: jammi_server::tiers::TierSet::all_compiled(),
+        metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
+        tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
+    };
+    let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
 
     Fixture {
         addr,

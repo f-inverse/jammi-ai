@@ -79,6 +79,20 @@ fn server_config_validation() {
         same.validate().is_err(),
         "Same health_listen and flight_listen should fail"
     );
+
+    // Two ephemeral (`:0`) requests are allowed even though the strings match:
+    // the kernel assigns each bind a distinct free port, so they never collide.
+    // This is what lets the OSS server bind both surfaces on `:0` for tests and
+    // ephemeral deployments.
+    let ephemeral = ServerConfig {
+        health_listen: "127.0.0.1:0".into(),
+        flight_listen: "127.0.0.1:0".into(),
+        ..Default::default()
+    };
+    assert!(
+        ephemeral.validate().is_ok(),
+        "identical ephemeral :0 addresses must be allowed (distinct ports at bind)"
+    );
 }
 
 // ─── Concurrent health checks ───────────────────────────────────────────────
@@ -111,10 +125,11 @@ async fn concurrent_health_checks() {
 
 #[tokio::test]
 async fn graceful_shutdown_completes_cleanly() {
-    // Bind to a random port.
+    // Bind to a random port and HOLD the listener — the health router is served
+    // on this same listener, so the port is never released between resolving it
+    // and serving on it.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
 
     // Oneshot channel acts as our shutdown trigger.
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -122,8 +137,12 @@ async fn graceful_shutdown_completes_cleanly() {
         let _ = rx.await;
     };
 
-    let server_handle =
-        tokio::spawn(async move { jammi_server::serve_with_shutdown(addr, shutdown).await });
+    let app = jammi_server::build_router();
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await
+    });
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 

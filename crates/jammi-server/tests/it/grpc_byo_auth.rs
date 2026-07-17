@@ -52,7 +52,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use hmac::{Hmac, Mac};
 use jammi_ai::session::InferenceSession;
@@ -189,22 +188,24 @@ async fn start_auth_server() -> AuthServer {
     );
     let catalog_svc = CatalogServiceServer::with_interceptor(catalog, BearerAuthInterceptor);
 
+    // Bind the listener eagerly and serve on it via `serve_with_incoming_shutdown`
+    // — the listener is held from bind through serve, so the resolved port is
+    // never released for a concurrent test process to grab in a
+    // release-then-rebind window.
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
+    let incoming = tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
+    let addr = incoming.local_addr().expect("local_addr");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         Server::builder()
             .add_service(catalog_svc)
-            .serve_with_shutdown(addr, async move {
+            .serve_with_incoming_shutdown(incoming, async move {
                 let _ = shutdown_rx.await;
             })
             .await
             .expect("grpc server");
     });
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     AuthServer {
         addr,
@@ -410,7 +411,7 @@ impl jammi_server::grpc::session::TenantResolver for HmacBearerResolver {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolver_seam_binds_the_engine_and_rejects_missing_credential() {
-    use jammi_server::runtime::{assemble_grpc_chain, GrpcChain};
+    use jammi_server::runtime::GrpcChain;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let session = Arc::new(
@@ -421,16 +422,10 @@ async fn resolver_seam_binds_the_engine_and_rejects_missing_credential() {
     register_source_for(&session, tenant_a(), "a_source", &dir).await;
     register_source_for(&session, tenant_b(), "b_source", &dir).await;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-
-    let flight_ctx = session.context().clone();
-    let flight_binding = session.tenant_binding_arc();
     let chain = GrpcChain {
-        addr,
-        flight_ctx,
-        flight_binding,
+        addr: super::common::grpc::ephemeral_addr(),
+        flight_ctx: session.context().clone(),
+        flight_binding: session.tenant_binding_arc(),
         store: jammi_server::grpc::session::SessionStore::new(),
         trigger: None,
         engine: Some(Arc::clone(&session)),
@@ -439,17 +434,8 @@ async fn resolver_seam_binds_the_engine_and_rejects_missing_credential() {
         // The consumer's authenticating resolver, plugged into the engine seam.
         tenant_resolver: Arc::new(HmacBearerResolver),
     };
-    let assembled = assemble_grpc_chain(chain).expect("assemble");
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let handle = tokio::spawn(async move {
-        assembled
-            .serve(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .expect("serve");
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
 
     // Two valid tokens for two tenants: each authenticated caller sees only its
     // own tenant's source, now through the ACTUAL engine seam (`assemble_grpc_chain`).

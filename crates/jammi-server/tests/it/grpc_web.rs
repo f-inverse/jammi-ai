@@ -1,4 +1,4 @@
-//! gRPC-Web smoke test for `serve_grpc_with_shutdown`. Drives the gRPC
+//! gRPC-Web smoke test over the in-process gRPC chain. Drives the gRPC
 //! surface with a hand-built HTTP/1.1 client (reqwest) so the test
 //! exercises the real `GrpcWebLayer` framing — the same path a browser
 //! takes when it can't speak HTTP/2 + grpc framing directly. A native
@@ -9,7 +9,6 @@
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use jammi_db::session::JammiSession;
 use jammi_db::TenantId;
@@ -18,7 +17,6 @@ use jammi_server::grpc::session::{SessionId, SessionStore};
 use jammi_test_utils::test_config;
 use prost::Message;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use super::common::grpc::TENANT_A;
@@ -42,40 +40,23 @@ async fn start_session_only_server() -> (
     let session = Arc::new(JammiSession::new(cfg).await.expect("session"));
 
     let store = SessionStore::new();
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let store_for_server = store.clone();
-    let flight_ctx = session.context().clone();
-    let binding = session.tenant_binding_arc();
-    let handle = tokio::spawn(async move {
-        jammi_server::runtime::serve_grpc_chain(
-            jammi_server::runtime::GrpcChain {
-                addr,
-                flight_ctx,
-                flight_binding: binding,
-                store: store_for_server.clone(),
-                trigger: None,
-                engine: None,
-                tiers: jammi_server::tiers::TierSet::resolve(std::iter::empty())
-                    .expect("core-only tier set resolves"),
-                metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
-                tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(
-                    store_for_server,
-                ),
-            },
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        )
-        .await
-        .expect("grpc server");
-    });
-
-    // Give the server a moment to bind.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let chain = jammi_server::runtime::GrpcChain {
+        addr: super::common::grpc::ephemeral_addr(),
+        flight_ctx: session.context().clone(),
+        flight_binding: session.tenant_binding_arc(),
+        store: store_for_server.clone(),
+        trigger: None,
+        engine: None,
+        tiers: jammi_server::tiers::TierSet::resolve(std::iter::empty())
+            .expect("core-only tier set resolves"),
+        metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
+        tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(
+            store_for_server,
+        ),
+    };
+    let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
 
     (addr, store, shutdown_tx, handle, dir)
 }

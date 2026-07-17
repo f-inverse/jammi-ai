@@ -39,7 +39,6 @@ use jammi_server::grpc::session::SessionStore;
 use jammi_server::TriggerHandles;
 use jammi_test_utils::test_config;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -212,44 +211,23 @@ async fn start_grpc_test_server(seeds: &[TopicSeed]) -> ServerFixture {
         subscriber: session.subscriber(),
     };
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let store_for_server = store.clone();
-    let flight_ctx = session.context().clone();
-    let binding = session.tenant_binding_arc();
-    let handle = tokio::spawn(async move {
-        jammi_server::runtime::serve_grpc_chain(
-            jammi_server::runtime::GrpcChain {
-                addr,
-                flight_ctx,
-                flight_binding: binding,
-                store: store_for_server.clone(),
-                trigger: Some(trigger),
-                engine: None,
-                tiers: jammi_server::tiers::TierSet::resolve([
-                    jammi_server::tiers::ServiceTier::Event,
-                ])
-                .expect("event tier resolves"),
-                metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
-                tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(
-                    store_for_server,
-                ),
-            },
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        )
-        .await
-        .expect("grpc server");
-    });
-
-    // Give the listener a moment to bind. Matches `grpc_session.rs` —
-    // the 50ms window is comfortably above the kernel's bind latency
-    // (microseconds on loopback) and the tonic handshake setup.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let chain = jammi_server::runtime::GrpcChain {
+        addr: super::common::grpc::ephemeral_addr(),
+        flight_ctx: session.context().clone(),
+        flight_binding: session.tenant_binding_arc(),
+        store: store_for_server.clone(),
+        trigger: Some(trigger),
+        engine: None,
+        tiers: jammi_server::tiers::TierSet::resolve([jammi_server::tiers::ServiceTier::Event])
+            .expect("event tier resolves"),
+        metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
+        tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(
+            store_for_server,
+        ),
+    };
+    let (addr, handle) = super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
 
     ServerFixture {
         addr,

@@ -14,7 +14,6 @@
 //! works end-to-end on a fresh tempdir. All three are hermetic — no
 //! network, no model download.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +25,6 @@ use jammi_server::grpc::session::SessionStore;
 use jammi_server::TriggerHandles;
 use jammi_test_utils::test_config;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
 
 async fn fresh_session(dir: &TempDir) -> JammiSession {
     JammiSession::new(test_config(dir.path()))
@@ -127,14 +125,16 @@ async fn shape_b_single_tenant_flight_server_exercises_primitives() {
     exercise_all_primitives(&session).await;
 
     // Boot serve_flight on an ephemeral port. The single-tenant shape
-    // does not mount SessionService — it accepts any caller.
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr: SocketAddr = listener.local_addr().unwrap();
-    drop(listener);
-
+    // does not mount SessionService — it accepts any caller. `serve_flight`
+    // binds `127.0.0.1:0` itself and serves on that listener, so nothing is
+    // released between picking a port and serving it.
     let ctx = session.context().clone();
     let handle = tokio::spawn(async move {
-        let _ = jammi_server::flight::serve_flight(&ctx, addr).await;
+        let _ = jammi_server::flight::serve_flight(
+            &ctx,
+            "127.0.0.1:0".parse().expect("loopback :0 parses"),
+        )
+        .await;
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -159,46 +159,29 @@ async fn shape_c_multi_tenant_server_isolates_two_tenants_across_primitives() {
 
     let store = SessionStore::new();
 
-    // gRPC + Flight SQL chain on one port — the OSS server's shape.
-    let grpc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let grpc_addr: SocketAddr = grpc_listener.local_addr().unwrap();
-    drop(grpc_listener);
-
+    // gRPC + Flight SQL chain on one port — the OSS server's shape. Assembled at
+    // the loopback ephemeral address and bound eagerly through the chain seam, so
+    // the listener is held live with no release-then-rebind window.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let trigger = TriggerHandles {
         topic_repo: session.topic_repo(),
         publisher: session.publisher(),
         subscriber: session.subscriber(),
     };
-    let store_for_grpc = store.clone();
-    let flight_ctx = session.context().clone();
-    let binding = session.tenant_binding_arc();
-    let grpc_handle = tokio::spawn(async move {
-        jammi_server::runtime::serve_grpc_chain(
-            jammi_server::runtime::GrpcChain {
-                addr: grpc_addr,
-                flight_ctx,
-                flight_binding: binding,
-                store: store_for_grpc,
-                trigger: Some(trigger),
-                engine: None,
-                tiers: jammi_server::tiers::TierSet::resolve([
-                    jammi_server::tiers::ServiceTier::Event,
-                ])
-                .expect("event tier resolves"),
-                metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
-                tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(
-                    store.clone(),
-                ),
-            },
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        )
-        .await
-        .expect("grpc server");
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let chain = jammi_server::runtime::GrpcChain {
+        addr: "127.0.0.1:0".parse().expect("loopback :0 parses"),
+        flight_ctx: session.context().clone(),
+        flight_binding: session.tenant_binding_arc(),
+        store: store.clone(),
+        trigger: Some(trigger),
+        engine: None,
+        tiers: jammi_server::tiers::TierSet::resolve([jammi_server::tiers::ServiceTier::Event])
+            .expect("event tier resolves"),
+        metrics: Arc::new(jammi_server::routes::health::MetricsRegistry::new().unwrap()),
+        tenant_resolver: jammi_server::grpc::session::SessionIdTenantResolver::arc(store),
+    };
+    let (_grpc_addr, grpc_handle) =
+        super::common::grpc::spawn_bound_chain(chain, shutdown_rx).await;
 
     // The multi-tenant shape's contract: the unified chain boots, the
     // SessionStore is shared between Flight SQL and the gRPC services,

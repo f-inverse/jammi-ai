@@ -1,45 +1,24 @@
-name: Image (CUDA)
+name: Image (CI base, CUDA)
+
+# Builds the CUDA CI base image (jammi-ai-ci-cuda = the CPU base + CUDA toolkit)
+# that the GPU build/prove lanes run inside. Thin caller of the shared
+# _ci-base-image reusable. Rebuilds when its own Dockerfile, ITS BASE
+# (ci.Dockerfile — ci-cuda is `FROM jammi-ai-ci`), or the toolchain changes;
+# watching the base closes the gap where a CPU-base change left the CUDA base
+# stale.
 
 on:
   push:
     branches: [main]
     paths:
+      - ".docker/ci.Dockerfile"
       - ".docker/ci-cuda.Dockerfile"
       - "rust-toolchain.toml"
   workflow_dispatch:
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}-ci-cuda
-
 jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest
-            type=sha,format=long
-
-      - uses: docker/build-push-action@v6
-        with:
-          context: .docker
-          file: .docker/ci-cuda.Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+  build:
+    uses: ./.github/workflows/_ci-base-image.yml
+    with:
+      image_suffix: ci-cuda
+      dockerfile: .docker/ci-cuda.Dockerfile

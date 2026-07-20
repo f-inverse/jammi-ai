@@ -1,0 +1,53 @@
+name: _ci-base-image
+
+# Reusable CI base-image builder. The CPU base (jammi-ai-ci) and the CUDA base
+# (jammi-ai-ci-cuda) build identically — same login → metadata → build-push —
+# differing only in the image name and the Dockerfile. One reusable, two thin
+# callers (image.yml / image-cuda.yml), instead of two byte-identical workflows.
+
+on:
+  workflow_call:
+    inputs:
+      image_suffix:
+        description: "ghcr image-name suffix appended to the repo: 'ci' or 'ci-cuda'."
+        type: string
+        required: true
+      dockerfile:
+        description: "Dockerfile to build (build context is .docker/)."
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}-${{ inputs.image_suffix }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=long
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .docker
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

@@ -90,32 +90,42 @@ print(json.dumps({"query": q, "variables": {"i": inp}}))
 PY
 }
 
-echo "=== provisioning an A100 (sm_80) with supply failover ==="
+SSHO=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -i "$SSH_KEY")
+
+# Provision with two independent failover dimensions:
+#   * capacity — SUPPLY_CONSTRAINT across cloud tiers + A100 variants, and
+#   * liveness — a pod can DEPLOY yet never expose a working SSH endpoint (a dead
+#     host); observed intermittently on RunPod.
+# For each candidate, deploy and give it ~4 min to accept SSH; on failure,
+# terminate that pod and move to the next candidate rather than giving up.
+echo "=== provisioning a live A100 (sm_80) ==="
+HOST=""; PORT=""; supply_seen=0
 for combo in "SECURE|NVIDIA A100 80GB PCIe" "COMMUNITY|NVIDIA A100 80GB PCIe" "SECURE|NVIDIA A100-SXM4-80GB" "COMMUNITY|NVIDIA A100-SXM4-80GB"; do
   cloud="${combo%%|*}"; gpu="${combo##*|}"
-  payload="$(deploy "$cloud" "$gpu")"
-  resp="$(gql "$payload")"
-  POD_ID="$(printf '%s' "$resp" | python3 -c 'import sys,json
+  POD_ID="$(gql "$(deploy "$cloud" "$gpu")" | python3 -c 'import sys,json
 d=json.load(sys.stdin)
-if "errors" in d: print("", end=""); sys.exit()
-print((d.get("data",{}).get("podFindAndDeployOnDemand") or {}).get("id",""), end="")')"
-  if [ -n "$POD_ID" ]; then echo "deployed ${POD_ID} on ${cloud} / ${gpu}"; break; fi
-  echo "  no capacity: ${cloud} / ${gpu}"
-done
-[ -z "$POD_ID" ] && { echo "::error::no A100 capacity on RunPod (SUPPLY_CONSTRAINT across all candidates); retry later"; exit 75; }
-
-# Poll for the public SSH endpoint, then wait for sshd.
-HOST=""; PORT=""
-for _ in $(seq 1 60); do
-  R="$(gql "{\"query\":\"query{ pod(input:{podId:\\\"${POD_ID}\\\"}){ runtime{ ports{ ip publicPort privatePort isIpPublic type } } } }\"}")"
-  read -r HOST PORT < <(printf '%s' "$R" | python3 -c 'import sys,json
+print("" if "errors" in d else (d.get("data",{}).get("podFindAndDeployOnDemand") or {}).get("id",""), end="")')"
+  if [ -z "$POD_ID" ]; then echo "  no capacity: ${cloud} / ${gpu}"; continue; fi
+  supply_seen=1
+  echo "  deployed ${POD_ID} on ${cloud} / ${gpu}; waiting for SSH (≤4m)..."
+  for _ in $(seq 1 24); do
+    R="$(gql "{\"query\":\"query{ pod(input:{podId:\\\"${POD_ID}\\\"}){ runtime{ ports{ ip publicPort privatePort isIpPublic type } } } }\"}")"
+    read -r HOST PORT < <(printf '%s' "$R" | python3 -c 'import sys,json
 p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
 [print(x["ip"], x["publicPort"]) for x in (p.get("ports") or []) if x.get("privatePort")==22 and x.get("isIpPublic")]' | head -1)
-  [ -n "${HOST:-}" ] && break; sleep 10
+    if [ -n "${HOST:-}" ] && ssh "${SSHO[@]}" -p "$PORT" "root@${HOST}" true 2>/dev/null; then break; fi
+    HOST=""; sleep 10
+  done
+  [ -n "${HOST:-}" ] && { echo "  SSH up on ${HOST}:${PORT}"; break; }
+  echo "  pod ${POD_ID} never became reachable; terminating and trying next candidate"
+  gql "{\"query\":\"mutation{ podTerminate(input:{podId:\\\"${POD_ID}\\\"}) }\"}" >/dev/null 2>&1
+  POD_ID=""
 done
-[ -z "${HOST:-}" ] && { echo "::error::pod ${POD_ID} never exposed SSH"; exit 1; }
-SSHO=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -i "$SSH_KEY")
-for _ in $(seq 1 40); do ssh "${SSHO[@]}" -p "$PORT" "root@${HOST}" true 2>/dev/null && break; sleep 10; done
+
+if [ -z "${HOST:-}" ]; then
+  if [ "$supply_seen" = "0" ]; then echo "::error::no A100 capacity on RunPod (SUPPLY_CONSTRAINT across all candidates); retry later"; exit 75; fi
+  echo "::error::A100(s) deployed but none became reachable over SSH; retry later"; exit 75
+fi
 
 echo "=== running GPU prove suites (${HOST}:${PORT}) ==="
 ssh "${SSHO[@]}" -p "$PORT" "root@${HOST}" "timeout ${POD_MAX_SECONDS} bash -s" <<REMOTE

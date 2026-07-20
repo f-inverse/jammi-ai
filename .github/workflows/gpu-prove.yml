@@ -1,0 +1,55 @@
+name: GPU prove (RunPod)
+
+# Runs the gated GPU suites on a REAL NVIDIA A100 (sm_80) via an ephemeral RunPod
+# pod — the only place jammi's CUDA path is exercised on a device before release.
+# Two suites: the served client/server GPU proof (`grpc_embedding_gpu`, the
+# recommended topology over gRPC) and the engine-core GPU correctness suite
+# (`gpu_capability`). It doubles as the #277 regression gate: the pod builds
+# candle's kernels at the CI image's baked CUDA_COMPUTE_CAP and runs them on an
+# 8.0 device, so a cap that regresses above the Ampere floor fails here.
+#
+# Off the merge path by default — GPU minutes cost money and A100 capacity is
+# intermittent. It fires on: the `run-gpu` PR label (opt-in per PR), a nightly
+# cron, and manual dispatch. Needs the `RUNPOD_API_KEY` repo secret.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+  schedule:
+    # Nightly at 03:47 UTC — off-peak, offset from the other crons.
+    - cron: "47 3 * * *"
+
+concurrency:
+  group: gpu-prove-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gpu-prove:
+    name: GPU prove on RunPod A100 (sm_80)
+    # Label event only runs for the `run-gpu` label; dispatch/schedule always run.
+    if: github.event_name != 'pull_request' || github.event.label.name == 'run-gpu'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The orchestrator rents an A100, runs the gated GPU suites on it, streams
+      # the output, and ALWAYS terminates the pod on exit. A `75` exit means no
+      # A100 capacity (SUPPLY_CONSTRAINT) — surfaced as a neutral skip, not a
+      # red, since it is a provider-capacity condition, not a code failure.
+      - name: Prove GPU suites on a real A100
+        id: prove
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          GIT_REPO: https://github.com/${{ github.repository }}.git
+          GIT_REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set +e
+          bash ci/scripts/runpod_gpu_prove.sh
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit $rc
+
+      - name: Note capacity skip
+        if: always() && steps.prove.outputs.rc == '75'
+        run: echo "::warning::GPU prove skipped — no A100 capacity on RunPod (SUPPLY_CONSTRAINT). Re-run when capacity returns."

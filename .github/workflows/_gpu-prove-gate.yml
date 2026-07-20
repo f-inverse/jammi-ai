@@ -1,0 +1,40 @@
+name: _gpu-prove-gate
+
+# Reusable release gate: prove the exact release commit on a real A100 before any
+# CUDA artifact is promoted. Called by every CUDA release lane (pypi-server-cuda,
+# release-binaries, server-image) so build → prove → promote is one shared gate,
+# not three copies. Runs the from-source prove-lane (grpc_embedding_gpu +
+# gpu_capability) — the real #277 kernel gate — against the release ref.
+#
+# A100 capacity is intermittent; a capacity/liveness skip (exit 75) is treated as
+# a WARN-and-pass so a third-party outage cannot block a release indefinitely,
+# while a real suite failure HARD-blocks promotion. Needs the RUNPOD_API_KEY
+# secret (pass `secrets: inherit` from the caller).
+
+on:
+  workflow_call:
+    inputs:
+      git_ref:
+        description: "The ref (tag/branch/sha) to prove — usually the release tag."
+        type: string
+        required: true
+
+jobs:
+  prove:
+    name: Prove on a real A100 (sm_80)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove the release commit on A100
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          GIT_REF: ${{ inputs.git_ref }}
+        run: |
+          set +e
+          bash ci/scripts/runpod_gpu_prove.sh
+          rc=$?
+          if [ "$rc" -eq 75 ]; then
+            echo "::warning::A100 capacity unavailable (SUPPLY_CONSTRAINT) — this release is NOT GPU-proven this run; re-run the gate when capacity returns."
+            exit 0
+          fi
+          exit "$rc"

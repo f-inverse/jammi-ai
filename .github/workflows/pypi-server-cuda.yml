@@ -104,11 +104,22 @@ jobs:
           name: server-cu12-dist
           path: packaging/server-cu12/dist/
 
+  gpu-prove:
+    name: GPU prove-gate (A100)
+    # Tag push only — prove the release commit on a real A100 before promotion.
+    if: github.event_name == 'push'
+    needs: build-wheel
+    uses: ./.github/workflows/_gpu-prove-gate.yml
+    with:
+      git_ref: ${{ github.ref_name }}
+    secrets: inherit
+
   publish:
     name: Publish to PyPI
     # Tag push only — a workflow_dispatch or PR is an artifact-only dry run.
+    # build → prove → promote: publishes only after the GPU prove-gate passes.
     if: github.event_name == 'push'
-    needs: build-wheel
+    needs: [build-wheel, gpu-prove]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

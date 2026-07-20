@@ -209,9 +209,7 @@ async fn text_embeddings_served_over_the_wire_on_gpu() {
         resp.hits.len()
     );
     assert!(
-        resp.hits
-            .windows(2)
-            .all(|w| w[0].score >= w[1].score),
+        resp.hits.windows(2).all(|w| w[0].score >= w[1].score),
         "hits must be ordered by descending score, got {:?}",
         resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
     );

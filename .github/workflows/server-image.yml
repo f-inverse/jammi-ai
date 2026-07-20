@@ -149,8 +149,21 @@ jobs:
   # and pushes the same tag scheme as the CPU image. GPU runtime is not tested
   # here (no GPU on CI runners) — the `build-cuda-pr` job below proves the
   # Dockerfile compiles on every PR that touches it, before any tag lands.
+  gpu-prove-cu12:
+    name: GPU prove-gate (A100)
+    # Tag push only — prove the release commit on a real A100 before the CUDA
+    # image is promoted.
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/_gpu-prove-gate.yml
+    with:
+      git_ref: ${{ github.ref_name }}
+    secrets: inherit
+
   build-and-push-cu12:
-    if: github.event_name != 'pull_request'
+    # build → prove → promote: on a tag push, push only after the A100 gate
+    # passes; dispatch builds are ungated (prove is skipped).
+    needs: [gpu-prove-cu12]
+    if: always() && github.event_name != 'pull_request' && (github.event_name != 'push' || needs.gpu-prove-cu12.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: read

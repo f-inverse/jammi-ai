@@ -339,7 +339,11 @@ docker run --rm --gpus all \
   ghcr.io/f-inverse/jammi-ai-server-cu12:latest serve --config /etc/jammi/jammi.toml
 ```
 
-Set `gpu.device = 0` in `jammi.toml` (or `JAMMI_GPU__DEVICE=0`) to select the CUDA device; see [GPU configuration](#gpu-configuration). The image is compiled for compute capability `8.0` (Ampere) and runs on `8.0` and every newer datacenter GPU — A10/A6000 (`8.6`), L40S (`8.9`), H100 (`9.0`) — via PTX forward-compatibility. Turing GPUs (e.g. Tesla T4, `7.5`) are not supported. The CPU image ignores GPU config and runs inference on the CPU.
+Set `gpu.device = 0` in `jammi.toml` (or `JAMMI_GPU__DEVICE=0`) to select the CUDA device; see [GPU configuration](#gpu-configuration). The image is compiled for compute capability `8.0` (Ampere) and runs on `8.0` and every newer datacenter GPU — A10/A6000 (`8.6`), L40S (`8.9`), H100 (`9.0`) — via PTX forward-compatibility. Turing GPUs (e.g. Tesla T4, `7.5`) are not supported.
+
+**Minimum NVIDIA driver:** the image is built against the CUDA 12.6 toolkit and ships single-architecture PTX, so on any GPU newer than `8.0` the driver **JIT-compiles** that PTX at first model load. This requires a driver new enough for the CUDA 12.6 runtime — **Linux: `r560` or later** (`≥ 560.28.03`). An older driver (for example `550.x`, which tops out at the CUDA 12.4 PTX ISA) can reject the image's newer PTX at load with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` / `CUDA_ERROR_INVALID_PTX`, even on a supported architecture. `nvidia-smi` reports the installed driver and its max CUDA version.
+
+The CPU image ignores GPU config and runs inference on the CPU.
 
 ### Building from source
 

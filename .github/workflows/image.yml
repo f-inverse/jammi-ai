@@ -1,45 +1,21 @@
-name: Image
+name: Image (CI base, CPU)
+
+# Builds the CPU CI base image (jammi-ai-ci) that the CPU workflows run inside.
+# Thin caller of the shared _ci-base-image reusable. Rebuilds on a change to its
+# own Dockerfile or the pinned toolchain (narrowed from `.docker/**` so a
+# CUDA-only Dockerfile change no longer needlessly rebuilds the CPU base).
 
 on:
   push:
     branches: [main]
     paths:
-      - ".docker/**"
+      - ".docker/ci.Dockerfile"
       - "rust-toolchain.toml"
   workflow_dispatch:
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}-ci
-
 jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest
-            type=sha,format=long
-
-      - uses: docker/build-push-action@v6
-        with:
-          context: .docker
-          file: .docker/ci.Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+  build:
+    uses: ./.github/workflows/_ci-base-image.yml
+    with:
+      image_suffix: ci
+      dockerfile: .docker/ci.Dockerfile

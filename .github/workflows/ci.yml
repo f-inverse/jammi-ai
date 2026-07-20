@@ -453,6 +453,19 @@ jobs:
         run: |
           cargo test -p jammi-db --features live-postgres-tests --test it -- --test-threads=1
 
+  # Doc↔enum parity guard — a trivial hermetic pure-Python check (no toolchain),
+  # folded in from the former standalone doc-parity.yml so the single `ci-summary`
+  # gate covers it. No path filter (runs on every PR) so the context stays safe to
+  # require. (The swarm-gates workflow is deliberately NOT folded: it is a
+  # human-amend-only governance gate and stays isolated.)
+  doc-parity:
+    name: Guard (doc↔enum parity)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert the guide's documented enum enumerations match the code
+        run: python3 ci/scripts/check_doc_parity.py
+
   # ── Single rolled-up gate ──────────────────────────────────────────────────
   # The ONE check a branch-protection ruleset should require, instead of listing
   # every job as a separate context. It fails if any job above failed/cancelled;
@@ -476,6 +489,7 @@ jobs:
       - test-broker
       - test-python
       - test-pg
+      - doc-parity
     if: always()
     uses: ./.github/workflows/_summary.yml
     with:

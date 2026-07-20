@@ -452,3 +452,31 @@ jobs:
         # `--test-threads=1` keeps that contract; the suite is small.
         run: |
           cargo test -p jammi-db --features live-postgres-tests --test it -- --test-threads=1
+
+  # ── Single rolled-up gate ──────────────────────────────────────────────────
+  # The ONE check a branch-protection ruleset should require, instead of listing
+  # every job as a separate context. It fails if any job above failed/cancelled;
+  # a `skipped` job (intentional — e.g. `test-live`, which is main-only) counts
+  # as a pass. `if: always()` makes it emit on every run, so the required check
+  # never hangs "waiting for status". `test-live` is deliberately excluded — it
+  # is `continue-on-error` (a live-network lane allowed to fail).
+  ci-summary:
+    needs:
+      - check
+      - test
+      - compile-check-gated
+      - test-clients
+      - cookbook-one-way
+      - sqlite-isms
+      - dep-direction
+      - oss-only-build
+      - dep-audit
+      - ts-client
+      - py-client
+      - test-broker
+      - test-python
+      - test-pg
+    if: always()
+    uses: ./.github/workflows/_summary.yml
+    with:
+      needs_json: ${{ toJSON(needs) }}

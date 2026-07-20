@@ -1,0 +1,49 @@
+name: Summary
+
+# Reusable status aggregator: roll every job in a workflow up into ONE check that
+# a branch-protection ruleset can require, instead of listing each context.
+#
+# The caller passes `toJSON(needs)`; this fails if any upstream job is `failure`
+# or `cancelled`. `skipped` counts as a PASS — an intentional skip (an event- or
+# path-gated job that didn't need to run on this PR) must not block the merge; a
+# skip caused by a failed dependency is caught via that dependency's own
+# `failure`. Because the caller runs it with `if: always()`, the check emits on
+# EVERY run regardless of what ran, so a required check never hangs "waiting for
+# status".
+#
+# Caller pattern:
+#   ci-summary:
+#     needs: [job-a, job-b, ...]
+#     if: always()
+#     uses: ./.github/workflows/_summary.yml
+#     with:
+#       needs_json: ${{ toJSON(needs) }}
+
+on:
+  workflow_call:
+    inputs:
+      needs_json:
+        description: "JSON-stringified `needs` context from the caller — pass toJSON(needs)."
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  assert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Assert all upstream jobs succeeded (skipped counts as pass)
+        env:
+          NEEDS: ${{ inputs.needs_json }}
+        run: |
+          # needs shape: { "<job>": { "result": success|failure|cancelled|skipped, … }, … }
+          failed="$(echo "$NEEDS" | jq -r 'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | "  \(.key)=\(.value.result)"')"
+          echo "$NEEDS" | jq -r 'to_entries[] | "  \(.key) = \(.value.result)"'
+          if [ -n "$failed" ]; then
+            echo "::error::one or more upstream jobs did not succeed:"
+            echo "$failed"
+            exit 1
+          fi
+          echo "All upstream jobs passed (or were intentionally skipped)."

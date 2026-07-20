@@ -54,14 +54,14 @@ print(json.dumps({"query": "mutation D($i: PodFindAndDeployOnDemandInput!){ podF
 PY
 }
 
-# Deploy an A100 (sm_80 — the ONLY arch that proves the compute_80 floor / #277),
-# failing over across cloud tiers + PCIe/SXM variants (capacity) and terminating
-# any pod that never becomes reachable (liveness). On success sets
-# RP_POD_ID/RP_HOST/RP_PORT and returns 0. Returns 75 (neutral skip) when no
-# candidate yields a reachable pod — a provider condition, not a code failure.
-rp_deploy_live_a100() {
+# Deploy a live GPU pod, failing over across a candidate list of "CLOUD|GPU_TYPE"
+# args (capacity) and terminating any pod that never becomes reachable
+# (liveness). On success sets RP_POD_ID/RP_HOST/RP_PORT and returns 0. Returns 75
+# (neutral skip) when no candidate yields a reachable pod — a provider condition,
+# not a code failure.
+rp_deploy_live() {
   local supply_seen=0 combo cloud gpu R
-  for combo in "SECURE|NVIDIA A100 80GB PCIe" "COMMUNITY|NVIDIA A100 80GB PCIe" "SECURE|NVIDIA A100-SXM4-80GB" "COMMUNITY|NVIDIA A100-SXM4-80GB"; do
+  for combo in "$@"; do
     cloud="${combo%%|*}"; gpu="${combo##*|}"
     RP_POD_ID="$(rp_gql "$(_rp_deploy_payload "$cloud" "$gpu")" | python3 -c 'import sys,json
 d=json.load(sys.stdin)
@@ -84,9 +84,17 @@ p=(json.load(sys.stdin).get("data",{}).get("pod") or {}).get("runtime") or {}
     rp_gql "{\"query\":\"mutation{ podTerminate(input:{podId:\\\"${RP_POD_ID}\\\"}) }\"}" >/dev/null 2>&1
     RP_POD_ID=""
   done
-  if [ "$supply_seen" = "0" ]; then echo "::error::no A100 capacity on RunPod (SUPPLY_CONSTRAINT); retry later"
-  else echo "::error::A100(s) deployed but none became reachable over SSH; retry later"; fi
+  if [ "$supply_seen" = "0" ]; then echo "::error::no GPU capacity on RunPod for the requested candidates (SUPPLY_CONSTRAINT); retry later"
+  else echo "::error::GPU pod(s) deployed but none became reachable over SSH; retry later"; fi
   return 75
+}
+
+# A100 (sm_80) — the arch that proves the compute_80 floor / #277. Wrapper over
+# rp_deploy_live with the A100 candidate list (PCIe + SXM, both cloud tiers).
+rp_deploy_live_a100() {
+  rp_deploy_live \
+    "SECURE|NVIDIA A100 80GB PCIe" "COMMUNITY|NVIDIA A100 80GB PCIe" \
+    "SECURE|NVIDIA A100-SXM4-80GB" "COMMUNITY|NVIDIA A100-SXM4-80GB"
 }
 
 # Run a bash script (read from stdin) on the pod, with the container ENV imported

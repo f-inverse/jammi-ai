@@ -1,6 +1,6 @@
 """Console-script entry point for the CUDA (cu12) `jammi-server` wheel.
 
-candle-core 0.9.2 pins cudarc with `dynamic-linking`, so the bundled binary has
+candle-core 0.11 pins cudarc with `dynamic-linking`, so the bundled binary has
 hard `DT_NEEDED` entries for libcudart / libcublas / libcublasLt / libcurand /
 libnvrtc. The dynamic loader resolves those *before* `main` runs — so the binary
 will not exec at all unless they are on the loader path (CPU fallback is a
@@ -17,7 +17,7 @@ import os
 import sys
 
 # Component subdirectories of the `nvidia` namespace package that ship the CUDA
-# runtime libraries the binary links against (cudarc 0.19.3's
+# runtime libraries the binary links against (cudarc 0.19.8's
 # cuda_runtime / cublas+cublasLt / curand / nvrtc feature set). cublasLt ships
 # inside the `cublas` component, so it needs no separate entry.
 _CUDA_COMPONENTS = ("cuda_runtime", "cublas", "curand", "cuda_nvrtc")

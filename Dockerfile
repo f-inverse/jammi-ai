@@ -178,8 +178,8 @@ EXPOSE 8080 8081
 # write its SQLite catalog there even when no volume is mounted.
 RUN groupadd --gid 65532 nonroot \
     && useradd --uid 65532 --gid 65532 --home-dir /home/nonroot --create-home nonroot \
-    && mkdir -p /var/lib/jammi \
-    && chown 65532:65532 /var/lib/jammi
+    && mkdir -p /var/lib/jammi /var/lib/jammi/.nv-cache \
+    && chown -R 65532:65532 /var/lib/jammi
 
 # Persistent state: catalog DB, model weights, indices.
 VOLUME ["/var/lib/jammi"]
@@ -188,6 +188,15 @@ USER 65532:65532
 # Point zero-config `jammi-server` at the declared volume rather than the user's
 # XDG data dir. An operator config's `artifact_dir` still wins via `--config`.
 ENV JAMMI_ARTIFACT_DIR=/var/lib/jammi
+
+# Persist the CUDA JIT (PTX→SASS) compute cache on the data volume. The image
+# ships single-arch PTX at CUDA_COMPUTE_CAP=80, so on an sm_80 device it loads
+# natively, but on 8.6/8.9/9.0 the driver JIT-compiles the PTX at first model
+# load. The container runs as uid 65532 whose default cache dir (`$HOME/.nv`) is
+# not writable here (HOME is unset, so it resolves under `/`), which would silently
+# disable the cache and re-JIT on every start. Pointing it at the writable,
+# persistent volume amortizes the one-time JIT across restarts.
+ENV CUDA_CACHE_PATH=/var/lib/jammi/.nv-cache
 
 # Turnkey: `docker run --gpus all <image>` runs `jammi-server` with zero config
 # (local SQLite catalog, in-memory broker, all tiers; GPU via the cuda build).

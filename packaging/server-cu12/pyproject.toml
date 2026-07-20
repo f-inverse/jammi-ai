@@ -26,10 +26,10 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Database",
 ]
-# candle-core 0.9.2 pins cudarc with `dynamic-linking`, so the binary carries
+# candle-core 0.11 pins cudarc with `dynamic-linking`, so the binary carries
 # hard DT_NEEDED entries for libcudart / libcublas / libcublasLt / libcurand /
 # libnvrtc. These wheels deliver those libraries so no system CUDA install is
-# needed — only an NVIDIA driver. The four packages cover cudarc 0.19.3's
+# needed — only an NVIDIA driver. The four packages cover cudarc 0.19.8's
 # cuda_runtime / cublas+cublasLt / curand / nvrtc feature set.
 #
 # Each pin tracks that library's OWN release lineage, not a single CUDA version

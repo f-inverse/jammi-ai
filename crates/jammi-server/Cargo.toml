@@ -66,6 +66,11 @@ default = ["train"]
 train = []
 cuda  = ["jammi-ai/cuda"]
 metal = ["jammi-ai/metal"]
+# Compiles the gated GPU-host integration lane (the client/server-topology GPU
+# proof in `tests/it/grpc_embedding_gpu.rs`). Off by default; a meaningful run
+# also needs `cuda` + a visible GPU, otherwise the suite skips. Mirrors
+# `jammi-ai`'s `live-gpu-tests` gate.
+live-gpu-tests = []
 # Compiles the JetStream broker driver into the binary so production
 # deploys can run Postgres + NATS via config without rebuilding from
 # source. CI publishes the OSS image with this feature enabled.

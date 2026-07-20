@@ -5,6 +5,10 @@ mod flight_annotate;
 mod flight_tenant;
 mod grpc_byo_auth;
 mod grpc_embedding;
+// The client/server-topology GPU proof: compiled only under `live-gpu-tests`,
+// a meaningful run also needs `cuda` + a visible GPU (it skips otherwise).
+#[cfg(feature = "live-gpu-tests")]
+mod grpc_embedding_gpu;
 mod grpc_eval;
 mod grpc_inference;
 mod grpc_introspection;

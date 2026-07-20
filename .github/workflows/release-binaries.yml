@@ -238,8 +238,22 @@ jobs:
   # DT_NEEDED entries for those libraries, so it will not exec without them on the
   # loader path; bundling makes the tarball run on any host with only an NVIDIA
   # driver. A GPU-less runner is fine — nothing runs the binary here.
+  gpu-prove-cu12:
+    name: GPU prove-gate (A100)
+    # Tag push only — prove the release commit on a real A100 before the CUDA
+    # tarball is uploaded to the release.
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/_gpu-prove-gate.yml
+    with:
+      git_ref: ${{ github.ref_name }}
+    secrets: inherit
+
   server-cu12:
     name: Build jammi-server (CUDA)
+    # build → prove → promote: on a tag push, upload only after the A100 gate
+    # passes; dispatch/dry-run builds are ungated (prove is skipped).
+    needs: [gpu-prove-cu12]
+    if: always() && (github.event_name != 'push' || needs.gpu-prove-cu12.result == 'success')
     runs-on: ubuntu-latest
     container: ghcr.io/f-inverse/jammi-ai-ci-cuda:latest
     steps:

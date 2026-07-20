@@ -339,7 +339,7 @@ docker run --rm --gpus all \
   ghcr.io/f-inverse/jammi-ai-server-cu12:latest serve --config /etc/jammi/jammi.toml
 ```
 
-Set `gpu.device = 0` in `jammi.toml` (or `JAMMI_GPU__DEVICE=0`) to select the CUDA device; see [GPU configuration](#gpu-configuration). The image is compiled for compute capability `8.6`. The CPU image ignores GPU config and runs inference on the CPU.
+Set `gpu.device = 0` in `jammi.toml` (or `JAMMI_GPU__DEVICE=0`) to select the CUDA device; see [GPU configuration](#gpu-configuration). The image is compiled for compute capability `8.0` (Ampere) and runs on `8.0` and every newer datacenter GPU — A10/A6000 (`8.6`), L40S (`8.9`), H100 (`9.0`) — via PTX forward-compatibility. Turing GPUs (e.g. Tesla T4, `7.5`) are not supported. The CPU image ignores GPU config and runs inference on the CPU.
 
 ### Building from source
 

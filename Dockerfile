@@ -8,7 +8,7 @@
 #
 # CUDA lives only on the server image (M2 §1, §5d). The CPU variants build on the generic
 # CI base (`jammi-ai-ci`) and a distroless runtime; the CUDA variant builds on the CUDA CI
-# base (`jammi-ai-ci-cuda`, which carries the CUDA 12.6 toolkit + CUDA_COMPUTE_CAP=86) and a
+# base (`jammi-ai-ci-cuda`, which carries the CUDA 12.6 toolkit + CUDA_COMPUTE_CAP=80) and a
 # CUDA runtime base that ships `libcudart` for candle's cudarc backend. Each runtime stage
 # copies from the builder it needs, so the single `RUNTIME_VARIANT` selector still resolves
 # the whole image — no Dockerfile fork.
@@ -51,7 +51,7 @@ RUN mkdir -p /tmp/jammi-data
 
 # ---- builder: cuda ----
 # The CUDA CI base extends `jammi-ai-ci` with the CUDA 12.6 toolkit (nvcc), GCC 13
-# (CUDA 12.6 supports GCC ≤ 13.2), and `CUDA_COMPUTE_CAP=86` — the same image the
+# (CUDA 12.6 supports GCC ≤ 13.2), and `CUDA_COMPUTE_CAP=80` — the same image the
 # (now-retired) CUDA wheel lane built against. `candle-core/cuda` reads CUDA_COMPUTE_CAP
 # at build time to target the GPU architecture; CC/CXX/PATH for nvcc are baked into the base.
 FROM ghcr.io/f-inverse/jammi-ai-ci-cuda:latest AS builder-cuda
@@ -60,7 +60,8 @@ WORKDIR /workspace
 COPY . .
 
 # Same cache-mount strategy as the CPU builder. The only delta is `--features cuda`,
-# which pulls in candle's CUDA backend (compiled for compute capability 86). Both
+# which pulls in candle's CUDA backend (compiled for compute capability 80 — PTX,
+# forward-compatible via JIT to 8.6/8.9/9.0). Both
 # binaries are built so the GPU image carries the admin `jammi` CLI too.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/workspace/target,sharing=locked \

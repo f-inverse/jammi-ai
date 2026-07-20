@@ -39,7 +39,7 @@ jobs:
     name: Build jammi-server binary (CUDA, manylinux_2_28)
     runs-on: ubuntu-latest
     # The CUDA CI base extends jammi-ai-ci with the CUDA 12.6 toolkit (nvcc),
-    # GCC 13, and CUDA_COMPUTE_CAP=86 — what candle's CUDA backend needs to
+    # GCC 13, and CUDA_COMPUTE_CAP=80 — what candle's CUDA backend needs to
     # compile. No GPU is required to build.
     container: ghcr.io/f-inverse/jammi-ai-ci-cuda:latest
     steps:
@@ -47,7 +47,8 @@ jobs:
 
       - uses: mozilla-actions/sccache-action@v0.0.9
 
-      # `cuda` pulls in candle's CUDA backend (compute capability 86); the broker
+      # `cuda` pulls in candle's CUDA backend (compute capability 80, forward-
+      # compatible to 8.6/8.9/9.0 via PTX JIT); the broker
       # + cloud-storage features match the CPU build so the GPU binary is equally
       # deployment-agnostic.
       - name: Build jammi-server (CUDA, release)
